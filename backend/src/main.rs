@@ -58,6 +58,8 @@ mod types;
 mod voice;
 mod web;
 mod web_server;
+mod ethernet_autoconfig;
+mod checklists;
 
 use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
 use crate::ring_buffer::RingBuffer;
@@ -855,6 +857,11 @@ async fn main() -> anyhow::Result<()> {
     let ring_buffer_capacity = env_usize("GS_RING_BUFFER_CAPACITY", 65_536, 1024, 1_000_000);
     let loadcell_calibration = loadcell::load_or_default();
     let comms_links = comms_config::load_or_default();
+    if let comms_config::CommsLinkConfig::PicoFiTcp { tcp } = &comms_links.fill_box {
+        ethernet_autoconfig::prepare(tcp.discovery_interface.clone()).await;
+    } else if rrls::is_rrls() {
+        ethernet_autoconfig::prepare(None).await;
+    }
     rrls::configure(&comms_links.av_bay)?;
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let users_path = std::env::var_os("GS_USERS_FILE")

@@ -217,6 +217,10 @@ fn transition_launch_clock_to_t_plus_from_pilot_open(state: &Arc<AppState>) {
 
 #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router: Arc<Router>) {
+    if let Some(reason) = crate::checklists::launch_block() {
+        emit_notification_warning(&state, reason);
+        return;
+    }
     if vent_valve_known_open_for_launch(&state) {
         warn_launch_blocked_by_vent_valve(&state);
         sequences::refresh_action_policy_now(&state);
@@ -265,6 +269,10 @@ async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router
 }
 
 async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc<Router>) {
+    if let Some(reason) = crate::checklists::launch_block() {
+        emit_notification_warning(&state, reason);
+        return;
+    }
     if vent_valve_known_open_for_launch(&state) {
         warn_launch_blocked_by_vent_valve(&state);
         sequences::refresh_action_policy_now(&state);

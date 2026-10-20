@@ -30,22 +30,36 @@ Run the usual build/run command or installed backend binary. The defaults are:
 | Setting | Default / purpose |
 | --- | --- |
 | `GS_BIND_ADDRESS` | `0.0.0.0:3000` — HTTP |
-| `GS_HTTPS_BIND_ADDRESS` | `0.0.0.0:3443` — HTTPS; `off` explicitly disables it for isolated tests |
+| `GS_HTTPS_BIND_ADDRESS` | `0.0.0.0:443` — HTTPS; `off` explicitly disables it for isolated tests |
 | `GS_TLS_DIR` | `backend/data/tls` relative to the working directory |
 | `GS_TLS_NAMES` | Additional comma-separated DNS names and IPs, without schemes or ports |
 | `GS_TLS_CERT`, `GS_TLS_KEY` | Optional PEM certificate chain and private key; set both |
 
 For example, native RRLS can use `GS_RRLS_ROLE=rrls` and
-`GS_TLS_NAMES=rrls.local,192.168.4.7`, then open `https://192.168.4.7:3443`.
+`GS_TLS_NAMES=rrls.local,192.168.4.7`, then open `https://192.168.4.7`.
 Localhost names are always included. Without explicit `GS_TLS_NAMES`, native
 interface addresses are included automatically. Explicit names keep the identity
 stable even if Docker assigns a different private container IP.
 Use explicit names in Docker because container interfaces do not identify host IPs.
 Names in a certificate do not configure DNS or mDNS; the name must resolve separately.
 
-To bind native ports 80/443 instead, change the two bind addresses. Linux systemd
-services then need `AmbientCapabilities=CAP_NET_BIND_SERVICE` and
-`CapabilityBoundingSet=CAP_NET_BIND_SERVICE`; running the backend as root is unnecessary.
+Native HTTPS now defaults to 443. HTTP stays on 3000 for existing clients.
+Docker explicitly uses 3443 internally and publishes 443 as before.
+For an unprivileged local development run, set `GS_HTTPS_BIND_ADDRESS=0.0.0.0:3443`.
+
+The root systemd service can also provision DHCP + link-local Ethernet. Install the
+service drop-in once, from the checked-out repository:
+
+```sh
+sudo python3 backend/tools/install_native_service.py
+sudo systemctl restart sed-ground-station.service
+```
+
+For RRLS use `--service rrls.service`. The installer preserves ExecStart, working
+directory and existing environment, adds native HTTPS on 443, and runs the service
+as root for wired Ethernet configuration. It does not restart the service itself.
+If Ethernet configuration is managed externally, an unprivileged service can use
+`AmbientCapabilities=CAP_NET_BIND_SERVICE` instead of running as root.
 
 ## Certificate lifecycle and trust
 

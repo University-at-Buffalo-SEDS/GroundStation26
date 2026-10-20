@@ -12,7 +12,7 @@ Recorded telemetry can be downloaded in every operating mode from **Data → Dat
 see [Data capture](docs/backend/data-capture.md).
 
 The backend listens on `0.0.0.0:3000` by default. Set `GS_BIND_ADDRESS` (for example `127.0.0.1:13000`) to run an
-independent test instance. The same Rust binary also serves HTTPS on `0.0.0.0:3443`,
+independent test instance. The same Rust binary also serves HTTPS on `0.0.0.0:443`,
 including in RRLS mode. Docker publishes HTTP on **80** and HTTPS on **443**.
 Certificates are generated and persisted automatically. See [HTTP and HTTPS](docs/backend/https.md)
 for certificate trust, LAN names/IPs, custom certificates and listener configuration.

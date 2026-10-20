@@ -25,7 +25,7 @@ impl Config {
             .parse()
             .context("invalid GS_BIND_ADDRESS")?;
         let address =
-            std::env::var("GS_HTTPS_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:3443".into());
+            std::env::var("GS_HTTPS_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:443".into());
         let https = if address == "off" {
             None
         } else {

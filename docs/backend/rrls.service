@@ -4,11 +4,11 @@ After=network.target
 
 [Service]
 Type=simple
-User=rrls
+User=root
 WorkingDirectory=/opt/rrls/GroundStation26
 Environment=GS_RRLS_ROLE=rrls
 Environment=GS_BIND_ADDRESS=0.0.0.0:3000
-Environment=GS_HTTPS_BIND_ADDRESS=0.0.0.0:3443
+Environment=GS_HTTPS_BIND_ADDRESS=0.0.0.0:443
 Environment=GS_COMMS_LINK_CONFIG=/etc/rrls/comms.json
 Environment=GS_USERS_FILE=/var/lib/rrls/users.json
 ExecStart=/opt/rrls/GroundStation26/target/release/groundstation_backend

@@ -1318,6 +1318,14 @@ impl AppState {
             }
         }
         crate::gse::decorate_policy(self, &mut policy);
+        if crate::checklists::launch_block().is_some() {
+            for control in &mut policy.controls {
+                if matches!(control.cmd.as_str(), "Launch" | "GroundStationLaunch") {
+                    control.enabled = false;
+                    control.blink = crate::sequences::BlinkMode::None;
+                }
+            }
+        }
         let mut slot = self.action_policy.lock().unwrap();
         if *slot == policy {
             return;

@@ -31,7 +31,7 @@ python3 backend/tools/ethernet_link_local.py --renderer networkmanager --interfa
 
 For networkd, merge the printed fields into the existing Ethernet definition in `/etc/netplan`, preserving its existing ID, match rules and other settings; back up the file first and use `sudo netplan try` locally. Pass `--netplan-id` when that definition has a different ID. For NetworkManager, use the existing wired connection name and the printed native `ipv4.link-local enabled` setting; Netplan's `link-local` field alone does not enable this alongside DHCP for that renderer. Apply at a suitable maintenance point because changing addressing can interrupt SSH. See the [Netplan addressing documentation](https://netplan.readthedocs.io/en/stable/netplan-yaml/) and [NetworkManager IPv4 configuration](https://networkmanager.pages.freedesktop.org/NetworkManager/NetworkManager/nm-settings-nmcli.html).
 
-Pico-Fi detects address conflicts while probing and after assignment, abandons conflicted addresses, and retries DHCP while disconnected. It does not interrupt a healthy TCP session merely to retry DHCP. Both peers must share the same broadcast LAN; discovery is not intended to cross routed networks.
+Pico-Fi detects address conflicts while probing and after assignment, abandons conflicted addresses, and retries DHCP while disconnected. While link-local is active it also sends a bounded DHCP-presence probe roughly every 15 seconds, with per-device jitter. A fresh matching offer triggers normal DHCP acquisition and reconnects discovery; probes without an offer leave healthy TCP sessions alone. Both TCP roles use the same address-change handling. Both peers must share the same broadcast LAN; discovery is not intended to cross routed networks.
 
 The existing Pico protocol is unchanged: `PICOFI1` handshake, then `B5 4E`, little-endian 16-bit length, and 1–4096 payload bytes. No UART envelope is added inside the TCP frame. Either end can reconnect. Both directions have bounded 128-frame queues and the decoder validates length before allocating a frame. A stalled writer resets the connection after 500 ms; accepted transmit frames from a failed connection are discarded, not replayed into a new session. Network reliability and command expiry remain owned by SEDSnet.
 
@@ -64,3 +64,20 @@ PICO_FI_UART_BAUD_RATE=1000000 python3 build.py --config pico-fi-gateway-etherne
 ```
 
 The build prints the UF2 path. These profiles connect the gateway-side Pico directly to the Pi's Ethernet LAN. Existing two-Pico profiles remain available for older deployments. Builds do not flash hardware or alter the Pi's network configuration.
+
+
+## Automatic Pi Ethernet addressing
+
+Native Linux root services provision DHCP plus IPv4 link-local on physical wired
+interfaces before starting discovery. NetworkManager defaults are installed in
+`/etc/NetworkManager/conf.d/90-groundstation-auto-<interface>.conf`; networkd
+uses a drop-in for an existing DHCP profile. Wi-Fi, VPN and explicit static
+profiles are preserved. Set `GS_ETHERNET_AUTOCONFIG=off` to opt out. Containers
+and unprivileged processes leave host network configuration to the administrator.
+
+Use `sudo python3 backend/tools/install_native_service.py` once if the existing
+systemd service runs as an ordinary user. Thereafter pulling, rebuilding and
+restarting the service is sufficient. Both TCP roles bind/discover using current
+addresses and reconnect when the Pico migrates between link-local and DHCP.
+The Ethernet cable must be connected; Wi-Fi connectivity alone does not power
+or connect the gateway-side Ethernet interface.

@@ -269,6 +269,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::voice::routes(state.clone(), voice))
         .merge(crate::gse::routes())
         .merge(crate::admin::routes())
+        .merge(crate::checklists::routes())
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)
         .with_state(state)
