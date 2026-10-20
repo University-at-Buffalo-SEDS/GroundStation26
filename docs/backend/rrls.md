@@ -86,7 +86,7 @@ python3 build.py rrls --frontend-dev
 
 RRLS uses `backend/comms/rrls.json` by default, separate from the primary station's
 `backend/comms/comms.json`. It does not migrate primary/legacy configuration.
-Choose the radio once with `python3 run_rrls.py --radio-port /dev/cu.YOUR_RADIO`
+Choose the radio once with `python3 run_rrls.py --frontend-dev --radio-port /dev/cu.YOUR_RADIO`
 on macOS, or `/dev/serial0` on the Pi. This selection is saved in the RRLS file.
 Use `--comms-config FILE` or `GS_RRLS_COMMS_LINK_CONFIG` for a different RRLS file.
 An explicit `GS_COMMS_LINK_CONFIG` remains supported; the RRLS-specific setting
@@ -113,13 +113,14 @@ GS_COMMS_LINK_CONFIG=/etc/rrls/comms.json python3 run_rrls.py --backend-only-bui
 On macOS, run the same launcher with an unprivileged HTTPS port:
 
 ```sh
-GS_HTTPS_BIND_ADDRESS=0.0.0.0:3443 python3 run_rrls.py --radio-port /dev/cu.YOUR_RADIO
+GS_HTTPS_BIND_ADDRESS=0.0.0.0:3443 python3 run_rrls.py --frontend-dev --radio-port /dev/cu.YOUR_RADIO
 ```
 
 Open `https://localhost:3443`. Use the Mac's actual `/dev/cu.*` radio device in
 `rrls-comms.json`. `run_rrls.py` accepts the same options as
-`run_groundstation.py`, including `--debug` and `--backend-only-build`;
-it always enables RRLS mode. Run `python3 run_rrls.py --help` to list options.
+`run_groundstation.py`, including `--debug`, `--backend-only-build`, and `--frontend-dev` (or `frontend_dev`);
+it always enables RRLS mode. As with `build.py`, the frontend defaults to `main`;
+`--frontend-dev` selects the matching development WebUI. Run `python3 run_rrls.py --help` to list options.
 
 For boot-time operation, adapt [rrls.service](rrls.service) to the installed user
 and paths. `GS_USERS_FILE` selects RRLS's own users file; provision accounts using

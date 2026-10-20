@@ -114,7 +114,9 @@ def parse_args() -> argparse.Namespace:
         help="Skip the frontend rebuild and only rebuild/run the backend.",
     )
     parser.add_argument("--rrls", action="store_true", help="Run the headless recovery receiver/relay with local web and mobile access.")
-    return parser.parse_args()
+    parser.add_argument("--frontend-dev", "--frontend_dev", action="store_true", help="Build the WebUI from the frontend dev branch (also accepts frontend_dev, like build.py).")
+    arguments=["--frontend-dev" if argument in {"frontend_dev", "frontend-dev"} else argument for argument in sys.argv[1:]]
+    return parser.parse_args(arguments)
 
 
 def main() -> None:
@@ -147,6 +149,8 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parent
     if not args.backend_only_build:
         frontend_cmd = [sys.executable, str(repo_root / "build.py"), "frontend_web"]
+        if args.frontend_dev:
+            frontend_cmd.append("--frontend-dev")
         if debug_mode:
             frontend_cmd.append("debug")
         print(f"Running: {' '.join(frontend_cmd)} (cwd={repo_root})")
