@@ -1,6 +1,6 @@
 //! Native Linux root-service provisioning for DHCP + IPv4LL on wired interfaces.
 //! Address acquisition remains owned by the OS; the application binds all addresses.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod linux {
     use anyhow::{Context, Result, bail};
@@ -94,6 +94,14 @@ mod linux {
         command("/usr/bin/systemctl", &["is-active", "--quiet", service])
             .is_ok_and(|v| v.status.success())
     }
+    fn is_wired_device(base: &Path) -> bool {
+        base.join("device").exists()
+            && !base.join("wireless").exists()
+            && !base.join("phy80211").exists()
+            && !std::fs::read_to_string(base.join("uevent"))
+                .is_ok_and(|v| v.lines().any(|line| line == "DEVTYPE=wlan"))
+            && std::fs::read_to_string(base.join("type")).is_ok_and(|v| v.trim() == "1")
+    }
     fn physical_interfaces(selected: Option<&str>) -> Result<Vec<String>> {
         if selected.is_some_and(|name| !valid_interface(name)) {
             bail!("invalid selected Ethernet interface");
@@ -106,10 +114,7 @@ mod linux {
                 continue;
             }
             let base = entry.path();
-            if base.join("device").exists()
-                && !base.join("wireless").exists()
-                && std::fs::read_to_string(base.join("type")).is_ok_and(|v| v.trim() == "1")
-            {
+            if is_wired_device(&base) {
                 names.push(name);
             }
         }
@@ -137,6 +142,98 @@ mod linux {
         }
         false
     }
+    fn automatic_profile(
+        interface: &str,
+        profiles: &[(String, String, String, String)],
+    ) -> Option<String> {
+        let matches: Vec<_> = profiles
+            .iter()
+            .filter(|(_, name, autoconnect, method)| {
+                name == interface && autoconnect == "yes" && method == "auto"
+            })
+            .collect();
+        (matches.len() == 1).then(|| matches[0].0.clone())
+    }
+    fn activate_idle_ethernet(name: &str) -> Result<()> {
+        let state = command(
+            "/usr/bin/nmcli",
+            &["-g", "GENERAL.STATE", "device", "show", name],
+        )?;
+        if !state.status.success()
+            || String::from_utf8_lossy(&state.stdout)
+                .split_whitespace()
+                .next()
+                != Some("30")
+            || std::fs::read_to_string(format!("/sys/class/net/{name}/carrier"))
+                .map_or(true, |v| v.trim() != "1")
+        {
+            return Ok(());
+        }
+        let listing = command(
+            "/usr/bin/nmcli",
+            &["-t", "-f", "UUID,TYPE", "connection", "show"],
+        )?;
+        if !listing.status.success() {
+            return Ok(());
+        }
+        let mut profiles = Vec::new();
+        for line in String::from_utf8_lossy(&listing.stdout).lines().take(64) {
+            let Some((uuid, kind)) = line.split_once(':') else {
+                continue;
+            };
+            if kind != "802-3-ethernet" || !uuid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+            {
+                continue;
+            }
+            let details = command(
+                "/usr/bin/nmcli",
+                &[
+                    "-g",
+                    "connection.interface-name,connection.autoconnect,ipv4.method",
+                    "connection",
+                    "show",
+                    uuid,
+                ],
+            )?;
+            if !details.status.success() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&details.stdout);
+            let mut lines = text.lines();
+            profiles.push((
+                uuid.into(),
+                lines.next().unwrap_or("").into(),
+                lines.next().unwrap_or("").into(),
+                lines.next().unwrap_or("").into(),
+            ));
+        }
+        if let Some(uuid) = automatic_profile(name, &profiles) {
+            let output = command(
+                "/usr/bin/nmcli",
+                &[
+                    "--wait",
+                    "0",
+                    "connection",
+                    "up",
+                    "uuid",
+                    &uuid,
+                    "ifname",
+                    name,
+                ],
+            )?;
+            if output.status.success() {
+                log::info!(
+                    "Ethernet {name}: started existing DHCP/link-local profile without waiting for autoconnect retry"
+                );
+            } else {
+                log::warn!(
+                    "Ethernet {name}: automatic activation failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        Ok(())
+    }
     pub(super) fn prepare(selected: Option<String>) -> Result<()> {
         if std::env::var("GS_ETHERNET_AUTOCONFIG")
             .is_ok_and(|v| matches!(v.as_str(), "off" | "0" | "false"))
@@ -158,12 +255,10 @@ mod linux {
             let managed_nm = nm
                 && command(
                     "/usr/bin/nmcli",
-                    &["-g", "GENERAL.STATE", "device", "show", &name],
+                    &["-g", "GENERAL.TYPE", "device", "show", &name],
                 )
                 .is_ok_and(|v| {
-                    v.status.success()
-                        && String::from_utf8_lossy(&v.stdout).split_whitespace().next()
-                            != Some("10")
+                    v.status.success() && String::from_utf8_lossy(&v.stdout).trim() == "ethernet"
                 });
             if managed_nm {
                 let path = PathBuf::from(format!(
@@ -171,20 +266,25 @@ mod linux {
                 ));
                 {
                     let changed = write_managed(&path, &networkmanager_config(&name)?)?;
-                    let output = command("/usr/bin/nmcli", &["general", "reload", "conf"])?;
-                    if !output.status.success() {
-                        bail!(
-                            "NetworkManager could not reload Ethernet defaults: {}",
-                            String::from_utf8_lossy(&output.stderr)
-                        );
-                    }
-                    // No activation/restart of Wi-Fi, VPN or the whole manager.
                     if changed {
-                        let _ = command(
+                        let output = command("/usr/bin/nmcli", &["general", "reload", "conf"])?;
+                        if !output.status.success() {
+                            bail!(
+                                "NetworkManager could not reload Ethernet defaults: {}",
+                                String::from_utf8_lossy(&output.stderr)
+                            );
+                        }
+                        let output = command(
                             "/usr/bin/nmcli",
                             &["--wait", "0", "device", "reapply", &name],
-                        );
+                        )?;
+                        if !output.status.success() {
+                            log::info!(
+                                "Ethernet {name}: profile is not active; checking its existing automatic profile"
+                            );
+                        }
                     }
+                    activate_idle_ethernet(&name)?;
                     log::info!(
                         "Ethernet {name}: persistent IPv4LL + ongoing DHCP enabled; existing explicit/static settings retained"
                     );
@@ -230,6 +330,61 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn automatic_activation_never_selects_wifi_static_disabled_or_ambiguous_profiles() {
+            let dhcp = (
+                "wired-id".into(),
+                "eth0".into(),
+                "yes".into(),
+                "auto".into(),
+            );
+            assert_eq!(
+                automatic_profile("eth0", &[dhcp.clone()]),
+                Some("wired-id".into())
+            );
+            assert!(
+                automatic_profile(
+                    "eth0",
+                    &[("wifi".into(), "wlan0".into(), "yes".into(), "auto".into())]
+                )
+                .is_none()
+            );
+            assert!(
+                automatic_profile(
+                    "eth0",
+                    &[(
+                        "static".into(),
+                        "eth0".into(),
+                        "yes".into(),
+                        "manual".into()
+                    )]
+                )
+                .is_none()
+            );
+            assert!(
+                automatic_profile(
+                    "eth0",
+                    &[("disabled".into(), "eth0".into(), "no".into(), "auto".into())]
+                )
+                .is_none()
+            );
+            assert!(automatic_profile("eth0", &[dhcp.clone(), dhcp]).is_none());
+        }
+        #[test]
+        fn wifi_is_excluded_even_with_an_ethernet_hardware_type() {
+            let dir = std::env::temp_dir().join(format!("gs-net-device-{}", rand::random::<u64>()));
+            std::fs::create_dir_all(dir.join("device")).unwrap();
+            std::fs::write(dir.join("type"), "1\n").unwrap();
+            assert!(is_wired_device(&dir));
+            for marker in ["wireless", "phy80211"] {
+                std::fs::create_dir(dir.join(marker)).unwrap();
+                assert!(!is_wired_device(&dir));
+                std::fs::remove_dir(dir.join(marker)).unwrap();
+            }
+            std::fs::write(dir.join("uevent"), "INTERFACE=wlan0\nDEVTYPE=wlan\n").unwrap();
+            assert!(!is_wired_device(&dir));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
         #[test]
         fn networkmanager_defaults_are_scoped_and_keep_dhcp_running() {
             let text = networkmanager_config("eth0").unwrap();

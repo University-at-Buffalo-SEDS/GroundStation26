@@ -36,6 +36,18 @@ pub struct Permissions {
 }
 
 impl Permissions {
+    pub fn for_roles(self, roles: &[StreamRole]) -> Self {
+        if roles.contains(&StreamRole::Admin) {
+            Self {
+                view_data: true,
+                send_commands: true,
+                set_system_time: true,
+                voice_transmit: true,
+            }
+        } else {
+            self.normalized()
+        }
+    }
     pub fn normalized(mut self) -> Self {
         if self.send_commands {
             self.view_data = true;
@@ -239,7 +251,19 @@ fn configured_user_access(
         .users
         .iter()
         .find(|user| user.username.eq_ignore_ascii_case(username))
-        .map(|user| (user.command_access.clone(), user.calibration_access))
+        .map(|user| {
+            if user.roles.contains(&StreamRole::Admin) {
+                (
+                    CommandAccess::default(),
+                    CalibrationAccess {
+                        view: true,
+                        edit: true,
+                    },
+                )
+            } else {
+                (user.command_access.clone(), user.calibration_access)
+            }
+        })
         .unwrap_or_default()
 }
 
@@ -575,14 +599,17 @@ impl AuthManager {
                 .iter()
                 .find(|u| u.username.eq_ignore_ascii_case(&username) && !u.disabled)
                 .ok_or_else(|| AuthFailure::Unauthorized("Account disabled or removed".into()))?;
-            // Revocation applies immediately to existing sessions. A session
-            // never gains data/command authority beyond its original grant.
-            let current = user.permissions.normalized();
-            permissions.view_data &= current.view_data;
-            permissions.send_commands &= current.send_commands;
-            permissions.set_system_time = user.permissions.set_system_time;
-            permissions.voice_transmit =
-                user.permissions.voice_transmit && user.permissions.view_data;
+            // Application admins inherit full application access. Removing that
+            // role or disabling the account is checked against the current file.
+            let current = user.permissions.for_roles(&user.roles);
+            if user.roles.contains(&StreamRole::Admin) {
+                permissions = current;
+            } else {
+                permissions.view_data &= current.view_data;
+                permissions.send_commands &= current.send_commands;
+                permissions.set_system_time = current.set_system_time;
+                permissions.voice_transmit = current.voice_transmit && current.view_data;
+            }
             if !permissions.allows(required) {
                 return Err(AuthFailure::Forbidden(
                     "session does not have the required permission".into(),
@@ -676,9 +703,10 @@ async fn create_session_for_user(
     let expires_at_ms =
         now_ms + (config.session_ttl_seconds.min(i64::MAX as u64 / 1000) as i64 * 1000);
     let token = generate_token();
-    let permissions = user.permissions.normalized();
+    let permissions = user.permissions.for_roles(&user.roles);
+    let (command_access, calibration_access) = configured_user_access(config, &user.username);
     let session_type = if remember_me { "remembered" } else { "session" };
-    let allowed_commands_json = serde_json::to_string(&user.command_access.allowed_commands)
+    let allowed_commands_json = serde_json::to_string(&command_access.allowed_commands)
         .map_err(|e| AuthFailure::Internal(format!("failed to serialize command access: {e}")))?;
 
     sqlx::query(
@@ -710,8 +738,8 @@ async fn create_session_for_user(
             expires_at_ms: Some(expires_at_ms),
             anonymous: false,
             session_type: Some(session_type.to_string()),
-            command_access: user.command_access.clone(),
-            calibration_access: user.calibration_access,
+            command_access,
+            calibration_access,
         }
         .session_status(),
     })

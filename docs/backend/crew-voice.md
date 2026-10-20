@@ -2,7 +2,7 @@
 
 Open `/radio` on the Ground Station's HTTPS origin, or select **Crew voice** in
 Mission. The link opens a separate tab so a call can continue while you use the
-dashboard. Sign in with a Ground Station account that has view access and explicit
+dashboard. Sign in with an application Admin account, or an account with view access and explicit
 **voice transmit** permission, then select **Join voice** and approve microphone
 access. Anonymous users and ordinary viewers cannot join the transmitting channel.
 They can listen through the audience program when a stream manager enables it.
@@ -146,3 +146,5 @@ The test generates temporary H.264/fMP4 segments and intercepts fixture requests
 it starts no MediaMTX instance or hardware tasks. It checks advancing playback,
 portrait layout, the always-visible status-bar diagram, camera loss, delay changes,
 and unified audience sound without microphone access or AudioWorklet support.
+
+Application administrators inherit voice transmit and stream management access, including existing sessions. Other roles still need an explicit voice transmit grant. Joining reports audio, permission and connection progress beside the Join button; failed startup releases the microphone and permits retry.

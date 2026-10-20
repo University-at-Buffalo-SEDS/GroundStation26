@@ -192,7 +192,7 @@ async fn save_user_inner(
         }
         if !config.users.iter().any(|u| {
             !u.disabled
-                && u.permissions.normalized().view_data
+                && u.permissions.for_roles(&u.roles).view_data
                 && u.roles.contains(&StreamRole::Admin)
         }) {
             return Err("Keep at least one enabled application administrator".into());
@@ -239,7 +239,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn admin_listing_never_exposes_passwords_or_grants_hardware_authority() {
+    async fn admin_listing_hides_passwords_and_admin_inherits_full_access() {
         let (_root, state, headers) = fixture("admin").await;
         let response = users(State(state.clone()), headers).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -249,6 +249,35 @@ mod tests {
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(!text.contains("password"));
         assert!(!text.contains("hash_b64"));
+        assert!(
+            state
+                .auth
+                .authorize_token(&state.auth_db, Some("admin-test"), Permission::SendCommands)
+                .await
+                .is_ok()
+        );
+    }
+    #[tokio::test]
+    async fn admin_inheritance_updates_legacy_sessions_and_role_revocation_is_immediate() {
+        let (root, state, _) = fixture("admin").await;
+        sqlx::query("UPDATE auth_sessions SET can_view_data=0, can_send_commands=0 WHERE token='admin-test'")
+            .execute(&state.auth_db).await.unwrap();
+        let principal = state
+            .auth
+            .authorize_token(&state.auth_db, Some("admin-test"), Permission::SendCommands)
+            .await
+            .unwrap();
+        assert!(principal.permissions.voice_transmit && principal.permissions.set_system_time);
+        assert!(principal.can_manage_stream());
+        assert!(principal.allows_command_name("StreamControl"));
+        assert!(principal.calibration_access.view && principal.calibration_access.edit);
+        let mut config = state.auth.load_users_file().unwrap();
+        config.users[0].roles.clear();
+        std::fs::write(
+            root.0.join("auth.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
         assert!(
             state
                 .auth

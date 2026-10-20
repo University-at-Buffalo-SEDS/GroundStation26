@@ -12,6 +12,9 @@ function radioLink(radio){
   if(!radioAvailable){$('radio-enable').checked=false;if(session)session.radio=false;}
 }
 const notice=text=>{$('status').textContent=text;};
+async function bounded(promise,ms,message){
+ let timer;try{return await Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error(message)),ms);})]);}finally{clearTimeout(timer);}
+}
 function updateControls(){
   $('join').disabled=!token||!!session||joining;$('leave').disabled=!session;
   $('device').disabled=!!session||joining;$('mode').disabled=joining;
@@ -40,7 +43,7 @@ function transmit(){
 }
 function leave(message='Left voice. Microphone released.'){
   const old=session;session=null;held=false;joining=false;$('radio-enable').checked=false;
-  if(old){clearInterval(old.ping);old.ws?.close();old.stream?.getTracks().forEach(t=>t.stop());old.node?.disconnect();old.context?.close().catch(()=>{});}
+  if(old){clearInterval(old.ping);clearTimeout(old.joinTimeout);old.ws?.close();old.stream?.getTracks().forEach(t=>t.stop());old.node?.disconnect();old.context?.close().catch(()=>{});}
   $('peers').replaceChildren();$('count').textContent='0 / 12';$('level').value=0;transmit();notice(message);
 }
 async function devices(){
@@ -64,18 +67,26 @@ $('logout').onclick=async()=>{
 $('join').onclick=async()=>{
   if(session||joining)return;
   if(!window.isSecureContext||!navigator.mediaDevices?.getUserMedia)return notice('Microphone access requires HTTPS (or localhost).');
-  joining=true;muted=false;held=false;updateControls();
+  joining=true;muted=false;held=false;updateControls();notice('Starting voice audio…');
   const s={ready:false,transmitting:false};session=s;
   try{
-    s.context=new AudioContext();await s.context.resume();
-    await s.context.audioWorklet.addModule('/assets/voice-worklet.js');
+    const Context=window.AudioContext||window.webkitAudioContext;
+    if(!Context)throw new Error('This browser does not support voice audio');
+    s.context=new Context();
+    await bounded(s.context.resume(),8000,'Audio could not start. Allow audio playback, then join again.');
+    if(!s.context.audioWorklet)throw new Error('Voice audio requires a trusted HTTPS connection and AudioWorklet support');
+    await bounded(s.context.audioWorklet.addModule('/assets/voice-worklet.js'),8000,'The voice audio processor did not load. Reload and try again.');
     if(session!==s)return;
-    const access=await fetch('/api/voice/status',{headers:{Authorization:`Bearer ${token}`}});
+    notice('Checking voice access…');
+    const access=await fetch('/api/voice/status',{headers:{Authorization:`Bearer ${token}`},signal:AbortSignal.timeout(8000)});
     const capabilities=access.ok?await access.json():null;
     if(!capabilities?.can_transmit)throw new Error('Your account needs the voice_transmit permission. Stream viewers can listen through the audience program.');
     radioLink(capabilities.radio);
     if(session!==s)return;
-    const stream=await navigator.mediaDevices.getUserMedia({audio:{deviceId:$('device').value?{exact:$('device').value}:undefined,channelCount:1,echoCancellation:true,noiseSuppression:noiseSupported?$('noise-suppression').checked:undefined,autoGainControl:false}});
+    notice('Waiting for microphone permission…');
+    const microphone=navigator.mediaDevices.getUserMedia({audio:{deviceId:$('device').value?{exact:$('device').value}:undefined,channelCount:1,echoCancellation:true,noiseSuppression:noiseSupported?$('noise-suppression').checked:undefined,autoGainControl:false}});
+    microphone.then(stream=>{if(session!==s)stream.getTracks().forEach(track=>track.stop());},()=>{});
+    const stream=await bounded(microphone,30000,'Microphone access is still pending. Check this browser’s microphone permission and join again.');
     if(session!==s){stream.getTracks().forEach(t=>t.stop());return;}
     s.stream=stream;s.stream.getAudioTracks().forEach(t=>{t.enabled=false;t.onended=()=>{if(session===s)leave('Microphone disconnected. Rejoin to choose another device.');};});
     if(noiseSupported){
@@ -105,7 +116,7 @@ $('join').onclick=async()=>{
       if(m.type==='radio_state'){$('radio-enable').checked=m.enabled;session.radio=m.enabled;}
 
       if(m.type==='broadcast_state')$('broadcast-notice').textContent=m.enabled?'Voice chat audio is included in the audience broadcast, with the program delay.':'Voice chat audio is not included in the audience broadcast.';
-      if(m.type==='joined'){s.ready=true;s.id=m.id;joining=false;transmit();notice('Connected to voice chat.');}
+      if(m.type==='joined'){clearTimeout(s.joinTimeout);s.ready=true;s.id=m.id;joining=false;transmit();notice('Connected to voice chat.');}
       if(m.type==='roster'){
         const next=new Set(m.peers.map(p=>p.id));
         for(const id of s.peers||[])if(!next.has(id))s.node.port.postMessage({type:'remove',id});s.peers=next;
@@ -116,6 +127,7 @@ $('join').onclick=async()=>{
     s.ws.onclose=()=>{if(session===s)leave('Voice disconnected. Your microphone is off; select Join voice to reconnect.');};
     s.ws.onerror=()=>{if(session===s)leave('Cannot connect to voice. Check your Ground Station connection.');};
     s.ping=setInterval(()=>{if(s.ws.readyState===WebSocket.OPEN)s.ws.send(JSON.stringify({type:'ping'}));},10000);
+    s.joinTimeout=setTimeout(()=>{if(session===s&&!s.ready)leave('Voice connection timed out. Check the station connection and join again.');},10000);
     notice('Connecting to voice…');await devices();
   }catch(e){if(session===s)leave(`Cannot join voice: ${e.message}`);}
 };
@@ -180,6 +192,7 @@ updateControls();
 
 // An embedded tool shares the dashboard session; no credentials are persisted.
 if (new URLSearchParams(location.search).get('embedded') === '1' && parent !== window) {
+  document.body.dataset.embedded='true';
   $('login').style.display = 'none';
   document.querySelector('nav').style.display = 'none';
   notice('Waiting for the dashboard session…');
