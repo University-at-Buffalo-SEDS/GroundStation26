@@ -28,9 +28,17 @@ class LauncherTests(unittest.TestCase):
     def test_default_remains_stable_and_backend_only_does_not_rebuild_frontend(self):
         build,_,_=self.invoke([])
         self.assertNotIn("--frontend-dev",build.call_args.args[0])
-        build,backend,_=self.invoke(["--rrls","--backend-only-build","--frontend-dev"])
+        build,backend,_=self.invoke(["--rrls","--backend-only-build"])
         build.assert_not_called()
         backend.assert_called_once()
+
+    def test_conflicting_backend_only_and_frontend_dev_fail_before_any_build(self):
+        for option in ["--backend-only","--backend-only-build"]:
+            with self.subTest(option=option),patch.object(sys,"argv",["run_groundstation.py","--rrls",option,"--frontend-dev"]),patch("sys.stderr"),patch.object(launcher.subprocess,"run") as build:
+                with self.assertRaises(SystemExit) as error:
+                    launcher.main()
+                self.assertEqual(error.exception.code,2)
+                build.assert_not_called()
 
     def test_rrls_on_pi_sets_role_without_enabling_local_gpio(self):
         _,backend,env=self.invoke(["--rrls"],pi=True)

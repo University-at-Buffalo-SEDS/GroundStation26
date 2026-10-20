@@ -153,3 +153,7 @@ fragment preservation, FIFO controls, queue pressure, and GPS coalescing. A
 This is software validation; physical RFD range/collision behavior still needs a
 three-radio field test. The earlier seven-board network qualification is
 separate from this new recovery-mesh mode.
+
+`--backend-only` / `--backend-only-build` reuses existing WebUI assets. Do not
+combine it with `--frontend-dev`: run `python3 run_rrls.py --frontend-dev`
+first to rebuild and serve the development UI.

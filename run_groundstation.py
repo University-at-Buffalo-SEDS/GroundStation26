@@ -109,14 +109,17 @@ def parse_args() -> argparse.Namespace:
         help="Build and run in debug mode for faster compile times.",
     )
     parser.add_argument(
-        "--backend-only-build",
+        "--backend-only-build", "--backend-only",
         action="store_true",
-        help="Skip the frontend rebuild and only rebuild/run the backend.",
+        help="Reuse the existing WebUI and only rebuild/run the backend; cannot be combined with --frontend-dev.",
     )
     parser.add_argument("--rrls", action="store_true", help="Run the headless recovery receiver/relay with local web and mobile access.")
     parser.add_argument("--frontend-dev", "--frontend_dev", action="store_true", help="Build the WebUI from the frontend dev branch (also accepts frontend_dev, like build.py).")
     arguments=["--frontend-dev" if argument in {"frontend_dev", "frontend-dev"} else argument for argument in sys.argv[1:]]
-    return parser.parse_args(arguments)
+    args=parser.parse_args(arguments)
+    if args.backend_only_build and args.frontend_dev:
+        parser.error("--backend-only skips the WebUI build. Remove it to build the dev WebUI with --frontend-dev.")
+    return args
 
 
 def main() -> None:
