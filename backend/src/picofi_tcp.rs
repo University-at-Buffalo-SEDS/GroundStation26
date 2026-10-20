@@ -256,6 +256,22 @@ impl Decoder {
         }
     }
 }
+// Reuse the same discovery/allowlist check for initial and replacement peers.
+fn accept_peer(
+    listener: &TcpListener,
+    config: &PicoFiTcpConfig,
+    discovery: Option<&LanDiscovery>,
+) -> std::io::Result<TcpStream> {
+    listener.accept().and_then(|(socket, peer)| {
+        if config.allowed_peer.is_none_or(|ip| ip == peer.ip())
+            && discovery.is_none_or(|d| d.authorized(peer.ip()))
+        {
+            Ok(socket)
+        } else {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+    })
+}
 fn worker(
     weak: Weak<Shared>,
     tx: Receiver<(u64, Vec<u8>)>,
@@ -265,6 +281,7 @@ fn worker(
     config: PicoFiTcpConfig,
     mut discovery: Option<LanDiscovery>,
 ) {
+    let mut replacement = None;
     loop {
         if let Some(discovery) = discovery.as_mut() {
             discovery.poll(false);
@@ -274,31 +291,27 @@ fn worker(
         let generation = shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
         while tx.try_recv().is_ok() {}
         drop(shared);
-        let candidate = match &listener {
-            Some(l) => l.accept().and_then(|(s, peer)| {
-                if config.allowed_peer.is_none_or(|ip| ip == peer.ip())
-                    && discovery.as_ref().is_none_or(|d| d.authorized(peer.ip()))
-                {
-                    Ok(s)
-                } else {
-                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        let socket = if let Some(socket) = replacement.take() {
+            Ok(socket) // Already authenticated by discovery and PICOFI1.
+        } else {
+            let candidate = match &listener {
+                Some(l) => accept_peer(l, &config, discovery.as_ref()),
+                None => {
+                    let target = discovery
+                        .as_ref()
+                        .map_or(Some(address), LanDiscovery::candidate);
+                    target
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                        .and_then(|target| {
+                            TcpStream::connect_timeout(&target, Duration::from_millis(250))
+                        })
                 }
-            }),
-            None => {
-                let target = discovery
-                    .as_ref()
-                    .map_or(Some(address), LanDiscovery::candidate);
-                target
-                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::WouldBlock))
-                    .and_then(|target| {
-                        TcpStream::connect_timeout(&target, Duration::from_millis(250))
-                    })
-            }
+            };
+            candidate.and_then(|mut s| {
+                handshake(&mut s, listener.is_none())?;
+                Ok(s)
+            })
         };
-        let socket = candidate.and_then(|mut s| {
-            handshake(&mut s, listener.is_none())?;
-            Ok(s)
-        });
         let Ok(mut socket) = socket else {
             std::thread::sleep(Duration::from_millis(100));
             continue;
@@ -315,6 +328,17 @@ fn worker(
             }
             if weak.strong_count() == 0 {
                 return;
+            }
+            // A power-cycled or readdressed bridge need not send FIN/RST on
+            // its old socket. Keep accepting while it is half-open. Only a
+            // compatible new handshake replaces it; failed probes preserve it.
+            if let Some(l) = &listener {
+                if let Ok(mut candidate) = accept_peer(l, &config, discovery.as_ref()) {
+                    if handshake(&mut candidate, false).is_ok() {
+                        replacement = Some(candidate);
+                        break 'session;
+                    }
+                }
             }
             // Bounded work per direction prevents a busy reader starving writes.
             for _ in 0..8 {
@@ -369,6 +393,7 @@ fn worker(
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+        let _ = socket.shutdown(std::net::Shutdown::Both);
         if let Some(discovery) = discovery.as_mut() {
             discovery.reconnect();
         }
@@ -447,6 +472,90 @@ mod tests {
                 std::thread::yield_now();
             }
         }
+    }
+    #[test]
+    fn new_boot_replaces_half_open_session_without_waiting_for_old_fin() {
+        use discovery_wire::{Kind, Message, Party, SIZE};
+        use std::net::{Ipv4Addr, UdpSocket};
+        let reservation = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let discovery_port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let config = PicoFiTcpConfig {
+            discovery: true,
+            discovery_port,
+            discovery_interface: None,
+            mode: TcpMode::Server,
+            address: "0.0.0.0:0".into(),
+            allowed_peer: None,
+        };
+        let mut device = PicoFiTcp::open(&config).unwrap();
+        let discovery = UdpSocket::bind("127.0.0.1:0").unwrap();
+        discovery
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut previous_boot = None;
+        for nonce in [10, 11] {
+            let query = Message {
+                kind: Kind::Query,
+                party: Party::Pico,
+                port: 0,
+                nonce,
+                identity: [2, 3, 4, 5, 6, 7],
+            };
+            discovery
+                .send_to(&query.encode(), (Ipv4Addr::LOCALHOST, discovery_port))
+                .unwrap();
+            let mut bytes = [0; SIZE];
+            let (n, _) = discovery.recv_from(&mut bytes).unwrap();
+            let offer = Message::decode(&bytes[..n]).unwrap();
+            assert!(offer.compatible_offer(query));
+            assert_ne!(offer.port, 0);
+            let mut peer = TcpStream::connect((Ipv4Addr::LOCALHOST, offer.port)).unwrap();
+            handshake(&mut peer, true).unwrap();
+            peer.set_nonblocking(false).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while device.send_data(&[nonce as u8]).is_err() {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            let mut frame = [0; 5];
+            peer.read_exact(&mut frame).unwrap();
+            assert_eq!(frame, [0xb5, 0x4e, 1, 0, nonce as u8]);
+            peer.write_all(&[0xb5, 0x4e, 1, 0, 42]).unwrap();
+            let mut received = vec![];
+            while received.is_empty() {
+                assert!(Instant::now() < deadline);
+                device
+                    .recv_serialized_packets(&mut |frame| received.push(frame))
+                    .unwrap();
+                std::thread::yield_now();
+            }
+            assert_eq!(received, vec![vec![42]]);
+            if nonce == 10 {
+                let mut invalid = TcpStream::connect((Ipv4Addr::LOCALHOST, offer.port)).unwrap();
+                invalid.write_all(b"INVALID").unwrap();
+                drop(invalid);
+                while device.send_data(&[77]).is_err() {
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                peer.read_exact(&mut frame).unwrap();
+                assert_eq!(frame, [0xb5, 0x4e, 1, 0, 77]);
+                // Simulate an interrupted old TCP frame with no FIN/RST. A
+                // restarted Pico can use a new address/port while Linux still
+                // considers the old connection established.
+                peer.write_all(&[0xb5, 0x4e, 4, 0, 0xaa]).unwrap();
+                previous_boot = Some(peer);
+                continue;
+            }
+            peer.shutdown(std::net::Shutdown::Both).unwrap();
+            drop(peer);
+            while device.shared.connected.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        }
+        drop(previous_boot);
     }
     #[test]
     fn client_worker_discovers_pico_server_and_reconnects_to_a_new_port() {

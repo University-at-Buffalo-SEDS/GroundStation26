@@ -81,3 +81,19 @@ restarting the service is sufficient. Both TCP roles bind/discover using current
 addresses and reconnect when the Pico migrates between link-local and DHCP.
 The Ethernet cable must be connected; Wi-Fi connectivity alone does not power
 or connect the gateway-side Ethernet interface.
+
+
+## Bridge restart without a TCP close
+
+A restarted or readdressed Pico may never close its previous TCP connection.
+The GroundStation server continues accepting discovery-authorized peers while
+that old connection is open. A valid PICOFI1 handshake replaces the old session;
+a failed handshake leaves it operating. The new connection receives a new TX
+generation and a fresh frame decoder, so an old partial frame cannot consume a
+new session's first packet. TCP work remains outside the router thread.
+
+The regression holds the original connection open with a partial frame, rejects
+an invalid replacement, then reconnects a discovered Pico and verifies both
+traffic directions without waiting for an old FIN. This failed before the
+repair and passes afterward. Pico builds also use fresh oscillator entropy for
+TCP state on every boot, retaining the same physical MAC and link-local identity.
