@@ -30,3 +30,6 @@ Cargo.lock
 # Saved operational checks are local runtime data, never firmware defaults.
 /backend/config/gse_qualification.json
 /backend/config/gse_qualification.upload
+
+# Local RRLS radio settings are independent of the primary station.
+/backend/comms/rrls.json

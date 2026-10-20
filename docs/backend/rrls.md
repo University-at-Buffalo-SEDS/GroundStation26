@@ -84,7 +84,16 @@ On the Pi, build the WebUI and backend without local launch GPIO:
 python3 build.py rrls --frontend-dev
 ```
 
-Configure the actual radio device in a separate communications file. For example:
+RRLS uses `backend/comms/rrls.json` by default, separate from the primary station's
+`backend/comms/comms.json`. It does not migrate primary/legacy configuration.
+Choose the radio once with `python3 run_rrls.py --radio-port /dev/cu.YOUR_RADIO`
+on macOS, or `/dev/serial0` on the Pi. This selection is saved in the RRLS file.
+Use `--comms-config FILE` or `GS_RRLS_COMMS_LINK_CONFIG` for a different RRLS file.
+An explicit `GS_COMMS_LINK_CONFIG` remains supported; the RRLS-specific setting
+has priority. An unplugged radio keeps the WebUI running and retries once per
+second; no telemetry is fabricated while disconnected.
+
+The saved communications file has this format:
 
 ```json
 {
@@ -104,7 +113,7 @@ GS_COMMS_LINK_CONFIG=/etc/rrls/comms.json python3 run_rrls.py --backend-only-bui
 On macOS, run the same launcher with an unprivileged HTTPS port:
 
 ```sh
-GS_COMMS_LINK_CONFIG=/path/to/rrls-comms.json GS_HTTPS_BIND_ADDRESS=0.0.0.0:3443 python3 run_rrls.py
+GS_HTTPS_BIND_ADDRESS=0.0.0.0:3443 python3 run_rrls.py --radio-port /dev/cu.YOUR_RADIO
 ```
 
 Open `https://localhost:3443`. Use the Mac's actual `/dev/cu.*` radio device in

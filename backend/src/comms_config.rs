@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::comms::{COMMS_BAUD_RATE, ROCKET_COMMS_PORT};
 
 const DEFAULT_CONFIG_PATH: &str = "comms/comms.json";
+const RRLS_CONFIG_PATH: &str = "comms/rrls.json";
 const LEGACY_CONFIG_PATHS: &[&str] = &[
     "comms/coms.json",
     "comms/radio_links.json",
@@ -228,11 +229,47 @@ impl CommsLinkConfig {
     }
 }
 
+fn selected_config_path(
+    rrls: bool,
+    rrls_override: Option<PathBuf>,
+    common_override: Option<PathBuf>,
+) -> PathBuf {
+    (if rrls { rrls_override } else { None })
+        .or(common_override)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(if rrls {
+                RRLS_CONFIG_PATH
+            } else {
+                DEFAULT_CONFIG_PATH
+            })
+        })
+}
 pub fn config_path() -> PathBuf {
-    std::env::var("GS_COMMS_LINK_CONFIG")
-        .or_else(|_| std::env::var("GS_RADIO_LINK_CONFIG"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_CONFIG_PATH))
+    selected_config_path(
+        crate::rrls::is_rrls(),
+        std::env::var_os("GS_RRLS_COMMS_LINK_CONFIG").map(PathBuf::from),
+        std::env::var_os("GS_COMMS_LINK_CONFIG")
+            .or_else(|| std::env::var_os("GS_RADIO_LINK_CONFIG"))
+            .map(PathBuf::from),
+    )
+}
+fn default_for_role(rrls: bool) -> CommsLinksConfig {
+    let mut config = CommsLinksConfig::default();
+    if rrls {
+        config.fill_box = CommsLinkConfig::Serial {
+            serial: SerialLinkConfig {
+                port: "unused".into(),
+                baud_rate: 115200,
+                protocol: SerialProtocol::RawUart,
+            },
+        };
+        if cfg!(target_os = "macos") {
+            if let CommsLinkConfig::Serial { serial } = &mut config.av_bay {
+                serial.port = "/dev/cu.RRLS-radio".into();
+            }
+        }
+    }
+    config
 }
 
 pub fn load_or_default() -> CommsLinksConfig {
@@ -248,12 +285,12 @@ pub fn load_or_default() -> CommsLinksConfig {
                         "WARNING: invalid comms link config at {}: {err}. Falling back to defaults.",
                         path.display()
                     );
-                    CommsLinksConfig::default()
+                    default_for_role(crate::rrls::is_rrls())
                 }
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let cfg = CommsLinksConfig::default();
+            let cfg = default_for_role(crate::rrls::is_rrls());
             if let Err(write_err) = save(&cfg) {
                 eprintln!(
                     "WARNING: failed to write default comms link config {}: {write_err}",
@@ -267,9 +304,19 @@ pub fn load_or_default() -> CommsLinksConfig {
                 "WARNING: failed to read comms link config {}: {err}. Falling back to defaults.",
                 path.display()
             );
-            CommsLinksConfig::default()
+            default_for_role(crate::rrls::is_rrls())
         }
     };
+    if crate::rrls::is_rrls() {
+        if let Ok(port) = std::env::var("GS_RRLS_RADIO_PORT") {
+            if !port.trim().is_empty() {
+                apply_simulator_serial_override(&mut config.av_bay, port, 115200);
+                if let Err(error) = save(&config) {
+                    eprintln!("WARNING: cannot save RRLS radio settings: {error}");
+                }
+            }
+        }
+    }
     apply_simulator_serial_overrides(&mut config);
     config
 }
@@ -357,6 +404,10 @@ pub fn save(cfg: &CommsLinksConfig) -> Result<(), String> {
 }
 
 fn migrate_legacy_config(target_path: &PathBuf) {
+    // RRLS must never rename or inherit the primary station's legacy settings.
+    if crate::rrls::is_rrls() {
+        return;
+    }
     if std::env::var_os("GS_COMMS_LINK_CONFIG").is_some()
         || std::env::var_os("GS_RADIO_LINK_CONFIG").is_some()
         || target_path.exists()
@@ -457,9 +508,43 @@ fn ensure_serial_protocol(link: &mut serde_json::Value, protocol: SerialProtocol
 mod tests {
     use super::{
         CanLinkConfig, CommsLinkConfig, CommsLinksConfig, I2cLinkConfig, SerialLinkConfig,
-        SerialProtocol, SpiLinkConfig, apply_simulator_serial_override,
+        SerialProtocol, SpiLinkConfig, apply_simulator_serial_override, default_for_role,
+        selected_config_path,
     };
+    use std::path::PathBuf;
 
+    #[test]
+    fn recovery_config_paths_and_defaults_are_separate() {
+        let regular = selected_config_path(false, None, None);
+        let recovery = selected_config_path(true, None, None);
+        assert_ne!(regular, recovery);
+        assert!(regular.ends_with("comms/comms.json"));
+        assert!(recovery.ends_with("comms/rrls.json"));
+        assert_eq!(
+            selected_config_path(
+                true,
+                Some("recovery.json".into()),
+                Some("common.json".into())
+            ),
+            PathBuf::from("recovery.json")
+        );
+        assert_eq!(
+            selected_config_path(false, Some("recovery.json".into()), None),
+            regular
+        );
+        let recovery = default_for_role(true);
+        assert_eq!(recovery.fill_box.port(), "unused");
+        assert!(matches!(
+            recovery.av_bay,
+            CommsLinkConfig::Serial {
+                serial: SerialLinkConfig {
+                    protocol: SerialProtocol::RawUart,
+                    baud_rate: 115200,
+                    ..
+                }
+            }
+        ));
+    }
     #[test]
     fn default_config_uses_ethernet_for_gateway_and_radio_uart_for_av_bay() {
         let cfg = CommsLinksConfig::default();

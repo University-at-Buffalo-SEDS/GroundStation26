@@ -42,6 +42,7 @@ mod recording_report;
 mod ring_buffer;
 mod rocket_commands;
 mod rrls;
+mod rrls_radio;
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 mod safety_task;
 mod sequences;
@@ -723,6 +724,12 @@ async fn shutdown_signal(state: Arc<AppState>) {
 }
 
 fn open_rocket_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>>, bool) {
+    if rrls::is_rrls() {
+        return (
+            Arc::new(Mutex::new(Box::new(rrls_radio::RecoveryRadio::new(link.clone())))),
+            false,
+        );
+    }
     match open_link(link) {
         Ok(r) => {
             gs_debug_println!("Rocket comms online");
