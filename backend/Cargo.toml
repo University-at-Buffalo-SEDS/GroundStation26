@@ -16,6 +16,9 @@ test_fire_mode = []
 gs-camera-discovery = { path = "../shared/camera_discovery" }
 gse_sequence = { path = "../shared/gse_sequence" }
 axum = { workspace = true, features = ["ws"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = "0.14.10"
 tokio.workspace = true
 serde_json.workspace = true
 rppal = { git = "https://gitlab.rylanswebsite.com/rylan-meilutis/rppal.git", branch = "main", optional = true }

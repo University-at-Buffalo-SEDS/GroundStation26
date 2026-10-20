@@ -121,5 +121,5 @@ COPY --from=builder /app/target/release/map_downloader /app/map_downloader/
 COPY --from=builder /app/frontend/dist/public /app/frontend/dist/public/
 COPY --from=builder /app/entrypoint.sh /app/
 
-EXPOSE 3000
+EXPOSE 3000 3443
 ENTRYPOINT ["/app/entrypoint.sh"]

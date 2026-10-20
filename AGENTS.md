@@ -43,5 +43,5 @@
 ## Configuration & Runtime Notes
 
 - Set the device identifier in `.cargo/config.toml`.
-- The backend expects a reverse proxy with TLS for geolocation; `docker-compose.yml` provides a self-signed setup for
-  local testing.
+- The Rust backend serves HTTP on 3000 and HTTPS on 3443 with persistent self-signed certificates.
+  Docker publishes 80/443 directly. This applies to GroundStation and RRLS; see `docs/backend/https.md`.

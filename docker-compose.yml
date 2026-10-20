@@ -8,8 +8,16 @@ services:
         TESTING: ""
     networks:
       - internal
+      - external
+    ports:
+      - "${GS_HTTP_PORT:-80}:3000"
+      - "${GS_HTTPS_PORT:-443}:3443"
     environment:
-      ENSURE_MAP_DATA: "true"
+      ENSURE_MAP_DATA: "${ENSURE_MAP_DATA:-true}"
+      GS_RRLS_ROLE: "${GS_RRLS_ROLE:-off}"
+      GS_BIND_ADDRESS: "0.0.0.0:3000"
+      GS_HTTPS_BIND_ADDRESS: "0.0.0.0:3443"
+      GS_TLS_NAMES: "${GS_TLS_NAMES:-}"
     volumes:
       - ./data:/app/data
       - ./backend/data:/app/backend/data
@@ -30,21 +38,6 @@ services:
   #      - /dev/gpiomem2:/dev/gpiomem2
   #      - /dev/gpiomem3:/dev/gpiomem3
   #      - /dev/gpiomem4:/dev/gpiomem4
-
-  nginx:
-    build: ./nginx
-    ports:
-      - "3000:443"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/nginx_certs:/etc/nginx/ssl
-    depends_on:
-      - web
-    networks:
-      - internal
-      - external
-    restart: always
-
 
 networks:
   internal:

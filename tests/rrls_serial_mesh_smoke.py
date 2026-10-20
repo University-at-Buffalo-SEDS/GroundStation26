@@ -48,7 +48,7 @@ def main():
                 master,slave=pty.openpty();tty.setraw(slave);port=free_port()
                 config={'version':1,'av_bay':{'interface':'serial','port':os.ttyname(slave),'baud_rate':0 if sys.platform=='darwin' else 115200,'protocol':'raw_uart'},'fill_box':{'interface':'serial','port':str(work/'absent-fill-uart'),'protocol':'raw_uart'}}
                 cfg=work/'comms.json';cfg.write_text(json.dumps(config));log=(work/'backend.log').open('w');logs.append(log)
-                env=os.environ.copy();env.update(GS_RRLS_ROLE=role,GS_BIND_ADDRESS=f'127.0.0.1:{port}',GS_COMMS_LINK_CONFIG=str(cfg),GS_USERS_FILE=str(work/'users.json'),GS_VIDEO_MANAGED='0',GROUNDSTATION_TIMESYNC='0')
+                env=os.environ.copy();env.update(GS_HTTPS_BIND_ADDRESS='off',GS_RRLS_ROLE=role,GS_BIND_ADDRESS=f'127.0.0.1:{port}',GS_COMMS_LINK_CONFIG=str(cfg),GS_USERS_FILE=str(work/'users.json'),GS_VIDEO_MANAGED='0',GROUNDSTATION_TIMESYNC='0')
                 process=subprocess.Popen([str(binary)],cwd=work,env=env,stdout=log,stderr=subprocess.STDOUT);procs.append(process)
                 os.set_blocking(master,False);selector.register(master,selectors.EVENT_READ,role);buffers[role]=bytearray();peers[role]=(master,slave,port)
             def status(role):

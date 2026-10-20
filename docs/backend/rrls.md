@@ -2,7 +2,8 @@
 
 RRLS runs the GroundStation backend on a Raspberry Pi 5 with an RFD900x radio.
 It needs no attached display or desktop session. The existing WebUI and mobile
-API remain available on port 3000 through a Wi-Fi router connected to the Pi's
+API remain available over native HTTP (3000) and HTTPS (3443), or Docker ports
+80 and 443, through a Wi-Fi router connected to the Pi's
 Ethernet port. This Wi-Fi network is separate from the main GroundStation's
 network; it is **not** the relay backhaul. Both relay directions use the RFD mesh.
 
@@ -104,7 +105,19 @@ For boot-time operation, adapt [rrls.service](rrls.service) to the installed use
 and paths. `GS_USERS_FILE` selects RRLS's own users file; provision accounts using
 the existing GroundStation authentication process. Serve the existing frontend
 bundle at `frontend/dist/public` under the service working directory. Connect the
-phone/tablet to RRLS's router and use the Pi's Ethernet address and port 3000.
+phone/tablet to RRLS's router and use `https://<pi-address>:3443` for a native
+service, or `https://<pi-address>` with Docker. Both roles automatically generate
+persistent self-signed certificates; see [HTTPS setup](https.md).
+
+For Docker RRLS, use:
+
+```sh
+GS_TLS_NAMES=rrls.local,192.168.4.7 docker compose -f docker-compose.yml -f docker-compose.rrls.yml up -d --build
+```
+
+Replace the address with RRLS's actual LAN address. Configure/pass through its
+radio serial device and communications file as described above. The HTTPS
+configuration is shared with the main GroundStation; RRLS uses its own stored identity.
 
 Deploy the matching RF-board firmware too: it ignores host-only recovery envelopes, validates/unwraps avionics uplinks
 before generic network parsing, and gives GPS first priority.

@@ -57,6 +57,7 @@ mod thermal_settling;
 mod types;
 mod voice;
 mod web;
+mod web_server;
 
 use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
 use crate::ring_buffer::RingBuffer;
@@ -2055,14 +2056,12 @@ async fn main() -> anyhow::Result<()> {
     let mut video_runtime = media_runtime::VideoRuntime::start();
     let app: Router = web::router(state.clone(), video_runtime.password.clone());
 
-    // Separate host-network simulator runs must not contend for port 3000.
-    // Normal deployments retain the existing address unless explicitly set.
-    let addr = std::env::var("GS_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:3000".to_owned());
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    log::info!("web server listening on {addr}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(state.clone()))
-        .await?;
+    web_server::serve(
+        app,
+        web_server::Config::from_env()?,
+        shutdown_signal(state.clone()),
+    )
+    .await?;
 
     video_runtime.stop().await;
     // Ensure background tasks are signaled even if server exits unexpectedly.

@@ -1,0 +1,6 @@
+# Use with: docker compose -f docker-compose.yml -f docker-compose.rrls.yml up -d --build
+services:
+  web:
+    environment:
+      GS_RRLS_ROLE: rrls
+      ENSURE_MAP_DATA: "${ENSURE_MAP_DATA:-false}"
