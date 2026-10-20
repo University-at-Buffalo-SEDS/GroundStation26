@@ -893,7 +893,9 @@ impl AppState {
                 endpoints.dedup();
                 NetworkTopologyNode {
                     id: node_id(&board.sender_id),
-                    label: if is_local {
+                    label: if is_local && board.sender_id == "RRLS" {
+                        "RRLS".to_string()
+                    } else if is_local {
                         "Ground Station Router".to_string()
                     } else {
                         label
@@ -1775,6 +1777,29 @@ pub(crate) mod tests {
         assert_eq!(state.get_pending_umbilical_valve_state(42), None);
     }
 
+    #[tokio::test]
+    async fn local_topology_label_matches_the_actual_router_identity() {
+        for (sender, label) in [
+            ("RRLS", "RRLS"),
+            (Board::GroundStation.sender_id(), "Ground Station Router"),
+        ] {
+            let state = test_app_state().await;
+            state
+                .topology_router
+                .set(Arc::new(Router::new(
+                    RouterConfig::new([]).with_sender(sender),
+                )))
+                .expect("set local router");
+            let topology = state.network_topology_snapshot(1000);
+            let local = topology
+                .nodes
+                .iter()
+                .find(|node| node.sender_id.as_deref() == Some(sender))
+                .expect("local node");
+            assert_eq!(local.label, label);
+            assert_eq!(local.kind, NetworkTopologyNodeKind::Router);
+        }
+    }
     #[tokio::test]
     async fn network_topology_snapshot_uses_sedsnet_discovery_and_runtime_stats() {
         let state = test_app_state().await;
