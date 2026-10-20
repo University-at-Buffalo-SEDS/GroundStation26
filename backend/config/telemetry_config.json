@@ -335,7 +335,7 @@
       "endpoints": [
         "GROUND_STATION"
       ],
-      "priority": 0
+      "priority": 16
     },
     {
       "name": "KG50",
@@ -350,7 +350,7 @@
       "endpoints": [
         "GROUND_STATION"
       ],
-      "priority": 0
+      "priority": 16
     },
     {
       "name": "GPS_SATELLITE_NUMBER",
