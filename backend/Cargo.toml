@@ -31,6 +31,7 @@ tower-http = { version = "0.7.1", features = ["fs", "compression-full"] }
 rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serialport = "4.10.1"
+crc32fast = "1"
 futures = "0.3.34"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 libc = "0.2"

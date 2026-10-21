@@ -6,7 +6,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
 };
@@ -20,13 +20,15 @@ const MAX: usize = 4096;
 const DEPTH: usize = 128;
 const STALL: Duration = Duration::from_millis(500);
 struct Shared {
-    connected: AtomicBool,
+    // One published epoch is the readiness snapshot; zero means disconnected.
+    // Separate ready/epoch loads can accidentally tag a new-session send old.
+    ready_generation: AtomicU64,
     generation: AtomicU64,
     tx: SyncSender<(u64, Vec<u8>)>,
 }
 pub struct PicoFiTcp {
     shared: Arc<Shared>,
-    rx: Arc<Mutex<Receiver<Vec<u8>>>>,
+    rx: Arc<Mutex<Receiver<(u64, Vec<u8>)>>>,
     side: Option<RouterSideId>,
     exhausted: bool,
 }
@@ -81,7 +83,7 @@ impl PicoFiTcp {
         let (tx, outgoing) = mpsc::sync_channel(DEPTH);
         let (incoming, rx) = mpsc::sync_channel(DEPTH);
         let shared = Arc::new(Shared {
-            connected: AtomicBool::new(false),
+            ready_generation: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             tx,
         });
@@ -121,8 +123,8 @@ impl CommsDevice for PicoFiTcp {
             )
             .into());
         }
-        let generation = self.shared.generation.load(Ordering::Acquire);
-        if !self.shared.connected.load(Ordering::Acquire) {
+        let generation = self.shared.ready_generation.load(Ordering::Acquire);
+        if generation == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::NotConnected).into());
         }
         let mut frame = Vec::with_capacity(payload.len() + 4);
@@ -169,7 +171,13 @@ impl CommsDevice for PicoFiTcp {
         let rx = self.rx.lock().unwrap();
         for _ in 0..max {
             match rx.try_recv() {
-                Ok(frame) => sink(frame),
+                Ok((generation, frame)) => {
+                    if generation != 0
+                        && generation == self.shared.ready_generation.load(Ordering::Acquire)
+                    {
+                        sink(frame);
+                    }
+                }
                 Err(_) => return Ok(()),
             }
         }
@@ -178,6 +186,13 @@ impl CommsDevice for PicoFiTcp {
     }
 }
 fn handshake(socket: &mut TcpStream, client: bool) -> std::io::Result<()> {
+    handshake_before_reply(socket, client, || {})
+}
+fn handshake_before_reply(
+    socket: &mut TcpStream,
+    client: bool,
+    before_reply: impl FnOnce(),
+) -> std::io::Result<()> {
     // Accepted sockets inherit nonblocking mode on macOS; the bounded
     // handshake must explicitly enter blocking mode on both platforms.
     socket.set_nonblocking(false)?;
@@ -196,6 +211,9 @@ fn handshake(socket: &mut TcpStream, client: bool) -> std::io::Result<()> {
         ));
     }
     if !client {
+        // A replacement peer can transmit as soon as this reply is visible.
+        // Retire the old ready epoch before exposing that handshake success.
+        before_reply();
         socket.write_all(HELLO)?;
     }
     socket.set_nonblocking(true)
@@ -275,7 +293,7 @@ fn accept_peer(
 fn worker(
     weak: Weak<Shared>,
     tx: Receiver<(u64, Vec<u8>)>,
-    rx: SyncSender<Vec<u8>>,
+    rx: SyncSender<(u64, Vec<u8>)>,
     listener: Option<TcpListener>,
     address: SocketAddr,
     config: PicoFiTcpConfig,
@@ -287,7 +305,7 @@ fn worker(
             discovery.poll(false);
         }
         let Some(shared) = weak.upgrade() else { return };
-        shared.connected.store(false, Ordering::Release);
+        shared.ready_generation.store(0, Ordering::Release);
         let generation = shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
         while tx.try_recv().is_ok() {}
         drop(shared);
@@ -317,7 +335,7 @@ fn worker(
             continue;
         };
         let Some(shared) = weak.upgrade() else { return };
-        shared.connected.store(true, Ordering::Release);
+        shared.ready_generation.store(generation, Ordering::Release);
         drop(shared);
         let mut decoder = Decoder::default();
         let mut inbound = None;
@@ -334,8 +352,20 @@ fn worker(
             // compatible new handshake replaces it; failed probes preserve it.
             if let Some(l) = &listener {
                 if let Ok(mut candidate) = accept_peer(l, &config, discovery.as_ref()) {
-                    if handshake(&mut candidate, false).is_ok() {
+                    let mut accepted = false;
+                    let result = handshake_before_reply(&mut candidate, false, || {
+                        accepted = true;
+                        if let Some(shared) = weak.upgrade() {
+                            shared.ready_generation.store(0, Ordering::Release);
+                        }
+                    });
+                    if result.is_ok() {
                         replacement = Some(candidate);
+                        break 'session;
+                    }
+                    if accepted {
+                        // A valid reboot retired the old connection, even if
+                        // its reply failed. Do not leave a live but unready loop.
                         break 'session;
                     }
                 }
@@ -343,9 +373,9 @@ fn worker(
             // Bounded work per direction prevents a busy reader starving writes.
             for _ in 0..8 {
                 if let Some(frame) = inbound.take() {
-                    match rx.try_send(frame) {
+                    match rx.try_send((generation, frame)) {
                         Ok(()) => {}
-                        Err(TrySendError::Full(frame)) => {
+                        Err(TrySendError::Full((_, frame))) => {
                             inbound = Some(frame);
                             break;
                         }
@@ -409,6 +439,76 @@ mod tests {
         (a, b)
     }
     #[test]
+    fn published_session_epoch_tags_writes_and_discards_old_receive_frames() {
+        let (tx, outgoing) = mpsc::sync_channel(4);
+        let (incoming, rx) = mpsc::sync_channel(8);
+        let shared = Arc::new(Shared {
+            ready_generation: AtomicU64::new(2),
+            generation: AtomicU64::new(99),
+            tx,
+        });
+        let mut device = PicoFiTcp {
+            shared: shared.clone(),
+            rx: Arc::new(Mutex::new(rx)),
+            side: None,
+            exhausted: false,
+        };
+        incoming.send((1, vec![7])).unwrap();
+        incoming.send((2, vec![8])).unwrap();
+        let mut received = vec![];
+        device
+            .recv_serialized_packets(&mut |frame| received.push(frame))
+            .unwrap();
+        assert_eq!(received, vec![vec![8]]);
+        shared.ready_generation.store(0, Ordering::Release);
+        incoming.send((2, vec![9])).unwrap();
+        device
+            .recv_serialized_packets(&mut |frame| received.push(frame))
+            .unwrap();
+        assert_eq!(received, vec![vec![8]]);
+        assert!(device.send_data(&[1]).is_err());
+        shared.ready_generation.store(3, Ordering::Release);
+        incoming.send((2, vec![10])).unwrap();
+        incoming.send((3, vec![11])).unwrap();
+        device
+            .recv_serialized_packets(&mut |frame| received.push(frame))
+            .unwrap();
+        assert_eq!(received, vec![vec![8], vec![11]]);
+        device.send_data(&[12]).unwrap();
+        assert_eq!(outgoing.recv().unwrap(), (3, vec![0xb5, 0x4e, 1, 0, 12]));
+    }
+    #[test]
+    fn replacement_retires_old_epoch_before_peer_can_observe_handshake_reply() {
+        let (mut peer, mut server) = pair();
+        let ready = Arc::new(AtomicU64::new(1));
+        let worker_ready = ready.clone();
+        let (verified, wait_verified) = mpsc::sync_channel(1);
+        let (resume, wait_resume) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            handshake_before_reply(&mut server, false, || {
+                worker_ready.store(0, Ordering::Release);
+                verified.send(()).unwrap();
+                wait_resume.recv_timeout(Duration::from_secs(2)).unwrap();
+            })
+            .unwrap();
+        });
+        peer.write_all(HELLO).unwrap();
+        wait_verified.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(ready.load(Ordering::Acquire), 0);
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.read(&mut [0; 7]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        resume.send(()).unwrap();
+        peer.set_nonblocking(false).unwrap();
+        peer.set_read_timeout(Some(STALL)).unwrap();
+        let mut reply = [0; 7];
+        peer.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, HELLO);
+        worker.join().unwrap();
+    }
+    #[test]
     fn discovered_ephemeral_server_transfers_frames_and_rediscovers_after_disconnect() {
         use discovery_wire::{Kind, Message, Party, SIZE};
         use std::net::{Ipv4Addr, UdpSocket};
@@ -467,7 +567,7 @@ mod tests {
             assert_eq!(received, vec![vec![42]]);
             peer.shutdown(std::net::Shutdown::Both).unwrap();
             drop(peer);
-            while device.shared.connected.load(Ordering::Acquire) {
+            while device.shared.ready_generation.load(Ordering::Acquire) != 0 {
                 assert!(Instant::now() < deadline);
                 std::thread::yield_now();
             }
@@ -550,7 +650,7 @@ mod tests {
             }
             peer.shutdown(std::net::Shutdown::Both).unwrap();
             drop(peer);
-            while device.shared.connected.load(Ordering::Acquire) {
+            while device.shared.ready_generation.load(Ordering::Acquire) != 0 {
                 assert!(Instant::now() < deadline);
                 std::thread::yield_now();
             }
@@ -582,7 +682,7 @@ mod tests {
         let (tx, outgoing) = mpsc::sync_channel(DEPTH);
         let (incoming, rx) = mpsc::sync_channel(DEPTH);
         let shared = Arc::new(Shared {
-            connected: AtomicBool::new(false),
+            ready_generation: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             tx,
         });
@@ -641,7 +741,7 @@ mod tests {
             peer.read_exact(&mut frame).unwrap();
             assert_eq!(frame, [0xb5, 0x4e, 1, 0, value]);
             peer.shutdown(std::net::Shutdown::Both).unwrap();
-            while device.shared.connected.load(Ordering::Acquire) {
+            while device.shared.ready_generation.load(Ordering::Acquire) != 0 {
                 assert!(Instant::now() < deadline);
                 std::thread::yield_now();
             }
@@ -682,7 +782,7 @@ mod tests {
         let (tx, _outgoing) = mpsc::sync_channel(1);
         let (_incoming, rx) = mpsc::sync_channel(1);
         let shared = Arc::new(Shared {
-            connected: AtomicBool::new(false),
+            ready_generation: AtomicU64::new(0),
             generation: AtomicU64::new(1),
             tx,
         });
@@ -693,7 +793,7 @@ mod tests {
             exhausted: false,
         };
         assert!(device.send_data(&[1]).is_err());
-        shared.connected.store(true, Ordering::Release);
+        shared.ready_generation.store(1, Ordering::Release);
         device.send_data(&[1]).unwrap();
         let error = device.send_data(&[2]).unwrap_err();
         assert_eq!(

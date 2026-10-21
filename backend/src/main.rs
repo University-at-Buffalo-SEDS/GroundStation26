@@ -20,6 +20,7 @@ mod comms_config;
 #[cfg(feature = "testing")]
 mod dummy_packets;
 mod ethernet_autoconfig;
+mod fill_delivery_probe;
 mod fill_targets;
 mod firmware_update;
 mod flight_setup;
@@ -1018,6 +1019,28 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    let fill_delivery_clock = ValidationInstant::now();
+    let fill_delivery = std::env::var_os("GS_SIM_VALIDATE_FILL_DELIVERY")
+        .map(|_| Arc::new(Mutex::new(fill_delivery_probe::Probe::default())));
+    if let Some(probe) = fill_delivery.clone() {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let now = validation_elapsed_ms(fill_delivery_clock);
+                let window = probe.lock().unwrap().take_window(now);
+                if let Some(w) = window {
+                    let detail = serde_json::json!({"start_ms":w.start_ms,"elapsed_ms":w.elapsed_ms,
+                        "channels":fill_delivery_probe::NAMES,"received":w.received,
+                        "max_gap_ms":w.max_gap_ms,"passed":w.passed});
+                    if w.passed {
+                        log::info!("sustained fill delivery passed {detail}");
+                    } else {
+                        log::error!("sustained fill delivery failed {detail}");
+                    }
+                }
+            }
+        });
+    }
     let daq_loadcell_rate = Arc::new(Mutex::new(StreamRateProbe::default()));
     let daq_loadcell_rate_handler = daq_loadcell_rate.clone();
     let daq_loadcell_rate_reported = Arc::new(AtomicBool::new(false));
@@ -1031,6 +1054,57 @@ async fn main() -> anyhow::Result<()> {
     let ground_station_handler = EndpointHandler::new_packet_handler(
         telemetry_schema::endpoint("GROUND_STATION"),
         move |pkt: &Packet| {
+            if let Some(probe) = &fill_delivery {
+                let board =
+                    ground_station_handler_state_clone.board_from_network_sender(pkt.sender());
+                let ty = pkt.data_type();
+                let channel = if board == Some(Board::DaqBoard) {
+                    if ty == telemetry_schema::data_type("KG1000") {
+                        Some(0)
+                    } else {
+                        let input = ground_station_handler_state_clone
+                            .loadcell_calibration
+                            .lock()
+                            .unwrap()
+                            .kg50_input
+                            .wire();
+                        pkt.data_as_f32()
+                            .is_ok_and(|values| {
+                                fill_delivery_probe::selected_kg50(
+                                    input,
+                                    ty == telemetry_schema::data_type("KG50"),
+                                    ty == telemetry_schema::data_type("DAQ_KG50_SELECTED"),
+                                    &values,
+                                )
+                            })
+                            .then_some(1)
+                    }
+                } else if board == Some(Board::ValveBoard) {
+                    if ty == telemetry_schema::data_type("BATTERY_VOLTAGE") {
+                        Some(2)
+                    } else if ty == telemetry_schema::data_type("BATTERY_CURRENT") {
+                        Some(3)
+                    } else if ty == telemetry_schema::data_type("FUEL_TANK_PRESSURE") {
+                        Some(4)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(channel) = channel {
+                    if pkt
+                        .data_as_f32()
+                        .is_ok_and(|v| !v.is_empty() && v.iter().all(|x| x.is_finite()))
+                    {
+                        probe.lock().unwrap().observe(
+                            channel,
+                            pkt.packet_id(),
+                            validation_elapsed_ms(fill_delivery_clock),
+                        );
+                    }
+                }
+            }
             if std::env::var_os("GS_SIM_VALIDATE_TELEMETRY_RETURN").is_some() {
                 let board =
                     ground_station_handler_state_clone.board_from_network_sender(pkt.sender());
@@ -2014,6 +2088,57 @@ async fn main() -> anyhow::Result<()> {
                 // Alternate states: periodic reports of the unchanged open
                 // state cannot stand in for execution of every command.
                 let open = round_index % 2 != 0;
+                if std::env::var("GS_SIM_VALIDATE_SOAK_AV_BAY").ok().as_deref() == Some("1") {
+                    if !wait_for_validation_idle(&soak_router).await {
+                        return;
+                    }
+                    let before = ["AV_BAY_UNDERGLOW", "FLIGHT_COMMAND"].map(|name| {
+                        let ty = telemetry_schema::data_type(name);
+                        let count = soak_router
+                            .export_runtime_stats()
+                            .sides
+                            .iter()
+                            .flat_map(|side| side.data_types.iter())
+                            .filter(|kind| kind.data_type == ty)
+                            .map(|kind| kind.tx_packets)
+                            .sum::<u64>();
+                        (ty, count)
+                    });
+                    // This path is simulation-only and never exercises a
+                    // deployment output. Require actual round transmissions
+                    // and their destination receipts throughout the soak.
+                    let command = FlightComputerCommands::EvaluationRelax as u8;
+                    if let Err(error) = network_variables::set_underglow(&soak_router, open)
+                        .and_then(|_| {
+                            queue_locally_routed_flight_command(
+                                &soak_router,
+                                "full-bay RF soak",
+                                &[command],
+                            )
+                            .map_err(anyhow::Error::from)
+                        })
+                    {
+                        log::error!(
+                            "full-bay RF soak failed to queue round {}: {error}",
+                            round_index + 1
+                        );
+                        return;
+                    }
+                    flush_command_tx(&soak_router, "full-bay RF soak tx");
+                    if !wait_for_validation_reliable_delivery(
+                        &soak_router,
+                        "RF soak round",
+                        &before,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    log::info!(
+                        "full-bay RF soak control acknowledged: round {}/{rounds}, sample {target_sample}",
+                        round_index + 1
+                    );
+                }
                 for (slot, board, ty, command) in command_probe::validation_commands(open) {
                     let generation_before = soak_status.lock().unwrap().generation(slot, open);
                     let started = ValidationInstant::now();

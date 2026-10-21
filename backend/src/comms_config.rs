@@ -671,6 +671,16 @@ mod tests {
             }
             other => panic!("RF-board av_bay link must be serial raw_uart, got {other:?}"),
         }
+        match cfg.fill_box {
+            CommsLinkConfig::PicoFiTcp { tcp } => {
+                assert_eq!(tcp.mode, super::TcpMode::Server);
+                assert!(tcp.discovery);
+                assert_eq!(tcp.address, "0.0.0.0:0");
+                assert_eq!(tcp.discovery_port, super::default_discovery_port());
+                assert_eq!(tcp.discovery_interface, None);
+            }
+            other => panic!("Fill link must use Pi-hosted Ethernet discovery, got {other:?}"),
+        }
     }
 
     #[test]

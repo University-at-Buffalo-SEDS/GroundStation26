@@ -291,6 +291,33 @@ fn i2c_rx_poll_burst() -> usize {
 // ======================================================================
 //  Real Comms Implementation
 // ======================================================================
+// Match RF's damaged-frame recovery window. Track simulation time separately:
+// slow instruction emulation must not expire valid frames using wall time.
+struct RawUartPartialStart {
+    header: [u8; RAW_UART_FRAME_HEADER_SIZE],
+    wall: Instant,
+    simulated_ms: Option<u64>,
+}
+struct RawUartFrameWait {
+    started: Option<RawUartPartialStart>,
+    timeout: Duration,
+}
+impl Default for RawUartFrameWait {
+    fn default() -> Self {
+        Self::for_baud(115_200)
+    }
+}
+impl RawUartFrameWait {
+    fn for_baud(baud: u32) -> Self {
+        let wire_ms = ((STREAM_PACKET_MAX_SIZE + RAW_UART_FRAME_HEADER_SIZE) as u64 * 10 * 1_000)
+            .div_ceil(u64::from(baud.max(1)));
+        Self {
+            started: None,
+            timeout: Duration::from_millis(wire_ms.saturating_add(500).max(2_000)),
+        }
+    }
+}
+
 pub struct UartComms {
     #[cfg(target_os = "linux")]
     inner: serialport::TTYPort,
@@ -298,6 +325,7 @@ pub struct UartComms {
     inner: Box<dyn SerialPort>,
     side_id: Option<RouterSideId>,
     rx_buf: Vec<u8>,
+    raw_uart_frame_wait: RawUartFrameWait,
     raw_uart_data_frames: VecDeque<Vec<u8>>,
     radio_window_updates: VecDeque<RadioWindowUpdate>,
     protocol: SerialProtocol,
@@ -335,6 +363,7 @@ impl UartComms {
             inner,
             side_id: None,
             rx_buf: Vec::with_capacity(STREAM_PACKET_MAX_SIZE),
+            raw_uart_frame_wait: RawUartFrameWait::for_baud(cfg.baud_rate as u32),
             raw_uart_data_frames: VecDeque::with_capacity(16),
             radio_window_updates: VecDeque::with_capacity(8),
             protocol: cfg.protocol.clone(),
@@ -474,7 +503,12 @@ impl UartComms {
         let outgoing = {
             let mut mesh = shared.lock().unwrap();
             let now = mesh.now();
-            while let Some((kind, payload)) = take_raw_uart_framed_payload(&mut self.rx_buf)? {
+            while let Some((kind, payload)) = take_raw_uart_framed_payload_with_clock(
+                &mut self.rx_buf,
+                &mut self.raw_uart_frame_wait,
+                Instant::now(),
+                crate::simulation_clock_ms(),
+            )? {
                 if kind == RawUartFrameKind::Ascii {
                     continue;
                 }
@@ -541,6 +575,7 @@ impl UartComms {
         }
         let _ = drain_raw_uart_buffered_frames(
             &mut self.rx_buf,
+            &mut self.raw_uart_frame_wait,
             &mut self.raw_uart_data_frames,
             &mut self.radio_window_updates,
             &self.protocol,
@@ -964,13 +999,20 @@ fn parse_radio_window_update(payload: &[u8]) -> Option<RadioWindowUpdate> {
 
 fn drain_raw_uart_buffered_frames(
     rx_buf: &mut Vec<u8>,
+    wait: &mut RawUartFrameWait,
     raw_uart_data_frames: &mut VecDeque<Vec<u8>>,
     radio_window_updates: &mut VecDeque<RadioWindowUpdate>,
     protocol: &SerialProtocol,
 ) -> TelemetryResult<bool> {
     let mut processed_any = false;
     loop {
-        let Some((frame_kind, payload)) = take_raw_uart_framed_payload(rx_buf)? else {
+        let Some((frame_kind, payload)) = take_raw_uart_framed_payload_with_clock(
+            rx_buf,
+            wait,
+            Instant::now(),
+            crate::simulation_clock_ms(),
+        )?
+        else {
             return Ok(processed_any);
         };
         processed_any = true;
@@ -996,6 +1038,59 @@ fn drain_raw_uart_buffered_frames(
             }
             RawUartFrameKind::Ascii => {}
         }
+    }
+}
+
+fn take_raw_uart_framed_payload_with_clock(
+    rx_buf: &mut Vec<u8>,
+    wait: &mut RawUartFrameWait,
+    wall: Instant,
+    simulated_ms: Option<u64>,
+) -> TelemetryResult<Option<(RawUartFrameKind, Vec<u8>)>> {
+    loop {
+        let result = take_raw_uart_framed_payload(rx_buf)?;
+        if result.is_some() || rx_buf.len() < RAW_UART_FRAME_HEADER_SIZE {
+            wait.started = None;
+            return Ok(result);
+        }
+        let frame_len = u16::from_le_bytes([rx_buf[2], rx_buf[3]]) as usize;
+        // The parser may have discarded an empty/invalid header. Continue
+        // resynchronizing now instead of waiting for another serial read.
+        if raw_uart_sync_kind(rx_buf[0], rx_buf[1]).is_none()
+            || frame_len == 0
+            || frame_len > STREAM_PACKET_MAX_SIZE
+            || rx_buf.len() >= RAW_UART_FRAME_HEADER_SIZE + frame_len
+        {
+            wait.started = None;
+            continue;
+        }
+        let header = rx_buf[..RAW_UART_FRAME_HEADER_SIZE].try_into().unwrap();
+        let restart = wait.started.as_ref().is_none_or(|started| {
+            started.header != header
+                || matches!((simulated_ms, started.simulated_ms),
+                (Some(now), Some(before)) if now < before)
+        });
+        if restart {
+            wait.started = Some(RawUartPartialStart {
+                header,
+                wall,
+                simulated_ms,
+            });
+            return Ok(None);
+        }
+        let started = wait.started.as_ref().unwrap();
+        let elapsed = match (simulated_ms, started.simulated_ms) {
+            (Some(now), Some(before)) => Duration::from_millis(now.saturating_sub(before)),
+            _ => wall.saturating_duration_since(started.wall),
+        };
+        if elapsed < wait.timeout {
+            return Ok(None);
+        }
+        maybe_log_raw_uart_parse_issue("expired incomplete raw UART frame", rx_buf);
+        // Preserve an intact following frame, including its sync. Never scan
+        // inside a valid, unexpired payload for an apparent nested frame.
+        rx_buf.drain(..1);
+        wait.started = None;
     }
 }
 
@@ -1071,7 +1166,19 @@ fn take_raw_uart_framed_payload(
         rx_buf.drain(..1);
         return Ok(None);
     };
-    let payload = rx_buf[RAW_UART_FRAME_HEADER_SIZE..total_len].to_vec();
+    let body = &rx_buf[RAW_UART_FRAME_HEADER_SIZE..total_len];
+    if matches!(frame_kind, RawUartFrameKind::Data) && body.starts_with(b"SDT") {
+        let valid = body.len() >= 8
+            && crc32fast::hash(&body[..body.len() - 4])
+                == u32::from_le_bytes(body[body.len() - 4..].try_into().unwrap());
+        if !valid {
+            // A damaged length may include the next frame's sync. Reject the
+            // checksum before consuming that frame, preserving bytes for resync.
+            rx_buf.drain(..1);
+            return Err(TelemetryError::Unpack("raw UART SDT crc32 mismatch"));
+        }
+    }
+    let payload = body.to_vec();
     rx_buf.drain(..total_len);
     Ok(Some((frame_kind, payload)))
 }
@@ -1446,6 +1553,7 @@ impl CommsDevice for UartComms {
             inner,
             side_id: self.side_id,
             rx_buf: Vec::new(),
+            raw_uart_frame_wait: RawUartFrameWait::default(),
             raw_uart_data_frames: VecDeque::new(),
             radio_window_updates: VecDeque::new(),
             protocol: self.protocol.clone(),
@@ -2927,6 +3035,7 @@ mod raw_uart_tests {
             inner: Box::new(port),
             side_id: Some(receiver_side),
             rx_buf: Vec::new(),
+            raw_uart_frame_wait: RawUartFrameWait::default(),
             raw_uart_data_frames: VecDeque::new(),
             radio_window_updates: VecDeque::new(),
             protocol: SerialProtocol::RawUart,
@@ -2996,6 +3105,120 @@ mod raw_uart_tests {
         assert_eq!(received[0], payload);
         assert_eq!(received[1], next);
         assert!(buffered.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_uart_recovers_a_following_frame_after_a_damaged_length_stalls() {
+        let (_peer, port) = serialport::TTYPort::pair().unwrap();
+        let mut uart = UartComms {
+            #[cfg(target_os = "linux")]
+            inner: port,
+            #[cfg(not(target_os = "linux"))]
+            inner: Box::new(port),
+            side_id: None,
+            rx_buf: vec![0xa5, 0x5a, 0xff, 0x0f],
+            raw_uart_frame_wait: RawUartFrameWait::default(),
+            raw_uart_data_frames: VecDeque::new(),
+            radio_window_updates: VecDeque::new(),
+            protocol: SerialProtocol::RawUart,
+            recovery: None,
+            write_lock: Default::default(),
+            #[cfg(target_os = "linux")]
+            baud_rate: 115200,
+            slow_start_deadline: None,
+        };
+        let good = vec![9, 8, 7];
+        uart.rx_buf
+            .extend_from_slice(&build_raw_uart_frame(&good).unwrap());
+        assert!(uart.try_take_raw_uart_packet().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(2_100));
+        assert_eq!(uart.try_take_raw_uart_packet().unwrap(), Some(good));
+        assert!(uart.rx_buf.is_empty());
+    }
+
+    #[test]
+    fn raw_uart_partial_expiry_preserves_valid_splits_and_uses_virtual_time() {
+        let wall = Instant::now();
+        let mut wait = RawUartFrameWait::default();
+        let mut bytes = vec![0xa5, 0x5a, 0xff, 0x0f];
+        let good = build_raw_uart_frame(&[9, 8, 7]).unwrap();
+        bytes.extend_from_slice(&good);
+        assert!(
+            take_raw_uart_framed_payload_with_clock(&mut bytes, &mut wait, wall, Some(100))
+                .unwrap()
+                .is_none()
+        );
+        // A slow simulator may spend many wall seconds on one virtual second.
+        assert!(
+            take_raw_uart_framed_payload_with_clock(
+                &mut bytes,
+                &mut wait,
+                wall + Duration::from_secs(60),
+                Some(2099)
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            take_raw_uart_framed_payload_with_clock(&mut bytes, &mut wait, wall, Some(2100))
+                .unwrap(),
+            Some((RawUartFrameKind::Data, vec![9, 8, 7]))
+        );
+        assert!(bytes.is_empty());
+        // A valid payload can contain frame-looking bytes. Do not resync into it.
+        let payload = [1, 2, 0xa5, 0x5a, 1, 0, 9, 3];
+        let whole = build_raw_uart_frame(&payload).unwrap();
+        bytes.extend_from_slice(&whole[..whole.len() - 1]);
+        assert!(
+            take_raw_uart_framed_payload_with_clock(&mut bytes, &mut wait, wall, None)
+                .unwrap()
+                .is_none()
+        );
+        bytes.push(*whole.last().unwrap());
+        assert_eq!(
+            take_raw_uart_framed_payload_with_clock(
+                &mut bytes,
+                &mut wait,
+                wall + Duration::from_millis(1999),
+                None
+            )
+            .unwrap(),
+            Some((RawUartFrameKind::Data, payload.to_vec()))
+        );
+        assert!(wait.started.is_none());
+    }
+
+    #[test]
+    fn raw_uart_invalid_headers_do_not_delay_a_buffered_valid_frame() {
+        let mut bytes = vec![0xa5, 0x5a, 0, 0, 0xa5, 0x5a, 0xff, 0xff];
+        bytes.extend_from_slice(&build_raw_uart_frame(&[42]).unwrap());
+        let mut wait = RawUartFrameWait::default();
+        assert_eq!(
+            take_raw_uart_framed_payload_with_clock(&mut bytes, &mut wait, Instant::now(), None)
+                .unwrap(),
+            Some((RawUartFrameKind::Data, vec![42]))
+        );
+        assert!(bytes.is_empty());
+        assert!(RawUartFrameWait::for_baud(1200).timeout > Duration::from_secs(34));
+    }
+
+    #[test]
+    fn raw_uart_corrupt_frame_cannot_swallow_a_valid_following_frame() {
+        // Captured failure shape: a 192-byte SDT frame loses 30 bytes, then
+        // its claimed length absorbs the next frame's sync and payload.
+        let mut damaged = vec![b'S', b'D', b'T', 3];
+        damaged.resize(162, 0x31);
+        let good = (0..92).collect::<Vec<u8>>();
+        let mut bytes = vec![0xa5, 0x5a, 192, 0];
+        bytes.extend_from_slice(&damaged);
+        bytes.extend_from_slice(&build_raw_uart_frame(&good).unwrap());
+        assert!(take_raw_uart_framed_payload(&mut bytes).is_err());
+        assert_eq!(
+            take_raw_uart_framed_payload(&mut bytes).unwrap(),
+            Some((RawUartFrameKind::Data, good))
+        );
+        assert!(bytes.is_empty());
     }
 
     #[test]
@@ -3083,6 +3306,7 @@ mod raw_uart_tests {
 
         let processed = drain_raw_uart_buffered_frames(
             &mut rx_buf,
+            &mut RawUartFrameWait::default(),
             &mut data_frames,
             &mut window_updates,
             &SerialProtocol::RawUart,
@@ -3417,6 +3641,7 @@ mod uart_duplex_tests {
             inner: Box::new(port),
             side_id: None,
             rx_buf: Vec::new(),
+            raw_uart_frame_wait: RawUartFrameWait::default(),
             raw_uart_data_frames: VecDeque::new(),
             radio_window_updates: VecDeque::new(),
             protocol: SerialProtocol::PacketFramed,
