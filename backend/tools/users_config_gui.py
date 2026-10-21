@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -125,11 +126,49 @@ def load_config(path: Path) -> dict[str, Any]:
     return cfg
 
 
-def save_config(path: Path, cfg: dict[str, Any]) -> None:
+ROLES = ("admin", "stream_admin", "stream_master", "stream_viewer")
+
+
+def is_last_admin(cfg: dict[str, Any], user: dict[str, Any]) -> bool:
+    return not user.get("disabled", False) and "admin" in user.get("roles", []) and not any(
+        other is not user and not other.get("disabled", False) and "admin" in other.get("roles", [])
+        for other in cfg["users"]
+    )
+
+
+def set_user_roles(cfg: dict[str, Any], username: str, roles: list[str]) -> None:
+    user = next((u for u in cfg["users"] if u["username"].casefold() == username.casefold()), None)
+    if user is None:
+        raise ValueError("Unknown account")
+    if set(roles) - set(ROLES):
+        raise ValueError("Unknown application role")
+    if "admin" not in roles and is_last_admin(cfg, user):
+        raise ValueError("Keep at least one enabled application administrator")
+    user["roles"] = sorted(set(roles))
+    if roles:
+        user["permissions"]["view_data"] = True
+
+
+def save_config(path: Path, cfg: dict[str, Any], *, expected: bytes | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(cfg, handle, indent=2, sort_keys=False)
-        handle.write("\n")
+    # Refuse stale terminal edits when another administrator saved meanwhile.
+    if expected is not None and (not path.exists() or path.read_bytes() != expected):
+        raise ValueError("Configuration changed on disk. Reload before saving; newer edits were preserved.")
+    mode = (path.stat().st_mode & 0o777) if path.exists() else 0o600
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".users-", delete=False) as handle:
+            temp = Path(handle.name)
+            os.chmod(temp, mode)
+            json.dump(cfg, handle, indent=2, sort_keys=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
 
 
 def upsert_user(
@@ -156,7 +195,7 @@ def upsert_user(
     calibration_access = normalize_calibration_access(
         {"view": calibration_view, "edit": calibration_edit}
     )
-    existing = next((user for user in cfg["users"] if user["username"] == username), None)
+    existing = next((user for user in cfg["users"] if user["username"].casefold() == username.casefold()), None)
     permissions["set_system_time"] = (
         bool(existing and existing["permissions"].get("set_system_time", False))
         if set_system_time is None else set_system_time
@@ -181,6 +220,8 @@ def upsert_user(
         cfg["users"].sort(key=lambda item: item["username"].lower())
         return
 
+    if disabled and is_last_admin(cfg, existing):
+        raise ValueError("Keep at least one enabled application administrator")
     existing["permissions"] = permissions
     existing["command_access"] = command_access
     existing["calibration_access"] = calibration_access
@@ -190,8 +231,11 @@ def upsert_user(
 
 
 def remove_user(cfg: dict[str, Any], username: str) -> bool:
+    target = next((u for u in cfg["users"] if u["username"].casefold() == username.casefold()), None)
+    if target is not None and is_last_admin(cfg, target):
+        raise ValueError("Keep at least one enabled application administrator")
     before = len(cfg["users"])
-    cfg["users"] = [user for user in cfg["users"] if user["username"] != username]
+    cfg["users"] = [user for user in cfg["users"] if user is not target]
     return len(cfg["users"]) != before
 
 
@@ -214,9 +258,11 @@ def print_summary(cfg: dict[str, Any]) -> None:
         return
     print("Users:")
     for user in cfg["users"]:
-        perms = user["permissions"]
+        perms = dict(user["permissions"])
+        if "admin" in user.get("roles", []):
+            perms = {key: True for key in perms}
         print(
-            f"  - {user['username']}: view_data={perms['view_data']} "
+            f"  - {user['username']}: roles={','.join(user.get('roles', [])) or 'none'} view_data={perms['view_data']} "
             f"send_commands={perms['send_commands']} disabled={user['disabled']} "
             f"set_system_time={perms['set_system_time']} voice_transmit={perms['voice_transmit']} "
             f"allowed_commands={','.join(user['command_access']['allowed_commands']) or 'all'} "
@@ -260,12 +306,7 @@ def cli_mode(args: argparse.Namespace) -> int:
         if args.access == "grant":
             roles.append(args.role)
             user["permissions"]["view_data"] = True
-        elif args.role == "admin" and not any(
-            other is not user and not other.get("disabled") and "admin" in other.get("roles", [])
-            for other in cfg["users"]
-        ):
-            raise ValueError("Keep at least one enabled application administrator")
-        user["roles"] = roles
+        set_user_roles(cfg, args.username, roles)
         changed = True
     elif args.command == "set-voice-permission":
         user = next((u for u in cfg["users"] if u["username"].casefold() == args.username.casefold()), None)
@@ -310,6 +351,7 @@ def cli_mode(args: argparse.Namespace) -> int:
 
 def tui_mode(path: Path) -> int:
     cfg = load_config(path)
+    baseline = path.read_bytes()
     commands_catalog = available_commands()
     while True:
         print("\nUsers Config")
@@ -321,7 +363,13 @@ def tui_mode(path: Path) -> int:
         print("6. Set session TTL")
         print("7. Save and exit")
         print("8. Exit without saving")
-        choice = input("> ").strip()
+        print("9. Manage account roles")
+        print("10. Reload from disk (discard local edits)")
+        try:
+            choice = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nClosed without saving.")
+            return 0
 
         try:
             if choice == "1":
@@ -356,11 +404,11 @@ def tui_mode(path: Path) -> int:
                 )
             elif choice == "3":
                 username = input("Username to edit: ").strip()
-                user = next((user for user in cfg["users"] if user["username"] == username), None)
+                user = next((user for user in cfg["users"] if user["username"].casefold() == username.casefold()), None)
                 if user is None:
                     print("User not found.")
                     continue
-                password = getpass.getpass("New password (leave blank to keep current): ").strip()
+                password = getpass.getpass("New password (leave blank to keep current): ")
                 perms = user["permissions"]
                 calibration = user["calibration_access"]
                 view_data = prompt_bool("Allow view data", perms["view_data"])
@@ -432,11 +480,28 @@ def tui_mode(path: Path) -> int:
                 ).strip() or str(cfg["session_ttl_seconds"])
                 cfg["session_ttl_seconds"] = max(1, int(raw))
             elif choice == "7":
-                save_config(path, cfg)
+                save_config(path, cfg, expected=baseline)
                 print(f"Saved {path}")
                 return 0
             elif choice == "8":
                 return 0
+            elif choice == "9":
+                username = input("Username: ").strip()
+                user = next((u for u in cfg["users"] if u["username"].casefold() == username.casefold()), None)
+                if user is None:
+                    raise ValueError("Unknown account")
+                print("Application admin inherits all permissions. Stream roles do not grant hardware access.")
+                roles = [role for role in ROLES if prompt_bool(role.replace("_", " "), role in user.get("roles", []))]
+                set_user_roles(cfg, username, roles)
+            elif choice == "10":
+                if prompt_bool("Discard local edits and reload", False):
+                    cfg = load_config(path)
+                    baseline = path.read_bytes()
+            else:
+                print("Choose a menu number.")
+        except EOFError:
+            print("\nClosed without saving.")
+            return 0
         except (ValueError, KeyboardInterrupt) as exc:
             print(f"Error: {exc}")
 
@@ -658,7 +723,11 @@ def gui_mode(path: Path) -> int:
             return
         if not messagebox.askyesno("Delete User", f"Delete user '{username}'?"):
             return
-        remove_user(cfg, username)
+        try:
+            remove_user(cfg, username)
+        except ValueError as exc:
+            messagebox.showerror("User Error", str(exc))
+            return
         refresh_user_list()
         new_user()
 
@@ -892,7 +961,7 @@ def build_parser() -> argparse.ArgumentParser:
     ttl = sub.add_parser("set-ttl", help="Set session TTL in seconds")
     ttl.add_argument("seconds", type=int)
 
-    role = sub.add_parser("set-role", help="Grant or revoke an application/stream role without granting hardware commands")
+    role = sub.add_parser("set-role", help="Grant or revoke roles; application admin inherits all application permissions")
     role.add_argument("username")
     role.add_argument("role", choices=["admin", "stream_admin", "stream_master", "stream_viewer"])
     role.add_argument("access", choices=["grant", "revoke"])
