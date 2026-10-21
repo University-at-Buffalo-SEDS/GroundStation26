@@ -13,11 +13,13 @@ macro_rules! gs_debug_println {
 mod antenna;
 mod auth;
 mod auto_zero;
+mod checklists;
 mod command_probe;
 mod comms;
 mod comms_config;
 #[cfg(feature = "testing")]
 mod dummy_packets;
+mod ethernet_autoconfig;
 mod fill_targets;
 mod firmware_update;
 mod flight_setup;
@@ -47,6 +49,7 @@ mod rrls_radio;
 mod safety_task;
 mod sequences;
 mod state;
+mod station_pairing;
 mod system_clock;
 mod telemetry_db;
 mod telemetry_schema;
@@ -59,8 +62,6 @@ mod types;
 mod voice;
 mod web;
 mod web_server;
-mod ethernet_autoconfig;
-mod checklists;
 
 use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
 use crate::ring_buffer::RingBuffer;
@@ -726,7 +727,9 @@ async fn shutdown_signal(state: Arc<AppState>) {
 fn open_rocket_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>>, bool) {
     if rrls::is_rrls() {
         return (
-            Arc::new(Mutex::new(Box::new(rrls_radio::RecoveryRadio::new(link.clone())))),
+            Arc::new(Mutex::new(Box::new(rrls_radio::RecoveryRadio::new(
+                link.clone(),
+            )))),
             false,
         );
     }
@@ -757,9 +760,6 @@ fn open_rocket_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>
 }
 
 fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>>, bool) {
-    if rrls::is_rrls() {
-        return (Arc::new(Mutex::new(Box::new(rrls::NoFill))), false);
-    }
     match open_link(link) {
         Ok(r) => {
             gs_debug_println!("Umbilical comms online");
@@ -1316,9 +1316,11 @@ async fn main() -> anyhow::Result<()> {
     let (rocket_comms, av_bay_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
         open_rocket_comms(&comms_links.av_bay);
 
-    #[cfg(feature = "testing")]
-    let (umbilical_comms, fill_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
-        if force_sim_comms {
+    let (umbilical_comms, fill_comms_connected) = if rrls::is_rrls() {
+        (None, false)
+    } else {
+        #[cfg(feature = "testing")]
+        let (comms, connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) = if force_sim_comms {
             gs_debug_println!(
                 "Testing simulator mode enabled; using DummyComms for umbilical comms"
             );
@@ -1329,9 +1331,11 @@ async fn main() -> anyhow::Result<()> {
         } else {
             open_umbilical_comms(&comms_links.fill_box)
         };
-    #[cfg(not(feature = "testing"))]
-    let (umbilical_comms, fill_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
-        open_umbilical_comms(&comms_links.fill_box);
+        #[cfg(not(feature = "testing"))]
+        let (comms, connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
+            open_umbilical_comms(&comms_links.fill_box);
+        (Some(comms), connected)
+    };
     state
         .av_bay_comms_connected
         .store(av_bay_comms_connected, Ordering::Relaxed);
@@ -1389,33 +1393,39 @@ async fn main() -> anyhow::Result<()> {
         )
     };
 
-    let umbilical_side = {
-        let umbilical_tx = umbilical_tx.clone();
-        let opts = RouterSideOptions {
-            reliable_enabled: router_hop_reliable_enabled(&comms_links.fill_box),
-            ..Default::default()
-        }
-        .with_small_packet_transport(1024);
-        router.add_side_packed_with_priority_and_options(
-            "umbilical_comms",
-            move |pkt, priority| {
-                umbilical_tx
-                    .send((priority, pkt.to_vec()))
-                    .map_err(|_| TelemetryError::HandlerError("umbilical_comms tx queue closed"))?;
-                Ok(())
-            },
-            opts,
-        )
+    let umbilical_side = if umbilical_comms.is_none() {
+        None
+    } else {
+        Some({
+            let umbilical_tx = umbilical_tx.clone();
+            let opts = RouterSideOptions {
+                reliable_enabled: router_hop_reliable_enabled(&comms_links.fill_box),
+                ..Default::default()
+            }
+            .with_small_packet_transport(1024);
+            router.add_side_packed_with_priority_and_options(
+                "umbilical_comms",
+                move |pkt, priority| {
+                    umbilical_tx.send((priority, pkt.to_vec())).map_err(|_| {
+                        TelemetryError::HandlerError("umbilical_comms tx queue closed")
+                    })?;
+                    Ok(())
+                },
+                opts,
+            )
+        })
     };
 
     rocket_comms
         .lock()
         .expect("failed to get rocket comms lock")
         .set_side_id(rocket_side);
-    umbilical_comms
-        .lock()
-        .expect("failed to get umbilical comms lock")
-        .set_side_id(umbilical_side);
+    if let (Some(comms), Some(side)) = (&umbilical_comms, umbilical_side) {
+        comms
+            .lock()
+            .expect("failed to get umbilical comms lock")
+            .set_side_id(side);
+    }
 
     if !rrls::is_rrls() {
         network_variables::publish_current(&router)?;
@@ -1467,33 +1477,34 @@ async fn main() -> anyhow::Result<()> {
     // --- Background tasks ---
     let telemetry_shutdown_rx = state.shutdown_subscribe();
     let safety_shutdown_rx = state.shutdown_subscribe();
+    let mut comms_workers = vec![CommsWorkerHandle {
+        name: "rocket_comms",
+        tx_budget: Some(rocket_tx_budget.clone()),
+        comms: rocket_comms,
+        tx_comms: None,
+        side_id: rocket_side,
+        tx_rx: rocket_rx,
+        legacy_single_worker: false,
+        prioritize_rx: false,
+        dedicated_radio_io: false,
+    }];
+    if let (Some(comms), Some(side_id)) = (umbilical_comms, umbilical_side) {
+        comms_workers.push(CommsWorkerHandle {
+            name: "umbilical_comms",
+            tx_budget: None,
+            comms,
+            tx_comms: None,
+            side_id,
+            tx_rx: umbilical_rx,
+            legacy_single_worker: false,
+            prioritize_rx: false,
+            dedicated_radio_io: false,
+        });
+    }
     let mut tt = tokio::spawn(telemetry_task(
         state.clone(),
         router.clone(),
-        vec![
-            CommsWorkerHandle {
-                name: "rocket_comms",
-                tx_budget: Some(rocket_tx_budget.clone()),
-                comms: rocket_comms,
-                tx_comms: None,
-                side_id: rocket_side,
-                tx_rx: rocket_rx,
-                legacy_single_worker: false,
-                prioritize_rx: false,
-                dedicated_radio_io: false,
-            },
-            CommsWorkerHandle {
-                name: "umbilical_comms",
-                tx_budget: None,
-                comms: umbilical_comms,
-                tx_comms: None,
-                side_id: umbilical_side,
-                tx_rx: umbilical_rx,
-                legacy_single_worker: false,
-                prioritize_rx: false,
-                dedicated_radio_io: false,
-            },
-        ],
+        comms_workers,
         cmd_rx,
         db_queue_rx,
         telemetry_shutdown_rx,

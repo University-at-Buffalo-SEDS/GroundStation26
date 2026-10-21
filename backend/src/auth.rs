@@ -181,6 +181,9 @@ impl Default for UsersFile {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionStatus {
+    pub station_name: &'static str,
+    pub station_role: &'static str,
+    pub station_pairing: Option<crate::station_pairing::Public>,
     pub roles: Vec<StreamRole>,
     pub authenticated: bool,
     pub username: Option<String>,
@@ -225,6 +228,17 @@ impl AuthPrincipal {
     }
     pub fn session_status(&self) -> SessionStatus {
         SessionStatus {
+            station_name: if crate::rrls::is_rrls() {
+                "RRLS"
+            } else {
+                "GroundStation"
+            },
+            station_role: if crate::rrls::is_rrls() {
+                "rrls"
+            } else {
+                "primary"
+            },
+            station_pairing: crate::station_pairing::public(),
             roles: self.roles.clone(),
             authenticated: !self.anonymous,
             username: self.username.clone(),
@@ -534,12 +548,115 @@ impl AuthManager {
     }
 
     pub async fn logout(&self, db: &SqlitePool, token: &str) -> Result<(), AuthFailure> {
+        let token = token.trim();
+        if token.starts_with("paired1.") {
+            let pairing = crate::station_pairing::Pairing::load()
+                .ok()
+                .flatten()
+                .ok_or_else(|| AuthFailure::Unauthorized("unpaired session".into()))?;
+            let claims = pairing
+                .verify(token, now_ms())
+                .map_err(|_| AuthFailure::Unauthorized("invalid paired session".into()))?;
+            // A destination may validate a portable session without a local row.
+            // Keep a tombstone until expiry so logout cannot resurrect it.
+            sqlx::query("INSERT INTO auth_sessions (token,username,session_type,can_view_data,can_send_commands,allowed_commands_json,created_at_ms,expires_at_ms) VALUES (?,?,'revoked',0,0,'[]',?,?) ON CONFLICT(token) DO UPDATE SET session_type='revoked',can_view_data=0,can_send_commands=0")
+                .bind(token).bind(claims.username).bind(now_ms()).bind(claims.expires_at_ms)
+                .execute(db).await.map_err(|_| AuthFailure::Internal("failed to revoke paired session".into()))?;
+            return Ok(());
+        }
         sqlx::query("DELETE FROM auth_sessions WHERE token = ?")
             .bind(token)
             .execute(db)
             .await
             .map_err(|e| AuthFailure::Internal(format!("failed to remove session: {e}")))?;
         Ok(())
+    }
+
+    fn authorize_paired(
+        &self,
+        token: &str,
+        row: Option<&sqlx::sqlite::SqliteRow>,
+        required: Permission,
+    ) -> Result<AuthPrincipal, AuthFailure> {
+        let unauthorized = || AuthFailure::Unauthorized("invalid or revoked paired session".into());
+        let pairing = crate::station_pairing::Pairing::load()
+            .ok()
+            .flatten()
+            .ok_or_else(unauthorized)?;
+        let claims = pairing
+            .verify(token, now_ms())
+            .map_err(|_| unauthorized())?;
+        if row.is_some_and(|r| r.get::<String, _>("session_type") == "revoked")
+            || claims.issuer == pairing.public.station_id && row.is_none()
+        {
+            return Err(unauthorized());
+        }
+        let config = self
+            .load_users_file()
+            .map_err(|_| AuthFailure::Internal("could not load accounts".into()))?;
+        let user = config
+            .users
+            .iter()
+            .find(|u| u.username.eq_ignore_ascii_case(&claims.username) && !u.disabled)
+            .ok_or_else(unauthorized)?;
+        let local = user.permissions.for_roles(&user.roles);
+        let roles: Vec<_> = user
+            .roles
+            .iter()
+            .copied()
+            .filter(|r| claims.roles.contains(r))
+            .collect();
+        let permissions = Permissions {
+            view_data: claims.permissions.view_data && local.view_data,
+            send_commands: claims.permissions.send_commands && local.send_commands,
+            set_system_time: claims.permissions.set_system_time && local.set_system_time,
+            voice_transmit: claims.permissions.voice_transmit && local.voice_transmit,
+        };
+        if !permissions.allows(required) {
+            return Err(AuthFailure::Forbidden(
+                "paired account lacks permission".into(),
+            ));
+        }
+        let (local_commands, local_calibration) = configured_user_access(&config, &user.username);
+        let mut allowed_commands = intersect_commands(
+            &claims.command_access.allowed_commands,
+            &local_commands.allowed_commands,
+        );
+        // An empty list means unrestricted, so an empty intersection must use a
+        // non-command sentinel rather than accidentally expanding permissions.
+        if !claims.command_access.allowed_commands.is_empty()
+            && !local_commands.allowed_commands.is_empty()
+            && allowed_commands.is_empty()
+        {
+            allowed_commands.push("__no_paired_commands__".into());
+        }
+        let local_expiry = claims.issued_at_ms.saturating_add(
+            (config.session_ttl_seconds.min(i64::MAX as u64 / 1000) as i64).saturating_mul(1000),
+        );
+        let expires = claims.expires_at_ms.min(local_expiry);
+        if expires <= now_ms() {
+            return Err(unauthorized());
+        }
+        Ok(AuthPrincipal {
+            roles,
+            username: Some(user.username.clone()),
+            permissions,
+            expires_at_ms: Some(expires),
+            anonymous: false,
+            session_type: Some(
+                if claims.remembered {
+                    "remembered"
+                } else {
+                    "session"
+                }
+                .into(),
+            ),
+            command_access: CommandAccess { allowed_commands },
+            calibration_access: CalibrationAccess {
+                view: claims.calibration_access.view && local_calibration.view,
+                edit: claims.calibration_access.edit && local_calibration.edit,
+            },
+        })
     }
 
     pub async fn authorize_token(
@@ -551,6 +668,7 @@ impl AuthManager {
         self.cleanup_expired_sessions(db).await?;
 
         if let Some(token) = token.filter(|token| !token.trim().is_empty()) {
+            let token = token.trim();
             let row = sqlx::query(
                 r#"
                 SELECT username, session_type, can_view_data, can_send_commands, expires_at_ms
@@ -565,6 +683,9 @@ impl AuthManager {
             .await
             .map_err(|e| AuthFailure::Internal(format!("failed to query session: {e}")))?;
 
+            if token.starts_with("paired1.") {
+                return self.authorize_paired(token, row.as_ref(), required);
+            }
             let Some(row) = row else {
                 return Err(AuthFailure::Unauthorized(
                     "invalid session token".to_string(),
@@ -702,10 +823,29 @@ async fn create_session_for_user(
     let now_ms = now_ms();
     let expires_at_ms =
         now_ms + (config.session_ttl_seconds.min(i64::MAX as u64 / 1000) as i64 * 1000);
-    let token = generate_token();
     let permissions = user.permissions.for_roles(&user.roles);
     let (command_access, calibration_access) = configured_user_access(config, &user.username);
     let session_type = if remember_me { "remembered" } else { "session" };
+    let token = match crate::station_pairing::Pairing::load()
+        .map_err(|_| AuthFailure::Internal("station pairing configuration invalid".into()))?
+    {
+        Some(pairing) => pairing
+            .token(&crate::station_pairing::Claims {
+                installation_id: pairing.public.installation_id.clone(),
+                issuer: pairing.public.station_id.clone(),
+                username: user.username.clone(),
+                issued_at_ms: now_ms,
+                expires_at_ms,
+                nonce: generate_token(),
+                roles: user.roles.clone(),
+                permissions,
+                command_access: command_access.clone(),
+                calibration_access,
+                remembered: remember_me,
+            })
+            .map_err(|_| AuthFailure::Internal("could not create paired session".into()))?,
+        None => generate_token(),
+    };
     let allowed_commands_json = serde_json::to_string(&command_access.allowed_commands)
         .map_err(|e| AuthFailure::Internal(format!("failed to serialize command access: {e}")))?;
 
@@ -878,6 +1018,20 @@ fn derive_pbkdf2(
         &mut out,
     );
     Ok(out)
+}
+
+fn intersect_commands(source: &[String], destination: &[String]) -> Vec<String> {
+    if source.is_empty() {
+        destination.to_vec()
+    } else if destination.is_empty() {
+        source.to_vec()
+    } else {
+        source
+            .iter()
+            .filter(|c| destination.contains(c))
+            .cloned()
+            .collect()
+    }
 }
 
 fn generate_token() -> String {

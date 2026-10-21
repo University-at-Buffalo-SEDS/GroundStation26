@@ -1,5 +1,5 @@
 {
-  "updated": "2026-10-17",
+  "updated": "2026-10-20",
   "constraints": [
     "Preserve firmware main and GroundStation SEDSnet version-4 dependency selectors",
     "Do not actuate outputs during diagnostics",
@@ -147,6 +147,12 @@
       "scope": "Cargo-style SEDSnet commands and flags, matching CMake invocation and migrated repository tooling/docs.",
       "validation": "Argument/release-tool tests, actual native and embedded CMake builds, consuming board builds.",
       "progress": "Cargo-style parser, CMake, C test and release-tool callers migrated, docs/changelog updated. Python tooling 33 tests pass with 9 existing binding-dependent skips; standalone native macOS CMake release build passes. All eight board factory images build with updated SDK build.py/CMake and existing board-prepared SDK/runtime configuration. Existing firmware build.py flags and main/v4 source policies unchanged. The native C integration harness also passes all five C executables, including runtime-schema, topology and timesync cases."
+    },
+    {
+      "id": "rrls-native-handover",
+      "status": "complete",
+      "scope": "RRLS-only radio config/identity, previous-tab mode return, explicit application-key pairing and native discovery/login handover independent of HTTPS certificates; browser handover remains out of scope per user choice",
+      "validation": "340 clean staged-source backend tests passed (1 existing ignored), 108 native macOS UI tests passed (7 existing ignored), three private provisioning tests, six signed browser-discovery scenarios, ordinary non-HITL macOS RRLS startup, two independent HTTP backends with service restarts/logout tombstones and permission ceilings, and full rendered dashboard/55-command mocked regression passed. Browser redirect is best-effort paired-origin probing; login portability is native-only. Pairing identity is independent of HTTPS certificates. Gateway fidelity/throughput qualification remains open after failed baseline."
     }
   ],
   "platform_matrix": [

@@ -216,6 +216,19 @@ pub async fn serve(app: Router, config: Config, shutdown: impl Future<Output = (
         None
     };
     log::info!("HTTP listening on {}", http.local_addr()?);
+    struct DiscoveryGuard(tokio::task::JoinHandle<()>);
+    impl Drop for DiscoveryGuard {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _discovery = crate::station_pairing::Pairing::load()?.map(|pairing| {
+        DiscoveryGuard(tokio::spawn(async move {
+            if let Err(error) = crate::station_pairing::serve_discovery(pairing).await {
+                log::warn!("paired station LAN discovery unavailable: {error}");
+            }
+        }))
+    });
     let http_handle = Handle::new();
     let https_handle = Handle::new();
     let http_server = axum_server::from_tcp(http)?

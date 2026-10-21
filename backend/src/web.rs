@@ -169,6 +169,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/auth/challenge", post(login_challenge))
         .route("/api/auth/login", post(login))
         .route("/api/auth/session", get(get_session_status))
+        .route("/api/station/discovery", get(crate::station_pairing::discover).options(crate::station_pairing::discovery_preflight))
         .route("/api/auth/logout", post(logout))
         .route("/api/recent", get(get_recent))
         .route("/api/command", post(send_command))

@@ -65,7 +65,10 @@ impl RecoveryRadio {
                 Err(error) => {
                     state.failures += 1;
                     if state.failures == 1 || state.failures % 30 == 0 {
-                        log::warn!("RRLS radio unavailable; retrying once per second: {error:#}");
+                        log::warn!(
+                            "RRLS radio {} unavailable; retrying once per second: {error:#}",
+                            crate::comms::link_description(&state.config)
+                        );
                     }
                 }
             }
@@ -89,6 +92,7 @@ impl RecoveryRadio {
         op: impl FnOnce(&mut dyn CommsDevice) -> Result<T, E>,
     ) -> Result<T, E> {
         let Some((generation, device)) = self.connect() else {
+            std::thread::sleep(Duration::from_millis(10));
             return Err(offline);
         };
         let result = {
@@ -150,7 +154,7 @@ impl CommsDevice for RecoveryRadio {
         max: usize,
     ) -> TelemetryResult<()> {
         if self.connect().is_none() {
-            std::thread::sleep(timeout.min(Duration::from_millis(10)));
+            std::thread::sleep(Duration::from_millis(10));
             return Err(TelemetryError::Io("RRLS radio disconnected"));
         }
         self.with_device(
@@ -215,6 +219,7 @@ mod tests {
     #[test]
     fn absent_radio_is_bounded_and_does_not_panic_or_fake_success() {
         let mut radio = missing();
+        let started = Instant::now();
         let mut tx = radio.try_clone_tx().unwrap().unwrap();
         for _ in 0..100 {
             assert!(
@@ -228,7 +233,11 @@ mod tests {
             );
             assert!(tx.send_data(&[1]).is_err());
         }
-        assert_eq!(radio.shared.lock().unwrap().failures, 1);
+        let attempts = radio.shared.lock().unwrap().failures;
+        assert!(
+            attempts >= 1 && attempts <= 1 + started.elapsed().as_secs(),
+            "retry storm: {attempts}"
+        );
     }
     struct TestRadio {
         online: Arc<AtomicBool>,

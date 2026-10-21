@@ -98,13 +98,13 @@ The saved communications file has this format:
 ```json
 {
   "version": 1,
-  "av_bay": {"interface": "serial", "port": "/dev/serial0", "baud_rate": 115200, "protocol": "raw_uart"},
-  "fill_box": {"interface": "serial", "port": "unused", "protocol": "raw_uart"}
+  "av_bay": {"interface": "serial", "port": "/dev/serial0", "baud_rate": 115200, "protocol": "raw_uart"}
 }
 ```
 
-The unused fill-box field is required by the shared configuration format; RRLS
-does not open it. Select this file with `GS_COMMS_LINK_CONFIG`.
+RRLS accepts and saves this radio-only file; it creates no fill-system router
+side or worker. The primary GroundStation still requires its own fill-system
+configuration. Select the RRLS file with `GS_RRLS_COMMS_LINK_CONFIG`.
 
 ```sh
 GS_COMMS_LINK_CONFIG=/etc/rrls/comms.json python3 run_rrls.py --backend-only-build
@@ -157,3 +157,54 @@ separate from this new recovery-mesh mode.
 `--backend-only` / `--backend-only-build` reuses existing WebUI assets. Do not
 combine it with `--frontend-dev`: run `python3 run_rrls.py --frontend-dev`
 first to rebuild and serve the development UI.
+
+## Native app handover and application identity
+
+Pairing is opt-in. Provision a persistent application signing identity, independent
+of HTTP, HTTPS certificates, or a reverse proxy:
+
+```sh
+python3 backend/tools/pair_stations.py --output /private/path/station-pair \
+  --primary-url https://groundstation.local --rrls-url https://rrls.local
+```
+
+Install `primary/` on the primary station and `rrls/` on RRLS, outside the source
+checkout. Set `GS_STATION_PAIRING_FILE` to each station's `pairing.json` and restart
+the service. Keep `identity.seed` private; it is the installation's application
+identity and session-signing key. Do not regenerate it for HTTPS certificate
+renewal. The configured URLs may use HTTP or HTTPS and may point at a proxy.
+TLS trust is still governed by the app's connection settings. HTTP retains its
+normal lack of transport encryption.
+
+Provision the same username on both servers with the intended local permissions.
+Sign in once after enabling pairing to obtain a portable session. The destination
+checks both the signed source grant and its current local account: a missing or
+disabled account is rejected, and destination permissions cannot exceed either
+grant. Remembered logins survive app restarts. Logout clears copies of that
+portable session on the device and records a revocation at the current station;
+offline servers cannot receive a global logout. Disable the account on both
+servers, or rotate the installation key, to revoke access installation-wide.
+
+Native apps keep a healthy connection. On disconnect they sweep UDP 49363 (IPv4
+LAN broadcast) and probe configured paired URLs, at most once every five seconds.
+Replies must match a fresh nonce, the installation signing key, and a configured
+peer identity/role before a session is sent. `/api/station/discovery?nonce=...` is
+the corresponding public HTTP discovery endpoint. The native app validates the
+portable session at the discovered station, changes address itself, and refreshes
+its layout, branding, telemetry and WebSocket. No command is replayed by handover.
+
+A backend behind Docker must publish UDP 49363 as well as its HTTP(S) ports.
+`pairing.json`'s `scheme` and `port` describe the client-facing listener/proxy,
+not the backend's internal port. `GS_STATION_DISCOVERY_BIND` overrides the UDP
+listener (default `0.0.0.0:49363`). The signing identity is application-level; it
+is not an HTTPS certificate pin.
+
+Browsers cannot broadcast UDP or share local storage across unrelated origins.
+Native apps perform the LAN sweep. An already-open browser page caches the paired
+HTTP(S) origins and probes them only after three failed checks of its current
+station. It verifies fresh, signed application identities with WebCrypto before
+redirecting. Only configured paired origins receive discovery CORS access. This
+is best-effort: browser local-network policies, certificate trust and WebCrypto
+secure-context requirements still apply. Browsers retain each origin's own saved
+login; cross-origin login handoff is not enabled. An unloaded page cannot discover
+a replacement server until its application assets can be loaded.

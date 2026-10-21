@@ -680,6 +680,10 @@ pub fn load_layout() -> Result<LayoutConfig, String> {
 
 fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
     layout.test_fire_mode = cfg!(feature = "test_fire_mode");
+    if crate::rrls::is_rrls() {
+        layout.branding.app_name = Some("RRLS".into());
+        layout.branding.dashboard_title = Some("RRLS".into());
+    }
     ensure_gse_sequence_actions(layout);
     #[cfg(feature = "hitl_mode")]
     for (cmd, label) in [

@@ -1129,29 +1129,6 @@ mod tests {
 }
 
 /// RRLS has no fill-system hardware.
-pub struct NoFill;
-impl crate::comms::CommsDevice for NoFill {
-    fn set_side_id(&mut self, _: sedsnet::router::RouterSideId) {}
-    fn recv_packet(
-        &mut self,
-        _: &sedsnet::router::Router,
-        _: &mut dyn FnMut(&sedsnet::packet::Packet),
-    ) -> sedsnet::TelemetryResult<()> {
-        Ok(())
-    }
-    fn recv_serialized_packets_with_budget(
-        &mut self,
-        _: &mut dyn FnMut(Vec<u8>),
-        timeout: std::time::Duration,
-        _: usize,
-    ) -> sedsnet::TelemetryResult<()> {
-        std::thread::sleep(timeout.min(std::time::Duration::from_millis(10)));
-        Ok(())
-    }
-    fn send_data(&mut self, _: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
-    }
-}
 
 pub fn voice_transport() -> Option<Shared> {
     RADIO

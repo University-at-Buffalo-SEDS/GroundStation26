@@ -129,6 +129,37 @@ pub struct CommsLinksConfig {
     pub fill_box: CommsLinkConfig,
 }
 
+#[derive(Serialize, Deserialize)]
+struct RecoveryCommsConfig {
+    #[serde(default = "default_config_version")]
+    version: u32,
+    av_bay: CommsLinkConfig,
+}
+fn parse_config(raw: &str, recovery: bool) -> Result<CommsLinksConfig, serde_json::Error> {
+    if recovery {
+        let radio: RecoveryCommsConfig = serde_json::from_str(raw)?;
+        let mut config = default_for_role(true);
+        config.version = radio.version;
+        config.av_bay = radio.av_bay;
+        Ok(config)
+    } else {
+        serde_json::from_str(raw)
+    }
+}
+fn serialize_config(
+    config: &CommsLinksConfig,
+    recovery: bool,
+) -> Result<String, serde_json::Error> {
+    if recovery {
+        serde_json::to_string_pretty(&RecoveryCommsConfig {
+            version: config.version,
+            av_bay: config.av_bay.clone(),
+        })
+    } else {
+        serde_json::to_string_pretty(config)
+    }
+}
+
 fn default_i2c_protocol_version() -> u8 {
     1
 }
@@ -278,7 +309,7 @@ pub fn load_or_default() -> CommsLinksConfig {
     let mut config = match fs::read_to_string(&path) {
         Ok(raw) => {
             let raw = migrate_serial_protocol_defaults(raw, &path);
-            match serde_json::from_str::<CommsLinksConfig>(&raw) {
+            match parse_config(&raw, crate::rrls::is_rrls()) {
                 Ok(cfg) => cfg,
                 Err(err) => {
                     eprintln!(
@@ -318,6 +349,16 @@ pub fn load_or_default() -> CommsLinksConfig {
         }
     }
     apply_simulator_serial_overrides(&mut config);
+    log::info!(
+        "{} communications config: {}; radio: {}",
+        if crate::rrls::is_rrls() {
+            "RRLS"
+        } else {
+            "GroundStation"
+        },
+        path.display(),
+        crate::comms::link_description(&config.av_bay)
+    );
     config
 }
 
@@ -397,7 +438,7 @@ pub fn save(cfg: &CommsLinksConfig) -> Result<(), String> {
         fs::create_dir_all(parent)
             .map_err(|err| format!("create config directory {}: {err}", parent.display()))?;
     }
-    let raw = serde_json::to_string_pretty(cfg)
+    let raw = serialize_config(cfg, crate::rrls::is_rrls())
         .map_err(|err| format!("serialize comms link config: {err}"))?;
     fs::write(&path, raw)
         .map_err(|err| format!("write comms link config {}: {err}", path.display()))
@@ -513,6 +554,20 @@ mod tests {
     };
     use std::path::PathBuf;
 
+    #[test]
+    fn recovery_accepts_and_saves_radio_only_config_without_inheriting_fill_transport() {
+        let raw = r#"{"version":1,"av_bay":{"interface":"serial","port":"/dev/cu.usbserial-BG00HPF3","baud_rate":115200,"protocol":"raw_uart"}}"#;
+        let config = super::parse_config(raw, true).unwrap();
+        assert_eq!(config.av_bay.port(), "/dev/cu.usbserial-BG00HPF3");
+        let saved: serde_json::Value =
+            serde_json::from_str(&super::serialize_config(&config, true).unwrap()).unwrap();
+        assert!(saved.get("fill_box").is_none());
+        assert_eq!(saved["av_bay"]["baud_rate"], 115200);
+        assert!(
+            super::parse_config(raw, false).is_err(),
+            "the primary station still requires its fill transport"
+        );
+    }
     #[test]
     fn recovery_config_paths_and_defaults_are_separate() {
         let regular = selected_config_path(false, None, None);
