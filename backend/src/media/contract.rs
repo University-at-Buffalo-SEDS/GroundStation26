@@ -254,13 +254,26 @@ async fn read_presentation(state: &MediaState) -> ApiResult<Presentation> {
             Err(err) => Err(io_error(err)),
         }?;
     if let Some(plan) = &presentation.broadcast.replay {
-        if !replay::available(state, plan).await { presentation.broadcast.replay = None; }
+        if !replay::available(state, plan).await {
+            presentation.broadcast.replay = None;
+        }
     }
     if presentation.stats.is_empty() {
         presentation.stats = default_stats();
     }
-    if cfg!(feature="test_fire_mode") && !presentation.stats.iter().any(|s|s.label=="Thrust") {
-        presentation.stats.push(BroadcastStat{label:"Thrust".into(),unit:"N".into(),precision:1,binding:Binding{data_type:"LOADCELL_WEIGHT_KG".into(),sender_id:None,index:0,scale:9.80665,offset:0.0}});
+    if cfg!(feature = "test_fire_mode") && !presentation.stats.iter().any(|s| s.label == "Thrust") {
+        presentation.stats.push(BroadcastStat {
+            label: "Thrust".into(),
+            unit: "N".into(),
+            precision: 1,
+            binding: Binding {
+                data_type: "LOADCELL_WEIGHT_KG".into(),
+                sender_id: None,
+                index: 0,
+                scale: 9.80665,
+                offset: 0.0,
+            },
+        });
     }
     Ok(presentation)
 }
