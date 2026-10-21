@@ -78,8 +78,12 @@ $('join').onclick=async()=>{
     await bounded(s.context.audioWorklet.addModule('/assets/voice-worklet.js'),8000,'The voice audio processor did not load. Reload and try again.');
     if(session!==s)return;
     notice('Checking voice access…');
-    const access=await fetch('/api/voice/status',{headers:{Authorization:`Bearer ${token}`},signal:AbortSignal.timeout(8000)});
-    const capabilities=access.ok?await access.json():null;
+    const access=await fetch('/api/voice/status',{headers:{Authorization:`Bearer ${token}`},cache:'no-store',signal:AbortSignal.timeout(8000)});
+    if(!access.ok){
+      if(access.status===401)throw new Error('Your session expired or is no longer valid. Sign in again from the dashboard.');
+      throw new Error(`Voice access check failed (HTTP ${access.status}). Try again or check the server log.`);
+    }
+    const capabilities=await access.json();
     if(!capabilities?.can_transmit)throw new Error('Your account needs the voice_transmit permission. Stream viewers can listen through the audience program.');
     radioLink(capabilities.radio);
     if(session!==s)return;

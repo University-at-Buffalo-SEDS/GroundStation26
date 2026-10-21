@@ -463,10 +463,10 @@ mod tests {
         let path = dir.join("users.json");
         let accounts = [
             ("producer", vec!["stream_master"]),
-            ("administrator", vec!["stream_admin"]),
+            ("administrator", vec!["admin"]),
             ("viewer", vec![]),
         ];
-        let users:Vec<_>=accounts.iter().map(|(name,roles)|serde_json::json!({"username":name,"roles":roles,"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true,"send_commands":false,"voice_transmit":*name!="viewer"}})).collect();
+        let users:Vec<_>=accounts.iter().map(|(name,roles)|serde_json::json!({"username":name,"roles":roles,"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true,"send_commands":false,"voice_transmit":*name=="producer"}})).collect();
         std::fs::write(&path,serde_json::to_vec(&serde_json::json!({"anonymous":{"view_data":true,"send_commands":false},"users":users})).unwrap()).unwrap();
         let mut app = crate::state::tests::test_app_state().await;
         Arc::get_mut(&mut app).unwrap().auth = Arc::new(crate::auth::AuthManager::new(path));

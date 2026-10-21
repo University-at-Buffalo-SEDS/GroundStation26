@@ -199,10 +199,15 @@ async fn capabilities(
     State(state): State<Arc<VoiceState>>,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
-    match crate::web::authorize_headers(&state.app, &headers, Permission::ViewData).await {
+    let mut response = match crate::web::authorize_headers(&state.app, &headers, Permission::ViewData).await {
         Ok(p) => axum::Json(serde_json::json!({"can_transmit":!p.anonymous && p.permissions.allows(Permission::VoiceTransmit),"broadcast_enabled":state.hub.enabled().await,"radio":crate::radio_voice::status()})).into_response(),
         Err(response) => response,
-    }
+    };
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 async fn upgrade(State(state): State<Arc<VoiceState>>, ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -429,6 +434,58 @@ mod tests {
                 .unwrap()
                 .len(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_status_uses_current_admin_role_without_explicit_voice_grant() {
+        use crate::recording_export::tests::{TestDirectory, export_state};
+        let root = TestDirectory::new();
+        let app = export_state(&root.0, true).await;
+        let save = |role: &str, disabled: bool| {
+            std::fs::write(root.0.join("auth.json"), serde_json::json!({
+                "anonymous":{"view_data":true},
+                "users":[{"username":"administrator","roles":[role],"password":{"salt_b64":"","hash_b64":""},
+                    "permissions":{"view_data":false,"send_commands":false,"voice_transmit":false},"disabled":disabled}]
+            }).to_string()).unwrap();
+        };
+        sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,created_at_ms,expires_at_ms) VALUES('voice-admin-test','administrator','session',0,0,0,9999999999999)")
+            .execute(&app.auth_db).await.unwrap();
+        let state = Arc::new(VoiceState {
+            app,
+            hub: Arc::new(VoiceHub::default()),
+            peers: Mutex::new(BTreeMap::new()),
+            next: AtomicU32::new(1),
+        });
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer voice-admin-test".parse().unwrap(),
+        );
+        save("admin", false);
+        let response = capabilities(State(state.clone()), headers.clone()).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["can_transmit"], true);
+        // Revocation is effective without replacing or reissuing the session.
+        save("stream_admin", false);
+        assert_eq!(
+            capabilities(State(state.clone()), headers.clone())
+                .await
+                .status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+        save("admin", true);
+        assert_eq!(
+            capabilities(State(state), headers).await.status(),
+            axum::http::StatusCode::UNAUTHORIZED
         );
     }
 

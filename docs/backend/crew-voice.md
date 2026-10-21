@@ -1,16 +1,16 @@
 # Crew voice
 
 Open `/radio` on the Ground Station's HTTPS origin, or select **Crew voice** in
-Mission. The link opens a separate tab so a call can continue while you use the
-dashboard. Sign in with an application Admin account, or an account with view access and explicit
+the navigation menu. The embedded voice session stays mounted while you use
+other dashboard pages. Sign in with an application Admin account, or an account with view access and explicit
 **voice transmit** permission, then select **Join voice** and approve microphone
 access. Anonymous users and ordinary viewers cannot join the transmitting channel.
 They can listen through the audience program when a stream manager enables it.
 
 ## Grant permission to talk
 
-Transmission is denied by default, including for hardware operators and stream
-admins. In `backend/tools/users_config_gui.py`, check **Transmit Crew Voice** on
+Application admins inherit voice permission. Other accounts require an explicit
+voice grant, including hardware operators and stream admins. In `backend/tools/users_config_gui.py`, check **Transmit Crew Voice** on
 the account and save the configuration. From the Ground Station repository you
 can also change just this permission for an existing user:
 
@@ -148,3 +148,9 @@ portrait layout, the always-visible status-bar diagram, camera loss, delay chang
 and unified audience sound without microphone access or AudioWorklet support.
 
 Application administrators inherit voice transmit and stream management access, including existing sessions. Other roles still need an explicit voice transmit grant. Joining reports audio, permission and connection progress beside the Join button; failed startup releases the microphone and permits retry.
+
+An expired session or a failed access request is reported separately from a voice
+permission denial. Voice capability responses are not cached. A username such as
+`admin` or hardware-command access does not itself grant the application `admin`
+role. The SSH terminal tool in `docs/application-administration.md` can inspect
+and change roles without a graphical desktop.
