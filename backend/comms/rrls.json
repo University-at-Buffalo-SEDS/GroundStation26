@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "av_bay": {
+    "interface": "serial",
+    "port": "/dev/cu.usbserial-BG00HPF3",
+    "baud_rate": 115200,
+    "protocol": "raw_uart"
+  }
+}
