@@ -42,7 +42,7 @@ use tower_http::services::{ServeDir, ServeFile};
 // NEW
 
 static FAVICON_DATA: OnceCell<Option<Vec<u8>>> = OnceCell::const_new();
-static TILE_DB_POOL: OnceCell<Option<sqlx::SqlitePool>> = OnceCell::const_new();
+static TILE_DB_POOL: OnceCell<sqlx::SqlitePool> = OnceCell::const_new();
 static TILE_DB_MODE: OnceCell<TileDbMode> = OnceCell::const_new();
 const RECENT_HISTORY_MS: i64 = 20 * 60 * 1000;
 const RECENT_BUCKET_MS: i64 = 20;
@@ -932,66 +932,156 @@ fn tile_path(z: u32, x: u32, y: u32) -> PathBuf {
     format!("./backend/data/maps/{DEFAULT_MAP_REGION}/tiles/{z}/{x}/{y}.jpg").into()
 }
 
-/// Lazily opens the read-only SQLite tile bundle when one exists.
+/// Cache successful opens only: downloading map data after startup must work
+/// without restarting the service or permanently caching an absent database.
 async fn tile_db_pool() -> Option<sqlx::SqlitePool> {
-    TILE_DB_POOL
-        .get_or_init(|| async {
-            let path = tile_bundle_path(DEFAULT_MAP_REGION);
-            let exists = tokio::fs::try_exists(&path).await.unwrap_or(false);
-            if !exists {
-                return None;
-            }
-            let url = format!("sqlite://{}?mode=ro", path.to_string_lossy());
-            match SqlitePoolOptions::new()
-                .max_connections(4)
-                .connect(&url)
-                .await
-            {
-                Ok(pool) => Some(pool),
-                Err(e) => {
-                    eprintln!(
-                        "WARNING: failed to open tile bundle {}: {e}",
-                        path.display()
-                    );
-                    None
-                }
-            }
-        })
-        .await
-        .clone()
+    open_tile_bundle(&TILE_DB_POOL, &tile_bundle_path(DEFAULT_MAP_REGION)).await
 }
 
-/// Detects whether the tile bundle uses the legacy inline-image schema or the deduped blob schema.
-async fn tile_db_mode() -> TileDbMode {
-    *TILE_DB_MODE
-        .get_or_init(|| async {
-            let Some(pool) = tile_db_pool().await else {
-                return TileDbMode::LegacyInline;
-            };
-            let Ok(rows) = sqlx::query("PRAGMA table_info(tiles)")
-                .fetch_all(&pool)
-                .await
-            else {
-                return TileDbMode::LegacyInline;
-            };
-            let has_blob_id = rows.iter().any(|r| {
-                r.try_get::<String, _>("name")
-                    .map(|n| n == "blob_id")
-                    .unwrap_or(false)
-            });
-            if has_blob_id {
-                TileDbMode::Deduped
-            } else {
-                TileDbMode::LegacyInline
-            }
-        })
-        .await
+async fn open_tile_bundle(
+    cell: &OnceCell<sqlx::SqlitePool>,
+    path: &std::path::Path,
+) -> Option<sqlx::SqlitePool> {
+    if let Some(pool) = cell.get() {
+        return Some(pool.clone());
+    }
+    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+        return None;
+    }
+    cell.get_or_try_init(|| async {
+        let result = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(path)
+                    .read_only(true),
+            )
+            .await;
+        if let Err(error) = &result {
+            log::warn!("failed to open tile bundle {}: {error}", path.display());
+        }
+        result
+    })
+    .await
+    .ok()
+    .cloned()
+}
+
+/// An empty or partially initialized download must not freeze the schema mode.
+async fn tile_db_mode(pool: &sqlx::SqlitePool, cell: &OnceCell<TileDbMode>) -> Option<TileDbMode> {
+    cell.get_or_try_init(|| async {
+        let rows = sqlx::query("PRAGMA table_info(tiles)")
+            .fetch_all(pool)
+            .await
+            .map_err(|_| ())?;
+        let has = |name: &str| {
+            rows.iter().any(|row| {
+                row.try_get::<String, _>("name")
+                    .is_ok_and(|column| column == name)
+            })
+        };
+        if has("blob_id") {
+            Ok(TileDbMode::Deduped)
+        } else if has("image") {
+            Ok(TileDbMode::LegacyInline)
+        } else {
+            Err(())
+        }
+    })
+    .await
+    .ok()
+    .copied()
+}
+
+#[cfg(test)]
+mod tile_bundle_lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn missing_bundle_and_unfinished_schema_are_retried_after_download() {
+        let dir = std::env::temp_dir().join(format!(
+            "gs-map-late-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("tiles.sqlite3");
+        let pool_cell = OnceCell::new();
+        let mode_cell = OnceCell::new();
+        assert!(open_tile_bundle(&pool_cell, &path).await.is_none());
+        assert!(
+            !path.exists(),
+            "a read request must not create an empty database"
+        );
+        assert!(pool_cell.get().is_none());
+        let writer = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        let reader = open_tile_bundle(&pool_cell, &path).await.unwrap();
+        assert!(tile_db_mode(&reader, &mode_cell).await.is_none());
+        assert!(mode_cell.get().is_none());
+        sqlx::query("CREATE TABLE tiles (z INTEGER, x INTEGER, y INTEGER, blob_id INTEGER)")
+            .execute(&writer)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE tile_blobs (id INTEGER PRIMARY KEY, image BLOB)")
+            .execute(&writer)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO tile_blobs VALUES (1, X'FFD8FFD9')")
+            .execute(&writer)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO tiles VALUES (5, 8, 11, 1)")
+            .execute(&writer)
+            .await
+            .unwrap();
+        assert!(matches!(
+            tile_db_mode(&reader, &mode_cell).await,
+            Some(TileDbMode::Deduped)
+        ));
+        let bytes: Vec<u8> = sqlx::query_scalar("SELECT b.image FROM tiles t JOIN tile_blobs b ON b.id=t.blob_id WHERE z=5 AND x=8 AND y=11")
+            .fetch_one(&reader).await.unwrap();
+        assert_eq!(bytes, [255, 216, 255, 217]);
+        writer.close().await;
+        reader.close().await;
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_inline_bundles_remain_supported() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE tiles (z INTEGER, x INTEGER, y INTEGER, image BLOB)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            tile_db_mode(&pool, &OnceCell::new()).await,
+            Some(TileDbMode::LegacyInline)
+        ));
+        pool.close().await;
+    }
 }
 
 /// Loads the exact tile from the bundle first and falls back to the legacy filesystem layout.
 async fn read_exact_tile(z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
-    if let Some(pool) = tile_db_pool().await {
-        match tile_db_mode().await {
+    if let Some(pool) = tile_db_pool().await
+        && let Some(mode) = tile_db_mode(&pool, &TILE_DB_MODE).await
+    {
+        match mode {
             TileDbMode::LegacyInline => {
                 match sqlx::query_scalar::<_, Vec<u8>>(
                     "SELECT image FROM tiles WHERE z = ? AND x = ? AND y = ? LIMIT 1",

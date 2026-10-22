@@ -189,6 +189,10 @@ struct Component {
     active_threshold: Option<f32>,
 }
 
+pub(super) async fn capture_program_history(state: Arc<MediaState>) {
+    program::capture_history(state).await;
+}
+
 pub(super) fn routes() -> Router<Arc<MediaState>> {
     Router::new()
         .route("/api/live_streams", get(live_streams))

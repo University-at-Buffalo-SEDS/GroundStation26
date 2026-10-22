@@ -90,6 +90,65 @@ fn program_t_clock(clock: &crate::telemetry_db::LaunchClockMsg, now: i64) -> Opt
         centis % 100
     ))
 }
+const PROGRAM_HISTORY_MS: u64 = 90_000;
+const PROGRAM_SAMPLE_MS: u64 = 250;
+const MAX_PROGRAM_SNAPSHOTS: usize = 364;
+
+fn retain_program_snapshot(
+    history: &mut std::collections::VecDeque<(u64, serde_json::Value)>,
+    now: u64,
+    snapshot: serde_json::Value,
+) {
+    // A UTC correction cannot leave future frames or unbounded retained data.
+    if history.back().is_some_and(|(time, _)| *time > now) {
+        history.clear();
+    }
+    if history
+        .back()
+        .is_none_or(|(time, _)| now.saturating_sub(*time) >= PROGRAM_SAMPLE_MS)
+    {
+        history.push_back((now, snapshot));
+    }
+    while history.len() > MAX_PROGRAM_SNAPSHOTS
+        || history
+            .front()
+            .is_some_and(|(time, _)| now.saturating_sub(*time) > PROGRAM_HISTORY_MS)
+    {
+        history.pop_front();
+    }
+}
+
+fn delayed_program_snapshot(
+    history: &std::collections::VecDeque<(u64, serde_json::Value)>,
+    target: u64,
+) -> Option<serde_json::Value> {
+    history
+        .iter()
+        .rev()
+        .find(|(time, _)| *time <= target)
+        .filter(|(time, _)| target.saturating_sub(*time) < 2000)
+        .map(|(_, value)| value.clone())
+}
+
+pub(super) async fn capture_history(state: Arc<MediaState>) {
+    let mut shutdown = state.app.shutdown_subscribe();
+    let mut timer = tokio::time::interval(Duration::from_millis(PROGRAM_SAMPLE_MS));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            _ = timer.tick() => {},
+        }
+        let Ok(presentation) = read_presentation(&state).await else {
+            continue;
+        };
+        let now = now_ms();
+        let mut snapshot = telemetry_snapshot(&state.app, &presentation, now);
+        snapshot["model_state"] = model_snapshot(&state.app, &presentation.vehicle, now);
+        retain_program_snapshot(&mut *state.program_history.lock().await, now, snapshot);
+    }
+}
+
 async fn program_state(
     State(state): State<Arc<MediaState>>,
     Query(query): Query<MediaQuery>,
@@ -124,21 +183,7 @@ async fn program_state(
     }
     let model = load_vehicle(state.clone(), headers.clone()).await?;
     let now = now_ms();
-    let mut snapshot = telemetry_snapshot(&state.app, &presentation, now);
-    snapshot["model_state"] = model_snapshot(&state.app, &model, now);
-    let mut history = state.program_history.lock().await;
-    if history
-        .back()
-        .is_none_or(|(t, _)| now.saturating_sub(*t) >= 250)
-    {
-        history.push_back((now, snapshot));
-    }
-    while history
-        .front()
-        .is_some_and(|(t, _)| now.saturating_sub(*t) > 90000)
-    {
-        history.pop_front();
-    }
+    let history = state.program_history.lock().await;
     let target = presentation
         .broadcast
         .replay
@@ -147,12 +192,7 @@ async fn program_state(
         .unwrap_or_else(|| {
             now.saturating_sub(presentation.broadcast.delay_seconds as u64 * 1000 + 2500)
         });
-    let live_telemetry = history
-        .iter()
-        .rev()
-        .find(|(t, _)| *t <= target)
-        .filter(|(t, _)| target.saturating_sub(*t) < 2000)
-        .map(|(_, v)| v.clone());
+    let live_telemetry = delayed_program_snapshot(&history, target);
     drop(history);
     let telemetry = if let Some(plan) = &presentation.broadcast.replay {
         super::replay::telemetry(&state, &plan.id, target).await
@@ -706,6 +746,50 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn delayed_clock_is_available_to_the_first_viewer_without_live_time_fallback() {
+        use crate::telemetry_db::{LaunchClockKind, LaunchClockMsg};
+        let clock = LaunchClockMsg {
+            kind: LaunchClockKind::TMinus,
+            anchor_timestamp_ms: Some(100_000),
+            duration_ms: Some(20_000),
+        };
+        let mut history = std::collections::VecDeque::new();
+        // The service sampler runs before any viewer joins, without a camera/API request.
+        for now in (100_000..=115_000).step_by(PROGRAM_SAMPLE_MS as usize) {
+            retain_program_snapshot(
+                &mut history,
+                now,
+                serde_json::json!({"t_clock":program_t_clock(&clock, now as i64)}),
+            );
+        }
+        let delayed = delayed_program_snapshot(&history, 102_500).unwrap();
+        assert_eq!(delayed["t_clock"], "T− 00:17.50");
+        assert_ne!(
+            delayed["t_clock"],
+            program_t_clock(&clock, 115_000).unwrap()
+        );
+        assert!(delayed_program_snapshot(&history, 99_999).is_none());
+        assert!(delayed_program_snapshot(&history, 118_000).is_none());
+    }
+
+    #[test]
+    fn program_history_is_bounded_and_rebuffers_after_a_backward_utc_step() {
+        let mut history = std::collections::VecDeque::new();
+        for now in 0..200_000 {
+            retain_program_snapshot(&mut history, now, serde_json::json!({"captured":now}));
+        }
+        assert!(history.len() <= MAX_PROGRAM_SNAPSHOTS);
+        assert!(history.back().unwrap().0 - history.front().unwrap().0 <= PROGRAM_HISTORY_MS);
+        retain_program_snapshot(&mut history, 100, serde_json::json!({"captured":100}));
+        assert_eq!(history.len(), 1);
+        assert!(delayed_program_snapshot(&history, 99).is_none());
+        assert_eq!(
+            delayed_program_snapshot(&history, 100).unwrap()["captured"],
+            100
+        );
+    }
+
     #[test]
     fn program_clock_uses_snapshot_time_and_backend_countdown_semantics() {
         use crate::telemetry_db::{LaunchClockKind, LaunchClockMsg};

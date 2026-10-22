@@ -77,6 +77,7 @@ pub fn router(
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/stage_models")),
     });
     tokio::spawn(publishing::reap(state.clone()));
+    tokio::spawn(contract::capture_program_history(state.clone()));
     let initial = state.clone();
     tokio::spawn(async move {
         contract::initialize_voice_broadcast(&initial).await;
