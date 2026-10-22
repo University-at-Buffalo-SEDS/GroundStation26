@@ -2,12 +2,15 @@ use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use blake3::Hasher;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::Client;
-use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+use sqlx::{
+    SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::sync::{
@@ -224,12 +227,30 @@ fn bundle_path_for(data_dir: &Path) -> PathBuf {
     }
 }
 
-async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Result<()> {
-    let parent = bundle_path
+async fn open_bundle_database(path: &Path) -> Result<SqlitePool> {
+    let parent = path
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("invalid bundle path: {}", bundle_path.display()))?;
-    fs::create_dir_all(parent)?;
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create map bundle directory {}", parent.display()))?;
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(path)
+                .create_if_missing(true),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "open map bundle {} (check directory ownership and write access)",
+                path.display()
+            )
+        })
+}
 
+async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Result<()> {
     let resume = should_resume_bundle();
     let existing_bundle = bundle_path.exists();
     let tmp_path = bundle_path.with_extension("sqlite.tmp");
@@ -264,18 +285,14 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
         println!("bundle resume disabled: rebuilding from scratch");
     }
 
-    let url = format!("sqlite://{}", working_path.to_string_lossy());
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect(&url)
-        .await?;
-    sqlx::query("PRAGMA journal_mode = OFF;")
+    let pool = open_bundle_database(&working_path).await?;
+    sqlx::query("PRAGMA journal_mode = WAL;")
         .execute(&pool)
         .await?;
-    sqlx::query("PRAGMA synchronous = OFF;")
+    sqlx::query("PRAGMA synchronous = NORMAL;")
         .execute(&pool)
         .await?;
-    sqlx::query("PRAGMA locking_mode = EXCLUSIVE;")
+    sqlx::query("PRAGMA locking_mode = NORMAL;")
         .execute(&pool)
         .await?;
     sqlx::query("PRAGMA temp_store = MEMORY;")
@@ -453,27 +470,19 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
 }
 
 async fn init_direct_bundle_pool(bundle_path: &Path, resume: bool) -> Result<SqlitePool> {
-    let parent = bundle_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("invalid bundle path: {}", bundle_path.display()))?;
-    fs::create_dir_all(parent)?;
     if !resume && bundle_path.exists() {
         fs::remove_file(bundle_path)?;
     }
 
-    let url = format!("sqlite://{}", bundle_path.to_string_lossy());
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect(&url)
-        .await?;
+    let pool = open_bundle_database(bundle_path).await?;
 
-    sqlx::query("PRAGMA journal_mode = OFF;")
+    sqlx::query("PRAGMA journal_mode = WAL;")
         .execute(&pool)
         .await?;
-    sqlx::query("PRAGMA synchronous = OFF;")
+    sqlx::query("PRAGMA synchronous = NORMAL;")
         .execute(&pool)
         .await?;
-    sqlx::query("PRAGMA locking_mode = EXCLUSIVE;")
+    sqlx::query("PRAGMA locking_mode = NORMAL;")
         .execute(&pool)
         .await?;
     sqlx::query("PRAGMA temp_store = MEMORY;")
@@ -1308,4 +1317,87 @@ fn bounds_tile_extent(coords: &[(u32, u32)]) -> (u32, u32, u32, u32) {
         y_max = y_max.max(*y);
     }
     (x_min, x_max, y_min, y_max)
+}
+
+#[cfg(test)]
+mod bundle_database_tests {
+    use super::*;
+
+    fn scratch(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "gs-map-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[tokio::test]
+    async fn first_download_creates_database_and_resume_keeps_tiles() {
+        let root = scratch("create-resume");
+        let path = root.join("new maps ?#%/tiles.sqlite3");
+        assert!(!path.exists());
+        let pool = init_direct_bundle_pool(&path, true).await.unwrap();
+        upsert_tile_to_bundle(&pool, 0, 0, 0, b"tile-one")
+            .await
+            .unwrap();
+        pool.close().await;
+        assert!(path.is_file());
+        let resumed = init_direct_bundle_pool(&path, true).await.unwrap();
+        assert!(bundle_has_tile(&resumed, 0, 0, 0).await.unwrap());
+        upsert_tile_to_bundle(&resumed, 1, 0, 0, b"tile-one")
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM tile_blobs")
+            .fetch_one(&resumed)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        resumed.close().await;
+        let reset = init_direct_bundle_pool(&path, false).await.unwrap();
+        assert!(!bundle_has_tile(&reset, 0, 0, 0).await.unwrap());
+        reset.close().await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn station_can_read_committed_tiles_while_download_remains_open() {
+        let root = scratch("concurrent-reader");
+        let path = root.join("tiles.sqlite3");
+        let writer = init_direct_bundle_pool(&path, true).await.unwrap();
+        upsert_tile_to_bundle(&writer, 0, 0, 0, b"tile-one")
+            .await
+            .unwrap();
+        let reader = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&path).read_only(true))
+            .await
+            .unwrap();
+        let mut transaction = writer.begin().await.unwrap();
+        sqlx::query("INSERT INTO tiles(z,x,y,blob_id) SELECT 1,0,0,blob_id FROM tiles LIMIT 1")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        assert!(bundle_has_tile(&reader, 0, 0, 0).await.unwrap());
+        assert!(!bundle_has_tile(&reader, 1, 0, 0).await.unwrap());
+        transaction.commit().await.unwrap();
+        assert!(bundle_has_tile(&reader, 1, 0, 0).await.unwrap());
+        reader.close().await;
+        writer.close().await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_bundling_creates_an_absent_output_database() {
+        let root = scratch("legacy");
+        let tiles = root.join("tiles");
+        fs::create_dir_all(tiles.join("0/0")).unwrap();
+        fs::write(tiles.join("0/0/0.jpg"), b"tile-one").unwrap();
+        let path = root.join("output/tiles.sqlite3");
+        build_tile_bundle_sqlite(&tiles, &path).await.unwrap();
+        let pool = open_bundle_database(&path).await.unwrap();
+        assert!(bundle_has_tile(&pool, 0, 0, 0).await.unwrap());
+        pool.close().await;
+        fs::remove_dir_all(root).unwrap();
+    }
 }

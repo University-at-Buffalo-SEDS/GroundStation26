@@ -433,3 +433,17 @@ required. This repair is not claimed to explain all RF queueing.
 
 Current UI source is pushed as89763ec;108 Rust tests,8 focused Node checks,
 real visible-tile recovery, and responsive settings/Tools browser checks pass.
+
+
+## Map downloader first-use repair
+
+The reported SQLite14 failure is reproduced by an absent output database:
+the downloader created directories but never enabled SQLite file creation.
+Both direct-download and legacy-bundling paths now use typed filename options
+with create-if-missing and contextual errors. WAL/normal locking allows the
+station to read committed tiles without waiting for the entire download.
+Three downloader regressions pass: first creation/resume/reset with special
+characters in the path, concurrent read visibility during an active writer,
+and legacy bundling into an absent output directory. The original first-use
+case fails with SQLite14; a URL-special path independently reproduces the old
+string-URL parsing failure. No second full tile download was started here.

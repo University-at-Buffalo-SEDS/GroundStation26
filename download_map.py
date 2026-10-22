@@ -103,7 +103,7 @@ def main() -> None:
             env=env,
         )
     except subprocess.CalledProcessError as e:
-        print("Backend exited with error.", file=sys.stderr)
+        print("Map downloader exited with error.", file=sys.stderr)
         sys.exit(e.returncode)
 
     except KeyboardInterrupt:

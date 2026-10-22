@@ -5,7 +5,11 @@ rule. Pulling the repository or rebuilding does not install or restore it.
 
 From the GroundStation repository root, run `python3 download_map.py` to populate
 `backend/data/maps/north_america/tiles.sqlite3`. The downloader resumes existing
-work. Its default coverage includes North America and higher-detail launch and
+work. First use creates the output database and any missing parent directories;
+paths are handled as filenames rather than SQLite URLs. Committed tiles are
+available to the running station during download using SQLite WAL mode. If an
+open fails, the error includes the exact output path for checking write access.
+Its default coverage includes North America and higher-detail launch and
 local regions. Do not delete the database to rebuild the application.
 
 GroundStation and RRLS serve their own local map data to all connected web and
