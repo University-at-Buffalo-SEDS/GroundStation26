@@ -489,3 +489,44 @@ map regressions and strict all-target Clippy pass, including deliberately
 truncated response bodies for both storage modes. One reported public tile
 was independently returned as a valid11371-byte JPEG; that does not establish
 which side caused the operator's intermittent transfers.
+
+## Latest checkpoint: descriptor exhaustion and C53–C56
+
+- Map downloader93c9dd5 is pushed to GS dev. Read-only Pi capture confirms its
+  actual1024 soft/1048576 hard file limit and a1024-open-descriptor snapshot;
+  another snapshot contains939 network sockets. Independent system lookups
+  succeed between failures. The downloader now raises only its own soft limit
+  within the existing hard limit (2304 for unchanged concurrency1024), shares
+  bounded per-host DNS results/single-flight refresh, and retains quiet retries.
+  Thirteen exact-lockfile macOS tests and strict all-target Clippy pass, including
+  child-process soft/hard-limit and1024-open-file headroom tests. No interfaces,
+  DNS servers, Pi service or running download were modified. Operator must pull
+  and restart the resumable download to use it.
+- C53 completes120 virtual seconds. The original report selection fails because
+  retained live and completed capture directories both match. Explicit read-only
+  analysis of the single completed capture passes the original per-source99.5%
+  preservation and500ms/3s freshness thresholds. Gateway CAN ring drops remain
+  zero in all12 observations. Initial admission6 / network queue12 counters
+  remain flat, so this does not establish zero refusals of all packet classes.
+- Independent C53 SD inspection rejects pressure record1362: consecutive source
+  sequences139/140 have ticks1598/1603, a5ms step instead of4ms. This is proven
+  timestamp lattice jitter, not evidence of a lost pressure sample. The Valve
+  candidate derives subsequent ticks from source sample progression while
+  preserving whole-period sequence gaps and late/overwritten DMA rejection.
+  The old code fails the expanded actual-ISR regression; candidate139 tests and
+  macOS TLSF/compact factory pass (452696/474624 FLASH). The inspector is unchanged.
+- Simulator's completed-capture selector correction passes both retained-live
+  and ambiguous/live-only regressions. Full current Python suite69 tests passes.
+  C54 remains a diagnostic-only run and retains its original selection failure;
+  it is not used to qualify latency or release. Its bounded20ms gateway profile
+  at virtual60s attributes1572600 instructions, with96856 unmapped. Varint slow
+  decoding10.394% and Rust memcpy10.314% are measured optimization targets, not
+  claims of cycle-accurate CPU utilization. Exact ELF/trace hashes are retained
+  with the profile; unsized assembly labels are included.
+- C55 fails before configuration because its helper assumes Release rather than
+  this board's Release_Script directory. Preserve that evidence. Corrected C56
+  isolated Linux factory passes; startup then unchanged120-second network/SD
+  rerun is in progress using FC52 + Valve56 + five hash-verified C45 boards and
+  the untraced C51 engine. Card inspection follows completion. No long or release
+  qualification is claimed; remaining paired settings/runtime, replay, audits,
+  platforms, source promotion and long-soak checklist items remain open.
