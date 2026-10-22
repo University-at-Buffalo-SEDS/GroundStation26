@@ -26,3 +26,8 @@ To diagnose a blank map, request an expected tile such as
 `/tiles/5/8/11.jpg` (southern Ontario). A missing tile returns HTTP204; an available
 exact or ancestor-derived tile returns a JPEG and an `X-GS26-Tile-Source` header.
 Check the service's startup log and working directory if no terrain is available.
+
+Temporary request/body/write failures retry quietly. A tile that exhausts its
+retry allowance reports its final underlying error once. The default concurrency
+is unchanged (1024 requests); `--max-concurrent` remains available for explicit
+local tuning. Existing downloaded tiles are retained across restarts.

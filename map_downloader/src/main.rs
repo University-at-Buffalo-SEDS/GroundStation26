@@ -87,6 +87,7 @@ async fn fetch_tile_with_retries(
     pb: Option<&ProgressBar>,
     limiter: Option<&Arc<BandwidthLimiter>>,
     max_attempts: u32,
+    base_url: &str,
 ) -> bool {
     let tile_path = z_dir.join(format!("{x}/{y}.{TILE_EXT}"));
     let part_path = tile_path.with_extension(format!("{}.part", TILE_EXT));
@@ -101,19 +102,14 @@ async fn fetch_tile_with_retries(
         let _ = async_fs::remove_file(&part_path).await;
     }
 
-    let url = format!(
-        "{base}/{z}/{y}/{x}",
-        base = SATELLITE_BASE_URL,
-        z = z,
-        y = y,
-        x = x,
-    );
+    let url = format!("{base}/{z}/{y}/{x}", base = base_url, z = z, y = y, x = x,);
 
     let mut attempts: u32 = 0;
     loop {
         attempts += 1;
-        let mut should_retry = true;
-        match client.get(&url).send().await {
+        // Transient failures stay quiet. Keep the final cause for one useful
+        // report only if this tile exhausts its bounded retry allowance.
+        let failure = match client.get(&url).send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -123,27 +119,18 @@ async fn fetch_tile_with_retries(
                                 lim.throttle_bytes(bytes.len()).await;
                             }
                             bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                            if write_tile_atomic_async(&tile_path, &bytes).await.is_ok() {
-                                return true;
+                            match write_tile_atomic_async(&tile_path, &bytes).await {
+                                Ok(()) => return true,
+                                Err(error) => format!("saving tile: {error:#}"),
                             }
                         }
-                        Err(e) => {
-                            log_progress_error(
-                                pb,
-                                format!(
-                                    "fetch_satellite_tiles_async: failed reading bytes for {} (attempt {attempts}/{max_attempts}): {e}",
-                                    url
-                                ),
-                            );
+                        Err(error) => {
+                            format!("reading response body: {:#}", anyhow::Error::new(error))
                         }
                     }
                 } else if status.as_u16() == 404 {
-                    // Fine: no tile for this location (e.g. ocean).
                     return true;
-                } else if status.as_u16() == 429 || status.is_server_error() {
-                    should_retry = true;
-                } else if status.is_client_error() {
-                    // Non-retryable client errors (except 404 handled above).
+                } else if status.is_client_error() && status.as_u16() != 429 {
                     log_progress_error(
                         pb,
                         format!(
@@ -152,27 +139,22 @@ async fn fetch_tile_with_retries(
                         ),
                     );
                     return true;
+                } else {
+                    format!("HTTP {status}")
                 }
             }
-            Err(_e) => {
-                should_retry = true;
-            }
-        }
-
+            Err(error) => format!("request: {:#}", anyhow::Error::new(error)),
+        };
         if attempts >= max_attempts {
             log_progress_error(
                 pb,
                 format!(
-                    "fetch_satellite_tiles_async: giving up on tile z={z}, x={x}, y={y} after {} attempts",
-                    attempts
+                    "fetch_satellite_tiles_async: giving up on tile z={z}, x={x}, y={y} after {attempts} attempts: {failure}"
                 ),
             );
             return false;
         }
-        if should_retry {
-            let delay_ms = retry_backoff_ms(attempts, z, x, y);
-            sleep(Duration::from_millis(delay_ms)).await;
-        }
+        sleep(Duration::from_millis(retry_backoff_ms(attempts, z, x, y))).await;
     }
 }
 
@@ -821,11 +803,7 @@ async fn fetch_tiles_for_zoom_async(
             let elapsed_s = start.elapsed().as_secs_f64().max(0.001);
             let bytes = bytes_for_rate.load(Ordering::Relaxed) as f64;
             let mib_per_s = (bytes / elapsed_s) / (1024.0 * 1024.0);
-            let pct = if total == 0 {
-                100
-            } else {
-                (done.saturating_mul(100)) / total
-            };
+            let pct = done.saturating_mul(100).checked_div(total).unwrap_or(100);
             let bucket = (pct / PROGRESS_PERCENT_STEP) as i64;
 
             if let Some(pb) = &pb_for_rate {
@@ -879,6 +857,7 @@ async fn fetch_tiles_for_zoom_async(
                     pb_for_worker.as_ref(),
                     limiter_for_worker.as_ref(),
                     MAX_RETRY_ATTEMPTS,
+                    SATELLITE_BASE_URL,
                 )
                 .await;
                 if !ok {
@@ -928,6 +907,7 @@ async fn fetch_tiles_for_zoom_async(
                         pb.as_ref(),
                         limiter.as_ref(),
                         MAX_RETRY_ATTEMPTS,
+                        SATELLITE_BASE_URL,
                     )
                     .await;
                     if !ok {
@@ -988,6 +968,7 @@ async fn fetch_tile_with_retries_to_db(
     pb: Option<&ProgressBar>,
     limiter: Option<&Arc<BandwidthLimiter>>,
     max_attempts: u32,
+    base_url: &str,
 ) -> bool {
     match bundle_has_tile(pool, z, x, y).await {
         Ok(true) => return true,
@@ -1002,19 +983,14 @@ async fn fetch_tile_with_retries_to_db(
         }
     }
 
-    let url = format!(
-        "{base}/{z}/{y}/{x}",
-        base = SATELLITE_BASE_URL,
-        z = z,
-        y = y,
-        x = x,
-    );
+    let url = format!("{base}/{z}/{y}/{x}", base = base_url, z = z, y = y, x = x,);
 
     let mut attempts: u32 = 0;
     loop {
         attempts += 1;
-        let mut should_retry = true;
-        match client.get(&url).send().await {
+        // Transient failures stay quiet. Keep the final cause for one useful
+        // report only if this tile exhausts its bounded retry allowance.
+        let failure = match client.get(&url).send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -1024,25 +1000,18 @@ async fn fetch_tile_with_retries_to_db(
                                 lim.throttle_bytes(bytes.len()).await;
                             }
                             bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                            if upsert_tile_to_bundle(pool, z, x, y, &bytes).await.is_ok() {
-                                return true;
+                            match upsert_tile_to_bundle(pool, z, x, y, &bytes).await {
+                                Ok(()) => return true,
+                                Err(error) => format!("saving tile: {error:#}"),
                             }
                         }
-                        Err(e) => {
-                            log_progress_error(
-                                pb,
-                                format!(
-                                    "fetch_satellite_tiles_async: failed reading bytes for {} (attempt {attempts}/{max_attempts}): {e}",
-                                    url
-                                ),
-                            );
+                        Err(error) => {
+                            format!("reading response body: {:#}", anyhow::Error::new(error))
                         }
                     }
                 } else if status.as_u16() == 404 {
                     return true;
-                } else if status.as_u16() == 429 || status.is_server_error() {
-                    should_retry = true;
-                } else if status.is_client_error() {
+                } else if status.is_client_error() && status.as_u16() != 429 {
                     log_progress_error(
                         pb,
                         format!(
@@ -1051,27 +1020,22 @@ async fn fetch_tile_with_retries_to_db(
                         ),
                     );
                     return true;
+                } else {
+                    format!("HTTP {status}")
                 }
             }
-            Err(_e) => {
-                should_retry = true;
-            }
-        }
-
+            Err(error) => format!("request: {:#}", anyhow::Error::new(error)),
+        };
         if attempts >= max_attempts {
             log_progress_error(
                 pb,
                 format!(
-                    "fetch_satellite_tiles_async: giving up on tile z={z}, x={x}, y={y} after {} attempts",
-                    attempts
+                    "fetch_satellite_tiles_async: giving up on tile z={z}, x={x}, y={y} after {attempts} attempts: {failure}"
                 ),
             );
             return false;
         }
-        if should_retry {
-            let delay_ms = retry_backoff_ms(attempts, z, x, y);
-            sleep(Duration::from_millis(delay_ms)).await;
-        }
+        sleep(Duration::from_millis(retry_backoff_ms(attempts, z, x, y))).await;
     }
 }
 
@@ -1143,11 +1107,7 @@ async fn fetch_tiles_for_zoom_async_to_db(
             let elapsed_s = start.elapsed().as_secs_f64().max(0.001);
             let bytes = bytes_for_rate.load(Ordering::Relaxed) as f64;
             let mib_per_s = (bytes / elapsed_s) / (1024.0 * 1024.0);
-            let pct = if total == 0 {
-                100
-            } else {
-                (done.saturating_mul(100)) / total
-            };
+            let pct = done.saturating_mul(100).checked_div(total).unwrap_or(100);
             let bucket = (pct / PROGRESS_PERCENT_STEP) as i64;
             if let Some(pb) = &pb_for_rate {
                 pb.set_position(done);
@@ -1197,6 +1157,7 @@ async fn fetch_tiles_for_zoom_async_to_db(
                     pb_for_worker.as_ref(),
                     limiter_for_worker.as_ref(),
                     MAX_RETRY_ATTEMPTS,
+                    SATELLITE_BASE_URL,
                 )
                 .await;
                 if !ok {
@@ -1245,6 +1206,7 @@ async fn fetch_tiles_for_zoom_async_to_db(
                         pb.as_ref(),
                         limiter.as_ref(),
                         MAX_RETRY_ATTEMPTS,
+                        SATELLITE_BASE_URL,
                     )
                     .await;
                     if !ok {
@@ -1399,5 +1361,130 @@ mod bundle_database_tests {
         assert!(bundle_has_tile(&pool, 0, 0, 0).await.unwrap());
         pool.close().await;
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tile_retry_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    const IMAGE: &[u8] = b"\xff\xd8\xfftile-data";
+    fn server(failures: usize, success: bool) -> (String, std::thread::JoinHandle<usize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let thread = std::thread::spawn(move || {
+            let expected = failures + usize::from(success);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut count = 0;
+            while count < expected && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        let mut request = Vec::new();
+                        while !request.ends_with(b"\r\n\r\n") && request.len() < 4096 {
+                            let mut chunk = [0_u8; 512];
+                            let count = socket.read(&mut chunk).unwrap();
+                            assert!(count != 0, "client closed before request headers");
+                            request.extend_from_slice(&chunk[..count]);
+                        }
+                        assert!(request.ends_with(b"\r\n\r\n"));
+                        let length = IMAGE.len() + if count < failures { 100 } else { 0 };
+                        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").unwrap();
+                        socket.write_all(IMAGE).unwrap();
+                        count += 1;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1))
+                    }
+                    Err(e) => panic!("test tile listener: {e}"),
+                }
+            }
+            count
+        });
+        (url, thread)
+    }
+
+    async fn check_retry(direct: bool, recover: bool) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = env::temp_dir().join(format!(
+            "gs-tile-retry-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("0/0")).unwrap();
+        let failures = if recover { 1 } else { 2 };
+        let (base, thread) = server(failures, recover);
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let bytes = Arc::new(AtomicU64::new(0));
+        if direct {
+            let pool = init_direct_bundle_pool(&root.join("tiles.sqlite3"), true)
+                .await
+                .unwrap();
+            let result = fetch_tile_with_retries_to_db(
+                0, 0, 0, &client, &pool, &bytes, None, None, 2, &base,
+            )
+            .await;
+            assert_eq!(result, recover);
+            assert_eq!(bundle_has_tile(&pool, 0, 0, 0).await.unwrap(), recover);
+            if recover {
+                let saved: Vec<u8> = sqlx::query_scalar("SELECT image FROM tile_blobs")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                assert_eq!(saved, IMAGE);
+            }
+            pool.close().await;
+        } else {
+            let result = fetch_tile_with_retries(
+                0,
+                0,
+                0,
+                &root.join("0"),
+                &client,
+                &bytes,
+                None,
+                None,
+                2,
+                &base,
+            )
+            .await;
+            assert_eq!(result, recover);
+            assert_eq!(root.join("0/0/0.jpg").exists(), recover);
+            if recover {
+                assert_eq!(fs::read(root.join("0/0/0.jpg")).unwrap(), IMAGE);
+            }
+        }
+        assert_eq!(thread.join().unwrap(), 2);
+        assert_eq!(
+            bytes.load(Ordering::Relaxed),
+            if recover { IMAGE.len() as u64 } else { 0 }
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn directory_retry_recovery_is_quiet() {
+        check_retry(false, true).await;
+    }
+    #[tokio::test]
+    async fn database_retry_recovery_is_quiet() {
+        check_retry(true, true).await;
+    }
+    #[tokio::test]
+    async fn directory_exhaustion_reports_final_cause_once() {
+        check_retry(false, false).await;
+    }
+    #[tokio::test]
+    async fn database_exhaustion_reports_final_cause_once() {
+        check_retry(true, false).await;
     }
 }
