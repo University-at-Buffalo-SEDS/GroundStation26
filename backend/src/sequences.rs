@@ -1077,6 +1077,13 @@ impl Default for FillCutoff {
     }
 }
 impl FillCutoff {
+    pub fn target_met(&self, mass: f32, target: f32) -> bool {
+        mass.is_finite()
+            && target.is_finite()
+            && target != 0.0
+            && (mass_target_reached(mass, target, self.cfg.nitrous_weight_rise_epsilon_kg)
+                || loadcell::fill_percent(target, mass) >= 99.5)
+    }
     pub fn reset(&mut self) {
         self.previous = None;
         self.level_since = None;
@@ -1086,9 +1093,7 @@ impl FillCutoff {
             self.reset();
             return false;
         }
-        if mass_target_reached(mass, target, self.cfg.nitrous_weight_rise_epsilon_kg)
-            || loadcell::fill_percent(target, mass) >= 99.5
-        {
+        if self.target_met(mass, target) {
             return true;
         }
         let mut previous_mass = self.previous.map(|(m, _)| m);

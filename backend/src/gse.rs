@@ -135,16 +135,27 @@ pub fn initialize(state: &AppState) {
         rt.operational.path = Some(path.clone());
         match operational::Saved::load(&path) {
             Ok(saved) => {
-                if saved.qualification.completed(Milestone::NitrogenTest) {
-                    rt.engine.status.nitrogen_passed = true;
+                if saved.qualification.nitrogen_satisfied() {
+                    rt.engine.status.nitrogen_passed =
+                        saved.qualification.completed(Milestone::NitrogenTest);
+                    rt.engine.status.nitrogen_overridden =
+                        saved.qualification.nitrogen_override().is_some();
                     rt.engine.status.self_test_locked = true;
                     rt.engine.status.baseline = saved.baseline.clone();
                     rt.engine.status.phase = Phase::Passed;
                     rt.engine.claimed = true;
                 }
+                if saved.qualification.stage() == gse_sequence::qualification::MissionStage::Fire {
+                    rt.engine.claimed = true;
+                    rt.engine.status.message = "Fire was already committed; manual reset is required before a new operation".into();
+                }
                 rt.operational.run_generation = saved.qualification.generation();
                 rt.operational.saved = saved;
-                if let Err(error) = rt.operational.persist() {
+                if let Err(error) = rt
+                    .operational
+                    .persist()
+                    .and_then(|()| rt.operational.flush_checklists())
+                {
                     log::error!(
                         "Qualification storage unavailable; automatic actions blocked: {error}"
                     );
@@ -501,6 +512,20 @@ pub fn handle_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
                     rt.operational.running = true;
                     rt.operational.run_generation = rt.operational.saved.qualification.generation();
                     rt.operational.target_reached = None;
+                    if action == Action::StartFill {
+                        if let Err(error) = rt.operational.begin_fill() {
+                            rt.operational.running = false;
+                            let now = rt.now();
+                            return {
+                                let effects = rt
+                                    .engine
+                                    .fault(now, &format!("Fill stage could not be saved: {error}"));
+                                drop(rt);
+                                apply(state, effects);
+                                true
+                            };
+                        }
+                    }
                 }
                 result
             }
@@ -605,6 +630,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(get_config).put(save_config).post(save_config),
         )
         .route("/api/gse/status", get(status))
+        .route(
+            "/api/gse/cold-flow/override",
+            axum::routing::post(override_cold_flow),
+        )
         .route("/api/gse/abort/clear", axum::routing::post(clear_abort))
         .route(
             "/api/gse/qualification/reset",
@@ -740,6 +769,8 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         let rt = state.gse.lock().unwrap();
         response["qualification"] =
             serde_json::to_value(&rt.operational.saved.qualification).unwrap();
+        response["mission_stage"] =
+            serde_json::to_value(rt.operational.saved.qualification.stage()).unwrap();
         response["topology_stable"] = serde_json::json!(rt.operational.topology_stable);
         response["storage_error"] = serde_json::json!(rt.operational.persist_error);
         response["launch_queued"] = serde_json::json!(rt.operational.qd.queued());
@@ -1246,8 +1277,11 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
             .map_err(|e| (StatusCode::CONFLICT, e.into()))?;
         rt.operational.saved.baseline = None;
         rt.operational.saved.fill_target_kg = None;
+        rt.operational.saved.pending_checklists.clear();
         rt.operational
             .persist()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        crate::checklists::reset_sequence_completions()
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
         rt.operational.persist_error = None;
         rt.operational.qd = QdWait::default();
@@ -1326,6 +1360,7 @@ async fn reset_qualification(State(state): State<Arc<AppState>>, headers: Header
         if let Err(error) = rt.operational.saved.qualification.reset() {
             return (StatusCode::CONFLICT, error).into_response();
         }
+        rt.operational.saved.pending_checklists.clear();
         rt.operational.saved.baseline = None;
         rt.operational.saved.fill_target_kg = None;
         rt.operational.persist_error = None;
@@ -1336,6 +1371,10 @@ async fn reset_qualification(State(state): State<Arc<AppState>>, headers: Header
         rt.engine.config.dry_self_test_confirmed = false;
         rt.operational.startup_configured = false;
         if let Err(error) = rt.operational.persist() {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+        }
+        if let Err(error) = crate::checklists::reset_sequence_completions() {
+            rt.operational.persist_error = Some(error.clone());
             return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
         }
         drop(rt);
@@ -1359,6 +1398,19 @@ pub(crate) fn set_operational_prerequisites_for_test(state: &AppState) {
 /// All GroundStation automatic abort producers share this stage boundary.
 /// Manual Abort remains a separate operator command.
 pub fn automatic_abort_allowed(state: &AppState) -> bool {
+    #[cfg(not(feature = "hitl_mode"))]
+    if state
+        .gse
+        .lock()
+        .unwrap()
+        .operational
+        .saved
+        .qualification
+        .stage()
+        == gse_sequence::qualification::MissionStage::Fire
+    {
+        return false;
+    }
     cfg!(feature = "hitl_mode")
         || matches!(
             *state.state.lock().unwrap(),
@@ -1370,4 +1422,215 @@ pub fn automatic_abort_allowed(state: &AppState) -> bool {
                 | FlightState::NitrousFill
                 | FlightState::Armed
         )
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ColdFlowOverrideRequest {
+    reason: String,
+}
+async fn override_cold_flow(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<ColdFlowOverrideRequest>,
+) -> Response {
+    let principal =
+        match crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await {
+            Ok(principal) => principal,
+            Err(error) => return error,
+        };
+    if principal.anonymous || !principal.allows_command_name("NitrogenTest") {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    #[cfg(feature = "hitl_mode")]
+    {
+        let _ = request.reason;
+        (
+            StatusCode::CONFLICT,
+            "Operational cold-flow overrides are not used in HITL",
+        )
+            .into_response()
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    {
+        match apply_cold_flow_override(
+            &state,
+            principal.username.as_deref().unwrap_or(""),
+            &request.reason,
+        ) {
+            Ok(()) => {
+                crate::sequences::refresh_action_policy_now(&state);
+                Json(serde_json::json!({"overridden":true})).into_response()
+            }
+            Err(error) => (StatusCode::CONFLICT, error).into_response(),
+        }
+    }
+}
+#[cfg(not(feature = "hitl_mode"))]
+fn apply_cold_flow_override(
+    state: &Arc<AppState>,
+    operator: &str,
+    reason: &str,
+) -> Result<(), String> {
+    if !matches!(
+        *state.state.lock().unwrap(),
+        FlightState::Startup | FlightState::Idle
+    ) {
+        return Err("Return to Idle before overriding cold flow".into());
+    }
+    let mut rt = state.gse.lock().unwrap();
+    let now = rt.now();
+    if rt.operational.running
+        || rt.engine.active()
+        || !rt.operational.topology_stable
+        || !rt.operational.startup_configured
+        || rt.operational.persist_error.is_some()
+        || !interlock(state, &state.action_policy_snapshot())
+    {
+        return Err(
+            "Override requires stable connections, interlock and no active sequence".into(),
+        );
+    }
+    let baseline = rt
+        .operational
+        .saved
+        .baseline
+        .clone()
+        .ok_or("Run the valve self-test to record an empty-tank baseline first")?;
+    if !rt
+        .pressure
+        .is_some_and(|p| p.at_ms <= now && now - p.at_ms <= 2000 && baseline.is_zero(p.value))
+        || ![3, 4].into_iter().all(|i| {
+            rt.valves[i].is_some_and(|v| !v.open && v.at_ms <= now && now - v.at_ms <= 2000)
+        })
+    {
+        return Err(
+            "Override requires fresh zero-band pressure and both supply valves confirmed closed"
+                .into(),
+        );
+    }
+    rt.operational
+        .override_cold_flow(gse_sequence::qualification::ColdFlowOverride {
+            operator: operator.into(),
+            reason: reason.into(),
+            at_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+        })?;
+    rt.engine.status.nitrogen_overridden = true;
+    rt.engine.status.nitrogen_passed = false;
+    rt.engine.status.baseline = Some(baseline);
+    rt.engine.status.phase = Phase::Passed;
+    rt.engine.status.self_test_locked = true;
+    rt.engine.claimed = true;
+    rt.engine.status.message =
+        "Cold-flow requirement overridden by operator; fresh fill interlocks still apply".into();
+    Ok(())
+}
+/// Commit once before dispatch, so service restart never repeats an irreversible Fire intent.
+#[cfg(not(feature = "hitl_mode"))]
+pub(crate) fn commit_fire_intent(state: &Arc<AppState>) -> Result<(), String> {
+    let mut rt = state.gse.lock().unwrap();
+    if !prelaunch(state)
+        || !operational_launch_allowed(state, &rt)
+        || !interlock(state, &state.action_policy_snapshot())
+    {
+        return Err("Fire prerequisites changed; launch was not dispatched".into());
+    }
+    if !cfg!(feature = "test_fire_mode")
+        && !matches!(rt.operational.qd.status(rt.now()), QdStatus::Ready)
+    {
+        return Err("Quick disconnect is not acknowledged and settled".into());
+    }
+    rt.operational.commit_fire()?;
+    rt.engine.claimed = true;
+    // From this point even a checklist-storage failure must not re-arm the operation.
+    let checklist_result = rt.operational.flush_checklists();
+    drop(rt);
+    state.set_local_flight_state(FlightState::Launch);
+    checklist_result.map_err(|error| {
+        format!("Fire intent saved, but checklist update failed; manual recovery required: {error}")
+    })
+}
+
+#[cfg(all(test, not(feature = "hitl_mode")))]
+pub(crate) fn armed_fixture_for_test(
+    state: &Arc<AppState>,
+    router: &Arc<sedsnet::router::Router>,
+) -> std::path::PathBuf {
+    use crate::types::Board;
+    state.set_local_flight_state(FlightState::Armed);
+    let side = router.add_side_packed("test_fixture_other_boards", |_| Ok(()));
+    let mut endpoints = vec![crate::telemetry_schema::endpoint("ACTUATOR_BOARD")];
+    if !cfg!(feature = "test_fire_mode") {
+        endpoints.push(crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"));
+    }
+    let announce = sedsnet::discovery::build_discovery_announce("GB", 123, &endpoints).unwrap();
+    router
+        .rx_packed_from_side(&sedsnet::wire_format::pack_packet(&announce), side)
+        .unwrap();
+    router.process_all_queues_with_timeout(0).unwrap();
+    if state.topology_router.get().is_none() {
+        state.topology_router.set(router.clone()).unwrap();
+    }
+    for board in [
+        Board::GatewayBoard,
+        Board::ValveBoard,
+        Board::ActuatorBoard,
+        Board::DaqBoard,
+    ] {
+        state.mark_board_seen(
+            board.sender_id(),
+            crate::telemetry_task::get_current_timestamp_ms(),
+        );
+    }
+    if !cfg!(feature = "test_fire_mode") {
+        state.mark_board_seen("FC", crate::telemetry_task::get_current_timestamp_ms());
+        crate::antenna::observe(&crate::types::TelemetryRow {
+            timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+            data_type: "GPS_DATA".into(),
+            sender_id: "RF".into(),
+            values: vec![Some(43.0), Some(-78.0), Some(150.0)],
+        });
+    }
+    let path =
+        std::env::temp_dir().join(format!("gse-armed-fixture-{}.json", rand::random::<u128>()));
+    let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
+    let mut rt = state.gse.lock().unwrap();
+    rt.clock = Instant::now() - std::time::Duration::from_secs(10);
+    rt.operational.path = Some(path.clone());
+    rt.operational.topology_stable = true;
+    rt.operational.startup_configured = true;
+    rt.operational.saved.baseline = Some(gse_sequence::Baseline {
+        average_psi: 0.0,
+        min_psi: 0.0,
+        max_psi: 0.0,
+        noise_psi: 0.1,
+        samples: 50,
+    });
+    for milestone in [
+        Milestone::SelfTest,
+        Milestone::NitrogenTest,
+        Milestone::FillTarget,
+    ] {
+        rt.operational
+            .saved
+            .qualification
+            .complete(milestone, 0)
+            .unwrap();
+    }
+    rt.operational.saved.fill_target_kg = Some(target);
+    rt.operational.qd.dispatched(0);
+    rt.operational.qd.confirm(1);
+    rt.operational.persist().unwrap();
+    rt.engine.status.phase = Phase::Paused;
+    rt.observe_pressure(Some(0.0));
+    rt.observe_mass(Some(target));
+    for key in KEYS {
+        rt.observe_valve(key, false);
+    }
+    drop(rt);
+    let mut policy = state.action_policy_snapshot();
+    policy.key_enabled = true;
+    policy.software_buttons_enabled = true;
+    state.set_action_policy(policy);
+    path
 }

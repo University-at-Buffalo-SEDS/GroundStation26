@@ -252,8 +252,19 @@ async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router
             .await;
         gs_debug_println!("Ground-station launch auto-started DB recording");
     }
+    #[cfg(not(feature = "hitl_mode"))]
+    if let Err(error) = crate::gse::commit_fire_intent(&state) {
+        state.clear_launch_sequence_command_pending();
+        emit_notification_warning(&state, error);
+        return;
+    }
     if !send_valve_launch_sequence_command(&router) {
         state.clear_launch_sequence_command_pending();
+        #[cfg(not(feature = "hitl_mode"))]
+        emit_notification_warning(
+            &state,
+            "Fire intent saved, but valve command was not queued. Manual recovery required.",
+        );
         return;
     }
     #[cfg(not(feature = "hitl_mode"))]
@@ -294,6 +305,11 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
             .await;
         gs_debug_println!("Launch auto-started DB recording");
     }
+    #[cfg(not(feature = "hitl_mode"))]
+    if let Err(error) = crate::gse::commit_fire_intent(&state) {
+        emit_notification_warning(&state, error);
+        return;
+    }
     let now_ms = get_current_timestamp_ms() as i64;
     state.set_launch_clock(launch_countdown_clock(now_ms));
     let flight_command_sent = if let Err(e) = queue_locally_routed_flight_command(
@@ -307,7 +323,22 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
         flush_command_tx(&router, "Launch command tx");
         true
     };
+    #[cfg(not(feature = "hitl_mode"))]
+    if !flight_command_sent {
+        emit_notification_warning(
+            &state,
+            "Fire intent saved, but FC command was not queued. Manual recovery required.",
+        );
+        return;
+    }
     let valve_command_sent = send_valve_launch_sequence_command(&router);
+    #[cfg(not(feature = "hitl_mode"))]
+    if !valve_command_sent {
+        emit_notification_warning(
+            &state,
+            "Fire dispatch incomplete: valve command was not queued. Manual recovery required.",
+        );
+    }
     if flight_command_sent || valve_command_sent {
         #[cfg(not(feature = "hitl_mode"))]
         state.set_local_flight_state(FlightState::Launch);
@@ -2220,7 +2251,15 @@ mod tests {
         router.process_all_queues_with_timeout(0).unwrap();
         sent.lock().unwrap().clear();
 
-        handle_local_ground_station_launch_command(state, router.clone()).await;
+        let qualification = crate::gse::armed_fixture_for_test(&state, &router);
+        handle_local_ground_station_launch_command(state.clone(), router.clone()).await;
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&qualification).unwrap()).unwrap();
+        assert_eq!(saved["qualification"]["fire_started"], true);
+        state.reset_launch_clock();
+        start_launch_clock_from_valve_sequence_status(&state);
+        assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::TMinus);
+        std::fs::remove_file(qualification).unwrap();
         router.process_all_queues_with_timeout(0).unwrap();
         let sent = sent.lock().unwrap();
         let packets: Vec<_> = sent
@@ -2511,7 +2550,16 @@ mod tests {
             .process_all_queues_with_timeout(0)
             .expect("failed to process valve-board discovery");
 
+        #[cfg(not(feature = "hitl_mode"))]
+        let qualification = crate::gse::armed_fixture_for_test(&state, &router);
         handle_flight_computer_launch_command(state, router.clone()).await;
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&qualification).unwrap()).unwrap();
+            assert_eq!(saved["qualification"]["fire_started"], true);
+            std::fs::remove_file(qualification).unwrap();
+        }
         router
             .process_all_queues_with_timeout(0)
             .expect("failed to process launch command queues");

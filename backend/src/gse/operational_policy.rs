@@ -38,7 +38,9 @@ pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool
         && rt.operational.persist_error.is_none()
         && rt.operational.topology_stable
         && rt.operational.saved.fill_target_kg == Some(target)
-        && rt.fresh_mass(now).is_some_and(|mass| mass.value >= target)
+        && rt
+            .fresh_mass(now)
+            .is_some_and(|mass| rt.fill_cutoff.target_met(mass.value, target))
         && matches!(
             rt.engine.status.phase,
             Phase::Passed | Phase::Paused | Phase::Idle
@@ -120,6 +122,7 @@ pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase)
         return;
     }
     let milestone = if previous == Phase::SelfFinish && phase == Phase::Idle {
+        rt.operational.saved.baseline = rt.engine.status.baseline.clone();
         Some(Milestone::SelfTest)
     } else if phase == Phase::Passed {
         rt.operational.saved.baseline = rt.engine.status.baseline.clone();
@@ -128,7 +131,7 @@ pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase)
         && phase == Phase::Paused
         && rt.operational.target_reached.is_some_and(|target| {
             rt.fresh_mass(rt.now())
-                .is_some_and(|mass| mass.value >= target)
+                .is_some_and(|mass| rt.fill_cutoff.target_met(mass.value, target))
         })
     {
         rt.operational.saved.fill_target_kg = rt.operational.target_reached;
@@ -138,14 +141,18 @@ pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase)
     };
     if matches!(phase, Phase::Cancelled | Phase::Paused) {
         rt.operational.running = false;
-        if phase == Phase::Cancelled
-            && rt
+        if phase == Phase::Cancelled && rt.operational.saved.qualification.nitrogen_satisfied() {
+            rt.engine.status.nitrogen_passed = rt
                 .operational
                 .saved
                 .qualification
-                .completed(Milestone::NitrogenTest)
-        {
-            rt.engine.status.nitrogen_passed = true;
+                .completed(Milestone::NitrogenTest);
+            rt.engine.status.nitrogen_overridden = rt
+                .operational
+                .saved
+                .qualification
+                .nitrogen_override()
+                .is_some();
             rt.engine.status.baseline = rt.operational.saved.baseline.clone();
             rt.engine.status.phase = Phase::Passed;
         }
@@ -154,6 +161,9 @@ pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase)
         if let Err(error) = rt.operational.complete(milestone) {
             rt.engine.status.message =
                 format!("Qualification could not be saved: {error}. Manual reset required.");
+        } else if let Err(error) = rt.operational.flush_checklists() {
+            rt.engine.status.message =
+                format!("Test passed, but checklist progress could not be saved: {error}");
         }
         rt.operational.running = false;
     }
@@ -169,6 +179,18 @@ pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase)
 }
 /// Returns true when automation must not advance this tick.
 pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
+    if state
+        .gse
+        .lock()
+        .unwrap()
+        .operational
+        .saved
+        .qualification
+        .stage()
+        == gse_sequence::qualification::MissionStage::Fire
+    {
+        return true;
+    }
     let stage = *state.state.lock().unwrap();
     // No GroundStation-generated abort or valve correction from Launch onward.
     if !matches!(
@@ -222,8 +244,10 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
         }
     }
     if rt.operational.saved.qualification.fault().is_none() {
-        let operating =
-            rt.operational.running || !matches!(stage, FlightState::Startup | FlightState::Idle);
+        let operating = rt.operational.running
+            || rt.operational.saved.qualification.stage()
+                != gse_sequence::qualification::MissionStage::Idle
+            || !matches!(stage, FlightState::Startup | FlightState::Idle);
         if operating && !healthy {
             effects = fault(
                 &mut rt,
@@ -322,6 +346,18 @@ pub(super) fn handle_operational_command(state: &Arc<AppState>, cmd: &TelemetryC
 }
 
 pub(super) fn check_report_safety(state: &Arc<AppState>) {
+    if state
+        .gse
+        .lock()
+        .unwrap()
+        .operational
+        .saved
+        .qualification
+        .stage()
+        == gse_sequence::qualification::MissionStage::Fire
+    {
+        return;
+    }
     let stage = *state.state.lock().unwrap();
     if !matches!(
         stage,
@@ -904,6 +940,171 @@ mod tests {
                 .fault(),
             Some(Fault::TopologyLost)
         );
+        cleanup(&state);
+    }
+    #[tokio::test]
+    async fn cold_flow_override_requires_real_self_test_and_live_safe_inputs() {
+        let state = fixture().await;
+        assert!(apply_cold_flow_override(&state, "alice", "External cold flow reviewed").is_err());
+        {
+            let mut rt = state.gse.lock().unwrap();
+            rt.operational
+                .saved
+                .qualification
+                .complete(Milestone::SelfTest, 0)
+                .unwrap();
+            rt.operational.saved.baseline = Some(gse_sequence::Baseline {
+                average_psi: 0.0,
+                min_psi: 0.0,
+                max_psi: 0.0,
+                noise_psi: 0.1,
+                samples: 50,
+            });
+            rt.observe_valve(9, true);
+        }
+        assert!(apply_cold_flow_override(&state, "alice", "External cold flow reviewed").is_err());
+        {
+            let mut rt = state.gse.lock().unwrap();
+            rt.observe_valve(9, false);
+            rt.observe_pressure(Some(2.0));
+        }
+        assert!(apply_cold_flow_override(&state, "alice", "External cold flow reviewed").is_err());
+        state.gse.lock().unwrap().observe_pressure(Some(0.0));
+        apply_cold_flow_override(&state, "alice", "External cold flow reviewed").unwrap();
+        let rt = state.gse.lock().unwrap();
+        assert!(!rt.engine.status.nitrogen_passed);
+        assert!(rt.engine.status.nitrogen_overridden);
+        assert!(rt.engine.allows(Action::StartFill, rt.input(true, true)));
+        let saved = operational::Saved::load(rt.operational.path.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            saved.qualification.nitrogen_override().unwrap().operator,
+            "alice"
+        );
+        assert!(!saved.qualification.completed(Milestone::NitrogenTest));
+        drop(rt);
+        cleanup(&state);
+    }
+    #[tokio::test]
+    async fn durable_fire_intent_is_once_only_and_prevents_restart_abort_or_valve_setup() {
+        let state = fixture().await;
+        let path = armed_fixture_for_test(&state, state.topology_router.get().unwrap());
+        commit_fire_intent(&state).unwrap();
+        assert!(commit_fire_intent(&state).is_err());
+        let saved = operational::Saved::load(&path).unwrap();
+        assert_eq!(
+            saved.qualification.stage(),
+            gse_sequence::qualification::MissionStage::Fire
+        );
+        assert!(!saved.qualification.nitrogen_satisfied());
+        assert!(saved.pending_checklists.is_empty());
+        // Missing FC flight state immediately after restart must not reactivate GSE automation.
+        state.set_local_flight_state(FlightState::Idle);
+        assert!(!automatic_abort_allowed(&state));
+        assert!(operational_tick(&state, false));
+        check_report_safety(&state);
+        assert_eq!(
+            state
+                .gse
+                .lock()
+                .unwrap()
+                .operational
+                .saved
+                .qualification
+                .fault(),
+            None
+        );
+        assert!(state.gse.lock().unwrap().engine.claimed);
+        cleanup(&state);
+        let _ = std::fs::remove_file(path);
+    }
+    #[tokio::test]
+    async fn paused_fill_and_armed_mission_keep_connectivity_protection_while_fc_state_is_idle() {
+        for armed in [false, true] {
+            let state = fixture().await;
+            {
+                let mut rt = state.gse.lock().unwrap();
+                for milestone in [Milestone::SelfTest, Milestone::NitrogenTest] {
+                    rt.operational
+                        .saved
+                        .qualification
+                        .complete(milestone, 0)
+                        .unwrap();
+                }
+                rt.operational.saved.baseline = Some(gse_sequence::Baseline {
+                    average_psi: 0.0,
+                    min_psi: 0.0,
+                    max_psi: 0.0,
+                    noise_psi: 0.1,
+                    samples: 50,
+                });
+                rt.operational.saved.qualification.begin_fill(0).unwrap();
+                if armed {
+                    rt.operational
+                        .saved
+                        .qualification
+                        .complete(Milestone::FillTarget, 0)
+                        .unwrap();
+                    rt.operational.saved.fill_target_kg = Some(8.0);
+                }
+                rt.operational.running = false;
+                rt.engine.status.phase = Phase::Paused;
+            }
+            state
+                .board_status
+                .lock()
+                .unwrap()
+                .get_mut(&Board::ValveBoard)
+                .unwrap()
+                .last_seen_instant = Some(Instant::now() - std::time::Duration::from_secs(4));
+            assert!(operational_tick(&state, true));
+            assert_eq!(
+                state
+                    .gse
+                    .lock()
+                    .unwrap()
+                    .operational
+                    .saved
+                    .qualification
+                    .fault(),
+                Some(Fault::TopologyLost)
+            );
+            cleanup(&state);
+        }
+    }
+    #[tokio::test]
+    async fn accepted_mass_cutoff_can_arm_without_requiring_an_unreachable_exact_float_target() {
+        let state = fixture().await;
+        let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
+        let mut rt = state.gse.lock().unwrap();
+        for milestone in [Milestone::SelfTest, Milestone::NitrogenTest] {
+            rt.operational
+                .saved
+                .qualification
+                .complete(milestone, 0)
+                .unwrap();
+        }
+        rt.operational.saved.baseline = Some(gse_sequence::Baseline {
+            average_psi: 0.0,
+            min_psi: 0.0,
+            max_psi: 0.0,
+            noise_psi: 0.1,
+            samples: 50,
+        });
+        rt.operational.saved.qualification.begin_fill(0).unwrap();
+        rt.operational.running = true;
+        rt.operational.target_reached = Some(target);
+        rt.engine.status.phase = Phase::Paused;
+        rt.observe_mass(Some(target * 0.996));
+        complete_operational_milestones(&mut rt, Phase::PauseSetup);
+        assert_eq!(
+            rt.operational.saved.qualification.stage(),
+            gse_sequence::qualification::MissionStage::Armed
+        );
+        assert!(rt.operational.saved.qualification.launch_qualified());
+        assert!(rt.fill_cutoff.target_met(target * 0.996, target));
+        assert!(!rt.fill_cutoff.target_met(target * 0.98, target));
+        assert!(!rt.fill_cutoff.target_met(f32::NAN, target));
+        drop(rt);
         cleanup(&state);
     }
 }

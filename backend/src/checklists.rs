@@ -16,12 +16,62 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
 };
+/// A binding to an actual successful engine transition, never a UI command request.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Sequence {
+    ValveSelfTest,
+    NitrogenTest,
+    FillTarget,
+}
+#[cfg(any(test, not(feature = "hitl_mode")))]
+impl Sequence {
+    fn actor(self) -> &'static str {
+        match self {
+            Self::ValveSelfTest => "automated:valve_self_test",
+            Self::NitrogenTest => "automated:nitrogen_test",
+            Self::FillTarget => "automated:fill_target",
+        }
+    }
+}
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionSource {
+    Operator,
+    ManualOverride,
+    AutomatedSequence,
+}
+#[cfg(any(test, not(feature = "hitl_mode")))]
+#[derive(Clone, Default, Serialize, Deserialize, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompletionAction {
+    #[default]
+    Passed,
+    Override {
+        operator: String,
+    },
+    Clear,
+}
+#[cfg(any(test, not(feature = "hitl_mode")))]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompletionEvent {
+    pub id: String,
+    pub sequence: Sequence,
+    pub at_ms: i64,
+    #[serde(default)]
+    pub action: CompletionAction,
+}
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Item {
     pub id: String,
     pub text: String,
     pub checked: bool,
+    #[serde(default)]
+    pub complete_on: Option<Sequence>,
+    #[serde(default)]
+    pub completion_source: Option<CompletionSource>,
     #[serde(default)]
     pub completed_by: Option<String>,
     #[serde(default)]
@@ -39,6 +89,8 @@ pub struct Checklist {
 #[serde(deny_unknown_fields)]
 pub struct Document {
     pub revision: u64,
+    #[serde(default)]
+    completion_events: Vec<String>,
     pub enforce_before_launch: bool,
     pub checklists: Vec<Checklist>,
 }
@@ -46,6 +98,7 @@ impl Default for Document {
     fn default() -> Self {
         Self {
             revision: 0,
+            completion_events: Vec::new(),
             enforce_before_launch: false,
             checklists: [
                 (
@@ -86,17 +139,54 @@ impl Default for Document {
                         id: format!("{id}-{i}"),
                         text: text.into(),
                         checked: false,
+                        complete_on: None,
+                        completion_source: None,
                         completed_by: None,
                         completed_at_ms: None,
                     })
                     .collect(),
             })
+            .chain(std::iter::once(Checklist {
+                id: "sequence-tests".into(),
+                title: "Sequence tests".into(),
+                required_before_launch: true,
+                items: [
+                    (
+                        "valve-self-test",
+                        "Valve self-test passed",
+                        Sequence::ValveSelfTest,
+                    ),
+                    (
+                        "nitrogen-cold-flow",
+                        "Nitrogen cold-flow test passed",
+                        Sequence::NitrogenTest,
+                    ),
+                ]
+                .into_iter()
+                .map(|(id, text, sequence)| Item {
+                    id: id.into(),
+                    text: text.into(),
+                    checked: false,
+                    complete_on: Some(sequence),
+                    completion_source: None,
+                    completed_by: None,
+                    completed_at_ms: None,
+                })
+                .collect(),
+            }))
             .collect(),
         }
     }
 }
 impl Document {
     fn validate(&self) -> Result<(), String> {
+        if self.completion_events.len() > 128
+            || self.completion_events.iter().any(|id| !valid_id(id))
+            || self.completion_events.iter().collect::<HashSet<_>>().len()
+                != self.completion_events.len()
+        {
+            return Err("Invalid sequence completion receipt history".into());
+        }
         if self.checklists.len() > 32 {
             return Err("Maximum 32 checklists".into());
         }
@@ -165,14 +255,52 @@ impl Document {
             .and_then(|c| c.items.iter_mut().find(|i| i.id == request.item_id))
             .ok_or("Checklist item no longer exists; refresh the page")?;
         item.checked = request.checked;
+        item.completion_source = request.checked.then_some(if item.complete_on.is_some() {
+            CompletionSource::ManualOverride
+        } else {
+            CompletionSource::Operator
+        });
         item.completed_by = request.checked.then(|| actor.into());
         item.completed_at_ms = request.checked.then_some(now);
         Ok(())
+    }
+    #[cfg(any(test, not(feature = "hitl_mode")))]
+    fn complete_sequence(&mut self, sequence: Sequence, now: i64) -> bool {
+        let mut changed = false;
+        for item in self.checklists.iter_mut().flat_map(|list| &mut list.items) {
+            if item.complete_on == Some(sequence)
+                && (!item.checked
+                    || item.completion_source != Some(CompletionSource::AutomatedSequence))
+            {
+                item.checked = true;
+                item.completed_by = Some(sequence.actor().into());
+                item.completed_at_ms = Some(now);
+                item.completion_source = Some(CompletionSource::AutomatedSequence);
+                changed = true;
+            }
+        }
+        changed
+    }
+    #[cfg(any(test, not(feature = "hitl_mode")))]
+    fn clear_sequence_completions(&mut self) -> bool {
+        let mut changed = false;
+        for item in self.checklists.iter_mut().flat_map(|list| &mut list.items) {
+            if item.complete_on.is_some() && item.checked {
+                item.checked = false;
+                item.completed_by = None;
+                item.completed_at_ms = None;
+                item.completion_source = None;
+                changed = true;
+            }
+        }
+        changed
     }
     fn edit(&mut self, mut next: Document) -> Result<(), String> {
         if next.revision != self.revision {
             return Err("Checklists changed on another device; reload before saving".into());
         }
+        // Receipt history is server-owned, including when an older UI omits it.
+        next.completion_events = self.completion_events.clone();
         next.validate()?;
         // Completion metadata is server-owned. Changed wording invalidates completion.
         for list in &mut next.checklists {
@@ -182,14 +310,17 @@ impl Document {
                     .iter()
                     .find(|c| c.id == list.id)
                     .and_then(|c| {
-                        c.items
-                            .iter()
-                            .find(|i| i.id == item.id && i.text == item.text)
+                        c.items.iter().find(|i| {
+                            i.id == item.id
+                                && i.text == item.text
+                                && i.complete_on == item.complete_on
+                        })
                     });
                 if let Some(old) = old {
                     *item = old.clone()
                 } else {
                     item.checked = false;
+                    item.completion_source = None;
                     item.completed_by = None;
                     item.completed_at_ms = None;
                 }
@@ -289,6 +420,77 @@ fn access<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, Strin
 pub fn launch_block() -> Option<String> {
     access(|s| Ok(s.document.launch_block()))
         .unwrap_or_else(|error| Some(format!("Checklist storage unavailable: {error}")))
+}
+/// Called only after a successful, durably recorded sequence completion.
+/// It is deliberately event-driven: refreshing/restarting never rechecks a manually cleared item.
+#[cfg(not(feature = "hitl_mode"))]
+pub(crate) fn sequence_completed(event: &CompletionEvent) -> Result<(), String> {
+    access(|store| store.record_sequence(event))
+}
+#[cfg(any(test, not(feature = "hitl_mode")))]
+impl Store {
+    fn record_sequence(&mut self, event: &CompletionEvent) -> Result<(), String> {
+        if !valid_id(&event.id) {
+            return Err("Invalid sequence event ID".into());
+        }
+        if self.document.completion_events.contains(&event.id) {
+            return Ok(());
+        }
+        self.update(|document| {
+            match &event.action {
+                CompletionAction::Passed => {
+                    document.complete_sequence(event.sequence, event.at_ms);
+                }
+                CompletionAction::Override { operator } => {
+                    for item in document
+                        .checklists
+                        .iter_mut()
+                        .flat_map(|list| &mut list.items)
+                    {
+                        if item.complete_on == Some(event.sequence) {
+                            item.checked = true;
+                            item.completed_by = Some(operator.clone());
+                            item.completed_at_ms = Some(event.at_ms);
+                            item.completion_source = Some(CompletionSource::ManualOverride);
+                        }
+                    }
+                }
+                CompletionAction::Clear => {
+                    for item in document
+                        .checklists
+                        .iter_mut()
+                        .flat_map(|list| &mut list.items)
+                    {
+                        if item.complete_on == Some(event.sequence) {
+                            item.checked = false;
+                            item.completed_by = None;
+                            item.completed_at_ms = None;
+                            item.completion_source = None;
+                        }
+                    }
+                }
+            }
+            if document.completion_events.len() == 128 {
+                document.completion_events.remove(0);
+            }
+            document.completion_events.push(event.id.clone());
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+#[cfg(not(feature = "hitl_mode"))]
+pub(crate) fn reset_sequence_completions() -> Result<(), String> {
+    access(|store| {
+        let mut next = store.document.clone();
+        if next.clear_sequence_completions() {
+            store.update(|document| {
+                *document = next;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    })
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -518,5 +720,226 @@ mod tests {
         );
         assert!(principal(&state, &headers, true).await.is_ok());
         assert!(principal(&state, &HeaderMap::new(), false).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod automation_tests {
+    use super::*;
+    #[test]
+    fn successful_events_update_only_linked_items_and_survive_restart() {
+        let path =
+            std::env::temp_dir().join(format!("gs-automation-{}.json", rand::random::<u64>()));
+        let mut store = Store::open(path.clone()).unwrap();
+        store
+            .update(|d| {
+                assert!(d.complete_sequence(Sequence::ValveSelfTest, 10));
+                Ok(())
+            })
+            .unwrap();
+        let reopened = Store::open(path.clone()).unwrap();
+        let list = reopened
+            .document
+            .checklists
+            .iter()
+            .find(|c| c.id == "sequence-tests")
+            .unwrap();
+        assert!(list.items[0].checked);
+        assert!(!list.items[1].checked);
+        assert_eq!(
+            list.items[0].completion_source,
+            Some(CompletionSource::AutomatedSequence)
+        );
+        assert_eq!(list.items[0].completed_at_ms, Some(10));
+        assert_eq!(
+            list.items[0].completed_by.as_deref(),
+            Some("automated:valve_self_test")
+        );
+        assert!(
+            !store
+                .document
+                .complete_sequence(Sequence::ValveSelfTest, 20)
+        );
+        assert_eq!(
+            store.document.checklists.last().unwrap().items[0].completed_at_ms,
+            Some(10)
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn overrides_are_distinct_and_admin_edits_cannot_forge_success() {
+        let mut d = Document::default();
+        d.check(
+            &Check {
+                checklist_id: "sequence-tests".into(),
+                item_id: "valve-self-test".into(),
+                checked: true,
+            },
+            "alice",
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            d.checklists.last().unwrap().items[0].completion_source,
+            Some(CompletionSource::ManualOverride)
+        );
+        let mut next = d.clone();
+        next.checklists.last_mut().unwrap().items[1].checked = true;
+        next.checklists.last_mut().unwrap().items[1].completion_source =
+            Some(CompletionSource::AutomatedSequence);
+        d.edit(next).unwrap();
+        assert!(!d.checklists.last().unwrap().items[1].checked);
+        assert!(d.complete_sequence(Sequence::ValveSelfTest, 2));
+        assert_eq!(
+            d.checklists.last().unwrap().items[0].completion_source,
+            Some(CompletionSource::AutomatedSequence)
+        );
+        let mut next = d.clone();
+        next.checklists.last_mut().unwrap().items[0].complete_on = Some(Sequence::NitrogenTest);
+        d.edit(next).unwrap();
+        assert!(!d.checklists.last().unwrap().items[0].checked);
+    }
+    #[test]
+    fn manual_clear_is_not_repopulated_without_a_new_success_and_reset_preserves_manual_items() {
+        let mut d = Document::default();
+        d.complete_sequence(Sequence::NitrogenTest, 1);
+        d.check(
+            &Check {
+                checklist_id: "setup".into(),
+                item_id: "setup-0".into(),
+                checked: true,
+            },
+            "bob",
+            2,
+        )
+        .unwrap();
+        d.check(
+            &Check {
+                checklist_id: "sequence-tests".into(),
+                item_id: "nitrogen-cold-flow".into(),
+                checked: false,
+            },
+            "bob",
+            3,
+        )
+        .unwrap();
+        let mut restored: Document =
+            serde_json::from_slice(&serde_json::to_vec(&d).unwrap()).unwrap();
+        assert!(!restored.checklists.last().unwrap().items[1].checked);
+        restored.complete_sequence(Sequence::ValveSelfTest, 4);
+        assert!(restored.clear_sequence_completions());
+        assert!(restored.checklists[0].items[0].checked);
+        assert!(
+            restored
+                .checklists
+                .last()
+                .unwrap()
+                .items
+                .iter()
+                .all(|i| !i.checked)
+        );
+    }
+}
+
+#[cfg(test)]
+mod outbox_receipt_tests {
+    use super::*;
+    #[test]
+    fn replay_after_checkpoint_crash_does_not_undo_a_manual_clear() {
+        let path = std::env::temp_dir().join(format!("gs-receipt-{}.json", rand::random::<u128>()));
+        let event = CompletionEvent {
+            id: "test-unique-event".into(),
+            sequence: Sequence::ValveSelfTest,
+            at_ms: 12,
+            action: CompletionAction::Passed,
+        };
+        let mut store = Store::open(path.clone()).unwrap();
+        store.record_sequence(&event).unwrap();
+        store
+            .update(|d| {
+                d.check(
+                    &Check {
+                        checklist_id: "sequence-tests".into(),
+                        item_id: "valve-self-test".into(),
+                        checked: false,
+                    },
+                    "operator",
+                    20,
+                )
+            })
+            .unwrap();
+        let mut restarted = Store::open(path.clone()).unwrap();
+        let revision = restarted.document.revision;
+        restarted.record_sequence(&event).unwrap();
+        assert_eq!(restarted.document.revision, revision);
+        assert!(!restarted.document.checklists.last().unwrap().items[0].checked);
+        // A genuine new run can complete the cleared item.
+        restarted
+            .record_sequence(&CompletionEvent {
+                id: "next-test-event".into(),
+                ..event
+            })
+            .unwrap();
+        assert!(restarted.document.checklists.last().unwrap().items[0].checked);
+        // An admin template write cannot erase the receipt history.
+        let mut edit = restarted.document.clone();
+        edit.completion_events.clear();
+        restarted.document.edit(edit).unwrap();
+        assert_eq!(restarted.document.completion_events.len(), 2);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod workflow_event_tests {
+    use super::*;
+    #[test]
+    fn fire_clears_only_cold_flow_and_late_receipt_replay_cannot_resurrect_it() {
+        let path = std::env::temp_dir().join(format!(
+            "gse-fire-checklist-{}.json",
+            rand::random::<u128>()
+        ));
+        let mut store = Store::open(path.clone()).unwrap();
+        let event = CompletionEvent {
+            id: "cold-flow-result".into(),
+            sequence: Sequence::NitrogenTest,
+            at_ms: 1,
+            action: CompletionAction::Passed,
+        };
+        store.record_sequence(&event).unwrap();
+        store
+            .update(|d| {
+                d.complete_sequence(Sequence::ValveSelfTest, 2);
+                Ok(())
+            })
+            .unwrap();
+        store
+            .record_sequence(&CompletionEvent {
+                id: "fire-consume".into(),
+                at_ms: 3,
+                action: CompletionAction::Clear,
+                ..event.clone()
+            })
+            .unwrap();
+        store = Store::open(path.clone()).unwrap();
+        store.record_sequence(&event).unwrap();
+        let list = store.document.checklists.last().unwrap();
+        assert!(list.items[0].checked);
+        assert!(!list.items[1].checked);
+        store
+            .record_sequence(&CompletionEvent {
+                id: "reviewed-override".into(),
+                at_ms: 4,
+                action: CompletionAction::Override {
+                    operator: "alice".into(),
+                },
+                ..event
+            })
+            .unwrap();
+        assert_eq!(
+            store.document.checklists.last().unwrap().items[1].completion_source,
+            Some(CompletionSource::ManualOverride)
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

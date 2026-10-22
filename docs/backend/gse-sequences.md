@@ -23,13 +23,15 @@ pressure regulation, relief protection and a hardware emergency stop are require
 permission required). `GET /api/gse/status` returns the runtime state (ViewData).
 Commands use the existing authenticated WebSocket command channel and action policy.
 Configuration persists in `backend/config/gse_sequence.json`, overridable with
-`GS_GSE_CONFIG`. Runtime calibration and nitrogen-pass status never survive restart.
+`GS_GSE_CONFIG`. Non-HITL operation checks, pressure baseline, cold-flow evidence
+and mission stage persist in the adjacent `gse_qualification.json` (`GS_GSE_QUALIFICATION`
+overrides it). A restart never resumes a valve sequence, queued QD request or Fire.
+HITL retains its runtime-only sequence behavior.
 
-The only numeric GSE settings in the UI are `nitrogen_target_psi` (nitrogen maximum
-pressure) and `pressure_step_psi` (positive increment, default 50 psi). The last
+The GSE UI exposes nitrogen maximum pressure, pressure step (default 50 psi),
+and the maximum acceptable empty-tank PT offset. The last
 increment is capped at the target. Backend administrators configure
-`pressure_ceiling_psi`, `maximum_zero_offset_psi`, and `grouped_panel` in the backend
-configuration. The two safety bounds ship unset: automatic operations are unavailable until valid
+`pressure_ceiling_psi` and `grouped_panel` in the backend configuration. The two safety bounds ship unset: automatic operations are unavailable until valid
 limits are supplied. Target plus zero allowance must be below the pressure ceiling.
 The ceiling is a software trip threshold, not a guarantee against overshoot.
 Removing those bounds from the UI does not remove their enforcement.
@@ -83,10 +85,10 @@ Disabled means use the saved calibration/tare without automatic capture.
 - Otherwise it collects 200 **new** samples before starting fill. Resuming a
   paused fill never re-tares contents already added. Pause, Cancel, Abort, or
   another accepted manual action cancels a pending fill capture.
-- Launch always captures the 1000 kg channel concurrently with the existing
-  countdown, limited to its first five seconds. It does not add a pre-countdown
-  delay. Timeout or failed stability requests Abort; operator/hardware safety
-  systems remain necessary because software cannot guarantee delivery of Abort.
+- Launch captures the 1000 kg channel concurrently with the existing countdown
+  in HITL/test-fire, limited to its first five seconds, without an additional delay.
+  Operational builds do not generate automatic GroundStation aborts after Fire
+  intent/countdown begins. HITL retains its prior abort/testing behavior.
 - The lowest and highest 5% of readings are excluded. The remaining 90% must
   span no more than 0.8 kg, and their mean must remain within ±0.8 kg. Larger
   offsets require inspection/manual tare, not automatic removal of actual load.
@@ -119,16 +121,58 @@ Self-test requires explicit confirmation that gas supplies are isolated. It open
 one of the five valves, waits for acknowledgement, holds two seconds, then confirms
 closure before moving to the next. Ignition and retraction are excluded. Confirmation
 is runtime-only and consumed when a test starts. Once nitrogen testing or filling
-starts, self-test stays locked for the process session. Restart requires a new
-nitrogen test; it does not preserve a previous pass.
+starts, self-test stays locked. Operational builds preserve successful tests across
+restarts until explicit reset; Fire consumes the cold-flow requirement. HITL keeps
+its existing runtime-only test status.
 
-Manual valve changes invalidate nitrogen-pass status. Manual valve, launch and
-retraction controls are locked while a sequence owns the valves; cancel first.
+HITL manual valve changes invalidate its runtime nitrogen-pass status. Operational
+qualification remains persisted until reset or Fire, while live unsafe supply
+reports latch a fault. Manual valve, launch and retraction controls remain subject
+to active-sequence ownership and backend interlocks.
 Missing/stale PT (2 s), invalid PT, pressure ceiling, lost interlock, command transport
 errors, missing acknowledgements (5 s), and step/dump timeouts (60 s) stop sequencing.
-Faults request supply closure and dump/vent opening while prelaunch. Once the vehicle
-leaves prelaunch, only supply closure is requested. Verify physical state after any
+Before Fire, faults request supply closure and dump/vent opening. Operational
+builds issue no automatic abort or valve correction after durable Fire intent;
+this boundary also survives a service restart. Independent board abort latches
+and FC autonomous protections remain in force. Verify physical state after any
 fault; a network failure can prevent all requested recovery actions.
+
+
+## Operational workflow (flight launch and test fire)
+
+The persisted mission stages are **Idle → Fill → Armed → Fire**. They are distinct
+from the flight computer's ascent/recovery states; no flight-state wire values are
+renumbered. HITL does not use this operational qualification policy.
+
+1. Complete valve self-test, then the existing stepped nitrogen test. Successful
+   tests complete linked checklist items automatically. The nitrogen test is the
+   cold-flow evidence; no new valve pattern is introduced.
+2. Start fill with fresh calibrated mass/pressure and stable fill-system routes.
+   The accepted automatic mass cutoff and Armed checks use the same tolerance.
+   A pressure-plateau stop below the accepted mass target does not arm the system.
+3. After a mass-target stop, all valves must acknowledge closed before Armed.
+   Paused Fill and Armed retain connectivity protection even if FC reports Idle.
+4. Fire rechecks live conditions at dispatch. Flight mode additionally requires
+   fresh rocket GPS, FC routes, and QD ACK plus five seconds settling. Test-fire
+   has no AV-bay requirement. A launch request during QD settling stays queued.
+5. Fire intent is saved before command dispatch. It clears cold-flow qualification
+   and its linked checklist items, rejects duplicate Fire, and cannot be replayed
+   by a restart. If storage fails, dispatch is refused; if dispatch is incomplete,
+   the operator receives a warning and must recover explicitly.
+
+**Override cold-flow requirement** opens a reason dialog. The backend requires a
+signed-in operator authorized for `NitrogenTest`, a passed valve self-test with a
+saved empty-tank baseline, fresh pressure inside that baseline, both supply valves
+confirmed closed, stable connections, interlock, and no active sequence or fault.
+The operator, reason and timestamp persist as an override, never a passed test.
+It can unlock fill but does not bypass pressure, mass, valve, GPS, route or QD gates.
+A later successful nitrogen test replaces it with actual test evidence.
+
+`POST /api/gse/cold-flow/override` accepts `{"reason":"reviewed procedure"}`.
+`GET /api/gse/status` includes `mission_stage`, `qualification.nitrogen_override`
+and `nitrogen_overridden` alongside actual `nitrogen_passed`. Reset operation
+checks from Idle to begin a new cycle. Older version-1 qualification files migrate
+without inventing an override or dropping valid evidence.
 
 ## Physical panel
 

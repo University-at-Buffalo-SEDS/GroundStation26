@@ -16,9 +16,46 @@ pub struct Saved {
     pub qualification: Qualification,
     pub baseline: Option<Baseline>,
     pub fill_target_kg: Option<f32>,
+    #[serde(default)]
+    pub pending_checklists: Vec<crate::checklists::CompletionEvent>,
 }
 impl Saved {
     fn validate(&self) -> Result<(), String> {
+        if self.pending_checklists.len() > 3 {
+            return Err("Too many pending sequence completion events".into());
+        }
+        let mut ids = std::collections::HashSet::new();
+        for event in &self.pending_checklists {
+            let milestone = match event.sequence {
+                crate::checklists::Sequence::ValveSelfTest => Milestone::SelfTest,
+                crate::checklists::Sequence::NitrogenTest => Milestone::NitrogenTest,
+                crate::checklists::Sequence::FillTarget => Milestone::FillTarget,
+            };
+            if event.id.is_empty()
+                || event.id.len() > 80
+                || !event.id.bytes().all(|b| b.is_ascii_hexdigit())
+                || !ids.insert(&event.id)
+                || match &event.action {
+                    crate::checklists::CompletionAction::Passed => {
+                        !self.qualification.completed(milestone)
+                    }
+                    crate::checklists::CompletionAction::Override { operator } => {
+                        event.sequence != crate::checklists::Sequence::NitrogenTest
+                            || self
+                                .qualification
+                                .nitrogen_override()
+                                .is_none_or(|e| &e.operator != operator)
+                    }
+                    crate::checklists::CompletionAction::Clear => {
+                        event.sequence != crate::checklists::Sequence::NitrogenTest
+                            || self.qualification.stage()
+                                != gse_sequence::qualification::MissionStage::Fire
+                    }
+                }
+            {
+                return Err("Invalid pending sequence completion event".into());
+            }
+        }
         if let Some(b) = &self.baseline {
             if b.samples < 3
                 || ![b.average_psi, b.min_psi, b.max_psi, b.noise_psi]
@@ -31,7 +68,7 @@ impl Saved {
                 return Err("Invalid saved pressure baseline".into());
             }
         }
-        if self.qualification.completed(Milestone::NitrogenTest) && self.baseline.is_none() {
+        if self.qualification.nitrogen_satisfied() && self.baseline.is_none() {
             return Err("Saved nitrogen test has no pressure baseline".into());
         }
         if self
@@ -74,6 +111,9 @@ impl Saved {
             std::fs::rename(&temporary, path)?;
             std::fs::File::open(parent)?.sync_all()
         })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
         result.map_err(|e| e.to_string())
     }
 }
@@ -122,11 +162,100 @@ impl Operational {
         result
     }
     pub fn complete(&mut self, milestone: Milestone) -> Result<(), String> {
+        if self.saved.pending_checklists.len() >= 3 {
+            return Err("Save pending checklist progress before another test".into());
+        }
         self.saved
             .qualification
             .complete(milestone, self.run_generation)
             .map_err(str::to_string)?;
+        self.saved
+            .pending_checklists
+            .push(crate::checklists::CompletionEvent {
+                id: format!("{:032x}", rand::random::<u128>()),
+                sequence: match milestone {
+                    Milestone::SelfTest => crate::checklists::Sequence::ValveSelfTest,
+                    Milestone::NitrogenTest => crate::checklists::Sequence::NitrogenTest,
+                    Milestone::FillTarget => crate::checklists::Sequence::FillTarget,
+                },
+                at_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+                action: crate::checklists::CompletionAction::Passed,
+            });
         self.persist()
+    }
+    pub fn begin_fill(&mut self) -> Result<(), String> {
+        self.saved
+            .qualification
+            .begin_fill(self.run_generation)
+            .map_err(str::to_string)?;
+        self.persist()
+    }
+    pub fn override_cold_flow(
+        &mut self,
+        evidence: gse_sequence::qualification::ColdFlowOverride,
+    ) -> Result<(), String> {
+        if !self.saved.pending_checklists.is_empty() {
+            return Err("Save pending checklist progress first".into());
+        }
+        self.saved
+            .qualification
+            .override_cold_flow(evidence.clone())
+            .map_err(str::to_string)?;
+        self.saved
+            .pending_checklists
+            .push(crate::checklists::CompletionEvent {
+                id: format!("{:032x}", rand::random::<u128>()),
+                sequence: crate::checklists::Sequence::NitrogenTest,
+                at_ms: evidence.at_ms,
+                action: crate::checklists::CompletionAction::Override {
+                    operator: evidence.operator,
+                },
+            });
+        self.persist()?;
+        self.flush_checklists()
+    }
+    pub fn commit_fire(&mut self) -> Result<(), String> {
+        if !self.saved.pending_checklists.is_empty() {
+            return Err("Save pending checklist progress first".into());
+        }
+        let mut next = self.saved.clone();
+        next.qualification.commit_fire().map_err(str::to_string)?;
+        next.pending_checklists
+            .push(crate::checklists::CompletionEvent {
+                id: format!("{:032x}", rand::random::<u128>()),
+                sequence: crate::checklists::Sequence::NitrogenTest,
+                at_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+                action: crate::checklists::CompletionAction::Clear,
+            });
+        let result = self
+            .path
+            .as_ref()
+            .ok_or_else(|| "Qualification storage is not initialized".to_string())
+            .and_then(|path| next.save(path));
+        if let Err(error) = &result {
+            self.saved.qualification.latch(Fault::MissingTelemetry);
+            self.persist_error = Some(error.clone());
+        }
+        result?;
+        self.saved = next;
+        Ok(())
+    }
+    pub fn flush_checklists(&mut self) -> Result<(), String> {
+        self.flush_checklists_with(crate::checklists::sequence_completed)
+    }
+    fn flush_checklists_with(
+        &mut self,
+        mut deliver: impl FnMut(&crate::checklists::CompletionEvent) -> Result<(), String>,
+    ) -> Result<(), String> {
+        while let Some(event) = self.saved.pending_checklists.first() {
+            if let Err(error) = deliver(event) {
+                self.persist_error = Some(error.clone());
+                return Err(error);
+            }
+            self.saved.pending_checklists.remove(0);
+            self.persist()?;
+        }
+        Ok(())
     }
 }
 #[cfg(test)]
@@ -189,5 +318,96 @@ mod tests {
         assert!(op.topology_stable);
         op.topology(4101, true, "b".into());
         assert!(!op.topology_stable);
+    }
+}
+
+#[cfg(test)]
+mod checklist_outbox_tests {
+    use super::*;
+    #[test]
+    fn restart_retries_the_same_saved_event_and_storage_failure_never_acks_it() {
+        let path = std::env::temp_dir().join(format!("gse-outbox-{}.json", rand::random::<u128>()));
+        let mut op = Operational {
+            path: Some(path.clone()),
+            ..Default::default()
+        };
+        op.complete(Milestone::SelfTest).unwrap();
+        let event = op.saved.pending_checklists[0].clone();
+        assert!(
+            op.flush_checklists_with(|_| Err("checklist disk unavailable".into()))
+                .is_err()
+        );
+        assert_eq!(
+            Saved::load(&path).unwrap().pending_checklists,
+            vec![event.clone()]
+        );
+        let mut restored = Operational {
+            path: Some(path.clone()),
+            saved: Saved::load(&path).unwrap(),
+            ..Default::default()
+        };
+        let mut calls = 0;
+        restored
+            .flush_checklists_with(|received| {
+                assert_eq!(received, &event);
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(calls, 1);
+        assert!(Saved::load(&path).unwrap().pending_checklists.is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn unfinished_or_stale_runs_cannot_enqueue_a_success() {
+        let mut op = Operational::default();
+        op.run_generation = 1;
+        assert!(op.complete(Milestone::SelfTest).is_err());
+        assert!(op.saved.pending_checklists.is_empty());
+        assert!(!op.saved.qualification.completed(Milestone::SelfTest));
+    }
+}
+
+#[cfg(test)]
+mod fire_persistence_tests {
+    use super::*;
+    #[test]
+    fn failed_fire_save_never_consumes_the_armed_evidence_in_memory() {
+        let path =
+            std::env::temp_dir().join(format!("gse-fire-blocked-{}", rand::random::<u128>()));
+        std::fs::create_dir(&path).unwrap();
+        let mut op = Operational {
+            path: Some(path.clone()),
+            ..Default::default()
+        };
+        for stage in [
+            Milestone::SelfTest,
+            Milestone::NitrogenTest,
+            Milestone::FillTarget,
+        ] {
+            op.saved.qualification.complete(stage, 0).unwrap();
+        }
+        op.saved.baseline = Some(Baseline {
+            average_psi: 0.0,
+            min_psi: 0.0,
+            max_psi: 0.0,
+            noise_psi: 0.1,
+            samples: 50,
+        });
+        op.saved.fill_target_kg = Some(8.0);
+        assert!(op.commit_fire().is_err());
+        assert_eq!(
+            op.saved.qualification.stage(),
+            gse_sequence::qualification::MissionStage::Armed
+        );
+        assert!(op.saved.qualification.nitrogen_satisfied());
+        assert!(op.saved.pending_checklists.is_empty());
+        assert!(op.persist_error.is_some());
+        assert!(!path.with_extension("upload").exists());
+        assert_eq!(
+            op.saved.qualification.fault(),
+            Some(Fault::MissingTelemetry)
+        );
+        std::fs::remove_dir(path).unwrap();
     }
 }

@@ -158,6 +158,7 @@ pub struct Status {
     pub phase: Phase,
     pub message: String,
     pub nitrogen_passed: bool,
+    pub nitrogen_overridden: bool,
     pub self_test_locked: bool,
     pub current_step_psi: f32,
     pub baseline: Option<Baseline>,
@@ -199,6 +200,7 @@ impl Default for Engine {
                 phase: Phase::Idle,
                 message: "Ready for GSE checkout".into(),
                 nitrogen_passed: false,
+                nitrogen_overridden: false,
                 self_test_locked: false,
                 current_step_psi: 0.0,
                 baseline: None,
@@ -280,7 +282,7 @@ impl Engine {
                 self.config
                     .pressure_limit(self.nitrous_target_psi, 50.0)
                     .is_ok_and(|limit| limit > self.nitrous_target_psi)
-                    && self.status.nitrogen_passed
+                    && (self.status.nitrogen_passed || self.status.nitrogen_overridden)
                     && matches!(self.status.phase, Phase::Passed | Phase::Paused)
                     && self
                         .status
@@ -400,6 +402,7 @@ impl Engine {
         Ok(match action {
             Action::CancelFill => {
                 self.status.nitrogen_passed = false;
+                self.status.nitrogen_overridden = false;
                 self.configure(
                     Phase::CancelSetup,
                     RELIEVED,
@@ -426,6 +429,7 @@ impl Engine {
             Action::SelfTest | Action::NitrogenTest => {
                 self.nitrous_session = false;
                 self.status.nitrogen_passed = false;
+                self.status.nitrogen_overridden = false;
                 self.status.baseline = None;
                 self.testing_valves = action == Action::SelfTest;
                 self.config.dry_self_test_confirmed = false;
@@ -452,6 +456,7 @@ impl Engine {
     }
     pub fn fault(&mut self, now: u64, message: &str) -> Effects {
         self.status.nitrogen_passed = false;
+        self.status.nitrogen_overridden = false;
         let mut effects = self.configure(Phase::Fault, RELIEVED, now, message);
         effects.notification = Some(format!(
             "GSE sequence failed: {message}. Supply close and dump/vent open requested; verify tank pressure."
@@ -460,6 +465,7 @@ impl Engine {
     }
     pub fn manual_override(&mut self) {
         self.status.nitrogen_passed = false;
+        self.status.nitrogen_overridden = false;
     }
     fn confirmed(&self, input: Inputs) -> bool {
         input
