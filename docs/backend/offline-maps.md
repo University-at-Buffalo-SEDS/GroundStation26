@@ -31,3 +31,17 @@ Temporary request/body/write failures retry quietly. A tile that exhausts its
 retry allowance reports its final underlying error once. The default concurrency
 is unchanged (1024 requests); `--max-concurrent` remains available for explicit
 local tuning. Existing downloaded tiles are retained across restarts.
+
+The downloader reserves file descriptors for its configured concurrency before
+opening network/database work. On Unix it raises only its own soft limit to
+`2 * concurrency + 256` when necessary, preserving the existing hard limit. If
+the hard limit is too low, it stops with an actionable error rather than silently
+reducing concurrency or exhausting sockets during the download. At the default
+1024 requests this requires2304 descriptors.
+
+DNS results are shared per hostname for60 seconds, with one system lookup in
+flight per host. A failed refresh can reuse a previously successful address for
+at most five minutes, retrying DNS at most once per second; certificate/hostname
+verification remains enabled. No DNS servers, interfaces or system-wide limits
+are changed. Exhausted tile retries still report the final error, and restarting
+the downloader retains completed tiles.

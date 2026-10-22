@@ -1,3 +1,6 @@
+mod dns;
+mod limits;
+
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
@@ -583,6 +586,7 @@ impl BandwidthLimiter {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    limits::prepare(max_concurrent())?;
     // Optional override for region, but default to north_america
     let region = env::var("MAP_REGION").unwrap_or_else(|_| REGION.to_string());
     let max_zoom = env::var("MAP_MAX_ZOOM")
@@ -621,6 +625,7 @@ async fn main() -> Result<()> {
     // Async HTTP client
     let client = Client::builder()
         .user_agent("GroundStationOfflineTileFetcher/0.1")
+        .dns_resolver(dns::CachedResolver::system())
         .build()?;
 
     if direct_to_bundle {
