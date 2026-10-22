@@ -30,6 +30,18 @@ fn radio_transport_priority(priority: u8, payload: &[u8]) -> u8 {
     }
 }
 
+fn is_delivery_receipt(payload: &[u8]) -> bool {
+    !payload.starts_with(b"SDT")
+        && serialize::peek_frame_info_unchecked(payload).is_ok_and(|info| {
+            matches!(
+                info.envelope.ty,
+                sedsnet::config::DataType::ReliableAck
+                    | sedsnet::config::DataType::ReliablePartialAck
+                    | sedsnet::config::DataType::ReliablePacketRequest
+            )
+        })
+}
+
 // Only delivery/application controls may consume the reserved command bytes.
 // Discovery's priority-255 address/topology snapshots must not exhaust them.
 fn uses_command_reserve(priority: u8, payload: &[u8]) -> bool {
@@ -123,11 +135,19 @@ impl TxQueueBudget {
         // exceed the ordinary target. Ownership still lasts until the write.
         let control = uses_command_reserve(priority, payload);
         if control {
+            // Receipts are essential but must leave room for a new operator
+            // command. Keep the same aggregate bound and retain refused frames
+            // in the router; never discard an accepted receipt.
+            let allowance = if is_delivery_receipt(payload) {
+                self.limit.saturating_sub((self.limit / 4).min(256))
+            } else {
+                self.limit
+            };
             self.pending_control
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                     pending
                         .checked_add(payload.len())
-                        .filter(|total| *total <= self.limit)
+                        .filter(|total| *total <= allowance)
                 })
                 .map_err(|_| sedsnet::TelemetryError::Io("side tx busy"))?;
         }
@@ -241,6 +261,8 @@ fn backlog_pop(backlog: &mut PriorityBacklog, control_bytes: &mut usize) -> Opti
 struct WireBacklog {
     ordered: VecDeque<(u8, Vec<u8>)>,
     routing: VecDeque<(u8, Vec<u8>)>,
+    receipts: VecDeque<(u8, Vec<u8>)>,
+    application_bytes: usize,
     ordered_metadata_next: bool,
     priority_bytes: usize,
     priorities: PriorityBacklog,
@@ -252,6 +274,8 @@ impl WireBacklog {
         Self {
             ordered: VecDeque::new(),
             routing: VecDeque::new(),
+            receipts: VecDeque::new(),
+            application_bytes: 0,
             ordered_metadata_next: false,
             priority_bytes: 0,
             priorities: PriorityBacklog::new(),
@@ -272,7 +296,13 @@ impl WireBacklog {
             && !payload.starts_with(b"SDT")
             && serialize::peek_frame_info_unchecked(&payload)
                 .is_ok_and(|info| sedsnet::discovery::is_discovery_type(info.envelope.ty));
-        if self.preserve_order && routing {
+        if self.preserve_order && is_delivery_receipt(&payload) {
+            if front {
+                self.receipts.push_front((priority, payload));
+            } else {
+                self.receipts.push_back((priority, payload));
+            }
+        } else if self.preserve_order && routing {
             if front {
                 self.routing.push_front((priority, payload));
             } else {
@@ -291,11 +321,26 @@ impl WireBacklog {
     fn pop(&mut self) -> Option<(u8, Vec<u8>)> {
         if self.preserve_order {
             // Bound control bursts so schema/bootstrap still makes progress.
-            if !self.priorities.is_empty()
+            if (!self.priorities.is_empty() || !self.receipts.is_empty())
                 && (self.control_bytes < MAX_CONTROL_BYTES
                     || (self.ordered.is_empty() && self.routing.is_empty()))
             {
-                let packet = backlog_pop(&mut self.priorities, &mut self.priority_bytes);
+                // Separate receipt and application FIFOs: a new managed value
+                // shares priority 255 with ACKs and otherwise sits behind the
+                // whole ACK backlog. Bound application bursts too, so neither
+                // side can starve the other. Stateful SDT order stays intact.
+                let packet = if !self.priorities.is_empty()
+                    && (self.receipts.is_empty() || self.application_bytes < 256)
+                {
+                    let packet = backlog_pop(&mut self.priorities, &mut self.priority_bytes);
+                    self.application_bytes = self
+                        .application_bytes
+                        .saturating_add(packet.as_ref().map_or(0, |(_, bytes)| bytes.len()));
+                    packet
+                } else {
+                    self.application_bytes = 0;
+                    self.receipts.pop_front()
+                };
                 self.control_bytes = self
                     .control_bytes
                     .saturating_add(packet.as_ref().map_or(0, |(_, payload)| payload.len()));
@@ -607,6 +652,84 @@ mod priority_tests {
     }
 
     #[test]
+    fn real_ack_backlog_preserves_command_admission_and_bounded_bidirectional_service() {
+        crate::telemetry_schema::initialize().unwrap();
+        let ep = crate::telemetry_schema::endpoint("AV_BAY_UNDERGLOW_OWNER");
+        let ack = serialize::pack_packet(
+            &Packet::new(
+                sedsnet::config::DataType::ReliableAck,
+                &[ep],
+                "GS",
+                1,
+                Arc::from(42_u64.to_le_bytes()),
+            )
+            .unwrap(),
+        )
+        .to_vec();
+        let command = serialize::pack_packet(
+            &Packet::new(
+                crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+                &[ep],
+                "GS",
+                2,
+                Arc::from([1_u8]),
+            )
+            .unwrap(),
+        )
+        .to_vec();
+        assert!(is_delivery_receipt(&ack));
+        assert!(!is_delivery_receipt(&command));
+        let budget = TxQueueBudget::new(2048);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut accepted = 0;
+        while budget.try_send(&tx, 255, &ack).is_ok() {
+            accepted += 1;
+        }
+        assert!(accepted > 0);
+        budget
+            .try_send(&tx, 254, &command)
+            .expect("ACK backlog must leave command space");
+        let mut backlog = WireBacklog::new(true);
+        while let Ok((priority, bytes)) = rx.try_recv() {
+            backlog.push(priority, bytes, false);
+        }
+        assert_eq!(backlog.pop(), Some((255, command.clone())));
+        budget.complete(255, &command);
+        let mut delivered = 0;
+        while let Some((priority, bytes)) = backlog.pop() {
+            assert_eq!(bytes, ack);
+            budget.complete(priority, &bytes);
+            delivered += 1;
+        }
+        assert_eq!(delivered, accepted);
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+        assert_eq!(budget.pending_control.load(Ordering::Acquire), 0);
+
+        // Sustained commands must still yield to accepted ACKs and metadata.
+        backlog.push(255, ack.clone(), false);
+        backlog.push(254, b"SDT\x03first".to_vec(), false);
+        backlog.push(254, b"SDT\x03second".to_vec(), false);
+        let mut receipt_seen = false;
+        let mut metadata = Vec::new();
+        for _ in 0..(2 * MAX_CONTROL_BYTES / command.len() + 20) {
+            backlog.push(254, command.clone(), false);
+            let (_, bytes) = backlog.pop().unwrap();
+            receipt_seen |= bytes == ack;
+            if bytes.starts_with(b"SDT") {
+                metadata.push(bytes);
+            }
+            if receipt_seen && metadata.len() == 2 {
+                break;
+            }
+        }
+        assert!(receipt_seen);
+        assert_eq!(
+            metadata,
+            [b"SDT\x03first".to_vec(), b"SDT\x03second".to_vec()]
+        );
+    }
+
+    #[test]
     fn continuous_canonical_controls_cannot_starve_the_stateful_stream() {
         let mut backlog = WireBacklog::new(true);
         backlog.push(254, b"SDT\x03schema".to_vec(), false);
@@ -627,20 +750,33 @@ mod priority_tests {
 
     #[test]
     fn radio_budget_stays_charged_until_write_completion() {
-        let budget = TxQueueBudget::new(2048);
+        crate::telemetry_schema::initialize().unwrap();
+        let frame = serialize::pack_packet(
+            &Packet::new(
+                crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+                &[crate::telemetry_schema::endpoint("AV_BAY_UNDERGLOW_OWNER")],
+                "GS",
+                1,
+                Arc::from([1_u8]),
+            )
+            .unwrap(),
+        )
+        .to_vec();
+        let size = frame.len();
+        let budget = TxQueueBudget::new(2 * size);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        budget.try_send(&tx, 255, &[0; 1024]).unwrap();
-        budget.try_send(&tx, 255, &[1; 1024]).unwrap();
+        budget.try_send(&tx, 255, &frame).unwrap();
+        budget.try_send(&tx, 255, &frame).unwrap();
         let (priority, first) = rx.try_recv().unwrap();
         assert!(matches!(
-            budget.try_send(&tx, 0, &[2; 32]),
+            budget.try_send(&tx, 0, &[2]),
             Err(sedsnet::TelemetryError::Io("side tx busy"))
         ));
         // Moving to a worker backlog or retrying a failed write frees nothing.
-        assert_eq!(budget.pending.load(Ordering::Acquire), 2048);
+        assert_eq!(budget.pending.load(Ordering::Acquire), 2 * size);
         budget.complete(priority, &first);
-        budget.try_send(&tx, 0, &[2; 32]).unwrap();
-        assert_eq!(budget.pending.load(Ordering::Acquire), 1056);
+        budget.try_send(&tx, 0, &[2]).unwrap();
+        assert_eq!(budget.pending.load(Ordering::Acquire), size + 1);
     }
 
     #[test]

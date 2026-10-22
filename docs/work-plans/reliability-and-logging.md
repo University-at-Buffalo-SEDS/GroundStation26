@@ -17,7 +17,7 @@ No hardware is available; use the approved Jupiter simulator workspace.
   Evidence / remaining validation: UI108 passed/7 existing ignored; Wasm build; isolated real-component browser checks at1440/390 widths and screenshots, help/save flows pass. Pushed to UI dev in1e6fc81, followed by89763ec (Tools-only clear action).
 
 - [x] **tools-clear-graphs** (complete): Add existing Clear all graphs/no-history-reseed action to Tools too.
-  Evidence / remaining validation: Same browser run clicks Tools action and verifies persisted history cutoff. Existing toolbar action retained; recording files unaffected. Pushed to UI dev in1e6fc81, followed by89763ec (Tools-only clear action).
+  Evidence / remaining validation: Same browser run clicks Tools action and verifies persisted history cutoff. Standalone toolbar action removed; Tools is the sole graph-clear action; recording files unaffected. Pushed to UI dev in1e6fc81, followed by89763ec (Tools-only clear action).
 
 - [ ] **final-software-audit** (pending): Reconcile earlier completed plan entries against latest changes, verify remaining actual UI controls, sequence/calibration flows, RRLS identity/config/native handover, Ethernet discovery and safety behavior.
   Evidence / remaining validation: Reuse recorded historical acceptance, rerun tests impacted by new settings/logging/network changes. Keep physical device checks and simulator checks distinct.
@@ -447,3 +447,45 @@ characters in the path, concurrent read visibility during an active writer,
 and legacy bundling into an absent output directory. The original first-use
 case fails with SQLite14; a URL-special path independently reproduces the old
 string-URL parsing failure. No second full tile download was started here.
+
+
+## Protected radio admission and FC real-schema rate mapping
+
+C49's time-sliced trace confirms repeated radio-side backpressure for discovery
+and ReliableAck traffic. A canonical-frame negative control fills the shared
+radio control allowance with actual ACKs and refuses a newly requested underglow
+value. GroundStation now leaves up to256 bytes inside the unchanged allowance
+for new commands and services receipts separately from the application FIFO.
+Application bursts remain bounded at256 bytes; total control bursts still yield
+to ordered schema/routing metadata. Accepted frames are retained until successful
+physical writes. The new regression checks command admission/first dispatch,
+all accepted receipts, bounded reverse fairness, metadata order and exact budget
+release.17 focused radio tests pass. Default backend383 tests and HITL369 pass,
+with one pre-existing ignored in each; these include the isolated workspace's
+three test-only calibration-adapter cases. Registry SEDSnet4.2.4 remains the
+native-test dependency and the production requirement remains `4`.
+
+C51, using the same C49 SDK diagnostic source and all seven unchanged hash-verified
+C45 firmware images, passes the original amplifier/startup gate including500ms
+RF managed-value receipt deadlines. C49 failed that gate. This is a startup
+repair, not a claim that sustained gateway drops/reconnects are solved. C53 adds
+the independently built FC rate-map candidate and runs startup followed by the
+unchanged120-second pressure/P6 gate; long qualification is conditional.
+
+FC's obsolete numeric rate map is replaced by13 bounded slots keyed by the
+actual SEDS_DT constants. The original implementation fails the actual-ID test;
+175 tests now pass, including byte-preserving nonallocating simulator publication
+observations. Sharing repeated barometer initialization diagnostic formatting
+recovers flash without removing errors, observations, features or partitions.
+The macOS production factory uses474012/474624 bytes (612 free); Linux simulator
+factory uses474596/474624 (28 free). The unsuccessful shared numeric-publisher
+experiment was reverted. Combined current-source network and SD-card checks
+are still required before release.
+
+Map fixes are pushed separately:37420cb creates missing databases and permits
+concurrent reads;1a314a0 keeps transient transfer retries quiet, emits the final
+underlying cause only on exhaustion, and keeps default concurrency1024. Seven
+map regressions and strict all-target Clippy pass, including deliberately
+truncated response bodies for both storage modes. One reported public tile
+was independently returned as a valid11371-byte JPEG; that does not establish
+which side caused the operator's intermittent transfers.
