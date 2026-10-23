@@ -760,3 +760,56 @@ which side caused the operator's intermittent transfers.
   GS/RRLS runtime synchronization and conflict UI; complete browser-source/repo
   organization and platform/feature audits; promote owned sources and perform
   qualified releases. No hardware changes or public firmware release occurred.
+
+
+### C89–C90 delivery and paired-calibration runtime checkpoint (2026-10-23)
+
+- C88 eliminates measured CAN ring/FIFO overflow, but fails original loadcell
+  preservation windows, with a minimum96.18% delivery. All three SD inspections
+  pass. The source/network failure remains a failure; gates are unchanged.
+- C89 borrows discovery-master graph names and reuses indexed BFS workspaces.
+  An old-algorithm reference matches240 partial/disconnected/asymmetric/duplicate/
+  self-loop graph cases. The full-topology response fixture falls from1417 to217
+  allocations and20056 to15382 peak native bytes. Heap544/compact551 unit tests,
+  full40-suite integrations per store, minimal191/198 and strict feature checks
+  pass. macOS FC production471428/474624 bytes and simulator471912 bytes both fit.
+  Immutable SDK89 SHA256:
+  cbb3bd7aeeb6a9af3b8072c43f587f6d88aa6065d4a14c7805135beb2d41410c.
+- C89 startup passes but two short-test loadcell windows narrowly fail99.5%
+  preservation. Its three SD inspections pass and CAN ring/FIFO drops remain
+  zero. It does not qualify for restart or a long soak.
+- C90 changes only gateway packet storage from compact to heap; SDK89, all
+  other firmware images, host/engine, clocks, limits, rates and gates are fixed.
+  The compact arena is allocated from TLSF; selecting heap releases that fixed
+  arena/handle reservation for general network allocations. No RAM limit grows.
+  Original startup and120-second network/source gates now pass, as do DAQ
+  pressure/raw and FC SD inspections. Loadcell windows preserve99.9584–100% of
+  published samples; whole-run CAN ring/FIFO drops and gateway CAN admission
+  failures are zero. This is a network-preservation result, not a physical ADC
+  rate or card qualification. The original GS-restart regression is running;
+  only success permits the600-second soak. No long-soak pass is claimed.
+- The exact path remains Pi main Ethernet UDP discovery/framed TCP to the
+  gateway-side Pico-Fi at1Mbaud, with no Pi-side Pico/I2C. The simulator engine
+  is unchanged C51; no physical hardware or production service was touched.
+- The isolated paired-calibration runtime now connects signed causal history
+  to the real mesh scheduler and typed calibration adapter. Durable save/CAS,
+  bounded low-priority256B/s envelopes, offline concurrent edits, checkpoint
+  failures, restart and explicit conflict resolution are covered. Calibration
+  waits for Idle and cleared qualification; HITL does not start the worker.
+  No imported calibration grants self-test/nitrogen evidence or clears abort.
+- Staged backend tests pass398 default,399 test-fire and384 HITL tests, with one
+  existing ignored test each. Frontend tests pass117 with seven existing
+  ignored tests; strict native/Wasm frontend Clippy passes. A real compiled
+  Wasm browser fixture verifies320/390/844/1440 layouts,44px controls, details/
+  Escape, exact reviewed-head resolution, stale-choice rejection without retry,
+  deferred apply, transient error recovery and read-only access. The conflict
+  interface is in Settings. This is not a deployed paired-sync claim; final
+  paired firmware-simulator acceptance and promotion remain required. Other
+  mission settings/checklists are not yet added to this synchronization adapter.
+- Local source/hash/test checkpoint:
+  /tmp/gs-mission-runtime-qualified-checkpoint.json and its source-only archive.
+  SDK/Python package validation is being refreshed for exact SDK89. Remaining
+  work includes the original restart/600-second gates, paired full-system tests,
+  frontend-source ownership/repository organization, final platform audit,
+  safe owned-source promotion and qualified releases. Root user-owned settings
+  and the earlier prototype remain untouched.
