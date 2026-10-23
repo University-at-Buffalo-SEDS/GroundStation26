@@ -57,6 +57,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use legacy flow: download into tiles directory before bundling.",
     )
+    parser.add_argument(
+        "--direct-interface", nargs="?", const="auto", default=None, metavar="auto|NAME",
+        help="Bind map HTTP sockets to a physical interface (auto if omitted), bypassing VPN/proxy; fall back to normal networking if unavailable. Does not change network configuration.",
+    )
+    parser.add_argument(
+        "--min-free-mib", type=int, default=None,
+        help="Keep at least this much disk space free during bundle download (default: 2048 MiB).",
+    )
     return parser.parse_args()
 
 
@@ -70,6 +78,16 @@ def main() -> None:
     if args.direct_to_db and args.no_bundle:
         print("Error: --direct-to-db requires bundle generation (remove --no-bundle).", file=sys.stderr)
         sys.exit(2)
+
+    if args.direct_interface is not None:
+        env["MAP_DIRECT_INTERFACE"] = args.direct_interface
+        print(f"Direct map interface requested: {args.direct_interface}")
+
+    if args.min_free_mib is not None:
+        if args.min_free_mib < 0:
+            print("Error: --min-free-mib must be nonnegative.", file=sys.stderr)
+            sys.exit(2)
+        env["MAP_MIN_FREE_MIB"] = str(args.min_free_mib)
 
     if args.max_concurrent is not None:
         env["MAP_MAX_CONCURRENT"] = str(args.max_concurrent)

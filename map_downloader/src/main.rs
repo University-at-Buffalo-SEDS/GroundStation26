@@ -1,5 +1,7 @@
 mod dns;
 mod limits;
+mod network;
+mod storage;
 
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
@@ -9,6 +11,8 @@ use anyhow::{Context, Result};
 use blake3::Hasher;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use network::TileClient;
+#[cfg(test)]
 use reqwest::Client;
 use sqlx::{
     SqlitePool,
@@ -71,6 +75,35 @@ fn retry_backoff_ms(attempt: u32, z: u32, x: u32, y: u32) -> u64 {
     (base_ms + jitter_ms).min(8_000)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TileOutcome {
+    Complete,
+    Unavailable,
+    Exhausted,
+    Permanent,
+}
+
+fn sane_eta(done: u64, total: u64, elapsed_s: f64) -> String {
+    let remaining = total.saturating_sub(done);
+    if remaining == 0 {
+        return "0s".to_owned();
+    }
+    if done == 0 || !elapsed_s.is_finite() || elapsed_s <= 0.0 {
+        return "--".to_owned();
+    }
+    let seconds = remaining as f64 * (elapsed_s / done as f64);
+    if !seconds.is_finite() || seconds < 0.0 || seconds > 366.0 * 86400.0 {
+        return "--".to_owned();
+    }
+    let seconds = seconds.ceil() as u64;
+    format!(
+        "{}h{:02}m{:02}s",
+        seconds / 3600,
+        (seconds / 60) % 60,
+        seconds % 60
+    )
+}
+
 fn log_progress_error(pb: Option<&ProgressBar>, msg: String) {
     if let Some(pb) = pb {
         pb.println(msg);
@@ -85,19 +118,19 @@ async fn fetch_tile_with_retries(
     x: u32,
     y: u32,
     z_dir: &Path,
-    client: &Client,
+    client: &TileClient,
     bytes_downloaded: &Arc<AtomicU64>,
     pb: Option<&ProgressBar>,
     limiter: Option<&Arc<BandwidthLimiter>>,
     max_attempts: u32,
     base_url: &str,
-) -> bool {
+) -> TileOutcome {
     let tile_path = z_dir.join(format!("{x}/{y}.{TILE_EXT}"));
     let part_path = tile_path.with_extension(format!("{}.part", TILE_EXT));
 
     // Skip if final tile already exists
     if async_fs::try_exists(&tile_path).await.unwrap_or(false) {
-        return true;
+        return TileOutcome::Complete;
     }
 
     // Remove any leftover .part file
@@ -112,27 +145,35 @@ async fn fetch_tile_with_retries(
         attempts += 1;
         // Transient failures stay quiet. Keep the final cause for one useful
         // report only if this tile exhausts its bounded retry allowance.
-        let failure = match client.get(&url).send().await {
+        let failure = match client.send(&url).await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
-                    match resp.bytes().await {
+                    match network::tile_body(resp).await {
                         Ok(bytes) => {
                             if let Some(lim) = limiter {
                                 lim.throttle_bytes(bytes.len()).await;
                             }
                             bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                             match write_tile_atomic_async(&tile_path, &bytes).await {
-                                Ok(()) => return true,
+                                Ok(()) => return TileOutcome::Complete,
                                 Err(error) => format!("saving tile: {error:#}"),
                             }
                         }
                         Err(error) => {
-                            format!("reading response body: {:#}", anyhow::Error::new(error))
+                            if error.is::<network::OversizedTile>() {
+                                log_progress_error(
+                                    pb,
+                                    format!("tile z={z},x={x},y={y} exceeds512KiB; not retried"),
+                                );
+                                return TileOutcome::Permanent;
+                            }
+                            client.direct_failed();
+                            format!("reading response body: {error:#}")
                         }
                     }
                 } else if status.as_u16() == 404 {
-                    return true;
+                    return TileOutcome::Unavailable;
                 } else if status.is_client_error() && status.as_u16() != 429 {
                     log_progress_error(
                         pb,
@@ -141,7 +182,7 @@ async fn fetch_tile_with_retries(
                             status.as_u16()
                         ),
                     );
-                    return true;
+                    return TileOutcome::Permanent;
                 } else {
                     format!("HTTP {status}")
                 }
@@ -155,7 +196,7 @@ async fn fetch_tile_with_retries(
                     "fetch_satellite_tiles_async: giving up on tile z={z}, x={x}, y={y} after {attempts} attempts: {failure}"
                 ),
             );
-            return false;
+            return TileOutcome::Exhausted;
         }
         sleep(Duration::from_millis(retry_backoff_ms(attempts, z, x, y))).await;
     }
@@ -502,15 +543,41 @@ async fn init_direct_bundle_pool(bundle_path: &Path, resume: bool) -> Result<Sql
     Ok(pool)
 }
 
-async fn finalize_direct_bundle_pool(pool: &SqlitePool, run_vacuum: bool) -> Result<()> {
+async fn finalize_direct_bundle_pool(pool: &SqlitePool) -> Result<()> {
     sqlx::query("ANALYZE;").execute(pool).await?;
     sqlx::query("PRAGMA optimize;").execute(pool).await?;
-    if run_vacuum {
-        sqlx::query("VACUUM;").execute(pool).await?;
+    // Append-only downloads need no full-size VACUUM copy. Release WAL space.
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn remove_saved_coords(
+    pool: &SqlitePool,
+    z: u32,
+    pending: &mut HashSet<(u32, u32)>,
+) -> Result<()> {
+    use futures::TryStreamExt;
+    let mut rows = sqlx::query("SELECT x,y FROM tiles WHERE z=?")
+        .bind(i64::from(z))
+        .fetch(pool);
+    while let Some(row) = rows
+        .try_next()
+        .await
+        .context("resume scan failed; saved tiles retained")?
+    {
+        use sqlx::Row;
+        let x: i64 = row.try_get("x")?;
+        let y: i64 = row.try_get("y")?;
+        if let (Ok(x), Ok(y)) = (u32::try_from(x), u32::try_from(y)) {
+            pending.remove(&(x, y));
+        }
     }
     Ok(())
 }
 
+#[cfg(test)]
 async fn bundle_has_tile(pool: &SqlitePool, z: u32, x: u32, y: u32) -> Result<bool> {
     let present: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM tiles WHERE z = ? AND x = ? AND y = ? LIMIT 1")
@@ -522,6 +589,7 @@ async fn bundle_has_tile(pool: &SqlitePool, z: u32, x: u32, y: u32) -> Result<bo
     Ok(present.is_some())
 }
 
+#[cfg(test)]
 async fn upsert_tile_to_bundle(
     pool: &SqlitePool,
     z: u32,
@@ -623,10 +691,7 @@ async fn main() -> Result<()> {
     }
 
     // Async HTTP client
-    let client = Client::builder()
-        .user_agent("GroundStationOfflineTileFetcher/0.1")
-        .dns_resolver(dns::CachedResolver::system())
-        .build()?;
+    let client = TileClient::configured(&format!("{SATELLITE_BASE_URL}/0/0/0")).await?;
 
     if direct_to_bundle {
         if !should_build_bundle() {
@@ -636,19 +701,17 @@ async fn main() -> Result<()> {
         } else {
             let bundle_path = bundle_path_for(&data_dir);
             let resume = should_resume_bundle();
-            let existing_bundle = bundle_path.exists();
             let pool = init_direct_bundle_pool(&bundle_path, resume).await?;
             for z in MIN_ZOOM..=max_zoom {
                 if z != MIN_ZOOM {
                     println!();
                     println!("----");
                 }
-                if fetch_tiles_for_zoom_async_to_db(z, &pool, &client)
+                fetch_tiles_for_zoom_async_to_db(z, &pool, &client)
                     .await
-                    .is_err()
-                {}
+                    .map_err(|error| anyhow::anyhow!("map zoom {z} failed: {error}"))?;
             }
-            if let Err(e) = finalize_direct_bundle_pool(&pool, !resume || !existing_bundle).await {
+            if let Err(e) = finalize_direct_bundle_pool(&pool).await {
                 eprintln!(
                     "WARNING: failed finalizing tile bundle {}: {e:#}",
                     bundle_path.display()
@@ -676,10 +739,9 @@ async fn main() -> Result<()> {
                 println!();
                 println!("----");
             }
-            if fetch_tiles_for_zoom_async(z, &tiles_root, &client)
+            fetch_tiles_for_zoom_async(z, &tiles_root, &client)
                 .await
-                .is_err()
-            {}
+                .map_err(|error| anyhow::anyhow!("map zoom {z} failed: {error}"))?;
         }
 
         if should_build_bundle() {
@@ -720,7 +782,7 @@ async fn main() -> Result<()> {
 async fn fetch_tiles_for_zoom_async(
     z: u32,
     tiles_root: &Path,
-    client: &Client,
+    client: &TileClient,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bounds = if z <= BASE_COVERAGE_MAX_ZOOM {
         vec![NA_BOUNDS]
@@ -777,12 +839,10 @@ async fn fetch_tiles_for_zoom_async(
     let pb = if is_tty {
         let pb = ProgressBar::new(total);
         pb.set_style(
-            ProgressStyle::with_template(
-                &format!(
-                    "z={z} [{{bar:40.cyan/blue}}] {{percent:>3}}% ETA {{eta_precise}} {{msg}} ({{pos}}/{{len}})"
-                ),
-            )?
-                .progress_chars("=> "),
+            ProgressStyle::with_template(&format!(
+                "z={z} [{{bar:40.cyan/blue}}] {{percent:>3}}% {{msg}} ({{pos}}/{{len}})"
+            ))?
+            .progress_chars("=> "),
         );
         pb.set_draw_target(ProgressDrawTarget::stdout_with_hz(10));
         pb.set_message("0.00 MiB/s");
@@ -813,18 +873,13 @@ async fn fetch_tiles_for_zoom_async(
 
             if let Some(pb) = &pb_for_rate {
                 pb.set_position(done);
-                pb.set_message(format!("{mib_per_s:.2} MiB/s"));
+                pb.set_message(format!(
+                    "ETA {} {mib_per_s:.2} MiB/s",
+                    sane_eta(done, total, elapsed_s)
+                ));
             } else if bucket != last_bucket || done == total {
-                let eta_secs = if done == 0 {
-                    0
-                } else {
-                    (((total - done) as f64) / ((done as f64) / elapsed_s)).max(0.0) as u64
-                };
-                let eta_m = eta_secs / 60;
-                let eta_s = eta_secs % 60;
-                println!(
-                    "z={z} {pct}% ETA {eta_m}m{eta_s:02}s {mib_per_s:.2} MiB/s ({done}/{total})"
-                );
+                let eta = sane_eta(done, total, elapsed_s);
+                println!("z={z} {pct}% ETA {eta} {mib_per_s:.2} MiB/s ({done}/{total})");
                 last_bucket = bucket;
             }
 
@@ -840,6 +895,10 @@ async fn fetch_tiles_for_zoom_async(
     let limiter_for_workers = bandwidth_limiter.clone();
     let failed_coords = Arc::new(AsyncMutex::new(Vec::<(u32, u32)>::new()));
     let failed_coords_for_workers = failed_coords.clone();
+    let permanent_failed = Arc::new(AtomicU64::new(0));
+    let permanent_for_workers = permanent_failed.clone();
+    let unavailable = Arc::new(AtomicU64::new(0));
+    let unavailable_for_workers = unavailable.clone();
     // Build an async stream of all coordinate tasks
     stream::iter(coords)
         .for_each_concurrent(max_concurrent, move |(x, y)| {
@@ -850,6 +909,8 @@ async fn fetch_tiles_for_zoom_async(
             let pb_for_worker = pb_for_workers.clone();
             let limiter_for_worker = limiter_for_workers.clone();
             let failed_coords = failed_coords_for_workers.clone();
+            let permanent_failed = permanent_for_workers.clone();
+            let unavailable = unavailable_for_workers.clone();
 
             async move {
                 let ok = fetch_tile_with_retries(
@@ -865,10 +926,19 @@ async fn fetch_tiles_for_zoom_async(
                     SATELLITE_BASE_URL,
                 )
                 .await;
-                if !ok {
-                    failed_coords.lock().await.push((x, y));
+                match ok {
+                    TileOutcome::Complete => {
+                        done_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    TileOutcome::Unavailable => {
+                        unavailable.fetch_add(1, Ordering::Relaxed);
+                        done_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    TileOutcome::Exhausted => failed_coords.lock().await.push((x, y)),
+                    TileOutcome::Permanent => {
+                        permanent_failed.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-                done_count.fetch_add(1, Ordering::Relaxed);
             }
         })
         .await;
@@ -877,6 +947,7 @@ async fn fetch_tiles_for_zoom_async(
         let mut failed = failed_coords.lock().await;
         std::mem::take(&mut *failed)
     };
+    let mut terminal_failed = 0;
     if !retry_coords.is_empty() {
         log_progress_error(
             pb.as_ref(),
@@ -888,6 +959,9 @@ async fn fetch_tiles_for_zoom_async(
 
         let retry_failures = Arc::new(AsyncMutex::new(Vec::<(u32, u32)>::new()));
         let retry_failures_workers = retry_failures.clone();
+        let done_retry = done_count.clone();
+        let permanent_retry = permanent_failed.clone();
+        let unavailable_retry = unavailable.clone();
         let z_dir_retry = z_dir.clone();
         let client_retry = client.clone();
         let bytes_retry = bytes_downloaded.clone();
@@ -901,6 +975,9 @@ async fn fetch_tiles_for_zoom_async(
                 let pb = pb_retry.clone();
                 let limiter = limiter_retry.clone();
                 let retry_failures = retry_failures_workers.clone();
+                let done_count = done_retry.clone();
+                let permanent_failed = permanent_retry.clone();
+                let unavailable = unavailable_retry.clone();
                 async move {
                     let ok = fetch_tile_with_retries(
                         z,
@@ -915,14 +992,25 @@ async fn fetch_tiles_for_zoom_async(
                         SATELLITE_BASE_URL,
                     )
                     .await;
-                    if !ok {
-                        retry_failures.lock().await.push((x, y));
+                    match ok {
+                        TileOutcome::Complete => {
+                            done_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        TileOutcome::Unavailable => {
+                            unavailable.fetch_add(1, Ordering::Relaxed);
+                            done_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        TileOutcome::Exhausted => retry_failures.lock().await.push((x, y)),
+                        TileOutcome::Permanent => {
+                            permanent_failed.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             })
             .await;
 
         let final_failed_count = retry_failures.lock().await.len();
+        terminal_failed = final_failed_count;
         if final_failed_count > 0 {
             log_progress_error(
                 pb.as_ref(),
@@ -931,19 +1019,28 @@ async fn fetch_tiles_for_zoom_async(
         }
     }
 
-    done_count.store(total, Ordering::Relaxed);
+    terminal_failed += permanent_failed.load(Ordering::Relaxed) as usize;
     stop_rate_updater.store(true, Ordering::Relaxed);
     let _ = rate_updater.await;
+    if terminal_failed != 0 {
+        return Err(anyhow::anyhow!(
+            "{terminal_failed} tiles unresolved (permanent responses or exhausted retries); rerun to resume"
+        )
+        .into());
+    }
     let elapsed_s = start.elapsed().as_secs_f64().max(0.001);
     let bytes = bytes_downloaded.load(Ordering::Relaxed) as f64;
     let avg_mib_per_s = (bytes / elapsed_s) / (1024.0 * 1024.0);
     if let Some(pb) = pb {
         pb.finish_and_clear();
-        println!(
-            "z={z} done: {total} tiles in {:.1}s at {:.2} MiB/s",
-            elapsed_s, avg_mib_per_s
-        );
     }
+    let unavailable = unavailable.load(Ordering::Relaxed);
+    let available = done_count
+        .load(Ordering::Relaxed)
+        .saturating_sub(unavailable);
+    println!(
+        "z={z} complete: {available} available, {unavailable} unavailable in {elapsed_s:.1}s at {avg_mib_per_s:.2} MiB/s"
+    );
     Ok(())
 }
 
@@ -967,55 +1064,53 @@ async fn fetch_tile_with_retries_to_db(
     z: u32,
     x: u32,
     y: u32,
-    client: &Client,
-    pool: &SqlitePool,
+    client: &TileClient,
+    writer: &storage::BundleWriter,
     bytes_downloaded: &Arc<AtomicU64>,
     pb: Option<&ProgressBar>,
     limiter: Option<&Arc<BandwidthLimiter>>,
     max_attempts: u32,
     base_url: &str,
-) -> bool {
-    match bundle_has_tile(pool, z, x, y).await {
-        Ok(true) => return true,
-        Ok(false) => {}
-        Err(e) => {
-            log_progress_error(
-                pb,
-                format!(
-                    "fetch_satellite_tiles_async: bundle precheck failed for tile z={z}, x={x}, y={y}: {e}"
-                ),
-            );
-        }
-    }
-
+) -> TileOutcome {
     let url = format!("{base}/{z}/{y}/{x}", base = base_url, z = z, y = y, x = x,);
 
     let mut attempts: u32 = 0;
     loop {
+        if writer.failed() {
+            return TileOutcome::Exhausted;
+        }
         attempts += 1;
         // Transient failures stay quiet. Keep the final cause for one useful
         // report only if this tile exhausts its bounded retry allowance.
-        let failure = match client.get(&url).send().await {
+        let failure = match client.send(&url).await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
-                    match resp.bytes().await {
+                    match network::tile_body(resp).await {
                         Ok(bytes) => {
                             if let Some(lim) = limiter {
                                 lim.throttle_bytes(bytes.len()).await;
                             }
                             bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                            match upsert_tile_to_bundle(pool, z, x, y, &bytes).await {
-                                Ok(()) => return true,
-                                Err(error) => format!("saving tile: {error:#}"),
+                            match writer.save(z, x, y, &bytes).await {
+                                Ok(()) => return TileOutcome::Complete,
+                                Err(_) => return TileOutcome::Exhausted,
                             }
                         }
                         Err(error) => {
-                            format!("reading response body: {:#}", anyhow::Error::new(error))
+                            if error.is::<network::OversizedTile>() {
+                                log_progress_error(
+                                    pb,
+                                    format!("tile z={z},x={x},y={y} exceeds512KiB; not retried"),
+                                );
+                                return TileOutcome::Permanent;
+                            }
+                            client.direct_failed();
+                            format!("reading response body: {error:#}")
                         }
                     }
                 } else if status.as_u16() == 404 {
-                    return true;
+                    return TileOutcome::Unavailable;
                 } else if status.is_client_error() && status.as_u16() != 429 {
                     log_progress_error(
                         pb,
@@ -1024,7 +1119,7 @@ async fn fetch_tile_with_retries_to_db(
                             status.as_u16()
                         ),
                     );
-                    return true;
+                    return TileOutcome::Permanent;
                 } else {
                     format!("HTTP {status}")
                 }
@@ -1038,7 +1133,7 @@ async fn fetch_tile_with_retries_to_db(
                     "fetch_satellite_tiles_async: giving up on tile z={z}, x={x}, y={y} after {attempts} attempts: {failure}"
                 ),
             );
-            return false;
+            return TileOutcome::Exhausted;
         }
         sleep(Duration::from_millis(retry_backoff_ms(attempts, z, x, y))).await;
     }
@@ -1047,7 +1142,7 @@ async fn fetch_tile_with_retries_to_db(
 async fn fetch_tiles_for_zoom_async_to_db(
     z: u32,
     pool: &SqlitePool,
-    client: &Client,
+    client: &TileClient,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bounds = if z <= BASE_COVERAGE_MAX_ZOOM {
         vec![NA_BOUNDS]
@@ -1064,6 +1159,16 @@ async fn fetch_tiles_for_zoom_async_to_db(
             }
         }
     }
+    let requested = coord_set.len();
+    remove_saved_coords(pool, z, &mut coord_set).await?;
+    let skipped = requested - coord_set.len();
+    println!(
+        "z={z}: resumed {skipped} saved tiles; {} remaining",
+        coord_set.len()
+    );
+    if coord_set.is_empty() {
+        return Ok(());
+    }
     let mut coords: Vec<(u32, u32)> = coord_set.into_iter().collect();
     coords.sort_unstable();
     let (x_start, x_end, y_start, y_end) = bounds_tile_extent(&coords);
@@ -1074,6 +1179,15 @@ async fn fetch_tiles_for_zoom_async_to_db(
     );
     let is_tty = std::io::stdout().is_terminal();
 
+    let directory = pool
+        .connect_options()
+        .get_filename()
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let reserve = storage::minimum_free_bytes()?;
+    storage::ensure_space(&directory, reserve.saturating_add(16 * 1024 * 1024))?;
+
     let start = std::time::Instant::now();
     let done_count = Arc::new(AtomicU64::new(0));
     let bytes_downloaded = Arc::new(AtomicU64::new(0));
@@ -1081,12 +1195,10 @@ async fn fetch_tiles_for_zoom_async_to_db(
     let pb = if is_tty {
         let pb = ProgressBar::new(total);
         pb.set_style(
-            ProgressStyle::with_template(
-                &format!(
-                    "z={z} [{{bar:40.green/blue}}] {{percent:>3}}% ETA {{eta_precise}} {{msg}} ({{pos}}/{{len}})"
-                ),
-            )?
-                .progress_chars("=> "),
+            ProgressStyle::with_template(&format!(
+                "z={z} [{{bar:40.green/blue}}] {{percent:>3}}% {{msg}} ({{pos}}/{{len}})"
+            ))?
+            .progress_chars("=> "),
         );
         pb.set_draw_target(ProgressDrawTarget::stdout_with_hz(10));
         pb.set_message("0.00 MiB/s");
@@ -1116,48 +1228,52 @@ async fn fetch_tiles_for_zoom_async_to_db(
             let bucket = (pct / PROGRESS_PERCENT_STEP) as i64;
             if let Some(pb) = &pb_for_rate {
                 pb.set_position(done);
-                pb.set_message(format!("{mib_per_s:.2} MiB/s"));
+                pb.set_message(format!(
+                    "ETA {} {mib_per_s:.2} MiB/s",
+                    sane_eta(done, total, elapsed_s)
+                ));
             } else if bucket != last_bucket || done == total {
-                let eta_secs = if done == 0 {
-                    0
-                } else {
-                    (((total - done) as f64) / ((done as f64) / elapsed_s)).max(0.0) as u64
-                };
-                let eta_m = eta_secs / 60;
-                let eta_s = eta_secs % 60;
-                println!(
-                    "z={z} {pct}% ETA {eta_m}m{eta_s:02}s {mib_per_s:.2} MiB/s ({done}/{total})"
-                );
+                let eta = sane_eta(done, total, elapsed_s);
+                println!("z={z} {pct}% ETA {eta} {mib_per_s:.2} MiB/s ({done}/{total})");
                 last_bucket = bucket;
             }
             sleep(Duration::from_millis(400)).await;
         }
     });
 
+    let (writer, writer_task) = storage::spawn(pool.clone(), directory, reserve);
     let client_arc = client.clone();
-    let pool_arc = pool.clone();
+    let writer_arc = writer.clone();
+    let writer_for_admission = writer.clone();
     let done_count_clone = done_count.clone();
     let bytes_downloaded_clone = bytes_downloaded.clone();
     let pb_for_workers = pb.clone();
     let limiter_for_workers = bandwidth_limiter.clone();
     let failed_coords = Arc::new(AsyncMutex::new(Vec::<(u32, u32)>::new()));
     let failed_coords_for_workers = failed_coords.clone();
+    let permanent_failed = Arc::new(AtomicU64::new(0));
+    let permanent_for_workers = permanent_failed.clone();
+    let unavailable = Arc::new(AtomicU64::new(0));
+    let unavailable_for_workers = unavailable.clone();
     stream::iter(coords)
+        .take_while(move |_| futures::future::ready(!writer_for_admission.failed()))
         .for_each_concurrent(max_concurrent, move |(x, y)| {
             let client = client_arc.clone();
-            let pool = pool_arc.clone();
+            let writer = writer_arc.clone();
             let done_count = done_count_clone.clone();
             let bytes_downloaded = bytes_downloaded_clone.clone();
             let pb_for_worker = pb_for_workers.clone();
             let limiter_for_worker = limiter_for_workers.clone();
             let failed_coords = failed_coords_for_workers.clone();
+            let permanent_failed = permanent_for_workers.clone();
+            let unavailable = unavailable_for_workers.clone();
             async move {
                 let ok = fetch_tile_with_retries_to_db(
                     z,
                     x,
                     y,
                     &client,
-                    &pool,
+                    &writer,
                     &bytes_downloaded,
                     pb_for_worker.as_ref(),
                     limiter_for_worker.as_ref(),
@@ -1165,10 +1281,19 @@ async fn fetch_tiles_for_zoom_async_to_db(
                     SATELLITE_BASE_URL,
                 )
                 .await;
-                if !ok {
-                    failed_coords.lock().await.push((x, y));
+                match ok {
+                    TileOutcome::Complete => {
+                        done_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    TileOutcome::Unavailable => {
+                        unavailable.fetch_add(1, Ordering::Relaxed);
+                        done_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    TileOutcome::Exhausted => failed_coords.lock().await.push((x, y)),
+                    TileOutcome::Permanent => {
+                        permanent_failed.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-                done_count.fetch_add(1, Ordering::Relaxed);
             }
         })
         .await;
@@ -1177,7 +1302,8 @@ async fn fetch_tiles_for_zoom_async_to_db(
         let mut failed = failed_coords.lock().await;
         std::mem::take(&mut *failed)
     };
-    if !retry_coords.is_empty() {
+    let mut terminal_failed = 0;
+    if !retry_coords.is_empty() && !writer.failed() {
         log_progress_error(
             pb.as_ref(),
             format!(
@@ -1187,26 +1313,32 @@ async fn fetch_tiles_for_zoom_async_to_db(
         );
         let retry_failures = Arc::new(AsyncMutex::new(Vec::<(u32, u32)>::new()));
         let retry_failures_workers = retry_failures.clone();
+        let done_retry = done_count.clone();
+        let permanent_retry = permanent_failed.clone();
+        let unavailable_retry = unavailable.clone();
         let client_retry = client.clone();
-        let pool_retry = pool.clone();
+        let writer_retry = writer.clone();
         let bytes_retry = bytes_downloaded.clone();
         let pb_retry = pb.clone();
         let limiter_retry = bandwidth_limiter.clone();
         stream::iter(retry_coords)
             .for_each_concurrent(max_concurrent, move |(x, y)| {
                 let client = client_retry.clone();
-                let pool = pool_retry.clone();
+                let writer = writer_retry.clone();
                 let bytes_downloaded = bytes_retry.clone();
                 let pb = pb_retry.clone();
                 let limiter = limiter_retry.clone();
                 let retry_failures = retry_failures_workers.clone();
+                let done_count = done_retry.clone();
+                let permanent_failed = permanent_retry.clone();
+                let unavailable = unavailable_retry.clone();
                 async move {
                     let ok = fetch_tile_with_retries_to_db(
                         z,
                         x,
                         y,
                         &client,
-                        &pool,
+                        &writer,
                         &bytes_downloaded,
                         pb.as_ref(),
                         limiter.as_ref(),
@@ -1214,13 +1346,24 @@ async fn fetch_tiles_for_zoom_async_to_db(
                         SATELLITE_BASE_URL,
                     )
                     .await;
-                    if !ok {
-                        retry_failures.lock().await.push((x, y));
+                    match ok {
+                        TileOutcome::Complete => {
+                            done_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        TileOutcome::Unavailable => {
+                            unavailable.fetch_add(1, Ordering::Relaxed);
+                            done_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        TileOutcome::Exhausted => retry_failures.lock().await.push((x, y)),
+                        TileOutcome::Permanent => {
+                            permanent_failed.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             })
             .await;
         let final_failed_count = retry_failures.lock().await.len();
+        terminal_failed = final_failed_count;
         if final_failed_count > 0 {
             log_progress_error(
                 pb.as_ref(),
@@ -1229,19 +1372,36 @@ async fn fetch_tiles_for_zoom_async_to_db(
         }
     }
 
-    done_count.store(total, Ordering::Relaxed);
+    terminal_failed += permanent_failed.load(Ordering::Relaxed) as usize;
     stop_rate_updater.store(true, Ordering::Relaxed);
     let _ = rate_updater.await;
+    let writer_failure = writer.failure();
+    drop(writer);
+    writer_task.await?;
+    if let Some(error) = writer_failure {
+        return Err(
+            anyhow::anyhow!("map bundle writer failed; saved tiles retained: {error}").into(),
+        );
+    }
+    if terminal_failed != 0 {
+        return Err(anyhow::anyhow!(
+            "{terminal_failed} tiles unresolved (permanent responses or exhausted retries); rerun to resume"
+        )
+        .into());
+    }
     let elapsed_s = start.elapsed().as_secs_f64().max(0.001);
     let bytes = bytes_downloaded.load(Ordering::Relaxed) as f64;
     let avg_mib_per_s = (bytes / elapsed_s) / (1024.0 * 1024.0);
     if let Some(pb) = pb {
         pb.finish_and_clear();
-        println!(
-            "z={z} done: {total} tiles in {:.1}s at {:.2} MiB/s",
-            elapsed_s, avg_mib_per_s
-        );
     }
+    let unavailable = unavailable.load(Ordering::Relaxed);
+    let available = done_count
+        .load(Ordering::Relaxed)
+        .saturating_sub(unavailable);
+    println!(
+        "z={z} complete: {available} available, {unavailable} unavailable in {elapsed_s:.1}s at {avg_mib_per_s:.2} MiB/s"
+    );
     Ok(())
 }
 
@@ -1424,21 +1584,24 @@ mod tile_retry_tests {
         fs::create_dir_all(root.join("0/0")).unwrap();
         let failures = if recover { 1 } else { 2 };
         let (base, thread) = server(failures, recover);
-        let client = Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
+        let client = TileClient::from(
+            Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+        );
         let bytes = Arc::new(AtomicU64::new(0));
         if direct {
             let pool = init_direct_bundle_pool(&root.join("tiles.sqlite3"), true)
                 .await
                 .unwrap();
+            let (writer, writer_task) = storage::spawn(pool.clone(), root.clone(), 0);
             let result = fetch_tile_with_retries_to_db(
-                0, 0, 0, &client, &pool, &bytes, None, None, 2, &base,
+                0, 0, 0, &client, &writer, &bytes, None, None, 2, &base,
             )
             .await;
-            assert_eq!(result, recover);
+            assert_eq!(result == TileOutcome::Complete, recover);
             assert_eq!(bundle_has_tile(&pool, 0, 0, 0).await.unwrap(), recover);
             if recover {
                 let saved: Vec<u8> = sqlx::query_scalar("SELECT image FROM tile_blobs")
@@ -1447,6 +1610,8 @@ mod tile_retry_tests {
                     .unwrap();
                 assert_eq!(saved, IMAGE);
             }
+            drop(writer);
+            writer_task.await.unwrap();
             pool.close().await;
         } else {
             let result = fetch_tile_with_retries(
@@ -1462,7 +1627,7 @@ mod tile_retry_tests {
                 &base,
             )
             .await;
-            assert_eq!(result, recover);
+            assert_eq!(result == TileOutcome::Complete, recover);
             assert_eq!(root.join("0/0/0.jpg").exists(), recover);
             if recover {
                 assert_eq!(fs::read(root.join("0/0/0.jpg")).unwrap(), IMAGE);
@@ -1491,5 +1656,200 @@ mod tile_retry_tests {
     #[tokio::test]
     async fn database_exhaustion_reports_final_cause_once() {
         check_retry(true, false).await;
+    }
+}
+
+#[cfg(test)]
+mod map_pipeline_tests {
+    use super::*;
+    #[test]
+    fn eta_handles_stalls_invalid_rates_and_counter_limits() {
+        for (done, total, elapsed) in [
+            (0, 100, 1.0),
+            (1, u64::MAX, f64::MAX),
+            (1, 100, f64::NAN),
+            (1, 100, f64::INFINITY),
+            (1, 100, -1.0),
+        ] {
+            assert_eq!(sane_eta(done, total, elapsed), "--");
+        }
+        assert_eq!(sane_eta(u64::MAX, 1, 1.0), "0s");
+        assert_eq!(sane_eta(10, 100, 10.0), "0h01m30s");
+    }
+    #[tokio::test]
+    async fn resume_scan_then_concurrent_writes_completes_with_one_pool_connection() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(100))
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE tile_blobs(id INTEGER PRIMARY KEY,hash BLOB UNIQUE,image BLOB)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE tiles(z INTEGER,x INTEGER,y INTEGER,blob_id INTEGER,PRIMARY KEY(z,x,y))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        upsert_tile_to_bundle(&pool, 17, 0, 0, b"existing")
+            .await
+            .unwrap();
+        upsert_tile_to_bundle(&pool, 16, 1, 0, b"other zoom")
+            .await
+            .unwrap();
+        let mut pending: HashSet<_> = (0..257).map(|x| (x, 0)).collect();
+        remove_saved_coords(&pool, 17, &mut pending).await.unwrap();
+        assert_eq!(pending.len(), 256);
+        assert!(!pending.contains(&(0, 0)));
+        let (writer, task) = storage::spawn(pool.clone(), std::env::temp_dir(), 0);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            futures::future::join_all(pending.into_iter().map(|(x, y)| {
+                let writer = writer.clone();
+                async move {
+                    writer.save(17, x, y, b"new tile").await.unwrap();
+                }
+            })),
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        task.await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tiles WHERE z=17")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            257
+        );
+        let mut pending = HashSet::from([(999, 0)]);
+        sqlx::query("DROP TABLE tiles")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(remove_saved_coords(&pool, 17, &mut pending).await.is_err());
+        assert_eq!(
+            pending,
+            HashSet::from([(999, 0)]),
+            "failed read must not be treated as a missing-tile scan"
+        );
+    }
+    #[tokio::test]
+    async fn oversized_tile_is_permanent_before_retry_budget_is_consumed() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                network::MAX_TILE_BYTES + 1
+            )
+            .unwrap();
+        });
+        let root = std::env::temp_dir().join(format!("gs-oversized-tile-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let client = TileClient::from(
+            Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+        );
+        let bytes = Arc::new(AtomicU64::new(0));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            fetch_tile_with_retries(
+                0,
+                0,
+                0,
+                &root,
+                &client,
+                &bytes,
+                None,
+                None,
+                40,
+                &format!("http://{addr}"),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, TileOutcome::Permanent);
+        assert_eq!(bytes.load(Ordering::Relaxed), 0);
+        server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn absent_imagery_is_unavailable_without_claiming_a_saved_tile() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0; 1024];
+                let _ = stream.read(&mut request);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+            }
+        });
+        let root = std::env::temp_dir().join(format!("gs-unavailable-tile-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let client = TileClient::from(
+            Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+        );
+        let bytes = Arc::new(AtomicU64::new(0));
+        let url = format!("http://{addr}");
+        assert_eq!(
+            fetch_tile_with_retries(0, 0, 0, &root, &client, &bytes, None, None, 40, &url).await,
+            TileOutcome::Unavailable
+        );
+        assert!(!root.join("0/0.jpg").exists());
+        let pool = init_direct_bundle_pool(&root.join("tiles.sqlite3"), true)
+            .await
+            .unwrap();
+        let (writer, task) = storage::spawn(pool.clone(), root.clone(), 0);
+        assert_eq!(
+            fetch_tile_with_retries_to_db(0, 0, 0, &client, &writer, &bytes, None, None, 40, &url)
+                .await,
+            TileOutcome::Unavailable
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tiles")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        drop(writer);
+        task.await.unwrap();
+        pool.close().await;
+        server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 }
