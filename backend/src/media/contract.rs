@@ -213,7 +213,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
                         (header::CONTENT_TYPE, "text/javascript"),
                         (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
                     ],
-                    include_bytes!("../../assets/model-viewer.min.js").as_slice(),
+                    gs_browser_assets::MODEL_VIEWER_JS,
                 )
             }),
         )
@@ -225,7 +225,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
                         (header::CONTENT_TYPE, "model/gltf-binary"),
                         (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
                     ],
-                    include_bytes!("../../assets/models/gse-site.glb").as_slice(),
+                    gs_browser_assets::GSE_SITE_MODEL,
                 )
             }),
         )
@@ -237,7 +237,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
                         (header::CONTENT_TYPE, "model/gltf-binary"),
                         (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
                     ],
-                    include_bytes!("../../assets/models/vehicle.glb").as_slice(),
+                    gs_browser_assets::VEHICLE_MODEL,
                 )
             }),
         )
@@ -709,12 +709,12 @@ async fn save_vehicle_post(
 
 async fn three_asset(Path(file): Path<String>) -> ApiResult<Response> {
     let bytes: &'static [u8] = match file.as_str() {
-        "vehicle-renderer.js" => include_bytes!("../../assets/three/vehicle-renderer.js"),
-        "software-renderer.js" => include_bytes!("../../assets/three/software-renderer.js"),
-        "three.module.js" => include_bytes!("../../assets/three/three.module.js"),
-        "three.core.js" => include_bytes!("../../assets/three/three.core.js"),
-        "GLTFLoader.js" => include_bytes!("../../assets/three/GLTFLoader.js"),
-        "BufferGeometryUtils.js" => include_bytes!("../../assets/three/BufferGeometryUtils.js"),
+        "vehicle-renderer.js" => gs_browser_assets::VEHICLE_RENDERER_JS,
+        "software-renderer.js" => gs_browser_assets::SOFTWARE_RENDERER_JS,
+        "three.module.js" => gs_browser_assets::THREE_MODULE_JS,
+        "three.core.js" => gs_browser_assets::THREE_CORE_JS,
+        "GLTFLoader.js" => gs_browser_assets::GLTF_LOADER_JS,
+        "BufferGeometryUtils.js" => gs_browser_assets::BUFFER_GEOMETRY_UTILS_JS,
         _ => return Err(error(StatusCode::NOT_FOUND, "Unknown renderer asset")),
     };
     Ok((
@@ -740,7 +740,7 @@ async fn player(
             (header::CACHE_CONTROL, "no-store"),
             (header::REFERRER_POLICY, "no-referrer"),
         ],
-        Html(include_str!("player.html")),
+        Html(gs_browser_assets::PLAYER_HTML),
     )
         .into_response())
 }

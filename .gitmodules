@@ -1,0 +1,4 @@
+[submodule "ui"]
+	path = ui
+	url = https://github.com/Rylan-Meilutis/Seds-Ground-Station-Frontend.git
+	branch = main

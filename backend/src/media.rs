@@ -103,7 +103,10 @@ pub fn router(
                 .layer(DefaultBodyLimit::max(MAX_MODEL)),
         )
         .with_state(state)
-        .route("/media", get(|| async { Html(include_str!("media.html")) }))
+        .route(
+            "/media",
+            get(|| async { Html(gs_browser_assets::MEDIA_HTML) }),
+        )
 }
 
 pub(crate) fn recordings_directory() -> PathBuf {
@@ -486,9 +489,18 @@ mod tests {
         )
         .merge(crate::voice::routes(app.clone(), voice))
         .with_state(app);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:19090")
-            .await
-            .unwrap();
+        let address: std::net::SocketAddr = std::env::var("GS_MEDIA_TEST_BIND")
+            .unwrap_or_else(|_| "127.0.0.1:19090".into())
+            .parse()
+            .expect("synthetic fixture requires a numeric loopback socket address");
+        assert!(
+            address.ip().is_loopback(),
+            "synthetic fixture must remain on loopback"
+        );
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        println!("GS_MEDIA_TEST_LISTEN={}", listener.local_addr().unwrap());
+        use std::io::Write as _;
+        std::io::stdout().flush().unwrap();
         axum::serve(listener, routes).await.unwrap();
     }
 

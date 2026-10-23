@@ -11,7 +11,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
             get(|| async {
                 (
                     [(header::CONTENT_TYPE, "text/javascript")],
-                    include_str!("program-art.js"),
+                    gs_browser_assets::PROGRAM_ART_JS,
                 )
             }),
         )
@@ -22,7 +22,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
             get(|| async {
                 (
                     [(header::CONTENT_TYPE, "text/javascript")],
-                    include_str!("program-audio.js"),
+                    gs_browser_assets::PROGRAM_AUDIO_JS,
                 )
             }),
         )
@@ -34,7 +34,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
             get(|| async {
                 (
                     [(header::CONTENT_TYPE, "text/javascript")],
-                    include_bytes!("../../assets/hls.min.js").as_slice(),
+                    gs_browser_assets::HLS_JS,
                 )
             }),
         )
@@ -50,7 +50,7 @@ async fn page(
             (header::CACHE_CONTROL, "no-store"),
             (header::REFERRER_POLICY, "no-referrer"),
         ],
-        Html(include_str!("program.html")),
+        Html(gs_browser_assets::PROGRAM_HTML),
     )
         .into_response())
 }

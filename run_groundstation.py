@@ -8,6 +8,7 @@ import time
 import platform
 from pathlib import Path
 from backend.build import refresh_sedsnet_dependency
+from build import prepare_browser_asset_source
 
 
 def warn_if_db_sidecars_present(repo_root: Path) -> None:
@@ -158,6 +159,9 @@ def main() -> None:
             frontend_cmd.append("debug")
         print(f"Running: {' '.join(frontend_cmd)} (cwd={repo_root})")
         subprocess.run(frontend_cmd, cwd=repo_root, check=True)
+    # The child WebUI build records the exact station-asset source. Reuse it
+    # here rather than independently fetching a potentially newer frontend.
+    prepare_browser_asset_source(repo_root, frontend_dev=args.frontend_dev, refresh=False)
     try:
         refresh_sedsnet_dependency(repo_root)
         run(cmd, cwd=repo_root)

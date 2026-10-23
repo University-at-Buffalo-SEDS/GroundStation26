@@ -13,7 +13,7 @@ spec.loader.exec_module(launcher)
 
 class LauncherTests(unittest.TestCase):
     def invoke(self,argv,pi=False):
-        with patch.object(sys,"argv",["run_groundstation.py",*argv]),patch.dict(os.environ,{},clear=True),patch.object(launcher,"is_raspberry_pi",return_value=pi),patch.object(launcher.subprocess,"run") as build,patch.object(launcher,"refresh_sedsnet_dependency"),patch.object(launcher,"run") as backend:
+        with patch.object(sys,"argv",["run_groundstation.py",*argv]),patch.dict(os.environ,{},clear=True),patch.object(launcher,"is_raspberry_pi",return_value=pi),patch.object(launcher.subprocess,"run") as build,patch.object(launcher,"refresh_sedsnet_dependency"),patch.object(launcher,"prepare_browser_asset_source"),patch.object(launcher,"run") as backend:
             launcher.main()
             return build,backend,dict(os.environ)
 

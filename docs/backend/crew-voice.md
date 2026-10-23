@@ -117,7 +117,7 @@ Run backend tests and the audio processor tests:
 
 ```sh
 cargo test -p groundstation_backend --no-default-features
-node tests/voice_audio.cjs
+(cd ui && node tests/station-voice_audio.cjs)
 ```
 
 For the optional browser test, start the existing isolated media fixture (no
@@ -133,14 +133,14 @@ cargo test -p groundstation_backend media::tests::serve_synthetic_media -- --ign
 Create an MP4 fixture under
 `/tmp/gs-voice-fixture/recordings/test_camera/2026-09-17_12-00-00-000001.mp4`, wait
 at least five seconds for its modification time to settle, then run
-`node tests/voice_browser.mjs` with Playwright installed. `PLAYWRIGHT_MODULE` can
+`(cd ui && node tests/station-voice_browser.mjs)` with Playwright installed. `PLAYWRIGHT_MODULE` can
 point to its `index.mjs`; `CHROME_BINARY` can select an installed Chrome executable.
 The test uses fake microphones and synthetic fixture sessions. Never run this
 fixture as a production service. Stop the fixture after testing.
 
 
 To check the buffered player independently of a station, install Playwright and
-FFmpeg and run `node tests/program_browser.mjs`. `PLAYWRIGHT_MODULE` and
+FFmpeg and run `(cd ui && node tests/station-program_browser.mjs)`. `PLAYWRIGHT_MODULE` and
 `CHROME_BINARY` select an existing Playwright installation and Chrome binary.
 The test generates temporary H.264/fMP4 segments and intercepts fixture requests;
 it starts no MediaMTX instance or hardware tasks. It checks advancing playback,

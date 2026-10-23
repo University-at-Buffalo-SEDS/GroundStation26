@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import hashlib
+import json
 import multiprocessing as mp
 import os
 import platform
@@ -382,6 +384,74 @@ def _sync_frontend_public_assets(repo_root: Path, checkout_dir: Path) -> None:
             shutil.copy2(favicon, dst_favicon)
 
 
+BROWSER_ASSET_SOURCE_ENV = "GS_FRONTEND_SOURCE_DIR"
+
+
+def _browser_asset_digest(source: Path) -> str:
+    source = source.resolve()
+    manifest_path = source / "station_ui/manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"Selected frontend has no valid station assets: {source}. Update that checkout or rebuild the WebUI.") from error
+    if manifest.get("version") != 1 or not isinstance(manifest.get("exports"), list):
+        raise RuntimeError("Unsupported frontend station asset manifest")
+    exports = manifest["exports"]
+    if not exports or len(exports) > 64:
+        raise RuntimeError("Frontend station asset exports must contain 1–64 entries")
+    digest = hashlib.sha256(manifest_path.read_bytes())
+    for asset in exports:
+        relative = Path(asset["path"])
+        if relative.is_absolute() or any(part in {".", ".."} for part in relative.parts):
+            raise RuntimeError("Frontend station asset paths must be relative")
+        path = (source / relative).resolve()
+        if not path.is_relative_to(source) or not path.is_file():
+            raise RuntimeError("Frontend station asset is missing or outside its checkout")
+        digest.update(str(relative).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _browser_source_receipt(repo_root: Path) -> Path:
+    return repo_root / "frontend/dist/station-source.json"
+
+
+def prepare_browser_asset_source(repo_root: Path, frontend_dev: bool = False, refresh: bool = True) -> Path:
+    explicit = os.environ.get(BROWSER_ASSET_SOURCE_ENV, "").strip()
+    if explicit:
+        source = Path(explicit).expanduser().resolve()
+        _browser_asset_digest(source)
+    elif not refresh and _browser_source_receipt(repo_root).is_file():
+        receipt = json.loads(_browser_source_receipt(repo_root).read_text(encoding="utf-8"))
+        source = Path(receipt["source_dir"]).resolve()
+        if receipt.get("version") != 1 or _browser_asset_digest(source) != receipt.get("asset_digest"):
+            raise RuntimeError("Frontend station assets changed since the WebUI build. Rebuild the WebUI before reusing it.")
+    elif not refresh:
+        source = repo_root / "ui"
+        if not (source / "station_ui/manifest.json").is_file():
+            run(["git", "submodule", "update", "--init", "--", "ui"], cwd=repo_root)
+        _browser_asset_digest(source)
+    else:
+        source = _frontend_checkout_dir()
+        branch = _frontend_branch(frontend_dev)
+        print(f"Frontend source: {FRONTEND_REPO_URL} branch {branch}")
+        _ensure_frontend_checkout(source, branch)
+        _browser_asset_digest(source)
+    source = source.resolve()
+    os.environ[BROWSER_ASSET_SOURCE_ENV] = str(source)
+    return source
+
+
+def _record_browser_asset_source(repo_root: Path, source: Path) -> None:
+    receipt = _browser_source_receipt(repo_root)
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    value = {"version": 1, "source_dir": str(source.resolve()), "asset_digest": _browser_asset_digest(source)}
+    temporary = receipt.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(receipt)
+
+
 def _run_frontend_build(
         repo_root: Path,
         debug_mode: bool,
@@ -389,11 +459,10 @@ def _run_frontend_build(
         use_existing: bool,
         log_file_arg: Optional[str],
         frontend_dev: bool,
+        checkout_dir: Optional[Path] = None,
 ) -> None:
-    checkout_dir = _frontend_checkout_dir()
-    branch = _frontend_branch(frontend_dev)
-    print(f"Frontend source: {FRONTEND_REPO_URL} branch {branch}")
-    _ensure_frontend_checkout(checkout_dir, branch)
+    if checkout_dir is None:
+        checkout_dir = prepare_browser_asset_source(repo_root, frontend_dev, refresh=True)
 
     script = _resolve_external_frontend_script(checkout_dir)
     args = ["frontend_web"]
@@ -411,6 +480,7 @@ def _run_frontend_build(
 
     _run_frontend_script_with_wasm_opt_fallback(script, checkout_dir, args)
     _sync_frontend_public_assets(repo_root, checkout_dir)
+    _record_browser_asset_source(repo_root, checkout_dir)
 
 
 def _backend_script(repo_root: Path) -> Path:
@@ -569,9 +639,12 @@ def main() -> None:
         return
 
     if backend_only:
+        if frontend_dev:
+            raise RuntimeError("backend_only reuses the WebUI. Remove it to build --frontend-dev.")
         if docker_mode:
             print("Error: backend_only cannot be combined with docker mode.", file=sys.stderr)
             print_usage()
+        prepare_browser_asset_source(repo_root, refresh=False)
         _run_script(
             repo_root,
             _backend_script(repo_root),
@@ -615,6 +688,9 @@ def main() -> None:
         log_file_arg=log_file_arg,
     )
 
+    # Resolve one checkout before starting either process. Both backend exports
+    # and the WebUI build read this exact source; children do not fetch again.
+    selected_frontend = prepare_browser_asset_source(repo_root, frontend_dev, refresh=True)
     if in_docker_build():
         print("Sequential build")
         _run_frontend_build(
@@ -624,13 +700,14 @@ def main() -> None:
             use_existing=use_existing,
             log_file_arg=log_file_arg,
             frontend_dev=frontend_dev,
+            checkout_dir=selected_frontend,
         )
         _run_script(repo_root, _backend_script(repo_root), backend_args)
         return
 
     frontend_proc = mp.Process(
         target=_run_frontend_build,
-        args=(repo_root, debug_mode, max_size_mode, use_existing, log_file_arg, frontend_dev),
+        args=(repo_root, debug_mode, max_size_mode, use_existing, log_file_arg, frontend_dev, selected_frontend),
     )
     backend_proc = mp.Process(
         target=_run_script,

@@ -165,13 +165,13 @@ pub fn routes(app: Arc<AppState>, hub: Arc<VoiceHub>) -> Router<Arc<AppState>> {
         .route("/api/voice/ws", get(upgrade))
         .route("/api/voice/status", get(capabilities))
         .with_state(voice_state)
-        .route("/radio", get(|| async { Html(include_str!("voice.html")) }))
+        .route("/radio", get(|| async { Html(gs_browser_assets::VOICE_HTML) }))
         .route(
             "/assets/voice.js",
             get(|| async {
                 (
                     [("Content-Type", "text/javascript")],
-                    include_str!("voice.js"),
+                    gs_browser_assets::VOICE_JS,
                 )
             }),
         )
@@ -180,7 +180,7 @@ pub fn routes(app: Arc<AppState>, hub: Arc<VoiceHub>) -> Router<Arc<AppState>> {
             get(|| async {
                 (
                     [("Content-Type", "text/javascript")],
-                    include_str!("voice-worklet.js"),
+                    gs_browser_assets::VOICE_WORKLET_JS,
                 )
             }),
         )
@@ -189,7 +189,7 @@ pub fn routes(app: Arc<AppState>, hub: Arc<VoiceHub>) -> Router<Arc<AppState>> {
             get(|| async {
                 (
                     [("Content-Type", "text/javascript")],
-                    include_str!("media-login.js"),
+                    gs_browser_assets::MEDIA_LOGIN_JS,
                 )
             }),
         )

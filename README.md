@@ -5,7 +5,7 @@ System and Avionics groups. Voice and recording tools stay embedded in the
 native client. Live viewing uses 2D artwork alongside camera feeds. The 3D rocket
 viewer is reserved for replay of recorded telemetry, with a Canvas2D wireframe
 fallback for devices without WebGL2. Verify both bundled GLB models with
-`node --test tests/software_model_renderer.mjs`. This software test does not
+`(cd ui && node --test tests/station-software_model_renderer.mjs)`. This software test does not
 replace checking performance in the Raspberry Pi native app.
 
 Recorded telemetry can be downloaded in every operating mode from **Data → Data capture · CSV downloads**;
@@ -167,3 +167,17 @@ python3 download_map.py
 This uses the `map_downloader/` crate and writes map data into `data/`.
 
 RRLS recovery receiver/mesh relay: [setup and radio firmware requirements](docs/backend/rrls.md).
+
+
+Browser pages, scripts, rendering assets and their license files live in the
+frontend repository under `station_ui`. The `ui` submodule tracks its main
+branch for direct Cargo builds; initialize it with
+`git submodule update --init ui`.
+
+`build.py` selects one frontend checkout before building the WebUI and backend.
+`--frontend-dev` selects dev for both. The launchers reuse the source recorded
+by the successful WebUI build and reject changed station-asset bytes. For a
+local or source-archive build, set `GS_FRONTEND_SOURCE_DIR` to a frontend checkout
+containing `station_ui/manifest.json`. Backend auth, APIs, MIME types and
+browser URLs are unchanged. See `ui/tests/station-*` for the relocated browser
+and artwork checks.

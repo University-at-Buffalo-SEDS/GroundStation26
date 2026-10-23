@@ -870,3 +870,42 @@ which side caused the operator's intermittent transfers.
   diagnostic overlays, not release source. No retry/cap/source-rate/acceptance
   limits are changed. The original startup/restart and600-second soak gates
   remain required; no firmware release is qualified.
+
+
+### Receipt forwarding repair and frontend ownership (2026-10-23)
+
+- The exact-SDK restart failure was traced to FC ordered receipts exhausting
+  24 retries. GroundStation received the same packet and generated its final
+  receipt 24 times. RF diagnostics captured unrelated DAQ pressure-log receipts
+  arriving over radio. Router and Relay incorrectly treated an original
+  publisher known on the ingress segment as an unknown route, then forwarded
+  the receipt onto the sole other segment. This leaked local CAN receipts into
+  the Ethernet/radio path.
+- The isolated fix preserves exact return routes, split horizon and denied
+  routes, while retaining sole-link fallback for genuinely unknown/legacy
+  publishers. Both old-code negative controls fail;53 ACK tests and the full
+  heap/compact, reduced-feature and strict embedded matrices pass. No wire
+  format, rates, budgets or retry thresholds changed. The frozen SDK103 source
+  archive is90a4a64bde7cf1e7abf651dfc9c5eea09b3f4b0ef8c0ed92c3155e7f09ee7caa.
+- All seven SDK103 factory builds and the original amplifier-startup gate pass.
+  The original pressure/source/SD, GS-restart and600-second gates remain required;
+  these are not replaced by unit-test success. The path remains Pi main Ethernet
+  discovery/framed TCP to gateway-side Pico-Fi, with no Pi-side Pico or I2C.
+- The backend/browser asset bridge passes399 default,400 test-fire,385 HITL and
+  404 testing tests, one existing ignored test each, plus strict bridge Clippy
+  and build/launcher source-selection regressions. Actual Chromium tests pass
+  stream playback/replay, artwork sizing, embedded media, voice-join failure,
+  real PCM PTT/open-mic relay, admin access, audience permissions and recording
+  playback. Synthetic fixtures use ephemeral loopback ports and fake headless
+  audio output; physical outputs and production services are untouched.
+- Browser pages, JS, GLB models and vendor licenses move byte-for-byte to the
+  frontend repository's station_ui directory, outside native resource globs.
+  Direct Cargo uses the ui submodule; build.py and launchers select/verify the
+  same main/dev source for WebUI and backend exports. Frontend main/dev now contain the complete licensed exports, and a fresh
+  default ui submodule checkout passes399 backend tests, strict bridge Clippy
+  and launcher/source tests. Docker/platform closure checks remain before release.
+- Native Linux all-four-mode backend and two-station paired-calibration tests
+  pass. ARM64 production compilation with raspberry_pi passes after supplying
+  the cross libc headers; this is a compile result, not physical Pi performance
+  qualification. Other mission-setting/checklist adapters and the final UI,
+  native handover, current-source long-run and package-release gates remain open.
