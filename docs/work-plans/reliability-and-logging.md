@@ -152,7 +152,7 @@ Tools clear-graphs UI acceptance remains complete but uncommitted.
   explicit UI override. Distinguish successful test evidence from overrides;
   persist/audit both, sync devices, and reject delayed completion after reset.
   Do not invent a new nitrogen valve pattern or automate commands from a checkbox.
-- [ ] **saved-data-3d-replay**: Rocket3D is for replay of saved telemetry, not live
+- [x] **saved-data-3d-replay**: Rocket3D is for replay of saved telemetry, not live
   viewing. Add recording selection, timeline/speed/seek and saved-sample binding;
   live dashboards/programs use cameras/2D. Do not silently bind missing saved
   attitude or phases to live telemetry. Test saved-data isolation and time bounds.
@@ -623,3 +623,47 @@ which side caused the operator's intermittent transfers.
   remaining platform/feature audits and qualified releases. Diagnostic reanalysis
   never substitutes for a failed original gate. No public SDK/firmware release
   or complete-plan claim is warranted yet.
+
+
+### C65–C73 receipt and size checkpoint (2026-10-22)
+
+- The C64/C67 compiler-budget comparisons and C65/C69 helper-outlining trials
+  do not improve FC fit; none is promoted. FC CMake deliberately forces extra
+  machine-outliner reruns off because of the earlier nested-helper miscompile.
+- C68 classifies exhausted receipt credit consistently as transient transport
+  pressure. C70 removes an unnecessary item clone from every reliable transmit;
+  the frozen contract retains the logical ID, including reordered/duplicate
+  endpoints. C71 removes redundant sorting/deduplication of BTreeMap keys.
+  All seven factories pass; Linux FC uses474284/474624 bytes (340 free).
+- A stronger route-change regression then exposes phantom receipt owners when
+  a new endpoint joins while accepted data waits for window credit. A separate
+  negative control exposes replacement of an explicitly frozen Packet cohort.
+  C72's first fix is rejected by the real routed-radio integration: it must not
+  restrict a targeted proxy from resolving its own downstream segment.
+- C73 explicitly distinguishes downstream proxy resolution from frozen retry
+  planning, filters owners using borrowed hashes without another owner array,
+  and preserves both an existing Packet cohort and its explicit payload shape.
+  Its 18 focused credit/hop/frozen cases pass; old-code negative controls fail.
+  Full native heap/compact suites pass525/531 unit tests plus integrations and
+  C-system tests. Required default all-target and embedded Clippy pass.
+- Immutable SDK73 SHA256:
+  a6b832ca0c8fc40109601b1ca1c8e8a27aec3c774578d6faece99982fa342544.
+  All seven Linux factories and the matching host image pass. Linux FC simulator
+  uses474532/474624 bytes (92 free). Independent macOS FC factory builds pass:
+  production473948 bytes (676 free), simulator474436 bytes (188 free).
+  No partition, source rate, memory cap, feature or acceptance threshold changed.
+- C73 startup passes. The original120-second network/pressure/SD gate is running
+  on Jupiter with the unchanged simulator engine; restart and600-second gates
+  remain conditional on every preceding original gate and independent card check.
+  No long pass, physical qualification or public release is claimed.
+- In a separate unpromoted copy, the40 existing discovery-disabled build warnings
+  are fixed at their feature boundaries without suppression. Minimal std,
+  std+time-sync, std+crypto/compression, default all-target and embedded strict
+  Clippy pass; default heap/compact525/531 unit tests pass. The legacy minimal
+  unit-test harness still imports discovery unconditionally and needs its own
+  feature guards. This audit copy is not the running C73 source snapshot.
+- Remaining work still includes production GS/RRLS setting synchronization and
+  conflict UI, frontend source ownership/submodule/repository organization,
+  remaining feature/platform audits, successful long network/SD qualification,
+  owned source promotion and qualified releases. Saved replay is complete and
+  pushed; it no longer remains an open checkbox above.
