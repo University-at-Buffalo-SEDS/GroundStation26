@@ -25,9 +25,9 @@ class VehicleViewer extends HTMLElement {
  disposeModel(){if(this.model){this.root.remove(this.model);this.model.traverse(n=>{n.geometry?.dispose();for(const m of Array.isArray(n.material)?n.material:n.material?[n.material]:[]){for(const v of Object.values(m))if(v?.isTexture)v.dispose();m.dispose();}});this.model=null;}}
  async load(){const src=this.getAttribute('src');if(!src)return;const generation=this.generation=(this.generation||0)+1;this.status.textContent='Loading model…';try{
    const gltf=await new GLTFLoader().loadAsync(src);if(!this.isConnected||generation!==this.generation){gltf.scene.traverse(n=>{n.geometry?.dispose();});return;}
-   this.disposeModel();this.model=gltf.scene;this.root.add(this.model);this.base=new Map();this.smooth=new Map();this.model.traverse(n=>this.base.set(n,{position:n.position.clone(),scale:n.scale.clone(),quaternion:n.quaternion.clone(),visible:n.visible}));
+   this.disposeModel();this.model=gltf.scene;const box=new T.Box3().setFromObject(this.model);const modelCenter=box.getCenter(new T.Vector3());const size=box.getSize(new T.Vector3());this.model.position.sub(modelCenter);this.center.set(0,0,0);this.root.add(this.model);this.base=new Map();this.smooth=new Map();this.model.traverse(n=>this.base.set(n,{position:n.position.clone(),scale:n.scale.clone(),quaternion:n.quaternion.clone(),visible:n.visible}));
    this.mixer=new T.AnimationMixer(this.model);this.clips=gltf.animations;this.activeClip=null;
-   const box=new T.Box3().setFromObject(this.model);box.getCenter(this.center);const size=box.getSize(new T.Vector3());this.distance=Math.max(size.length()*1.45,2);this.status.textContent='';this.dataset.loaded='true';
+   this.distance=Math.max(size.length()*1.6,2);this.status.textContent='';this.dataset.loaded='true';
   }catch(e){this.status.textContent='Model could not load. Check the GLB and its assets.';this.dataset.loaded='false';}
  }
  frame(){
@@ -36,13 +36,14 @@ class VehicleViewer extends HTMLElement {
   if(state.orbit&&state.orbit!==this.orbit){const parts=state.orbit.trim().split(/\s+/);const theta=parseFloat(parts[0]),phi=parseFloat(parts[1]),radius=parseFloat(parts[2]);if(Number.isFinite(theta))this.theta=T.MathUtils.degToRad(theta);if(Number.isFinite(phi))this.phi=T.MathUtils.clamp(T.MathUtils.degToRad(phi),.1,3);if(Number.isFinite(radius)&&radius>0)this.distance=radius;this.orbit=state.orbit;}
   if(state.clip!==this.activeClip){this.mixer.stopAllAction();const clip=this.clips.find(c=>c.name===state.clip);if(clip)this.mixer.clipAction(clip).play();this.activeClip=state.clip;}
   for(const node of this.driven||[]){const b=this.base.get(node);if(b){node.position.copy(b.position);node.quaternion.copy(b.quaternion);node.scale.copy(b.scale);node.visible=b.visible;}}
-  this.mixer.update(dt);
+  const replay=Number.isFinite(state.replay_time_seconds);
+  if(replay)this.mixer.setTime(Math.max(0,state.replay_time_seconds));else this.mixer.update(dt);
   const modified=new Set();let missing=0,unknown=0;
   for(const motion of state.motions||[]){const node=this.model.getObjectByName(motion.node);if(!node){missing++;continue;}const base=this.base.get(node);if(!base)continue;
    if(!modified.has(node)){node.position.copy(base.position);node.quaternion.copy(base.quaternion);node.scale.copy(base.scale);node.visible=base.visible;modified.add(node);}
    if(motion.value==null||!Number.isFinite(motion.value)){unknown++;continue;}
    const target=motion.from+(motion.to-motion.from)*T.MathUtils.clamp(motion.value,0,1),key=motion.node+':'+motion.transform+':'+motion.axis.join(',');
-   const prior=this.smooth.get(key)??target,v=T.MathUtils.lerp(prior,target,1-Math.exp(-dt*10));this.smooth.set(key,v);
+   const prior=this.smooth.get(key)??target,v=replay?target:T.MathUtils.lerp(prior,target,1-Math.exp(-dt*10));this.smooth.set(key,v);
    const axis=new T.Vector3(...motion.axis);
    if(motion.transform==='rotate'&&axis.lengthSq()>0)node.quaternion.multiply(new T.Quaternion().setFromAxisAngle(axis.normalize(),T.MathUtils.degToRad(v)));
    if(motion.transform==='translate')node.position.addScaledVector(axis,v);
@@ -52,7 +53,7 @@ class VehicleViewer extends HTMLElement {
   this.driven=modified;
   this.status.textContent=missing?missing+' mapped model node(s) missing':unknown?unknown+' component(s): no telemetry':this.software?'Compatibility preview: reduced-detail model':'';
   const a=state.attitude||[0,0,0];this.root.rotation.set(...a.map(v=>T.MathUtils.degToRad(v||0)));
-  this.camera.position.set(this.center.x+this.distance*Math.sin(this.phi)*Math.sin(this.theta),this.center.y+this.distance*Math.cos(this.phi),this.center.z+this.distance*Math.sin(this.phi)*Math.cos(this.theta));this.camera.lookAt(this.center);this.renderer.render(this.scene,this.camera);
+  const distance=this.distance/Math.min(1,Math.max(.1,this.camera.aspect));this.camera.position.set(this.center.x+distance*Math.sin(this.phi)*Math.sin(this.theta),this.center.y+distance*Math.cos(this.phi),this.center.z+distance*Math.sin(this.phi)*Math.cos(this.theta));this.camera.lookAt(this.center);this.renderer.render(this.scene,this.camera);
  }
  disconnectedCallback(){this.generation++;this.resize?.disconnect();this.renderer?.setAnimationLoop(null);this.disposeModel();this.renderer?.dispose();this.renderer?.domElement.remove();this.status?.remove();this.renderer=null;}
 }

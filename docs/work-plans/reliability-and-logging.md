@@ -530,3 +530,61 @@ which side caused the operator's intermittent transfers.
   the untraced C51 engine. Card inspection follows completion. No long or release
   qualification is claimed; remaining paired settings/runtime, replay, audits,
   platforms, source promotion and long-soak checklist items remain open.
+
+## Current checkpoint: C57–C59 and saved recording replay
+
+- C56's rounded individual sample clock can overlap adjacent four-sample DMA
+  batches. Valve now advances whole16ms DMA half periods, preserves genuinely
+  missing halves, rejects repeated/backward jitter and keeps source sequence/tick
+  wrapping. An actual-ISR negative control fails on the old code. All139 Valve
+  tests and macOS/Linux factory builds pass (macOS452712/474624 FLASH).
+- C57 startup passes, but the unchanged120-second network/SD campaign fails.
+  The prior duplicate/overlap is gone; the pressure card now exposes a real
+  retired-prefix sequence hole. Valve battery freshness also fails. Neither
+  network nor SD is qualified, and no long gate is accepted.
+- Gateway profile analyzer f251c10 is pushed separately to simulator main after
+  explicit approval. Its three regressions cover unsized assembly labels and
+  aliases. The published diagnostic tool is not a firmware/image release.
+- A new isolated SDK candidate filters only known, live, nonlocal target sets
+  proven to be entirely behind the ingress side, before owning/queuing payloads.
+  Dynamic schema, unknown/local/mixed/alternate routes, managed variables,
+  explicit policies, encrypted data and sequenced hop receipts retain normal
+  processing. Runtime-added schema and actual old-code negative tests pass.
+  Final521heap/527compact library tests and strict embedded/all-target Clippy
+  pass. The native instrumented10000-frame comparison changes median elapsed
+  time16.713ms to3.004ms and70688 counted allocation calls to zero for that
+  specific filtered stream; this is not MCU cycle utilization or end-to-end
+  qualification.
+- C58 fails before firmware build because its archive omits Cargo-declared
+  benchmark paths; it also exposes a generic build.py feature forwarding defect.
+  Both packaging and forwarding are corrected and executable CLI tests added.
+  C59's fresh archive SHA256 is
+  1ec645c97b406668fe3849eaca09bc06d4773c46afd806e73014debe84bf8adb.
+  Its gateway factory and startup pass. The exact executed cargo feature list
+  includes ingress-target-filter. The unchanged 120-second run fails its nominal-rate count check. Separate
+  source-preservation analysis passes the original 99.5% threshold and freshness
+  bounds, with zero CAN/UART ring drops in all 12 observations. Gateway CAN
+  admission refusals still grow from 2 to 64; allocation failures remain zero.
+  Pressure capture/publication reaches 29,624 samples, DAQ enqueues/writes 29,556
+  and flushes 29,536. Both DAQ inspector modes reject the same pressure sequence
+  hole at CSV record 16,659; this does not independently establish raw-ADC loss.
+  FC card inspection passes. The original failed run is retained; no long gate
+  is accepted. Memory caps/source rates/thresholds are unchanged. No production SDK promotion or public release has occurred.
+- Saved3D replay is staged independently: explicit recording selection, frozen
+  record-ID snapshot, bounded/paged read-only windows and saved-only state.
+  Current live telemetry/calibration/phase cannot become replay data. Application
+  station origin, recording ID and snapshot ID are isolated across native GS/RRLS
+  changes. Seeking commits after drag rather than fetching every intermediate
+  position. Playback supports0.25–4x, pause/rewind and missing-data indication.
+  Live audience program uses2D artwork/cameras. Seven replay API tests pass,
+  including HTTP authorization and active-file snapshot exclusion. Native UI
+  tests, Wasm build and real-component desktop/mobile control tests pass; real-model rendering including mobile pivot/framing and saved-clock
+  pause/slow-motion checks passes. Full staged backend suite passes 390 tests
+  with one existing ignored; the staged workspace also includes three earlier
+  typed-settings adapter tests. Exact repository checks follow promotion.
+  A strict frontend Clippy audit identifies existing warnings plus four new
+  replay-clock nesting warnings; the new warnings are fixed. A clean full
+  frontend warning audit remains required before release.
+- Paired settings production runtime/conflict UI, final audits, all-platform
+  builds, pressure/network long soak and release remain open. Core anti-entropy
+  and adapter tests alone do not establish cross-station settings synchronization.

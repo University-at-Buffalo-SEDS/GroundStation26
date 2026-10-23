@@ -1,5 +1,6 @@
 mod admin;
 mod radio_voice;
+mod recording_replay;
 // main.rs
 
 macro_rules! gs_debug_println {

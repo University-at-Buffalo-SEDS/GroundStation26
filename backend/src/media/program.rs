@@ -143,8 +143,7 @@ pub(super) async fn capture_history(state: Arc<MediaState>) {
             continue;
         };
         let now = now_ms();
-        let mut snapshot = telemetry_snapshot(&state.app, &presentation, now);
-        snapshot["model_state"] = model_snapshot(&state.app, &presentation.vehicle, now);
+        let snapshot = telemetry_snapshot(&state.app, &presentation, now);
         retain_program_snapshot(&mut *state.program_history.lock().await, now, snapshot);
     }
 }
@@ -181,7 +180,6 @@ async fn program_state(
         };
         streams.push(serde_json::json!({"id":id,"label":presentation.stream_labels.get(&id).unwrap_or(&id),"url":url}));
     }
-    let model = load_vehicle(state.clone(), headers.clone()).await?;
     let now = now_ms();
     let history = state.program_history.lock().await;
     let target = presentation
@@ -199,7 +197,7 @@ async fn program_state(
     } else {
         live_telemetry
     };
-    Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"model":model,"server_now_ms":now,"telemetry":telemetry}))).into_response())
+    Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"server_now_ms":now,"telemetry":telemetry}))).into_response())
 }
 
 #[derive(Deserialize)]
@@ -227,32 +225,6 @@ async fn program_audio(
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(batch)).into_response())
 }
 
-fn model_snapshot(app: &AppState, model: &Vehicle, now: u64) -> serde_json::Value {
-    let phase = format!("{:?}", *app.state.lock().unwrap());
-    let rows = app.recent_telemetry_cache.lock().unwrap();
-    let value = |binding: &Binding| {
-        rows.iter()
-            .rev()
-            .find(|row| {
-                row.data_type == binding.data_type
-                    && binding
-                        .sender_id
-                        .as_ref()
-                        .is_none_or(|sender| sender == &row.sender_id)
-            })
-            .filter(|row| {
-                row.timestamp_ms >= 0 && now.saturating_sub(row.timestamp_ms as u64) < 5000
-            })
-            .and_then(|row| row.values.get(binding.index).copied().flatten())
-            .map(|v| v * binding.scale + binding.offset)
-            .filter(|v| v.is_finite())
-    };
-    let motions:Vec<_>=model.motions.iter().map(|motion|{
-        let v=if let Some(binding)=&motion.binding {value(binding)} else {motion.phase_values.get(&phase).or_else(||motion.phase_values.get("*")).copied()};
-        serde_json::json!({"node":motion.node,"transform":motion.transform,"axis":motion.axis,"from":motion.from,"to":motion.to,"value":v})
-    }).collect();
-    serde_json::json!({"motions":motions,"orbit":model.camera_orbit,"attitude":[model.attitude.pitch.as_ref().and_then(value),model.attitude.yaw.as_ref().and_then(value),model.attitude.roll.as_ref().and_then(value)],"clip":model.phase_animations.get(&phase).cloned().unwrap_or_default()})
-}
 async fn dashboard_status(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -676,34 +648,14 @@ async fn set_role(
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn model_motion_uses_captured_phase_and_never_falls_back_for_missing_binding() {
+    async fn live_program_uses_phase_without_projecting_3d_attitude_or_motion() {
         let app = crate::state::tests::test_app_state().await;
         *app.state.lock().unwrap() = crate::types::FlightState::Ascent;
-        let mut model = Vehicle::default();
-        model.motions.push(Motion {
-            node: "motor-flame".into(),
-            transform: "visible".into(),
-            axis: [0.0, 1.0, 0.0],
-            from: 0.0,
-            to: 1.0,
-            binding: None,
-            phase_values: BTreeMap::from([("*".into(), 0.0), ("Ascent".into(), 1.0)]),
-        });
-        let captured = model_snapshot(&app, &model, 100_000);
-        *app.state.lock().unwrap() = crate::types::FlightState::Coast;
-        assert_eq!(captured["motions"][0]["value"], 1.0);
-        assert_eq!(
-            model_snapshot(&app, &model, 100_500)["motions"][0]["value"],
-            0.0
-        );
-        model.motions[0].binding = Some(Binding {
-            data_type: "MISSING".into(),
-            sender_id: None,
-            index: 0,
-            scale: 1.0,
-            offset: 0.0,
-        });
-        assert!(model_snapshot(&app, &model, 100_500)["motions"][0]["value"].is_null());
+        let presentation = Presentation::default();
+        let snapshot = telemetry_snapshot(&app, &presentation, 100_000);
+        assert_eq!(snapshot["phase"], "Ascent");
+        assert!(snapshot.get("model_state").is_none());
+        assert!(snapshot.get("attitude").is_none());
     }
     #[tokio::test]
     async fn dashboard_resolves_channels_and_marks_stale_samples_unknown() {

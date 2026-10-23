@@ -34,6 +34,14 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/recordings", get(list))
         .route(
+            "/api/recordings/{id}/replay",
+            get(crate::recording_replay::snapshot),
+        )
+        .route(
+            "/api/recordings/{id}/replay/window",
+            get(crate::recording_replay::window),
+        )
+        .route(
             "/api/recordings/report",
             get(crate::recording_report::report),
         )
