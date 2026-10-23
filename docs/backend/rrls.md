@@ -154,9 +154,10 @@ This is software validation; physical RFD range/collision behavior still needs a
 three-radio field test. The earlier seven-board network qualification is
 separate from this new recovery-mesh mode.
 
-`--backend-only` / `--backend-only-build` reuses existing WebUI assets. Do not
-combine it with `--frontend-dev`: run `python3 run_rrls.py --frontend-dev`
-first to rebuild and serve the development UI.
+`--backend-only` / `--backend-only-build` reuses existing WebUI assets unless
+`--frontend-dev` explicitly requests rebuilding them. For example,
+`python3 run_rrls.py --backend-only --frontend-dev` builds the matching dev WebUI
+before starting RRLS. Both builds use the same isolated frontend revision.
 
 ## Native app handover and application identity
 

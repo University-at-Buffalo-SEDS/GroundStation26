@@ -112,14 +112,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend-only-build", "--backend-only",
         action="store_true",
-        help="Reuse the existing WebUI and only rebuild/run the backend; cannot be combined with --frontend-dev.",
+        help="Reuse the existing WebUI unless --frontend-dev explicitly requests rebuilding it.",
     )
     parser.add_argument("--rrls", action="store_true", help="Run the headless recovery receiver/relay with local web and mobile access.")
     parser.add_argument("--frontend-dev", "--frontend_dev", action="store_true", help="Build the WebUI from the frontend dev branch (also accepts frontend_dev, like build.py).")
     arguments=["--frontend-dev" if argument in {"frontend_dev", "frontend-dev"} else argument for argument in sys.argv[1:]]
     args=parser.parse_args(arguments)
-    if args.backend_only_build and args.frontend_dev:
-        parser.error("--backend-only skips the WebUI build. Remove it to build the dev WebUI with --frontend-dev.")
     return args
 
 
@@ -151,7 +149,7 @@ def main() -> None:
     if features:
         cmd.extend(["--features", ",".join(features)])
     repo_root = Path(__file__).resolve().parent
-    if not args.backend_only_build:
+    if args.frontend_dev or not args.backend_only_build:
         frontend_cmd = [sys.executable, str(repo_root / "build.py"), "frontend_web"]
         if args.frontend_dev:
             frontend_cmd.append("--frontend-dev")

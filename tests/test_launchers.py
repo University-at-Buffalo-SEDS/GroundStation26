@@ -32,13 +32,15 @@ class LauncherTests(unittest.TestCase):
         build.assert_not_called()
         backend.assert_called_once()
 
-    def test_conflicting_backend_only_and_frontend_dev_fail_before_any_build(self):
-        for option in ["--backend-only","--backend-only-build"]:
-            with self.subTest(option=option),patch.object(sys,"argv",["run_groundstation.py","--rrls",option,"--frontend-dev"]),patch("sys.stderr"),patch.object(launcher.subprocess,"run") as build:
-                with self.assertRaises(SystemExit) as error:
-                    launcher.main()
-                self.assertEqual(error.exception.code,2)
-                build.assert_not_called()
+    def test_explicit_frontend_dev_builds_webui_with_backend_only(self):
+        for role in [[], ["--rrls"]]:
+            for option in ["--backend-only", "--backend-only-build"]:
+                with self.subTest(role=role, option=option):
+                    frontend, backend, _ = self.invoke([*role, option, "--frontend-dev"])
+                    frontend.assert_called_once()
+                    self.assertIn("frontend_web", frontend.call_args.args[0])
+                    self.assertIn("--frontend-dev", frontend.call_args.args[0])
+                    backend.assert_called_once()
 
     def test_rrls_on_pi_sets_role_without_enabling_local_gpio(self):
         _,backend,env=self.invoke(["--rrls"],pi=True)

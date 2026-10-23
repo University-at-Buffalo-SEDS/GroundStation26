@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 import hashlib
+import errno
+from contextlib import contextmanager
+import re
+import tempfile
+import time
 import json
 import multiprocessing as mp
 import os
@@ -181,8 +186,13 @@ def _run_frontend_script_with_wasm_opt_fallback(script: Path, checkout_dir: Path
     print(cmd_line)
     _append_log(cmd_line + "\n")
 
+    environment = os.environ.copy()
+    target = _frontend_shared_target(checkout_dir)
+    if target is not None:
+        environment.setdefault("CARGO_TARGET_DIR", str(target))
     proc = subprocess.Popen(
         [str(part) for part in cmd],
+        env=environment,
         cwd=checkout_dir,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -368,6 +378,69 @@ def _ensure_frontend_checkout(checkout_dir: Path, branch: str) -> None:
     run(["git", "-C", str(checkout_dir), "pull", "--ff-only", "origin", branch], cwd=checkout_dir)
 
 
+@contextmanager
+def _frontend_cache_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+            if lock.seek(0, os.SEEK_END) == 0:
+                lock.write(b"0")
+                lock.flush()
+            while True:
+                try:
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as error:
+                    if error.errno not in {errno.EAGAIN, errno.EACCES, errno.EBUSY, errno.EDEADLK}:
+                        raise
+                    time.sleep(0.1)
+            try:
+                yield
+            finally:
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _immutable_frontend_checkout(checkout: Path, branch: str) -> Path:
+    revisions = checkout.with_name(checkout.name + "-revisions")
+    with _frontend_cache_lock(checkout.with_name(checkout.name + ".fetch.lock")):
+        _ensure_frontend_checkout(checkout, branch)
+        revision = run_capture(["git", "-C", str(checkout), "rev-parse", "HEAD"], cwd=checkout).strip()
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", revision):
+            raise RuntimeError("Invalid frontend Git revision")
+        source = revisions / revision
+        if not source.exists():
+            revisions.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".snapshot-", dir=revisions) as temporary:
+                clone = Path(temporary) / "source"
+                run(["git", "clone", "--no-hardlinks", "--no-checkout", str(checkout.resolve()), str(clone)], cwd=revisions)
+                run(["git", "-C", str(clone), "checkout", "--detach", revision], cwd=clone)
+                _browser_asset_digest(clone)
+                clone.rename(source)
+        actual = run_capture(["git", "-C", str(source), "rev-parse", "HEAD"], cwd=source).strip()
+        dirty = run_capture(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=no"], cwd=source)
+        if actual != revision or dirty:
+            raise RuntimeError("Cached frontend revision has changed; restore it before rebuilding")
+        _browser_asset_digest(source)
+        print(f"Frontend revision: {revision}")
+        return source
+
+
+def _frontend_shared_target(checkout: Path) -> Optional[Path]:
+    if checkout.parent.name.endswith("-revisions") and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", checkout.name):
+        return checkout.parent / "target"
+    return None
+
+
 def _sync_frontend_public_assets(repo_root: Path, checkout_dir: Path) -> None:
     src_public_dir = _resolve_external_public_dir(checkout_dir)
     dst_public_dir = _frontend_sync_public_dir(repo_root)
@@ -436,8 +509,7 @@ def prepare_browser_asset_source(repo_root: Path, frontend_dev: bool = False, re
         source = _frontend_checkout_dir()
         branch = _frontend_branch(frontend_dev)
         print(f"Frontend source: {FRONTEND_REPO_URL} branch {branch}")
-        _ensure_frontend_checkout(source, branch)
-        _browser_asset_digest(source)
+        source = _immutable_frontend_checkout(source, branch)
     source = source.resolve()
     os.environ[BROWSER_ASSET_SOURCE_ENV] = str(source)
     return source
@@ -478,9 +550,14 @@ def _run_frontend_build(
             log_path = repo_root / log_path
         args.append(f"log={log_path}")
 
-    _run_frontend_script_with_wasm_opt_fallback(script, checkout_dir, args)
-    _sync_frontend_public_assets(repo_root, checkout_dir)
-    _record_browser_asset_source(repo_root, checkout_dir)
+    # Revisions share compiler artifacts, but Dioxus output generation and sync
+    # must complete together. Backend compilation reads immutable input files.
+    target = _frontend_shared_target(checkout_dir)
+    lock = target.parent / ".web-build.lock" if target is not None else checkout_dir.with_name(checkout_dir.name + ".web-build.lock")
+    with _frontend_cache_lock(lock):
+        _run_frontend_script_with_wasm_opt_fallback(script, checkout_dir, args)
+        _sync_frontend_public_assets(repo_root, checkout_dir)
+        _record_browser_asset_source(repo_root, checkout_dir)
 
 
 def _backend_script(repo_root: Path) -> Path:
@@ -639,11 +716,11 @@ def main() -> None:
         return
 
     if backend_only:
-        if frontend_dev:
-            raise RuntimeError("backend_only reuses the WebUI. Remove it to build --frontend-dev.")
         if docker_mode:
             print("Error: backend_only cannot be combined with docker mode.", file=sys.stderr)
             print_usage()
+        if frontend_dev:
+            _run_frontend_build(repo_root, debug_mode, max_size_mode, use_existing, log_file_arg, True)
         prepare_browser_asset_source(repo_root, refresh=False)
         _run_script(
             repo_root,

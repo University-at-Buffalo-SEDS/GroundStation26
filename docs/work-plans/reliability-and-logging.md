@@ -931,3 +931,23 @@ which side caused the operator's intermittent transfers.
   live2D browser test. Backend documentation now points to frontend-owned files
   and clearly distinguishes live2D from saved-data3D replay. No product JS
   remains in the GroundStation source outside its frontend submodule.
+
+
+### Full campaign and concurrent frontend builds (2026-10-23)
+
+- SDK103 installed-wheel validation passes53 Python3.12 tests and48 Python3.14
+  headless tests, plus strict Python-feature Clippy. The build.py test --full
+  campaign and CI compact/compression campaign are now running with Nextest and
+  the installed candidate wheel; focused checks do not substitute for these
+  campaigns. Publication remains gated on their outcome and the current soak.
+- A real two-branch negative control proves the shared mutable frontend checkout
+  could change another build's inputs. Builds now select detached per-commit
+  source copies, serialize fetch and WebUI output generation, and share compiler
+  artifacts. Six source/concurrency tests include two real simultaneous Git
+  builders, interrupted-clone cleanup, changed-source refusal and scoped cache
+  overrides. Combined source/build/launcher checks pass24 on macOS and Linux.
+  Actual main/dev exports also pass strict bridge compilation with all22 asset/
+  license hashes unchanged.
+- Explicit --frontend-dev now rebuilds the WebUI even with --backend-only. This
+  restores the previously requested RRLS command instead of rejecting it. Plain
+  backend-only reuse, separate RRLS config and Pi GPIO behavior are unchanged.

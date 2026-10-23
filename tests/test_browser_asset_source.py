@@ -16,6 +16,12 @@ class BrowserAssetSourceTests(unittest.TestCase):
             {'name':'PAGE_HTML','path':'station_ui/page.html','kind':'text'}]}))
         return source
 
+    def test_backend_only_honors_explicit_dev_before_building_backend(self):
+        order = []
+        with patch.dict(os.environ, {}, clear=True), patch.object(build.sys, 'argv', ['build.py', 'backend_only', '--frontend-dev']), patch.object(build, '_run_frontend_build', side_effect=lambda *args: order.append(('web', args[-1]))), patch.object(build, 'prepare_browser_asset_source', side_effect=lambda *args, **kwargs: order.append(('reuse', kwargs['refresh']))), patch.object(build, '_run_script', side_effect=lambda *args: order.append(('backend', True))):
+            build.main()
+        self.assertEqual(order, [('web', True), ('reuse', False), ('backend', True)])
+
     def test_parallel_build_selects_dev_once_before_children(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
             root=Path(tmp);source=self.source(root);processes=[]
@@ -26,7 +32,7 @@ class BrowserAssetSourceTests(unittest.TestCase):
                     self.source=os.environ.get(build.BROWSER_ASSET_SOURCE_ENV)
                 def start(self): pass
                 def join(self): pass
-            with patch.object(build.sys,'argv',['build.py','--frontend-dev']),patch.object(build,'_frontend_checkout_dir',return_value=source),patch.object(build,'_ensure_frontend_checkout') as ensure,patch.object(build,'in_docker_build',return_value=False),patch.object(build.mp,'Process',Process):
+            with patch.object(build.sys,'argv',['build.py','--frontend-dev']),patch.object(build,'_frontend_checkout_dir',return_value=source),patch.object(build,'_immutable_frontend_checkout',return_value=source) as ensure,patch.object(build,'in_docker_build',return_value=False),patch.object(build.mp,'Process',Process):
                 build.main()
             ensure.assert_called_once_with(source,'dev')
             self.assertEqual(len(processes),2)

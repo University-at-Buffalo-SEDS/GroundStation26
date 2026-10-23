@@ -74,9 +74,13 @@ python3 build.py debug
 python3 build.py --frontend-dev
 ```
 
-`--frontend-dev` checks out the frontend's `dev` branch; the default frontend build uses its stable release branch. The
-cached checkout is fetched and reset to the selected remote branch, so an existing local branch is not assumed to have
-valid tracking metadata.
+`--frontend-dev` selects the frontend's `dev` branch; the default selects `main`.
+The branch cache is fast-forwarded, then both builds use a detached copy of that
+exact commit. Concurrent builds cannot switch each other's source. Revisions
+share one compiler cache, and WebUI generation is serialized.
+
+`--backend-only` reuses existing WebUI assets. Adding `--frontend-dev` explicitly
+requests a fresh development WebUI, including with `run_rrls.py`.
 
 Scoped build entry points:
 
