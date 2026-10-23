@@ -1,3 +1,4 @@
+pub mod mission;
 use crate::fill_targets::FillTargetsConfig;
 use crate::layout::ValueFormatter;
 use crate::types::FlightState;
@@ -595,10 +596,13 @@ pub fn save(cfg: &LoadcellCalibrationFile) -> Result<(), String> {
     save_at(cfg, &calibration_path())
 }
 
-fn save_at(cfg: &LoadcellCalibrationFile, path: &std::path::Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all({parent:?}): {e}"))?;
-    }
+pub(crate) fn save_at(cfg: &LoadcellCalibrationFile, path: &std::path::Path) -> Result<(), String> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all({parent:?}): {e}"))?;
     let raw =
         serde_json::to_string_pretty(cfg).map_err(|e| format!("serialize calibration: {e}"))?;
     if let Ok(previous) = std::fs::read(&path) {
@@ -619,18 +623,34 @@ fn save_at(cfg: &LoadcellCalibrationFile, path: &std::path::Path) -> Result<(), 
             "{}-{stamp}.json",
             path.file_stem().unwrap_or_default().to_string_lossy()
         ));
-        use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&backup)
             .map_err(|e| format!("create calibration backup: {e}"))?;
         file.write_all(&previous)
+            .and_then(|()| file.sync_all())
             .map_err(|e| format!("save calibration backup: {e}"))?;
+        #[cfg(unix)]
+        std::fs::File::open(&backups)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| format!("sync calibration backups: {e}"))?;
     }
     let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, raw).map_err(|e| format!("write calibration {path:?}: {e}"))?;
-    std::fs::rename(&temporary, &path).map_err(|e| format!("replace calibration {path:?}: {e}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temporary)
+        .map_err(|e| format!("open calibration temporary file: {e}"))?;
+    file.write_all(raw.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("write calibration {path:?}: {e}"))?;
+    std::fs::rename(&temporary, path).map_err(|e| format!("replace calibration {path:?}: {e}"))?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| format!("sync calibration directory: {e}"))?;
     Ok(())
 }
 

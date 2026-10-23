@@ -730,7 +730,12 @@ impl FlightSimState {
                     self.set_flight_state(FlightState::NitrousFill, now_ms);
                 }
             }
-            TelemetryCommand::StartWritingNow
+            TelemetryCommand::StartFill
+            | TelemetryCommand::PauseFill
+            | TelemetryCommand::CancelFill
+            | TelemetryCommand::ValveSelfTest
+            | TelemetryCommand::NitrogenTest
+            | TelemetryCommand::StartWritingNow
             | TelemetryCommand::StartWritingLastTwoMinutes
             | TelemetryCommand::PauseWritingDb
             | TelemetryCommand::StopWritingDb
@@ -1406,7 +1411,17 @@ pub fn handle_command(cmd: &TelemetryCommand) -> bool {
     if !sim_mode_enabled() {
         return false;
     }
-    if matches!(cmd, TelemetryCommand::ResetSim) {
+    if matches!(
+        cmd,
+        TelemetryCommand::ResetSim
+            | TelemetryCommand::StartFill
+            | TelemetryCommand::PauseFill
+            | TelemetryCommand::CancelFill
+            | TelemetryCommand::ValveSelfTest
+            | TelemetryCommand::NitrogenTest
+    ) {
+        // The shared backend sequence engine owns these controls. Never consume
+        // one here or manufacture completion independently of its interlocks.
         return false;
     }
     let now_ms = get_current_timestamp_ms();
@@ -1499,6 +1514,20 @@ pub fn _next_state_aware_packet() -> TelemetryResult<Option<Packet>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "testing")]
+    #[test]
+    fn backend_sequence_commands_are_not_consumed_by_the_flight_simulator() {
+        use crate::types::TelemetryCommand::*;
+        for command in [
+            StartFill,
+            PauseFill,
+            CancelFill,
+            ValveSelfTest,
+            NitrogenTest,
+        ] {
+            assert!(!super::handle_command(&command));
+        }
+    }
     #[cfg(feature = "testing")]
     #[test]
     fn queued_flight_state_is_prioritized_for_launch_clock_sync() {

@@ -813,3 +813,41 @@ which side caused the operator's intermittent transfers.
   frontend-source ownership/repository organization, final platform audit,
   safe owned-source promotion and qualified releases. Root user-owned settings
   and the earlier prototype remain untouched.
+
+
+### Installed paired settings and C90 restart capture (2026-10-23)
+
+- Paired calibration is now integrated in the GS source under the separate
+  `shared/paired_settings` package, preserving the existing untracked prototype
+  and root manifest. Supported calibration documents, actual low-priority mesh
+  transport and conflict APIs are wired to the runtime. The frontend Settings
+  contains the reviewed-revision conflict controls. Other mission settings
+  remain open; this is not a complete settings-sync or firmware-release claim.
+- Final package checks pass:22 core tests plus two integrations and strict core
+  Clippy;399 default backend,400 test-fire,385 HITL and404 testing tests, with one
+  existing ignored backend test in each mode. Two real local backend processes
+  connected through synthetic PTY radios pass primary-to-RRLS import, durable
+  offline API edits, conflict reconnect, exact-head HTTP resolution/stale replay
+  rejection, convergence and RRLS restart. Their ephemeral signing seeds are
+  deleted after the fixture. No real credentials or hardware are involved.
+- The full testing-feature build exposed an exhaustive command-match omission.
+  Its five GSE sequence commands now remain owned by the shared sequence engine
+  instead of being consumed by the flight simulator; a regression covers all
+  five. Tests preserve launch qualification even in simulator mode. Explicit
+  macOS simulator PTYs avoid an unsupported baud ioctl while retaining the
+  configured rate for framing/pacing; hardware-port baud settings are unchanged.
+- Installed source verification passes backend compile,117 frontend tests with
+  seven existing ignored tests, and strict native/Wasm frontend Clippy. Real
+  Wasm conflict-screen behavior passes desktop/mobile tests. Compass/GPS JS
+  helpers have moved from frontend source to frontend assets, with all four
+  sensor lifecycle/datum tests passing. Backend browser-asset relocation and
+  broader repository organization remain open.
+- Exact SDK89 local wheel passes50 Python3.12 tests and45 Python3.14 headless
+  tests plus strict Python-feature Clippy. Tk editor logic is covered on3.12;
+  the3.14 interpreter lacks its optional Tk extension. No package was published.
+- C90's original GS-restart gate fails a single FC `queue_errors` increment
+  after sample6, while the short traffic and three SD gates remain passed.
+  All10 valve/actuator command rounds acknowledge, and captured post-restart
+  managed-variable checks remain within500ms. These successful observations do
+  not override the original zero-error gate. The precise FC failure is under
+  investigation; no600-second soak starts and no release is qualified.

@@ -22,6 +22,9 @@ const AV_BAY_COMMAND: u8 = 6;
 const READY: u8 = 7;
 const POSITION: u8 = 8;
 const VOICE: u8 = 9;
+const SETTINGS: u8 = 10;
+const MAX_SETTINGS_INBOX: usize = 4;
+const SETTINGS_PEER_AGE_MS: u64 = 15_000;
 #[derive(Clone, Copy)]
 struct FrameClass {
     priority: u8,
@@ -129,6 +132,8 @@ struct Queued {
 pub struct Mesh {
     pub role: Role,
     voice_enabled: bool,
+    settings_peer_seen: Option<u64>,
+    settings_inbox: VecDeque<Vec<u8>>,
     started: Instant,
     session: u32,
     sequence: u32,
@@ -158,6 +163,8 @@ impl Mesh {
         Self {
             role,
             voice_enabled: false,
+            settings_peer_seen: None,
+            settings_inbox: VecDeque::new(),
             started: Instant::now(),
             session,
             sequence: 0,
@@ -287,8 +294,12 @@ impl Mesh {
     }
     fn clear(&mut self) {
         let old = self.queue.len();
-        self.queue
-            .retain(|q| matches!(q.frame.bytes.get(3), Some(&POSITION) | Some(&VOICE)));
+        self.queue.retain(|q| {
+            matches!(
+                q.frame.bytes.get(3),
+                Some(&POSITION) | Some(&VOICE) | Some(&SETTINGS)
+            )
+        });
         self.dropped += (old - self.queue.len()) as u64;
         self.bytes = self.queue.iter().map(|q| q.frame.bytes.len()).sum();
     }
@@ -382,6 +393,48 @@ impl Mesh {
             self.forwarded += 1;
             return Some(q.frame);
         }
+    }
+    /// Only the authenticated settings runtime calls this after verifying an
+    /// installation signature. Raw mesh reception never establishes presence.
+    pub fn authenticated_settings_peer(&mut self, now: u64) {
+        self.settings_peer_seen = Some(now);
+    }
+    pub fn settings_available(&self, now: u64) -> bool {
+        let radio_seen = match self.role {
+            Role::Primary => self.relay_seen,
+            Role::Rrls => self.health_received,
+        };
+        radio_seen.is_some_and(|last| now >= last && now - last < LEASE_MS)
+            || self
+                .settings_peer_seen
+                .is_some_and(|last| now >= last && now - last < SETTINGS_PEER_AGE_MS)
+    }
+    /// One pending low-priority frame; no eviction of commands, GPS, voice or
+    /// telemetry to admit settings. Caller retains its frame on backpressure.
+    pub fn queue_settings(&mut self, payload: &[u8], now: u64) -> bool {
+        if !self.settings_available(now)
+            || payload.len() > paired_settings::auth::MAX_WIRE
+            || self.queue.len() >= MAX_FRAMES
+            || self.bytes + payload.len() + 8 > MAX_BYTES
+            || self
+                .queue
+                .iter()
+                .any(|q| q.frame.bytes.get(3) == Some(&SETTINGS))
+        {
+            return false;
+        }
+        self.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(SETTINGS, payload),
+            },
+            0,
+            now,
+        );
+        true
+    }
+    pub fn take_settings(&mut self) -> Option<Vec<u8>> {
+        self.settings_inbox.pop_front()
     }
     pub fn voice_available(&self, now: u64) -> bool {
         self.voice_enabled
@@ -521,6 +574,18 @@ impl Mesh {
         if command && payload.starts_with(b"RR") {
             let (kind, data) = decode(payload)?;
             match (self.role, kind) {
+                (_, SETTINGS) => {
+                    if data.len() <= paired_settings::auth::MAX_WIRE
+                        && self.settings_inbox.len() < MAX_SETTINGS_INBOX
+                    {
+                        self.settings_inbox.push_back(data.to_vec());
+                    } else {
+                        self.dropped += 1;
+                    }
+                    // Never forward these application envelopes into SEDSnet,
+                    // refresh liveness, or treat them as output commands.
+                    None
+                }
                 (_, VOICE) if self.voice_available(now) => {
                     crate::radio_voice::receive(self.role, data);
                     None
@@ -683,6 +748,79 @@ fn decode(bytes: &[u8]) -> Option<(u8, &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn settings_are_bounded_and_never_displace_other_radio_work() {
+        let mut mesh = Mesh::new(Role::Primary, 7);
+        assert!(!mesh.queue_settings(&[1], 0));
+        mesh.authenticated_settings_peer(0);
+        assert!(mesh.queue_settings(&[1, 2, 3], 0));
+        assert!(!mesh.queue_settings(&[4], 0));
+        mesh.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(POSITION, &[0; 39]),
+            },
+            255,
+            0,
+        );
+        mesh.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(UP_COMMAND, &[7]),
+            },
+            254,
+            0,
+        );
+        mesh.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(VOICE, &[8]),
+            },
+            1,
+            0,
+        );
+        for expected in [POSITION, UP_COMMAND, VOICE, SETTINGS] {
+            assert_eq!(decode(&mesh.pop(1).unwrap().bytes).unwrap().0, expected);
+        }
+        assert!(!mesh.queue_settings(&vec![0; paired_settings::auth::MAX_WIRE + 1], 1));
+        assert!(!mesh.queue_settings(&[1], SETTINGS_PEER_AGE_MS));
+        assert!(!mesh.voice_available(1));
+        assert!(!mesh.active(1));
+    }
+    #[test]
+    fn unverified_settings_cannot_refresh_presence_forward_or_grow_an_unbounded_inbox() {
+        let mut mesh = Mesh::new(Role::Primary, 7);
+        for byte in 0..12 {
+            assert!(mesh.incoming(true, &encode(SETTINGS, &[byte]), 0).is_none());
+        }
+        assert!(!mesh.settings_available(0));
+        assert!(!mesh.active(0));
+        assert!(mesh.pop(0).is_none());
+        let frames: Vec<_> = std::iter::from_fn(|| mesh.take_settings()).collect();
+        assert_eq!(frames, vec![vec![0], vec![1], vec![2], vec![3]]);
+        assert_eq!(mesh.dropped, 8);
+        let before = mesh.dropped;
+        assert!(
+            mesh.incoming(
+                true,
+                &encode(SETTINGS, &vec![0; paired_settings::auth::MAX_WIRE + 1]),
+                0
+            )
+            .is_none()
+        );
+        assert!(mesh.take_settings().is_none());
+        assert_eq!(mesh.dropped, before + 1);
+    }
+    #[test]
+    fn settings_expire_without_enabling_relay_or_local_recovery_commands() {
+        let mut mesh = Mesh::new(Role::Rrls, 7);
+        mesh.health_received = Some(0);
+        assert!(mesh.queue_settings(&[9], 0));
+        assert!(mesh.pop(251).is_none());
+        assert!(mesh.local_tx(true, &[1], 251).is_none());
+        assert!(!mesh.active(251));
+    }
+
     fn health(session: u32, seq: u32, direct: bool) -> Vec<u8> {
         let mut p = session.to_le_bytes().to_vec();
         p.extend_from_slice(&seq.to_le_bytes());
@@ -1130,6 +1268,9 @@ mod tests {
 
 /// RRLS has no fill-system hardware.
 
+pub fn settings_transport() -> Option<Shared> {
+    RADIO.get().map(|(_, shared)| shared.clone())
+}
 pub fn voice_transport() -> Option<Shared> {
     RADIO
         .get()

@@ -131,6 +131,9 @@ impl Pairing {
             scheme: c.scheme,
         })
     }
+    pub(crate) fn mission_signing_key(&self) -> &signature::Ed25519KeyPair {
+        &self.key
+    }
     fn sign(&self, domain: &str, payload: &str) -> String {
         B64.encode(
             self.key

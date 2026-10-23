@@ -334,14 +334,14 @@ impl Engine {
     ) -> Effects {
         self.self_pending = 0;
         self.self_waiting = None;
-        for i in 0..5 {
+        for (i, &target) in desired.iter().enumerate() {
             let already_confirmed = input.valves[i].is_some_and(|v| {
-                v.open == desired[i]
+                v.open == target
                     && v.at_ms <= input.now_ms
                     && if phase == Phase::BaselineSetup {
                         input.now_ms - v.at_ms <= 2000
                     } else {
-                        self.target[i] == desired[i] && v.at_ms >= self.self_ack_since[i]
+                        self.target[i] == target && v.at_ms >= self.self_ack_since[i]
                     }
             });
             if already_confirmed {
@@ -645,16 +645,14 @@ impl Engine {
         if awaiting_valves && self.valve_ack_expired(input) {
             return self.valve_ack_timeout(input);
         }
-        if self.self_confirmation_phase() {
-            if let Some(i) = self.self_waiting {
-                if input.valves[i]
-                    .is_some_and(|v| v.open == self.target[i] && v.at_ms >= self.self_ack_since[i])
-                {
-                    self.self_waiting = None;
-                    if self.self_pending != 0 {
-                        return self.next_self_command(input.now_ms);
-                    }
-                }
+        if self.self_confirmation_phase()
+            && let Some(i) = self.self_waiting
+            && input.valves[i]
+                .is_some_and(|v| v.open == self.target[i] && v.at_ms >= self.self_ack_since[i])
+        {
+            self.self_waiting = None;
+            if self.self_pending != 0 {
+                return self.next_self_command(input.now_ms);
             }
         }
         match self.status.phase {

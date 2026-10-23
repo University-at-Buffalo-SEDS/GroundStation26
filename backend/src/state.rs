@@ -268,6 +268,29 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Reset derived samples after a physical KG50 input change. The caller
+    /// invalidates GSE mass under its own sequence lock.
+    pub fn clear_kg50_samples(&self) {
+        self.loadcell_processing.reset_kg50_input();
+        self.auto_zero.lock().unwrap().reset_kg50_input();
+        self.recent_telemetry_cache.lock().unwrap().retain(|r| {
+            !matches!(
+                r.data_type.as_str(),
+                "KG50" | "LOADCELL_50_WEIGHT_KG" | "LOADCELL_FILL_PERCENT"
+            )
+        });
+        *self.latest_fill_mass_kg.lock().unwrap() = None;
+        for data_type in ["KG50", "LOADCELL_50_WEIGHT_KG", "LOADCELL_FILL_PERCENT"] {
+            let row = crate::types::TelemetryRow {
+                timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+                data_type: data_type.into(),
+                sender_id: "DAQ".into(),
+                values: vec![None],
+            };
+            self.cache_recent_telemetry(row.clone());
+            let _ = self.ws_tx.send(row);
+        }
+    }
     pub(crate) fn board_from_network_sender(&self, sender: &str) -> Option<Board> {
         if let Some(board) = Board::from_sender_id(canonical_sender_id(sender)) {
             return Some(board);
@@ -2114,7 +2137,12 @@ pub(crate) mod tests {
                 .iter()
                 .find(|node| node.sender_id.as_deref() == Some(board.sender_id()))
                 .unwrap();
-            assert_eq!(node.status, NetworkTopologyStatus::Online, "{board:?}");
+            let expected_status = if crate::flight_sim::sim_mode_enabled() {
+                NetworkTopologyStatus::Simulated
+            } else {
+                NetworkTopologyStatus::Online
+            };
+            assert_eq!(node.status, expected_status, "{board:?}");
             assert_eq!(node.last_seen_ms, Some(25_001));
             assert!(node.age_ms.unwrap() < BOARD_SEEN_TIMEOUT_MS);
         }
@@ -2695,9 +2723,9 @@ pub(crate) mod tests {
             .map(|control| (control.enabled, control.actuated))
     }
 
-    #[cfg(feature = "testing")]
+    #[cfg(all(feature = "testing", not(feature = "hitl_mode")))]
     #[tokio::test]
-    async fn simulator_mode_allows_button_commands_even_when_policy_disabled() {
+    async fn simulator_mode_allows_manual_controls_but_keeps_launch_qualification() {
         let state = test_app_state().await;
         let mut policy = crate::sequences::default_action_policy();
         for control in &mut policy.controls {
@@ -2707,7 +2735,8 @@ pub(crate) mod tests {
 
         assert!(crate::flight_sim::sim_mode_enabled());
         assert!(state.is_command_allowed(&TelemetryCommand::Dump));
-        assert!(state.is_command_allowed(&TelemetryCommand::Launch));
+        // Simulated manual controls must not bypass the shared launch gate.
+        assert!(!state.is_command_allowed(&TelemetryCommand::Launch));
         assert!(state.is_command_allowed(&TelemetryCommand::ResetSim));
     }
 

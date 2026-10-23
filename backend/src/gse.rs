@@ -63,6 +63,29 @@ impl Default for Runtime {
     }
 }
 impl Runtime {
+    /// Imported calibration must not invalidate an active or already-qualified
+    /// procedure. Retain it as pending until the operator returns to Idle and
+    /// explicitly clears qualification. Never clear evidence automatically.
+    pub fn calibration_import_allowed(&self) -> bool {
+        #[cfg(feature = "hitl_mode")]
+        {
+            false
+        }
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            self.engine.status.phase == Phase::Idle
+                && !self.engine.active()
+                && self.operational.saved.qualification.stage()
+                    == gse_sequence::qualification::MissionStage::Idle
+                && ![
+                    Milestone::SelfTest,
+                    Milestone::NitrogenTest,
+                    Milestone::FillTarget,
+                ]
+                .into_iter()
+                .any(|m| self.operational.saved.qualification.completed(m))
+        }
+    }
     fn fresh_mass(&self, now_ms: u64) -> Option<Sample> {
         self.mass
             .filter(|m| m.at_ms <= now_ms && now_ms - m.at_ms <= 2000)
@@ -1633,4 +1656,33 @@ pub(crate) fn armed_fixture_for_test(
     policy.software_buttons_enabled = true;
     state.set_action_policy(policy);
     path
+}
+
+#[cfg(test)]
+mod mission_calibration_guard_tests {
+    use super::*;
+    #[cfg(not(feature = "hitl_mode"))]
+    #[test]
+    fn imported_calibration_waits_for_idle_and_explicit_qualification_reset() {
+        let mut runtime = Runtime::default();
+        assert!(runtime.calibration_import_allowed());
+        runtime.engine.status.phase = Phase::BaselineSetup;
+        assert!(!runtime.calibration_import_allowed());
+        runtime.engine.status.phase = Phase::Idle;
+        let generation = runtime.operational.saved.qualification.generation();
+        runtime
+            .operational
+            .saved
+            .qualification
+            .complete(Milestone::SelfTest, generation)
+            .unwrap();
+        assert!(!runtime.calibration_import_allowed());
+        runtime.operational.saved.qualification.reset().unwrap();
+        assert!(runtime.calibration_import_allowed());
+    }
+    #[cfg(feature = "hitl_mode")]
+    #[test]
+    fn hitl_does_not_import_paired_calibration() {
+        assert!(!Runtime::default().calibration_import_allowed());
+    }
 }

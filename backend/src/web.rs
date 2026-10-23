@@ -169,7 +169,11 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/auth/challenge", post(login_challenge))
         .route("/api/auth/login", post(login))
         .route("/api/auth/session", get(get_session_status))
-        .route("/api/station/discovery", get(crate::station_pairing::discover).options(crate::station_pairing::discovery_preflight))
+        .route(
+            "/api/station/discovery",
+            get(crate::station_pairing::discover)
+                .options(crate::station_pairing::discovery_preflight),
+        )
         .route("/api/auth/logout", post(logout))
         .route("/api/recent", get(get_recent))
         .route("/api/command", post(send_command))
@@ -271,6 +275,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::gse::routes())
         .merge(crate::admin::routes())
         .merge(crate::checklists::routes())
+        .merge(crate::mission_sync::routes())
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)
         .with_state(state)
@@ -311,7 +316,7 @@ pub(crate) async fn authorize_headers(
 fn calibration_edit_forbidden_response() -> axum::response::Response {
     (
         StatusCode::FORBIDDEN,
-        "calibration editing is restricted to the rylan user",
+        "Calibration edit permission required",
     )
         .into_response()
 }
@@ -675,7 +680,7 @@ async fn get_loadcell_calibration(
     Json(state.loadcell_calibration.lock().unwrap().clone()).into_response()
 }
 
-fn publish_daq_calibration(
+pub(crate) fn publish_daq_calibration(
     state: &AppState,
     calibration: &loadcell::LoadcellCalibrationFile,
 ) -> Result<(), String> {
@@ -763,26 +768,8 @@ async fn set_kg50_input(
         return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
     }
     *state.loadcell_calibration.lock().unwrap() = cfg.clone();
-    state.loadcell_processing.reset_kg50_input();
-    state.auto_zero.lock().unwrap().reset_kg50_input();
-    state.recent_telemetry_cache.lock().unwrap().retain(|r| {
-        !matches!(
-            r.data_type.as_str(),
-            "KG50" | "LOADCELL_50_WEIGHT_KG" | "LOADCELL_FILL_PERCENT"
-        )
-    });
-    *state.latest_fill_mass_kg.lock().unwrap() = None;
+    state.clear_kg50_samples();
     state.gse.lock().unwrap().observe_mass(None);
-    for data_type in ["KG50", "LOADCELL_50_WEIGHT_KG", "LOADCELL_FILL_PERCENT"] {
-        let row = crate::types::TelemetryRow {
-            timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
-            data_type: data_type.into(),
-            sender_id: "DAQ".into(),
-            values: vec![None],
-        };
-        state.cache_recent_telemetry(row.clone());
-        let _ = state.ws_tx.send(row);
-    }
     if let Err(err) = publish_daq_calibration(&state, &cfg) {
         return (StatusCode::SERVICE_UNAVAILABLE, err).into_response();
     }

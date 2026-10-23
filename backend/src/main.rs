@@ -37,6 +37,7 @@ mod logger;
 mod map;
 mod media;
 mod media_runtime;
+mod mission_sync;
 mod network_health;
 mod network_traffic;
 mod network_variables;
@@ -2202,6 +2203,8 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let _antenna_gpsd = antenna::start_gpsd(state.shutdown_subscribe());
+
+    let _mission_sync = mission_sync::start(state.clone());
 
     // --- Webserver ---
     let mut video_runtime = media_runtime::VideoRuntime::start();

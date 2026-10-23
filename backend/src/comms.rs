@@ -336,6 +336,43 @@ pub struct UartComms {
     slow_start_deadline: Option<Instant>,
 }
 
+#[cfg(not(target_os = "linux"))]
+fn serial_open_baud(cfg: &SerialLinkConfig) -> u32 {
+    #[cfg(target_os = "macos")]
+    if macos_fixture_pty(
+        &cfg.port,
+        std::env::var("GS_SIMULATED_SERIAL_PTY").as_deref() == Ok("1"),
+    ) {
+        // serialport explicitly accepts baud 0 for PTYs, avoiding IOSSIOSPEED.
+        // Retain cfg.baud_rate for framing deadlines and simulated wire pacing.
+        return 0;
+    }
+    cfg.baud_rate as u32
+}
+#[cfg(target_os = "macos")]
+fn macos_fixture_pty(port: &str, simulator_enabled: bool) -> bool {
+    simulator_enabled
+        && port.strip_prefix("/dev/ttys").is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn macos_pty_fixture_never_changes_a_hardware_ports_baud() {
+    assert!(macos_fixture_pty("/dev/ttys023", true));
+    for port in [
+        "/dev/ttys023",
+        "/dev/cu.usbserial-fixture",
+        "/dev/tty.usbserial-fixture",
+        "/dev/ttys",
+        "/dev/ttysABC",
+    ] {
+        assert!(!macos_fixture_pty(port, false));
+        if port != "/dev/ttys023" {
+            assert!(!macos_fixture_pty(port, true));
+        }
+    }
+}
 impl UartComms {
     pub fn open(cfg: &SerialLinkConfig) -> anyhow::Result<Self> {
         #[cfg(target_os = "linux")]
@@ -348,7 +385,7 @@ impl UartComms {
             .open_native()
             .context("failed to configure serial port")?;
         #[cfg(not(target_os = "linux"))]
-        let inner = serialport::new(&cfg.port, cfg.baud_rate as u32)
+        let inner = serialport::new(&cfg.port, serial_open_baud(cfg))
             .data_bits(serialport::DataBits::Eight)
             .parity(serialport::Parity::None)
             .stop_bits(serialport::StopBits::One)
