@@ -22,8 +22,10 @@ permissions fall back normally.
 
 The default disk reserve is 2048 MiB. Override with `--min-free-mib N` or
 `MAP_MIN_FREE_MIB=N`. Low space pauses the download with a terminal error, retaining
-committed tiles for a later run. Append-only downloads checkpoint their WAL rather
-than making a full-database VACUUM copy.
+committed tiles for a later run. Both direct downloads and directory-to-bundle packaging checkpoint their WAL
+rather than making a full-database VACUUM copy. Packaging also checks the reserve
+and commits at most 16 MiB of image data at a time; a disk-space failure keeps
+both committed bundle data and input tiles, then exits unsuccessfully.
 
 Each tile body is limited to 512 KiB, sufficient for the source's 256-pixel JPEG/PNG
 raster tiles. Oversized responses are terminal for that tile. HTTP response buffers

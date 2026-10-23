@@ -280,6 +280,13 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
     let resume = should_resume_bundle();
     let existing_bundle = bundle_path.exists();
     let tmp_path = bundle_path.with_extension("sqlite.tmp");
+    let directory = bundle_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(directory)?;
+    let reserve = storage::minimum_free_bytes()?;
+    storage::ensure_space(directory, reserve.saturating_add(16 * 1024 * 1024))?;
     if !resume && tmp_path.exists() {
         fs::remove_file(&tmp_path)?;
     }
@@ -354,6 +361,7 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
     let mut tx = pool.begin().await?;
     let commit_every: u64 = 10_000;
     let mut pending_writes: u64 = 0;
+    let mut pending_bytes: u64 = 0;
 
     let mut inserted: u64 = 0;
     let mut skipped_existing: u64 = 0;
@@ -428,7 +436,22 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
                         continue;
                     }
                 }
-                let bytes = fs::read(&path)?;
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                fs::File::open(&path)?
+                    .take((network::MAX_TILE_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)?;
+                anyhow::ensure!(
+                    bytes.len() <= network::MAX_TILE_BYTES,
+                    "saved tile exceeds512KiB; input files retained"
+                );
+                storage::ensure_space(
+                    directory,
+                    reserve
+                        .saturating_add(pending_bytes)
+                        .saturating_add(bytes.len() as u64)
+                        .saturating_add(16 * 1024 * 1024),
+                )?;
                 let mut hasher = Hasher::new();
                 hasher.update(&bytes);
                 let hash = hasher.finalize();
@@ -453,10 +476,12 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
                     .await?;
                 inserted += 1;
                 pending_writes += 1;
-                if pending_writes >= commit_every {
+                pending_bytes = pending_bytes.saturating_add(bytes.len() as u64);
+                if pending_writes >= commit_every || pending_bytes >= 16 * 1024 * 1024 {
                     tx.commit().await?;
                     tx = pool.begin().await?;
                     pending_writes = 0;
+                    pending_bytes = 0;
                 }
                 if inserted.is_multiple_of(50_000) {
                     println!("bundle progress: inserted {inserted} tiles");
@@ -468,11 +493,13 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
     tx.commit().await?;
     sqlx::query("ANALYZE;").execute(&pool).await?;
     sqlx::query("PRAGMA optimize;").execute(&pool).await?;
-    if !resume || !existing_bundle {
-        sqlx::query("VACUUM;").execute(&pool).await?;
-    } else {
-        println!("bundle resume mode: skipping VACUUM for faster incremental updates");
-    }
+    // Fresh/append-only bundles need no whole-database rewrite. VACUUM can
+    // otherwise consume another database-sized temporary allocation after
+    // the download already respected its disk reserve.
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);")
+        .execute(&pool)
+        .await?;
+    println!("Map bundle finalized without a full-database VACUUM rewrite.");
     let unique_blobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tile_blobs")
         .fetch_one(&pool)
         .await
@@ -746,12 +773,15 @@ async fn main() -> Result<()> {
 
         if should_build_bundle() {
             let bundle_path = bundle_path_for(&data_dir);
-            if let Err(e) = build_tile_bundle_sqlite(&tiles_root, &bundle_path).await {
-                eprintln!(
-                    "WARNING: failed building tile bundle {}: {e:#}",
-                    bundle_path.display()
-                );
-            } else if !should_keep_tiles() {
+            build_tile_bundle_sqlite(&tiles_root, &bundle_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "building map bundle {}; saved tiles retained",
+                        bundle_path.display()
+                    )
+                })?;
+            if !should_keep_tiles() {
                 match fs::remove_dir_all(&tiles_root) {
                     Ok(_) => {
                         println!(
@@ -1850,6 +1880,36 @@ mod map_pipeline_tests {
         task.await.unwrap();
         pool.close().await;
         server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_pack_low_space_preserves_committed_bundle_and_input_tiles() {
+        const CHILD: &str = "GS_MAP_PACK_RESERVE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","map_pipeline_tests::legacy_pack_low_space_preserves_committed_bundle_and_input_tiles","--test-threads=1"]).env(CHILD,"1").env("MAP_MIN_FREE_MIB","1000000000").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("gs-map-pack-reserve-{}", std::process::id()));
+        fs::create_dir_all(root.join("tiles/0/0")).unwrap();
+        let tile = root.join("tiles/0/0/0.jpg");
+        fs::write(&tile, b"input tile").unwrap();
+        let path = root.join("tiles.sqlite3");
+        let pool = init_direct_bundle_pool(&path, true).await.unwrap();
+        upsert_tile_to_bundle(&pool, 1, 0, 0, b"committed tile")
+            .await
+            .unwrap();
+        pool.close().await;
+        let error = build_tile_bundle_sqlite(&root.join("tiles"), &path)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("disk space"));
+        assert_eq!(fs::read(&tile).unwrap(), b"input tile");
+        let pool = open_bundle_database(&path).await.unwrap();
+        assert!(bundle_has_tile(&pool, 1, 0, 0).await.unwrap());
+        assert!(!bundle_has_tile(&pool, 0, 0, 0).await.unwrap());
+        pool.close().await;
         fs::remove_dir_all(root).unwrap();
     }
 }
