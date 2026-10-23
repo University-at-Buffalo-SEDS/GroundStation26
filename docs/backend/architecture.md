@@ -26,7 +26,7 @@ Most backend subsystems coordinate through `AppState`.
   revision-checked broadcast edits.
 - `backend/src/media/program.rs`: server-resolved live dashboard snapshots, delayed
   audience history, HLS release enforcement and stream-admin role assignment.
-- `backend/src/media/program.html`: audience player, 550 ms camera fades, cycling
+- `ui/station_ui/pages/program.html`: audience player, 550 ms camera fades, cycling
   delayed telemetry and T clock; unavailable timing fails closed.
 - `backend/src/auth.rs`: `roles` on account/session principals, independent of
   hardware command permission. Roles are rechecked when authorizing existing sessions.

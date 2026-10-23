@@ -196,15 +196,14 @@ The included unbranded GLB scene depicts nitrogen/nitrous tanks, manifold, plumb
 launch tower and vehicle. Valve colors reflect last acknowledged state, not measured
 flow. Animated `nitrogen-test`, `nitrous-fill`, and `dumping` clips indicate sequence
 activity only. These illustrative models are not engineering CAD or tank-level data.
-Regenerate with `node scripts/build_gse_models.mjs`. The main Dashboard defaults to
-a single-stage rocket with aft fins only. Uploaded multi-stage profiles remain
-supported through backend configuration and `/media` model administration. Select
-Settings → General → Viewing mode → Ground Station view for the instrument/GSE
-dashboard. See [model configuration](model-animations.md).
+Regenerate with `(cd ui && node scripts/build_gse_models.mjs)`. The built-in
+rocket has one stage and aft fins. GLB profiles and named-node animation are
+used for saved telemetry replay; live Dashboard and audience views use 2D art.
+See [model configuration](model-animations.md).
 
 The equipment preview's bundled model-viewer 4.3.1 is Apache-2.0 licensed; see
-`backend/assets/model-viewer.LICENSE`. Built-in uncompressed models require no CDN.
-The main dashboard instead uses the bundled Three.js named-node renderer (MIT).
+`ui/station_ui/vendor/model-viewer.LICENSE`. Built-in uncompressed models require
+no CDN. The replay renderer uses bundled Three.js (MIT).
 Uploaded models using compression may need additional decoder assets.
 # HITL button availability
 

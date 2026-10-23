@@ -1,17 +1,13 @@
 # Telemetry-driven model animation
 
-The default Dashboard renders the backend GLB using the bundled Three.js named-node
-renderer. The current rocket is single-stage, with aft fins and no upper fins or
-airbrake panels. Multi-stage support remains available for other backend profiles.
-Settings → General → Viewing mode → Ground Station view restores the instrument
-and control dashboard on that device. The separate Vehicle tab and user-facing
-binding editor have been removed.
+Recorded telemetry replay uses the bundled Three.js named-node renderer. The
+current rocket is single-stage, with aft fins and no upper fins or airbrake
+panels. Multi-stage profiles remain available for saved-data replay.
 
-Ground equipment/setup is visible in Dashboard/state and Mission only before Launch;
-the subsequent model views contain the rocket and flight/recovery data. Streamer
-uses this model full-size without active video and a simple 2D rocket inset with video.
-Its model motion/attitude state is resolved server-side and buffered with telemetry,
-so launch or recovery visuals cannot precede the delayed stream.
+Live Dashboard and audience-program views use 2D artwork. The artwork grows when
+there is no active camera and returns to its compact inset when video resumes.
+The live program does not load the 3D renderer or GLB assets. Audience phase and
+clock values still follow the server's delayed telemetry history.
 
 Configure bindings in the backend's stage-model directory `_presentation.json`
 (`vehicle.motions`, `vehicle.attitude`, `vehicle.stages`, and `stats`). Backend
@@ -71,7 +67,7 @@ Uploaded GLBs must have suitable named nodes; do not expect the renderer to infe
 mechanical joints from arbitrary meshes. Built-ins are uncompressed and offline-ready;
 compressed third-party GLBs may require additional decoder support.
 
-Regenerate built-in assets with `node scripts/build_gse_models.mjs`.
+Regenerate built-in assets with `(cd ui && node scripts/build_gse_models.mjs)`.
 The bundled Three.js 0.180.0 is MIT licensed. Its GLTFLoader/BufferGeometryUtils import
-paths are patched to local relative modules; see `backend/assets/three/LICENSE`.
+paths are patched to local relative modules; see `ui/station_ui/rendering/three/LICENSE`.
 Reference: [Three.js glTF and animation documentation](https://threejs.org/manual/en/animation-system.html).

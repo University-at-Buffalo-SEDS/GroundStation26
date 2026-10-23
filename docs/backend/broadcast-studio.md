@@ -116,7 +116,7 @@ not implement these contracts yet. Supply `GS_VIDEO_HOST` and `GS_VIDEO_PASSWORD
 as described in the [receiver setup](video-and-models.md).
 Native installations set `GS_VIDEO_HLS_URL` (default `http://127.0.0.1:8888`) and use
 the updated `backend/config/mediamtx.yml`. HLS uses internal port 8888, not a new
-public port. The bundled HLS.js 1.6.13 is BSD-2-Clause licensed (`backend/assets/hls.LICENSE`).
+public port. The bundled HLS.js 1.6.13 is BSD-2-Clause licensed (`ui/station_ui/vendor/hls.LICENSE`).
 
 Delayed playback requires Media Source Extensions and H.264 support. A browser lacking
 those capabilities shows the model instead, with no live-video fallback. Chrome desktop
@@ -192,8 +192,8 @@ Enable working WebGL2 for the model test (macOS testing used `--use-angle=metal
 for media retention, then run sequentially:
 
 ```sh
-node scripts/test-broadcast.cjs
-node scripts/test-model-animation.cjs
+(cd ui && node tests/station-broadcast.cjs)
+(cd ui && node tests/station-model-animation.cjs)
 ```
 
 The scripts verify real decoding/delay, unreleased-segment denial, cuts, grid/hiding,

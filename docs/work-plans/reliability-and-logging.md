@@ -909,3 +909,25 @@ which side caused the operator's intermittent transfers.
   the cross libc headers; this is a compile result, not physical Pi performance
   qualification. Other mission-setting/checklist adapters and the final UI,
   native handover, current-source long-run and package-release gates remain open.
+
+
+### Continued qualification and model tooling (2026-10-23)
+
+- SDK103 passes the original startup, pressure/source/three-SD gates and the GS
+  restart regression. The unchanged600-second simulated soak is running; no
+  long-run or release pass is claimed yet. The private Linux/ARM64 browser-source
+  closure audit waits for it to finish, then the optional PowerBoard compact
+  startup/pressure/restart comparison runs with original arena/pool/stack limits.
+- macOS FC production and simulator factories pass with the exact SDK103 runtime.
+  Production flash is471996/474624 bytes. PowerBoard compact/TLSF production and
+  simulator factories also pass at default limits; this is not a runtime result.
+- The isolated Cargo-output repair passes real external-target C integration,
+  config/environment/cache path precedence, CLI/wheel-argument and Ninja-input
+  regressions. Runtime Rust/profile bytes remain SDK103-identical. Promotion is
+  pending alongside the qualified SDK changes.
+- Replay-model generation and remaining browser fixtures now live in frontend
+  main/dev. Both built-in GLBs regenerate byte-for-byte from a different working
+  directory. The retired live3D streamer fixture is replaced by the passing
+  live2D browser test. Backend documentation now points to frontend-owned files
+  and clearly distinguishes live2D from saved-data3D replay. No product JS
+  remains in the GroundStation source outside its frontend submodule.
