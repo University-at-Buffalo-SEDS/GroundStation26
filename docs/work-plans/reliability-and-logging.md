@@ -707,3 +707,56 @@ which side caused the operator's intermittent transfers.
   and callback deferral. macOS factories and full native integrations are
   running. No physical firmware has been flashed, and no long soak or complete
   release qualification is claimed.
+
+### C85–C88 queue CPU and sustained-load checkpoint (2026-10-23)
+
+- C84 still exceeds macOS FC flash by204 bytes and is not promoted. C85 removes
+  eager fallback metadata allocation and redundant route-search collections.
+  A frozen-shape validation regression measures192 allocations before versus
+  zero after64 validations. All seven Linux factories and both macOS FC modes
+  fit without changing partitions, features or limits.
+- C85 fails the original startup gate with two gateway CAN ring drops. C86
+  avoids a second CRC verification for validated known discovery snapshots;
+  a negative control observes two verifications before versus one after.
+  C86 still fails startup with five ring drops. Neither starts a long soak.
+- The C86 first-drop capture points into linear priority insertion. C87 makes
+  same-priority tail insertion constant work: a256-entry regression falls from
+  257 priority classifications to at most three while preserving FIFO order.
+  Heap541/compact548 unit tests, full40-suite integrations in each store mode,
+  strict native/embedded checks, and discovery-disabled189/196 unit tests pass.
+  Minimal harness feature guards are now fixed without warning suppression.
+- Immutable SDK87 SHA256:
+  13222c31f45144f45503f46523af532738df9fe0dd5b4f244bf30ee11ead7e3e.
+  All seven Linux factories and matching host image pass. macOS FC production
+  uses469696/474624 bytes (4928 free); simulator470192 bytes (4432 free).
+  C87 passes startup but fails the original120-second pressure gate because
+  gateway drops must be zero for the entire run. The52 ring drops occur during
+  initial load-up and do not increase after warmup; hardware-FIFO overflow also
+  fails the original zero-counter gate. Every measured loadcell preservation/
+  freshness window passes. DAQ pressure/raw and FC SD inspections all pass,
+  including29704 flushed pressure rows with no inspector continuity failure.
+  Source-preservation still fails its whole-run zero-drop condition. Restart
+  and600-second gates remain blocked, rather than waived.
+- C88 independently addresses the remaining mixed-priority search: inserting
+  behind256 equal-priority entries and before one lower-priority entry falls
+  from260 classifications to at most16. A1024-step wrapped-ring comparison
+  preserves priority and FIFO order. Full heap/compact integrations pass with
+  543/550 unit tests; minimal191/198 and strict feature checks pass. macOS FC
+  production469768 and simulator470256 bytes both fit the unchanged slot.
+- Immutable SDK88 SHA256:
+  cf577b606fece8457b4bd96f62b9229d93361ffde85dd6102c6e9775bd076212.
+  Its Jupiter workflow waits for C87 to finish before building/running, so the
+  candidate cannot compete with C87 for host CPU. No C88 network pass is claimed.
+  Both use the unchanged C51 simulator engine, Pi main-Ethernet discovery and
+  framed TCP to the gateway-side Pico-Fi, original rates/caps/1Mbaud and gates.
+- The separate GS/RRLS settings prototype now shares one256-byte/second radio
+  allowance across peers, charges actual signed envelope lengths, retains a
+  bounded pending frame on backpressure, rotates peers fairly and paces failed
+  attempts. Its22 core tests plus paired reconnect and paced signed-loss/reorder/
+  restart tests pass with strict Clippy. Production backend integration and
+  conflict UI are still open; this is not a deployed settings-sync claim.
+- Still required: resolve gateway load-up drops and repeat pressure SD continuity;
+  pass original short, restart and600-second network/card gates; finish typed
+  GS/RRLS runtime synchronization and conflict UI; complete browser-source/repo
+  organization and platform/feature audits; promote owned sources and perform
+  qualified releases. No hardware changes or public firmware release occurred.
