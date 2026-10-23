@@ -851,3 +851,22 @@ which side caused the operator's intermittent transfers.
   managed-variable checks remain within500ms. These successful observations do
   not override the original zero-error gate. The precise FC failure is under
   investigation; no600-second soak starts and no release is qualified.
+
+
+### SDK89 integration and startup diagnosis (2026-10-23)
+
+- Exact SDK89 backend checks pass:399 default,400 test-fire,385 HITL and404
+  testing tests, with one existing ignored test per mode. The abort-clear test
+  asserts its own router's cached Idle value, local state, saved qualification
+  reset and zero output commands. Its redundant process-global default assertion
+  raced other independent AppStates in parallel tests; isolated execution passed.
+- The actual stream browser fixture passes synthetic H.264 playback, replay,
+  audio, portrait layout, delay changes, camera loss and server failure. It now
+  checks the current live2D graphic and rejects all live3D asset requests.
+- Simulator C93 exposed an off-site GPS fixture rejected by the unchanged FC
+  site validator. C94 corrects only simulated GPS input to the compiled site;
+  endpoint errors disappear but one queue error remains. C95 adds private
+  error-only atomic probes to identify the remaining failure; these probes are
+  diagnostic overlays, not release source. No retry/cap/source-rate/acceptance
+  limits are changed. The original startup/restart and600-second soak gates
+  remain required; no firmware release is qualified.

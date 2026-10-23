@@ -14,7 +14,7 @@ try {
   const page=await browser.newPage({viewport:{width:360,height:800}});
   const errors=[];page.on('pageerror',e=>errors.push(e.message));
   const start=Date.now()-20000;
-  let live=true,offline=false,layout='hero',delay=3,audioCursor=0,replay=null;
+  let live=true,offline=false,layout='hero',delay=3,audioCursor=0,replay=null,live3dRequests=0;
   await page.addInitScript(()=>{
     window.audioFrames=0;
     const start=AudioBufferSourceNode.prototype.start;
@@ -28,7 +28,7 @@ try {
     if(path==='/assets/hls.min.js')return route.fulfill({contentType:'text/javascript',body:readFileSync('backend/assets/hls.min.js')});
     if(path==='/assets/program-art.js')return route.fulfill({contentType:'text/javascript',body:readFileSync('backend/src/media/program-art.js')});
     if(path==='/assets/program-audio.js')return route.fulfill({contentType:'text/javascript',body:readFileSync('backend/src/media/program-audio.js')});
-    if(path==='/assets/three/vehicle-renderer.js')return route.fulfill({contentType:'text/javascript',body:"customElements.define('gs-vehicle-viewer',class extends HTMLElement{});"});
+    if(path.startsWith('/assets/three/')){live3dRequests++;return route.abort();}
     if(path==='/api/media-assets/program/state') {
       if(offline)return route.fulfill({status:503,body:'offline'});
       return route.fulfill({json:{server_now_ms:Date.now(),broadcast:{replay:replay&&Date.now()<replay.started_at_ms+replay.duration_seconds*1000/replay.speed?replay:null,delay_seconds:delay,comms_audio_enabled:true,label:'Test mission',featured_stream_id:'camera',layout},streams:live?(replay&&Date.now()<replay.started_at_ms+replay.duration_seconds*1000/replay.speed?replay.cameras.map(c=>c.id):['camera','other']).map(id=>({id,label:id,url:`/hls/${id}/index.m3u8`})):[],telemetry:{phase:'Idle',t_clock:'T− 00:10.00',stats:[{label:'Altitude',value:12,precision:1,unit:'m'}]}}});
@@ -88,27 +88,28 @@ try {
   await page.setViewportSize({width:360,height:800});layout='grid';
   await page.waitForFunction(()=>document.querySelectorAll('video').length===2&&[...document.querySelectorAll('video')].every(v=>v.style.opacity==='1'));
   assert.deepEqual(await page.locator('video').evaluateAll(v=>v.map(x=>x.style.width)),['100%','100%'],'portrait grid stacks cameras');
-  assert.equal(await page.locator('#model-stage').isVisible(),false,'camera grids do not show a 3D model by default');
+  assert.equal(await page.locator('#graphic-stage').isVisible(),false,'camera grids do not show a 3D model by default');
   layout='grid-model';
-  await page.waitForFunction(()=>document.querySelector('#model-stage').style.display==='block'&&document.querySelector('#model-stage').style.height.includes('33.3'));
-  assert.equal(await page.locator('video').count(),2,'model tile coexists with the camera feeds');
-  await page.locator('#model-stage gs-vehicle-viewer').waitFor();
-  assert.equal(await page.locator('#model-stage gs-vehicle-viewer').count(),1);
+  await page.waitForFunction(()=>document.querySelector('#graphic-stage').style.display==='flex'&&document.querySelector('#graphic-stage').style.height.includes('33.3'));
+  assert.equal(await page.locator('video').count(),2,'2D graphic tile coexists with the camera feeds');
+  await page.locator('#graphic-stage #rocket-inset svg').waitFor({state:'visible'});
+  assert.equal(await page.locator('#graphic-stage gs-vehicle-viewer').count(),0,'live graphic uses no 3D viewer');
   layout='model';
-  await page.waitForFunction(()=>!document.querySelector('video')&&document.querySelector('#model-stage').style.height==='100%');
-  assert.equal(await page.locator('#model-stage').isVisible(),true,'operator may select a model-only view');
+  await page.waitForFunction(()=>!document.querySelector('video')&&document.querySelector('#graphic-stage').style.height==='100%');
+  assert.equal(await page.locator('#graphic-stage').isVisible(),true,'operator may select a 2D graphic-only view');
   layout='hero';
   await page.waitForFunction(()=>document.querySelectorAll('video').length===1&&document.querySelector('video').style.opacity==='1');
-  assert.equal(await page.locator('#model-stage').isVisible(),false);
+  assert.equal(await page.locator('#graphic-stage').isVisible(),false);
   delay=10;await page.waitForTimeout(1600);
   await page.waitForFunction(()=>[...document.querySelectorAll('video')].some(v=>v.style.opacity==='1'));
-  live=false;await page.waitForFunction(()=>!document.querySelector('video')&&document.querySelector('#model-stage').dataset.flat==='true');await page.locator('#rocket-inset').waitFor({state:'visible'});
-  assert.equal(await page.locator('#model-stage #rocket-inset').count(),1,'2D rocket fills the main area without a camera');
-  assert.equal(await page.locator('#model-stage gs-vehicle-viewer').count(),0,'fallback needs no 3D viewer');
+  live=false;await page.waitForFunction(()=>!document.querySelector('video')&&document.querySelector('#graphic-stage').dataset.flat==='true');await page.locator('#rocket-inset').waitFor({state:'visible'});
+  assert.equal(await page.locator('#graphic-stage #rocket-inset').count(),1,'2D rocket fills the main area without a camera');
+  assert.equal(await page.locator('#graphic-stage gs-vehicle-viewer').count(),0,'fallback needs no 3D viewer');
   live=true;await page.waitForFunction(()=>document.querySelector('video')?.style.opacity==='1');
   assert.equal(await page.locator('#program-bar #rocket-inset').count(),1,'same artwork returns beside the live camera');
   offline=true;await page.waitForFunction(()=>document.querySelector('#status').textContent.includes('unavailable'));
   await page.locator('#rocket-inset').waitFor({state:'visible'});
+  assert.equal(live3dRequests,0,'3D assets are reserved for saved replay');
   assert.equal(errors.length,0,errors.join('\n'));
   console.log('PASS: H.264 playback advances, single decoder, portrait grid/status bar, unified camera/crew sound without worklet or microphone, delay changes, camera loss and server failure');
 } finally {await browser?.close();rmSync(dir,{recursive:true,force:true});}
