@@ -951,3 +951,87 @@ which side caused the operator's intermittent transfers.
 - Explicit --frontend-dev now rebuilds the WebUI even with --backend-only. This
   restores the previously requested RRLS command instead of rejecting it. Plain
   backend-only reuse, separate RRLS config and Pi GPIO behavior are unchanged.
+
+
+### Completed SEDSnet CI-entry-point qualification (2026-10-23)
+
+- Ran the actual build-script campaigns, not only selected Cargo tests. The
+  current CLI is `python3 build.py test --full`; `test all` is not its syntax.
+  Default full Nextest passes672 tests, zero skipped. The additional full
+  compact/compression/fair-admission campaign passes698 tests, zero skipped,
+  including the ignored600-second codec/arena soak. Both ten-step campaigns
+  include strict hosted/Python/embedded Clippy, doctests, reduced-feature memory
+  checks, benchmarks, Python tests and an embedded build.
+- The exact working-HEAD candidate also passes the complete GitLab test entry
+  point, `python3 publish_crates.py`, without skip or publish flags. Both default
+  and compact CI campaigns, clean-tree/version checks, package verification and
+  Cargo publish dry-runs return zero. An earlier source-only package audit lacked
+  Git metadata and failed its clean-tree guard; the successful rerun uses a clean
+  private Git commit based on a98bc5a922b233cc843732234a241d1f807ac4b2, preserving
+  executable modes. No package was uploaded and no public tag/image was released.
+- Evidence: /tmp/sdk103-full-build-campaign.json,
+  /tmp/sdk103-extra-release-gates.json (compact-full passes; the source-only
+  package attempt fails), and /tmp/sdk103-exact-ci-publisher-proof.json (complete
+  corrected CI entry point passes). The tested immutable runtime remains SDK103,
+  archive90a4a64bde7cf1e7abf651dfc9c5eea09b3f4b0ef8c0ed92c3155e7f09ee7caa.
+- Jupiter's original startup, pressure/source/three-SD and GroundStation-restart
+  gates pass, as does the original600-second simulated traffic soak (6088 seconds
+  wall time). No retry, rate, budget or acceptance threshold was relaxed. The
+  frontend-owned asset closure audit passes native Linux and Raspberry Pi ARM64
+  production compilation; this is not physical Raspberry Pi qualification.
+- PowerBoard compact storage passes startup and120-second pressure/source/SD
+  checks at its original arena, pool and stack limits. Its separate restart
+  comparison remains running; no independent compact600-second soak is claimed.
+  Qualified-source promotion, public releases and the other remaining work-plan
+  items are still pending. CI success here does not claim all release work done.
+
+
+### Qualified source promotion and bounded local builds (2026-10-23)
+
+- PowerBoard compact startup,120-second pressure/source/SD and GroundStation
+  restart comparisons all pass at original arena/pool/stack limits. The original
+  SDK103600-second network/source/three-SD gate also passes; no separate compact
+  600-second soak is claimed. Authoritative raw evidence remains on Jupiter under
+  /home/rylan/seds-gateway-fidelity-20261020. Earlier local temporary build trees
+  have been removed; concise qualification records are committed in SEDSnet and
+  DAQ documentation.
+- All seven production factories pass on macOS. FC and PowerBoard simulator
+  factories pass too. The remaining five production builds pass fresh dependency
+  resolution and the qualified lock. DAQ193 tests (two existing skips), Valve140,
+  gateway143, RF165 (one existing skip), actuator115 pass. Valve's qualified
+  independent pressure/sample clock and drift/wrap regressions are now promoted;
+  pressure logging keeps reliable unordered delivery. Stale remote tests expecting
+  Off were not used to disable that delivery contract.
+- SEDSnet qualified runtime is promoted to main/dev through24d095b; the subsequent
+  release-tool fix fd55bde moves local PyPI tokens into a supported OS credential
+  store. Legacy plaintext config is replaced only after verified secure storage;
+  the repo file contains no token.35 focused tests and23 Python3.14 security tests
+  pass. No Rust runtime code changed for this hardening. The user's replacement
+  credential is migrated and read-back verified without displaying any values.
+- SEDSnet4.2.5 is published on crates.io from this Mac, with package verification
+  enabled. Macro2.1.1 was already published and skipped. PyPI artifacts/publication
+  and simulator0.4.15 image/tag promotion remain pending.
+- All seven firmware migration branches are pushed: FCb4f5a6d, Powerc5c1ad8,
+  DAQe7ab11e, Valvef6f0829, gateway602cc17, RF ee81468 and actuator848b08d.
+  Unrelated actuator .clangd and protected GS inputs remain untouched. RF's
+  simulator GPS position now retains the exact tested launch-site fix; FC's
+  geographic validator is unchanged.
+
+Local disk rules for the remaining work:
+
+- Check free space before each heavy job and preserve at least30GiB. Stop instead
+  of starting a new matrix if its working space would consume that reserve.
+- Use one shared non-incremental Cargo target; do not duplicate targets inside
+  source snapshots. Serialize large local builds and run simulator work on the
+  approved Jupiter host after checking its free space too.
+- Retain source commits, compact logs/results and final firmware/package artifacts;
+  retire completed owned build intermediates once those records are saved. Do
+  not delete user-owned source, settings, recordings or unknown build directories.
+- Credential hardening uses a roughly5MiB test fixture, not a repeated Rust/firmware
+  matrix. The current native package verification cache is roughly0.53GiB.
+
+Remaining release work includes final public simulator source/image validation,
+PyPI wheel artifacts and local upload, current paired-GS firmware-simulator
+acceptance, remaining mission-setting/checklist sync adapters, full frontend
+stable promotion and final UI/native/platform acceptance. This milestone does
+not mark those items complete or establish physical radio/current/SD performance.
