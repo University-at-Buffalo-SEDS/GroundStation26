@@ -652,10 +652,11 @@ which side caused the operator's intermittent transfers.
   uses474532/474624 bytes (92 free). Independent macOS FC factory builds pass:
   production473948 bytes (676 free), simulator474436 bytes (188 free).
   No partition, source rate, memory cap, feature or acceptance threshold changed.
-- C73 startup passes. The original120-second network/pressure/SD gate is running
-  on Jupiter with the unchanged simulator engine; restart and600-second gates
-  remain conditional on every preceding original gate and independent card check.
-  No long pass, physical qualification or public release is claimed.
+- C73 startup passes, but the original120-second network/pressure/SD gate
+  fails. DAQ pressure rows fall below the original per-window threshold; both
+  DAQ card inspections reject the pressure sequence gap. Restart and600-second
+  gates are blocked. Source-preservation and FC-card checks pass separately;
+  they do not replace the failed original gate.
 - In a separate unpromoted copy, the40 existing discovery-disabled build warnings
   are fixed at their feature boundaries without suppression. Minimal std,
   std+time-sync, std+crypto/compression, default all-target and embedded strict
@@ -667,3 +668,42 @@ which side caused the operator's intermittent transfers.
   remaining feature/platform audits, successful long network/SD qualification,
   owned source promotion and qualified releases. Saved replay is complete and
   pushed; it no longer remains an open checkbox above.
+
+
+### C73 loss audit and retry ownership repairs (2026-10-23)
+
+- Recovered DAQ SD contains29636 unique pressure samples, sequence0..29691:
+  56 samples (14 complete four-sample batches) are missing. There are no duplicate
+  or backwards arrivals and no sample-grid errors. Valve captured/published29712
+  samples with zero capture/publication drops; DAQ reports no handoff drops.
+  The additional20 accepted/written rows not yet flushed explain the file tail,
+  not the internal holes. This is genuine delivery loss, not unordered arrival.
+- Negative native controls reproduce stuck retry reservations after admission
+  refusal, shared-budget/ring eviction, queue clearing and egress disable.
+  Another control exhausts retries by repeatedly evicting a timer marker without
+  advancing time. Reservation ownership now follows actual queue entries;
+  retained payloads survive and reservation timestamps bound rescheduling.
+- Three additional old-code failures prove that accepted original reliable
+  packets can be silently evicted before their first dispatch. The candidate
+  preserves these originals, reclaims disposable best-effort work first, and
+  backpressures admission when no safe victim exists. Existing schema reclamation
+  checks continue to pass. No original simulator gate has been relaxed.
+- The disposability flag is computed before parking and fits existing metadata
+  padding, checked at compile time on native and ARM targets. Borrowed target
+  cohorts remove owned arrays from route selection. Prepared insertion removes
+  a second admission/parking pass, with an executable single-parking regression.
+  Embedded error reporting forwards existing length-delimited text without
+  allocating a formatted copy; platform callbacks own line presentation.
+- The current isolated candidate passes539 heap and546 compact unit tests and
+  strict default/embedded checks. Full integration, factory and simulator gates
+  remain required. Minimal-feature library warnings are fixed; the old minimal
+  unit harness still needs discovery-specific feature guards.
+- C75/C76/C77/C78/C79 fail Linux FC flash fit; C80 exposes an embedded feature
+  guard missed by default builds and is rejected. C81 corrects that guard;
+  C81/C82 still fail macOS FC fit. C83 reduces that overflow to476 bytes but
+  remains rejected. These failures are retained and do not qualify a release.
+- C84 shares the typed logging dispatch across direct/queued and implicit/
+  explicit timestamp APIs, preserving queued producers' discovery-free path
+  and callback deferral. macOS factories and full native integrations are
+  running. No physical firmware has been flashed, and no long soak or complete
+  release qualification is claimed.
