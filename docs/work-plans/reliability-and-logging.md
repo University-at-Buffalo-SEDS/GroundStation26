@@ -588,3 +588,38 @@ which side caused the operator's intermittent transfers.
 - Paired settings production runtime/conflict UI, final audits, all-platform
   builds, pressure/network long soak and release remain open. Core anti-entropy
   and adapter tests alone do not establish cross-station settings synchronization.
+
+
+### C60–C64 continuation checkpoint (2026-10-22)
+
+- C60 fails its original 120-second source-preservation gate: one ten-second
+  second-loadcell window preserves 99.3918% (99.5% required). Freshness passes
+  and the observed CAN rings remain drop-free. Both DAQ inspector modes reject
+  the same pressure-part sequence gap at CSV record 17,173; FC card inspection
+  passes. No long gate is accepted.
+- Valve62 separates observed HAL capture time from the ADC sample grid, so UTC
+  age never subtracts projected future sample time. Its 140 tests, including
+  drift/gap/wrap checks and old-code negative reproductions, pass. macOS and
+  Linux factory builds pass. Source rates and the 44-byte CAN payload remain
+  unchanged; network/SD qualification still requires a fresh cohort.
+- SDK61 preserves accepted queued reliable packets under exhausted receipt
+  credit and prioritizes/drains queued hop ACKs in Router and Relay. Twelve
+  Packet/Packed ordered/unordered regressions exercise actual wire ACKs. Native
+  524 heap/530 compact, C-system integration and strict Clippy checks pass. Its
+  Linux FC image overflows flash by 348 bytes, blocking the simulator campaign.
+- The SDK63 cold error-classifier experiment passes native and strict Clippy
+  checks but increases Linux FC overflow to 540 bytes. It is rejected; the failed
+  immutable build remains available. C64 compares compiler inlining budgets
+  against the original frozen SDK61 without changing source, features, rates,
+  memory limits, diagnostics, partitions or acceptance thresholds.
+- Saved replay is pushed as backend 5a8335a and frontend 182cdef. Exact checkout
+  tests pass 387 backend tests (one existing ignored) and 114 frontend tests
+  (seven existing ignored). Frontend dfea867 fixes warning causes without
+  suppression; native/Wasm all-target Clippy passes. Backend 4014880 renders
+  paused replay only on view/state changes and preserves centered animation
+  transforms. Actual desktop/mobile model browser checks pass.
+- Still open: pressure/network short reproduction and long soak, production
+  paired-settings runtime/conflict UI, browser-source ownership/organization,
+  remaining platform/feature audits and qualified releases. Diagnostic reanalysis
+  never substitutes for a failed original gate. No public SDK/firmware release
+  or complete-plan claim is warranted yet.
