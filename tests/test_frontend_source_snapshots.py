@@ -131,6 +131,32 @@ source=build.prepare_browser_asset_source(root,sys.argv[2]=='dev')
             build._run_frontend_script_with_wasm_opt_fallback(script, checkout, [])
             self.assertEqual(output.read_text(), str(root / 'explicit-target'))
 
+    def test_frontend_build_closes_output_and_limits_fallback_to_wasm_opt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = Path(tmp)
+            script = checkout / 'build.py'
+            public = checkout / 'dist/public'
+            public.mkdir(parents=True)
+            real_popen = subprocess.Popen
+            children = []
+            def capture_process(*args, **kwargs):
+                child = real_popen(*args, **kwargs)
+                children.append(child)
+                return child
+            with patch.object(build.subprocess, 'Popen', side_effect=capture_process), patch('builtins.print'):
+                script.write_text('print("wasm-opt failed")\nraise SystemExit(1)\n')
+                build._run_frontend_script_with_wasm_opt_fallback(script, checkout, [])
+                script.write_text('print("compiler error")\nraise SystemExit(2)\n')
+                with self.assertRaises(subprocess.CalledProcessError) as failure:
+                    build._run_frontend_script_with_wasm_opt_fallback(script, checkout, [])
+                self.assertEqual(failure.exception.returncode, 2)
+                script.write_text('print("wasm-opt failed")\nraise SystemExit(1)\n')
+                public.rmdir()
+                with self.assertRaises(FileNotFoundError):
+                    build._run_frontend_script_with_wasm_opt_fallback(script, checkout, [])
+            self.assertEqual(len(children), 3)
+            self.assertTrue(all(child.stdout.closed for child in children))
+
     def test_lock_serializes_independent_processes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

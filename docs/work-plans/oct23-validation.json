@@ -72,7 +72,7 @@
     },
     {
       "id": "saved-replay-ground-horizon-trajectory-and-camera",
-      "native_and_wasm_app_compilation": "pending",
+      "native_and_wasm_app_compilation": "passed",
       "isolated_canvas_rendering": "passed desktop and mobile",
       "explicit_webgl_rendering": "passed in installed Brave151 at1280 and390 widths;16 checks each",
       "status": "pushed to frontend dev",
@@ -123,9 +123,7 @@
       "sdk_commit": "cd236dd9c6c404fe62c0baadbc204f9ad38c9a3b",
       "limits": "original cohort103 controller, rates and acceptance limits",
       "must_not_relabel_as_later_sdk": true,
-      "last_observed_network_samples": 31,
       "required_network_samples": 60,
-      "wall_seconds_observed": 3160,
       "sd_checks": "passed",
       "status": "passed",
       "network_samples": 60,
@@ -146,25 +144,26 @@
       "backend_source": "included in425-test SDK4c qualification",
       "actual_console_and_file_sinks": "passed with fake sentinels",
       "real_credentials_read": false
+    },
+    {
+      "id": "actual-fresh-wasm-browser-acceptance",
+      "product_commit": "f98acc3bc59473efa7ffb00e97ee61f6415e290d",
+      "test_fixture_commit": "05c959b2e5944545b5934a8bfc0c648b3d292eb9",
+      "modules_passed": 17,
+      "simulated_command_buttons": 55,
+      "physical_hardware_tested": false,
+      "native_rpi_runtime_tested": false,
+      "evidence": "/tmp/gs-ui-acceptance/acceptance-summary.json"
     }
   ],
   "in_progress": [
     {
       "id": "ordinary-data-codec-negotiation",
       "status": "design and failing mixed-capability regression required; discovery fix alone does not solve ordinary compressed payloads"
-    },
-    {
-      "id": "actual-fresh-wasm-browser-acceptance",
-      "frontend_commit": "f98acc3bc59473efa7ffb00e97ee61f6415e290d",
-      "initial_pass": 6,
-      "fixture_corrected_pass": 3,
-      "production_changes_required": false,
-      "test_only_fixes_pending": true
     }
   ],
   "next": [
-    "Complete rendered actual-Wasm UI acceptance; publish matching qualified backend/catalog. Use --frontend-dev as requested; do not promote frontend main.",
-    "Collect actual combined Cargo results and initial FC soak; retain exact source and image hashes.",
+    "Qualify native Ubuntu/RPi frontend packaging/runtime separately from portable Wasm browser acceptance; keep frontend main unchanged and select dev via --frontend-dev.",
     "Rebuild all seven current firmware images plus GroundStation against the final SDK source, then run the unchanged full-system acceptance campaign and long soak.",
     "Verify current simulator topology uses Pi Ethernet TCP/discovery and no removed GroundStation-side Pico/I2C path.",
     "Finish paired GroundStation/RRLS mission/checklist settings synchronization and conflict acceptance tests.",
@@ -183,6 +182,6 @@
     "mode": "dev",
     "flag": "--frontend-dev",
     "main_promoted": false,
-    "current_dev": "f98acc3bc59473efa7ffb00e97ee61f6415e290d"
+    "current_dev": "05c959b2e5944545b5934a8bfc0c648b3d292eb9"
   }
 }

@@ -201,12 +201,13 @@ def _run_frontend_script_with_wasm_opt_fallback(script: Path, checkout_dir: Path
     )
     assert proc.stdout is not None
 
-    lines: list[str] = []
+    wasm_opt_failed = False
     try:
         for line in proc.stdout:
             print(line, end="")
             _append_log(line)
-            lines.append(line)
+            if any(hint in line.lower() for hint in WASM_OPT_FAILURE_HINTS):
+                wasm_opt_failed = True
         rc = proc.wait()
     except KeyboardInterrupt:
         proc.terminate()
@@ -216,13 +217,14 @@ def _run_frontend_script_with_wasm_opt_fallback(script: Path, checkout_dir: Path
             proc.kill()
             proc.wait()
         raise
+    finally:
+        proc.stdout.close()
 
     if rc == 0:
         return
 
-    combined_output = "".join(lines).lower()
     public_dir = _resolve_external_public_dir(checkout_dir)
-    if public_dir.is_dir() and any(hint in combined_output for hint in WASM_OPT_FAILURE_HINTS):
+    if public_dir.is_dir() and wasm_opt_failed:
         warning = (
             "Warning: frontend build completed but wasm-opt post-processing failed. "
             "Continuing with the unoptimized wasm bundle because dist/public was produced."
