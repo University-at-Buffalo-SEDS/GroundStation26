@@ -1710,22 +1710,32 @@ async fn set_fill_targets(
     if !principal.permissions.send_commands {
         return (StatusCode::FORBIDDEN, "permission denied").into_response();
     }
-    if cfg.fill_source != state.fill_targets_snapshot().fill_source
-        && (crate::gse::active(&state) || state.auto_zero.lock().unwrap().pending())
-    {
-        return (
-            StatusCode::CONFLICT,
-            "Cancel the fill/zero capture before changing its loadcell source",
-        )
-            .into_response();
-    }
-    match fill_targets::save(&cfg) {
-        Ok(()) => {
-            let saved = fill_targets::load_or_default();
-            state.set_fill_targets(saved.clone());
+    let result = (|| -> Result<FillTargetsConfig, (StatusCode, String)> {
+        let mut gse = state.gse.lock().unwrap();
+        let zero = state.auto_zero.lock().unwrap();
+        let mut current = state.fill_targets.lock().unwrap();
+        let source_changed = cfg.fill_source != current.fill_source;
+        if source_changed && (gse.engine.active() || zero.pending()) {
+            return Err((
+                StatusCode::CONFLICT,
+                "Cancel the fill/zero capture before changing its loadcell source".into(),
+            ));
+        }
+        let next = fill_targets::canonical_settings(cfg);
+        fill_targets::save(&next).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        *current = next.clone();
+        if source_changed {
+            *state.latest_fill_mass_kg.lock().unwrap() = None;
+            gse.observe_mass(None);
+        }
+        Ok(next)
+    })();
+    match result {
+        Ok(saved) => {
+            state.broadcast_fill_targets_snapshot();
             Json(saved).into_response()
         }
-        Err(err) => (StatusCode::BAD_REQUEST, err).into_response(),
+        Err((status, err)) => (status, err).into_response(),
     }
 }
 

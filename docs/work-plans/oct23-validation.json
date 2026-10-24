@@ -5,11 +5,16 @@
   "complete": [
     {
       "id": "fc-flash-headroom",
-      "sdk_commit": "cd236dd9c6c404fe62c0baadbc204f9ad38c9a3b",
-      "flash_bytes": 449820,
+      "sdk_commit": "ea95a993cd6f1154775ce98472bd7a954f907ffd",
+      "flash_bytes": 449844,
       "flash_capacity_bytes": 474624,
-      "percent": 94.774,
-      "features_removed": false
+      "percent": 94.779,
+      "features_removed": false,
+      "previous_qualification": {
+        "sdk_commit": "cd236dd9c6c404fe62c0baadbc204f9ad38c9a3b",
+        "flash_bytes": 449820
+      },
+      "simulator_flash_bytes": 450340
     },
     {
       "id": "sdk-codec-independent-discovery",
@@ -154,19 +159,69 @@
       "physical_hardware_tested": false,
       "native_rpi_runtime_tested": false,
       "evidence": "/tmp/gs-ui-acceptance/acceptance-summary.json"
+    },
+    {
+      "id": "ordinary-data-codec-negotiation",
+      "sdk_commit": "ea95a993cd6f1154775ce98472bd7a954f907ffd",
+      "rust_tests": 712,
+      "python_tests": 70,
+      "clippy_profiles": 3,
+      "cross_target_checks": "passed",
+      "latest_full_cohort_qualified": false
+    },
+    {
+      "id": "paired-inert-mission-settings-backend",
+      "status": "backend and matching frontend qualified; included in this source integration",
+      "sdk_commit": "ea95a993cd6f1154775ce98472bd7a954f907ffd",
+      "backend_passed": 435,
+      "backend_ignored": 3,
+      "paired_unit_passed": 23,
+      "paired_integration_passed": 2,
+      "isolated_no_output_worker_passed": 1,
+      "isolated_saved_file_transaction_passed": 1,
+      "hitl_passed": 6,
+      "settings": [
+        "raw saved fill targets",
+        "validated GSE pressure settings excluding dry confirmation",
+        "saved flight setup without Apply",
+        "automatic-zero enabled preference only"
+      ],
+      "strict_import_boundary": "Idle and explicit qualification cleared; no pending auto-zero",
+      "operational_state_synced": false,
+      "checkpoint_number_precision": "exact float roundtrip; original calibration numbers preserved",
+      "evidence": "/tmp/gs-mission-stage1-results.json",
+      "frontend_commit": "967c1df02906dcc60d3326f2ecdefa2e41d9d45f"
+    },
+    {
+      "id": "paired-mission-settings-conflict-ui",
+      "frontend_commit": "967c1df02906dcc60d3326f2ecdefa2e41d9d45f",
+      "native_passed": 132,
+      "fresh_wasm_status": "passed",
+      "real_wasm_mission_keys": 4,
+      "real_wasm_widths": 4,
+      "fractional_cas": "exact numbers preserved",
+      "permission_separation": "calibration vs mission edit access passed",
+      "main_promoted": false,
+      "evidence": [
+        "/tmp/frontend-paired-settings/qualification.json",
+        "/tmp/frontend-paired-settings/extended-qualified-dev.json"
+      ]
     }
   ],
   "in_progress": [
     {
-      "id": "ordinary-data-codec-negotiation",
-      "status": "design and failing mixed-capability regression required; discovery fix alone does not solve ordinary compressed payloads"
+      "id": "paired-checklist-definition-progress-sync",
+      "status": "representation and nine-head budgets designed; implementation pending",
+      "design": "/tmp/gs-checklist-sync-design.json",
+      "budget_evidence": "/tmp/gs-checklist-budget.json",
+      "existing_file_safety": "1MiB shared serialized read/write limit qualified; no checklist-sync implementation claimed"
     }
   ],
   "next": [
     "Qualify native Ubuntu/RPi frontend packaging/runtime separately from portable Wasm browser acceptance; keep frontend main unchanged and select dev via --frontend-dev.",
     "Rebuild all seven current firmware images plus GroundStation against the final SDK source, then run the unchanged full-system acceptance campaign and long soak.",
     "Verify current simulator topology uses Pi Ethernet TCP/discovery and no removed GroundStation-side Pico/I2C path.",
-    "Finish paired GroundStation/RRLS mission/checklist settings synchronization and conflict acceptance tests.",
+    "Implement paired checklist definition/progress synchronization with incremental per-document persistence/reconciliation; preserve operational state, recovery progress and explicit conflicts.",
     "Publish manually built simulator image only after source/image/test provenance is complete.",
     "Rebuild and audit local-release Python artifacts for the final SDK version; do not reuse older-version wheels.",
     "Publish packages, tags and remaining repos only after qualification; maintain SDK v4 range and firmware SDK main tracking."
@@ -182,6 +237,6 @@
     "mode": "dev",
     "flag": "--frontend-dev",
     "main_promoted": false,
-    "current_dev": "05c959b2e5944545b5934a8bfc0c648b3d292eb9"
+    "current_dev": "967c1df02906dcc60d3326f2ecdefa2e41d9d45f"
   }
 }

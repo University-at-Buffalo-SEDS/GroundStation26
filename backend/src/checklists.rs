@@ -336,16 +336,51 @@ fn valid_id(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
+const MAX_FILE_BYTES: usize = 1_048_576;
+const FILE_LIMIT_ERROR: &str = "Checklist file exceeds 1 MiB";
+
+// Bound serialized bytes too: JSON escapes can expand an otherwise valid template.
+#[derive(Default)]
+struct DocumentWriter(Vec<u8>);
+impl std::io::Write for DocumentWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_FILE_BYTES.saturating_sub(self.0.len()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                FILE_LIMIT_ERROR,
+            ));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn serialize_document(document: &Document) -> Result<Vec<u8>, String> {
+    let mut writer = DocumentWriter::default();
+    serde_json::to_writer_pretty(&mut writer, document).map_err(|error| error.to_string())?;
+    Ok(writer.0)
+}
 struct Store {
     path: PathBuf,
     document: Document,
 }
 impl Store {
     fn open(path: PathBuf) -> Result<Self, String> {
-        let document = match std::fs::read(&path) {
-            Ok(data) => {
-                if data.len() > 1_048_576 {
-                    return Err("Checklist file exceeds 1 MiB".into());
+        let document = match std::fs::File::open(&path) {
+            Ok(file) => {
+                use std::io::Read;
+                if file.metadata().map_err(|error| error.to_string())?.len() > MAX_FILE_BYTES as u64
+                {
+                    return Err(FILE_LIMIT_ERROR.into());
+                }
+                let mut data = Vec::new();
+                file.take(MAX_FILE_BYTES as u64 + 1)
+                    .read_to_end(&mut data)
+                    .map_err(|error| error.to_string())?;
+                if data.len() > MAX_FILE_BYTES {
+                    return Err(FILE_LIMIT_ERROR.into());
                 }
                 serde_json::from_slice(&data)
                     .map_err(|e| format!("Cannot read checklist data: {e}"))?
@@ -368,7 +403,7 @@ impl Store {
             .revision
             .checked_add(1)
             .ok_or("Checklist revision overflow")?;
-        let data = serde_json::to_vec_pretty(&next).map_err(|e| e.to_string())?;
+        let data = serialize_document(&next)?;
         let parent = self
             .path
             .parent()
@@ -575,6 +610,84 @@ mod tests {
         std::env::temp_dir()
             .join(format!("gs-checklists-{}", rand::random::<u64>()))
             .join("checklists.json")
+    }
+    #[test]
+    fn serialized_file_limit_rejects_escaped_templates_without_mutation() {
+        let path = temp();
+        let mut store = Store::open(path.clone()).unwrap();
+        store.update(|_| Ok(())).unwrap();
+        let before = store.document.clone();
+        let bytes = std::fs::read(&path).unwrap();
+        let mut large = Document::default();
+        large.checklists.clear();
+        for list in 0..8 {
+            large.checklists.push(Checklist {
+                id: format!("list-{list}"),
+                title: "Escaped content".into(),
+                required_before_launch: false,
+                items: (0..128)
+                    .map(|item| Item {
+                        id: format!("item-{item}"),
+                        text: "\u{1}".repeat(500),
+                        checked: false,
+                        complete_on: None,
+                        completion_source: None,
+                        completed_by: None,
+                        completed_at_ms: None,
+                    })
+                    .collect(),
+            });
+        }
+        large.validate().unwrap();
+        let error = store
+            .update(|next| {
+                *next = large;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.contains(FILE_LIMIT_ERROR), "{error}");
+        assert_eq!(store.document, before);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(Store::open(path.clone()).unwrap().document, before);
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn serialized_writer_accepts_exact_limit_and_refuses_extra_byte() {
+        use std::io::Write;
+        let mut writer = DocumentWriter::default();
+        for _ in 0..128 {
+            writer.write_all(&[b' '; 8192]).unwrap();
+        }
+        assert_eq!(writer.0.len(), MAX_FILE_BYTES);
+        assert!(writer.write_all(b"x").is_err());
+        assert_eq!(writer.0.len(), MAX_FILE_BYTES);
+    }
+    #[test]
+    fn read_accepts_exact_limit_and_rejects_larger_file_without_overwrite() {
+        let path = temp();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = Document::default();
+        let mut data = serialize_document(&original).unwrap();
+        data.resize(MAX_FILE_BYTES, b' ');
+        std::fs::write(&path, &data).unwrap();
+        assert_eq!(Store::open(path.clone()).unwrap().document, original);
+        data.push(b' ');
+        std::fs::write(&path, &data).unwrap();
+        assert!(
+            Store::open(path.clone())
+                .err()
+                .unwrap()
+                .contains(FILE_LIMIT_ERROR)
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (MAX_FILE_BYTES + 1) as u64
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
     #[test]
     fn concurrent_item_updates_survive_restart_and_record_actors() {

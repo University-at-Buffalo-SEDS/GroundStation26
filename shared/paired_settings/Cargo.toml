@@ -5,7 +5,7 @@ edition.workspace = true
 license-file.workspace = true
 [dependencies]
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 anyhow = "1"
 base64 = "0.22"
 ring = "0.17"

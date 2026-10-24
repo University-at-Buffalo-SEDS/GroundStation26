@@ -148,6 +148,22 @@ fn config_path() -> std::path::PathBuf {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/gse_sequence.json")
         })
 }
+pub(crate) fn persist_settings(config: &Config) -> Result<(), String> {
+    config.validate_settings()?;
+    let path = config_path();
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("upload");
+    let mut persisted = config.clone();
+    persisted.dry_self_test_confirmed = false;
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec_pretty(&persisted).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::rename(tmp, path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub fn initialize(state: &AppState) {
     #[cfg(not(feature = "hitl_mode"))]
     {
@@ -712,7 +728,6 @@ async fn save_config(
     if let Err(err) = config.validate_settings() {
         return (StatusCode::BAD_REQUEST, err).into_response();
     }
-    let path = config_path();
     let result = (|| -> Result<(), String> {
         let mut rt = state.gse.lock().unwrap();
         if rt.engine.active() {
@@ -735,16 +750,7 @@ async fn save_config(
                 return Err("Reset operation checks before changing test pressure limits".into());
             }
         }
-        std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
-        let tmp = path.with_extension("upload");
-        let mut persisted = config.clone();
-        persisted.dry_self_test_confirmed = false;
-        std::fs::write(
-            &tmp,
-            serde_json::to_vec_pretty(&persisted).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        std::fs::rename(tmp, path).map_err(|e| e.to_string())?;
+        persist_settings(&config)?;
         rt.engine.config = config;
         #[cfg(feature = "hitl_mode")]
         {

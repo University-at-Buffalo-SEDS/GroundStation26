@@ -1,4 +1,4 @@
-//! Paired calibration history travels below live telemetry over the RRLS mesh.
+//! Paired mission settings travel below live telemetry over the RRLS mesh.
 //! Authentication is application-level and independent of TLS/proxy certificates.
 use crate::{loadcell, state::AppState};
 use axum::{
@@ -19,6 +19,48 @@ use std::{
     time::Instant,
 };
 
+#[path = "mission_sync/settings.rs"]
+mod settings;
+#[derive(Clone)]
+struct Catalog {
+    calibration: loadcell::LoadcellCalibrationFile,
+    settings: Option<settings::Settings>,
+}
+impl Catalog {
+    fn capture(state: &AppState) -> anyhow::Result<Self> {
+        // Bounded disk read/JSON parsing precedes all sequence locks. A later
+        // flight import still performs its own file CAS under the save mutex.
+        let flight = crate::flight_setup::snapshot_saved().map_err(anyhow::Error::msg)?;
+        // Lazy auto-zero preference I/O also precedes the sequence lock.
+        let _ = state.auto_zero.lock().unwrap().settings();
+        let gse = state.gse.lock().unwrap();
+        let mut zero = state.auto_zero.lock().unwrap();
+        let fill = state.fill_targets.lock().unwrap().clone();
+        Ok(Self {
+            calibration: state.loadcell_calibration.lock().unwrap().clone(),
+            settings: Some(settings::Settings {
+                fill,
+                limits: gse.engine.config.clone(),
+                flight,
+                auto_zero: zero.settings(),
+            }),
+        })
+    }
+    fn snapshot(&self) -> anyhow::Result<BTreeMap<String, Value>> {
+        let mut snapshot = loadcell::mission::snapshot(&self.calibration)?;
+        if let Some(settings) = &self.settings {
+            snapshot.extend(settings.snapshot()?);
+        }
+        Ok(snapshot)
+    }
+    #[cfg(test)]
+    fn calibration_only(cfg: &loadcell::LoadcellCalibrationFile) -> Self {
+        Self {
+            calibration: cfg.clone(),
+            settings: None,
+        }
+    }
+}
 static RUNTIME: OnceLock<Arc<Mutex<Runtime>>> = OnceLock::new();
 struct Runtime {
     installation: String,
@@ -79,32 +121,32 @@ impl Runtime {
         }
         Ok(())
     }
-    fn validate(
-        cfg: &loadcell::LoadcellCalibrationFile,
-        key: &str,
-        document: &Document,
-    ) -> anyhow::Result<()> {
-        let live = loadcell::mission::snapshot(cfg)?;
+    fn validate(cfg: &Catalog, key: &str, document: &Document) -> anyhow::Result<()> {
+        if !key.starts_with("calibration/") {
+            return cfg
+                .settings
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Unsupported mission setting"))?
+                .validate_document(key, document);
+        }
+        let live = loadcell::mission::snapshot(&cfg.calibration)?;
         let expected = live
             .get(key)
             .ok_or_else(|| anyhow::anyhow!("Unsupported calibration document"))?;
         for revision in &document.heads {
-            loadcell::mission::replace(cfg, key, expected, &revision.value)?;
+            loadcell::mission::replace(&cfg.calibration, key, expected, &revision.value)?;
         }
         Ok(())
     }
-    fn observe(&mut self, cfg: &loadcell::LoadcellCalibrationFile) -> anyhow::Result<()> {
-        if self
-            .coordinator
-            .observe(&loadcell::mission::snapshot(cfg)?, &self.actors)?
-        {
+    fn observe(&mut self, cfg: &Catalog) -> anyhow::Result<()> {
+        if self.coordinator.observe(&cfg.snapshot()?, &self.actors)? {
             self.dirty = true;
         }
         self.checkpoint()
     }
     fn receive(
         &mut self,
-        cfg: &loadcell::LoadcellCalibrationFile,
+        cfg: &Catalog,
         wire: &[u8],
         now: u64,
         verify_key: &[u8],
@@ -124,11 +166,7 @@ impl Runtime {
         }
         Ok(())
     }
-    fn resolve(
-        &mut self,
-        cfg: &loadcell::LoadcellCalibrationFile,
-        request: Resolve,
-    ) -> anyhow::Result<()> {
+    fn resolve(&mut self, cfg: &Catalog, request: Resolve) -> anyhow::Result<()> {
         anyhow::ensure!(
             request.expected.heads.len() > 1,
             "Review a current conflict before resolving it"
@@ -172,7 +210,7 @@ fn step(
         .elapsed()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64;
-    let current = state.loadcell_calibration.lock().unwrap().clone();
+    let current = Catalog::capture(state)?;
     runtime.observe(&current)?;
     let frames = {
         let mut link = mesh.lock().unwrap();
@@ -202,33 +240,84 @@ fn step(
         if !gse.calibration_import_allowed() {
             break;
         }
-        let auto_zero = state.auto_zero.lock().unwrap();
+        let mut auto_zero = state.auto_zero.lock().unwrap();
         if auto_zero.pending() {
             break;
         }
-        let mut calibration = state.loadcell_calibration.lock().unwrap();
-        let preview = loadcell::mission::replace(
-            &calibration,
-            &pending.key,
-            &pending.expected_local,
-            &pending.revision.value,
-        )?;
-        let source_changed = preview.kg50_input != calibration.kg50_input;
-        let recording = state.recording_status.lock().unwrap();
-        if source_changed && recording.mode != crate::telemetry_db::RecordingModeWire::Idle {
-            break;
+        let mut publish_fill = false;
+        if !pending.key.starts_with("calibration/") {
+            let mut fill = state.fill_targets.lock().unwrap();
+            let flight = current
+                .settings
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Missing inert settings catalog"))?
+                .flight
+                .clone();
+            let mut current = settings::Settings {
+                fill: fill.clone(),
+                limits: gse.engine.config.clone(),
+                flight,
+                auto_zero: auto_zero.settings(),
+            };
+            let expected_flight = current.flight.clone();
+            current.apply_and_save(&pending, true, false, |key, next| {
+                match key {
+                    settings::FILL => {
+                        crate::fill_targets::save(&next.fill).map_err(anyhow::Error::msg)?;
+                        if fill.fill_source != next.fill.fill_source {
+                            *state.latest_fill_mass_kg.lock().unwrap() = None;
+                            gse.observe_mass(None);
+                        }
+                        *fill = next.fill.clone();
+                        publish_fill = true;
+                    }
+                    settings::LIMITS => {
+                        crate::gse::persist_settings(&next.limits).map_err(anyhow::Error::msg)?;
+                        gse.engine.config = next.limits.clone();
+                    }
+                    settings::FLIGHT => {
+                        crate::flight_setup::compare_and_save(&expected_flight, &next.flight)
+                            .map_err(anyhow::Error::msg)?
+                    }
+                    settings::AUTO_ZERO => auto_zero
+                        .configure(next.auto_zero)
+                        .map_err(anyhow::Error::msg)?,
+                    _ => anyhow::bail!("Unsupported mission setting"),
+                }
+                Ok(())
+            })?;
+            drop(fill);
+            drop(auto_zero);
+        } else {
+            let mut calibration = state.loadcell_calibration.lock().unwrap();
+            let preview = loadcell::mission::replace(
+                &calibration,
+                &pending.key,
+                &pending.expected_local,
+                &pending.revision.value,
+            )?;
+            let source_changed = preview.kg50_input != calibration.kg50_input;
+            let recording = state.recording_status.lock().unwrap();
+            if source_changed && recording.mode != crate::telemetry_db::RecordingModeWire::Idle {
+                break;
+            }
+            loadcell::mission::apply_and_save(&mut calibration, &pending, loadcell::save)?;
+            drop(calibration);
+            drop(recording);
+            drop(auto_zero);
+            if source_changed {
+                state.clear_kg50_samples();
+                gse.observe_mass(None);
+            }
         }
-        loadcell::mission::apply_and_save(&mut calibration, &pending, loadcell::save)?;
-        drop(calibration);
-        drop(recording);
-        drop(auto_zero);
-        if source_changed {
-            state.clear_kg50_samples();
-            gse.observe_mass(None);
+        drop(gse);
+        if publish_fill {
+            state.broadcast_fill_targets_snapshot();
         }
         runtime.coordinator.applied(&pending)?;
         runtime.dirty = true;
-        runtime.needs_publication = !crate::rrls::is_rrls();
+        runtime.needs_publication |=
+            pending.key.starts_with("calibration/") && !crate::rrls::is_rrls();
         runtime.checkpoint()?;
     }
     if runtime.needs_publication {
@@ -268,10 +357,10 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
         log::warn!("Paired settings require the primary or RRLS radio role");
         return None;
     };
-    let snapshot = match loadcell::mission::snapshot(&state.loadcell_calibration.lock().unwrap()) {
+    let snapshot = match Catalog::capture(&state).and_then(|catalog| catalog.snapshot()) {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            log::warn!("Invalid local calibration prevents paired settings: {error}");
+            log::warn!("Invalid local mission settings prevent paired settings: {error}");
             return None;
         }
     };
@@ -315,9 +404,9 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
                     if let Err(error) = tokio::task::spawn_blocking(move || {
                         let mut runtime = runtime.lock().unwrap();
                         let result = step(&mut runtime, &state, &mesh, pairing.mission_signing_key());
-                        let message = result.as_ref().err().map(|_| "Shared calibration could not be synchronized".to_owned());
+                        let message = result.as_ref().err().map(|_| "Shared mission settings could not be synchronized".to_owned());
                         if runtime.last_error != message {
-                            if let Err(error) = &result { log::warn!("Paired calibration synchronization deferred: {error}"); }
+                            if let Err(error) = &result { log::warn!("Paired mission settings synchronization deferred: {error}"); }
                             runtime.last_error = message;
                         }
                     }).await { log::error!("Paired settings worker failed: {error}"); }
@@ -372,12 +461,8 @@ async fn conflicts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
             Ok(p) => p,
             Err(e) => return e,
         };
-    if !principal.calibration_access.view {
-        return (
-            StatusCode::FORBIDDEN,
-            "Calibration view permission required",
-        )
-            .into_response();
+    if !principal.permissions.view_data {
+        return (StatusCode::FORBIDDEN, "View data permission required").into_response();
     }
     let Some(runtime) = RUNTIME.get() else {
         return Json(BTreeMap::<String, Document>::new()).into_response();
@@ -389,7 +474,14 @@ async fn conflicts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
             .store()
             .documents()
             .iter()
-            .filter(|(_, d)| d.heads.len() > 1)
+            .filter(|(key, d)| {
+                d.heads.len() > 1
+                    && settings::can_view(
+                        key,
+                        principal.permissions.view_data,
+                        principal.calibration_access.view,
+                    )
+            })
             .map(|(k, d)| (k.clone(), d.clone()))
             .collect::<BTreeMap<_, _>>(),
     )
@@ -407,10 +499,15 @@ async fn resolve(
             Ok(p) => p,
             Err(e) => return e,
         };
-    if !principal.calibration_access.edit {
+    if !settings::can_resolve(
+        &request.key,
+        principal.permissions.view_data,
+        principal.calibration_access.edit,
+        principal.permissions.send_commands,
+    ) {
         return (
             StatusCode::FORBIDDEN,
-            "Calibration edit permission required",
+            "Edit permission for this setting is required",
         )
             .into_response();
     }
@@ -423,8 +520,10 @@ async fn resolve(
     };
     let result = {
         let mut runtime = runtime.lock().unwrap();
-        let calibration = state.loadcell_calibration.lock().unwrap();
-        runtime.resolve(&calibration, request)
+        match Catalog::capture(&state) {
+            Ok(catalog) => runtime.resolve(&catalog, request),
+            Err(error) => Err(error),
+        }
     };
     match result {
         Ok(()) => Json(serde_json::json!({"resolved":true})).into_response(),
@@ -508,7 +607,10 @@ mod tests {
                 .mesh
                 .incoming(true, &[b'R', b'S', 1, 0, 0, 0, 0, 0, 0], now);
             for (direction, station) in stations.iter_mut().enumerate() {
-                station.runtime.observe(&station.calibration).unwrap();
+                station
+                    .runtime
+                    .observe(&Catalog::calibration_only(&station.calibration))
+                    .unwrap();
                 station.mesh.tick(now);
                 let runtime = &mut station.runtime;
                 runtime
@@ -543,7 +645,12 @@ mod tests {
                 while let Some(wire) = station.mesh.take_settings() {
                     station
                         .runtime
-                        .receive(&station.calibration, &wire, now, key.public_key().as_ref())
+                        .receive(
+                            &Catalog::calibration_only(&station.calibration),
+                            &wire,
+                            now,
+                            key.public_key().as_ref(),
+                        )
                         .unwrap();
                     station.mesh.authenticated_settings_peer(now);
                 }
@@ -576,7 +683,10 @@ mod tests {
         for (station, mass) in stations.iter_mut().zip([20.0, 21.0]) {
             station.calibration.full_mass_kg = Some(mass);
             loadcell::save_at(&station.calibration, &station.calibration_path).unwrap();
-            station.runtime.observe(&station.calibration).unwrap();
+            station
+                .runtime
+                .observe(&Catalog::calibration_only(&station.calibration))
+                .unwrap();
         }
         exchange(&mut stations, &key, 400_000);
         let reviewed = stations[0]
@@ -623,7 +733,7 @@ mod tests {
                 primary
                     .runtime
                     .resolve(
-                        &primary.calibration,
+                        &Catalog::calibration_only(&primary.calibration),
                         Resolve {
                             key: "calibration/full_mass_kg".into(),
                             expected: reviewed.clone(),
@@ -639,7 +749,7 @@ mod tests {
         primary
             .runtime
             .resolve(
-                &primary.calibration,
+                &Catalog::calibration_only(&primary.calibration),
                 Resolve {
                     key: "calibration/full_mass_kg".into(),
                     expected: reviewed.clone(),
@@ -652,7 +762,7 @@ mod tests {
             primary
                 .runtime
                 .resolve(
-                    &primary.calibration,
+                    &Catalog::calibration_only(&primary.calibration),
                     Resolve {
                         key: "calibration/full_mass_kg".into(),
                         expected: reviewed,
@@ -679,9 +789,140 @@ mod tests {
                 value: json!({"not_a_mass":true}),
             }],
         };
-        assert!(Runtime::validate(&station.calibration, "calibration/full_mass_kg", &doc).is_err());
+        assert!(
+            Runtime::validate(
+                &Catalog::calibration_only(&station.calibration),
+                "calibration/full_mass_kg",
+                &doc
+            )
+            .is_err()
+        );
         assert_eq!(std::fs::read(&station.runtime.path).unwrap(), before);
         assert_eq!(station.calibration.full_mass_kg, Some(17.0));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// Explicitly isolated process: fake config paths supplied by qualification runner.
+    #[cfg(not(feature = "hitl_mode"))]
+    #[tokio::test]
+    #[ignore = "requires isolated fake settings directory; never use operator configuration"]
+    async fn inert_worker_persists_four_settings_without_apply_outputs_or_qualification_changes() {
+        let dir = PathBuf::from(
+            std::env::var("GS_MISSION_ADAPTER_TEST_DIR")
+                .expect("isolated fake settings directory required"),
+        );
+        for path in [
+            crate::fill_targets::config_path(),
+            crate::flight_setup::config_path(),
+        ] {
+            assert!(
+                path.starts_with(&dir),
+                "test must not access operator settings"
+            );
+        }
+        for name in [
+            "GS_GSE_CONFIG",
+            "GS_AUTO_ZERO_CONFIG",
+            "GS_LOADCELL_CALIBRATION_PATH",
+            "GS_CALIBRATION_CONFIG_PATH",
+        ] {
+            assert!(
+                PathBuf::from(std::env::var(name).expect("explicit fake path required"))
+                    .starts_with(&dir),
+                "test must not read or write operator configuration"
+            );
+        }
+        let mut state = Arc::try_unwrap(crate::state::tests::test_app_state().await)
+            .ok()
+            .unwrap();
+        let (commands, mut received) = tokio::sync::mpsc::channel(8);
+        state.cmd_tx = commands;
+        let state = Arc::new(state);
+        state
+            .gse
+            .lock()
+            .unwrap()
+            .engine
+            .config
+            .dry_self_test_confirmed = true;
+        let before = serde_json::to_value(&state.gse.lock().unwrap().engine.status).unwrap();
+        let current = Catalog::capture(&state).unwrap();
+        let mut runtime = Runtime::new(
+            "fake".into(),
+            "gs".into(),
+            vec!["rrls".into()],
+            current.snapshot().unwrap(),
+            true,
+            dir.join("history.json"),
+        )
+        .unwrap();
+        let mut desired = current.settings.as_ref().unwrap().clone();
+        desired.fill.nitrous.target_mass_kg = 19.5;
+        desired.flight.selected_profile_id = "wind_2".into();
+        desired.limits.pressure_step_psi = 25.;
+        desired.auto_zero.enabled = false;
+        for (key, value) in desired.snapshot().unwrap() {
+            let doc = Document {
+                heads: vec![paired_settings::Revision {
+                    clock: BTreeMap::from([("gs".into(), 1), ("rrls".into(), 1)]),
+                    value,
+                }],
+            };
+            Runtime::validate(&current, &key, &doc).unwrap();
+            runtime
+                .coordinator
+                .merge("fake", &key, &doc, &runtime.actors)
+                .unwrap();
+            runtime.dirty = true;
+        }
+        let mesh = Arc::new(Mutex::new(Mesh::new(Role::Primary, 7)));
+        let key = Ed25519KeyPair::from_seed_unchecked(&[88; 32]).unwrap();
+        step(&mut runtime, &state, &mesh, &key).unwrap();
+        assert!(
+            matches!(
+                received.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "no Apply, valve, QD, abort or other output command may be sent"
+        );
+        assert!(runtime.coordinator.pending().is_empty());
+        let unchanged = runtime.coordinator.store().clone();
+        let tick_start = Instant::now();
+        for _ in 0..100 {
+            step(&mut runtime, &state, &mesh, &key).unwrap();
+        }
+        assert_eq!(
+            runtime.coordinator.store(),
+            &unchanged,
+            "unchanged ticks must not invent local revisions"
+        );
+        eprintln!(
+            "warm_inert_catalog: ticks=100 elapsed_us={}",
+            tick_start.elapsed().as_micros()
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            state.fill_targets.lock().unwrap().nitrous.target_mass_kg,
+            19.5
+        );
+        assert_eq!(
+            crate::flight_setup::snapshot_saved()
+                .unwrap()
+                .selected_profile_id,
+            "wind_2"
+        );
+        assert!(!state.auto_zero.lock().unwrap().settings().enabled);
+        let gse = state.gse.lock().unwrap();
+        assert!(gse.engine.config.dry_self_test_confirmed);
+        assert!(gse.calibration_import_allowed());
+        assert_eq!(serde_json::to_value(&gse.engine.status).unwrap(), before);
+    }
+    #[cfg(feature = "hitl_mode")]
+    #[tokio::test]
+    async fn hitl_start_remains_disabled_before_any_pairing_or_settings_worker() {
+        let state = crate::state::tests::test_app_state().await;
+        assert!(start(state).is_none());
     }
 }

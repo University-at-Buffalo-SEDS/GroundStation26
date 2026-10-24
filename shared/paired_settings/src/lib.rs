@@ -448,3 +448,49 @@ pub mod auth;
 pub mod coordinator;
 
 pub mod radio;
+
+#[cfg(test)]
+mod exact_number_tests {
+    use super::*;
+    #[test]
+    fn fractional_calibration_numbers_keep_exact_document_hash_context_after_wire_and_restart() {
+        let peers = vec!["gs".into(), "rrls".into()];
+        let values = serde_json::to_value([0.08_f32, 0.12, 0.2, 0.55, 0.85, 1.1]).unwrap();
+        let mut coordinator = crate::coordinator::Coordinator::new(
+            "test".into(),
+            "gs".into(),
+            BTreeMap::from([("calibration/fractional".into(), values)]),
+            true,
+            &peers,
+        )
+        .unwrap();
+        let original = coordinator
+            .store()
+            .document("calibration/fractional")
+            .unwrap()
+            .clone();
+        let wire: Document =
+            serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
+        assert_eq!(
+            wire, original,
+            "JSON parsing must preserve exact calibration numbers"
+        );
+        let path =
+            std::env::temp_dir().join(format!("gs-exact-number-{}.json", std::process::id()));
+        let snapshot = BTreeMap::from([(
+            "calibration/fractional".into(),
+            original.heads[0].value.clone(),
+        )]);
+        for _ in 0..16 {
+            coordinator.save(&path).unwrap();
+            coordinator =
+                crate::coordinator::Coordinator::load(&path, "test", "gs", &peers).unwrap();
+            assert!(!coordinator.observe(&snapshot, &peers).unwrap());
+            assert_eq!(
+                coordinator.store().document("calibration/fractional"),
+                Some(&original)
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+}

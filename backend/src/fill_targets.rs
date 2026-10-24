@@ -105,6 +105,11 @@ fn normalize_mass_target(value: f32) -> f32 {
     }
 }
 
+/// Canonical saved form shared by the API and paired-settings adapter.
+pub(crate) fn canonical_settings(cfg: FillTargetsConfig) -> FillTargetsConfig {
+    normalize(cfg)
+}
+
 pub fn load_or_default() -> FillTargetsConfig {
     let path = config_path();
     match load_from_path(&path) {
