@@ -274,12 +274,53 @@
       "barrier_fix_commit": "61b858024d21e06fca051c91d26fd3fcc4fb29f5",
       "barrier_only_rerun": {
         "groundstation_commit": "61b858024d21e06fca051c91d26fd3fcc4fb29f5",
-        "status": "running original120s restart gate; firmware/SDK/engine/controller unchanged; no600soak started"
+        "status": "passed original restart gate; no600soak started",
+        "proof_sha256": "aba74bb5457a76c9515e3f6de23d418b41a1d4681607dc73f77246671d2b1102",
+        "acknowledgements": 20,
+        "max_virtual_ack_ms": 30,
+        "wall_seconds": 1305.8
+      },
+      "candidate_sdk_status": {
+        "location": "SEDSnet source327049b7b027798fa396277c96c657b899307e07 pushed main+dev;4.2.6development;packages not yet published",
+        "ownership_tests": "route-churn raw/codec, Ordered/Unordered clock expiry/schema policy, true packed post-registration error, concurrent publication and credit-window regressions passed",
+        "flash_gate": "Accepted by user:453552production/454044simulator of474624;95percent no longer a release gate.",
+        "compact_unit_suite": "578passed1ignored; fixed test budgets to reserve global schema and recent-ID growth without weakening delivery assertions or runtime budgets",
+        "rf_fidelity": "current UART model lacks shared64kbps air contention and third RRLS endpoint; no physical5second latency resolution claimed",
+        "cached_modem": "2026-10-20 Pi capture identifies ASYNC4.03; no active radio reconfiguration",
+        "cpu_fairness": {
+          "cases_passed": 30,
+          "scope": "single-run host debug diagnostics;8KiB/1MiB,same/distinct Ordered types,healthy/no-route/paused-credit,real E2E ACK and unrelated low-priority progress",
+          "largest_distinct_types": 768,
+          "healthy_max_drain_ms_before": 1515.87,
+          "healthy_max_drain_ms_after": 71.75,
+          "no_route_max_drain_ms_before": 1682.4,
+          "no_route_max_drain_ms_after": 40.35,
+          "extra_packet_ram_bytes": 0
+        },
+        "full_build_py_campaign": {
+          "command": "python3 build.py test --features compact-packet-store",
+          "status": "all10stages passed; accepted_queue_delivery tests now run in compressed and uncompressed profiles",
+          "rust_passed": 737,
+          "python_passed": 71,
+          "clippy_variants": 3,
+          "embedded_cross_build": "thumbv7em-none-eabihf passed",
+          "rust_ignored": 4,
+          "long_codec_soak": "not run; final runtime source and FC95 gate remain pending",
+          "proof_log_sha256": "300f3ad60c6001d763dc6f37b2ed8b8fd138b5f6866bf3be65d115aa1c3bc61e"
+        },
+        "rfd_no_lora": {
+          "firmware": "RFBOARD_LORA_SCHEDULER defaultsOFF;RFD bypasses airtime quiet periods and E22 AUX/mode gating;UART DMA readiness and owned bounded priority queues retained",
+          "groundstation": "generic RFD worker has no artificial airtime gap/windows;transient write error keeps full owned frame and bounded retry delay",
+          "firmware_tests": "169pass,1skipped;actualCgatefunctions tested RFD and explicitlegacyLoRa,including tickwrap",
+          "groundstation_tests": "439backend pass,3ignored;frozenvirtualclock RFDworker passes;unchangedoldworker stalls under identicalfixture",
+          "remaining": "Fresh all7 firmware builds plus full linked network/command latency/sequence and soak qualification; no physical-latency resolution claimed."
+        }
       }
     }
   ],
   "next": [
-    "Fix and independently validate queued reliable ownership during route churn; correct simulator command sequencing, rerun original restart gate then600-second soak without relaxing assertions.",
+    "Rebuild all7 firmware and GroundStation using SDK327049b and RFD LoRa scheduling disabled; run original coupled network/command/sequence gates and600-second soak without relaxing delivery or latency assertions.",
+    "Extend optional radio simulator with bounded shared-air/RFD-owned arbitration, finite modem buffers and GS/RRLS/RF three-node tests; keep LoRa scheduler disabled for RFD and existing HITL procedure behavior unchanged.",
     "Implement paired checklist definition/progress synchronization with incremental per-document persistence/reconciliation; preserve operational state, recovery progress and explicit conflicts.",
     "Publish manually built simulator image only after source/image/test provenance is complete.",
     "Rebuild and audit local-release Python artifacts for the final SDK version; do not reuse older-version wheels.",
@@ -298,5 +339,12 @@
     "flag": "--frontend-dev",
     "main_promoted": false,
     "current_dev": "4f0da47346e3a898d6c4353e57020790ca7162dd"
+  },
+  "priority_order": {
+    "deadline": "2026-10-29",
+    "first": "Stable, low-latency RFD path on latest SEDSnet v4: memory pressure, route recovery and command/status delivery; RFD firmware owns scheduling and LoRa airtime gating is disabled.",
+    "second": "Test-fire and flight sequences with real network failure/recovery and correct persisted checklist/qualification behavior.",
+    "then": "Remaining UI, RRLS, platform and release backlog.",
+    "fc_flash": "User accepts current FC453552/474624 production flash;95percent target no longer blocks network fixes."
   }
 }

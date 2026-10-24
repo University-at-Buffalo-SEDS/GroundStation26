@@ -1078,7 +1078,6 @@ pub(super) fn spawn_comms_worker_threads(
                         break;
                     };
                     let mut comms = tx_worker_comms.lock().expect("failed to get lock");
-                    let send_started_at = TxDeadline::now();
                     if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some() {
                         log::info!("full-bay transport selected side={worker_name} sim={:?} priority={priority} len={} type={:?}", crate::simulation_clock_ms(), payload.len(), serialize::peek_frame_info_unchecked(&payload).map(|info| info.envelope.ty));
                     }
@@ -1097,11 +1096,9 @@ pub(super) fn spawn_comms_worker_threads(
                                 suppressed_send_errors = 0;
                                 last_send_error_log_ms = 0;
                             }
-                            if worker_name == "rocket_comms" {
-                                // UART drain does not drain the RFD modem's air FIFO.
-                                next_tx_allowed_at = send_started_at.after(radio_air_time_for_payload(payload.len()));
-                                break;
-                            }
+                            // RFD firmware owns radio scheduling. This full-duplex
+                            // worker adds no LoRa airtime/cooldown or receive window.
+                            next_tx_allowed_at = TxDeadline::now();
                         }
                         Err(e) => {
                             // A transport error means the packet never reached
@@ -1115,16 +1112,12 @@ pub(super) fn spawn_comms_worker_threads(
                                 &mut last_send_error_log_ms,
                                 &mut suppressed_send_errors,
                             );
+                            break;
                         }
                     }
                 }
 
                 if sent_any {
-                    // Only the RFD modem needs an over-air budget. The Pico
-                    // path can keep draining at its device transport rate.
-                    if worker_name != "rocket_comms" {
-                        next_tx_allowed_at = TxDeadline::now();
-                    }
                     thread::yield_now();
                 } else {
                     thread::sleep(Duration::from_millis(COMMS_IDLE_SLEEP_MS));
@@ -2333,4 +2326,105 @@ fn send_while_uplink_window_open(
         }
     }
     sent_any
+}
+#[cfg(test)]
+mod rfd_worker_tests {
+    use super::*;
+    use std::error::Error;
+
+    struct CaptureDevice {
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        done: std::sync::mpsc::Sender<()>,
+        fail_first: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl CommsDevice for CaptureDevice {
+        fn recv_packet(
+            &mut self,
+            _: &Router,
+            _: &mut dyn FnMut(&Packet),
+        ) -> sedsnet::TelemetryResult<()> {
+            Ok(())
+        }
+        fn send_data(&mut self, bytes: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+            if self.fail_first.swap(false, Ordering::SeqCst) {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+            }
+            let mut sent = self.sent.lock().unwrap();
+            sent.push(bytes.to_vec());
+            if sent.len() == 32 {
+                let _ = self.done.send(());
+            }
+            Ok(())
+        }
+        fn set_side_id(&mut self, _: RouterSideId) {}
+    }
+
+    async fn run_rfd_worker(fail: bool) {
+        let state = crate::state::tests::test_app_state().await;
+        let router = Arc::new(Router::new(Default::default()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let (done, complete) = std::sync::mpsc::channel();
+        let fail_first = Arc::new(std::sync::atomic::AtomicBool::new(fail));
+        let device = || {
+            Box::new(CaptureDevice {
+                sent: sent.clone(),
+                done: done.clone(),
+                fail_first: fail_first.clone(),
+            }) as Box<dyn CommsDevice>
+        };
+        let (sender, receiver) = mpsc::unbounded_channel();
+        crate::telemetry_schema::initialize().unwrap();
+        let mut expected = Vec::new();
+        for marker in 0..32u8 {
+            let packet = Packet::new(
+                crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+                &[crate::telemetry_schema::endpoint("AV_BAY_UNDERGLOW_OWNER")],
+                "GS",
+                u64::from(marker),
+                Arc::from([marker]),
+            )
+            .unwrap();
+            let bytes = serialize::pack_packet(&packet).to_vec();
+            sender.send((16, bytes.clone())).unwrap();
+            expected.push(bytes);
+        }
+        let workers = spawn_comms_worker_threads(
+            router,
+            state.clone(),
+            CommsWorkerHandle {
+                name: "rocket_comms",
+                tx_budget: None,
+                comms: Arc::new(Mutex::new(device())),
+                tx_comms: Some(Arc::new(Mutex::new(device()))),
+                side_id: 0,
+                tx_rx: receiver,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: false,
+            },
+        )
+        .unwrap();
+        // A frozen simulator clock cannot satisfy an artificial air deadline.
+        // A real UART would supply its own DMA/driver readiness instead.
+        let received =
+            tokio::task::spawn_blocking(move || complete.recv_timeout(Duration::from_secs(2)))
+                .await
+                .unwrap();
+        state.request_shutdown();
+        drop(sender);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        received.expect("RFD TX worker waited for LoRa airtime instead of UART readiness");
+        let captured = sent.lock().unwrap();
+        assert_eq!(*captured, expected);
+    }
+    #[tokio::test]
+    async fn rfd_worker_drains_without_lora_airtime_waits() {
+        run_rfd_worker(false).await;
+    }
+    #[tokio::test]
+    async fn rfd_worker_preserves_order_after_transient_write_failure() {
+        run_rfd_worker(true).await;
+    }
 }
