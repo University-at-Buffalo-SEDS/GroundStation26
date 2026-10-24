@@ -1,7 +1,9 @@
+mod budget;
 mod connection_test;
 mod dns;
 mod limits;
 mod network;
+mod profile;
 mod storage;
 
 use std::f64::consts::PI;
@@ -13,6 +15,7 @@ use blake3::Hasher;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use network::TileClient;
+use profile::Profile;
 #[cfg(test)]
 use reqwest::Client;
 use sqlx::{
@@ -262,6 +265,13 @@ fn bundle_path_for(data_dir: &Path) -> PathBuf {
 }
 
 async fn open_bundle_database(path: &Path) -> Result<SqlitePool> {
+    open_bundle_database_with_budget(path, None).await
+}
+
+async fn open_bundle_database_with_budget(
+    path: &Path,
+    budget: Option<Arc<budget::DatasetBudget>>,
+) -> Result<SqlitePool> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -270,6 +280,38 @@ async fn open_bundle_database(path: &Path) -> Result<SqlitePool> {
         .with_context(|| format!("create map bundle directory {}", parent.display()))?;
     SqlitePoolOptions::new()
         .max_connections(1)
+        .after_connect(move |connection, _| {
+            let budget = budget.clone();
+            Box::pin(async move {
+                if let Some(budget) = budget {
+                    let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+                        .fetch_one(&mut *connection)
+                        .await?;
+                    let pages = budget.max_database_bytes() / page_size as u64;
+                    // PRAGMA assignments cannot bind parameters; `pages` is an unsigned integer.
+                    let actual: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                        "PRAGMA max_page_count={pages}"
+                    )))
+                    .fetch_one(&mut *connection)
+                    .await?;
+                    if actual as u64 > pages {
+                        return Err(sqlx::Error::Protocol(
+                            "existing RRLS database exceeds its page cap".into(),
+                        ));
+                    }
+                    sqlx::query("PRAGMA cache_spill=OFF")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("PRAGMA temp_store=MEMORY")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("PRAGMA wal_autocheckpoint=0")
+                        .execute(&mut *connection)
+                        .await?;
+                }
+                Ok(())
+            })
+        })
         .connect_with(
             SqliteConnectOptions::new()
                 .filename(path)
@@ -530,12 +572,28 @@ async fn build_tile_bundle_sqlite(tiles_root: &Path, bundle_path: &Path) -> Resu
     Ok(())
 }
 
+#[cfg(test)]
 async fn init_direct_bundle_pool(bundle_path: &Path, resume: bool) -> Result<SqlitePool> {
+    init_direct_bundle_pool_with_budget(bundle_path, resume, None).await
+}
+
+async fn init_direct_bundle_pool_with_budget(
+    bundle_path: &Path,
+    resume: bool,
+    budget: Option<Arc<budget::DatasetBudget>>,
+) -> Result<SqlitePool> {
+    anyhow::ensure!(
+        budget.is_none() || resume,
+        "RRLS dataset must resume; existing data will not be deleted"
+    );
     if !resume && bundle_path.exists() {
         fs::remove_file(bundle_path)?;
     }
 
-    let pool = open_bundle_database(bundle_path).await?;
+    let pool = open_bundle_database_with_budget(bundle_path, budget.clone()).await?;
+    if let Some(budget) = &budget {
+        budget.checkpoint(&pool).await?;
+    }
 
     sqlx::query("PRAGMA journal_mode = WAL;")
         .execute(&pool)
@@ -555,6 +613,11 @@ async fn init_direct_bundle_pool(bundle_path: &Path, resume: bool) -> Result<Sql
     sqlx::query("PRAGMA page_size = 8192;")
         .execute(&pool)
         .await?;
+    if let Some(budget) = &budget {
+        budget.checkpoint(&pool).await?;
+    }
+    // One schema transaction keeps initialization inside the same WAL bound.
+    let mut schema = pool.begin().await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS tile_blobs (
             id INTEGER PRIMARY KEY,
@@ -562,7 +625,7 @@ async fn init_direct_bundle_pool(bundle_path: &Path, resume: bool) -> Result<Sql
             image BLOB NOT NULL
         );",
     )
-    .execute(&pool)
+    .execute(&mut *schema)
     .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS tiles (
@@ -573,12 +636,24 @@ async fn init_direct_bundle_pool(bundle_path: &Path, resume: bool) -> Result<Sql
             PRIMARY KEY (z, x, y)
         ) WITHOUT ROWID;",
     )
-    .execute(&pool)
+    .execute(&mut *schema)
     .await?;
+    schema.commit().await?;
+    if let Some(budget) = &budget {
+        budget.checkpoint(&pool).await?;
+    }
     Ok(pool)
 }
 
-async fn finalize_direct_bundle_pool(pool: &SqlitePool) -> Result<()> {
+async fn finalize_direct_bundle_pool(
+    pool: &SqlitePool,
+    budget: Option<&budget::DatasetBudget>,
+) -> Result<()> {
+    if let Some(budget) = budget {
+        // Primary-key lookups need no optional statistics writes. Each extra
+        // ANALYZE/optimize transaction could otherwise append another full WAL.
+        return budget.checkpoint(pool).await;
+    }
     sqlx::query("ANALYZE;").execute(pool).await?;
     sqlx::query("PRAGMA optimize;").execute(pool).await?;
     // Append-only downloads need no full-size VACUUM copy. Release WAL space.
@@ -689,8 +764,8 @@ impl BandwidthLimiter {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    // Optional override for region, but default to north_america
-    let region = env::var("MAP_REGION").unwrap_or_else(|_| REGION.to_string());
+    let profile = Profile::configured()?;
+    let region = env::var("MAP_REGION").unwrap_or_else(|_| profile.default_region().to_string());
     let max_zoom = env::var("MAP_MAX_ZOOM")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
@@ -699,12 +774,19 @@ async fn main() -> Result<()> {
     if max_zoom > 30 {
         anyhow::bail!("MAP_MAX_ZOOM must be between 0 and 30");
     }
+    profile.validate(
+        max_zoom,
+        should_direct_to_bundle(),
+        should_resume_bundle(),
+        should_build_bundle(),
+    )?;
     let test_only = env::args().skip(1).any(|arg| arg == "--test");
     if test_only {
         let client = TileClient::configured(&format!("{SATELLITE_BASE_URL}/0/0/0")).await?;
         return connection_test::run(
             &client,
             &region,
+            profile,
             max_zoom,
             SATELLITE_BASE_URL,
             env::var_os("MAP_DIRECT_INTERFACE").is_some(),
@@ -753,17 +835,26 @@ async fn main() -> Result<()> {
         } else {
             let bundle_path = bundle_path_for(&data_dir);
             let resume = should_resume_bundle();
-            let pool = init_direct_bundle_pool(&bundle_path, resume).await?;
+            let budget = if profile == Profile::Rrls {
+                Some(budget::DatasetBudget::open(&bundle_path)?)
+            } else {
+                None
+            };
+            let pool =
+                init_direct_bundle_pool_with_budget(&bundle_path, resume, budget.clone()).await?;
             for z in MIN_ZOOM..=max_zoom {
                 if z != MIN_ZOOM {
                     println!();
                     println!("----");
                 }
-                fetch_tiles_for_zoom_async_to_db(z, &pool, &client)
+                fetch_tiles_for_zoom_async_to_db(z, &pool, &client, profile, budget.clone())
                     .await
                     .map_err(|error| anyhow::anyhow!("map zoom {z} failed: {error}"))?;
             }
-            if let Err(e) = finalize_direct_bundle_pool(&pool).await {
+            let finalized = finalize_direct_bundle_pool(&pool, budget.as_deref()).await;
+            if budget.is_some() {
+                finalized.context("RRLS finalization failed; saved tiles retained")?;
+            } else if let Err(e) = finalized {
                 eprintln!(
                     "WARNING: failed finalizing tile bundle {}: {e:#}",
                     bundle_path.display()
@@ -791,7 +882,7 @@ async fn main() -> Result<()> {
                 println!();
                 println!("----");
             }
-            fetch_tiles_for_zoom_async(z, &tiles_root, &client)
+            fetch_tiles_for_zoom_async(z, &tiles_root, &client, profile)
                 .await
                 .map_err(|error| anyhow::anyhow!("map zoom {z} failed: {error}"))?;
         }
@@ -838,8 +929,9 @@ async fn fetch_tiles_for_zoom_async(
     z: u32,
     tiles_root: &Path,
     client: &TileClient,
+    profile: Profile,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bounds = coverage_bounds(z);
+    let bounds = profile.bounds(z);
 
     // Enumerate + de-duplicate all tile coordinates across selected bounds.
     let mut coord_set = HashSet::<(u32, u32)>::new();
@@ -1187,8 +1279,10 @@ async fn fetch_tiles_for_zoom_async_to_db(
     z: u32,
     pool: &SqlitePool,
     client: &TileClient,
+    profile: Profile,
+    budget: Option<Arc<budget::DatasetBudget>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bounds = coverage_bounds(z);
+    let bounds = profile.bounds(z);
 
     let mut coord_set = HashSet::<(u32, u32)>::new();
     for bbox in bounds {
@@ -1281,7 +1375,8 @@ async fn fetch_tiles_for_zoom_async_to_db(
         }
     });
 
-    let (writer, writer_task) = storage::spawn(pool.clone(), directory, reserve);
+    let (writer, writer_task) =
+        storage::spawn_with_budget(pool.clone(), directory, reserve, budget);
     let client_arc = client.clone();
     let writer_arc = writer.clone();
     let writer_for_admission = writer.clone();

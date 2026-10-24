@@ -5,7 +5,7 @@ use crate::flight_setup::{self, FlightSetupConfig};
 use crate::i18n::{self, TranslateRequest, TranslateResponse, TranslationCatalogResponse};
 use crate::layout;
 use crate::loadcell;
-use crate::map::{DEFAULT_MAP_REGION, detect_max_native_zoom, tile_bundle_path};
+use crate::map::{detect_max_native_zoom, selected_map_region, tile_bundle_path};
 use crate::sequences::{ActionPolicyMsg, PersistentNotification, command_name};
 use crate::state::AppState;
 use crate::telemetry_db::{DbQueueItem, DbWrite, LaunchClockMsg, RecordingStatusMsg};
@@ -635,7 +635,7 @@ async fn get_map_config(
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
-    let max_native_zoom = match detect_max_native_zoom(DEFAULT_MAP_REGION).await {
+    let max_native_zoom = match detect_max_native_zoom(&selected_map_region()).await {
         Ok(Some(z)) => z,
         Ok(None) => 12,
         Err(e) => {
@@ -647,10 +647,19 @@ async fn get_map_config(
     Json(MapConfigDto {
         max_native_zoom,
         max_display_zoom: max_native_zoom.saturating_add(1),
-        default_center_lat: 31.0,
-        default_center_lon: -99.0,
-        default_zoom: 7.0,
-        map_title: "Map".to_string(),
+        default_center_lat: if crate::rrls::is_rrls() { 43.001 } else { 31.0 },
+        default_center_lon: if crate::rrls::is_rrls() {
+            -78.790
+        } else {
+            -99.0
+        },
+        default_zoom: if crate::rrls::is_rrls() { 12.0 } else { 7.0 },
+        map_title: if crate::rrls::is_rrls() {
+            "RRLS Map"
+        } else {
+            "Map"
+        }
+        .to_string(),
         tracked_asset_label: "Tracked Asset".to_string(),
     })
     .into_response()
@@ -916,13 +925,13 @@ async fn get_tile_jpg(Path((z, x, y_raw)): Path<(u32, u32, String)>) -> impl Int
 
 /// Builds the legacy on-disk tile path for a map tile.
 fn tile_path(z: u32, x: u32, y: u32) -> PathBuf {
-    format!("./backend/data/maps/{DEFAULT_MAP_REGION}/tiles/{z}/{x}/{y}.jpg").into()
+    crate::map::map_region_base_dir(&selected_map_region()).join(format!("tiles/{z}/{x}/{y}.jpg"))
 }
 
 /// Cache successful opens only: downloading map data after startup must work
 /// without restarting the service or permanently caching an absent database.
 async fn tile_db_pool() -> Option<sqlx::SqlitePool> {
-    open_tile_bundle(&TILE_DB_POOL, &tile_bundle_path(DEFAULT_MAP_REGION)).await
+    open_tile_bundle(&TILE_DB_POOL, &tile_bundle_path(&selected_map_region())).await
 }
 
 async fn open_tile_bundle(

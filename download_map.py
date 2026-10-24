@@ -13,6 +13,8 @@ def run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download offline map tiles.")
+    parser.add_argument("--profile", choices=["groundstation", "rrls"], default=None,
+                        help="Coverage preset: rrls downloads only UB, URRG and Midland into its own bounded dataset; default keeps normal GroundStation coverage.")
     parser.add_argument("--test",action="store_true",help="Test a few configured map tiles without creating or writing map data; reports direct and fallback routing.")
     parser.add_argument(
         "--max-concurrent",
@@ -73,6 +75,8 @@ def main() -> None:
     args = parse_args()
     repo_root = Path(__file__).resolve().parent
     env = os.environ.copy()
+    if args.profile is not None:
+        env["MAP_PROFILE"] = args.profile
     if args.direct_to_db and args.via_tiles:
         print("Error: --direct-to-db and --via-tiles are mutually exclusive.", file=sys.stderr)
         sys.exit(2)

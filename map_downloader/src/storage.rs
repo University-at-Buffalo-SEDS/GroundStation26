@@ -91,10 +91,20 @@ pub(crate) fn minimum_free_bytes() -> Result<u64> {
         .context("MAP_MIN_FREE_MIB is too large")
 }
 
+#[cfg(test)]
 pub(crate) fn spawn(
     pool: SqlitePool,
     directory: PathBuf,
     reserve: u64,
+) -> (BundleWriter, tokio::task::JoinHandle<()>) {
+    spawn_with_budget(pool, directory, reserve, None)
+}
+
+pub(crate) fn spawn_with_budget(
+    pool: SqlitePool,
+    directory: PathBuf,
+    reserve: u64,
+    budget: Option<Arc<crate::budget::DatasetBudget>>,
 ) -> (BundleWriter, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<Tile>(QUEUE_CAPACITY);
     let failed = Arc::new(AtomicBool::new(false));
@@ -113,7 +123,7 @@ pub(crate) fn spawn(
                     Err(_) => break,
                 }
             }
-            let result = write_batch(&pool, &directory, reserve, &batch).await;
+            let result = write_batch(&pool, &directory, reserve, &batch, budget.as_deref()).await;
             let message = result.as_ref().err().map(|error| format!("{error:#}"));
             if let Some(message) = &message {
                 *failure.lock().unwrap() = Some(message.clone());
@@ -138,7 +148,11 @@ async fn write_batch(
     directory: &Path,
     reserve: u64,
     batch: &[Tile],
+    budget: Option<&crate::budget::DatasetBudget>,
 ) -> Result<()> {
+    if let Some(budget) = budget {
+        budget.checkpoint(pool).await?;
+    }
     let incoming = batch.iter().fold(0u64, |sum, tile| {
         sum.saturating_add(tile.bytes.len() as u64)
     });
@@ -163,6 +177,9 @@ async fn write_batch(
             .await?;
     }
     tx.commit().await?;
+    if let Some(budget) = budget {
+        budget.checkpoint(pool).await?;
+    }
     Ok(())
 }
 

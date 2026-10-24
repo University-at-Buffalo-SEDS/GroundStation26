@@ -6,7 +6,10 @@ use image::{ImageFormat, ImageReader};
 use std::io::Cursor;
 use std::time::Duration;
 
-fn sample_tiles(max_zoom: u32) -> Vec<(u32, u32, u32)> {
+fn sample_tiles_for_profile(
+    max_zoom: u32,
+    profile: crate::profile::Profile,
+) -> Vec<(u32, u32, u32)> {
     let mut tiles = vec![(0, 0, 0)];
     let mut add = |bounds: (f64, f64, f64, f64), z| {
         let (x, y) = lonlat_to_tile((bounds.0 + bounds.2) / 2.0, (bounds.1 + bounds.3) / 2.0, z);
@@ -15,6 +18,12 @@ fn sample_tiles(max_zoom: u32) -> Vec<(u32, u32, u32)> {
             tiles.push(tile)
         }
     };
+    if profile == crate::profile::Profile::Rrls {
+        for &bounds in profile.bounds(max_zoom) {
+            add(bounds, max_zoom);
+        }
+        return tiles;
+    }
     add(NA_BOUNDS, max_zoom.min(BASE_COVERAGE_MAX_ZOOM));
     if max_zoom > BASE_COVERAGE_MAX_ZOOM {
         for &bounds in coverage_bounds(max_zoom) {
@@ -22,6 +31,10 @@ fn sample_tiles(max_zoom: u32) -> Vec<(u32, u32, u32)> {
         }
     }
     tiles
+}
+#[cfg(test)]
+fn sample_tiles(max_zoom: u32) -> Vec<(u32, u32, u32)> {
+    sample_tiles_for_profile(max_zoom, crate::profile::Profile::GroundStation)
 }
 fn validate_image(bytes: &[u8]) -> Result<(&'static str, u32, u32)> {
     if bytes.len() > MAX_TILE_BYTES {
@@ -108,11 +121,12 @@ async fn check(client: &TileClient, tiles: &[(u32, u32, u32)], base_url: &str) -
 pub(crate) async fn run(
     client: &TileClient,
     region: &str,
+    profile: crate::profile::Profile,
     max_zoom: u32,
     base_url: &str,
     direct_requested: bool,
 ) -> Result<()> {
-    let tiles = sample_tiles(max_zoom);
+    let tiles = sample_tiles_for_profile(max_zoom, profile);
     println!(
         "Map connection test: region={region}, zoom=0..={max_zoom}, {} tiles; no map data will be written.",
         tiles.len()
@@ -167,6 +181,19 @@ mod tests {
         assert_eq!(sample_tiles(17).len(), 5);
         let (x, y) = lonlat_to_tile(-77.175, 42.70, 17);
         assert!(sample_tiles(17).contains(&(17, x, y)));
+    }
+    #[test]
+    fn rrls_probe_covers_each_small_region_without_bulk_sample() {
+        let samples = sample_tiles_for_profile(17, crate::profile::Profile::Rrls);
+        assert_eq!(samples.len(), 4);
+        for b in crate::profile::RRLS_BOUNDS {
+            let (x, y) = lonlat_to_tile((b.0 + b.2) / 2.0, (b.1 + b.3) / 2.0, 17);
+            assert!(samples.contains(&(17, x, y)));
+        }
+        assert_eq!(
+            sample_tiles_for_profile(0, crate::profile::Profile::Rrls),
+            vec![(0, 0, 0)]
+        );
     }
     #[test]
     fn real_png_and_jpeg_decode_and_report_dimensions() {

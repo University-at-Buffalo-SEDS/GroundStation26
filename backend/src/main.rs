@@ -67,7 +67,7 @@ mod voice;
 mod web;
 mod web_server;
 
-use crate::map::{DEFAULT_MAP_REGION, ensure_map_data};
+use crate::map::{selected_map_region, ensure_map_data};
 use crate::ring_buffer::RingBuffer;
 use crate::rocket_commands::{FlightComputerCommands, ValveBoardCommands};
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
@@ -807,7 +807,7 @@ async fn main() -> anyhow::Result<()> {
     let gpio = gpio::GpioPins::new();
 
     // Ensure offline map tiles
-    if let Err(e) = ensure_map_data(DEFAULT_MAP_REGION).await {
+    if let Err(e) = ensure_map_data(&selected_map_region()).await {
         log::warn!("failed to ensure map tiles: {e:#}");
         // you can choose to return Err(e) instead if tiles are mandatory
     }

@@ -2,8 +2,16 @@ use sqlx::Row;
 use std::path::PathBuf;
 use tokio::fs;
 
-/// Default region for map tiles. Change this to switch regions in code.
+/// Default GroundStation dataset; RRLS uses its independent compact dataset.
 pub const DEFAULT_MAP_REGION: &str = "north_america";
+
+fn select_region(explicit: Option<String>, rrls: bool) -> String {
+    explicit.unwrap_or_else(|| if rrls { "rrls" } else { DEFAULT_MAP_REGION }.to_owned())
+}
+
+pub fn selected_map_region() -> String {
+    select_region(std::env::var("MAP_REGION").ok(), crate::rrls::is_rrls())
+}
 
 pub fn map_region_base_dir(region: &str) -> PathBuf {
     PathBuf::from(format!("./backend/data/maps/{region}"))
@@ -34,9 +42,14 @@ pub async fn ensure_map_data(region: &str) -> anyhow::Result<()> {
     }
 
     anyhow::bail!(
-        "No map data found (expected {} or {}). Run `python3 download_map.py` to generate offline map data.",
+        "No map data found (expected {} or {}). Run `python3 download_map.py{}` to generate offline map data.",
         tiles_dir.display(),
-        bundle_path.display()
+        bundle_path.display(),
+        if region == "rrls" {
+            " --profile rrls"
+        } else {
+            ""
+        }
     );
 }
 
@@ -85,4 +98,17 @@ pub async fn detect_max_native_zoom(region: &str) -> anyhow::Result<Option<u32>>
     }
 
     Ok(max_zoom)
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+    #[test]
+    fn roles_choose_distinct_datasets_and_explicit_region_wins() {
+        assert_eq!(select_region(None, false), "north_america");
+        assert_eq!(select_region(None, true), "rrls");
+        for rrls in [false, true] {
+            assert_eq!(select_region(Some("custom".into()), rrls), "custom");
+        }
+    }
 }

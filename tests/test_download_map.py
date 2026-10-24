@@ -13,6 +13,12 @@ class WrapperTests(unittest.TestCase):
   args=self.invoke(['--test','--direct-interface','eth0','--max-concurrent','1024','--max-bandwidth-mibps','0']);self.assertEqual(args.kwargs['env']['MAP_DIRECT_INTERFACE'],'eth0');self.assertEqual(args.kwargs['env']['MAP_MAX_CONCURRENT'],'1024');self.assertEqual(args.kwargs['env']['MAP_MAX_BANDWIDTH_MIBPS'],'0.0')
  def test_auto_interface_flag_and_test_compatible(self):
   args=self.invoke(['--test','--direct-interface']);self.assertEqual(args.kwargs['env']['MAP_DIRECT_INTERFACE'],'auto')
+ def test_rrls_profile_is_explicit_and_preserves_other_configuration(self):
+  args=self.invoke(['--profile','rrls','--test','--max-concurrent','1024']);self.assertEqual(args.kwargs['env']['MAP_PROFILE'],'rrls');self.assertEqual(args.kwargs['env']['MAP_MAX_CONCURRENT'],'1024');self.assertEqual(args.args[0][-2:],['--','--test'])
+ def test_profile_overrides_only_profile_and_preserves_explicit_region(self):
+  with patch('sys.argv',['download_map.py','--profile','rrls','--test']),patch.dict(module.os.environ,{'MAP_PROFILE':'groundstation','MAP_REGION':'custom'},clear=True),patch.object(module,'run')as run:
+   module.main()
+  self.assertEqual(run.call_args.kwargs['env']['MAP_PROFILE'],'rrls');self.assertEqual(run.call_args.kwargs['env']['MAP_REGION'],'custom')
  def test_ordinary_download_command_unchanged(self):
   args=self.invoke([]);self.assertEqual(args.args[0],['cargo','run','--release','-p','map_downloader'])
 if __name__=='__main__':unittest.main()
