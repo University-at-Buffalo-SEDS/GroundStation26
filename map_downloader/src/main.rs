@@ -58,6 +58,20 @@ const BUFFALO_ROCHESTER_BOUNDS: (f64, f64, f64, f64) = (-79.30, 42.70, -77.25, 4
 /// lon_min, lat_min, lon_max, lat_max
 const TEXAS_DESERT_BOUNDS: (f64, f64, f64, f64) = (-106.80, 29.00, -101.00, 32.60);
 
+/// Higher-detail region: URRG launch field and recovery area near Potter, NY.
+/// The official URRG field map is centered near 42.7004 N, 77.1941 W:
+/// https://www.urrg.us/content.aspx (Field Map).
+/// lon_min, lat_min, lon_max, lat_max; roughly 20 km east/west by 22 km north/south.
+const URRG_BOUNDS: (f64, f64, f64, f64) = (-77.30, 42.60, -77.05, 42.80);
+
+fn coverage_bounds(z: u32) -> &'static [(f64, f64, f64, f64)] {
+    if z <= BASE_COVERAGE_MAX_ZOOM {
+        &[NA_BOUNDS]
+    } else {
+        &[BUFFALO_ROCHESTER_BOUNDS, TEXAS_DESERT_BOUNDS, URRG_BOUNDS]
+    }
+}
+
 /// Max concurrent HTTP fetches at a time.
 /// Tune this: higher = faster but more load on remote tile service / network.
 const DEFAULT_MAX_CONCURRENT: usize = 1024;
@@ -819,21 +833,17 @@ async fn main() -> Result<()> {
 
 /// Download satellite tiles at zoom level `z` with tiered coverage:
 /// - z=0..=8: full North America bounds
-/// - z=9..=MAX: Buffalo/Rochester + West Texas desert bounds
+/// - z=9..=MAX: Buffalo/Rochester + West Texas desert + URRG bounds
 async fn fetch_tiles_for_zoom_async(
     z: u32,
     tiles_root: &Path,
     client: &TileClient,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bounds = if z <= BASE_COVERAGE_MAX_ZOOM {
-        vec![NA_BOUNDS]
-    } else {
-        vec![BUFFALO_ROCHESTER_BOUNDS, TEXAS_DESERT_BOUNDS]
-    };
+    let bounds = coverage_bounds(z);
 
     // Enumerate + de-duplicate all tile coordinates across selected bounds.
     let mut coord_set = HashSet::<(u32, u32)>::new();
-    for bbox in &bounds {
+    for bbox in bounds {
         let (x_start, x_end, y_start, y_end) = tile_range_for_bounds(*bbox, z);
         for x in x_start..=x_end {
             for y in y_start..=y_end {
@@ -1178,14 +1188,10 @@ async fn fetch_tiles_for_zoom_async_to_db(
     pool: &SqlitePool,
     client: &TileClient,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bounds = if z <= BASE_COVERAGE_MAX_ZOOM {
-        vec![NA_BOUNDS]
-    } else {
-        vec![BUFFALO_ROCHESTER_BOUNDS, TEXAS_DESERT_BOUNDS]
-    };
+    let bounds = coverage_bounds(z);
 
     let mut coord_set = HashSet::<(u32, u32)>::new();
-    for bbox in &bounds {
+    for bbox in bounds {
         let (x_start, x_end, y_start, y_end) = tile_range_for_bounds(*bbox, z);
         for x in x_start..=x_end {
             for y in y_start..=y_end {
@@ -1483,6 +1489,25 @@ fn bounds_tile_extent(coords: &[(u32, u32)]) -> (u32, u32, u32, u32) {
 #[cfg(test)]
 mod bundle_database_tests {
     use super::*;
+
+    #[test]
+    fn coverage_keeps_north_america_at_low_zoom_and_launch_regions_at_high_zoom() {
+        for z in MIN_ZOOM..=BASE_COVERAGE_MAX_ZOOM {
+            assert_eq!(coverage_bounds(z), &[NA_BOUNDS]);
+        }
+        for z in BASE_COVERAGE_MAX_ZOOM + 1..=DEFAULT_MAX_ZOOM {
+            assert_eq!(
+                coverage_bounds(z),
+                &[BUFFALO_ROCHESTER_BOUNDS, TEXAS_DESERT_BOUNDS, URRG_BOUNDS]
+            );
+            // URRG's field map center was outside the old Buffalo/Rochester bounds.
+            let (x, y) = lonlat_to_tile(-77.1941, 42.7004, z);
+            let (x_min, x_max, y_min, y_max) = tile_range_for_bounds(URRG_BOUNDS, z);
+            assert!((x_min..=x_max).contains(&x));
+            assert!((y_min..=y_max).contains(&y));
+        }
+        assert!(-77.1941 > BUFFALO_ROCHESTER_BOUNDS.2);
+    }
 
     fn scratch(label: &str) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);

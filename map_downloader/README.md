@@ -33,3 +33,11 @@ can retain up to configured concurrency × 512 KiB; queued/batched payload copie
 add at most 32 MiB. SQLite cache, coordinate sets, HTTP/TLS buffers and runtime
 state consume additional memory. HTTP concurrency and existing bandwidth limits
 remain configurable as before.
+
+Default coverage caches North America at zooms 0–8 and Buffalo/Rochester, West
+Texas, and the URRG launch/recovery area near Potter, NY at zooms 9–17. The URRG
+bounds are longitude -77.30 to -77.05, latitude 42.60 to 42.80 (about 20 × 22 km),
+around the [official URRG field map](https://www.urrg.us/content.aspx) at
+4270 NY-364. Both download modes use the same coverage, de-duplicate overlapping
+tiles, and retain the existing bundle on resume. `--test` includes one URRG tile
+at the configured high zoom and remains a small read-only connection probe.

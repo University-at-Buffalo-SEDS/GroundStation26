@@ -600,6 +600,8 @@ mod recovery_transport_tests {
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 };
+                // Accepted sockets inherit nonblocking mode on macOS.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();

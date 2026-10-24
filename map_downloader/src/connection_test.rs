@@ -1,8 +1,5 @@
 //! Small read-only connection qualification; never opens a map database or tile path.
-use super::{
-    BASE_COVERAGE_MAX_ZOOM, BUFFALO_ROCHESTER_BOUNDS, NA_BOUNDS, TEXAS_DESERT_BOUNDS,
-    lonlat_to_tile,
-};
+use super::{BASE_COVERAGE_MAX_ZOOM, NA_BOUNDS, coverage_bounds, lonlat_to_tile};
 use crate::network::{MAX_TILE_BYTES, Route, TileClient};
 use anyhow::{Result, bail};
 use image::{ImageFormat, ImageReader};
@@ -20,8 +17,9 @@ fn sample_tiles(max_zoom: u32) -> Vec<(u32, u32, u32)> {
     };
     add(NA_BOUNDS, max_zoom.min(BASE_COVERAGE_MAX_ZOOM));
     if max_zoom > BASE_COVERAGE_MAX_ZOOM {
-        add(BUFFALO_ROCHESTER_BOUNDS, max_zoom);
-        add(TEXAS_DESERT_BOUNDS, max_zoom);
+        for &bounds in coverage_bounds(max_zoom) {
+            add(bounds, max_zoom);
+        }
     }
     tiles
 }
@@ -154,7 +152,7 @@ mod tests {
     fn samples_are_small_distinct_and_follow_configured_zoom_bounds() {
         for z in [0, 1, 8, 9, 17] {
             let tiles = sample_tiles(z);
-            assert!((1..=4).contains(&tiles.len()));
+            assert!((1..=5).contains(&tiles.len()));
             let mut unique = tiles.clone();
             unique.sort();
             unique.dedup();
@@ -166,7 +164,9 @@ mod tests {
             );
         }
         assert_eq!(sample_tiles(0), vec![(0, 0, 0)]);
-        assert_eq!(sample_tiles(17).len(), 4);
+        assert_eq!(sample_tiles(17).len(), 5);
+        let (x, y) = lonlat_to_tile(-77.175, 42.70, 17);
+        assert!(sample_tiles(17).contains(&(17, x, y)));
     }
     #[test]
     fn real_png_and_jpeg_decode_and_report_dimensions() {
@@ -223,6 +223,8 @@ mod tests {
                         std::thread::sleep(Duration::from_millis(1));
                         continue;
                     };
+                    // Accepted sockets inherit nonblocking mode on macOS.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
