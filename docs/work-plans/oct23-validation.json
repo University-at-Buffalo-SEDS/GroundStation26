@@ -227,6 +227,18 @@
       "linux_amd64_runtime": "Ubuntu GTK/WebKit navigation and raster map at1280/768/390",
       "arm64": "genuine cross-linked ELF; no physical Pi runtime claim",
       "tao_channel_tests": 5
+    },
+    {
+      "id": "map-direct-recovery-and-test-mode",
+      "groundstation_commit": "e97ab314d5737e72bf7caab3a916bf47d43e6c58",
+      "cargo_tests": 44,
+      "python_tests": 4,
+      "normal_test_main_requests": 4,
+      "readonly_existing_data_unchanged": true,
+      "normal_concurrency_unchanged": 1024,
+      "direct_recovery": "three failures cause30s cooldown; one existing tile checks recovery; no added recovery-probe downloads",
+      "test_command": "./download_map.py --test [--direct-interface eth0]",
+      "direct_test_scope": "1\u20134 representative tiles plus existing startup interface probe; actual Pi run still required"
     }
   ],
   "in_progress": [
@@ -257,12 +269,13 @@
         "hitl_probe_tests": 5,
         "hitl_existing_tests": 6,
         "production_and_hitl_checks": "passed; zero warnings; root apply pending"
+      },
+      "short_test_scope": "Source-preservation and simulator SD record gates only; does not prove physical250SPS acquisition/physicalSD. Emulated nominal per-window production-rate diagnostic false (~240/~230Hz); investigate separately.",
+      "barrier_fix_commit": "61b858024d21e06fca051c91d26fd3fcc4fb29f5",
+      "barrier_only_rerun": {
+        "groundstation_commit": "61b858024d21e06fca051c91d26fd3fcc4fb29f5",
+        "status": "running original120s restart gate; firmware/SDK/engine/controller unchanged; no600soak started"
       }
-    },
-    {
-      "id": "map-direct-recovery-and-test-mode",
-      "status": "temporary fallback recovery and --test few-tile no-database mode under development",
-      "preserve_concurrency": 1024
     }
   ],
   "next": [
