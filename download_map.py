@@ -13,6 +13,7 @@ def run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download offline map tiles.")
+    parser.add_argument("--test",action="store_true",help="Test a few configured map tiles without creating or writing map data; reports direct and fallback routing.")
     parser.add_argument(
         "--max-concurrent",
         type=int,
@@ -116,7 +117,7 @@ def main() -> None:
 
     try:
         run(
-            ["cargo", "run", "--release", "-p", "map_downloader"],
+            ["cargo", "run", "--release", "-p", "map_downloader"] + (["--", "--test"] if args.test else []),
             cwd=repo_root,
             env=env,
         )

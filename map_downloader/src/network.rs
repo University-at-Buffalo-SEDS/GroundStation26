@@ -1,32 +1,155 @@
 //! Optional per-socket VPN bypass. Never changes routes or interface configuration.
-use reqwest::{Client, Response};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-use std::time::Duration;
+use reqwest::{Client, Response, StatusCode};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub(crate) const MAX_TILE_BYTES: usize = 512 * 1024;
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
+const DIRECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DIRECT_COOLDOWN_MS: u64 = 30_000;
+const DIRECT_FAILURE_THRESHOLD: u8 = 3;
 
-const DIRECT_TIMEOUT: Duration = Duration::from_secs(6);
+#[derive(Clone, Copy)]
+struct Ticket {
+    direct: bool,
+    generation: u64,
+}
+#[derive(Default)]
+struct Policy {
+    generation: u64,
+    failures: u8,
+    retry_at: Option<u64>,
+    probe: bool,
+}
+impl Policy {
+    fn acquire(&mut self, now: u64) -> Ticket {
+        let direct = match self.retry_at {
+            None => true,
+            Some(at) if now >= at && !self.probe => {
+                self.probe = true;
+                true
+            }
+            Some(_) => false,
+        };
+        Ticket {
+            direct,
+            generation: self.generation,
+        }
+    }
+    fn success(&mut self, t: Ticket) -> bool {
+        if !t.direct || t.generation != self.generation {
+            return false;
+        }
+        self.failures = 0;
+        let recovered = self.retry_at.take().is_some();
+        if recovered {
+            self.probe = false;
+            self.generation = self.generation.wrapping_add(1);
+        }
+        recovered
+    }
+    fn failure(&mut self, t: Ticket, now: u64) -> bool {
+        if !t.direct || t.generation != self.generation {
+            return false;
+        }
+        self.failures = self.failures.saturating_add(1);
+        if self.retry_at.is_some() || self.failures >= DIRECT_FAILURE_THRESHOLD {
+            self.retry_at = Some(now.saturating_add(DIRECT_COOLDOWN_MS));
+            self.probe = false;
+            self.generation = self.generation.wrapping_add(1);
+            return true;
+        }
+        false
+    }
+}
+struct Health {
+    state: Mutex<Policy>,
+    started: Instant,
+}
+impl Health {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(Policy::default()),
+            started: Instant::now(),
+        }
+    }
+    fn now(&self) -> u64 {
+        self.started.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+    fn lock(&self) -> std::sync::MutexGuard<'_, Policy> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+// Own a direct attempt through body completion. Cancellation releases a half-open
+// probe too, so a dropped request cannot disable future direct retries forever.
+struct Attempt {
+    health: Arc<Health>,
+    ticket: Ticket,
+    done: bool,
+}
+impl Attempt {
+    fn success(mut self) {
+        self.done = true;
+        if self.health.lock().success(self.ticket) {
+            println!("Direct map downloads restored.");
+        }
+    }
+    fn failure(mut self) {
+        self.done = true;
+        self.failed();
+    }
+    fn failed(&self) {
+        if self.health.lock().failure(self.ticket, self.health.now()) {
+            eprintln!(
+                "Direct map downloads temporarily unavailable; using normal network and retrying direct after 30 seconds."
+            );
+        }
+    }
+}
+impl Drop for Attempt {
+    fn drop(&mut self) {
+        if !self.done {
+            self.failed();
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct TileClient {
     normal: Client,
     direct: Option<Client>,
-    failed: Arc<AtomicBool>,
+    health: Arc<Health>,
 }
-
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Route {
+    Direct,
+    Normal,
+    NormalFallback,
+}
+impl Route {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Normal => "normal",
+            Self::NormalFallback => "normal-fallback",
+        }
+    }
+}
+pub(crate) struct TileResponse {
+    pub status: StatusCode,
+    pub bytes: Vec<u8>,
+    pub route: Route,
+    pub direct_failed: bool,
+}
 impl From<Client> for TileClient {
     fn from(normal: Client) -> Self {
         Self {
             normal,
             direct: None,
-            failed: Arc::new(AtomicBool::new(false)),
+            health: Arc::new(Health::new()),
         }
     }
 }
-
 impl TileClient {
     pub(crate) async fn configured(probe_url: &str) -> anyhow::Result<Self> {
         let normal = builder().build()?;
@@ -57,9 +180,9 @@ impl TileClient {
             );
             return Ok(selected);
         };
-        // Probe once, including the response body, before launching concurrent tiles.
-        // Do not print reqwest errors: they may contain URL/proxy credentials.
-        let ready = tokio::time::timeout(DIRECT_TIMEOUT, async {
+        // Retain the existing one-time startup check. Recovery never downloads probes:
+        // one ordinary requested tile becomes the shared half-open attempt.
+        let ready = tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, async {
             let response = direct.get(probe_url).send().await?.error_for_status()?;
             tile_body(response).await
         })
@@ -71,30 +194,67 @@ impl TileClient {
             );
             selected.direct = Some(direct);
         } else {
-            eprintln!("Direct map download probe failed; using normal network for this run.");
+            eprintln!(
+                "Direct map download probe failed; using normal network and retrying direct after 30 seconds."
+            );
+            selected.health.lock().retry_at =
+                Some(selected.health.now().saturating_add(DIRECT_COOLDOWN_MS));
+            selected.direct = Some(direct);
         }
         Ok(selected)
     }
-
-    pub(crate) async fn send(&self, url: &str) -> reqwest::Result<Response> {
-        if let Some(direct) = self
-            .direct
-            .as_ref()
-            .filter(|_| !self.failed.load(Ordering::Relaxed))
-        {
-            match direct.get(url).send().await {
-                Ok(response) => return Ok(response),
-                Err(_) => self.direct_failed(),
+    pub(crate) async fn fetch(&self, url: &str) -> anyhow::Result<TileResponse> {
+        let mut direct_failed = false;
+        if let Some(direct) = &self.direct {
+            let ticket = self.health.lock().acquire(self.health.now());
+            if ticket.direct {
+                let attempt = Attempt {
+                    health: self.health.clone(),
+                    ticket,
+                    done: false,
+                };
+                match fetch_response(direct, url, Route::Direct).await {
+                    Ok(response) => {
+                        attempt.success();
+                        return Ok(response);
+                    }
+                    Err(error) if error.is::<OversizedTile>() => {
+                        attempt.success();
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        direct_failed = true;
+                        attempt.failure();
+                    }
+                }
             }
         }
-        self.normal.get(url).send().await
+        let route = if self.direct.is_some() {
+            Route::NormalFallback
+        } else {
+            Route::Normal
+        };
+        let mut response = fetch_response(&self.normal, url, route).await?;
+        response.direct_failed = direct_failed;
+        Ok(response)
     }
-
-    pub(crate) fn direct_failed(&self) {
-        if self.direct.is_some() && !self.failed.swap(true, Ordering::Relaxed) {
-            eprintln!("Direct map connection failed; remaining downloads use the normal network.");
-        }
-    }
+}
+async fn fetch_response(client: &Client, url: &str, route: Route) -> anyhow::Result<TileResponse> {
+    let response = client.get(url).send().await?;
+    let status = response.status();
+    // HTTP responses describe tile availability/server load, not routing failure.
+    // Avoid downloading error bodies and preserve existing retry policy at caller.
+    let bytes = if status.is_success() {
+        tile_body(response).await?
+    } else {
+        Vec::new()
+    };
+    Ok(TileResponse {
+        status,
+        bytes,
+        route,
+        direct_failed: false,
+    })
 }
 
 #[derive(Debug)]
@@ -136,6 +296,7 @@ fn direct_client(interface: &str) -> Option<Client> {
         builder()
             .interface(interface)
             .no_proxy()
+            .connect_timeout(DIRECT_CONNECT_TIMEOUT)
             .timeout(DIRECT_TIMEOUT)
             .build()
             .ok()
@@ -246,68 +407,6 @@ fn macos_default(routes: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
-    async fn failed_direct_transport_falls_back_once_across_clones() {
-        use std::{
-            io::{Read, Write},
-            net::TcpListener,
-        };
-        let direct = TcpListener::bind("127.0.0.1:0").unwrap();
-        let direct_addr = direct.local_addr().unwrap();
-        let normal = TcpListener::bind("127.0.0.1:0").unwrap();
-        let normal_addr = normal.local_addr().unwrap();
-        let direct_thread = std::thread::spawn(move || {
-            let (mut stream, _) = direct.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut request = [0; 1024];
-            let _ = stream.read(&mut request);
-            // Connection closes before headers; normal routing must recover.
-        });
-        let normal_thread = std::thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut stream, _) = normal.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut request = [0; 1024];
-                let _ = stream.read(&mut request);
-                stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                    )
-                    .unwrap();
-            }
-        });
-        let name = "map-direct-test.invalid";
-        let client = TileClient {
-            normal: Client::builder()
-                .no_proxy()
-                .resolve(name, normal_addr)
-                .timeout(Duration::from_secs(2))
-                .build()
-                .unwrap(),
-            direct: Some(
-                Client::builder()
-                    .no_proxy()
-                    .resolve(name, direct_addr)
-                    .timeout(Duration::from_secs(2))
-                    .build()
-                    .unwrap(),
-            ),
-            failed: Arc::new(AtomicBool::new(false)),
-        };
-        let peer = client.clone();
-        let url = format!("http://{name}/tile");
-        assert_eq!(client.send(&url).await.unwrap().text().await.unwrap(), "ok");
-        assert!(peer.failed.load(Ordering::Relaxed));
-        // The direct listener is gone. A clone must retain the fallback latch.
-        assert_eq!(peer.send(&url).await.unwrap().text().await.unwrap(), "ok");
-        direct_thread.join().unwrap();
-        normal_thread.join().unwrap();
-    }
-
     #[test]
     fn linux_selects_lowest_up_physical_default() {
         let routes = "Iface Destination Gateway Flags RefCnt Use Metric Mask\ntun0 00000000 0 0001 0 0 0 00000000\neth0 00000000 0 0001 0 0 100 00000000\nwlan0 00000000 0 0001 0 0 600 00000000\neth1 00000000 0 0000 0 0 1 00000000\n";
@@ -370,5 +469,280 @@ mod tests {
             assert!(tile_body(response).await.unwrap_err().is::<OversizedTile>());
             server.join().unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    fn open(p: &mut Policy) {
+        for _ in 0..3 {
+            let t = p.acquire(0);
+            p.failure(t, 0);
+        }
+        assert!(p.retry_at.is_some());
+    }
+    #[test]
+    fn one_transient_keeps_direct() {
+        let mut p = Policy::default();
+        let t = p.acquire(0);
+        p.failure(t, 1);
+        assert!(p.acquire(2).direct);
+    }
+    #[test]
+    fn body_success_resets_failure_streak() {
+        let mut p = Policy::default();
+        for _ in 0..2 {
+            let t = p.acquire(0);
+            p.failure(t, 0);
+        }
+        let t = p.acquire(1);
+        p.success(t);
+        for _ in 0..2 {
+            let t = p.acquire(2);
+            p.failure(t, 2);
+        }
+        assert!(p.acquire(3).direct);
+    }
+    #[test]
+    fn normal_body_errors_never_poison_direct() {
+        let mut p = Policy::default();
+        p.failure(
+            Ticket {
+                direct: false,
+                generation: 0,
+            },
+            0,
+        );
+        assert_eq!(p.failures, 0);
+        assert!(p.acquire(0).direct);
+    }
+    #[test]
+    fn threshold_cools_then_one_probe_recovers() {
+        let mut p = Policy::default();
+        open(&mut p);
+        assert!(!p.acquire(29999).direct);
+        let probe = p.acquire(30000);
+        assert!(probe.direct);
+        for _ in 0..1024 {
+            assert!(!p.acquire(30000).direct)
+        }
+        p.success(probe);
+        assert!(p.acquire(30001).direct);
+    }
+    #[test]
+    fn failed_probe_reopens_cooldown() {
+        let mut p = Policy::default();
+        open(&mut p);
+        let t = p.acquire(30000);
+        p.failure(t, 30000);
+        assert!(!p.acquire(59999).direct);
+        assert!(p.acquire(60000).direct);
+    }
+    #[test]
+    fn stale_success_cannot_close_new_circuit() {
+        let mut p = Policy::default();
+        let stale = p.acquire(0);
+        open(&mut p);
+        p.success(stale);
+        assert!(!p.acquire(1).direct);
+    }
+    #[test]
+    fn stale_failures_cannot_reopen_recovered_circuit() {
+        let mut p = Policy::default();
+        let stale = p.acquire(0);
+        open(&mut p);
+        let probe = p.acquire(30000);
+        p.success(probe);
+        for _ in 0..1024 {
+            p.failure(stale, 30001);
+        }
+        assert!(p.acquire(30001).direct);
+    }
+    #[test]
+    fn in_flight_failures_cannot_multiply_probe_or_extend_cooldown() {
+        let mut p = Policy::default();
+        let stale = p.acquire(0);
+        open(&mut p);
+        let at = p.retry_at;
+        for _ in 0..1024 {
+            p.failure(stale, 10000);
+        }
+        assert_eq!(p.retry_at, at);
+    }
+}
+#[cfg(test)]
+mod recovery_transport_tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    fn server(
+        failures: usize,
+        requests: usize,
+        partial: bool,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicUsize>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        let thread = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while seen.load(Ordering::SeqCst) < requests && Instant::now() < deadline {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while request.len() < 8192 && !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut buffer = [0; 1024];
+                    let read = socket.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let index = seen.fetch_add(1, Ordering::SeqCst);
+                if index < failures {
+                    if partial {
+                        let _=socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nbad");
+                    }
+                } else {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .unwrap();
+                }
+            }
+        });
+        (address, count, thread)
+    }
+    fn client(direct: std::net::SocketAddr, normal: std::net::SocketAddr) -> TileClient {
+        let make = |address| {
+            Client::builder()
+                .no_proxy()
+                .resolve("tile.invalid", address)
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap()
+        };
+        TileClient {
+            normal: make(normal),
+            direct: Some(make(direct)),
+            health: Arc::new(Health::new()),
+        }
+    }
+    #[tokio::test]
+    async fn transient_body_failure_recovers_next_requested_tile_across_clones() {
+        let (direct, ds, dt) = server(1, 2, true);
+        let (normal, ns, nt) = server(0, 1, false);
+        let client = client(direct, normal);
+        let peer = client.clone();
+        let fallback = client.fetch("http://tile.invalid/tile").await.unwrap();
+        assert_eq!(fallback.bytes, b"ok");
+        assert_eq!(fallback.route, Route::NormalFallback);
+        assert!(fallback.direct_failed);
+        let recovered = peer.fetch("http://tile.invalid/tile2").await.unwrap();
+        assert_eq!(recovered.bytes, b"ok");
+        assert_eq!(recovered.route, Route::Direct);
+        assert!(!recovered.direct_failed);
+        dt.join().unwrap();
+        nt.join().unwrap();
+        assert_eq!(ds.load(Ordering::SeqCst), 2);
+        assert_eq!(ns.load(Ordering::SeqCst), 1);
+        assert_eq!(client.health.lock().failures, 0);
+    }
+    #[tokio::test]
+    async fn cooldown_and_recovery_use_only_requested_tiles_no_probe_downloads() {
+        let (direct, ds, dt) = server(3, 4, false);
+        let (normal, ns, nt) = server(0, 4, false);
+        let client = client(direct, normal);
+        for _ in 0..4 {
+            assert_eq!(
+                client
+                    .fetch("http://tile.invalid/tile")
+                    .await
+                    .unwrap()
+                    .bytes,
+                b"ok"
+            )
+        }
+        assert_eq!(ds.load(Ordering::SeqCst), 3);
+        assert_eq!(ns.load(Ordering::SeqCst), 4);
+        client.health.lock().retry_at = Some(client.health.now());
+        assert_eq!(
+            client
+                .fetch("http://tile.invalid/tile")
+                .await
+                .unwrap()
+                .bytes,
+            b"ok"
+        );
+        dt.join().unwrap();
+        nt.join().unwrap();
+        assert_eq!(ds.load(Ordering::SeqCst), 4);
+        assert_eq!(ns.load(Ordering::SeqCst), 4);
+        assert!(client.health.lock().retry_at.is_none());
+    }
+    #[test]
+    fn canceled_half_open_attempt_releases_probe_and_preserves_cooldown() {
+        let health = Arc::new(Health::new());
+        {
+            let mut state = health.lock();
+            state.retry_at = Some(0);
+        }
+        let ticket = health.lock().acquire(0);
+        assert!(ticket.direct);
+        assert!(health.lock().probe);
+        drop(Attempt {
+            health: health.clone(),
+            ticket,
+            done: false,
+        });
+        assert!(!health.lock().probe);
+        assert!(
+            health
+                .lock()
+                .retry_at
+                .is_some_and(|at| at >= DIRECT_COOLDOWN_MS)
+        );
+    }
+    #[tokio::test]
+    async fn normal_fallback_body_failure_does_not_poison_or_extend_direct_cooldown() {
+        let (direct, _ds, dt) = server(0, 0, false);
+        let (normal, ns, nt) = server(1, 2, true);
+        let client = client(direct, normal);
+        {
+            let mut state = client.health.lock();
+            state.retry_at = Some(client.health.now() + DIRECT_COOLDOWN_MS);
+            state.failures = 3;
+        }
+        let before = {
+            let state = client.health.lock();
+            (state.generation, state.retry_at, state.failures)
+        };
+        assert!(client.fetch("http://tile.invalid/tile").await.is_err());
+        let after = {
+            let state = client.health.lock();
+            (state.generation, state.retry_at, state.failures)
+        };
+        assert_eq!(before, after);
+        let recovered = client.fetch("http://tile.invalid/tile2").await.unwrap();
+        assert_eq!(recovered.route, Route::NormalFallback);
+        assert!(!recovered.direct_failed);
+        nt.join().unwrap();
+        dt.join().unwrap();
+        assert_eq!(ns.load(Ordering::SeqCst), 2);
     }
 }

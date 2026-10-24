@@ -1,3 +1,4 @@
+mod connection_test;
 mod dns;
 mod limits;
 mod network;
@@ -145,32 +146,18 @@ async fn fetch_tile_with_retries(
         attempts += 1;
         // Transient failures stay quiet. Keep the final cause for one useful
         // report only if this tile exhausts its bounded retry allowance.
-        let failure = match client.send(&url).await {
+        let failure = match client.fetch(&url).await {
             Ok(resp) => {
-                let status = resp.status();
+                let status = resp.status;
                 if status.is_success() {
-                    match network::tile_body(resp).await {
-                        Ok(bytes) => {
-                            if let Some(lim) = limiter {
-                                lim.throttle_bytes(bytes.len()).await;
-                            }
-                            bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                            match write_tile_atomic_async(&tile_path, &bytes).await {
-                                Ok(()) => return TileOutcome::Complete,
-                                Err(error) => format!("saving tile: {error:#}"),
-                            }
-                        }
-                        Err(error) => {
-                            if error.is::<network::OversizedTile>() {
-                                log_progress_error(
-                                    pb,
-                                    format!("tile z={z},x={x},y={y} exceeds512KiB; not retried"),
-                                );
-                                return TileOutcome::Permanent;
-                            }
-                            client.direct_failed();
-                            format!("reading response body: {error:#}")
-                        }
+                    let bytes = resp.bytes;
+                    if let Some(lim) = limiter {
+                        lim.throttle_bytes(bytes.len()).await;
+                    }
+                    bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    match write_tile_atomic_async(&tile_path, &bytes).await {
+                        Ok(()) => return TileOutcome::Complete,
+                        Err(error) => format!("saving tile: {error:#}"),
                     }
                 } else if status.as_u16() == 404 {
                     return TileOutcome::Unavailable;
@@ -187,7 +174,14 @@ async fn fetch_tile_with_retries(
                     format!("HTTP {status}")
                 }
             }
-            Err(error) => format!("request: {:#}", anyhow::Error::new(error)),
+            Err(error) if error.is::<network::OversizedTile>() => {
+                log_progress_error(
+                    pb,
+                    format!("tile z={z},x={x},y={y} exceeds512KiB; not retried"),
+                );
+                return TileOutcome::Permanent;
+            }
+            Err(error) => format!("request or response body: {error:#}"),
         };
         if attempts >= max_attempts {
             log_progress_error(
@@ -681,13 +675,30 @@ impl BandwidthLimiter {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    limits::prepare(max_concurrent())?;
     // Optional override for region, but default to north_america
     let region = env::var("MAP_REGION").unwrap_or_else(|_| REGION.to_string());
     let max_zoom = env::var("MAP_MAX_ZOOM")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(DEFAULT_MAX_ZOOM);
+
+    if max_zoom > 30 {
+        anyhow::bail!("MAP_MAX_ZOOM must be between 0 and 30");
+    }
+    let test_only = env::args().skip(1).any(|arg| arg == "--test");
+    if test_only {
+        let client = TileClient::configured(&format!("{SATELLITE_BASE_URL}/0/0/0")).await?;
+        return connection_test::run(
+            &client,
+            &region,
+            max_zoom,
+            SATELLITE_BASE_URL,
+            env::var_os("MAP_DIRECT_INTERFACE").is_some(),
+        )
+        .await;
+    }
+
+    limits::prepare(max_concurrent())?;
 
     // Use CARGO_MANIFEST_DIR if present (when run via `cargo run`),
     // otherwise fall back to current directory.
@@ -1112,32 +1123,18 @@ async fn fetch_tile_with_retries_to_db(
         attempts += 1;
         // Transient failures stay quiet. Keep the final cause for one useful
         // report only if this tile exhausts its bounded retry allowance.
-        let failure = match client.send(&url).await {
+        let failure = match client.fetch(&url).await {
             Ok(resp) => {
-                let status = resp.status();
+                let status = resp.status;
                 if status.is_success() {
-                    match network::tile_body(resp).await {
-                        Ok(bytes) => {
-                            if let Some(lim) = limiter {
-                                lim.throttle_bytes(bytes.len()).await;
-                            }
-                            bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                            match writer.save(z, x, y, &bytes).await {
-                                Ok(()) => return TileOutcome::Complete,
-                                Err(_) => return TileOutcome::Exhausted,
-                            }
-                        }
-                        Err(error) => {
-                            if error.is::<network::OversizedTile>() {
-                                log_progress_error(
-                                    pb,
-                                    format!("tile z={z},x={x},y={y} exceeds512KiB; not retried"),
-                                );
-                                return TileOutcome::Permanent;
-                            }
-                            client.direct_failed();
-                            format!("reading response body: {error:#}")
-                        }
+                    let bytes = resp.bytes;
+                    if let Some(lim) = limiter {
+                        lim.throttle_bytes(bytes.len()).await;
+                    }
+                    bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    match writer.save(z, x, y, &bytes).await {
+                        Ok(()) => return TileOutcome::Complete,
+                        Err(_) => return TileOutcome::Exhausted,
                     }
                 } else if status.as_u16() == 404 {
                     return TileOutcome::Unavailable;
@@ -1154,7 +1151,14 @@ async fn fetch_tile_with_retries_to_db(
                     format!("HTTP {status}")
                 }
             }
-            Err(error) => format!("request: {:#}", anyhow::Error::new(error)),
+            Err(error) if error.is::<network::OversizedTile>() => {
+                log_progress_error(
+                    pb,
+                    format!("tile z={z},x={x},y={y} exceeds512KiB; not retried"),
+                );
+                return TileOutcome::Permanent;
+            }
+            Err(error) => format!("request or response body: {error:#}"),
         };
         if attempts >= max_attempts {
             log_progress_error(

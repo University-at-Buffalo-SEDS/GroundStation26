@@ -168,7 +168,29 @@ Download map data with:
 python3 download_map.py
 ```
 
-This uses the `map_downloader/` crate and writes map data into `data/`.
+This uses the `map_downloader/` crate. Test connectivity before a large download:
+
+```bash
+./download_map.py --test
+./download_map.py --test --direct-interface       # choose a physical default interface
+./download_map.py --test --direct-interface eth0  # choose an interface explicitly
+```
+
+The test checks one to four representative tiles using the configured region
+and maximum zoom, checks HTTP status and decodes bounded PNG/JPEG images.
+The direct-interface option also performs its existing single startup
+connectivity probe. It creates no map database or tile files and performs no
+resume scan. Each result
+reports direct, normal or fallback routing. An explicitly requested direct
+interface fails the test if any sample needs normal fallback, even if
+normal fallback can download images.
+
+Normal downloads retain their concurrency and retry policy. A single transient
+direct failure falls back for that tile; repeated failures pause direct routing
+for 30 seconds, after which one requested tile tests recovery. No recovery probe
+tiles are downloaded. Socket binding does not change system routes, Wi-Fi or
+interface configuration. Downloads resume committed tiles in the map bundle
+under `backend/data/maps/<region>/tiles.sqlite3`.
 
 RRLS recovery receiver/mesh relay: [setup and radio firmware requirements](docs/backend/rrls.md).
 
