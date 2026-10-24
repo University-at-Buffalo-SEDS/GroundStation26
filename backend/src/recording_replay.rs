@@ -217,6 +217,247 @@ pub async fn window(
             .into_response(),
     }
 }
+const MAX_TRAJECTORY_POINTS: usize = 8192;
+const MAX_TRAJECTORY_ROWS: i64 = 2_000_000;
+const TRAJECTORY_GAP_MS: i64 = 5_000;
+
+#[derive(Debug, Deserialize)]
+pub struct TrajectoryQuery {
+    pub upper_id: i64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrajectoryPoint {
+    pub timestamp_ms: i64,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub altitude_m: f64,
+    pub break_before: bool,
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Trajectory {
+    pub upper_id: i64,
+    pub source_sender_id: Option<String>,
+    pub points: Vec<TrajectoryPoint>,
+    pub truncated: bool,
+    pub sampled: bool,
+}
+#[derive(Clone)]
+struct SegmentPoint {
+    point: TrajectoryPoint,
+    segment: u64,
+}
+#[derive(Default)]
+struct TrajectorySampler {
+    points: Vec<SegmentPoint>,
+    segment: u64,
+    previous_ms: Option<i64>,
+    invalid_since_previous: bool,
+    sampled: bool,
+    truncated: bool,
+}
+impl TrajectorySampler {
+    fn push(&mut self, timestamp_ms: i64, raw: &str) {
+        let Some(mut point) = saved_gps_point(timestamp_ms, raw) else {
+            self.invalid_since_previous = true;
+            return;
+        };
+        point.break_before = self.previous_ms.is_none_or(|previous| {
+            self.invalid_since_previous || timestamp_ms.saturating_sub(previous) > TRAJECTORY_GAP_MS
+        });
+        if point.break_before {
+            self.segment = self.segment.saturating_add(1);
+        }
+        self.previous_ms = Some(timestamp_ms);
+        self.invalid_since_previous = false;
+        self.points.push(SegmentPoint {
+            point,
+            segment: self.segment,
+        });
+        if self.points.len() > MAX_TRAJECTORY_POINTS * 2 {
+            self.compact(MAX_TRAJECTORY_POINTS);
+        }
+    }
+    fn compact(&mut self, budget: usize) {
+        use std::collections::BTreeSet;
+        let len = self.points.len();
+        if len <= budget {
+            return;
+        }
+        self.sampled = true;
+        let min = (0..len)
+            .min_by(|&a, &b| {
+                self.points[a]
+                    .point
+                    .altitude_m
+                    .total_cmp(&self.points[b].point.altitude_m)
+            })
+            .unwrap();
+        let max = (0..len)
+            .max_by(|&a, &b| {
+                self.points[a]
+                    .point
+                    .altitude_m
+                    .total_cmp(&self.points[b].point.altitude_m)
+            })
+            .unwrap();
+        let required = BTreeSet::from([0, len - 1, min, max]);
+        let mut boundaries = required.clone();
+        for i in 1..len {
+            if self.points[i].segment != self.points[i - 1].segment {
+                boundaries.insert(i - 1);
+                boundaries.insert(i);
+            }
+        }
+        let mut chosen = if boundaries.len() <= budget {
+            boundaries
+        } else {
+            // Too many real gaps to represent every boundary. Omit whole
+            // portions explicitly rather than joining across a missing segment.
+            self.truncated = true;
+            required
+        };
+        let optional: Vec<_> = (0..len).filter(|i| !chosen.contains(i)).collect();
+        let slots = budget.saturating_sub(chosen.len());
+        for i in 0..slots {
+            chosen.insert(optional[i * optional.len() / slots]);
+        }
+        let mut kept = Vec::with_capacity(chosen.len());
+        for (i, mut value) in self.points.drain(..).enumerate() {
+            if chosen.contains(&i) {
+                value.point.break_before = kept
+                    .last()
+                    .is_none_or(|previous: &SegmentPoint| previous.segment != value.segment);
+                kept.push(value);
+            }
+        }
+        self.points = kept;
+    }
+}
+fn saved_gps_point(timestamp_ms: i64, raw: &str) -> Option<TrajectoryPoint> {
+    if timestamp_ms < 0 || raw.len() > 32768 {
+        return None;
+    }
+    let values: Vec<Option<f64>> = serde_json::from_str(raw).ok()?;
+    if values.len() > 1024 {
+        return None;
+    }
+    let latitude = *values.first()?.as_ref()?;
+    let longitude = *values.get(1)?.as_ref()?;
+    let altitude_m = *values.get(2)?.as_ref()?;
+    if !latitude.is_finite()
+        || !(-90.0..=90.0).contains(&latitude)
+        || !longitude.is_finite()
+        || !(-180.0..=180.0).contains(&longitude)
+        || !altitude_m.is_finite()
+        || !(-20_000.0..=10_000_000.0).contains(&altitude_m)
+    {
+        return None;
+    }
+    Some(TrajectoryPoint {
+        timestamp_ms,
+        latitude,
+        longitude,
+        altitude_m,
+        break_before: false,
+    })
+}
+async fn trajectory_from(db: &SqlitePool, upper_id: i64) -> anyhow::Result<Trajectory> {
+    use futures::TryStreamExt;
+    anyhow::ensure!(upper_id >= 0, "invalid replay snapshot");
+    let mut radio = TrajectorySampler::default();
+    let mut fc = TrajectorySampler::default();
+    let mut rows = sqlx::query("SELECT timestamp_ms,sender_id,substr(COALESCE(values_json,'[]'),1,32769) AS values_json FROM telemetry WHERE id <= ? AND sender_id IN ('RF','FC') AND data_type IN ('GPS_DATA','GPS','ROCKET_GPS') ORDER BY timestamp_ms,id LIMIT ?")
+        .bind(upper_id).bind(MAX_TRAJECTORY_ROWS + 1).fetch(db);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut count = 0;
+    let mut truncated = false;
+    loop {
+        let row = match tokio::time::timeout_at(deadline, rows.try_next()).await {
+            Ok(result) => match result? {
+                Some(row) => row,
+                None => break,
+            },
+            Err(_) => {
+                truncated = true;
+                break;
+            }
+        };
+        count += 1;
+        if count > MAX_TRAJECTORY_ROWS {
+            truncated = true;
+            break;
+        }
+        let sender: String = row.try_get("sender_id")?;
+        let sampler = if sender == "RF" { &mut radio } else { &mut fc };
+        sampler.push(
+            row.try_get("timestamp_ms")?,
+            &row.try_get::<String, _>("values_json")?,
+        );
+    }
+    // Match antenna GPS's rocket source whitelist, preferring RF receiver fixes.
+    // A single frozen source prevents mixing FC-relative and RF-MSL altitudes.
+    let (mut selected, source) = if !radio.points.is_empty() {
+        (radio, Some("RF"))
+    } else if !fc.points.is_empty() {
+        (fc, Some("FC"))
+    } else {
+        (radio, None)
+    };
+    selected.compact(MAX_TRAJECTORY_POINTS);
+    Ok(Trajectory {
+        upper_id,
+        source_sender_id: source.map(str::to_owned),
+        points: selected
+            .points
+            .into_iter()
+            .map(|value| value.point)
+            .collect(),
+        truncated: truncated || selected.truncated,
+        sampled: selected.sampled,
+    })
+}
+
+pub async fn trajectory(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<TrajectoryQuery>,
+) -> Response {
+    if let Err(response) =
+        crate::web::authorize_headers(&state, &headers, Permission::ViewData).await
+    {
+        return response;
+    }
+    if query.upper_id < 0 {
+        return (StatusCode::BAD_REQUEST, "Invalid replay snapshot").into_response();
+    }
+    let db = match open(&state, &id).await {
+        Ok(db) => db,
+        Err(code) => return code.into_response(),
+    };
+    match snapshot_from(&db).await {
+        Ok(snapshot) if query.upper_id <= snapshot.upper_id => {}
+        Ok(_) => {
+            return (StatusCode::BAD_REQUEST, "Replay snapshot exceeds recording").into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Recording has no readable telemetry table",
+            )
+                .into_response();
+        }
+    }
+    match trajectory_from(&db, query.upper_id).await {
+        Ok(value) => json(value),
+        Err(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Recording contains unreadable trajectory data",
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +632,173 @@ mod tests {
         assert_eq!(page.seeds.len(), 1);
         assert_eq!(page.seeds[0].values[0], Some(4.));
         assert_eq!(page.seeds[0].timestamp_ms, 2000);
+    }
+    #[test]
+    fn trajectory_compaction_preserves_extrema_ends_and_true_gaps() {
+        let mut sampler = TrajectorySampler::default();
+        for n in 0..40_000_i64 {
+            let time = n * 10 + if n >= 20_000 { 10_000 } else { 0 };
+            let altitude = match n {
+                12_345 => 99_999,
+                23_456 => -20_000,
+                _ => 100,
+            };
+            sampler.push(time, &format!("[43,-78,{altitude}]"));
+            assert!(sampler.points.len() <= MAX_TRAJECTORY_POINTS * 2);
+        }
+        sampler.compact(MAX_TRAJECTORY_POINTS);
+        let points: Vec<_> = sampler.points.iter().map(|p| &p.point).collect();
+        assert!(points.len() <= MAX_TRAJECTORY_POINTS);
+        assert_eq!(points.first().unwrap().timestamp_ms, 0);
+        assert_eq!(points.last().unwrap().timestamp_ms, 409_990);
+        assert!(points.iter().any(|p| p.altitude_m == 99_999.0));
+        assert!(points.iter().any(|p| p.altitude_m == -20_000.0));
+        assert!(points.iter().any(|p| p.timestamp_ms == 199_990));
+        assert!(
+            points
+                .iter()
+                .any(|p| p.timestamp_ms == 210_000 && p.break_before)
+        );
+        assert_eq!(points.iter().filter(|p| p.break_before).count(), 2);
+        assert!(sampler.sampled);
+        assert!(!sampler.truncated);
+    }
+    #[test]
+    fn trajectory_decimation_does_not_invent_time_gaps() {
+        let mut sampler = TrajectorySampler::default();
+        for n in 0..1000 {
+            sampler.push(n * 1000, "[0,0,100]");
+        }
+        sampler.compact(32);
+        assert_eq!(sampler.points.len(), 32);
+        assert!(
+            sampler
+                .points
+                .windows(2)
+                .any(
+                    |pair| pair[1].point.timestamp_ms - pair[0].point.timestamp_ms
+                        > TRAJECTORY_GAP_MS
+                )
+        );
+        assert!(sampler.points[0].point.break_before);
+        assert!(sampler.points[1..].iter().all(|p| !p.point.break_before));
+        assert!(!sampler.truncated);
+    }
+    #[test]
+    fn invalid_gps_breaks_saved_path_without_substituting_zero() {
+        let mut sampler = TrajectorySampler::default();
+        sampler.push(0, "[43,-78,100]");
+        sampler.push(1000, "[null,-78,100]");
+        sampler.push(2000, "[43,-78,101]");
+        assert_eq!(sampler.points.len(), 2);
+        assert!(sampler.points[1].point.break_before);
+        for raw in [
+            "[91,0,0]",
+            "[0,181,0]",
+            "[0,0,1e300]",
+            "[0,0,null]",
+            "[0,0]",
+            "[\"43\",0,0]",
+            "not json",
+        ] {
+            assert!(saved_gps_point(0, raw).is_none(), "{raw}");
+        }
+        assert!(saved_gps_point(-1, "[0,0,0]").is_none());
+        assert!(saved_gps_point(0, "[0,0,0]").is_some());
+    }
+    #[test]
+    fn pathological_gap_counts_truncate_without_drawing_false_connections() {
+        let mut sampler = TrajectorySampler::default();
+        for n in 0..1000 {
+            sampler.push(n * 10_000, "[43,-78,100]");
+        }
+        sampler.compact(32);
+        assert!(sampler.truncated);
+        assert_eq!(sampler.points.len(), 32);
+        assert_eq!(sampler.points.first().unwrap().point.timestamp_ms, 0);
+        assert_eq!(sampler.points.last().unwrap().point.timestamp_ms, 9_990_000);
+        assert!(sampler.points.iter().all(|p| p.point.break_before));
+    }
+    #[tokio::test]
+    async fn saved_trajectory_uses_one_rocket_source_and_frozen_ids_in_time_order() {
+        let db = db().await;
+        for (sender, time, values) in [
+            ("FC", 1000, "[43,-78,10]"),
+            ("RRLS", 1000, "[44,-79,9999]"),
+            ("GS", 1000, "[45,-80,9999]"),
+            ("GB", 1000, "[46,-81,9999]"),
+            ("RF", 3000, "[43,-78,300]"),
+            ("RF", 2000, "[43,-78,200]"),
+        ] {
+            sqlx::query("INSERT INTO telemetry(timestamp_ms,sender_id,data_type,values_json) VALUES(?,?,'GPS_DATA',?)")
+                .bind(time).bind(sender).bind(values).execute(&db).await.unwrap();
+        }
+        let upper = snapshot_from(&db).await.unwrap().upper_id;
+        sqlx::query("INSERT INTO telemetry(timestamp_ms,sender_id,data_type,values_json) VALUES(2000,'RF','GPS_DATA','[43,-78,999]')").execute(&db).await.unwrap();
+        let trajectory = trajectory_from(&db, upper).await.unwrap();
+        assert_eq!(trajectory.upper_id, upper);
+        assert_eq!(trajectory.source_sender_id.as_deref(), Some("RF"));
+        assert_eq!(trajectory.points.len(), 2);
+        assert_eq!(trajectory.points[0].timestamp_ms, 2000);
+        assert_eq!(trajectory.points[0].altitude_m, 200.0);
+        assert_eq!(trajectory.points[1].altitude_m, 300.0);
+        assert!(!trajectory.sampled && !trajectory.truncated);
+        let fc = trajectory_from(&db, 1).await.unwrap();
+        assert_eq!(fc.source_sender_id.as_deref(), Some("FC"));
+        assert_eq!(fc.points[0].altitude_m, 10.0);
+        let empty = trajectory_from(&db, 0).await.unwrap();
+        assert!(empty.points.is_empty());
+        assert!(empty.source_sender_id.is_none());
+    }
+    #[tokio::test]
+    async fn trajectory_http_authorizes_and_validates_frozen_recording() {
+        use axum::{
+            body::{Body, to_bytes},
+            http::Request,
+        };
+        use tower::ServiceExt;
+        let root = recording_export::tests::TestDirectory::new();
+        let id = "groundstation_recording_2.db";
+        let url = format!("/api/recordings/{id}/replay/trajectory?upper_id=0");
+        let denied = recording_export::routes()
+            .with_state(recording_export::tests::export_state(&root.0, false).await);
+        let response = denied
+            .oneshot(Request::builder().uri(&url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ));
+        assert!(!root.0.join(id).exists());
+        let (db, _) = crate::telemetry_db::open_telemetry_db(&root.0.join(id))
+            .await
+            .unwrap();
+        let app = recording_export::routes()
+            .with_state(recording_export::tests::export_state(&root.0, true).await);
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(&url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let value: Trajectory =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(value.upper_id, 0);
+        assert!(value.points.is_empty() && value.source_sender_id.is_none());
+        for url in [
+            format!("/api/recordings/{id}/replay/trajectory?upper_id=1"),
+            format!("/api/recordings/{id}/replay/trajectory?upper_id=-1"),
+            "/api/recordings/auth.json/replay/trajectory?upper_id=0".to_owned(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(url).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        db.close().await;
     }
 }

@@ -42,6 +42,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(crate::recording_replay::window),
         )
         .route(
+            "/api/recordings/{id}/replay/trajectory",
+            get(crate::recording_replay::trajectory),
+        )
+        .route(
             "/api/recordings/report",
             get(crate::recording_report::report),
         )

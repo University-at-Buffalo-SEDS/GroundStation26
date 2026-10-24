@@ -710,6 +710,14 @@ async fn save_vehicle_post(
 async fn three_asset(Path(file): Path<String>) -> ApiResult<Response> {
     let bytes: &'static [u8] = match file.as_str() {
         "vehicle-renderer.js" => gs_browser_assets::VEHICLE_RENDERER_JS,
+        "replay-scene.js" => {
+            gs_browser_assets::asset_bytes("REPLAY_SCENE_JS").ok_or_else(|| {
+                error(
+                    StatusCode::NOT_FOUND,
+                    "Renderer asset unavailable in selected frontend",
+                )
+            })?
+        }
         "software-renderer.js" => gs_browser_assets::SOFTWARE_RENDERER_JS,
         "three.module.js" => gs_browser_assets::THREE_MODULE_JS,
         "three.core.js" => gs_browser_assets::THREE_CORE_JS,
@@ -770,6 +778,34 @@ async fn model_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn selected_frontend_replay_asset_is_served_or_explicitly_absent() {
+        let result = three_asset(Path("replay-scene.js".into())).await;
+        match gs_browser_assets::asset_bytes("REPLAY_SCENE_JS") {
+            Some(expected) => {
+                let response = result.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()[header::CONTENT_TYPE], "text/javascript");
+                let body = axum::body::to_bytes(response.into_body(), expected.len() + 1)
+                    .await
+                    .unwrap();
+                assert_eq!(body.as_ref(), expected);
+            }
+            None => assert_eq!(result.err().unwrap().status(), StatusCode::NOT_FOUND),
+        }
+    }
+    #[tokio::test]
+    async fn unknown_renderer_asset_remains_not_found() {
+        assert_eq!(
+            three_asset(Path("unlisted.js".into()))
+                .await
+                .err()
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
     #[test]
     fn vehicle_defaults_preserve_frontend_contract() {
         let config: Vehicle = serde_json::from_str(r#"{"stages":[{"id":"booster","label":"Stage 1","components":[{"id":"motor","label":"Motor","binding":{"data_type":"THRUST"}}]}]}"#).unwrap();

@@ -50,6 +50,8 @@ const UART_READ_CHUNK_BYTES: usize = 512;
 const RAW_UART_MAX_FRAME_BYTES: usize =
     STREAM_PACKET_MAX_SIZE + RAW_UART_FRAME_HEADER_SIZE + UART_READ_CHUNK_BYTES;
 const RAW_UART_DEBUG_PREVIEW_BYTES: usize = 48;
+// Recovery never hashes more than four bounded receive buffers per call.
+const RAW_UART_RECOVERY_CRC_BUDGET_BYTES: usize = RAW_UART_MAX_FRAME_BYTES * 4;
 const RADIO_SCHED_MAGIC_0: u8 = 0x52;
 const RADIO_SCHED_MAGIC_1: u8 = 0x53;
 const RADIO_SCHED_VERSION: u8 = 1;
@@ -299,6 +301,9 @@ struct RawUartPartialStart {
     simulated_ms: Option<u64>,
 }
 struct RawUartFrameWait {
+    // Bytes still belonging to the last CRC-rejected frame. A new boundary
+    // outside this prefix returns to ordinary partial-frame handling.
+    failed_prefix: usize,
     started: Option<RawUartPartialStart>,
     timeout: Duration,
 }
@@ -312,6 +317,7 @@ impl RawUartFrameWait {
         let wire_ms = ((STREAM_PACKET_MAX_SIZE + RAW_UART_FRAME_HEADER_SIZE) as u64 * 10 * 1_000)
             .div_ceil(u64::from(baud.max(1)));
         Self {
+            failed_prefix: 0,
             started: None,
             timeout: Duration::from_millis(wire_ms.saturating_add(500).max(2_000)),
         }
@@ -1084,8 +1090,23 @@ fn take_raw_uart_framed_payload_with_clock(
     wall: Instant,
     simulated_ms: Option<u64>,
 ) -> TelemetryResult<Option<(RawUartFrameKind, Vec<u8>)>> {
+    if wait.failed_prefix != 0 {
+        bound_raw_uart_buffer(rx_buf, &mut wait.failed_prefix);
+        if let Some(offset) = raw_uart_recovery_anchor(rx_buf, wait.failed_prefix) {
+            discard_raw_uart_prefix(rx_buf, offset, &mut wait.failed_prefix);
+            wait.failed_prefix = 0;
+            wait.started = None;
+        }
+    }
     loop {
-        let result = take_raw_uart_framed_payload(rx_buf)?;
+        let result = match take_raw_uart_framed_payload_recovering(rx_buf, &mut wait.failed_prefix)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                wait.started = None;
+                return Err(error);
+            }
+        };
         if result.is_some() || rx_buf.len() < RAW_UART_FRAME_HEADER_SIZE {
             wait.started = None;
             return Ok(result);
@@ -1126,22 +1147,73 @@ fn take_raw_uart_framed_payload_with_clock(
         maybe_log_raw_uart_parse_issue("expired incomplete raw UART frame", rx_buf);
         // Preserve an intact following frame, including its sync. Never scan
         // inside a valid, unexpired payload for an apparent nested frame.
-        rx_buf.drain(..1);
+        discard_raw_uart_prefix(rx_buf, 1, &mut wait.failed_prefix);
         wait.started = None;
     }
 }
 
+#[cfg(test)]
 fn take_raw_uart_framed_payload(
     rx_buf: &mut Vec<u8>,
 ) -> TelemetryResult<Option<(RawUartFrameKind, Vec<u8>)>> {
+    take_raw_uart_framed_payload_recovering(rx_buf, &mut 0)
+}
+
+fn discard_raw_uart_prefix(rx_buf: &mut Vec<u8>, count: usize, failed_prefix: &mut usize) {
+    rx_buf.drain(..count);
+    *failed_prefix = failed_prefix.saturating_sub(count);
+}
+
+fn bound_raw_uart_buffer(rx_buf: &mut Vec<u8>, failed_prefix: &mut usize) {
     if rx_buf.len() > RAW_UART_MAX_FRAME_BYTES {
         let drop_len = rx_buf.len() - RAW_UART_MAX_FRAME_BYTES;
         maybe_log_raw_uart_parse_issue(
             "dropping oversized raw UART buffer",
             &rx_buf[..rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
         );
-        rx_buf.drain(..drop_len);
+        discard_raw_uart_prefix(rx_buf, drop_len, failed_prefix);
     }
+}
+
+// Only known-rejected bytes permit lookahead. A complete CRC-valid data frame
+// can restore framing inside that span. The first candidate outside the span
+// is handled normally, even when incomplete: never inspect its payload for a
+// nested frame. Unexpired ordinary frames never enter this recovery path.
+fn raw_uart_recovery_anchor(rx_buf: &[u8], failed_prefix: usize) -> Option<usize> {
+    let mut crc_budget = RAW_UART_RECOVERY_CRC_BUDGET_BYTES;
+    let scan_len = rx_buf.len().min(RAW_UART_MAX_FRAME_BYTES);
+    for offset in 0..scan_len.saturating_sub(RAW_UART_FRAME_HEADER_SIZE - 1) {
+        let Some(kind) = raw_uart_sync_kind(rx_buf[offset], rx_buf[offset + 1]) else {
+            continue;
+        };
+        let len = u16::from_le_bytes([rx_buf[offset + 2], rx_buf[offset + 3]]) as usize;
+        if len == 0 || len > STREAM_PACKET_MAX_SIZE {
+            continue;
+        }
+        if offset >= failed_prefix {
+            return Some(offset);
+        }
+        let end = offset + RAW_UART_FRAME_HEADER_SIZE + len;
+        if kind != RawUartFrameKind::Data || len < 8 || end > rx_buf.len() || len > crc_budget {
+            continue;
+        }
+        crc_budget -= len;
+        let body = &rx_buf[offset + RAW_UART_FRAME_HEADER_SIZE..end];
+        if body.starts_with(b"SDT")
+            && crc32fast::hash(&body[..len - 4])
+                == u32::from_le_bytes(body[len - 4..].try_into().unwrap())
+        {
+            return Some(offset);
+        }
+    }
+    None
+}
+
+fn take_raw_uart_framed_payload_recovering(
+    rx_buf: &mut Vec<u8>,
+    failed_prefix: &mut usize,
+) -> TelemetryResult<Option<(RawUartFrameKind, Vec<u8>)>> {
+    bound_raw_uart_buffer(rx_buf, failed_prefix);
 
     let sync_pos = rx_buf
         .windows(2)
@@ -1153,7 +1225,7 @@ fn take_raw_uart_framed_payload(
                 "dropping bytes before raw UART frame sync",
                 &rx_buf[..pos.min(RAW_UART_DEBUG_PREVIEW_BYTES)],
             );
-            rx_buf.drain(..pos);
+            discard_raw_uart_prefix(rx_buf, pos, failed_prefix);
         }
         None => {
             if !rx_buf.is_empty() {
@@ -1164,7 +1236,7 @@ fn take_raw_uart_framed_payload(
                 let keep = usize::from(rx_buf.last().copied().is_some_and(is_raw_uart_sync_byte));
                 let drop_len = rx_buf.len().saturating_sub(keep);
                 if drop_len > 0 {
-                    rx_buf.drain(..drop_len);
+                    discard_raw_uart_prefix(rx_buf, drop_len, failed_prefix);
                 }
             }
             return Ok(None);
@@ -1181,7 +1253,7 @@ fn take_raw_uart_framed_payload(
             "ignoring empty raw UART frame",
             &rx_buf[..RAW_UART_FRAME_HEADER_SIZE],
         );
-        rx_buf.drain(..RAW_UART_FRAME_HEADER_SIZE);
+        discard_raw_uart_prefix(rx_buf, RAW_UART_FRAME_HEADER_SIZE, failed_prefix);
         return Ok(None);
     }
 
@@ -1190,7 +1262,7 @@ fn take_raw_uart_framed_payload(
             &format!("invalid raw UART frame length: {frame_len}"),
             &rx_buf[..rx_buf.len().min(RAW_UART_DEBUG_PREVIEW_BYTES)],
         );
-        rx_buf.drain(..1);
+        discard_raw_uart_prefix(rx_buf, 1, failed_prefix);
         return Ok(None);
     }
 
@@ -1200,7 +1272,7 @@ fn take_raw_uart_framed_payload(
     }
 
     let Some(frame_kind) = raw_uart_sync_kind(rx_buf[0], rx_buf[1]) else {
-        rx_buf.drain(..1);
+        discard_raw_uart_prefix(rx_buf, 1, failed_prefix);
         return Ok(None);
     };
     let body = &rx_buf[RAW_UART_FRAME_HEADER_SIZE..total_len];
@@ -1211,12 +1283,14 @@ fn take_raw_uart_framed_payload(
         if !valid {
             // A damaged length may include the next frame's sync. Reject the
             // checksum before consuming that frame, preserving bytes for resync.
-            rx_buf.drain(..1);
+            discard_raw_uart_prefix(rx_buf, 1, failed_prefix);
+            *failed_prefix = total_len - 1;
             return Err(TelemetryError::Unpack("raw UART SDT crc32 mismatch"));
         }
     }
     let payload = body.to_vec();
-    rx_buf.drain(..total_len);
+    discard_raw_uart_prefix(rx_buf, total_len, failed_prefix);
+    *failed_prefix = 0;
     Ok(Some((frame_kind, payload)))
 }
 
@@ -3256,6 +3330,224 @@ mod raw_uart_tests {
             Some((RawUartFrameKind::Data, good))
         );
         assert!(bytes.is_empty());
+    }
+
+    fn crc_recovery_valid_body(payload: &[u8]) -> Vec<u8> {
+        let mut body = b"SDT\x03".to_vec();
+        body.extend_from_slice(payload);
+        body.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+        body
+    }
+
+    fn crc_recovery_damaged_frame() -> Vec<u8> {
+        let mut body = vec![0_u8; 64];
+        body[..4].copy_from_slice(b"SDT\x03");
+        // Plausible 4096-byte header inside the CRC-rejected payload.
+        body[16..20].copy_from_slice(&[0xa5, 0x5a, 0, 16]);
+        build_raw_uart_frame(&body).unwrap()
+    }
+
+    #[test]
+    fn raw_uart_crc_recovery_skips_false_partial_inside_failed_span() {
+        let mut bytes = crc_recovery_damaged_frame();
+        let body = crc_recovery_valid_body(b"healthy");
+        bytes.extend_from_slice(&build_raw_uart_frame(&body).unwrap());
+        let now = Instant::now();
+        let mut wait = RawUartFrameWait::default();
+        assert!(take_raw_uart_framed_payload_with_clock(&mut bytes, &mut wait, now, None).is_err());
+        assert_eq!(
+            take_raw_uart_framed_payload_with_clock(&mut bytes, &mut wait, now, None).unwrap(),
+            Some((RawUartFrameKind::Data, body))
+        );
+        assert_eq!(wait.failed_prefix, 0);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn raw_uart_crc_recovery_preserves_every_following_frame_split() {
+        let body = crc_recovery_valid_body(b"healthy split data");
+        let good = build_raw_uart_frame(&body).unwrap();
+        for split in 0..=good.len() {
+            let mut bytes = crc_recovery_damaged_frame();
+            bytes.extend_from_slice(&good[..split]);
+            let now = Instant::now();
+            let mut wait = RawUartFrameWait::default();
+            assert!(
+                take_raw_uart_framed_payload_with_clock(&mut bytes, &mut wait, now, None).is_err()
+            );
+            let before =
+                take_raw_uart_framed_payload_with_clock(&mut bytes, &mut wait, now, None).unwrap();
+            if split < good.len() {
+                assert!(before.is_none(), "split={split}");
+                bytes.extend_from_slice(&good[split..]);
+                assert_eq!(
+                    take_raw_uart_framed_payload_with_clock(&mut bytes, &mut wait, now, None)
+                        .unwrap(),
+                    Some((RawUartFrameKind::Data, body.clone())),
+                    "split={split}"
+                );
+            } else {
+                assert_eq!(before, Some((RawUartFrameKind::Data, body.clone())));
+            }
+            assert!(bytes.is_empty(), "split={split}");
+            assert_eq!(wait.failed_prefix, 0);
+        }
+    }
+
+    #[test]
+    fn raw_uart_crc_recovery_counts_consecutive_damaged_frames() {
+        let mut bytes = crc_recovery_damaged_frame();
+        bytes.extend_from_slice(&crc_recovery_damaged_frame());
+        let body = crc_recovery_valid_body(b"after two errors");
+        bytes.extend_from_slice(&build_raw_uart_frame(&body).unwrap());
+        let mut wait = RawUartFrameWait::default();
+        let now = Instant::now();
+        for _ in 0..2 {
+            assert!(
+                take_raw_uart_framed_payload_with_clock(&mut bytes, &mut wait, now, Some(100))
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            take_raw_uart_framed_payload_with_clock(&mut bytes, &mut wait, now, Some(100)).unwrap(),
+            Some((RawUartFrameKind::Data, body))
+        );
+        assert!(bytes.is_empty());
+        assert_eq!(wait.failed_prefix, 0);
+    }
+
+    #[test]
+    fn raw_uart_recovery_resets_before_a_new_partial_payload_with_nested_valid_frame() {
+        let inner = build_raw_uart_frame(&crc_recovery_valid_body(b"nested")).unwrap();
+        let mut payload = b"outer-start".to_vec();
+        payload.extend_from_slice(&inner);
+        payload.extend_from_slice(&[42; 32]);
+        let body = crc_recovery_valid_body(&payload);
+        let outer = build_raw_uart_frame(&body).unwrap();
+        let split = outer.len() - 7;
+        for recover_first in [false, true] {
+            let mut wait = RawUartFrameWait::default();
+            let now = Instant::now();
+            let mut bytes = if recover_first {
+                crc_recovery_damaged_frame()
+            } else {
+                Vec::new()
+            };
+            bytes.extend_from_slice(&outer[..split]);
+            if recover_first {
+                assert!(
+                    take_raw_uart_framed_payload_with_clock(&mut bytes, &mut wait, now, None)
+                        .is_err()
+                );
+            }
+            assert!(
+                take_raw_uart_framed_payload_with_clock(&mut bytes, &mut wait, now, None)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                wait.failed_prefix, 0,
+                "new trusted boundary must end lookahead"
+            );
+            assert!(
+                take_raw_uart_framed_payload_with_clock(
+                    &mut bytes,
+                    &mut wait,
+                    now + Duration::from_millis(1_999),
+                    None
+                )
+                .unwrap()
+                .is_none()
+            );
+            bytes.extend_from_slice(&outer[split..]);
+            assert_eq!(
+                take_raw_uart_framed_payload_with_clock(
+                    &mut bytes,
+                    &mut wait,
+                    now + Duration::from_millis(1_999),
+                    None
+                )
+                .unwrap(),
+                Some((RawUartFrameKind::Data, body.clone()))
+            );
+            assert!(bytes.is_empty());
+        }
+    }
+
+    #[test]
+    fn raw_uart_crc_recovery_keeps_normal_command_at_new_boundary() {
+        let mut bytes = crc_recovery_damaged_frame();
+        let command = [0x52, 0x53, 1, 1, 2, 3, 0];
+        bytes.extend_from_slice(&build_raw_uart_command_frame(&command).unwrap());
+        let mut wait = RawUartFrameWait::default();
+        let now = Instant::now();
+        assert!(take_raw_uart_framed_payload_with_clock(&mut bytes, &mut wait, now, None).is_err());
+        assert_eq!(
+            take_raw_uart_framed_payload_with_clock(&mut bytes, &mut wait, now, None).unwrap(),
+            Some((RawUartFrameKind::Command, command.to_vec()))
+        );
+        assert_eq!(wait.failed_prefix, 0);
+    }
+
+    #[test]
+    fn raw_uart_crc_recovery_does_not_invent_crc_for_legacy_data() {
+        let mut body = b"legacy data".to_vec();
+        body.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+        let bytes = build_raw_uart_frame(&body).unwrap();
+        assert_eq!(raw_uart_recovery_anchor(&bytes, bytes.len()), None);
+        // Outside rejected bytes, legacy framing retains its original semantics.
+        assert_eq!(raw_uart_recovery_anchor(&bytes, 0), Some(0));
+        let mut ordinary = bytes;
+        assert_eq!(
+            take_raw_uart_framed_payload(&mut ordinary).unwrap(),
+            Some((RawUartFrameKind::Data, body))
+        );
+    }
+
+    #[test]
+    fn raw_uart_crc_recovery_caps_oversized_input_before_scanning() {
+        let mut wait = RawUartFrameWait::default();
+        wait.failed_prefix = STREAM_PACKET_MAX_SIZE;
+        let body = crc_recovery_valid_body(b"bounded");
+        let mut bytes = vec![0_u8; RAW_UART_MAX_FRAME_BYTES * 2];
+        bytes.extend_from_slice(&build_raw_uart_frame(&body).unwrap());
+        assert_eq!(
+            take_raw_uart_framed_payload_with_clock(&mut bytes, &mut wait, Instant::now(), None)
+                .unwrap(),
+            Some((RawUartFrameKind::Data, body))
+        );
+        assert!(bytes.is_empty());
+        assert_eq!(wait.failed_prefix, 0);
+    }
+
+    #[test]
+    fn raw_uart_crc_recovery_bounds_lookahead_hash_work() {
+        let mut bytes = vec![0_u8; RAW_UART_MAX_FRAME_BYTES];
+        // Overlapping large candidate frames must not multiply CRC work by
+        // their count. The last candidate is valid but beyond this pass's
+        // hash budget, so ordinary timeout recovery remains the fallback.
+        let payload_len = 2_048;
+        let last = 80;
+        for offset in (0..=last).step_by(8) {
+            bytes[offset..offset + 4].copy_from_slice(&[0xa5, 0x5a, 0, 8]);
+            bytes[offset + 4..offset + 8].copy_from_slice(b"SDT\x03");
+        }
+        let body_start = last + RAW_UART_FRAME_HEADER_SIZE;
+        let crc_at = body_start + payload_len - 4;
+        let crc = crc32fast::hash(&bytes[body_start..crc_at]);
+        bytes[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            crc32fast::hash(&bytes[body_start..crc_at]),
+            u32::from_le_bytes(bytes[crc_at..crc_at + 4].try_into().unwrap())
+        );
+        assert_eq!(
+            raw_uart_recovery_anchor(&bytes[last..], STREAM_PACKET_MAX_SIZE),
+            Some(0)
+        );
+        assert_eq!(
+            raw_uart_recovery_anchor(&bytes, STREAM_PACKET_MAX_SIZE),
+            None
+        );
     }
 
     #[test]

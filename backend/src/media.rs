@@ -149,6 +149,7 @@ async fn authorize(
 }
 
 fn upstream_error(err: reqwest::Error) -> Response {
+    let err = err.without_url();
     log::warn!("video relay: {err}");
     error(
         StatusCode::BAD_GATEWAY,

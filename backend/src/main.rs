@@ -34,6 +34,7 @@ mod layout;
 mod loadcell;
 mod loadcell_zero;
 mod logger;
+mod log_redaction;
 mod map;
 mod media;
 mod media_runtime;

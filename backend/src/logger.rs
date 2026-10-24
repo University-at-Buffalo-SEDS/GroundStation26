@@ -79,17 +79,12 @@ fn write_file_open_separator(log_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn format_console_record(
-    writer: &mut dyn std::io::Write,
-    now: &mut DeferredNow,
-    record: &Record<'_>,
-) -> std::io::Result<()> {
+fn rendered_record(now: &mut DeferredNow, record: &Record<'_>) -> String {
     let thread = std::thread::current();
     let thread_name = thread.name().unwrap_or("unnamed");
     let file = record.file().unwrap_or("unknown");
     let line = record.line().unwrap_or(0);
-    write!(
-        writer,
+    format!(
         "{} {:<5} [{} {:?}] {}:{} {}",
         now.now().format("%Y-%m-%d %H:%M:%S%.3f%:z"),
         record.level(),
@@ -101,27 +96,25 @@ fn format_console_record(
     )
 }
 
+fn format_console_record(
+    writer: &mut dyn std::io::Write,
+    now: &mut DeferredNow,
+    record: &Record<'_>,
+) -> std::io::Result<()> {
+    let rendered = rendered_record(now, record);
+    let safe = crate::log_redaction::redact_urls(&rendered);
+    writer.write_all(safe.as_bytes())
+}
+
 fn format_file_record(
     writer: &mut dyn std::io::Write,
     now: &mut DeferredNow,
     record: &Record<'_>,
 ) -> std::io::Result<()> {
-    let thread = std::thread::current();
-    let thread_name = thread.name().unwrap_or("unnamed");
-    let file = record.file().unwrap_or("unknown");
-    let line = record.line().unwrap_or(0);
-    let rendered = format!(
-        "{} {:<5} [{} {:?}] {}:{} {}",
-        now.now().format("%Y-%m-%d %H:%M:%S%.3f%:z"),
-        record.level(),
-        thread_name,
-        thread.id(),
-        file,
-        line,
-        record.args()
-    );
-    writer.write_all(rendered.as_bytes())?;
-    append_to_archive(rendered.as_bytes())?;
+    let rendered = rendered_record(now, record);
+    let safe = crate::log_redaction::redact_urls(&rendered);
+    writer.write_all(safe.as_bytes())?;
+    append_to_archive(safe.as_bytes())?;
     Ok(())
 }
 
@@ -147,4 +140,30 @@ fn install_panic_hook() {
         log::error!("panic: {panic_info}");
         previous(panic_info);
     }));
+}
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn console_and_file_sinks_hide_credentials_without_hiding_endpoint_or_error() {
+        let record = Record::builder()
+            .args(format_args!("request failed https://fake-user:FAKE_PASSWORD@station.local/api?ticket=FAKE_TICKET (timeout)"))
+            .level(flexi_logger::Level::Warn)
+            .file(Some("fake.rs"))
+            .line(Some(42))
+            .build();
+        for formatter in [format_console_record, format_file_record] {
+            let mut output = Vec::new();
+            formatter(&mut output, &mut DeferredNow::new(), &record).unwrap();
+            let text = String::from_utf8(output).unwrap();
+            for secret in ["fake-user", "FAKE_PASSWORD", "FAKE_TICKET"] {
+                assert!(!text.contains(secret));
+            }
+            assert!(text.contains("station.local/api"));
+            assert!(text.contains("timeout"));
+            assert!(text.contains("WARN"));
+            assert!(text.contains("fake.rs:42"));
+        }
+    }
 }

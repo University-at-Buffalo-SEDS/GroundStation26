@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::{
     collections::BTreeSet,
     env, fs,
-    path::{Component, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +30,17 @@ fn main() {
     let source = source.canonicalize().unwrap_or_else(|error| {
         panic!("Frontend source {} missing: {error}. Initialize the ui submodule with git submodule update --init ui, or set GS_FRONTEND_SOURCE_DIR to its checkout.", source.display())
     });
+    let generated = generate(&source);
+    fs::write(
+        PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("browser_assets.rs"),
+        generated,
+    )
+    .unwrap();
+}
+
+// Export discovery is generated from the selected frontend, not a fixed revision.
+pub fn generate(source: &Path) -> String {
+    let source = source.canonicalize().expect("Frontend source missing");
     let manifest = source.join("station_ui/manifest.json");
     println!("cargo:rerun-if-changed={}", manifest.display());
     let manifest: Manifest = serde_json::from_slice(
@@ -40,6 +51,7 @@ fn main() {
     assert!(!manifest.exports.is_empty() && manifest.exports.len() <= 64);
     let mut names = BTreeSet::new();
     let mut generated = String::new();
+    let mut catalog = String::new();
     for asset in manifest.exports {
         assert!(
             !asset.name.is_empty()
@@ -71,6 +83,16 @@ fn main() {
             "bytes" => ("&[u8]", "include_bytes"),
             _ => panic!("Unknown asset kind"),
         };
+        catalog.push_str(&format!(
+            "        {:?} => Some({}{}),\n",
+            asset.name,
+            asset.name,
+            if asset.kind == "text" {
+                ".as_bytes()"
+            } else {
+                ""
+            },
+        ));
         generated.push_str(&format!(
             "pub const {}: {} = {}!({:?});\n",
             asset.name,
@@ -79,9 +101,9 @@ fn main() {
             path.to_str().expect("Asset path is not UTF-8")
         ));
     }
-    fs::write(
-        PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("browser_assets.rs"),
-        generated,
-    )
-    .unwrap();
+    generated
+        .push_str("pub fn asset_bytes(name: &str) -> Option<&'static [u8]> {\n    match name {\n");
+    generated.push_str(&catalog);
+    generated.push_str("        _ => None,\n    }\n}\n");
+    generated
 }
