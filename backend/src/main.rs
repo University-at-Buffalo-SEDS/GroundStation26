@@ -1587,6 +1587,13 @@ async fn main() -> anyhow::Result<()> {
         telemetry_shutdown_rx,
     ));
     let full_bay_discovery_ready = Arc::new(AtomicBool::new(false));
+    // No allocation or command-path change outside simulator validation. Keep
+    // the boot PilotOpen test from racing the soak's first PilotClose.
+    let valve_startup_ack = (std::env::var("GS_SIM_VALIDATE_VALVE_ROUNDTRIP")
+        .ok()
+        .as_deref()
+        == Some("1"))
+    .then(|| Arc::new(command_probe::StartupAck::new()));
     if let Ok(expected) = std::env::var("GS_SIM_EXPECT_DISCOVERY_NODES") {
         let validation_router = router.clone();
         let validation_state = state.clone();
@@ -1929,6 +1936,10 @@ async fn main() -> anyhow::Result<()> {
         let validation_state = state.clone();
         let validation_pilot_ack_generation = pilot_open_ack_generation.clone();
         let validation_discovery_ready = full_bay_discovery_ready.clone();
+        let mut startup_run = valve_startup_ack
+            .as_ref()
+            .expect("validation flag has startup barrier")
+            .begin();
         tokio::spawn(async move {
             let discovery_started = ValidationInstant::now();
             let valve_endpoint = telemetry_schema::endpoint("VALVE_BOARD");
@@ -2025,6 +2036,12 @@ async fn main() -> anyhow::Result<()> {
                     log::info!(
                         "full-bay valve ACK latency within bound: {elapsed_ms} ms <= {ack_latency_limit_ms} ms"
                     );
+                    if !startup_run.pass() {
+                        log::error!(
+                            "full-bay startup validation already failed; soak remains blocked"
+                        );
+                        return;
+                    }
                     log::info!("full-bay valve ACK reached GroundStation");
                     return;
                 }
@@ -2053,6 +2070,7 @@ async fn main() -> anyhow::Result<()> {
         let soak_router = router.clone();
         let soak_status = command_status_probe.clone();
         let soak_discovery_ready = full_bay_discovery_ready.clone();
+        let soak_startup_ack = valve_startup_ack.clone();
         let command_samples = std::env::var("GS_SIM_SOAK_COMMAND_SAMPLES")
             .ok()
             .map(|value| {
@@ -2070,7 +2088,29 @@ async fn main() -> anyhow::Result<()> {
                 .ok()
                 .and_then(|value| value.trim().parse::<u32>().ok())
                 .unwrap_or(0);
-            while !soak_discovery_ready.load(Ordering::Acquire) {
+            let startup_wait = ValidationInstant::now();
+            loop {
+                match command_probe::startup_state(soak_startup_ack.as_deref()) {
+                    command_probe::StartupState::Passed
+                        if soak_discovery_ready.load(Ordering::Acquire) =>
+                    {
+                        break;
+                    }
+                    command_probe::StartupState::Failed => {
+                        log::error!("full-bay soak blocked: initial Valve validation failed");
+                        return;
+                    }
+                    _ => {}
+                }
+                if validation_elapsed_ms(startup_wait) > 30_000 {
+                    if let Some(barrier) = &soak_startup_ack {
+                        barrier.fail();
+                    }
+                    log::error!(
+                        "full-bay soak startup validation timed out; required rounds remain unacknowledged"
+                    );
+                    return;
+                }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             let rounds = command_samples.len();

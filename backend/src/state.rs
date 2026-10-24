@@ -1365,7 +1365,7 @@ impl AppState {
         let _ = self.action_policy_tx.send(self.action_policy_snapshot());
     }
 
-    /// Replaces the current fill targets and broadcasts them if they changed.
+    #[cfg(test)] // Test publication helper; production saves use the atomic API transaction.
     pub fn set_fill_targets(&self, targets: FillTargetsConfig) {
         let mut slot = self.fill_targets.lock().unwrap();
         if *slot == targets {

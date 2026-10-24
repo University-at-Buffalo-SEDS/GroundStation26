@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "run_date": "2026-10-23",
+  "run_date": "2026-10-24",
   "release_ready": false,
   "complete": [
     {
@@ -206,6 +206,27 @@
         "/tmp/frontend-paired-settings/qualification.json",
         "/tmp/frontend-paired-settings/extended-qualified-dev.json"
       ]
+    },
+    {
+      "id": "sdk-cmake-lto-assembler-warning",
+      "sdk_commit": "7228d5a2f33d57e199c78e68199e6c153999b3f1",
+      "runtime_source_unchanged_from": "ea95a993cd6f1154775ce98472bd7a954f907ffd",
+      "rust_tests": 712,
+      "python_tests": 71,
+      "fc_binary_identical": true
+    },
+    {
+      "id": "frontend-native-encoding",
+      "frontend_dev_commit": "4f0da47346e3a898d6c4353e57020790ca7162dd",
+      "native_tests": 133,
+      "real_html_decoder_negative_control": true
+    },
+    {
+      "id": "frontend-native-linux-validation",
+      "frontend_dev_commit": "967c1df02906dcc60d3326f2ecdefa2e41d9d45f",
+      "linux_amd64_runtime": "Ubuntu GTK/WebKit navigation and raster map at1280/768/390",
+      "arm64": "genuine cross-linked ELF; no physical Pi runtime claim",
+      "tao_channel_tests": 5
     }
   ],
   "in_progress": [
@@ -215,16 +236,42 @@
       "design": "/tmp/gs-checklist-sync-design.json",
       "budget_evidence": "/tmp/gs-checklist-budget.json",
       "existing_file_safety": "1MiB shared serialized read/write limit qualified; no checklist-sync implementation claimed"
+    },
+    {
+      "id": "latest-full-cohort-network-restart",
+      "sdk_runtime_commit": "ea95a993cd6f1154775ce98472bd7a954f907ffd",
+      "groundstation_commit": "05beb722e1bf402186d1709242cd21e6d5c2b84e",
+      "frontend_assets_commit": "967c1df02906dcc60d3326f2ecdefa2e41d9d45f",
+      "firmware_builds_passed": 7,
+      "amplifier_gate": "passed",
+      "short120_network_and_source_sd_gates": "passed",
+      "restart_gate": "failed: after second GS restart VB close status not observed;12 command assertions fail",
+      "long600_soak": "not started; release held",
+      "topology": "Pi Ethernet discovery/framed TCP to gateway-side PicoFi; no GS Pico/I2C",
+      "investigation": [
+        "competing simulator startup Open and soak Close",
+        "accepted reliable TX discarded during temporary no-route: exact ea95-runtime offline Cargo reproduction proven; owner/order-preserving fix not yet qualified"
+      ],
+      "simulator_barrier_qualification": {
+        "default_tests": 437,
+        "hitl_probe_tests": 5,
+        "hitl_existing_tests": 6,
+        "production_and_hitl_checks": "passed; zero warnings; root apply pending"
+      }
+    },
+    {
+      "id": "map-direct-recovery-and-test-mode",
+      "status": "temporary fallback recovery and --test few-tile no-database mode under development",
+      "preserve_concurrency": 1024
     }
   ],
   "next": [
-    "Qualify native Ubuntu/RPi frontend packaging/runtime separately from portable Wasm browser acceptance; keep frontend main unchanged and select dev via --frontend-dev.",
-    "Rebuild all seven current firmware images plus GroundStation against the final SDK source, then run the unchanged full-system acceptance campaign and long soak.",
-    "Verify current simulator topology uses Pi Ethernet TCP/discovery and no removed GroundStation-side Pico/I2C path.",
+    "Fix and independently validate queued reliable ownership during route churn; correct simulator command sequencing, rerun original restart gate then600-second soak without relaxing assertions.",
     "Implement paired checklist definition/progress synchronization with incremental per-document persistence/reconciliation; preserve operational state, recovery progress and explicit conflicts.",
     "Publish manually built simulator image only after source/image/test provenance is complete.",
     "Rebuild and audit local-release Python artifacts for the final SDK version; do not reuse older-version wheels.",
-    "Publish packages, tags and remaining repos only after qualification; maintain SDK v4 range and firmware SDK main tracking."
+    "Publish packages, tags and remaining repos only after qualification; maintain SDK v4 range and firmware SDK main tracking.",
+    "Lower priority: native disconnected Explore UI mode with labelled synthetic data and all real transport/output paths disabled; after map downloader and network loss/latency fixes."
   ],
   "constraints": [
     "No hardware output commands or flashing while hardware is unavailable.",
@@ -237,6 +284,6 @@
     "mode": "dev",
     "flag": "--frontend-dev",
     "main_promoted": false,
-    "current_dev": "967c1df02906dcc60d3326f2ecdefa2e41d9d45f"
+    "current_dev": "4f0da47346e3a898d6c4353e57020790ca7162dd"
   }
 }
