@@ -1,0 +1,79 @@
+{
+  "scope": "AArch64 GNU/Linux backend cross compilation/release on AMD64 and native Linux desktop frontend compilation. No ARM execution, physical GPU/device, macOS or hardware validation.",
+  "commits": {
+    "gs": "35d34928d66a2f82593df22124c20899c4fbe527",
+    "sdk": "edb3b19217a9c7abea134aee46f33a0e3c52bd59",
+    "frontend": "2b5bc862cb636846a9220df1ff078bc1408d3229"
+  },
+  "source_manifest_sha256": "f419c6be9ad0698c87dfe2cd61d5f16dfa1d5749b2b7dea54c8c7851992e2517",
+  "source_files_before_after": 928,
+  "desktop_source_files_after": 374,
+  "backend_arm64": {
+    "exit_code": 0,
+    "duration_seconds": 311.5972712080693,
+    "container": "seds-platform-final-arm64-retry2-20261025",
+    "image": "seds-native-ui-builder:arm64-20261023",
+    "source": "FirmwareSimulator/build/platform-final-35d3492-20261025",
+    "scope": "cross/native compile only; no physical runtime/GPU, QEMU or host changes",
+    "reserve_bytes": 53687091200,
+    "image_id": "sha256:9f183df41acba03de1d1a780656fb5a4fc9e9a098318ac203c091ffb6f3d0327"
+  },
+  "desktop_frontend": {
+    "exit_code": 0,
+    "duration_seconds": 79.11922858399339,
+    "container": "seds-platform-final-desktop-retry2-20261025",
+    "image": "seds-native-ui-builder:amd64-20261023",
+    "source": "FirmwareSimulator/build/platform-final-35d3492-20261025",
+    "scope": "cross/native compile only; no physical runtime/GPU, QEMU or host changes",
+    "reserve_bytes": 53687091200,
+    "image_id": "sha256:053509b0bbe1171a854c7adb7a2bc307668b59a375cd3d8fbc6bd3ec84a8a4f8"
+  },
+  "backend_stages": {
+    "production_check_seconds": 61,
+    "testing_hitl_check_seconds": 8.14,
+    "release_seconds": 240,
+    "warnings": 0,
+    "elf": "ELF64 AArch64 PIE",
+    "binary_sha256": "32abd28ea68c2cc5a40ac6df4d3b85ca5ebd2174886c1820a19f33eafb48fa6c",
+    "binary_bytes": 25462648,
+    "needed": [
+      "libgcc_s.so.1",
+      "libm.so.6",
+      "libc.so.6",
+      "ld-linux-aarch64.so.1"
+    ],
+    "max_glibc": "2.35"
+  },
+  "desktop_warnings": 0,
+  "resolved_lock_sha256": {
+    "GroundStation.Cargo.lock": "7cbdf6a383c6c77601ddf5a09333aff06f62fc8f2f11cb3a7765a630c4fb5cc3",
+    "Frontend.Cargo.lock": "6eb844007056fb07c70939a8ac8b7234722468166989fa715d0e867d9d07c0b3"
+  },
+  "preparation_retries": [
+    "Offline metadata initially requested an unused macOS-only archive; restrict metadata resolution to the actual ARM64 target.",
+    "The clean frontend archive has no tracked Cargo.lock; generate it offline before locked compilation.",
+    "A public cached dependency uses mode0640; supplemental container group1000 grants read-only access while all capabilities remain dropped."
+  ],
+  "no_privileged_host_changes": true,
+  "frozen_sources_mutated": false,
+  "disk_reserve_bytes": 53687091200,
+  "free_bytes_after": 494546202624,
+  "log_paths": [
+    ".workspace-progress/platform-final-arm64-retry2.log",
+    ".workspace-progress/platform-final-desktop-retry2.log"
+  ],
+  "excluded_runtime_accounts": [
+    "backend/users/users.json",
+    "ui"
+  ],
+  "prior_account_filename_audit": {
+    "FirmwareSimulator/build/platform-clock-fixed-sdk5403896b-20261025/gs/backend/users/users.json": false,
+    "FirmwareSimulator/build/platform-assets-522bd74-20261025/gs/backend/users/users.json": false,
+    "FirmwareSimulator/build/clock-fixed-cohort-20261025/host/gs/backend/users/users.json": false
+  },
+  "account_audit_scope": "Filename existence only; no account contents or credential hashes read or computed. Existing source files and user work were not removed.",
+  "packaging_followup": {
+    "commit": "167fa36",
+    "scope": "Docker account-copy/context exclusions only, with three fake-fixture packaging/bootstrap checks. This does not change the compiled Rust source from35d3492."
+  }
+}
