@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod rrls_http_tests;
 mod automatic_abort;
 pub(crate) use automatic_abort::claim_automatic_abort;
 #[cfg(not(feature = "hitl_mode"))]
@@ -768,6 +770,9 @@ async fn self_test_confirmation(
             Ok(p) => p,
             Err(e) => return e,
         };
+    if let Err(error) = require_primary_operational_station() {
+        return error.into_response();
+    }
     if !principal.allows_command_name("ValveSelfTest") {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -1443,8 +1448,17 @@ pub fn qd_confirmation(state: &AppState, sender: &str, key: u8, open: bool, sour
     #[cfg(feature = "hitl_mode")]
     let _ = (state, sender, key, open, source_ms);
 }
+/// RRLS relays telemetry and shared settings but cannot change live operation.
+fn require_primary_operational_station() -> Result<(), (StatusCode, String)> {
+    if crate::rrls::is_rrls() {
+        Err((StatusCode::FORBIDDEN, "Live GSE operations are read-only on RRLS".into()))
+    } else {
+        Ok(())
+    }
+}
 /// Operator recovery only: never dispatch a valve, ignition or launch command.
 fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)> {
+    require_primary_operational_station()?;
     #[cfg(not(feature = "hitl_mode"))]
     let _clear_reservation;
     #[allow(unused_mut)] // Operational recovery mutates this guard outside HITL.
@@ -1564,6 +1578,9 @@ async fn reset_qualification(State(state): State<Arc<AppState>>, headers: Header
             Ok(p) => p,
             Err(error) => return error,
         };
+    if let Err(error) = require_primary_operational_station() {
+        return error.into_response();
+    }
     if !principal.allows_command_name("ValveSelfTest") {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -1658,6 +1675,9 @@ async fn override_cold_flow(
             Ok(principal) => principal,
             Err(error) => return error,
         };
+    if let Err(error) = require_primary_operational_station() {
+        return error.into_response();
+    }
     if principal.anonymous || !principal.allows_command_name("NitrogenTest") {
         return StatusCode::FORBIDDEN.into_response();
     }
