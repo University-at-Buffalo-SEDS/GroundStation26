@@ -30,12 +30,70 @@ fn main() {
     let source = source.canonicalize().unwrap_or_else(|error| {
         panic!("Frontend source {} missing: {error}. Initialize the ui submodule with git submodule update --init ui, or set GS_FRONTEND_SOURCE_DIR to its checkout.", source.display())
     });
+    prepare_browser_assets(&source);
     let generated = generate(&source);
     fs::write(
         PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("browser_assets.rs"),
         generated,
     )
     .unwrap();
+}
+
+// Backend-only cargo builds must prepare the selected frontend's generated
+// dependencies too. This performs no UI compilation or package installation.
+pub fn prepare_browser_assets(source: &Path) {
+    for name in [
+        "MAPLIBRE_GL_VERSION",
+        "MAPLIBRE_GL_BASE_URL",
+        "GS_BROWSER_ASSETS_CACHE",
+        "GS_PYTHON",
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    let script = source.join("scripts/browser_assets.py");
+    println!("cargo:rerun-if-changed={}", script.display());
+    if !script.is_file() {
+        // Existing frontends without generated exports can still be selected.
+        // generate() retains its explicit missing-asset error for older sources.
+        return;
+    }
+    let candidates = env::var_os("GS_PYTHON")
+        .map(|python| vec![python])
+        .unwrap_or_else(|| vec!["python3".into(), "python".into(), "py".into()]);
+    for python in candidates {
+        let mut probe = std::process::Command::new(&python);
+        if python == "py" {
+            probe.arg("-3");
+        }
+        match probe
+            .args([
+                "-c",
+                "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)",
+            ])
+            .output()
+        {
+            Ok(output) if output.status.success() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("Unable to find Python3.10+ for browser assets: {error}"),
+        }
+        let mut command = std::process::Command::new(&python);
+        if python == "py" {
+            command.arg("-3");
+        }
+        match command.arg(&script).arg("--root").arg(source).output() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("Unable to prepare selected frontend browser assets: {error}"),
+            Ok(output) if output.status.success() => return,
+            Ok(output) => panic!(
+                "Selected frontend browser asset preparation failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+    }
+    panic!(
+        "Python3.10+ is required to prepare selected frontend browser assets; set GS_PYTHON to its executable"
+    );
 }
 
 // Export discovery is generated from the selected frontend, not a fixed revision.

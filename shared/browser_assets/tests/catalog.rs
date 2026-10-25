@@ -81,3 +81,37 @@ fn declared_missing_asset_is_still_an_error() {
     fs::remove_file(fixture.0.join("replay.js")).unwrap();
     assert!(std::panic::catch_unwind(|| build_script::generate(&fixture.0)).is_err());
 }
+
+#[test]
+fn selected_frontend_prepares_missing_generated_assets_before_catalog() {
+    let fixture = Fixture::new(false);
+    fs::create_dir_all(fixture.0.join("scripts")).unwrap();
+    fs::write(fixture.0.join("scripts/browser_assets.py"),"import pathlib,sys\nroot=pathlib.Path(sys.argv[sys.argv.index('--root')+1])\n(root/'generated.js').write_text('prepared frontend asset')\n").unwrap();
+    fs::write(
+        fixture.0.join("station_ui/manifest.json"),
+        r#"{"version":1,"exports":[{"name":"GENERATED_JS","path":"generated.js","kind":"text"}]}"#,
+    )
+    .unwrap();
+    assert!(!fixture.0.join("generated.js").exists());
+    build_script::prepare_browser_assets(&fixture.0);
+    let generated = build_script::generate(&fixture.0);
+    assert!(generated.contains("pub const GENERATED_JS"));
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("generated.js")).unwrap(),
+        "prepared frontend asset"
+    );
+}
+#[test]
+fn failed_frontend_preparation_is_an_actionable_error_before_catalog() {
+    let fixture = Fixture::new(false);
+    fs::create_dir_all(fixture.0.join("scripts")).unwrap();
+    fs::write(
+        fixture.0.join("scripts/browser_assets.py"),
+        "import sys\nsys.exit('fake network failure; no placeholder assets')\n",
+    )
+    .unwrap();
+    let error =
+        std::panic::catch_unwind(|| build_script::prepare_browser_assets(&fixture.0)).unwrap_err();
+    let message = error.downcast_ref::<String>().unwrap();
+    assert!(message.contains("fake network failure"));
+}

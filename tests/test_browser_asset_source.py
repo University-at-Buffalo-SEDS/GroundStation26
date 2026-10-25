@@ -82,6 +82,16 @@ class BrowserAssetSourceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'no valid station assets'):
                 build._browser_asset_digest(source)
 
+    def test_digest_prepares_missing_generated_assets_without_frontend_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);source=self.source(root)
+            (source/'scripts').mkdir()
+            (source/'scripts/browser_assets.py').write_text("import pathlib,sys\nroot=pathlib.Path(sys.argv[sys.argv.index('--root')+1])\n(root/'generated.js').write_text('prepared by selected frontend')\n")
+            (source/'station_ui/manifest.json').write_text(json.dumps({'version':1,'exports':[{'name':'GENERATED_JS','path':'generated.js','kind':'text'}]}))
+            digest=build._browser_asset_digest(source)
+            self.assertEqual((source/'generated.js').read_text(),'prepared by selected frontend')
+            self.assertEqual(build._browser_asset_digest(source),digest)
+
     def test_first_backend_only_run_initializes_pinned_ui_without_building_webui(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
             root=Path(tmp);source=self.source(root);source.rename(root/'ui')

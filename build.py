@@ -464,6 +464,9 @@ BROWSER_ASSET_SOURCE_ENV = "GS_FRONTEND_SOURCE_DIR"
 
 def _browser_asset_digest(source: Path) -> str:
     source = source.resolve()
+    preparer = source / "scripts/browser_assets.py"
+    if preparer.is_file():
+        run([sys.executable, str(preparer), "--root", str(source)], cwd=source)
     manifest_path = source / "station_ui/manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -513,6 +516,7 @@ def prepare_browser_asset_source(repo_root: Path, frontend_dev: bool = False, re
         print(f"Frontend source: {FRONTEND_REPO_URL} branch {branch}")
         source = _immutable_frontend_checkout(source, branch)
     source = source.resolve()
+    _browser_asset_digest(source)
     os.environ[BROWSER_ASSET_SOURCE_ENV] = str(source)
     return source
 
