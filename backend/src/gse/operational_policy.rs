@@ -905,12 +905,24 @@ mod tests {
     async fn flight_launch_waits_five_seconds_from_qd_ack_and_rechecks_live_gates() {
         const NAME: &str = "gse::operational_policy::tests::flight_launch_waits_five_seconds_from_qd_ack_and_rechecks_live_gates";
         if std::env::var_os("GS_QD_GATES_CHILD").is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let clock =
+                std::env::temp_dir().join(format!("gse-qd-gates-clock-{}", std::process::id()));
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
                 .args(["--exact", NAME, "--test-threads=1"])
-                .env("GS_QD_GATES_CHILD", "1")
-                .env_remove("GS_SIM_CLOCK_FILE")
-                .output()
-                .unwrap();
+                .env("GS_QD_GATES_CHILD", "1");
+            if cfg!(feature = "firmware_sim") {
+                std::fs::write(&clock, "0").unwrap();
+                child
+                    .env("GS_SIM_CLOCK_FILE", &clock)
+                    .env("GS_SIM_NETWORK_EPOCH_MS", "1767225600000");
+            } else {
+                child.env_remove("GS_SIM_CLOCK_FILE");
+            }
+            let output = child.output().unwrap();
+            if cfg!(feature = "firmware_sim") {
+                std::fs::remove_file(clock).unwrap();
+            }
             assert!(
                 output.status.success(),
                 "{}",
@@ -918,7 +930,14 @@ mod tests {
             );
             return;
         }
-        for revoke in ["none", "gps", "fc-route"] {
+        for revoke in [
+            "none",
+            "gps",
+            "fc-route",
+            "five-second-valves",
+            "ten-second-valves",
+            "one-second-valves",
+        ] {
             queued_flight_launch_scenario(revoke).await;
         }
     }
@@ -1021,8 +1040,33 @@ mod tests {
                 .any(|notice| notice.message.contains("QD settling")
                     && notice.message.contains("seconds remaining"))
         );
-        for (advance, should_launch) in [(4999, false), (5000, revoke == "none")] {
-            if advance == 5000 {
+        let exact_model = crate::simulation_clock_ms().is_some();
+        let before = if exact_model { 4999 } else { 4900 };
+        let ready = if exact_model { 5000 } else { 5100 };
+        for (advance, should_launch) in [
+            (before, false),
+            (ready, matches!(revoke, "none" | "one-second-valves")),
+        ] {
+            if exact_model {
+                let clock =
+                    std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
+                let next = clock.with_extension("next");
+                std::fs::write(&next, (acknowledged_at + advance).to_string()).unwrap();
+                std::fs::rename(next, clock).unwrap();
+                for board in [
+                    Board::GatewayBoard,
+                    Board::ValveBoard,
+                    Board::ActuatorBoard,
+                    Board::DaqBoard,
+                    Board::FlightComputer,
+                ] {
+                    state.mark_board_seen(
+                        board.sender_id(),
+                        crate::telemetry_task::get_current_timestamp_ms(),
+                    );
+                }
+            }
+            if advance == ready {
                 match revoke {
                     "gps" => crate::antenna::clear_rocket_fix_for_test(),
                     "fc-route" => {
@@ -1038,6 +1082,23 @@ mod tests {
             for key in KEYS {
                 rt.observe_valve(key, false);
             }
+            if matches!(
+                revoke,
+                "five-second-valves" | "ten-second-valves" | "one-second-valves"
+            ) {
+                let period = match revoke {
+                    "five-second-valves" => 5000,
+                    "ten-second-valves" => 10000,
+                    _ => 1000,
+                };
+                // Periodic closed reports begin at t=1000. At QD Ready t=5000,
+                // old5s/10s cadences have only t=1000 evidence;1Hz has t=5000.
+                let now = rt.now();
+                let stamp = 1000 + now.saturating_sub(1000) / period * period;
+                for valve in rt.valves.iter_mut().flatten() {
+                    valve.at_ms = stamp;
+                }
+            }
             drop(rt);
             operational_tick(&state, true);
             if should_launch {
@@ -1046,7 +1107,7 @@ mod tests {
                 assert!(received.try_recv().is_err());
             }
         }
-        if revoke != "none" {
+        if !matches!(revoke, "none" | "one-second-valves") {
             assert!(
                 !state.gse.lock().unwrap().operational.qd.queued(),
                 "Lost live prerequisites must cancel the queued launch"
