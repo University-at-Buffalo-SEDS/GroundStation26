@@ -42,3 +42,28 @@ frame per peer on backpressure, rotates peers after each attempt, and cannot
 accumulate credit during idle periods. Failed sends are paced too. This module
 is wired into the backend mesh below commands, GPS, voice and telemetry.
 Full paired firmware-simulator qualification remains a release gate.
+
+The `checklists` module prepares bounded typed checklist projections for future
+paired synchronization. Original IDs are retained in values and checked against
+hashed keys. List and global manifests require complete membership before a
+candidate can be returned. Progress is bound to exact semantic definitions and
+list generations; conflicts or stale receipts are unchecked. Data from a remote
+station never invokes sequence completion or grants operational qualification.
+
+This model is not yet enabled in the backend synchronization worker. The legacy
+256-document store remains unchanged. Do not increase that limit or export full
+checklist catalogs until the durable per-key journal, incremental reconciliation,
+profile negotiation and qualified atomic activation described in
+`docs/work-plans/paired-checklist-sync-design.json` are integrated.
+
+The optional `sqlite-journal` feature provides host-only durable staging without
+changing the legacy store. It validates and hashes one causal document per
+mutation, retains tombstones, enforces aggregate count/byte quotas transactionally,
+and serves bounded key/digest pages and revision change pages. SQLite uses
+FULL-synchronous WAL; slow storage does not acquire backend operational locks.
+It is not wired to active checklists yet. Its own fake-database tests run with:
+
+```sh
+cargo test -p paired_settings --features sqlite-journal
+cargo clippy -p paired_settings --features sqlite-journal --all-targets -- -D warnings
+```

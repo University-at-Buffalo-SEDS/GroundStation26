@@ -494,3 +494,8 @@ mod exact_number_tests {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+pub mod checklists;
+
+#[cfg(feature = "sqlite-journal")]
+pub mod journal;

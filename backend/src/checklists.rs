@@ -16,31 +16,9 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
 };
-/// A binding to an actual successful engine transition, never a UI command request.
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Sequence {
-    ValveSelfTest,
-    NitrogenTest,
-    FillTarget,
-}
-#[cfg(any(test, not(feature = "hitl_mode")))]
-impl Sequence {
-    fn actor(self) -> &'static str {
-        match self {
-            Self::ValveSelfTest => "automated:valve_self_test",
-            Self::NitrogenTest => "automated:nitrogen_test",
-            Self::FillTarget => "automated:fill_target",
-        }
-    }
-}
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CompletionSource {
-    Operator,
-    ManualOverride,
-    AutomatedSequence,
-}
+// Shared wire definitions also serve the bounded paired-checklist model.
+// They are data only: importing a completion never invokes an engine transition.
+pub use paired_settings::checklists::{CompletionSource, Sequence};
 #[cfg(any(test, not(feature = "hitl_mode")))]
 #[derive(Clone, Default, Serialize, Deserialize, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]

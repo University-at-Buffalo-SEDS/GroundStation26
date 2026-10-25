@@ -1,5 +1,5 @@
 {
-  "status": "proposed representation and budgets; no checklist implementation",
+  "status": "typed membership model and optional host SQLite per-key staging implemented and tested; live paired checklist activation remains disabled pending incremental wire/profile and qualified selector integration",
   "identity": {
     "list_key": "checklists/list/<sha256(original list ID)>",
     "definition_key": "checklists/item/<sha256(length-prefixed list ID and item ID)>",
@@ -150,5 +150,46 @@
       "Review additive saved-qualification template binding and explicit legacy qualification migration.",
       "Implement typed membership/receipt model and atomic immutable generation preparation first."
     ]
+  },
+  "implemented_typed_model": {
+    "module": "shared/paired_settings/src/checklists",
+    "backend": "Sequence and CompletionSource enums shared without changing JSON API values",
+    "bounds": [
+      "32lists/1024items",
+      "80-byte original IDs hashed into <=128-byte keys",
+      "64KiB per document including9heads",
+      "64MiB encoded history catalog, capped counting serializer"
+    ],
+    "projection": "Complete policy/list/item manifest proofs required before producing a candidate. Definition conflicts defer the whole candidate; progress conflicts/stale generation/wording cannot satisfy checks. Reorder preserves semantic receipt binding.",
+    "side_effects": "No file writes, operational qualification, sequence callbacks, overrides, aborts or hardware commands",
+    "tests": "33unit and2integration tests pass without SQLite;41unit and2integration with sqlite-journal; strict all-target Clippy passes in both;14backend checklist tests pass and HITL check passes",
+    "not_implemented": [
+      "Live export/import worker or profile negotiation",
+      "Incremental wire reconciliation using cached journal pages",
+      "Immutable active selector and saved qualification-generation binding",
+      "Runtime projection activation or API conflict UI"
+    ]
+  },
+  "implemented_journal": {
+    "module": "shared/paired_settings/src/journal.rs",
+    "feature": "sqlite-journal (optional host-only; backend not yet enabled)",
+    "durability": "FULL-synchronous WAL SQLite per-key history transaction plus quota/revision metadata; no whole-store rewrite/hash per item",
+    "bounds": [
+      "8192documents including tombstones",
+      "64MiB encoded history payload plus keys",
+      "64KiB per causal document",
+      "64entry metadata pages and bounded snapshot reads"
+    ],
+    "causality": "Existing causal merge rules reused on one-key temporary store, explicit equivocation/conflict handling, retained tombstones",
+    "tests": [
+      "300document inert staging",
+      "32concurrent updates",
+      "per-row cached digest/revision pages and replay no-op",
+      "conflict/tombstone restart and replay",
+      "exact-byte quota, count quota and typed rejection preserve rows and physical database bytes",
+      "UTF8 byte quota and installation mismatch",
+      "blocked SQLite leaves unrelated current-thread async control task runnable"
+    ],
+    "not_enabled": "No new runtime worker, no active checklist writes, no qualification changes, no hardware outputs"
   }
 }

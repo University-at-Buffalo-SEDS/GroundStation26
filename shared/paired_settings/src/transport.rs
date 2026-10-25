@@ -61,10 +61,10 @@ fn canonical_bytes<T: Serialize>(value: &T) -> Vec<u8> {
     sort(&mut value);
     serde_json::to_vec(&value).expect("JSON mission serialization")
 }
-fn document_bytes(doc: &Document) -> Vec<u8> {
+pub(crate) fn document_bytes(doc: &Document) -> Vec<u8> {
     canonical_bytes(doc)
 }
-fn document_hash(doc: &Document) -> String {
+pub(crate) fn document_hash(doc: &Document) -> String {
     hash(&document_bytes(doc))
 }
 fn root(store: &Store) -> String {
