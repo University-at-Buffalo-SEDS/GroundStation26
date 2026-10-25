@@ -215,6 +215,7 @@ impl TransportTxActivity {
         }
         Ok(())
     }
+    #[cfg(any(not(feature = "hitl_mode"), test))]
     pub fn has_pending(&self) -> bool {
         self.pending.load(Ordering::Acquire) != 0
     }

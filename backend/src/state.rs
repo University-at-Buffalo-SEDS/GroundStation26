@@ -273,6 +273,7 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[cfg(any(not(feature = "hitl_mode"), test))]
     pub(crate) fn has_pending_transport_tx(&self) -> bool {
         self.transport_tx_activity.has_pending() || crate::rrls::status().queued_frames != 0
     }
