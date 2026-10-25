@@ -1558,7 +1558,11 @@ impl AppState {
 
     /// Appends a telemetry row to the in-memory reseed cache and prunes old entries.
     pub fn cache_recent_telemetry(&self, row: TelemetryRow) {
-        crate::antenna::observe(&row);
+        // Live GPS is observed at packet decoding with its source timestamp.
+        // Receipt-only cache/history rows cannot establish a receiver lock.
+        if row.data_type != "GPS_DATA" {
+            crate::antenna::observe(&row);
+        }
         const CACHE_WINDOW_MS: i64 = 20 * 60 * 1000;
         const CACHE_MAX_ROWS: usize = 250_000;
 

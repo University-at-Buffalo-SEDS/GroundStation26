@@ -1930,12 +1930,16 @@ async fn handle_packet(
                 .await;
             }
 
-            out.push(TelemetryRow {
+            let row = TelemetryRow {
                 timestamp_ms: ts_ms,
                 data_type: row_data_type,
                 sender_id: sender_id.clone(),
                 values: row_values,
-            });
+            };
+            if row.data_type == "GPS_DATA" {
+                crate::antenna::observe_source_gps(&row, pkt.timestamp());
+            }
+            out.push(row);
         }
 
         out

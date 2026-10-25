@@ -62,13 +62,24 @@ pub struct Snapshot {
 struct TimedFix {
     fix: Fix,
     received: Instant,
+    received_model_ms: Option<u64>,
 }
 impl TimedFix {
     fn snapshot(&self) -> Fix {
+        self.snapshot_at(Instant::now(), crate::simulation_clock_ms())
+    }
+    fn snapshot_at(&self, wall: Instant, model_ms: Option<u64>) -> Fix {
+        let elapsed = match (self.received_model_ms, model_ms) {
+            (Some(received), Some(now)) if now >= received => now - received,
+            // A model reset/lost clock cannot make an old sample young again.
+            (Some(_), _) => u64::MAX,
+            (None, _) => wall
+                .saturating_duration_since(self.received)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        };
         let mut value = self.fix.clone();
-        value.age_ms = value
-            .age_ms
-            .saturating_add(self.received.elapsed().as_millis() as u64);
+        value.age_ms = value.age_ms.saturating_add(elapsed);
         value.stale = value.age_ms > FIX_FRESH_MS;
         value
     }
@@ -85,12 +96,43 @@ fn cache() -> &'static Mutex<Cache> {
     CACHE.get_or_init(|| Mutex::new(Cache::default()))
 }
 
+/// Publication age is comparable only when both timestamps are Unix UTC.
+/// Boot-relative/unset source clocks retain receipt-age behavior; never subtract
+/// them from the synchronized network epoch.
+fn source_fix_age_ms(source_ms: Option<u64>, network_utc_ms: Option<u64>) -> Option<u64> {
+    const UTC_FLOOR_MS: u64 = 946_684_800_000; // 2000-01-01 UTC
+    const FUTURE_SKEW_MS: u64 = 5_000;
+    match (source_ms, network_utc_ms) {
+        (Some(source), Some(now)) if source >= UTC_FLOOR_MS && now >= UTC_FLOOR_MS => {
+            if source > now.saturating_add(FUTURE_SKEW_MS) {
+                return None;
+            }
+            let age = now.saturating_sub(source);
+            (age <= FIX_FRESH_MS).then_some(age)
+        }
+        _ => Some(0),
+    }
+}
+
+pub(crate) fn observe_source_gps(row: &TelemetryRow, source_ms: u64) {
+    let network_utc_ms =
+        crate::telemetry_task::recording_network_utc_ms().and_then(|value| value.try_into().ok());
+    observe_at(row, Some(source_ms), network_utc_ms);
+}
+
 pub fn observe(row: &TelemetryRow) {
+    observe_at(row, None, None);
+}
+
+fn observe_at(row: &TelemetryRow, source_ms: Option<u64>, network_utc_ms: Option<u64>) {
     if row.data_type == "GPS_DATA" {
         let index = match row.sender_id.as_str() {
             "RF" => 0,
             "FC" => 1,
             _ => return,
+        };
+        let Some(age_ms) = source_fix_age_ms(source_ms, network_utc_ms) else {
+            return;
         };
         let value = |i: usize| row.values.get(i).copied().flatten().map(f64::from);
         if let (Some(latitude), Some(longitude)) = (value(0), value(1)) {
@@ -101,7 +143,7 @@ pub fn observe(row: &TelemetryRow) {
                 altitude_reference: AltitudeReference::MeanSeaLevel,
                 accuracy_m: None,
                 geoid_separation_m: None,
-                age_ms: 0,
+                age_ms,
                 stale: false,
                 source: row.sender_id.clone(),
                 manual: false,
@@ -110,6 +152,7 @@ pub fn observe(row: &TelemetryRow) {
                 cache().lock().unwrap().rocket[index] = Some(TimedFix {
                     fix,
                     received: Instant::now(),
+                    received_model_ms: crate::simulation_clock_ms(),
                 });
             }
         }
@@ -163,6 +206,7 @@ pub fn accept_remote_fix(mut fix: Fix) {
     cache().lock().unwrap().remote = Some(TimedFix {
         fix,
         received: Instant::now(),
+        received_model_ms: None,
     });
 }
 pub fn snapshot() -> Snapshot {
@@ -297,6 +341,7 @@ pub fn start_gpsd(
                                 cache().lock().unwrap().local = Some(TimedFix {
                                     fix,
                                     received: Instant::now(),
+                                    received_model_ms: None,
                                 });
                             }
                             line.clear();
@@ -393,8 +438,99 @@ mod tests {
         let timed = TimedFix {
             fix,
             received: Instant::now() - Duration::from_secs(11),
+            received_model_ms: None,
         };
         assert!(timed.snapshot().stale);
+    }
+    #[test]
+    fn network_gps_publication_age_requires_comparable_utc_and_preserves_remaining_life() {
+        let now = 1_767_225_600_000;
+        assert_eq!(source_fix_age_ms(Some(now - 15_001), Some(now)), None);
+        assert_eq!(
+            source_fix_age_ms(Some(now - 15_000), Some(now)),
+            Some(15_000)
+        );
+        assert_eq!(source_fix_age_ms(Some(now - 1_200), Some(now)), Some(1_200));
+        assert_eq!(source_fix_age_ms(Some(now + 5_001), Some(now)), None);
+        assert_eq!(source_fix_age_ms(Some(now + 5_000), Some(now)), Some(0));
+        assert_eq!(source_fix_age_ms(Some(123), Some(now)), Some(0));
+        assert_eq!(source_fix_age_ms(Some(now), None), Some(0));
+        assert_eq!(source_fix_age_ms(None, Some(now)), Some(0));
+    }
+    #[test]
+    fn rocket_fix_ages_in_model_time_without_wall_acceleration_or_reset_revival() {
+        let wall = Instant::now();
+        let fix = gpsd_fix(br#"{"class":"TPV","mode":3,"lat":43,"lon":-78,"altMSL":150}"#).unwrap();
+        let mut timed = TimedFix {
+            fix,
+            received: wall,
+            received_model_ms: Some(1000),
+        };
+        timed.fix.age_ms = 1200;
+        assert_eq!(
+            timed
+                .snapshot_at(wall + Duration::from_secs(600), Some(1000))
+                .age_ms,
+            1200
+        );
+        assert!(
+            !timed
+                .snapshot_at(wall + Duration::from_secs(600), Some(14_800))
+                .stale
+        );
+        assert!(timed.snapshot_at(wall, Some(14_801)).stale);
+        assert!(timed.snapshot_at(wall, Some(999)).stale);
+        assert!(timed.snapshot_at(wall, None).stale);
+        timed.received_model_ms = None;
+        assert_eq!(
+            timed
+                .snapshot_at(wall + Duration::from_millis(500), Some(99_000))
+                .age_ms,
+            1700
+        );
+    }
+    #[test]
+    fn delayed_gps_does_not_establish_or_replace_live_receiver_lock() {
+        const CHILD: &str = "GS_ANTENNA_SOURCE_AGE_TEST_CHILD";
+        const NAME: &str =
+            "antenna::tests::delayed_gps_does_not_establish_or_replace_live_receiver_lock";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env_remove("GS_SIM_CLOCK_FILE")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        clear_rocket_fix_for_test();
+        let now = 1_767_225_600_000;
+        let mut row = TelemetryRow {
+            timestamp_ms: now as i64,
+            data_type: "GPS_DATA".into(),
+            sender_id: "RF".into(),
+            values: vec![Some(43.0), Some(-78.0), Some(150.0)],
+        };
+        observe_at(&row, Some(now - 15_001), Some(now));
+        assert!(cache().lock().unwrap().rocket[0].is_none());
+        observe_at(&row, Some(now - 1_200), Some(now));
+        row.values[0] = Some(44.0);
+        observe_at(&row, Some(now - 15_001), Some(now));
+        let locked = cache().lock().unwrap();
+        let value = locked.rocket[0].as_ref().unwrap().snapshot();
+        assert_eq!(value.latitude, 43.0);
+        assert!(value.age_ms >= 1200 && value.age_ms < 2000);
+        drop(locked);
+        clear_rocket_fix_for_test();
+        row.sender_id = "FC".into();
+        observe_at(&row, Some(now), Some(now));
+        assert!(cache().lock().unwrap().rocket[0].is_none());
     }
     #[test]
     fn mesh_position_roundtrip_rejects_bad_version_coordinates_age_and_datum() {
@@ -428,4 +564,9 @@ pub fn rocket_launch_fix_locked() -> bool {
             let fix = value.snapshot();
             fix.valid() && !fix.stale && fix.altitude_m.is_some()
         })
+}
+
+#[cfg(test)]
+pub(crate) fn clear_rocket_fix_for_test() {
+    cache().lock().unwrap().rocket[0] = None;
 }
