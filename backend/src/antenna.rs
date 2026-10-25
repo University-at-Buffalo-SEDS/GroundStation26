@@ -92,7 +92,9 @@ struct NoFix {
     network_utc_ms: Option<u64>,
 }
 fn comparable_publications(left: u64, right: u64) -> bool {
-    (left >= UTC_FLOOR_MS) == (right >= UTC_FLOOR_MS)
+    // RF exposes no boot-session identity with these publications. Numeric
+    // boot-relative order alone cannot distinguish delayed pre-reboot packets.
+    left >= UTC_FLOOR_MS && right >= UTC_FLOOR_MS
 }
 impl NoFix {
     fn precedes(self, publication_ms: u64) -> bool {
@@ -172,7 +174,7 @@ fn observe_satellites_at(sender: &str, count: u8, source_ms: u64, network_utc_ms
     cache.rocket[0] = None;
     cache.rf_no_fix = Some(NoFix {
         publication_ms: source_ms,
-        network_utc_ms,
+        network_utc_ms: network_utc_ms.filter(|now| *now >= UTC_FLOOR_MS),
     });
 }
 
@@ -693,9 +695,31 @@ mod tests {
         assert!(!locked());
         observe_at(&row, Some(211), Some(now));
         assert!(
-            locked(),
-            "boot-relative publications are compared only with each other"
+            !locked(),
+            "post-loss boot-relative data has no proven boot session"
         );
+        observe_at(&row, Some(now + 1), Some(now));
+        assert!(locked(), "a comparable UTC bridge permits valid recovery");
+
+        clear_rocket_fix_for_test();
+        observe_at(&row, Some(9_990), Some(now));
+        assert!(
+            locked(),
+            "initial receipt behavior remains available before explicit no-fix"
+        );
+        observe_satellites_at("RF", 0, 10_000, Some(now));
+        observe_satellites_at("RF", 0, 10, Some(now)); // A possible RF reboot.
+        for source in [11, 9_990, 10_001] {
+            observe_at(&row, Some(source), Some(now));
+            assert!(
+                !locked(),
+                "neither a new boot nor delayed large preboot values prove recovery"
+            );
+        }
+        observe_at(&row, Some(now - 1), Some(now));
+        assert!(!locked());
+        observe_at(&row, Some(now + 1), Some(now));
+        assert!(locked(), "fresh UTC recovers after the reboot ambiguity");
 
         clear_rocket_fix_for_test();
         observe_satellites_at("RF", 0, 210, Some(now));
@@ -709,23 +733,25 @@ mod tests {
             locked(),
             "fresh UTC acquisition can follow boot-relative no-fix"
         );
-        clear_rocket_fix_for_test();
-        observe_satellites_at("RF", 0, 210, None);
-        observe_at(&row, Some(now - 1), None);
-        assert!(
-            !locked(),
-            "unorderable domain transition is not proof of recovery"
-        );
-        observe_at(&row, Some(now - 1), Some(now));
-        assert!(
-            !locked(),
-            "old UTC cannot cross the newly established UTC fence"
-        );
-        observe_at(&row, Some(now + 1), Some(now + 2));
-        assert!(
-            locked(),
-            "a fixed UTC fence permits later valid recovery without another zero report"
-        );
+        for unset_utc in [None, Some(0)] {
+            clear_rocket_fix_for_test();
+            observe_satellites_at("RF", 0, 210, unset_utc);
+            observe_at(&row, Some(now - 1), None);
+            assert!(
+                !locked(),
+                "unorderable domain transition is not proof of recovery"
+            );
+            observe_at(&row, Some(now - 1), Some(now));
+            assert!(
+                !locked(),
+                "old UTC cannot cross the newly established UTC fence"
+            );
+            observe_at(&row, Some(now + 1), Some(now + 2));
+            assert!(
+                locked(),
+                "a fixed UTC fence permits later valid recovery without another zero report"
+            );
+        }
     }
 
     #[test]
