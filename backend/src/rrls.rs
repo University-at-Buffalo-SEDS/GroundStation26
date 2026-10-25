@@ -210,7 +210,11 @@ impl Mesh {
         }
     }
     pub fn now(&self) -> u64 {
-        self.started.elapsed().as_millis().min(u64::MAX as u128) as u64
+        // A linked emulator can run far slower than wall time. Liveness, relay
+        // leases and UART drain must advance on the same explicit test clock.
+        // Ordinary stations and standalone HITL retain their monotonic clock.
+        crate::simulation_clock_ms()
+            .unwrap_or_else(|| self.started.elapsed().as_millis().min(u64::MAX as u128) as u64)
     }
     fn direct(&mut self, now: u64) {
         if self.last_direct.is_none_or(|v| now.saturating_sub(v) > 750) {
@@ -825,6 +829,89 @@ fn decode(bytes: &[u8]) -> Option<(u8, &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(feature = "hitl_mode")]
+    fn recovery_liveness_uses_the_shared_virtual_clock_when_configured() {
+        const CHILD: &str = "GS_RRLS_CLOCK_REGRESSION_CHILD";
+        const NAME: &str =
+            "rrls::tests::recovery_liveness_uses_the_shared_virtual_clock_when_configured";
+        if std::env::var_os(CHILD).is_some() {
+            let path = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
+            let mesh = Mesh::new(Role::Rrls, 1);
+            assert_eq!(
+                mesh.now(),
+                1000,
+                "RRLS is using wall time instead of virtual time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert_eq!(
+                mesh.now(),
+                1000,
+                "a paused MCU must not expire RRLS liveness"
+            );
+            std::fs::write(&path, "2000").unwrap();
+            assert_eq!(mesh.now(), 2000);
+            std::fs::write(&path, "").unwrap();
+            assert_eq!(
+                mesh.now(),
+                2000,
+                "truncate/write races must retain the last tick"
+            );
+            std::fs::write(&path, "5").unwrap();
+            assert_eq!(
+                mesh.now(),
+                2000,
+                "clock reversal cannot renew expired leases"
+            );
+            println!("RRLS_SHARED_CLOCK_PASS");
+            return;
+        }
+        // Isolate main's OnceLock clock configuration from concurrent tests.
+        struct ClockDirectory(std::path::PathBuf);
+        impl Drop for ClockDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = ClockDirectory(
+            std::env::temp_dir().join(format!("rrls-clock-{}-{stamp}", std::process::id())),
+        );
+        std::fs::create_dir(&directory.0).unwrap();
+        let path = directory.0.join("clock.txt");
+        std::fs::write(&path, "1000").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("GS_SIM_CLOCK_FILE", path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(10) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("isolated RRLS clock check timed out");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("RRLS_SHARED_CLOCK_PASS"),
+            "RRLS clock regression: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn settings_are_bounded_and_never_displace_other_radio_work() {
         let mut mesh = Mesh::new(Role::Primary, 7);

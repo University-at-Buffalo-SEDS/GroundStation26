@@ -377,7 +377,7 @@
         "untraced_short": "passed",
         "pressure120_network_source_daq_fc_sd": "all passed",
         "gs_restart": "passed original network gate",
-        "pressure600": "running"
+        "pressure600": "Network latency/source preservation/FC SD passed; DAQ SD gate correctly failed one missing4sample pressure batch52..55 at startup. Raw and accepted SD records fully reconcile. Valve captured/published all samples with0drops; DAQ had0invalid/refused batches. Investigate delivery before claiming release readiness."
       },
       "limits": [
         "No physical RFD performance claim",
@@ -411,6 +411,12 @@
       },
       "combined_hitl": "Remaining no-op FC controls now forward in combined testing+HITL builds; duplicate unreachable patterns removed. Pure simulation and standalone HITL behavior retained.",
       "limits": "Shared64kbps three-radio and linked MCU qualification remain pending; no physical RF resolution claimed."
+    },
+    "rrls_shared_clock": {
+      "status": "implemented; Mac445/Linux452 tests passed,2ignored each; normal production checks pass with0warnings",
+      "reason": "RRLS lease/liveness time must use the explicit linked simulator clock so paused or slow emulation does not create false route expiry. Ordinary station clocks unchanged.",
+      "negative_control": "old wall clock fails the new isolated runtime regression",
+      "linked_three_radio_qualification": "pending"
     }
   }
 }
