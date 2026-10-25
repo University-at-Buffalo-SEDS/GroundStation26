@@ -12,7 +12,7 @@ use paired_settings::{Document, coordinator::Coordinator, radio::RadioSync};
 use ring::signature::KeyPair;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-#[cfg(test)]
+#[cfg(all(test, not(feature = "hitl_mode")))]
 use std::time::Instant;
 use std::{
     collections::BTreeMap,
