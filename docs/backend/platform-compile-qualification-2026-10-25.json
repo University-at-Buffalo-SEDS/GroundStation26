@@ -1,5 +1,5 @@
 {
-  "scope": "AArch64 GNU/Linux backend cross compilation/release on AMD64 and native Linux desktop frontend compilation. No ARM execution, physical GPU/device, macOS or hardware validation.",
+  "scope": "AArch64 GNU/Linux backend and desktop UI compilation/release on AMD64, including Pi GPIO production/HITL/test-fire feature checks. No ARM execution, physical GPIO/GPU/device, macOS or hardware validation.",
   "commits": {
     "gs": "35d34928d66a2f82593df22124c20899c4fbe527",
     "sdk": "edb3b19217a9c7abea134aee46f33a0e3c52bd59",
@@ -57,14 +57,10 @@
   "no_privileged_host_changes": true,
   "frozen_sources_mutated": false,
   "disk_reserve_bytes": 53687091200,
-  "free_bytes_after": 494546202624,
+  "free_bytes_after": 491729334272,
   "log_paths": [
     ".workspace-progress/platform-final-arm64-retry2.log",
     ".workspace-progress/platform-final-desktop-retry2.log"
-  ],
-  "excluded_runtime_accounts": [
-    "backend/users/users.json",
-    "ui"
   ],
   "prior_account_filename_audit": {
     "FirmwareSimulator/build/platform-clock-fixed-sdk5403896b-20261025/gs/backend/users/users.json": false,
@@ -75,5 +71,108 @@
   "packaging_followup": {
     "commit": "167fa36",
     "scope": "Docker account-copy/context exclusions only, with three fake-fixture packaging/bootstrap checks. This does not change the compiled Rust source from35d3492."
+  },
+  "frontend_arm64": {
+    "exit_code": 0,
+    "duration_seconds": 51.53933270892594,
+    "container": "seds-platform-final-frontend-arm64-resume-20261025",
+    "image": "seds-platform-cache:frontend-arm64-2b5bc86-20261025",
+    "source": "FirmwareSimulator/build/platform-final-35d3492-20261025",
+    "scope": "Compilation and actual AArch64 link only. No ARM execution, GUI/GPU, physical input, camera/microphone, Ubuntu installation or runtime library availability is claimed.",
+    "reserve_bytes": 53687091200,
+    "commit": "2b5bc862cb636846a9220df1ff078bc1408d3229",
+    "check_and_release_link": "PASS",
+    "source_files_after": 374,
+    "warnings": 0,
+    "elf": "ELF64 AArch64 PIE",
+    "binary_sha256": "d523c5bf43633fffcab5235f94161452768212673fbe08b135b7c31b74333c50",
+    "binary_bytes": 34799320,
+    "needed": [
+      "libxdo.so.3",
+      "libssl.so.3",
+      "libcrypto.so.3",
+      "libwebkit2gtk-4.1.so.0",
+      "libgtk-3.so.0",
+      "libgdk-3.so.0",
+      "libpango-1.0.so.0",
+      "libcairo-gobject.so.2",
+      "libcairo.so.2",
+      "libgdk_pixbuf-2.0.so.0",
+      "libsoup-3.0.so.0",
+      "libgio-2.0.so.0",
+      "libjavascriptcoregtk-4.1.so.0",
+      "libgobject-2.0.so.0",
+      "libglib-2.0.so.0",
+      "libgcc_s.so.1",
+      "libm.so.6",
+      "libc.so.6"
+    ],
+    "own_elf_max_glibc": "2.35",
+    "gtk3_sysroot": "3.24.38",
+    "webkit2gtk_sysroot": "2.50.6",
+    "sysroot": "/opt/gs-arm64-sysroot",
+    "cached_resume_image": "sha256:33715236a6f8a8d6c3ba5512c9240831544793bf507f6749463cfd584cda1257",
+    "preparation_fixes": [
+      "Use cached ARM64 GUI pkg-config prefix.",
+      "Pass existing multiarch OpenSSL header directory to target C compiler.",
+      "Pass the cached GUI libc sysroot to the final link. Resume from local compiled dependencies; no downloads or host changes."
+    ],
+    "log": ".workspace-progress/platform-final-frontend-arm64-resume.log"
+  },
+  "pi_backend_features": {
+    "exit_code": 0,
+    "duration_seconds": 71.27963852405082,
+    "container": "seds-platform-final-pi-features-cache-20261025",
+    "image": "seds-native-ui-builder:arm64-20261023",
+    "source": "FirmwareSimulator/build/platform-final-35d3492-20261025",
+    "scope": "Compile checks only; no GPIO execution or physical control acceptance.",
+    "reserve_bytes": 53687091200,
+    "source_commit": "35d34928d66a2f82593df22124c20899c4fbe527",
+    "checks": {
+      "raspberry_pi": "PASS55.60s",
+      "raspberry_pi,testing,hitl_mode": "PASS7.15s",
+      "raspberry_pi,test_fire_mode": "PASS5.29s"
+    },
+    "source_files_before_after": 928,
+    "public_cached_fallback": {
+      "crate": "version-compare0.1.1",
+      "sha256": "579a42fc0b8e0c63b76519a339be31bed574929511fa53c1a3acae26eb258f29",
+      "origin": "Already cached builder archive, temporary private union cache; no fetch/private authentication"
+    },
+    "warnings": [
+      {
+        "source": "backend/src/auto_zero.rs:430",
+        "message": "Test-only paused capture helper unused without hitl_mode/firmware_sim; no production warning."
+      }
+    ],
+    "log": ".workspace-progress/platform-final-pi-features-cache.log",
+    "historical_warning_resolved_by": "pi_test_cfg_followup"
+  },
+  "excluded_archive_entries": [
+    "backend/users/users.json",
+    "ui"
+  ],
+  "pi_test_cfg_followup": {
+    "exit_code": 0,
+    "duration_seconds": 10.796614319086075,
+    "source": "GS35d3492 committed source plus one test-only cfg guard matching its only caller",
+    "scope": "ARM64 Pi HITL/test-fire code checks only; no GPIO/runtimeexecution or host changes",
+    "source_files_validated": 928,
+    "test_only_overlay": "backend/src/auto_zero.rs",
+    "overlay_sha256": "8b4a8c76c95906cfe6493c2c4a0661e33cf4cde4daec1adc7c222d5a9bd5cb1b",
+    "warnings": 0,
+    "checks": {
+      "raspberry_pi,testing,hitl_mode": {
+        "result": "PASS",
+        "seconds": 4.94
+      },
+      "raspberry_pi,test_fire_mode": {
+        "result": "PASS",
+        "seconds": 5.26
+      }
+    },
+    "runtime_behavior_changed": false,
+    "cached_image_id": "sha256:5febecc8fa7aef58a3e2c9b3842816b0604c9eb48a7a6077d2de71e9c865c516",
+    "log": ".workspace-progress/platform-pi-cfg-followup.log"
   }
 }

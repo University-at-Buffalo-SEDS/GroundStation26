@@ -426,7 +426,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "hitl_mode", feature = "firmware_sim")))]
 pub(crate) async fn verify_paused_capture_cancellation_and_shutdown(state: &Arc<AppState>) {
     assert!(
         crate::simulation_clock_ms().is_some(),
