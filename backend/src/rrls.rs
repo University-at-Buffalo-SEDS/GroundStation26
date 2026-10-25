@@ -28,7 +28,6 @@ const SETTINGS_PEER_AGE_MS: u64 = 15_000;
 #[derive(Clone, Copy)]
 struct FrameClass {
     priority: u8,
-    avionics: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -388,7 +387,15 @@ impl Mesh {
             priority,
         });
     }
+    #[cfg(test)]
     pub(crate) fn begin_transmission(&mut self, now: u64) -> Option<Transmission> {
+        self.begin_transmission_at_priority(now, 0)
+    }
+    pub(crate) fn begin_transmission_at_priority(
+        &mut self,
+        now: u64,
+        minimum_priority: u8,
+    ) -> Option<Transmission> {
         if self.active_transmission.is_some() {
             return None;
         }
@@ -409,6 +416,9 @@ impl Mesh {
                 .max_by_key(|(i, q)| (q.priority, std::cmp::Reverse(*i)))
                 .map(|(i, _)| i)?;
             let q = &self.queue[i];
+            if q.priority < minimum_priority {
+                return None;
+            }
             if now.saturating_sub(q.at)
                 > if q.frame.bytes.get(3) == Some(&VOICE) {
                     180
@@ -584,7 +594,6 @@ impl Mesh {
                 } else {
                     sedsnet::transport_priority(p.envelope.ty).min(254)
                 },
-                avionics: matches!(p.envelope.sender.as_ref(), "RF" | "FC" | "PB"),
             })
         }
         if !bytes.starts_with(b"SDT") {
@@ -623,10 +632,7 @@ impl Mesh {
                     .find(|(key, _)| *key == template)
                     .map(|(_, class)| *class)
             }
-            3 => Some(FrameClass {
-                priority: 253,
-                avionics: false,
-            }),
+            3 => Some(FrameClass { priority: 253 }),
             _ => None,
         }
     }
@@ -762,7 +768,13 @@ impl Mesh {
                 if command && payload.starts_with(b"RS\x01") && payload.len() == 9 {
                     self.direct(now);
                 }
-                if !command && frame_class.is_some_and(|class| class.avionics) {
+                // This radio's unwrapped, CRC-valid SDK traffic is the direct
+                // AV-bay path. RRLS forwarding is always an RRv1 envelope and
+                // took the separate branch above. Lean v4 headers carry source
+                // addresses, so display names (often @addr:...) cannot establish
+                // physical link liveness. Valid metadata also renews it before
+                // any sensor type or source identity has been learned.
+                if !command && frame_class.is_some() {
                     self.direct(now);
                 }
             } else if self.active(now) {
@@ -1137,6 +1149,110 @@ mod tests {
         );
     }
     #[test]
+    fn lean_v4_direct_frames_prevent_false_relay_fallback_and_real_loss_recovers() {
+        const FIXTURES: &str = "GS_RRLS_LEAN_FIXTURES";
+        if let Ok(encoded) = std::env::var(FIXTURES) {
+            let fixtures: Vec<Vec<u8>> = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(fixtures.len(), 4);
+            crate::telemetry_schema::initialize().unwrap();
+            let mut primary = Mesh::new(Role::Primary, 1);
+            // This fresh process did not serialize the sources, so the actual
+            // SDK exposes their lean numeric identities as an @addr alias.
+            for (index, wire) in fixtures.iter().enumerate() {
+                let info = sedsnet::wire_format::peek_frame_info(wire).unwrap();
+                assert!(info.envelope.sender.starts_with("@addr:"));
+                assert_ne!(info.envelope.source_address, 0);
+                let at = index as u64 * 1000;
+                primary.incoming(false, wire, at).unwrap();
+                primary.relay_seen = Some(at);
+                primary.tick(at);
+                assert!(!primary.active(at));
+                assert_eq!(primary.last_direct, Some(at));
+            }
+            let last = 3000;
+            let mut broken = fixtures[0].clone();
+            *broken.last_mut().unwrap() ^= 1;
+            primary.incoming(false, &broken, last + 100);
+            assert_eq!(
+                primary.last_direct,
+                Some(last),
+                "invalid CRC cannot renew direct liveness"
+            );
+            primary.incoming(true, &encode(DOWN_DATA, &fixtures[0]), last + 200);
+            assert_eq!(
+                primary.last_direct,
+                Some(last),
+                "relay data cannot renew direct liveness"
+            );
+            let lost_at = last + LOSS_MS;
+            primary.relay_seen = Some(lost_at);
+            primary.tick(lost_at);
+            assert!(
+                primary.active(lost_at),
+                "real direct loss must enable a live relay"
+            );
+            assert_eq!(
+                decode(&primary.local_tx(false, b"pending", lost_at).unwrap().bytes)
+                    .unwrap()
+                    .0,
+                UP_DATA
+            );
+            for delta in [100, 600, 1100, 1600, 2100] {
+                primary.incoming(false, &fixtures[0], lost_at + delta);
+                primary.relay_seen = Some(lost_at + delta);
+                primary.tick(lost_at + delta);
+            }
+            assert!(
+                !primary.active(lost_at + 2100),
+                "stable direct recovery must exit fallback"
+            );
+            assert_eq!(
+                decode(
+                    &primary
+                        .local_tx(false, b"pending", lost_at + 2100)
+                        .unwrap()
+                        .bytes
+                )
+                .unwrap()
+                .0,
+                AV_BAY_DATA
+            );
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let fixtures: Vec<Vec<u8>> = ["RF", "FC", "PB", "NEW_SENSOR_ROUTER"]
+            .iter()
+            .enumerate()
+            .map(|(index, sender)| {
+                let ty = if index < 3 {
+                    crate::telemetry_schema::data_type("GPS_DATA")
+                } else {
+                    sedsnet::config::DataType::identity("FUTURE_LINK_METADATA")
+                };
+                let packet = sedsnet::packet::Packet::new(
+                    ty,
+                    &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                    sender,
+                    1,
+                    vec![0; 12].into(),
+                )
+                .unwrap();
+                sedsnet::wire_format::pack_packet(&packet).to_vec()
+            })
+            .collect();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "rrls::tests::lean_v4_direct_frames_prevent_false_relay_fallback_and_real_loss_recovers", "--nocapture"])
+            .env(FIXTURES, serde_json::to_string(&fixtures).unwrap())
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "fresh-process actual lean codec regression failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn direct_ground_uplink_is_namespaced_away_from_rocket_templates() {
         let p = Mesh::new(Role::Primary, 1);
         let mut r = Mesh::new(Role::Rrls, 2);
@@ -1213,6 +1329,31 @@ mod tests {
                 .0,
             AV_BAY_DATA
         );
+    }
+
+    #[test]
+    fn protected_mesh_service_leaves_lower_priority_bytes_owned_and_queued() {
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        mesh.tick(0);
+        mesh.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(SETTINGS, b"settings"),
+            },
+            20,
+            0,
+        );
+        let health = mesh.begin_transmission_at_priority(0, 255).unwrap();
+        assert_eq!(decode(&health.frame().bytes).unwrap().0, HEALTH);
+        mesh.finish_transmission(health, true);
+        let owned = mesh.bytes;
+        assert!(mesh.begin_transmission_at_priority(1, 255).is_none());
+        assert_eq!(mesh.bytes, owned);
+        assert_eq!(mesh.queue.len(), 1);
+        let settings = mesh.begin_transmission(1).unwrap();
+        assert_eq!(decode(&settings.frame().bytes).unwrap().0, SETTINGS);
+        mesh.finish_transmission(settings, true);
+        assert_eq!(mesh.bytes, 0);
     }
 
     #[test]
@@ -1609,8 +1750,8 @@ pub fn voice_status() -> (bool, bool) {
 }
 
 #[cfg(test)]
-#[path = "rrls/shared_air.rs"]
-mod shared_air;
-#[cfg(test)]
 #[path = "rrls/air_campaign.rs"]
 mod air_campaign;
+#[cfg(test)]
+#[path = "rrls/shared_air.rs"]
+mod shared_air;

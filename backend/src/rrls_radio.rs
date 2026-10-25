@@ -47,7 +47,8 @@ impl RecoveryRadio {
         let mut state = self.shared.lock().unwrap();
         if state.rx.is_none() && Instant::now() >= state.retry_at {
             state.retry_at = Instant::now() + Duration::from_secs(1);
-            match (state.opener)(&state.config).and_then(|rx| {
+            match (state.opener)(&state.config).and_then(|mut rx| {
+                rx.enable_radio_capacity_control();
                 let tx = rx
                     .try_clone_tx()?
                     .ok_or_else(|| anyhow::anyhow!("RRLS requires independent UART transmit"))?;
@@ -116,6 +117,13 @@ fn io_failure(error: &TelemetryError) -> bool {
     )
 }
 impl CommsDevice for RecoveryRadio {
+    fn service_transmit(&mut self) -> TelemetryResult<()> {
+        self.with_device(
+            TelemetryError::Io("RRLS radio disconnected"),
+            io_failure,
+            |device| device.service_transmit(),
+        )
+    }
     fn transmit_ready(&self) -> bool {
         let device = {
             let state = self.shared.lock().unwrap();

@@ -8,7 +8,7 @@ it does not operate valves, ignition or deployment outputs.
 From the GroundStation repository, with the sibling frontend dev checkout:
 
 ```sh
-GS_FRONTEND_SOURCE_DIR=../Seds-Ground-Station-Frontend \
+GS_FRONTEND_SOURCE_DIR="$PWD/../Seds-Ground-Station-Frontend" \
   cargo test -p groundstation_backend --bin groundstation_backend \
   finite_three_radio_mesh_recovers_actual_reliable_commands_and_receipts -- --nocapture
 ```
@@ -17,7 +17,7 @@ For unreleased SDK changes, retain the normal `SEDSnet = "4"` requirement and
 select the sibling source explicitly for qualification:
 
 ```sh
-GS_FRONTEND_SOURCE_DIR=../Seds-Ground-Station-Frontend \
+GS_FRONTEND_SOURCE_DIR="$PWD/../Seds-Ground-Station-Frontend" \
   cargo test -p groundstation_backend --bin groundstation_backend \
   --config 'patch.crates-io.SEDSnet.path="../SEDSnet"' -- --nocapture
 ```

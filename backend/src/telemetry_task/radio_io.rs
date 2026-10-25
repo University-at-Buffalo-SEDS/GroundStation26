@@ -1042,6 +1042,11 @@ pub(super) fn spawn_comms_worker_threads(
     let tx_worker = thread::Builder::new()
         .name(format!("{}_comms_tx", worker_name))
         .spawn(move || {
+            if worker_name == "rocket_comms" {
+                // No modem turn scheduling: this only bounds bytes offloaded
+                // at UART speed into a slower finite-capacity radio modem.
+                tx_worker_comms.lock().unwrap().enable_radio_capacity_control();
+            }
             let mut comms_shutdown_rx = tx_worker_state.shutdown_subscribe();
             let mut last_send_error_log_ms = 0;
             let mut suppressed_send_errors = 0;
@@ -1075,6 +1080,17 @@ pub(super) fn spawn_comms_worker_threads(
                         }
                     }
                     let mut comms = tx_worker_comms.lock().expect("failed to get lock");
+                    // Mesh HEALTH/READY must not depend on receiving another
+                    // radio byte. Service protected egress before SDK queue
+                    // ownership/priority selection, even when SDK is idle.
+                    if let Err(error) = comms.service_transmit() {
+                        log_repeated_worker_error(
+                            &format!("{worker_name} comms worker transport service failed"),
+                            &error.to_string(), &mut last_send_error_log_ms,
+                            &mut suppressed_send_errors,
+                        );
+                        break;
+                    }
                     if !comms.transmit_ready() {
                         // Leave frames queued so a newly admitted command can
                         // overtake bulk traffic when the UART finishes writing.
@@ -1101,8 +1117,9 @@ pub(super) fn spawn_comms_worker_threads(
                                 suppressed_send_errors = 0;
                                 last_send_error_log_ms = 0;
                             }
-                            // RFD firmware owns radio scheduling. This full-duplex
-                            // worker adds no LoRa airtime/cooldown or receive window.
+                            // RFD firmware owns MAC/turn scheduling. The UART
+                            // device enforces shared capacity before queue pop;
+                            // no LoRa cooldown, AUX or receive window is used.
                             next_tx_allowed_at = TxDeadline::now();
                         }
                         Err(e) => {
@@ -2420,17 +2437,117 @@ mod rfd_worker_tests {
         for worker in workers {
             worker.join().unwrap();
         }
-        received.expect("RFD TX worker waited for LoRa airtime instead of UART readiness");
+        received.expect("RFD TX worker did not drain after device capacity became ready");
         let captured = sent.lock().unwrap();
         assert_eq!(*captured, expected);
     }
     #[tokio::test]
-    async fn rfd_worker_drains_without_lora_airtime_waits() {
+    async fn rfd_worker_respects_device_capacity_without_lora_turn_windows() {
         run_rfd_worker(false).await;
     }
     #[tokio::test]
     async fn rfd_worker_preserves_order_after_transient_write_failure() {
         run_rfd_worker(true).await;
+    }
+
+    struct MeshPriorityDevice {
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        credit: Arc<AtomicUsize>,
+        pending_health: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl CommsDevice for MeshPriorityDevice {
+        fn service_transmit(&mut self) -> sedsnet::TelemetryResult<()> {
+            if self.credit.load(Ordering::Acquire) > 0
+                && self.pending_health.swap(false, Ordering::AcqRel)
+            {
+                self.credit.fetch_sub(1, Ordering::AcqRel);
+                self.sent.lock().unwrap().push(b"HEALTH".to_vec());
+            }
+            Ok(())
+        }
+        fn transmit_ready(&self) -> bool {
+            self.credit.load(Ordering::Acquire) > 0
+        }
+        fn recv_packet(
+            &mut self,
+            _: &Router,
+            _: &mut dyn FnMut(&Packet),
+        ) -> sedsnet::TelemetryResult<()> {
+            Ok(())
+        }
+        fn send_data(&mut self, bytes: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+            assert!(self.credit.fetch_sub(1, Ordering::AcqRel) > 0);
+            self.sent.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        }
+        fn set_side_id(&mut self, _: RouterSideId) {}
+    }
+    #[tokio::test]
+    async fn queued_mesh_health_gets_capacity_before_sdk_and_keeps_its_reservation() {
+        let state = crate::state::tests::test_app_state().await;
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let credit = Arc::new(AtomicUsize::new(1));
+        let pending_health = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let device = || {
+            Box::new(MeshPriorityDevice {
+                sent: sent.clone(),
+                credit: credit.clone(),
+                pending_health: pending_health.clone(),
+            }) as Box<dyn CommsDevice>
+        };
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let frame = vec![0xa1, 0xb2];
+        let budget = Arc::new(TxQueueBudget::new(4096));
+        budget.try_send(&sender, 16, &frame).unwrap();
+        let workers = spawn_comms_worker_threads(
+            Arc::new(Router::new(Default::default())),
+            state.clone(),
+            CommsWorkerHandle {
+                name: "rocket_comms",
+                tx_budget: Some(budget.clone()),
+                comms: Arc::new(Mutex::new(device())),
+                tx_comms: Some(Arc::new(Mutex::new(device()))),
+                side_id: 0,
+                tx_rx: receiver,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: false,
+            },
+        )
+        .unwrap();
+        let result = async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while sent.lock().unwrap().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .map_err(|_| "worker stalled")?;
+            if sent.lock().unwrap()[0] != b"HEALTH" {
+                return Err("SDK bulk took capacity before queued mesh health");
+            }
+            if budget.pending.load(Ordering::Acquire) != frame.len() {
+                return Err("SDK reservation released before UART offload");
+            }
+            credit.store(1, Ordering::Release);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while sent.lock().unwrap().len() < 2 {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .map_err(|_| "SDK data never resumed")?;
+            Ok(())
+        }
+        .await;
+        state.request_shutdown();
+        drop(sender);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        result.unwrap();
+        assert_eq!(*sent.lock().unwrap(), vec![b"HEALTH".to_vec(), frame]);
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
     }
 
     struct ReadinessDevice {

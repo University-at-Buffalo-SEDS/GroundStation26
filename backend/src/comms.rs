@@ -3,6 +3,8 @@
 mod i2c_packet;
 #[path = "picofi_tcp.rs"]
 mod picofi_tcp;
+#[path = "comms/rfd_capacity.rs"]
+mod rfd_capacity;
 #[cfg(any(target_os = "linux", test))]
 #[path = "comms/virtual_uart.rs"]
 mod virtual_uart;
@@ -111,6 +113,15 @@ pub trait CommsDevice: Send {
     /// result leaves ownership and priority selection in the caller's queue.
     fn transmit_ready(&self) -> bool {
         true
+    }
+
+    /// Enable capacity backpressure on the actual radio UART only.
+    fn enable_radio_capacity_control(&mut self) {}
+
+    /// Service already queued transport controls before selecting SDK bytes.
+    /// This performs bounded work without transferring ownership of SDK data.
+    fn service_transmit(&mut self) -> TelemetryResult<()> {
+        Ok(())
     }
 
     /// True only when the last bounded receive exhausted its work budget.
@@ -335,6 +346,7 @@ impl RawUartFrameWait {
 
 #[derive(Default)]
 struct UartWriteState {
+    radio_capacity: Option<rfd_capacity::Capacity>,
     #[cfg(target_os = "linux")]
     wire: virtual_uart::WireDrain,
 }
@@ -583,13 +595,19 @@ impl UartComms {
             }
             mesh.tick(now);
         }
+        self.flush_recovery_output(0)
+    }
+
+    fn flush_recovery_output(&mut self, minimum_priority: u8) -> TelemetryResult<()> {
+        let shared = self.recovery.as_ref().unwrap().clone();
+        self.enable_radio_capacity_control();
         for _ in 0..4 {
             // Reserve only the frame being written. Do not pop a batch and lose
             // its remaining members if the first write fails.
             #[cfg(target_os = "linux")]
             let mut write_state = self.write_lock.lock().unwrap();
             #[cfg(not(target_os = "linux"))]
-            let _write_state = self.write_lock.lock().unwrap();
+            let mut write_state = self.write_lock.lock().unwrap();
             #[cfg(target_os = "linux")]
             let virtual_wire_now = if simulated_serial_pty() {
                 crate::simulation_clock_ms()
@@ -602,10 +620,19 @@ impl UartComms {
             {
                 break;
             }
+            let capacity_wall = Instant::now();
+            let capacity_clock = crate::simulation_clock_ms();
+            if write_state
+                .radio_capacity
+                .as_ref()
+                .is_some_and(|cap| !cap.ready(capacity_wall, capacity_clock))
+            {
+                break;
+            }
             let transmission = {
                 let mut mesh = shared.lock().unwrap();
                 let now = mesh.now();
-                mesh.begin_transmission(now)
+                mesh.begin_transmission_at_priority(now, minimum_priority)
             };
             let Some(transmission) = transmission else {
                 break;
@@ -635,6 +662,9 @@ impl UartComms {
                 {
                     self.inner.write_all(&framed)?;
                     self.inner.flush()?;
+                }
+                if let Some(capacity) = &mut write_state.radio_capacity {
+                    capacity.committed(capacity_wall, capacity_clock, framed.len());
                 }
                 Ok(())
             })();
@@ -1711,13 +1741,49 @@ fn hex_preview(bytes: &[u8], limit: usize) -> String {
 }
 
 impl CommsDevice for UartComms {
+    fn service_transmit(&mut self) -> TelemetryResult<()> {
+        let Some(shared) = &self.recovery else {
+            return Ok(());
+        };
+        let minimum_priority = {
+            let mut mesh = shared.lock().unwrap();
+            let now = mesh.now();
+            mesh.tick(now);
+            // The primary's HEALTH is protected ahead of SDK traffic. Lower
+            // priority voice/settings keep their existing RX-side service.
+            // RRLS has no local SDK output: its mesh owns the entire egress.
+            if mesh.role == crate::rrls::Role::Primary {
+                255
+            } else {
+                0
+            }
+        };
+        self.flush_recovery_output(minimum_priority)
+    }
+    fn enable_radio_capacity_control(&mut self) {
+        if matches!(self.protocol, SerialProtocol::RawUart) {
+            self.write_lock
+                .lock()
+                .unwrap()
+                .radio_capacity
+                .get_or_insert_with(rfd_capacity::Capacity::from_env);
+        }
+    }
     fn transmit_ready(&self) -> bool {
+        let state = self.write_lock.lock().unwrap();
+        if state
+            .radio_capacity
+            .as_ref()
+            .is_some_and(|cap| !cap.ready(Instant::now(), crate::simulation_clock_ms()))
+        {
+            return false;
+        }
         #[cfg(target_os = "linux")]
         if simulated_serial_pty()
             && matches!(self.protocol, SerialProtocol::RawUart)
             && let Some(now) = crate::simulation_clock_ms()
         {
-            return self.write_lock.lock().unwrap().wire.ready(now);
+            return state.wire.ready(now);
         }
         true
     }
@@ -1780,6 +1846,9 @@ impl CommsDevice for UartComms {
 
     /// Blocking send of serialized bytes.
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if self.recovery.is_some() {
+            self.enable_radio_capacity_control();
+        }
         if !self.transmit_ready() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -1801,7 +1870,7 @@ impl CommsDevice for UartComms {
         #[cfg(target_os = "linux")]
         let mut write_state = self.write_lock.lock().unwrap();
         #[cfg(not(target_os = "linux"))]
-        let _write_state = self.write_lock.lock().unwrap();
+        let mut write_state = self.write_lock.lock().unwrap();
         #[cfg(target_os = "linux")]
         let virtual_wire_now =
             if simulated_serial_pty() && matches!(self.protocol, SerialProtocol::RawUart) {
@@ -1818,6 +1887,19 @@ impl CommsDevice for UartComms {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "simulated UART wire is still transmitting",
+            )
+            .into());
+        }
+        let capacity_wall = Instant::now();
+        let capacity_clock = crate::simulation_clock_ms();
+        if write_state
+            .radio_capacity
+            .as_ref()
+            .is_some_and(|cap| !cap.ready(capacity_wall, capacity_clock))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "radio modem capacity is still draining",
             )
             .into());
         }
@@ -1866,6 +1948,15 @@ impl CommsDevice for UartComms {
                     self.inner.flush()?;
                 }
             }
+        }
+        if matches!(self.protocol, SerialProtocol::RawUart)
+            && let Some(capacity) = &mut write_state.radio_capacity
+        {
+            capacity.committed(
+                capacity_wall,
+                capacity_clock,
+                len + RAW_UART_FRAME_HEADER_SIZE,
+            );
         }
         Ok(())
     }
@@ -3178,6 +3269,25 @@ mod raw_uart_tests {
             slow_start_deadline: None,
         };
         (uart, shared, expected)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cloned_uart_tx_services_pending_health_without_any_rx_bytes() {
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(200)).unwrap();
+        let (uart, shared, expected) = recovery_uart_fixture(port);
+        assert!(uart.rx_buf.is_empty());
+        let mut tx = uart.try_clone_tx().unwrap().unwrap();
+        let length = expected.len();
+        let reader = std::thread::spawn(move || {
+            let mut bytes = vec![0; length];
+            peer.read_exact(&mut bytes).unwrap();
+            bytes
+        });
+        tx.service_transmit().unwrap();
+        assert_eq!(reader.join().unwrap(), expected);
+        assert!(shared.lock().unwrap().begin_transmission(0).is_none());
     }
 
     #[test]
