@@ -1,12 +1,12 @@
 {
-  "updated_utc": "2026-10-25T19:57:27.378147+00:00",
+  "updated_utc": "2026-10-25T22:25:49.478678+00:00",
   "source_ready": false,
   "release_ready": false,
   "packages_published": "4.2.6 crates.io confirmed;4.2.7 notpublished",
   "priorities": [
     {
       "task": "4.2.7 independent-endpoint multicast and full flight acceptance",
-      "status": "qualification_in_progress",
+      "status": "final_runtime_network_endurance_in_progress",
       "results": [
         "Actual RF GPS C-ABI publication reproduced CAN1/radio0 despite success. SDK3971aef preserves distinct endpoint roles and now emits CAN1/radio1; redundant paths, explicit policies and retry ownership retain focused tests.",
         "SDK4.2.7 snapshot55fcdd5 and FC managed-state callback c690a0a compile in all8 factory variants; no overflow. FCSDK-absent/Cargo+rustc-blocked factory also passes.",
@@ -18,12 +18,14 @@
         "Actuator/Valve1Hz status fixes stale2second GSE freshness during QDsettlement without weakening interlocks; all8 final factory variants fit and warningclean.",
         "Deterministic two-producer test reproduces automaticabort check/Firecommit race; atomic persisted claim and in-flight dispatch guard are being implemented.",
         "FreshGPS-loss-during-QD negative also completes70,000modelms/all7MCUs+GS+4links exit0: realNMEAfixloss cancels queuedlaunch, Firefalse and FCLaunchrx0 throughsample60+. Rawdecoder satellitepayload extraction is separate diagnostic followup.",
-        "ActualGPSnegative wire decoder confirms12sat38.0607s+position38.085s, then0sat39.0497/40.0967s. Cancellation43.260s leaves savedFirefalse/generation0 and FCLaunch received/accepted/processed0. Strictfinished69strace has0codecerrors; explicit14usTXtimestampjitterbound preservesbyteorder."
+        "ActualGPSnegative wire decoder confirms12sat38.0607s+position38.085s, then0sat39.0497/40.0967s. Cancellation43.260s leaves savedFirefalse/generation0 and FCLaunch received/accepted/processed0. Strictfinished69strace has0codecerrors; explicit14usTXtimestampjitterbound preservesbyteorder.",
+        "Final SDK2b queued-TX ownership and GS persisted automatic-abort claim prevent Fire/Clear races. Active SDK dispatch and software transport retention are checked before explicit Clear; storage failure blocks Fire while preserving abort delivery.",
+        "Final ordinary flight positive and GPS-loss negative each complete70,000modelms with all7MCUs: positive FCLaunch received/accepted/processed1/1/1, watchdog rejection0; negative0/0/0 and no Fire. See ordinary-flight-owned-tx-2026-10-25.json.",
+        "Final A748 backend matrices pass production549, HITL531, ordinary551 and test-fire552 tests; explicit HTTP-only composition preserves all7 network files used in current endurance runs."
       ],
       "remaining": [
-        "Finish atomic automaticabort/Fire exclusion including busy transport retainedABORT ownership through explicitClear, restart and storageerror cases; validate finalaffectedpolicy.",
-        "Repeat current-runtime two/three-radio600s network/source/SD and120s restart validation plus relay/outage; require actual GPS position preservation at GS/RRLS. EarlierSDK5b latency remains historical.",
-        "Update final source closures and push qualified4.2.7 sources before notifying local publisher; preserve published4.2.6."
+        "Finish current-runtime two/three-radio600s network/source/SD gates,120s restart gates and60s relay/outage gate with actual fresh RF GPS positions at GS and RRLS.",
+        "Complete source package and CI verification, then finalize4.2.7 release qualification. Source main/dev already pushed; no package publication from Jupiter."
       ]
     },
     {
@@ -41,45 +43,49 @@
         "FirmwareSimulator/docs/qualification/rrls-telemetry-retention-2026-10-25.json"
       ],
       "remaining": [
+        "Complete current SDK2b long network/restart/relay qualification; historical SDK results do not substitute for these runs.",
         "Validate actual RFD MAC/retries, propagation and physical hardware when available; the finite medium is an explicit approximation."
       ]
     },
     {
       "task": "Production sequence and checklist acceptance",
-      "status": "test_fire_qualified_flight_acceptance_in_progress",
+      "status": "final_ordinary_positive_negative_and_test_fire_passed",
       "results": [
         "An independent firmware_sim build exercises ordinary test-fire policy without HITL or testing bypasses. Existing HITL behavior is preserved.",
         "Actual four-MCU flow passes self-test17.81s, nitrogen32.99s, Fill33.07s, Armed35.68s, Fire and pilot/T-plus45.72s. Input pressure/mass passes through modeled ADC/SPI hardware, real firmware and the network.",
         "Persisted automatic checklist receipts and cold-flow reset after Fire are observed; premature Fill/Nitrogen/Fire requests are rejected.",
         "Quantized fill completion now uses the existing cutoff tolerance consistently; below-target plateaus do not qualify. Committed Fire can accept actual pilot confirmation even while the fill engine remains paused.",
         "Actual modeled pilot/igniter output timing and DAQ session/deadline memory are verified. No board timings or safety gates were weakened.",
-        "Finalcandidate ordinaryflight positive also passes70second linkedrun; pending atomicabort race closure and negativeGPS/QD acceptance remain separate."
+        "Finalcandidate ordinaryflight positive also passes70second linkedrun; pending atomicabort race closure and negativeGPS/QD acceptance remain separate.",
+        "Final A748 test-fire70,000modelms passes with4MCUs: real self-test/N2/Fill/Armed/Fire/pilot; Valve start/attempt/finish1 each and abort0. Actual modeled actuator ignition output pulse10002ticks then off. Shared checklist receipts reset after Fire."
       ],
       "evidence": [
         "FirmwareSimulator/docs/qualification/operational-gse-linked-2026-10-25.json"
       ],
       "remaining": [
-        "Finish atomic automaticabort/Fire exclusion and freshGPS-loss-during-QD negative acceptance; revalidate final affectedpolicy source.",
         "Physical pneumatic, combustion, key-switch and output-load acceptance remains outside simulator proof."
       ]
     },
     {
       "task": "SEDSnet full campaign and release tooling",
-      "status": "4_2_7_full_campaigns_and_packages_passed_simulator_gates_pending",
+      "status": "source_main_dev_pushed_full_matrix_passed_network_gates_pending",
       "results": [
         "Both exact current full pipelines pass: default715 Rust+80 Python/API tests; compact/compression/fair/crypto741 Rust+80 Python/API tests. Zero skipped, unshortened600.005-second pressure test.",
         "The full runner now builds and loads the actual native Python extension. Historical72-test discoveries are correctly recorded as63 passed/9 skipped, separately from the new complete campaigns.",
         "UTC sample projection/steering and board holdover priority are corrected without wire-format/API or runtime state-size changes.",
         "Environment overrides, child output and quoted/encoded release diagnostics are sanitized. Fake-token tests pass; no real credentials were inspected.",
         "Offline source package listing includes both new Python helpers and excludes credential filenames. Version remains4.2.6.",
-        "Current4.2.7 full campaigns pass721/747 Rust plus81 actualnativePython/API tests each,0skips, full600.005s pressure; macro/core offline package verification passes. Earlier4.2.6 results remain historical."
+        "Current4.2.7 full campaigns pass721/747 Rust plus81 actualnativePython/API tests each,0skips, full600.005s pressure; macro/core offline package verification passes. Earlier4.2.6 results remain historical.",
+        "Source b38b017 is pushed to SEDSnet main and dev. Architecture-aware queue metadata guards fix actual i686 E0080 without changing runtime fields/accounting; actual Zig i686 wheel build, ELF32 import and4API tests pass.",
+        "Publisher now invokes one build.py test --all --full matrix. Shared forwarding-memory, benchmarks and script contracts run once; distinct storage/feature profiles still test their own compiled code. Actual a1 matrix passes in1001.725s:727/753Rust plus86/14Python tests, all0skips, unshortened600s pressure.",
+        "Exact CLI parsing rejects publisher --all, which previously silently abbreviated --allow-dirty. Use --all on build.py test; --docker-all-wheels remains the publisher wheel-platform option."
       ],
       "evidence": [
         "SEDSnet/docs/qualification-4.2.6-2026-10-25.json",
         "SEDSnet/docs/qualification-4.2.7-2026-10-25.json"
       ],
       "remaining": [
-        "Complete fresh4.2.7 simulator qualification and sourcepush; maintainer runs nativeMac release locally."
+        "Finish final-source package, source CI and remaining simulator network gates, then notify maintainer for local Mac4.2.7 publication."
       ]
     },
     {
@@ -104,7 +110,8 @@
       "results": [
         "Signed, bounded incremental replication handles offline edits and explicit conflicts. Calibration, inert mission settings, saved coordinates and checklist progress retain their permission boundaries.",
         "Durable SQLite journal/selector recovery, compare-and-swap conflicts and actual automatic procedure receipts are tested. Operational abort/QD/qualification state is not imported as ordinary settings.",
-        "Admin station coordinates and device-location actions persist; live GPS retains priority over manual positions."
+        "Admin station coordinates and device-location actions persist; live GPS retains priority over manual positions.",
+        "RRLS cannot use operational HTTP Clear/reset/override/self-test-confirmation routes. Bulk config preserves or revokes existing dry-test consent but cannot grant it; inert offline settings edits remain allowed. Authenticated mutation and callback regression tests pass."
       ],
       "remaining": []
     },
@@ -138,7 +145,7 @@
   "constraints": [
     "No physical hardware flashing or actuation occurred.",
     "Firmware SDK sources remain pinned to main; hosted requirement remains4. Frontend uses dev through --frontend-dev.",
-    "Keep50GiB disk reserve, bounded traces and sparse SD images; current free space is over450GiB.",
+    "Keep50GiB disk reserve, bounded traces and sparse SD images; current free space is 439GiB at latest check.",
     "Never read/log credentials or publish packages from this host.",
     "Keep failed/interrupted candidate evidence; do not relabel older runs as newer source qualification."
   ],
@@ -157,8 +164,8 @@
     "scope": "Historical4.2.6 frozen cohort. Current4.2.7 candidate source/artifact manifests are separate; do not interpret these as latest qualification."
   },
   "source_pushes": {
-    "status": "historical_4_2_6_source_pushes_current_4_2_7_pending",
-    "sdk_main_and_dev": "9a8140a",
+    "status": "sdk_4_2_7_source_pushed_dependent_backend_held_for_public_crate",
+    "sdk_main_and_dev": "b38b017",
     "backend_dev": "83d43ed plus final8c298f3 test-only/platform follow-up",
     "frontend_dev": "2b5bc86",
     "simulator_main": "1fd7ff6",
@@ -173,7 +180,7 @@
       "ActuatorBoard26": "79238da"
     },
     "frontend_main_promoted": false,
-    "scope": "These refs are historical pushed baseline. Current4.2.7 and sequence fixes remain local until fresh qualification passes. Registry publication is performed by maintainer on Mac."
+    "scope": "SDK source main/dev updated;4.2.7 tag/package not published. Hold dependent backend push until public4.2.7 API is available. Preserve immutable4.2.6 tag and historical baseline refs."
   },
   "github_release": {
     "version": "4.2.6",
