@@ -401,11 +401,16 @@ mod tests {
         let path = armed_fixture_for_test(&state, &router);
         router.remove_side(0).unwrap(); // This test deliberately has no ACK owner.
         let activity = state.transport_tx_activity.clone();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<(u8, Vec<u8>)>();
         router.add_side_packed("asynchronous_transport", move |wire| {
             if sedsnet::wire_format::peek_frame_info(wire)
                 .is_ok_and(|f| f.envelope.ty == crate::telemetry_schema::data_type("ABORT"))
             {
-                activity.try_enqueue(|| Ok(()))?;
+                activity.try_enqueue(|| {
+                    sender
+                        .send((255, wire.to_vec()))
+                        .map_err(|_| sedsnet::TelemetryError::Io("software transport closed"))
+                })?;
             }
             Ok(())
         });
@@ -414,6 +419,18 @@ mod tests {
             !router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT")),
             "no advertised peer: SDK has handed off this publication"
         );
+        assert!(state.has_pending_transport_tx());
+        let (_, wire) = receiver
+            .try_recv()
+            .expect("actual Comms channel owns the accepted abort");
+        let packet = sedsnet::wire_format::unpack_packet(&wire).unwrap();
+        assert_eq!(
+            packet.data_type(),
+            crate::telemetry_schema::data_type("ABORT")
+        );
+        assert_eq!(packet.payload(), b"Safety Task Abort Command Issued");
+        // Popping the software channel does not release ownership before the
+        // worker completes its write; active-write retries remain pending.
         assert!(state.has_pending_transport_tx());
         assert!(
             clear_ground_abort(&state)
