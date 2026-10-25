@@ -1,12 +1,34 @@
 {
-  "updated_utc": "2026-10-25T16:19:02.717315+00:00",
-  "source_ready": true,
+  "updated_utc": "2026-10-25T19:57:27.378147+00:00",
+  "source_ready": false,
   "release_ready": false,
-  "packages_published": false,
+  "packages_published": "4.2.6 crates.io confirmed;4.2.7 notpublished",
   "priorities": [
     {
+      "task": "4.2.7 independent-endpoint multicast and full flight acceptance",
+      "status": "qualification_in_progress",
+      "results": [
+        "Actual RF GPS C-ABI publication reproduced CAN1/radio0 despite success. SDK3971aef preserves distinct endpoint roles and now emits CAN1/radio1; redundant paths, explicit policies and retry ownership retain focused tests.",
+        "SDK4.2.7 snapshot55fcdd5 and FC managed-state callback c690a0a compile in all8 factory variants; no overflow. FCSDK-absent/Cargo+rustc-blocked factory also passes.",
+        "Simulator RTC/RCC modeld756b45 exercises unchanged real FC initialization: old clock_ready0/rejection1 becomes clock_ready1/rejection0; no safety flag injection.",
+        "Fresh RF zero-satellite reports now revoke cached lock, stale publications cannot restore it, and recovery requires newer comparable UTC (GS8a11dd9).",
+        "First70s ordinary-flight attempt and12s diagnostic remain non-passing flight evidence: actual Armed was reached but GPS positions were not routed to radio and FC blocked actuation on missing modeled recovery clock. No fake ACK, qualification or readiness fields were injected.",
+        "FinalSDKb6bdac4 passes both complete build.py test --full campaigns:721/747 Rust,81 nativePython/API/script tests per campaign, zero skips; compact pressure runs600.005seconds. Source packages for core and macro verify offline without credentials or publication.",
+        "Ordinaryflight70,000modelms positive passes on immutableimage328c6dc8: all7MCUs, GS and4links exit successfully; QDACK38.290s, Fire43.300s, FCLaunch received/accepted/processed exactlyonce, watchdogrejection0, pilotTplus53.340s. Actualsavedcoldflow receipt clears afterFire.",
+        "Actuator/Valve1Hz status fixes stale2second GSE freshness during QDsettlement without weakening interlocks; all8 final factory variants fit and warningclean.",
+        "Deterministic two-producer test reproduces automaticabort check/Firecommit race; atomic persisted claim and in-flight dispatch guard are being implemented.",
+        "FreshGPS-loss-during-QD negative also completes70,000modelms/all7MCUs+GS+4links exit0: realNMEAfixloss cancels queuedlaunch, Firefalse and FCLaunchrx0 throughsample60+. Rawdecoder satellitepayload extraction is separate diagnostic followup.",
+        "ActualGPSnegative wire decoder confirms12sat38.0607s+position38.085s, then0sat39.0497/40.0967s. Cancellation43.260s leaves savedFirefalse/generation0 and FCLaunch received/accepted/processed0. Strictfinished69strace has0codecerrors; explicit14usTXtimestampjitterbound preservesbyteorder."
+      ],
+      "remaining": [
+        "Finish atomic automaticabort/Fire exclusion including busy transport retainedABORT ownership through explicitClear, restart and storageerror cases; validate finalaffectedpolicy.",
+        "Repeat current-runtime two/three-radio600s network/source/SD and120s restart validation plus relay/outage; require actual GPS position preservation at GS/RRLS. EarlierSDK5b latency remains historical.",
+        "Update final source closures and push qualified4.2.7 sources before notifying local publisher; preserve published4.2.6."
+      ]
+    },
+    {
       "task": "Stable low-latency RF and fill-system communication",
-      "status": "simulator_qualified",
+      "status": "historical_baseline_passed_current_4_2_7_requalification_running",
       "results": [
         "Two- and three-radio startup,600-second network/source/SD tests and120-second GroundStation restart tests pass. PowerBoard compact is included in the three-radio cohort.",
         "Each long cohort completes59 RF control rounds in100\u2013210ms; source-window preservation is at least99.9131percent. All modeled CAN FIFO overflow counters remain zero.",
@@ -24,36 +46,40 @@
     },
     {
       "task": "Production sequence and checklist acceptance",
-      "status": "simulator_qualified",
+      "status": "test_fire_qualified_flight_acceptance_in_progress",
       "results": [
         "An independent firmware_sim build exercises ordinary test-fire policy without HITL or testing bypasses. Existing HITL behavior is preserved.",
         "Actual four-MCU flow passes self-test17.81s, nitrogen32.99s, Fill33.07s, Armed35.68s, Fire and pilot/T-plus45.72s. Input pressure/mass passes through modeled ADC/SPI hardware, real firmware and the network.",
         "Persisted automatic checklist receipts and cold-flow reset after Fire are observed; premature Fill/Nitrogen/Fire requests are rejected.",
         "Quantized fill completion now uses the existing cutoff tolerance consistently; below-target plateaus do not qualify. Committed Fire can accept actual pilot confirmation even while the fill engine remains paused.",
-        "Actual modeled pilot/igniter output timing and DAQ session/deadline memory are verified. No board timings or safety gates were weakened."
+        "Actual modeled pilot/igniter output timing and DAQ session/deadline memory are verified. No board timings or safety gates were weakened.",
+        "Finalcandidate ordinaryflight positive also passes70second linkedrun; pending atomicabort race closure and negativeGPS/QD acceptance remain separate."
       ],
       "evidence": [
         "FirmwareSimulator/docs/qualification/operational-gse-linked-2026-10-25.json"
       ],
       "remaining": [
+        "Finish atomic automaticabort/Fire exclusion and freshGPS-loss-during-QD negative acceptance; revalidate final affectedpolicy source.",
         "Physical pneumatic, combustion, key-switch and output-load acceptance remains outside simulator proof."
       ]
     },
     {
       "task": "SEDSnet full campaign and release tooling",
-      "status": "qualified_on_linux",
+      "status": "4_2_7_full_campaigns_and_packages_passed_simulator_gates_pending",
       "results": [
         "Both exact current full pipelines pass: default715 Rust+80 Python/API tests; compact/compression/fair/crypto741 Rust+80 Python/API tests. Zero skipped, unshortened600.005-second pressure test.",
         "The full runner now builds and loads the actual native Python extension. Historical72-test discoveries are correctly recorded as63 passed/9 skipped, separately from the new complete campaigns.",
         "UTC sample projection/steering and board holdover priority are corrected without wire-format/API or runtime state-size changes.",
         "Environment overrides, child output and quoted/encoded release diagnostics are sanitized. Fake-token tests pass; no real credentials were inspected.",
-        "Offline source package listing includes both new Python helpers and excludes credential filenames. Version remains4.2.6."
+        "Offline source package listing includes both new Python helpers and excludes credential filenames. Version remains4.2.6.",
+        "Current4.2.7 full campaigns pass721/747 Rust plus81 actualnativePython/API tests each,0skips, full600.005s pressure; macro/core offline package verification passes. Earlier4.2.6 results remain historical."
       ],
       "evidence": [
-        "SEDSnet/docs/qualification-4.2.6-2026-10-25.json"
+        "SEDSnet/docs/qualification-4.2.6-2026-10-25.json",
+        "SEDSnet/docs/qualification-4.2.7-2026-10-25.json"
       ],
       "remaining": [
-        "Final Mac qualification and local package publication require Mac access; no package or release tag has been published."
+        "Complete fresh4.2.7 simulator qualification and sourcepush; maintainer runs nativeMac release locally."
       ]
     },
     {
@@ -117,7 +143,7 @@
     "Keep failed/interrupted candidate evidence; do not relabel older runs as newer source qualification."
   ],
   "qualified_runtime_refs": {
-    "sdk": "5b15190 runtime;edb3b19 current scripts/docs",
+    "sdk": "5b15190 runtime;9a8140a current release scripts (macOS direct test-link fix)",
     "groundstation": "35d3492 runtime;8c298f3 packaging/test-only/platform follow-ups",
     "frontend_dev": "2b5bc86",
     "simulator": "1fd7ff6",
@@ -127,11 +153,12 @@
     "valve_board": "136eb1e",
     "daq": "f095625",
     "gateway": "72c8d8d",
-    "actuator": "b27a1ac"
+    "actuator": "b27a1ac",
+    "scope": "Historical4.2.6 frozen cohort. Current4.2.7 candidate source/artifact manifests are separate; do not interpret these as latest qualification."
   },
   "source_pushes": {
-    "status": "qualified_sources_pushed",
-    "sdk_main_and_dev": "edb3b19",
+    "status": "historical_4_2_6_source_pushes_current_4_2_7_pending",
+    "sdk_main_and_dev": "9a8140a",
     "backend_dev": "83d43ed plus final8c298f3 test-only/platform follow-up",
     "frontend_dev": "2b5bc86",
     "simulator_main": "1fd7ff6",
@@ -146,6 +173,20 @@
       "ActuatorBoard26": "79238da"
     },
     "frontend_main_promoted": false,
-    "scope": "Source only. Registry publication and Mac signing remain pending."
+    "scope": "These refs are historical pushed baseline. Current4.2.7 and sequence fixes remain local until fresh qualification passes. Registry publication is performed by maintainer on Mac."
+  },
+  "github_release": {
+    "version": "4.2.6",
+    "tag_commit": "edb3b19217a9c7abea134aee46f33a0e3c52bd59",
+    "url": "https://github.com/Rylan-Meilutis/SEDSnet/releases/tag/v4.2.6",
+    "tag_moved": false,
+    "packages": "4.2.6 crates.io publication confirmed; PyPI completion notconfirmed"
+  },
+  "target_release": "4.2.7",
+  "previous_publication": {
+    "version": "4.2.6",
+    "crates_io_published_at": "2026-10-25T17:34:00.033850Z",
+    "pypi_status_at_check": "404; maintainer publication in progress",
+    "check_scope": "public version metadata only, no credentials"
   }
 }
