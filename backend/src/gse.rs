@@ -804,10 +804,17 @@ async fn save_config(
     if let Err(err) = config.validate_settings() {
         return (StatusCode::BAD_REQUEST, err).into_response();
     }
-    let result = (|| -> Result<(), String> {
+    let result = (|| -> Result<(), (StatusCode, String)> {
         let mut rt = state.gse.lock().unwrap();
         if rt.engine.active() {
-            return Err("Stop the active sequence before editing GSE configuration".into());
+            return Err((StatusCode::CONFLICT, "Stop the active sequence before editing GSE configuration".into()));
+        }
+        // Bulk settings may preserve or revoke consent, but never grant it.
+        // Compare and assign under this same lock so an intervening nitrogen
+        // test cannot have its invalidated confirmation revived by stale UI.
+        if config.dry_self_test_confirmed && !rt.engine.config.dry_self_test_confirmed {
+            return Err((StatusCode::FORBIDDEN,
+                "Grant dry self-test confirmation through its dedicated control".into()));
         }
         #[cfg(not(feature = "hitl_mode"))]
         {
@@ -823,10 +830,10 @@ async fn save_config(
                     .qualification
                     .completed(Milestone::SelfTest)
             {
-                return Err("Reset operation checks before changing test pressure limits".into());
+                return Err((StatusCode::CONFLICT, "Reset operation checks before changing test pressure limits".into()));
             }
         }
-        persist_settings(&config)?;
+        persist_settings(&config).map_err(|error| (StatusCode::CONFLICT, error))?;
         rt.engine.config = config;
         #[cfg(feature = "hitl_mode")]
         {
@@ -839,7 +846,7 @@ async fn save_config(
             crate::sequences::refresh_action_policy_now(&state);
             Json(state.gse.lock().unwrap().engine.config.clone()).into_response()
         }
-        Err(err) => (StatusCode::CONFLICT, err).into_response(),
+        Err(error) => error.into_response(),
     }
 }
 async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
