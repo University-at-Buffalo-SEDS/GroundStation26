@@ -167,9 +167,12 @@ impl Store {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         fs::create_dir_all(parent)?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
         let temporary = self
             .path
-            .with_extension(format!("{}.tmp", std::process::id()));
+            .with_extension(format!("{}.{nonce}.tmp", std::process::id()));
         let result = (|| -> anyhow::Result<()> {
             let mut file = fs::OpenOptions::new()
                 .write(true)
