@@ -1,6 +1,8 @@
 //! Bounded local WebSocket crew voice, with an opt-in RRLS Opus bridge.
 //! Camera/video and voice recording are outside the radio voice path.
 use crate::{auth::Permission, state::AppState};
+#[path = "voice/program.rs"]
+mod program;
 use axum::{
     Router,
     extract::{
@@ -34,6 +36,7 @@ struct AudioFrame {
 #[derive(Default)]
 struct BroadcastHistory {
     enabled: bool,
+    commentary_enabled: bool,
     generation: u64,
     next: u64,
     frames: VecDeque<AudioFrame>,
@@ -44,10 +47,11 @@ pub(crate) struct VoiceHub {
 }
 
 impl VoiceHub {
-    pub(crate) async fn set_broadcast(&self, enabled: bool) {
+    pub(crate) async fn set_mix(&self, enabled: bool, commentary: bool) {
         let mut history = self.history.lock().await;
-        if history.enabled != enabled {
+        if history.enabled != enabled || history.commentary_enabled != commentary {
             history.enabled = enabled;
+            history.commentary_enabled = commentary;
             history.generation += 1;
             history.frames.clear();
         }
@@ -55,9 +59,22 @@ impl VoiceHub {
     async fn enabled(&self) -> bool {
         self.history.lock().await.enabled
     }
+    async fn commentary_enabled(&self) -> bool {
+        self.history.lock().await.commentary_enabled
+    }
     async fn capture(&self, speaker: u32, pcm: &[u8]) {
+        self.capture_source(speaker, pcm, false).await;
+    }
+    async fn capture_program(&self, speaker: u32, pcm: &[u8]) {
+        self.capture_source(speaker, pcm, true).await;
+    }
+    async fn capture_source(&self, speaker: u32, pcm: &[u8], commentary: bool) {
         let mut history = self.history.lock().await;
-        if !history.enabled {
+        if if commentary {
+            !history.commentary_enabled
+        } else {
+            !history.enabled
+        } {
             return;
         }
         history.next += 1;
@@ -90,7 +107,7 @@ impl VoiceHub {
         let delay = Duration::from_millis(u64::from(delay_seconds) * 1000 + 2500);
         let mut cursor = after.min(history.next);
         let mut frames = Vec::new();
-        if history.enabled {
+        if history.enabled || history.commentary_enabled {
             let start = history
                 .frames
                 .partition_point(|frame| frame.sequence <= cursor);
@@ -105,7 +122,7 @@ impl VoiceHub {
                 }
             }
         }
-        serde_json::json!({"enabled":history.enabled,"generation":history.generation,"cursor":cursor,"frames":frames})
+        serde_json::json!({"enabled":history.enabled||history.commentary_enabled,"generation":history.generation,"cursor":cursor,"frames":frames})
     }
 }
 
@@ -120,6 +137,7 @@ struct VoiceState {
     hub: Arc<VoiceHub>,
     peers: Mutex<BTreeMap<u32, Peer>>,
     next: AtomicU32,
+    program_slots: Arc<tokio::sync::Semaphore>,
 }
 
 pub fn routes(app: Arc<AppState>, hub: Arc<VoiceHub>) -> Router<Arc<AppState>> {
@@ -128,6 +146,7 @@ pub fn routes(app: Arc<AppState>, hub: Arc<VoiceHub>) -> Router<Arc<AppState>> {
         hub,
         peers: Mutex::new(BTreeMap::new()),
         next: AtomicU32::new(1),
+        program_slots: Arc::new(tokio::sync::Semaphore::new(4)),
     });
     if crate::rrls::voice_status().0 {
         let weak = Arc::downgrade(&voice_state);
@@ -164,8 +183,25 @@ pub fn routes(app: Arc<AppState>, hub: Arc<VoiceHub>) -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/voice/ws", get(upgrade))
         .route("/api/voice/status", get(capabilities))
+        .route("/api/program/commentary/ws", get(program::upgrade))
+        .route(
+            "/studio-audio",
+            get(|| async { Html(gs_browser_assets::STUDIO_AUDIO_HTML) }),
+        )
+        .route(
+            "/assets/studio-audio.js",
+            get(|| async {
+                (
+                    [("Content-Type", "text/javascript")],
+                    gs_browser_assets::STUDIO_AUDIO_JS,
+                )
+            }),
+        )
         .with_state(voice_state)
-        .route("/radio", get(|| async { Html(gs_browser_assets::VOICE_HTML) }))
+        .route(
+            "/radio",
+            get(|| async { Html(gs_browser_assets::VOICE_HTML) }),
+        )
         .route(
             "/assets/voice.js",
             get(|| async {
@@ -200,7 +236,7 @@ async fn capabilities(
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     let mut response = match crate::web::authorize_headers(&state.app, &headers, Permission::ViewData).await {
-        Ok(p) => axum::Json(serde_json::json!({"can_transmit":!p.anonymous && p.permissions.allows(Permission::VoiceTransmit),"broadcast_enabled":state.hub.enabled().await,"radio":crate::radio_voice::status()})).into_response(),
+        Ok(p) => axum::Json(serde_json::json!({"can_transmit":!p.anonymous && p.permissions.allows(Permission::VoiceTransmit),"can_listen":!p.anonymous&&(p.permissions.allows(Permission::VoiceTransmit)||p.can_manage_stream()),"can_commentate":!p.anonymous&&p.can_manage_stream(),"commentary_enabled":state.hub.commentary_enabled().await,"broadcast_enabled":state.hub.enabled().await,"radio":crate::radio_voice::status()})).into_response(),
         Err(response) => response,
     };
     response.headers_mut().insert(
@@ -261,10 +297,15 @@ async fn connection(state: Arc<VoiceState>, mut socket: WebSocket) {
     let principal = match state
         .app
         .auth
-        .authorize_token(&state.app.auth_db, Some(&token), Permission::VoiceTransmit)
+        .authorize_token(&state.app.auth_db, Some(&token), Permission::ViewData)
         .await
     {
-        Ok(p) if !p.anonymous => p,
+        Ok(p)
+            if !p.anonymous
+                && (p.permissions.allows(Permission::VoiceTransmit) || p.can_manage_stream()) =>
+        {
+            p
+        }
         _ => {
             reject(
                 &mut socket,
@@ -274,6 +315,7 @@ async fn connection(state: Arc<VoiceState>, mut socket: WebSocket) {
             return;
         }
     };
+    let mut can_transmit = principal.permissions.allows(Permission::VoiceTransmit);
     let id = state.next.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = mpsc::channel(16); // bounded to about 320 ms of audio per listener
     {
@@ -309,7 +351,7 @@ async fn connection(state: Arc<VoiceState>, mut socket: WebSocket) {
                     Message::Binary(bytes) => {
                         if !budget.accept() || bytes.len() != FRAME_BYTES { break; }
                         let peers = state.peers.lock().await;
-                        if !peers.get(&id).is_some_and(|p| p.transmitting) { continue; }
+                        if !can_transmit || !peers.get(&id).is_some_and(|p| p.transmitting) { continue; }
                         let radio=peers.get(&id).is_some_and(|p|p.radio_enabled);
                         let mut packet = Vec::with_capacity(4 + FRAME_BYTES);
                         packet.extend_from_slice(&id.to_le_bytes()); packet.extend_from_slice(&bytes);
@@ -326,13 +368,13 @@ async fn connection(state: Arc<VoiceState>, mut socket: WebSocket) {
                         match serde_json::from_str::<Control>(&raw) {
                             Ok(Control::Transmitting { enabled }) => {
                                 let mut peers = state.peers.lock().await;
-                                if let Some(peer) = peers.get_mut(&id) { peer.transmitting = enabled; }
+                                if let Some(peer) = peers.get_mut(&id) { peer.transmitting = enabled && can_transmit; }
                                 roster(&peers);
                                 drop(peers);
                                 if !enabled {crate::radio_voice::release(id);}
                             }
                             Ok(Control::Radio{enabled})=>{
-                                let allowed=enabled && crate::rrls::voice_status().1;
+                                let allowed=enabled && can_transmit && crate::rrls::voice_status().1;
                                 let mut peers=state.peers.lock().await;
                                 if let Some(peer)=peers.get_mut(&id) {
                                     peer.radio_enabled=allowed;
@@ -355,7 +397,9 @@ async fn connection(state: Arc<VoiceState>, mut socket: WebSocket) {
             }
             _ = interval.tick() => {
                 if last_message.elapsed() > Duration::from_secs(40) { break; }
-                if !matches!(state.app.auth.authorize_token(&state.app.auth_db, Some(&token), Permission::VoiceTransmit).await, Ok(p) if !p.anonymous) { break; }
+                let current=match state.app.auth.authorize_token(&state.app.auth_db,Some(&token),Permission::ViewData).await {Ok(p) if !p.anonymous && (p.permissions.allows(Permission::VoiceTransmit)||p.can_manage_stream())=>p,_=>break};
+                can_transmit=current.permissions.allows(Permission::VoiceTransmit);
+                if !can_transmit {if let Some(peer)=state.peers.lock().await.get_mut(&id){peer.transmitting=false;peer.radio_enabled=false;}crate::radio_voice::release(id);}
                 roster(&*state.peers.lock().await);
                 let radio=crate::radio_voice::status();
                 if radio["available"].as_bool()!=Some(true) {
@@ -403,7 +447,7 @@ mod tests {
         let hub = VoiceHub::default();
         hub.capture(1, &[0; FRAME_BYTES]).await;
         assert!(hub.history.lock().await.frames.is_empty());
-        hub.set_broadcast(true).await;
+        hub.set_mix(true, false).await;
         hub.capture(1, &[0; FRAME_BYTES]).await;
         assert_eq!(
             hub.audience_batch(0, 3).await["frames"]
@@ -424,10 +468,10 @@ mod tests {
                 .len(),
             0
         );
-        hub.set_broadcast(false).await;
+        hub.set_mix(false, false).await;
         assert!(hub.history.lock().await.frames.is_empty());
         hub.capture(1, &[0; FRAME_BYTES]).await;
-        hub.set_broadcast(true).await;
+        hub.set_mix(true, false).await;
         assert_eq!(
             hub.audience_batch(0, 3).await["frames"]
                 .as_array()
@@ -456,6 +500,7 @@ mod tests {
             hub: Arc::new(VoiceHub::default()),
             peers: Mutex::new(BTreeMap::new()),
             next: AtomicU32::new(1),
+            program_slots: Arc::new(tokio::sync::Semaphore::new(4)),
         });
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(

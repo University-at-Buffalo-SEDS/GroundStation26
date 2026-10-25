@@ -267,6 +267,7 @@ mod tests {
             hls_segments: Mutex::new(std::collections::HashMap::new()),
             preview_sessions: Mutex::new(Vec::new()),
             publishers: Mutex::new(Vec::new()),
+            recorded_vehicle_cache: Mutex::new(Default::default()),
         });
         let headers = |name: &str| {
             let mut h = HeaderMap::new();

@@ -3,8 +3,12 @@
 mod contract;
 #[path = "media/publishing.rs"]
 mod publishing;
+#[path = "media/recorded_vehicle.rs"]
+mod recorded_vehicle;
 #[path = "media/recordings.rs"]
 mod recordings;
+#[path = "media/rundown.rs"]
+mod rundown;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
@@ -41,6 +45,7 @@ struct MediaState {
     hls_segments: Mutex<std::collections::HashMap<(String, String), u64>>,
     preview_sessions: Mutex<Vec<(String, String, String)>>,
     publishers: Mutex<Vec<publishing::Publisher>>,
+    recorded_vehicle_cache: Mutex<recorded_vehicle::SceneCache>,
 }
 
 pub fn router(
@@ -72,6 +77,7 @@ pub fn router(
         hls_segments: Mutex::new(std::collections::HashMap::new()),
         preview_sessions: Mutex::new(Vec::new()),
         publishers: Mutex::new(Vec::new()),
+        recorded_vehicle_cache: Mutex::new(Default::default()),
         models: std::env::var_os("GS_STAGE_MODELS_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/stage_models")),
@@ -86,6 +92,7 @@ pub fn router(
         .merge(contract::routes())
         .merge(recordings::routes())
         .merge(publishing::routes())
+        .merge(recorded_vehicle::routes())
         .route("/api/video/streams", get(list_streams))
         .route(
             "/api/video/streams/{id}/whep",

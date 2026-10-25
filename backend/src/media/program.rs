@@ -7,6 +7,33 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
     Router::new()
         .route("/api/media-assets/program", get(page))
         .route(
+            "/assets/program-map.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript")],
+                    gs_browser_assets::PROGRAM_MAP_JS,
+                )
+            }),
+        )
+        .route(
+            "/assets/maplibre-gl.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript")],
+                    gs_browser_assets::MAPLIBRE_JS,
+                )
+            }),
+        )
+        .route(
+            "/assets/maplibre-gl.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css")],
+                    gs_browser_assets::MAPLIBRE_CSS,
+                )
+            }),
+        )
+        .route(
             "/assets/program-art.js",
             get(|| async {
                 (
@@ -156,30 +183,6 @@ async fn program_state(
     let headers = ticket_headers(&state, &headers, &query, "program").await?;
     authorize(&state, &headers, Permission::ViewData).await?;
     let presentation = read_presentation(&state).await?;
-    let mut streams = Vec::new();
-    let available = fetch_streams(&state).await.unwrap_or_default().0;
-    let chosen: Vec<String> = if let Some(replay) = &presentation.broadcast.replay {
-        replay.cameras.iter().map(|c| c.id.clone()).collect()
-    } else {
-        available
-            .iter()
-            .filter(|s| s.live && !presentation.broadcast.hidden_stream_ids.contains(&s.id))
-            .take(8)
-            .map(|s| s.id.clone())
-            .collect()
-    };
-    for id in chosen {
-        let access = ticket(&state, &headers, &format!("stream:{id}")).await?;
-        let url = if let Some(replay) = &presentation.broadcast.replay {
-            format!(
-                "/api/media-assets/replay/{}/{id}/index.m3u8?ticket={access}",
-                replay.id
-            )
-        } else {
-            format!("/api/media-assets/hls/{id}/index.m3u8?ticket={access}")
-        };
-        streams.push(serde_json::json!({"id":id,"label":presentation.stream_labels.get(&id).unwrap_or(&id),"url":url}));
-    }
     let now = now_ms();
     let history = state.program_history.lock().await;
     let target = presentation
@@ -197,6 +200,52 @@ async fn program_state(
     } else {
         live_telemetry
     };
+    let mut streams = Vec::new();
+    let effective_scene = telemetry
+        .as_ref()
+        .and_then(|v| v.get("scene"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| *s != "inherit")
+        .unwrap_or(&presentation.broadcast.layout);
+    let no_video = presentation.broadcast.replay.is_none()
+        && matches!(effective_scene, "map" | "recorded-replay");
+    // Maps, saved flight scenes and cached camera replays must not wait on a
+    // disconnected live camera relay before updating telemetry/coordinates.
+    let available = if no_video || presentation.broadcast.replay.is_some() {
+        Vec::new()
+    } else {
+        fetch_streams(&state).await.unwrap_or_default().0
+    };
+    let chosen: Vec<String> = if no_video {
+        Vec::new()
+    } else if let Some(replay) = &presentation.broadcast.replay {
+        replay.cameras.iter().map(|c| c.id.clone()).collect()
+    } else {
+        available
+            .iter()
+            .filter(|s| {
+                s.live
+                    && !presentation.broadcast.hidden_stream_ids.contains(&s.id)
+                    && (effective_scene != "interview"
+                        || s.id == presentation.broadcast.interview.main_stream_id
+                        || s.id == presentation.broadcast.interview.pip_stream_id)
+            })
+            .take(8)
+            .map(|s| s.id.clone())
+            .collect()
+    };
+    for id in chosen {
+        let access = ticket(&state, &headers, &format!("stream:{id}")).await?;
+        let url = if let Some(replay) = &presentation.broadcast.replay {
+            format!(
+                "/api/media-assets/replay/{}/{id}/index.m3u8?ticket={access}",
+                replay.id
+            )
+        } else {
+            format!("/api/media-assets/hls/{id}/index.m3u8?ticket={access}")
+        };
+        streams.push(serde_json::json!({"id":id,"label":presentation.stream_labels.get(&id).unwrap_or(&id),"url":url}));
+    }
     Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"server_now_ms":now,"telemetry":telemetry}))).into_response())
 }
 
@@ -214,7 +263,9 @@ async fn program_audio(
 ) -> ApiResult<Response> {
     authorize_media(&state, &headers, &query, "program").await?;
     let broadcast = read_presentation(&state).await?.broadcast;
-    let batch = if broadcast.comms_audio_enabled && broadcast.replay.is_none() {
+    let batch = if (broadcast.comms_audio_enabled || broadcast.commentary_audio_enabled)
+        && broadcast.replay.is_none()
+    {
         state
             .voice
             .audience_batch(cursor.after, broadcast.delay_seconds)
@@ -243,29 +294,23 @@ pub(super) fn telemetry_snapshot(
     now: u64,
 ) -> serde_json::Value {
     let phase = *app.state.lock().unwrap();
-    let fill_visible = cfg!(feature = "test_fire_mode")
-        || matches!(
-            phase,
-            crate::types::FlightState::Startup
-                | crate::types::FlightState::Idle
-                | crate::types::FlightState::PreFill
-                | crate::types::FlightState::FillTest
-                | crate::types::FlightState::NitrogenFill
-                | crate::types::FlightState::NitrousFill
-                | crate::types::FlightState::Armed
-                | crate::types::FlightState::Aborted
-        );
+    let (profile_id, profile) = presentation
+        .broadcast
+        .rundown
+        .profile(phase, cfg!(feature = "test_fire_mode"));
+    let fill_source = app.fill_targets.lock().unwrap().fill_source;
     let stats: Vec<_> = {
         let rows = app.recent_telemetry_cache.lock().unwrap();
-        presentation.stats.iter().filter(|stat|fill_visible || !matches!(stat.binding.data_type.as_str(),"KG50"|"KG1000"|"LOADCELL_WEIGHT_KG"|"LOADCELL_50_WEIGHT_KG"|"LOADCELL_FILL_PERCENT"|"FUEL_TANK_PRESSURE"|"PRESSURE_TRANSDUCER_CALIBRATED"|"VALVE_STATE")).map(|stat|{
-            let b=&stat.binding;
-            let value=rows.iter().rev().find(|r|r.data_type==b.data_type && b.sender_id.as_ref().is_none_or(|s|s==&r.sender_id))
+        profile.stats.iter().map(|stat| {
+            let (binding, absolute) = stat.binding_for_fill(fill_source);
+            let value = rows.iter().rev().find(|r|r.data_type==binding.data_type && binding.sender_id.as_ref().is_none_or(|s|s==&r.sender_id))
                 .filter(|r|r.timestamp_ms>=0 && now.saturating_sub(r.timestamp_ms as u64)<5000)
-                .and_then(|r|r.values.get(b.index).copied().flatten()).map(|v|v*b.scale+b.offset).filter(|v|v.is_finite());
-            serde_json::json!({"label":stat.label,"value":value,"unit":stat.unit,"precision":stat.precision.min(6),"binding":b})
+                .and_then(|r|r.values.get(binding.index).copied().flatten())
+                .map(|v|if absolute {v.abs()}else{v}).map(|v|v*binding.scale+binding.offset).filter(|v|v.is_finite());
+            serde_json::json!({"label":stat.label,"value":value,"unit":stat.unit,"precision":stat.precision,"format":stat.format,"binding":binding})
         }).collect()
     };
-    serde_json::json!({"phase":format!("{phase:?}"),"test_fire_mode":cfg!(feature="test_fire_mode"),"stats":stats,"t_clock":program_t_clock(&app.launch_clock_snapshot(),now.min(i64::MAX as u64) as i64)})
+    serde_json::json!({"phase":format!("{phase:?}"),"test_fire_mode":cfg!(feature="test_fire_mode"),"stats":stats,"profile":profile_id,"cycle_seconds":profile.cycle_seconds,"stats_per_page":profile.stats_per_page,"scene":profile.scene,"positions":crate::antenna::snapshot(),"t_clock":program_t_clock(&app.launch_clock_snapshot(),now.min(i64::MAX as u64) as i64)})
 }
 
 fn valid_hls_file(name: &str) -> bool {
@@ -660,10 +705,11 @@ mod tests {
     #[tokio::test]
     async fn dashboard_resolves_channels_and_marks_stale_samples_unknown() {
         let app = crate::state::tests::test_app_state().await;
-        let profile = Presentation {
-            stats: default_stats(),
-            ..Presentation::default()
-        };
+        let mut profile = Presentation::default();
+        // Exercise generic configured bindings independently of stock phase profiles.
+        for page in profile.broadcast.rundown.profiles.values_mut() {
+            page.stats = default_stats().into_iter().map(Into::into).collect();
+        }
         app.recent_telemetry_cache
             .lock()
             .unwrap()

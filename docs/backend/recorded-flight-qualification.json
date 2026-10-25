@@ -1,0 +1,26 @@
+{
+  "date": "2026-10-25",
+  "feature": "saved recorded flight replay and audience scene",
+  "checks": {
+    "backend_recorded_vehicle": "5 passed",
+    "backend_recording_replay": "14 passed",
+    "frontend_native": "136 passed, 7 ignored",
+    "renderer_webgl": "passed at 1280, 390, 320 pixels; apogee, ground/horizon, orbit, touch pinch",
+    "audience_browser": "passed at 1280, 390, 320 pixels; saved-only playback, source switches, freeze, pause",
+    "pure_js": "replay-scene.test.mjs and saved-replay-player.test.mjs passed"
+  },
+  "limitations": [
+    "Synthetic local saved data only; no live devices or output commands",
+    "Physical Raspberry Pi/iOS/Android GPU validation remains outstanding",
+    "Ground is a reference Earth surface rather than surveyed terrain",
+    "Active recording expands only when operator refreshes saved snapshot"
+  ],
+  "sha256": {
+    "Seds-Ground-Station-Frontend/station_ui/rendering/three/saved-replay-player.js": "f1b8100faf2d75806a7bd82a029ee515a50ffeb15c88c99b5dc542e4f723e490",
+    "Seds-Ground-Station-Frontend/station_ui/rendering/three/replay-scene.js": "5ebc053e54d0c9d1bb78bded6f59605a268f3254a08fc929cf1230d61d2cbf3a",
+    "Seds-Ground-Station-Frontend/station_ui/rendering/three/vehicle-renderer.js": "cc56fdc654e66ef9b0d784d370539b980ba30cd6ff185a9553c4b740dec16b9f",
+    "Seds-Ground-Station-Frontend/src/telemetry_dashboard/recorded_replay_controls.rs": "6111bb40adc95461753b5c6e6917a73de6feb37e75ece2d0ae9187b07af4c660",
+    "GroundStation26/backend/src/media/recorded_vehicle.rs": "16512fabc465bfc28da1376214443efe90da42d985577043571c16ee1a52935f",
+    "GroundStation26/backend/src/recording_replay.rs": "e41343730a2a7b57336007df9653e7f71275d0f7d512c554c3e9006a6245d0c6"
+  }
+}

@@ -18,6 +18,10 @@ pub(super) struct Broadcast {
     layout: String,
     revision: u64,
     replay: Option<replay::Plan>,
+    rundown: super::rundown::Rundown,
+    commentary_audio_enabled: bool,
+    interview: Interview,
+    pub(super) recorded_replay: Option<super::recorded_vehicle::RecordedReplayPlan>,
 }
 
 impl Default for Broadcast {
@@ -31,31 +35,54 @@ impl Default for Broadcast {
             layout: "hero".into(),
             revision: 0,
             replay: None,
+            rundown: Default::default(),
+            commentary_audio_enabled: false,
+            interview: Default::default(),
+            recorded_replay: None,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct Interview {
+    main_stream_id: String,
+    pip_stream_id: String,
+    main_audio: bool,
+    pip_audio: bool,
+}
+impl Default for Interview {
+    fn default() -> Self {
+        Self {
+            main_stream_id: String::new(),
+            pip_stream_id: String::new(),
+            main_audio: true,
+            pip_audio: false,
         }
     }
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
-struct Presentation {
+pub(super) struct Presentation {
     title: String,
     stream_labels: BTreeMap<String, String>,
     stats: Vec<BroadcastStat>,
-    broadcast: Broadcast,
-    vehicle: Vehicle,
+    pub(super) broadcast: Broadcast,
+    pub(super) vehicle: Vehicle,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct Binding {
-    data_type: String,
+pub(super) struct Binding {
+    pub(super) data_type: String,
     #[serde(default)]
-    sender_id: Option<String>,
+    pub(super) sender_id: Option<String>,
     #[serde(default)]
-    index: usize,
+    pub(super) index: usize,
     #[serde(default = "one")]
-    scale: f32,
+    pub(super) scale: f32,
     #[serde(default)]
-    offset: f32,
+    pub(super) offset: f32,
 }
 fn one() -> f32 {
     1.0
@@ -65,13 +92,13 @@ fn precision() -> usize {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct BroadcastStat {
-    label: String,
-    binding: Binding,
+pub(super) struct BroadcastStat {
+    pub(super) label: String,
+    pub(super) binding: Binding,
     #[serde(default)]
-    unit: String,
+    pub(super) unit: String,
     #[serde(default = "precision")]
-    precision: usize,
+    pub(super) precision: usize,
 }
 
 fn default_stats() -> Vec<BroadcastStat> {
@@ -126,7 +153,7 @@ fn default_stats() -> Vec<BroadcastStat> {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
-struct Vehicle {
+pub(super) struct Vehicle {
     motions: Vec<Motion>,
     title: String,
     model_url: String,
@@ -244,7 +271,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
         .route("/api/media-assets/models/{stage}/{name}", get(model_asset))
 }
 
-async fn read_presentation(state: &MediaState) -> ApiResult<Presentation> {
+pub(super) async fn read_presentation(state: &MediaState) -> ApiResult<Presentation> {
     let mut presentation: Presentation =
         match tokio::fs::read(state.models.join("_presentation.json")).await {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| {
@@ -257,6 +284,11 @@ async fn read_presentation(state: &MediaState) -> ApiResult<Presentation> {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Presentation::default()),
             Err(err) => Err(io_error(err)),
         }?;
+    presentation
+        .broadcast
+        .rundown
+        .validate()
+        .map_err(|message| error(StatusCode::INTERNAL_SERVER_ERROR, message))?;
     if let Some(plan) = &presentation.broadcast.replay {
         if !replay::available(state, plan).await {
             presentation.broadcast.replay = None;
@@ -282,12 +314,36 @@ async fn read_presentation(state: &MediaState) -> ApiResult<Presentation> {
     Ok(presentation)
 }
 
+/// Normalize the same saved model contract as the operator replay without
+/// putting a login token into an audience scene or uploaded-model URL.
+pub(super) async fn recorded_vehicle_config(
+    state: &Arc<MediaState>,
+    headers: &HeaderMap,
+    query: &MediaQuery,
+) -> ApiResult<serde_json::Value> {
+    let headers = ticket_headers(state, headers, query, "program").await?;
+    let vehicle = load_vehicle(state.clone(), headers).await?;
+    serde_json::to_value(vehicle).map_err(|_| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Saved replay configuration unavailable",
+        )
+    })
+}
+
+pub(super) fn program_now_ms() -> u64 {
+    program::now_ms()
+}
+
 pub(super) async fn initialize_voice_broadcast(state: &MediaState) {
     let _guard = state.presentation_write.lock().await;
     if let Ok(presentation) = read_presentation(state).await {
         state
             .voice
-            .set_broadcast(presentation.broadcast.comms_audio_enabled)
+            .set_mix(
+                presentation.broadcast.comms_audio_enabled,
+                presentation.broadcast.commentary_audio_enabled,
+            )
             .await;
     }
 }
@@ -482,7 +538,7 @@ async fn live_streams(
         .into_response())
 }
 
-async fn control_broadcast(
+pub(super) async fn control_broadcast(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
     axum::Json(mut broadcast): axum::Json<Broadcast>,
@@ -495,15 +551,56 @@ async fn control_broadcast(
             "Stream-master permission required",
         ));
     }
+    broadcast
+        .rundown
+        .validate()
+        .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
     if broadcast.label.len() > 200
         || !(3..=60).contains(&broadcast.delay_seconds)
-        || !["hero", "grid", "model", "grid-model"].contains(&broadcast.layout.as_str())
+        || ![
+            "hero",
+            "grid",
+            "model",
+            "grid-model",
+            "interview",
+            "map",
+            "recorded-replay",
+        ]
+        .contains(&broadcast.layout.as_str())
         || broadcast.hidden_stream_ids.len() > 1000
     {
         return Err(error(
             StatusCode::BAD_REQUEST,
             "Invalid broadcast label, layout or camera list",
         ));
+    }
+    if broadcast.layout == "interview"
+        || broadcast
+            .rundown
+            .profiles
+            .values()
+            .any(|p| p.scene == "interview")
+    {
+        if broadcast.interview.main_stream_id.is_empty()
+            || broadcast.interview.pip_stream_id.is_empty()
+            || broadcast.interview.main_stream_id == broadcast.interview.pip_stream_id
+        {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "Choose different interview and picture-in-picture camera/participant feeds",
+            ));
+        }
+    }
+    for id in [
+        &broadcast.interview.main_stream_id,
+        &broadcast.interview.pip_stream_id,
+    ] {
+        if !id.is_empty() {
+            check_id(id)?;
+        }
+    }
+    if let Some(plan) = broadcast.recorded_replay.as_mut() {
+        super::recorded_vehicle::validate_plan(&state, plan).await?;
     }
     if !broadcast.featured_stream_id.is_empty() {
         check_id(&broadcast.featured_stream_id)?;
@@ -531,7 +628,10 @@ async fn control_broadcast(
     write_presentation(&state, &presentation).await?;
     state
         .voice
-        .set_broadcast(broadcast.comms_audio_enabled)
+        .set_mix(
+            broadcast.comms_audio_enabled,
+            broadcast.commentary_audio_enabled,
+        )
         .await;
     Ok(axum::Json(broadcast))
 }

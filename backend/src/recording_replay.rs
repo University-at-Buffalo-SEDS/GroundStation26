@@ -458,9 +458,145 @@ pub async fn trajectory(
     }
 }
 
+#[derive(Serialize)]
+struct FlightSnapshot {
+    upper_id: i64,
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+    flight_detected: bool,
+}
+async fn flight_snapshot_from(db: &SqlitePool) -> anyhow::Result<FlightSnapshot> {
+    let snapshot = snapshot_from(db).await?;
+    // Repeated phase samples are not repeated launches. Select the latest
+    // actual saved transition into Ascent, with Launch as a pre-ascent fallback.
+    let row=sqlx::query("WITH flight AS (SELECT id,timestamp_ms,CASE WHEN json_valid(values_json) THEN json_extract(values_json,'$[0]') END AS phase FROM telemetry WHERE id <= ? AND sender_id='FC' AND data_type='FLIGHT_STATE'), edges AS (SELECT *,LAG(phase) OVER(ORDER BY id) AS previous FROM flight) SELECT id,timestamp_ms FROM edges WHERE phase IN (7,8) AND (previous IS NULL OR previous != phase) ORDER BY id DESC LIMIT 1")
+        .bind(snapshot.upper_id).fetch_optional(db).await?;
+    let first_id = row
+        .as_ref()
+        .map(|row| row.try_get::<i64, _>("id"))
+        .transpose()?;
+    let start = row
+        .map(|row| row.try_get::<i64, _>("timestamp_ms"))
+        .transpose()?;
+    let end = if let Some(start) = start {
+        let prior: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(timestamp_ms) FROM telemetry WHERE id<?")
+                .bind(first_id.unwrap())
+                .fetch_one(db)
+                .await?;
+        anyhow::ensure!(
+            prior.is_none_or(|time| time <= start),
+            "Saved clock epochs overlap the selected flight"
+        );
+        let row=sqlx::query("SELECT MIN(timestamp_ms) AS landed FROM telemetry WHERE id<=? AND id>=? AND timestamp_ms>=? AND sender_id='FC' AND data_type='FLIGHT_STATE' AND CASE WHEN json_valid(values_json) THEN json_extract(values_json,'$[0]') IN (13,14) ELSE 0 END")
+            .bind(snapshot.upper_id).bind(first_id.unwrap()).bind(start).fetch_one(db).await?;
+        row.try_get::<Option<i64>, _>("landed")?
+            .map(|end| end.saturating_add(5000).min(snapshot.end_ms.unwrap_or(end)))
+            .or(snapshot.end_ms)
+    } else {
+        snapshot.end_ms
+    };
+    Ok(FlightSnapshot {
+        upper_id: snapshot.upper_id,
+        start_ms: start.or(snapshot.start_ms),
+        end_ms: end,
+        flight_detected: start.is_some(),
+    })
+}
+pub async fn flight_snapshot(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(response) =
+        crate::web::authorize_headers(&state, &headers, Permission::ViewData).await
+    {
+        return response;
+    }
+    let db = match open(&state, &id).await {
+        Ok(db) => db,
+        Err(code) => return code.into_response(),
+    };
+    match flight_snapshot_from(&db).await {
+        Ok(value) => json(value),
+        Err(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Recording contains unreadable flight bounds",
+        )
+            .into_response(),
+    }
+}
+
+/// Internal read-only entry points. Media callers authorize a narrow selected
+/// replay capability before invoking these; recording IDs still use the same
+/// guarded directory lookup as the authenticated recording APIs.
+pub(crate) async fn saved_snapshot(state: &AppState, id: &str) -> anyhow::Result<Snapshot> {
+    let db = open(state, id)
+        .await
+        .map_err(|status| anyhow::anyhow!("Recording unavailable ({status})"))?;
+    snapshot_from(&db).await
+}
+pub(crate) async fn saved_window(
+    state: &AppState,
+    id: &str,
+    upper_id: i64,
+    after_id: i64,
+    start_ms: i64,
+    end_ms: i64,
+    types: Vec<String>,
+) -> anyhow::Result<Page> {
+    let window = Window {
+        upper_id,
+        after_id,
+        start_ms,
+        end_ms,
+        types: serde_json::to_string(&types)?,
+    };
+    window.types()?;
+    let db = open(state, id)
+        .await
+        .map_err(|status| anyhow::anyhow!("Recording unavailable ({status})"))?;
+    page_from(&db, &window).await
+}
+pub(crate) async fn saved_trajectory(
+    state: &AppState,
+    id: &str,
+    upper_id: i64,
+) -> anyhow::Result<Trajectory> {
+    let db = open(state, id)
+        .await
+        .map_err(|status| anyhow::anyhow!("Recording unavailable ({status})"))?;
+    trajectory_from(&db, upper_id).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn flight_selection_skips_fill_and_repeated_phase_samples_and_stops_after_landing() {
+        let db = db().await;
+        insert(&db, 1000, "ROLL", "[1]").await;
+        insert(&db, 5000, "FLIGHT_STATE", "[7]").await;
+        insert(&db, 6000, "FLIGHT_STATE", "[8]").await;
+        insert(&db, 7000, "FLIGHT_STATE", "[8]").await;
+        insert(&db, 10000, "FLIGHT_STATE", "[13]").await;
+        insert(&db, 30000, "ROLL", "[99]").await;
+        let bounds = flight_snapshot_from(&db).await.unwrap();
+        assert!(bounds.flight_detected);
+        assert_eq!(bounds.start_ms, Some(6000));
+        assert_eq!(bounds.end_ms, Some(15000));
+        insert(&db, 31000, "FLIGHT_STATE", "[7]").await;
+        insert(&db, 32000, "FLIGHT_STATE", "[8]").await;
+        let next = flight_snapshot_from(&db).await.unwrap();
+        assert_eq!(next.start_ms, Some(32000));
+        assert_eq!(next.end_ms, Some(32000));
+        insert(&db, 1000, "FLIGHT_STATE", "[1]").await;
+        insert(&db, 2000, "FLIGHT_STATE", "[8]").await;
+        assert!(
+            flight_snapshot_from(&db).await.is_err(),
+            "overlappingwallclockepochs mustnotmixdifferentflights"
+        );
+    }
     #[tokio::test]
     async fn replay_http_routes_authorize_and_read_only_the_selected_recording() {
         use axum::{

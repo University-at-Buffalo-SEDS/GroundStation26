@@ -38,6 +38,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(crate::recording_replay::snapshot),
         )
         .route(
+            "/api/recordings/{id}/replay/flight",
+            get(crate::recording_replay::flight_snapshot),
+        )
+        .route(
             "/api/recordings/{id}/replay/window",
             get(crate::recording_replay::window),
         )

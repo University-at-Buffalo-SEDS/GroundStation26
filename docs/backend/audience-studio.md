@@ -1,0 +1,23 @@
+# Audience studio and commentary
+
+The persisted media presentation holds `broadcast.rundown`, `broadcast.interview`, `broadcast.commentary_audio_enabled` and the separately documented `broadcast.recorded_replay`. Updates use the existing authenticated `POST /api/live_streams/control` with the presentation revision. Stream masters, stream administrators and application administrators can edit; viewers cannot. Stale revisions return HTTP 409. Saving the atomic presentation file survives MediaState/backend restart.
+
+`rundown.profiles` includes `ground`, `flight`, `recovery` and `test_fire`. Each profile specifies `title`, `cycle_seconds` (1–30), `stats_per_page` (1–6), `scene` and ordered `stats`. A stat has label, telemetry binding, unit, precision, source (`telemetry` or `selected_fill_mass`) and format (`number`, `boolean` or `valve`). Additional bounded profiles and known flight-phase assignments are supported. Invalid phases, scenes, nonfinite transformations, excessive strings/collections and channel bounds are rejected. The default test-fire policy always selects test-fire content, independent of Fire/Launch phase. These profiles affect audience snapshots only; they never mutate Dashboard display or operational state.
+
+Audience snapshots resolve the configured calibrated fill source and reject stale/nonfinite metric values. The programme's history/delay retains the same snapshot and T-clock policy. Unknown GPS-lock telemetry remains unavailable rather than being inferred from satellite count. Map scenes consume `antenna::snapshot` canonical rocket/station positions, including saved/manual and stale flags. Map and saved-vehicle scenes do not require a successful live MediaMTX camera-list request.
+
+`interview` specifies `main_stream_id`, `pip_stream_id`, `main_audio` and `pip_audio`. Feed IDs must exist, differ, and be selected explicitly. Existing browser-camera WHIP publishing remains permission/session-owned. Publishers opt into their camera microphone; H.264 preferences are applied only to video transceivers, leaving the negotiated audio codec independent. No guest invitation/authentication mechanism is introduced.
+
+## Programme microphone isolation
+
+`GET /api/voice/status` reports `can_listen`, `can_transmit`, `can_commentate` and `commentary_enabled`. Stream managers may monitor crew voice without microphone/transmit rights. The existing crew WebSocket enforces transmit permission for every binary/transmitting/radio action, including clients with receive-only admission.
+
+`GET /api/program/commentary/ws` is a separate WebSocket. Authentication is the first text frame, never a URL credential. Admission and periodic rechecks require an active authenticated ViewData session with stream-management rights. There are at most four simultaneous programme microphones, 640-byte PCM16/16 kHz/20 ms frames, per-socket message limits and idle timeout. Programme sockets are never crew peers, never appear in crew roster and never forward to crew/radio transports. They only enter the bounded delayed programme-audio history while commentary mix is enabled. Changing either crew/commentary mix clears retained audio and changes the audience generation.
+
+`/studio-audio` and `/assets/studio-audio.js` provide an explicit audio desk. Monitoring does not call getUserMedia. Commentary capture requires the local operator's action; enabling its station-wide mix never starts capture. VC hold-to-speak temporarily chooses the crew destination exclusively. Capture epochs reset partial PCM and reject queued frames from the previous destination. Lost sessions/permissions, close and explicit stop release tracks. Audio is synthetic in automated browser tests; no real device is activated.
+
+## Validation
+
+Backend full suite: 489 passed, 3 existing ignored on 2026-10-25; media subset 31 passed, 1 ignored. Actual loopback sockets test programme PCM cannot reach an admitted crew peer, a viewer cannot join programme ingest, and receive-only stream managers cannot forge crew transmission. Persistence tests cover rundown and selected recorded-replay round trips, restart, validation and 409/403 rejection. Frontend qualification is recorded in its `docs/qualification/broadcast-studio-2026-10-25.json`.
+
+Not yet qualified: live MediaMTX interview-audio conversion on deployed camera codecs, real microphones/acoustics, native mobile permission dialogs, and real radio performance. These features do not transmit operational output commands.
