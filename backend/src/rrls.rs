@@ -127,6 +127,9 @@ struct Queued {
     frame: Outgoing,
     at: u64,
     priority: u8,
+    independent_discovery: bool,
+    sdt_kind: u8,
+    sdt_template: u32,
 }
 /// One owned frame, still charged to the mesh until serial delivery finishes.
 /// Keeping metadata with the frame permits retry without copying its payload.
@@ -171,6 +174,9 @@ pub struct Mesh {
     active_cancelled: bool,
     active_survives_clear: bool,
     next_transmission: u64,
+    discovery_balance_bytes: i32,
+    active_fair_delta_bytes: i32,
+    fair_overhead_bytes: u16,
 }
 
 impl Mesh {
@@ -206,6 +212,13 @@ impl Mesh {
             active_cancelled: false,
             active_survives_clear: false,
             next_transmission: 0,
+            discovery_balance_bytes: 0,
+            active_fair_delta_bytes: 0,
+            fair_overhead_bytes: std::env::var("GS_RADIO_AIR_FRAME_OVERHEAD_BYTES")
+                .ok()
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|value| *value <= 256)
+                .unwrap_or(16),
         }
     }
     pub fn now(&self) -> u64 {
@@ -334,6 +347,74 @@ impl Mesh {
         // Only bytes actually removed above release their reservation.
         self.bytes -= removed_bytes;
     }
+    fn independent_discovery(frame: &Outgoing) -> bool {
+        if !matches!(frame.bytes.get(3), Some(&DOWN_DATA) | Some(&AV_BAY_DATA)) {
+            return false;
+        }
+        let Some(body) = frame.bytes.get(4..frame.bytes.len().saturating_sub(4)) else {
+            return false;
+        };
+        // Canonical snapshots have no SDT dictionary/chunk dependency. Never
+        // classify ground SDT through the avionics-side template namespace.
+        !body.starts_with(b"SDT")
+            && sedsnet::wire_format::peek_frame_info(body).is_ok_and(|packet| {
+                packet.envelope.ty == sedsnet::config::DataType::DiscoveryAddress
+            })
+    }
+
+    fn sdt_dependency(frame: &Outgoing) -> (u8, u32) {
+        if !matches!(frame.bytes.get(3), Some(&DOWN_DATA) | Some(&AV_BAY_DATA)) {
+            return (0, 0);
+        }
+        let Some(bytes) = frame.bytes.get(4..frame.bytes.len().saturating_sub(4)) else {
+            return (0, 0);
+        };
+        if !bytes.starts_with(b"SDT") {
+            return (0, 0);
+        }
+        if bytes.len() < 8 {
+            return (2, 0);
+        }
+        let end = bytes.len() - 4;
+        if crc(&bytes[..end]) != u32::from_le_bytes(bytes[end..].try_into().unwrap()) {
+            return (2, 0);
+        }
+        let mut offset = match bytes[3] {
+            1 => 4,
+            2 | 4 | 5 => 5,
+            // A chunk's template cannot be known without reassembly. It is a
+            // conservative barrier within its explicit RR wire namespace.
+            _ => return (2, 0),
+        };
+        let mut template = 0u32;
+        for shift in (0..=28).step_by(7) {
+            let Some(&byte) = bytes.get(offset).filter(|_| offset < end) else {
+                return (2, 0);
+            };
+            offset += 1;
+            if shift == 28 && byte > 15 {
+                return (2, 0);
+            }
+            template |= u32::from(byte & 127) << shift;
+            if byte & 128 == 0 {
+                return (1, template);
+            }
+        }
+        (2, 0)
+    }
+
+    fn dependency_ready(&self, index: usize) -> bool {
+        let item = &self.queue[index];
+        item.sdt_kind == 0
+            || !self.queue.iter().take(index).any(|earlier| {
+                earlier.frame.bytes.get(3) == item.frame.bytes.get(3)
+                    && earlier.sdt_kind != 0
+                    && (earlier.sdt_kind == 2
+                        || item.sdt_kind == 2
+                        || earlier.sdt_template == item.sdt_template)
+            })
+    }
+
     fn enqueue(&mut self, frame: Outgoing, priority: u8, now: u64) {
         if frame.bytes.len() > MAX_PAYLOAD + 8 {
             self.dropped += 1;
@@ -381,10 +462,15 @@ impl Mesh {
             self.dropped += 1;
         }
         self.bytes += frame.bytes.len();
+        let independent_discovery = Self::independent_discovery(&frame);
+        let (sdt_kind, sdt_template) = Self::sdt_dependency(&frame);
         self.queue.push_back(Queued {
             frame,
             at: now,
             priority,
+            independent_discovery,
+            sdt_kind,
+            sdt_template,
         });
     }
     #[cfg(test)]
@@ -409,12 +495,56 @@ impl Mesh {
             .min(4_160_000);
         self.credit_at = now;
         loop {
-            let i = self
+            let protected = self
                 .queue
                 .iter()
                 .enumerate()
-                .max_by_key(|(i, q)| (q.priority, std::cmp::Reverse(*i)))
-                .map(|(i, _)| i)?;
+                .filter(|(index, item)| {
+                    !item.independent_discovery
+                        && item.priority >= 253
+                        && self.dependency_ready(*index)
+                })
+                .max_by_key(|(index, item)| (item.priority, std::cmp::Reverse(*index)))
+                .map(|(index, _)| index);
+            let discovery = self
+                .queue
+                .iter()
+                .position(|item| item.independent_discovery);
+            // Only the ordinary head may yield into service: a later packet
+            // must never leapfrog an earlier opaque SDT bootstrap or follower.
+            let ordinary = self
+                .queue
+                .iter()
+                .enumerate()
+                .find(|(index, item)| {
+                    item.priority < 253
+                        && item.frame.bytes.get(3) == Some(&DOWN_DATA)
+                        && self.dependency_ready(*index)
+                })
+                .map(|(index, _)| index);
+            let lanes_ready = discovery.is_some() && ordinary.is_some();
+            if !lanes_ready {
+                self.discovery_balance_bytes = 0;
+            }
+            let contested = protected.is_none() && lanes_ready;
+            let i = if let Some(index) = protected {
+                index
+            } else if contested {
+                if self.discovery_balance_bytes > 0 {
+                    ordinary.unwrap()
+                } else {
+                    discovery.unwrap()
+                }
+            } else {
+                // No credit earned while a lane is absent or dependency-blocked.
+                self.discovery_balance_bytes = 0;
+                self.queue
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| self.dependency_ready(*index))
+                    .max_by_key(|(index, item)| (item.priority, std::cmp::Reverse(*index)))
+                    .map(|(index, _)| index)?
+            };
             let q = &self.queue[i];
             if q.priority < minimum_priority {
                 return None;
@@ -422,6 +552,8 @@ impl Mesh {
             if now.saturating_sub(q.at)
                 > if q.frame.bytes.get(3) == Some(&VOICE) {
                     180
+                } else if q.independent_discovery {
+                    3_000
                 } else if q.priority == 255
                     || (q.priority < 254 && q.frame.bytes.get(3) == Some(&DOWN_DATA))
                 {
@@ -443,6 +575,19 @@ impl Mesh {
                 return None;
             }
             let queued = self.queue.remove(i).unwrap();
+            self.active_fair_delta_bytes = if contested {
+                let cost =
+                    (queued.frame.bytes.len() + 4 + usize::from(self.fair_overhead_bytes)) as i32;
+                // Source-paced discovery bursts reserve four ordinary bytes per
+                // independent snapshot byte to keep accepted reports below 1.5 s with allowance for radio transit.
+                if queued.independent_discovery {
+                    4 * cost
+                } else {
+                    -cost
+                }
+            } else {
+                0
+            };
             self.next_transmission = id;
             self.active_transmission = Some(id);
             self.active_survives_clear = matches!(
@@ -460,6 +605,7 @@ impl Mesh {
     ) -> Option<Outgoing> {
         assert_eq!(self.active_transmission, Some(transmission.id));
         self.active_transmission = None;
+        let fair_delta = std::mem::take(&mut self.active_fair_delta_bytes);
         if !sent && self.active_cancelled {
             // A topology transition invalidated this write while IO was outside
             // the mesh lock. Do not resurrect its old relay frame on retry.
@@ -475,6 +621,7 @@ impl Mesh {
             self.queue.push_front(transmission.queued);
             return None;
         }
+        self.discovery_balance_bytes = self.discovery_balance_bytes.saturating_add(fair_delta);
         let frame = transmission.queued.frame;
         self.bytes -= frame.bytes.len();
         if self.role == Role::Rrls {
@@ -1562,8 +1709,179 @@ mod tests {
         }
     }
 
+    fn independent_address(now: u64) -> Vec<u8> {
+        let ad = sedsnet::discovery::AddressAdvertisement {
+            hostname: "DISCOVERY_BURST_ROUTER".into(),
+            address: 101,
+            requested_address: 101,
+            mode: 2,
+            state: 1,
+            birth_ms: 0,
+            owner_hash: 123,
+            reachable_endpoints: vec![
+                crate::telemetry_schema::endpoint("GROUND_STATION"),
+                crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"),
+                crate::telemetry_schema::endpoint("SD_CARD"),
+            ],
+            reachable_network_variables: vec![
+                crate::telemetry_schema::data_type("FLIGHT_STATE"),
+                crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+            ],
+            reachable_timesync_sources: vec!["RF".into()],
+            link_capabilities: sedsnet::discovery::LinkCapabilities {
+                version: 1,
+                flags: 3,
+                profile: 0,
+                max_frame_bytes: 192,
+                compact_header_target_bytes: 12,
+                max_side_transport_templates: 256,
+            },
+        };
+        let packet = sedsnet::discovery::build_discovery_address("RF", now, &ad).unwrap();
+        let wire = sedsnet::wire_format::pack_packet(&packet);
+        wire.to_vec()
+    }
+
     #[test]
-    fn source_paced_sparse_telemetry_survives_bursts_without_delaying_controls() {
+    fn independent_metadata_fairness_protects_controls_and_commits_only_successful_bytes() {
+        crate::telemetry_schema::initialize().unwrap();
+        let wire = |name: &str, size| {
+            sedsnet::wire_format::pack_packet(
+                &sedsnet::packet::Packet::new(
+                    crate::telemetry_schema::data_type(name),
+                    &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                    "RF",
+                    1,
+                    vec![0; size].into(),
+                )
+                .unwrap(),
+            )
+        };
+        let mut mesh = Mesh::new(Role::Rrls, 2);
+        mesh.incoming(true, &health(1, 0, false), 0);
+        mesh.incoming(false, &independent_address(1), 0);
+        mesh.incoming(true, &encode(UP_DATA, &independent_address(2)), 0);
+        let battery = wire("BATTERY_VOLTAGE", 4);
+        mesh.incoming(false, &battery, 0);
+        mesh.incoming(false, &wire("FLIGHT_COMMAND", 1), 0);
+        mesh.incoming(false, &wire("GPS_DATA", 12), 0);
+        for expected in ["GPS_DATA", "FLIGHT_COMMAND"] {
+            let frame = mesh.pop(0).unwrap();
+            let (_, body) = decode(&frame.bytes).unwrap();
+            assert_eq!(
+                sedsnet::wire_format::peek_frame_info(body)
+                    .unwrap()
+                    .envelope
+                    .ty,
+                crate::telemetry_schema::data_type(expected)
+            );
+        }
+        let transmission = mesh.begin_transmission(0).unwrap();
+        assert!(transmission.queued.independent_discovery);
+        let cost =
+            transmission.frame().bytes.len() as i32 + 4 + i32::from(mesh.fair_overhead_bytes);
+        mesh.finish_transmission(transmission, false);
+        assert_eq!(
+            mesh.discovery_balance_bytes, 0,
+            "failed IO earns no fairness debit"
+        );
+        let transmission = mesh.begin_transmission(0).unwrap();
+        mesh.finish_transmission(transmission, true);
+        assert_eq!(mesh.discovery_balance_bytes, 4 * cost);
+        let frame = mesh.pop(0).unwrap();
+        assert_eq!(decode(&frame.bytes).unwrap().1, battery.as_ref());
+        let transmission = mesh.begin_transmission(0).unwrap();
+        assert_eq!(
+            mesh.discovery_balance_bytes, 0,
+            "no credit survives a missing ordinary lane"
+        );
+        mesh.finish_transmission(transmission, false);
+        assert_eq!(
+            std::mem::size_of::<Queued>(),
+            std::mem::size_of::<(Outgoing, u64, u8)>(),
+            "queue metadata fits existing item padding"
+        );
+    }
+
+    #[test]
+    fn fair_metadata_cannot_overtake_real_sdt_chunk_bootstrap_and_compact_followers() {
+        use sedsnet::router::{EndpointHandler, Router, RouterConfig};
+        crate::telemetry_schema::initialize().unwrap();
+        let endpoint = crate::telemetry_schema::endpoint("GROUND_STATION");
+        let sensor = crate::telemetry_schema::data_type("IMU_DATA");
+        let captured = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let output = captured.clone();
+        let source =
+            Router::new_with_clock(RouterConfig::new([]).with_sender("FC"), Box::new(|| 0));
+        source.add_side_packed_small_packets(
+            "radio",
+            move |bytes| {
+                if bytes.starts_with(b"SDT") {
+                    output.lock().unwrap().push(bytes.to_vec());
+                }
+                Ok(())
+            },
+            48,
+        );
+        for timestamp in [1, 2] {
+            source
+                .tx(sedsnet::packet::Packet::new(
+                    sensor,
+                    &[endpoint],
+                    "FC",
+                    timestamp,
+                    vec![0; 24].into(),
+                )
+                .unwrap()
+                .with_nonce(timestamp as u16))
+                .unwrap();
+        }
+        let frames = captured.lock().unwrap().clone();
+        assert!(
+            frames.iter().any(|frame| frame[3] == 3),
+            "actual SDK chunks the bootstrap"
+        );
+        assert!(
+            frames.iter().any(|frame| matches!(frame[3], 2 | 4 | 5)),
+            "actual SDK compact follower"
+        );
+        let timestamps = Arc::new(Mutex::new(Vec::new()));
+        let seen = timestamps.clone();
+        let receiver = Router::new_with_clock(
+            RouterConfig::new([EndpointHandler::new_packet_handler(
+                endpoint,
+                move |packet| {
+                    if packet.data_type() == sensor {
+                        seen.lock().unwrap().push(packet.timestamp());
+                    }
+                    Ok(())
+                },
+            )]),
+            Box::new(|| 0),
+        );
+        let side = receiver.add_side_packed_small_packets("radio", |_| Ok(()), 48);
+        let mut mesh = Mesh::new(Role::Rrls, 2);
+        mesh.incoming(true, &health(1, 0, false), 0);
+        mesh.incoming(false, &independent_address(0), 0);
+        for frame in &frames {
+            mesh.incoming(false, frame, 0);
+        }
+        let mut forwarded = Vec::new();
+        while let Some(frame) = mesh.pop(0) {
+            let (_, body) = decode(&frame.bytes).unwrap();
+            if body.starts_with(b"SDT") {
+                forwarded.push(body.to_vec());
+                receiver.rx_packed_from_side(body, side).unwrap();
+            }
+        }
+        assert_eq!(
+            forwarded, frames,
+            "never reorder an opaque dependency stream"
+        );
+        assert_eq!(*timestamps.lock().unwrap(), vec![1, 2]);
+    }
+
+    fn source_paced_campaign(with_discovery: bool) {
         crate::telemetry_schema::initialize().unwrap();
         fn wire(name: &str, sender: &'static str, timestamp: u64, bytes: usize) -> Vec<u8> {
             let packet = sedsnet::packet::Packet::new(
@@ -1580,7 +1898,10 @@ mod tests {
         let mut batteries = Vec::new();
         let mut commands = Vec::new();
         let mut gps = Vec::new();
+        let mut ordinary_lateness = Vec::new();
         let mut peak = 0;
+        let mut next_egress_ms = 0;
+        let mut discovery_delivered = 0;
         for now in (0..=22_000u64).step_by(10) {
             if now % 500 == 0 {
                 relay.incoming(true, &health(1, (now / 500) as u32, false), now);
@@ -1613,19 +1934,39 @@ mod tests {
                 relay.incoming(false, &command, now);
                 relay.incoming(false, &wire("GPS_DATA", "RF", now, 12), now);
             }
+            if with_discovery && (5_000..7_040).contains(&now) && (now - 5_000) % 120 == 0 {
+                let wire = independent_address(now);
+                if ((now - 5_000) / 120) % 2 == 0 {
+                    relay.incoming(false, &wire, now);
+                } else {
+                    relay.incoming(true, &encode(UP_DATA, &wire), now);
+                }
+            }
             peak = peak.max(relay.queue.len());
             assert!(relay.queue.len() <= MAX_FRAMES && relay.bytes <= MAX_BYTES);
-            // Bounded egress: one <=80-byte frame every40ms is <=2000B/s.
-            if now % 40 == 0
+            // Same16kbps share and16-byte overhead as production capacity.
+            if now >= next_egress_ms
                 && let Some(frame) = relay.pop(now)
             {
-                assert!(frame.bytes.len() + 4 <= 80);
+                let framed_cost = frame.bytes.len() as u64 + 4 + 16;
+                next_egress_ms = now + (framed_cost * 8 * 1000).div_ceil(16_000);
+                assert!(frame.bytes.len() + 4 <= 220);
                 let (kind, body) = decode(&frame.bytes).unwrap();
-                if kind != DOWN_DATA {
+                if kind != DOWN_DATA && kind != AV_BAY_DATA {
                     continue;
                 }
                 let packet = sedsnet::wire_format::unpack_packet(body).unwrap();
-                if packet.data_type() == crate::telemetry_schema::data_type("BATTERY_VOLTAGE") {
+                if ["BATTERY_VOLTAGE", "IMU_DATA", "BAROMETER_DATA"]
+                    .iter()
+                    .any(|name| packet.data_type() == crate::telemetry_schema::data_type(name))
+                {
+                    ordinary_lateness.push(now - packet.timestamp());
+                }
+                if packet.data_type() == sedsnet::config::DataType::DiscoveryAddress {
+                    discovery_delivered += 1;
+                } else if packet.data_type()
+                    == crate::telemetry_schema::data_type("BATTERY_VOLTAGE")
+                {
                     batteries.push((packet.timestamp(), now));
                 } else if packet.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND")
                 {
@@ -1635,7 +1976,20 @@ mod tests {
                 }
             }
         }
-        eprintln!("RRLS_SOURCE_PACED peak={peak} battery_deliveries={batteries:?} command_delays_ms={commands:?} gps_delays_ms={gps:?} dropped={}", relay.dropped);
+        eprintln!(
+            "RRLS_SOURCE_PACED peak={peak} battery_deliveries={batteries:?} command_delays_ms={commands:?} gps_delays_ms={gps:?} max_sensor_lateness_ms={} dropped={}",
+            ordinary_lateness.iter().max().copied().unwrap_or(0),
+            relay.dropped
+        );
+        assert!(
+            ordinary_lateness.iter().all(|delay| *delay <= 1500),
+            "sensor lateness remains bounded"
+        );
+        assert_eq!(
+            discovery_delivered,
+            if with_discovery { 17 } else { 0 },
+            "all independent route snapshots must survive fair service"
+        );
         assert!(peak >= 24, "exercise the measured burst depth");
         assert_eq!(
             batteries.len(),
@@ -1653,6 +2007,15 @@ mod tests {
         assert!(gps.iter().all(|delay| *delay <= 500));
         assert_eq!(relay.dropped, 0, "do not hide expired accepted telemetry");
     }
+    #[test]
+    fn source_paced_sparse_telemetry_survives_bursts_without_delaying_controls() {
+        source_paced_campaign(false);
+    }
+    #[test]
+    fn discovery_burst_byte_fairness_preserves_sparse_reports_and_controls() {
+        source_paced_campaign(true);
+    }
+
     #[test]
     fn gps_uses_real_schema_priority_and_latest_value() {
         crate::telemetry_schema::initialize().unwrap();
