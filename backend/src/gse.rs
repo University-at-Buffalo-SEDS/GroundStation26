@@ -688,6 +688,8 @@ pub fn tick(state: &Arc<AppState>, interlock: bool) {
         }
     };
     apply(state, effects);
+    #[cfg(not(feature = "hitl_mode"))]
+    publish_qualified_flight_armed(state);
 }
 
 /// The existing five-valve hardware cluster can be switched as one group.

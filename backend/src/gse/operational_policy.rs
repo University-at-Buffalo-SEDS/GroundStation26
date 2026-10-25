@@ -177,6 +177,27 @@ pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase)
         rt.operational.qd = QdWait::default();
     }
 }
+/// Publish the durable mission stage through the existing real FC state path.
+/// G_Armed asks FC to perform Postinit; it never bypasses FC readiness checks.
+pub(super) fn publish_qualified_flight_armed(state: &Arc<AppState>) {
+    if cfg!(feature = "test_fire_mode") || !prelaunch(state) {
+        return;
+    }
+    let qualified = {
+        let rt = state.gse.lock().unwrap();
+        rt.operational.saved.qualification.stage()
+            == gse_sequence::qualification::MissionStage::Armed
+            && rt.operational.persist_error.is_none()
+            && rt.operational.saved.pending_checklists.is_empty()
+            && matches!(
+                rt.engine.status.phase,
+                Phase::Paused | Phase::Passed | Phase::Idle
+            )
+    };
+    if qualified {
+        state.set_local_flight_state(FlightState::Armed);
+    }
+}
 /// Returns true when automation must not advance this tick.
 pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
     if state
@@ -282,6 +303,9 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
     }
     skip
 }
+fn qd_dispatch_timestamp_ms() -> u64 {
+    crate::telemetry_task::procedure_clock::now().utc_ms()
+}
 pub(super) fn handle_operational_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
     let name = crate::sequences::command_name(cmd);
     if name == "RetractPlumbing" && !cfg!(feature = "test_fire_mode") {
@@ -305,8 +329,7 @@ pub(super) fn handle_operational_command(state: &Arc<AppState>, cmd: &TelemetryC
             Ok(()) => {
                 let now = rt.now();
                 rt.operational.qd.dispatched(now);
-                rt.operational.qd_dispatch_utc_ms =
-                    Some(crate::telemetry_task::get_current_timestamp_ms());
+                rt.operational.qd_dispatch_utc_ms = Some(qd_dispatch_timestamp_ms());
                 drop(rt);
                 state.set_pending_umbilical_valve_state(
                     crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8,
@@ -788,12 +811,123 @@ mod tests {
         ));
         cleanup(&state);
     }
+    #[tokio::test]
+    async fn durable_armed_publication_is_mode_sensitive_and_once_only() {
+        let state = fixture().await;
+        let mut updates = state.state_tx.subscribe();
+        publish_qualified_flight_armed(&state);
+        assert!(
+            updates.try_recv().is_err(),
+            "Incomplete qualification must not arm FC"
+        );
+        {
+            let mut rt = state.gse.lock().unwrap();
+            for milestone in [
+                Milestone::SelfTest,
+                Milestone::NitrogenTest,
+                Milestone::FillTarget,
+            ] {
+                rt.operational
+                    .saved
+                    .qualification
+                    .complete(milestone, 0)
+                    .unwrap();
+            }
+            rt.engine.status.phase = Phase::Paused;
+            rt.operational.persist_error = Some("simulated durable write failure".into());
+        }
+        publish_qualified_flight_armed(&state);
+        assert!(
+            updates.try_recv().is_err(),
+            "A failed durable save must not arm FC"
+        );
+        state.gse.lock().unwrap().operational.persist_error = None;
+        publish_qualified_flight_armed(&state);
+        if cfg!(feature = "test_fire_mode") {
+            assert!(updates.try_recv().is_err());
+            assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
+        } else {
+            assert_eq!(updates.try_recv().unwrap().state, FlightState::Armed);
+            publish_qualified_flight_armed(&state);
+            assert!(
+                updates.try_recv().is_err(),
+                "Repeated ticks must not republish Armed"
+            );
+        }
+        cleanup(&state);
+    }
+    #[cfg(feature = "firmware_sim")]
+    #[test]
+    fn qd_dispatch_uses_the_explicit_model_source_epoch_without_changing_wall_mode() {
+        const NAME: &str = "gse::operational_policy::tests::qd_dispatch_uses_the_explicit_model_source_epoch_without_changing_wall_mode";
+        if let Ok(mode) = std::env::var("GS_QD_CLOCK_CHILD") {
+            if mode == "model" {
+                assert_eq!(qd_dispatch_timestamp_ms(), 1_767_225_612_345);
+                assert_eq!(
+                    qd_dispatch_timestamp_ms(),
+                    1_767_225_612_345,
+                    "Paused model must not advance the dispatch watermark"
+                );
+            } else {
+                let before = crate::telemetry_task::get_current_timestamp_ms();
+                let dispatched = qd_dispatch_timestamp_ms();
+                let after = crate::telemetry_task::get_current_timestamp_ms();
+                assert!((before..=after).contains(&dispatched));
+            }
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("gse-qd-clock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clock");
+        std::fs::write(&path, "12345").unwrap();
+        for mode in ["model", "wall"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", NAME, "--test-threads=1"])
+                .env("GS_QD_CLOCK_CHILD", mode)
+                .env("GS_SIM_NETWORK_EPOCH_MS", "1767225600000");
+            if mode == "model" {
+                child.env("GS_SIM_CLOCK_FILE", &path);
+            } else {
+                child.env_remove("GS_SIM_CLOCK_FILE");
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[cfg(not(feature = "test_fire_mode"))]
     #[tokio::test]
     async fn flight_launch_waits_five_seconds_from_qd_ack_and_rechecks_live_gates() {
+        const NAME: &str = "gse::operational_policy::tests::flight_launch_waits_five_seconds_from_qd_ack_and_rechecks_live_gates";
+        if std::env::var_os("GS_QD_GATES_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--test-threads=1"])
+                .env("GS_QD_GATES_CHILD", "1")
+                .env_remove("GS_SIM_CLOCK_FILE")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        for revoke in ["none", "gps", "fc-route"] {
+            queued_flight_launch_scenario(revoke).await;
+        }
+    }
+    #[cfg(not(feature = "test_fire_mode"))]
+    async fn queued_flight_launch_scenario(revoke: &str) {
         let mut state = fixture().await;
         let (commands, mut received) = tokio::sync::mpsc::channel(8);
         Arc::get_mut(&mut state).unwrap().cmd_tx = commands;
+        let mut notices = state.notifications_tx.subscribe();
         let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
         {
             let mut rt = state.gse.lock().unwrap();
@@ -851,6 +985,14 @@ mod tests {
             received.try_recv().is_err(),
             "queued launch cannot run before a fresh QD ACK"
         );
+        let mut seen = Vec::new();
+        while let Ok(messages) = notices.try_recv() {
+            seen.extend(messages);
+        }
+        assert!(
+            seen.iter()
+                .any(|notice| notice.message.contains("waiting for QD acknowledgement"))
+        );
         let dispatched = state
             .gse
             .lock()
@@ -866,7 +1008,29 @@ mod tests {
             dispatched + 1,
         );
         let acknowledged_at = state.gse.lock().unwrap().now();
-        for (advance, should_launch) in [(4900, false), (5100, true)] {
+        assert!(handle_operational_command(
+            &state,
+            &TelemetryCommand::Launch
+        ));
+        let mut seen = Vec::new();
+        while let Ok(messages) = notices.try_recv() {
+            seen.extend(messages);
+        }
+        assert!(
+            seen.iter()
+                .any(|notice| notice.message.contains("QD settling")
+                    && notice.message.contains("seconds remaining"))
+        );
+        for (advance, should_launch) in [(4999, false), (5000, revoke == "none")] {
+            if advance == 5000 {
+                match revoke {
+                    "gps" => crate::antenna::clear_rocket_fix_for_test(),
+                    "fc-route" => {
+                        router.remove_side(radio).unwrap();
+                    }
+                    _ => (),
+                }
+            }
             let mut rt = state.gse.lock().unwrap();
             rt.clock = Instant::now() - std::time::Duration::from_millis(acknowledged_at + advance);
             rt.observe_pressure(Some(0.0));
@@ -881,6 +1045,23 @@ mod tests {
             } else {
                 assert!(received.try_recv().is_err());
             }
+        }
+        if revoke != "none" {
+            assert!(
+                !state.gse.lock().unwrap().operational.qd.queued(),
+                "Lost live prerequisites must cancel the queued launch"
+            );
+            assert_ne!(
+                state
+                    .gse
+                    .lock()
+                    .unwrap()
+                    .operational
+                    .saved
+                    .qualification
+                    .stage(),
+                gse_sequence::qualification::MissionStage::Fire
+            );
         }
         operational_tick(&state, true);
         assert!(
@@ -1000,6 +1181,18 @@ mod tests {
         // Missing FC flight state immediately after restart must not reactivate GSE automation.
         state.set_local_flight_state(FlightState::Idle);
         assert!(!automatic_abort_allowed(&state));
+        assert!(
+            crate::telemetry_task::command_at_dispatch(&state, TelemetryCommand::AutomaticAbort)
+                .is_none(),
+            "Delayed automatic abort must stay blocked after durable Fire even if local state restarted Idle"
+        );
+        assert!(
+            matches!(
+                crate::telemetry_task::command_at_dispatch(&state, TelemetryCommand::Abort),
+                Some(TelemetryCommand::Abort)
+            ),
+            "Manual abort authority remains explicit"
+        );
         assert!(operational_tick(&state, false));
         check_report_safety(&state);
         assert_eq!(
