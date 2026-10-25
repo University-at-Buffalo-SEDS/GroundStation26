@@ -27,6 +27,16 @@ const ROUTER_DECODE_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
 static ROUTER_DECODE_ERROR_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static ROUTER_DECODE_ERROR_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 
+pub(crate) fn command_at_dispatch(state: &AppState, command: TelemetryCommand) -> Option<TelemetryCommand> {
+    if matches!(command, TelemetryCommand::AutomaticAbort) {
+        // A failed tare can enqueue before Fire commits and be consumed after
+        // it. Preserve its automatic origin until this final policy check.
+        crate::gse::automatic_abort_allowed(state).then_some(TelemetryCommand::Abort)
+    } else {
+        Some(command)
+    }
+}
+
 #[cfg(feature = "hitl_mode")]
 fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
     Some(match cmd {
@@ -661,6 +671,10 @@ pub async fn telemetry_task(
             biased;
 
                 Some(cmd) = rx.recv() => {
+                    let automatic_abort = matches!(cmd, TelemetryCommand::AutomaticAbort);
+                    let Some(cmd) = command_at_dispatch(&state, cmd) else {
+                        continue;
+                    };
                     if matches!(cmd, TelemetryCommand::ResetSim) {
                         reset_testing_simulation(&state).await;
                         continue;
@@ -687,6 +701,7 @@ pub async fn telemetry_task(
                         continue;
                     }
                     match cmd {
+                        TelemetryCommand::AutomaticAbort => unreachable!("automatic abort checked before dispatch"),
                         TelemetryCommand::StartFill | TelemetryCommand::PauseFill
                         | TelemetryCommand::CancelFill | TelemetryCommand::ValveSelfTest
                         | TelemetryCommand::NitrogenTest => unreachable!("GSE commands handled before dispatch"),
@@ -713,13 +728,13 @@ pub async fn telemetry_task(
                                 state.clear_launch_sequence_command_pending();
                                 if let Err(e) = queue_abort_packet(
                                     &router,
-                                    "Manual Abort Command Issued",
+                                    if automatic_abort { "Automatic zero failure abort" } else { "Manual Abort Command Issued" },
                                 ) {
                                     log_telemetry_error("failed to log Abort command", e);
                                 } else {
                                     flush_command_tx(&router, "Abort command tx");
                                 }
-                                emit_error(&state, "Manual abort triggered!".to_string());
+                                emit_error(&state, if automatic_abort { "Automatic zero failure abort triggered!" } else { "Manual abort triggered!" }.to_string());
                                 gs_debug_println!("Abort command sent");
                             }
                         TelemetryCommand::Igniter => {
@@ -4041,6 +4056,31 @@ mod tests {
         telemetry.await.expect("telemetry task join failed");
     }
 
+    #[tokio::test]
+    async fn queued_automatic_abort_rechecks_launch_boundary_without_blocking_manual_abort() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        *state.state.lock().unwrap() = FlightState::Idle;
+        assert!(matches!(
+            command_at_dispatch(&state, TelemetryCommand::AutomaticAbort),
+            Some(TelemetryCommand::Abort)
+        ));
+        *state.state.lock().unwrap() = FlightState::Launch;
+        if cfg!(feature = "hitl_mode") {
+            assert!(matches!(
+                command_at_dispatch(&state, TelemetryCommand::AutomaticAbort),
+                Some(TelemetryCommand::Abort)
+            ));
+        } else {
+            assert!(command_at_dispatch(&state, TelemetryCommand::AutomaticAbort).is_none());
+        }
+        assert!(matches!(
+            command_at_dispatch(&state, TelemetryCommand::Abort),
+            Some(TelemetryCommand::Abort)
+        ));
+        assert!(serde_json::from_str::<TelemetryCommand>("\"AutomaticAbort\"").is_err());
+    }
+
     async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {
         test_app_state_with_cmd_rx(db_tx).await.0
     }
@@ -4423,7 +4463,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(command, TelemetryCommand::Abort));
+        assert!(matches!(command, TelemetryCommand::AutomaticAbort));
         assert!(!state.auto_zero.lock().unwrap().pending());
     }
 

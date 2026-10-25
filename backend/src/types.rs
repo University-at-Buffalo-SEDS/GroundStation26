@@ -90,6 +90,9 @@ pub enum TelemetryCommand {
     CancelFill,
     ValveSelfTest,
     NitrogenTest,
+    /// Internal producer intent; never accepted as a client command.
+    #[serde(skip)]
+    AutomaticAbort,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]

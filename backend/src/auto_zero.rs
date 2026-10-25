@@ -321,7 +321,7 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
                     }
                 ));
                 if request_abort {
-                    let _ = state.cmd_tx.send(TelemetryCommand::Abort).await;
+                    let _ = state.cmd_tx.send(TelemetryCommand::AutomaticAbort).await;
                 }
             }
         }

@@ -552,6 +552,7 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::Launch => "Launch",
         TelemetryCommand::Dump => "Dump",
         TelemetryCommand::Abort => "Abort",
+        TelemetryCommand::AutomaticAbort => "AutomaticAbort",
         TelemetryCommand::NormallyOpen => "NormallyOpen",
         TelemetryCommand::Pilot => "Pilot",
         TelemetryCommand::Igniter => "Igniter",
