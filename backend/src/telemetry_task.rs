@@ -4,12 +4,12 @@ use prelude::*;
 mod commands;
 use commands::log_command_dispatch;
 pub(crate) use commands::{
-    flush_command_tx, queue_abort_packet, queue_locally_routed_flight_command,
+    flush_command_tx, queue_abort_packet, queue_automatic_abort_packet, queue_locally_routed_flight_command,
 };
 mod periodic;
 pub(crate) mod procedure_clock;
 mod radio_io;
-pub use radio_io::{CommsWorkerHandle, TxQueueBudget};
+pub use radio_io::{CommsWorkerHandle, TransportTxActivity, TxQueueBudget};
 #[cfg(test)]
 use radio_io::{radio_command_log_line, spawn_dedicated_radio_io_threads};
 use radio_io::{spawn_comms_worker_threads, spawn_router_worker_thread};
@@ -672,6 +672,10 @@ pub async fn telemetry_task(
 
                 Some(cmd) = rx.recv() => {
                     let automatic_abort = matches!(cmd, TelemetryCommand::AutomaticAbort);
+                    let _automatic_abort_claim = if automatic_abort {
+                        let Some(claim) = crate::gse::claim_automatic_abort(&state) else { continue; };
+                        Some(claim)
+                    } else { None };
                     let Some(cmd) = command_at_dispatch(&state, cmd) else {
                         continue;
                     };
@@ -726,16 +730,18 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::Abort => {
                                 state.clear_launch_sequence_command_pending();
-                                if let Err(e) = queue_abort_packet(
+                                let enqueue_abort = if automatic_abort { queue_automatic_abort_packet } else { queue_abort_packet };
+                                if let Err(e) = enqueue_abort(
                                     &router,
                                     if automatic_abort { "Automatic zero failure abort" } else { "Manual Abort Command Issued" },
                                 ) {
                                     log_telemetry_error("failed to log Abort command", e);
                                 } else {
                                     flush_command_tx(&router, "Abort command tx");
+                                    gs_debug_println!("Abort command accepted for delivery");
                                 }
                                 emit_error(&state, if automatic_abort { "Automatic zero failure abort triggered!" } else { "Manual abort triggered!" }.to_string());
-                                gs_debug_println!("Abort command sent");
+
                             }
                         TelemetryCommand::Igniter => {
                                 let key = ActuatorBoardCommands::IgniterOn as u8;
@@ -3033,6 +3039,7 @@ mod tests {
             state.clone(),
             router.clone(),
             vec![CommsWorkerHandle {
+                transport_activity: None,
                 tx_budget: None,
                 name: "rocket_comms",
                 comms,
@@ -3185,6 +3192,7 @@ mod tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                transport_activity: None,
                 tx_budget: None,
                 name: "rocket_comms",
                 comms,
@@ -3278,6 +3286,7 @@ mod tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                transport_activity: None,
                 tx_budget: None,
                 name: "rocket_comms",
                 comms,
@@ -3362,6 +3371,7 @@ mod tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                transport_activity: None,
                 tx_budget: None,
                 name: "rocket_comms",
                 comms,
@@ -3432,6 +3442,7 @@ mod tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                transport_activity: None,
                 tx_budget: None,
                 name: "rocket_comms",
                 comms,
@@ -3514,6 +3525,7 @@ mod tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                transport_activity: None,
                 tx_budget: None,
                 name: "rocket_comms",
                 comms,
@@ -3601,6 +3613,7 @@ mod tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                transport_activity: None,
                 tx_budget: None,
                 name: "rocket_comms",
                 comms,
@@ -3688,6 +3701,7 @@ mod tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                transport_activity: None,
                 tx_budget: None,
                 name: "rocket_comms",
                 comms,
@@ -3762,6 +3776,7 @@ mod tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                transport_activity: None,
                 tx_budget: None,
                 name: "rocket_comms",
                 comms,
@@ -4057,6 +4072,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_automatic_abort_claim_reaches_packet_callback_without_gse_lock() {
+        let (db_tx, db_rx) = mpsc::channel(16);
+        let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
+        let weak = Arc::downgrade(&state);
+        let (delivered, mut received) = mpsc::unbounded_channel::<()>();
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([
+            sedsnet::router::EndpointHandler::new_packet_handler(
+                crate::telemetry_schema::endpoint("ABORT"), move |packet| {
+                    if packet.data_type() == crate::telemetry_schema::data_type("ABORT") {
+                        assert!(weak.upgrade().unwrap().gse.try_lock().is_ok(), "automatic router callback held GSE lock");
+                        delivered.send(()).unwrap();
+                    }
+                    Ok(())
+                }),
+        ])));
+        #[cfg(not(feature = "hitl_mode"))]
+        let path = crate::gse::armed_fixture_for_test(&state, &router);
+        #[cfg(feature = "hitl_mode")]
+        state.set_local_flight_state(FlightState::Launch);
+        let shutdown = state.shutdown_subscribe();
+        let worker = tokio::spawn(telemetry_task(state.clone(), router, Vec::new(), cmd_rx, db_rx, shutdown));
+        state.cmd_tx.send(TelemetryCommand::AutomaticAbort).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), received.recv()).await;
+        state.request_shutdown();
+        worker.await.unwrap();
+        assert_eq!(result.unwrap(), Some(()));
+        assert!(state.is_command_allowed(&TelemetryCommand::Abort));
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(record["automatic_abort_claimed"], true);
+            assert_eq!(state.gse.lock().unwrap().engine.status.phase, gse_sequence::Phase::Fault);
+            assert!(crate::gse::commit_fire_intent(&state).is_err());
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn queued_automatic_abort_rechecks_launch_boundary_without_blocking_manual_abort() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
@@ -4157,6 +4210,7 @@ mod tests {
             shutdown_tx,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             pending_db_writes: Arc::new(AtomicUsize::new(0)),
+            transport_tx_activity: Arc::new(Default::default()),
             db_write_notify: Arc::new(Notify::new()),
             notifications: Arc::new(Mutex::new(Vec::new())),
             notifications_tx,

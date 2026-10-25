@@ -1,3 +1,5 @@
+mod automatic_abort;
+pub(crate) use automatic_abort::claim_automatic_abort;
 #[cfg(not(feature = "hitl_mode"))]
 mod operational_policy;
 #[cfg(not(feature = "hitl_mode"))]
@@ -46,6 +48,8 @@ pub struct Runtime {
     mass: Option<Sample>,
     fill_cutoff: crate::sequences::FillCutoff,
     ground_station_control: bool,
+    #[cfg(not(feature = "hitl_mode"))]
+    automatic_abort_in_flight: bool,
 }
 impl Default for Runtime {
     fn default() -> Self {
@@ -61,6 +65,8 @@ impl Default for Runtime {
             mass: None,
             fill_cutoff: Default::default(),
             ground_station_control: true,
+            #[cfg(not(feature = "hitl_mode"))]
+            automatic_abort_in_flight: false,
         }
     }
 }
@@ -232,6 +238,22 @@ pub fn initialize(state: &AppState) {
                 log::error!("Cannot restore GSE qualification; manual reset required: {error}");
             }
         }
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    {
+        let claimed = {
+            let mut rt = state.gse.lock().unwrap();
+            let claimed = rt.operational.saved.automatic_abort_claimed;
+            if claimed {
+                rt.operational.running = false;
+                rt.operational.startup_configured = true;
+                rt.engine.claimed = true;
+                rt.engine.status.phase = Phase::Fault;
+                rt.engine.status.message = "Automatic abort remains latched; clear GSE abort before another operation".into();
+            }
+            claimed
+        };
+        if claimed { state.set_local_flight_state(FlightState::Aborted); }
     }
     match std::fs::read(config_path())
         .map_err(|e| e.to_string())
@@ -851,6 +873,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             serde_json::to_value(rt.operational.saved.qualification.stage()).unwrap();
         response["topology_stable"] = serde_json::json!(rt.operational.topology_stable);
         response["storage_error"] = serde_json::json!(rt.operational.persist_error);
+        response["automatic_abort_claimed"] = serde_json::json!(rt.operational.saved.automatic_abort_claimed);
         response["launch_queued"] = serde_json::json!(rt.operational.qd.queued());
         response["qd"] = serde_json::json!(format!("{:?}", rt.operational.qd.status(rt.now())));
     }
@@ -1422,10 +1445,39 @@ pub fn qd_confirmation(state: &AppState, sender: &str, key: u8, open: bool, sour
 }
 /// Operator recovery only: never dispatch a valve, ignition or launch command.
 fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)> {
+    #[cfg(not(feature = "hitl_mode"))]
+    let _clear_reservation;
+    #[allow(unused_mut)] // Operational recovery mutates this guard outside HITL.
     let mut rt = state.gse.lock().unwrap();
-    if *state.state.lock().unwrap() != FlightState::Aborted {
+    let aborted = *state.state.lock().unwrap() == FlightState::Aborted;
+    #[cfg(not(feature = "hitl_mode"))]
+    let aborted = aborted || (rt.operational.saved.automatic_abort_claimed
+        && matches!(state.local_flight_state_snapshot(), FlightState::Startup | FlightState::Idle | FlightState::Armed));
+    if !aborted {
         return Err((StatusCode::CONFLICT, "GroundStation is not aborted".into()));
     }
+    #[cfg(not(feature = "hitl_mode"))]
+    {
+        if rt.automatic_abort_in_flight {
+            return Err((StatusCode::CONFLICT, "Automatic abort dispatch is still in progress".into()));
+        }
+        _clear_reservation = automatic_abort::reserve_abort_clear(state, &mut rt);
+    }
+    // Reservation excludes new automatic producers and Fire while ownership is
+    // inspected. Do not hold GSE across router/transport locks or callbacks.
+    drop(rt);
+    let router = state.topology_router.get().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE, "Network is not initialized".into(),
+    ))?;
+    #[cfg(not(feature = "hitl_mode"))]
+    if router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT"))
+        || state.has_pending_transport_tx()
+    {
+        return Err((StatusCode::CONFLICT,
+            "Abort delivery is still pending; retry after the network drains".into()));
+    }
+    #[allow(unused_mut)] // Operational recovery mutates this guard outside HITL.
+    let mut rt = state.gse.lock().unwrap();
     if rt.engine.active() {
         return Err((
             StatusCode::CONFLICT,
@@ -1463,20 +1515,21 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
         // The next explicit self-test establishes and checks its own baseline.
         rt.operational.startup_configured = true;
     }
-    let router = state.topology_router.get().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Network is not initialized".into(),
-    ))?;
     // Update the persisted managed value as well as the local/UI state, so
     // discovery and reconnection cannot replay this station's old abort value.
+    drop(rt);
     crate::network_variables::set_flight_state(router, FlightState::Idle as u8)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut rt = state.gse.lock().unwrap();
+    #[cfg(not(feature = "hitl_mode"))]
+    rt.operational.clear_automatic_abort_claim()
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let config = rt.engine.config.clone();
     rt.engine = Engine::default();
     rt.engine.config = config;
     rt.engine.config.dry_self_test_confirmed = false;
-    state.set_local_flight_state(FlightState::Idle);
     drop(rt);
+    state.set_local_flight_state(FlightState::Idle);
     crate::sequences::refresh_action_policy_now(state);
     state.broadcast_action_policy_snapshot();
     Ok(())
@@ -1573,30 +1626,13 @@ pub(crate) fn set_operational_prerequisites_for_test(state: &AppState) {
 /// All GroundStation automatic abort producers share this stage boundary.
 /// Manual Abort remains a separate operator command.
 pub fn automatic_abort_allowed(state: &AppState) -> bool {
+    #[cfg(feature = "hitl_mode")]
+    { let _ = state; true }
     #[cfg(not(feature = "hitl_mode"))]
-    if state
-        .gse
-        .lock()
-        .unwrap()
-        .operational
-        .saved
-        .qualification
-        .stage()
-        == gse_sequence::qualification::MissionStage::Fire
     {
-        return false;
+        let rt = state.gse.lock().unwrap();
+        automatic_abort::stage_allows_automatic_abort(&rt, state.local_flight_state_snapshot())
     }
-    cfg!(feature = "hitl_mode")
-        || matches!(
-            *state.state.lock().unwrap(),
-            FlightState::Startup
-                | FlightState::Idle
-                | FlightState::PreFill
-                | FlightState::FillTest
-                | FlightState::NitrogenFill
-                | FlightState::NitrousFill
-                | FlightState::Armed
-        )
 }
 
 #[derive(serde::Deserialize)]
@@ -1704,6 +1740,9 @@ fn apply_cold_flow_override(
 #[cfg(not(feature = "hitl_mode"))]
 pub(crate) fn commit_fire_intent(state: &Arc<AppState>) -> Result<(), String> {
     let mut rt = state.gse.lock().unwrap();
+    if rt.operational.saved.automatic_abort_claimed || rt.automatic_abort_in_flight {
+        return Err("Automatic abort is pending; clear GSE abort before Fire".into());
+    }
     if !prelaunch(state)
         || !operational_launch_allowed(state, &rt)
         || !interlock(state, &state.action_policy_snapshot())

@@ -171,6 +171,9 @@ pub struct AppState {
     /// Number of in-flight async DB writes (alerts/warnings/errors).
     pub pending_db_writes: Arc<AtomicUsize>,
 
+    /// Software TX ownership from callback admission through physical write.
+    pub transport_tx_activity: Arc<crate::telemetry_task::TransportTxActivity>,
+
     /// Notifies waiters when pending DB writes changes.
     pub db_write_notify: Arc<Notify>,
 
@@ -270,6 +273,10 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn has_pending_transport_tx(&self) -> bool {
+        self.transport_tx_activity.has_pending() || crate::rrls::status().queued_frames != 0
+    }
+
     /// Reset derived samples after a physical KG50 input change. The caller
     /// invalidates GSE mass under its own sequence lock.
     pub fn clear_kg50_samples(&self) {
@@ -2707,6 +2714,7 @@ pub(crate) mod tests {
             shutdown_tx,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             pending_db_writes: Arc::new(AtomicUsize::new(0)),
+            transport_tx_activity: Arc::new(Default::default()),
             db_write_notify: Arc::new(Notify::new()),
             notifications: Arc::new(Mutex::new(Vec::new())),
             notifications_tx,

@@ -199,7 +199,34 @@ impl TxQueueBudget {
     }
 }
 
+/// Accepted software TX ownership, including queue-pop and active-write windows.
+/// This does not assert drain/receipt inside an external modem or remote board.
+#[derive(Default)]
+pub struct TransportTxActivity {
+    pending: AtomicUsize,
+}
+impl TransportTxActivity {
+    pub fn try_enqueue(&self, send: impl FnOnce() -> sedsnet::TelemetryResult<()>) -> sedsnet::TelemetryResult<()> {
+        self.pending.try_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_add(1))
+            .map_err(|_| sedsnet::TelemetryError::Io("side tx busy"))?;
+        if let Err(error) = send() {
+            self.complete();
+            return Err(error);
+        }
+        Ok(())
+    }
+    pub fn has_pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire) != 0
+    }
+    fn complete(&self) {
+        // Underflow retains a fail-closed nonzero count even in release builds.
+        let previous = self.pending.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0, "unowned software TX completion");
+    }
+}
+
 pub struct CommsWorkerHandle {
+    pub transport_activity: Option<Arc<TransportTxActivity>>,
     pub name: &'static str,
     /// Used by the generic worker; legacy/dedicated workers leave this None.
     pub tx_budget: Option<Arc<TxQueueBudget>>,
@@ -1107,6 +1134,7 @@ pub(super) fn spawn_comms_worker_threads(
                             if let Some(budget) = &comms_handle.tx_budget {
                                 budget.complete(priority, &payload);
                             }
+                            if let Some(activity) = &comms_handle.transport_activity { activity.complete(); }
                             sent_any = true;
                             log_link_control_send(worker_name, &payload);
                             log_radio_command_event("radio TX sent", worker_name, &payload);
@@ -1215,6 +1243,7 @@ fn spawn_legacy_comms_worker_thread(
             let mut suppressed_send_errors = 0;
             let mut last_recv_error_log_ms = 0;
             let mut suppressed_recv_errors = 0;
+            let mut pending_tx = None;
             loop {
                 match comms_shutdown_rx.try_recv() {
                     Ok(_)
@@ -1233,11 +1262,14 @@ fn spawn_legacy_comms_worker_thread(
                 };
                 let mut comms = comms.lock().expect("failed to get lock");
                 for _ in 0..COMMS_TX_BURST {
-                    match comms_handle.tx_rx.try_recv() {
-                        Ok((_priority, payload)) => {
+                    let selected = pending_tx.take().map(Ok).unwrap_or_else(|| comms_handle.tx_rx.try_recv());
+                    match selected {
+                        Ok((priority, payload)) => {
                             sent_any = true;
                             match comms.send_data(&payload) {
                                 Ok(()) => {
+                                    if let Some(budget) = &comms_handle.tx_budget { budget.complete(priority, &payload); }
+                                    if let Some(activity) = &comms_handle.transport_activity { activity.complete(); }
                                     log_link_control_send(worker_name, &payload);
                                     log_radio_command_event("radio TX sent", worker_name, &payload);
                                     if suppressed_send_errors > 0 {
@@ -1249,6 +1281,7 @@ fn spawn_legacy_comms_worker_thread(
                                     }
                                 }
                                 Err(e) => {
+                                    pending_tx = Some((priority, payload));
                                     log_repeated_worker_error(
                                         &format!("{worker_name} comms worker send_data failed"),
                                         &e.to_string(),
@@ -1322,8 +1355,8 @@ pub(super) fn spawn_dedicated_radio_io_threads(
             let radio_uplink_turnaround = Duration::from_millis(radio_uplink_turnaround_ms());
             let radio_uplink_tx_guard = Duration::from_millis(radio_uplink_tx_guard_ms());
             let radio_uplink_yield_grace = Duration::from_millis(radio_uplink_yield_grace_ms());
-            let mut command_backlog: VecDeque<Vec<u8>> = VecDeque::new();
-            let mut telemetry_backlog: VecDeque<Vec<u8>> = VecDeque::new();
+            let mut command_backlog: VecDeque<(u8, Vec<u8>)> = VecDeque::new();
+            let mut telemetry_backlog: VecDeque<(u8, Vec<u8>)> = VecDeque::new();
             let mut last_window_update_at: Option<std::time::Instant> = None;
             let mut follow_window_opened_at: Option<std::time::Instant> = None;
             let mut follow_window_until: Option<std::time::Instant> = None;
@@ -1352,7 +1385,10 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     &mut command_backlog,
                     &mut telemetry_backlog,
                     radio_tx_backlog_limit,
-                ) {
+
+                    comms_handle.transport_activity.as_deref(),
+                    comms_handle.tx_budget.as_deref(),
+) {
                     return;
                 }
 
@@ -1396,7 +1432,10 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                         &mut next_uplink_tx_at,
                         &mut last_send_error_log_ms,
                         &mut suppressed_send_errors,
-                    );
+
+                    comms_handle.transport_activity.as_deref(),
+                    comms_handle.tx_budget.as_deref(),
+);
                 }
                 match comms.recv_serialized_packets_with_budget(
                     &mut |payload| {
@@ -1423,7 +1462,10 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     &mut command_backlog,
                     &mut telemetry_backlog,
                     radio_tx_backlog_limit,
-                ) {
+
+                    comms_handle.transport_activity.as_deref(),
+                    comms_handle.tx_budget.as_deref(),
+) {
                     return;
                 }
                 while let Some(update) = comms.take_radio_window_update() {
@@ -1433,7 +1475,10 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                         &mut command_backlog,
                         &mut telemetry_backlog,
                         radio_tx_backlog_limit,
-                    ) {
+
+                    comms_handle.transport_activity.as_deref(),
+                    comms_handle.tx_budget.as_deref(),
+) {
                         return;
                     }
                     let now = std::time::Instant::now();
@@ -1516,7 +1561,10 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                                 &mut next_uplink_tx_at,
                                 &mut last_send_error_log_ms,
                                 &mut suppressed_send_errors,
-                            );
+
+                    comms_handle.transport_activity.as_deref(),
+                    comms_handle.tx_budget.as_deref(),
+);
                         }
                     }
                 }
@@ -1526,7 +1574,10 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     &mut command_backlog,
                     &mut telemetry_backlog,
                     radio_tx_backlog_limit,
-                ) {
+
+                    comms_handle.transport_activity.as_deref(),
+                    comms_handle.tx_budget.as_deref(),
+) {
                     return;
                 }
                 let _ = send_while_uplink_window_open(
@@ -1548,7 +1599,10 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     &mut next_uplink_tx_at,
                     &mut last_send_error_log_ms,
                     &mut suppressed_send_errors,
-                );
+
+                    comms_handle.transport_activity.as_deref(),
+                    comms_handle.tx_budget.as_deref(),
+);
                 let uplink_turnaround_elapsed = follow_window_opened_at
                     .map(|opened_at| {
                         std::time::Instant::now()
@@ -1671,6 +1725,7 @@ fn spawn_rx_priority_comms_worker_thread(
             let mut suppressed_recv_errors = 0;
             let mut next_tx_allowed_at = std::time::Instant::now();
 
+            let mut pending_tx = None;
             loop {
                 match comms_shutdown_rx.try_recv() {
                     Ok(_)
@@ -1693,10 +1748,12 @@ fn spawn_rx_priority_comms_worker_thread(
                     Ok(()) => {
                         let now = std::time::Instant::now();
                         if now >= next_tx_allowed_at
-                            && let Ok((_priority, payload)) = comms_handle.tx_rx.try_recv()
+                            && let Some((priority, payload)) = pending_tx.take().or_else(|| comms_handle.tx_rx.try_recv().ok())
                         {
                             match comms.send_data(&payload) {
                                 Ok(()) => {
+                                    if let Some(budget) = &comms_handle.tx_budget { budget.complete(priority, &payload); }
+                                    if let Some(activity) = &comms_handle.transport_activity { activity.complete(); }
                                     log_radio_command_event("radio TX sent", worker_name, &payload);
                                     if suppressed_send_errors > 0 {
                                         eprintln!(
@@ -1709,6 +1766,7 @@ fn spawn_rx_priority_comms_worker_thread(
                                         + Duration::from_millis(COMMS_TX_GAP_MS);
                                 }
                                 Err(e) => {
+                                    pending_tx = Some((priority, payload));
                                     log_repeated_worker_error(
                                         &format!("{worker_name} comms worker send_data failed"),
                                         &e.to_string(),
@@ -2187,13 +2245,15 @@ fn is_flight_command_payload(payload: &[u8]) -> bool {
 fn drain_radio_tx_queue(
     tx_rx: &mut mpsc::UnboundedReceiver<(u8, Vec<u8>)>,
     worker_name: &str,
-    command_backlog: &mut VecDeque<Vec<u8>>,
-    telemetry_backlog: &mut VecDeque<Vec<u8>>,
+    command_backlog: &mut VecDeque<(u8, Vec<u8>)>,
+    telemetry_backlog: &mut VecDeque<(u8, Vec<u8>)>,
     radio_tx_backlog_limit: usize,
+    transport_activity: Option<&TransportTxActivity>,
+    tx_budget: Option<&TxQueueBudget>,
 ) -> bool {
     loop {
         match tx_rx.try_recv() {
-            Ok((_priority, payload)) => {
+            Ok((priority, payload)) => {
                 log_radio_command_event("radio TX backlog", worker_name, &payload);
                 let repeats =
                     if worker_name == "rocket_comms" && is_flight_command_payload(&payload) {
@@ -2203,13 +2263,16 @@ fn drain_radio_tx_queue(
                     };
                 for _ in 0..repeats {
                     if is_command_payload(&payload) {
-                        command_backlog.push_back(payload.clone());
+                        command_backlog.push_back((priority, payload.clone()));
                     } else {
-                        telemetry_backlog.push_back(payload.clone());
+                        telemetry_backlog.push_back((priority, payload.clone()));
                     }
                 }
                 while telemetry_backlog.len() > radio_tx_backlog_limit {
-                    telemetry_backlog.pop_front();
+                    if let Some((priority, payload)) = telemetry_backlog.pop_front() {
+                        if let Some(budget) = tx_budget { budget.complete(priority, &payload); }
+                        if let Some(activity) = transport_activity { activity.complete(); }
+                    }
                 }
             }
             Err(mpsc::error::TryRecvError::Empty) => return true,
@@ -2221,8 +2284,8 @@ fn drain_radio_tx_queue(
 fn send_while_uplink_window_open(
     comms: &mut dyn CommsDevice,
     worker_name: &str,
-    command_backlog: &mut VecDeque<Vec<u8>>,
-    telemetry_backlog: &mut VecDeque<Vec<u8>>,
+    command_backlog: &mut VecDeque<(u8, Vec<u8>)>,
+    telemetry_backlog: &mut VecDeque<(u8, Vec<u8>)>,
     max_packets_per_window: usize,
     radio_follow_timeout: Duration,
     has_seen_window_update: bool,
@@ -2237,6 +2300,8 @@ fn send_while_uplink_window_open(
     next_uplink_tx_at: &mut Option<std::time::Instant>,
     last_send_error_log_ms: &mut u64,
     suppressed_send_errors: &mut u64,
+    transport_activity: Option<&TransportTxActivity>,
+    tx_budget: Option<&TxQueueBudget>,
 ) -> bool {
     let mut sent_any = false;
     loop {
@@ -2294,7 +2359,7 @@ fn send_while_uplink_window_open(
         }
 
         let sending_command = !command_backlog.is_empty();
-        let Some(payload) = (if sending_command {
+        let Some((_, payload)) = (if sending_command {
             command_backlog.front()
         } else {
             telemetry_backlog.front()
@@ -2307,7 +2372,7 @@ fn send_while_uplink_window_open(
             break;
         }
 
-        let Some(payload) = (if sending_command {
+        let Some((priority, payload)) = (if sending_command {
             command_backlog.pop_front()
         } else {
             telemetry_backlog.pop_front()
@@ -2318,6 +2383,8 @@ fn send_while_uplink_window_open(
         maybe_log_green_radio_command_send(worker_name, &payload);
         match comms.send_data(&payload) {
             Ok(()) => {
+                if let Some(budget) = tx_budget { budget.complete(priority, &payload); }
+                if let Some(activity) = transport_activity { activity.complete(); }
                 log_radio_command_event("radio TX sent", worker_name, &payload);
                 *sent_in_current_uplink_window += 1;
                 let sent_at = std::time::Instant::now();
@@ -2335,7 +2402,9 @@ fn send_while_uplink_window_open(
             Err(e) => {
                 log_radio_packet_event("radio TX send_data failed for", worker_name, &payload);
                 if sending_command {
-                    command_backlog.push_front(payload);
+                    command_backlog.push_front((priority, payload));
+                } else {
+                    telemetry_backlog.push_front((priority, payload));
                 }
                 log_repeated_worker_error(
                     &format!("{worker_name} radio io send_data failed"),
@@ -2414,6 +2483,7 @@ mod rfd_worker_tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                transport_activity: None,
                 name: "rocket_comms",
                 tx_budget: None,
                 comms: Arc::new(Mutex::new(device())),
@@ -2503,6 +2573,7 @@ mod rfd_worker_tests {
             Arc::new(Router::new(Default::default())),
             state.clone(),
             CommsWorkerHandle {
+                transport_activity: None,
                 name: "rocket_comms",
                 tx_budget: Some(budget.clone()),
                 comms: Arc::new(Mutex::new(device())),
@@ -2607,6 +2678,7 @@ mod rfd_worker_tests {
             router,
             state.clone(),
             CommsWorkerHandle {
+                transport_activity: None,
                 name: "rocket_comms",
                 tx_budget: Some(budget.clone()),
                 comms: Arc::new(Mutex::new(device())),
@@ -2659,5 +2731,83 @@ mod rfd_worker_tests {
         );
         assert_eq!(budget.pending.load(Ordering::Acquire), 0);
         assert_eq!(budget.pending_control.load(Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod transport_pending_tests {
+    use super::*;
+    use std::error::Error;
+    struct BlockThenRetry { attempts: Arc<AtomicUsize>, release: Arc<AtomicUsize>, entered: std::sync::mpsc::Sender<usize> }
+    impl CommsDevice for BlockThenRetry {
+        fn recv_packet(&mut self, _: &Router, _: &mut dyn FnMut(&Packet)) -> sedsnet::TelemetryResult<()> { Ok(()) }
+        fn send_data(&mut self, _: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+            let attempt=self.attempts.fetch_add(1,Ordering::AcqRel);self.entered.send(attempt).unwrap();
+            while self.release.load(Ordering::Acquire)<=attempt { thread::sleep(Duration::from_millis(1)); }
+            if attempt==0 { return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into()); } Ok(())
+        }
+        fn set_side_id(&mut self, _: RouterSideId) {}
+    }
+    #[test]
+    fn rejected_enqueue_does_not_leave_phantom_transport_ownership() {
+        let activity=TransportTxActivity::default();
+        assert!(activity.try_enqueue(||Err(sedsnet::TelemetryError::Io("side tx busy"))).is_err());assert!(!activity.has_pending());
+        activity.try_enqueue(||{assert!(activity.has_pending(),"ownership must precede handoff");Ok(())}).unwrap();
+        assert!(activity.has_pending());activity.complete();assert!(!activity.has_pending());
+    }
+    #[tokio::test]
+    async fn software_owner_survives_queue_pop_active_write_and_retry_in_all_workers() {
+        for (legacy,prioritize_rx) in [(false,false),(true,false),(false,true)] {
+            let state=crate::state::tests::test_app_state().await;let activity=state.transport_tx_activity.clone();
+            let attempts=Arc::new(AtomicUsize::new(0));let release=Arc::new(AtomicUsize::new(0));
+            let (entered,observed)=std::sync::mpsc::channel();let (sender,receiver)=mpsc::unbounded_channel();
+            activity.try_enqueue(||sender.send((16,vec![1,2,3])).map_err(|_|sedsnet::TelemetryError::Io("test queue closed"))).unwrap();
+            assert!(state.has_pending_transport_tx(),"queued work must block clear");
+            let workers=spawn_comms_worker_threads(Arc::new(Router::new(Default::default())),state.clone(),CommsWorkerHandle {
+                transport_activity:Some(activity.clone()),name:"pending_fixture",tx_budget:None,
+                comms:Arc::new(Mutex::new(Box::new(BlockThenRetry {attempts:attempts.clone(),release:release.clone(),entered}))),
+                tx_comms:None,side_id:0,tx_rx:receiver,legacy_single_worker:legacy,prioritize_rx,dedicated_radio_io:false,
+            }).unwrap();
+            let result=(||->Result<(),&'static str>{
+                if observed.recv_timeout(Duration::from_secs(2))!=Ok(0){return Err("first write not reached");}
+                if !state.has_pending_transport_tx(){return Err("ownership disappeared during active write");}
+                release.store(1,Ordering::Release);
+                if observed.recv_timeout(Duration::from_secs(2))!=Ok(1){return Err("failed write dropped instead of retried");}
+                if !state.has_pending_transport_tx(){return Err("ownership disappeared across retry");}
+                release.store(2,Ordering::Release);
+                for _ in 0..2000 {if !activity.has_pending(){return Ok(());}thread::sleep(Duration::from_millis(1));}
+                Err("successful write did not release ownership")
+            })();
+            release.store(usize::MAX,Ordering::Release);state.request_shutdown();drop(sender);
+            for worker in workers {worker.join().unwrap();}
+            assert!(result.is_ok(),"legacy={legacy} rx_priority={prioritize_rx}: {result:?}");assert!(!activity.has_pending());
+        }
+    }
+    #[test]
+    fn dedicated_retry_retains_software_owner_and_exact_capacity_priority() {
+        let activity=TransportTxActivity::default();let budget=TxQueueBudget::new(2048);
+        let (sender,mut receiver)=mpsc::unbounded_channel();
+        activity.try_enqueue(||budget.try_send(&sender,0,&[1,2,3])).unwrap();
+        let mut commands=VecDeque::new();let mut telemetry=VecDeque::new();
+        assert!(drain_radio_tx_queue(&mut receiver,"fixture",&mut commands,&mut telemetry,8,Some(&activity),Some(&budget)));
+        let (entered,_observed)=std::sync::mpsc::channel();
+        let mut device=BlockThenRetry {attempts:Arc::new(AtomicUsize::new(0)),release:Arc::new(AtomicUsize::new(usize::MAX)),entered};
+        let now=std::time::Instant::now();let mut until=Some(now+Duration::from_secs(4));let mut uplink=true;
+        let mut sent=0;let mut last=None;let mut next=None;let mut error_time=0;let mut suppressed=0;
+        for round in 0..2 {
+            let wrote=send_while_uplink_window_open(&mut device,"fixture",&mut commands,&mut telemetry,8,Duration::from_secs(5),true,Some(now),Some(now),Duration::ZERO,Duration::ZERO,&mut until,&mut uplink,&mut sent,&mut last,&mut next,&mut error_time,&mut suppressed,Some(&activity),Some(&budget));
+            assert_eq!(wrote,round==1);
+            assert_eq!(activity.has_pending(),round==0);
+            assert_eq!(budget.pending.load(Ordering::Acquire),if round==0 {3}else{0});
+            assert_eq!(telemetry.len(),if round==0 {1}else{0});
+        }
+    }
+    #[test]
+    fn dedicated_backlog_eviction_releases_only_discarded_telemetry() {
+        let activity=TransportTxActivity::default();let (sender,mut receiver)=mpsc::unbounded_channel();
+        for byte in 1..=3 {activity.try_enqueue(||sender.send((0,vec![byte])).map_err(|_|sedsnet::TelemetryError::Io("closed"))).unwrap();}
+        let mut commands=VecDeque::new();let mut telemetry=VecDeque::new();
+        assert!(drain_radio_tx_queue(&mut receiver,"fixture",&mut commands,&mut telemetry,1,Some(&activity),None));
+        assert_eq!(telemetry.len(),1);assert!(activity.has_pending());activity.complete();assert!(!activity.has_pending());
     }
 }

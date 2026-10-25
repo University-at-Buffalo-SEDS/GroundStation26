@@ -951,6 +951,7 @@ async fn main() -> anyhow::Result<()> {
         shutdown_tx,
         shutdown_requested: Arc::new(AtomicBool::new(false)),
         pending_db_writes: Arc::new(AtomicUsize::new(0)),
+        transport_tx_activity: Arc::new(Default::default()),
         db_write_notify: Arc::new(Notify::new()),
         notifications: Arc::new(Mutex::new(Vec::new())),
         notifications_tx,
@@ -1477,6 +1478,7 @@ async fn main() -> anyhow::Result<()> {
     let rocket_side = {
         let rocket_tx = rocket_tx.clone();
         let budget = rocket_tx_budget.clone();
+        let activity = state.transport_tx_activity.clone();
         let opts = RouterSideOptions {
             reliable_enabled: router_hop_reliable_enabled(&comms_links.av_bay),
             ..Default::default()
@@ -1486,7 +1488,7 @@ async fn main() -> anyhow::Result<()> {
         .with_small_packet_transport(RADIO_SIDE_MAX_FRAME_BYTES);
         router.add_side_packed_with_priority_and_options(
             "rocket_comms",
-            move |pkt, priority| budget.try_send(&rocket_tx, priority, pkt),
+            move |pkt, priority| activity.try_enqueue(|| budget.try_send(&rocket_tx, priority, pkt)),
             opts,
         )
     };
@@ -1496,6 +1498,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Some({
             let umbilical_tx = umbilical_tx.clone();
+            let activity = state.transport_tx_activity.clone();
             let opts = RouterSideOptions {
                 reliable_enabled: router_hop_reliable_enabled(&comms_links.fill_box),
                 ..Default::default()
@@ -1504,10 +1507,11 @@ async fn main() -> anyhow::Result<()> {
             router.add_side_packed_with_priority_and_options(
                 "umbilical_comms",
                 move |pkt, priority| {
-                    umbilical_tx.send((priority, pkt.to_vec())).map_err(|_| {
-                        TelemetryError::HandlerError("umbilical_comms tx queue closed")
-                    })?;
-                    Ok(())
+                    activity.try_enqueue(|| {
+                        umbilical_tx.send((priority, pkt.to_vec())).map_err(|_| {
+                            TelemetryError::HandlerError("umbilical_comms tx queue closed")
+                        })
+                    })
                 },
                 opts,
             )
@@ -1576,6 +1580,7 @@ async fn main() -> anyhow::Result<()> {
     let telemetry_shutdown_rx = state.shutdown_subscribe();
     let safety_shutdown_rx = state.shutdown_subscribe();
     let mut comms_workers = vec![CommsWorkerHandle {
+        transport_activity: Some(state.transport_tx_activity.clone()),
         name: "rocket_comms",
         tx_budget: Some(rocket_tx_budget.clone()),
         comms: rocket_comms,
@@ -1588,6 +1593,7 @@ async fn main() -> anyhow::Result<()> {
     }];
     if let (Some(comms), Some(side_id)) = (umbilical_comms, umbilical_side) {
         comms_workers.push(CommsWorkerHandle {
+            transport_activity: Some(state.transport_tx_activity.clone()),
             name: "umbilical_comms",
             tx_budget: None,
             comms,

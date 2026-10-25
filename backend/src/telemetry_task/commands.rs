@@ -54,7 +54,16 @@ pub(crate) fn queue_locally_routed_flight_command(
 }
 
 pub(crate) fn queue_abort_packet(router: &Router, reason: &str) -> sedsnet::TelemetryResult<()> {
-    let pkt = Packet::new(
+    router.rx_queue(abort_packet(reason)?)
+}
+
+/// Locally generated automatic aborts retain accepted TX ownership until handoff.
+pub(crate) fn queue_automatic_abort_packet(router: &Router, reason: &str) -> sedsnet::TelemetryResult<()> {
+    router.tx_queue(abort_packet(reason)?)
+}
+
+fn abort_packet(reason: &str) -> sedsnet::TelemetryResult<Packet> {
+    Packet::new(
         crate::telemetry_schema::data_type("ABORT"),
         &[
             crate::telemetry_schema::endpoint("GROUND_STATION"),
@@ -68,8 +77,7 @@ pub(crate) fn queue_abort_packet(router: &Router, reason: &str) -> sedsnet::Tele
         Board::GroundStation.sender_id(),
         get_current_timestamp_ms(),
         Arc::from(reason.as_bytes()),
-    )?;
-    router.rx_queue(pkt)
+    )
 }
 
 pub(crate) fn flush_command_tx(router: &Router, context: &str) {

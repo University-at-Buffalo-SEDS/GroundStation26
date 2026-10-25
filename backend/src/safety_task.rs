@@ -1,5 +1,5 @@
 use crate::state::AppState;
-use crate::telemetry_task::{get_current_timestamp_ms, queue_abort_packet};
+use crate::telemetry_task::{get_current_timestamp_ms, queue_automatic_abort_packet};
 use crate::types::{Board, FlightState, canonical_sender_id};
 use crate::web::{emit_warning, emit_warning_db_only};
 use sedsnet::router::Router;
@@ -537,23 +537,29 @@ pub async fn safety_task(
             }
         }
 
-        if !crate::gse::automatic_abort_allowed(&state) {
-            abort = false;
-        }
-        if abort {
-            state.set_abort_indicator_latched(true);
-            crate::sequences::refresh_action_policy_now(&state);
-            state.broadcast_action_policy_snapshot();
-            queue_abort_packet(&router, "Safety Task Abort Command Issued").unwrap_or_else(|e| {
-                eprintln!("failed to log Abort command: {:?}", e);
-            });
-            if let Err(e) = router.process_all_queues_with_timeout(3) {
-                eprintln!("failed to flush Abort command: {:?}", e);
-            }
-            gs_debug_println!("Safety task: Abort command sent");
+        if abort && dispatch_safety_abort(&state, &router) {
             break;
         }
     }
+}
+
+/// Claims launch exclusion before dispatch, without holding the GSE mutex over
+/// router callbacks. Admission failure keeps the persisted recovery latch.
+pub(crate) fn dispatch_safety_abort(state: &Arc<AppState>, router: &Router) -> bool {
+    let Some(_claim) = crate::gse::claim_automatic_abort(state) else { return false; };
+    state.set_abort_indicator_latched(true);
+    crate::sequences::refresh_action_policy_now(state);
+    state.broadcast_action_policy_snapshot();
+    match queue_automatic_abort_packet(router, "Safety Task Abort Command Issued") {
+        Ok(()) => {
+            if let Err(error) = router.process_all_queues_with_timeout(3) {
+                log::error!("failed to flush automatic abort: {error:?}");
+            }
+            gs_debug_println!("Safety task: Abort command accepted for delivery");
+        }
+        Err(error) => log::error!("failed to queue automatic abort; GSE abort remains latched: {error:?}"),
+    }
+    true
 }
 
 #[cfg(test)]

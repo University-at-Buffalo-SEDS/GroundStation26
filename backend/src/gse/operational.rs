@@ -14,6 +14,8 @@ use std::{
 #[serde(deny_unknown_fields)]
 pub struct Saved {
     pub qualification: Qualification,
+    #[serde(default)]
+    pub(super) automatic_abort_claimed: bool,
     pub baseline: Option<Baseline>,
     pub fill_target_kg: Option<f32>,
     #[serde(default)]
@@ -170,6 +172,22 @@ impl Operational {
             self.persist_error = Some(error.clone());
         }
         result
+    }
+    pub fn clear_automatic_abort_claim(&mut self) -> Result<(), String> {
+        if !self.saved.automatic_abort_claimed {
+            return Ok(());
+        }
+        let mut next = self.saved.clone();
+        next.automatic_abort_claimed = false;
+        let result = self.path.as_ref()
+            .ok_or_else(|| "Qualification storage is not initialized".to_string())
+            .and_then(|path| next.save(path));
+        if let Err(error) = result {
+            self.persist_error = Some(error.clone());
+            return Err(error);
+        }
+        self.saved = next;
+        Ok(())
     }
     pub fn complete(&mut self, milestone: Milestone) -> Result<(), String> {
         self.bind_checklists()?;

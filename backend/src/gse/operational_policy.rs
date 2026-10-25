@@ -12,7 +12,7 @@ pub(super) fn operational_action_allowed(rt: &Runtime, action: Action) -> bool {
         Action::StartFill => Milestone::FillTarget,
         _ => unreachable!(),
     };
-    crate::checklists::paired::qualification_allowed(
+    !rt.operational.saved.automatic_abort_claimed && crate::checklists::paired::qualification_allowed(
         rt.operational.saved.checklist_digest.as_deref(),
         rt.operational.has_checklist_evidence(),
     ) && rt.operational.saved.pending_checklists.is_empty()
@@ -34,7 +34,7 @@ fn flight_routes(state: &AppState) -> bool {
 pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool {
     let now = rt.now();
     let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
-    crate::checklists::paired::qualification_allowed(
+    !rt.operational.saved.automatic_abort_claimed && crate::checklists::paired::qualification_allowed(
         rt.operational.saved.checklist_digest.as_deref(),
         rt.operational.has_checklist_evidence(),
     ) && rt.operational.saved.pending_checklists.is_empty()
@@ -200,18 +200,13 @@ pub(super) fn publish_qualified_flight_armed(state: &Arc<AppState>) {
 }
 /// Returns true when automation must not advance this tick.
 pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
-    if state
-        .gse
-        .lock()
-        .unwrap()
-        .operational
-        .saved
-        .qualification
-        .stage()
-        == gse_sequence::qualification::MissionStage::Fire
-    {
-        return true;
-    }
+    let blocked = {
+        let rt = state.gse.lock().unwrap();
+        rt.operational.saved.qualification.stage()
+            == gse_sequence::qualification::MissionStage::Fire
+            || rt.operational.saved.automatic_abort_claimed
+    };
+    if blocked { return true; }
     let stage = *state.state.lock().unwrap();
     // No GroundStation-generated abort or valve correction from Launch onward.
     if !matches!(
@@ -369,6 +364,7 @@ pub(super) fn handle_operational_command(state: &Arc<AppState>, cmd: &TelemetryC
 }
 
 pub(super) fn check_report_safety(state: &Arc<AppState>) {
+    if state.gse.lock().unwrap().operational.saved.automatic_abort_claimed { return; }
     if state
         .gse
         .lock()
