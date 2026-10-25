@@ -4,10 +4,12 @@
   "checks": {
     "backend_recorded_vehicle": "6 passed, including opt-in bounded saved growth, pause/elapsed preservation and later-flight refusal",
     "backend_recording_replay": "14 passed",
-    "frontend_native": "136 passed, 7 ignored",
+    "frontend_native": "138 passed, 7 ignored",
     "renderer_webgl": "passed at 1280, 390, 320 pixels; apogee, ground/horizon, orbit, touch pinch",
     "audience_browser": "passed at 1280, 390, 320 pixels; saved-only playback, growing saved snapshot, source switches, freeze, pause",
-    "pure_js": "replay-scene.test.mjs and saved-replay-player.test.mjs passed"
+    "pure_js": "replay-scene.test.mjs and saved-replay-player.test.mjs passed",
+    "configuration_concurrency": "HTTP regression: automatic growth permits old scene draft, preserves newest snapshot/clock, explicit seek/pause preserves grown bounds, genuine operator edit still returns409",
+    "backend_media": "32 passed, 1 ignored; camera replay, rundown persistence, recorded replay and scoped capabilities"
   },
   "limitations": [
     "Synthetic local saved data only; no live devices or output commands",
@@ -19,8 +21,8 @@
     "Seds-Ground-Station-Frontend/station_ui/rendering/three/saved-replay-player.js": "f1b8100faf2d75806a7bd82a029ee515a50ffeb15c88c99b5dc542e4f723e490",
     "Seds-Ground-Station-Frontend/station_ui/rendering/three/replay-scene.js": "5ebc053e54d0c9d1bb78bded6f59605a268f3254a08fc929cf1230d61d2cbf3a",
     "Seds-Ground-Station-Frontend/station_ui/rendering/three/vehicle-renderer.js": "cc56fdc654e66ef9b0d784d370539b980ba30cd6ff185a9553c4b740dec16b9f",
-    "Seds-Ground-Station-Frontend/src/telemetry_dashboard/recorded_replay_controls.rs": "cb6b0f471f0d2f09b45eb2e9089131544724a4ada322eb1e4470dc610698b453",
-    "GroundStation26/backend/src/media/recorded_vehicle.rs": "628b95c7b4b2c6b39ca66e1763f65ef230e9d9f3bd2c4f2d11530c865120381f",
+    "Seds-Ground-Station-Frontend/src/telemetry_dashboard/recorded_replay_controls.rs": "ed06620ddb99fe4bd89be4b6e475d5773785099c7d51267a7f4b53c4df0515cf",
+    "GroundStation26/backend/src/media/recorded_vehicle.rs": "262fde181d2e9421ce68fede568a0445368ad5b271d31b6fac9c86e66c8c138d",
     "GroundStation26/backend/src/recording_replay.rs": "488b4eed45619d4d9628f2cba6ab7bbaf13592cbcaac8d18b811f79c1105fef1"
   }
 }

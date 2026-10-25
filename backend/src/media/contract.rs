@@ -541,7 +541,24 @@ async fn live_streams(
 pub(super) async fn control_broadcast(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
-    axum::Json(mut broadcast): axum::Json<Broadcast>,
+    axum::Json(broadcast): axum::Json<Broadcast>,
+) -> ApiResult<axum::Json<Broadcast>> {
+    control_broadcast_inner(state, headers, broadcast, false).await
+}
+
+pub(super) async fn control_recorded_broadcast(
+    State(state): State<Arc<MediaState>>,
+    headers: HeaderMap,
+    axum::Json(broadcast): axum::Json<Broadcast>,
+) -> ApiResult<axum::Json<Broadcast>> {
+    control_broadcast_inner(state, headers, broadcast, true).await
+}
+
+async fn control_broadcast_inner(
+    state: Arc<MediaState>,
+    headers: HeaderMap,
+    mut broadcast: Broadcast,
+    edit_recorded_replay: bool,
 ) -> ApiResult<axum::Json<Broadcast>> {
     let principal =
         crate::web::authorize_headers(&state.app, &headers, Permission::ViewData).await?;
@@ -599,8 +616,10 @@ pub(super) async fn control_broadcast(
             check_id(id)?;
         }
     }
-    if let Some(plan) = broadcast.recorded_replay.as_mut() {
-        super::recorded_vehicle::validate_plan(&state, plan).await?;
+    if edit_recorded_replay {
+        if let Some(plan) = broadcast.recorded_replay.as_mut() {
+            super::recorded_vehicle::validate_plan(&state, plan).await?;
+        }
     }
     if !broadcast.featured_stream_id.is_empty() {
         check_id(&broadcast.featured_stream_id)?;
@@ -617,6 +636,21 @@ pub(super) async fn control_broadcast(
             StatusCode::CONFLICT,
             "Broadcast changed; refresh before editing",
         ));
+    }
+    if edit_recorded_replay {
+        // An automatic refresh can extend a snapshot while an explicit seek or
+        // pause request is in flight. Keep those newly saved bounds while
+        // applying the requested playback position and controls atomically.
+        if let (Some(requested), Some(current)) = (
+            broadcast.recorded_replay.as_mut(),
+            presentation.broadcast.recorded_replay.as_ref(),
+        ) {
+            super::recorded_vehicle::preserve_grown_snapshot(requested, current);
+        }
+    } else {
+        // Scene/rundown/audio edits never own the saved replay clock. A draft
+        // may predate automatic growth without being a stale operator edit.
+        broadcast.recorded_replay = presentation.broadcast.recorded_replay.clone();
     }
     replay::prepare(&state, &mut broadcast, &presentation.broadcast).await?;
     broadcast.revision = presentation

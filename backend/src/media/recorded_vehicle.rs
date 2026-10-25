@@ -91,6 +91,20 @@ pub(super) async fn validate_plan(
     Ok(())
 }
 
+pub(super) fn preserve_grown_snapshot(
+    requested: &mut RecordedReplayPlan,
+    current: &RecordedReplayPlan,
+) {
+    if current.follow_saved
+        && requested.recording_id == current.recording_id
+        && requested.start_ms == current.start_ms
+        && requested.upper_id < current.upper_id
+    {
+        requested.upper_id = current.upper_id;
+        requested.end_ms = requested.end_ms.max(current.end_ms);
+    }
+}
+
 #[derive(Default)]
 pub(super) struct SceneCache {
     track: Option<(String, i64, serde_json::Value)>,
@@ -109,6 +123,10 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
     Router::new()
         .route("/api/media-assets/recorded-vehicle", get(page))
         .route("/api/media-assets/recorded-vehicle/state", get(scene_state))
+        .route(
+            "/api/media-assets/recorded-vehicle/control",
+            post(contract::control_recorded_broadcast),
+        )
         .route("/api/media-assets/recorded-vehicle/window", get(window))
         .route(
             "/api/media-assets/recorded-vehicle/trajectory",
@@ -221,11 +239,8 @@ async fn refresh_saved(state: &Arc<MediaState>) -> ApiResult<()> {
         return Ok(());
     }
     presentation.broadcast.recorded_replay = Some(next.clone());
-    presentation.broadcast.revision = presentation
-        .broadcast
-        .revision
-        .checked_add(1)
-        .ok_or_else(|| error(StatusCode::CONFLICT, "Broadcast revision exhausted"))?;
+    // This is playback state advancement, not an operator configuration edit.
+    // Audience selection identity includes bounds, independently of revision.
     contract::write_presentation(state, &presentation).await?;
     state.recorded_vehicle_cache.lock().await.refresh = Some((
         format!("{}:{}:{}", next.recording_id, next.start_ms, next.upper_id),
@@ -717,15 +732,16 @@ mod tests {
         selection.position_ms = 0;
         selection.anchor_server_ms = 0;
         selection.paused = true;
+        selection.follow_saved = true;
         let mut broadcast: serde_json::Value =
             serde_json::to_value(contract::Broadcast::default()).unwrap();
         broadcast["layout"] = "recorded-replay".into();
         broadcast["recorded_replay"] = serde_json::to_value(selection).unwrap();
         let app = contract::routes().merge(routes()).with_state(state.clone());
-        let request = |name: &str, body: serde_json::Value| {
+        let request = |name: &str, body: serde_json::Value, path: &str| {
             Request::builder()
                 .method("POST")
-                .uri("/api/live_streams/control")
+                .uri(path)
                 .header(header::AUTHORIZATION, format!("Bearer fixture-{name}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
@@ -733,7 +749,11 @@ mod tests {
         };
         assert_eq!(
             app.clone()
-                .oneshot(request("viewer", broadcast.clone()))
+                .oneshot(request(
+                    "viewer",
+                    broadcast.clone(),
+                    "/api/media-assets/recorded-vehicle/control"
+                ))
                 .await
                 .unwrap()
                 .status(),
@@ -741,7 +761,11 @@ mod tests {
         );
         let response = app
             .clone()
-            .oneshot(request("operator", broadcast.clone()))
+            .oneshot(request(
+                "operator",
+                broadcast.clone(),
+                "/api/media-assets/recorded-vehicle/control",
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -752,12 +776,88 @@ mod tests {
         assert_eq!(saved["recorded_replay"]["start_ms"], 1000);
         assert_eq!(
             app.clone()
-                .oneshot(request("operator", broadcast))
+                .oneshot(request(
+                    "operator",
+                    broadcast,
+                    "/api/media-assets/recorded-vehicle/control"
+                ))
                 .await
                 .unwrap()
                 .status(),
             StatusCode::CONFLICT,
             "oldoperatorpagecannotoverwriteanewprogramme"
+        );
+        // A long-lived ordinary scene draft must survive automatic playback
+        // growth, without rolling back its snapshot or replay clock.
+        insert(&db, 3000, "GPS_DATA", "[43,-78,5000]").await;
+        refresh_saved(&state).await.unwrap();
+        let grown = selected(&state).await.unwrap().0;
+        let mut scene_draft = saved.clone();
+        scene_draft["label"] = "Recovery replay".into();
+        let response = app
+            .clone()
+            .oneshot(request(
+                "operator",
+                scene_draft,
+                "/api/live_streams/control",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "automatic growth must not conflict with an operator draft"
+        );
+        let scene_saved: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 100000).await.unwrap()).unwrap();
+        assert_eq!(
+            scene_saved["revision"], 2,
+            "only operator edits advance configuration revision"
+        );
+        assert_eq!(
+            scene_saved["recorded_replay"],
+            serde_json::to_value(&grown).unwrap(),
+            "ordinary save must preserve latest replay state"
+        );
+        // Simulate growth between an explicit pause/seek request's read and
+        // commit. Its controls apply while the new saved bounds remain intact.
+        let mut replay_draft = scene_saved.clone();
+        replay_draft["recorded_replay"] = saved["recorded_replay"].clone();
+        replay_draft["recorded_replay"]["position_ms"] = 250.into();
+        replay_draft["recorded_replay"]["paused"] = false.into();
+        replay_draft["recorded_replay"]["anchor_server_ms"] = 0.into();
+        insert(&db, 4000, "GPS_DATA", "[43,-78,6000]").await;
+        state.recorded_vehicle_cache.lock().await.refresh = None;
+        refresh_saved(&state).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(
+                "operator",
+                replay_draft,
+                "/api/media-assets/recorded-vehicle/control",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 100000).await.unwrap()).unwrap();
+        assert_eq!(saved["revision"], 3);
+        assert_eq!(saved["recorded_replay"]["upper_id"], 4);
+        assert_eq!(saved["recorded_replay"]["end_ms"], 4000);
+        assert_eq!(saved["recorded_replay"]["position_ms"], 250);
+        assert_eq!(saved["recorded_replay"]["paused"], false);
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "operator",
+                    scene_saved,
+                    "/api/live_streams/control"
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT,
+            "a genuine intervening operator edit still conflicts"
         );
         let persisted: serde_json::Value = serde_json::from_slice(
             &tokio::fs::read(root.0.join("_presentation.json"))
@@ -772,8 +872,8 @@ mod tests {
         let restarted = media_state(&root.0, true).await;
         let replay = selected(&restarted).await.unwrap().0;
         assert_eq!(replay.recording_id, id);
-        assert_eq!(replay.upper_id, 2);
-        assert!(replay.paused);
+        assert_eq!(replay.upper_id, 4);
+        assert!(!replay.paused);
         assert!(!root.0.join("_presentation.upload").exists());
     }
     #[test]
