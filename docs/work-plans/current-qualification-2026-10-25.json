@@ -1,0 +1,138 @@
+{
+  "updated_utc": "2026-10-25T15:54:58.053938+00:00",
+  "source_ready": true,
+  "release_ready": false,
+  "packages_published": false,
+  "priorities": [
+    {
+      "task": "Stable low-latency RF and fill-system communication",
+      "status": "simulator_qualified",
+      "results": [
+        "Two- and three-radio startup,600-second network/source/SD tests and120-second GroundStation restart tests pass. PowerBoard compact is included in the three-radio cohort.",
+        "Each long cohort completes59 RF control rounds in100\u2013210ms; source-window preservation is at least99.9131percent. All modeled CAN FIFO overflow counters remain zero.",
+        "Directed outage/recovery: all297 checked frames,150 sensor reports and17 independent discovery messages arrive. Both host mesh drop counters and modem FIFO loss counters are zero.",
+        "Relayed command rounds300/290ms; maximum sensor delay457.32ms and discovery delay517.9ms. Main and relay share one physical UART quota; healthy defaults and explicit overrides remain unchanged.",
+        "During active relay, RF40percent + main15percent + RRLS35percent uses90percent of modeled air capacity. RFD firmware continues to own the MAC; LoRa scheduling/AUX/GRANT/windows stay off."
+      ],
+      "evidence": [
+        "FirmwareSimulator/docs/qualification/radio-clock-fixed-600s-2026-10-25.json",
+        "FirmwareSimulator/docs/qualification/rrls-telemetry-retention-2026-10-25.json"
+      ],
+      "remaining": [
+        "Push qualified source branches.",
+        "Validate actual RFD MAC/retries, propagation and physical hardware when available; the finite medium is an explicit approximation."
+      ]
+    },
+    {
+      "task": "Production sequence and checklist acceptance",
+      "status": "simulator_qualified",
+      "results": [
+        "An independent firmware_sim build exercises ordinary test-fire policy without HITL or testing bypasses. Existing HITL behavior is preserved.",
+        "Actual four-MCU flow passes self-test17.81s, nitrogen32.99s, Fill33.07s, Armed35.68s, Fire and pilot/T-plus45.72s. Input pressure/mass passes through modeled ADC/SPI hardware, real firmware and the network.",
+        "Persisted automatic checklist receipts and cold-flow reset after Fire are observed; premature Fill/Nitrogen/Fire requests are rejected.",
+        "Quantized fill completion now uses the existing cutoff tolerance consistently; below-target plateaus do not qualify. Committed Fire can accept actual pilot confirmation even while the fill engine remains paused.",
+        "Actual modeled pilot/igniter output timing and DAQ session/deadline memory are verified. No board timings or safety gates were weakened."
+      ],
+      "evidence": [
+        "FirmwareSimulator/docs/qualification/operational-gse-linked-2026-10-25.json"
+      ],
+      "remaining": [
+        "Physical pneumatic, combustion, key-switch and output-load acceptance remains outside simulator proof."
+      ]
+    },
+    {
+      "task": "SEDSnet full campaign and release tooling",
+      "status": "qualified_on_linux",
+      "results": [
+        "Both exact current full pipelines pass: default715 Rust+80 Python/API tests; compact/compression/fair/crypto741 Rust+80 Python/API tests. Zero skipped, unshortened600.005-second pressure test.",
+        "The full runner now builds and loads the actual native Python extension. Historical72-test discoveries are correctly recorded as63 passed/9 skipped, separately from the new complete campaigns.",
+        "UTC sample projection/steering and board holdover priority are corrected without wire-format/API or runtime state-size changes.",
+        "Environment overrides, child output and quoted/encoded release diagnostics are sanitized. Fake-token tests pass; no real credentials were inspected.",
+        "Offline source package listing includes both new Python helpers and excludes credential filenames. Version remains4.2.6."
+      ],
+      "evidence": [
+        "SEDSnet/docs/qualification-4.2.6-2026-10-25.json"
+      ],
+      "remaining": [
+        "Push main/dev source and publish qualified packages locally on the Mac after final Mac qualification."
+      ]
+    },
+    {
+      "task": "Audience studio and recorded3D recovery replay",
+      "status": "implemented_and_tested",
+      "results": [
+        "Recorded replay follows ascent, draws a progressive3D trajectory and shows reference ground/horizon. Orbit, pan, zoom, keyboard and touch controls work; Path overview marks the recorded rocket.",
+        "Growing saved snapshots preserve free-camera position and valid frames. Superseded requests are cancelled; changing recording/source/origin clears stale pose safely.",
+        "Persistent state/mode-sensitive rundown, commentary separate from crew transmit, interview/PiP, saved station positions and recovery map are implemented.",
+        "Actual WebGL/browser checks pass at1280/390/320px; native140 tests and Wasm checks pass. Synthetic saved-data screenshots were inspected."
+      ],
+      "commits": {
+        "frontend_dev": "2b5bc86"
+      },
+      "remaining": [
+        "Push frontend dev with matching backend; do not promote frontend main.",
+        "Physical phone/Pi GPU, compass, camera and microphone acceptance when available."
+      ]
+    },
+    {
+      "task": "Shared saved settings and modular checklists",
+      "status": "implemented_and_tested",
+      "results": [
+        "Signed, bounded incremental replication handles offline edits and explicit conflicts. Calibration, inert mission settings, saved coordinates and checklist progress retain their permission boundaries.",
+        "Durable SQLite journal/selector recovery, compare-and-swap conflicts and actual automatic procedure receipts are tested. Operational abort/QD/qualification state is not imported as ordinary settings.",
+        "Admin station coordinates and device-location actions persist; live GPS retains priority over manual positions."
+      ],
+      "remaining": [
+        "Coordinated backend/frontend source push."
+      ]
+    },
+    {
+      "task": "Map downloader, assets and packaging",
+      "status": "implemented_and_tested",
+      "results": [
+        "Map image validation, quiet retries, bounded single-writer storage, resumable cache repair, direct-interface fallback and small --test probes pass73 Rust+9 Python tests.",
+        "RRLS UB/URRG/Midland profile plans22,724,018,176bytes, below50GB.",
+        "Clean backend-only builds prepare independently verified pinned MapLibre assets without compiling the frontend.",
+        "Container builds exclude runtime accounts/credentials while preserving mounted user storage and first-admin setup. Existing local user data is untouched."
+      ],
+      "remaining": [
+        "Source push."
+      ]
+    },
+    {
+      "task": "Firmware build and platform checks",
+      "status": "qualified_with_explicit_limits",
+      "results": [
+        "All eight matched MCU factory variants fit their flash partitions; all seven --no-telemetry factories link with SDK source deliberately absent and Cargo/rustc blocked.",
+        "Post-soak source/artifact verification confirms the frozen cohort was unchanged.",
+        "Latest backend AArch64 production/HITL checks and release link pass warning-free; ELF requires at mostGLIBC2.35. Linux desktop frontend compilation passes.",
+        "SD pressure/raw/FC files reconcile with writer counters, pending buffers accounted for, with1000Hz monotonic clock metadata. These tests do not prove physical-card durability or nominal ADC acquisition rates."
+      ],
+      "remaining": [
+        "Finish latest native AArch64 frontend compile/link check.",
+        "Final macOS build/signing/notarization and local Mac package publication require access to the Mac; the existing async hostname question is unanswered.",
+        "Physical iOS/Android/Pi acceptance remains hardware follow-up."
+      ]
+    }
+  ],
+  "constraints": [
+    "No physical hardware flashing or actuation occurred.",
+    "Firmware SDK sources remain pinned to main; hosted requirement remains4. Frontend uses dev through --frontend-dev.",
+    "Keep50GiB disk reserve, bounded traces and sparse SD images; current free space is over450GiB.",
+    "Never read/log credentials or publish packages from this host.",
+    "Keep failed/interrupted candidate evidence; do not relabel older runs as newer source qualification."
+  ],
+  "qualified_runtime_refs": {
+    "sdk": "5b15190 runtime;edb3b19 current scripts/docs",
+    "groundstation": "35d3492 runtime;9d09ef4 packaging/docs follow-ups",
+    "frontend_dev": "2b5bc86",
+    "simulator": "1fd7ff6",
+    "flight_computer": "1572dfe",
+    "rf_board": "6b97760",
+    "power_board": "d636a5b",
+    "valve_board": "136eb1e",
+    "daq": "f095625",
+    "gateway": "72c8d8d",
+    "actuator": "b27a1ac"
+  }
+}

@@ -480,5 +480,9 @@
     ],
     "release_ready": false,
     "simulator_peripheral_tests": "Manual Docker uart-tests build passed from migrated repository, including ADC/DMA and register contracts"
+  },
+  "current_validation": {
+    "superseding_plan": "current-qualification-2026-10-25.json",
+    "scope": "This file preserves historical source-scoped results. Follow the current qualification plan for active source hashes, outstanding tests and release readiness; earlier completion does not qualify later changes."
   }
 }
