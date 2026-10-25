@@ -158,7 +158,7 @@ fn simulation_clock_ms() -> Option<u64> {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = PATH
         .get_or_init(|| {
-            if cfg!(feature = "hitl_mode") {
+            if cfg!(any(feature = "hitl_mode", feature = "firmware_sim")) {
                 std::env::var_os("GS_SIM_CLOCK_FILE").map(std::path::PathBuf::from)
             } else {
                 None
@@ -488,6 +488,26 @@ mod router_link_policy_tests {
                 .payload(),
             payload.as_ref()
         );
+    }
+
+    #[test]
+    fn no_explicit_clock_preserves_wall_runtime_in_an_isolated_process() {
+        const NAME: &str = "router_link_policy_tests::no_explicit_clock_preserves_wall_runtime_in_an_isolated_process";
+        if std::env::var_os("GS_NO_MODEL_CLOCK_CHILD").is_some() {
+            assert_eq!(super::simulation_clock_ms(), None);
+            let before = super::telemetry_task::get_current_timestamp_ms();
+            let purpose = super::telemetry_task::procedure_clock::now();
+            let after = super::telemetry_task::get_current_timestamp_ms();
+            assert!(purpose.utc_ms() >= before && purpose.utc_ms() <= after);
+            assert_eq!(purpose.model_monotonic_ms(), None);
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--test-threads=1"])
+            .env("GS_NO_MODEL_CLOCK_CHILD", "1")
+            .env_remove("GS_SIM_CLOCK_FILE")
+            .output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     }
 
     #[test]
@@ -858,6 +878,7 @@ async fn main() -> anyhow::Result<()> {
             BoardStatus {
                 packet_count: 0,
                 last_seen_ms: None,
+                    last_seen_model_ms: None,
                 last_seen_instant: None,
                 ema_gap_ms: None,
                 warned: false,

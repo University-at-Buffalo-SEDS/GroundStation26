@@ -182,5 +182,27 @@ async fn child() {
     assert_eq!(phase.timestamp_ms, phase_wall);
     assert_eq!(phase.source_timestamp_ms, Some(1_767_225_710_000));
     assert!(page.rows.iter().all(|row| row.timestamp_ms >= wall_before));
+    state.mark_board_seen(
+        Board::ValveBoard.sender_id(),
+        super::super::get_current_timestamp_ms(),
+    );
+    // A slow/paused model does not turn real packet receipt into a stale
+    // procedure board merely because more host wall time has passed.
+    {
+        let mut boards = state.board_status.lock().unwrap();
+        let board = boards.get_mut(&Board::ValveBoard).unwrap();
+        board.last_seen_instant =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(30));
+        board.last_seen_ms = Some(super::super::get_current_timestamp_ms() - 30_000);
+    }
+    assert!(state.operational_board_recent(Board::ValveBoard, 3_000));
+    std::fs::write(directory.join("clock"), "115501").unwrap();
+    assert!(!state.operational_board_recent(Board::ValveBoard, 3_000));
+    state.mark_board_seen(
+        Board::ValveBoard.sender_id(),
+        super::super::get_current_timestamp_ms(),
+    );
+    assert!(state.operational_board_recent(Board::ValveBoard, 3_000));
+
     println!("MODEL_PURPOSE_CLOCK_REPLAY_PHASE_AND_NO_REPUBLISH_PASS");
 }

@@ -22,11 +22,7 @@ pub(super) fn operational_action_allowed(rt: &Runtime, action: Action) -> bool {
         && rt.operational.saved.qualification.permits(milestone)
 }
 fn flight_routes(state: &AppState) -> bool {
-    let recent = state
-        .board_status_snapshot(crate::telemetry_task::get_current_timestamp_ms())
-        .boards
-        .iter()
-        .any(|b| b.board == Board::FlightComputer && b.age_ms.is_some_and(|age| age <= 3_000));
+    let recent = state.operational_board_recent(Board::FlightComputer, 3_000);
     recent
         && state.topology_router.get().is_some_and(|r| {
             r.export_topology().routes.iter().any(|s| {
@@ -77,13 +73,9 @@ fn topology(state: &AppState) -> (bool, String) {
         Board::ActuatorBoard,
         Board::DaqBoard,
     ];
-    let boards = state.board_status_snapshot(crate::telemetry_task::get_current_timestamp_ms());
-    let fresh = required.iter().all(|board| {
-        boards
-            .boards
-            .iter()
-            .any(|b| b.board == *board && b.age_ms.is_some_and(|age| age <= 3_000))
-    });
+    let fresh = required
+        .iter()
+        .all(|board| state.operational_board_recent(*board, 3_000));
     let Some(router) = state.topology_router.get() else {
         return (false, String::new());
     };

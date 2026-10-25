@@ -59,6 +59,8 @@ fn recording_command_state(cmd: &str, mode: RecordingModeWire) -> Option<(bool, 
 pub struct BoardStatus {
     pub packet_count: u64,
     pub last_seen_ms: Option<u64>,
+    /// Actual packet receipt in explicit model time, never a projected wall age.
+    pub last_seen_model_ms: Option<u64>,
     pub last_seen_instant: Option<std::time::Instant>,
     pub ema_gap_ms: Option<u64>,
     pub warned: bool,
@@ -573,6 +575,27 @@ impl AppState {
         }
     }
 
+    /// Procedure-only liveness: explicit firmware models use actual virtual
+    /// packet receipt. UI board health and ordinary deployments keep wall age.
+    #[cfg(any(not(feature = "hitl_mode"), test))]
+    pub(crate) fn operational_board_recent(&self, board: Board, maximum_age_ms: u64) -> bool {
+        if let Some(now) = crate::simulation_clock_ms() {
+            return self
+                .board_status
+                .lock()
+                .unwrap()
+                .get(&board)
+                .and_then(|status| status.last_seen_model_ms)
+                .is_some_and(|seen| now >= seen && now - seen <= maximum_age_ms);
+        }
+        self.board_status_snapshot(crate::telemetry_task::get_current_timestamp_ms())
+            .boards
+            .iter()
+            .any(|status| {
+                status.board == board && status.age_ms.is_some_and(|age| age <= maximum_age_ms)
+            })
+    }
+
     /// Updates heartbeat tracking for a board after a packet arrives from that sender.
     pub fn mark_board_seen(&self, sender: &str, timestamp_ms: u64) {
         let board = self.board_from_network_sender(sender);
@@ -600,6 +623,7 @@ impl AppState {
         let mut map = self.board_status.lock().unwrap();
         let mut force_broadcast = false;
         if let Some(status) = map.get_mut(&board) {
+            status.last_seen_model_ms = crate::simulation_clock_ms();
             status.packet_count = status.packet_count.saturating_add(1);
             if let Some(last_seen) = status.last_seen_ms {
                 let observed_ms = timestamp_ms.max(last_seen);
@@ -2636,6 +2660,7 @@ pub(crate) mod tests {
                 BoardStatus {
                     packet_count: 0,
                     last_seen_ms: None,
+                    last_seen_model_ms: None,
                     last_seen_instant: None,
                     ema_gap_ms: None,
                     warned: false,

@@ -4069,6 +4069,7 @@ mod tests {
                 crate::state::BoardStatus {
                     packet_count: 0,
                     last_seen_ms: None,
+                    last_seen_model_ms: None,
                     last_seen_instant: None,
                     ema_gap_ms: None,
                     warned: false,

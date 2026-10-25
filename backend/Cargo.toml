@@ -10,6 +10,8 @@ repository.workspace = true
 raspberry_pi = ["rppal"]
 testing = []
 hitl_mode = []
+# Explicit MCU simulator clocks without changing operational/HITL policy.
+firmware_sim = []
 test_fire_mode = []
 
 [dependencies]
