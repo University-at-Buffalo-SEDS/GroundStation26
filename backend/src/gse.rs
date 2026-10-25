@@ -1463,6 +1463,14 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
         }
         _clear_reservation = automatic_abort::reserve_abort_clear(state, &mut rt);
     }
+    // Preserve the existing validation priority even before a router exists.
+    if rt.engine.active() {
+        return Err((StatusCode::CONFLICT, "Stop the active sequence first".into()));
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    if rt.operational.running {
+        return Err((StatusCode::CONFLICT, "Stop the active sequence first".into()));
+    }
     // Reservation excludes new automatic producers and Fire while ownership is
     // inspected. Do not hold GSE across router/transport locks or callbacks.
     drop(rt);

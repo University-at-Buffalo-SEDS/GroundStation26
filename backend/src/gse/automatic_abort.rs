@@ -112,6 +112,31 @@ mod tests {
         let path = armed_fixture_for_test(&state, &router);
         (state, router, seen, path)
     }
+    // The direct safety producer is deliberately absent from test-fire builds.
+    // Exercise shared claim/TX/Clear policy there; the separate actual command
+    // worker regression covers the applicable automatic producer end to end.
+    fn dispatch_abort_for_shared_policy_test(
+        state: &Arc<AppState>,
+        router: &sedsnet::router::Router,
+    ) -> bool {
+        #[cfg(not(feature = "test_fire_mode"))]
+        {
+            crate::safety_task::dispatch_safety_abort(state, router)
+        }
+        #[cfg(feature = "test_fire_mode")]
+        {
+            let Some(_claim) = claim_automatic_abort(state) else {
+                return false;
+            };
+            crate::telemetry_task::queue_automatic_abort_packet(
+                router,
+                "Safety Task Abort Command Issued",
+            )
+            .unwrap();
+            router.process_all_queues_with_timeout(3).unwrap();
+            true
+        }
+    }
     fn acknowledge_abort_owners(router: &sedsnet::router::Router) {
         for row in router.export_reliable_pending_stats() {
             if row.data_type != crate::telemetry_schema::data_type("ABORT") {
@@ -202,7 +227,7 @@ mod tests {
         let (state, router, seen, path) = fixture().await;
         commit_fire_intent(&state).unwrap();
         assert!(claim_automatic_abort(&state).is_none());
-        assert!(!crate::safety_task::dispatch_safety_abort(&state, &router));
+        assert!(!dispatch_abort_for_shared_policy_test(&state, &router));
         assert!(state.is_command_allowed(&TelemetryCommand::Abort));
         crate::telemetry_task::queue_abort_packet(&router, "manual operator abort").unwrap();
         router.process_all_queues_with_timeout(0).unwrap();
@@ -214,7 +239,7 @@ mod tests {
         let (state, router, seen, path) = fixture().await;
         state.gse.lock().unwrap().operational.path = Some(path.join("cannot-create-below-file"));
         assert!(
-            crate::safety_task::dispatch_safety_abort(&state, &router),
+            dispatch_abort_for_shared_policy_test(&state, &router),
             "storage failure must not suppress critical abort"
         );
         assert_eq!(seen.load(Ordering::SeqCst), 1);
@@ -366,7 +391,7 @@ mod tests {
             }
             Ok(())
         });
-        assert!(crate::safety_task::dispatch_safety_abort(&state, &router));
+        assert!(dispatch_abort_for_shared_policy_test(&state, &router));
         assert!(
             clear_ground_abort(&state)
                 .unwrap_err()
@@ -414,7 +439,7 @@ mod tests {
             }
             Ok(())
         });
-        assert!(crate::safety_task::dispatch_safety_abort(&state, &router));
+        assert!(dispatch_abort_for_shared_policy_test(&state, &router));
         assert!(
             !router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT")),
             "no advertised peer: SDK has handed off this publication"

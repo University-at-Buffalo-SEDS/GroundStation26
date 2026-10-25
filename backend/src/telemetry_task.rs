@@ -4073,6 +4073,24 @@ mod tests {
 
     #[tokio::test]
     async fn queued_automatic_abort_claim_reaches_packet_callback_without_gse_lock() {
+        // Testing mode normally consumes Abort inside its synthetic FlightSim.
+        // Disable only that simulator in a fresh process, before its OnceLock
+        // initializes, so this remains an actual Router dispatch proof in HITL
+        // and cannot race another test's process-global simulator state.
+        #[cfg(feature = "testing")]
+        {
+            const CHILD: &str = "GS_AUTOMATIC_ABORT_ACTUAL_DISPATCH_CHILD";
+            const NAME: &str = "telemetry_task::tests::queued_automatic_abort_claim_reaches_packet_callback_without_gse_lock";
+            if std::env::var_os(CHILD).is_none() {
+                let result = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, "1").env("GS_SIM_MODE", "0").output().unwrap();
+                assert!(result.status.success(), "{}{}",
+                    String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+                return;
+            }
+            assert!(!flight_sim::sim_mode_enabled());
+        }
         let (db_tx, db_rx) = mpsc::channel(16);
         let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
         let weak = Arc::downgrade(&state);
