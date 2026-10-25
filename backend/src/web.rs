@@ -1571,7 +1571,7 @@ async fn get_launch_clock(
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
-    Json(state.launch_clock_snapshot()).into_response()
+    Json(state.launch_clock_presentation_snapshot()).into_response()
 }
 
 async fn get_recording_status(
@@ -2271,10 +2271,15 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         if ws_out_tx.send(initial_fill_targets).await.is_err() {
             return;
         }
-        let initial_launch_clock = serde_json::to_string(&WsOutMsg::LaunchClock(
-            state_for_send.launch_clock_snapshot(),
-        ))
-        .unwrap_or_default();
+        let model_clock_enabled = crate::telemetry_task::procedure_clock::now()
+            .model_monotonic_ms()
+            .is_some();
+        let mut model_clock_samples =
+            crate::telemetry_task::procedure_clock::HeldSamples::default();
+        let initial_clock = state_for_send.launch_clock_presentation_snapshot();
+        model_clock_samples.remember(&initial_clock);
+        let initial_launch_clock =
+            serde_json::to_string(&WsOutMsg::LaunchClock(initial_clock)).unwrap_or_default();
         if ws_out_tx.send(initial_launch_clock).await.is_err() {
             return;
         }
@@ -2318,6 +2323,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         let adaptive_rate = std::env::var("GS_WS_ADAPTIVE_RATE").ok().as_deref() != Some("0");
         let mut last_chart_calibration = String::new();
         let mut network_time_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut model_clock_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        model_clock_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let telemetry_flush_ms: u64 = std::env::var("GS_WS_TELEMETRY_FLUSH_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -2437,6 +2444,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                 recv = launch_clock_rx.recv() => {
                     match recv {
                         Ok(clock) => {
+                            let clock = if model_clock_enabled {
+                                state_for_send.launch_clock_presentation_snapshot()
+                            } else { clock };
+                            model_clock_samples.remember(&clock);
                             let msg = WsOutMsg::LaunchClock(clock);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
@@ -2444,7 +2455,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            let msg = WsOutMsg::LaunchClock(state_for_send.launch_clock_snapshot());
+                            let clock=state_for_send.launch_clock_presentation_snapshot();
+                            model_clock_samples.remember(&clock);
+                            let msg = WsOutMsg::LaunchClock(clock);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
                                 break;
@@ -2591,6 +2604,15 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
+                _ = model_clock_tick.tick(), if model_clock_enabled => {
+                    // UI-only250ms polling, deduplicated while paused. Never call
+                    // set_launch_clock or the SEDSnet/DAQ publisher from here.
+                    if let Some(clock)=model_clock_samples.changed(state_for_send.launch_clock_presentation_snapshot()) {
+                        let text=serde_json::to_string(&WsOutMsg::LaunchClock(clock)).unwrap_or_default();
+                        if ws_out_tx.send(text).await.is_err() { break; }
                     }
                 }
 

@@ -124,6 +124,10 @@ async fn page_from(db: &SqlitePool, window: &Window) -> anyhow::Result<Page> {
         seeds,
     })
 }
+#[cfg(all(test, feature = "hitl_mode"))]
+pub(crate) async fn test_page_from(db: &SqlitePool, window: &Window) -> anyhow::Result<Page> {
+    page_from(db, window).await
+}
 fn decode(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Sample> {
     let raw: String = row.try_get("values_json")?;
     let sender: String = row.try_get("sender_id")?;

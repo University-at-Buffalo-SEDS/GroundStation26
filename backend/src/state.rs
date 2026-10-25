@@ -398,6 +398,11 @@ impl AppState {
         self.launch_clock.lock().unwrap().clone()
     }
 
+    /// UI projection only; never changes canonical anchors or publishes DAQ traffic.
+    pub fn launch_clock_presentation_snapshot(&self) -> LaunchClockMsg {
+        telemetry_task::procedure_clock::now().presentation(&self.launch_clock_snapshot())
+    }
+
     pub fn set_launch_clock(&self, launch_clock: LaunchClockMsg) {
         let mut current = self.launch_clock.lock().unwrap();
         let next = monotonic_launch_clock_update(&current, launch_clock);
@@ -424,7 +429,7 @@ impl AppState {
         // Rotate at command acceptance, without starting the UI clock before
         // Valve confirms the sequence. Its ACK/pilot report corrects T0 later.
         self.publish_daq_launch_clock(&launch_countdown_clock(
-            telemetry_task::get_current_timestamp_ms() as i64,
+            telemetry_task::procedure_clock::timestamp_ms(),
         ));
     }
 
@@ -1084,7 +1089,10 @@ impl AppState {
         let _ = self.state_tx.send(FlightStateMsg { state: next_state });
         self.broadcast_fill_targets_snapshot();
         let ts_ms = crate::telemetry_task::get_current_timestamp_ms() as i64;
-        self.update_launch_clock_for_state(next_state, ts_ms);
+        self.update_launch_clock_for_state(
+            next_state,
+            telemetry_task::procedure_clock::for_wall(ts_ms as u64).timestamp_ms(),
+        );
         let tx = self.db_queue_tx.clone();
         tokio::spawn(async move {
             let _ = tx

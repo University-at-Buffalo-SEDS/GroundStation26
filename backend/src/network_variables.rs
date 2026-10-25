@@ -340,7 +340,7 @@ pub fn set_daq_calibration(
 fn daq_log_clock_payload(
     session: u64,
     clock: &crate::telemetry_db::LaunchClockMsg,
-    wall_now: i64,
+    launch_now: i64,
     network_now: i64,
 ) -> Result<Vec<u8>> {
     use crate::telemetry_db::LaunchClockKind;
@@ -356,7 +356,7 @@ fn daq_log_clock_payload(
             0
         };
         let deadline = network_now
-            .saturating_add(anchor.saturating_sub(wall_now))
+            .saturating_add(anchor.saturating_sub(launch_now))
             .saturating_add(countdown)
             .saturating_add(120_000);
         anyhow::ensure!(
@@ -407,10 +407,13 @@ pub fn set_daq_log_clock(
     session: u64,
     clock: &crate::telemetry_db::LaunchClockMsg,
 ) -> Result<()> {
-    let wall_now = get_current_timestamp_ms() as i64;
-    let network_now = usable_daq_utc(router.network_time().and_then(|t| t.unix_time_ms), wall_now);
+    let launch_now = crate::telemetry_task::procedure_clock::timestamp_ms();
+    let network_now = usable_daq_utc(
+        router.network_time().and_then(|t| t.unix_time_ms),
+        launch_now,
+    );
 
-    let payload = daq_log_clock_payload(session, clock, wall_now, network_now)?;
+    let payload = daq_log_clock_payload(session, clock, launch_now, network_now)?;
     // Preserve the absolute deadline, not a fresh countdown on service restart.
     // Drop the disk-cache lock before entering SEDSNet (callbacks may use it).
     {
@@ -523,6 +526,29 @@ mod tests {
         );
         assert!(daq_log_clock_payload(0, &clock, now, now).is_err());
         assert!(daq_log_clock_payload(17, &crate::state::launch_countdown_clock(0), 0, 0).is_err());
+    }
+
+    #[test]
+    fn model_virtual_utc_deadline_is_stable_across_pause_and_late_ascent() {
+        use crate::telemetry_db::{LaunchClockKind, LaunchClockMsg};
+        let epoch = 1_767_225_600_000i64;
+        let start = epoch + 100_000;
+        let clock = crate::state::launch_countdown_clock(start);
+        let deadline = |clock: &LaunchClockMsg, now: i64| {
+            let bytes = daq_log_clock_payload(17, clock, now, now).unwrap();
+            u64::from_le_bytes(bytes[8..].try_into().unwrap())
+        };
+        let expected = (start + 130_000) as u64;
+        assert_eq!(deadline(&clock, start), expected);
+        assert_eq!(deadline(&clock, start + 833), expected);
+        assert_eq!(deadline(&clock, start + 833), expected); // paused model
+        let ascent = LaunchClockMsg {
+            kind: LaunchClockKind::TPlus,
+            anchor_timestamp_ms: Some(start + 10_000),
+            duration_ms: None,
+        };
+        assert_eq!(deadline(&ascent, start + 10_000), expected);
+        assert_eq!(deadline(&ascent, start + 12_500), expected);
     }
 
     #[test]

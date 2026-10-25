@@ -6,6 +6,8 @@ use commands::log_command_dispatch;
 pub(crate) use commands::{
     flush_command_tx, queue_abort_packet, queue_locally_routed_flight_command,
 };
+mod periodic;
+pub(crate) mod procedure_clock;
 mod radio_io;
 pub use radio_io::{CommsWorkerHandle, TxQueueBudget};
 #[cfg(test)]
@@ -134,6 +136,7 @@ mod recovery_tests {
 }
 
 pub(crate) fn refresh_host_network_time(router: &Router, utc_ms: u64) {
+    let utc_ms = procedure_clock::for_wall(utc_ms).utc_ms();
     // Calendar range shared with DAQ's timestamped logging validation.
     if (315_532_800_000..4_354_819_200_000).contains(&utc_ms) {
         router.set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(utc_ms));
@@ -193,7 +196,7 @@ fn start_launch_clock_from_valve_sequence_status(state: &Arc<AppState>) {
     }
 
     state.clear_launch_sequence_command_pending();
-    let now_ms = get_current_timestamp_ms() as i64;
+    let now_ms = procedure_clock::timestamp_ms();
     state.set_launch_clock(launch_countdown_clock(now_ms));
 
     gs_debug_println!(
@@ -209,7 +212,7 @@ fn transition_launch_clock_to_t_plus_from_pilot_open(state: &Arc<AppState>) {
 
     state.set_launch_clock(LaunchClockMsg {
         kind: LaunchClockKind::TPlus,
-        anchor_timestamp_ms: Some(get_current_timestamp_ms() as i64),
+        anchor_timestamp_ms: Some(procedure_clock::timestamp_ms()),
         duration_ms: None,
     });
     gs_debug_println!("Pilot valve open status received; launch clock switched to T+");
@@ -310,7 +313,7 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
         emit_notification_warning(&state, error);
         return;
     }
-    let now_ms = get_current_timestamp_ms() as i64;
+    let now_ms = procedure_clock::timestamp_ms();
     state.set_launch_clock(launch_countdown_clock(now_ms));
     let flight_command_sent = if let Err(e) = queue_locally_routed_flight_command(
         &router,
@@ -369,7 +372,13 @@ pub async fn telemetry_task(
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value >= 100)
         .unwrap_or(500);
-    let mut heartbeat_interval = interval(Duration::from_millis(heartbeat_period_ms));
+    let mut heartbeat_cadence = periodic::ProtocolCadence::new(heartbeat_period_ms);
+    let heartbeat_poll_ms = if crate::simulation_clock_ms().is_some() {
+        1
+    } else {
+        heartbeat_period_ms
+    };
+    let mut heartbeat_interval = interval(Duration::from_millis(heartbeat_poll_ms));
     handle_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat_failed = false;
@@ -1140,6 +1149,7 @@ pub async fn telemetry_task(
                     }
                 }
                 _ = heartbeat_interval.tick() => {
+                    if !heartbeat_cadence.due(crate::simulation_clock_ms()) { continue; }
                     if router.log_queue::<u8>(crate::telemetry_schema::data_type("HEARTBEAT"), &[]).is_ok() {
                         state.mark_board_seen(
                             Board::GroundStation.sender_id(),
@@ -1763,8 +1773,18 @@ async fn handle_packet(
             let mut fs = state.state.lock().unwrap();
             *fs = new_flight_state;
         }
-        let ts_ms = pkt.timestamp() as i64;
-        let launch_clock_ts_ms = if sender_id == Board::GroundStation.sender_id() {
+        let purpose = procedure_clock::now();
+        let explicit_model = purpose.model_monotonic_ms().is_some();
+        // Recording/replay's primary timeline is receipt wall time. Keep the
+        // model network UTC separately, just like sensor telemetry rows.
+        let ts_ms = if explicit_model {
+            get_current_timestamp_ms() as i64
+        } else {
+            pkt.timestamp() as i64
+        };
+        let launch_clock_ts_ms = if explicit_model {
+            purpose.timestamp_ms()
+        } else if sender_id == Board::GroundStation.sender_id() {
             ts_ms
         } else {
             get_current_timestamp_ms() as i64
@@ -1780,6 +1800,25 @@ async fn handle_packet(
             },
         )
         .await;
+
+        if explicit_model {
+            queue_db_write(
+                state,
+                db_tx,
+                db_overflow,
+                DbWrite::Telemetry {
+                    timestamp_ms: ts_ms,
+                    source_timestamp_ms: Some(pkt.timestamp() as i64),
+                    data_type: "FLIGHT_STATE".into(),
+                    sender_id: sender_id.clone(),
+                    values_json: Some(
+                        serde_json::to_string(&[pkt_data as f32]).expect("finite flight state"),
+                    ),
+                    payload_json: payload_json_from_pkt(&pkt),
+                },
+            )
+            .await;
+        }
 
         let _ = state.state_tx.send(FlightStateMsg {
             state: new_flight_state,

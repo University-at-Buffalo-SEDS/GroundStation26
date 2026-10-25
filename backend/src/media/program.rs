@@ -310,7 +310,7 @@ pub(super) fn telemetry_snapshot(
             serde_json::json!({"label":stat.label,"value":value,"unit":stat.unit,"precision":stat.precision,"format":stat.format,"binding":binding})
         }).collect()
     };
-    serde_json::json!({"phase":format!("{phase:?}"),"test_fire_mode":cfg!(feature="test_fire_mode"),"stats":stats,"profile":profile_id,"cycle_seconds":profile.cycle_seconds,"stats_per_page":profile.stats_per_page,"scene":profile.scene,"positions":crate::antenna::snapshot(),"t_clock":program_t_clock(&app.launch_clock_snapshot(),now.min(i64::MAX as u64) as i64)})
+    serde_json::json!({"phase":format!("{phase:?}"),"test_fire_mode":cfg!(feature="test_fire_mode"),"stats":stats,"profile":profile_id,"cycle_seconds":profile.cycle_seconds,"stats_per_page":profile.stats_per_page,"scene":profile.scene,"positions":crate::antenna::snapshot(),"t_clock":program_t_clock(&app.launch_clock_snapshot(),crate::telemetry_task::procedure_clock::for_wall(now).timestamp_ms())})
 }
 
 fn valid_hls_file(name: &str) -> bool {
@@ -785,6 +785,34 @@ mod tests {
         assert_eq!(
             delayed_program_snapshot(&history, 100).unwrap()["captured"],
             100
+        );
+    }
+
+    #[test]
+    fn model_program_t_clock_follows_virtual_samples_and_holds_on_pause() {
+        use crate::telemetry_db::{LaunchClockKind, LaunchClockMsg};
+        let epoch = 1_767_225_600_000;
+        let minus = crate::state::launch_countdown_clock(epoch + 100_000);
+        assert_eq!(
+            program_t_clock(&minus, epoch + 100_833).as_deref(),
+            Some("T− 00:09.17")
+        );
+        assert_eq!(
+            program_t_clock(&minus, epoch + 100_833).as_deref(),
+            Some("T− 00:09.17")
+        );
+        let plus = LaunchClockMsg {
+            kind: LaunchClockKind::TPlus,
+            anchor_timestamp_ms: Some(epoch + 110_000),
+            duration_ms: None,
+        };
+        assert_eq!(
+            program_t_clock(&plus, epoch + 110_000).as_deref(),
+            Some("T+ 00:00.00")
+        );
+        assert_eq!(
+            program_t_clock(&plus, epoch + 112_500).as_deref(),
+            Some("T+ 00:02.50")
         );
     }
 
