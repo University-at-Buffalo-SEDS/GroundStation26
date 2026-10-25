@@ -168,8 +168,6 @@ pub struct Mesh {
     dropped: u64,
     forwarded: u64,
     templates: VecDeque<(u32, FrameClass)>,
-    credit_millibytes: u64,
-    credit_at: u64,
     active_transmission: Option<u64>,
     active_cancelled: bool,
     active_survives_clear: bool,
@@ -206,8 +204,6 @@ impl Mesh {
             dropped: 0,
             forwarded: 0,
             templates: VecDeque::new(),
-            credit_millibytes: 4_160_000,
-            credit_at: 0,
             active_transmission: None,
             active_cancelled: false,
             active_survives_clear: false,
@@ -250,6 +246,15 @@ impl Mesh {
             }
         }
     }
+    pub(crate) fn recovery_air_share(&self, now: u64) -> Option<u8> {
+        match self.role {
+            // Match the advertised relay request even before READY is received.
+            Role::Primary if self.fallback => Some(15),
+            Role::Rrls if self.active(now) => Some(35),
+            _ => None,
+        }
+    }
+
     pub fn tick(&mut self, now: u64) {
         if self.role == Role::Primary {
             if self.last_direct.map_or(now, |v| now.saturating_sub(v)) >= LOSS_MS {
@@ -487,13 +492,8 @@ impl Mesh {
         }
         // Never reuse a reservation identity after wraparound.
         let id = self.next_transmission.checked_add(1)?;
-        // At 64 kbps, a two-hop relay must leave airtime for the rocket and
-        // ground uplink. Bound accepted UART work before the modem's FIFO.
-        self.credit_millibytes = self
-            .credit_millibytes
-            .saturating_add(now.saturating_sub(self.credit_at).saturating_mul(2_000))
-            .min(4_160_000);
-        self.credit_at = now;
+        // The caller gates this reservation through its shared physical UART
+        // Capacity. Mesh retains ownership/priorities; it has no second bucket.
         loop {
             let protected = self
                 .queue
@@ -570,10 +570,6 @@ impl Mesh {
                 self.dropped += 1;
                 continue;
             }
-            let cost = (q.frame.bytes.len() as u64 + 4) * 1000;
-            if self.role == Role::Rrls && self.credit_millibytes < cost {
-                return None;
-            }
             let queued = self.queue.remove(i).unwrap();
             self.active_fair_delta_bytes = if contested {
                 let cost =
@@ -624,10 +620,6 @@ impl Mesh {
         self.discovery_balance_bytes = self.discovery_balance_bytes.saturating_add(fair_delta);
         let frame = transmission.queued.frame;
         self.bytes -= frame.bytes.len();
-        if self.role == Role::Rrls {
-            let cost = (frame.bytes.len() as u64 + 4) * 1000;
-            self.credit_millibytes = self.credit_millibytes.saturating_sub(cost);
-        }
         self.forwarded += 1;
         Some(frame)
     }
@@ -1521,7 +1513,6 @@ mod tests {
                 0,
             );
         }
-        let initial_credit = mesh.credit_millibytes;
         let transmission = mesh.begin_transmission(0).unwrap();
         assert_eq!(transmission.frame().bytes, [0]);
         let payload_pointer = transmission.frame().bytes.as_ptr();
@@ -1529,7 +1520,6 @@ mod tests {
         assert_eq!(mesh.forwarded, 0);
         assert!(mesh.begin_transmission(0).is_none());
         assert!(mesh.finish_transmission(transmission, false).is_none());
-        assert_eq!(mesh.credit_millibytes, initial_credit);
         assert_eq!(mesh.bytes, 4);
         for byte in 0..4 {
             let frame = mesh.pop(0).unwrap();
@@ -1544,7 +1534,6 @@ mod tests {
         }
         assert_eq!(mesh.forwarded, 4);
         assert_eq!(mesh.bytes, 0);
-        assert_eq!(mesh.credit_millibytes, initial_credit - 4 * 5_000);
     }
 
     #[test]
@@ -2155,6 +2144,29 @@ mod tests {
         p.tick(4000);
         assert!(p.active(4000));
     }
+    #[test]
+    fn fallback_air_shares_match_advertised_request_and_recovery() {
+        let mut primary = Mesh::new(Role::Primary, 1);
+        let mut relay = Mesh::new(Role::Rrls, 2);
+        assert_eq!(primary.recovery_air_share(0), None);
+        assert_eq!(relay.recovery_air_share(0), None);
+        primary.tick(3_000);
+        assert!(!primary.active(3_000), "no READY proof yet");
+        assert_eq!(primary.recovery_air_share(3_000), Some(15));
+        relay.incoming(true, &health(1, 0, false), 3_000);
+        assert_eq!(relay.recovery_air_share(3_000), Some(35));
+        assert_eq!(
+            40 + 15 + 35,
+            90,
+            "RF share remains unchanged and total default reservation stays90%"
+        );
+        primary.direct(3_100);
+        primary.tick(5_100);
+        assert_eq!(primary.recovery_air_share(5_100), None);
+        relay.incoming(true, &health(1, 1, true), 5_100);
+        assert_eq!(relay.recovery_air_share(5_100), None);
+    }
+
     #[test]
     fn stable_direct_recovery_has_hysteresis() {
         let mut p = Mesh::new(Role::Primary, 1);

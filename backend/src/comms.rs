@@ -598,6 +598,21 @@ impl UartComms {
         self.flush_recovery_output(0)
     }
 
+    fn refresh_recovery_capacity(
+        &self,
+        state: &mut UartWriteState,
+        wall: Instant,
+        virtual_ms: Option<u64>,
+    ) {
+        let requested = self.recovery.as_ref().and_then(|shared| {
+            let mesh = shared.lock().unwrap();
+            mesh.recovery_air_share(mesh.now())
+        });
+        if let Some(capacity) = state.radio_capacity.as_mut() {
+            capacity.apply_recovery_share(requested, wall, virtual_ms);
+        }
+    }
+
     fn flush_recovery_output(&mut self, minimum_priority: u8) -> TelemetryResult<()> {
         let shared = self.recovery.as_ref().unwrap().clone();
         self.enable_radio_capacity_control();
@@ -622,6 +637,7 @@ impl UartComms {
             }
             let capacity_wall = Instant::now();
             let capacity_clock = crate::simulation_clock_ms();
+            self.refresh_recovery_capacity(&mut write_state, capacity_wall, capacity_clock);
             if write_state
                 .radio_capacity
                 .as_ref()
@@ -1770,7 +1786,8 @@ impl CommsDevice for UartComms {
         }
     }
     fn transmit_ready(&self) -> bool {
-        let state = self.write_lock.lock().unwrap();
+        let mut state = self.write_lock.lock().unwrap();
+        self.refresh_recovery_capacity(&mut state, Instant::now(), crate::simulation_clock_ms());
         if state
             .radio_capacity
             .as_ref()
@@ -1892,6 +1909,7 @@ impl CommsDevice for UartComms {
         }
         let capacity_wall = Instant::now();
         let capacity_clock = crate::simulation_clock_ms();
+        self.refresh_recovery_capacity(&mut write_state, capacity_wall, capacity_clock);
         if write_state
             .radio_capacity
             .as_ref()
@@ -3269,6 +3287,40 @@ mod raw_uart_tests {
             slow_start_deadline: None,
         };
         (uart, shared, expected)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn one_physical_quota_gates_both_mesh_reservation_and_sdk_offload() {
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(10)).unwrap();
+        let (mut uart, shared, _) = recovery_uart_fixture(port);
+        uart.enable_radio_capacity_control();
+        uart.write_lock
+            .lock()
+            .unwrap()
+            .radio_capacity
+            .as_mut()
+            .unwrap()
+            .committed(Instant::now(), None, u16::MAX as usize);
+        let mut tx = uart.try_clone_tx().unwrap().unwrap();
+        tx.service_transmit().unwrap();
+        assert!(!tx.transmit_ready());
+        let error = tx.send_data(b"SDK").unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let mut mesh = shared.lock().unwrap();
+        let transmission = mesh
+            .begin_transmission(0)
+            .expect("quota refusal retains the mesh owner");
+        mesh.finish_transmission(transmission, false);
+        let mut byte = [0];
+        assert!(
+            peer.read(&mut byte).is_err(),
+            "no mesh or SDK bytes bypass the quota"
+        );
     }
 
     #[test]
