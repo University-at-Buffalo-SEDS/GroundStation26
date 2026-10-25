@@ -252,6 +252,24 @@ pub fn claimed(state: &AppState) -> bool {
 pub fn active(state: &AppState) -> bool {
     state.gse.lock().unwrap().engine.active()
 }
+// A filled-tank hold remains Engine-active after operational Fire is
+// committed. Actual pilot feedback must still advance its launch countdown.
+fn pilot_clock_allowed(engine_active: bool, fire_committed: bool, hitl_mode: bool) -> bool {
+    !engine_active || (!hitl_mode && fire_committed)
+}
+pub(crate) fn pilot_report_can_advance_launch_clock(state: &AppState) -> bool {
+    let runtime = state.gse.lock().unwrap();
+    #[cfg(feature = "hitl_mode")]
+    let fire_committed = false;
+    #[cfg(not(feature = "hitl_mode"))]
+    let fire_committed = runtime.operational.saved.qualification.stage()
+        == gse_sequence::qualification::MissionStage::Fire;
+    pilot_clock_allowed(
+        runtime.engine.active(),
+        fire_committed,
+        cfg!(feature = "hitl_mode"),
+    )
+}
 fn action(cmd: &TelemetryCommand) -> Option<Action> {
     match cmd {
         TelemetryCommand::StartFill => Some(Action::StartFill),
@@ -851,6 +869,37 @@ mod tests {
         assert!(!runtime.checklist_definition_edit_allowed());
         runtime.operational.saved.pending_checklists.clear();
         assert!(runtime.checklist_definition_edit_allowed());
+    }
+    #[test]
+    fn committed_fire_pilot_clock_advances_a_paused_hold_but_qualification_does_not() {
+        let mut engine = Engine::default();
+        engine.status.phase = Phase::Paused;
+        assert!(
+            engine.active(),
+            "The filled-tank hold still owns GSE controls"
+        );
+        assert!(!pilot_clock_allowed(engine.active(), false, false));
+        assert!(pilot_clock_allowed(engine.active(), true, false));
+        // The former !Engine::active guard rejected this genuine Fire case.
+        let old_guard_allowed = !engine.active();
+        assert!(!old_guard_allowed);
+    }
+    #[cfg(feature = "hitl_mode")]
+    #[tokio::test]
+    async fn hitl_pilot_clock_wrapper_keeps_the_original_active_engine_guard() {
+        let state = crate::state::tests::test_app_state().await;
+        state.gse.lock().unwrap().engine.status.phase = Phase::Paused;
+        assert!(!pilot_report_can_advance_launch_clock(&state));
+        state.gse.lock().unwrap().engine.status.phase = Phase::Idle;
+        assert!(pilot_report_can_advance_launch_clock(&state));
+    }
+    #[test]
+    fn pilot_clock_guard_preserves_hitl_and_inactive_behavior() {
+        for fire in [false, true] {
+            assert!(!pilot_clock_allowed(true, fire, true));
+            assert!(pilot_clock_allowed(false, fire, true));
+            assert!(pilot_clock_allowed(false, fire, false));
+        }
     }
     #[test]
     fn sequence_clock_uses_only_explicit_simulation_time() {

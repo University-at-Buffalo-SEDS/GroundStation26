@@ -55,3 +55,12 @@ and reconnect. No physical output commands or real settings are used.
 Network qualification belongs to the separately frozen network image; these
 procedure-clock tests are additional simulator-fidelity evidence. They do not
 retroactively modify or replace the immutable network-soak source/binary proof.
+
+## Operational Fire feedback
+
+A completed fill stays in the engine's active Paused hold after Fire is committed.
+Pilot feedback may advance an existing T-minus clock for that committed ordinary
+Fire even while the hold still owns controls. An ordinary uncommitted Paused
+fill/self-test keeps its guard; HITL retains the prior active-engine guard. This
+changes only clock interpretation of actual pilot reports, not valve commands,
+qualification, abort policy or firmware countdown timing.

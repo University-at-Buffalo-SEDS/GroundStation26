@@ -1611,7 +1611,7 @@ pub(crate) fn apply_umbilical_status_at_ingress(
             );
             if key_cmd_id == ValveBoardCommands::PilotOpen as u8
                 && key_on
-                && !crate::gse::active(state)
+                && crate::gse::pilot_report_can_advance_launch_clock(state)
             {
                 transition_launch_clock_to_t_plus_from_pilot_open(state);
             }
