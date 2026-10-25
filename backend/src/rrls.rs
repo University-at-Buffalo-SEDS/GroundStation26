@@ -422,7 +422,12 @@ impl Mesh {
             if now.saturating_sub(q.at)
                 > if q.frame.bytes.get(3) == Some(&VOICE) {
                     180
-                } else if q.priority == 255 {
+                } else if q.priority == 255
+                    || (q.priority < 254 && q.frame.bytes.get(3) == Some(&DOWN_DATA))
+                {
+                    // Retain sparse reports through bounded sensor bursts. Reliable
+                    // interactive controls retain their 250 ms deadline at priority 254.
+                    // Stateful SDT fragments remain owned and ordered; never coalesce.
                     1500
                 } else {
                     250
@@ -1530,6 +1535,123 @@ mod tests {
         for b in 0..10 {
             assert_eq!(m.pop(1).unwrap().bytes, vec![b]);
         }
+    }
+    #[test]
+    fn telemetry_retention_does_not_extend_reliable_control_deadlines() {
+        crate::telemetry_schema::initialize().unwrap();
+        for (name, size, age, survives) in [
+            ("FLIGHT_COMMAND", 1, 251, false),
+            ("BATTERY_VOLTAGE", 4, 1_499, true),
+            ("BATTERY_VOLTAGE", 4, 1_501, false),
+        ] {
+            let packet = sedsnet::packet::Packet::new(
+                crate::telemetry_schema::data_type(name),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "RF",
+                0,
+                vec![0; size].into(),
+            )
+            .unwrap();
+            let wire = sedsnet::wire_format::pack_packet(&packet);
+            let mut relay = Mesh::new(Role::Rrls, 2);
+            relay.incoming(true, &health(1, 0, false), 0);
+            relay.incoming(false, &wire, 0);
+            assert_eq!(relay.pop(age).is_some(), survives, "{name} age{age}");
+            assert_eq!(relay.dropped, u64::from(!survives));
+            assert!(relay.queue.is_empty() && relay.bytes == 0);
+        }
+    }
+
+    #[test]
+    fn source_paced_sparse_telemetry_survives_bursts_without_delaying_controls() {
+        crate::telemetry_schema::initialize().unwrap();
+        fn wire(name: &str, sender: &'static str, timestamp: u64, bytes: usize) -> Vec<u8> {
+            let packet = sedsnet::packet::Packet::new(
+                crate::telemetry_schema::data_type(name),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                sender,
+                timestamp,
+                vec![0; bytes].into(),
+            )
+            .unwrap();
+            sedsnet::wire_format::pack_packet(&packet).to_vec()
+        }
+        let mut relay = Mesh::new(Role::Rrls, 2);
+        let mut batteries = Vec::new();
+        let mut commands = Vec::new();
+        let mut gps = Vec::new();
+        let mut peak = 0;
+        for now in (0..=22_000u64).step_by(10) {
+            if now % 500 == 0 {
+                relay.incoming(true, &health(1, (now / 500) as u32, false), now);
+            }
+            relay.tick(now);
+            if now < 20_000 && now % 5_000 == 0 {
+                // The observed24-frame relay burst fits the existing64-frame cap.
+                for index in 0..24 {
+                    let (name, bytes) = if index % 2 == 0 {
+                        ("IMU_DATA", 24)
+                    } else {
+                        ("BAROMETER_DATA", 12)
+                    };
+                    relay.incoming(false, &wire(name, "FC", now + index, bytes), now);
+                }
+                relay.incoming(false, &wire("BATTERY_VOLTAGE", "PB", now, 4), now);
+            }
+            if now < 20_000 && now % 200 == 100 {
+                relay.incoming(false, &wire("IMU_DATA", "FC", now, 24), now);
+                relay.incoming(false, &wire("BAROMETER_DATA", "FC", now, 12), now);
+            }
+            if now < 20_000 && now % 5_000 == 50 {
+                let command = wire("FLIGHT_COMMAND", "FC", now, 1);
+                assert!(
+                    sedsnet::wire_format::peek_frame_info(&command)
+                        .unwrap()
+                        .reliable
+                        .is_some()
+                );
+                relay.incoming(false, &command, now);
+                relay.incoming(false, &wire("GPS_DATA", "RF", now, 12), now);
+            }
+            peak = peak.max(relay.queue.len());
+            assert!(relay.queue.len() <= MAX_FRAMES && relay.bytes <= MAX_BYTES);
+            // Bounded egress: one <=80-byte frame every40ms is <=2000B/s.
+            if now % 40 == 0
+                && let Some(frame) = relay.pop(now)
+            {
+                assert!(frame.bytes.len() + 4 <= 80);
+                let (kind, body) = decode(&frame.bytes).unwrap();
+                if kind != DOWN_DATA {
+                    continue;
+                }
+                let packet = sedsnet::wire_format::unpack_packet(body).unwrap();
+                if packet.data_type() == crate::telemetry_schema::data_type("BATTERY_VOLTAGE") {
+                    batteries.push((packet.timestamp(), now));
+                } else if packet.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND")
+                {
+                    commands.push(now - packet.timestamp());
+                } else if packet.data_type() == crate::telemetry_schema::data_type("GPS_DATA") {
+                    gps.push(now - packet.timestamp());
+                }
+            }
+        }
+        eprintln!("RRLS_SOURCE_PACED peak={peak} battery_deliveries={batteries:?} command_delays_ms={commands:?} gps_delays_ms={gps:?} dropped={}", relay.dropped);
+        assert!(peak >= 24, "exercise the measured burst depth");
+        assert_eq!(
+            batteries.len(),
+            4,
+            "every sparse5s report must survive the bounded burst"
+        );
+        assert!(
+            batteries
+                .windows(2)
+                .all(|pair| pair[1].1 - pair[0].1 <= 5_500)
+        );
+        assert_eq!(commands.len(), 4);
+        assert!(commands.iter().all(|delay| *delay <= 500));
+        assert_eq!(gps.len(), 4);
+        assert!(gps.iter().all(|delay| *delay <= 500));
+        assert_eq!(relay.dropped, 0, "do not hide expired accepted telemetry");
     }
     #[test]
     fn gps_uses_real_schema_priority_and_latest_value() {
