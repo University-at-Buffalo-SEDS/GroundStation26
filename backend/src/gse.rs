@@ -633,6 +633,14 @@ pub fn handle_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
     }
     false
 }
+#[cfg(not(feature = "hitl_mode"))]
+fn remember_automatic_cutoff_target(runtime: &mut Runtime, mass: f32, target: f32) {
+    // The stop and qualification candidate must agree on the existing target
+    // tolerance. A pressure plateau alone must never qualify a short fill.
+    if target.is_finite() && target > 0.0 && runtime.fill_cutoff.target_met(mass, target) {
+        runtime.operational.target_reached = Some(target);
+    }
+}
 pub fn tick(state: &Arc<AppState>, interlock: bool) {
     #[cfg(not(feature = "hitl_mode"))]
     if operational_tick(state, interlock) {
@@ -660,9 +668,7 @@ pub fn tick(state: &Arc<AppState>, interlock: bool) {
                         .reached(Instant::now(), m.value, p.value, target)
                     {
                         #[cfg(not(feature = "hitl_mode"))]
-                        if target.is_finite() && target > 0.0 && m.value >= target {
-                            rt.operational.target_reached = Some(target);
-                        }
+                        remember_automatic_cutoff_target(&mut rt, m.value, target);
                         match rt.engine.request(Action::PauseFill, input) {
                             Ok(mut stopped) => {
                                 stopped.notification = Some("Automatic fill cutoff: target weight reached or fill stabilized. Closing supplies and vent; waiting for valve acknowledgements.".into());
@@ -899,6 +905,42 @@ mod tests {
             assert!(!pilot_clock_allowed(true, fire, true));
             assert!(pilot_clock_allowed(false, fire, true));
             assert!(pilot_clock_allowed(false, fire, false));
+        }
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    #[test]
+    fn quantized_automatic_target_cutoff_keeps_the_existing_qualification_tolerance() {
+        let mut runtime = Runtime::default();
+        let target = 5.0;
+        let quantized_mass = target * 0.996;
+        assert!(quantized_mass < target);
+        assert!(runtime.fill_cutoff.target_met(quantized_mass, target));
+        remember_automatic_cutoff_target(&mut runtime, quantized_mass, target);
+        assert_eq!(runtime.operational.target_reached, Some(target));
+        assert!(
+            !runtime
+                .operational
+                .saved
+                .qualification
+                .completed(Milestone::FillTarget),
+            "The candidate alone must not grant qualification before fresh mass and valve ACKs"
+        );
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    #[test]
+    fn below_target_plateau_and_invalid_inputs_do_not_record_a_fill_target() {
+        for (mass, target) in [
+            (4.9, 5.0),
+            (f32::NAN, 5.0),
+            (f32::INFINITY, 5.0),
+            (5.0, f32::NAN),
+            (5.0, f32::INFINITY),
+            (0.0, 0.0),
+            (-5.0, -5.0),
+        ] {
+            let mut runtime = Runtime::default();
+            remember_automatic_cutoff_target(&mut runtime, mass, target);
+            assert_eq!(runtime.operational.target_reached, None, "{mass}/{target}");
         }
     }
     #[test]
