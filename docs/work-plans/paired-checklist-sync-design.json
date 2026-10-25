@@ -1,5 +1,5 @@
 {
-  "status": "typed membership, bounded SQLite per-key staging and signed incremental journal replication implemented/tested; backend activation and operational binding still disabled/pending",
+  "status": "live host integration implemented; validating paired storage, qualification, API, conflict UI and regression suites before release",
   "identity": {
     "list_key": "checklists/list/<sha256(original list ID)>",
     "definition_key": "checklists/item/<sha256(length-prefixed list ID and item ID)>",
@@ -223,11 +223,14 @@
       "Progress remains editable in Fire/recovery while definitions wait for Idle+qualification cleared; unresolved progress is unchecked."
     ],
     "remaining_tests": [
-      "Backend fake-DB API and paired worker integration with real Mesh envelope/pacing",
-      "Offline local check/edit/delete/recreate and restart with retained observation contexts",
-      "Competing activation revisions and crash/failure injection before/after selector rename/runtime swap/directory sync",
-      "Existing GSE qualification/sequence/HITL suites and simulator routes remain unchanged",
-      "UI displays stage/conflict/unsupported status and admin-reviewed resolution without local authority synthesis"
-    ]
+      "Full firmware-bay paired-station soak including low-priority synchronization alongside commands/GPS; root network qualification remains separate."
+    ],
+    "implementation": "Per-key observed context and journal, immutable prepared generations/atomic selector, host worker, shared signed-envelope pacing, saved qualification binding and admin conflict UI implemented. All tests use fake databases; no hardware outputs or real settings."
+  },
+  "migration": {
+    "initial_generation": "Deterministic domain-separated installation/list-ID hash for first legacy migration only, so equivalent built-in IDs bind the same genuine offline progress; newly added/recreated lists use random immutable generations.",
+    "primary": "Main GS publishes a complete initial definition catalog; it omits fabricated default-unchecked raw revisions. Genuine legacy completion metadata is preserved only when typed and valid.",
+    "secondary": "RRLS does not automatically publish defaults. An explicit local admin template edit before any applied policy publishes its entire explicit catalog causally; normal edits publish changed keys only.",
+    "safety": "Legacy operational evidence has no paired template binding; explicit local qualification reset is required. Local reset receipts drain durably before definitions can switch. Incoming shared checklist data never earns local operational qualification."
   }
 }

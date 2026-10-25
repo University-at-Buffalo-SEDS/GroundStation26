@@ -85,7 +85,8 @@ pub struct Policy {
     pub list_count: u16,
     pub lists_digest: String,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ProgressIssue {
     Conflict,
     DefinitionChanged,
@@ -509,28 +510,8 @@ pub fn project(histories: &BTreeMap<String, Document>) -> anyhow::Result<Project
         definitions.sort_by_key(|item| item.order);
         let mut items = Vec::new();
         for definition in definitions {
-            let mut progress = Progress::unchecked(&definition)?;
-            let mut issue = None;
-            if let Some(history) =
-                histories.get(&progress_key(&definition.list_id, &definition.id)?)
-            {
-                if history.heads.len() != 1 {
-                    issue = Some(ProgressIssue::Conflict);
-                } else if !history.heads[0].value.is_null() {
-                    let received: Progress =
-                        serde_json::from_value(history.heads[0].value.clone())?;
-                    if received.matches(&definition)? {
-                        progress = received;
-                    } else {
-                        issue = Some(ProgressIssue::DefinitionChanged);
-                    }
-                }
-            }
-            items.push(ProjectedItem {
-                definition,
-                progress,
-                issue,
-            });
+            let history = histories.get(&progress_key(&definition.list_id, &definition.id)?);
+            items.push(project_progress(&definition, history)?);
         }
         lists.push(ProjectedList { manifest, items });
     }
@@ -544,6 +525,33 @@ pub fn project(histories: &BTreeMap<String, Document>) -> anyhow::Result<Project
     );
     lists.sort_by_key(|list| list.manifest.order);
     Ok(Projection { policy, lists })
+}
+
+/// Project one progress row without parsing or hashing the template catalog.
+pub fn project_progress(
+    definition: &ItemDefinition,
+    history: Option<&Document>,
+) -> anyhow::Result<ProjectedItem> {
+    let mut progress = Progress::unchecked(definition)?;
+    let mut issue = None;
+    if let Some(history) = history {
+        validate_document(&progress_key(&definition.list_id, &definition.id)?, history)?;
+        if history.heads.len() != 1 {
+            issue = Some(ProgressIssue::Conflict);
+        } else if !history.heads[0].value.is_null() {
+            let received: Progress = serde_json::from_value(history.heads[0].value.clone())?;
+            if received.matches(definition)? {
+                progress = received;
+            } else {
+                issue = Some(ProgressIssue::DefinitionChanged);
+            }
+        }
+    }
+    Ok(ProjectedItem {
+        definition: definition.clone(),
+        progress,
+        issue,
+    })
 }
 
 #[cfg(test)]

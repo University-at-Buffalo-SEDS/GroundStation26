@@ -16,6 +16,8 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
 };
+#[cfg(not(feature = "hitl_mode"))]
+pub(crate) mod paired;
 // Shared wire definitions also serve the bounded paired-checklist model.
 // They are data only: importing a completion never invokes an engine transition.
 pub use paired_settings::checklists::{CompletionSource, Sequence};
@@ -431,6 +433,10 @@ fn access<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, Strin
     }
 }
 pub fn launch_block() -> Option<String> {
+    #[cfg(not(feature = "hitl_mode"))]
+    if let Some(reason) = paired::extra_launch_block() {
+        return Some(reason);
+    }
     access(|s| Ok(s.document.launch_block()))
         .unwrap_or_else(|error| Some(format!("Checklist storage unavailable: {error}")))
 }
@@ -494,6 +500,9 @@ impl Store {
 }
 #[cfg(not(feature = "hitl_mode"))]
 pub(crate) fn reset_sequence_completions() -> Result<(), String> {
+    if paired::requested() {
+        return Ok(());
+    } // Explicit reset events are durable in local qualification.
     access(|store| {
         let mut next = store.document.clone();
         if next.clear_sequence_completions() {
@@ -548,6 +557,19 @@ async fn check_item(
         Ok(p) => p,
         Err(e) => return e,
     };
+    #[cfg(not(feature = "hitl_mode"))]
+    if paired::requested() {
+        let result = paired::check(
+            &request,
+            p.username.as_deref().unwrap_or("operator"),
+            crate::telemetry_task::get_current_timestamp_ms() as i64,
+        )
+        .await;
+        if result.is_ok() {
+            crate::sequences::refresh_action_policy_now(&state);
+        }
+        return response(result);
+    }
     let result = access(|s| {
         s.update(|doc| {
             doc.check(
@@ -570,6 +592,14 @@ async fn edit_lists(
     if let Err(e) = principal(&state, &headers, true).await {
         return e;
     }
+    #[cfg(not(feature = "hitl_mode"))]
+    if paired::requested() {
+        let result = paired::edit(request, &state).await;
+        if result.is_ok() {
+            crate::sequences::refresh_action_policy_now(&state);
+        }
+        return response(result);
+    }
     let result = access(|s| s.update(|doc| doc.edit(request)));
     if result.is_ok() {
         crate::sequences::refresh_action_policy_now(&state);
@@ -577,9 +607,12 @@ async fn edit_lists(
     response(result)
 }
 pub fn routes() -> Router<Arc<AppState>> {
-    Router::new()
+    let router = Router::new()
         .route("/api/checklists", get(get_lists).post(edit_lists))
-        .route("/api/checklists/check", post(check_item))
+        .route("/api/checklists/check", post(check_item));
+    #[cfg(not(feature = "hitl_mode"))]
+    let router = router.merge(paired::routes());
+    router
 }
 #[cfg(test)]
 mod tests {

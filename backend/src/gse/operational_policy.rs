@@ -12,7 +12,11 @@ pub(super) fn operational_action_allowed(rt: &Runtime, action: Action) -> bool {
         Action::StartFill => Milestone::FillTarget,
         _ => unreachable!(),
     };
-    rt.operational.topology_stable
+    crate::checklists::paired::qualification_allowed(
+        rt.operational.saved.checklist_digest.as_deref(),
+        rt.operational.has_checklist_evidence(),
+    ) && rt.operational.saved.pending_checklists.is_empty()
+        && rt.operational.topology_stable
         && rt.operational.startup_configured
         && rt.operational.persist_error.is_none()
         && rt.operational.saved.qualification.permits(milestone)
@@ -34,7 +38,11 @@ fn flight_routes(state: &AppState) -> bool {
 pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool {
     let now = rt.now();
     let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
-    rt.operational.saved.qualification.launch_qualified()
+    crate::checklists::paired::qualification_allowed(
+        rt.operational.saved.checklist_digest.as_deref(),
+        rt.operational.has_checklist_evidence(),
+    ) && rt.operational.saved.pending_checklists.is_empty()
+        && rt.operational.saved.qualification.launch_qualified()
         && rt.operational.persist_error.is_none()
         && rt.operational.topology_stable
         && rt.operational.saved.fill_target_kg == Some(target)

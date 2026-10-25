@@ -308,3 +308,143 @@ async fn rejected_overflow_leaves_database_bytes_and_existing_rows_unchanged() {
     journal.close().await;
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
+
+#[tokio::test]
+async fn local_edits_preserve_unseen_offline_heads_and_context_across_restart() {
+    let path = temp();
+    let journal = open(&path, Limits::default()).await;
+    let initial = journal
+        .edit("item", serde_json::json!(1), "gs", |_, _| Ok(()))
+        .await
+        .unwrap();
+    let mut remote = Store::new("test".into()).unwrap();
+    remote.merge("test", "item", &initial, &peers()).unwrap();
+    let edited = remote
+        .edit(
+            "item",
+            Some(&initial.heads[0]),
+            serde_json::json!(2),
+            "rrls",
+            &peers(),
+        )
+        .unwrap();
+    journal.merge("item", &edited, |_, _| Ok(())).await.unwrap();
+    journal.close().await;
+    let journal = open(&path, Limits::default()).await;
+    let conflict = journal
+        .edit("item", serde_json::json!(3), "gs", |_, _| Ok(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        conflict.heads.len(),
+        2,
+        "an edit must not implicitly acknowledge an unactivated remote value"
+    );
+    let resolved = journal
+        .resolve("item", &conflict, serde_json::json!(2), "gs", |_, _| Ok(()))
+        .await
+        .unwrap();
+    assert_eq!(resolved.heads.len(), 1);
+    assert!(
+        journal
+            .resolve("item", &conflict, serde_json::json!(1), "gs", |_, _| Ok(()))
+            .await
+            .is_err()
+    );
+    let before = journal.metadata().await.unwrap();
+    journal
+        .edit("item", serde_json::json!(2), "gs", |_, _| Ok(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        journal.metadata().await.unwrap(),
+        before,
+        "same-value edit must not mint another head"
+    );
+    journal.close().await;
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+#[tokio::test]
+async fn remote_application_acknowledges_only_the_exact_nonconflicting_head() {
+    let path = temp();
+    let journal = open(&path, Limits::default()).await;
+    let remote = doc("rrls", 1, serde_json::json!(1));
+    journal.merge("item", &remote, |_, _| Ok(())).await.unwrap();
+    journal.acknowledge("item", &remote.heads[0]).await.unwrap();
+    let local = journal
+        .edit("item", serde_json::json!(2), "gs", |_, _| Ok(()))
+        .await
+        .unwrap();
+    assert_eq!(local.heads.len(), 1);
+    assert_eq!(local.heads[0].clock.get("rrls"), Some(&1));
+    assert!(journal.acknowledge("item", &remote.heads[0]).await.is_err());
+    journal.close().await;
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn conflict_pages_use_incremental_head_counts_and_resolution_clears_cache() {
+    let path = temp();
+    let journal = open(&path, Limits::default()).await;
+    for key in ["a", "b"] {
+        journal
+            .edit(key, serde_json::json!(1), "gs", |_, _| Ok(()))
+            .await
+            .unwrap();
+        journal
+            .merge(key, &doc("rrls", 1, serde_json::json!(2)), |_, _| Ok(()))
+            .await
+            .unwrap();
+    }
+    let first = journal.conflicts_page("", 1).await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert!(first.contains_key("a"));
+    let next = journal.conflicts_page("a", 1).await.unwrap();
+    assert!(next.contains_key("b"));
+    journal
+        .resolve("a", &first["a"], serde_json::json!(3), "gs", |_, _| Ok(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        journal
+            .conflicts_page("", 8)
+            .await
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["b"]
+    );
+    assert_eq!(journal.conflict_count().await.unwrap(), 1);
+    // Derived-index upgrade/recovery reconstructs bounded rows atomically and
+    // removes orphan cache entries instead of repeatedly retaining them.
+    sqlx::query("DELETE FROM paired_document_heads")
+        .execute(&journal.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO paired_document_heads VALUES('orphan',2)")
+        .execute(&journal.pool)
+        .await
+        .unwrap();
+    journal.close().await;
+    let journal = open(&path, Limits::default()).await;
+    assert_eq!(journal.conflict_count().await.unwrap(), 1);
+    assert!(
+        journal
+            .conflicts_page("", 8)
+            .await
+            .unwrap()
+            .contains_key("b")
+    );
+    assert!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM paired_document_heads WHERE key='orphan'"
+        )
+        .fetch_one(&journal.pool)
+        .await
+        .unwrap()
+            == 0
+    );
+    journal.close().await;
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}

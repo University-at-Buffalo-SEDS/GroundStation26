@@ -152,6 +152,46 @@ impl Journal {
                 && actual.try_get::<i64, _>("largest")? <= DOCUMENT_LIMIT as i64,
             "paired journal quota metadata mismatch"
         );
+        this.local_tables().await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS paired_document_heads(key TEXT PRIMARY KEY,heads INTEGER NOT NULL)").execute(&this.pool).await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS paired_conflicts ON paired_document_heads(heads,key)",
+        )
+        .execute(&this.pool)
+        .await?;
+        // Derived cache, reconstructed only on upgrade/recovery, never per poll.
+        let indexed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM paired_document_heads")
+            .fetch_one(&this.pool)
+            .await?;
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM paired_documents")
+            .fetch_one(&this.pool)
+            .await?;
+        if indexed != total {
+            let mut transaction = this.pool.begin().await?;
+            sqlx::query("DELETE FROM paired_document_heads")
+                .execute(&mut *transaction)
+                .await?;
+            let mut cursor = String::new();
+            loop {
+                let rows=sqlx::query("SELECT key,CASE WHEN length(document)<=65536 THEN document ELSE NULL END AS document,hash FROM paired_documents WHERE key>? ORDER BY key LIMIT 64").bind(&cursor).fetch_all(&mut *transaction).await?;
+                if rows.is_empty() {
+                    break;
+                }
+                for row in rows {
+                    let key: String = row.try_get("key")?;
+                    let body: Option<Vec<u8>> = row.try_get("document")?;
+                    let document = this.decode(
+                        &key,
+                        &body.ok_or_else(|| anyhow::anyhow!("paired document exceeds quota"))?,
+                        &row.try_get::<String, _>("hash")?,
+                    )?;
+                    sqlx::query("INSERT INTO paired_document_heads VALUES(?,?) ON CONFLICT(key) DO UPDATE SET heads=excluded.heads").bind(&key).bind(document.heads.len() as i64).execute(&mut *transaction).await?;
+                    cursor = key;
+                }
+            }
+            transaction.commit().await?;
+        }
+
         Ok(this)
     }
     fn metadata_row(&self, row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Metadata> {
@@ -269,6 +309,7 @@ impl Journal {
             .ok_or_else(|| anyhow::anyhow!("paired journal revision exhausted"))?;
         sqlx::query("INSERT INTO paired_documents VALUES(?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET document=excluded.document,hash=excluded.hash,revision=excluded.revision,encoded_bytes=excluded.encoded_bytes")
             .bind(key).bind(&bytes).bind(&hash).bind(revision).bind(i64::try_from(size)?).execute(&mut *transaction).await?;
+        sqlx::query("INSERT INTO paired_document_heads VALUES(?,?) ON CONFLICT(key) DO UPDATE SET heads=excluded.heads").bind(key).bind(document.heads.len() as i64).execute(&mut *transaction).await?;
         sqlx::query(
             "UPDATE paired_metadata SET revision=?,documents=?,encoded_bytes=? WHERE singleton=1",
         )
@@ -323,6 +364,41 @@ impl Journal {
             })
         })
         .collect()
+    }
+    pub async fn conflict_count(&self) -> anyhow::Result<usize> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM paired_document_heads WHERE heads>1")
+                .fetch_one(&self.pool)
+                .await?;
+        let count = usize::try_from(count)?;
+        anyhow::ensure!(
+            count <= self.limits.documents,
+            "Conflict catalog exceeds quota"
+        );
+        Ok(count)
+    }
+    pub async fn conflicts_page(
+        &self,
+        after: &str,
+        limit: usize,
+    ) -> anyhow::Result<BTreeMap<String, Document>> {
+        anyhow::ensure!(
+            after.len() <= 128 && limit > 0 && limit <= 8,
+            "invalid conflict page bounds"
+        );
+        let rows=sqlx::query("SELECT d.key,CASE WHEN length(d.document)<=65536 THEN d.document ELSE NULL END AS document,d.hash FROM paired_document_heads h JOIN paired_documents d ON d.key=h.key WHERE h.heads>1 AND h.key>? ORDER BY h.key LIMIT ?").bind(after).bind(limit as i64).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                let key: String = row.try_get("key")?;
+                let bytes: Option<Vec<u8>> = row.try_get("document")?;
+                let document = self.decode(
+                    &key,
+                    &bytes.ok_or_else(|| anyhow::anyhow!("paired document exceeds quota"))?,
+                    &row.try_get::<String, _>("hash")?,
+                )?;
+                Ok((key, document))
+            })
+            .collect()
     }
     pub async fn changed_page(
         &self,
@@ -429,3 +505,6 @@ impl Journal {
 
 #[cfg(test)]
 mod tests;
+
+#[path = "journal/local.rs"]
+mod local;

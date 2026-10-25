@@ -18,9 +18,16 @@ pub struct Saved {
     pub fill_target_kg: Option<f32>,
     #[serde(default)]
     pub pending_checklists: Vec<crate::checklists::CompletionEvent>,
+    #[serde(default)]
+    pub checklist_digest: Option<String>,
 }
 impl Saved {
     fn validate(&self) -> Result<(), String> {
+        if self.checklist_digest.as_ref().is_some_and(|digest| {
+            digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err("Invalid checklist qualification binding".into());
+        }
         if self.pending_checklists.len() > 3 {
             return Err("Too many pending sequence completion events".into());
         }
@@ -47,9 +54,12 @@ impl Saved {
                                 .is_none_or(|e| &e.operator != operator)
                     }
                     crate::checklists::CompletionAction::Clear => {
-                        event.sequence != crate::checklists::Sequence::NitrogenTest
-                            || self.qualification.stage()
-                                != gse_sequence::qualification::MissionStage::Fire
+                        !((event.sequence == crate::checklists::Sequence::NitrogenTest
+                            && self.qualification.stage()
+                                == gse_sequence::qualification::MissionStage::Fire)
+                            || (self.qualification.stage()
+                                == gse_sequence::qualification::MissionStage::Idle
+                                && !self.qualification.completed(milestone)))
                     }
                 }
             {
@@ -162,6 +172,7 @@ impl Operational {
         result
     }
     pub fn complete(&mut self, milestone: Milestone) -> Result<(), String> {
+        self.bind_checklists()?;
         if self.saved.pending_checklists.len() >= 3 {
             return Err("Save pending checklist progress before another test".into());
         }
@@ -172,7 +183,7 @@ impl Operational {
         self.saved
             .pending_checklists
             .push(crate::checklists::CompletionEvent {
-                id: format!("{:032x}", rand::random::<u128>()),
+                id: crate::checklists::paired::completion_event_id(),
                 sequence: match milestone {
                     Milestone::SelfTest => crate::checklists::Sequence::ValveSelfTest,
                     Milestone::NitrogenTest => crate::checklists::Sequence::NitrogenTest,
@@ -184,6 +195,7 @@ impl Operational {
         self.persist()
     }
     pub fn begin_fill(&mut self) -> Result<(), String> {
+        self.bind_checklists()?;
         self.saved
             .qualification
             .begin_fill(self.run_generation)
@@ -194,6 +206,7 @@ impl Operational {
         &mut self,
         evidence: gse_sequence::qualification::ColdFlowOverride,
     ) -> Result<(), String> {
+        self.bind_checklists()?;
         if !self.saved.pending_checklists.is_empty() {
             return Err("Save pending checklist progress first".into());
         }
@@ -204,7 +217,7 @@ impl Operational {
         self.saved
             .pending_checklists
             .push(crate::checklists::CompletionEvent {
-                id: format!("{:032x}", rand::random::<u128>()),
+                id: crate::checklists::paired::completion_event_id(),
                 sequence: crate::checklists::Sequence::NitrogenTest,
                 at_ms: evidence.at_ms,
                 action: crate::checklists::CompletionAction::Override {
@@ -215,6 +228,7 @@ impl Operational {
         self.flush_checklists()
     }
     pub fn commit_fire(&mut self) -> Result<(), String> {
+        self.bind_checklists()?;
         if !self.saved.pending_checklists.is_empty() {
             return Err("Save pending checklist progress first".into());
         }
@@ -222,7 +236,7 @@ impl Operational {
         next.qualification.commit_fire().map_err(str::to_string)?;
         next.pending_checklists
             .push(crate::checklists::CompletionEvent {
-                id: format!("{:032x}", rand::random::<u128>()),
+                id: crate::checklists::paired::completion_event_id(),
                 sequence: crate::checklists::Sequence::NitrogenTest,
                 at_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
                 action: crate::checklists::CompletionAction::Clear,
@@ -241,7 +255,58 @@ impl Operational {
         Ok(())
     }
     pub fn flush_checklists(&mut self) -> Result<(), String> {
+        if crate::checklists::paired::requested() {
+            while let Some(event) = self.saved.pending_checklists.first() {
+                if !crate::checklists::paired::deliver_event(event)? {
+                    break;
+                }
+                self.saved.pending_checklists.remove(0);
+                self.persist()?;
+            }
+            return Ok(());
+        }
         self.flush_checklists_with(crate::checklists::sequence_completed)
+    }
+    fn bind_checklists(&mut self) -> Result<(), String> {
+        if !crate::checklists::paired::qualification_allowed(
+            self.saved.checklist_digest.as_deref(),
+            self.has_checklist_evidence(),
+        ) {
+            return Err("Checklist template changed or is not durably ready; return to Idle and reset qualification".into());
+        }
+        if let Some(digest) = crate::checklists::paired::qualification_binding()? {
+            self.saved.checklist_digest = Some(digest);
+        }
+        Ok(())
+    }
+    pub fn has_checklist_evidence(&self) -> bool {
+        [
+            Milestone::SelfTest,
+            Milestone::NitrogenTest,
+            Milestone::FillTarget,
+        ]
+        .into_iter()
+        .any(|milestone| self.saved.qualification.completed(milestone))
+            || self.saved.qualification.nitrogen_override().is_some()
+    }
+    pub fn queue_checklist_reset(&mut self) {
+        if !crate::checklists::paired::requested() {
+            return;
+        }
+        for sequence in [
+            crate::checklists::Sequence::ValveSelfTest,
+            crate::checklists::Sequence::NitrogenTest,
+            crate::checklists::Sequence::FillTarget,
+        ] {
+            self.saved
+                .pending_checklists
+                .push(crate::checklists::CompletionEvent {
+                    id: crate::checklists::paired::completion_event_id(),
+                    sequence,
+                    at_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+                    action: crate::checklists::CompletionAction::Clear,
+                });
+        }
     }
     fn flush_checklists_with(
         &mut self,
@@ -261,6 +326,56 @@ impl Operational {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn saved_template_binding_and_local_reset_receipts_survive_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "gse-paired-binding-{}.json",
+            rand::random::<u128>()
+        ));
+        let digest = "a".repeat(64);
+        let mut saved = Saved {
+            checklist_digest: Some(digest.clone()),
+            ..Default::default()
+        };
+        saved
+            .qualification
+            .complete(Milestone::SelfTest, 0)
+            .unwrap();
+        saved.save(&path).unwrap();
+        let restored = Saved::load(&path).unwrap();
+        assert_eq!(restored.checklist_digest.as_deref(), Some(digest.as_str()));
+        assert!(restored.qualification.completed(Milestone::SelfTest));
+        // Explicit local reset is data delivered to matching checklist items,
+        // while the operational milestone itself is already locally cleared.
+        let mut reset = Saved::default();
+        for (index, sequence) in [
+            crate::checklists::Sequence::ValveSelfTest,
+            crate::checklists::Sequence::NitrogenTest,
+            crate::checklists::Sequence::FillTarget,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            reset
+                .pending_checklists
+                .push(crate::checklists::CompletionEvent {
+                    id: format!("{}{:016x}", digest, index),
+                    sequence,
+                    at_ms: 100,
+                    action: crate::checklists::CompletionAction::Clear,
+                });
+        }
+        reset.save(&path).unwrap();
+        let restored = Saved::load(&path).unwrap();
+        assert_eq!(restored.pending_checklists.len(), 3);
+        assert!(!restored.qualification.completed(Milestone::SelfTest));
+        assert!(restored.checklist_digest.is_none());
+        let mut invalid = restored;
+        invalid.checklist_digest = Some("bad".into());
+        assert!(invalid.save(&path).is_err());
+        assert!(Saved::load(&path).unwrap().checklist_digest.is_none());
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn restart_retains_ordered_tests_but_never_resumes_outputs_or_queued_launch() {
         let path = std::env::temp_dir().join(format!(

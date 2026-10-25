@@ -14,7 +14,7 @@ test_fire_mode = []
 
 [dependencies]
 gs-browser-assets = { path = "../shared/browser_assets" }
-paired_settings = { path = "../shared/paired_settings" }
+paired_settings = { path = "../shared/paired_settings", features = ["sqlite-journal"] }
 gs-camera-discovery = { path = "../shared/camera_discovery" }
 gse_sequence = { path = "../shared/gse_sequence" }
 axum = { workspace = true, features = ["ws"] }

@@ -12,15 +12,17 @@ use paired_settings::{Document, coordinator::Coordinator, radio::RadioSync};
 use ring::signature::KeyPair;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(test)]
+use std::time::Instant;
 use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
-    time::Instant,
 };
 
 #[path = "mission_sync/settings.rs"]
 mod settings;
+pub(crate) mod wire;
 #[derive(Clone)]
 struct Catalog {
     calibration: loadcell::LoadcellCalibrationFile,
@@ -72,7 +74,6 @@ struct Runtime {
     path: PathBuf,
     dirty: bool,
     needs_publication: bool,
-    started: Instant,
     last_error: Option<String>,
 }
 impl Runtime {
@@ -112,7 +113,6 @@ impl Runtime {
             path,
             dirty,
             needs_publication: false,
-            started: Instant::now(),
             last_error: None,
         })
     }
@@ -207,11 +207,7 @@ fn step(
     mesh: &crate::rrls::Shared,
     signer: &ring::signature::Ed25519KeyPair,
 ) -> anyhow::Result<()> {
-    let now = runtime
-        .started
-        .elapsed()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64;
+    let now = mesh.lock().unwrap().now();
     let current = Catalog::capture(state)?;
     runtime.observe(&current)?;
     let frames = {
@@ -222,6 +218,13 @@ fn step(
     };
     let mut reception_error = None;
     for wire in frames {
+        #[cfg(not(feature = "hitl_mode"))]
+        if paired_settings::journal_replication::JournalRadio::recognizes(&wire) {
+            if !crate::checklists::paired::receive_wire(wire) {
+                reception_error = Some(anyhow::anyhow!("Shared checklist inbox is busy"));
+            }
+            continue;
+        }
         match runtime.receive(&current, &wire, now, signer.public_key().as_ref()) {
             Ok(()) => {
                 // Only authenticated, protocol-valid reception establishes presence.
@@ -337,11 +340,10 @@ fn step(
     }
     runtime
         .radio
-        .poll(runtime.coordinator.store(), now, signer, |_, wire| {
-            let mut link = mesh.lock().unwrap();
-            let link_now = link.now();
-            link.queue_settings(wire, link_now)
+        .poll(runtime.coordinator.store(), now, signer, |_, bytes| {
+            wire::offer(wire::Class::Legacy, bytes)
         })?;
+    wire::flush(mesh, now);
     if let Some(error) = reception_error {
         return Err(error);
     }
@@ -397,6 +399,9 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
     if RUNTIME.set(runtime.clone()).is_err() {
         return None;
     }
+    #[cfg(not(feature = "hitl_mode"))]
+    let _checklists =
+        crate::checklists::paired::start(state.clone(), pairing.clone(), mesh.clone());
     let mut shutdown = state.shutdown_subscribe();
     Some(tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));

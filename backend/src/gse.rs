@@ -49,6 +49,8 @@ pub struct Runtime {
 }
 impl Default for Runtime {
     fn default() -> Self {
+        #[cfg(not(any(test, feature = "hitl_mode")))]
+        crate::checklists::paired::preflight();
         Self {
             engine: Engine::default(),
             #[cfg(not(feature = "hitl_mode"))]
@@ -62,6 +64,10 @@ impl Default for Runtime {
         }
     }
 }
+fn sequence_clock_ms(elapsed_ms: u64, simulated_ms: Option<u64>) -> u64 {
+    simulated_ms.unwrap_or(elapsed_ms)
+}
+
 impl Runtime {
     /// Imported calibration must not invalidate an active or already-qualified
     /// procedure. Retain it as pending until the operator returns to Idle and
@@ -86,6 +92,20 @@ impl Runtime {
                 .any(|m| self.operational.saved.qualification.completed(m))
         }
     }
+    #[cfg(not(feature = "hitl_mode"))]
+    pub(crate) fn checklist_definition_edit_allowed(&self) -> bool {
+        self.calibration_import_allowed()
+            && !self.operational.running
+            && self.operational.saved.pending_checklists.is_empty()
+            && self.operational.saved.qualification.fault().is_none()
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    pub(crate) fn checklist_template_bound(&self) -> bool {
+        crate::checklists::paired::qualification_allowed(
+            self.operational.saved.checklist_digest.as_deref(),
+            self.operational.has_checklist_evidence(),
+        )
+    }
     fn fresh_mass(&self, now_ms: u64) -> Option<Sample> {
         self.mass
             .filter(|m| m.at_ms <= now_ms && now_ms - m.at_ms <= 2000)
@@ -97,7 +117,10 @@ impl Runtime {
         });
     }
     fn now(&self) -> u64 {
-        self.clock.elapsed().as_millis() as u64
+        sequence_clock_ms(
+            self.clock.elapsed().as_millis() as u64,
+            crate::simulation_clock_ms(),
+        )
     }
     pub fn observe_pressure(&mut self, value: Option<f32>) {
         self.pressure = value.filter(|p| p.is_finite()).map(|value| Sample {
@@ -810,6 +833,33 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "hitl_mode"))]
+    #[test]
+    fn template_switch_waits_for_local_reset_receipts() {
+        let mut runtime = super::Runtime::default();
+        assert!(runtime.checklist_definition_edit_allowed());
+        runtime
+            .operational
+            .saved
+            .pending_checklists
+            .push(crate::checklists::CompletionEvent {
+                id: "0".repeat(80),
+                sequence: crate::checklists::Sequence::ValveSelfTest,
+                at_ms: 0,
+                action: crate::checklists::CompletionAction::Clear,
+            });
+        assert!(!runtime.checklist_definition_edit_allowed());
+        runtime.operational.saved.pending_checklists.clear();
+        assert!(runtime.checklist_definition_edit_allowed());
+    }
+    #[test]
+    fn sequence_clock_uses_only_explicit_simulation_time() {
+        assert_eq!(super::sequence_clock_ms(25_000, Some(1_000)), 1_000);
+        assert_eq!(super::sequence_clock_ms(26_000, Some(1_000)), 1_000);
+        assert_eq!(super::sequence_clock_ms(27_000, Some(2_000)), 2_000);
+        assert_eq!(super::sequence_clock_ms(25_000, None), 25_000);
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -1306,6 +1356,8 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
         rt.operational.saved.baseline = None;
         rt.operational.saved.fill_target_kg = None;
         rt.operational.saved.pending_checklists.clear();
+        rt.operational.saved.checklist_digest = None;
+        rt.operational.queue_checklist_reset();
         rt.operational
             .persist()
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -1389,6 +1441,8 @@ async fn reset_qualification(State(state): State<Arc<AppState>>, headers: Header
             return (StatusCode::CONFLICT, error).into_response();
         }
         rt.operational.saved.pending_checklists.clear();
+        rt.operational.saved.checklist_digest = None;
+        rt.operational.queue_checklist_reset();
         rt.operational.saved.baseline = None;
         rt.operational.saved.fill_target_kg = None;
         rt.operational.persist_error = None;
