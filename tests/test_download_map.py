@@ -19,6 +19,13 @@ class WrapperTests(unittest.TestCase):
   with patch('sys.argv',['download_map.py','--profile','rrls','--test']),patch.dict(module.os.environ,{'MAP_PROFILE':'groundstation','MAP_REGION':'custom'},clear=True),patch.object(module,'run')as run:
    module.main()
   self.assertEqual(run.call_args.kwargs['env']['MAP_PROFILE'],'rrls');self.assertEqual(run.call_args.kwargs['env']['MAP_REGION'],'custom')
+ def test_targeted_repairs_forward_only_selected_coordinates(self):
+  args=self.invoke(['--repair-tile','17/37437/48311','--repair-tile','17/36836/48184']);self.assertEqual(args.args[0][-5:],['--','--repair-tile','17/37437/48311','--repair-tile','17/36836/48184'])
+ def test_probe_and_repair_are_rejected_before_starting_cargo(self):
+  with self.assertRaises(SystemExit)as error:self.invoke(['--test','--repair-tile','0/0/0'])
+  self.assertEqual(error.exception.code,2)
+ def test_no_bundle_selects_legacy_files_instead_of_a_silent_direct_noop(self):
+  args=self.invoke(['--no-bundle']);self.assertEqual(args.kwargs['env']['MAP_BUILD_BUNDLE'],'0');self.assertEqual(args.kwargs['env']['MAP_DIRECT_TO_BUNDLE'],'0')
  def test_ordinary_download_command_unchanged(self):
   args=self.invoke([]);self.assertEqual(args.args[0],['cargo','run','--release','-p','map_downloader'])
 if __name__=='__main__':unittest.main()

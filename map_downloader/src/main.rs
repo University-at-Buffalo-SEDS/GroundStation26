@@ -1,9 +1,13 @@
 mod budget;
+mod cache_probe;
 mod connection_test;
 mod dns;
 mod limits;
 mod network;
+mod options;
 mod profile;
+mod raster;
+mod repair;
 mod storage;
 
 use std::f64::consts::PI;
@@ -130,6 +134,16 @@ fn log_progress_error(pb: Option<&ProgressBar>, msg: String) {
     }
 }
 
+async fn fetch_valid_raster(client: &TileClient, url: &str) -> Result<network::TileResponse> {
+    let mut response = client.fetch(url).await?;
+    if response.status.is_success() {
+        response.bytes = raster::validate_download(response.bytes)
+            .await
+            .context("invalid PNG/JPEG tile response")?;
+    }
+    Ok(response)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fetch_tile_with_retries(
     z: u32,
@@ -142,12 +156,16 @@ async fn fetch_tile_with_retries(
     limiter: Option<&Arc<BandwidthLimiter>>,
     max_attempts: u32,
     base_url: &str,
+    force: bool,
 ) -> TileOutcome {
     let tile_path = z_dir.join(format!("{x}/{y}.{TILE_EXT}"));
     let part_path = tile_path.with_extension(format!("{}.part", TILE_EXT));
 
     // Skip if final tile already exists
-    if async_fs::try_exists(&tile_path).await.unwrap_or(false) {
+    if !force
+        && async_fs::try_exists(&tile_path).await.unwrap_or(false)
+        && raster::cached_file_ok(&tile_path).unwrap_or(false)
+    {
         return TileOutcome::Complete;
     }
 
@@ -163,7 +181,7 @@ async fn fetch_tile_with_retries(
         attempts += 1;
         // Transient failures stay quiet. Keep the final cause for one useful
         // report only if this tile exhausts its bounded retry allowance.
-        let failure = match client.fetch(&url).await {
+        let failure = match fetch_valid_raster(client, &url).await {
             Ok(resp) => {
                 let status = resp.status;
                 if status.is_success() {
@@ -239,7 +257,7 @@ fn should_build_bundle() -> bool {
 fn should_direct_to_bundle() -> bool {
     match env::var("MAP_DIRECT_TO_BUNDLE") {
         Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
-        Err(_) => true,
+        Err(_) => should_build_bundle(),
     }
 }
 
@@ -669,9 +687,10 @@ async fn remove_saved_coords(
     pending: &mut HashSet<(u32, u32)>,
 ) -> Result<()> {
     use futures::TryStreamExt;
-    let mut rows = sqlx::query("SELECT x,y FROM tiles WHERE z=?")
+    let mut rows = sqlx::query("SELECT t.x,t.y,length(b.image) AS bytes,substr(b.image,1,32) AS head,substr(b.image,-12) AS tail FROM tiles t LEFT JOIN tile_blobs b ON b.id=t.blob_id WHERE t.z=?")
         .bind(i64::from(z))
         .fetch(pool);
+    let mut invalid = 0u64;
     while let Some(row) = rows
         .try_next()
         .await
@@ -681,8 +700,26 @@ async fn remove_saved_coords(
         let x: i64 = row.try_get("x")?;
         let y: i64 = row.try_get("y")?;
         if let (Ok(x), Ok(y)) = (u32::try_from(x), u32::try_from(y)) {
-            pending.remove(&(x, y));
+            let length: Option<i64> = row.try_get("bytes")?;
+            let head: Option<Vec<u8>> = row.try_get("head")?;
+            let tail: Option<Vec<u8>> = row.try_get("tail")?;
+            if length
+                .zip(head)
+                .zip(tail)
+                .is_some_and(|((length, head), tail)| {
+                    length >= 0 && raster::cached_header_ok(&head, &tail, length as u64)
+                })
+            {
+                pending.remove(&(x, y));
+            } else if pending.contains(&(x, y)) {
+                invalid += 1;
+            }
         }
+    }
+    if invalid > 0 {
+        println!(
+            "z={z}: {invalid} invalid cached tile headers queued for replacement; other saved tiles retained"
+        );
     }
     Ok(())
 }
@@ -780,10 +817,27 @@ async fn main() -> Result<()> {
         should_resume_bundle(),
         should_build_bundle(),
     )?;
-    let test_only = env::args().skip(1).any(|arg| arg == "--test");
-    if test_only {
+    let options = options::Options::parse(env::args().skip(1))?;
+    options.validate(
+        profile,
+        max_zoom,
+        should_resume_bundle(),
+        should_direct_to_bundle(),
+        should_build_bundle(),
+    )?;
+    if options.test {
+        let manifest_dir = env::var("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| env::current_dir().expect("failed to get current dir"));
+        let data_dir = manifest_dir.join("../backend/data/maps").join(&region);
+        let cache = cache_probe::check(
+            &bundle_path_for(&data_dir),
+            &data_dir.join("tiles"),
+            &connection_test::sample_tiles_for_profile(max_zoom, profile),
+        )
+        .await;
         let client = TileClient::configured(&format!("{SATELLITE_BASE_URL}/0/0/0")).await?;
-        return connection_test::run(
+        let network = connection_test::run(
             &client,
             &region,
             profile,
@@ -792,9 +846,15 @@ async fn main() -> Result<()> {
             env::var_os("MAP_DIRECT_INTERFACE").is_some(),
         )
         .await;
+        cache?;
+        return network;
     }
 
-    limits::prepare(max_concurrent())?;
+    limits::prepare(if options.repairs.is_empty() {
+        max_concurrent()
+    } else {
+        max_concurrent().min(options.repairs.len())
+    })?;
 
     // Use CARGO_MANIFEST_DIR if present (when run via `cargo run`),
     // otherwise fall back to current directory.
@@ -826,6 +886,20 @@ async fn main() -> Result<()> {
 
     // Async HTTP client
     let client = TileClient::configured(&format!("{SATELLITE_BASE_URL}/0/0/0")).await?;
+
+    if !options.repairs.is_empty() {
+        return repair::run(
+            &options.repairs,
+            &bundle_path_for(&data_dir),
+            &tiles_root,
+            &client,
+            profile,
+            direct_to_bundle,
+            MAX_RETRY_ATTEMPTS,
+            SATELLITE_BASE_URL,
+        )
+        .await;
+    }
 
     if direct_to_bundle {
         if !should_build_bundle() {
@@ -1067,6 +1141,7 @@ async fn fetch_tiles_for_zoom_async(
                     limiter_for_worker.as_ref(),
                     MAX_RETRY_ATTEMPTS,
                     SATELLITE_BASE_URL,
+                    false,
                 )
                 .await;
                 match ok {
@@ -1133,6 +1208,7 @@ async fn fetch_tiles_for_zoom_async(
                         limiter.as_ref(),
                         MAX_RETRY_ATTEMPTS,
                         SATELLITE_BASE_URL,
+                        false,
                     )
                     .await;
                     match ok {
@@ -1188,6 +1264,38 @@ async fn fetch_tiles_for_zoom_async(
 }
 
 async fn write_tile_atomic_async(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_tile_atomic_with_reserve(
+        path,
+        bytes,
+        storage::minimum_free_bytes().map_err(std::io::Error::other)?,
+    )
+    .await
+}
+
+async fn write_tile_atomic_with_reserve(
+    path: &Path,
+    bytes: &[u8],
+    reserve: u64,
+) -> std::io::Result<()> {
+    if bytes.len() > network::MAX_TILE_BYTES {
+        return Err(std::io::Error::other(
+            "tile exceeds bounded atomic-write size",
+        ));
+    }
+    const WRITE_SLOTS: usize = 32;
+    const WRITE_HEADROOM: u64 =
+        WRITE_SLOTS as u64 * network::MAX_TILE_BYTES as u64 + 16 * 1024 * 1024;
+    static WRITERS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let _permit = WRITERS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(WRITE_SLOTS)))
+        .acquire()
+        .await
+        .map_err(std::io::Error::other)?;
+    let directory = path.parent().unwrap_or(Path::new("."));
+    // Allow for every admitted atomic file write before consuming the disk
+    // reserve. HTTP concurrency is independent of these bounded disk writes.
+    storage::ensure_space(directory, reserve.saturating_add(WRITE_HEADROOM))
+        .map_err(std::io::Error::other)?;
     let tmp_path = path.with_extension(format!(
         "{}.part",
         path.extension().unwrap().to_string_lossy()
@@ -1225,7 +1333,7 @@ async fn fetch_tile_with_retries_to_db(
         attempts += 1;
         // Transient failures stay quiet. Keep the final cause for one useful
         // report only if this tile exhausts its bounded retry allowance.
-        let failure = match client.fetch(&url).await {
+        let failure = match fetch_valid_raster(client, &url).await {
             Ok(resp) => {
                 let status = resp.status;
                 if status.is_success() {
@@ -1688,8 +1796,14 @@ mod tile_retry_tests {
     use super::*;
     use std::io::{Read, Write};
 
-    const IMAGE: &[u8] = b"\xff\xd8\xfftile-data";
-    fn server(failures: usize, success: bool) -> (String, std::thread::JoinHandle<usize>) {
+    fn image() -> Vec<u8> {
+        raster::image()
+    }
+    fn server(
+        failures: usize,
+        success: bool,
+        complete_bad_body: bool,
+    ) -> (String, std::thread::JoinHandle<usize>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -1712,9 +1826,19 @@ mod tile_retry_tests {
                             request.extend_from_slice(&chunk[..count]);
                         }
                         assert!(request.ends_with(b"\r\n\r\n"));
-                        let length = IMAGE.len() + if count < failures { 100 } else { 0 };
+                        let bytes = if count < failures && complete_bad_body {
+                            b"<html>upstream temporarily unavailable</html>".to_vec()
+                        } else {
+                            image()
+                        };
+                        let length = bytes.len()
+                            + if count < failures && !complete_bad_body {
+                                100
+                            } else {
+                                0
+                            };
                         write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").unwrap();
-                        socket.write_all(IMAGE).unwrap();
+                        socket.write_all(&bytes).unwrap();
                         count += 1;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1729,6 +1853,14 @@ mod tile_retry_tests {
     }
 
     async fn check_retry(direct: bool, recover: bool) {
+        check_retry_case(direct, recover, false, false).await;
+    }
+    async fn check_retry_case(
+        direct: bool,
+        recover: bool,
+        complete_bad_body: bool,
+        corrupt_cached: bool,
+    ) {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = env::temp_dir().join(format!(
             "gs-tile-retry-{}-{}",
@@ -1737,7 +1869,7 @@ mod tile_retry_tests {
         ));
         fs::create_dir_all(root.join("0/0")).unwrap();
         let failures = if recover { 1 } else { 2 };
-        let (base, thread) = server(failures, recover);
+        let (base, thread) = server(failures, recover, complete_bad_body);
         let client = TileClient::from(
             Client::builder()
                 .no_proxy()
@@ -1750,6 +1882,11 @@ mod tile_retry_tests {
             let pool = init_direct_bundle_pool(&root.join("tiles.sqlite3"), true)
                 .await
                 .unwrap();
+            if corrupt_cached {
+                upsert_tile_to_bundle(&pool, 0, 0, 0, b"<html>previous failed body</html>")
+                    .await
+                    .unwrap();
+            }
             let (writer, writer_task) = storage::spawn(pool.clone(), root.clone(), 0);
             let result = fetch_tile_with_retries_to_db(
                 0, 0, 0, &client, &writer, &bytes, None, None, 2, &base,
@@ -1758,16 +1895,19 @@ mod tile_retry_tests {
             assert_eq!(result == TileOutcome::Complete, recover);
             assert_eq!(bundle_has_tile(&pool, 0, 0, 0).await.unwrap(), recover);
             if recover {
-                let saved: Vec<u8> = sqlx::query_scalar("SELECT image FROM tile_blobs")
+                let saved: Vec<u8> = sqlx::query_scalar("SELECT b.image FROM tiles t JOIN tile_blobs b ON b.id=t.blob_id WHERE t.z=0 AND t.x=0 AND t.y=0")
                     .fetch_one(&pool)
                     .await
                     .unwrap();
-                assert_eq!(saved, IMAGE);
+                assert_eq!(saved, image());
             }
             drop(writer);
             writer_task.await.unwrap();
             pool.close().await;
         } else {
+            if corrupt_cached {
+                fs::write(root.join("0/0/0.jpg"), b"<html>previous failed body</html>").unwrap();
+            }
             let result = fetch_tile_with_retries(
                 0,
                 0,
@@ -1779,18 +1919,19 @@ mod tile_retry_tests {
                 None,
                 2,
                 &base,
+                false,
             )
             .await;
             assert_eq!(result == TileOutcome::Complete, recover);
             assert_eq!(root.join("0/0/0.jpg").exists(), recover);
             if recover {
-                assert_eq!(fs::read(root.join("0/0/0.jpg")).unwrap(), IMAGE);
+                assert_eq!(fs::read(root.join("0/0/0.jpg")).unwrap(), image());
             }
         }
         assert_eq!(thread.join().unwrap(), 2);
         assert_eq!(
             bytes.load(Ordering::Relaxed),
-            if recover { IMAGE.len() as u64 } else { 0 }
+            if recover { image().len() as u64 } else { 0 }
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -1810,6 +1951,30 @@ mod tile_retry_tests {
     #[tokio::test]
     async fn database_exhaustion_reports_final_cause_once() {
         check_retry(true, false).await;
+    }
+    #[tokio::test]
+    async fn complete_http200_html_is_retried_and_never_saved_to_directory() {
+        check_retry_case(false, false, true, false).await;
+    }
+    #[tokio::test]
+    async fn complete_http200_html_is_retried_and_never_saved_to_database() {
+        check_retry_case(true, false, true, false).await;
+    }
+    #[tokio::test]
+    async fn invalid_http200_body_then_real_image_recovers_directory_quietly() {
+        check_retry_case(false, true, true, false).await;
+    }
+    #[tokio::test]
+    async fn invalid_http200_body_then_real_image_recovers_database_quietly() {
+        check_retry_case(true, true, true, false).await;
+    }
+    #[tokio::test]
+    async fn directory_resume_replaces_only_bad_cached_tile_after_valid_response() {
+        check_retry_case(false, true, true, true).await;
+    }
+    #[tokio::test]
+    async fn database_resume_replaces_only_bad_cached_tile_after_valid_response() {
+        check_retry_case(true, true, true, true).await;
     }
 }
 
@@ -1848,7 +2013,7 @@ mod map_pipeline_tests {
         .execute(&pool)
         .await
         .unwrap();
-        upsert_tile_to_bundle(&pool, 17, 0, 0, b"existing")
+        upsert_tile_to_bundle(&pool, 17, 0, 0, &raster::image())
             .await
             .unwrap();
         upsert_tile_to_bundle(&pool, 16, 1, 0, b"other zoom")
@@ -1890,6 +2055,21 @@ mod map_pipeline_tests {
             HashSet::from([(999, 0)]),
             "failed read must not be treated as a missing-tile scan"
         );
+    }
+    #[tokio::test]
+    async fn legacy_low_space_refuses_before_touching_old_tile_or_partial_file() {
+        let dir = std::env::temp_dir().join(format!("gs-legacy-reserve-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tile.jpg");
+        fs::write(&path, b"old cached data").unwrap();
+        assert!(
+            write_tile_atomic_with_reserve(&path, &raster::image(), u64::MAX)
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"old cached data");
+        assert!(!dir.join("tile.jpg.part").exists());
+        fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
     async fn oversized_tile_is_permanent_before_retry_budget_is_consumed() {
@@ -1936,6 +2116,7 @@ mod map_pipeline_tests {
                 None,
                 40,
                 &format!("http://{addr}"),
+                false,
             ),
         )
         .await
@@ -1980,7 +2161,8 @@ mod map_pipeline_tests {
         let bytes = Arc::new(AtomicU64::new(0));
         let url = format!("http://{addr}");
         assert_eq!(
-            fetch_tile_with_retries(0, 0, 0, &root, &client, &bytes, None, None, 40, &url).await,
+            fetch_tile_with_retries(0, 0, 0, &root, &client, &bytes, None, None, 40, &url, false)
+                .await,
             TileOutcome::Unavailable
         );
         assert!(!root.join("0/0.jpg").exists());

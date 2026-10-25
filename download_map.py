@@ -15,6 +15,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download offline map tiles.")
     parser.add_argument("--profile", choices=["groundstation", "rrls"], default=None,
                         help="Coverage preset: rrls downloads only UB, URRG and Midland into its own bounded dataset; default keeps normal GroundStation coverage.")
+    parser.add_argument("--repair-tile", action="append", default=[], metavar="Z/X/Y",
+                        help="Refetch only selected cached coordinates (repeat up to32); preserves each old tile until a valid replacement commits. Cannot combine with --test.")
     parser.add_argument("--test",action="store_true",help="Test a few configured map tiles without creating or writing map data; reports direct and fallback routing.")
     parser.add_argument(
         "--max-concurrent",
@@ -73,6 +75,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.test and args.repair_tile:
+        print("Error: --test and --repair-tile cannot be combined; --test never writes map data.", file=sys.stderr)
+        sys.exit(2)
     repo_root = Path(__file__).resolve().parent
     env = os.environ.copy()
     if args.profile is not None:
@@ -102,6 +107,7 @@ def main() -> None:
         print(f"Using MAP_MAX_BANDWIDTH_MIBPS={env['MAP_MAX_BANDWIDTH_MIBPS']}")
     if args.no_bundle:
         env["MAP_BUILD_BUNDLE"] = "0"
+        env["MAP_DIRECT_TO_BUNDLE"] = "0"
         print("Using MAP_BUILD_BUNDLE=0")
     if args.bundle_path is not None:
         env["MAP_BUNDLE_PATH"] = str(args.bundle_path)
@@ -120,8 +126,9 @@ def main() -> None:
         print("Using MAP_DIRECT_TO_BUNDLE=0")
 
     try:
+        binary_args = ["--test"] if args.test else [arg for tile in args.repair_tile for arg in ("--repair-tile", tile)]
         run(
-            ["cargo", "run", "--release", "-p", "map_downloader"] + (["--", "--test"] if args.test else []),
+            ["cargo", "run", "--release", "-p", "map_downloader"] + (["--"] + binary_args if binary_args else []),
             cwd=repo_root,
             env=env,
         )

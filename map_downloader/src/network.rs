@@ -286,6 +286,8 @@ pub(crate) async fn tile_body(mut response: Response) -> anyhow::Result<Vec<u8>>
 
 fn builder() -> reqwest::ClientBuilder {
     Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
         .user_agent("GroundStationOfflineTileFetcher/0.1")
         .dns_resolver(crate::dns::CachedResolver::system())
 }

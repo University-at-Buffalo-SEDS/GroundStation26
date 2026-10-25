@@ -14,8 +14,10 @@ To bind only the downloader's HTTP sockets to a physical interface:
 ```
 
 This disables HTTP proxies only for direct requests. A single six-second probe
-checks the route; failure uses the normal route/proxy settings. A later direct
-transport/body failure switches the remaining run to normal networking. No routes,
+checks the route; failure uses the normal route/proxy settings. Three consecutive direct transport/body failures switch traffic temporarily to
+the normal route. After thirty seconds, one requested tile probes direct again;
+recovery restores direct downloads. A transient single failure does not disable
+direct for the remainder of a long run. No routes,
 firewall rules, Wi-Fi settings or DNS configuration are changed. DNS continues to
 follow the operating system's resolver policy. Unsupported platforms or interface
 permissions fall back normally.
@@ -25,12 +27,23 @@ The default disk reserve is 2048 MiB. Override with `--min-free-mib N` or
 committed tiles for a later run. Both direct downloads and directory-to-bundle packaging checkpoint their WAL
 rather than making a full-database VACUUM copy. Packaging also checks the reserve
 and commits at most 16 MiB of image data at a time; a disk-space failure keeps
-both committed bundle data and input tiles, then exits unsuccessfully.
+both committed bundle data and input tiles, then exits unsuccessfully. Legacy
+unbundled/via-tiles downloads also check the reserve before atomic writes, with
+at most 32 file writes and 32 MiB aggregate headroom independent of HTTP concurrency.
+That headroom covers all 32 maximum-size bodies plus 16 MiB for allocation/metadata;
+each permit remains held until the atomic rename. Existing tile space is already
+included in available disk calculations and is released only after replacement.
 
 Each tile body is limited to 512 KiB, sufficient for the source's 256-pixel JPEG/PNG
 raster tiles. Oversized responses are terminal for that tile. HTTP response buffers
 can retain up to configured concurrency × 512 KiB; queued/batched payload copies
-add at most 32 MiB. SQLite cache, coordinate sets, HTTP/TLS buffers and runtime
+add at most 32 MiB. New successful HTTP responses must fully decode as PNG/JPEG
+with valid bounded dimensions and image trailers before storage; HTML error pages
+and truncated images use the same quiet bounded retries as network failures.
+At most four image decoders run concurrently on blocking workers, retaining the
+original body without an extra copy. Normal HTTP requests have a ten-second
+connection deadline and sixty-second total deadline; direct requests retain their
+six-second connection and thirty-second total deadlines. SQLite cache, coordinate sets, HTTP/TLS buffers and runtime
 state consume additional memory. HTTP concurrency and existing bandwidth limits
 remain configurable as before.
 
@@ -121,3 +134,42 @@ placing an unrelated large dataset in that same directory. `--test` does not
 create or lock a dataset, and samples only the configured local regions plus
 the shared zoom 0 tile. The default GroundStation profile and its download paths
 remain unchanged.
+
+
+## Corrupt cached tiles and read-only checks
+
+Resume reads only each saved tile's 32-byte header, 12-byte trailer and length.
+HTML responses, missing blobs, invalid PNG dimensions and obvious truncated
+JPEG/PNG bodies stay in the pending coordinate set. Valid cached headers remain
+skipped. Only a successful, fully decoded new image replaces the affected tile;
+old cached data is not deleted before the replacement commits. This bounded
+header check is not a full integrity scan of multi-gigabyte map imagery, so damage
+inside an otherwise well-formed compressed image requires the explicit targeted repair below.
+The legacy directory path uses the same cheap resume check.
+
+`--test` additionally decodes only its few selected cached coordinates and reports
+invalid samples clearly, alongside the public endpoint connection results. It
+opens an existing bundle in immutable read-only mode and creates no directories,
+databases or sidecars. A nonempty WAL prevents a consistent immutable cache check:
+stop the downloader after its checkpoint, then repeat the test. The cache is left unchanged.
+A successful connection probe alone does not certify every existing cached tile.
+
+
+To replace a known bad tile without scanning/deleting the map dataset or starting
+a region download, repeat your profile/interface/storage options and add:
+
+```sh
+python3 download_map.py --profile rrls --repair-tile 17/37437/48311
+# Multiple known coordinates, maximum 32 distinct tiles:
+python3 download_map.py --repair-tile 17/37437/48311 --repair-tile 17/36836/48184
+```
+
+Repair fetches only those coordinates, including when a corrupt old image retains
+a valid header and trailer. A failed request, invalid HTTP200 body or unavailable
+tile leaves its old row/file intact and exits unsuccessfully. Unselected tiles
+are unchanged. Replacement images still require full bounded raster decoding,
+HTTP retries/bandwidth limits, disk reserve and the RRLS database/WAL budget.
+Coordinates must fit the selected profile and configured maximum zoom. Repair
+requires resume; `--test`, `--no-bundle-resume`, and `--via-tiles` bundle rebuilds
+cannot be combined with it. Legacy unbundled image files can be repaired using
+`--no-bundle`. A successful targeted repair is not a whole-dataset integrity scan.

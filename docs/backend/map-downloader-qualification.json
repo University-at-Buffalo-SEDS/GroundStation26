@@ -1,0 +1,81 @@
+{
+  "date": "2026-10-25",
+  "scope": "Map tools only; no bulk downloads, real map database access, physical devices or network configuration changes.",
+  "validation": {
+    "rust_map_downloader": "73 passed",
+    "python_wrapper": "9 passed",
+    "cargo_check": "passed without warnings",
+    "diff_check": "passed",
+    "public_rrls_probe": {
+      "result": "4/4 valid JPEGs",
+      "coordinates": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          17,
+          36836,
+          48184
+        ],
+        [
+          17,
+          37437,
+          48311
+        ],
+        [
+          17,
+          28353,
+          53238
+        ]
+      ],
+      "total_response_bytes": 74246,
+      "cache_path": "isolated nonexistent/tmp path; remained absent"
+    },
+    "public_direct_probe": {
+      "result": "1/1 valid JPEG via socket-bound enp14s0 plus one startup probe",
+      "configuration_changes": false
+    }
+  },
+  "features_verified": [
+    "Small --test follows selected zoom/profile; cached samples decoded read-only without creating map data",
+    "HTTP200 HTML and truncated PNG/JPEG cannot be saved; quiet retry succeeds or reports final exhaustion",
+    "Resume streams only a 32-byte header, 12-byte trailer and length only, retaining good cached coords and requeueing obvious corruption",
+    "One bounded SQLite writer; resume completes before concurrent HTTP writes to avoid pool timeout spam",
+    "Direct-route shared circuit recovers after a 30-second cooldown without reducing HTTP concurrency",
+    "Default high zoom includes URRG; RRLS only UB/URRG/Midland with a 22,724,018,176-byte worst-case plan below the 50,000,000,000-byte total cap",
+    "Targeted --repair-tile bounded to 32 tiles with profile/zoom/resume checks, cannot combine with --test or bundle rebuild; fetches no unselected tiles",
+    "Failed explicit repair preserves old target and unselected data; valid replacement handles even internally-corrupt images with good headers",
+    "Legacy atomic file writes honor disk reserve with 32-writer / 32 MiB headroom (all 32 maximum-size bodies plus 16 MiB allocation margin); low-space refusal preserves existing tile and creates no partial file"
+  ],
+  "limitations": [
+    "Header-only resume is not a full compressed-image integrity scan; --test checks only selected sample coordinates and --repair-tile repairs explicit targets.",
+    "Stop the downloader after checkpoint before inspecting an existing cache; a nonempty WAL is refused by the immutable read-only probe.",
+    "Public direct-interface test validates this Linux host only; macOS auto-detection is covered by parser tests, not live interface use.",
+    "No bulk-provider throughput or complete dataset download performed during this audit."
+  ],
+  "evidence_logs": [
+    ".workspace-progress/map-audit-tests.log",
+    ".workspace-progress/map-wrapper-tests.log",
+    ".workspace-progress/map-audit-check.log",
+    ".workspace-progress/map-public-rrls-test.log",
+    ".workspace-progress/map-public-direct-test.log"
+  ],
+  "sha256": {
+    "download_map.py": "41cdffe50e35610eaa34a3f7dffcf98c916145d6d6bb425ce83cbb5c881fcc94",
+    "tests/test_download_map.py": "9395883ddd12aa7f3f77274712527bfe72e246d095ed16bdeb55f6d842e9265a",
+    "map_downloader/src/budget.rs": "12ec62f8f324f8d75436f78dd9ebb5ead9fbcb94968b7b3b2f4662a1eea6c02c",
+    "map_downloader/src/cache_probe.rs": "f5b6055385249e5fc8666c1f5ae224ecbdf07efc2a8813960d27ce0181b7d920",
+    "map_downloader/src/connection_test.rs": "64b0c6fa5d324cfb4e40ed9426bf1010c435c761ec068edc685ad8ae36c0c408",
+    "map_downloader/src/dns.rs": "8011e812aeaa1c4b81fafa831f32bdb4617ac417a2fd11f6556cfeede6333615",
+    "map_downloader/src/limits.rs": "76c57b10693e1db3d53434ce90957c370b0c0455a3317d601966f73e50851add",
+    "map_downloader/src/main.rs": "997d24f5ce6510f0f1a7417984d83964b4051dbc06d62a2d349ebc4a59e5e506",
+    "map_downloader/src/network.rs": "b5bd2f5c527fced4127b0a77999d59eae0b4a07efc77a33d60e31e1e2f36a1e8",
+    "map_downloader/src/options.rs": "f6ee6a25d1c8cc389cf3e952c6bdb1ff6194f72ff255fa6c721ae76351b9fa2b",
+    "map_downloader/src/profile.rs": "c2db9b95ec02447b5e1e61867e3b092ddbc765eb16801274f1d14b65b0c000b7",
+    "map_downloader/src/raster.rs": "6cf3bc67235a048c6bbc37bec0016150753b3acd5c8d6bdc68cdb0caf2ca83c2",
+    "map_downloader/src/repair.rs": "3807524868bd59945f698016693032c006d93c8f08b824020c9b5be5fad9760d",
+    "map_downloader/src/storage.rs": "cb086eb36c4e24c332d7cce7b59bb9c9b7769d56c48c01b21d71eee3d6b6ece9"
+  }
+}

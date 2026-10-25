@@ -1,12 +1,14 @@
 //! Small read-only connection qualification; never opens a map database or tile path.
 use super::{BASE_COVERAGE_MAX_ZOOM, NA_BOUNDS, coverage_bounds, lonlat_to_tile};
-use crate::network::{MAX_TILE_BYTES, Route, TileClient};
+use crate::network::{Route, TileClient};
 use anyhow::{Result, bail};
-use image::{ImageFormat, ImageReader};
+#[cfg(test)]
+use image::ImageFormat;
+#[cfg(test)]
 use std::io::Cursor;
 use std::time::Duration;
 
-fn sample_tiles_for_profile(
+pub(crate) fn sample_tiles_for_profile(
     max_zoom: u32,
     profile: crate::profile::Profile,
 ) -> Vec<(u32, u32, u32)> {
@@ -36,25 +38,7 @@ fn sample_tiles_for_profile(
 fn sample_tiles(max_zoom: u32) -> Vec<(u32, u32, u32)> {
     sample_tiles_for_profile(max_zoom, crate::profile::Profile::GroundStation)
 }
-fn validate_image(bytes: &[u8]) -> Result<(&'static str, u32, u32)> {
-    if bytes.len() > MAX_TILE_BYTES {
-        bail!("image exceeds512KiB")
-    }
-    let format = image::guess_format(bytes)?;
-    let name = match format {
-        ImageFormat::Png => "PNG",
-        ImageFormat::Jpeg => "JPEG",
-        _ => bail!("tile is not PNG or JPEG"),
-    };
-    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(4096);
-    limits.max_image_height = Some(4096);
-    limits.max_alloc = Some(64 * 1024 * 1024);
-    reader.limits(limits);
-    let image = reader.decode()?;
-    Ok((name, image.width(), image.height()))
-}
+use crate::raster::validate as validate_image;
 #[derive(Default)]
 struct Report {
     passed: usize,
