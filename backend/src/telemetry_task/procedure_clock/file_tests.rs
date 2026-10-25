@@ -204,5 +204,6 @@ async fn child() {
     );
     assert!(state.operational_board_recent(Board::ValveBoard, 3_000));
 
+    crate::auto_zero::verify_paused_capture_cancellation_and_shutdown(&state).await;
     println!("MODEL_PURPOSE_CLOCK_REPLAY_PHASE_AND_NO_REPUBLISH_PASS");
 }

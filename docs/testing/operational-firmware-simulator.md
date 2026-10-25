@@ -25,3 +25,9 @@ sensor stimulus represents assumed plant behavior only; it cannot establish
 physical pneumatic calibration, valve timing, pressure stability or field
 safety. Do not describe host helper tests or the HITL network startup as a full
 linked operational procedure acceptance run.
+
+Automatic tare uses the same purpose-only capture clock for its unchanged5s
+window,250ms freshness bound and200-sample requirement. A slow or paused model
+does not expire that capture on wall time. Captures remain bounded to200samples
+per sensor and can still be cancelled or shut down while the model is paused.
+Calibration settings, completed-at receipts and authentication remain wall-based.

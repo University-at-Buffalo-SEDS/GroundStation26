@@ -282,6 +282,7 @@ async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router
     );
 }
 
+#[cfg(any(test, not(all(feature = "test_fire_mode", not(feature = "hitl_mode")))))]
 async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc<Router>) {
     if let Some(reason) = crate::checklists::launch_block() {
         emit_notification_warning(&state, reason);

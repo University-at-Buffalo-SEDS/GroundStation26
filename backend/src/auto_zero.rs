@@ -1,11 +1,10 @@
 //! Bounded, monotonic-clock tare capture. Never blocks the telemetry receiver.
 use crate::{loadcell, state::AppState, types::TelemetryCommand};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::VecDeque,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
+
+mod capture_clock;
+use capture_clock::CaptureClock;
 
 const COUNT: usize = 200;
 const WINDOW: Duration = Duration::from_secs(5);
@@ -23,7 +22,7 @@ impl Default for Settings {
 
 #[derive(Clone, Copy)]
 struct Sample {
-    at: Instant,
+    at: CaptureClock,
     raw: f32,
 }
 #[derive(Default)]
@@ -117,14 +116,14 @@ impl Runtime {
             _ => return,
         };
         samples.push_back(Sample {
-            at: Instant::now(),
+            at: CaptureClock::now(),
             raw,
         });
         while samples.len() > COUNT {
             samples.pop_front();
         }
     }
-    fn samples(&self, sensor: &str, after: Instant) -> Vec<f32> {
+    fn samples(&self, sensor: &str, after: CaptureClock) -> Vec<f32> {
         let samples = if sensor == "KG50" {
             &self.kg50
         } else {
@@ -132,7 +131,7 @@ impl Runtime {
         };
         samples
             .iter()
-            .filter(|v| v.at >= after)
+            .filter(|v| v.at.at_or_after(after))
             .map(|v| v.raw)
             .collect()
     }
@@ -198,7 +197,7 @@ pub fn launch(state: &Arc<AppState>) {
 
 fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
     let cfg = state.loadcell_calibration.lock().unwrap().clone();
-    let start = Instant::now();
+    let start = CaptureClock::now();
     let token = {
         let mut rt = state.auto_zero.lock().unwrap();
         if !rt.settings().enabled {
@@ -208,7 +207,7 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
             return true;
         }
         if fill {
-            let recent = rt.samples(sensor, start - WINDOW);
+            let recent = rt.samples(sensor, start.earlier(WINDOW));
             // Require a live stream, not merely a recently stopped sensor.
             let history = if sensor == "KG50" {
                 &rt.kg50
@@ -232,9 +231,17 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
         false,
     );
     let state = state.clone();
+    let mut shutdown = state.shutdown_subscribe();
     tokio::spawn(async move {
         let result = loop {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+                _ = shutdown.recv() => {
+                    let mut runtime = state.auto_zero.lock().unwrap();
+                    if runtime.generation == token { runtime.cancel(); }
+                    return;
+                }
+            }
             let raw = {
                 let rt = state.auto_zero.lock().unwrap();
                 if rt.generation != token {
@@ -362,7 +369,7 @@ mod tests {
         let latest = rt.kg1000.back().unwrap().at;
         assert!(!rt.samples("KG1000", latest).is_empty());
         assert!(
-            rt.samples("KG1000", latest + Duration::from_nanos(1))
+            rt.samples("KG1000", latest.later(Duration::from_nanos(1)))
                 .is_empty()
         );
         rt.pending = true;
@@ -417,4 +424,23 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&dir).unwrap();
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn verify_paused_capture_cancellation_and_shutdown(state: &Arc<AppState>) {
+    assert!(
+        crate::simulation_clock_ms().is_some(),
+        "This contract requires an explicit paused model"
+    );
+    *state.auto_zero.lock().unwrap() = Runtime::testing(true);
+    launch(state);
+    assert!(state.auto_zero.lock().unwrap().pending());
+    state.auto_zero.lock().unwrap().cancel();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(!state.auto_zero.lock().unwrap().pending());
+    launch(state);
+    assert!(state.auto_zero.lock().unwrap().pending());
+    state.request_shutdown();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(!state.auto_zero.lock().unwrap().pending());
 }
