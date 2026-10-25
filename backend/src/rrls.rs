@@ -102,7 +102,7 @@ pub fn status() -> Status {
             forwarding: m.active(now),
             relay_requested: m.fallback,
             direct_age_ms: m.last_direct.map(|v| now.saturating_sub(v)),
-            queued_frames: m.queue.len(),
+            queued_frames: m.queue.len() + usize::from(m.active_transmission.is_some()),
             dropped_frames: m.dropped,
             forwarded_frames: m.forwarded,
         }
@@ -129,6 +129,18 @@ struct Queued {
     at: u64,
     priority: u8,
 }
+/// One owned frame, still charged to the mesh until serial delivery finishes.
+/// Keeping metadata with the frame permits retry without copying its payload.
+pub(crate) struct Transmission {
+    queued: Queued,
+    id: u64,
+}
+impl Transmission {
+    pub(crate) fn frame(&self) -> &Outgoing {
+        &self.queued.frame
+    }
+}
+
 pub struct Mesh {
     pub role: Role,
     voice_enabled: bool,
@@ -156,6 +168,10 @@ pub struct Mesh {
     templates: VecDeque<(u32, FrameClass)>,
     credit_millibytes: u64,
     credit_at: u64,
+    active_transmission: Option<u64>,
+    active_cancelled: bool,
+    active_survives_clear: bool,
+    next_transmission: u64,
 }
 
 impl Mesh {
@@ -187,6 +203,10 @@ impl Mesh {
             templates: VecDeque::new(),
             credit_millibytes: 4_160_000,
             credit_at: 0,
+            active_transmission: None,
+            active_cancelled: false,
+            active_survives_clear: false,
+            next_transmission: 0,
         }
     }
     pub fn now(&self) -> u64 {
@@ -293,15 +313,23 @@ impl Mesh {
         }
     }
     fn clear(&mut self) {
+        self.active_cancelled |= self.active_transmission.is_some() && !self.active_survives_clear;
         let old = self.queue.len();
+        let mut removed_bytes = 0;
         self.queue.retain(|q| {
-            matches!(
+            let keep = matches!(
                 q.frame.bytes.get(3),
                 Some(&POSITION) | Some(&VOICE) | Some(&SETTINGS)
-            )
+            );
+            if !keep {
+                removed_bytes += q.frame.bytes.len();
+            }
+            keep
         });
         self.dropped += (old - self.queue.len()) as u64;
-        self.bytes = self.queue.iter().map(|q| q.frame.bytes.len()).sum();
+        // An active write is outside this queue and remains owned/charged.
+        // Only bytes actually removed above release their reservation.
+        self.bytes -= removed_bytes;
     }
     fn enqueue(&mut self, frame: Outgoing, priority: u8, now: u64) {
         if frame.bytes.len() > MAX_PAYLOAD + 8 {
@@ -326,7 +354,9 @@ impl Mesh {
                 self.dropped += 1;
             }
         }
-        while self.queue.len() >= MAX_FRAMES || self.bytes + frame.bytes.len() > MAX_BYTES {
+        while self.queue.len() + usize::from(self.active_transmission.is_some()) >= MAX_FRAMES
+            || self.bytes + frame.bytes.len() > MAX_BYTES
+        {
             let Some((i, p)) = self
                 .queue
                 .iter()
@@ -334,7 +364,10 @@ impl Mesh {
                 .min_by_key(|(_, q)| q.priority)
                 .map(|(i, q)| (i, q.priority))
             else {
-                break;
+                // The only reservation may belong to an active serial write;
+                // it cannot be evicted or admitted a second time.
+                self.dropped += 1;
+                return;
             };
             if p > priority {
                 self.dropped += 1;
@@ -351,7 +384,12 @@ impl Mesh {
             priority,
         });
     }
-    pub fn pop(&mut self, now: u64) -> Option<Outgoing> {
+    pub(crate) fn begin_transmission(&mut self, now: u64) -> Option<Transmission> {
+        if self.active_transmission.is_some() {
+            return None;
+        }
+        // Never reuse a reservation identity after wraparound.
+        let id = self.next_transmission.checked_add(1)?;
         // At 64 kbps, a two-hop relay must leave airtime for the rocket and
         // ground uplink. Bound accepted UART work before the modem's FIFO.
         self.credit_millibytes = self
@@ -385,14 +423,53 @@ impl Mesh {
             if self.role == Role::Rrls && self.credit_millibytes < cost {
                 return None;
             }
-            let q = self.queue.remove(i).unwrap();
-            self.bytes -= q.frame.bytes.len();
-            if self.role == Role::Rrls {
-                self.credit_millibytes -= cost;
-            }
-            self.forwarded += 1;
-            return Some(q.frame);
+            let queued = self.queue.remove(i).unwrap();
+            self.next_transmission = id;
+            self.active_transmission = Some(id);
+            self.active_survives_clear = matches!(
+                queued.frame.bytes.get(3),
+                Some(&POSITION) | Some(&VOICE) | Some(&SETTINGS)
+            );
+            return Some(Transmission { queued, id });
         }
+    }
+
+    pub(crate) fn finish_transmission(
+        &mut self,
+        transmission: Transmission,
+        sent: bool,
+    ) -> Option<Outgoing> {
+        assert_eq!(self.active_transmission, Some(transmission.id));
+        self.active_transmission = None;
+        if !sent && self.active_cancelled {
+            // A topology transition invalidated this write while IO was outside
+            // the mesh lock. Do not resurrect its old relay frame on retry.
+            self.active_cancelled = false;
+            self.bytes -= transmission.queued.frame.bytes.len();
+            self.dropped += 1;
+            return None;
+        }
+        self.active_cancelled = false;
+        if !sent {
+            // Keep the original timestamp, priority, payload and reservation.
+            // The next selection may choose a newly queued higher-priority frame.
+            self.queue.push_front(transmission.queued);
+            return None;
+        }
+        let frame = transmission.queued.frame;
+        self.bytes -= frame.bytes.len();
+        if self.role == Role::Rrls {
+            let cost = (frame.bytes.len() as u64 + 4) * 1000;
+            self.credit_millibytes = self.credit_millibytes.saturating_sub(cost);
+        }
+        self.forwarded += 1;
+        Some(frame)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pop(&mut self, now: u64) -> Option<Outgoing> {
+        let transmission = self.begin_transmission(now)?;
+        self.finish_transmission(transmission, true)
     }
     /// Only the authenticated settings runtime calls this after verifying an
     /// installation signature. Raw mesh reception never establishes presence.
@@ -414,7 +491,7 @@ impl Mesh {
     pub fn queue_settings(&mut self, payload: &[u8], now: u64) -> bool {
         if !self.settings_available(now)
             || payload.len() > paired_settings::auth::MAX_WIRE
-            || self.queue.len() >= MAX_FRAMES
+            || self.queue.len() + usize::from(self.active_transmission.is_some()) >= MAX_FRAMES
             || self.bytes + payload.len() + 8 > MAX_BYTES
             || self
                 .queue
@@ -1049,6 +1126,164 @@ mod tests {
                 .0,
             AV_BAY_DATA
         );
+    }
+
+    #[test]
+    fn serial_failure_keeps_the_frame_and_reservation_until_success() {
+        let mut mesh = Mesh::new(Role::Rrls, 2);
+        for byte in 0..4 {
+            mesh.enqueue(
+                Outgoing {
+                    command: false,
+                    bytes: vec![byte],
+                },
+                254,
+                0,
+            );
+        }
+        let initial_credit = mesh.credit_millibytes;
+        let transmission = mesh.begin_transmission(0).unwrap();
+        assert_eq!(transmission.frame().bytes, [0]);
+        let payload_pointer = transmission.frame().bytes.as_ptr();
+        assert_eq!(mesh.bytes, 4);
+        assert_eq!(mesh.forwarded, 0);
+        assert!(mesh.begin_transmission(0).is_none());
+        assert!(mesh.finish_transmission(transmission, false).is_none());
+        assert_eq!(mesh.credit_millibytes, initial_credit);
+        assert_eq!(mesh.bytes, 4);
+        for byte in 0..4 {
+            let frame = mesh.pop(0).unwrap();
+            assert_eq!(frame.bytes, [byte]);
+            if byte == 0 {
+                assert_eq!(
+                    frame.bytes.as_ptr(),
+                    payload_pointer,
+                    "retry copied the payload"
+                );
+            }
+        }
+        assert_eq!(mesh.forwarded, 4);
+        assert_eq!(mesh.bytes, 0);
+        assert_eq!(mesh.credit_millibytes, initial_credit - 4 * 5_000);
+    }
+
+    #[test]
+    fn active_serial_frame_stays_inside_queue_limits_and_survives_clear() {
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        for byte in 0..MAX_FRAMES {
+            mesh.enqueue(
+                Outgoing {
+                    command: false,
+                    bytes: vec![byte as u8],
+                },
+                254,
+                0,
+            );
+        }
+        let transmission = mesh.begin_transmission(0).unwrap();
+        for _ in 0..MAX_FRAMES {
+            mesh.enqueue(
+                Outgoing {
+                    command: false,
+                    bytes: vec![99],
+                },
+                254,
+                0,
+            );
+            assert_eq!(mesh.queue.len() + 1, MAX_FRAMES);
+            assert_eq!(mesh.bytes, MAX_FRAMES);
+        }
+        mesh.clear();
+        assert_eq!(
+            mesh.bytes, 1,
+            "clear cannot release an active write's bytes"
+        );
+        assert!(mesh.queue.is_empty());
+        mesh.finish_transmission(transmission, true);
+        assert_eq!(mesh.bytes, 0);
+        assert_eq!(mesh.forwarded, 1);
+    }
+
+    #[test]
+    fn active_settings_keep_clear_semantics_and_prevent_false_queue_admission() {
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        mesh.authenticated_settings_peer(0);
+        for byte in 0..MAX_FRAMES {
+            mesh.enqueue(
+                Outgoing {
+                    command: false,
+                    bytes: vec![byte as u8],
+                },
+                254,
+                0,
+            );
+        }
+        let transmission = mesh.begin_transmission(0).unwrap();
+        let drops = mesh.dropped;
+        assert!(!mesh.queue_settings(b"not accepted", 0));
+        assert_eq!(
+            mesh.dropped, drops,
+            "settings cannot evict already admitted traffic"
+        );
+        mesh.finish_transmission(transmission, true);
+        mesh.clear();
+        assert!(mesh.queue_settings(b"accepted", 0));
+        let transmission = mesh.begin_transmission(0).unwrap();
+        let expected = transmission.frame().bytes.clone();
+        mesh.clear();
+        mesh.finish_transmission(transmission, false);
+        assert_eq!(mesh.pop(0).unwrap().bytes, expected);
+        assert_eq!(mesh.bytes, 0);
+    }
+
+    #[test]
+    fn topology_clear_during_failed_write_does_not_restore_old_route_frames() {
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        mesh.enqueue(
+            Outgoing {
+                command: false,
+                bytes: vec![1],
+            },
+            254,
+            0,
+        );
+        let transmission = mesh.begin_transmission(0).unwrap();
+        mesh.clear();
+        mesh.finish_transmission(transmission, false);
+        assert_eq!(mesh.bytes, 0);
+        assert_eq!(mesh.dropped, 1);
+        assert_eq!(mesh.forwarded, 0);
+        assert!(mesh.pop(0).is_none());
+    }
+
+    #[test]
+    fn failed_serial_write_does_not_renew_deadline_or_block_new_priority() {
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        mesh.enqueue(
+            Outgoing {
+                command: false,
+                bytes: vec![1],
+            },
+            2,
+            0,
+        );
+        let transmission = mesh.begin_transmission(0).unwrap();
+        mesh.enqueue(
+            Outgoing {
+                command: true,
+                bytes: vec![2],
+            },
+            254,
+            100,
+        );
+        mesh.finish_transmission(transmission, false);
+        assert_eq!(mesh.pop(100).unwrap().bytes, [2]);
+        assert!(
+            mesh.pop(251).is_none(),
+            "failed bulk retains its original age"
+        );
+        assert_eq!(mesh.dropped, 1);
+        assert_eq!(mesh.bytes, 0);
     }
 
     #[test]

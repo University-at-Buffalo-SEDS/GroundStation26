@@ -558,7 +558,7 @@ impl UartComms {
 
     fn drain_recovery_frames(&mut self) -> TelemetryResult<()> {
         let shared = self.recovery.as_ref().unwrap().clone();
-        let outgoing = {
+        {
             let mut mesh = shared.lock().unwrap();
             let now = mesh.now();
             while let Some((kind, payload)) = take_raw_uart_framed_payload_with_clock(
@@ -582,23 +582,67 @@ impl UartComms {
                 }
             }
             mesh.tick(now);
-            (0..4).filter_map(|_| mesh.pop(now)).collect::<Vec<_>>()
-        };
-        for frame in outgoing {
-            let framed = if frame.command {
-                build_raw_uart_command_frame(&frame.bytes)
-            } else {
-                build_raw_uart_frame(&frame.bytes)
-            }
-            .map_err(|_| TelemetryError::HandlerError("RRLS frame too large"))?;
-            let _guard = self.write_lock.lock().unwrap();
+        }
+        for _ in 0..4 {
+            // Reserve only the frame being written. Do not pop a batch and lose
+            // its remaining members if the first write fails.
             #[cfg(target_os = "linux")]
-            write_all_fd_with_poll(self.inner.as_raw_fd(), &framed, UART_TX_POLL_TIMEOUT)?;
+            let mut write_state = self.write_lock.lock().unwrap();
             #[cfg(not(target_os = "linux"))]
+            let _write_state = self.write_lock.lock().unwrap();
+            #[cfg(target_os = "linux")]
+            let virtual_wire_now = if simulated_serial_pty() {
+                crate::simulation_clock_ms()
+            } else {
+                None
+            };
+            #[cfg(target_os = "linux")]
+            if let Some(now) = virtual_wire_now
+                && !write_state.wire.ready(now)
             {
-                self.inner.write_all(&framed)?;
-                self.inner.flush()?;
+                break;
             }
+            let transmission = {
+                let mut mesh = shared.lock().unwrap();
+                let now = mesh.now();
+                mesh.begin_transmission(now)
+            };
+            let Some(transmission) = transmission else {
+                break;
+            };
+            let result = (|| -> TelemetryResult<()> {
+                let frame = transmission.frame();
+                let framed = if frame.command {
+                    build_raw_uart_command_frame(&frame.bytes)
+                } else {
+                    build_raw_uart_frame(&frame.bytes)
+                }
+                .map_err(|_| TelemetryError::HandlerError("RRLS frame too large"))?;
+                #[cfg(target_os = "linux")]
+                {
+                    write_all_fd_with_poll(self.inner.as_raw_fd(), &framed, UART_TX_POLL_TIMEOUT)?;
+                    drain_fd_with_timeout(
+                        self.inner.as_raw_fd(),
+                        uart_wire_timeout(framed.len(), self.baud_rate),
+                    )?;
+                    if let Some(now) = virtual_wire_now {
+                        write_state
+                            .wire
+                            .committed(now, framed.len(), self.baud_rate);
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    self.inner.write_all(&framed)?;
+                    self.inner.flush()?;
+                }
+                Ok(())
+            })();
+            shared
+                .lock()
+                .unwrap()
+                .finish_transmission(transmission, result.is_ok());
+            result?;
         }
         Ok(())
     }
@@ -3103,6 +3147,77 @@ mod tests {
 mod raw_uart_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[cfg(unix)]
+    fn recovery_uart_fixture(
+        port: serialport::TTYPort,
+    ) -> (UartComms, crate::rrls::Shared, Vec<u8>) {
+        let mut mesh = crate::rrls::Mesh::new(crate::rrls::Role::Primary, 1);
+        mesh.tick(0);
+        let transmission = mesh.begin_transmission(0).expect("initial health frame");
+        let frame = transmission.frame();
+        assert!(frame.command);
+        let expected = build_raw_uart_command_frame(&frame.bytes).unwrap();
+        mesh.finish_transmission(transmission, false);
+        let shared = Arc::new(Mutex::new(mesh));
+        let uart = UartComms {
+            #[cfg(target_os = "linux")]
+            inner: port,
+            #[cfg(not(target_os = "linux"))]
+            inner: Box::new(port),
+            side_id: None,
+            rx_buf: Vec::new(),
+            raw_uart_frame_wait: RawUartFrameWait::default(),
+            raw_uart_data_frames: VecDeque::new(),
+            radio_window_updates: VecDeque::new(),
+            protocol: SerialProtocol::RawUart,
+            recovery: Some(shared.clone()),
+            write_lock: Default::default(),
+            #[cfg(target_os = "linux")]
+            baud_rate: 115200,
+            slow_start_deadline: None,
+        };
+        (uart, shared, expected)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recovery_uart_failed_write_retains_the_exact_queued_frame() {
+        let (peer, port) = serialport::TTYPort::pair().unwrap();
+        let (mut uart, shared, expected) = recovery_uart_fixture(port);
+        drop(peer);
+        assert!(
+            uart.drain_recovery_frames().is_err(),
+            "closed PTY must fail IO"
+        );
+        let mut mesh = shared.lock().unwrap();
+        let transmission = mesh.begin_transmission(0).expect("failed frame retained");
+        assert_eq!(
+            build_raw_uart_command_frame(&transmission.frame().bytes).unwrap(),
+            expected
+        );
+        mesh.finish_transmission(transmission, false);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recovery_uart_success_releases_only_the_written_frame() {
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(100)).unwrap();
+        let (mut uart, shared, expected) = recovery_uart_fixture(port);
+        // A PTY driver may wait for its peer during flush; real UART TX/RX
+        // proceed concurrently too. Start the reader before draining output.
+        let length = expected.len();
+        let reader = std::thread::spawn(move || {
+            let mut actual = vec![0; length];
+            peer.read_exact(&mut actual).unwrap();
+            (peer, actual)
+        });
+        uart.drain_recovery_frames().unwrap();
+        let (_peer, actual) = reader.join().unwrap();
+        assert_eq!(actual, expected);
+        assert!(shared.lock().unwrap().begin_transmission(0).is_none());
+    }
 
     #[test]
     fn i2c_adapter_passes_small_transport_fragments_to_router_reassembly() {

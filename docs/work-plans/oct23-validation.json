@@ -376,20 +376,41 @@
         "traced_short": "passed",
         "untraced_short": "passed",
         "pressure120_network_source_daq_fc_sd": "all passed",
-        "gs_restart": "running",
-        "pressure600": "not started"
+        "gs_restart": "passed original network gate",
+        "pressure600": "running"
       },
       "limits": [
         "No physical RFD performance claim",
         "Shared64kbps medium, finite modem FIFO and three-node GS/RRLS/RF fidelity remain pending",
         "No package/image release until qualification"
-      ]
+      ],
+      "linux_tests": {
+        "backend_passed": 444,
+        "backend_ignored": 2,
+        "sequence_tests_passed": 37
+      }
     },
     "fc_current": {
       "production_flash_bytes": 453552,
       "capacity_bytes": 474624,
       "user_accepted": true
     },
-    "remaining_rrls_audit": "drain_recovery_frames pops up to4 frames before serial writes; repair ownership and apply UART drain to that path separately after the frozen baseline qualification"
+    "rrls_serial_ownership": {
+      "status": "implemented; Mac and Linux tests passed",
+      "before": "A receive pass removed up to4 relay frames before any serial write; a write error lost the failed frame and all unwritten batch members.",
+      "after": "One owned transmission retains its payload, original priority/age, queue bytes and frame reservation until IO succeeds. Failed writes requeue without a payload copy. Clearing a route cannot resurrect an obsolete failed relay frame; settings retain their prior clear behavior.",
+      "uart": "Relay writes now use physical Linux drain and the explicit simulator UART credit; no Mesh mutex is held during IO.",
+      "tests": {
+        "mac_backend_passed": 444,
+        "mac_ignored": 2,
+        "linux_backend_passed": 451,
+        "linux_ignored": 2,
+        "production_checks": "Mac and Linux passed",
+        "compiler_warnings": 0,
+        "negative_control": "Original UART batch-pop fails the new closed-PTY retention assertion at runtime"
+      },
+      "combined_hitl": "Remaining no-op FC controls now forward in combined testing+HITL builds; duplicate unreachable patterns removed. Pure simulation and standalone HITL behavior retained.",
+      "limits": "Shared64kbps three-radio and linked MCU qualification remain pending; no physical RF resolution claimed."
+    }
   }
 }

@@ -751,7 +751,10 @@ impl FlightSimState {
             | TelemetryCommand::RevokeResetFailures
             | TelemetryCommand::ValidateMeasms
             | TelemetryCommand::RevokeValidateMeasms => {
-                // Flight-computer commands are backend-forwarded and do not affect fill simulation.
+                // A combined testing+HITL build must forward FC controls too.
+                // Pure software simulation retains its existing no-op behavior.
+                #[cfg(feature = "hitl_mode")]
+                return false;
             }
             #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
             TelemetryCommand::GroundStationLaunch => {
@@ -776,14 +779,6 @@ impl FlightSimState {
             | TelemetryCommand::ReinitBarometer
             | TelemetryCommand::EnableIMU
             | TelemetryCommand::DisableIMU
-            | TelemetryCommand::MonitorAltitude
-            | TelemetryCommand::RevokeMonitorAltitude
-            | TelemetryCommand::ConsecutiveSamples
-            | TelemetryCommand::RevokeConsecutiveSamples
-            | TelemetryCommand::ResetFailures
-            | TelemetryCommand::RevokeResetFailures
-            | TelemetryCommand::ValidateMeasms
-            | TelemetryCommand::RevokeValidateMeasms
             | TelemetryCommand::AbortAfter100
             | TelemetryCommand::AbortAfter40
             | TelemetryCommand::AbortAfter250
@@ -1534,6 +1529,15 @@ mod tests {
             EvaluationRelax,
             EvaluationFocus,
             EvaluationAbort,
+            MonitorAltitude,
+            Postinit,
+            RevokeMonitorAltitude,
+            ConsecutiveSamples,
+            RevokeConsecutiveSamples,
+            ResetFailures,
+            RevokeResetFailures,
+            ValidateMeasms,
+            RevokeValidateMeasms,
         ] {
             assert!(
                 !sim.apply_command(&command, 1_000),
