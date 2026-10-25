@@ -1,0 +1,154 @@
+{
+  "status": "proposed representation and budgets; no checklist implementation",
+  "identity": {
+    "list_key": "checklists/list/<sha256(original list ID)>",
+    "definition_key": "checklists/item/<sha256(length-prefixed list ID and item ID)>",
+    "progress_key": "checklists/progress/<same item hash>",
+    "global_key": "checklists/policy",
+    "rule": "Keep original IDs in typed values and verify hash matches. Hash keys stay under128bytes with maximum80byte IDs; never concatenate raw IDs into keys."
+  },
+  "typed_values": {
+    "list": [
+      "original ID",
+      "random immutable generation for this creation",
+      "title",
+      "required_before_launch",
+      "order",
+      "expected item count",
+      "canonical item-definition set digest"
+    ],
+    "item_definition": [
+      "original list ID",
+      "list generation",
+      "original item ID",
+      "text",
+      "complete_on binding",
+      "order"
+    ],
+    "item_progress": [
+      "canonical definition digest",
+      "checked",
+      "completion_source",
+      "completed_by <=96 UTF8bytes",
+      "completed_at_ms"
+    ],
+    "policy": [
+      "enforce_before_launch",
+      "expected list count",
+      "canonical list manifest set digest"
+    ],
+    "deletion": "Explicit null tombstone retained in causal history. Never drop an absent object from observed catalog and accidentally recreate it. List tombstone/generation hides stale child values; explicit recreated list uses a new generation.",
+    "binding": "Progress definition_digest hashes only list generation, list/item IDs, wording and complete_on. It excludes order so reordering does not clear checks. Full definition-value digests (including order) feed list membership manifests; list metadata manifests feed the global catalog manifest.",
+    "excluded": [
+      "local checklist file revision",
+      "local completion_events receipt history",
+      "operational qualification",
+      "sequence state",
+      "override/abort/QD/launch commands"
+    ]
+  },
+  "limits": {
+    "active_lists": 32,
+    "active_total_items": 1024,
+    "items_per_list": 128,
+    "ID_bytes": 80,
+    "title_bytes": 120,
+    "item_text_bytes": 500,
+    "completion_actor_bytes": 96,
+    "heads": 9,
+    "remote_peers": 8,
+    "per_document_encoded_bytes": 65536,
+    "key_bytes": 128,
+    "host_only_store_profile": {
+      "max_documents_including_tombstones": 8192,
+      "max_encoded_store_bytes": 67108864,
+      "max_encoded_checkpoint_bytes": 100663296
+    },
+    "legacy_profile_retained": {
+      "max_documents": 256,
+      "max_store_bytes": 2097152
+    },
+    "allocation": "Caps only, no eager allocation. GS/RRLS host paired-settings crate only; no SEDSnet/embedded allocations or firmware budget changes."
+  },
+  "checklist_file": {
+    "max_serialized_bytes": 1048576,
+    "read": "Read at most1MiB+1 with metadata check; reject larger input before unbounded allocation.",
+    "write": "All mutations/templates/imports validate the SAME actual serialized bytes before creating or replacing file; strict1MiB cap matches existing read guard.",
+    "maximum_counts_not_a_size_promise": "1024ASCII500byte items may fit;1024maxescaped/control-character texts exceed1MiB and must fail explicitly. Never truncate/strip text or partially import to fit.",
+    "merged_overquota": "Retain incoming histories without echoing stale runtime. Defer entire materialization with actionable quota status. Explicit reviewed edits/delete/resolution may reduce size; no automatic conflict loss."
+  },
+  "budget_evidence": "/tmp/gs-checklist-budget.json",
+  "budget_result": "Conservative nine-head active catalog59,140,416bytes including maximum clocks/escaped text/keys, membership digests and9additional maximum-size existing documents; fits64MiB. Definition39,521B/progress16,859B/list19,046B each fit64KiB.",
+  "quota_and_tombstones": "Count tombstones and every head. Refuse new edits/merges with explicit quota error before mutating memory or disk. No FIFO eviction or silent pruning. Tombstone GC requires proof all paired actors acknowledge removal or an explicit paired-installation generation change; never evict an offline peer's unseen deletion.",
+  "performance_prerequisites": [
+    "Per-item progress update transmits only changed progress document; no whole checklist text document.",
+    "Existing transport root() serializes/hashes whole store and resends catalog on every mismatch; replace with cached dirty-document digests and bounded incremental reconciliation before enabling thousands of documents.",
+    "Preserve signed128byte chunks/shared256Bps actual-wire pacing below commands/GPS; fair peer scheduling and bounded requests/assemblies.",
+    "Existing JSON checkpoint clones/rewrites store; add host-only incremental durable journal/per-document transactions with bounded compaction rather than64MiB clone/hash/write for each checkbox.",
+    "Network capability/profile agreement required; keep legacy limits for existing small catalogs and reject unsupported profile data explicitly."
+  ],
+  "acceptance": [
+    "Nine concurrent heads, nine96byte clock actors, maximumu64counters and maximum allowed escaped UTF8/control-character strings.",
+    "32lists/1024items/128perlist plus original80byte IDs: all hashed keys <=128 and each nine-head document <=64KiB.",
+    "Whole encoded store/checkpoint limits including histories, original IDs, keys and retained tombstones; one byte over quota leaves memory/files unchanged.",
+    "Exactly1MiB checklist serialization accepted,1MiB+1 rejected identically on read/write/import.",
+    "Concurrent check/edit/delete/recreate/offline-restart: no stale progress applies to new wording or list generation; no deletion resurrection.",
+    "Checkbox delta does not transmit definition text or serialize whole store; bounded CPU/allocation and signed-wire byte counters.",
+    "No imported checklist completion invokes qualification.complete/reset or dispatches any command."
+  ],
+  "application_gates": {
+    "definitions_and_policy": {
+      "applies_to": [
+        "list metadata, order and tombstones",
+        "item wording, order, complete_on binding and tombstones",
+        "launch-enforcement and required-before-launch flags"
+      ],
+      "boundary": "Idle + explicit operational qualification cleared + no active sequence or pending zero; same gate for local template edits and remote imports",
+      "after_fire": "Defer definition/policy edits until explicit return/reset; existing recovery checklists remain visible and progress remains editable"
+    },
+    "progress": {
+      "boundary": "Allowed during Idle,Fill,Armed,countdown,Fire and recovery when current list generation and exact nonconflicting definition digest match; no qualification-cleared gate",
+      "permission": "Local signed-in ViewData collaborators per existing checkbox API; no anonymous writes. Template/conflict changes retain proper administrator permission. Remote values require valid paired-installation authentication plus typed bounded receipt fields",
+      "origin": "Only actual authenticated local checkbox/override handlers or actual successful local engine events mint local operator/automated receipts. Preserve remote station/operator/event provenance; imported progress is data and never invokes complete/reset or synthesizes local receipts",
+      "safety": "Progress conflicts remain explicit and never count as satisfied while unresolved. A stale digest, deleted list or changed generation is not complete; recovery progress is never blocked just because Fire already happened."
+    },
+    "operational_qualification": "Never import operational milestones, override latches, engine receipts, abort state or clear/reset requests. Checklist completion cannot manufacture successful nitrogen/self-test evidence."
+  },
+  "atomic_materialization": {
+    "staging": "Authenticate/validate and durably stage individual documents in bounded per-key transactions; no partial template becomes active. Transport delivery order cannot reveal a partially received required list.",
+    "membership": "List metadata declares item count+canonical set digest, never an80byte-ID array that exceeds9head64KiB limits. Global policy declares list count+canonical set digest. Activation verifies complete nonconflicting membership and all local limits in one transaction.",
+    "activation": "Persist a bounded<=1MiB active definition snapshot/reference and matching per-item projection rows atomically, gated by safe-state policy. Retain old approved template/progress until full candidate can activate.",
+    "routine_progress": "A checkbox changes only its progress document and per-item materialized row; it must not rewrite the1MiB definition snapshot or serialize/hash the64MiB history store.",
+    "batch_budget": "Bound incoming/staged mutation transactions by bytes+document count; large initial histories may stage over multiple transactions, with final activation atomic once membership proofs match.",
+    "partial_or_conflicted": "Missing/changed membership or conflicting definitions stays pending and visible, not silently truncated or treated as a complete required list."
+  },
+  "activation_transaction_invariant": {
+    "status": "proposed, not implemented; requires review and crash/race tests before integration",
+    "authority": "Raw causal documents and immutable validated projection generations live in SQLite. A small local durable selector chooses the active generation. Staged docs never become active merely because they reached SQLite.",
+    "prepare_outside_gate": [
+      "Validate complete nonconflicting policy/list/item manifests and exact serialized 1MiB snapshot limit. Build immutable Arc projection and keyed progress rows outside GSE locks.",
+      "Commit immutable projection generation and its canonical digest in SQLite; keep previous generation. Fsync its data before selection.",
+      "Write+fsync a fresh bounded <=1KiB selector file referencing generation+digest+previous selector revision. No runtime state changes yet."
+    ],
+    "linearization": "Acquire existing GSE-to-auto-zero lock order briefly. Recheck exact expected active selector revision, candidate causal revision, Idle, explicit qualification cleared, no sequence/pending zero, no concurrent definition activation. Atomically rename the already prepared selector and swap an already built immutable Arc; no SQLite operations, serialization, file reads, fsync or await while holding these locks. Rename is the activation linearization point.",
+    "rename_limitation": "Rename is a synchronous filesystem syscall and cannot guarantee a wall-clock bound on a failing filesystem. Only this tiny metadata operation is inside the gate; no large IO. Instrument its duration and do not claim absolute emergency-latency immunity. If zero syscall latency in the gate is mandatory, a single durable state authority with serialized transition commits is required instead.",
+    "post_commit": "Directory fsync occurs outside GSE locks with an explicit activation-durability-pending token. Non-emergency qualification/start transitions reject while that token is pending; controls and emergency abort remain usable. Error retains the new selected runtime state, marks durability uncertain, and blocks qualification/start; never report rolled-back failure after selection.",
+    "qualification_binding": "Persist the exact active checklist generation+digest with every newly earned local operational qualification milestone. Before any fill/arm/fire transition and after restart, require its binding to match the active selector. A mismatch or missing binding with existing evidence blocks qualification/start and requires explicit operator reconciliation; it never resets evidence or silently chooses a weaker template. Existing legacy qualification needs an explicit migration policy, not inferred successful binding.",
+    "restart": "Verify selector size, digest, SQLite projection existence, all membership proofs and saved qualification binding before admitting sequence start. Either old or new selector may survive a crash around directory sync; both were fully prepared, but evidence bound to the other generation cannot authorize a transition. Missing/corrupt selector/projection or unresolved durability state is fail-closed for starts, while emergency commands remain available.",
+    "progress": "Authenticated progress updates use dedicated SQLite actor and immutable projection revision CAS, never acquire GSE locks and never change the selected template. Definition changes invalidate only progress whose exact semantic definition digest no longer matches. Unknown/conflicted receipts do not satisfy enforcement. Imported progress has no qualification callback.",
+    "required_tests": [
+      "Abort/phase/qualification change before final gate rejects candidate without changing selector.",
+      "Competing prepared generations: only expected selector revision wins; loser remains staged.",
+      "Crash before selector rename, after rename before runtime swap, after swap before directory sync, and after sync before response: restart selects a complete generation and mismatched evidence cannot start.",
+      "Forced rename/fsync/SQLite preparation failure preserves explicit truthful outcome and never weakens launch checks.",
+      "Slow/blocked SQLite progress/raw-doc writes do not acquire GSE mutex or delay fake emergency command dispatch.",
+      "Progress remains editable during Fire/recovery; pending definition activation does not hide recovery progress.",
+      "HITL worker remains absent and existing HITL behavior stays unchanged."
+    ],
+    "unresolved_before_code": [
+      "Review small-selector filesystem choice and existing checklist JSON migration/compatibility without dual authorities.",
+      "Review additive saved-qualification template binding and explicit legacy qualification migration.",
+      "Implement typed membership/receipt model and atomic immutable generation preparation first."
+    ]
+  }
+}

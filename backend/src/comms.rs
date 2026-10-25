@@ -4167,3 +4167,7 @@ mod uart_duplex_tests {
         assert_eq!(wire, [3, 0, 1, 2, 3]);
     }
 }
+
+#[cfg(test)]
+#[path = "comms/reference_decoder.rs"]
+pub(crate) mod reference_decoder;

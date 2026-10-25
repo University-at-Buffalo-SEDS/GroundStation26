@@ -1,0 +1,102 @@
+{
+  "updated_utc": "2026-10-25T06:29:05.332365+00:00",
+  "host": "Jupiter",
+  "workspace": "/home/rylan/Documents/Gitkraken/SEDS",
+  "sdk": "6980f9b6f9594f785c157938a6aefd5647bbdb5f",
+  "groundstation_base": "e4467f16816cf5336817c46f156511869cae14ab",
+  "frontend": "4f0da47346e3a898d6c4353e57020790ca7162dd",
+  "repository_sync": "All seven boards use matching tested source commits; prior Jupiter edits remain on local preservation/jupiter-pre-sync-20261025 branches. DAQ thermal-offset-calibration retained. SDK/GS/frontend/simulator migrations preserved.",
+  "boards": {
+    "ActuatorBoard26": {
+      "exit_code": 0,
+      "seconds": 2.77,
+      "log": ".workspace-progress/ActuatorBoard26-tests.log",
+      "test_count": 120,
+      "skips": "skipped=1"
+    },
+    "FlightComputer26": {
+      "exit_code": 0,
+      "seconds": 4.33,
+      "log": ".workspace-progress/FlightComputer26-tests.log",
+      "test_count": 189,
+      "skips": "skipped=1"
+    },
+    "DAQ-Board": {
+      "exit_code": 0,
+      "seconds": 7.11,
+      "log": ".workspace-progress/DAQ-Board-tests.log",
+      "test_count": 198,
+      "skips": null
+    },
+    "PowerBoard26": {
+      "exit_code": 0,
+      "seconds": 3.04,
+      "log": ".workspace-progress/PowerBoard26-tests.log",
+      "test_count": 133,
+      "skips": null
+    },
+    "ValveBoard26": {
+      "exit_code": 0,
+      "seconds": 4.3,
+      "log": ".workspace-progress/ValveBoard26-tests.log",
+      "test_count": 145,
+      "skips": null
+    },
+    "gateway-board26": {
+      "exit_code": 0,
+      "seconds": 4.22,
+      "log": ".workspace-progress/gateway-board26-tests.log",
+      "test_count": 146,
+      "skips": null
+    },
+    "RFBoard26": {
+      "exit_code": 0,
+      "seconds": 11.36,
+      "log": ".workspace-progress/RFBoard26-tests.log",
+      "test_count": 169,
+      "skips": null
+    }
+  },
+  "groundstation": {
+    "passed": 473,
+    "ignored": 3,
+    "sdk_selection": "cargo --config patch.crates-io.SEDSnet.path=<workspace>/SEDSnet; version requirement remains4",
+    "radio_reference": {
+      "profiles": 6,
+      "commands": 1584,
+      "ordered_and_unordered": true,
+      "medium": "bounded aggregate64kbps; finite4/16KiB FIFO; explicit deterministic contention approximation",
+      "receive": "production raw UART stream decoder, split/coalesced read and CRC recovery tests",
+      "limits": "Reference uses native packed routers and Mesh; not linked MCU execution or vendor MAC/packetization/FEC/propagation proof"
+    },
+    "published_sdk_4_2_5": {
+      "passed": 473,
+      "ignored": 3
+    }
+  },
+  "simulator": {
+    "native_passed": 119,
+    "python_total": 69,
+    "python_skipped": 4
+  },
+  "linked_cohort": {
+    "progress": "/home/rylan/seds-gateway-fidelity-20261020/receive-cohort426-unordered1/progress.json",
+    "startup_120s": "passed all network/source/DAQ pressure/DAQ raw/FC SD gates",
+    "groundstation_restart": "passed",
+    "600s": "running; do not label release-qualified until inspectors complete",
+    "radio": "UART hub; bounded three-radio MCU model remains outstanding"
+  },
+  "remaining": [
+    "Complete600s unchanged gates and SD/source inspectors",
+    "Integrate bounded shared radio with linked firmware and two host stations",
+    "Complete current SDK full campaigns on Jupiter",
+    "Shared checklist definition/progress offline conflict-aware synchronization",
+    "Release qualification, platform validation and package publication after required gates; publication credentials never read by test scripts"
+  ],
+  "release_ready": false,
+  "test_source_sha256": {
+    "backend/src/comms/reference_decoder.rs": "2de787f4f37f35ad8fd0cba2e51b01dc7df6b1646755031d78e5fdd5ede2257c",
+    "backend/src/rrls/shared_air.rs": "08f0c1d53809d29daef5d6c8c35b3584b85cfc3d6d0519390c45e684914b44a7",
+    "backend/src/rrls/air_campaign.rs": "43c721739ef318da830ca64af940d2a729581c7afeca9bacbfa8125f4aaa464e"
+  }
+}

@@ -1607,3 +1607,10 @@ pub fn voice_status() -> (bool, bool) {
         (false, false)
     }
 }
+
+#[cfg(test)]
+#[path = "rrls/shared_air.rs"]
+mod shared_air;
+#[cfg(test)]
+#[path = "rrls/air_campaign.rs"]
+mod air_campaign;
