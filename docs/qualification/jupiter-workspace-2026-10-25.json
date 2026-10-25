@@ -1,5 +1,5 @@
 {
-  "updated_utc": "2026-10-25T06:29:05.332365+00:00",
+  "updated_utc": "2026-10-25T06:36:03.988896+00:00",
   "host": "Jupiter",
   "workspace": "/home/rylan/Documents/Gitkraken/SEDS",
   "sdk": "6980f9b6f9594f785c157938a6aefd5647bbdb5f",
@@ -19,14 +19,16 @@
       "seconds": 4.33,
       "log": ".workspace-progress/FlightComputer26-tests.log",
       "test_count": 189,
-      "skips": "skipped=1"
+      "skips": "skipped=1",
+      "test_commit": "9da7313"
     },
     "DAQ-Board": {
       "exit_code": 0,
       "seconds": 7.11,
       "log": ".workspace-progress/DAQ-Board-tests.log",
       "test_count": 198,
-      "skips": null
+      "skips": null,
+      "test_commit": "6afc09d"
     },
     "PowerBoard26": {
       "exit_code": 0,
@@ -77,7 +79,8 @@
   "simulator": {
     "native_passed": 119,
     "python_total": 69,
-    "python_skipped": 4
+    "python_skipped": 4,
+    "peripheral_docker_build": "passed manual uart-tests target from current repository"
   },
   "linked_cohort": {
     "progress": "/home/rylan/seds-gateway-fidelity-20261020/receive-cohort426-unordered1/progress.json",
@@ -89,7 +92,6 @@
   "remaining": [
     "Complete600s unchanged gates and SD/source inspectors",
     "Integrate bounded shared radio with linked firmware and two host stations",
-    "Complete current SDK full campaigns on Jupiter",
     "Shared checklist definition/progress offline conflict-aware synchronization",
     "Release qualification, platform validation and package publication after required gates; publication credentials never read by test scripts"
   ],
@@ -98,5 +100,26 @@
     "backend/src/comms/reference_decoder.rs": "2de787f4f37f35ad8fd0cba2e51b01dc7df6b1646755031d78e5fdd5ede2257c",
     "backend/src/rrls/shared_air.rs": "08f0c1d53809d29daef5d6c8c35b3584b85cfc3d6d0519390c45e684914b44a7",
     "backend/src/rrls/air_campaign.rs": "43c721739ef318da830ca64af940d2a729581c7afeca9bacbfa8125f4aaa464e"
+  },
+  "sdk_campaigns": {
+    "default": {
+      "passed_rust": 702,
+      "skipped_rust": 4,
+      "passed_python": 72,
+      "complete": true
+    },
+    "compact_compression_fair": {
+      "passed_rust": 727,
+      "skipped_rust": 5,
+      "passed_python": 72,
+      "complete": true
+    },
+    "included": [
+      "strict SDK Clippy",
+      "hosted/no_std checks",
+      "benchmark smoke",
+      "Cortex-M4 embedded build"
+    ],
+    "source_commit": "6980f9b6f9594f785c157938a6aefd5647bbdb5f"
   }
 }

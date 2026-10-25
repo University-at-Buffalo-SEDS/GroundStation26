@@ -472,12 +472,13 @@
     "groundstation": "473passed3ignored with local SDK6980; six shared-air scenarios passed1584diagnostic commands, ordered/unordered, actual stream decoder; normal publishedSDK4.2.5 radio scenario also passed",
     "simulator": "119native tests passed;69Python tests ran with4skipped",
     "linked600": "Still running,17of60samples at last check; startup120s andGSrestart passed; all gates remain unchanged",
-    "sdk_campaigns": "Default and compact/fair full campaigns running on Jupiter",
+    "sdk_campaigns": "Both passed in full on Jupiter: default702Rust/72Python; compact+compression+fair727Rust/72Python; strict SDK Clippy, no_std, benchmark smoke and M4 embedded builds included",
     "next": [
       "Finish unchanged600second network/source/SD gates",
       "Build linked three-radio bounded-medium MCU+GS+RRLS fidelity",
       "Finish paired checklist sync and remaining recorded plan"
     ],
-    "release_ready": false
+    "release_ready": false,
+    "simulator_peripheral_tests": "Manual Docker uart-tests build passed from migrated repository, including ADC/DMA and register contracts"
   }
 }
