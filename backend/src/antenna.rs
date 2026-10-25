@@ -10,6 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub(crate) mod positions;
 
 const FIX_FRESH_MS: u64 = 15_000;
+const UTC_FLOOR_MS: u64 = 946_684_800_000; // 2000-01-01 UTC
 const RSSI_FRESH_MS: u64 = 3_000;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -63,6 +64,7 @@ struct TimedFix {
     fix: Fix,
     received: Instant,
     received_model_ms: Option<u64>,
+    publication_ms: Option<u64>,
 }
 impl TimedFix {
     fn snapshot(&self) -> Fix {
@@ -84,9 +86,32 @@ impl TimedFix {
         value
     }
 }
+#[derive(Clone, Copy)]
+struct NoFix {
+    publication_ms: u64,
+    network_utc_ms: Option<u64>,
+}
+fn comparable_publications(left: u64, right: u64) -> bool {
+    (left >= UTC_FLOOR_MS) == (right >= UTC_FLOOR_MS)
+}
+impl NoFix {
+    fn precedes(self, publication_ms: u64) -> bool {
+        if comparable_publications(self.publication_ms, publication_ms) {
+            return publication_ms > self.publication_ms;
+        }
+        // RF can acquire GPS UTC after starting with a boot-relative clock.
+        // Order that transition only against a known UTC receipt bound; never
+        // subtract unlike publication domains or accept a delayed pre-loss fix.
+        publication_ms >= UTC_FLOOR_MS
+            && self
+                .network_utc_ms
+                .is_some_and(|now| now >= UTC_FLOOR_MS && publication_ms > now)
+    }
+}
 #[derive(Default)]
 struct Cache {
     rocket: [Option<TimedFix>; 2],
+    rf_no_fix: Option<NoFix>,
     local: Option<TimedFix>,
     remote: Option<TimedFix>,
     signal: Option<(SignalStrength, Instant)>,
@@ -100,7 +125,6 @@ fn cache() -> &'static Mutex<Cache> {
 /// Boot-relative/unset source clocks retain receipt-age behavior; never subtract
 /// them from the synchronized network epoch.
 fn source_fix_age_ms(source_ms: Option<u64>, network_utc_ms: Option<u64>) -> Option<u64> {
-    const UTC_FLOOR_MS: u64 = 946_684_800_000; // 2000-01-01 UTC
     const FUTURE_SKEW_MS: u64 = 5_000;
     match (source_ms, network_utc_ms) {
         (Some(source), Some(now)) if source >= UTC_FLOOR_MS && now >= UTC_FLOOR_MS => {
@@ -118,6 +142,38 @@ pub(crate) fn observe_source_gps(row: &TelemetryRow, source_ms: u64) {
     let network_utc_ms =
         crate::telemetry_task::recording_network_utc_ms().and_then(|value| value.try_into().ok());
     observe_at(row, Some(source_ms), network_utc_ms);
+}
+
+/// A positive satellite count alone never establishes a receiver lock.
+/// RF publishes zero when its satellite solution is absent or stale.
+pub(crate) fn observe_source_satellites(sender: &str, count: u8, source_ms: u64) {
+    let network_utc_ms =
+        crate::telemetry_task::recording_network_utc_ms().and_then(|value| value.try_into().ok());
+    observe_satellites_at(sender, count, source_ms, network_utc_ms);
+}
+fn observe_satellites_at(sender: &str, count: u8, source_ms: u64, network_utc_ms: Option<u64>) {
+    if sender != "RF" || count != 0 || source_fix_age_ms(Some(source_ms), network_utc_ms).is_none()
+    {
+        return;
+    }
+    let mut cache = cache().lock().unwrap();
+    let older_than =
+        |previous| comparable_publications(source_ms, previous) && source_ms < previous;
+    if cache.rocket[0]
+        .as_ref()
+        .and_then(|fix| fix.publication_ms)
+        .is_some_and(older_than)
+        || cache
+            .rf_no_fix
+            .is_some_and(|lost| older_than(lost.publication_ms))
+    {
+        return;
+    }
+    cache.rocket[0] = None;
+    cache.rf_no_fix = Some(NoFix {
+        publication_ms: source_ms,
+        network_utc_ms,
+    });
 }
 
 pub fn observe(row: &TelemetryRow) {
@@ -149,10 +205,43 @@ fn observe_at(row: &TelemetryRow, source_ms: Option<u64>, network_utc_ms: Option
                 manual: false,
             };
             if fix.valid() {
-                cache().lock().unwrap().rocket[index] = Some(TimedFix {
+                let mut cache = cache().lock().unwrap();
+                if index == 0
+                    && let Some(mut lost) = cache.rf_no_fix
+                {
+                    // Anchor a newly available UTC domain once. Repeated
+                    // arrivals cannot move the fence and chase recovery forever.
+                    if lost.network_utc_ms.is_none()
+                        && source_ms.is_some_and(|source| {
+                            source >= UTC_FLOOR_MS
+                                && !comparable_publications(source, lost.publication_ms)
+                        })
+                        && network_utc_ms.is_some_and(|now| now >= UTC_FLOOR_MS)
+                    {
+                        lost.network_utc_ms = network_utc_ms;
+                        cache.rf_no_fix = Some(lost);
+                    }
+                    if !source_ms.is_some_and(|source| lost.precedes(source)) {
+                        return;
+                    }
+                }
+                if index == 0
+                    && source_ms.is_some_and(|source| {
+                        cache.rocket[0]
+                            .as_ref()
+                            .and_then(|previous| previous.publication_ms)
+                            .is_some_and(|previous| {
+                                comparable_publications(source, previous) && source < previous
+                            })
+                    })
+                {
+                    return;
+                }
+                cache.rocket[index] = Some(TimedFix {
                     fix,
                     received: Instant::now(),
                     received_model_ms: crate::simulation_clock_ms(),
+                    publication_ms: source_ms,
                 });
             }
         }
@@ -207,6 +296,7 @@ pub fn accept_remote_fix(mut fix: Fix) {
         fix,
         received: Instant::now(),
         received_model_ms: None,
+        publication_ms: None,
     });
 }
 pub fn snapshot() -> Snapshot {
@@ -342,6 +432,7 @@ pub fn start_gpsd(
                                     fix,
                                     received: Instant::now(),
                                     received_model_ms: None,
+                                    publication_ms: None,
                                 });
                             }
                             line.clear();
@@ -439,6 +530,7 @@ mod tests {
             fix,
             received: Instant::now() - Duration::from_secs(11),
             received_model_ms: None,
+            publication_ms: None,
         };
         assert!(timed.snapshot().stale);
     }
@@ -465,6 +557,7 @@ mod tests {
             fix,
             received: wall,
             received_model_ms: Some(1000),
+            publication_ms: None,
         };
         timed.fix.age_ms = 1200;
         assert_eq!(
@@ -533,6 +626,109 @@ mod tests {
         assert!(cache().lock().unwrap().rocket[0].is_none());
     }
     #[test]
+    fn rf_zero_satellites_revokes_lock_and_source_order_controls_recovery() {
+        const CHILD: &str = "GS_ANTENNA_NO_FIX_TEST_CHILD";
+        const NAME: &str =
+            "antenna::tests::rf_zero_satellites_revokes_lock_and_source_order_controls_recovery";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env_remove("GS_SIM_CLOCK_FILE")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let now = 1_767_225_600_000;
+        let row = TelemetryRow {
+            timestamp_ms: now as i64,
+            data_type: "GPS_DATA".into(),
+            sender_id: "RF".into(),
+            values: vec![Some(43.0), Some(-78.0), Some(150.0)],
+        };
+        let locked = || cache().lock().unwrap().rocket[0].is_some();
+        clear_rocket_fix_for_test();
+        observe_satellites_at("RF", 12, now, Some(now));
+        assert!(
+            !locked(),
+            "satellite count alone cannot prove a position lock"
+        );
+        observe_at(&row, Some(now), Some(now));
+        assert!(locked());
+        observe_satellites_at("FC", 0, now + 1, Some(now));
+        assert!(locked(), "other boards cannot revoke RF lock");
+        observe_satellites_at("RF", 0, now - 1, Some(now));
+        assert!(locked(), "delayed no-fix cannot revoke newer RF GPS");
+        observe_satellites_at("RF", 0, now - 15_001, Some(now));
+        assert!(locked(), "stale zero must not replace current state");
+        observe_satellites_at("RF", 0, now + 1, Some(now));
+        assert!(
+            !locked(),
+            "current RF zero revokes the cached fix immediately"
+        );
+        for source in [now - 1, now, now + 1] {
+            observe_at(&row, Some(source), Some(now));
+            assert!(!locked(), "old/equal GPS publication cannot revive no-fix");
+        }
+        observe(&row);
+        assert!(
+            !locked(),
+            "receipt-only cache cannot bypass publication watermark"
+        );
+        observe_at(&row, Some(now + 2), Some(now));
+        assert!(locked(), "newer valid RF GPS recovers normally");
+        observe_satellites_at("RF", 0, now + 1, Some(now));
+        assert!(locked());
+
+        clear_rocket_fix_for_test();
+        observe_at(&row, Some(200), Some(now));
+        observe_satellites_at("RF", 0, 210, Some(now));
+        observe_at(&row, Some(209), Some(now));
+        assert!(!locked());
+        observe_at(&row, Some(211), Some(now));
+        assert!(
+            locked(),
+            "boot-relative publications are compared only with each other"
+        );
+
+        clear_rocket_fix_for_test();
+        observe_satellites_at("RF", 0, 210, Some(now));
+        observe_at(&row, Some(now - 1), Some(now));
+        assert!(
+            !locked(),
+            "cross-domain old UTC cannot bypass the synchronized loss bound"
+        );
+        observe_at(&row, Some(now + 1), Some(now));
+        assert!(
+            locked(),
+            "fresh UTC acquisition can follow boot-relative no-fix"
+        );
+        clear_rocket_fix_for_test();
+        observe_satellites_at("RF", 0, 210, None);
+        observe_at(&row, Some(now - 1), None);
+        assert!(
+            !locked(),
+            "unorderable domain transition is not proof of recovery"
+        );
+        observe_at(&row, Some(now - 1), Some(now));
+        assert!(
+            !locked(),
+            "old UTC cannot cross the newly established UTC fence"
+        );
+        observe_at(&row, Some(now + 1), Some(now + 2));
+        assert!(
+            locked(),
+            "a fixed UTC fence permits later valid recovery without another zero report"
+        );
+    }
+
+    #[test]
     fn mesh_position_roundtrip_rejects_bad_version_coordinates_age_and_datum() {
         let fix = gpsd_fix(br#"{"class":"TPV","mode":3,"lat":43,"lon":-78,"altMSL":150}"#).unwrap();
         let encoded = encode_position(&fix).unwrap();
@@ -568,5 +764,7 @@ pub fn rocket_launch_fix_locked() -> bool {
 
 #[cfg(test)]
 pub(crate) fn clear_rocket_fix_for_test() {
-    cache().lock().unwrap().rocket[0] = None;
+    let mut cache = cache().lock().unwrap();
+    cache.rocket[0] = None;
+    cache.rf_no_fix = None;
 }
