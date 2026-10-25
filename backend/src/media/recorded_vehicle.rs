@@ -18,6 +18,8 @@ pub(super) struct RecordedReplayPlan {
     pub speed: f64,
     pub paused: bool,
     pub loop_playback: bool,
+    #[serde(default)]
+    pub follow_saved: bool,
 }
 impl RecordedReplayPlan {
     fn valid(&self) -> bool {
@@ -92,6 +94,7 @@ pub(super) async fn validate_plan(
 #[derive(Default)]
 pub(super) struct SceneCache {
     track: Option<(String, i64, serde_json::Value)>,
+    refresh: Option<(String, std::time::Instant)>,
 }
 #[derive(Deserialize)]
 struct WindowQuery {
@@ -166,12 +169,77 @@ async fn player_asset() -> ApiResult<Response> {
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Replay player asset unavailable"))?;
     Ok(([(header::CONTENT_TYPE, "text/javascript")], bytes).into_response())
 }
+/// Expand only the selected saved flight, at most once per five seconds for all
+/// viewers together. Never silently jump into a later flight in the same file.
+async fn refresh_saved(state: &Arc<MediaState>) -> ApiResult<()> {
+    let presentation = contract::read_presentation(state).await?;
+    let Some(plan) = presentation.broadcast.recorded_replay else {
+        return Ok(());
+    };
+    if !plan.follow_saved {
+        return Ok(());
+    }
+    let identity = format!("{}:{}:{}", plan.recording_id, plan.start_ms, plan.upper_id);
+    {
+        let mut cache = state.recorded_vehicle_cache.lock().await;
+        if cache.refresh.as_ref().is_some_and(|(id, at)| {
+            id == &identity && at.elapsed() < std::time::Duration::from_secs(5)
+        }) {
+            return Ok(());
+        }
+        cache.refresh = Some((identity, std::time::Instant::now()));
+    }
+    let saved = recording_replay::saved_flight_snapshot(&state.app, &plan.recording_id)
+        .await
+        .map_err(|_| {
+            error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Saved flight refresh unavailable",
+            )
+        })?;
+    let Some(end) = saved.end_ms else {
+        return Ok(());
+    };
+    if saved.start_ms != Some(plan.start_ms) || saved.upper_id <= plan.upper_id || end < plan.end_ms
+    {
+        return Ok(());
+    }
+    let mut next = plan.clone();
+    let now = contract::program_now_ms();
+    next.position_ms = plan.elapsed(now);
+    next.anchor_server_ms = now;
+    next.upper_id = saved.upper_id;
+    next.end_ms = end;
+    if !next.valid() {
+        return Ok(());
+    }
+    // A saved-DB scan never holds the presentation write lock. Preserve any
+    // operator edit made while that scan was running.
+    let _guard = state.presentation_write.lock().await;
+    let mut presentation = contract::read_presentation(state).await?;
+    if presentation.broadcast.recorded_replay.as_ref() != Some(&plan) {
+        return Ok(());
+    }
+    presentation.broadcast.recorded_replay = Some(next.clone());
+    presentation.broadcast.revision = presentation
+        .broadcast
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| error(StatusCode::CONFLICT, "Broadcast revision exhausted"))?;
+    contract::write_presentation(state, &presentation).await?;
+    state.recorded_vehicle_cache.lock().await.refresh = Some((
+        format!("{}:{}:{}", next.recording_id, next.start_ms, next.upper_id),
+        std::time::Instant::now(),
+    ));
+    Ok(())
+}
 async fn scene_state(
     State(state): State<Arc<MediaState>>,
     Query(query): Query<contract::MediaQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     contract::authorize_media(&state, &headers, &query, "program").await?;
+    refresh_saved(&state).await?;
     let (plan, _) = selected(&state).await?;
     let config = contract::recorded_vehicle_config(&state, &headers, &query).await?;
     let now = contract::program_now_ms();
@@ -310,6 +378,7 @@ mod tests {
             speed: 1.,
             paused: false,
             loop_playback: false,
+            follow_saved: false,
         }
     }
 
@@ -338,6 +407,91 @@ mod tests {
     async fn insert(db: &sqlx::SqlitePool, time: i64, kind: &str, values: &str) {
         sqlx::query("INSERT INTO telemetry(timestamp_ms,sender_id,data_type,values_json) VALUES (?,'FC',?,?)")
             .bind(time).bind(kind).bind(values).execute(db).await.unwrap();
+    }
+    #[tokio::test]
+    async fn follow_saved_is_opt_in_bounded_preserves_playback_and_never_changes_flights() {
+        let root = crate::recording_export::tests::TestDirectory::new();
+        let state = media_state(&root.0, true).await;
+        let id = "groundstation_recording_1.db";
+        let (db, _) = crate::telemetry_db::open_telemetry_db(&root.0.join(id))
+            .await
+            .unwrap();
+        insert(&db, 1000, "FLIGHT_STATE", "[8]").await;
+        insert(&db, 2000, "GPS_DATA", "[43,-78,300]").await;
+        let mut p = plan();
+        p.recording_id = id.into();
+        p.upper_id = 2;
+        p.end_ms = 2000;
+        p.position_ms = 500;
+        p.paused = true;
+        let mut presentation = contract::read_presentation(&state).await.unwrap();
+        presentation.broadcast.recorded_replay = Some(p.clone());
+        contract::write_presentation(&state, &presentation)
+            .await
+            .unwrap();
+        insert(&db, 3000, "GPS_DATA", "[43,-78,4000]").await;
+        refresh_saved(&state).await.unwrap();
+        assert_eq!(
+            selected(&state).await.unwrap().0.upper_id,
+            2,
+            "default snapshot stays frozen"
+        );
+        p.follow_saved = true;
+        presentation.broadcast.recorded_replay = Some(p);
+        contract::write_presentation(&state, &presentation)
+            .await
+            .unwrap();
+        refresh_saved(&state).await.unwrap();
+        let grown = selected(&state).await.unwrap().0;
+        assert_eq!(
+            (
+                grown.upper_id,
+                grown.end_ms,
+                grown.position_ms,
+                grown.paused
+            ),
+            (3, 3000, 500, true)
+        );
+        insert(&db, 4000, "GPS_DATA", "[43,-78,5000]").await;
+        refresh_saved(&state).await.unwrap();
+        assert_eq!(
+            selected(&state).await.unwrap().0.upper_id,
+            3,
+            "shared refresh is throttled"
+        );
+        state.recorded_vehicle_cache.lock().await.refresh = None;
+        refresh_saved(&state).await.unwrap();
+        assert_eq!(selected(&state).await.unwrap().0.upper_id, 4);
+        let mut stored = contract::read_presentation(&state).await.unwrap();
+        let running = stored.broadcast.recorded_replay.as_mut().unwrap();
+        running.paused = false;
+        running.anchor_server_ms = contract::program_now_ms().saturating_sub(1000);
+        contract::write_presentation(&state, &stored).await.unwrap();
+        insert(&db, 4500, "GPS_DATA", "[43,-78,6000]").await;
+        state.recorded_vehicle_cache.lock().await.refresh = None;
+        refresh_saved(&state).await.unwrap();
+        let playing = selected(&state).await.unwrap().0;
+        assert_eq!(
+            (playing.upper_id, playing.end_ms, playing.paused),
+            (5, 4500, false)
+        );
+        assert!(
+            (1500..=1600).contains(&playing.position_ms),
+            "growing snapshot preserves elapsed replay position"
+        );
+        insert(&db, 5000, "FLIGHT_STATE", "[1]").await;
+        insert(&db, 6000, "FLIGHT_STATE", "[8]").await;
+        state.recorded_vehicle_cache.lock().await.refresh = None;
+        refresh_saved(&state).await.unwrap();
+        let persisted = selected(&state).await.unwrap().0;
+        assert_eq!(
+            persisted.upper_id, 5,
+            "a later flight requires explicit selection"
+        );
+        assert!(
+            persisted.follow_saved,
+            "persisted opt-in works without operator presence"
+        );
     }
     #[tokio::test]
     async fn audience_capability_is_selected_snapshot_only_and_revocation_is_rechecked() {

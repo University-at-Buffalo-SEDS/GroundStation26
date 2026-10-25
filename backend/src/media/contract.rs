@@ -16,7 +16,7 @@ pub(super) struct Broadcast {
     featured_stream_id: String,
     hidden_stream_ids: Vec<String>,
     layout: String,
-    revision: u64,
+    pub(super) revision: u64,
     replay: Option<replay::Plan>,
     rundown: super::rundown::Rundown,
     commentary_audio_enabled: bool,
@@ -348,7 +348,7 @@ pub(super) async fn initialize_voice_broadcast(state: &MediaState) {
     }
 }
 
-async fn write_presentation(state: &MediaState, value: &Presentation) -> ApiResult<()> {
+pub(super) async fn write_presentation(state: &MediaState, value: &Presentation) -> ApiResult<()> {
     tokio::fs::create_dir_all(&state.models)
         .await
         .map_err(io_error)?;

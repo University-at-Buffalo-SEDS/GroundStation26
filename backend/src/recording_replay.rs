@@ -459,10 +459,10 @@ pub async fn trajectory(
 }
 
 #[derive(Serialize)]
-struct FlightSnapshot {
-    upper_id: i64,
-    start_ms: Option<i64>,
-    end_ms: Option<i64>,
+pub(crate) struct FlightSnapshot {
+    pub(crate) upper_id: i64,
+    pub(crate) start_ms: Option<i64>,
+    pub(crate) end_ms: Option<i64>,
     flight_detected: bool,
 }
 async fn flight_snapshot_from(db: &SqlitePool) -> anyhow::Result<FlightSnapshot> {
@@ -530,6 +530,15 @@ pub async fn flight_snapshot(
 /// Internal read-only entry points. Media callers authorize a narrow selected
 /// replay capability before invoking these; recording IDs still use the same
 /// guarded directory lookup as the authenticated recording APIs.
+pub(crate) async fn saved_flight_snapshot(
+    state: &AppState,
+    id: &str,
+) -> anyhow::Result<FlightSnapshot> {
+    let db = open(state, id)
+        .await
+        .map_err(|status| anyhow::anyhow!("Recording unavailable ({status})"))?;
+    flight_snapshot_from(&db).await
+}
 pub(crate) async fn saved_snapshot(state: &AppState, id: &str) -> anyhow::Result<Snapshot> {
     let db = open(state, id)
         .await
