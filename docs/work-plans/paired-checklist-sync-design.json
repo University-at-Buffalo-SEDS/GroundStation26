@@ -1,5 +1,5 @@
 {
-  "status": "typed membership model and optional host SQLite per-key staging implemented and tested; live paired checklist activation remains disabled pending incremental wire/profile and qualified selector integration",
+  "status": "typed membership, bounded SQLite per-key staging and signed incremental journal replication implemented/tested; backend activation and operational binding still disabled/pending",
   "identity": {
     "list_key": "checklists/list/<sha256(original list ID)>",
     "definition_key": "checklists/item/<sha256(length-prefixed list ID and item ID)>",
@@ -190,6 +190,44 @@
       "UTF8 byte quota and installation mismatch",
       "blocked SQLite leaves unrelated current-thread async control task runnable"
     ],
-    "not_enabled": "No new runtime worker, no active checklist writes, no qualification changes, no hardware outputs"
+    "not_enabled": "No new runtime worker, no active checklist writes, no qualification changes, no hardware outputs",
+    "format": 2
+  },
+  "implemented_incremental_replication": {
+    "module": "shared/paired_settings/src/journal_replication.rs",
+    "wire": "Distinct MS-v2 framed application signature domain; explicit profile/capacity agreement; bounded128B chunks; retained signed frame on backpressure",
+    "replication": "Initial cached key/digest scan; then per-row revision cursor with atomic scan fence; persisted journal incarnation detects a new database. Old inventories cannot move same-incarnation advertised revision backward.",
+    "bandwidth": "One shared256B/s allowance across peers based on actual signed bytes; replaces rather than accompanies legacy allowance. Missing-chunk bitmap requests retransmit holes only.",
+    "bounds": "One64KiB assembly/transfer per peer, <=8control messages, <=8peers, no eager whole-history serialization or hashing",
+    "tests": "47unit+2integration tests pass with sqlite-journal; strict all-target Clippy passes; six replication tests cover loss, progress-only delta, signatures/profile, scan/read revision race, >60s transfer and exact backpressure retry",
+    "not_enabled": "Backend worker does not enable journal profile yet; no active snapshot, qualification or hardware mutation"
+  },
+  "live_integration_followup": {
+    "storage_and_observation": [
+      "Migrate legacy mission Coordinator histories/observed clocks into journal with explicit one-time format/version record; preserve offline conflicts and tombstones.",
+      "Persist per-key observed local value/causal context so a reconnect racing an API edit remains concurrent.",
+      "Add bounded prepared immutable projection generations and active selector; backend checklist API must preserve existing JSON field shapes and1MiB exact snapshot bound.",
+      "Store per-item progress independently so routine checkbox/automated-event updates avoid rewriting definition snapshot."
+    ],
+    "backend_worker": [
+      "Enable journal feature only for host paired worker; preserve HITL no-worker behavior.",
+      "Dispatch MS-v2 to JournalRadio and MS-v1 only for explicit legacy negotiation; do not run two independent256B/s allowances.",
+      "All future journal receive paths authenticate before typed validation/merge and report unsupported profile or quota conflicts explicitly.",
+      "Use shared simulator monotonic mesh clock in qualification; do not age slow emulated nodes using host wall time."
+    ],
+    "activation_and_qualification": [
+      "Prepare and fsync complete generation outside GSE/auto-zero locks; final selector CAS/rename and Arc swap at same safe-state gate with no large IO.",
+      "Persist active template generation/digest with newly earned local operational qualification; legacy unbound evidence must not silently authorize a changed template.",
+      "Retain durability-pending token while directory fsync occurs outside locks; block non-emergency starts during uncertainty, preserve emergency outputs.",
+      "Remote progress is data: never call local complete/reset, mint local engine receipts, import abort/QD/override state or weaken operational interlocks.",
+      "Progress remains editable in Fire/recovery while definitions wait for Idle+qualification cleared; unresolved progress is unchecked."
+    ],
+    "remaining_tests": [
+      "Backend fake-DB API and paired worker integration with real Mesh envelope/pacing",
+      "Offline local check/edit/delete/recreate and restart with retained observation contexts",
+      "Competing activation revisions and crash/failure injection before/after selector rename/runtime swap/directory sync",
+      "Existing GSE qualification/sequence/HITL suites and simulator routes remain unchanged",
+      "UI displays stage/conflict/unsupported status and admin-reviewed resolution without local authority synthesis"
+    ]
   }
 }

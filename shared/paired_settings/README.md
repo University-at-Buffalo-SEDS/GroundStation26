@@ -67,3 +67,20 @@ It is not wired to active checklists yet. Its own fake-database tests run with:
 cargo test -p paired_settings --features sqlite-journal
 cargo clippy -p paired_settings --features sqlite-journal --all-targets -- -D warnings
 ```
+
+`journal_replication::JournalRadio` is the incremental signed profile for that
+journal. It exchanges cached key/digest pages initially and follows row revisions
+thereafter, retaining explicit causal conflicts. Journal incarnations identify a
+new database. A scan/read race preserves the earlier cursor so a newly changed
+row cannot skip another update. Lost chunks use a bounded missing-piece bitmap.
+All peers share one256B/s allowance measured from signed bytes, including failed
+attempts. This profile replaces the legacy allowance when activated; both must
+never be run with independent budgets.
+
+The journal profile uses a distinct application signing domain and MS-v2 frame;
+HTTPS identity remains irrelevant. Both endpoints must agree on its profile and
+capacity. This is not yet wired into `mission_sync`: raw history synchronization
+alone cannot activate a checklist template, authorize a procedure or replicate
+abort/QD/qualification state. Exact remaining backend migration and qualified
+selector work is recorded in the paired checklist design's
+`live_integration_followup` section.

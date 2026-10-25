@@ -499,3 +499,6 @@ pub mod checklists;
 
 #[cfg(feature = "sqlite-journal")]
 pub mod journal;
+
+#[cfg(feature = "sqlite-journal")]
+pub mod journal_replication;

@@ -12,7 +12,7 @@ use sqlx::{
 };
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
-const FORMAT_VERSION: i64 = 1;
+const FORMAT_VERSION: i64 = 2;
 const DOCUMENT_LIMIT: usize = 65_536;
 const PAGE_LIMIT: usize = 64;
 #[derive(Clone, Copy, Debug)]
@@ -55,9 +55,21 @@ pub struct InventoryEntry {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Metadata {
+    pub incarnation: String,
     pub revision: i64,
     pub documents: usize,
     pub encoded_bytes: usize,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ScanCursor {
+    Full { after: String },
+    Changes { after: i64 },
+}
+#[derive(Debug)]
+pub struct ScanPage {
+    pub metadata: Metadata,
+    pub entry: Option<InventoryEntry>,
 }
 #[derive(Debug)]
 pub struct Snapshot {
@@ -99,14 +111,22 @@ impl Journal {
             .max_connections(1)
             .connect_with(options)
             .await?;
-        sqlx::query("CREATE TABLE IF NOT EXISTS paired_metadata (singleton INTEGER PRIMARY KEY CHECK(singleton=1), format INTEGER NOT NULL, installation TEXT NOT NULL, revision INTEGER NOT NULL, documents INTEGER NOT NULL, encoded_bytes INTEGER NOT NULL)").execute(&pool).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS paired_metadata (singleton INTEGER PRIMARY KEY CHECK(singleton=1), format INTEGER NOT NULL, installation TEXT NOT NULL, incarnation TEXT NOT NULL, revision INTEGER NOT NULL, documents INTEGER NOT NULL, encoded_bytes INTEGER NOT NULL)").execute(&pool).await?;
         sqlx::query("CREATE TABLE IF NOT EXISTS paired_documents (key TEXT PRIMARY KEY, document BLOB NOT NULL, hash TEXT NOT NULL, revision INTEGER NOT NULL, encoded_bytes INTEGER NOT NULL)").execute(&pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS paired_changes ON paired_documents(revision)")
             .execute(&pool)
             .await?;
-        sqlx::query("INSERT OR IGNORE INTO paired_metadata VALUES(1,?,?,0,0,0)")
+        use base64::Engine as _;
+        use ring::rand::SecureRandom;
+        let mut entropy = [0u8; 32];
+        ring::rand::SystemRandom::new()
+            .fill(&mut entropy)
+            .map_err(|_| anyhow::anyhow!("paired journal entropy unavailable"))?;
+        let incarnation = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(entropy);
+        sqlx::query("INSERT OR IGNORE INTO paired_metadata VALUES(1,?,?,?,0,0,0)")
             .bind(FORMAT_VERSION)
             .bind(&installation)
+            .bind(incarnation)
             .execute(&pool)
             .await?;
         let this = Self {
@@ -136,22 +156,41 @@ impl Journal {
     }
     fn metadata_row(&self, row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Metadata> {
         let metadata = Metadata {
+            incarnation: row.try_get("incarnation")?,
             revision: row.try_get("revision")?,
             documents: usize::try_from(row.try_get::<i64, _>("documents")?)?,
             encoded_bytes: usize::try_from(row.try_get::<i64, _>("encoded_bytes")?)?,
         };
         anyhow::ensure!(
-            metadata.revision >= 0
+            metadata.incarnation.len() == 43
+                && metadata.revision >= 0
                 && metadata.documents <= self.limits.documents
                 && metadata.encoded_bytes <= self.limits.encoded_bytes,
             "paired journal quota exceeded"
         );
         Ok(metadata)
     }
+    pub fn installation(&self) -> &str {
+        &self.installation
+    }
+    pub fn peers(&self) -> &[String] {
+        &self.peers
+    }
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+    pub async fn digest(&self, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT hash FROM paired_documents WHERE key=?")
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
     pub async fn metadata(&self) -> anyhow::Result<Metadata> {
         self.metadata_row(
             &sqlx::query(
-                "SELECT revision,documents,encoded_bytes FROM paired_metadata WHERE singleton=1",
+                "SELECT incarnation,revision,documents,encoded_bytes FROM paired_metadata WHERE singleton=1",
             )
             .fetch_one(&self.pool)
             .await?,
@@ -184,7 +223,7 @@ impl Journal {
         let mut transaction = self.pool.begin().await?;
         let metadata = self.metadata_row(
             &sqlx::query(
-                "SELECT revision,documents,encoded_bytes FROM paired_metadata WHERE singleton=1",
+                "SELECT incarnation,revision,documents,encoded_bytes FROM paired_metadata WHERE singleton=1",
             )
             .fetch_one(&mut *transaction)
             .await?,
@@ -298,13 +337,46 @@ impl Journal {
             .bind(after_revision).bind(limit as i64).fetch_all(&self.pool).await?.into_iter()
             .map(|row|Ok(InventoryEntry {key:row.try_get("key")?,hash:row.try_get("hash")?,revision:row.try_get("revision")?})).collect()
     }
+    /// Metadata and one cached entry share a read snapshot. A replication
+    /// cursor must not skip writes racing an empty catalog/change response.
+    pub async fn scan(&self, cursor: &ScanCursor) -> anyhow::Result<ScanPage> {
+        let mut transaction = self.pool.begin().await?;
+        let metadata = self.metadata_row(&sqlx::query("SELECT incarnation,revision,documents,encoded_bytes FROM paired_metadata WHERE singleton=1")
+            .fetch_one(&mut *transaction).await?)?;
+        let row = match cursor {
+            ScanCursor::Full { after } => {
+                anyhow::ensure!(after.len() <= 128, "invalid journal full cursor");
+                sqlx::query("SELECT key,hash,revision FROM paired_documents WHERE key>? ORDER BY key LIMIT 1")
+                    .bind(after).fetch_optional(&mut *transaction).await?
+            }
+            ScanCursor::Changes { after } => {
+                anyhow::ensure!(
+                    *after >= 0 && *after <= metadata.revision,
+                    "invalid journal change cursor"
+                );
+                sqlx::query("SELECT key,hash,revision FROM paired_documents WHERE revision>? ORDER BY revision LIMIT 1")
+                    .bind(after).fetch_optional(&mut *transaction).await?
+            }
+        };
+        let entry = row
+            .map(|row| -> anyhow::Result<_> {
+                Ok(InventoryEntry {
+                    key: row.try_get("key")?,
+                    hash: row.try_get("hash")?,
+                    revision: row.try_get("revision")?,
+                })
+            })
+            .transpose()?;
+        transaction.commit().await?;
+        Ok(ScanPage { metadata, entry })
+    }
     /// Snapshot allocation is bounded by the stored byte/count quotas. Read in
     /// small pages to avoid an additional whole-history SQL result allocation.
     pub async fn snapshot(&self) -> anyhow::Result<Snapshot> {
         let mut transaction = self.pool.begin().await?;
         let metadata = self.metadata_row(
             &sqlx::query(
-                "SELECT revision,documents,encoded_bytes FROM paired_metadata WHERE singleton=1",
+                "SELECT incarnation,revision,documents,encoded_bytes FROM paired_metadata WHERE singleton=1",
             )
             .fetch_one(&mut *transaction)
             .await?,
