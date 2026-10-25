@@ -417,6 +417,52 @@
       "reason": "RRLS lease/liveness time must use the explicit linked simulator clock so paused or slow emulation does not create false route expiry. Ordinary station clocks unchanged.",
       "negative_control": "old wall clock fails the new isolated runtime regression",
       "linked_three_radio_qualification": "pending"
-    }
+    },
+    "sdk_unordered_route_receipts": {
+      "status": "qualified and pushed SEDSnet main/dev6980f9b; no package publication",
+      "defect": "An intermediate topology snapshot could remove an unacknowledged unordered destination. Pressure logging uses this mode. A topology change is not a delivery receipt.",
+      "fix": "Retain the frozen destination in both reliable modes, update known next hops, and preserve bounded retry expiry; no per-packet RAM added.",
+      "negative_control": "Real packed fixture passes Ordered and fails Unordered before fix; both pass afterward. Lost first transmission recovers exactly once and only an actual destination ACK retires pending state. Permanent absence still expires at the configured retry bound.",
+      "full_campaigns": {
+        "default_rust": 702,
+        "compact_compression_fair_rust": 727,
+        "python_each": 72,
+        "strict_clippy": "default/Python/embedded passed",
+        "embedded_and_memory_checks": "passed",
+        "benchmark_smoke": "passed; no isolated performance speedup claimed"
+      },
+      "pressure600_causality": "Not proven. Original600-second run passed network/latency/source preservation/FC SD but missed one four-sample pressure batch52..55 near startup. Valve captured/published all samples; no DAQ invalid/refused batch counters. All raw and accepted/flushed SD counts reconcile.",
+      "followup70": "Unchanged firmware plus passive CAN trace: network and DAQ pressure/raw/FC SD gates passed. First20seconds show1180pressure batches sourceTX andDAQwireRX with no gaps. This does not supersede failed600run."
+    },
+    "fresh_macos_artifacts": {
+      "sdk_commit": "6980f9b6f9594f785c157938a6aefd5647bbdb5f",
+      "architectures": [
+        "arm64",
+        "x86_64"
+      ],
+      "source_packages": [
+        "Rust crate",
+        "Python sdist"
+      ],
+      "audit": "source hashes, metadata, binary architectures, credential/cache exclusion passed",
+      "native_python": "72tests passed each on3.12and3.14",
+      "publication": "held pending remaining qualification; local machine only"
+    },
+    "next_firmware_cohort": {
+      "sdk": "6980f9b",
+      "groundstation_runtime": "b7ffe71",
+      "rfd_lora_scheduler": "OFF",
+      "build": "manual seven-board rebuild on Jupiter; previous evidence retained",
+      "gates": [
+        "all firmware factory builds fit flash",
+        "Linux GroundStation and GSE tests",
+        "startup and120-second source/SD reconciliation",
+        "GroundStation restart recovery",
+        "600-second network/latency/source/DAQ pressure/raw/FC SD reconciliation"
+      ],
+      "flash_policy": "Retain hard partition-fit checks. Latest user instruction says FC flash is fine and RF stability is priority; FC links453732/474624bytes,20892bytes free. Earlier95% headroom gate is not reinstated.",
+      "release_ready": false
+    },
+    "remaining_radio_fidelity": "Actual linked MCU plus GS/RRLS three-radio shared-air qualification remains pending. Native bounded64kbps reference passed792commands exactly once with realACKs; MAC collision/backoff/FEC and raw-stream burst interleaving are not vendor-faithful proof."
   }
 }
