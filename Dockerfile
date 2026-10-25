@@ -35,7 +35,6 @@ COPY backend/layout backend/layout
 COPY backend/calibration backend/calibration
 COPY backend/comms backend/comms
 COPY backend/config backend/config
-COPY backend/users backend/users
 COPY backend/build.py backend/
 
 # Map downloader crate
@@ -114,7 +113,6 @@ RUN mkdir -p /app/backend/data \
 COPY --from=builder /app/backend/calibration /app/backend/calibration/
 COPY --from=builder /app/backend/comms /app/backend/comms/
 COPY --from=builder /app/backend/layout /app/backend/layout/
-COPY --from=builder /app/backend/users /app/backend/users/
 COPY --from=builder /app/target/release/groundstation_backend /app/
 COPY --from=builder /app/target/release/map_downloader /app/map_downloader/
 COPY --from=builder /app/frontend/dist/public /app/frontend/dist/public/

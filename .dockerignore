@@ -34,3 +34,16 @@ build/
 *.tmp
 .DS_Store
 Thumbs.db
+
+# Runtime accounts and credentials never belong in a build context or image.
+# Directories are created empty in the image; mount private state at runtime.
+backend/users/
+backend/users/**
+**/users.json
+.sedsnet-release.toml
+.pypirc
+.netrc
+**/credentials.toml
+**/credentials.json
+**/*.key
+**/*.pem
