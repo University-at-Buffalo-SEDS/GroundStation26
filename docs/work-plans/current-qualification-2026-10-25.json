@@ -1,5 +1,5 @@
 {
-  "updated_utc": "2026-10-25T15:54:58.053938+00:00",
+  "updated_utc": "2026-10-25T16:19:02.717315+00:00",
   "source_ready": true,
   "release_ready": false,
   "packages_published": false,
@@ -19,7 +19,6 @@
         "FirmwareSimulator/docs/qualification/rrls-telemetry-retention-2026-10-25.json"
       ],
       "remaining": [
-        "Push qualified source branches.",
         "Validate actual RFD MAC/retries, propagation and physical hardware when available; the finite medium is an explicit approximation."
       ]
     },
@@ -54,7 +53,7 @@
         "SEDSnet/docs/qualification-4.2.6-2026-10-25.json"
       ],
       "remaining": [
-        "Push main/dev source and publish qualified packages locally on the Mac after final Mac qualification."
+        "Final Mac qualification and local package publication require Mac access; no package or release tag has been published."
       ]
     },
     {
@@ -70,7 +69,6 @@
         "frontend_dev": "2b5bc86"
       },
       "remaining": [
-        "Push frontend dev with matching backend; do not promote frontend main.",
         "Physical phone/Pi GPU, compass, camera and microphone acceptance when available."
       ]
     },
@@ -82,9 +80,7 @@
         "Durable SQLite journal/selector recovery, compare-and-swap conflicts and actual automatic procedure receipts are tested. Operational abort/QD/qualification state is not imported as ordinary settings.",
         "Admin station coordinates and device-location actions persist; live GPS retains priority over manual positions."
       ],
-      "remaining": [
-        "Coordinated backend/frontend source push."
-      ]
+      "remaining": []
     },
     {
       "task": "Map downloader, assets and packaging",
@@ -95,9 +91,7 @@
         "Clean backend-only builds prepare independently verified pinned MapLibre assets without compiling the frontend.",
         "Container builds exclude runtime accounts/credentials while preserving mounted user storage and first-admin setup. Existing local user data is untouched."
       ],
-      "remaining": [
-        "Source push."
-      ]
+      "remaining": []
     },
     {
       "task": "Firmware build and platform checks",
@@ -106,10 +100,10 @@
         "All eight matched MCU factory variants fit their flash partitions; all seven --no-telemetry factories link with SDK source deliberately absent and Cargo/rustc blocked.",
         "Post-soak source/artifact verification confirms the frozen cohort was unchanged.",
         "Latest backend AArch64 production/HITL checks and release link pass warning-free; ELF requires at mostGLIBC2.35. Linux desktop frontend compilation passes.",
-        "SD pressure/raw/FC files reconcile with writer counters, pending buffers accounted for, with1000Hz monotonic clock metadata. These tests do not prove physical-card durability or nominal ADC acquisition rates."
+        "SD pressure/raw/FC files reconcile with writer counters, pending buffers accounted for, with1000Hz monotonic clock metadata. These tests do not prove physical-card durability or nominal ADC acquisition rates.",
+        "Latest native desktop frontend AArch64 check and release link pass warning-free; Pi backend production, HITL and test-fire feature checks also pass. No ARM/GPIO/GPU execution claim is made."
       ],
       "remaining": [
-        "Finish latest native AArch64 frontend compile/link check.",
         "Final macOS build/signing/notarization and local Mac package publication require access to the Mac; the existing async hostname question is unanswered.",
         "Physical iOS/Android/Pi acceptance remains hardware follow-up."
       ]
@@ -124,7 +118,7 @@
   ],
   "qualified_runtime_refs": {
     "sdk": "5b15190 runtime;edb3b19 current scripts/docs",
-    "groundstation": "35d3492 runtime;9d09ef4 packaging/docs follow-ups",
+    "groundstation": "35d3492 runtime;8c298f3 packaging/test-only/platform follow-ups",
     "frontend_dev": "2b5bc86",
     "simulator": "1fd7ff6",
     "flight_computer": "1572dfe",
@@ -134,5 +128,24 @@
     "daq": "f095625",
     "gateway": "72c8d8d",
     "actuator": "b27a1ac"
+  },
+  "source_pushes": {
+    "status": "qualified_sources_pushed",
+    "sdk_main_and_dev": "edb3b19",
+    "backend_dev": "83d43ed plus final8c298f3 test-only/platform follow-up",
+    "frontend_dev": "2b5bc86",
+    "simulator_main": "1fd7ff6",
+    "board_branch": "migration/sedlaunch-sedsnet-mainline",
+    "boards": {
+      "FlightComputer26": "1572dfe",
+      "RFBoard26": "6b97760",
+      "PowerBoard26": "d636a5b",
+      "ValveBoard26": "136eb1e",
+      "DAQ-Board": "f095625",
+      "gateway-board26": "72c8d8d",
+      "ActuatorBoard26": "79238da"
+    },
+    "frontend_main_promoted": false,
+    "scope": "Source only. Registry publication and Mac signing remain pending."
   }
 }
