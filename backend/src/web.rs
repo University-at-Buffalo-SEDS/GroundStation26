@@ -262,6 +262,10 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/flightstate", get(get_flight_state))
         .route("/api/gps", get(get_gps))
         .route("/api/antenna/status", get(get_antenna_status))
+        .route(
+            "/api/station_positions",
+            get(crate::antenna::positions::get).post(crate::antenna::positions::set),
+        )
         .route("/ws", get(ws_handler))
         .route("/tiles/{z}/{x}/{y}", get(get_tile_jpg))
         .route("/favicon.ico", get(get_favicon))

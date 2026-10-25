@@ -33,3 +33,6 @@ Cargo.lock
 
 # Local RRLS radio settings are independent of the primary station.
 /backend/comms/rrls.json
+
+# Station locations are local administrator settings.
+/backend/config/station_positions.json

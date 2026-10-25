@@ -6,6 +6,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[path = "antenna_positions.rs"]
+pub(crate) mod positions;
+
 const FIX_FRESH_MS: u64 = 15_000;
 const RSSI_FRESH_MS: u64 = 3_000;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -26,6 +29,9 @@ pub struct Fix {
     pub age_ms: u64,
     pub stale: bool,
     pub source: String,
+    /// Static administrator-saved fallback, not a live GPS solution.
+    #[serde(default)]
+    pub manual: bool,
 }
 impl Fix {
     fn valid(&self) -> bool {
@@ -98,6 +104,7 @@ pub fn observe(row: &TelemetryRow) {
                 age_ms: 0,
                 stale: false,
                 source: row.sender_id.clone(),
+                manual: false,
             };
             if fix.valid() {
                 cache().lock().unwrap().rocket[index] = Some(TimedFix {
@@ -181,10 +188,19 @@ pub fn snapshot() -> Snapshot {
             v
         })
     });
+    drop(cache);
+    let (saved_gs, saved_rrls) = positions::fallbacks();
+    let choose = |live: Option<Fix>, saved: Option<Fix>| {
+        live.as_ref()
+            .filter(|f| !f.stale)
+            .cloned()
+            .or(saved)
+            .or(live)
+    };
     Snapshot {
         rocket,
-        ground_station,
-        rrls,
+        ground_station: choose(ground_station, saved_gs),
+        rrls: choose(rrls, saved_rrls),
         rssi,
         gpsd_configured: std::env::var_os("GS_GPSD_ADDR").is_some(),
     }
@@ -245,6 +261,7 @@ fn gpsd_fix_at(line: &[u8], now: time::OffsetDateTime) -> Option<Fix> {
         age_ms,
         stale: false,
         source: "Attached GPS".into(),
+        manual: false,
     };
     fix.valid().then_some(fix)
 }
@@ -304,7 +321,7 @@ pub fn start_gpsd(
 // Fixed-size application-level RRLS position exchange. Age is relative, so
 // different host UTC offsets cannot silently turn an old fix into a fresh one.
 pub fn encode_position(fix: &Fix) -> Option<[u8; 38]> {
-    if !fix.valid() || fix.age_ms > FIX_FRESH_MS {
+    if !fix.valid() || fix.manual || fix.age_ms > FIX_FRESH_MS {
         return None;
     }
     let mut out = [0; 38];
@@ -343,6 +360,7 @@ pub fn decode_position(data: &[u8]) -> Option<Fix> {
         age_ms: u32::from_le_bytes(data[34..38].try_into().ok()?) as u64,
         stale: false,
         source: "Radio GPS".into(),
+        manual: false,
     };
     (fix.valid() && fix.age_ms <= FIX_FRESH_MS).then_some(fix)
 }
