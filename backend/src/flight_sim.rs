@@ -613,7 +613,7 @@ impl FlightSimState {
         );
     }
 
-    fn apply_command(&mut self, cmd: &TelemetryCommand, now_ms: u64) {
+    fn apply_command(&mut self, cmd: &TelemetryCommand, now_ms: u64) -> bool {
         match cmd {
             TelemetryCommand::Abort => {
                 self.launch_sequence_started_ms = None;
@@ -759,6 +759,7 @@ impl FlightSimState {
             }
             #[cfg(feature = "hitl_mode")]
             TelemetryCommand::ToggleButtonInterlock
+            | TelemetryCommand::ToggleGroundStationControl
             | TelemetryCommand::ToggleLaunchInterlock
             | TelemetryCommand::TogglePhysicalLaunchMode
             | TelemetryCommand::ToggleAvBayUnderglow
@@ -791,13 +792,16 @@ impl FlightSimState {
             | TelemetryCommand::ReinitAfter50
             | TelemetryCommand::AdvanceFlightState
             | TelemetryCommand::RewindFlightState => {
-                // No-op in simulator mode; these commands are forwarded by telemetry_task.
+                // Let telemetry_task forward HITL controls. Consuming a no-op
+                // here silently swallowed them when testing was also enabled.
+                return false;
             }
         }
 
         self.update_launch_sequence(now_ms);
         self.update_actuator_igniter_sequence(now_ms);
         self.update_ground_sequence(now_ms);
+        true
     }
 
     fn update_actuator_igniter_sequence(&mut self, now_ms: u64) {
@@ -1426,8 +1430,7 @@ pub fn handle_command(cmd: &TelemetryCommand) -> bool {
     }
     let now_ms = get_current_timestamp_ms();
     let mut s = sim().lock().expect("flight sim mutex poisoned");
-    s.apply_command(cmd, now_ms);
-    true
+    s.apply_command(cmd, now_ms)
 }
 
 #[cfg(feature = "testing")]
@@ -1514,6 +1517,32 @@ pub fn _next_state_aware_packet() -> TelemetryResult<Option<Packet>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "testing", feature = "hitl_mode"))]
+    #[test]
+    fn hitl_controls_are_forwarded_without_simulating_output_effects() {
+        use crate::types::TelemetryCommand::*;
+        let mut sim = super::FlightSimState::new();
+        let valves = sim.valves.clone();
+        for command in [
+            ToggleGroundStationControl,
+            ToggleAvBayUnderglow,
+            ToggleFlightBuzzer,
+            AdvanceFlightState,
+            RewindFlightState,
+            DeployParachute,
+            ExpandParachute,
+            EvaluationRelax,
+            EvaluationFocus,
+            EvaluationAbort,
+        ] {
+            assert!(
+                !sim.apply_command(&command, 1_000),
+                "absorbed HITL control {command:?}"
+            );
+            assert_eq!(sim.valves, valves);
+        }
+    }
+
     #[cfg(feature = "testing")]
     #[test]
     fn backend_sequence_commands_are_not_consumed_by_the_flight_simulator() {

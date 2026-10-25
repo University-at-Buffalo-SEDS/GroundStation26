@@ -1074,10 +1074,15 @@ pub(super) fn spawn_comms_worker_threads(
                             Err(mpsc::error::TryRecvError::Disconnected) => return,
                         }
                     }
+                    let mut comms = tx_worker_comms.lock().expect("failed to get lock");
+                    if !comms.transmit_ready() {
+                        // Leave frames queued so a newly admitted command can
+                        // overtake bulk traffic when the UART finishes writing.
+                        break;
+                    }
                     let Some((priority, payload)) = backlog.pop() else {
                         break;
                     };
-                    let mut comms = tx_worker_comms.lock().expect("failed to get lock");
                     if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some() {
                         log::info!("full-bay transport selected side={worker_name} sim={:?} priority={priority} len={} type={:?}", crate::simulation_clock_ms(), payload.len(), serialize::peek_frame_info_unchecked(&payload).map(|info| info.envelope.ty));
                     }
@@ -2426,5 +2431,116 @@ mod rfd_worker_tests {
     #[tokio::test]
     async fn rfd_worker_preserves_order_after_transient_write_failure() {
         run_rfd_worker(true).await;
+    }
+
+    struct ReadinessDevice {
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        credit: Arc<AtomicUsize>,
+    }
+    impl CommsDevice for ReadinessDevice {
+        fn transmit_ready(&self) -> bool {
+            self.credit.load(Ordering::Acquire) > 0
+        }
+        fn recv_packet(
+            &mut self,
+            _: &Router,
+            _: &mut dyn FnMut(&Packet),
+        ) -> sedsnet::TelemetryResult<()> {
+            Ok(())
+        }
+        fn send_data(&mut self, bytes: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+            assert!(self.credit.fetch_sub(1, Ordering::AcqRel) > 0);
+            self.sent.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        }
+        fn set_side_id(&mut self, _: RouterSideId) {}
+    }
+
+    #[tokio::test]
+    async fn uart_backpressure_retains_budget_and_selects_new_controls_before_bulk() {
+        let state = crate::state::tests::test_app_state().await;
+        let router = Arc::new(Router::new(Default::default()));
+        crate::telemetry_schema::initialize().unwrap();
+        let frames = (0..3u8)
+            .map(|marker| {
+                let packet = Packet::new(
+                    crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+                    &[crate::telemetry_schema::endpoint("AV_BAY_UNDERGLOW_OWNER")],
+                    "GS",
+                    u64::from(marker),
+                    Arc::from([marker]),
+                )
+                .unwrap();
+                serialize::pack_packet(&packet).to_vec()
+            })
+            .collect::<Vec<_>>();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let credit = Arc::new(AtomicUsize::new(1));
+        let device = || {
+            Box::new(ReadinessDevice {
+                sent: sent.clone(),
+                credit: credit.clone(),
+            }) as Box<dyn CommsDevice>
+        };
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let budget = Arc::new(TxQueueBudget::new(4096));
+        budget.try_send(&sender, 16, &frames[0]).unwrap();
+        budget.try_send(&sender, 16, &frames[1]).unwrap();
+        let workers = spawn_comms_worker_threads(
+            router,
+            state.clone(),
+            CommsWorkerHandle {
+                name: "rocket_comms",
+                tx_budget: Some(budget.clone()),
+                comms: Arc::new(Mutex::new(device())),
+                tx_comms: Some(Arc::new(Mutex::new(device()))),
+                side_id: 0,
+                tx_rx: receiver,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: false,
+            },
+        )
+        .unwrap();
+        let observations = async {
+            for count in 1..=3 {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while sent.lock().unwrap().len() < count
+                        || (count == 1 && budget.pending.load(Ordering::Acquire) != frames[1].len())
+                    {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                })
+                .await
+                .map_err(|_| "UART worker failed to advance or retain transport ownership")?;
+                if count == 1 {
+                    if budget.pending.load(Ordering::Acquire) != frames[1].len() {
+                        return Err("transport budget was released before the write");
+                    }
+                    budget.try_send(&sender, 255, &frames[2]).unwrap();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if sent.lock().unwrap().len() != 1 {
+                        return Err("worker wrote while UART readiness was false");
+                    }
+                }
+                if count < 3 {
+                    credit.store(1, Ordering::Release);
+                }
+            }
+            Ok(())
+        }
+        .await;
+        state.request_shutdown();
+        drop(sender);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        observations.unwrap();
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![frames[0].clone(), frames[2].clone(), frames[1].clone()]
+        );
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+        assert_eq!(budget.pending_control.load(Ordering::Acquire), 0);
     }
 }

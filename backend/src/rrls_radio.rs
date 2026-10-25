@@ -116,6 +116,18 @@ fn io_failure(error: &TelemetryError) -> bool {
     )
 }
 impl CommsDevice for RecoveryRadio {
+    fn transmit_ready(&self) -> bool {
+        let device = {
+            let state = self.shared.lock().unwrap();
+            if self.tx {
+                state.tx.clone()
+            } else {
+                state.rx.clone()
+            }
+        };
+        device.is_none_or(|device| device.lock().unwrap().transmit_ready())
+    }
+
     fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
         Ok(Some(Box::new(Self {
             shared: self.shared.clone(),
@@ -166,7 +178,14 @@ impl CommsDevice for RecoveryRadio {
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.with_device(
             "RRLS radio disconnected".into(),
-            |_| true,
+            |error| {
+                !error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    )
+                })
+            },
             |device| device.send_data(payload),
         )
     }
@@ -241,6 +260,7 @@ mod tests {
     }
     struct TestRadio {
         online: Arc<AtomicBool>,
+        ready: Arc<AtomicBool>,
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
         alive: Arc<AtomicUsize>,
     }
@@ -249,6 +269,7 @@ mod tests {
             self.alive.fetch_add(1, Ordering::Relaxed);
             Self {
                 online: self.online.clone(),
+                ready: self.ready.clone(),
                 sent: self.sent.clone(),
                 alive: self.alive.clone(),
             }
@@ -260,6 +281,9 @@ mod tests {
         }
     }
     impl CommsDevice for TestRadio {
+        fn transmit_ready(&self) -> bool {
+            self.ready.load(Ordering::Relaxed)
+        }
         fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
             Ok(Some(Box::new(self.copy())))
         }
@@ -270,6 +294,9 @@ mod tests {
         fn send_data(&mut self, data: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
             if !self.online.load(Ordering::Relaxed) {
                 return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into());
+            }
+            if !self.ready.load(Ordering::Relaxed) {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
             }
             self.sent.lock().unwrap().push(data.to_vec());
             Ok(())
@@ -299,6 +326,7 @@ mod tests {
             a.fetch_add(1, Ordering::Relaxed);
             Ok(Box::new(TestRadio {
                 online: o.clone(),
+                ready: Arc::new(AtomicBool::new(true)),
                 sent: s.clone(),
                 alive: a.clone(),
             }))
@@ -339,6 +367,36 @@ mod tests {
             "late failure must not close new session"
         );
     }
+    #[test]
+    fn uart_backpressure_keeps_recovery_radio_connected_and_can_resume() {
+        let radio = missing();
+        let ready = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let alive = Arc::new(AtomicUsize::new(0));
+        let (r, s, a) = (ready.clone(), sent.clone(), alive.clone());
+        radio.shared.lock().unwrap().opener = Box::new(move |_| {
+            a.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(TestRadio {
+                online: Arc::new(AtomicBool::new(true)),
+                ready: r.clone(),
+                sent: s.clone(),
+                alive: a.clone(),
+            }))
+        });
+        assert!(radio.connect().is_some());
+        let mut tx = radio.try_clone_tx().unwrap().unwrap();
+        assert!(!tx.transmit_ready());
+        assert!(tx.send_data(&[7]).is_err());
+        assert_eq!(alive.load(Ordering::Relaxed), 2);
+        assert_eq!(radio.shared.lock().unwrap().generation, 1);
+        assert!(sent.lock().unwrap().is_empty());
+        ready.store(true, Ordering::Relaxed);
+        assert!(tx.transmit_ready());
+        tx.send_data(&[7]).unwrap();
+        assert_eq!(*sent.lock().unwrap(), vec![vec![7]]);
+        assert_eq!(radio.shared.lock().unwrap().generation, 1);
+    }
+
     // macOS pseudo terminals reject UART hardware setup with ENOTTY. The
     // transport-independent test above exercises the same lifecycle on macOS.
     #[cfg(target_os = "linux")]

@@ -3,6 +3,9 @@
 mod i2c_packet;
 #[path = "picofi_tcp.rs"]
 mod picofi_tcp;
+#[cfg(any(target_os = "linux", test))]
+#[path = "comms/virtual_uart.rs"]
+mod virtual_uart;
 use crate::comms_config::{
     CanLinkConfig, CommsLinkConfig, I2cLinkConfig, SerialLinkConfig, SerialProtocol, SpiLinkConfig,
 };
@@ -102,6 +105,12 @@ pub trait CommsDevice: Send {
     /// keep the default so reads and writes remain serialized.
     fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
         Ok(None)
+    }
+
+    /// Whether the transport can accept another complete frame now. A false
+    /// result leaves ownership and priority selection in the caller's queue.
+    fn transmit_ready(&self) -> bool {
+        true
     }
 
     /// True only when the last bounded receive exhausted its work budget.
@@ -324,6 +333,12 @@ impl RawUartFrameWait {
     }
 }
 
+#[derive(Default)]
+struct UartWriteState {
+    #[cfg(target_os = "linux")]
+    wire: virtual_uart::WireDrain,
+}
+
 pub struct UartComms {
     #[cfg(target_os = "linux")]
     inner: serialport::TTYPort,
@@ -336,7 +351,7 @@ pub struct UartComms {
     radio_window_updates: VecDeque<RadioWindowUpdate>,
     protocol: SerialProtocol,
     recovery: Option<crate::rrls::Shared>,
-    write_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    write_lock: std::sync::Arc<std::sync::Mutex<UartWriteState>>,
     #[cfg(target_os = "linux")]
     baud_rate: u32,
     slow_start_deadline: Option<Instant>,
@@ -1652,6 +1667,17 @@ fn hex_preview(bytes: &[u8], limit: usize) -> String {
 }
 
 impl CommsDevice for UartComms {
+    fn transmit_ready(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if simulated_serial_pty()
+            && matches!(self.protocol, SerialProtocol::RawUart)
+            && let Some(now) = crate::simulation_clock_ms()
+        {
+            return self.write_lock.lock().unwrap().wire.ready(now);
+        }
+        true
+    }
+
     fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
         #[cfg(target_os = "linux")]
         let inner = self
@@ -1710,6 +1736,13 @@ impl CommsDevice for UartComms {
 
     /// Blocking send of serialized bytes.
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if !self.transmit_ready() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "simulated UART wire is still transmitting",
+            )
+            .into());
+        }
         let routed = if let Some(shared) = &self.recovery {
             let mesh = shared.lock().unwrap();
             let Some(frame) = mesh.local_tx(false, payload, mesh.now()) else {
@@ -1721,7 +1754,29 @@ impl CommsDevice for UartComms {
         };
         let recovery_command = routed.as_ref().is_some_and(|frame| frame.command);
         let payload = routed.as_ref().map_or(payload, |frame| &frame.bytes[..]);
-        let _guard = self.write_lock.lock().unwrap();
+        #[cfg(target_os = "linux")]
+        let mut write_state = self.write_lock.lock().unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let _write_state = self.write_lock.lock().unwrap();
+        #[cfg(target_os = "linux")]
+        let virtual_wire_now =
+            if simulated_serial_pty() && matches!(self.protocol, SerialProtocol::RawUart) {
+                crate::simulation_clock_ms()
+            } else {
+                None
+            };
+        #[cfg(target_os = "linux")]
+        if let Some(now) = virtual_wire_now
+            && !write_state.wire.ready(now)
+        {
+            // A second writer may have committed while this call wrapped the
+            // recovery envelope. This refusal occurs before any serial bytes.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "simulated UART wire is still transmitting",
+            )
+            .into());
+        }
         let len = payload.len();
 
         if len == 0 || len > u16::MAX as usize {
@@ -1749,6 +1804,11 @@ impl CommsDevice for UartComms {
                         self.inner.as_raw_fd(),
                         uart_wire_timeout(framed.len(), self.baud_rate),
                     )?;
+                    if let Some(now) = virtual_wire_now {
+                        write_state
+                            .wire
+                            .committed(now, framed.len(), self.baud_rate);
+                    }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {

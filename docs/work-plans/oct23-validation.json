@@ -319,7 +319,7 @@
     }
   ],
   "next": [
-    "Rebuild all7 firmware and GroundStation using SDK327049b and RFD LoRa scheduling disabled; run original coupled network/command/sequence gates and600-second soak without relaxing delivery or latency assertions.",
+    "Complete original GroundStation restart and600-second network/source/SD gates for the frozen SDK327 + UART-fidelity cohort; all7 builds and short/120-second gates passed. Do not relax assertions.",
     "Extend optional radio simulator with bounded shared-air/RFD-owned arbitration, finite modem buffers and GS/RRLS/RF three-node tests; keep LoRa scheduler disabled for RFD and existing HITL procedure behavior unchanged.",
     "Implement paired checklist definition/progress synchronization with incremental per-document persistence/reconciliation; preserve operational state, recovery progress and explicit conflicts.",
     "Publish manually built simulator image only after source/image/test provenance is complete.",
@@ -346,5 +346,50 @@
     "second": "Test-fire and flight sequences with real network failure/recovery and correct persisted checklist/qualification behavior.",
     "then": "Remaining UI, RRLS, platform and release backlog.",
     "fc_flash": "User accepts current FC453552/474624 production flash;95percent target no longer blocks network fixes."
+  },
+  "validation_update": {
+    "source": "SDK runtime327049b; test-only SDK follow-up8de7185 (CI7660 passed); all7 firmware rebuilt with RFD LoRa scheduler disabled",
+    "uart_fidelity": {
+      "cause": "PTY tcdrain returned before the emulator serialized bytes at115200 baud; 19503B backlog delayed a command1518ms before RF received it",
+      "change": "Explicit simulated PTY plus virtual-clock mode now models UART8N1 drain with10ms clock lookahead. Priority worker retains queued frames until transport readiness. Physical UART behavior is unchanged.",
+      "trace": {
+        "before_max_pending_bytes": 19503,
+        "after_max_pending_bytes": 316,
+        "after_uart_overruns": 0,
+        "managed_variable_round_ms": [
+          290,
+          60,
+          50
+        ],
+        "original_limit_ms": 500
+      },
+      "hitl": "Combined testing+HITL no longer consumes forwarded commands as simulator no-ops; standalone HITL behavior retained",
+      "native_tests": {
+        "backend_passed": 437,
+        "backend_ignored": 2,
+        "map_passed": 55,
+        "production_check": "passed",
+        "negative_control": "Old worker fails the new ownership/priority regression at runtime"
+      },
+      "jupiter": {
+        "image": "seds-firmware-simulator:uart-drain-v4-20261025",
+        "traced_short": "passed",
+        "untraced_short": "passed",
+        "pressure120_network_source_daq_fc_sd": "all passed",
+        "gs_restart": "running",
+        "pressure600": "not started"
+      },
+      "limits": [
+        "No physical RFD performance claim",
+        "Shared64kbps medium, finite modem FIFO and three-node GS/RRLS/RF fidelity remain pending",
+        "No package/image release until qualification"
+      ]
+    },
+    "fc_current": {
+      "production_flash_bytes": 453552,
+      "capacity_bytes": 474624,
+      "user_accepted": true
+    },
+    "remaining_rrls_audit": "drain_recovery_frames pops up to4 frames before serial writes; repair ownership and apply UART drain to that path separately after the frozen baseline qualification"
   }
 }
