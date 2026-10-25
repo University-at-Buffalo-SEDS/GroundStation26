@@ -615,6 +615,9 @@ impl FlightSimState {
 
     fn apply_command(&mut self, cmd: &TelemetryCommand, now_ms: u64) -> bool {
         match cmd {
+            // Only telemetry_task may authorize and normalize this internal
+            // intent; direct model calls must not bypass the dispatch check.
+            TelemetryCommand::AutomaticAbort => return false,
             TelemetryCommand::Abort => {
                 self.launch_sequence_started_ms = None;
                 self.actuator_igniter_sequence_started_ms = None;
@@ -1512,6 +1515,17 @@ pub fn _next_state_aware_packet() -> TelemetryResult<Option<Packet>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "testing")]
+    #[test]
+    fn automatic_abort_intent_requires_the_normal_dispatch_guard() {
+        let mut sim = super::FlightSimState::new();
+        let valves = sim.valves.clone();
+        let flight_state = sim.flight_state;
+        assert!(!sim.apply_command(&crate::types::TelemetryCommand::AutomaticAbort, 1_000));
+        assert_eq!(sim.valves, valves);
+        assert_eq!(sim.flight_state, flight_state);
+    }
+
     #[cfg(all(feature = "testing", feature = "hitl_mode"))]
     #[test]
     fn hitl_controls_are_forwarded_without_simulating_output_effects() {
