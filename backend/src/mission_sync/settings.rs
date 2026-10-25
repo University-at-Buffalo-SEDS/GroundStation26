@@ -8,6 +8,7 @@ pub const FILL: &str = "mission/fill_targets";
 pub const LIMITS: &str = "mission/gse_limits";
 pub const FLIGHT: &str = "mission/saved_flight_setup";
 pub const AUTO_ZERO: &str = "mission/auto_zero_preference";
+pub const POSITIONS: &str = "mission/saved_station_positions";
 
 #[derive(Clone)]
 pub struct Settings {
@@ -15,6 +16,7 @@ pub struct Settings {
     pub limits: gse_sequence::Config,
     pub flight: flight_setup::FlightSetupConfig,
     pub auto_zero: auto_zero::Settings,
+    pub positions: crate::antenna::positions::SavedPositions,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,6 +60,7 @@ impl Settings {
             ),
             (FLIGHT.into(), wire_value(&self.flight)?),
             (AUTO_ZERO.into(), wire_value(self.auto_zero)?),
+            (POSITIONS.into(), wire_value(&self.positions)?),
         ]);
         for (key, value) in &values {
             self.decode(key, value)?;
@@ -88,6 +91,11 @@ impl Settings {
             AUTO_ZERO => {
                 next.auto_zero = serde_json::from_value(value.clone())?;
                 wire_value(next.auto_zero)?
+            }
+            POSITIONS => {
+                next.positions = serde_json::from_value(value.clone())?;
+                next.positions.validate()?;
+                wire_value(&next.positions)?
             }
             _ => anyhow::bail!("Unsupported inert mission document"),
         };
@@ -136,7 +144,7 @@ pub fn can_view(key: &str, view_data: bool, calibration_view: bool) -> bool {
         && if key.starts_with("calibration/") {
             calibration_view
         } else {
-            matches!(key, FILL | LIMITS | FLIGHT | AUTO_ZERO)
+            matches!(key, FILL | LIMITS | FLIGHT | AUTO_ZERO | POSITIONS)
         }
 }
 pub fn can_resolve(
@@ -144,10 +152,13 @@ pub fn can_resolve(
     view_data: bool,
     calibration_edit: bool,
     send_commands: bool,
+    admin: bool,
 ) -> bool {
     view_data
         && if key.starts_with("calibration/") {
             calibration_edit
+        } else if key == POSITIONS {
+            admin
         } else {
             matches!(key, FILL | LIMITS | FLIGHT | AUTO_ZERO) && send_commands
         }
@@ -164,6 +175,7 @@ mod tests {
             limits: Default::default(),
             flight: Default::default(),
             auto_zero: Default::default(),
+            positions: Default::default(),
         }
     }
     fn peers() -> Vec<String> {
@@ -184,7 +196,7 @@ mod tests {
         let mut a = model();
         a.limits.dry_self_test_confirmed = true;
         let docs = a.snapshot().unwrap();
-        assert_eq!(docs.len(), 4);
+        assert_eq!(docs.len(), 5);
         assert!(
             !docs[LIMITS]
                 .as_object()
@@ -312,11 +324,62 @@ mod tests {
     #[test]
     fn conflict_permissions_match_existing_setting_apis() {
         assert!(can_view(FILL, true, false));
+        assert!(can_view(POSITIONS, true, false));
+        assert!(!can_resolve(POSITIONS, true, true, true, false));
+        assert!(can_resolve(POSITIONS, true, false, false, true));
         assert!(!can_view("calibration/ch1", true, false));
-        assert!(!can_resolve(FILL, true, true, false));
-        assert!(can_resolve(FILL, true, false, true));
-        assert!(!can_resolve("calibration/ch1", true, false, true));
-        assert!(can_resolve("calibration/ch1", true, true, false));
-        assert!(!can_resolve("operational/abort", true, true, true));
+        assert!(!can_resolve(FILL, true, true, false, false));
+        assert!(can_resolve(FILL, true, false, true, false));
+        assert!(!can_resolve("calibration/ch1", true, false, true, false));
+        assert!(can_resolve("calibration/ch1", true, true, false, false));
+        assert!(!can_resolve("operational/abort", true, true, true, true));
+    }
+    #[test]
+    fn station_position_edits_conflict_and_remain_pending_until_reviewed_and_idle() {
+        let a = model();
+        let mut b = model();
+        let mut ca = coordinator("gs", &a, true);
+        let mut cb = coordinator("rrls", &b, true);
+        let mut left = a.snapshot().unwrap()[POSITIONS].clone();
+        left["ground_station"] = json!({"latitude":43.0,"longitude":-78.8,
+            "altitude_m":null,"accuracy_m":null,"source":"manual"});
+        let mut right = b.snapshot().unwrap()[POSITIONS].clone();
+        right["rrls"] = left["ground_station"].clone();
+        for (c, value) in [(&mut ca, left.clone()), (&mut cb, right)] {
+            let old = c.store().document(POSITIONS).unwrap().clone();
+            c.resolve(POSITIONS, &old, value, &peers()).unwrap();
+        }
+        cb.merge(
+            "test",
+            POSITIONS,
+            ca.store().document(POSITIONS).unwrap(),
+            &peers(),
+        )
+        .unwrap();
+        let conflict = cb.store().document(POSITIONS).unwrap().clone();
+        assert_eq!(conflict.heads.len(), 2);
+        cb.resolve(POSITIONS, &conflict, left.clone(), &peers())
+            .unwrap();
+        let pending = cb
+            .pending()
+            .into_iter()
+            .find(|p| p.key == POSITIONS)
+            .unwrap();
+        assert!(
+            !b.apply_and_save(&pending, false, false, |_, _| panic!("must defer"))
+                .unwrap()
+        );
+        assert!(b.positions.ground_station.is_none());
+        b.apply_and_save(&pending, true, false, |key, next| {
+            assert_eq!(key, POSITIONS);
+            assert_eq!(wire_value(&next.positions)?, left);
+            Ok(())
+        })
+        .unwrap();
+        cb.applied(&pending).unwrap();
+        assert!(cb.pending().is_empty());
+        let mut bad = left;
+        bad["revision"] = json!(999);
+        assert!(b.decode(POSITIONS, &bad).is_err());
     }
 }

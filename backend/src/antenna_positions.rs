@@ -18,14 +18,14 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 const MAX_BYTES: u64 = 16 * 1024;
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
     #[default]
     Manual,
     DeviceLocation,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Coordinate {
     pub latitude: f64,
@@ -73,6 +73,21 @@ impl Coordinate {
         }
     }
 }
+/// Saved configuration only: no live GPS, local revision, clock or editor.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedPositions {
+    pub ground_station: Option<Coordinate>,
+    pub rrls: Option<Coordinate>,
+}
+impl SavedPositions {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for position in [&self.ground_station, &self.rrls].into_iter().flatten() {
+            position.validate()?;
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
@@ -113,6 +128,32 @@ struct Store {
     document: Document,
 }
 impl Store {
+    fn snapshot(&self) -> SavedPositions {
+        SavedPositions {
+            ground_station: self.document.ground_station.clone(),
+            rrls: self.document.rrls.clone(),
+        }
+    }
+    fn compare_and_save(
+        &mut self,
+        expected: &SavedPositions,
+        next: SavedPositions,
+    ) -> anyhow::Result<()> {
+        next.validate()?;
+        anyhow::ensure!(
+            self.snapshot() == *expected,
+            "Saved station positions changed locally"
+        );
+        self.save(
+            Update {
+                expected_revision: self.document.revision,
+                ground_station: next.ground_station,
+                rrls: next.rrls,
+            },
+            "paired station",
+        )?;
+        Ok(())
+    }
     fn open(path: PathBuf) -> anyhow::Result<Self> {
         let document = match fs::File::open(&path) {
             Ok(file) => {
@@ -214,6 +255,24 @@ fn store() -> &'static Mutex<Option<Store>> {
             }
         })
     })
+}
+pub fn saved_snapshot() -> anyhow::Result<SavedPositions> {
+    store()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(Store::snapshot)
+        .ok_or_else(|| anyhow::anyhow!("Cannot load saved station positions"))
+}
+/// The content comparison and durable write share one lock with administrator
+/// edits. A concurrent local edit remains intact and must be resolved explicitly.
+pub fn compare_and_save(expected: &SavedPositions, next: SavedPositions) -> anyhow::Result<()> {
+    store()
+        .lock()
+        .unwrap()
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("Cannot load saved station positions"))?
+        .compare_and_save(expected, next)
 }
 pub fn fallbacks() -> (Option<Fix>, Option<Fix>) {
     let store = store().lock().unwrap();
@@ -348,5 +407,41 @@ mod tests {
         assert!(fix.manual && !fix.stale);
         assert_eq!(fix.altitude_reference, AltitudeReference::Unknown);
         assert!(super::super::encode_position(&fix).is_none());
+    }
+    #[test]
+    fn paired_content_excludes_local_metadata_and_rejects_concurrent_edits() {
+        let dir = std::env::temp_dir().join(format!(
+            "station-position-pairing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("positions.json");
+        let mut s = Store::open(path.clone()).unwrap();
+        let expected = s.snapshot();
+        let remote = SavedPositions {
+            ground_station: None,
+            rrls: Some(position()),
+        };
+        s.save(update(0), "local admin").unwrap();
+        assert!(s.compare_and_save(&expected, remote.clone()).is_err());
+        assert_eq!(s.document.updated_by.as_deref(), Some("local admin"));
+        let current = s.snapshot();
+        s.compare_and_save(&current, remote.clone()).unwrap();
+        assert_eq!(Store::open(path.clone()).unwrap().snapshot(), remote);
+        let value = serde_json::to_value(&remote).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 2);
+        assert!(value.get("revision").is_none());
+        // A failed durable replacement cannot publish a new in-memory value.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(
+            s.compare_and_save(&remote, SavedPositions::default())
+                .is_err()
+        );
+        assert_eq!(s.snapshot(), remote);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

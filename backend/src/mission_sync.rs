@@ -31,6 +31,7 @@ impl Catalog {
         // Bounded disk read/JSON parsing precedes all sequence locks. A later
         // flight import still performs its own file CAS under the save mutex.
         let flight = crate::flight_setup::snapshot_saved().map_err(anyhow::Error::msg)?;
+        let positions = crate::antenna::positions::saved_snapshot()?;
         // Lazy auto-zero preference I/O also precedes the sequence lock.
         let _ = state.auto_zero.lock().unwrap().settings();
         let gse = state.gse.lock().unwrap();
@@ -43,6 +44,7 @@ impl Catalog {
                 limits: gse.engine.config.clone(),
                 flight,
                 auto_zero: zero.settings(),
+                positions,
             }),
         })
     }
@@ -258,8 +260,10 @@ fn step(
                 limits: gse.engine.config.clone(),
                 flight,
                 auto_zero: auto_zero.settings(),
+                positions: crate::antenna::positions::saved_snapshot()?,
             };
             let expected_flight = current.flight.clone();
+            let expected_positions = current.positions.clone();
             current.apply_and_save(&pending, true, false, |key, next| {
                 match key {
                     settings::FILL => {
@@ -282,6 +286,10 @@ fn step(
                     settings::AUTO_ZERO => auto_zero
                         .configure(next.auto_zero)
                         .map_err(anyhow::Error::msg)?,
+                    settings::POSITIONS => crate::antenna::positions::compare_and_save(
+                        &expected_positions,
+                        next.positions.clone(),
+                    )?,
                     _ => anyhow::bail!("Unsupported mission setting"),
                 }
                 Ok(())
@@ -504,6 +512,7 @@ async fn resolve(
         principal.permissions.view_data,
         principal.calibration_access.edit,
         principal.permissions.send_commands,
+        !principal.anonymous && principal.roles.contains(&crate::auth::StreamRole::Admin),
     ) {
         return (
             StatusCode::FORBIDDEN,
@@ -805,7 +814,7 @@ mod tests {
     #[cfg(not(feature = "hitl_mode"))]
     #[tokio::test]
     #[ignore = "requires isolated fake settings directory; never use operator configuration"]
-    async fn inert_worker_persists_four_settings_without_apply_outputs_or_qualification_changes() {
+    async fn inert_worker_persists_saved_settings_without_outputs_or_qualification_changes() {
         let dir = PathBuf::from(
             std::env::var("GS_MISSION_ADAPTER_TEST_DIR")
                 .expect("isolated fake settings directory required"),
@@ -824,6 +833,7 @@ mod tests {
             "GS_AUTO_ZERO_CONFIG",
             "GS_LOADCELL_CALIBRATION_PATH",
             "GS_CALIBRATION_CONFIG_PATH",
+            "GS_STATION_POSITIONS_PATH",
         ] {
             assert!(
                 PathBuf::from(std::env::var(name).expect("explicit fake path required"))
@@ -860,6 +870,13 @@ mod tests {
         desired.flight.selected_profile_id = "wind_2".into();
         desired.limits.pressure_step_psi = 25.;
         desired.auto_zero.enabled = false;
+        desired.positions.rrls = Some(crate::antenna::positions::Coordinate {
+            latitude: 43.0,
+            longitude: -78.8,
+            altitude_m: None,
+            accuracy_m: None,
+            source: crate::antenna::positions::Source::Manual,
+        });
         for (key, value) in desired.snapshot().unwrap() {
             let doc = Document {
                 heads: vec![paired_settings::Revision {
@@ -914,6 +931,10 @@ mod tests {
             "wind_2"
         );
         assert!(!state.auto_zero.lock().unwrap().settings().enabled);
+        assert_eq!(
+            crate::antenna::positions::saved_snapshot().unwrap(),
+            desired.positions
+        );
         let gse = state.gse.lock().unwrap();
         assert!(gse.engine.config.dry_self_test_confirmed);
         assert!(gse.calibration_import_allowed());

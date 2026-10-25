@@ -21,9 +21,17 @@ claim a valid antenna elevation reference.
 `GET /api/station_positions` returns the saved configuration and revision;
 `POST` takes `expected_revision`, `ground_station` and `rrls`. Each coordinate
 contains `latitude`, `longitude`, optional `altitude_m`/`accuracy_m`, and source
-`manual` or `device_location`. These settings currently persist on the selected
-host; automatic station GPS and paired-settings replication remain separate
-integration work.
+`manual` or `device_location`.
+
+Paired installations share the saved coordinate content through the signed
+mission-settings channel, using its existing bounded radio allowance. Each host
+keeps its own file revision, editor and save time; live GPS and motion are never
+part of this document. Imports wait for the existing safe Idle state. Concurrent
+offline edits remain conflicts until an application administrator selects a
+version in Paired settings. A simultaneous local edit also blocks replacement.
+Synchronization does not send commands, publish a synthetic GPS lock or change
+sequence qualification. Automatic station GPS remains separate from saved
+configuration.
 
 The isolated `station_positions_preview` example and
 `tests/station-positions-browser.mjs` test bounds, synthetic device location,
