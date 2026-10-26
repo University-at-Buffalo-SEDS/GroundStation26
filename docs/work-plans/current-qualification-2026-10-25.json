@@ -1,5 +1,5 @@
 {
-  "updated_utc": "2026-10-26T05:57:12.308671+00:00",
+  "updated_utc": "2026-10-26T05:58:57.813378+00:00",
   "source_ready": true,
   "release_ready": true,
   "packages_published": "Maintainer reports SEDSnet4.2.7 release published successfully. Publiccrate source match was independently verified earlier.",
@@ -172,8 +172,8 @@
   },
   "source_pushes": {
     "status": "qualified_firmware_simulator_and_sdk_main_pushed_and_verified",
-    "backend_dev": "c912b8a (qualified runtime; subsequent commits change qualification documentation only)",
-    "frontend_dev": "01a92c97fed53d873e84361366edb1c26199fe3d",
+    "backend_dev": "b851015 (reviewed workspace/config/editor cleanup after qualified runtime c912b8a)",
+    "frontend_dev": "5399321 (runtime unchanged; final UI audit and browser regression)",
     "simulator_main": "1627897a49e3f669662d3dde9663aceae6cdcc1d",
     "board_branch": "migration/sedlaunch-sedsnet-mainline",
     "boards": {
@@ -182,13 +182,14 @@
       "PowerBoard26": "733da336280e9d59503af20e688a68ff6ca4d966",
       "ValveBoard26": "7701dd2fa4038fd931eef3d6e24c00518f2b6b0f",
       "DAQ-Board": "a2613d110c8c8ff1c358d11fb792250c8b95672f",
-      "ActuatorBoard26": "bf0ba6eb5625d5d4e502c19ab89b5adefb927e7d",
+      "ActuatorBoard26": "6539f57 (clangd formatting only after qualified firmware bf0ba6e)",
       "gateway-board26": "72c8d8deb97194d778af141b6df05415d0ee453b"
     },
     "frontend_main_promoted": false,
-    "scope": "All seven firmware migration branches and simulator main pushed and verified. SDK main qualification-only updates pushed; SDK dev remains unchanged with matching released runtime. Backend dev carries this qualification record; frontend remains dev01a92c97 with no main promotion. No tag, release, package publication or physical hardware action performed here.",
+    "scope": "Qualified firmware branches and simulator main pushed and verified. SDK main qualification-only updates pushed; SDK dev remains aligned with its own remote. Final UI audit/regression is on frontend dev5399321; GroundStation devb851015 includes tested workspace/settings cleanup. This record adds documentation only. No frontend main promotion, tag, release, package publication or physical hardware action.",
     "sdk_main": "56a6848caec839cdef11e08c62581d288c9aa3aa",
-    "sdk_dev": "a2a7419791836e8ab7eaffc74914db61affc94c8"
+    "sdk_dev": "a2a7419791836e8ab7eaffc74914db61affc94c8",
+    "frontend_runtime": "01a92c97fed53d873e84361366edb1c26199fe3d"
   },
   "github_release": {
     "version": "4.2.6",
@@ -245,5 +246,12 @@
     "sequence_tests_passed": 37,
     "webassembly_release": "PASS",
     "remaining_software_ui_changes": []
+  },
+  "final_ui_source_sync": {
+    "frontend_dev": "5399321",
+    "backend_cleanup_commit": "b851015",
+    "actuator_editor_commit": "6539f57",
+    "validation": "140native UI tests;10browser suites;54settings tests;37sequence tests;release WebAssembly build",
+    "scope": "Existing dev/migration branches; all tracked branch tips checked against remotes."
   }
 }
