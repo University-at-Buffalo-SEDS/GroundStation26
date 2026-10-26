@@ -1,5 +1,5 @@
 {
-  "updated_utc": "2026-10-26T00:42:44.025854+00:00",
+  "updated_utc": "2026-10-26T00:51:24.104313+00:00",
   "source_ready": false,
   "release_ready": false,
   "packages_published": "4.2.7 public crates.io version metadata confirmed; PyPI4.2.7 returns404 at this check. Publication occurs on maintainer Mac.",
@@ -25,7 +25,8 @@
         "Final original-cohort three-source600, two/three-source120s restart, relay60, ordinary-flight positive/negative70 and test-fire70 checks passed in their separately recorded artifact scopes.",
         "Final original-cohort two-source600 failed one battery voltage window:8 reports/10s, maxgap3050ms. All loadcell preservation, actual RF GPS/control and SD reconciliation checks passed independently. Original failure remains retained.",
         "Isolated actual-SDK queue fixture reproduces accepted best-effort voltage eviction. Fair admission plus nine-slot startup passes36 protected-SD/background cases; native causality remains unproven. Candidate26e98a0 factory and SDK-absent telemetry-OFF factory pass with zero warnings.",
-        "Final SDK full matrix passed: normal727Rust/86Python, compact753Rust/14Python, zero binding skips, full600s pressure soak; GitHubb38 CI passed. GitLab automatically mirrored b38, latest pipeline result still to verify."
+        "Final SDK full matrix passed: normal727Rust/86Python, compact753Rust/14Python, zero binding skips, full600s pressure soak; GitHubb38 CI passed. GitLab automatically mirrored b38; pipeline7684 rust-tests failed and protected joblog is needed for diagnosis.",
+        "ActualARM128-byte inline payload makesTXentries224B: original512 has2TXslots and1536candidate has6, correcting prior64-bytepayload math. Corrected2048candidatefactorypasses and exactpayload1289slotfixturepasses36/36faircases; startup4144-byte allocation assertion and linked acceptance pending."
       ],
       "remaining": [
         "Complete selected ValveBoard fair-admission/1536-byte startup candidate short comparison and actual allocation assertion, then matching affected600s source/SD/GPS acceptance. Preserve original530-540s voltage freshness failure.",
@@ -168,9 +169,9 @@
     "scope": "Historical4.2.6 frozen cohort. Current4.2.7 candidate source/artifact manifests are separate; do not interpret these as latest qualification."
   },
   "source_pushes": {
-    "status": "public_4_2_7_crate_available_backend_dev_push_ready",
+    "status": "backend_dev_pushed_after_public_sdk_available",
     "sdk_main_and_dev": "b38b017",
-    "backend_dev": "83d43ed plus final8c298f3 test-only/platform follow-up",
+    "backend_dev": "c912b8a",
     "frontend_dev": "01a92c97fed53d873e84361366edb1c26199fe3d",
     "simulator_main": "1fd7ff6",
     "board_branch": "migration/sedlaunch-sedsnet-mainline",
@@ -184,7 +185,7 @@
       "ActuatorBoard26": "79238da"
     },
     "frontend_main_promoted": false,
-    "scope": "Public4.2.7 API now available, lifting dependent backend push hold. Backend code was qualified atA748; two-source network acceptance remains blocked on ValveBoard candidate. Frontend staysdev; no4.2.7tag or remote package publication authorized from this host."
+    "scope": "GroundStationdevc912b8a pushed after public SDK4.2.7 availability. Existing unrelatedWIP preserved unstaged. Frontend remainsdev01a92c97; no mainpromotion or package upload from thishost. ValveBoard endurance qualification remains pending."
   },
   "github_release": {
     "version": "4.2.6",
@@ -201,16 +202,18 @@
     "check_scope": "public version metadata only, no credentials"
   },
   "current_candidate": {
-    "valve_board": "26e98a00e7fd01c88cde89708205ce0606a4bf75",
+    "valve_board": "d5c699b82bd133352a9d91032a68749a91690648",
     "sdk_source": "b38b017c8e4c963682362d34fa1362c67607d4d1",
     "factory_evidence": "FirmwareSimulator/docs/qualification/valve-fair-admission-candidate-2026-10-25.json",
-    "native_status": "short_comparison_running_endurance_pending",
-    "release_ready": false
+    "native_status": "corrected_start2048_short_pending_prior1536_is_six_slots_not_nine",
+    "release_ready": false,
+    "expected_startup_queue_storage_bytes": 4144
   },
   "publication_check": {
     "checked_utc": "2026-10-26T00:42:44.025854+00:00",
     "crates_io_4_2_7": "available",
     "pypi_4_2_7": "HTTP404",
-    "gitlab_main": "b38b017c8e4c963682362d34fa1362c67607d4d1"
+    "gitlab_main": "b38b017c8e4c963682362d34fa1362c67607d4d1",
+    "gitlab_b38_pipeline": "7684failed rust-tests job29023; publictraceHTTP401; finalerror requested"
   }
 }
