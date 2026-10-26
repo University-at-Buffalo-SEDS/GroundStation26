@@ -49,6 +49,10 @@ def main():
                 config={'version':1,'av_bay':{'interface':'serial','port':os.ttyname(slave),'baud_rate':0 if sys.platform=='darwin' else 115200,'protocol':'raw_uart'},'fill_box':{'interface':'serial','port':str(work/'absent-fill-uart'),'protocol':'raw_uart'}}
                 cfg=work/'comms.json';cfg.write_text(json.dumps(config));log=(work/'backend.log').open('w');logs.append(log)
                 env=os.environ.copy();env.update(GS_HTTPS_BIND_ADDRESS='off',GS_RRLS_ROLE=role,GS_BIND_ADDRESS=f'127.0.0.1:{port}',GS_COMMS_LINK_CONFIG=str(cfg),GS_USERS_FILE=str(work/'users.json'),GS_VIDEO_MANAGED='0',GROUNDSTATION_TIMESYNC='0')
+                if role=='primary':
+                    # Match systemd's ordinary launch: no simulator-only role
+                    # override may conceal disabled primary recovery startup.
+                    env.pop('GS_RRLS_ROLE',None)
                 process=subprocess.Popen([str(binary)],cwd=work,env=env,stdout=log,stderr=subprocess.STDOUT);procs.append(process)
                 os.set_blocking(master,False);selector.register(master,selectors.EVENT_READ,role);buffers[role]=bytearray();peers[role]=(master,slave,port)
             def status(role):
@@ -94,9 +98,11 @@ def main():
                 if not ready:
                     try:
                         first=status('rrls');primary=status('primary')
-                        assert first['role']=='rrls' and primary['role']=='primary';ready=True
+                    except OSError:pass
+                    else:
+                        assert first['role']=='rrls' and primary['role']=='primary', {'rrls':first,'primary':primary}
                         with urllib.request.urlopen(f'http://127.0.0.1:{peers["rrls"][2]}/',timeout=1) as response:assert response.status==200
-                    except (OSError,AssertionError):pass
+                        ready=True
                 for at,name in [(4,'standby'),(11,'relaying'),(17,'restored'),(18,'quiet'),(21,'rrls_disconnected')]:
                     if ready and elapsed>=at and name not in checkpoint:
                         checkpoint[name]={'primary':status('primary'),'rrls':status('rrls')}

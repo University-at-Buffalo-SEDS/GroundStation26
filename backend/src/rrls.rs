@@ -44,13 +44,42 @@ pub fn is_rrls() -> bool {
 pub type Shared = Arc<Mutex<Mesh>>;
 static RADIO: OnceLock<(String, Shared)> = OnceLock::new();
 
+fn role_for_link(
+    link: &crate::comms_config::CommsLinkConfig,
+    configured: Option<&str>,
+) -> anyhow::Result<Option<Role>> {
+    use crate::comms_config::{CommsLinkConfig as L, SerialProtocol};
+    match configured {
+        Some("off") => Ok(None),
+        Some("primary") => Ok(Some(Role::Primary)),
+        Some("rrls") => Ok(Some(Role::Rrls)),
+        Some(_) => anyhow::bail!("GS_RRLS_ROLE must be off, primary, or rrls"),
+        None => Ok(match link {
+            L::Serial { serial }
+            | L::CustomSerial { serial }
+            | L::RaspberryPiGpioUart { serial }
+                if serial.protocol == SerialProtocol::RawUart =>
+            {
+                Some(Role::Primary)
+            }
+            _ => None,
+        }),
+    }
+}
+
 pub fn configure(link: &crate::comms_config::CommsLinkConfig) -> anyhow::Result<()> {
     use crate::comms_config::{CommsLinkConfig as L, SerialProtocol};
-    let role = match std::env::var("GS_RRLS_ROLE").ok().as_deref() {
-        None | Some("off") => return Ok(()),
-        Some("primary") => Role::Primary,
-        Some("rrls") => Role::Rrls,
-        Some(_) => anyhow::bail!("GS_RRLS_ROLE must be off, primary, or rrls"),
+    let configured = std::env::var("GS_RRLS_ROLE").ok();
+    let Some(role) = role_for_link(link, configured.as_deref())? else {
+        log::info!(
+            "Radio recovery disabled: {}",
+            if configured.as_deref() == Some("off") {
+                "GS_RRLS_ROLE=off"
+            } else {
+                "AV-bay interface is not raw UART"
+            }
+        );
+        return Ok(());
     };
     let serial = match link {
         L::Serial { serial } | L::CustomSerial { serial } | L::RaspberryPiGpioUart { serial } => {
@@ -70,6 +99,11 @@ pub fn configure(link: &crate::comms_config::CommsLinkConfig) -> anyhow::Result<
     RADIO
         .set((serial.port.clone(), Arc::new(Mutex::new(mesh))))
         .map_err(|_| anyhow::anyhow!("RRLS radio already configured"))?;
+    log::info!(
+        "Radio recovery role={role:?} port={} automatic={}",
+        serial.port,
+        configured.is_none()
+    );
     Ok(())
 }
 
@@ -985,6 +1019,34 @@ fn decode(bytes: &[u8]) -> Option<(u8, &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn raw_uart_service_launch_defaults_to_primary_and_preserves_explicit_roles() {
+        for interface in ["serial", "custom_serial", "raspberry_pi_gpio_uart"] {
+            let link = serde_json::from_value(serde_json::json!({
+                "interface": interface, "port": "/dev/test-radio", "protocol": "raw_uart"
+            }))
+            .unwrap();
+            assert_eq!(role_for_link(&link, None).unwrap(), Some(Role::Primary));
+            assert_eq!(role_for_link(&link, Some("off")).unwrap(), None);
+            assert_eq!(
+                role_for_link(&link, Some("rrls")).unwrap(),
+                Some(Role::Rrls)
+            );
+            assert_eq!(
+                role_for_link(&link, Some("primary")).unwrap(),
+                Some(Role::Primary)
+            );
+            assert!(role_for_link(&link, Some("invalid")).is_err());
+        }
+        for config in [
+            serde_json::json!({"interface":"serial","port":"/dev/test-radio","protocol":"packet_framed"}),
+            serde_json::json!({"interface":"i2c"}),
+        ] {
+            let link = serde_json::from_value(config).unwrap();
+            assert_eq!(role_for_link(&link, None).unwrap(), None);
+        }
+    }
+
     #[test]
     #[cfg(feature = "hitl_mode")]
     fn recovery_liveness_uses_the_shared_virtual_clock_when_configured() {

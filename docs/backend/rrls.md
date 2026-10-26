@@ -31,8 +31,13 @@ the main station's direct-link health. RSSI is not used by this implementation.
 
 ## Operation
 
-Set `GS_RRLS_ROLE=primary` on the main GroundStation and `GS_RRLS_ROLE=rrls` on
-RRLS. Leaving it unset preserves the existing two-radio behavior.
+Raw UART radio links default to `primary`, including a backend launched directly
+by systemd. `run_rrls.py` selects `GS_RRLS_ROLE=rrls` for the receiver/relay.
+An explicit `GS_RRLS_ROLE=primary` is also accepted. Set `GS_RRLS_ROLE=off` only
+when intentionally disabling recovery mesh participation. Other interfaces keep
+recovery disabled unless a role is explicitly requested; requesting recovery on
+an incompatible interface fails startup. A primary without an available relay
+continues attempting the direct avionics path.
 
 The main station emits a small link-health message twice per second. After
 three seconds without direct AV-bay packets or radio-window advertisements, it
