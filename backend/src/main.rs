@@ -49,6 +49,7 @@ mod ring_buffer;
 mod rocket_commands;
 mod rrls;
 mod rrls_radio;
+mod rrls_topology;
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 mod safety_task;
 mod sequences;

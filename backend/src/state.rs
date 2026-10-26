@@ -1045,6 +1045,9 @@ impl AppState {
                 stats: None,
             });
         }
+        if let Some(observation) = crate::rrls::topology_observation() {
+            crate::rrls_topology::project(&mut nodes, &mut links, now_ms, observation);
+        }
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
 
         NetworkTopologyMsg {

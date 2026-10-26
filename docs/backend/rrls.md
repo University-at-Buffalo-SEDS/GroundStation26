@@ -214,3 +214,15 @@ is best-effort: browser local-network policies, certificate trust and WebCrypto
 secure-context requirements still apply. Browsers retain each origin's own saved
 login; cross-origin login handoff is not enabled. An unloaded page cannot discover
 a replacement server until its application assets can be loaded.
+
+### Observed topology
+
+The network snapshot projects the physical recovery path separately from SDK
+logical routes. Recent relayed reception shows GS–RRLS–RF without a direct
+GS–RF edge. Direct reception must be observed before the direct edge is shown
+again. A delayed READY can establish radio presence without renewing command
+readiness. The detail panel distinguishes relayed telemetry from confirmed
+command readiness; stale peer observations become offline after 15 seconds.
+A previously observed RRLS remains visible in standby. A never-observed standby
+radio cannot be inferred from configuration alone because standby does not
+advertise SDK discovery. Downstream board connections still come from discovery.

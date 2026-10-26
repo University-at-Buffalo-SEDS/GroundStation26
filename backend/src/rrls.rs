@@ -195,6 +195,8 @@ pub struct Mesh {
     direct_since: Option<u64>,
     fallback: bool,
     relay_seen: Option<u64>,
+    topology_peer_seen: Option<u64>,
+    topology_relay_rx: Option<u64>,
     last_ready_sequence: Option<u32>,
     last_ready_sent: Option<u64>,
     queue: VecDeque<Queued>,
@@ -231,6 +233,8 @@ impl Mesh {
             direct_since: None,
             fallback: false,
             relay_seen: None,
+            topology_peer_seen: None,
+            topology_relay_rx: None,
             last_ready_sequence: None,
             last_ready_sent: None,
             queue: VecDeque::new(),
@@ -871,6 +875,9 @@ impl Mesh {
                     if session != self.session {
                         return None;
                     }
+                    // Presence is separate from the command lease: a delayed
+                    // valid reply proves reception, not current readiness.
+                    self.topology_peer_seen = Some(now);
                     if self.last_ready_sequence.is_some_and(|old| {
                         let delta = seq.wrapping_sub(old);
                         delta == 0 || delta > i32::MAX as u32
@@ -907,14 +914,14 @@ impl Mesh {
                     }
                     None
                 }
-                (Role::Primary, DOWN_DATA) => Some(Outgoing {
-                    command: false,
-                    bytes: data.to_vec(),
-                }),
-                (Role::Primary, DOWN_COMMAND) => Some(Outgoing {
-                    command: true,
-                    bytes: data.to_vec(),
-                }),
+                (Role::Primary, DOWN_DATA | DOWN_COMMAND) => {
+                    self.topology_peer_seen = Some(now);
+                    self.topology_relay_rx = Some(now);
+                    Some(Outgoing {
+                        command: kind == DOWN_COMMAND,
+                        bytes: data.to_vec(),
+                    })
+                }
                 (Role::Rrls, UP_DATA | UP_COMMAND) if self.active(now) => {
                     self.enqueue(
                         Outgoing {
@@ -1016,9 +1023,52 @@ fn decode(bytes: &[u8]) -> Option<(u8, &[u8])> {
         .then_some((bytes[3], &bytes[4..n]))
 }
 
+/// Observed physical recovery path, separate from SEDSnet's logical routes.
+#[derive(Clone, Copy)]
+pub(crate) struct TopologyObservation {
+    pub peer_age_ms: Option<u64>,
+    pub direct_age_ms: Option<u64>,
+    pub relaying: bool,
+    pub command_ready: bool,
+}
+impl Mesh {
+    fn topology_observation(&self, now: u64) -> TopologyObservation {
+        TopologyObservation {
+            peer_age_ms: self.topology_peer_seen.map(|last| now.saturating_sub(last)),
+            direct_age_ms: self.last_direct.map(|last| now.saturating_sub(last)),
+            relaying: self.active(now) || self.topology_relay_rx
+                .is_some_and(|last| now.saturating_sub(last) < LOSS_MS),
+            command_ready: self.active(now),
+        }
+    }
+}
+pub(crate) fn topology_observation() -> Option<TopologyObservation> {
+    let (_, shared) = RADIO.get()?;
+    let mesh = shared.lock().unwrap();
+    (mesh.role == Role::Primary).then(|| mesh.topology_observation(mesh.now()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delayed_ready_is_presence_without_extending_command_lease() {
+        let mut mesh = Mesh::new(Role::Primary, 42);
+        mesh.sequence = 20;
+        mesh.fallback = true;
+        let mut payload = 42u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        assert!(mesh.incoming(true, &encode(READY, &payload), 10_000).is_none());
+        let observed = mesh.topology_observation(10_000);
+        assert_eq!(observed.peer_age_ms, Some(0));
+        assert!(!observed.command_ready);
+        assert!(!observed.relaying);
+        mesh.incoming(true, &encode(DOWN_DATA, &[1, 2, 3]), 10_001);
+        assert!(mesh.topology_observation(10_002).relaying);
+        assert!(!mesh.topology_observation(10_002).command_ready);
+        assert!(!mesh.topology_observation(13_001).relaying);
+    }
+
     #[test]
     fn raw_uart_service_launch_defaults_to_primary_and_preserves_explicit_roles() {
         for interface in ["serial", "custom_serial", "raspberry_pi_gpio_uart"] {
