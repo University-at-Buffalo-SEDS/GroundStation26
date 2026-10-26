@@ -1,12 +1,12 @@
 {
-  "updated_utc": "2026-10-26T00:51:24.104313+00:00",
+  "updated_utc": "2026-10-26T02:59:25.592249+00:00",
   "source_ready": false,
   "release_ready": false,
   "packages_published": "4.2.7 public crates.io version metadata confirmed; PyPI4.2.7 returns404 at this check. Publication occurs on maintainer Mac.",
   "priorities": [
     {
       "task": "4.2.7 independent-endpoint multicast and full flight acceptance",
-      "status": "two_source_battery_freshness_failure_candidate_under_validation",
+      "status": "final_valve_stack_fix_under_matching_artifact_qualification",
       "results": [
         "Actual RF GPS C-ABI publication reproduced CAN1/radio0 despite success. SDK3971aef preserves distinct endpoint roles and now emits CAN1/radio1; redundant paths, explicit policies and retry ownership retain focused tests.",
         "SDK4.2.7 snapshot55fcdd5 and FC managed-state callback c690a0a compile in all8 factory variants; no overflow. FCSDK-absent/Cargo+rustc-blocked factory also passes.",
@@ -26,16 +26,20 @@
         "Final original-cohort two-source600 failed one battery voltage window:8 reports/10s, maxgap3050ms. All loadcell preservation, actual RF GPS/control and SD reconciliation checks passed independently. Original failure remains retained.",
         "Isolated actual-SDK queue fixture reproduces accepted best-effort voltage eviction. Fair admission plus nine-slot startup passes36 protected-SD/background cases; native causality remains unproven. Candidate26e98a0 factory and SDK-absent telemetry-OFF factory pass with zero warnings.",
         "Final SDK full matrix passed: normal727Rust/86Python, compact753Rust/14Python, zero binding skips, full600s pressure soak; GitHubb38 CI passed. GitLab automatically mirrored b38; pipeline7684 rust-tests failed and protected joblog is needed for diagnosis.",
-        "ActualARM128-byte inline payload makesTXentries224B: original512 has2TXslots and1536candidate has6, correcting prior64-bytepayload math. Corrected2048candidatefactorypasses and exactpayload1289slotfixturepasses36/36faircases; startup4144-byte allocation assertion and linked acceptance pending."
+        "ActualARM128-byte inline payload makesTXentries224B: original512 has2TXslots and1536candidate has6, correcting prior64-bytepayload math. Corrected2048candidatefactorypasses and exactpayload1289slotfixturepasses36/36faircases; startup4144-byte allocation assertion and linked acceptance pending.",
+        "Three-radio candidate with the original4.5KiB pressure worker stack failed with corrupted counters, HardFault and watchdog reset. The new first-error callback localizes a pressure-worker stack violation; this failed capture is preserved.",
+        "Stack-adjusted firmware passes90s native/source checks and strict postvalidation of all9GPS windows. The original wrapper observer-duration error is preserved separately. Final rebuilt artifact currently has healthy two/three-radio endurance prefixes; three-radio measured pressure-stack use4856bytes exceeds the former4608-byte allocation.",
+        "Final-artifact ordinary-flight positive completes full70s with nativeexit0 and unchanged artifacts; actualGPS-loss negative has cancelled queuedlaunch with Firefalse/generation0 and still awaits full70s completion."
       ],
       "remaining": [
-        "Complete selected ValveBoard fair-admission/1536-byte startup candidate short comparison and actual allocation assertion, then matching affected600s source/SD/GPS acceptance. Preserve original530-540s voltage freshness failure.",
-        "Finish release evidence only after affected candidate qualification passes; no package publication from Jupiter."
+        "Complete matching final-artifact two/three-radio600s source/GPS/control/SD gates with zero stack errors and required margins.",
+        "Complete final-artifact GPS-loss negative/test-fire70s and restart120s/relay60s checks; preserve all prior artifacts and failures.",
+        "Record final qualification and push qualified source branches. Leave rerunning transient CI alone as requested; no package upload from this host."
       ]
     },
     {
       "task": "Stable low-latency RF and fill-system communication",
-      "status": "two_source_battery_freshness_failure_candidate_under_validation",
+      "status": "final_stack_fix_endurance_running_prior_three_radio_failure_retained",
       "results": [
         "Two- and three-radio startup,600-second network/source/SD tests and120-second GroundStation restart tests pass. PowerBoard compact is included in the three-radio cohort.",
         "Each long cohort completes59 RF control rounds in100\u2013210ms; source-window preservation is at least99.9131percent. All modeled CAN FIFO overflow counters remain zero.",
@@ -48,8 +52,8 @@
         "FirmwareSimulator/docs/qualification/rrls-telemetry-retention-2026-10-25.json"
       ],
       "remaining": [
-        "Complete selected ValveBoard fair-admission/1536-byte startup candidate short comparison and actual allocation assertion, then matching affected600s source/SD/GPS acceptance. Preserve original530-540s voltage freshness failure.",
-        "Finish release evidence only after affected candidate qualification passes; no package publication from Jupiter."
+        "Complete matching final-artifact two/three-radio600s source/GPS/control/SD gates with zero stack errors and required margins.",
+        "Complete final-artifact GPS-loss negative/test-fire70s and restart120s/relay60s checks; preserve all prior artifacts and failures."
       ]
     },
     {
@@ -185,7 +189,7 @@
       "ActuatorBoard26": "79238da"
     },
     "frontend_main_promoted": false,
-    "scope": "GroundStationdevc912b8a pushed after public SDK4.2.7 availability. Existing unrelatedWIP preserved unstaged. Frontend remainsdev01a92c97; no mainpromotion or package upload from thishost. ValveBoard endurance qualification remains pending."
+    "scope": "Backend runtime devc912b8a and frontend dev01a92c97 pushed; newer local qualification updates pending final results. Firmware source fixes remain local until native gates pass. SDK main/dev a2a7419 is documentation-only after the published matching Rust sources."
   },
   "github_release": {
     "version": "4.2.6",
@@ -202,12 +206,14 @@
     "check_scope": "public version metadata only, no credentials"
   },
   "current_candidate": {
-    "valve_board": "d5c699b82bd133352a9d91032a68749a91690648",
+    "valve_source_tip": "7701dd2 (documentation only after compiled source)",
+    "compiled_board_commit": "ae0514730102a0af1114cb0471b5ea4759626c7d",
     "sdk_source": "b38b017c8e4c963682362d34fa1362c67607d4d1",
-    "factory_evidence": "FirmwareSimulator/docs/qualification/valve-fair-admission-candidate-2026-10-25.json",
-    "native_status": "corrected_start2048_short_pending_prior1536_is_six_slots_not_nine",
+    "queue": "Existing fair admission,2048-byte startup allocation, unchanged8192-byte logical budget; actual RX10/TX9/recent16 verified.",
+    "stack_fix": "Pressure worker4.5->6.5KiB, acquisition4.5->5.5KiB, control12->11KiB. First stack-error capture and permanent1KiB pressure-worker margin checks.",
+    "native_status": "Matching final-artifact two/three-radio600s running; positive-flight70passed; GPS-loss negative70running; test-fire/restart/relay pending.",
     "release_ready": false,
-    "expected_startup_queue_storage_bytes": 4144
+    "evidence": "FirmwareSimulator/docs/qualification/valve-pressure-worker-stack-2026-10-25.json"
   },
   "publication_check": {
     "checked_utc": "2026-10-26T00:42:44.025854+00:00",
