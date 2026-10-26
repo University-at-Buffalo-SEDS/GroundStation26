@@ -1,5 +1,5 @@
 {
-  "updated_utc": "2026-10-26T21:31:15.673489+00:00",
+  "updated_utc": "2026-10-26T22:09:10.830294+00:00",
   "status": "media_verified_rrls_and_fc_followups_in_progress",
   "branch": "dev",
   "constraints": [
@@ -56,8 +56,8 @@
     },
     {
       "id": "validation_push",
-      "status": "in_progress",
-      "scope": "Regression tests, commit/push, final repository alignment."
+      "status": "verified",
+      "scope": "Relevant regression tests passed; source changes committed/pushed on existing branches; 12 valid repositories and 18 tracked branches aligned."
     }
   ],
   "verification": {
@@ -70,13 +70,13 @@
     "voice": "Two real backend clients with synthetic audio, broadcast/archive permissions, range playback and stalled startup cleanup passed",
     "layout": "Ordering, sizing, stale revision rejection and live role revocation passed",
     "dashboard": "Full dashboard customization browser regression passed after correcting stale manager-label and viewer-only grant fixtures",
-    "utilities": "Underglow, buzzer and T-clock reset: all 16 flight states in normal/HITL/test-fire; UTC HTTP authorization/revocation and post-launch browser control passed"
+    "utilities": "Underglow, buzzer and T-clock reset: all 16 flight states in normal/HITL/test-fire; UTC HTTP authorization/revocation and post-launch browser control passed",
+    "repositories": "12 valid repositories clean; 18 tracked branches equal upstream; historical invalid worktrees preserved"
   },
   "remaining_followups": [
     "Installed main GS systemd AV-bay configuration and reception failure",
     "RRLS visibility in topology",
     "Authenticated primary-controlled RRLS sequence requests and automatic mirrored operating mode/status",
-    "Full integrated FC barometer freshness campaign with corrected sensor model; physical hardware confirmation",
-    "Final commit/push and remote alignment"
+    "Full integrated FC barometer freshness campaign with corrected sensor model; physical hardware confirmation"
   ]
 }
