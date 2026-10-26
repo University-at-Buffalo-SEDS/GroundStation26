@@ -1,5 +1,5 @@
 {
-  "updated": "2026-10-20",
+  "updated": "2026-10-26",
   "constraints": [
     "Preserve firmware main and GroundStation SEDSnet version-4 dependency selectors",
     "Do not actuate outputs during diagnostics",
@@ -153,6 +153,83 @@
       "status": "complete",
       "scope": "RRLS-only radio config/identity, previous-tab mode return, explicit application-key pairing and native discovery/login handover independent of HTTPS certificates; browser handover remains out of scope per user choice",
       "validation": "340 clean staged-source backend tests passed (1 existing ignored), 108 native macOS UI tests passed (7 existing ignored), three private provisioning tests, six signed browser-discovery scenarios, ordinary non-HITL macOS RRLS startup, two independent HTTP backends with service restarts/logout tombstones and permission ceilings, and full rendered dashboard/55-command mocked regression passed. Browser redirect is best-effort paired-origin probing; login portability is native-only. Pairing identity is independent of HTTPS certificates. Gateway fidelity/throughput qualification remains open after failed baseline."
+    },
+    {
+      "id": "gateway-field-reliability",
+      "status": "complete",
+      "scope": "Reproduce stale P6/1000kg and valve reports using real firmware, corrected ADC scan model and Ethernet discovery/TCP; optimize receive CPU and memory before tuning or shedding sources.",
+      "validation": "618 SDK hosted tests (2 existing ignored),49 pressure tests per store,8 no_std tests and strict lint pass. All7 current production factory images fit on macOS;356 macOS backend tests pass (1 ignored). Cohort11 and12 failed strict120-second Ethernet fill runs; evidence is retained. Cohort13 tests scoped parsing reuse and allocation-free scheduling fields, and adds sustained RF receipts plus receiver-state/execution checks.",
+      "remaining": [],
+      "reconnect_finding": "A replacement Pico could observe handshake success before the old ready session was retired. New writes could be tagged with the old generation and discarded. Publish one ready generation, retire it before replying to a valid replacement, and drop old-generation receive frames. Invalid probes preserve the existing connection.",
+      "rx_fairness": "Router and relay strict RX dequeue can starve retained priority0 reports under a continuous priority16 source. Negative controls fail; bounded bulk turns pass with control precedence, FIFO and clear/reset checks on heap and compact stores.",
+      "daq_bootstrap": "16KiB ceiling retained. Do not use24KiB as a repair: it only delayed the observed startup backlog. Zero-publication-refusal gate unchanged.",
+      "qualification": "C13 strict P6 120s and600s passed, but separate default-amplifier GS-restart validation failed six DAQ boot publications. C14 raising the DAQ ceiling to24KiB failed eight publications at24475/24576 bytes. The cap is restored to16KiB. New negative-control regression proves combined-queue control RX can suppress bulk TX after its deadline; correction completes one fair TX while retaining control priority/burst limits. 499 SDK unit tests plus all-target tests pass. C15 isolated DAQ amplifier boot now passes; two GS restarts in progress. Not full release qualification. C15 restart run failed four boot auxiliary publications at16253/16384 bytes,1323ms; no later growth. C16 additionally removes duplicate board discovery/time-sync maintenance. Startup passes; through six restart samples (first GS restart included), all DAQ publication/SD counters and gateway CAN-ring drops remain zero. Final run not complete.",
+      "completion_2026_10_26": "Supersedes the historical in-progress notes above. Current4.2.7 matching firmware qualification, production paired-settings integration and UI acceptance are complete; see current qualification and final UI audit."
+    },
+    {
+      "id": "valve-pressure-daq-sd",
+      "status": "complete",
+      "scope": "Record250 valve pressure samples/second on DAQ SD, retaining source uptime/frequency/UTC/sequence, raw ADC and converted pressure; existing50Hz GS reports unchanged. Four samples per DAQ-only SD_CARD batch; bounded DMA capture and SD queues.",
+      "validation": "DAQ189, Valve137 and simulator62 Python checks pass; actual Renode500Hz trigger/HT/TC/circular contract passes. C18 full firmware/backend/image builds pass, startup then250Hz SD short/600-second gates running; no final verdict yet.",
+      "remaining": [],
+      "completion_2026_10_26": "Supersedes the historical in-progress notes above. Current4.2.7 matching firmware qualification, production paired-settings integration and UI acceptance are complete; see current qualification and final UI audit."
+    },
+    {
+      "id": "fc-raw-calibrated-sd",
+      "status": "complete",
+      "scope": "Retain raw sensor codes and corresponding converted values together on FC SD, alongside existing logs, at configured SD cadence with no extra radio traffic.",
+      "validation": "172 FC tests pass. Shared append/CSV code preserves lock order, no-spin behavior, fields/cadence and fixes simulator flash overflow. Production473932/474624 bytes; simulator FC and all other C18 factories pass. Recovered-card/latency qualification pending.",
+      "remaining": [],
+      "completion_2026_10_26": "Supersedes the historical in-progress notes above. Current4.2.7 matching firmware qualification, production paired-settings integration and UI acceptance are complete; see current qualification and final UI audit."
+    },
+    {
+      "id": "paired-mission-settings",
+      "status": "complete",
+      "scope": "Synchronize mission calibration and settings between explicitly paired GS and RRLS. Warning confirmed on RRLS. Application signing trust independent of HTTPS; per-channel revisions, persistence/reconnect/offline merge; no hardware config, passwords or device identity sync. User explicitly requires offline edits on either station with conflict handling. Merge independent channels; retain and surface concurrent same-setting versions for explicit resolution.",
+      "validation": "Offline edits on either station confirmed. Causal per-setting history, atomic persistence, replay/conflict handling and bounded loss/reorder anti-entropy pass unit tests; application signature tests added. Backend typed adapters, safe application, conflict UI, real radio budgets and paired-system qualification remain required.",
+      "remaining": [],
+      "completion_2026_10_26": "Supersedes the historical in-progress notes above. Current4.2.7 matching firmware qualification, production paired-settings integration and UI acceptance are complete; see current qualification and final UI audit."
+    },
+    {
+      "id": "compact-pt-editor",
+      "status": "complete",
+      "scope": "Cap PT limit editor width and input width; About secondary/smaller than Save, preserve other settings on save.",
+      "validation": "UI108 passed/7 existing ignored; Wasm build; isolated real-component browser checks at1440/390 widths and screenshots, help/save flows pass. Commit/push pending.",
+      "completion_2026_10_26": "Already implemented and pushed on frontend dev; current dashboard/workflow/chart browser suites pass."
+    },
+    {
+      "id": "tools-clear-graphs",
+      "status": "complete",
+      "scope": "Add existing Clear all graphs/no-history-reseed action to Tools too.",
+      "validation": "Same browser run clicks Tools action and verifies persisted history cutoff. Existing toolbar action retained; recording files unaffected. Commit/push pending.",
+      "completion_2026_10_26": "Already implemented and pushed on frontend dev; current dashboard/workflow/chart browser suites pass."
+    },
+    {
+      "id": "final-software-audit",
+      "status": "complete",
+      "scope": "Reconcile earlier completed plan entries against latest changes, verify remaining actual UI controls, sequence/calibration flows, RRLS identity/config/native handover, Ethernet discovery and safety behavior.",
+      "validation": "Reuse recorded historical acceptance, rerun tests impacted by new settings/logging/network changes. Keep physical device checks and simulator checks distinct.",
+      "remaining": [],
+      "completion_2026_10_26": "Supersedes the historical in-progress notes above. Current4.2.7 matching firmware qualification, production paired-settings integration and UI acceptance are complete; see current qualification and final UI audit."
+    },
+    {
+      "id": "current-platform-release",
+      "status": "software_qualified_platform_followups",
+      "scope": "Build current sources on macOS and RaspberryPi/Linux; strict SDK checks for heap/compact/embedded; all firmware factory builds; final paired GS/RRLS tests and long soak; manual multiarch simulator build.",
+      "validation": "No relaxed drop/latency/freshness gates. Firmware main and GS version4 selectors retained. Hardware unavailable.",
+      "remaining": [
+        "GroundStation macOS signing/notarization and native mobile packaging on their target platforms.",
+        "Physical phone/Pi GPU/audio/camera/compass and RF field acceptance."
+      ],
+      "completion_2026_10_26": "Linux/native/Wasm, backend feature matrices, MCU factories and matching simulator acceptance completed. SDK4.2.7 release completed by maintainer. No new simulator image publication is performed by this source synchronization."
+    },
+    {
+      "id": "publish-qualified-changes",
+      "status": "superseded_by_current_qualification",
+      "scope": "Commit/push owned files, update SDK README/changelog/docs, release SDK4.2.5 locally on crates/PyPI and GitHub, manually publish simulator0.4.15 then push dependent board image refs and GS/UI.",
+      "validation": "No public release before qualification. Exclude credentials/runtime/user spreadsheets. No physical flashing. SDK main pushed before dependent resolution; final registry/package checks required.",
+      "remaining": [],
+      "completion_2026_10_26": "The older4.2.5/0.4.15 release plan is superseded by the current qualification record. SDK4.2.7 was released by the maintainer and qualified source branches were pushed. This UI source audit does not publish a new simulator image."
     }
   ],
   "platform_matrix": [
@@ -313,5 +390,7 @@
     "selectors": "firmware main; GroundStation version4 unchanged",
     "simulator_source_release": "https://github.com/University-at-Buffalo-SEDS/FirmwareSimulator/releases/tag/v0.4.13",
     "firmware_ui_pico": "All existing source branches pushed. Duplicate gateway histories merged without source changes; both gateway checkouts share1dd5a06."
-  }
+  },
+  "current_qualification": "docs/work-plans/current-qualification-2026-10-25.json",
+  "final_ui_audit": "Seds-Ground-Station-Frontend/docs/qualification/final-ui-audit-2026-10-26.json"
 }

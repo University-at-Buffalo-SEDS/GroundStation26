@@ -1,5 +1,5 @@
 {
-  "updated_utc": "2026-10-26T04:27:25.245825+00:00",
+  "updated_utc": "2026-10-26T05:57:12.308671+00:00",
   "source_ready": true,
   "release_ready": true,
   "packages_published": "Maintainer reports SEDSnet4.2.7 release published successfully. Publiccrate source match was independently verified earlier.",
@@ -37,7 +37,7 @@
     },
     {
       "task": "Stable low-latency RF and fill-system communication",
-      "status": "final_stack_fix_endurance_running_prior_three_radio_failure_retained",
+      "status": "qualified",
       "results": [
         "Two- and three-radio startup,600-second network/source/SD tests and120-second GroundStation restart tests pass. PowerBoard compact is included in the three-radio cohort.",
         "Each long cohort completes59 RF control rounds in100\u2013210ms; source-window preservation is at least99.9131percent. All modeled CAN FIFO overflow counters remain zero.",
@@ -47,12 +47,11 @@
       ],
       "evidence": [
         "FirmwareSimulator/docs/qualification/radio-clock-fixed-600s-2026-10-25.json",
-        "FirmwareSimulator/docs/qualification/rrls-telemetry-retention-2026-10-25.json"
+        "FirmwareSimulator/docs/qualification/rrls-telemetry-retention-2026-10-25.json",
+        "FirmwareSimulator/docs/qualification/valve-final8-endurance-2026-10-25.json",
+        "FirmwareSimulator/docs/qualification/valve-final8-relay-2026-10-25.json"
       ],
-      "remaining": [
-        "Complete matching final-artifact two/three-radio600s source/GPS/control/SD gates with zero stack errors and required margins.",
-        "Complete final-artifact GPS-loss negative/test-fire70s and restart120s/relay60s checks; preserve all prior artifacts and failures."
-      ]
+      "remaining": []
     },
     {
       "task": "Production sequence and checklist acceptance",
@@ -64,7 +63,8 @@
         "Quantized fill completion now uses the existing cutoff tolerance consistently; below-target plateaus do not qualify. Committed Fire can accept actual pilot confirmation even while the fill engine remains paused.",
         "Actual modeled pilot/igniter output timing and DAQ session/deadline memory are verified. No board timings or safety gates were weakened.",
         "Finalcandidate ordinaryflight positive also passes70second linkedrun; pending atomicabort race closure and negativeGPS/QD acceptance remain separate.",
-        "Final A748 test-fire70,000modelms passes with4MCUs: real self-test/N2/Fill/Armed/Fire/pilot; Valve start/attempt/finish1 each and abort0. Actual modeled actuator ignition output pulse10002ticks then off. Shared checklist receipts reset after Fire."
+        "Final A748 test-fire70,000modelms passes with4MCUs: real self-test/N2/Fill/Armed/Fire/pilot; Valve start/attempt/finish1 each and abort0. Actual modeled actuator ignition output pulse10002ticks then off. Shared checklist receipts reset after Fire.",
+        "Final8 operational report supersedes earlier timing inference: programmed ignition deadline10000ticks; actual GPIO high in10consecutive1Hzsamples and off thereafter, sampled duration bounded9000..11000ticks. No exact physical pulse-duration claim."
       ],
       "evidence": [
         "FirmwareSimulator/docs/qualification/operational-gse-linked-2026-10-25.json"
@@ -234,5 +234,16 @@
     "publication_origin": "maintainer local Mac",
     "scope": "SDK publication completed; firmware artifact qualification continues separately."
   },
-  "readiness_scope": "Software source and simulator qualification only; no physical hardware, RF propagation or physical actuation acceptance is claimed."
+  "readiness_scope": "Software source and simulator qualification only; no physical hardware, RF propagation or physical actuation acceptance is claimed.",
+  "ui_final_audit": {
+    "status": "PASS",
+    "evidence": "Seds-Ground-Station-Frontend/docs/qualification/final-ui-audit-2026-10-26.json",
+    "native_passed": 140,
+    "native_ignored": 7,
+    "browser_suites_passed": 10,
+    "prototype_and_production_settings_tests_passed": 54,
+    "sequence_tests_passed": 37,
+    "webassembly_release": "PASS",
+    "remaining_software_ui_changes": []
+  }
 }

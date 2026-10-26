@@ -1,5 +1,5 @@
 [workspace]
-members = ["backend", "map_downloader", "video_sender", "shared/gse_sequence", "shared/camera_discovery"]
+members = ["backend", "map_downloader", "video_sender", "shared/gse_sequence", "shared/camera_discovery", "shared/mission_settings"]
 resolver = "3"
 
 [workspace.package]

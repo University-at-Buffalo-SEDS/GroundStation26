@@ -33,8 +33,8 @@ mod i18n;
 mod layout;
 mod loadcell;
 mod loadcell_zero;
-mod logger;
 mod log_redaction;
+mod logger;
 mod map;
 mod media;
 mod media_runtime;
@@ -67,7 +67,7 @@ mod voice;
 mod web;
 mod web_server;
 
-use crate::map::{selected_map_region, ensure_map_data};
+use crate::map::{ensure_map_data, selected_map_region};
 use crate::ring_buffer::RingBuffer;
 use crate::rocket_commands::{FlightComputerCommands, ValveBoardCommands};
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
