@@ -613,7 +613,7 @@ def print_usage(exit_code: int = 1) -> None:
     print("  ./build.py log=build.log           # tee command output into a log file")
     print("  ./build.py docker [pi_build|no_pi] [testing]")
     print("  ./build.py rrls                   # headless recovery backend + web UI, no local launch GPIO")
-    print("  ./build.py backend_only            # local: build backend only")
+    print("  ./build.py --backend-only          # local: build backend only (backend_only also accepted)")
     print("  ./build.py frontend_web            # local: build frontend web only")
     print("  ./build.py web                     # alias for frontend_web")
     print("  ./backend/build.py ...             # backend-only entry point")
@@ -672,7 +672,7 @@ def main() -> None:
             debug_mode = True
         elif arg == "max_size":
             max_size_mode = True
-        elif arg in {"backend_only", "backend"}:
+        elif arg in {"backend_only", "backend-only", "--backend_only", "--backend-only", "backend"}:
             backend_only = True
         elif arg == "existing":
             use_existing = True
