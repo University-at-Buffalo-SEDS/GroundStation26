@@ -1,12 +1,12 @@
 {
-  "updated_utc": "2026-10-25T22:25:49.478678+00:00",
+  "updated_utc": "2026-10-26T00:42:44.025854+00:00",
   "source_ready": false,
   "release_ready": false,
-  "packages_published": "4.2.6 crates.io confirmed;4.2.7 notpublished",
+  "packages_published": "4.2.7 public crates.io version metadata confirmed; PyPI4.2.7 returns404 at this check. Publication occurs on maintainer Mac.",
   "priorities": [
     {
       "task": "4.2.7 independent-endpoint multicast and full flight acceptance",
-      "status": "final_runtime_network_endurance_in_progress",
+      "status": "two_source_battery_freshness_failure_candidate_under_validation",
       "results": [
         "Actual RF GPS C-ABI publication reproduced CAN1/radio0 despite success. SDK3971aef preserves distinct endpoint roles and now emits CAN1/radio1; redundant paths, explicit policies and retry ownership retain focused tests.",
         "SDK4.2.7 snapshot55fcdd5 and FC managed-state callback c690a0a compile in all8 factory variants; no overflow. FCSDK-absent/Cargo+rustc-blocked factory also passes.",
@@ -21,16 +21,20 @@
         "ActualGPSnegative wire decoder confirms12sat38.0607s+position38.085s, then0sat39.0497/40.0967s. Cancellation43.260s leaves savedFirefalse/generation0 and FCLaunch received/accepted/processed0. Strictfinished69strace has0codecerrors; explicit14usTXtimestampjitterbound preservesbyteorder.",
         "Final SDK2b queued-TX ownership and GS persisted automatic-abort claim prevent Fire/Clear races. Active SDK dispatch and software transport retention are checked before explicit Clear; storage failure blocks Fire while preserving abort delivery.",
         "Final ordinary flight positive and GPS-loss negative each complete70,000modelms with all7MCUs: positive FCLaunch received/accepted/processed1/1/1, watchdog rejection0; negative0/0/0 and no Fire. See ordinary-flight-owned-tx-2026-10-25.json.",
-        "Final A748 backend matrices pass production549, HITL531, ordinary551 and test-fire552 tests; explicit HTTP-only composition preserves all7 network files used in current endurance runs."
+        "Final A748 backend matrices pass production549, HITL531, ordinary551 and test-fire552 tests; explicit HTTP-only composition preserves all7 network files used in current endurance runs.",
+        "Final original-cohort three-source600, two/three-source120s restart, relay60, ordinary-flight positive/negative70 and test-fire70 checks passed in their separately recorded artifact scopes.",
+        "Final original-cohort two-source600 failed one battery voltage window:8 reports/10s, maxgap3050ms. All loadcell preservation, actual RF GPS/control and SD reconciliation checks passed independently. Original failure remains retained.",
+        "Isolated actual-SDK queue fixture reproduces accepted best-effort voltage eviction. Fair admission plus nine-slot startup passes36 protected-SD/background cases; native causality remains unproven. Candidate26e98a0 factory and SDK-absent telemetry-OFF factory pass with zero warnings.",
+        "Final SDK full matrix passed: normal727Rust/86Python, compact753Rust/14Python, zero binding skips, full600s pressure soak; GitHubb38 CI passed. GitLab automatically mirrored b38, latest pipeline result still to verify."
       ],
       "remaining": [
-        "Finish current-runtime two/three-radio600s network/source/SD gates,120s restart gates and60s relay/outage gate with actual fresh RF GPS positions at GS and RRLS.",
-        "Complete source package and CI verification, then finalize4.2.7 release qualification. Source main/dev already pushed; no package publication from Jupiter."
+        "Complete selected ValveBoard fair-admission/1536-byte startup candidate short comparison and actual allocation assertion, then matching affected600s source/SD/GPS acceptance. Preserve original530-540s voltage freshness failure.",
+        "Finish release evidence only after affected candidate qualification passes; no package publication from Jupiter."
       ]
     },
     {
       "task": "Stable low-latency RF and fill-system communication",
-      "status": "historical_baseline_passed_current_4_2_7_requalification_running",
+      "status": "two_source_battery_freshness_failure_candidate_under_validation",
       "results": [
         "Two- and three-radio startup,600-second network/source/SD tests and120-second GroundStation restart tests pass. PowerBoard compact is included in the three-radio cohort.",
         "Each long cohort completes59 RF control rounds in100\u2013210ms; source-window preservation is at least99.9131percent. All modeled CAN FIFO overflow counters remain zero.",
@@ -43,8 +47,8 @@
         "FirmwareSimulator/docs/qualification/rrls-telemetry-retention-2026-10-25.json"
       ],
       "remaining": [
-        "Complete current SDK2b long network/restart/relay qualification; historical SDK results do not substitute for these runs.",
-        "Validate actual RFD MAC/retries, propagation and physical hardware when available; the finite medium is an explicit approximation."
+        "Complete selected ValveBoard fair-admission/1536-byte startup candidate short comparison and actual allocation assertion, then matching affected600s source/SD/GPS acceptance. Preserve original530-540s voltage freshness failure.",
+        "Finish release evidence only after affected candidate qualification passes; no package publication from Jupiter."
       ]
     },
     {
@@ -164,10 +168,10 @@
     "scope": "Historical4.2.6 frozen cohort. Current4.2.7 candidate source/artifact manifests are separate; do not interpret these as latest qualification."
   },
   "source_pushes": {
-    "status": "sdk_4_2_7_source_pushed_dependent_backend_held_for_public_crate",
+    "status": "public_4_2_7_crate_available_backend_dev_push_ready",
     "sdk_main_and_dev": "b38b017",
     "backend_dev": "83d43ed plus final8c298f3 test-only/platform follow-up",
-    "frontend_dev": "2b5bc86",
+    "frontend_dev": "01a92c97fed53d873e84361366edb1c26199fe3d",
     "simulator_main": "1fd7ff6",
     "board_branch": "migration/sedlaunch-sedsnet-mainline",
     "boards": {
@@ -180,7 +184,7 @@
       "ActuatorBoard26": "79238da"
     },
     "frontend_main_promoted": false,
-    "scope": "SDK source main/dev updated;4.2.7 tag/package not published. Hold dependent backend push until public4.2.7 API is available. Preserve immutable4.2.6 tag and historical baseline refs."
+    "scope": "Public4.2.7 API now available, lifting dependent backend push hold. Backend code was qualified atA748; two-source network acceptance remains blocked on ValveBoard candidate. Frontend staysdev; no4.2.7tag or remote package publication authorized from this host."
   },
   "github_release": {
     "version": "4.2.6",
@@ -195,5 +199,18 @@
     "crates_io_published_at": "2026-10-25T17:34:00.033850Z",
     "pypi_status_at_check": "404; maintainer publication in progress",
     "check_scope": "public version metadata only, no credentials"
+  },
+  "current_candidate": {
+    "valve_board": "26e98a00e7fd01c88cde89708205ce0606a4bf75",
+    "sdk_source": "b38b017c8e4c963682362d34fa1362c67607d4d1",
+    "factory_evidence": "FirmwareSimulator/docs/qualification/valve-fair-admission-candidate-2026-10-25.json",
+    "native_status": "short_comparison_running_endurance_pending",
+    "release_ready": false
+  },
+  "publication_check": {
+    "checked_utc": "2026-10-26T00:42:44.025854+00:00",
+    "crates_io_4_2_7": "available",
+    "pypi_4_2_7": "HTTP404",
+    "gitlab_main": "b38b017c8e4c963682362d34fa1362c67607d4d1"
   }
 }
