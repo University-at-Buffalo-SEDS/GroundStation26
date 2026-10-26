@@ -55,7 +55,7 @@ def main():
                 with urllib.request.urlopen(f'http://127.0.0.1:{peers[role][2]}/api/rrls/status',timeout=1) as response:return json.load(response)
             # Pump startup traffic while both HTTP servers initialize.
             started=time.monotonic();next_gps=started;next_window=started;ready=False
-            checkpoint={};uplinks=0
+            checkpoint={};uplinks=0;rrls_wire_frames=0
             while time.monotonic()-started<23:
                 now=time.monotonic();elapsed=now-started
                 direct=elapsed<5 or elapsed>=12
@@ -78,6 +78,13 @@ def main():
                     except (BlockingIOError,OSError):continue
                     buffers[role].extend(data)
                     for command,payload in take(buffers[role]):
+                        if role=='rrls':
+                            # Check the actual serial bytes, not the worker's
+                            # accepted-packet log (observer drops return Ok).
+                            # RRLS may emit mesh control/relay envelopes only;
+                            # it must never originate an unwrapped SDK packet.
+                            assert command and payload[:3]==b'RR\x01', ('RRLS originated SDK traffic',payload[:32].hex())
+                            rrls_wire_frames+=1
                         wire=frame(command,payload)
                         other='rrls' if role=='primary' else 'primary'
                         if relay_connected:os.write(peers[other][0],wire)
@@ -94,6 +101,7 @@ def main():
                     if ready and elapsed>=at and name not in checkpoint:
                         checkpoint[name]={'primary':status('primary'),'rrls':status('rrls')}
             assert ready and len(checkpoint)==5,checkpoint
+            assert rrls_wire_frames>0,'RRLS wire assertion had no observations'
             assert uplinks>0,"no recovery uplink frames reached the rocket model"
             assert not checkpoint['standby']['rrls']['forwarding'],checkpoint
             assert not checkpoint['rrls_disconnected']['primary']['forwarding'],checkpoint
@@ -103,7 +111,9 @@ def main():
             assert checkpoint['relaying']['rrls']['forwarded_frames']>5,checkpoint
             assert not checkpoint['restored']['primary']['forwarding'] and not checkpoint['restored']['rrls']['forwarding'],checkpoint
             assert checkpoint['quiet']['rrls']['forwarded_frames']==checkpoint['restored']['rrls']['forwarded_frames'],checkpoint
-            print(json.dumps({'passed':True,'checkpoints':checkpoint,'recovery_uplink_frames':uplinks},indent=2))
+            print(json.dumps({'passed':True,'checkpoints':checkpoint,'recovery_uplink_frames':uplinks,
+                             'rrls_wire_frames_checked':rrls_wire_frames,
+                             'scope':'serial relay failover and RRLS wire ownership; excludes UI/control parity, sensor acquisition and physical RF'},indent=2))
         except Exception:
             for log in logs:log.flush();print(pathlib.Path(log.name).read_text()[-12000:])
             raise

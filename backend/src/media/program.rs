@@ -5,6 +5,7 @@ use axum::Json;
 
 pub(super) fn routes() -> Router<Arc<MediaState>> {
     Router::new()
+        .route("/assets/stay-awake.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript")],gs_browser_assets::STAY_AWAKE_JS) }))
         .route("/api/media-assets/program", get(page))
         .route(
             "/assets/program-map.js",
@@ -193,6 +194,7 @@ async fn program_state(
         .unwrap_or_else(|| {
             now.saturating_sub(presentation.broadcast.delay_seconds as u64 * 1000 + 2500)
         });
+    let target=query.playback_ms.filter(|at|*at<=target&&target-*at<=30_000).unwrap_or(target);
     let live_telemetry = delayed_program_snapshot(&history, target);
     drop(history);
     let telemetry = if let Some(plan) = &presentation.broadcast.replay {
@@ -225,10 +227,10 @@ async fn program_state(
             .iter()
             .filter(|s| {
                 s.live
-                    && !presentation.broadcast.hidden_stream_ids.contains(&s.id)
+                    && !presentation.broadcast.hidden_stream_ids.iter().any(|id|id==s.id.strip_prefix("transcoded-").unwrap_or(&s.id))
                     && (effective_scene != "interview"
-                        || s.id == presentation.broadcast.interview.main_stream_id
-                        || s.id == presentation.broadcast.interview.pip_stream_id)
+                        || s.id.strip_prefix("transcoded-").unwrap_or(&s.id) == presentation.broadcast.interview.main_stream_id
+                        || s.id.strip_prefix("transcoded-").unwrap_or(&s.id) == presentation.broadcast.interview.pip_stream_id)
             })
             .take(8)
             .map(|s| s.id.clone())
@@ -244,7 +246,9 @@ async fn program_state(
         } else {
             format!("/api/media-assets/hls/{id}/index.m3u8?ticket={access}")
         };
-        streams.push(serde_json::json!({"id":id,"label":presentation.stream_labels.get(&id).unwrap_or(&id),"url":url}));
+        let logical=id.strip_prefix("transcoded-").unwrap_or(&id);
+        let fallback=available.iter().find(|s|s.id==id).map(|s|s.name.as_str()).unwrap_or(logical);
+        streams.push(serde_json::json!({"id":logical,"label":presentation.stream_labels.get(logical).map(String::as_str).unwrap_or(fallback),"url":url}));
     }
     Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"server_now_ms":now,"telemetry":telemetry}))).into_response())
 }
@@ -263,12 +267,13 @@ async fn program_audio(
 ) -> ApiResult<Response> {
     authorize_media(&state, &headers, &query, "program").await?;
     let broadcast = read_presentation(&state).await?.broadcast;
+    let audio_delay=query.playback_ms.filter(|at|*at<=now_ms()&&now_ms()-*at<=90_000).map(|at|((now_ms()-at).div_ceil(1000)as u32).max(broadcast.delay_seconds)).unwrap_or(broadcast.delay_seconds);
     let batch = if (broadcast.comms_audio_enabled || broadcast.commentary_audio_enabled)
         && broadcast.replay.is_none()
     {
         state
             .voice
-            .audience_batch(cursor.after, broadcast.delay_seconds)
+            .audience_batch(cursor.after, audio_delay)
             .await
     } else {
         serde_json::json!({"enabled":false,"generation":0,"cursor":0,"frames":[]})
@@ -475,24 +480,27 @@ pub(super) fn delayed_playlist(
     }
     Ok((result.join("\n") + "\n", segments))
 }
-async fn hls(
-    State(state): State<Arc<MediaState>>,
-    Path((id, file)): Path<(String, String)>,
-    Query(query): Query<MediaQuery>,
-    headers: HeaderMap,
-) -> ApiResult<Response> {
+async fn hls(State(state):State<Arc<MediaState>>,Path((id,file)):Path<(String,String)>,Query(query):Query<MediaQuery>,headers:HeaderMap)->ApiResult<Response>{
+    hls_impl(state,id,file,query,headers,false).await
+}
+pub(crate) async fn raw_hls(State(state):State<Arc<MediaState>>,Path((id,file)):Path<(String,String)>,Query(query):Query<MediaQuery>,headers:HeaderMap)->ApiResult<Response>{
+    hls_impl(state,id,file,query,headers,true).await
+}
+async fn hls_impl(state:Arc<MediaState>,id:String,file:String,query:MediaQuery,headers:HeaderMap,raw:bool)->ApiResult<Response>{
     check_id(&id)?;
     if !valid_hls_file(&file) {
         return Err(error(StatusCode::BAD_REQUEST, "Invalid HLS path"));
     }
-    let headers = ticket_headers(&state, &headers, &query, &format!("stream:{id}")).await?;
+    let resource=if raw {format!("raw-stream:{id}")}else{format!("stream:{id}")};
+    let headers = ticket_headers(&state, &headers, &query, &resource).await?;
+    if raw {authorize_preview(&state,&headers).await?;}
     authorize(&state, &headers, Permission::ViewData).await?;
     let broadcast = read_presentation(&state).await?.broadcast;
-    if broadcast.hidden_stream_ids.contains(&id) {
+    if !raw && broadcast.hidden_stream_ids.iter().any(|hidden|hidden==id.strip_prefix("transcoded-").unwrap_or(&id)) {
         return Err(error(StatusCode::FORBIDDEN, "Camera removed from program"));
     }
     let cutoff = now_ms().saturating_sub(broadcast.delay_seconds as u64 * 1000);
-    if !file.ends_with(".m3u8") {
+    if !raw && !file.ends_with(".m3u8") {
         let segments = state.hls_segments.lock().await;
         if !segments
             .get(&(id.clone(), file.clone()))
@@ -541,8 +549,8 @@ async fn hls(
         bytes.extend_from_slice(&chunk);
     }
     let content = if file.ends_with(".m3u8") {
-        let access = ticket(&state, &headers, &format!("stream:{id}")).await?;
-        let (delayed, entries) = delayed_playlist(
+        let access = ticket(&state, &headers, &resource).await?;
+        let (delayed, entries) = if raw {(std::str::from_utf8(&bytes).map_err(|_|error(StatusCode::BAD_GATEWAY,"Invalid playlist"))?.to_owned(),Vec::new())}else{delayed_playlist(
             std::str::from_utf8(&bytes)
                 .map_err(|_| error(StatusCode::BAD_GATEWAY, "Invalid playlist"))?,
             cutoff,
@@ -552,7 +560,7 @@ async fn hls(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Building delayed video buffer",
             )
-        })?;
+        })?};
         {
             let mut segments = state.hls_segments.lock().await;
             segments.retain(|_, end| *end == 0 || *end >= now_ms().saturating_sub(120000));

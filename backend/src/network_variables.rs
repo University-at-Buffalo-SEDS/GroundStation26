@@ -112,6 +112,10 @@ fn packet_bytes(data_type: &str, endpoint: &str, payload: Arc<[u8]>) -> Result<P
 }
 
 pub fn initialize(router: &Router) -> Result<()> {
+    initialize_for_role(router, crate::rrls::is_rrls())
+}
+
+fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
     for data_type in [
         UNDERGLOW_TYPE,
         FLIGHT_BUZZER_TYPE,
@@ -125,7 +129,11 @@ pub fn initialize(router: &Router) -> Result<()> {
     ] {
         router.enable_network_variable(
             crate::telemetry_schema::data_type(data_type),
-            NetworkVariablePermissions::READ_WRITE,
+            if observer {
+                NetworkVariablePermissions::READ_ONLY
+            } else {
+                NetworkVariablePermissions::READ_WRITE
+            },
         )?;
     }
     router.on_network_variable_update(
@@ -156,6 +164,12 @@ pub fn initialize(router: &Router) -> Result<()> {
             })
         },
     )?;
+    // RRLS receives the primary's values. Seeding its local disk defaults as
+    // GS-owned packets creates competing managed-variable refresh traffic,
+    // even though the recovery transport ultimately discards those packets.
+    if observer {
+        return Ok(());
+    }
     {
         let guard = store()
             .lock()
@@ -864,6 +878,29 @@ mod tests {
             .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
             .collect();
         assert_eq!(decoded, vec![2.0, -3.0, 4.5, 6.0]);
+    }
+
+    #[test]
+    fn rrls_startup_has_no_gs_owned_defaults_and_cannot_publish_controls() {
+        crate::telemetry_schema::initialize().unwrap();
+        let observer = Router::new(RouterConfig::new([]).with_sender("RRLS"));
+        initialize_for_role(&observer, true).unwrap();
+        for name in [UNDERGLOW_TYPE, FLIGHT_BUZZER_TYPE, FLIGHT_STATE_TYPE] {
+            let ty = crate::telemetry_schema::data_type(name);
+            assert!(observer.get_cached_network_variable(ty).unwrap().is_none());
+        }
+        assert!(
+            observer
+                .set_network_variable(packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", 0).unwrap())
+                .is_err()
+        );
+        observer.process_all_queues().unwrap();
+        assert!(
+            observer
+                .get_cached_network_variable(crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

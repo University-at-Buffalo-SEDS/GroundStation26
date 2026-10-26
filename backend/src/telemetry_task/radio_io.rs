@@ -2189,8 +2189,10 @@ fn log_link_control_send(worker_name: &str, payload: &[u8]) {
         .map(|byte| format!("{byte:02x}"))
         .collect::<Vec<_>>()
         .join(" ");
-    log::info!(
-        "link tx sent side={worker_name} ty={:?} sender={} endpoints={:?} payload={payload_preview}",
+    // Success here means the transport accepted the packet; an RRLS observer
+    // may deliberately discard it before any serial write.
+    log::debug!(
+        "link tx accepted side={worker_name} ty={:?} sender={} endpoints={:?} payload={payload_preview}",
         pkt.data_type(),
         pkt.sender(),
         pkt.endpoints(),

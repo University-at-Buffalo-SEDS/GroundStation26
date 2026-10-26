@@ -41,15 +41,12 @@ pub enum TelemetryCommand {
     ToggleLaunchInterlock,
     #[cfg(feature = "hitl_mode")]
     TogglePhysicalLaunchMode,
-    #[cfg(feature = "hitl_mode")]
     ToggleAvBayUnderglow,
-    #[cfg(feature = "hitl_mode")]
     ToggleFlightBuzzer,
     #[cfg(feature = "hitl_mode")]
     ResetLaunchLatch,
     #[cfg(feature = "hitl_mode")]
     ResetFlightState,
-    #[cfg(feature = "hitl_mode")]
     ResetTClock,
     #[cfg(feature = "hitl_mode")]
     DeployParachute,

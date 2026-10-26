@@ -166,18 +166,8 @@ mod tests {
         no_crew_audio(&mut crew).await;
         let (_denied, error) = sign_in(&format!("ws://{addr}/commentary"), "audio-viewer").await;
         assert_eq!(error["type"], "error");
-        let (mut monitor, joined) = sign_in(&format!("ws://{addr}/crew"), "audio-producer").await;
-        assert_eq!(joined["type"], "joined");
-        monitor
-            .send(Wire::Text(
-                "{\"type\":\"transmitting\",\"enabled\":true}".into(),
-            ))
-            .await
-            .unwrap();
-        monitor
-            .send(Wire::Binary(vec![9; FRAME_BYTES].into()))
-            .await
-            .unwrap();
+        let (_monitor, denied) = sign_in(&format!("ws://{addr}/crew"), "audio-producer").await;
+        assert_eq!(denied["type"], "error", "Stream management cannot grant crew voice access");
         no_crew_audio(&mut crew).await;
         assert!(
             !state
@@ -209,7 +199,7 @@ mod tests {
             "disabled mix cannot retain private audio"
         );
         program.close(None).await.unwrap();
-        monitor.close(None).await.unwrap();
+
         crew.close(None).await.unwrap();
         server.abort();
     }

@@ -1,0 +1,82 @@
+{
+  "updated_utc": "2026-10-26T21:31:15.673489+00:00",
+  "status": "media_verified_rrls_and_fc_followups_in_progress",
+  "branch": "dev",
+  "constraints": [
+    "No physical hardware or real accounts",
+    "Keep frontend on dev; no package or release publication",
+    "Preserve transport IDs; use human-readable camera labels",
+    "Server authorization enforces publishing, management and media access separately"
+  ],
+  "changes": [
+    {
+      "id": "permissions",
+      "status": "verified",
+      "scope": "Hide unauthorized tabs; separate camera publishing from stream management; managers/admins only for live previews and recordings."
+    },
+    {
+      "id": "mobile_navigation",
+      "status": "verified",
+      "scope": "Full-size mobile menu, direct Sign in, useful navigation without nested tiny dropdowns."
+    },
+    {
+      "id": "voice",
+      "status": "verified",
+      "scope": "Remove broadcast notice; prevent mobile text selection and long-press interruptions; release PTT reliably."
+    },
+    {
+      "id": "camera",
+      "status": "verified",
+      "scope": "Rear-camera default, switch cameras, viewfinder, supported zoom, microphone choice, audio and readable names."
+    },
+    {
+      "id": "broadcast",
+      "status": "verified",
+      "scope": "Concurrent viewers, continuous mobile playback, internal buffering without delay readout."
+    },
+    {
+      "id": "obs",
+      "status": "verified",
+      "scope": "Clean OBS view without exit or audio controls; stable controls and transitions."
+    },
+    {
+      "id": "layout_editor",
+      "status": "verified",
+      "scope": "Manager live-feed tiles, known layouts, ordering/resizing, saved layout and replay fades."
+    },
+    {
+      "id": "wake_lock",
+      "status": "verified",
+      "scope": "Keep visible playback/publishing awake and reacquire supported wake locks."
+    },
+    {
+      "id": "remote_transcoding",
+      "status": "verified",
+      "scope": "Optional remote encoded ingest/transcoding/distribution with minimal Pi video work."
+    },
+    {
+      "id": "validation_push",
+      "status": "in_progress",
+      "scope": "Regression tests, commit/push, final repository alignment."
+    }
+  ],
+  "verification": {
+    "backend": "556 normal, 532 HITL, 557 test-fire passed; manual fixtures remain ignored",
+    "frontend_native": "142 passed, 7 existing platform/manual tests ignored",
+    "sender": "6 unit and 2 discovery CLI tests passed",
+    "helper": "3 unit tests passed; manual real-media roundtrip passed; Linux build and Clippy -D warnings passed",
+    "playback": "Actual MediaMTX: one/two viewers, disconnect, saved geometry and clean OBS passed on raw and remote H264/AAC feeds; no frozen samples",
+    "mobile": "Permission matrix, direct login, full-height menu, camera/mic/zoom/name, PTT and wake-lock lifetime passed",
+    "voice": "Two real backend clients with synthetic audio, broadcast/archive permissions, range playback and stalled startup cleanup passed",
+    "layout": "Ordering, sizing, stale revision rejection and live role revocation passed",
+    "dashboard": "Full dashboard customization browser regression passed after correcting stale manager-label and viewer-only grant fixtures",
+    "utilities": "Underglow, buzzer and T-clock reset: all 16 flight states in normal/HITL/test-fire; UTC HTTP authorization/revocation and post-launch browser control passed"
+  },
+  "remaining_followups": [
+    "Installed main GS systemd AV-bay configuration and reception failure",
+    "RRLS visibility in topology",
+    "Authenticated primary-controlled RRLS sequence requests and automatic mirrored operating mode/status",
+    "Full integrated FC barometer freshness campaign with corrected sensor model; physical hardware confirmation",
+    "Final commit/push and remote alignment"
+  ]
+}

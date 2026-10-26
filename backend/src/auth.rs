@@ -33,6 +33,8 @@ pub struct Permissions {
     pub set_system_time: bool,
     #[serde(default)]
     pub voice_transmit: bool,
+    #[serde(default)]
+    pub camera_publish: bool,
 }
 
 impl Permissions {
@@ -43,6 +45,7 @@ impl Permissions {
                 send_commands: true,
                 set_system_time: true,
                 voice_transmit: true,
+                camera_publish: true,
             }
         } else {
             self.normalized()
@@ -62,6 +65,7 @@ impl Permissions {
             Permission::SendCommands => normalized.send_commands,
             Permission::SetSystemTime => normalized.set_system_time,
             Permission::VoiceTransmit => normalized.view_data && normalized.voice_transmit,
+            Permission::CameraPublish => normalized.view_data && normalized.camera_publish,
         }
     }
 }
@@ -113,6 +117,7 @@ pub enum Permission {
     SendCommands,
     SetSystemTime,
     VoiceTransmit,
+    CameraPublish,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +214,10 @@ pub struct AuthPrincipal {
 }
 
 impl AuthPrincipal {
+    pub fn can_publish_camera(&self) -> bool {
+        !self.anonymous && (self.roles.contains(&StreamRole::Admin) || self.permissions.allows(Permission::CameraPublish))
+    }
+
     pub fn can_manage_stream(&self) -> bool {
         if self.roles.contains(&StreamRole::StreamViewer)
             && !self.roles.contains(&StreamRole::StreamAdmin)
@@ -293,6 +302,7 @@ mod stream_role_tests {
                 send_commands: false,
                 set_system_time: false,
                 voice_transmit: false,
+                camera_publish: false,
             },
             expires_at_ms: None,
             anonymous,
@@ -611,6 +621,7 @@ impl AuthManager {
             send_commands: claims.permissions.send_commands && local.send_commands,
             set_system_time: claims.permissions.set_system_time && local.set_system_time,
             voice_transmit: claims.permissions.voice_transmit && local.voice_transmit,
+            camera_publish: claims.permissions.camera_publish && local.camera_publish,
         };
         if !permissions.allows(required) {
             return Err(AuthFailure::Forbidden(
@@ -708,6 +719,7 @@ impl AuthManager {
                 send_commands: row.get::<i64, _>("can_send_commands") != 0,
                 set_system_time: false,
                 voice_transmit: false,
+                camera_publish: false,
             }
             .normalized();
 
@@ -730,6 +742,7 @@ impl AuthManager {
                 permissions.send_commands &= current.send_commands;
                 permissions.set_system_time = current.set_system_time;
                 permissions.voice_transmit = current.voice_transmit && current.view_data;
+                permissions.camera_publish = current.camera_publish && current.view_data;
             }
             if !permissions.allows(required) {
                 return Err(AuthFailure::Forbidden(
@@ -756,6 +769,7 @@ impl AuthManager {
         let mut permissions = config.anonymous.normalized();
         permissions.set_system_time = false;
         permissions.voice_transmit = false;
+        permissions.camera_publish = false;
         if !permissions.allows(required) {
             return Err(AuthFailure::Unauthorized(
                 "authentication required".to_string(),
@@ -790,6 +804,7 @@ impl AuthManager {
                     username: None,
                     permissions: Permissions {
                         voice_transmit: false,
+                camera_publish: false,
                         ..config.anonymous.normalized()
                     },
                     expires_at_ms: None,

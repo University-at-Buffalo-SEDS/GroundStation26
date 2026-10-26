@@ -65,6 +65,10 @@ fn is_recording_command(cmd: &str) -> bool {
     )
 }
 
+pub(crate) fn is_station_utility_command(cmd: &str) -> bool {
+    matches!(cmd, "ToggleAvBayUnderglow" | "ToggleFlightBuzzer" | "ResetTClock")
+}
+
 #[cfg_attr(feature = "hitl_mode", allow(dead_code))]
 fn default_recording_command_enabled(cmd: &str) -> Option<bool> {
     match cmd {
@@ -86,9 +90,7 @@ fn default_recording_command_actuated(cmd: &str) -> Option<bool> {
 fn default_command_actuated(cmd: &str) -> Option<bool> {
     match cmd {
         "ResetSim" => Some(true),
-        #[cfg(feature = "hitl_mode")]
         "ToggleAvBayUnderglow" => Some(crate::network_variables::underglow_enabled()),
-        #[cfg(feature = "hitl_mode")]
         "ToggleFlightBuzzer" => Some(crate::network_variables::flight_buzzer_enabled()),
         _ => default_recording_command_actuated(cmd),
     }
@@ -590,15 +592,12 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::ToggleLaunchInterlock => "ToggleLaunchInterlock",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::TogglePhysicalLaunchMode => "TogglePhysicalLaunchMode",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ToggleAvBayUnderglow => "ToggleAvBayUnderglow",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ToggleFlightBuzzer => "ToggleFlightBuzzer",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ResetLaunchLatch => "ResetLaunchLatch",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ResetFlightState => "ResetFlightState",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ResetTClock => "ResetTClock",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DeployParachute => "DeployParachute",
@@ -640,6 +639,9 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
 #[cfg(all(not(feature = "hitl_mode"), not(feature = "test_fire_mode")))]
 pub fn all_command_names() -> Vec<&'static str> {
     let mut names = vec![
+        "ToggleAvBayUnderglow",
+        "ToggleFlightBuzzer",
+        "ResetTClock",
         "Dump",
         "Abort",
         "NormallyOpen",
@@ -730,6 +732,9 @@ pub fn all_command_names() -> Vec<&'static str> {
 #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
 pub fn all_command_names() -> Vec<&'static str> {
     vec![
+        "ToggleAvBayUnderglow",
+        "ToggleFlightBuzzer",
+        "ResetTClock",
         "Dump",
         "Abort",
         "NormallyOpen",
@@ -778,7 +783,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
         let controls = all_command_names()
             .into_iter()
             .map(|cmd| {
-                let enabled = default_recording_command_enabled(cmd)
+                let enabled = is_station_utility_command(cmd) || default_recording_command_enabled(cmd)
                     .unwrap_or_else(|| matches!(cmd, "Abort" | "Postinit" | "ResetSim"));
                 ActionControl {
                     cmd: cmd.to_string(),

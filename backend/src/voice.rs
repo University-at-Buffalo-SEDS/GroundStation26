@@ -236,7 +236,7 @@ async fn capabilities(
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     let mut response = match crate::web::authorize_headers(&state.app, &headers, Permission::ViewData).await {
-        Ok(p) => axum::Json(serde_json::json!({"can_transmit":!p.anonymous && p.permissions.allows(Permission::VoiceTransmit),"can_listen":!p.anonymous&&(p.permissions.allows(Permission::VoiceTransmit)||p.can_manage_stream()),"can_commentate":!p.anonymous&&p.can_manage_stream(),"commentary_enabled":state.hub.commentary_enabled().await,"broadcast_enabled":state.hub.enabled().await,"radio":crate::radio_voice::status()})).into_response(),
+        Ok(p) => axum::Json(serde_json::json!({"can_transmit":!p.anonymous && p.permissions.allows(Permission::VoiceTransmit),"can_listen":!p.anonymous&&p.permissions.allows(Permission::VoiceTransmit),"can_commentate":!p.anonymous&&p.can_manage_stream(),"commentary_enabled":state.hub.commentary_enabled().await,"broadcast_enabled":state.hub.enabled().await,"radio":crate::radio_voice::status()})).into_response(),
         Err(response) => response,
     };
     response.headers_mut().insert(
@@ -302,7 +302,7 @@ async fn connection(state: Arc<VoiceState>, mut socket: WebSocket) {
     {
         Ok(p)
             if !p.anonymous
-                && (p.permissions.allows(Permission::VoiceTransmit) || p.can_manage_stream()) =>
+                && p.permissions.allows(Permission::VoiceTransmit) =>
         {
             p
         }
@@ -397,7 +397,7 @@ async fn connection(state: Arc<VoiceState>, mut socket: WebSocket) {
             }
             _ = interval.tick() => {
                 if last_message.elapsed() > Duration::from_secs(40) { break; }
-                let current=match state.app.auth.authorize_token(&state.app.auth_db,Some(&token),Permission::ViewData).await {Ok(p) if !p.anonymous && (p.permissions.allows(Permission::VoiceTransmit)||p.can_manage_stream())=>p,_=>break};
+                let current=match state.app.auth.authorize_token(&state.app.auth_db,Some(&token),Permission::ViewData).await {Ok(p) if !p.anonymous && p.permissions.allows(Permission::VoiceTransmit)=>p,_=>break};
                 can_transmit=current.permissions.allows(Permission::VoiceTransmit);
                 if !can_transmit {if let Some(peer)=state.peers.lock().await.get_mut(&id){peer.transmitting=false;peer.radio_enabled=false;}crate::radio_voice::release(id);}
                 roster(&*state.peers.lock().await);

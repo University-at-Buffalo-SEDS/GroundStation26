@@ -4,7 +4,8 @@ use std::time::Instant;
 
 pub(super) struct Publisher {
     owner: String,
-    id: String,
+    pub(super) label: String,
+    pub(super) id: String,
     session: String,
     expires: Instant,
 }
@@ -17,16 +18,16 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
         )
         .route(
             "/api/video/publish/{id}/{session}",
-            post(renew).delete(stop),
+            post(renew).patch(rename).delete(stop),
         )
 }
 
 async fn owner(state: &MediaState, headers: &HeaderMap) -> ApiResult<String> {
     let p = crate::web::authorize_headers(&state.app, headers, Permission::ViewData).await?;
-    if !p.can_manage_stream() {
+    if !p.can_publish_camera() {
         return Err(error(
             StatusCode::FORBIDDEN,
-            "Stream-management permission required to publish a camera",
+            "Camera-publishing permission required",
         ));
     }
     p.username
@@ -69,12 +70,24 @@ pub(super) async fn reap(state: Arc<MediaState>) {
     }
 }
 
+#[derive(Default, serde::Deserialize)]
+struct PublishOptions { name: Option<String> }
+fn camera_label(value: &str) -> ApiResult<String> {
+    let value=value.trim();
+    if value.is_empty() || value.len()>256 || value.chars().count()>80 || value.chars().any(char::is_control) {
+        return Err(error(StatusCode::BAD_REQUEST,"Camera name must be 1–80 characters without control characters"));
+    }
+    Ok(value.to_owned())
+}
+
 async fn offer(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
+    Query(options): Query<PublishOptions>,
     bytes: Bytes,
 ) -> ApiResult<Response> {
     let username = owner(&state, &headers).await?;
+    let label = camera_label(options.name.as_deref().unwrap_or("Camera"))?;
     if headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -135,6 +148,7 @@ async fn offer(
         .to_string();
     let publisher = Publisher {
         owner: username,
+        label,
         id: id.clone(),
         session: session.clone(),
         expires: Instant::now() + Duration::from_secs(45),
@@ -164,6 +178,18 @@ async fn offer(
         body,
     )
         .into_response())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CameraName { name: String }
+async fn rename(State(state): State<Arc<MediaState>>, Path((id,session)): Path<(String,String)>, headers: HeaderMap, axum::Json(body): axum::Json<CameraName>) -> ApiResult<StatusCode> {
+    let username=owner(&state,&headers).await?;
+    let label=camera_label(&body.name)?;
+    let mut publishers=state.publishers.lock().await;
+    let publisher=publishers.iter_mut().find(|p|p.owner==username && p.id==id && p.session==session && p.expires>Instant::now()).ok_or_else(||error(StatusCode::NOT_FOUND,"Camera session not found"))?;
+    publisher.label=label;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn renew(
@@ -214,8 +240,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let users_path = dir.join("users.json");
         std::fs::write(&users_path, serde_json::to_vec(&serde_json::json!({"anonymous":{"view_data":true},"users":[
-            {"username":"producer","roles":["stream_master"],"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true}},
-            {"username":"other","roles":["stream_admin"],"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true}},
+            {"username":"producer","roles":[],"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true,"camera_publish":true}},
+            {"username":"other","roles":[],"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true,"camera_publish":true}},
             {"username":"viewer","roles":["stream_viewer"],"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true}}
         ]})).unwrap()).unwrap();
         let mut app = crate::state::tests::test_app_state().await;
@@ -267,6 +293,7 @@ mod tests {
             hls_segments: Mutex::new(std::collections::HashMap::new()),
             preview_sessions: Mutex::new(Vec::new()),
             publishers: Mutex::new(Vec::new()),
+            transcoding: Mutex::default(),
             recorded_vehicle_cache: Mutex::new(Default::default()),
         });
         let headers = |name: &str| {
@@ -282,6 +309,7 @@ mod tests {
             offer(
                 State(state.clone()),
                 headers("viewer"),
+                Query(PublishOptions::default()),
                 Bytes::from("offer")
             )
             .await
@@ -290,13 +318,14 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         assert!(
-            offer(State(state.clone()), HeaderMap::new(), Bytes::from("offer"))
+            offer(State(state.clone()), HeaderMap::new(), Query(PublishOptions::default()), Bytes::from("offer"))
                 .await
                 .is_err()
         );
         let response = offer(
             State(state.clone()),
             headers("producer"),
+            Query(PublishOptions {name:Some("Pad interview".into())}),
             Bytes::from("offer"),
         )
         .await
@@ -332,7 +361,7 @@ mod tests {
         // Revoking the user's role immediately rejects the next lease renewal.
         let mut users: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("users.json")).unwrap()).unwrap();
-        users["users"][0]["roles"] = serde_json::json!(["stream_viewer"]);
+        users["users"][0]["permissions"]["camera_publish"] = serde_json::json!(false);
         std::fs::write(dir.join("users.json"), serde_json::to_vec(&users).unwrap()).unwrap();
         assert!(
             renew(State(state.clone()), path(), headers("producer"))

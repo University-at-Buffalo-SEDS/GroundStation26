@@ -29,6 +29,8 @@ struct StreamConfig {
     fps: u32,
     bitrate: u32,
     enabled: bool,
+    #[serde(default)]
+    audio_device: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -75,6 +77,13 @@ impl Config {
         let mut ids = HashSet::new();
         let mut cameras = HashSet::new();
         for s in &self.streams {
+            ensure!(
+                s.audio_device.as_ref().is_none_or(|d| !d.is_empty()
+                    && d.len() <= 256
+                    && !d.starts_with('-')
+                    && d.chars().all(|c| c.is_ascii_graphic())),
+                "invalid ALSA audio device"
+            );
             ensure!(
                 !s.id.is_empty()
                     && s.id.len() <= 64
@@ -131,8 +140,17 @@ async fn save_config(path: &Path, config: &Config) -> Result<()> {
 
 fn updated_config(config: &Config, id: &str, field: &str, value: Value) -> Result<Config> {
     ensure!(
-        ["camera", "width", "height", "fps", "bitrate", "enabled"].contains(&field),
-        "unknown setting; use camera, width, height, fps, bitrate or enabled"
+        [
+            "camera",
+            "width",
+            "height",
+            "fps",
+            "bitrate",
+            "enabled",
+            "audio_device"
+        ]
+        .contains(&field),
+        "unknown setting; use camera, width, height, fps, bitrate, enabled or audio_device"
     );
     let mut next = config.clone();
     let stream = next
@@ -199,7 +217,7 @@ fn ffmpeg_args(config: &Config, stream: &StreamConfig, password: &str) -> Vec<St
         config.port,
         stream.id
     );
-    [
+    let mut args: Vec<String> = [
         "-hide_banner",
         "-loglevel",
         "error",
@@ -212,26 +230,62 @@ fn ffmpeg_args(config: &Config, stream: &StreamConfig, password: &str) -> Vec<St
         &stream.fps.to_string(),
         "-i",
         "pipe:0",
-        "-map",
-        "0:v:0",
-        "-c:v",
-        "copy",
-        "-an",
-        "-f",
-        "rtsp",
-        "-rtsp_transport",
-        "tcp",
-        "-rw_timeout",
-        "5000000",
-        "-progress",
-        "pipe:1",
-        "-stats_period",
-        "1",
-        &destination,
     ]
     .into_iter()
     .map(str::to_owned)
-    .collect()
+    .collect();
+    if let Some(device) = &stream.audio_device {
+        args.extend(
+            [
+                "-thread_queue_size",
+                "512",
+                "-f",
+                "alsa",
+                "-i",
+                device,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+    } else {
+        args.extend(
+            ["-map", "0:v:0", "-c:v", "copy", "-an"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+    }
+    args.extend(
+        [
+            "-f",
+            "rtsp",
+            "-rtsp_transport",
+            "tcp",
+            "-rw_timeout",
+            "5000000",
+            "-progress",
+            "pipe:1",
+            "-stats_period",
+            "1",
+            &destination,
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    );
+    args
 }
 
 struct Pipeline {
@@ -692,6 +746,30 @@ mod tests {
         let args = camera_args(&config.streams[0]);
         assert!(args.contains(&"--low-latency".into()));
         assert!(args.windows(2).any(|pair| pair == ["--intra", "30"]));
+    }
+
+    #[test]
+    fn microphone_audio_is_optional_and_keeps_hardware_video_copy() {
+        let mut config = example();
+        config.streams[0].audio_device = Some("plughw:1,0".into());
+        config.validate().unwrap();
+        let args = ffmpeg_args(&config, &config.streams[0], "fixture-only");
+        for expected in [
+            ["-f", "alsa"],
+            ["-i", "plughw:1,0"],
+            ["-map", "1:a:0"],
+            ["-c:v", "copy"],
+            ["-c:a", "aac"],
+        ] {
+            assert!(args.windows(2).any(|pair| pair == expected));
+        }
+        assert!(!args.contains(&"-an".to_string()));
+        config.streams[0].audio_device = Some("-unsafe".into());
+        assert!(config.validate().is_err());
+        config.streams[0].audio_device = None;
+        assert!(
+            ffmpeg_args(&config, &config.streams[0], "fixture-only").contains(&"-an".to_string())
+        );
     }
 
     #[tokio::test]

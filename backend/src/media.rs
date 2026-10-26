@@ -3,6 +3,8 @@
 mod contract;
 #[path = "media/publishing.rs"]
 mod publishing;
+#[path = "media/transcoding.rs"]
+mod transcoding;
 #[path = "media/recorded_vehicle.rs"]
 mod recorded_vehicle;
 #[path = "media/recordings.rs"]
@@ -45,6 +47,7 @@ struct MediaState {
     hls_segments: Mutex<std::collections::HashMap<(String, String), u64>>,
     preview_sessions: Mutex<Vec<(String, String, String)>>,
     publishers: Mutex<Vec<publishing::Publisher>>,
+    transcoding: Mutex<transcoding::Registry>,
     recorded_vehicle_cache: Mutex<recorded_vehicle::SceneCache>,
 }
 
@@ -77,6 +80,7 @@ pub fn router(
         hls_segments: Mutex::new(std::collections::HashMap::new()),
         preview_sessions: Mutex::new(Vec::new()),
         publishers: Mutex::new(Vec::new()),
+        transcoding: Mutex::default(),
         recorded_vehicle_cache: Mutex::new(Default::default()),
         models: std::env::var_os("GS_STAGE_MODELS_DIR")
             .map(PathBuf::from)
@@ -92,8 +96,10 @@ pub fn router(
         .merge(contract::routes())
         .merge(recordings::routes())
         .merge(publishing::routes())
+        .merge(transcoding::routes())
         .merge(recorded_vehicle::routes())
         .route("/api/video/streams", get(list_streams))
+        .route("/api/video/streams/{id}/name",post(contract::rename_camera).layer(DefaultBodyLimit::max(1024)))
         .route(
             "/api/video/streams/{id}/whep",
             post(whep_offer).layer(DefaultBodyLimit::max(64 * 1024)),
@@ -167,6 +173,7 @@ fn upstream_error(err: reqwest::Error) -> Response {
 #[derive(Serialize)]
 struct StreamInfo {
     id: String,
+    name: String,
     live: bool,
 }
 
@@ -175,9 +182,15 @@ async fn list_streams(
     headers: HeaderMap,
 ) -> ApiResult<axum::Json<Vec<StreamInfo>>> {
     contract::authorize_preview(&state, &headers).await?;
-    fetch_streams(&state).await
+    let mut streams=fetch_streams(&state).await?.0;
+    let presentation=contract::read_presentation(&state).await?;
+    for stream in &mut streams{let logical=stream.id.strip_prefix("transcoded-").unwrap_or(&stream.id);if let Some(label)=presentation.stream_labels.get(logical){stream.name=label.clone();}}
+    Ok(axum::Json(streams))
 }
-async fn fetch_streams(state: &MediaState) -> ApiResult<axum::Json<Vec<StreamInfo>>> {
+async fn fetch_streams(state:&MediaState)->ApiResult<axum::Json<Vec<StreamInfo>>>{
+    Ok(axum::Json(transcoding::choose(state,fetch_streams_raw(state).await?.0).await))
+}
+async fn fetch_streams_raw(state: &MediaState) -> ApiResult<axum::Json<Vec<StreamInfo>>> {
     let response = state
         .client
         .get(format!(
@@ -191,6 +204,7 @@ async fn fetch_streams(state: &MediaState) -> ApiResult<axum::Json<Vec<StreamInf
         .error_for_status()
         .map_err(upstream_error)?;
     let body: serde_json::Value = response.json().await.map_err(upstream_error)?;
+    let labels: std::collections::HashMap<_,_> = state.publishers.lock().await.iter().map(|p|(p.id.clone(),p.label.clone())).collect();
     let streams = body["items"]
         .as_array()
         .into_iter()
@@ -199,6 +213,7 @@ async fn fetch_streams(state: &MediaState) -> ApiResult<axum::Json<Vec<StreamInf
             let id = item["name"].as_str()?;
             valid_id(id).then(|| StreamInfo {
                 id: id.into(),
+                name: labels.get(id).cloned().unwrap_or_else(||id.to_owned()),
                 live: item["ready"].as_bool().unwrap_or(false),
             })
         })
@@ -477,8 +492,13 @@ mod tests {
             ("producer", vec!["stream_master"]),
             ("administrator", vec!["admin"]),
             ("viewer", vec![]),
+            ("publisher", vec![]),
+            ("operator", vec![]),
         ];
-        let users:Vec<_>=accounts.iter().map(|(name,roles)|serde_json::json!({"username":name,"roles":roles,"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true,"send_commands":false,"voice_transmit":*name=="producer"}})).collect();
+        let mut verifier=[0u8;32];ring::pbkdf2::derive(ring::pbkdf2::PBKDF2_HMAC_SHA256,std::num::NonZeroU32::new(10000).unwrap(),b"fixture-media-salt",b"fixture-only-password",&mut verifier);
+        use base64::Engine;
+        let password=serde_json::json!({"algorithm":"pbkdf2_sha256","iterations":10000,"salt_b64":base64::engine::general_purpose::STANDARD.encode(b"fixture-media-salt"),"hash_b64":base64::engine::general_purpose::STANDARD.encode(verifier)});
+        let users:Vec<_>=accounts.iter().map(|(name,roles)|serde_json::json!({"username":name,"roles":roles,"password":password,"permissions":{"view_data":true,"send_commands":*name=="operator","voice_transmit":*name=="producer","camera_publish":*name=="producer"||*name=="publisher"}})).collect();
         std::fs::write(&path,serde_json::to_vec(&serde_json::json!({"anonymous":{"view_data":true,"send_commands":false},"users":users})).unwrap()).unwrap();
         let mut app = crate::state::tests::test_app_state().await;
         Arc::get_mut(&mut app).unwrap().auth = Arc::new(crate::auth::AuthManager::new(path));
@@ -496,6 +516,8 @@ mod tests {
             voice.clone(),
         )
         .merge(crate::voice::routes(app.clone(), voice))
+        .route("/api/auth/challenge",post(crate::web::login_challenge))
+        .route("/api/auth/login",post(crate::web::login))
         .with_state(app);
         let address: std::net::SocketAddr = std::env::var("GS_MEDIA_TEST_BIND")
             .unwrap_or_else(|_| "127.0.0.1:19090".into())

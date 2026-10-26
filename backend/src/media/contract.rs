@@ -3,7 +3,7 @@ use super::*;
 use serde::Deserialize;
 use std::{collections::BTreeMap, time::Instant};
 #[path = "program.rs"]
-mod program;
+pub(crate) mod program;
 #[path = "replay.rs"]
 pub(crate) mod replay;
 
@@ -16,12 +16,21 @@ pub(super) struct Broadcast {
     featured_stream_id: String,
     hidden_stream_ids: Vec<String>,
     layout: String,
+    tiles: Vec<CameraTile>,
     pub(super) revision: u64,
     replay: Option<replay::Plan>,
     rundown: super::rundown::Rundown,
     commentary_audio_enabled: bool,
     interview: Interview,
     pub(super) recorded_replay: Option<super::recorded_vehicle::RecordedReplayPlan>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CameraTile { stream_id:String, x:f64, y:f64, width:f64, height:f64 }
+fn valid_tiles(tiles:&[CameraTile])->bool {
+ let mut ids=std::collections::HashSet::new();
+ tiles.len()<=8 && tiles.iter().all(|t|valid_id(&t.stream_id)&&ids.insert(&t.stream_id)&&[t.x,t.y,t.width,t.height].iter().all(|v|v.is_finite())&&t.x>=0.0&&t.y>=0.0&&t.width>=10.0&&t.height>=10.0&&t.x+t.width<=100.001&&t.y+t.height<=100.001)
 }
 
 impl Default for Broadcast {
@@ -33,6 +42,7 @@ impl Default for Broadcast {
             featured_stream_id: String::new(),
             hidden_stream_ids: Vec::new(),
             layout: "hero".into(),
+            tiles: Vec::new(),
             revision: 0,
             replay: None,
             rundown: Default::default(),
@@ -66,7 +76,7 @@ impl Default for Interview {
 #[serde(default)]
 pub(super) struct Presentation {
     title: String,
-    stream_labels: BTreeMap<String, String>,
+    pub(super) stream_labels: BTreeMap<String, String>,
     stats: Vec<BroadcastStat>,
     pub(super) broadcast: Broadcast,
     pub(super) vehicle: Vehicle,
@@ -374,6 +384,7 @@ pub(super) struct Ticket {
 pub(super) struct MediaQuery {
     ticket: Option<String>,
     session: Option<String>,
+    playback_ms: Option<u64>,
 }
 
 pub(super) async fn ticket(
@@ -453,17 +464,27 @@ async fn ticket_headers(
             headers.insert(header::AUTHORIZATION, value.clone());
         }
     }
+    authorize(state,&headers,Permission::ViewData).await?;
+    if let Some(id)=&query.ticket {if let Some(ticket)=state.tickets.lock().await.iter_mut().find(|t|&t.id==id&&t.resource==resource){ticket.expires=Instant::now()+Duration::from_secs(3600);}}
     Ok(headers)
+}
+
+#[derive(Deserialize)]
+pub(super) struct CameraName {name:String}
+pub(super) async fn rename_camera(State(state):State<Arc<MediaState>>,Path(id):Path<String>,headers:HeaderMap,axum::Json(body):axum::Json<CameraName>)->ApiResult<axum::Json<serde_json::Value>>{
+ let principal=crate::web::authorize_headers(&state.app,&headers,Permission::ViewData).await?;if !principal.can_manage_stream(){return Err(error(StatusCode::FORBIDDEN,"Stream-manager access required"));}
+ check_id(&id)?;let id=id.strip_prefix("transcoded-").unwrap_or(&id).to_owned();let name=body.name.trim();if name.is_empty()||name.len()>256||name.chars().count()>80||name.chars().any(char::is_control){return Err(error(StatusCode::BAD_REQUEST,"Choose a camera name of 1–80 characters"));}
+ let _guard=state.presentation_write.lock().await;let mut presentation=read_presentation(&state).await?;presentation.stream_labels.insert(id.clone(),name.to_owned());write_presentation(&state,&presentation).await?;Ok(axum::Json(serde_json::json!({"id":id,"name":name})))
 }
 
 pub(super) async fn authorize_preview(state: &MediaState, headers: &HeaderMap) -> ApiResult<()> {
     let p = crate::web::authorize_headers(&state.app, headers, Permission::ViewData).await?;
-    if p.can_manage_stream() || p.permissions.send_commands {
+    if p.can_manage_stream() {
         Ok(())
     } else {
         Err(error(
             StatusCode::FORBIDDEN,
-            "Live preview requires operator or stream-master access",
+            "Live preview requires stream-manager access",
         ))
     }
 }
@@ -508,9 +529,10 @@ async fn live_streams(
     let program_ticket = ticket(&state, &headers, "program").await?;
     let program_url = format!("/api/media-assets/program?ticket={program_ticket}");
     for stream in streams {
+        let logical=stream.id.strip_prefix("transcoded-").unwrap_or(&stream.id);
         let ticket = ticket(&state, &headers, &format!("stream:{}", stream.id)).await?;
         feeds.push(serde_json::json!({
-            "id": stream.id, "label": presentation.stream_labels.get(&stream.id).unwrap_or(&stream.id),
+            "id": logical, "label": presentation.stream_labels.get(logical).unwrap_or(&stream.name),
             "url": format!("/api/media-assets/streams/{}?ticket={ticket}", stream.id),
             "kind": "webrtc", "poster_url": "", "online": stream.live,
         }));
@@ -532,7 +554,8 @@ async fn live_streams(
             "stats": presentation.stats, "broadcast": presentation.broadcast,
             "program_url": program_url,
             "can_manage_stream": principal.can_manage_stream(),
-            "can_preview_live": principal.can_manage_stream() || principal.permissions.send_commands,
+            "can_publish_camera": principal.can_publish_camera(),
+            "can_preview_live": principal.can_manage_stream(),
         })),
     )
         .into_response())
@@ -577,6 +600,7 @@ async fn control_broadcast_inner(
         || ![
             "hero",
             "grid",
+            "tiles",
             "model",
             "grid-model",
             "interview",
@@ -584,6 +608,8 @@ async fn control_broadcast_inner(
             "recorded-replay",
         ]
         .contains(&broadcast.layout.as_str())
+        || !valid_tiles(&broadcast.tiles)
+        || (broadcast.layout=="tiles" && broadcast.tiles.is_empty())
         || broadcast.hidden_stream_ids.len() > 1000
     {
         return Err(error(
@@ -912,6 +938,16 @@ async fn model_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn saved_tiles_reject_duplicate_ids_and_out_of_canvas_geometry() {
+        let tile = CameraTile {stream_id:"front".into(),x:0.0,y:0.0,width:65.0,height:100.0};
+        assert!(valid_tiles(std::slice::from_ref(&tile)));
+        assert!(!valid_tiles(&[tile.clone(),tile.clone()]));
+        for bad in [CameraTile{x:60.0,..tile.clone()},CameraTile{width:0.0,..tile.clone()},CameraTile{y:f64::NAN,..tile.clone()},CameraTile{stream_id:"../front".into(),..tile.clone()}] {
+            assert!(!valid_tiles(&[bad]));
+        }
+    }
+
     #[tokio::test]
     async fn selected_frontend_replay_asset_is_served_or_explicitly_absent() {
         let result = three_asset(Path("replay-scene.js".into())).await;

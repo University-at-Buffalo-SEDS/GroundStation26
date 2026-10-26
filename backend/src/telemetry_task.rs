@@ -166,6 +166,10 @@ pub(crate) fn recording_network_utc_ms() -> Option<i64> {
         .ok()
 }
 
+pub(crate) fn displayed_network_utc_ms() -> i64 {
+    recording_network_utc_ms().unwrap_or_else(|| get_current_timestamp_ms() as i64)
+}
+
 fn send_valve_launch_sequence_command(router: &Router) -> bool {
     let payload = [ValveBoardCommands::Sequence as u8];
     if let Err(e) = router.log_queue(
@@ -1042,7 +1046,6 @@ pub async fn telemetry_task(
                                 state.broadcast_action_policy_snapshot();
                                 gs_debug_println!("HITL physical launch mode toggled: uses_ground_station={uses_gs}");
                         }
-                        #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::ToggleAvBayUnderglow => {
                             match crate::network_variables::toggle_underglow(&router) {
                                 Ok(enabled) => {
@@ -1058,7 +1061,6 @@ pub async fn telemetry_task(
                                 }
                             }
                         }
-                        #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::ToggleFlightBuzzer => {
                             match crate::network_variables::toggle_flight_buzzer(&router) {
                                 Ok(enabled) => {
@@ -1085,7 +1087,6 @@ pub async fn telemetry_task(
                         TelemetryCommand::ResetFlightState => {
                             reset_operator_flight_state(&state);
                         }
-                        #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::ResetTClock => {
                             state.reset_launch_clock();
                         }

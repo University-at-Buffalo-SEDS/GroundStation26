@@ -207,3 +207,5 @@ local or source-archive build, set `GS_FRONTEND_SOURCE_DIR` to a frontend checko
 containing `station_ui/manifest.json`. Backend auth, APIs, MIME types and
 browser URLs are unchanged. See `ui/tests/station-*` for the relocated browser
 and artwork checks.
+
+Camera permissions, mobile sharing, broadcast layouts and clean OBS output are documented in [Camera access and broadcast operation](docs/media/access-and-broadcast.md). Remote encoding uses the separate [native Video Transcoder](video_transcoder/README.md).

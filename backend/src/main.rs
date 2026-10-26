@@ -1266,7 +1266,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             if pkt.data_type() == telemetry_schema::data_type("UMBILICAL_STATUS") {
-                log::info!(
+                log::debug!(
                     "umbilical status packet received sender={} endpoints={:?} payload={:02x?}",
                     pkt.sender(),
                     pkt.endpoints(),

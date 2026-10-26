@@ -101,6 +101,94 @@ pub async fn sync(
         }
     }
 }
+
+/// Set the primary's SEDSnet UTC source without changing the host wall clock.
+/// Authorization is independent of flight state and physical button interlocks.
+pub async fn sync_network(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<SyncRequest>,
+) -> Response {
+    let principal = match crate::web::authorize_headers(&state, &headers, Permission::SetSystemTime)
+        .await
+    {
+        Ok(principal) if !principal.anonymous => principal,
+        Ok(_) => return (StatusCode::UNAUTHORIZED, "Sign in to set network UTC.").into_response(),
+        Err(error) => return error,
+    };
+    if crate::rrls::is_rrls() {
+        return (
+            StatusCode::CONFLICT,
+            "Network UTC is owned by the primary GroundStation.",
+        )
+            .into_response();
+    }
+    let SyncRequest::Client { utc_ms } = request else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Supply a complete UTC date and time.",
+        )
+            .into_response();
+    };
+    let Some(router) = state.topology_router.get() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Network router is not ready.",
+        )
+            .into_response();
+    };
+    if let Err(error) = set_network_utc(router, utc_ms) {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+    log::info!(
+        "Network UTC source set by {:?} to {utc_ms} ms",
+        principal.username
+    );
+    Json(snapshot(true)).into_response()
+}
+
+fn set_network_utc(router: &sedsnet::router::Router, utc_ms: i64) -> Result<(), &'static str> {
+    time_argument(utc_ms)?;
+    router.set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(
+        utc_ms as u64,
+    ));
+    Ok(())
+}
+
+#[cfg(test)]
+mod network_tests {
+    #[test]
+    fn utc_corrections_steer_the_existing_network_clock_without_a_hard_jump() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+        let clock = Arc::new(AtomicU64::new(0));
+        let input = clock.clone();
+        let router = sedsnet::router::Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([]),
+            Box::new(move || input.load(Ordering::Relaxed)),
+        );
+        let base = 1_800_000_000_000;
+        super::set_network_utc(&router, base).unwrap();
+        clock.store(1000, Ordering::Relaxed);
+        super::set_network_utc(&router, base + 11_000).unwrap();
+        assert_eq!(router.network_time_ms(), Some(base as u64 + 1000));
+        clock.store(2000, Ordering::Relaxed);
+        assert_eq!(router.network_time_ms(), Some(base as u64 + 2050));
+    }
+
+    #[test]
+    fn network_utc_changes_the_router_without_invoking_a_system_clock_command() {
+        let router = sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([]));
+        let desired = 1_800_000_000_000;
+        super::set_network_utc(&router, desired).unwrap();
+        let actual = router.network_time().unwrap().unix_time_ms.unwrap();
+        assert!((desired as u64..desired as u64 + 1000).contains(&actual));
+        assert!(super::set_network_utc(&router, -1).is_err());
+        assert!(super::set_network_utc(&router, i64::MAX).is_err());
+    }
+}
 async fn set_os_time(argument: &str) -> Result<(), String> {
     if !cfg!(target_os = "linux") {
         return Err("Setting the machine clock is supported on Linux/systemd hosts only.".into());
@@ -164,7 +252,49 @@ mod tests {
                 .await
                 .is_ok()
         );
+        let router = Arc::new(sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([]),
+        ));
+        assert!(state.topology_router.set(router.clone()).is_ok());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer clock-test".parse().unwrap(),
+        );
+        let mut previous = 0;
+        for flight_state in 0..=15 {
+            *state.state.lock().unwrap() = crate::types::u8_to_flight_state(flight_state).unwrap();
+            let utc_ms = 1_800_000_000_000 + i64::from(flight_state) * 60_000;
+            let reply = sync_network(
+                State(state.clone()),
+                headers.clone(),
+                Json(SyncRequest::Client { utc_ms }),
+            )
+            .await;
+            assert_eq!(
+                reply.status(),
+                StatusCode::OK,
+                "UTC setter in state {flight_state}"
+            );
+            let reading = router.network_time().unwrap().unix_time_ms.unwrap();
+            // SEDSnet slews subsequent corrections instead of jumping running
+            // network clocks. Flight state must not prevent accepting a source.
+            assert!(reading >= previous);
+            previous = reading;
+        }
         save(false, false);
+        assert!(
+            !sync_network(
+                State(state.clone()),
+                headers.clone(),
+                Json(SyncRequest::Client {
+                    utc_ms: 1_900_000_000_000
+                })
+            )
+            .await
+            .status()
+            .is_success()
+        );
         assert!(
             state
                 .auth

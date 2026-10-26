@@ -1383,6 +1383,12 @@ impl AppState {
             }
         }
         crate::gse::decorate_policy(self, &mut policy);
+        for control in &mut policy.controls {
+            if crate::sequences::is_station_utility_command(&control.cmd) {
+                control.enabled = true;
+                control.blink = crate::sequences::BlinkMode::None;
+            }
+        }
         if crate::checklists::launch_block().is_some() {
             for control in &mut policy.controls {
                 if matches!(control.cmd.as_str(), "Launch" | "GroundStationLaunch") {
@@ -1431,6 +1437,11 @@ impl AppState {
                     | TelemetryCommand::PauseWritingDb
                     | TelemetryCommand::StopWritingDb
             );
+        }
+        if crate::sequences::is_station_utility_command(command_name(cmd)) {
+            // These utilities have no flight-state or physical-interlock
+            // restriction; retain the explicit software-control disable.
+            return self.action_policy.lock().unwrap().software_buttons_enabled;
         }
         if let Some(allowed) = crate::gse::command_allowed(self, cmd) {
             return allowed;
@@ -2530,6 +2541,31 @@ pub(crate) mod tests {
                 key && software
             );
             assert!(state.is_command_allowed(&TelemetryCommand::CancelFill));
+        }
+    }
+
+    #[tokio::test]
+    async fn station_utilities_remain_available_in_every_flight_state() {
+        let state = test_app_state().await;
+        for value in 0..=15 {
+            *state.state.lock().unwrap() = crate::types::u8_to_flight_state(value).unwrap();
+            let mut policy = crate::sequences::default_action_policy();
+            policy.key_enabled = false;
+            for control in &mut policy.controls {
+                control.enabled = false;
+            }
+            state.set_action_policy(policy);
+            let policy = state.action_policy_snapshot();
+            for command in [
+                TelemetryCommand::ToggleAvBayUnderglow,
+                TelemetryCommand::ToggleFlightBuzzer,
+                TelemetryCommand::ResetTClock,
+            ] {
+                let name = crate::sequences::command_name(&command);
+                assert!(state.is_command_allowed(&command), "{name}, state {value}");
+                assert!(policy.controls.iter().any(|c| c.cmd == name && c.enabled),
+                        "{name} missing or disabled in state {value}");
+            }
         }
     }
 

@@ -763,16 +763,16 @@ impl FlightSimState {
             TelemetryCommand::GroundStationLaunch => {
                 // Valve-board-owned launch commands are forwarded by telemetry_task.
             }
+            TelemetryCommand::ToggleAvBayUnderglow
+            | TelemetryCommand::ToggleFlightBuzzer
+            | TelemetryCommand::ResetTClock => return false,
             #[cfg(feature = "hitl_mode")]
             TelemetryCommand::ToggleButtonInterlock
             | TelemetryCommand::ToggleGroundStationControl
             | TelemetryCommand::ToggleLaunchInterlock
             | TelemetryCommand::TogglePhysicalLaunchMode
-            | TelemetryCommand::ToggleAvBayUnderglow
-            | TelemetryCommand::ToggleFlightBuzzer
             | TelemetryCommand::ResetLaunchLatch
             | TelemetryCommand::ResetFlightState
-            | TelemetryCommand::ResetTClock
             | TelemetryCommand::DeployParachute
             | TelemetryCommand::ExpandParachute
             | TelemetryCommand::ReinitSensors

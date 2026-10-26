@@ -685,10 +685,12 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
         layout.branding.dashboard_title = Some("RRLS".into());
     }
     ensure_gse_sequence_actions(layout);
-    #[cfg(feature = "hitl_mode")]
     for (cmd, label) in [
-        ("ResetFlightState", "Reset flight state to Idle"),
+        ("ToggleAvBayUnderglow", "AV Bay Underglow"),
+        ("ToggleFlightBuzzer", "Flight Buzzer"),
         ("ResetTClock", "Reset T-clock"),
+        #[cfg(feature = "hitl_mode")]
+        ("ResetFlightState", "Reset flight state to Idle"),
     ] {
         if !layout
             .actions_tab

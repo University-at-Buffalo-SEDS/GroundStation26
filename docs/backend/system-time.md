@@ -11,6 +11,20 @@ than silently omitting its data. Individual-session downloads remain available.
 
 ## Per-user clock authority
 
+Network UTC is also available in Actions and Settings in every flight state.
+`POST /api/network_time` accepts `{"source":"client","utc_ms":1793052000000}`
+with the same explicit `set_system_time` account permission. This updates the
+primary station's SEDSnet UTC source, without invoking systemd or changing the
+host wall clock. Existing network clocks converge using SEDSnet's bounded slew;
+they do not immediately jump to the requested value. Network time labels use
+the router's synchronized UTC when available. RRLS must receive its time from
+the primary; direct network-clock writes on RRLS return a conflict response.
+
+AV-bay underglow, FC buzzer, and T-clock reset are available in normal, HITL,
+and test-fire builds in every flight state. Account command permissions and
+an explicit software-control disable still apply. T-clock reset changes the
+displayed launch clock without resetting flight state or board sequences.
+
 Add `"set_system_time": true` under a user's `permissions` in `users.json`, or
 use **Set System Date/Time** in `backend/tools/users_config_gui.py` (GUI/TUI).
 The CLI also supports `--set-system-time` / `--no-set-system-time`.

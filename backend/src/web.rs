@@ -223,7 +223,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/calibration/capture_zero", post(capture_loadcell_zero))
         .route("/api/calibration/capture_span", post(capture_loadcell_span))
         .route("/api/calibration/refit", post(refit_loadcell_channel))
-        .route("/api/network_time", get(get_network_time))
+        .route("/api/network_time", get(get_network_time).post(crate::system_clock::sync_network))
         .route("/api/launch_clock", get(get_launch_clock))
         .route("/api/network_topology", get(get_network_topology))
         .route("/api/network_diagnostics", get(get_network_diagnostics))
@@ -330,7 +330,7 @@ fn principal_can_edit_calibration(principal: &crate::auth::AuthPrincipal) -> boo
 }
 
 /// Creates a one-time login challenge bound to a username.
-async fn login_challenge(
+pub(crate) async fn login_challenge(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoginChallengeRequest>,
 ) -> impl IntoResponse {
@@ -341,7 +341,7 @@ async fn login_challenge(
 }
 
 /// Creates a new authenticated session from challenge-bound credentials.
-async fn login(
+pub(crate) async fn login(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoginRequest>,
 ) -> impl IntoResponse {
@@ -1559,7 +1559,7 @@ async fn get_network_time(
         return response;
     }
     Json(NetworkTimeMsg {
-        timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+        timestamp_ms: crate::telemetry_task::displayed_network_utc_ms(),
     })
     .into_response()
 }
@@ -2313,7 +2313,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
             return;
         }
         let initial_network_time = serde_json::to_string(&WsOutMsg::NetworkTime(NetworkTimeMsg {
-            timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+            timestamp_ms: crate::telemetry_task::displayed_network_utc_ms(),
         }))
         .unwrap_or_default();
         if ws_out_tx.send(initial_network_time).await.is_err() {
@@ -2625,7 +2625,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                         if ws_out_tx.send(msg).await.is_err() { break; }
                     }
                     let msg = WsOutMsg::NetworkTime(NetworkTimeMsg {
-                        timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+                        timestamp_ms: crate::telemetry_task::displayed_network_utc_ms(),
                     });
                     let text = serde_json::to_string(&msg).unwrap_or_default();
                     if ws_out_tx.send(text).await.is_err() {

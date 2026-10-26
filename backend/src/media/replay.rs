@@ -513,6 +513,7 @@ mod tests {
             hls_segments: Mutex::new(Default::default()),
             preview_sessions: Mutex::new(Vec::new()),
             publishers: Mutex::new(Vec::new()),
+            transcoding: Mutex::default(),
             recorded_vehicle_cache: Mutex::new(Default::default()),
         });
         let mut headers = HeaderMap::new();
