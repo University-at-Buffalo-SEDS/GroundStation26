@@ -1,12 +1,12 @@
 {
-  "updated_utc": "2026-10-26T02:59:25.592249+00:00",
-  "source_ready": false,
-  "release_ready": false,
-  "packages_published": "4.2.7 public crates.io version metadata confirmed; PyPI4.2.7 returns404 at this check. Publication occurs on maintainer Mac.",
+  "updated_utc": "2026-10-26T04:27:25.245825+00:00",
+  "source_ready": true,
+  "release_ready": true,
+  "packages_published": "Maintainer reports SEDSnet4.2.7 release published successfully. Publiccrate source match was independently verified earlier.",
   "priorities": [
     {
       "task": "4.2.7 independent-endpoint multicast and full flight acceptance",
-      "status": "final_valve_stack_fix_under_matching_artifact_qualification",
+      "status": "qualified",
       "results": [
         "Actual RF GPS C-ABI publication reproduced CAN1/radio0 despite success. SDK3971aef preserves distinct endpoint roles and now emits CAN1/radio1; redundant paths, explicit policies and retry ownership retain focused tests.",
         "SDK4.2.7 snapshot55fcdd5 and FC managed-state callback c690a0a compile in all8 factory variants; no overflow. FCSDK-absent/Cargo+rustc-blocked factory also passes.",
@@ -29,13 +29,11 @@
         "ActualARM128-byte inline payload makesTXentries224B: original512 has2TXslots and1536candidate has6, correcting prior64-bytepayload math. Corrected2048candidatefactorypasses and exactpayload1289slotfixturepasses36/36faircases; startup4144-byte allocation assertion and linked acceptance pending.",
         "Three-radio candidate with the original4.5KiB pressure worker stack failed with corrupted counters, HardFault and watchdog reset. The new first-error callback localizes a pressure-worker stack violation; this failed capture is preserved.",
         "Stack-adjusted firmware passes90s native/source checks and strict postvalidation of all9GPS windows. The original wrapper observer-duration error is preserved separately. Final rebuilt artifact currently has healthy two/three-radio endurance prefixes; three-radio measured pressure-stack use4856bytes exceeds the former4608-byte allocation.",
-        "Final-artifact ordinary-flight positive completes full70s with nativeexit0 and unchanged artifacts; actualGPS-loss negative has cancelled queuedlaunch with Firefalse/generation0 and still awaits full70s completion."
+        "Final-artifact ordinary-flight positive completes full70s with nativeexit0 and unchanged artifacts; actualGPS-loss negative has cancelled queuedlaunch with Firefalse/generation0 and still awaits full70s completion.",
+        "Matching final8 operational positive-flight, real GPS-loss negative and test-fire70s all pass. Both120s primary restart cases pass with fresh RF GPS publication after80s; minimum ValveBoard stack margin1792bytes. Endurance and relay remain pending.",
+        "Matching final8 two/three-radio600s each PASS58source-aware windows,59fresh RF GPS observations,60memory samples and all3SDreconciliations. RF managed-variable maximum170/180ms; fillACK maximum30/60ms. Valve minimum stack2028/1800bytes, no selected failure counters. Both120s restart and60s actual relay fallback PASS. Original failed candidate captures remain retained."
       ],
-      "remaining": [
-        "Complete matching final-artifact two/three-radio600s source/GPS/control/SD gates with zero stack errors and required margins.",
-        "Complete final-artifact GPS-loss negative/test-fire70s and restart120s/relay60s checks; preserve all prior artifacts and failures.",
-        "Record final qualification and push qualified source branches. Leave rerunning transient CI alone as requested; no package upload from this host."
-      ]
+      "remaining": []
     },
     {
       "task": "Stable low-latency RF and fill-system communication",
@@ -146,7 +144,7 @@
         "Latest native desktop frontend AArch64 check and release link pass warning-free; Pi backend production, HITL and test-fire feature checks also pass. No ARM/GPIO/GPU execution claim is made."
       ],
       "remaining": [
-        "Final macOS build/signing/notarization and local Mac package publication require access to the Mac; the existing async hostname question is unanswered.",
+        "GroundStation final macOS build/signing/notarization remains a Mac platform follow-up; SDK4.2.7 publication was separately completed by the maintainer.",
         "Physical iOS/Android/Pi acceptance remains hardware follow-up."
       ]
     }
@@ -173,23 +171,24 @@
     "scope": "Historical4.2.6 frozen cohort. Current4.2.7 candidate source/artifact manifests are separate; do not interpret these as latest qualification."
   },
   "source_pushes": {
-    "status": "backend_dev_pushed_after_public_sdk_available",
-    "sdk_main_and_dev": "b38b017",
-    "backend_dev": "c912b8a",
+    "status": "qualified_firmware_simulator_and_sdk_main_pushed_and_verified",
+    "backend_dev": "c912b8a (qualified runtime; subsequent commits change qualification documentation only)",
     "frontend_dev": "01a92c97fed53d873e84361366edb1c26199fe3d",
-    "simulator_main": "1fd7ff6",
+    "simulator_main": "1627897a49e3f669662d3dde9663aceae6cdcc1d",
     "board_branch": "migration/sedlaunch-sedsnet-mainline",
     "boards": {
-      "FlightComputer26": "1572dfe",
-      "RFBoard26": "6b97760",
-      "PowerBoard26": "d636a5b",
-      "ValveBoard26": "136eb1e",
-      "DAQ-Board": "f095625",
-      "gateway-board26": "72c8d8d",
-      "ActuatorBoard26": "79238da"
+      "FlightComputer26": "c690a0af9635453f013b51ea72de4ff01b761a65",
+      "RFBoard26": "c30c9121ec697ef7cc84091381b8470f17d4d71e",
+      "PowerBoard26": "733da336280e9d59503af20e688a68ff6ca4d966",
+      "ValveBoard26": "7701dd2fa4038fd931eef3d6e24c00518f2b6b0f",
+      "DAQ-Board": "a2613d110c8c8ff1c358d11fb792250c8b95672f",
+      "ActuatorBoard26": "bf0ba6eb5625d5d4e502c19ab89b5adefb927e7d",
+      "gateway-board26": "72c8d8deb97194d778af141b6df05415d0ee453b"
     },
     "frontend_main_promoted": false,
-    "scope": "Backend runtime devc912b8a and frontend dev01a92c97 pushed; newer local qualification updates pending final results. Firmware source fixes remain local until native gates pass. SDK main/dev a2a7419 is documentation-only after the published matching Rust sources."
+    "scope": "All seven firmware migration branches and simulator main pushed and verified. SDK main qualification-only updates pushed; SDK dev remains unchanged with matching released runtime. Backend dev carries this qualification record; frontend remains dev01a92c97 with no main promotion. No tag, release, package publication or physical hardware action performed here.",
+    "sdk_main": "56a6848caec839cdef11e08c62581d288c9aa3aa",
+    "sdk_dev": "a2a7419791836e8ab7eaffc74914db61affc94c8"
   },
   "github_release": {
     "version": "4.2.6",
@@ -211,15 +210,29 @@
     "sdk_source": "b38b017c8e4c963682362d34fa1362c67607d4d1",
     "queue": "Existing fair admission,2048-byte startup allocation, unchanged8192-byte logical budget; actual RX10/TX9/recent16 verified.",
     "stack_fix": "Pressure worker4.5->6.5KiB, acquisition4.5->5.5KiB, control12->11KiB. First stack-error capture and permanent1KiB pressure-worker margin checks.",
-    "native_status": "Matching final-artifact two/three-radio600s running; positive-flight70passed; GPS-loss negative70running; test-fire/restart/relay pending.",
-    "release_ready": false,
-    "evidence": "FirmwareSimulator/docs/qualification/valve-pressure-worker-stack-2026-10-25.json"
+    "native_status": "PASS: matching two/three-radio600s source/GPS/control/SD, all three operational70s, both restart120s, relay60s; exact compiled final8 artifact.",
+    "release_ready": true,
+    "evidence": "FirmwareSimulator/docs/qualification/valve-pressure-worker-stack-2026-10-25.json",
+    "evidence_reports": [
+      "FirmwareSimulator/docs/qualification/valve-final8-endurance-2026-10-25.json",
+      "FirmwareSimulator/docs/qualification/valve-final8-operational-2026-10-25.json",
+      "FirmwareSimulator/docs/qualification/valve-final8-restart-2026-10-25.json",
+      "FirmwareSimulator/docs/qualification/valve-final8-relay-2026-10-25.json"
+    ]
   },
   "publication_check": {
     "checked_utc": "2026-10-26T00:42:44.025854+00:00",
     "crates_io_4_2_7": "available",
     "pypi_4_2_7": "HTTP404",
     "gitlab_main": "b38b017c8e4c963682362d34fa1362c67607d4d1",
-    "gitlab_b38_pipeline": "7684failed rust-tests job29023; publictraceHTTP401; finalerror requested"
-  }
+    "gitlab_b38_pipeline": "Historical pipeline7684 rust-tests job29023 failed before tests because DNS failed downloading Clippy. User reports rerun in progress and requested no further CI investigation."
+  },
+  "maintainer_release_completion": {
+    "reported_utc": "2026-10-26T03:33:57.994414+00:00",
+    "version": "4.2.7",
+    "status": "maintainer_reports_release_published_successfully",
+    "publication_origin": "maintainer local Mac",
+    "scope": "SDK publication completed; firmware artifact qualification continues separately."
+  },
+  "readiness_scope": "Software source and simulator qualification only; no physical hardware, RF propagation or physical actuation acceptance is claimed."
 }
