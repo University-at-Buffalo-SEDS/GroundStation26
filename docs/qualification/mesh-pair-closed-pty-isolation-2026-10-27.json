@@ -1,0 +1,33 @@
+{
+  "scope": "Test-only closed-PTY lifecycle correction. ProductionMeshpair/Capacity/clock/airbudget/ownership implementations unchanged.",
+  "base_gs_commit": "7f4977200e0c930b8388a70e94a1281f6113d380",
+  "failed_cohort": "Frozen90fa DockerHITL receiptfilter:18pass/1failure, closedPTYflushunexpectedlyOkwhileaircampaignchildexecutesconcurrently.",
+  "cause": "serialport4.10.1TTYPort::pair opensmasterposix_openpt(O_RDWR), noCLOEXEC. A childcreatedafterpaircaninheritmasterandkeeptheslavewritableafterparentdrop(peer). ThatmakesIOfactuallysucceed; thetestwasnotestablishingclosed-peercondition. ProductionTTYPort::openusesO_CLOEXEC.",
+  "controlled_native_reproduction": {
+    "source": "FirmwareSimulator/build/schema-progress-cohort-20261027/native-mesh-pair-pty-isolation/fd-inheritance-reproducer.rs",
+    "source_sha256": "5ae686bc76493a880f9952a76224bbbf65b893c6f475668fb42e156be523834b",
+    "log": "FirmwareSimulator/build/schema-progress-cohort-20261027/native-mesh-pair-pty-isolation/fd-inheritance-reproducer.log",
+    "log_sha256": "1e548f4b4758f138ff40d4ffea4b85e924941def19ab634521502a2efa501c11",
+    "observed": [
+      "MasterFDflags0; childinherits/dev/pts/ptmx.",
+      "Parentdropsmaster:slavewriteOk(1)whilechildholdsdescriptor.",
+      "Childexits:nextslavewriteBrokenPipe."
+    ]
+  },
+  "fix": "ReexeconlytheexactfailuretestbeforecreatingitsPTY. Thepairiscreatedinsingle-testchild, sootherparalleltestschildreninparentcannotinheritit. Removesinheritedsimulationclock/PTymodeenvonlyforthisphysicalclosed-peerfixture. ExistingassertErr, bothoriginalownerrestoreandcapacityassertionsunchanged. Wholematrixremainsparallel.",
+  "validation": {
+    "exact_HITL_receipt_cohort": {
+      "passed": 19,
+      "failed": 0,
+      "log": "/tmp/mesh-pair-isolated-hitl-receipt-cohort-20261027.log",
+      "sha256": "af13b3f48ec84a4afe4167962a881d51e4f589cce5b56e4befa151d6c0346ca8",
+      "features": "hitl_mode",
+      "includes": "Sameconcurrentfinite_three_radio_meshactualSDKaircampaignthatreproduceddescriptorinheritanceopportunityinDocker."
+    }
+  },
+  "source_sha256": {
+    "backend/src/comms.rs": "74762650092d7e55c076f4914783f88e18b0a8a8499766ce12a7da04c4ac4bc0"
+  },
+  "limits": "Parentwillbuildnewimmutablecontextandrerunrequiredcontainerchecks; failed90faimage/contextpreserved. No pacingfixorintegrated500mslatencyqualificationimplied.",
+  "release": "Localtest-onlycommit,nopush/deploy. ParentCargo.toml/build.py/lock/test_dependency_refreshworknotstaged."
+}

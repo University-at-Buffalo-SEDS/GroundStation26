@@ -4310,6 +4310,28 @@ mod raw_uart_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn mesh_receipt_pair_uart_failure_restores_both_original_frames() {
+        const CHILD: &str = "GS_MESH_RECEIPT_FAILURE_CHILD";
+        const NAME: &str =
+            "comms::raw_uart_tests::mesh_receipt_pair_uart_failure_restores_both_original_frames";
+        if std::env::var_os(CHILD).is_none() {
+            // TTYPort::pair's master lacks CLOEXEC. A concurrently spawned air
+            // campaign can inherit it and keep this slave writable after drop.
+            // Create this test's PTY only after entering its isolated process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env_remove("GS_SIM_CLOCK_FILE")
+                .env_remove("GS_SIMULATED_SERIAL_PTY")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated closed-PTY ownership regression failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
         let (peer, port) = serialport::TTYPort::pair().unwrap();
         let (mut uart, shared, expected) = mesh_receipt_pair_fixture(port);
         drop(peer);
