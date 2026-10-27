@@ -28,9 +28,12 @@ pub enum Mode {
     Normal,
     Hitl,
     TestFire,
+    Testing,
 }
 pub fn local_mode() -> Mode {
-    if cfg!(feature = "hitl_mode") {
+    if cfg!(feature = "testing") {
+        Mode::Testing
+    } else if cfg!(feature = "hitl_mode") {
         Mode::Hitl
     } else if cfg!(feature = "test_fire_mode") {
         Mode::TestFire
@@ -427,6 +430,7 @@ fn display_frame(session: u32, nonce: u128, mode: Option<Mode>) -> Vec<u8> {
             Mode::Normal => 0,
             Mode::Hitl => 1,
             Mode::TestFire => 2,
+            Mode::Testing => 3,
         });
     }
     wire
@@ -489,6 +493,7 @@ impl DisplayRuntime {
                 0 => Mode::Normal,
                 1 => Mode::Hitl,
                 2 => Mode::TestFire,
+                3 => Mode::Testing,
                 _ => anyhow::bail!("Invalid display mode"),
             };
             if !self.persisted || self.mode != Some(mode) {
@@ -718,6 +723,55 @@ pub fn routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn testing_mode_is_explicit_in_local_signed_display_and_persisted_metadata() {
+        if cfg!(feature = "testing") {
+            assert_eq!(local_mode(), Mode::Testing);
+        }
+        let root = root();
+        let gs = fixture(&root, "gs", 1);
+        let pair = fixture(&root, "rrls", 1);
+        let mut signed = Runtime::new(&pair, true, root.join("signed-testing")).unwrap();
+        let nonce = "b".repeat(32);
+        waiting(&mut signed, &nonce, 0);
+        let wire = seal(
+            &gs,
+            "rrls",
+            Message::Reply {
+                nonce,
+                generation: 1,
+                mode: Mode::Testing,
+            },
+        )
+        .unwrap();
+        signed.receive(&pair, &wire, 1).unwrap();
+        assert_eq!(signed.mode, Some(Mode::Testing));
+        assert_eq!(
+            Runtime::new(&pair, true, root.join("signed-testing"))
+                .unwrap()
+                .mode,
+            Some(Mode::Testing)
+        );
+        let mut display = DisplayRuntime::new(true, root.join("display-testing")).unwrap();
+        display.connect(Some(7));
+        display.pending = Some((123, 0));
+        let wire = display_frame(7, 123, Some(Mode::Testing));
+        assert_eq!(wire.len(), 25);
+        assert_eq!(wire[24], 3);
+        display.receive(&wire, 1).unwrap();
+        assert_eq!(display.mode, Some(Mode::Testing));
+        assert_eq!(
+            DisplayRuntime::new(true, root.join("display-testing"))
+                .unwrap()
+                .mode,
+            Some(Mode::Testing)
+        );
+        assert_eq!(
+            serde_json::to_string(&Mode::Testing).unwrap(),
+            "\"testing\""
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn default_direct_mesh_syncs_without_pairing_voice_ready_or_document_presence() {
         use crate::rrls::{Mesh, Role};

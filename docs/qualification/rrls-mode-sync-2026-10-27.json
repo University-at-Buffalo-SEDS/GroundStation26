@@ -65,5 +65,26 @@
     "No hardware/device/deployment validation",
     "Two browser origins use independent preauthorized synthetic sessions",
     "No new cross-origin authentication transfer or sequence-control protocol"
-  ]
+  ],
+  "presentation_and_testing_followup": {
+    "base_feature_commit": "bb732e1fd767731cef0ef75177b8b5edb0dc8d25",
+    "source_sha256": {
+      "backend/src/station_mode.rs": "a19a2e062dbd37ab60f7a7766af9ee13618f95204e0d69a2f85237f623dd762a"
+    },
+    "changes": [
+      "Main observer notice emphasizes effective primary mode, freshness and read-only role; local build remains API/local gate diagnostics",
+      "Explicit Testing mode in signed JSON and OM2 byte3; Normal0/HITL1/TestFire2 preserved",
+      "cfgtesting takes precedence, matching active synthetic telemetry generator"
+    ],
+    "tests": {
+      "native_mode_normal": "10 passed,0 failed; /tmp/station-mode-testing-enum-normal-20261027.log",
+      "native_mode_hitl": "10 passed,0 failed; /tmp/station-mode-testing-enum-hitl-20261027.log",
+      "native_mode_testing": "10 passed,0 failed; /tmp/station-mode-testing-profile-20261027.log",
+      "frontend_native": "1 passed; /tmp/station-mode-banner-native-20261027.log",
+      "wasm": "PASS /tmp/station-mode-banner-wasm-20261027.log",
+      "browser_signed_discovery_failover": "PASS /tmp/station-mode-banner-failover-20261027.log",
+      "browser_legacy_mode": "PASS /tmp/station-mode-banner-legacy-20261027.log"
+    },
+    "full_backend_profiles": "Parent-owned; initial feature full profiles passed, final followup combined qualification pending"
+  }
 }
