@@ -402,3 +402,111 @@ fn captured_bidirectional_relay_burst_retains_source_and_canonical_deadlines() {
         "captured source/canonical deadlines missed"
     );
 }
+
+#[test]
+fn ordinary_source_progress_survives_routine_heartbeat_without_metadata() {
+    crate::telemetry_schema::initialize().unwrap();
+    let fixture: Fixture =
+        serde_json::from_str(include_str!("fixtures/full-path-50ms-rx.json")).unwrap();
+    let event = fixture
+        .events
+        .iter()
+        .find(|e| e.label.starts_with("BAROMETER_DATA:"))
+        .unwrap();
+    let source = STANDARD.decode(&event.payload).unwrap();
+    let heartbeat = fixture
+        .events
+        .iter()
+        .filter(|e| e.routine_uplink_heartbeat)
+        .find_map(|e| {
+            let bytes = STANDARD.decode(&e.payload).unwrap();
+            let (kind, body) = decode(&bytes)?;
+            (kind == UP_DATA).then(|| encode(AV_BAY_DATA, body))
+        })
+        .unwrap();
+    let mut mesh = Mesh::new(Role::Rrls, 2);
+    mesh.enqueue(
+        Outgoing {
+            command: false,
+            bytes: encode(DOWN_DATA, &source),
+        },
+        0,
+        0,
+    );
+    let mut delivered = None;
+    // Fixed available-admission opportunities, not a new rate setting. Every
+    // opportunity has one fresh routine packet, so strict priority cannot
+    // claim eventual sensor service merely from its 1500ms retention bound.
+    for now in (50..=2000u64).step_by(50) {
+        mesh.enqueue(
+            Outgoing {
+                command: true,
+                bytes: heartbeat.clone(),
+            },
+            253,
+            now,
+        );
+        let tx = mesh.begin_transmission(now).unwrap();
+        if decode(&tx.frame().bytes).is_some_and(|(kind, body)| kind == DOWN_DATA && body == source)
+        {
+            delivered = Some(now);
+        }
+        mesh.finish_transmission(tx, true);
+    }
+    assert!(
+        delivered.is_some_and(|at| at <= 1500),
+        "routineHB253starvedacceptedFCsource0: {delivered:?}"
+    );
+}
+
+#[test]
+fn ordinary_fifo_preserves_nondata_priority_and_equal_priority_age() {
+    let mut mesh = Mesh::new(Role::Rrls, 2);
+    // Voice1 retains its priority over sensor0 when it is the generic winner.
+    mesh.enqueue(
+        Outgoing {
+            command: false,
+            bytes: encode(DOWN_DATA, b"sensor"),
+        },
+        0,
+        0,
+    );
+    mesh.enqueue(
+        Outgoing {
+            command: true,
+            bytes: encode(VOICE, b"voice"),
+        },
+        1,
+        1,
+    );
+    let tx = mesh.begin_transmission(2).unwrap();
+    assert_eq!(decode(&tx.frame().bytes).unwrap().0, VOICE);
+    mesh.finish_transmission(tx, true);
+    let tx = mesh.begin_transmission(3).unwrap();
+    assert_eq!(decode(&tx.frame().bytes).unwrap().0, DOWN_DATA);
+    mesh.finish_transmission(tx, true);
+    // An older settings0 winner keeps its equal-priority queue age; selecting
+    // FIFO inside ordinary does not promote sensor0 across a different lane.
+    mesh.enqueue(
+        Outgoing {
+            command: true,
+            bytes: encode(SETTINGS, b"settings"),
+        },
+        0,
+        4,
+    );
+    mesh.enqueue(
+        Outgoing {
+            command: false,
+            bytes: encode(DOWN_DATA, b"sensor2"),
+        },
+        0,
+        5,
+    );
+    let tx = mesh.begin_transmission(6).unwrap();
+    assert_eq!(decode(&tx.frame().bytes).unwrap().0, SETTINGS);
+    mesh.finish_transmission(tx, true);
+    let tx = mesh.begin_transmission(7).unwrap();
+    assert_eq!(decode(&tx.frame().bytes).unwrap().0, DOWN_DATA);
+    mesh.finish_transmission(tx, true);
+}

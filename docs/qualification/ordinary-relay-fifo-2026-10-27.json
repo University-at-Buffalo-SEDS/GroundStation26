@@ -1,0 +1,60 @@
+{
+  "scope": "Absent-metadata ordinary relay FIFO starvation fix only; no boundedMeshpairingyet. SDK/RF/clocks/rates/queuecaps/deadlines unchanged.",
+  "base_gs_commit": "621983ac2efb184e96ff360c45bc3c1d4cf9f746",
+  "bug": "Without an independentDiscoveryAddress snapshot, genericpriority selection let every freshroutineHB253 overtake accepted FC/PBsource0 until it expired.",
+  "change": "Retain existing protected>=254 and contested4:1selection. In genericfallback, selectexistingmaxprioritywinner first; only when thatwinnerbelongsordinarydata substituteoldestdependency-readyordinaryFIFOhead. VOICE1 andoldSETTINGS0 priority/age survive.",
+  "regressions": [
+    "ActualfixtureBAROMETER_DATA0 versus continuousfreshHB253: baseline40availableturnsneverdelivered; candidatefirstturn withinunchanged1500ms.",
+    "VOICE1 overordinary0 andolderSETTINGS0 queueage preserved.",
+    "SDTdependency barriers/protectedpriority/metadata ratio unchanged."
+  ],
+  "validation": {
+    "product_integration": {
+      "RRLS_tests_passed": 66,
+      "failed": 0,
+      "log": "/tmp/ordinary-fifo-product-integration-20261027.log",
+      "log_sha256": "d24a520632023083c8affa0b32259af4034005db89e976b2f9feb0419bb35268"
+    },
+    "independent_refined_prototype": {
+      "RRLS_tests_passed": 68,
+      "failed": 0,
+      "log": "/tmp/ordinary-fifo-refined-20261027.log",
+      "log_sha256": "044344b44d66af4d9ef78a16cdf0029ead5c79dcb3dfb3f83fcab30f5e3c277b",
+      "extra_tests": "Two additionalunchangedcurrent149/11and147/19capturedreplays areadditivefixtures; no productfixturecopyneeded."
+    },
+    "native_offload_metrics": {
+      "old14915": {
+        "source": 149,
+        "canonical": 15,
+        "max_source_ms": 1102.6,
+        "max_canonical_ms": 1329.7,
+        "routine_up_HB_expiry": 22
+      },
+      "current14911": {
+        "source": 149,
+        "canonical": 11,
+        "max_source_ms": 761.8,
+        "max_canonical_ms": 1399.8
+      },
+      "new14719": {
+        "source": 147,
+        "canonical": 19,
+        "max_source_ms": 1182.0,
+        "max_canonical_ms": 611.2
+      }
+    },
+    "codec_current14719": {
+      "artifact": "FirmwareSimulator/build/schema-progress-cohort-20261027/native-current14719-replay/heartbeat-codec-audit/audit.json",
+      "sha256": "c858d6d338e05059177a7991df81ec3d2d84d334cf6f4230551d62e228c672ba",
+      "note": "Exact22omittedroutineUPHBs withfrozenSDKd82: zeroerrors and allremainingpacketJSONsource/type/ID/timeunchanged inRRLSandmappedRFnamespace. Thisauditrefersnew147/19fixture, notothercapturepacketIDs."
+    }
+  },
+  "source_sha256": {
+    "backend/src/rrls.rs": "f6b0db8b375cb2d44d5a01dfd0450e0fbc329e389cda746bcec99d7792fbff86",
+    "backend/src/rrls/captured_replay.rs": "85de7dffa645f890d2cdb21c9d9047a342951328abae6448f140b8582acee4ae",
+    "backend/src/comms/virtual_uart.rs": "5eaf65503dab6ab5dc58672959f12463cdb1620d61643de217e362368ae1eeee"
+  },
+  "additional_comment": "Rootrequestedvirtual_uartcommentclarificationincluded; fixed10mslookaheadbehaviorunchanged andindependentofpublisherinterval.",
+  "limits": "Nativeoffload isnotend-to-endRFDqualification. ParentwillbuildimmutableFIFO-onlyhostimageandexecuteoriginal60sgates. No claimthat147/19actualsourcefailureisfullyresolveduntilthatrun.",
+  "release": "Localcommitonly, noSDK/RFedit, publication or hardwaredeployment."
+}

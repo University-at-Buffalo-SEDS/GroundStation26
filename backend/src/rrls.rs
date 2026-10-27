@@ -652,12 +652,23 @@ impl Mesh {
                 if discovery.is_none() {
                     self.receipt_service_pending = false;
                 }
-                self.queue
+                let highest = self.queue
                     .iter()
                     .enumerate()
                     .filter(|(index, _)| self.dependency_ready(*index))
                     .max_by_key(|(index, item)| (item.priority, std::cmp::Reverse(*index)))
-                    .map(|(index, _)| index)?
+                    .map(|(index, _)| index)?;
+                // Preserve priority between lanes (including voice/settings),
+                // then use dependency-safe FIFO inside ordinary data. A fresh
+                // routine heartbeat must not starve an accepted sensor report
+                // merely because no independent snapshot is currently queued.
+                if matches!(self.queue[highest].frame.bytes.get(3), Some(&DOWN_DATA) | Some(&AV_BAY_DATA))
+                    && !self.queue[highest].independent_discovery
+                {
+                    ordinary.unwrap_or(highest)
+                } else {
+                    highest
+                }
             };
             let q = &self.queue[i];
             if q.priority < minimum_priority {

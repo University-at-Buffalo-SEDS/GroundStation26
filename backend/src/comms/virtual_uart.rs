@@ -9,9 +9,9 @@ pub(super) struct WireDrain {
 }
 
 impl WireDrain {
-    // The linked emulator publishes its shared clock every10ms. Permit at
-    // most that much lookahead, rather than reducing throughput by rounding
-    // every small frame up to a whole clock quantum. Idle time earns no credit.
+    // Permit at most10ms of accumulated UART lookahead. This remains fixed
+    // independently of the simulator clock's publication interval, rather than
+    // rounding each small frame up to that interval. Idle time earns no credit.
     const CLOCK_QUANTUM_US: u64 = 10_000;
 
     pub(super) fn ready(&self, now_ms: u64) -> bool {
