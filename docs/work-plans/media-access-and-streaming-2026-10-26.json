@@ -1,6 +1,6 @@
 {
-  "updated_utc": "2026-10-27T01:17:49.162775+00:00",
-  "status": "media_verified_rrls_and_fc_followups_in_progress",
+  "updated_utc": "2026-10-27T03:14:48.425963+00:00",
+  "status": "media_product_followups_verified_radio_and_sequence_followups_in_progress",
   "branch": "dev",
   "constraints": [
     "No physical hardware or real accounts",
@@ -68,11 +68,21 @@
       "id": "remote_camera_audio",
       "status": "verified",
       "scope": "Preserve alternate HLS audio renditions through an authenticated loopback proxy; upload live Matroska codec headers; keep media uploads alive beyond control read deadlines; bound station probing and helper cluster buffering."
+    },
+    {
+      "id": "manager_preview_recovery",
+      "status": "verified",
+      "scope": "Bound stalled preview signaling/connection startup to20seconds, abort abandoned WHEP requests, release received tracks and sessions, suspend actual pagehide viewer creation, and reconnect previews on pageshow after rechecking permissions. Camera publishing still persists across dashboard tab switches and requires explicit restart after leaving the page."
+    },
+    {
+      "id": "checklist_sync_feedback",
+      "status": "verified",
+      "scope": "Show bounded plain-text pending-template reasons from the existing API; unresolved progress conflicts render unchecked and do not inflate checklist/list completion summaries. Reviewed receipt and permission behavior stay intact."
     }
   ],
   "verification": {
     "backend": "556 normal, 532 HITL, 557 test-fire passed; manual fixtures remain ignored",
-    "frontend_native": "142 passed, 7 existing platform/manual tests ignored",
+    "frontend_native": "143 passed,7 existing platform/manual tests ignored in final2026-10-27 run",
     "sender": "6 unit and 2 discovery CLI tests passed",
     "helper": "5 unit tests and Clippy -D warnings passed; real native fixture passed 108.17 s, including legacy video-only TS, sustained H264/AAC jobs and explicit disconnect fallback",
     "playback": "Actual MediaMTX raw camera and remotely encoded H264/AAC: decoded non-silent camera/clean OBS audio, one/two viewers, independent disconnect, saved geometry and restored OBS; zero frozen samples. Final sustained encoded camera RMS 0.06303 / restored OBS 0.06206,30 fps. Legacy TS available 825 ms; Matroska audio/video 1,015 ms on loopback.",
@@ -83,12 +93,39 @@
     "utilities": "Underglow, buzzer and T-clock reset: all 16 flight states in normal/HITL/test-fire; UTC HTTP authorization/revocation and post-launch browser control passed",
     "repositories": "12 valid repositories clean; 18 tracked branches equal upstream; historical invalid worktrees preserved",
     "playback_lifecycle": "Standalone synthetic WebRTC tracks and real synthetic H.264 browser regressions pass; original audio-negotiation and restore failures reproduced against unchanged assets. Existing publisher permission/revocation/PTT regression and 5 asset-catalog tests pass; restored clean OBS retains camera audio.",
-    "final_media_artifact": "target/media-roundtrip-verified-audio-lifecycle-streaming-final-20261026/result.json: raw viewers, encoded viewers and native worker all exit0; source asset digest checked"
+    "final_media_artifact": "target/media-roundtrip-verified-audio-lifecycle-streaming-final-20261026/result.json: raw viewers, encoded viewers and native worker all exit0; source asset digest checked",
+    "manager_preview_recovery": "Isolated Chromium regression reproduces permanent connecting against previous assets; final synthetic audio/video fixture passes stalled POST timeout+abort, one replacement session, pagehide suspension, pageshow restore, received-track release and manager-role revocation. Existing camera/mic/PTT/hidden-tab publisher permission fixture also passes.",
+    "checklist_sync_feedback": "Real Wasm browser passes retained checked conflict\u2192unchecked/0-of-1/required incomplete, reviewed receipt\u2192complete, visible pending reason, administrator/read-only conflict controls, and320/390/844/1440px widths. Two checklist native tests and five browser-asset catalog tests pass."
   },
   "remaining_followups": [
     "Installed main GS systemd AV-bay configuration and reception failure",
     "RRLS visibility in topology",
     "Authenticated primary-controlled RRLS sequence requests and automatic mirrored operating mode/status",
     "Full integrated FC barometer freshness campaign with corrected sensor model; physical hardware confirmation"
-  ]
+  ],
+  "followthrough_2026_10_27": {
+    "frontend_branch": "dev",
+    "source_scope": [
+      "station_ui/pages/media.html",
+      "src/telemetry_dashboard/checklists.rs"
+    ],
+    "logs": [
+      "/tmp/media-manager-preview-negative-20261027.log",
+      "/tmp/media-manager-preview-positive-20261027.log",
+      "/tmp/media-publisher-permissions-20261027.log",
+      "/tmp/ui-checklist-conflict-browser-20261027.log",
+      "/tmp/ui-followthrough-native-full-20261027.log",
+      "/tmp/media-followthrough-asset-catalog-20261027.log"
+    ],
+    "limitations": [
+      "Preview signaling/track regression uses synthetic RTC peers; actual MediaMTX/native audio roundtrip evidence remains from prior validated revision because these changes do not alter encoded/native worker paths.",
+      "Actual pagehide/pageshow events are dispatched; physical iOS background/camera/bfcache behavior remains unqualified.",
+      "No physical Pi load, RF reception, real microphone or native Windows/macOS GUI qualification in this UI pass.",
+      "RRLS sequence and automatic mirrored operating-mode/status followups remain unresolved until implemented and independently verified.",
+      "Full firmware-bay paired-checklist synchronization soak remains a separate qualification requirement."
+    ],
+    "deployment": "Source changes only; no deployment, main promotion or SDK release",
+    "frontend_commit": "88292a7046e7af8b831fb6d7618fc5c69ac67825",
+    "frontend_pushed": true
+  }
 }
