@@ -1,5 +1,5 @@
 {
-  "status": "native_and_paired_host_passed_full_firmware_campaign_running",
+  "status": "integrated_latency_and_sensor_gates_still_failing_schema_retry_progress_under_diagnosis",
   "rrls_observer": {
     "evidence": "Live RRLS reported2309 local SDK queued frames and roughly160million cumulative handler failures dominated by managed-variable requests.",
     "cause": "READ_ONLY variables can still request refreshes; rejecting local SDK transmission at the radio worker occurs after queue admission and pacing.",
@@ -14,10 +14,113 @@
     "rf": "Queue-depth observation no longer deletes accepted SDT history; statistics initialize queue depth. RF native172tests and matched firmware build passed.",
     "coverage": "Simulator analyzer requires explicitly named FC IMU/barometer and PB voltage/current streams; heartbeats alone no longer satisfy source freshness.13 analyzer tests passed."
   },
-  "backend_validation": {"normal": "564 passed,3 ignored", "hitl": "541 passed,2 ignored"},
+  "backend_validation": {
+    "normal_registry_sdk": "582 passed,3 ignored",
+    "test_fire_registry_sdk": "583 passed,3 ignored",
+    "hitl_registry_sdk": "558 passed,2 ignored",
+    "hitl_git_sdk": "FAIL:557 passed,1 failed,2 ignored; ordered three-radio air campaign exhausts retries for first command before outage; deterministic isolated reproduction under diagnosis"
+  },
   "limits": [
-    "Full seven-board application campaign using the50ms/3968byte modem envelope is running; its result is not yet claimed.",
-    "The live Pi was still running earlier sourceb7d8e03; physical latency and current modem configuration remain unqualified.",
-    "No modem configuration, physical outputs or firmware flash changed."
-  ]
+    "Three full seven-board stress campaigns failed the unchanged500ms command and1500ms sensor gates; combined new candidate has not yet passed.",
+    "Latest read-only live Pi status: active primary, relay_requested=true, forwarding=false, no direct_age; RRLS Mac SSH times out. Physical modem settings and latency remain unqualified.",
+    "No modem configuration, physical outputs, services or firmware flash changed. No SDK version bump, release or tag."
+  ],
+  "integrated_stress": {
+    "profile": "async-64k-50ms-envelope.json",
+    "result": "FAIL, unchanged500ms command and1500ms source gates",
+    "commands": "Startup managed round and30second RF round missed acknowledgement deadline. Remaining rounds aborted by their error paths.",
+    "sensors": "149 source reports in26..39seconds;148 relayed; one PB current expired in RRLS queue. Maximum sensor end-to-end1876.1ms, dominated by1440.4ms RRLS queue plus353.4ms RRLS-to-GS transit.",
+    "cadence": "FC IMU/barometer RF-TX gaps<=320.9ms; PB current/voltage gaps<=5066.6ms at unchanged5second acquisition. No source sampling stall in this run.",
+    "drops": "One PB current and two canonical discovery frames expired; two FC rows cleared on direct restoration also arrived directly at GS.",
+    "decoder": "Zero codec errors; actual SDK exact packet identities and original byte order retained.",
+    "next": "Investigate idle-boundary admission semantics in the emulator and retry-driven RRLS queue load; do not increase freshness thresholds or claim hardware qualification."
+  },
+  "additional_findings": [
+    {
+      "cause": "Routine GS heartbeat/bootstrap traffic and uplink schema classification hid source traffic; wrapped primary state was discarded before RRLS observation.",
+      "fix": "Separate fixed-budget template namespaces, classify canonical controls by real reliability/type, bounded ordinary bidirectional service and read-only wrapped state observation.",
+      "validation": "Actual SDK captured replay retains all149 source and15 canonical reports; heartbeat codec audit verifies exact remaining decoded identities."
+    },
+    {
+      "cause": "RF chose the first independent control rather than the highest trusted SDK priority; older routine frames delayed owner acknowledgements.",
+      "fix": "Choose highest priority independent canonical control, FIFO ties, preserve seven-control/one-FIFO turn.",
+      "validation": "RF172native tests plus sanitizer and firmware build pass. Direct diagnostic improved startup receipts to410/490/470ms and RF control390ms, but relay still failed; not full qualification."
+    },
+    {
+      "cause": "A192byte schema UART frame created184ms airtime debt just before a command. Closing the100ms batch alone did not remove this wait.",
+      "fix": "Bound critical batch closing and allow one critical airtime loan only inside155ms debt, preserve UART quiet gap and charge full prior debt plus new transmission cost.",
+      "validation": "Native exact captured command admission9205ms ->9019ms;162focused tests pass;149/15replay preserved. Worst source offload1482.6ms is not proof of1500ms end-to-end."
+    },
+    {
+      "cause": "Three identical3736byte schema catalogs in~200ms filled DAQ logical transmit admission, losing one three-report analog batch; not ADC failure.",
+      "fix": "SDK7ea5a300 coalesces redundant pending/active schema responses before encoding, preserves failures/restart refresh and partial transfer ordering.",
+      "validation": "SDK727tests, supported no-compression567tests, embedded check and Clippy pass. All seven frozen firmware factory images build with original flags/budgets, zero warnings. Full application execution pending."
+    },
+    {
+      "cause": "Failed cosmetic persistence changed RAM state, allowing identical retry to acknowledge without repairing flash.",
+      "fix": "Invalidate persisted-state cache only on failed write; identical retries retry storage. Buzzer behavior already correct; regression added.",
+      "validation": "RF/PB/FC native regressions and all seven candidate builds pass; no asynchronous persistence thread or ACK durability change."
+    }
+  ],
+  "combined_candidate": {
+    "cohort": "FirmwareSimulator/build/schema-admission-cohort-20261027",
+    "sdk_commit": "7ea5a3003f8a3d85423a0e8e1d484306ef48082a",
+    "gs_commit": "8ed32cd",
+    "source": "Independent Git archives and per-board SDK/Rust target directories; explicit manifests, no fabricated published-crate VCS metadata.",
+    "bounds": "500ms command;1500ms source;3000ms canonical; existing sampling/memory/storage/zero-loss assertions unchanged.",
+    "state": "All seven firmware builds passed. Full host HITL acceptance rejected SDK candidate due ordered air regression. Initial image used only for labeled14s diagnostic; no full qualification or deployment.",
+    "diagnostics": [
+      "schema-admission-cohort-20261027/relay-schema-loan-diagnostic/diagnostic-result.json",
+      "schema-admission-rf-reserve-20261027/relay-reserve-diagnostic/diagnostic-result.json"
+    ]
+  },
+  "ack_trace_correction": {
+    "evidence": ".workspace-progress/ack-exact-identity-audit-20261027.json",
+    "finding": "Initial ACKs on CAN never appear on RF UART; late ACKs previously matched by ack_for+owner are different packet IDs from retries. Exact matched CAN-to-UART delays max122ms baseline and231.1ms RF-priority candidate. The previous apparent~673ms queue residence is not established.",
+    "limit": "CAN medium receipt does not establish SDK admission. Firmware discards receive API result. Temporary CPU-hook rows used wrong monitor bus and are invalid for timing/priority conclusions; corrected bus-bound diagnostic hooks are being prepared.",
+    "interpretation": "Child ACKs accepted on CAN but absent from RF callbacks may be normal proxy aggregation. Nested timing matches child cohort completion followed by an RF-owned upstream receipt; no routing loss established. Valid CPU-bound closed-write hooks confirm immediate admission of the first aggregate receipt, followed by638.6ms total command round-trip.",
+    "valid_evidence": "FirmwareSimulator/build/schema-admission-cohort-20261027/relay-rf-ack-hooks-closed-diagnostic/exact-ack-stage-audit.json"
+  },
+  "simulator_python_validation": "44 radio Python tests passed,1 skipped",
+  "rf_admission_reserve": {
+    "commit": "1ba7048",
+    "bug": "Routine canonical253heartbeats could consume the two reserved slots/256bytes and refuse ACK255 before priority dequeue.",
+    "fix": "Reserve access requires independent canonical priority>=254; ordinary service/dequeue ordering, SDT dependency guards, queue bounds and memory unchanged.",
+    "validation": "173native tests including ASan/UBSan and red\u2192green slot/byte/SDT admission regressions; additive SDK7ea firmware build zero warnings, RAM unchanged, flash+12bytes.",
+    "qualification": "RF-only14second comparison still FAILS original500ms managed/relay controls; zeroDAQ analog losses across14samples. Native admission fix is valid but does not establish aggregate round-trip improvement.",
+    "artifact": "RFBoard26/docs/qualification/radio-critical-admission-reserve-2026-10-27.json"
+  },
+  "sdk_followthrough": {
+    "replay_urgency": "Diagnosed retry255 priority lost after denied callback; preserve queued service priority through continuation rather than recompute original16. Native red-to-green passed; fullair now advances beyond original10.5s failure. Not yet accepted/frozen.",
+    "ordinary_starvation": "Simple rollback on final callbackIo was insufficient: partial schema fragments can actually be accepted before callbackIo. Candidate reports dispatch-local actual frame progress, commits fairness on any admitted fragment and preserves zero-progress owed turns. No global epoch (concurrent independent sides), no perentry/RouterInner growth. Native/air/concurrency validation in progress.",
+    "state": "6201162 committed locally:735 default tests,575 no-compression,610 compact/fair, embedded and six original native air profiles pass; integrated firmware gates still fail."
+  },
+  "packetization_followthrough": {
+    "evidence": "FirmwareSimulator/build/schema-admission-cohort-20261027/relay-rf-ack-hooks-closed-diagnostic/ack-declared-medium-budget.json",
+    "finding": "Offline original C#medium replay predicts allfourhop RX within15..92us. RF ACK group extended92.063ms after ACK wirestop to344B; RRLS ACK group extended40.846ms; fourdeclared50ms formation waits remain200ms.",
+    "candidate": "Bounded RF canonical critical batchclose under development, once155ms, preserve55ms actualdrainquiet and airtime accounting. No modem envelope or gate changes.",
+    "rf_commit": "728b9c0",
+    "rf_validation": "174native tests+ASan/UBSan pass; exact C DMA\u2192unchanged C#medium preserves344bytes0drops and receipt197.2\u219269.0ms. Factory0warnings/RAMunchanged114424B; flash418008B.",
+    "linked_result": "Same14s diagnostic stillfails500ms controls. Exact aggregate receipt roundtrip638.6\u2192531ms across changing admitted traffic; RFhop192.5\u219276.1ms, postACK RFbatch extension92ms\u21920. RRLS still queues35.4ms and extends ACKpacket79.364ms. Not full qualification.",
+    "linked_evidence": "FirmwareSimulator/build/schema-admission-rf-critical-close-20261027/relay-critical-close-diagnostic/ack-declared-medium-budget.json"
+  },
+  "latest_checkpoint": {
+    "gs_commit": "da7e97ff08b5da8b6a1b393ce828dd7c12838523",
+    "sdk_commit": "6201162a5be4ad7e7fd6282249e056a5a930a7e5",
+    "cohort": "FirmwareSimulator/build/radio-fairness-cohort-20261027",
+    "integrated_result": "FAIL: original 500ms command gate still fails startup and relay rounds; direct sample2/3 pass410/420ms. Original1500ms source gate remains unresolved.",
+    "image": "seds-firmware-simulator:radio-fairness-drain-final-20261027",
+    "native_validation": "Exact SDK620/GSda7 fullHITL575passed/0failed/2ignored; focused PTY/drain/capacity/capture/receipt/observer/worker checks pass. Earlier GSa4 public registry normal595/testfire596/HITL571 and exact SDK normal595/testfire596 pass.",
+    "packetization": "GS critical command/receipt boundaries deduplicated by logical contract; ordinary service compensates for extra receipt quiet without adding air credit. Simulator virtual UART now bases55ms quiet on accumulated wire drain rather than just the newest write.",
+    "prior_capture_source_evidence": "Before virtual-drain correction:111 unique RF source reports26..39s,35 delivered toGS,76missing all seen atRRLS RX but neverRRLS TX; surviving source max1861.4ms.12canonical max414.2ms. Strict latest-drain capture analysis pending.",
+    "overload": "Native exact new-capture replay offers47,800chargedB plus936READY in13s against36,400B nominal relay allowance.35..60percent share sweeps all fail1500ms; no production share/rate changes made.",
+    "schema_candidate": "RF17catalogs/3distinct contents;13identical final3736B catalogs. Investigating same-peer unique schema-fragment progress before receiver recovery retries; unrelated peers, duplicate fragments, stalled transfers and restart recovery must remain correct.",
+    "harness_diagnostic": "DAQ wrapper already declares publication_failure_snapshot_words; runner appended it again, producing24/12samples. Runner made idempotent for diagnostic probes; existing diagnostics/assertions preserved. Earlier run results remain failures.",
+    "publication": "No SDK release/tag/version bump. SDK fixes local only; backend production dependency remains registry4 until explicitly wired to validated source revision. No hardware deploy/flash/service changes.",
+    "historical_sections": "Other sections retain intermediate campaign findings; this checkpoint supersedes their pending validation status.",
+    "latest_capture_source_evidence": "Corrected accumulated-drain campaign:134unique RF source reports26..39s,75delivered,59missing all seen atRRLS RX but neverRRLS TX; source max1871.5ms. PBcurrent2emitted/0delivered.6canonical all delivered,max480.8ms. All6codec streams0errors. DAQ2399analog publications0loss; all7boards12samples0panic/TLSF/allocfail/CANoverflow.",
+    "latest_capture_metadata": "Fulltrace RF15catalogs(12final3736B), GS19(16final3736B). Active26..39SDTchunkframed RF10159B/GS10497B/RRLS15776B. Repeated metadata remains significant.",
+    "harness_commit": "FirmwareSimulator17d7392;12hardware-fill profile tests pass; existing diagnostic preserved exactly and repeated configuration produces one sample stream per probe.",
+    "latest_command_trace": "Exact matched fourhop FC command: GS30190.1ms\u2192RRLS30267.2\u2192RF30395\u2192ACK RRLS30565.2\u2192GS30699.5 (~509.4ms). RFbatch extended36.025ms afterACKwirestop; RRLSreceipt waited54.8ms beforeTX. Native diagnosis underway; gates unchanged."
+  }
 }
