@@ -9,6 +9,11 @@ pub(crate) struct Capacity {
     next_packet: Option<(Instant, Option<u64>)>,
     packet_started: Option<(Instant, Option<u64>)>,
     last_forced_boundary: Option<(Instant, Option<u64>)>,
+    last_receipt_boundary: Option<(Instant, Option<u64>)>,
+    promotion_contracts: [u64; 4],
+    promotion_flags: u8,
+    promotion_contract_count: u8,
+    promotion_contract_cursor: u8,
     early_frame_outstanding: bool,
     packet_burst_ms: u64,
     uart_baud: u32,
@@ -46,23 +51,77 @@ impl Capacity {
     /// retry/ACK burst must not turn all ordinary traffic into one-frame
     /// packets. Keep airtime debt and the stopbit/quiet deadline unchanged.
     pub(crate) fn close_packet_batch(&mut self, wall: Instant, virtual_ms: Option<u64>) {
+        self.close_packet_batch_with_receipt(wall, virtual_ms, None);
+    }
+    pub(crate) fn close_packet_batch_with_receipt(
+        &mut self,
+        wall: Instant,
+        virtual_ms: Option<u64>,
+        receipt: Option<u64>,
+    ) {
+        self.close_packet_batch_for_contract(wall, virtual_ms, receipt.map(|id| (id, true)));
+    }
+    pub(crate) fn close_packet_batch_for_contract(
+        &mut self,
+        wall: Instant,
+        virtual_ms: Option<u64>,
+        contract: Option<(u64, bool)>,
+    ) -> bool {
         let cycle_ms = self.packet_burst_ms.saturating_add(self.packet_gap_ms);
-        if self
-            .last_forced_boundary
-            .is_some_and(
-                |(last_wall, last_virtual)| match (virtual_ms, last_virtual) {
-                    (Some(now), Some(last)) => now.saturating_sub(last) < cycle_ms,
-                    _ => {
-                        wall.saturating_duration_since(last_wall) < Duration::from_millis(cycle_ms)
-                    }
-                },
-            )
-        {
-            return;
+        let receipt = contract.is_some_and(|(_, receipt)| receipt);
+        let slot = contract.and_then(|(id, _)| {
+            self.promotion_contracts[..usize::from(self.promotion_contract_count)]
+                .iter()
+                .position(|stored| *stored == id)
+        });
+        if slot.is_some_and(|slot| {
+            self.promotion_flags & (1 << (slot + if receipt { 4 } else { 0 })) != 0
+        }) {
+            return false;
+        }
+        // The first returning receipt may override a recent uplink close, but
+        // updates the global cooldown so later commands yield. At most two
+        // boundaries fit a rolling normal cycle; neither retry gets new credit.
+        let previous = if receipt {
+            self.last_receipt_boundary
+        } else {
+            self.last_forced_boundary
+        };
+        if previous.is_some_and(
+            |(last_wall, last_virtual)| match (virtual_ms, last_virtual) {
+                (Some(now), Some(last)) => now.saturating_sub(last) < cycle_ms,
+                _ => wall.saturating_duration_since(last_wall) < Duration::from_millis(cycle_ms),
+            },
+        ) {
+            return false;
         }
         self.packet_started = None;
         self.last_forced_boundary = Some((wall, virtual_ms));
+        if receipt {
+            self.last_receipt_boundary = Some((wall, virtual_ms));
+        }
+        if let Some((id, _)) = contract {
+            let slot = slot.unwrap_or_else(|| {
+                let slot = usize::from(self.promotion_contract_cursor);
+                self.promotion_contracts[slot] = id;
+                self.promotion_flags &= !((1 << slot) | (1 << (slot + 4)));
+                self.promotion_contract_cursor = (self.promotion_contract_cursor + 1) % 4;
+                self.promotion_contract_count =
+                    self.promotion_contract_count.saturating_add(1).min(4);
+                slot
+            });
+            self.promotion_flags |= 1 << (slot + if receipt { 4 } else { 0 });
+        }
+        true
     }
+    /// Charged ordinary bytes displaced by one modem idle gap. This is a
+    /// scheduler-service allowance only, never UART or airtime readiness.
+    pub(crate) fn packet_idle_service_bytes(&self) -> usize {
+        (u128::from(self.air_bps) * u128::from(self.share_percent) * u128::from(self.packet_gap_ms)
+            / 800_000)
+            .min(usize::MAX as u128) as usize
+    }
+
     pub(crate) fn packetization(&self) -> (u64, u64) {
         (self.packet_burst_ms, self.packet_gap_ms)
     }
@@ -94,6 +153,11 @@ impl Capacity {
             next_packet: None,
             packet_started: None,
             last_forced_boundary: None,
+            last_receipt_boundary: None,
+            promotion_contracts: [0; 4],
+            promotion_flags: 0,
+            promotion_contract_count: 0,
+            promotion_contract_cursor: 0,
             early_frame_outstanding: false,
             packet_burst_ms: 100,
             uart_baud: 115_200,
@@ -239,6 +303,157 @@ impl Capacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn logical_command_and_receipt_each_promote_once_while_retries_keep_batching() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64_000, 35, 16);
+        cap.committed(wall, Some(30120), 55);
+        cap.close_packet_batch_for_contract(wall, Some(30120), Some((11, false)));
+        let first = cap.last_forced_boundary;
+        for now in [30420, 30690] {
+            cap.committed(wall, Some(now), 55);
+            cap.close_packet_batch_for_contract(wall, Some(now), Some((11, false)));
+            assert_eq!(
+                cap.last_forced_boundary, first,
+                "retry retains normal batching"
+            );
+        }
+        cap.committed(wall, Some(30750), 62);
+        cap.close_packet_batch_for_contract(wall, Some(30750), Some((12, false)));
+        assert_eq!(cap.last_forced_boundary.unwrap().1, Some(30750));
+        cap.committed(wall, Some(30800), 63);
+        cap.close_packet_batch_for_contract(wall, Some(30800), Some((11, true)));
+        assert_eq!(
+            cap.last_forced_boundary.unwrap().1,
+            Some(30800),
+            "command promotion must not consume the same contract's first receipt promotion"
+        );
+        let receipt = cap.last_forced_boundary;
+        for now in [31370, 31660] {
+            cap.committed(wall, Some(now), 63);
+            cap.close_packet_batch_for_contract(wall, Some(now), Some((11, true)));
+            assert_eq!(
+                cap.last_forced_boundary, receipt,
+                "a regenerated receipt nonce does not buy another logical promotion"
+            );
+        }
+        assert_eq!(cap.promotion_contract_count, 2);
+    }
+
+    #[test]
+    fn four_contract_history_is_bounded_and_denied_attempts_do_not_claim_it() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64_000, 35, 16);
+        cap.close_packet_batch_for_contract(wall, Some(0), Some((0, false)));
+        cap.close_packet_batch_for_contract(wall, Some(1), Some((1, false)));
+        assert_eq!(cap.promotion_contract_count, 1);
+        for id in 1..=4 {
+            cap.close_packet_batch_for_contract(wall, Some(id * 155), Some((id, false)));
+        }
+        assert_eq!(cap.promotion_contract_count, 4);
+        assert!(!cap.promotion_contracts.contains(&0));
+        cap.close_packet_batch_for_contract(wall, Some(775), Some((0, true)));
+        assert_eq!(cap.last_receipt_boundary.unwrap().1, Some(775));
+        assert_eq!(cap.promotion_contract_count, 4);
+        assert!(
+            std::mem::size_of::<Capacity>() <= 256,
+            "promotion metadata is fixed host state, never a new frame queue"
+        );
+    }
+    #[test]
+    fn captured_return_receipt_gets_a_boundary_after_the_uplink_command() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64_000, 35, 16);
+        cap.committed(wall, Some(9290), 62);
+        cap.close_packet_batch(wall, Some(9290));
+        assert!(cap.ready(wall, Some(9360)));
+        cap.committed(wall, Some(9360), 63);
+        cap.close_packet_batch_with_receipt(wall, Some(9360), Some(1));
+        assert!(
+            !cap.ready(wall, Some(9410)),
+            "captured ordinary9410/retry9440 must not extend the return receipt's packet"
+        );
+        assert!(!cap.ready(wall, Some(9420)));
+        assert!(cap.ready(wall, Some(9421)));
+        cap.committed(wall, Some(9421), 42);
+        cap.close_packet_batch(wall, Some(9421));
+        assert!(
+            cap.ready(wall, Some(9442)),
+            "the receipt updates the global cooldown, so later commands keep normal batching"
+        );
+    }
+
+    #[test]
+    fn receipt_overrides_are_bounded_and_preserve_ordinary_progress_and_airtime() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64_000, 35, 16);
+        let mut boundaries = Vec::new();
+        let mut ordinary = 0;
+        for now in 0..2000 {
+            let receipt = now % 3 == 0;
+            if !cap.ready_for(wall, Some(now), true) {
+                continue;
+            }
+            cap.committed(wall, Some(now), 42);
+            let before = cap.last_forced_boundary;
+            if now % 5 == 0 {
+                ordinary += 1;
+            } else {
+                cap.close_packet_batch_with_receipt(wall, Some(now), receipt.then_some(now));
+            }
+            if before != cap.last_forced_boundary {
+                boundaries.push(now);
+            }
+        }
+        assert!(
+            ordinary >= 5,
+            "ordinary frames must continue to make progress"
+        );
+        for start in &boundaries {
+            assert!(
+                boundaries
+                    .iter()
+                    .filter(|at| **at >= *start && **at < *start + 155)
+                    .count()
+                    <= 2,
+                "at most a command and a receipt boundary per rolling155ms: {boundaries:?}"
+            );
+        }
+        let mut low = Capacity::new(64_000, 1, 16);
+        low.committed(wall, Some(0), 42);
+        low.close_packet_batch_with_receipt(wall, Some(0), Some(1));
+        assert!(!low.ready_for(wall, Some(569), true));
+        assert!(low.ready_for(wall, Some(570), true));
+        low.committed(wall, Some(570), 42);
+        low.close_packet_batch_with_receipt(wall, Some(570), Some(2));
+        assert!(!low.ready_for(wall, Some(1295), true));
+        assert!(
+            low.ready(wall, Some(1450)),
+            "receipt closing cannot forgive an unpaid loan"
+        );
+    }
+
+    #[test]
+    fn receipt_cooldown_survives_virtual_wall_and_backward_clock_changes() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64_000, 35, 16);
+        cap.committed(wall, Some(0), 42);
+        cap.close_packet_batch(wall, Some(0));
+        cap.committed(wall + Duration::from_millis(62), Some(62), 42);
+        cap.close_packet_batch_with_receipt(wall + Duration::from_millis(62), Some(62), Some(1));
+        let receipt = cap.last_receipt_boundary;
+        cap.close_packet_batch_with_receipt(wall + Duration::from_millis(120), None, Some(1));
+        assert_eq!(cap.last_receipt_boundary, receipt);
+        cap.close_packet_batch(wall + Duration::from_millis(220), None);
+        cap.close_packet_batch_with_receipt(wall + Duration::from_millis(230), Some(230), Some(2));
+        assert_eq!(cap.last_receipt_boundary.unwrap().1, Some(230));
+        let receipt = cap.last_receipt_boundary;
+        cap.close_packet_batch_with_receipt(wall + Duration::from_millis(240), Some(200), Some(3));
+        assert_eq!(
+            cap.last_receipt_boundary, receipt,
+            "backward time cannot create new credit"
+        );
+    }
     #[test]
     fn critical_head_can_borrow_one_bounded_lead_but_must_repay_all_airtime() {
         let wall = Instant::now();

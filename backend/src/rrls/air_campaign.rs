@@ -31,6 +31,8 @@ fn driver_send(
     now: u64,
     bytes: Vec<u8>,
     close_batch: bool,
+    contract: Option<(u64, bool)>,
+    mesh: Option<&Shared>,
 ) -> sedsnet::TelemetryResult<()> {
     let mut driver = drivers.lock().unwrap();
     if !driver[node].wire.ready(now)
@@ -59,9 +61,19 @@ fn driver_send(
         .capacity
         .committed(std::time::Instant::now(), Some(now), length);
     if close_batch {
-        driver[node]
-            .capacity
-            .close_packet_batch(std::time::Instant::now(), Some(now));
+        let promoted = driver[node].capacity.close_packet_batch_for_contract(
+            std::time::Instant::now(),
+            Some(now),
+            contract,
+        );
+        if promoted
+            && contract.is_some_and(|(_, receipt)| receipt)
+            && let Some(mesh) = mesh
+        {
+            mesh.lock()
+                .unwrap()
+                .note_receipt_packet_boundary(driver[node].capacity.packet_idle_service_bytes());
+        }
     }
     Ok(())
 }
@@ -114,6 +126,8 @@ fn flush_mesh(
             now,
             serial(transmission.frame()),
             transmission.closes_packet_batch(),
+            transmission.boundary_contract(),
+            Some(mesh),
         )
         .is_ok();
         mesh.lock()
@@ -222,6 +236,8 @@ fn run_case(mode: ReliableMode, fifo: usize, overhead_bits: u32, duration: u64) 
                 now,
                 serial(&frame),
                 crate::comms::closes_radio_packet_batch(priority, bytes),
+                crate::comms::radio_packet_boundary_contract(priority, bytes),
+                Some(&mesh),
             )
         },
         sedsnet::router::RouterSideOptions::default()
@@ -243,6 +259,8 @@ fn run_case(mode: ReliableMode, fifo: usize, overhead_bits: u32, duration: u64) 
                     bytes: bytes.to_vec(),
                 }),
                 crate::comms::closes_radio_packet_batch(priority, bytes),
+                None, // RF firmware retains its single bounded close allowance.
+                None,
             )
         },
         sedsnet::router::RouterSideOptions::default()

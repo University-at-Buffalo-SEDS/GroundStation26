@@ -124,6 +124,30 @@ pub(crate) fn closes_radio_packet_batch(priority: u8, payload: &[u8]) -> bool {
     ) || (sedsnet::is_reliable_type(ty) && sedsnet::message_priority(ty) >= 16)
 }
 
+/// A separate bounded promotion is reserved for actual canonical receipts.
+/// Mesh priority may be capped at254; validate the wire type and payload rather
+/// than inferring a receipt from that scheduling band or an outer wrapper.
+#[cfg(test)]
+pub(crate) fn is_radio_packet_receipt(priority: u8, payload: &[u8]) -> bool {
+    radio_packet_receipt_contract(priority, payload).is_some()
+}
+#[cfg(test)]
+pub(crate) fn radio_packet_receipt_contract(priority: u8, payload: &[u8]) -> Option<u64> {
+    radio_packet_boundary_contract(priority, payload)
+        .and_then(|(id, receipt)| receipt.then_some(id))
+}
+pub(crate) fn radio_packet_boundary_contract(priority: u8, payload: &[u8]) -> Option<(u64, bool)> {
+    if !closes_radio_packet_batch(priority, payload) {
+        return None;
+    }
+    let packet = serialize::unpack_packet(payload).ok()?;
+    if packet.data_type() == sedsnet::config::DataType::ReliableAck {
+        Some((u64::from_le_bytes(packet.payload().try_into().ok()?), true))
+    } else {
+        Some((packet.packet_id(), false))
+    }
+}
+
 pub trait CommsDevice: Send {
     /// An independent writer for full-duplex transports. Shared-bus devices
     /// keep the default so reads and writes remain serialized.
@@ -731,7 +755,20 @@ impl UartComms {
                     capacity.committed(capacity_wall, capacity_clock, framed.len());
                     capacity.drained(Instant::now());
                     if transmission.closes_packet_batch() {
-                        capacity.close_packet_batch(capacity_wall, capacity_clock);
+                        if let Some(contract) = transmission.boundary_contract() {
+                            let promoted = capacity.close_packet_batch_for_contract(
+                                capacity_wall,
+                                capacity_clock,
+                                Some(contract),
+                            );
+                            if promoted && contract.1 {
+                                shared.lock().unwrap().note_receipt_packet_boundary(
+                                    capacity.packet_idle_service_bytes(),
+                                );
+                            }
+                        } else {
+                            capacity.close_packet_batch(capacity_wall, capacity_clock);
+                        }
                     }
                 }
                 Ok(())
@@ -1933,6 +1970,11 @@ impl CommsDevice for UartComms {
         priority: u8,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let close_batch = closes_radio_packet_batch(priority, payload);
+        let contract = if close_batch {
+            radio_packet_boundary_contract(priority, payload)
+        } else {
+            None
+        };
         if self.recovery.is_some() {
             self.enable_radio_capacity_control();
         }
@@ -2047,7 +2089,23 @@ impl CommsDevice for UartComms {
             );
             capacity.drained(Instant::now());
             if close_batch {
-                capacity.close_packet_batch(capacity_wall, capacity_clock);
+                if contract.is_some() {
+                    let promoted = capacity.close_packet_batch_for_contract(
+                        capacity_wall,
+                        capacity_clock,
+                        contract,
+                    );
+                    if promoted
+                        && contract.is_some_and(|(_, receipt)| receipt)
+                        && let Some(mesh) = &self.recovery
+                    {
+                        mesh.lock()
+                            .unwrap()
+                            .note_receipt_packet_boundary(capacity.packet_idle_service_bytes());
+                    }
+                } else {
+                    capacity.close_packet_batch(capacity_wall, capacity_clock);
+                }
             }
         }
         Ok(())
@@ -3330,6 +3388,83 @@ mod tests {
 mod raw_uart_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn receipt_promotion_requires_a_valid_canonical_ack_despite_priority_cap() {
+        crate::telemetry_schema::initialize().unwrap();
+        let packet = sedsnet::packet::Packet::new(
+            sedsnet::config::DataType::ReliableAck,
+            &[sedsnet::config::DataEndpoint::TelemetryError],
+            "RF",
+            1,
+            42u64.to_le_bytes().to_vec().into(),
+        )
+        .unwrap();
+        let bytes = serialize::pack_packet(&packet);
+        assert!(is_radio_packet_receipt(254, &bytes));
+        assert!(is_radio_packet_receipt(255, &bytes));
+        assert!(!is_radio_packet_receipt(0, &bytes));
+        let mut corrupt = bytes.to_vec();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(!is_radio_packet_receipt(255, &corrupt));
+        let mut malformed = bytes.to_vec();
+        assert_eq!(&malformed[2..4], &[1, 8]);
+        malformed.truncate(malformed.len() - 4);
+        malformed.pop();
+        malformed[3] = 7;
+        malformed.extend_from_slice(&crc32fast::hash(&malformed).to_le_bytes());
+        assert!(!is_radio_packet_receipt(255, &malformed));
+        assert!(!is_radio_packet_receipt(255, b"SDT\x03\x01\x08 fake ack"));
+        assert!(!is_radio_packet_receipt(255, b"RR\x01\x06 fake ack"));
+        let hop_ack = serialize::pack_reliable_ack(
+            "RF",
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            1,
+            1,
+        );
+        assert!(
+            !is_radio_packet_receipt(255, &hop_ack),
+            "the separate allowance is only for canonical ReliableAck receipts"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn uart_receipt_promotion_survives_the_trusted_mesh_priority_cap() {
+        crate::telemetry_schema::initialize().unwrap();
+        let packet = sedsnet::packet::Packet::new(
+            sedsnet::config::DataType::ReliableAck,
+            &[sedsnet::config::DataEndpoint::TelemetryError],
+            "RF",
+            1,
+            42u64.to_le_bytes().to_vec().into(),
+        )
+        .unwrap();
+        let bytes = serialize::pack_packet(&packet);
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_secs(1)).unwrap();
+        let (mut uart, _, _) = recovery_uart_fixture(port);
+        uart.recovery = None;
+        let length = bytes.len() + 4;
+        let reader = std::thread::spawn(move || {
+            let mut out = vec![0; length];
+            peer.read_exact(&mut out).unwrap();
+            out
+        });
+        let mut cap = rfd_capacity::Capacity::new(64_000, 35, 16);
+        cap.close_packet_batch(Instant::now(), None);
+        uart.write_lock.lock().unwrap().radio_capacity = Some(cap);
+        uart.send_data_with_priority(&bytes, 254).unwrap();
+        let completed = Instant::now();
+        let state = uart.write_lock.lock().unwrap();
+        let cap = state.radio_capacity.as_ref().unwrap();
+        assert!(!cap.ready(completed + Duration::from_millis(40), None));
+        assert!(cap.ready(completed + Duration::from_millis(80), None));
+        assert_eq!(
+            reader.join().unwrap(),
+            build_raw_uart_frame(&bytes).unwrap()
+        );
+    }
 
     #[test]
     fn packet_boundary_uses_trusted_command_priority_and_actual_schema_reliability() {

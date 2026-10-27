@@ -286,7 +286,11 @@ fn captured_bidirectional_relay_burst_retains_source_and_canonical_deadlines() {
             wire.committed(now, framed_len, 115_200);
             capacity.committed(wall, Some(now), framed_len);
             if transmission.closes_packet_batch() {
-                capacity.close_packet_batch(wall, Some(now));
+                let contract = transmission.boundary_contract();
+                let promoted = capacity.close_packet_batch_for_contract(wall, Some(now), contract);
+                if promoted && contract.is_some_and(|(_, receipt)| receipt) {
+                    relay.note_receipt_packet_boundary(capacity.packet_idle_service_bytes());
+                }
             }
             relay.finish_transmission(transmission, true);
         }

@@ -6,6 +6,10 @@ use std::{
     time::Instant,
 };
 
+#[cfg(test)]
+#[path = "comms/virtual_uart.rs"]
+mod receipt_test_wire;
+
 const LOSS_MS: u64 = 3_000;
 const RESTORE_MS: u64 = 2_000;
 const LEASE_MS: u64 = 2_000;
@@ -177,6 +181,13 @@ impl Queued {
                 crate::comms::closes_radio_packet_batch(self.priority, body)
             })
     }
+    fn boundary_contract(&self) -> Option<(u64, bool)> {
+        if self.independent_discovery {
+            return None;
+        }
+        decode(&self.frame.bytes)
+            .and_then(|(_, body)| crate::comms::radio_packet_boundary_contract(self.priority, body))
+    }
 }
 /// One owned frame, still charged to the mesh until serial delivery finishes.
 /// Keeping metadata with the frame permits retry without copying its payload.
@@ -190,6 +201,15 @@ impl Transmission {
     }
     pub(crate) fn closes_packet_batch(&self) -> bool {
         self.queued.closes_packet_batch()
+    }
+    pub(crate) fn boundary_contract(&self) -> Option<(u64, bool)> {
+        self.queued.boundary_contract()
+    }
+    #[cfg(test)]
+    pub(crate) fn is_receipt(&self) -> bool {
+        self.queued
+            .boundary_contract()
+            .is_some_and(|(_, receipt)| receipt)
     }
 }
 
@@ -225,6 +245,7 @@ pub struct Mesh {
     active_survives_clear: bool,
     next_transmission: u64,
     discovery_balance_bytes: i32,
+    receipt_service_pending: bool,
     active_fair_delta_bytes: i32,
     fair_overhead_bytes: u16,
 }
@@ -263,6 +284,7 @@ impl Mesh {
             active_survives_clear: false,
             next_transmission: 0,
             discovery_balance_bytes: 0,
+            receipt_service_pending: false,
             active_fair_delta_bytes: 0,
             fair_overhead_bytes: std::env::var("GS_RADIO_AIR_FRAME_OVERHEAD_BYTES")
                 .ok()
@@ -611,6 +633,9 @@ impl Mesh {
             let lanes_ready = discovery.is_some() && ordinary.is_some();
             if !critical_only && !lanes_ready {
                 self.discovery_balance_bytes = 0;
+                if discovery.is_none() {
+                    self.receipt_service_pending = false;
+                }
             }
             let contested = protected.is_none() && lanes_ready;
             let i = if let Some(index) = protected {
@@ -624,6 +649,9 @@ impl Mesh {
             } else {
                 // No credit earned while a lane is absent or dependency-blocked.
                 self.discovery_balance_bytes = 0;
+                if discovery.is_none() {
+                    self.receipt_service_pending = false;
+                }
                 self.queue
                     .iter()
                     .enumerate()
@@ -704,10 +732,40 @@ impl Mesh {
             return None;
         }
         self.discovery_balance_bytes = self.discovery_balance_bytes.saturating_add(fair_delta);
+        if transmission.queued.independent_discovery {
+            self.receipt_service_pending = false;
+        }
         let frame = transmission.queued.frame;
         self.bytes -= frame.bytes.len();
         self.forwarded += 1;
         Some(frame)
+    }
+
+    /// Replacing a live ordinary/metadata batch with a receipt idle gap costs
+    /// ordinary service. Reserve only that charged-byte service before the next
+    /// independent snapshot. A successful snapshot must occur before another
+    /// allowance can accrue, so repeated receipts cannot starve metadata.
+    pub(crate) fn note_receipt_packet_boundary(&mut self, charged_bytes: usize) {
+        let metadata_ready = self.queue.iter().any(|item| item.independent_discovery);
+        let ordinary_ready = self.queue.iter().enumerate().any(|(index, item)| {
+            item.priority < 254
+                && !item.independent_discovery
+                && matches!(
+                    item.frame.bytes.get(3),
+                    Some(&DOWN_DATA) | Some(&AV_BAY_DATA)
+                )
+                && self.dependency_ready(index)
+        });
+        if !metadata_ready {
+            self.receipt_service_pending = false;
+            return;
+        }
+        if !ordinary_ready || self.receipt_service_pending || charged_bytes == 0 {
+            return;
+        }
+        let bytes = charged_bytes.min(MAX_BYTES) as i32;
+        self.discovery_balance_bytes = self.discovery_balance_bytes.saturating_add(bytes);
+        self.receipt_service_pending = true;
     }
 
     #[cfg(test)]
@@ -1138,6 +1196,31 @@ pub(crate) fn topology_observation() -> Option<TopologyObservation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn receipt_boundary_metadata_survives_downlink_wrapping_and_priority_cap() {
+        crate::telemetry_schema::initialize().unwrap();
+        let packet = sedsnet::packet::Packet::new(
+            sedsnet::config::DataType::ReliableAck,
+            &[sedsnet::config::DataEndpoint::TelemetryError],
+            "RF",
+            1,
+            42u64.to_le_bytes().to_vec().into(),
+        )
+        .unwrap();
+        let bytes = sedsnet::wire_format::pack_packet(&packet);
+        let mut relay = Mesh::new(Role::Rrls, 2);
+        relay.incoming(true, &health(1, 0, false), 0);
+        while relay.pop(0).is_some() {}
+        relay.incoming(false, &bytes, 1);
+        assert_eq!(relay.queue.front().unwrap().priority, 254);
+        let tx = relay.begin_transmission(1).unwrap();
+        assert!(tx.closes_packet_batch());
+        assert!(tx.is_receipt());
+        assert_eq!(
+            decode(&tx.frame().bytes).unwrap(),
+            (DOWN_DATA, bytes.as_ref())
+        );
+    }
     #[test]
     fn delayed_ready_is_presence_without_extending_command_lease() {
         let mut mesh = Mesh::new(Role::Primary, 42);
@@ -2079,6 +2162,145 @@ mod tests {
     }
 
     #[test]
+    fn receipt_service_is_latched_until_metadata_succeeds_without_idle_credit() {
+        crate::telemetry_schema::initialize().unwrap();
+        let mut mesh = Mesh::new(Role::Rrls, 2);
+        mesh.incoming(true, &health(1, 0, false), 0);
+        while mesh.pop(0).is_some() {}
+        mesh.incoming(false, &independent_address(0), 0);
+        mesh.note_receipt_packet_boundary(154);
+        assert_eq!(mesh.discovery_balance_bytes, 0, "no idle ordinary credit");
+        let battery = sedsnet::wire_format::pack_packet(
+            &sedsnet::packet::Packet::new(
+                crate::telemetry_schema::data_type("BATTERY_VOLTAGE"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "PB",
+                1,
+                vec![0; 4].into(),
+            )
+            .unwrap(),
+        );
+        mesh.incoming(false, &battery, 0);
+        mesh.note_receipt_packet_boundary(154);
+        assert_eq!(mesh.discovery_balance_bytes, 154);
+        assert!(mesh.receipt_service_pending);
+        let tx = mesh.begin_transmission(0).unwrap();
+        assert!(!tx.queued.independent_discovery);
+        mesh.finish_transmission(tx, false);
+        mesh.note_receipt_packet_boundary(154);
+        assert_eq!(
+            mesh.discovery_balance_bytes, 154,
+            "failed IO cannot rearm compensation"
+        );
+        mesh.pop(0).unwrap();
+        let tx = mesh.begin_transmission(0).unwrap();
+        assert!(tx.queued.independent_discovery);
+        assert!(
+            mesh.receipt_service_pending,
+            "an empty ordinary lane cannot rearm before metadata"
+        );
+        mesh.finish_transmission(tx, false);
+        mesh.incoming(false, &battery, 0);
+        mesh.note_receipt_packet_boundary(154);
+        assert_eq!(
+            mesh.discovery_balance_bytes, 0,
+            "lane flapping cannot renew the allowance"
+        );
+        let tx = mesh.begin_transmission(0).unwrap();
+        assert!(tx.queued.independent_discovery);
+        mesh.finish_transmission(tx, true);
+        assert!(!mesh.receipt_service_pending);
+    }
+
+    #[test]
+    fn repeated_new_receipts_preserve_bounded_metadata_service_under_refusal() {
+        crate::telemetry_schema::initialize().unwrap();
+        let wall = Instant::now();
+        let mut cap = crate::comms::rfd_capacity::Capacity::new(64_000, 35, 16);
+        let mut wire = receipt_test_wire::WireDrain::default();
+        let mut mesh = Mesh::new(Role::Rrls, 2);
+        mesh.incoming(true, &health(1, 0, false), 0);
+        let mut metadata = 0;
+        let mut ordinary = 0;
+        let mut refused_once = false;
+        for now in 0..6000 {
+            if now % 500 == 0 {
+                mesh.incoming(true, &health(1, (now / 500) as u32, false), now);
+            }
+            if now < 4000 && now % 1000 == 0 {
+                mesh.incoming(false, &independent_address(now), now);
+            }
+            if now < 4000 && now % 100 == 0 {
+                let packet = sedsnet::packet::Packet::new(
+                    crate::telemetry_schema::data_type("BATTERY_VOLTAGE"),
+                    &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                    "PB",
+                    now,
+                    vec![0; 4].into(),
+                )
+                .unwrap();
+                mesh.incoming(false, &sedsnet::wire_format::pack_packet(&packet), now);
+            }
+            if now < 4000 && now % 155 == 0 {
+                let packet = sedsnet::packet::Packet::new(
+                    sedsnet::config::DataType::ReliableAck,
+                    &[sedsnet::config::DataEndpoint::TelemetryError],
+                    "RF",
+                    now,
+                    now.to_le_bytes().to_vec().into(),
+                )
+                .unwrap();
+                mesh.incoming(false, &sedsnet::wire_format::pack_packet(&packet), now);
+            }
+            if !wire.ready(now) {
+                continue;
+            }
+            let tx = if cap.ready(wall, Some(now)) {
+                mesh.begin_transmission(now)
+            } else {
+                mesh.begin_critical_transmission(now, 0)
+            };
+            let Some(tx) = tx else {
+                continue;
+            };
+            if !cap.ready_for(wall, Some(now), tx.closes_packet_batch()) {
+                mesh.finish_transmission(tx, false);
+                continue;
+            }
+            if tx.queued.independent_discovery && !refused_once {
+                mesh.finish_transmission(tx, false);
+                refused_once = true;
+                continue;
+            }
+            let age = now.saturating_sub(tx.queued.at);
+            if tx.queued.independent_discovery {
+                metadata += 1;
+                assert!(age <= 3000, "metadata service was starved: {age}");
+            } else if tx.queued.priority < 254 {
+                ordinary += 1;
+                assert!(age <= 1500, "ordinary service was starved: {age}");
+            }
+            let bytes = tx.frame().bytes.len() + 4;
+            wire.committed(now, bytes, 115_200);
+            cap.committed(wall, Some(now), bytes);
+            if tx.closes_packet_batch() {
+                let contract = tx.boundary_contract();
+                if cap.close_packet_batch_for_contract(wall, Some(now), contract)
+                    && contract.is_some_and(|(_, receipt)| receipt)
+                {
+                    mesh.note_receipt_packet_boundary(cap.packet_idle_service_bytes());
+                }
+            }
+            mesh.finish_transmission(tx, true);
+            assert!(mesh.queue.len() <= MAX_FRAMES && mesh.bytes <= MAX_BYTES);
+        }
+        assert!(refused_once);
+        assert_eq!(metadata, 4);
+        assert_eq!(ordinary, 40);
+        assert_eq!(mesh.dropped, 0);
+    }
+
+    #[test]
     fn fair_metadata_cannot_overtake_real_sdt_chunk_bootstrap_and_compact_followers() {
         use sedsnet::router::{EndpointHandler, Router, RouterConfig};
         crate::telemetry_schema::initialize().unwrap();
@@ -2142,7 +2364,9 @@ mod tests {
             mesh.incoming(false, frame, 0);
         }
         let mut forwarded = Vec::new();
-        while let Some(frame) = mesh.pop(0) {
+        loop {
+            mesh.note_receipt_packet_boundary(154);
+            let Some(frame) = mesh.pop(0) else { break };
             let (_, body) = decode(&frame.bytes).unwrap();
             if body.starts_with(b"SDT") {
                 forwarded.push(body.to_vec());
