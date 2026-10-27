@@ -1,0 +1,23 @@
+{
+  "status": "native_and_paired_host_passed_full_firmware_campaign_running",
+  "rrls_observer": {
+    "evidence": "Live RRLS reported2309 local SDK queued frames and roughly160million cumulative handler failures dominated by managed-variable requests.",
+    "cause": "READ_ONLY variables can still request refreshes; rejecting local SDK transmission at the radio worker occurs after queue admission and pacing.",
+    "fix": "Disable egress on the RRLS local SDK radio side before queue admission. Continue ingress and original-frame Mesh relay.",
+    "regression": "30seconds of virtual-clock GS ingress and managed-variable requests: cached GS value present, zero local callback attempts, zero queue depth and zero handler retries.",
+    "negative_control": "Original egress policy fails with HandlerError(tx handler failed).",
+    "paired_hosts": "Real backend processes over PTYs:107 RRLS wire frames checked,6 recovery uplinks; failover and direct restoration passed."
+  },
+  "sensor_freshness": {
+    "pb": "Retry rejected latest sensor publications every100ms for at most1second; retain acquisition timestamps and preserve newer concurrent samples. PB native135tests and matched4.2.7 firmware build passed.",
+    "derived_speed": "Invalidate fused speed after all existing600ms acceleration,1500ms barometer and4500ms GPS freshness bounds expire. Invalid raw FC/PB values already become missing values rather than fresh old numbers.",
+    "rf": "Queue-depth observation no longer deletes accepted SDT history; statistics initialize queue depth. RF native172tests and matched firmware build passed.",
+    "coverage": "Simulator analyzer requires explicitly named FC IMU/barometer and PB voltage/current streams; heartbeats alone no longer satisfy source freshness.13 analyzer tests passed."
+  },
+  "backend_validation": {"normal": "564 passed,3 ignored", "hitl": "541 passed,2 ignored"},
+  "limits": [
+    "Full seven-board application campaign using the50ms/3968byte modem envelope is running; its result is not yet claimed.",
+    "The live Pi was still running earlier sourceb7d8e03; physical latency and current modem configuration remain unqualified.",
+    "No modem configuration, physical outputs or firmware flash changed."
+  ]
+}

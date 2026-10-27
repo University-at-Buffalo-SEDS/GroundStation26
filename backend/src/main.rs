@@ -389,6 +389,17 @@ fn router_hop_reliable_enabled(link: &CommsLinkConfig) -> bool {
     }
 }
 
+fn rocket_router_side_options(link: &CommsLinkConfig, observer: bool) -> RouterSideOptions {
+    RouterSideOptions {
+        reliable_enabled: router_hop_reliable_enabled(link),
+        // RRLS forwards original frames through Mesh, not its local SDK.
+        // Suppress local discovery/managed queries before they enter TX queues.
+        egress_enabled: !observer,
+        ..Default::default()
+    }
+    .with_small_packet_transport(RADIO_SIDE_MAX_FRAME_BYTES)
+}
+
 struct ValvePowerFreshness {
     clock: ValidationInstant,
     last_source: [Option<u64>; 2],
@@ -578,6 +589,65 @@ mod router_link_policy_tests {
         assert!(router.export_runtime_stats().queues.shared_queue_bytes_used > 100 * 1024);
         router.process_rx_queue_with_timeout(0).unwrap();
         assert_eq!(delivered.load(Ordering::Relaxed), 2048);
+    }
+
+    #[test]
+    fn rrls_observer_does_not_accumulate_local_sdk_transmissions() {
+        use sedsnet::router::{NetworkVariablePermissions, Router, RouterConfig};
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
+        telemetry_schema::initialize().unwrap();
+        let clock = Arc::new(AtomicU64::new(0));
+        let now = clock.clone();
+        let observer = Router::new_with_clock(
+            RouterConfig::new([]).with_sender("RRLS"),
+            Box::new(move || now.load(Ordering::SeqCst)),
+        );
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let link: CommsLinkConfig = serde_json::from_value(serde_json::json!({
+            "interface":"serial", "port":"/dev/test-radio", "protocol":"raw_uart"
+        }))
+        .unwrap();
+        let side = observer.add_side_packed_with_priority_and_options(
+            "radio",
+            move |_, _| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Err(sedsnet::TelemetryError::Io(
+                    "observer has no local SDK egress",
+                ))
+            },
+            rocket_router_side_options(&link, true),
+        );
+        let ty = telemetry_schema::data_type("FLIGHT_STATE");
+        observer
+            .enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+            .unwrap();
+        for tick in (0..30_000).step_by(100) {
+            clock.store(tick, Ordering::SeqCst);
+            // A live observer must learn a GS value while remaining silent.
+            if tick % 1000 == 0 {
+                let packet = Packet::new(
+                    ty,
+                    &[telemetry_schema::endpoint("FLIGHT_STATE")],
+                    "GS",
+                    tick + 1,
+                    vec![2].into(),
+                )
+                .unwrap();
+                observer.rx_from_side(&packet, side).unwrap();
+                observer.request_managed_variable(ty).unwrap();
+            }
+            observer.process_all_queues_with_timeout(0).unwrap();
+        }
+        assert!(observer.get_cached_network_variable(ty).unwrap().is_some());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "RRLS must suppress local SDK work before its radio queue, not after pacing"
+        );
+        let stats = observer.export_runtime_stats();
+        assert_eq!(stats.queues.tx_len, 0);
+        assert_eq!(stats.total_handler_retries, 0);
     }
 
     #[test]
@@ -1480,13 +1550,7 @@ async fn main() -> anyhow::Result<()> {
         let rocket_tx = rocket_tx.clone();
         let budget = rocket_tx_budget.clone();
         let activity = state.transport_tx_activity.clone();
-        let opts = RouterSideOptions {
-            reliable_enabled: router_hop_reliable_enabled(&comms_links.av_bay),
-            ..Default::default()
-        }
-        // Bound an uninterruptible schema chunk to about 67 ms at the
-        // configured 64 kbit/s radio and 40% airtime share.
-        .with_small_packet_transport(RADIO_SIDE_MAX_FRAME_BYTES);
+        let opts = rocket_router_side_options(&comms_links.av_bay, rrls::is_rrls());
         router.add_side_packed_with_priority_and_options(
             "rocket_comms",
             move |pkt, priority| activity.try_enqueue(|| budget.try_send(&rocket_tx, priority, pkt)),
