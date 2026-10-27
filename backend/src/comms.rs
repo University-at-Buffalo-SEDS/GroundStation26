@@ -880,15 +880,19 @@ impl UartComms {
                     let contract = transmission.boundary_contract();
                     if io_result.is_ok() && transmission.closes_packet_batch() {
                         if let Some(contracts) = contracts {
-                            (promoted, receipt_promoted) =
-                                capacity.close_control_batch(capacity_wall, capacity_clock, contracts);
+                            (promoted, receipt_promoted) = capacity.close_control_batch(
+                                capacity_wall,
+                                capacity_clock,
+                                contracts,
+                            );
                         } else {
                             promoted = capacity.close_packet_batch_for_contract(
                                 capacity_wall,
                                 capacity_clock,
                                 contract,
                             );
-                            receipt_promoted = promoted && contract.is_some_and(|(_, receipt)| receipt);
+                            receipt_promoted =
+                                promoted && contract.is_some_and(|(_, receipt)| receipt);
                         }
                     }
                     if io_result.is_ok() {
@@ -2217,9 +2221,17 @@ impl CommsDevice for UartComms {
                     };
                     for contract in contracts {
                         trace_virtual_uart_admission(
-                            "batch", self.side_id, Some((contract, false)), virtual_now, clock,
-                            stop, capacity.next_packet_virtual_ms(), promoted,
-                            bytes.len(), accepted, result.is_ok(),
+                            "batch",
+                            self.side_id,
+                            Some((contract, false)),
+                            virtual_now,
+                            clock,
+                            stop,
+                            capacity.next_packet_virtual_ms(),
+                            promoted,
+                            bytes.len(),
+                            accepted,
+                            result.is_ok(),
                         );
                     }
                 }
@@ -2231,14 +2243,24 @@ impl CommsDevice for UartComms {
         self.transmit_ready_for(0, &[])
     }
     fn transmit_ready_for(&self, priority: u8, payload: &[u8]) -> bool {
+        // Advisory worker precheck uses the fully wrapped wire cost. The
+        // writer rechecks the actual routed bytes under this same lock below.
+        #[cfg(target_os = "linux")]
+        let command = self
+            .command_batch_frame_len(priority, payload)
+            .and_then(|len| {
+                radio_packet_boundary_contract(priority, payload).map(|(id, _)| (id, len))
+            });
         let mut state = self.write_lock.lock().unwrap();
-        self.refresh_recovery_capacity(&mut state, Instant::now(), crate::simulation_clock_ms());
+        let wall = Instant::now();
+        let clock = crate::simulation_clock_ms();
+        self.refresh_recovery_capacity(&mut state, wall, clock);
         if state.radio_capacity.as_ref().is_some_and(|cap| {
-            !cap.ready_for(
-                Instant::now(),
-                crate::simulation_clock_ms(),
-                closes_radio_packet_batch(priority, payload),
-            )
+            #[cfg(target_os = "linux")]
+            if let Some((id, len)) = command {
+                return !cap.ready_for_command(wall, clock, id, len, true);
+            }
+            !cap.ready_for(wall, clock, closes_radio_packet_batch(priority, payload))
         }) {
             return false;
         }
@@ -2323,6 +2345,14 @@ impl CommsDevice for UartComms {
         } else {
             None
         };
+        // Only canonical, CRC-valid unsequenced commands may use the remaining
+        // slot. Receipts, ordered packets and opaque SDT retain regular pacing.
+        #[cfg(target_os = "linux")]
+        let command_id = matches!(self.protocol, SerialProtocol::RawUart)
+            .then(|| is_radio_batch_command(priority, payload).then_some(contract))
+            .flatten()
+            .flatten()
+            .map(|(id, _)| id);
         if self.recovery.is_some() {
             self.enable_radio_capacity_control();
         }
@@ -2370,11 +2400,19 @@ impl CommsDevice for UartComms {
         let capacity_wall = Instant::now();
         let capacity_clock = crate::simulation_clock_ms();
         self.refresh_recovery_capacity(&mut write_state, capacity_wall, capacity_clock);
-        if write_state
-            .radio_capacity
-            .as_ref()
-            .is_some_and(|cap| !cap.ready_for(capacity_wall, capacity_clock, close_batch))
-        {
+        if write_state.radio_capacity.as_ref().is_some_and(|cap| {
+            #[cfg(target_os = "linux")]
+            if let Some(id) = command_id {
+                return !cap.ready_for_command(
+                    capacity_wall,
+                    capacity_clock,
+                    id,
+                    payload.len() + RAW_UART_FRAME_HEADER_SIZE,
+                    true,
+                );
+            }
+            !cap.ready_for(capacity_wall, capacity_clock, close_batch)
+        }) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "radio modem capacity is still draining",
@@ -2443,6 +2481,21 @@ impl CommsDevice for UartComms {
             && accepted > 0
             && let Some(capacity) = &mut write_state.radio_capacity
         {
+            #[cfg(target_os = "linux")]
+            if let Some(id) = command_id {
+                capacity.committed_command(
+                    capacity_wall,
+                    capacity_clock,
+                    id,
+                    len + RAW_UART_FRAME_HEADER_SIZE,
+                    true,
+                    accepted,
+                    io_result.is_ok(),
+                );
+            } else {
+                capacity.committed(capacity_wall, capacity_clock, accepted);
+            }
+            #[cfg(not(target_os = "linux"))]
             capacity.committed(capacity_wall, capacity_clock, accepted);
             capacity.drained(Instant::now());
             #[cfg(target_os = "linux")]
@@ -2456,8 +2509,11 @@ impl CommsDevice for UartComms {
             }
             let mut promoted = false;
             if io_result.is_ok() && close_batch {
-                promoted =
-                    capacity.close_packet_batch_for_contract(capacity_wall, capacity_clock, contract);
+                promoted = capacity.close_packet_batch_for_contract(
+                    capacity_wall,
+                    capacity_clock,
+                    contract,
+                );
                 if promoted
                     && contract.is_some_and(|(_, receipt)| receipt)
                     && let Some(mesh) = &self.recovery
@@ -3761,6 +3817,127 @@ mod tests {
 #[cfg(test)]
 mod raw_uart_tests {
     use super::*;
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "hitl_mode"))]
+    fn late_sibling_actual_uart_captured117_and_metadata_limits() {
+        const CHILD: &str = "GS_LATE_SIBLING_PTY_CHILD";
+        const NAME: &str =
+            "comms::raw_uart_tests::late_sibling_actual_uart_captured117_and_metadata_limits";
+        if std::env::var_os(CHILD).is_none() {
+            let clock =
+                std::env::temp_dir().join(format!("gs-late-sibling-{}.clock", std::process::id()));
+            std::fs::write(&clock, "30000").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("GS_SIM_CLOCK_FILE", &clock)
+                .env("GS_SIMULATED_SERIAL_PTY", "1")
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_file(clock);
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let clock = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
+        let set_clock = |n: u64| std::fs::write(&clock, n.to_string()).unwrap();
+        let und = include_bytes!("comms/late_sibling_fixtures/und.bin").to_vec();
+        let fc = include_bytes!("comms/late_sibling_fixtures/fc.bin").to_vec();
+        for p in [&und, &fc] {
+            assert!(is_radio_batch_command(255, p));
+        }
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(30)).unwrap();
+        let (mut uart, _, _) = recovery_uart_fixture(port);
+        {
+            let mut state = uart.write_lock.lock().unwrap();
+            let mut cap = rfd_capacity::Capacity::new(64000, 15, 16);
+            cap.committed(Instant::now(), Some(30000), 21);
+            state.wire.committed(30000, 21, 115200);
+            cap.drained_virtual(state.wire.stop_us());
+            state.radio_capacity = Some(cap);
+        }
+        assert_eq!(uart.command_batch_frame_len(255, &und), Some(55));
+        assert_eq!(uart.command_batch_frame_len(255, &fc), Some(62));
+        set_clock(30001);
+        uart.send_data_with_priority(&und, 255).unwrap();
+        let mut first = vec![0; 55];
+        peer.read_exact(&mut first).unwrap();
+        set_clock(30061);
+        assert!(!uart.transmit_ready_for(255, &fc));
+        assert!(uart.send_data_with_priority(&fc, 255).is_err());
+        set_clock(30062);
+        assert!(uart.transmit_ready_for(255, &fc));
+        assert!(!uart.transmit_ready_for(255, &und));
+        let ordered = serialize::pack_packet_with_reliable(
+            &serialize::unpack_packet(&fc).unwrap(),
+            serialize::ReliableHeader {
+                flags: 0,
+                seq: 7,
+                ack: 0,
+            },
+        );
+        assert!(!uart.transmit_ready_for(255, &ordered));
+        assert!(
+            uart.send_command_batch(&[(255, &und), (255, &fc)]).is_err(),
+            "remainingone slot mustnotauthorizeanotherpair"
+        );
+        // Fully encoded routed bytes, rather than the canonical payload size,
+        // determine the128B limit. Find a valid129B total in this SDKprofile.
+        let oversized = (1..80)
+            .find_map(|n| {
+                [1u64, 128, 16384, 2097152, 268435456]
+                    .into_iter()
+                    .find_map(|ts| {
+                        let endpoints = (0..n)
+                            .map(|i| sedsnet::config::DataEndpoint(1000 + i))
+                            .collect::<Vec<_>>();
+                        let packet = Packet::new(
+                            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+                            &endpoints,
+                            "GS",
+                            ts,
+                            std::sync::Arc::from([1u8]),
+                        )
+                        .ok()?;
+                        let bytes = serialize::pack_packet(&packet).to_vec();
+                        (uart.command_batch_frame_len(255, &bytes) == Some(74)).then_some(bytes)
+                    })
+            })
+            .expect("valid canonical routed74B sibling fixture");
+        assert!(55 + uart.command_batch_frame_len(255, &oversized).unwrap() == 129);
+        assert!(!uart.transmit_ready_for(255, &oversized));
+        assert!(uart.send_data_with_priority(&oversized, 255).is_err());
+        let mut probe = [0];
+        assert!(
+            peer.read(&mut probe).is_err(),
+            "refusedmetadata/pair/129Brequests mustnotwriteanyprefix"
+        );
+        let mut worker_tx = uart.try_clone_tx().unwrap().unwrap();
+        assert!(worker_tx.transmit_ready_for(255, &fc));
+        worker_tx.send_data_with_priority(&fc, 255).unwrap();
+        let mut second = vec![0; 62];
+        peer.read_exact(&mut second).unwrap();
+        let expected = |p: &[u8]| {
+            let mesh = uart.recovery.as_ref().unwrap().lock().unwrap();
+            build_raw_uart_command_frame(&mesh.local_tx(false, p, mesh.now()).unwrap().bytes)
+                .unwrap()
+        };
+        assert_eq!(first, expected(&und));
+        assert_eq!(second, expected(&fc));
+        assert!(!uart.transmit_ready_for(255, &und));
+        assert!(!uart.transmit_ready_for(255, &fc));
+        set_clock(30155);
+        assert!(!uart.transmit_ready_for(255, &fc));
+        set_clock(30156);
+        assert!(uart.transmit_ready_for(255, &fc));
+    }
+
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -4009,8 +4186,11 @@ mod raw_uart_tests {
                 priority == 0
             );
             assert!(cap.ready(completed + Duration::from_millis(80), None));
-            assert_eq!(cap.ordinary_service_credit_ms() > 0, priority == 0,
-                "only completed ordinary IO funds another close, including on wall-clock UART");
+            assert_eq!(
+                cap.ordinary_service_credit_ms() > 0,
+                priority == 0,
+                "only completed ordinary IO funds another close, including on wall-clock UART"
+            );
             assert_eq!(
                 reader.join().unwrap(),
                 build_raw_uart_frame(&bytes).unwrap()
@@ -4207,8 +4387,10 @@ mod raw_uart_tests {
             .iter()
             .flat_map(|p| {
                 let shared = uart.recovery.as_ref().unwrap().lock().unwrap();
-                build_raw_uart_command_frame(&shared.local_tx(false, p, shared.now()).unwrap().bytes)
-                    .unwrap()
+                build_raw_uart_command_frame(
+                    &shared.local_tx(false, p, shared.now()).unwrap().bytes,
+                )
+                .unwrap()
             })
             .collect::<Vec<_>>();
         let packet = serialize::unpack_packet(&packets[1]).unwrap();
@@ -4387,7 +4569,16 @@ mod raw_uart_tests {
         let (mut uart, shared, expected) = mesh_receipt_pair_fixture(port);
         drop(peer);
         assert!(uart.flush_recovery_output(0).is_err());
-        assert_eq!(uart.write_lock.lock().unwrap().radio_capacity.as_ref().unwrap().ordinary_service_credit_ms(), 0);
+        assert_eq!(
+            uart.write_lock
+                .lock()
+                .unwrap()
+                .radio_capacity
+                .as_ref()
+                .unwrap()
+                .ordinary_service_credit_ms(),
+            0
+        );
         let mut mesh = shared.lock().unwrap();
         let tx = mesh.begin_bounded_transmission(0, 0, false, 2).unwrap();
         let mut actual = build_raw_uart_command_frame(&tx.frame().bytes).unwrap();
@@ -4429,7 +4620,11 @@ mod raw_uart_tests {
         let wall = Instant::now();
         let mut capacity = rfd_capacity::Capacity::new(64_000, 15, 16);
         capacity.committed(wall, Some(10), accepted);
-        assert_eq!(capacity.ordinary_service_credit_ms(), 0, "partial logical IO cannot fund a close");
+        assert_eq!(
+            capacity.ordinary_service_credit_ms(),
+            0,
+            "partial logical IO cannot fund a close"
+        );
         assert!(
             !capacity.ready(wall, Some(11)),
             "accepted partial bytes retain full airtime debt"
@@ -4562,7 +4757,8 @@ mod raw_uart_tests {
             let result = uart.send_data_with_priority(&payload, 0);
             let flags = unsafe { libc::fcntl(peer.as_raw_fd(), libc::F_GETFL) };
             assert!(
-                unsafe { libc::fcntl(peer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0
+                unsafe { libc::fcntl(peer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                    >= 0
             );
             let mut drained = Vec::new();
             let mut buf = [0u8; 8192];
@@ -4575,7 +4771,9 @@ mod raw_uart_tests {
                 }
             }
             let accepted = drained.len().saturating_sub(filled - released);
-            if result.is_err() && accepted > 0 && accepted < payload.len() + RAW_UART_FRAME_HEADER_SIZE
+            if result.is_err()
+                && accepted > 0
+                && accepted < payload.len() + RAW_UART_FRAME_HEADER_SIZE
             {
                 saw_partial = true;
                 assert_eq!(

@@ -15,11 +15,14 @@ pub(crate) struct Capacity {
     promotion_contract_count: u8,
     promotion_contract_cursor: u8,
     early_frame_outstanding: bool,
+    late_command_id: u64,
+    late_command_len: u8,
+    late_command_virtual: bool,
     ordinary_service_credit_ms: u8,
     extra_close_owed: bool,
-    packet_burst_ms: u64,
+    packet_burst_ms: u16,
     uart_baud: u32,
-    packet_gap_ms: u64,
+    packet_gap_ms: u16,
     air_bps: u64,
     share_percent: u64,
     overhead_bytes: u64,
@@ -41,13 +44,86 @@ impl Capacity {
         if !critical || self.early_frame_outstanding || !self.packet_ready(wall, virtual_ms) {
             return false;
         }
-        let limit = self.packet_burst_ms.saturating_add(self.packet_gap_ms);
+        let limit = u64::from(self.packet_burst_ms).saturating_add(u64::from(self.packet_gap_ms));
         self.next.is_some_and(
             |(next_wall, next_virtual)| match (virtual_ms, next_virtual) {
                 (Some(now), Some(next)) => next.saturating_sub(now) <= limit,
                 _ => next_wall.saturating_duration_since(wall) <= Duration::from_millis(limit),
             },
         )
+    }
+    /// A canonical unsequenced command may finish the existing bounded loan.
+    /// Eligibility is validated from the wire contract, not bool critical.
+    pub(crate) fn ready_for_command(
+        &self,
+        wall: Instant,
+        clock: Option<u64>,
+        id: u64,
+        encoded_len: usize,
+        canonical_unsequenced: bool,
+    ) -> bool {
+        encoded_len > 0
+            && (self.ready_for(wall, clock, true)
+                || self.late_sibling_ready(wall, clock, id, encoded_len, canonical_unsequenced))
+    }
+    fn late_sibling_ready(
+        &self,
+        wall: Instant,
+        clock: Option<u64>,
+        id: u64,
+        encoded_len: usize,
+        canonical_unsequenced: bool,
+    ) -> bool {
+        let first_id = self.late_command_id;
+        let first_len = usize::from(self.late_command_len);
+        let virtual_domain = self.late_command_virtual;
+        if first_len == 0 {
+            return false;
+        }
+        canonical_unsequenced
+            && self.early_frame_outstanding
+            && id != first_id
+            && encoded_len > 0
+            && first_len
+                .checked_add(encoded_len)
+                .is_some_and(|len| len <= 128)
+            && virtual_domain == clock.is_some()
+            && !Self::reached(self.next, wall, clock)
+            && Self::reached(self.next_packet, wall, clock)
+    }
+    /// Charge every accepted byte. First partial/error cannot license another
+    /// frame; any positive late-sibling prefix consumes the sole remaining slot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn committed_command(
+        &mut self,
+        wall: Instant,
+        clock: Option<u64>,
+        id: u64,
+        encoded_len: usize,
+        canonical_unsequenced: bool,
+        accepted: usize,
+        full_io_success: bool,
+    ) {
+        if accepted == 0 {
+            return;
+        }
+        let late = self.late_sibling_ready(wall, clock, id, encoded_len, canonical_unsequenced);
+        let admissible = self.ready_for(wall, clock, true);
+        self.committed(wall, clock, accepted);
+        // Keep the existing first-loan semantics; historical IDs do not
+        // create another slot in the current outstanding loan epoch.
+        if !late
+            && admissible
+            && canonical_unsequenced
+            && full_io_success
+            && accepted == encoded_len
+            && (1..=128).contains(&encoded_len)
+            && self.early_frame_outstanding
+        {
+            self.late_command_id = id;
+            self.late_command_len = encoded_len as u8;
+            self.late_command_virtual = clock.is_some();
+        }
     }
     /// Promote the first interactive completion per normal batch cycle. A
     /// retry/ACK burst must not turn all ordinary traffic into one-frame
@@ -69,16 +145,17 @@ impl Capacity {
         virtual_ms: Option<u64>,
         contract: Option<(u64, bool)>,
     ) -> bool {
-        let cycle_ms = self.packet_burst_ms.saturating_add(self.packet_gap_ms);
+        let cycle_ms =
+            u64::from(self.packet_burst_ms).saturating_add(u64::from(self.packet_gap_ms));
         let receipt = contract.is_some_and(|(_, receipt)| receipt);
         let slot = contract.and_then(|(id, _)| {
             self.promotion_contracts[..usize::from(self.promotion_contract_count)]
                 .iter()
                 .position(|stored| *stored == id)
         });
-        if slot
-            .is_some_and(|slot| self.promotion_flags & (1 << (slot + if receipt { 4 } else { 0 })) != 0)
-        {
+        if slot.is_some_and(|slot| {
+            self.promotion_flags & (1 << (slot + if receipt { 4 } else { 0 })) != 0
+        }) {
             return false;
         }
         // The first returning receipt may override a recent uplink close, but
@@ -99,7 +176,7 @@ impl Capacity {
             if contract.is_none()
                 || self.extra_close_owed
                 || !(1..=55).contains(&self.packet_gap_ms)
-                || u64::from(self.ordinary_service_credit_ms) < self.packet_gap_ms
+                || u64::from(self.ordinary_service_credit_ms) < u64::from(self.packet_gap_ms)
             {
                 return false;
             }
@@ -125,7 +202,8 @@ impl Capacity {
                 self.promotion_contracts[slot] = id;
                 self.promotion_flags &= !((1 << slot) | (1 << (slot + 4)));
                 self.promotion_contract_cursor = (self.promotion_contract_cursor + 1) % 4;
-                self.promotion_contract_count = self.promotion_contract_count.saturating_add(1).min(4);
+                self.promotion_contract_count =
+                    self.promotion_contract_count.saturating_add(1).min(4);
                 slot
             });
         self.promotion_flags |= 1 << (slot + if receipt { 4 } else { 0 });
@@ -196,7 +274,10 @@ impl Capacity {
         self.extra_close_owed
     }
     pub(crate) fn packetization(&self) -> (u64, u64) {
-        (self.packet_burst_ms, self.packet_gap_ms)
+        (
+            u64::from(self.packet_burst_ms),
+            u64::from(self.packet_gap_ms),
+        )
     }
     pub(crate) fn from_env(uart_baud: u32) -> Self {
         let recovery = matches!(
@@ -214,8 +295,11 @@ impl Capacity {
             bounded_env("GS_RADIO_AIR_FRAME_OVERHEAD_BYTES", 16, 0, 256),
         );
         capacity.uart_baud = uart_baud.max(1);
-        capacity.packet_burst_ms = bounded_env("GS_RADIO_PACKET_BURST_MS", 100, 0, 500);
-        capacity.packet_gap_ms = bounded_env("GS_RADIO_PACKET_GAP_MS", 55, 0, 1_000);
+        capacity.packet_burst_ms =
+            u16::try_from(bounded_env("GS_RADIO_PACKET_BURST_MS", 100, 0, 500))
+                .expect("bounded burst fits u16");
+        capacity.packet_gap_ms = u16::try_from(bounded_env("GS_RADIO_PACKET_GAP_MS", 55, 0, 1_000))
+            .expect("bounded gap fits u16");
         capacity.default_share_percent = default_share;
         capacity.fixed_share = configured_share.is_some();
         capacity
@@ -232,6 +316,9 @@ impl Capacity {
             promotion_contract_count: 0,
             promotion_contract_cursor: 0,
             early_frame_outstanding: false,
+            late_command_id: 0,
+            late_command_len: 0,
+            late_command_virtual: false,
             ordinary_service_credit_ms: 0,
             extra_close_owed: false,
             packet_burst_ms: 100,
@@ -280,6 +367,9 @@ impl Capacity {
             };
             self.next = Some((next_wall, next_virtual));
         }
+        if share != self.share_percent {
+            self.late_command_len = 0;
+        }
         self.share_percent = share;
     }
     pub(crate) fn ready(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
@@ -308,10 +398,12 @@ impl Capacity {
         };
         let within_burst = self.packet_started.is_some_and(|(started, virtual_start)| {
             match (virtual_ms, virtual_start) {
-                (Some(now), Some(start)) => now.saturating_sub(start) < self.packet_burst_ms,
+                (Some(now), Some(start)) => {
+                    now.saturating_sub(start) < u64::from(self.packet_burst_ms)
+                }
                 _ => {
                     wall.saturating_duration_since(started)
-                        < Duration::from_millis(self.packet_burst_ms)
+                        < Duration::from_millis(u64::from(self.packet_burst_ms))
                 }
             }
         });
@@ -328,14 +420,17 @@ impl Capacity {
     /// the modeled 8N1 duration, independently of host scheduling delays.
     pub(crate) fn drained(&mut self, completed: Instant) {
         if let Some((deadline, _)) = self.next_packet.as_mut() {
-            *deadline = (*deadline).max(completed + Duration::from_millis(self.packet_gap_ms));
+            *deadline =
+                (*deadline).max(completed + Duration::from_millis(u64::from(self.packet_gap_ms)));
         }
     }
 
     /// PTYs complete writes before their modeled UART drains. Preserve the
     /// same quiet interval as physical tcdrain, including accumulated lookahead.
     pub(crate) fn drained_virtual(&mut self, stop_us: u64) {
-        let quiet_until = stop_us.div_ceil(1_000).saturating_add(self.packet_gap_ms);
+        let quiet_until = stop_us
+            .div_ceil(1_000)
+            .saturating_add(u64::from(self.packet_gap_ms));
         if let Some((_, Some(deadline))) = self.next_packet.as_mut() {
             *deadline = (*deadline).max(quiet_until);
         }
@@ -358,9 +453,9 @@ impl Capacity {
             if bytes == 0 {
                 0
             } else {
-                ((bytes as u128 + u128::from(self.overhead_bytes)) * 8 * 1000)
-                    .div_ceil((u128::from(self.air_bps) * u128::from(self.share_percent) / 100).max(1))
-                    as u64
+                ((bytes as u128 + u128::from(self.overhead_bytes)) * 8 * 1000).div_ceil(
+                    (u128::from(self.air_bps) * u128::from(self.share_percent) / 100).max(1),
+                ) as u64
             }
         };
         let separate = cost(accepted.min(lengths[0])) + cost(accepted.saturating_sub(lengths[0]));
@@ -379,6 +474,9 @@ impl Capacity {
         virtual_ms: Option<u64>,
         framed_bytes: usize,
     ) {
+        if framed_bytes > 0 {
+            self.late_command_len = 0;
+        }
         let bps = (self.air_bps as u128 * self.share_percent as u128 / 100).max(1);
         let millis = ((framed_bytes as u128 + self.overhead_bytes as u128) * 8 * 1000)
             .div_ceil(bps)
@@ -386,8 +484,8 @@ impl Capacity {
         // Small writes can exhaust neither the airtime budget nor MAX_DATA.
         // Without an idle boundary they can still be held inside an async
         // modem for seconds. Keep this bound separate from air-share debt.
-        let packet_ms =
-            (framed_bytes as u64 * 10_000).div_ceil(u64::from(self.uart_baud)) + self.packet_gap_ms;
+        let packet_ms = (framed_bytes as u64 * 10_000).div_ceil(u64::from(self.uart_baud))
+            + u64::from(self.packet_gap_ms);
         let boundary_passed = self.next_packet.is_none_or(|(next_wall, next_virtual)| {
             match (virtual_ms, next_virtual) {
                 (Some(now), Some(next)) => now >= next,
@@ -456,15 +554,19 @@ mod tests {
 
     #[test]
     fn diagnostic_packet_deadline_snapshot_keeps_exact_admission_state() {
-        let wall=Instant::now();let mut cap=Capacity::new(64_000,35,16);
-        assert_eq!(cap.next_packet_virtual_ms(),None);
-        cap.committed(wall,Some(30080),55);cap.drained_virtual(30_084_775);
-        assert!(cap.close_packet_batch_for_contract(wall,Some(30080),Some((1,false))));
-        assert_eq!(cap.next_packet_virtual_ms(),Some(30140));
-        assert_eq!(cap.next_packet_virtual_ms(),Some(30140));
-        assert!(!cap.ready(wall,Some(30139)));assert!(cap.ready(wall,Some(30140)));
-        let mut physical=Capacity::new(64_000,35,16);physical.committed(wall,None,55);
-        assert_eq!(physical.next_packet_virtual_ms(),None);
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64_000, 35, 16);
+        assert_eq!(cap.next_packet_virtual_ms(), None);
+        cap.committed(wall, Some(30080), 55);
+        cap.drained_virtual(30_084_775);
+        assert!(cap.close_packet_batch_for_contract(wall, Some(30080), Some((1, false))));
+        assert_eq!(cap.next_packet_virtual_ms(), Some(30140));
+        assert_eq!(cap.next_packet_virtual_ms(), Some(30140));
+        assert!(!cap.ready(wall, Some(30139)));
+        assert!(cap.ready(wall, Some(30140)));
+        let mut physical = Capacity::new(64_000, 35, 16);
+        physical.committed(wall, None, 55);
+        assert_eq!(physical.next_packet_virtual_ms(), None);
     }
 
     #[test]
@@ -1091,7 +1193,7 @@ mod funded_gap_scope_tests {
     use super::*;
     #[test]
     fn unsupported_idle_gaps_never_expand_the_literal_55ms_bank() {
-        for gap in [0u64, 56, 1000] {
+        for gap in [0u16, 56, 1000] {
             let wall = Instant::now();
             let mut c = Capacity::new(64_000, 35, 16);
             c.packet_gap_ms = gap;
@@ -1105,5 +1207,118 @@ mod funded_gap_scope_tests {
             assert_eq!(c.ordinary_service_credit_ms, 55);
             assert!(!c.extra_close_owed());
         }
+    }
+}
+
+#[cfg(test)]
+mod late_sibling_prototype_tests {
+    use super::*;
+    fn prefix(first_len: usize, accepted: usize, success: bool) -> (Capacity, Instant) {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 15, 16);
+        cap.committed(wall, Some(30000), 21);
+        cap.drained_virtual(30001927);
+        assert!(cap.ready_for_command(wall, Some(30001), 1, first_len, true));
+        cap.committed_command(wall, Some(30001), 1, first_len, true, accepted, success);
+        cap.drained_virtual(30006712);
+        cap.close_packet_batch_for_contract(wall, Some(30001), Some((1, false)));
+        (cap, wall)
+    }
+    #[test]
+    fn captured117_after_quiet_matches_queued_pair_debt() {
+        let (mut cap, w) = prefix(55, 55, true);
+        assert!(!cap.ready_for_command(w, Some(30061), 2, 62, true));
+        assert!(cap.ready_for_command(w, Some(30062), 2, 62, true));
+        assert!(!cap.ready_for(w, Some(30062), true));
+        cap.committed_command(w, Some(30062), 2, 62, true, 62, true);
+        assert_eq!(cap.next.unwrap().1, Some(30156));
+        assert!(cap.late_command_len == 0);
+        for now in [30062, 30100, 30155] {
+            assert!(!cap.ready_for_command(w, Some(now), 3, 1, true));
+        }
+        assert!(cap.ready(w, Some(30156)));
+    }
+    #[test]
+    fn same_epoch_retry_and_noncanonical_metadata_do_not_extend() {
+        let (cap, w) = prefix(55, 55, true);
+        assert!(!cap.ready_for_command(w, Some(30062), 1, 62, true));
+        assert!(!cap.ready_for_command(w, Some(30062), 2, 62, false));
+        let mut c = Capacity::new(64000, 15, 16);
+        c.committed(w, Some(0), 21);
+        c.committed_command(w, Some(1), 9, 55, false, 55, true);
+        assert!(c.late_command_len == 0);
+    }
+    #[test]
+    fn first_partial_or_flush_error_never_licenses() {
+        for (n, ok) in [(1, false), (54, true), (55, false)] {
+            let (c, w) = prefix(55, n, ok);
+            assert!(c.late_command_len == 0);
+            assert_eq!(
+                c.ready_for_command(w, Some(30062), 2, 62, true),
+                c.ready_for(w, Some(30062), true)
+            );
+        }
+    }
+    #[test]
+    fn partial_second_consumes_slot_and_actual_debt() {
+        for n in [1, 31, 61] {
+            let (mut c, w) = prefix(55, 55, true);
+            c.committed_command(w, Some(30062), 2, 62, true, n, false);
+            assert!(c.late_command_len == 0);
+            let next = c.next.unwrap().1.unwrap();
+            assert_eq!(next, 30091 + ((n as u64 + 16) * 8000).div_ceil(9600));
+            assert!(!c.ready_for_command(w, Some(next - 1), 3, 1, true));
+        }
+    }
+    #[test]
+    fn zero_prefix_error_keeps_epoch_without_sliding() {
+        let (mut c, w) = prefix(55, 55, true);
+        let debt = c.next.unwrap().1;
+        c.committed_command(w, Some(30062), 2, 62, true, 0, false);
+        assert_eq!(c.next.unwrap().1, debt);
+        assert_eq!(c.late_command_id, 1);
+        assert!(c.ready_for_command(w, Some(30062), 2, 62, true));
+    }
+    #[test]
+    fn strict_total_wire_byte_and_frame_bounds() {
+        let (c, w) = prefix(55, 55, true);
+        assert!(c.ready_for_command(w, Some(30062), 2, 73, true));
+        assert!(!c.ready_for_command(w, Some(30062), 2, 74, true));
+        assert!(!c.ready_for_command(w, Some(30062), 2, 0, true));
+        let (c, w) = prefix(129, 129, true);
+        assert!(c.late_command_len == 0);
+        assert!(!c.ready_for_command(w, Some(30062), 2, 1, true));
+    }
+    #[test]
+    fn already_queued_pair_has_no_third_slot() {
+        let w = Instant::now();
+        let mut c = Capacity::new(64000, 15, 16);
+        c.committed(w, Some(30000), 21);
+        c.committed_command_batch(w, Some(30001), [55, 62], 117);
+        assert!(c.late_command_len == 0);
+        assert!(!c.ready_for_command(w, Some(30062), 3, 1, true));
+    }
+    #[test]
+    fn noncommand_commit_share_or_clock_domain_change_cannot_extend() {
+        let (mut c, w) = prefix(55, 55, true);
+        c.committed(w, Some(30062), 1);
+        assert!(c.late_command_len == 0);
+        let (mut c, w) = prefix(55, 55, true);
+        c.apply_recovery_share(Some(35), w, Some(30002));
+        assert!(c.late_command_len == 0);
+        let (c, w) = prefix(55, 55, true);
+        assert!(!c.ready_for_command(w + Duration::from_millis(62), None, 2, 62, true));
+    }
+    #[test]
+    fn wall_only_loan_respects_full_quiet() {
+        let w = Instant::now();
+        let mut c = Capacity::new(64000, 15, 16);
+        c.committed(w, None, 21);
+        assert!(c.ready_for_command(w + Duration::from_millis(1), None, 1, 55, true));
+        c.committed_command(w + Duration::from_millis(1), None, 1, 55, true, 55, true);
+        c.close_packet_batch_for_contract(w + Duration::from_millis(1), None, Some((1, false)));
+        c.drained(w + Duration::from_millis(7));
+        assert!(!c.ready_for_command(w + Duration::from_millis(61), None, 2, 62, true));
+        assert!(c.ready_for_command(w + Duration::from_millis(62), None, 2, 62, true));
     }
 }

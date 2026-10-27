@@ -1,0 +1,40 @@
+{
+  "scope": "NativeGSboundedlate-siblingloan qualification; no physicalhardware/newRenodecampaign, no500ms/1500ms gate or radio-rate changes. All-board TLSF+compactON campaign remains required; historical mixed-compact traces are diagnostic-only.",
+  "problem": "Exact acceptedHEALTH21B\u2192UND55Bprefixusedoneearlyloan, leavingdistinctlaterFC62Bwaitinguntil30091 despitefullquiet30062; alreadyqueued117Bpairhadexisting2frame128Ballowance.",
+  "result": "Oneadditionaldistinctcanonicalunsequencedcommand mayuseonlyunusedsecondslot afterfullUARTquiet, totalactualroutedwire<=128B. Samefullychargedfinalairdebt30156asqueuedpair; neitherthird/retry/newloan norfuturewait introduced.",
+  "contract_guards": [
+    "Firstfullysuccessfulactualearlycommandwrite/drain only; partial/errorcannotlicense",
+    "Secondpositiveacceptedprefixconsumesremaining slot andchargesactualbytes eveniflogicalwritefails; zeroacceptedprefixdoesnotslideepoch",
+    "CurrentepochdistinctpacketID; samefirst/siblingretriescannotextend; historicalIDsafterfulldebtretainoriginalfirstloansemantics",
+    "Pairedalreadyownedcommandsconsumeallslots; noncommandcommitneverlicenses; share/clockdomainchangesconservative",
+    "First/secondframefullyroutedencodedwirecostinclRR+UARTheaders; canonicalCRC/payload/headercontractvalidatedbeforeIO",
+    "Linuxprimaryworkerpreviewplusactualwriterlock ID/len readinessrecheck; paired/Mesh/portable pathsretainoriginalpacing APIs",
+    "Boundedburst<=500/gap<=1000configstoredasu16withcheckedconversionandwidenedarithmetic; existingCapacitysize<=256assertionunchanged"
+  ],
+  "validation": {
+    "isolated_original_negative": "Captured117Bpostquiet case failsoriginal7eb at30062; negative logpreserved",
+    "isolated_native": "37pass0fail including9newguards +existingCapacity/WireDrain tests",
+    "isolated_fullcrate": "CompilesagainstimmutableSDKGit a54020b7832f324f15ce2c9bcda2a14a460b77a5",
+    "production_hitl_raw_uart": "43pass0fail0ignored; realPTYcaptured117bytefixture sendsafter30062, rejects30061/sameID/ordered/secondpair/actual129BbeforeanyIO, clonedtraitwriterpreservesoriginalbytes; existingpartial/Mesh/refusal/drain tests pass",
+    "production_hitl_capacity": "34pass0fail0ignored, includingunchanged256Bmetadata cap",
+    "production_worker_head": "1pass0fail0ignored",
+    "format": "rustfmtchangedtwoRustfiles; gitdiffcheckpasses",
+    "limits": "Fullnormal/HITL/testfire, fmt/clippy andexactall7compactON simulation are parent-ownedfollowups beforepush; noendtoendlatencyqualificationclaimfromnativeoffload alone"
+  },
+  "evidence_root": "FirmwareSimulator/build/rf-two-window-close-cohort-20261027/gs-late-sibling-prototype",
+  "sdk_pin_ownership": "Root-ownedbackendCargo.toml/ignoredCargo.lockresolveda540forvalidation; manifest/workplanexcludedfromthisselectivecodecommit",
+  "source_sha256": {
+    "backend/src/comms.rs": "982b6574d9971996b56185facbb1f1e7f9a7a64489ed79b9da7fec144a8aa797",
+    "backend/src/comms/rfd_capacity.rs": "a472c4f69a977dbd0f1337c93bb94977a4c97dc121f0991e7e9d35a630eecc70",
+    "backend/src/comms/late_sibling_fixtures/und.bin": "42ba2c7d002cdb1898a80d2565990ab384705b2d1a79e86ab63da585a1c0d7d9",
+    "backend/src/comms/late_sibling_fixtures/fc.bin": "b1271cfb69340b36e73efbef220cbcf4018eccb9314e530913acfe9ac8a0f958"
+  },
+  "logs": {
+    "production-raw-uart.log": "b332c0d5a0ea72ad46443dc386bba81c8853e2038e7d50e0b76c3d0af6de6789",
+    "production-capacity.log": "3d0822e6507fb0a83e0d3588b9e46ad79fcb7e06c0733fd0fbaea0c6b352463f",
+    "production-worker-head.log": "b75e9eeb9aa378d2db1aa01a884770090db79dd404082fd76f11898eb529e3b6",
+    "production-sdk-lock-update.log": "941220064214545dc79f2c11b89c043de33d605cb366ac97c54c44bf91467c0b",
+    "isolated-late-sibling-pty-cloned-trait.log": "d5c81e027df89feb8ac9366ea3173021760b27dbcbe5a0459412b298bcbe0790",
+    "isolated-worker-head.log": "66792f3eca266f0daecc7079bf179d206157b9f33858f859a420940b7af07f40"
+  }
+}
