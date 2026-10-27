@@ -2360,12 +2360,14 @@ impl CommsDevice for UartComms {
             return Err(format!("packet too large to send over comms: {len} bytes").into());
         }
 
-        match self.protocol {
+        let mut accepted = 0;
+        let io_result: std::io::Result<()> = match self.protocol {
             SerialProtocol::PacketFramed => {
                 let len_bytes = (len as u16).to_le_bytes();
                 self.inner.write_all(&len_bytes)?;
                 self.inner.write_all(payload)?;
                 self.inner.flush()?;
+                Ok(())
             }
             SerialProtocol::RawUart => {
                 #[cfg(target_os = "linux")]
@@ -2376,16 +2378,24 @@ impl CommsDevice for UartComms {
                         build_raw_uart_frame(payload)?
                     };
                     maybe_log_raw_uart_tx(&framed, &self.protocol);
-                    write_all_fd_with_poll(self.inner.as_raw_fd(), &framed, UART_TX_POLL_TIMEOUT)?;
-                    drain_fd_with_timeout(
+                    let result = write_all_fd_with_poll_counted(
                         self.inner.as_raw_fd(),
-                        uart_wire_timeout(framed.len(), self.baud_rate),
-                    )?;
-                    if let Some(now) = virtual_wire_now {
-                        write_state
-                            .wire
-                            .committed(now, framed.len(), self.baud_rate);
+                        &framed,
+                        UART_TX_POLL_TIMEOUT,
+                        &mut accepted,
+                    )
+                    .and_then(|_| {
+                        drain_fd_with_timeout(
+                            self.inner.as_raw_fd(),
+                            uart_wire_timeout(framed.len(), self.baud_rate),
+                        )
+                    });
+                    if let Some(now) = virtual_wire_now
+                        && accepted > 0
+                    {
+                        write_state.wire.committed(now, accepted, self.baud_rate);
                     }
+                    result
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -2397,51 +2407,57 @@ impl CommsDevice for UartComms {
                     maybe_log_raw_uart_tx(&framed, &self.protocol);
                     self.inner.write_all(&framed)?;
                     self.inner.flush()?;
+                    accepted = framed.len();
+                    Ok(())
                 }
             }
-        }
+        };
         #[cfg(target_os = "linux")]
         let virtual_stop_us = virtual_wire_now.map(|_| write_state.wire.stop_us());
         if matches!(self.protocol, SerialProtocol::RawUart)
+            && accepted > 0
             && let Some(capacity) = &mut write_state.radio_capacity
         {
-            capacity.committed(
-                capacity_wall,
-                capacity_clock,
-                len + RAW_UART_FRAME_HEADER_SIZE,
-            );
+            capacity.committed(capacity_wall, capacity_clock, accepted);
             capacity.drained(Instant::now());
             #[cfg(target_os = "linux")]
             if let Some(stop_us) = virtual_stop_us {
                 capacity.drained_virtual(stop_us);
             }
-            // Reached only after a complete write and platform drain/flush.
-            // Refusals and failed/partial logical frames cannot fund a close.
-            if priority < 254 && !close_batch {
+            // Only complete writes and platform drains/flushes fund a close.
+            // Accepted prefixes still consume debt on a failed logical frame.
+            if io_result.is_ok() && priority < 254 && !close_batch {
                 capacity.note_successful_ordinary_service(len + RAW_UART_FRAME_HEADER_SIZE);
             }
             let mut promoted = false;
-            if close_batch {
-                promoted = capacity.close_packet_batch_for_contract(
-                    capacity_wall, capacity_clock, contract,
-                );
+            if io_result.is_ok() && close_batch {
+                promoted =
+                    capacity.close_packet_batch_for_contract(capacity_wall, capacity_clock, contract);
                 if promoted
                     && contract.is_some_and(|(_, receipt)| receipt)
                     && let Some(mesh) = &self.recovery
                 {
-                    mesh.lock().unwrap().note_receipt_packet_boundary(
-                        capacity.packet_idle_service_bytes(),
-                    );
+                    mesh.lock()
+                        .unwrap()
+                        .note_receipt_packet_boundary(capacity.packet_idle_service_bytes());
                 }
             }
             #[cfg(target_os = "linux")]
             trace_virtual_uart_admission(
-                "sdk", self.side_id, contract, virtual_wire_now, capacity_clock,
-                virtual_stop_us, capacity.next_packet_virtual_ms(), promoted,
-                len + RAW_UART_FRAME_HEADER_SIZE, len + RAW_UART_FRAME_HEADER_SIZE, true,
+                "sdk",
+                self.side_id,
+                contract,
+                virtual_wire_now,
+                capacity_clock,
+                virtual_stop_us,
+                capacity.next_packet_virtual_ms(),
+                promoted,
+                len + RAW_UART_FRAME_HEADER_SIZE,
+                accepted,
+                io_result.is_ok(),
             );
         }
-        Ok(())
+        io_result.map_err(Into::into)
     }
 
     fn send_radio_scheduler_status(
@@ -4486,6 +4502,129 @@ mod raw_uart_tests {
         let earned = ((length + 16) * 8000).div_ceil(22_400).min(55) as u8;
         assert_eq!(cap.ordinary_service_credit_ms(), earned);
         assert!(shared.lock().unwrap().begin_transmission(0).is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn scalar_uart_short_write_must_retain_physical_prefix_debt() {
+        let mut saw_partial = false;
+        for space in [512usize, 1024, 2048, 3072] {
+            let (peer, port) = serialport::TTYPort::pair().unwrap();
+            configure_linux_raw_serial(port.as_raw_fd(), 115200).unwrap();
+            let (mut uart, _, _) = recovery_uart_fixture(port);
+            uart.recovery = None;
+            uart.write_lock.lock().unwrap().radio_capacity =
+                Some(rfd_capacity::Capacity::new(64_000, 35, 16));
+            let padding = [0x55u8; 4096];
+            let mut filled = 0usize;
+            loop {
+                match write_once_fd(uart.inner.as_raw_fd(), &padding) {
+                    Ok(n) if n > 0 => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    other => panic!("unexpected prefill {other:?}"),
+                }
+                assert!(filled < 1_000_000);
+            }
+            let mut released = vec![0u8; space];
+            let n = unsafe {
+                libc::read(
+                    peer.as_raw_fd(),
+                    released.as_mut_ptr().cast(),
+                    released.len(),
+                )
+            };
+            assert!(n > 0);
+            let released = n as usize;
+            let payload = vec![0x77u8; 4096];
+            let result = uart.send_data_with_priority(&payload, 0);
+            let flags = unsafe { libc::fcntl(peer.as_raw_fd(), libc::F_GETFL) };
+            assert!(
+                unsafe { libc::fcntl(peer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0
+            );
+            let mut drained = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                match read_fd_for_prefix_audit(peer.as_raw_fd(), &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => drained.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    other => panic!("unexpected drain {other:?}"),
+                }
+            }
+            let accepted = drained.len().saturating_sub(filled - released);
+            if result.is_err() && accepted > 0 && accepted < payload.len() + RAW_UART_FRAME_HEADER_SIZE
+            {
+                saw_partial = true;
+                assert_eq!(
+                    &drained[filled - released..],
+                    &build_raw_uart_frame(&payload).unwrap()[..accepted]
+                );
+                assert_eq!(
+                    payload.len(),
+                    4096,
+                    "caller retains the complete logical frame for same-ID retry"
+                );
+                let state = uart.write_lock.lock().unwrap();
+                let cap = state.radio_capacity.as_ref().unwrap();
+                let next_debt = ((accepted + 16) * 8000).div_ceil(22_400);
+                eprintln!(
+                    "SCALAR_PARTIAL free={space} prefill={filled} released={released} accepted={accepted}/4100 required_air_ms={next_debt} result={result:?} ready={} bank={}",
+                    cap.ready(Instant::now(), None),
+                    cap.ordinary_service_credit_ms()
+                );
+                assert!(
+                    !cap.ready(Instant::now(), None),
+                    "actually accepted scalar prefix must remain charged despite logical failure"
+                );
+                assert_eq!(cap.ordinary_service_credit_ms(), 0);
+                if let Some(clock) = crate::simulation_clock_ms() {
+                    let stop = clock * 1000 + (accepted as u64 * 10_000_000).div_ceil(115_200);
+                    assert_eq!(state.wire.stop_us(), stop);
+                    assert_eq!(cap.next_packet_virtual_ms(), Some(stop.div_ceil(1000) + 55));
+                    assert!(!cap.ready(Instant::now(), Some(clock + next_debt as u64 - 1)));
+                    assert!(cap.ready(Instant::now(), Some(clock + next_debt as u64)));
+                }
+                break;
+            }
+        }
+        assert!(
+            saw_partial,
+            "fixture must actually admit a partial UART prefix"
+        );
+    }
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "hitl_mode"))]
+    fn virtual_scalar_uart_partial_preserves_accepted_stop_and_quiet() {
+        let path =
+            std::env::temp_dir().join(format!("gs-scalar-prefix-clock-{}.txt", std::process::id()));
+        std::fs::write(&path, "9080").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "comms::raw_uart_tests::scalar_uart_short_write_must_retain_physical_prefix_debt",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("GS_SIM_CLOCK_FILE", &path)
+            .env("GS_SIMULATED_SERIAL_PTY", "1")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(path);
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[cfg(target_os = "linux")]
+    fn read_fd_for_prefix_audit(fd: RawFd, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let n = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+        if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
     }
 
     #[test]
