@@ -1005,6 +1005,7 @@ async fn main() -> anyhow::Result<()> {
         db_path: Arc::new(Mutex::new("sqlite::memory:".to_string())),
         placeholder_db_path: placeholder_db_path.to_string_lossy().to_string(),
         db_queue_tx,
+        db_write_runtime: tokio::runtime::Handle::current(),
         auth_db,
         state: Arc::new(Mutex::new(
             crate::types::u8_to_flight_state(network_variables::flight_state())

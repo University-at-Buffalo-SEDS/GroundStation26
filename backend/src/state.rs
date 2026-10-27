@@ -117,6 +117,9 @@ pub struct AppState {
     /// Shared DB writer/control queue.
     pub db_queue_tx: mpsc::Sender<DbQueueItem>,
 
+    /// Runtime captured at initialization for asynchronous writes from SDK threads.
+    pub db_write_runtime: tokio::runtime::Handle,
+
     /// Separate SQLite database for auth sessions.
     pub auth_db: SqlitePool,
 
@@ -1129,7 +1132,7 @@ impl AppState {
             telemetry_task::procedure_clock::for_wall(ts_ms as u64).timestamp_ms(),
         );
         let tx = self.db_queue_tx.clone();
-        tokio::spawn(async move {
+        self.db_write_runtime.spawn(async move {
             let _ = tx
                 .send(DbQueueItem::Write(
                     crate::telemetry_db::DbWrite::FlightState {
@@ -1762,6 +1765,102 @@ fn t_plus_anchor_timestamp(current: &LaunchClockMsg, timestamp_ms: i64) -> i64 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[tokio::test]
+    async fn sdk_thread_flight_state_callback_retains_full_database_queue_write() {
+        let mut state = test_app_state().await;
+        let (db_tx, mut db_rx) = mpsc::channel(1);
+        db_tx
+            .send(DbQueueItem::Write(
+                crate::telemetry_db::DbWrite::FlightState {
+                    timestamp_ms: 11,
+                    state_code: FlightState::Startup as i64,
+                },
+            ))
+            .await
+            .unwrap();
+        Arc::get_mut(&mut state).unwrap().db_queue_tx = db_tx;
+        let mut notifications = state.state_tx.subscribe();
+        let callback_state = state.clone();
+        let router =
+            sedsnet::router::Router::new(RouterConfig::new([EndpointHandler::new_packet_handler(
+                crate::telemetry_schema::endpoint("FLIGHT_STATE"),
+                move |packet: &Packet| {
+                    let next = match packet.payload() {
+                        [1] => FlightState::Idle,
+                        [2] => FlightState::PreFill,
+                        _ => panic!("unexpected test state"),
+                    };
+                    callback_state.set_local_flight_state(next);
+                    Ok(())
+                },
+            )]));
+        let packet = Packet::new(
+            crate::telemetry_schema::data_type("FLIGHT_STATE"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_STATE")],
+            "FC",
+            1,
+            Arc::<[u8]>::from([FlightState::Idle as u8]),
+        )
+        .unwrap();
+        let router = std::thread::spawn(move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            router.rx(&packet).unwrap();
+            router
+        })
+        .join()
+        .expect("SDK callback must not require its thread to enter Tokio");
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
+        assert_eq!(notifications.try_recv().unwrap().state, FlightState::Idle);
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            db_rx.try_recv().unwrap(),
+            DbQueueItem::Write(crate::telemetry_db::DbWrite::FlightState {
+                timestamp_ms: 11,
+                ..
+            })
+        ));
+        let write = tokio::time::timeout(Duration::from_secs(2), db_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(write, DbQueueItem::Write(crate::telemetry_db::DbWrite::FlightState { state_code, .. }) if state_code == FlightState::Idle as i64)
+        );
+        state.set_local_flight_state(FlightState::Idle);
+        tokio::task::yield_now().await;
+        assert!(
+            db_rx.try_recv().is_err(),
+            "unchanged states do not duplicate DB history"
+        );
+        assert!(
+            notifications.try_recv().is_err(),
+            "unchanged states do not duplicate notifications"
+        );
+        let next = Packet::new(
+            crate::telemetry_schema::data_type("FLIGHT_STATE"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_STATE")],
+            "FC",
+            2,
+            Arc::<[u8]>::from([FlightState::PreFill as u8]),
+        )
+        .unwrap();
+        std::thread::spawn(move || router.rx(&next).unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::PreFill);
+        assert_eq!(
+            notifications.try_recv().unwrap().state,
+            FlightState::PreFill
+        );
+        let followup = tokio::time::timeout(Duration::from_secs(2), db_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(followup, DbQueueItem::Write(crate::telemetry_db::DbWrite::FlightState { state_code, .. }) if state_code == FlightState::PreFill as i64)
+        );
+    }
+
     #[tokio::test]
     async fn temporary_notifications_are_live_only_and_do_not_replay() {
         let state = test_app_state().await;
@@ -2732,6 +2831,7 @@ pub(crate) mod tests {
             db_path: Arc::new(Mutex::new("sqlite::memory:".to_string())),
             placeholder_db_path: "sqlite::memory:".to_string(),
             db_queue_tx,
+            db_write_runtime: tokio::runtime::Handle::current(),
             auth_db,
             state: Arc::new(Mutex::new(FlightState::Startup)),
             state_tx,

@@ -4207,6 +4207,7 @@ mod tests {
             db_path: Arc::new(Mutex::new("sqlite::memory:".to_string())),
             placeholder_db_path: "sqlite::memory:".to_string(),
             db_queue_tx: db_tx,
+            db_write_runtime: tokio::runtime::Handle::current(),
             auth_db,
             state: Arc::new(Mutex::new(FlightState::Startup)),
             state_tx,
