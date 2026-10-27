@@ -270,7 +270,15 @@ pub(super) fn update_vehicle_speed_estimate(
     let state_cell =
         SPEED_ESTIMATOR_STATE.get_or_init(|| Mutex::new(SpeedEstimatorState::default()));
     let mut state = state_cell.lock().unwrap();
+    update_vehicle_speed_state(&mut state, data_type, ts_ms, values)
+}
 
+fn update_vehicle_speed_state(
+    state: &mut SpeedEstimatorState,
+    data_type: &str,
+    ts_ms: i64,
+    values: &[Option<f32>],
+) -> Option<f32> {
     match data_type {
         dt if dt == &*crate::telemetry_schema::data_type("ACCEL_DATA").as_str()
             || dt == &*crate::telemetry_schema::data_type("IMU_DATA").as_str() =>
@@ -364,6 +372,13 @@ pub(super) fn update_vehicle_speed_estimate(
         has_measurement = true;
     }
 
+    if !has_measurement && accel_mps2.is_none() {
+        // Invalid rows still prove transport activity, but cannot renew an
+        // estimate after all contributing sensor samples have expired.
+        state.speed_mps = None;
+        state.last_update_ts_ms = None;
+        return None;
+    }
     if !has_measurement && state.speed_mps.is_none() {
         return None;
     }
@@ -1037,6 +1052,79 @@ pub(super) fn smooth_remaining_minutes(
 #[cfg(test)]
 mod invalid_analog_tests {
     use super::*;
+    #[test]
+    fn missing_sensor_values_cannot_refresh_an_expired_vehicle_speed() {
+        let mut state = SpeedEstimatorState::default();
+        let baro = crate::telemetry_schema::data_type("BAROMETER_DATA").as_str();
+        assert!(
+            update_vehicle_speed_state(
+                &mut state,
+                &baro,
+                1000,
+                &[Some(100000.0), Some(20.0), Some(100.0)]
+            )
+            .is_none()
+        );
+        assert!(
+            update_vehicle_speed_state(
+                &mut state,
+                &baro,
+                1200,
+                &[Some(100000.0), Some(20.0), Some(102.0)]
+            )
+            .is_some()
+        );
+        assert!(update_vehicle_speed_state(&mut state, &baro, 2700, &[None, None, None]).is_some());
+        // The last actual altitude-derived speed is now beyond the existing
+        // 1500 ms barometer freshness bound. No other sensor ever contributed.
+        assert!(update_vehicle_speed_state(&mut state, &baro, 2701, &[None, None, None]).is_none());
+        assert!(
+            update_vehicle_speed_state(&mut state, &baro, 60000, &[None, None, None]).is_none()
+        );
+        assert!(state.speed_mps.is_none());
+        assert!(state.last_update_ts_ms.is_none());
+        // Recovery needs actual altitude samples; the expired estimate is not
+        // used to seed a new speed merely because a packet arrived.
+        assert!(
+            update_vehicle_speed_state(
+                &mut state,
+                &baro,
+                60200,
+                &[Some(100000.0), Some(20.0), Some(200.0)]
+            )
+            .is_none()
+        );
+        assert!(
+            update_vehicle_speed_state(
+                &mut state,
+                &baro,
+                60400,
+                &[Some(100000.0), Some(20.0), Some(202.0)]
+            )
+            .is_some()
+        );
+    }
+    #[test]
+    fn speed_expiry_preserves_existing_accelerometer_and_gps_bounds() {
+        let baro = crate::telemetry_schema::data_type("BAROMETER_DATA").as_str();
+        let mut state = SpeedEstimatorState {
+            speed_mps: Some(5.0),
+            last_update_ts_ms: Some(1000),
+            accel_mps2: Some(0.0),
+            accel_ts_ms: Some(1000),
+            ..Default::default()
+        };
+        assert!(update_vehicle_speed_state(&mut state, &baro, 1600, &[None, None, None]).is_some());
+        assert!(update_vehicle_speed_state(&mut state, &baro, 1601, &[None, None, None]).is_none());
+        state = SpeedEstimatorState {
+            speed_mps: Some(5.0),
+            gps_speed_mps: Some(5.0),
+            gps_speed_ts_ms: Some(1000),
+            ..Default::default()
+        };
+        assert!(update_vehicle_speed_state(&mut state, &baro, 5500, &[None, None, None]).is_some());
+        assert!(update_vehicle_speed_state(&mut state, &baro, 5501, &[None, None, None]).is_none());
+    }
     #[test]
     fn unavailable_adc_values_do_not_poison_battery_estimator() {
         let source = "invalid-analog-regression";
