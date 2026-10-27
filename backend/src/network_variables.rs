@@ -41,7 +41,31 @@ static NETWORK_VARIABLE_NONCE: AtomicU16 = AtomicU16::new(1);
 fn cache_path() -> PathBuf {
     std::env::var_os("GS_NETWORK_VARIABLE_CACHE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CACHE_PATH))
+        .unwrap_or_else(default_cache_path)
+}
+
+fn default_cache_path() -> PathBuf {
+    #[cfg(not(test))]
+    {
+        PathBuf::from(DEFAULT_CACHE_PATH)
+    }
+    #[cfg(test)]
+    {
+        // A test binary may re-exec itself while the parent suite is still
+        // writing. Its process-local STORE mutex cannot protect the parent's
+        // JSON or rename temporary file, nor should tests touch operator data.
+        static PATH: OnceLock<PathBuf> = OnceLock::new();
+        PATH.get_or_init(|| {
+            std::env::temp_dir()
+                .join(format!(
+                    "groundstation-network-variables-test-{}-{}",
+                    std::process::id(),
+                    rand::random::<u128>()
+                ))
+                .join("network_variables.json")
+        })
+        .clone()
+    }
 }
 
 fn load(path: &Path) -> PersistentVariables {
@@ -491,6 +515,98 @@ pub fn flight_state() -> u8 {
 mod tests {
     use super::*;
     use sedsnet::router::{EndpointHandler, RouterConfig};
+
+    #[test]
+    fn default_cache_is_owned_by_each_test_process_and_explicit_paths_are_preserved() {
+        const CHILD: &str = "GS_NETWORK_CACHE_ISOLATION_TEST_CHILD";
+        const NAME: &str = "network_variables::tests::default_cache_is_owned_by_each_test_process_and_explicit_paths_are_preserved";
+        const MARKER: &str = "GS_NETWORK_CACHE_RESULT ";
+        if let Ok(value) = std::env::var(CHILD) {
+            let state = value.parse::<u8>().unwrap();
+            let path = cache_path();
+            // Fail before writing anything if the old shared production default is selected.
+            assert_ne!(path, PathBuf::from(DEFAULT_CACHE_PATH));
+            assert!(path.starts_with(std::env::temp_dir()));
+            assert_eq!(
+                cache_path(),
+                path,
+                "one process must retain one default store"
+            );
+            persist(
+                &path,
+                PersistentVariables {
+                    flight_state: state,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            println!("{MARKER}{}", serde_json::json!({"path":path,"state":state}));
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "network-cache-owner-proof-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let explicit = root.join("explicit.json");
+        let mut children = Vec::new();
+        for state in [1u8, 2, 3] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, state.to_string());
+            if state == 3 {
+                child.env("GS_NETWORK_VARIABLE_CACHE", &explicit);
+            } else {
+                child.env_remove("GS_NETWORK_VARIABLE_CACHE");
+            }
+            children.push(
+                child
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        let mut paths = Vec::new();
+        let outputs = children
+            .into_iter()
+            .map(|child| child.wait_with_output().unwrap())
+            .collect::<Vec<_>>();
+        for (index, output) in outputs.into_iter().enumerate() {
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let row = stdout
+                .lines()
+                .find_map(|line| line.split_once(MARKER).map(|(_, row)| row))
+                .expect("child cache ownership report");
+            let row: serde_json::Value = serde_json::from_str(row).unwrap();
+            let path = PathBuf::from(row["path"].as_str().unwrap());
+            assert_eq!(
+                load(&path).flight_state,
+                index as u8 + 1,
+                "another test process must not replace this process's cache"
+            );
+            paths.push(path);
+        }
+        assert_ne!(
+            paths[0], paths[1],
+            "forked tests must not share json or json.tmp paths"
+        );
+        assert_eq!(
+            paths[2], explicit,
+            "explicit restart-test/config paths remain unchanged"
+        );
+        for path in &paths[..2] {
+            fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn daq_clock_ignores_uptime_and_overflow_but_preserves_valid_network_utc() {
