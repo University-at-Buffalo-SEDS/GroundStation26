@@ -1,0 +1,73 @@
+{
+  "status": "PASS isolated RED/GREEN and focused production integration; final combined qualification pending",
+  "GS_base": "e1e1517",
+  "SDK": "existing Git a540; no SDK change",
+  "change": "Private AppState::queue_router_flight_state_update returns immediately for the existing RRLS observer role; all local snapshot, UI, DB queue and incoming durable cache paths remain active.",
+  "red": {
+    "states": [
+      1,
+      2,
+      1
+    ],
+    "state_republication_warnings": 3,
+    "warning": "failed to persist or publish flight-state network variable: PermissionDenied",
+    "log": "/tmp/gs-rrls-observed-state-before-20261027.log"
+  },
+  "green": {
+    "actual_received_path": "Read-only SDK managed-variable callbacks on ordinary std threads in an isolated GS_RRLS_ROLE=rrls child process",
+    "states": [
+      1,
+      2,
+      1
+    ],
+    "UI_and_local_snapshots": "all3 match primary",
+    "DB_records": "all3 expected flight-state writes accepted by existing async DB queue; recording policy not bypassed",
+    "persistent_JSON_cache": "all3 match primary",
+    "SDK_cached_identity": "exact primary GS packet IDs and source retained",
+    "state_republication_warnings": 0,
+    "SDK_TX_and_replay_queues": 0,
+    "network_frames": 0,
+    "direct_operator_set": "PermissionDenied retained",
+    "log": "/tmp/gs-rrls-observed-state-after-20261027.log"
+  },
+  "existing_guards": {
+    "authenticated_RRLS_HTTP_permissions": {
+      "passed": 2,
+      "log": "/tmp/gs-rrls-observer-http-guards-20261027.log"
+    },
+    "primary_and_remote_flight_state": {
+      "passed": 11,
+      "log": "/tmp/gs-rrls-observer-flightstate-guards-20261027.log"
+    }
+  },
+  "unchanged": [
+    "External operator API gates",
+    "Read-only managed-variable permissions",
+    "SDK role capabilities",
+    "SDK and network_variables source",
+    "DB queue/recording semantics",
+    "Network and radio scheduling"
+  ],
+  "limits": [
+    "No new hardware/simulation run.",
+    "No claim of physical SQLite recording while recording policy is idle.",
+    "Final combined4profile/newSDK qualification remains parent-owned."
+  ],
+  "patch_sha256": "41dce739cba3082944242e5a759d52e3d8bc82f7c2eead2290334b78541c9276",
+  "production_parent_commit": "2b8a9c0d1a5987cd205cb2fa2548fbce553afbdb",
+  "production_focused": {
+    "new_RRLS_role_callback": {
+      "passed": 1,
+      "log": "/tmp/gs-rrls-observer-production-20261027.log"
+    },
+    "authenticated_RRLS_HTTP_permissions": {
+      "passed": 2,
+      "log": "/tmp/gs-rrls-observer-production-http-20261027.log"
+    },
+    "primary_and_remote_flight_state": {
+      "passed": 11,
+      "log": "/tmp/gs-rrls-observer-production-flightstate-20261027.log"
+    }
+  },
+  "state_rs_sha256": "cfba51af1f43ae4e22d037cc7c1f6134e2e6a2afed226bd29eda3a8383181810"
+}

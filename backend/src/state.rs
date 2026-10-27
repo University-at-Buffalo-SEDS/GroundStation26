@@ -329,6 +329,11 @@ impl AppState {
     }
 
     fn queue_router_flight_state_update(&self, next_state: FlightState) {
+        // RRLS projects the primary's state locally; observing it is not a
+        // request to publish that state back through its read-only router.
+        if crate::rrls::is_rrls() {
+            return;
+        }
         let Some(router) = self.topology_router.get() else {
             log::warn!(
                 "flight-state change not dispatched because topology router is not initialized state={next_state:?}"
@@ -1765,6 +1770,128 @@ fn t_plus_anchor_timestamp(current: &LaunchClockMsg, timestamp_ms: i64) -> i64 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[tokio::test]
+    async fn rrls_received_primary_state_updates_local_views_without_republishing() {
+        const CHILD: &str = "GS_RRLS_STATE_OBSERVER_TEST_CHILD";
+        const NAME: &str =
+            "state::tests::rrls_received_primary_state_updates_local_views_without_republishing";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir().join(format!(
+                "rrls-state-observer-{}-{}",
+                std::process::id(),
+                rand::random::<u128>()
+            ));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("GS_RRLS_ROLE", "rrls")
+                .env("GS_NETWORK_VARIABLE_CACHE", root.join("variables.json"))
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(root);
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        struct Capture(Mutex<Vec<String>>);
+        impl log::Log for Capture {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                let text = record.args().to_string();
+                if text.contains("failed to persist or publish flight-state network variable") {
+                    self.0.lock().unwrap().push(text);
+                }
+            }
+            fn flush(&self) {}
+        }
+        static LOG: Capture = Capture(Mutex::new(Vec::new()));
+        log::set_logger(&LOG).unwrap();
+        log::set_max_level(log::LevelFilter::Warn);
+        assert!(crate::rrls::is_rrls());
+        let mut state = test_app_state().await;
+        let (db_tx, mut db_rx) = mpsc::channel(8);
+        Arc::get_mut(&mut state).unwrap().db_queue_tx = db_tx;
+        let mut ui = state.state_tx.subscribe();
+        let router = Arc::new(Router::new(RouterConfig::new([]).with_sender("RRLS")));
+        let frames = Arc::new(AtomicUsize::new(0));
+        let output = frames.clone();
+        let side = router.add_side_packed("rocket_comms", move |_| {
+            output.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        router.set_side_egress_enabled(side, false).unwrap();
+        crate::network_variables::initialize(&router).unwrap();
+        state.topology_router.set(router.clone()).unwrap();
+        let observed = Arc::downgrade(&state);
+        let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
+        router
+            .on_network_variable_update(ty, move |packet| {
+                observed.upgrade().unwrap().set_local_flight_state(
+                    crate::types::u8_to_flight_state(packet.payload()[0]).unwrap(),
+                );
+                Ok(())
+            })
+            .unwrap();
+        let path = std::path::PathBuf::from(std::env::var_os("GS_NETWORK_VARIABLE_CACHE").unwrap());
+        for (index, code) in [1u8, 2, 1].into_iter().enumerate() {
+            let packet = Packet::new(
+                ty,
+                &[crate::telemetry_schema::endpoint("FLIGHT_STATE")],
+                "GS",
+                1000 + index as u64,
+                Arc::<[u8]>::from([code]),
+            )
+            .unwrap();
+            let expected_id = packet.packet_id();
+            let receiver = router.clone();
+            std::thread::spawn(move || receiver.rx_from_side(&packet, side).unwrap())
+                .join()
+                .unwrap();
+            assert_eq!(state.local_flight_state_snapshot() as u8, code);
+            assert_eq!(ui.try_recv().unwrap().state as u8, code);
+            let write = tokio::time::timeout(Duration::from_secs(2), db_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(write, DbQueueItem::Write(crate::telemetry_db::DbWrite::FlightState { state_code, .. }) if state_code == code as i64)
+            );
+            let disk: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(disk["flight_state"], code);
+            let cached = router.cached_managed_variable(ty).unwrap();
+            assert_eq!(cached.packet_id(), expected_id);
+            assert_eq!(cached.sender(), "GS");
+        }
+        assert_eq!(frames.load(Ordering::SeqCst), 0);
+        let stats = router.export_runtime_stats();
+        assert_eq!(stats.queues.tx_len, 0);
+        assert_eq!(stats.queues.replay_len, 0);
+        let denied = Packet::new(
+            ty,
+            &[crate::telemetry_schema::endpoint("FLIGHT_STATE")],
+            "RRLS",
+            9999,
+            Arc::<[u8]>::from([3]),
+        )
+        .unwrap();
+        assert!(matches!(
+            router.set_network_variable(denied),
+            Err(sedsnet::TelemetryError::PermissionDenied)
+        ));
+        let warnings = LOG.0.lock().unwrap().clone();
+        assert!(
+            warnings.is_empty(),
+            "observer must not attempt local publication: {warnings:?}"
+        );
+    }
+
     #[tokio::test]
     async fn sdk_thread_flight_state_callback_retains_full_database_queue_write() {
         let mut state = test_app_state().await;
