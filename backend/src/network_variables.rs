@@ -1132,6 +1132,170 @@ mod thermal_wire_tests {
 mod persistence_callback_tests {
     use super::*;
     #[test]
+    fn bootstrap_cache_without_discovered_readers_is_not_an_operational_receipt() {
+        const NAME: &str = "network_variables::persistence_callback_tests::bootstrap_cache_without_discovered_readers_is_not_an_operational_receipt";
+        if !isolated(NAME) {
+            return;
+        }
+        use sedsnet::router::RouterConfig;
+        use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+        crate::telemetry_schema::initialize().unwrap();
+        let names = [
+            FLIGHT_STATE_TYPE,
+            UNDERGLOW_TYPE,
+            FLIGHT_BUZZER_TYPE,
+            DAQ_CALIBRATION_TYPE,
+            DAQ_KG50_CALIBRATION_TYPE,
+            "DAQ_LOG_CLOCK",
+            "DAQ_THERMAL_CALIBRATION",
+            "DAQ_FILTER_CALIBRATION",
+            "DAQ_KG50_INPUT",
+        ];
+        let now = Arc::new(AtomicU64::new(0));
+        let clock = now.clone();
+        let source = Arc::new(Router::new_with_clock(
+            RouterConfig::new([]).with_sender("GS"),
+            Box::new(move || clock.load(Ordering::Relaxed)),
+        ));
+        initialize_for_role(&source, false).unwrap();
+        let clock = now.clone();
+        let peer = Arc::new(Router::new_with_clock(
+            RouterConfig::new([]).with_sender("DAQ"),
+            Box::new(move || clock.load(Ordering::Relaxed)),
+        ));
+        for name in names {
+            peer.enable_network_variable(
+                crate::telemetry_schema::data_type(name),
+                NetworkVariablePermissions::READ_ONLY,
+            )
+            .unwrap();
+        }
+        // Phase0 matches real bootstrap: sides exist, no RX worker/discovery yet.
+        let phase = Arc::new(AtomicU8::new(0));
+        let held = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let delivery_phase = phase.clone();
+        let received = held.clone();
+        let target = peer.clone();
+        source.add_side_packed("rocket_comms", move |bytes| {
+            match delivery_phase.load(Ordering::Relaxed) {
+                0 => Ok(()),
+                1 => target.rx_packed_from_side(bytes, 0),
+                _ => {
+                    received.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                }
+            }
+        });
+        source.add_side_packed("umbilical_comms", |_| Ok(()));
+        let target = source.clone();
+        peer.add_side_packed("GS", move |bytes| target.rx_packed_from_side(bytes, 0));
+        assert_eq!(source.export_runtime_stats().sides.len(), 2);
+        assert!(
+            source
+                .export_topology()
+                .routes
+                .iter()
+                .all(|route| route.announcers.is_empty())
+        );
+        crate::qualification_requests::prime_initial_cache(&source, || {
+            let expected = if std::env::var("GS_SIM_POLICY_CORRECT_CONTROLS").as_deref() == Ok("1")
+                && std::env::var("GS_SIM_TRACE_API_REQUESTS").as_deref() == Ok("1")
+            {
+                Some(1)
+            } else {
+                None
+            };
+            assert_eq!(
+                crate::qualification_requests::bootstrap_phase_for_test(),
+                expected
+            );
+            assert_eq!(
+                std::thread::spawn(crate::qualification_requests::bootstrap_phase_for_test)
+                    .join()
+                    .unwrap(),
+                None,
+                "other threads must never inherit bootstrap exception"
+            );
+            publish_current(&source)
+        })
+        .unwrap();
+        assert_eq!(
+            crate::qualification_requests::bootstrap_phase_for_test(),
+            None,
+            "phase must seal before any operational setter"
+        );
+        let bootstrap = names.map(|name| {
+            source
+                .get_cached_network_variable(crate::telemetry_schema::data_type(name))
+                .unwrap()
+                .unwrap()
+        });
+        assert!(source.export_reliable_pending_stats().is_empty());
+        println!(
+            "LIFECYCLE_BOOT cached9, packedSides2, knownAnnouncers0, API success, pendingOwners0; no end-to-end ACK implied"
+        );
+        phase.store(1, Ordering::Relaxed);
+        now.store(1000, Ordering::Relaxed);
+        peer.announce_discovery().unwrap();
+        source.announce_discovery().unwrap();
+        for _ in 0..30 {
+            source.process_all_queues().unwrap();
+            peer.process_all_queues().unwrap();
+        }
+        for (name, original) in names.iter().zip(&bootstrap) {
+            let ty = crate::telemetry_schema::data_type(name);
+            peer.request_managed_variable(ty).unwrap();
+            for _ in 0..8 {
+                source.process_all_queues().unwrap();
+                peer.process_all_queues().unwrap();
+            }
+            let value = peer.get_cached_network_variable(ty).unwrap().unwrap();
+            assert_eq!(
+                value.payload(),
+                original.payload(),
+                "bootstrap latest value {name}"
+            );
+            assert_eq!(
+                value.packet_id(),
+                original.packet_id(),
+                "bootstrap identity retained {name}"
+            );
+        }
+        assert!(
+            source
+                .export_topology()
+                .routes
+                .iter()
+                .any(|route| !route.announcers.is_empty())
+        );
+        println!(
+            "LIFECYCLE_DISCOVERY all9 real peer caches converge to original boot PacketIDs via discovery/managed refresh; separate from operational500ms"
+        );
+        phase.store(2, Ordering::Relaxed);
+        now.store(1100, Ordering::Relaxed);
+        set_flight_state(&source, 1).unwrap();
+        let pending = source.export_reliable_pending_stats();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].data_type,
+            crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE)
+        );
+        assert_eq!(pending[0].pending_destinations.len(), 1);
+        println!(
+            "LIFECYCLE_OPERATIONAL one new State1 ID{} has one frozen owner; accepted UART-buffer bytes alone are not an ACK",
+            pending[0].packet_id
+        );
+        phase.store(1, Ordering::Relaxed);
+        for bytes in held.lock().unwrap().drain(..) {
+            peer.rx_packed_from_side(&bytes, 0).unwrap();
+        }
+        for _ in 0..8 {
+            source.process_all_queues().unwrap();
+            peer.process_all_queues().unwrap();
+        }
+        assert!(source.export_reliable_pending_stats().is_empty());
+    }
+    #[test]
     fn policy_qualified_actual_sdk_all_owner_receipts() {
         const NAME: &str = "network_variables::persistence_callback_tests::policy_qualified_actual_sdk_all_owner_receipts";
         if !isolated(NAME) {

@@ -30,6 +30,100 @@ pub(crate) fn trace_scope() {
     });
 }
 
+thread_local! { static BOOTSTRAP_PHASE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) }; }
+const BOOTSTRAP_SOURCE: &str = "main.initial_publish_current.before_workers";
+const MANAGED_NAMES: [&str; 9] = [
+    "FLIGHT_STATE",
+    "AV_BAY_UNDERGLOW",
+    "FLIGHT_BUZZER",
+    "DAQ_LOADCELL_CALIBRATION",
+    "DAQ_KG50_CALIBRATION",
+    "DAQ_LOG_CLOCK",
+    "DAQ_THERMAL_CALIBRATION",
+    "DAQ_FILTER_CALIBRATION",
+    "DAQ_KG50_INPUT",
+];
+
+fn bootstrap_observation(router: &Router) -> (usize, usize, usize) {
+    (
+        router.export_runtime_stats().sides.len(),
+        router
+            .export_topology()
+            .routes
+            .iter()
+            .map(|route| route.announcers.len())
+            .sum(),
+        router
+            .export_reliable_pending_stats()
+            .iter()
+            .map(|row| row.pending_destinations.len())
+            .sum(),
+    )
+}
+
+/// Only main's initial cache publication may enter this one-shot context.
+/// It describes local cache priming, never remote delivery or an ACK.
+pub(crate) fn prime_initial_cache(
+    router: &Router,
+    run: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if !cfg!(any(feature = "hitl_mode", feature = "firmware_sim"))
+        || std::env::var("GS_SIM_TRACE_API_REQUESTS").as_deref() != Ok("1")
+        || std::env::var("GS_SIM_POLICY_CORRECT_CONTROLS").as_deref() != Ok("1")
+    {
+        return run();
+    }
+    static USED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    anyhow::ensure!(
+        !USED.swap(true, Ordering::SeqCst),
+        "bootstrap cache phase cannot reopen"
+    );
+    anyhow::ensure!(
+        bootstrap_observation(router) == (2, 0, 0),
+        "bootstrap cache phase requires two configured sides and no discovered readers/pending owners"
+    );
+    trace_scope();
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BOOTSTRAP_PHASE.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(BOOTSTRAP_PHASE.with(|slot| slot.replace(Some(1))));
+    eprintln!(
+        "[gs-qualification-bootstrap] {}",
+        serde_json::json!({"event":"begin","phase":1,"source":BOOTSTRAP_SOURCE,"at_ms":crate::simulation_clock_ms(),"configured_sides":2,"discovered_announcers":0,"pending_owners":0})
+    );
+    let result = run();
+    let observation = bootstrap_observation(router);
+    let cached = MANAGED_NAMES
+        .iter()
+        .map(|name| {
+            let ty = crate::telemetry_schema::data_type(name);
+            let packet = router.get_cached_network_variable(ty)?.ok_or(
+                sedsnet::TelemetryError::HandlerError("bootstrap cache value missing"),
+            )?;
+            Ok(serde_json::json!({"name":name,"id":ty.as_u32(),"packet_id":packet.packet_id()}))
+        })
+        .collect::<sedsnet::TelemetryResult<Vec<_>>>();
+    eprintln!(
+        "[gs-qualification-bootstrap] {}",
+        serde_json::json!({"event":"seal","phase":1,"source":BOOTSTRAP_SOURCE,"at_ms":crate::simulation_clock_ms(),"ok":result.is_ok()&&cached.is_ok()&&observation==(2,0,0),"configured_sides":observation.0,"discovered_announcers":observation.1,"pending_owners":observation.2,"cache":cached.as_ref().ok(),"meaning":"LOCAL_CACHE_PRIMED; remote delivery not proven"})
+    );
+    result?;
+    cached?;
+    anyhow::ensure!(
+        observation == (2, 0, 0),
+        "bootstrap ownership changed before phase sealed"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn bootstrap_phase_for_test() -> Option<u64> {
+    BOOTSTRAP_PHASE.with(|slot| slot.get())
+}
+
 pub(crate) struct Request {
     token: Option<u64>,
     submissions: std::cell::Cell<u64>,
@@ -43,7 +137,7 @@ impl Request {
         if let Some(token) = token {
             trace_scope();
             emit(
-                serde_json::json!({"event":"begin","token":token,"publisher":publisher,"request_ms":crate::simulation_clock_ms(),"controlled_round":CONTROLLED_ROUND.with(|slot|slot.get())}),
+                serde_json::json!({"event":"begin","token":token,"publisher":publisher,"request_ms":crate::simulation_clock_ms(),"controlled_round":CONTROLLED_ROUND.with(|slot|slot.get()),"bootstrap_phase":BOOTSTRAP_PHASE.with(|slot|slot.get())}),
             );
         }
         Self {

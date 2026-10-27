@@ -1631,7 +1631,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if !rrls::is_rrls() {
-        network_variables::publish_current(&router)?;
+        qualification_requests::prime_initial_cache(&router, || {
+            network_variables::publish_current(&router)
+        })?;
     }
     // The full-system simulator uses the production toggle path while each
     // phase starts a fresh GroundStation process. Keeping this behind an
