@@ -155,7 +155,13 @@ pub(crate) fn is_radio_batch_command(priority: u8, payload: &[u8]) -> bool {
         return false;
     }
     serialize::peek_frame_info(payload).is_ok_and(|info| {
-        !matches!(
+        // Ordered delivery and piggyback receipts keep individual admissions;
+        // preserving byte order alone does not make these commands independent.
+        info.reliable.is_none_or(|header| {
+            header.flags == serialize::RELIABLE_FLAG_UNSEQUENCED
+                && header.seq == 0
+                && header.ack == 0
+        }) && !matches!(
             info.envelope.ty,
             sedsnet::config::DataType::ReliableAck
                 | sedsnet::config::DataType::ReliablePartialAck
@@ -4016,6 +4022,41 @@ mod raw_uart_tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
+        let packet = serialize::unpack_packet(&packets[1]).unwrap();
+        for header in [
+            serialize::ReliableHeader {
+                flags: 0,
+                seq: 7,
+                ack: 0,
+            },
+            serialize::ReliableHeader {
+                flags: serialize::RELIABLE_FLAG_UNORDERED,
+                seq: 7,
+                ack: 0,
+            },
+            serialize::ReliableHeader {
+                flags: serialize::RELIABLE_FLAG_ACK_ONLY,
+                seq: 0,
+                ack: 7,
+            },
+            serialize::ReliableHeader {
+                flags: serialize::RELIABLE_FLAG_UNSEQUENCED,
+                seq: 7,
+                ack: 0,
+            },
+            serialize::ReliableHeader {
+                flags: serialize::RELIABLE_FLAG_UNSEQUENCED,
+                seq: 0,
+                ack: 11,
+            },
+        ] {
+            let ineligible = serialize::pack_packet_with_reliable(&packet, header);
+            assert!(!is_radio_batch_command(255, &ineligible));
+            assert!(
+                uart.send_command_batch(&[(255, &packets[0]), (255, &ineligible)])
+                    .is_err()
+            );
+        }
         let mut malformed = packets[1].clone();
         let removed = malformed.len() - 5;
         malformed.remove(removed);

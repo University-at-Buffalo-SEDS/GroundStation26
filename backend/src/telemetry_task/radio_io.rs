@@ -475,6 +475,54 @@ impl WireBacklog {
 #[cfg(test)]
 mod priority_tests {
     use super::*;
+    #[test]
+    fn ordered_and_piggyback_controls_keep_individual_admissions() {
+        crate::telemetry_schema::initialize().unwrap();
+        let packet = Packet::new(
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            "GS",
+            1,
+            Arc::from([1u8]),
+        )
+        .unwrap();
+        let normal = serialize::pack_packet(&packet);
+        assert!(crate::comms::is_radio_batch_command(255, &normal));
+        for header in [
+            serialize::ReliableHeader {
+                flags: 0,
+                seq: 7,
+                ack: 0,
+            },
+            serialize::ReliableHeader {
+                flags: serialize::RELIABLE_FLAG_UNORDERED,
+                seq: 7,
+                ack: 0,
+            },
+            serialize::ReliableHeader {
+                flags: serialize::RELIABLE_FLAG_UNSEQUENCED,
+                seq: 7,
+                ack: 0,
+            },
+            serialize::ReliableHeader {
+                flags: serialize::RELIABLE_FLAG_UNSEQUENCED,
+                seq: 0,
+                ack: 11,
+            },
+        ] {
+            let bytes = serialize::pack_packet_with_reliable(&packet, header);
+            assert_eq!(
+                serialize::peek_frame_info(&bytes).unwrap().reliable,
+                Some(header)
+            );
+            assert!(serialize::unpack_packet(&bytes).is_ok());
+            assert!(
+                !crate::comms::is_radio_batch_command(255, &bytes),
+                "sequenced or piggyback receipt header must not share command admission: {header:?}"
+            );
+        }
+    }
+
     struct BatchTestComms;
     impl CommsDevice for BatchTestComms {
         fn command_batch_frame_len(&self, priority:u8, payload:&[u8]) -> Option<usize> {
