@@ -46,10 +46,10 @@
         "During active relay, RF40percent + main15percent + RRLS35percent uses90percent of modeled air capacity. RFD firmware continues to own the MAC; LoRa scheduling/AUX/GRANT/windows stay off."
       ],
       "evidence": [
-        "FirmwareSimulator/docs/qualification/radio-clock-fixed-600s-2026-10-25.json",
-        "FirmwareSimulator/docs/qualification/rrls-telemetry-retention-2026-10-25.json",
-        "FirmwareSimulator/docs/qualification/valve-final8-endurance-2026-10-25.json",
-        "FirmwareSimulator/docs/qualification/valve-final8-relay-2026-10-25.json"
+        ".workspace-progress/qualification-artifact-archive-20261027/FirmwareSimulator/docs/qualification/radio-clock-fixed-600s-2026-10-25.json",
+        ".workspace-progress/qualification-artifact-archive-20261027/FirmwareSimulator/docs/qualification/rrls-telemetry-retention-2026-10-25.json",
+        ".workspace-progress/qualification-artifact-archive-20261027/FirmwareSimulator/docs/qualification/valve-final8-endurance-2026-10-25.json",
+        ".workspace-progress/qualification-artifact-archive-20261027/FirmwareSimulator/docs/qualification/valve-final8-relay-2026-10-25.json"
       ],
       "remaining": []
     },
@@ -67,7 +67,7 @@
         "Final8 operational report supersedes earlier timing inference: programmed ignition deadline10000ticks; actual GPIO high in10consecutive1Hzsamples and off thereafter, sampled duration bounded9000..11000ticks. No exact physical pulse-duration claim."
       ],
       "evidence": [
-        "FirmwareSimulator/docs/qualification/operational-gse-linked-2026-10-25.json"
+        ".workspace-progress/qualification-artifact-archive-20261027/FirmwareSimulator/docs/qualification/operational-gse-linked-2026-10-25.json"
       ],
       "remaining": [
         "Physical pneumatic, combustion, key-switch and output-load acceptance remains outside simulator proof."
@@ -213,12 +213,12 @@
     "stack_fix": "Pressure worker4.5->6.5KiB, acquisition4.5->5.5KiB, control12->11KiB. First stack-error capture and permanent1KiB pressure-worker margin checks.",
     "native_status": "PASS: matching two/three-radio600s source/GPS/control/SD, all three operational70s, both restart120s, relay60s; exact compiled final8 artifact.",
     "release_ready": true,
-    "evidence": "FirmwareSimulator/docs/qualification/valve-pressure-worker-stack-2026-10-25.json",
+    "evidence": ".workspace-progress/qualification-artifact-archive-20261027/FirmwareSimulator/docs/qualification/valve-pressure-worker-stack-2026-10-25.json",
     "evidence_reports": [
-      "FirmwareSimulator/docs/qualification/valve-final8-endurance-2026-10-25.json",
-      "FirmwareSimulator/docs/qualification/valve-final8-operational-2026-10-25.json",
-      "FirmwareSimulator/docs/qualification/valve-final8-restart-2026-10-25.json",
-      "FirmwareSimulator/docs/qualification/valve-final8-relay-2026-10-25.json"
+      ".workspace-progress/qualification-artifact-archive-20261027/FirmwareSimulator/docs/qualification/valve-final8-endurance-2026-10-25.json",
+      ".workspace-progress/qualification-artifact-archive-20261027/FirmwareSimulator/docs/qualification/valve-final8-operational-2026-10-25.json",
+      ".workspace-progress/qualification-artifact-archive-20261027/FirmwareSimulator/docs/qualification/valve-final8-restart-2026-10-25.json",
+      ".workspace-progress/qualification-artifact-archive-20261027/FirmwareSimulator/docs/qualification/valve-final8-relay-2026-10-25.json"
     ]
   },
   "publication_check": {

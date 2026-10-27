@@ -466,7 +466,7 @@
     "remaining_radio_fidelity": "Actual linked MCU plus GS/RRLS three-radio shared-air qualification remains pending. Native bounded64kbps reference passed792commands exactly once with realACKs; MAC collision/backoff/FEC and raw-stream burst interleaving are not vendor-faithful proof."
   },
   "jupiter_workspace_20261025": {
-    "report": "../qualification/jupiter-workspace-2026-10-25.json",
+    "report": ".workspace-progress/qualification-artifact-archive-20261027/GroundStation26/docs/qualification/jupiter-workspace-2026-10-25.json",
     "repositories": "All7boards synchronized to qualified source; legacy Jupiter edits preserved on local branches; GS/SDK/frontend migrated source active. New work lives in these repositories.",
     "boards": "1100tests total passed,2skipped across7boards after correcting2stale harnesses; no production runtime changes",
     "groundstation": "473passed3ignored with local SDK6980; six shared-air scenarios passed1584diagnostic commands, ordered/unordered, actual stream decoder; normal publishedSDK4.2.5 radio scenario also passed",

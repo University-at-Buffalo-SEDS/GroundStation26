@@ -25,7 +25,7 @@
         "Pi currently marks every remote board stale despite incoming numeric-sender status packets; investigate mapping and running binary/dependency state before inferring sensor loss.",
         "User reports 0.5\u20131.5 seconds GS-to-AV-bay managed-variable latency."
       ],
-      "progress": "Complete: SDK7f1a2ad passed all-seven-board automatic-Ethernet startup25/restart30/full600 with20ACKs(VBmax230ms,ABmax60ms),9managed updates(max260ms),no power-freshness/UART-drop/sampled allocator/panic/stack faults. SEDSnet4.2.3 is published on GitHub/crates.io; release pipeline green; PyPI correctly skips without token. Normal GS registry Mac305 tests+release build and UbuntuPi312 tests pass, one hardware test ignored per mode. Native AMD64/ARM64 simulator images built manually and passed complete packaged checks and anonymous pull/run; publicv0.4.13/latest/STM32 aliases sharesha256:cc62b61c395704474b9300429f052220ffc76bca9fdbabeae1e6be75ecc49e83. All source branches pushed. Proofs are in FirmwareSimulator/docs/qualification."
+      "progress": "Complete: SDK7f1a2ad passed all-seven-board automatic-Ethernet startup25/restart30/full600 with20ACKs(VBmax230ms,ABmax60ms),9managed updates(max260ms),no power-freshness/UART-drop/sampled allocator/panic/stack faults. SEDSnet4.2.3 is published on GitHub/crates.io; release pipeline green; PyPI correctly skips without token. Normal GS registry Mac305 tests+release build and UbuntuPi312 tests pass, one hardware test ignored per mode. Native AMD64/ARM64 simulator images built manually and passed complete packaged checks and anonymous pull/run; publicv0.4.13/latest/STM32 aliases sharesha256:cc62b61c395704474b9300429f052220ffc76bca9fdbabeae1e6be75ecc49e83. All source branches pushed. Proofs are in .workspace-progress/qualification-artifact-archive-20261027/FirmwareSimulator/docs/qualification."
     },
     {
       "id": "ethernet",
@@ -38,7 +38,7 @@
         "Keep discovery on Ethernet; do not forward discovery onto RFD, CAN or application-command queues",
         "Full linked command/ACK/freshness qualification with existing limits"
       ],
-      "progress": "Complete: SDK7f1a2ad passed all-seven-board automatic-Ethernet startup25/restart30/full600 with20ACKs(VBmax230ms,ABmax60ms),9managed updates(max260ms),no power-freshness/UART-drop/sampled allocator/panic/stack faults. SEDSnet4.2.3 is published on GitHub/crates.io; release pipeline green; PyPI correctly skips without token. Normal GS registry Mac305 tests+release build and UbuntuPi312 tests pass, one hardware test ignored per mode. Native AMD64/ARM64 simulator images built manually and passed complete packaged checks and anonymous pull/run; publicv0.4.13/latest/STM32 aliases sharesha256:cc62b61c395704474b9300429f052220ffc76bca9fdbabeae1e6be75ecc49e83. All source branches pushed. Proofs are in FirmwareSimulator/docs/qualification."
+      "progress": "Complete: SDK7f1a2ad passed all-seven-board automatic-Ethernet startup25/restart30/full600 with20ACKs(VBmax230ms,ABmax60ms),9managed updates(max260ms),no power-freshness/UART-drop/sampled allocator/panic/stack faults. SEDSnet4.2.3 is published on GitHub/crates.io; release pipeline green; PyPI correctly skips without token. Normal GS registry Mac305 tests+release build and UbuntuPi312 tests pass, one hardware test ignored per mode. Native AMD64/ARM64 simulator images built manually and passed complete packaged checks and anonymous pull/run; publicv0.4.13/latest/STM32 aliases sharesha256:cc62b61c395704474b9300429f052220ffc76bca9fdbabeae1e6be75ecc49e83. All source branches pushed. Proofs are in .workspace-progress/qualification-artifact-archive-20261027/FirmwareSimulator/docs/qualification."
     },
     {
       "id": "aiming-data",
@@ -114,7 +114,7 @@
       "status": "complete",
       "scope": "Run current simulator on Jupiter with current firmware, GS, SDK and bridge; targeted failures then extended soak; commit/push relevant fixes",
       "validation": "Command/variable delivery latency, per-board battery freshness, reconnects, bounded memory and no crashes; record limits and distinguish simulation from hardware validation",
-      "progress": "Complete: SDK7f1a2ad passed all-seven-board automatic-Ethernet startup25/restart30/full600 with20ACKs(VBmax230ms,ABmax60ms),9managed updates(max260ms),no power-freshness/UART-drop/sampled allocator/panic/stack faults. SEDSnet4.2.3 is published on GitHub/crates.io; release pipeline green; PyPI correctly skips without token. Normal GS registry Mac305 tests+release build and UbuntuPi312 tests pass, one hardware test ignored per mode. Native AMD64/ARM64 simulator images built manually and passed complete packaged checks and anonymous pull/run; publicv0.4.13/latest/STM32 aliases sharesha256:cc62b61c395704474b9300429f052220ffc76bca9fdbabeae1e6be75ecc49e83. All source branches pushed. Proofs are in FirmwareSimulator/docs/qualification."
+      "progress": "Complete: SDK7f1a2ad passed all-seven-board automatic-Ethernet startup25/restart30/full600 with20ACKs(VBmax230ms,ABmax60ms),9managed updates(max260ms),no power-freshness/UART-drop/sampled allocator/panic/stack faults. SEDSnet4.2.3 is published on GitHub/crates.io; release pipeline green; PyPI correctly skips without token. Normal GS registry Mac305 tests+release build and UbuntuPi312 tests pass, one hardware test ignored per mode. Native AMD64/ARM64 simulator images built manually and passed complete packaged checks and anonymous pull/run; publicv0.4.13/latest/STM32 aliases sharesha256:cc62b61c395704474b9300429f052220ffc76bca9fdbabeae1e6be75ecc49e83. All source branches pushed. Proofs are in .workspace-progress/qualification-artifact-archive-20261027/FirmwareSimulator/docs/qualification."
     },
     {
       "id": "camera-discovery",
@@ -139,7 +139,7 @@
       "status": "complete",
       "scope": "Docker frontend builders, explicit target listing, all device targets and all,sims expansion with per-target output.",
       "validation": "CLI and Docker invocation tests; representative real container build; native worker requirements explicit.",
-      "progress": "Local Docker Desktop recovered; user updated it to 4.95.0. Native ARM64 Web Docker build passes end to end, exporting valid Wasm/index artifacts. Web selects the native host architecture; explicit cross-platform Linux/Android targets retain their architecture. Preserve inherited Rust paths and cache required wasm-bindgen/esbuild tools in the builder image. Use checksum-verified Binaryen 133 to parse Rust 1.99 output. All 9 target/argument/batch/container-environment tests pass. No source transfer to Jupiter needed. Apple/Windows native-worker requirements remain explicit. Evidence: docs/qualification/frontend-docker-2026-10-17.json."
+      "progress": "Local Docker Desktop recovered; user updated it to 4.95.0. Native ARM64 Web Docker build passes end to end, exporting valid Wasm/index artifacts. Web selects the native host architecture; explicit cross-platform Linux/Android targets retain their architecture. Preserve inherited Rust paths and cache required wasm-bindgen/esbuild tools in the builder image. Use checksum-verified Binaryen 133 to parse Rust 1.99 output. All 9 target/argument/batch/container-environment tests pass. No source transfer to Jupiter needed. Apple/Windows native-worker requirements remain explicit. Evidence: .workspace-progress/qualification-artifact-archive-20261027/GroundStation26/docs/qualification/frontend-docker-2026-10-17.json."
     },
     {
       "id": "sedsnet-cargo-cli",
@@ -385,7 +385,7 @@
         "linux/arm64"
       ],
       "method": "manual native builds; organization Actions unchanged",
-      "proof": "FirmwareSimulator/docs/qualification/sedsnet-4.2.3-manual-image.json"
+      "proof": ".workspace-progress/qualification-artifact-archive-20261027/FirmwareSimulator/docs/qualification/sedsnet-4.2.3-manual-image.json"
     },
     "selectors": "firmware main; GroundStation version4 unchanged",
     "simulator_source_release": "https://github.com/University-at-Buffalo-SEDS/FirmwareSimulator/releases/tag/v0.4.13",

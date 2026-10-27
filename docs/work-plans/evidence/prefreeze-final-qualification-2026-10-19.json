@@ -7573,5 +7573,5 @@
       }
     ]
   },
-  "linux_arm64_backend_evidence": "docs/qualification/backend-linux-arm64-2026-10-19.json"
+  "linux_arm64_backend_evidence": ".workspace-progress/qualification-artifact-archive-20261027/GroundStation26/docs/qualification/backend-linux-arm64-2026-10-19.json"
 }
