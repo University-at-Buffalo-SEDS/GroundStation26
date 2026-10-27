@@ -896,6 +896,16 @@ impl Mesh {
     pub fn authenticated_settings_peer(&mut self, now: u64) {
         self.settings_peer_seen = Some(now);
     }
+    /// Display metadata only: never grants settings authentication or control.
+    pub(crate) fn operating_mode_session(&self, now: u64) -> Option<u32> {
+        match self.role {
+            Role::Primary => Some(self.session),
+            Role::Rrls => self
+                .health_received
+                .filter(|last| now >= *last && now - *last < LEASE_MS)
+                .and(self.primary_session),
+        }
+    }
     pub fn settings_available(&self, now: u64) -> bool {
         let radio_seen = match self.role {
             Role::Primary => self.relay_seen,
@@ -909,7 +919,15 @@ impl Mesh {
     /// One pending low-priority frame; no eviction of commands, GPS, voice or
     /// telemetry to admit settings. Caller retains its frame on backpressure.
     pub fn queue_settings(&mut self, payload: &[u8], now: u64) -> bool {
-        if !self.settings_available(now)
+        self.queue_settings_inner(payload, now, false)
+    }
+    /// Only the mode worker's validated query replies use this admission.
+    /// It does not grant general settings presence, liveness or a command lease.
+    pub(crate) fn queue_operating_mode_reply(&mut self, payload: &[u8], now: u64) -> bool {
+        self.queue_settings_inner(payload, now, self.role == Role::Primary)
+    }
+    fn queue_settings_inner(&mut self, payload: &[u8], now: u64, mode_reply: bool) -> bool {
+        if !(mode_reply || self.settings_available(now))
             || payload.len() > paired_settings::auth::MAX_WIRE
             || self.queue.len() + usize::from(self.active_frame_count) >= MAX_FRAMES
             || self.bytes + payload.len() + 8 > MAX_BYTES
@@ -931,7 +949,18 @@ impl Mesh {
         true
     }
     pub fn take_settings(&mut self) -> Option<Vec<u8>> {
-        self.settings_inbox.pop_front()
+        let index = self
+            .settings_inbox
+            .iter()
+            .position(|wire| !crate::station_mode::recognizes(wire))?;
+        self.settings_inbox.remove(index)
+    }
+    pub(crate) fn take_operating_mode(&mut self) -> Option<Vec<u8>> {
+        let index = self
+            .settings_inbox
+            .iter()
+            .position(|wire| crate::station_mode::recognizes(wire))?;
+        self.settings_inbox.remove(index)
     }
     pub fn voice_available(&self, now: u64) -> bool {
         self.voice_enabled
@@ -1471,6 +1500,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn display_mode_session_requires_fresh_accepted_health_not_settings_presence() {
+        let mut rr = Mesh::new(Role::Rrls, 99);
+        rr.authenticated_settings_peer(0);
+        assert!(rr.settings_available(0));
+        assert_eq!(rr.operating_mode_session(0), None);
+        let health = |session: u32, seq: u32| {
+            let mut body = session.to_le_bytes().to_vec();
+            body.extend(seq.to_le_bytes());
+            body.push(1);
+            encode(HEALTH, &body)
+        };
+        rr.incoming(true, &health(7, 1), 100);
+        assert_eq!(rr.operating_mode_session(100), Some(7));
+        rr.incoming(true, &health(8, 1), 101);
+        assert_eq!(
+            rr.operating_mode_session(101),
+            Some(7),
+            "another session cannot replace a live primary"
+        );
+        rr.incoming(true, &health(7, 1), 1999);
+        assert_eq!(
+            rr.operating_mode_session(2100),
+            None,
+            "duplicate HEALTH cannot renew lease"
+        );
+        rr.incoming(true, &health(8, 1), 2100);
+        assert_eq!(rr.operating_mode_session(2100), Some(8));
+        assert_eq!(
+            rr.operating_mode_session(0),
+            None,
+            "clock regression is not fresh"
+        );
+        assert_eq!(
+            Mesh::new(Role::Primary, 11).operating_mode_session(0),
+            Some(11)
+        );
+    }
+    #[test]
+    fn operating_mode_demux_preserves_shared_bounded_settings_inbox() {
+        let mut rr = Mesh::new(Role::Rrls, 99);
+        let document = vec![1, 2, 3];
+        let mode = b"OM\x02display".to_vec();
+        rr.incoming(true, &encode(SETTINGS, &mode), 0);
+        rr.incoming(true, &encode(SETTINGS, &document), 0);
+        assert_eq!(rr.take_settings(), Some(document));
+        assert_eq!(rr.take_settings(), None);
+        assert_eq!(rr.take_operating_mode(), Some(mode));
+        assert_eq!(rr.take_operating_mode(), None);
+    }
     #[test]
     fn settings_are_bounded_and_never_displace_other_radio_work() {
         let mut mesh = Mesh::new(Role::Primary, 7);

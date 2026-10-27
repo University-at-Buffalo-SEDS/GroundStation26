@@ -80,7 +80,7 @@ impl Pairing {
         };
         Self::from_file(Path::new(&path)).map(Some)
     }
-    fn from_file(path: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn from_file(path: &Path) -> anyhow::Result<Self> {
         let c: FileConfig = serde_json::from_slice(&std::fs::read(path)?)?;
         anyhow::ensure!(
             c.version == 1 && !c.installation_id.is_empty() && !c.station_id.is_empty(),

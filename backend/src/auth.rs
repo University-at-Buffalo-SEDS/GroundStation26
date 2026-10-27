@@ -189,6 +189,7 @@ pub struct SessionStatus {
     pub station_name: &'static str,
     pub station_role: &'static str,
     pub station_pairing: Option<crate::station_pairing::Public>,
+    pub operating_mode: crate::station_mode::Snapshot,
     pub roles: Vec<StreamRole>,
     pub authenticated: bool,
     pub username: Option<String>,
@@ -248,6 +249,7 @@ impl AuthPrincipal {
                 "primary"
             },
             station_pairing: crate::station_pairing::public(),
+            operating_mode: crate::station_mode::snapshot(),
             roles: self.roles.clone(),
             authenticated: !self.anonymous,
             username: self.username.clone(),

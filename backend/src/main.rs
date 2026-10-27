@@ -54,6 +54,7 @@ mod rrls_topology;
 mod safety_task;
 mod sequences;
 mod state;
+mod station_mode;
 mod station_pairing;
 mod system_clock;
 mod telemetry_db;
@@ -2345,6 +2346,7 @@ async fn main() -> anyhow::Result<()> {
     let _antenna_gpsd = antenna::start_gpsd(state.shutdown_subscribe());
 
     let _mission_sync = mission_sync::start(state.clone());
+    let _station_mode = station_mode::start(state.clone());
 
     // --- Webserver ---
     let mut video_runtime = media_runtime::VideoRuntime::start();

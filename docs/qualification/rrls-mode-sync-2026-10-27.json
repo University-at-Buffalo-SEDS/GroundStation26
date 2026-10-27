@@ -1,0 +1,69 @@
+{
+  "date": "2026-10-27",
+  "status": "focused-software-passed; full backend profiles and combined simulator qualification pending parent",
+  "sdk_git_revision": "a54020b7832f324f15ce2c9bcda2a14a460b77a5",
+  "base_backend_commit": "1343b190acda585fc267c24b58f572ca295a55df",
+  "source_sha256": {
+    "backend/src/station_mode.rs": "7b8cbb6dc7d53b8c19cd4e1ad01db25b1552a399e233aa6515215e57d285100f",
+    "backend/src/mission_sync/wire.rs": "3d7e22a7e3ab2bf5c983d34f01eeb6ea1de0125425196dc715d3b3a72d6fb9f2",
+    "backend/src/rrls.rs": "dccd8decf129e230d2548a8a8ee4f72259b3afb461d4f5d1d2d97df9d9a39f87",
+    "backend/src/main.rs": "b89a6b93abf9a7b77c1191c0ba5ed6c1c18a6524c73c3ff9916b66c7057a3df6",
+    "backend/src/auth.rs": "e72a18168c54bf1f46f90581e337505b7cf1711dc8f577518ecc62f380f7024f",
+    "backend/src/gse.rs": "d680b652d76700cff671096e1aca5863f145d1f29bb90d607f5f87f5b189b50c",
+    "backend/src/web.rs": "5133c793c8d2281dd04c54641ff54b06d0b63509b1d3b08871b7ec24be22de34",
+    "backend/src/station_pairing.rs": "fecd6d27ef0070031ab81d1d2a50360b37d12d41beb18f8f2221a38b18135383"
+  },
+  "tests": {
+    "normal_mode_filter": {
+      "passed": 28,
+      "failed": 0,
+      "log": "/tmp/station-mode-direct-bootstrap-normal-20261027-attempt2.log"
+    },
+    "hitl_mode_filter": {
+      "passed": 27,
+      "failed": 0,
+      "log": "/tmp/station-mode-direct-bootstrap-hitl-20261027.log"
+    },
+    "shared_settings_outbox_normal": {
+      "passed": 3,
+      "failed": 0,
+      "log": "/tmp/station-mode-final-wire-normal-20261027.log"
+    },
+    "shared_settings_outbox_hitl": {
+      "passed": 3,
+      "failed": 0,
+      "log": "/tmp/station-mode-final-wire-hitl-20261027.log"
+    },
+    "frontend_native": {
+      "passed": 1,
+      "failed": 0,
+      "log": "/tmp/station-mode-frontend-native-20261027.log"
+    },
+    "wasm_build": "PASS /tmp/station-mode-wasm-build-20261027.log",
+    "wasm_two_origin_signed_discovery_failover": "PASS /tmp/station-mode-failover-browser-20261027-attempt2.log",
+    "legacy_rrls_labels": "PASS /tmp/station-mode-legacy-browser-20261027.log",
+    "strict_clippy": {
+      "status": "existing 185 test-target errors; zero diagnostics in new station_mode.rs or changed wire.rs",
+      "log": "/tmp/station-mode-clippy-20261027.log"
+    }
+  },
+  "negative_evidence": [
+    "Initial browser launch sandbox EPERM; rerun approved local HTTP fixture succeeded",
+    "Initial ModeReply test closure arity compile failure corrected; logs retained"
+  ],
+  "invariants": [
+    "HEALTH payload remains9 bytes",
+    "OM2 metadata24/25 bytes; no new manual pairing setup",
+    "Configured pairing only OM1 signed envelopes, no unsigned downgrade",
+    "No change to compiled capabilities, permissions, live-operation restrictions or interlocks",
+    "Validated primary reply-only bootstrap grants no general settings or liveness presence",
+    "One mode pending slot under existing256B/s aggregate budget",
+    "Crypto and atomic persistence outside Mesh locks",
+    "Persisted mode restores stale, not fresh"
+  ],
+  "limits": [
+    "No hardware/device/deployment validation",
+    "Two browser origins use independent preauthorized synthetic sessions",
+    "No new cross-origin authentication transfer or sequence-control protocol"
+  ]
+}
