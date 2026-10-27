@@ -19,13 +19,24 @@
     "production_hitl_capacity": "34pass0fail0ignored, includingunchanged256Bmetadata cap",
     "production_worker_head": "1pass0fail0ignored",
     "format": "rustfmtchangedtwoRustfiles; gitdiffcheckpasses",
-    "limits": "Fullnormal/HITL/testfire, fmt/clippy andexactall7compactON simulation are parent-ownedfollowups beforepush; noendtoendlatencyqualificationclaimfromnativeoffload alone"
+    "limits": "Fullnormal/HITL/testfireandhardwarematchedall7TLSF+compactONsim parentownedbeforepush; strictClippyexisting185styleerrorsunchanged, no broadstylecampaign.",
+    "strict_clippy_baseline": {
+      "result": "Strictall-targetsClippyFAILSbothbaseline7ebandcurrent, identicaldiagnosticfingerprints,0added/0removed; not a cleanClippyclaim",
+      "sdk_both": "a54020b7832f324f15ce2c9bcda2a14a460b77a5",
+      "baseline": "Exactfiltered7ebGitarchivewithsameSDKmanifest/ignoredlockoverlay, accountfileexcluded",
+      "compiler_test_target_error_summary": 185,
+      "raw_diagnostic_blocks_each": 188,
+      "fingerprint": "error message +relativefile +lintID +primarysourcecode, ignoringline/column",
+      "evidence": "FirmwareSimulator/build/rf-two-window-close-cohort-20261027/gs-late-sibling-prototype/clippy-baseline-comparison.json",
+      "new_cleanup": "Removednewtoo_many_argumentsallow; groupedexplicitcommandID/fullyencodedlengthtuple, reducingcommitted_command8\u21927argswithoutpolicychange"
+    },
+    "after_contract_cleanup": "Production43RawUART+34CapacitytestsPASS0fail0ignored; samefixture/quiet/debtguards"
   },
   "evidence_root": "FirmwareSimulator/build/rf-two-window-close-cohort-20261027/gs-late-sibling-prototype",
   "sdk_pin_ownership": "Root-ownedbackendCargo.toml/ignoredCargo.lockresolveda540forvalidation; manifest/workplanexcludedfromthisselectivecodecommit",
   "source_sha256": {
-    "backend/src/comms.rs": "982b6574d9971996b56185facbb1f1e7f9a7a64489ed79b9da7fec144a8aa797",
-    "backend/src/comms/rfd_capacity.rs": "a472c4f69a977dbd0f1337c93bb94977a4c97dc121f0991e7e9d35a630eecc70",
+    "backend/src/comms.rs": "b18f8d5588aea7712a96b5b9cf87257a197f908e05f7c42b0726fbf2780392fd",
+    "backend/src/comms/rfd_capacity.rs": "a7b273cdb15e411c9999dde30a2249714bbd951edafee3baf7694cfc7e22e91d",
     "backend/src/comms/late_sibling_fixtures/und.bin": "42ba2c7d002cdb1898a80d2565990ab384705b2d1a79e86ab63da585a1c0d7d9",
     "backend/src/comms/late_sibling_fixtures/fc.bin": "b1271cfb69340b36e73efbef220cbcf4018eccb9314e530913acfe9ac8a0f958"
   },
@@ -35,6 +46,10 @@
     "production-worker-head.log": "b75e9eeb9aa378d2db1aa01a884770090db79dd404082fd76f11898eb529e3b6",
     "production-sdk-lock-update.log": "941220064214545dc79f2c11b89c043de33d605cb366ac97c54c44bf91467c0b",
     "isolated-late-sibling-pty-cloned-trait.log": "d5c81e027df89feb8ac9366ea3173021760b27dbcbe5a0459412b298bcbe0790",
-    "isolated-worker-head.log": "66792f3eca266f0daecc7079bf179d206157b9f33858f859a420940b7af07f40"
+    "isolated-worker-head.log": "66792f3eca266f0daecc7079bf179d206157b9f33858f859a420940b7af07f40",
+    "production-raw-uart-after-contract.log": "cef0580bfc62cae3f8059ead162b86d5497dc8e701dd4848a2d202567fa6e63e",
+    "production-capacity-after-contract.log": "17a51b49c95974a78bff9af6a2972564eaaef587b381b4ddd83d6f9ebfe2fd19",
+    "baseline-clippy.log": "570dfa926d60057865ba61800639ba44924e149b277457c5f21aebf0257561c6",
+    "production-clippy-after-contract.log": "bdb3a5912fa3b47c382039a2a231d232c1bee229650559ed119ba1a0b9b5010d"
   }
 }

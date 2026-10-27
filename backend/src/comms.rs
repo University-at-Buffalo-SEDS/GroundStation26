@@ -2486,8 +2486,7 @@ impl CommsDevice for UartComms {
                 capacity.committed_command(
                     capacity_wall,
                     capacity_clock,
-                    id,
-                    len + RAW_UART_FRAME_HEADER_SIZE,
+                    (id, len + RAW_UART_FRAME_HEADER_SIZE),
                     true,
                     accepted,
                     io_result.is_ok(),

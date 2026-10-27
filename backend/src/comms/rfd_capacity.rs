@@ -93,17 +93,16 @@ impl Capacity {
     }
     /// Charge every accepted byte. First partial/error cannot license another
     /// frame; any positive late-sibling prefix consumes the sole remaining slot.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn committed_command(
         &mut self,
         wall: Instant,
         clock: Option<u64>,
-        id: u64,
-        encoded_len: usize,
+        command: (u64, usize),
         canonical_unsequenced: bool,
         accepted: usize,
         full_io_success: bool,
     ) {
+        let (id, encoded_len) = command;
         if accepted == 0 {
             return;
         }
@@ -1219,7 +1218,7 @@ mod late_sibling_prototype_tests {
         cap.committed(wall, Some(30000), 21);
         cap.drained_virtual(30001927);
         assert!(cap.ready_for_command(wall, Some(30001), 1, first_len, true));
-        cap.committed_command(wall, Some(30001), 1, first_len, true, accepted, success);
+        cap.committed_command(wall, Some(30001), (1, first_len), true, accepted, success);
         cap.drained_virtual(30006712);
         cap.close_packet_batch_for_contract(wall, Some(30001), Some((1, false)));
         (cap, wall)
@@ -1230,7 +1229,7 @@ mod late_sibling_prototype_tests {
         assert!(!cap.ready_for_command(w, Some(30061), 2, 62, true));
         assert!(cap.ready_for_command(w, Some(30062), 2, 62, true));
         assert!(!cap.ready_for(w, Some(30062), true));
-        cap.committed_command(w, Some(30062), 2, 62, true, 62, true);
+        cap.committed_command(w, Some(30062), (2, 62), true, 62, true);
         assert_eq!(cap.next.unwrap().1, Some(30156));
         assert!(cap.late_command_len == 0);
         for now in [30062, 30100, 30155] {
@@ -1245,7 +1244,7 @@ mod late_sibling_prototype_tests {
         assert!(!cap.ready_for_command(w, Some(30062), 2, 62, false));
         let mut c = Capacity::new(64000, 15, 16);
         c.committed(w, Some(0), 21);
-        c.committed_command(w, Some(1), 9, 55, false, 55, true);
+        c.committed_command(w, Some(1), (9, 55), false, 55, true);
         assert!(c.late_command_len == 0);
     }
     #[test]
@@ -1263,7 +1262,7 @@ mod late_sibling_prototype_tests {
     fn partial_second_consumes_slot_and_actual_debt() {
         for n in [1, 31, 61] {
             let (mut c, w) = prefix(55, 55, true);
-            c.committed_command(w, Some(30062), 2, 62, true, n, false);
+            c.committed_command(w, Some(30062), (2, 62), true, n, false);
             assert!(c.late_command_len == 0);
             let next = c.next.unwrap().1.unwrap();
             assert_eq!(next, 30091 + ((n as u64 + 16) * 8000).div_ceil(9600));
@@ -1274,7 +1273,7 @@ mod late_sibling_prototype_tests {
     fn zero_prefix_error_keeps_epoch_without_sliding() {
         let (mut c, w) = prefix(55, 55, true);
         let debt = c.next.unwrap().1;
-        c.committed_command(w, Some(30062), 2, 62, true, 0, false);
+        c.committed_command(w, Some(30062), (2, 62), true, 0, false);
         assert_eq!(c.next.unwrap().1, debt);
         assert_eq!(c.late_command_id, 1);
         assert!(c.ready_for_command(w, Some(30062), 2, 62, true));
@@ -1315,7 +1314,7 @@ mod late_sibling_prototype_tests {
         let mut c = Capacity::new(64000, 15, 16);
         c.committed(w, None, 21);
         assert!(c.ready_for_command(w + Duration::from_millis(1), None, 1, 55, true));
-        c.committed_command(w + Duration::from_millis(1), None, 1, 55, true, 55, true);
+        c.committed_command(w + Duration::from_millis(1), None, (1, 55), true, 55, true);
         c.close_packet_batch_for_contract(w + Duration::from_millis(1), None, Some((1, false)));
         c.drained(w + Duration::from_millis(7));
         assert!(!c.ready_for_command(w + Duration::from_millis(61), None, 2, 62, true));
