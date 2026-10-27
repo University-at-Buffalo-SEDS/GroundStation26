@@ -17,7 +17,11 @@ use std::{
 
 #[path = "../comms/virtual_uart.rs"]
 mod virtual_uart;
-type Drivers = Arc<Mutex<[virtual_uart::WireDrain; 3]>>;
+struct Driver {
+    wire: virtual_uart::WireDrain,
+    capacity: crate::comms::rfd_capacity::Capacity,
+}
+type Drivers = Arc<Mutex<[Driver; 3]>>;
 static FIFO_REJECT_LOGGED: AtomicU64 = AtomicU64::new(0);
 
 fn driver_send(
@@ -28,7 +32,11 @@ fn driver_send(
     bytes: Vec<u8>,
 ) -> sedsnet::TelemetryResult<()> {
     let mut driver = drivers.lock().unwrap();
-    if !driver[node].ready(now) {
+    if !driver[node].wire.ready(now)
+        || !driver[node]
+            .capacity
+            .ready(std::time::Instant::now(), Some(now))
+    {
         return Err(sedsnet::TelemetryError::Io("side tx busy"));
     }
     let length = bytes.len();
@@ -45,7 +53,10 @@ fn driver_send(
             );
         }
     }
-    driver[node].committed(now, length, 115_200);
+    driver[node].wire.committed(now, length, 115_200);
+    driver[node]
+        .capacity
+        .committed(std::time::Instant::now(), Some(now), length);
     Ok(())
 }
 fn process(router: &Router) {
@@ -76,7 +87,11 @@ fn flush_mesh(
     now: u64,
 ) {
     for _ in 0..4 {
-        if !drivers.lock().unwrap()[node].ready(now) {
+        if !drivers.lock().unwrap()[node].wire.ready(now)
+            || !drivers.lock().unwrap()[node]
+                .capacity
+                .ready(std::time::Instant::now(), Some(now))
+        {
             break;
         }
         let Some(transmission) = mesh.lock().unwrap().begin_transmission(now) else {
@@ -121,7 +136,14 @@ fn run_case(mode: ReliableMode, fifo: usize, overhead_bits: u32, duration: u64) 
         )
         .unwrap(),
     ));
-    let drivers: Drivers = Arc::new(Mutex::new(std::array::from_fn(|_| Default::default())));
+    let drivers: Drivers = Arc::new(Mutex::new(std::array::from_fn(|node| Driver {
+        wire: Default::default(),
+        capacity: crate::comms::rfd_capacity::Capacity::new(
+            64_000,
+            if node == 2 { 25 } else { 40 },
+            16,
+        ),
+    })));
     let primary = Arc::new(Mutex::new(Mesh::new(Role::Primary, 1)));
     let recovery = Arc::new(Mutex::new(Mesh::new(Role::Rrls, 2)));
     let clock = Arc::new(AtomicU64::new(1000));
@@ -265,6 +287,13 @@ fn run_case(mode: ReliableMode, fifo: usize, overhead_bits: u32, duration: u64) 
         }
         primary.lock().unwrap().tick(now);
         recovery.lock().unwrap().tick(now);
+        for (node, mesh) in [(0, &primary), (2, &recovery)] {
+            drivers.lock().unwrap()[node].capacity.apply_recovery_share(
+                mesh.lock().unwrap().recovery_air_share(now),
+                std::time::Instant::now(),
+                Some(now),
+            );
+        }
         flush_mesh(&primary, &air, &drivers, 0, now);
         flush_mesh(&recovery, &air, &drivers, 2, now);
         if now % 100 == 0 && now < duration - 5000 {

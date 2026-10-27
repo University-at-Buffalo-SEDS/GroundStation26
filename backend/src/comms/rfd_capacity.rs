@@ -1,10 +1,16 @@
 //! Capacity backpressure before UART offload, independent of modem MAC/turns.
 //! Retain the next frame in its priority queue until one bounded airtime share
-//! has drained. No AUX, GRANT, receive windows, accumulated idle credit or sleep.
+//! has drained. Bounded write batches also leave a serial packet boundary.
+//! No AUX, GRANT, receive windows, accumulated idle credit or blocking sleep.
 use std::time::{Duration, Instant};
 
-pub(super) struct Capacity {
+pub(crate) struct Capacity {
     next: Option<(Instant, Option<u64>)>,
+    next_packet: Option<(Instant, Option<u64>)>,
+    packet_started: Option<(Instant, Option<u64>)>,
+    packet_burst_ms: u64,
+    uart_baud: u32,
+    packet_gap_ms: u64,
     air_bps: u64,
     share_percent: u64,
     overhead_bytes: u64,
@@ -19,7 +25,10 @@ fn bounded_env(name: &str, default: u64, min: u64, max: u64) -> u64 {
         .unwrap_or(default)
 }
 impl Capacity {
-    pub(super) fn from_env() -> Self {
+    pub(crate) fn packetization(&self) -> (u64, u64) {
+        (self.packet_burst_ms, self.packet_gap_ms)
+    }
+    pub(crate) fn from_env(uart_baud: u32) -> Self {
         let recovery = matches!(
             std::env::var("GS_RRLS_ROLE").as_deref(),
             Ok("primary" | "rrls")
@@ -34,13 +43,21 @@ impl Capacity {
             configured_share.unwrap_or(default_share),
             bounded_env("GS_RADIO_AIR_FRAME_OVERHEAD_BYTES", 16, 0, 256),
         );
+        capacity.uart_baud = uart_baud.max(1);
+        capacity.packet_burst_ms = bounded_env("GS_RADIO_PACKET_BURST_MS", 100, 0, 500);
+        capacity.packet_gap_ms = bounded_env("GS_RADIO_PACKET_GAP_MS", 55, 0, 1_000);
         capacity.default_share_percent = default_share;
         capacity.fixed_share = configured_share.is_some();
         capacity
     }
-    fn new(air_bps: u64, share_percent: u64, overhead_bytes: u64) -> Self {
+    pub(crate) fn new(air_bps: u64, share_percent: u64, overhead_bytes: u64) -> Self {
         Self {
             next: None,
+            next_packet: None,
+            packet_started: None,
+            packet_burst_ms: 100,
+            uart_baud: 115_200,
+            packet_gap_ms: 55,
             air_bps,
             share_percent,
             overhead_bytes,
@@ -48,7 +65,7 @@ impl Capacity {
             fixed_share: false,
         }
     }
-    pub(super) fn apply_recovery_share(
+    pub(crate) fn apply_recovery_share(
         &mut self,
         requested: Option<u8>,
         wall: Instant,
@@ -86,15 +103,36 @@ impl Capacity {
         }
         self.share_percent = share;
     }
-    pub(super) fn ready(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
-        self.next.is_none_or(
-            |(next_wall, next_virtual)| match (virtual_ms, next_virtual) {
-                (Some(now), Some(next)) => now >= next,
-                _ => wall >= next_wall,
-            },
-        )
+    pub(crate) fn ready(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
+        let reached = |deadline: Option<(Instant, Option<u64>)>| {
+            deadline.is_none_or(
+                |(next_wall, next_virtual)| match (virtual_ms, next_virtual) {
+                    (Some(now), Some(next)) => now >= next,
+                    _ => wall >= next_wall,
+                },
+            )
+        };
+        let within_burst = self.packet_started.is_some_and(|(started, virtual_start)| {
+            match (virtual_ms, virtual_start) {
+                (Some(now), Some(start)) => now.saturating_sub(start) < self.packet_burst_ms,
+                _ => {
+                    wall.saturating_duration_since(started)
+                        < Duration::from_millis(self.packet_burst_ms)
+                }
+            }
+        });
+        reached(self.next) && (within_burst || reached(self.next_packet))
     }
-    pub(super) fn committed(
+    /// A physical tcdrain may complete later than its nominal wire duration.
+    /// Anchor the quiet gap to actual completion; virtual time still follows
+    /// the modeled 8N1 duration, independently of host scheduling delays.
+    pub(crate) fn drained(&mut self, completed: Instant) {
+        if let Some((deadline, _)) = self.next_packet.as_mut() {
+            *deadline = (*deadline).max(completed + Duration::from_millis(self.packet_gap_ms));
+        }
+    }
+
+    pub(crate) fn committed(
         &mut self,
         wall: Instant,
         virtual_ms: Option<u64>,
@@ -104,6 +142,25 @@ impl Capacity {
         let millis = ((framed_bytes as u128 + self.overhead_bytes as u128) * 8 * 1000)
             .div_ceil(bps)
             .min(u64::MAX as u128) as u64;
+        // Small writes can exhaust neither the airtime budget nor MAX_DATA.
+        // Without an idle boundary they can still be held inside an async
+        // modem for seconds. Keep this bound separate from air-share debt.
+        let packet_ms =
+            (framed_bytes as u64 * 10_000).div_ceil(u64::from(self.uart_baud)) + self.packet_gap_ms;
+        let boundary_passed = self.next_packet.is_none_or(|(next_wall, next_virtual)| {
+            match (virtual_ms, next_virtual) {
+                (Some(now), Some(next)) => now >= next,
+                _ => wall >= next_wall,
+            }
+        });
+        if boundary_passed {
+            self.packet_started = Some((wall, virtual_ms));
+        }
+        self.next_packet = Some((
+            wall.checked_add(Duration::from_millis(packet_ms))
+                .unwrap_or(wall),
+            virtual_ms.map(|now| now.saturating_add(packet_ms)),
+        ));
         let duration = Duration::from_millis(millis);
         self.next = Some((
             wall.checked_add(duration).unwrap_or(wall),
@@ -114,6 +171,57 @@ impl Capacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bounded_batches_keep_small_frame_throughput_without_starving_packet_flush() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64_000, 15, 16);
+        for now in [0, 49, 98] {
+            assert!(cap.ready(wall, Some(now)));
+            cap.committed(wall, Some(now), 42);
+        }
+        // The airtime deadline alone is 147ms. The batch must now leave enough
+        // silence for the last frame to finish and the modem to flush.
+        assert!(!cap.ready(wall, Some(147)));
+        assert!(!cap.ready(wall, Some(156)));
+        assert!(cap.ready(wall, Some(157)));
+        cap.committed(wall, Some(157), 42);
+        assert!(cap.ready(wall, Some(206)));
+        cap.committed(wall, Some(206), 42);
+        assert!(!cap.ready(wall + Duration::from_secs(60), Some(206)));
+    }
+
+    #[test]
+    fn short_frames_leave_a_real_packet_boundary_after_uart_completion() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64_000, 15, 16);
+        cap.packet_burst_ms = 0; // Exercise the boundary itself without batching.
+        cap.committed(wall, Some(0), 42);
+        // The old 49ms capacity-only interval never left 50ms of UART silence.
+        assert!(!cap.ready(wall, Some(58)));
+        assert!(cap.ready(wall, Some(59)));
+        cap.drained(wall + Duration::from_millis(100));
+        assert!(!cap.ready(wall + Duration::from_millis(154), None));
+        assert!(cap.ready(wall + Duration::from_millis(155), None));
+        // Host scheduling cannot move a virtual-time packet boundary.
+        assert!(cap.ready(wall, Some(59)));
+        cap.uart_baud = 9_600;
+        cap.committed(wall, Some(1_000), 42);
+        assert!(!cap.ready(wall, Some(1_098)));
+        assert!(cap.ready(wall, Some(1_099)));
+    }
+
+    #[test]
+    fn changing_air_share_cannot_shorten_the_serial_idle_boundary() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64_000, 40, 16);
+        cap.packet_burst_ms = 0;
+        cap.committed(wall, Some(0), 42);
+        cap.apply_recovery_share(Some(15), wall, Some(10));
+        cap.apply_recovery_share(Some(35), wall, Some(20));
+        assert!(!cap.ready(wall, Some(58)));
+        assert!(cap.ready(wall, Some(59)));
+    }
+
     #[test]
     fn active_relay_budget_changes_preserve_existing_debt_and_healthy_defaults() {
         let wall = Instant::now();

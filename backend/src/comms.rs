@@ -4,7 +4,7 @@ mod i2c_packet;
 #[path = "picofi_tcp.rs"]
 mod picofi_tcp;
 #[path = "comms/rfd_capacity.rs"]
-mod rfd_capacity;
+pub(crate) mod rfd_capacity;
 #[cfg(any(target_os = "linux", test))]
 #[path = "comms/virtual_uart.rs"]
 mod virtual_uart;
@@ -681,6 +681,7 @@ impl UartComms {
                 }
                 if let Some(capacity) = &mut write_state.radio_capacity {
                     capacity.committed(capacity_wall, capacity_clock, framed.len());
+                    capacity.drained(Instant::now());
                 }
                 Ok(())
             })();
@@ -1782,7 +1783,12 @@ impl CommsDevice for UartComms {
                 .lock()
                 .unwrap()
                 .radio_capacity
-                .get_or_insert_with(rfd_capacity::Capacity::from_env);
+                .get_or_insert_with(|| {
+                    let capacity = rfd_capacity::Capacity::from_env(self.baud_rate);
+                    let (burst_ms, gap_ms) = capacity.packetization();
+                    log::info!("RFD UART pacing: baud={} packet_burst_ms={burst_ms} packet_gap_ms={gap_ms}", self.baud_rate);
+                    capacity
+                });
         }
     }
     fn transmit_ready(&self) -> bool {
@@ -1975,6 +1981,7 @@ impl CommsDevice for UartComms {
                 capacity_clock,
                 len + RAW_UART_FRAME_HEADER_SIZE,
             );
+            capacity.drained(Instant::now());
         }
         Ok(())
     }

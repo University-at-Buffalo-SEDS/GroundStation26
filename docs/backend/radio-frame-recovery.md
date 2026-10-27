@@ -53,3 +53,29 @@ observation to data availability upstream of the GS read loop, without proving
 which modem, RF arbitration, or sender-side queue caused it. The user confirmed
 that the reported 3–40 second delay concerns command response, so a simultaneous
 command-send/receipt capture is still needed to locate the full delay.
+
+## Reproduced packetization stall and bounded write batches
+
+The production UART capacity gate previously admitted small frames continuously
+without a bound on packetization delay. A deterministic simulator regression
+uses that exact Rust gate to schedule the captured 42-byte write size. The actual
+`SedsRadioMedium` source delivers it within 17.2 ms under the earlier 2 ms /
+256-byte profile, but takes 5.11 seconds with a 50 ms idle threshold and a
+3,968-byte packet limit. No fixed multi-second delay is injected. The latter is
+an explicit configuration envelope; the active hardware's registers remain
+unverified.
+
+GS/RRLS and RF now allow bounded 100 ms batches and then preserve 55 ms of serial
+silence after actual UART completion. Average airtime admission remains a
+separate constraint. This prevents a stream of short frames from postponing the
+packet boundary indefinitely, without adding LoRa turn windows or changing
+command retries/recovery leases. A per-frame gap was rejected because it caused
+a reliable-delivery regression; the bounded batch passes the unchanged campaign.
+
+The final raw-byte fixture measures 173.7 ms with no loss or reordering. It also
+passes on Renode's real virtual clock, and disabling only the new boundary still
+reproduces 5.11 seconds. Startup logs show the active host burst/gap values.
+`GS_RADIO_PACKET_BURST_MS` and `GS_RADIO_PACKET_GAP_MS` control these bounds;
+the baud rate comes from the selected serial link. RF needs the matching firmware
+build. Hardware confirmation still requires modem readback and physical command
+receipt timing; no active station configuration or firmware was changed here.
