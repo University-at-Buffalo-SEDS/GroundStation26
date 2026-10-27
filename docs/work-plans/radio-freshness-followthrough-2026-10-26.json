@@ -23,7 +23,8 @@
   "limits": [
     "Three full seven-board stress campaigns failed the unchanged500ms command and1500ms sensor gates; combined new candidate has not yet passed.",
     "Latest read-only live Pi status: active primary, relay_requested=true, forwarding=false, no direct_age; RRLS Mac SSH times out. Physical modem settings and latency remain unqualified.",
-    "No modem configuration, physical outputs, services or firmware flash changed. No SDK version bump, release or tag."
+    "No modem configuration, physical outputs, services or firmware flash changed. No SDK version bump, release or tag.",
+    "User explicitly selected simulator-only followthrough; hardware remains untouched."
   ],
   "integrated_stress": {
     "profile": "async-64k-50ms-envelope.json",
@@ -121,6 +122,93 @@
     "latest_capture_source_evidence": "Corrected accumulated-drain campaign:134unique RF source reports26..39s,75delivered,59missing all seen atRRLS RX but neverRRLS TX; source max1871.5ms. PBcurrent2emitted/0delivered.6canonical all delivered,max480.8ms. All6codec streams0errors. DAQ2399analog publications0loss; all7boards12samples0panic/TLSF/allocfail/CANoverflow.",
     "latest_capture_metadata": "Fulltrace RF15catalogs(12final3736B), GS19(16final3736B). Active26..39SDTchunkframed RF10159B/GS10497B/RRLS15776B. Repeated metadata remains significant.",
     "harness_commit": "FirmwareSimulator17d7392;12hardware-fill profile tests pass; existing diagnostic preserved exactly and repeated configuration produces one sample stream per probe.",
-    "latest_command_trace": "Exact matched fourhop FC command: GS30190.1ms\u2192RRLS30267.2\u2192RF30395\u2192ACK RRLS30565.2\u2192GS30699.5 (~509.4ms). RFbatch extended36.025ms afterACKwirestop; RRLSreceipt waited54.8ms beforeTX. Native diagnosis underway; gates unchanged."
+    "latest_command_trace": "Exact matched fourhop FC command: GS30190.1ms\u2192RRLS30267.2\u2192RF30395\u2192ACK RRLS30565.2\u2192GS30699.5 (~509.4ms). RFbatch extended36.025ms afterACKwirestop; RRLSreceipt waited54.8ms beforeTX. Native diagnosis underway; gates unchanged.",
+    "schema_progress_commit": "SEDSnet e80380acd5d64dc009b5b7a32a34a5fab2d3eb2d local only. Same-peer unique fragment guard native closedloop avoids1request/secondcatalog (5786\u21924012SDTbytes in scoped fixture); no new full linked result.",
+    "pb_catalog_root_cause_progress": "The compiled PB catalog is 3,129 bytes, with schema definitions stored in flash. Its fixed 512-byte queue (growth factor 1.0) has two descriptors on ARM: compiler output proves TxQueued is 224 bytes. Address priority254 and topology priority254 can fill those descriptors before schema priority253. The embedded-feature hosted test rejects schema before CAN callback; explicit two-slot ABI normalization and deferred-catalog recovery are under validation. No queue growth or memory budget change is proposed.",
+    "rejected_candidate": "Strict post-admission debtlead<=155ms alone improvesoneoffload but starvesordinarytraffic (358critical/0ordinary turns10s) and breaksold149/15 replay. Isolatedprototype rejected; productionone-unpaid-loan guard retained.",
+    "ui_followthrough": "Frontenddev42b4b910a1e7a07a5e0ab7961cb409b4c5c8e329 pushed/clean. Responsive Menu900px breakpoint now matches header collapse;844x390 outerpanel828x322,900x390884x322;901desktopToolsanchored. Sevenviewports+navigationpermissions pass. Longaccountlabels wrap and preserve44px minimum. Simulator/browseronly; nohardware.",
+    "schema_progress_validation": "SDK3cf4c9d409bf06b9c02982605b9d77c4829df54d (guard e803 ancestor), local only. Default native+integration740pass/6ignored; no-compressionlib580/2ignored; fair/ingress/compact+compressionlib615/3ignored plus28targetedintegration/1ignored. SupportedARM0warnings; minimal8warnings samebaseline. No linked candidate acceptance yet."
+  },
+  "schema_prefix_candidate": {
+    "status": "Exact60s source and runtime loss/memory gates pass; overall campaign still fails500ms commands.",
+    "sdk_commit": "d82b5526c56a20f65f6257478ae32f3ff9af5674",
+    "gs_commit": "46c0cd5dae0813c1fb5fdc840b1344e07e76b476",
+    "frontend_commit": "42b4b910a1e7a07a5e0ab7961cb409b4c5c8e329",
+    "cause": "PB has two fixed queue descriptors on ARM. Full snapshots repeatedly admitted protected address/topology messages before the lower-priority catalog, refusing the catalog despite ample byte budget.",
+    "fix": "Retain catalog intent after the protected prefix is admitted. Retry catalog admission without repeating the prefix. Explicit phases and a dedicated generation counter protect ownership across concurrent polling, cancellation and restart.",
+    "matched_native_proof": "Embedded-feature PB with two ABI-normalized descriptors: zero catalogs before; three complete 3129-byte catalogs after, all wrapper/canonical CRC and payload checks pass; receiver marks peer schema known.",
+    "scope_limits": "One-slot prefix streaming is not changed. Protected refill test preserves existing equal-priority discovery eviction policy and proves catalog progress; it does not claim both prefix packets always reach wire.",
+    "memory_layout": "ARM RouterInner592\u2192600 bytes; per-side throttle72 and TxQueued224 unchanged. Hosted1088\u21921096, per-side80 and TxQueued272 unchanged. No queue, sampling, airtime or freshness limit changes.",
+    "sdk_validation": "751 default native/integration passed,6 ignored;591 no-compression,2 ignored;626 fair/ingress/compact+compression,3 ignored;28 targeted integrations,1 ignored;11 new phase and13 prior ownership regressions pass; supported ARM check zero warnings.",
+    "firmware_cohort": "FirmwareSimulator/build/schema-progress-cohort-20261027",
+    "firmware_builds": "All seven factory images build with zero warnings. All original linker memory limits pass; static RAM totals unchanged. Runtime allocator and loss gates still require the new simulation.",
+    "host_image": "seds-firmware-simulator:schema-progress-final-20261027",
+    "image_id": "sha256:afc86b985510607db62806654560e72a97173157129f16ffad6fc6edb7681036",
+    "binary_sha256": "9a48fb7f9a9ea55c51fab15f44b8dcbe7dfe5f398d7782fe14ca756f43fd5ca4",
+    "host_validation": "575 HITL passed,0 failed,2 ignored; normal598/0/3ignored; test-fire599/0/3ignored. Compiler warnings zero. Exact sources/lock verified. All focused drain, capacity, old149/15 capture, receipt and observer checks pass.",
+    "full_campaign": "full-path-exact-60s-50ms is running. Actual simulator stdout confirms60000ms/12samples. Exact prior outage20..40s topology is copied unchanged except ephemeral loopback HTTP status ports. Original500/1500/3000ms gates and56000ms capture cutoff preserved; provenance and source hashes retained. No acceptance claim yet.",
+    "harness": "FirmwareSimulator17d7392 keeps existing diagnostic probes unique; prior25 read-only DAQ probes reused with explicit overlay proof, no threshold changes.",
+    "publication": "SDK source remains local/unpublished. No release, tag or version bump. GS production manifest still uses registry4; source consumption will be wired only after qualification. No hardware actions.",
+    "short_diagnostic": "A mistaken default16s/7sample launch is retained at full-path-final-50ms with explicit run-scope.json. It fails a startup buzzer510ms deadline and terminal state assertions after controller abort. It cannot qualify the26..39s source window or relay restoration; original60s trace configuration is unfinished. Separate derived forensic subset analysis only.",
+    "full_campaign_result": {
+      "evidence": "full-path-exact-60s-50ms/offline-analysis.json",
+      "source": "149/149 delivered; maximum1349.1ms<=1500; FCIMU,barometer,PBvoltage/current all present",
+      "canonical": "11/11 delivered; maximum1089.8ms<=3000",
+      "codec": "Six streams,zero errors",
+      "control": "FAIL: third startup completion510ms and relay FC command510ms deadline; only2/6 RF rounds completed",
+      "schema_load": "RF4catalogs/2semanticversions,last11.306s;GS7catalogs/3versions,last16.0801s;lastRFSchemaRequest8.3625s;no schema storm26..39s",
+      "runtime": "All seven boards12samples:zero panic/TLSF/allocator/CANoverflow;DAQ2399analog/zero failures;SDwrite/rawdropzero",
+      "status": "Relay activates~23.173s and directrestores~42.199s; RRLS14drops vs171prior, maxqueue21 vs43",
+      "observability": "No CANtrace in originalprofile; PBcatalog emission verified separately in matched embedded native fixture, not directly observed on radio."
+    }
+  },
+  "command_batch_candidate": {
+    "status": "GS99ed exact60s completedFAIL; startup improved, source constraint regressed. Guard84bc and opt-in diagnostic11e are separate later commits, not the captured99ed image.",
+    "gs_commit": "99ed741905e017fbf6490f5f7cf5f6804c524d33",
+    "sdk_commit": "d82b5526c56a20f65f6257478ae32f3ff9af5674",
+    "frontend_test_commit": "59bf24745347ceb11cdbc3be06669bca548e19f2",
+    "frontend_product_commit": "42b4b910a1e7a07a5e0ab7961cb409b4c5c8e329",
+    "change": "Two already-queued independent canonical commands,at most128framedbytes,may share one UART write. Preserve per-original-frame charges, one unpaid loan, same route snapshot,55ms actualdrain quiet, both logical promotion IDs, per-frame stats/budget/activity and rollback. Receipts/SDT/discovery/invalidpayloads excluded. LinuxRawUart only; other links retain single path.",
+    "native": "Normal607/0/3ignored;testfire608/0/3ignored;fullHITL583/0/2ignored;focusedworker/fairness/partialwrite/PTY and both149/15+149/11 captures pass.",
+    "image": "seds-firmware-simulator:command-batch-final-20261027",
+    "image_id": "sha256:beee2df30376c1903387068b9483f5020fa563333dcbe887ea752aa1c715b1c3",
+    "binary_sha256": "47cde8efac9e4ec8cf8957cceffef84cb8c004c3a1400a89a9c67bcda05bdf91",
+    "evidence": "FirmwareSimulator/build/schema-progress-cohort-20261027/full-path-command-batch-60s-50ms",
+    "scope": "Same SDKd82 MCU factory artifacts, exact preserved60s/12sample profile and64k/50ms medium. Only fresh loopback status ports differ. No hardware or release.",
+    "full_result": {
+      "startup_ms": [
+        380,
+        490,
+        420
+      ],
+      "direct_rounds_ms": [
+        420,
+        390
+      ],
+      "relay": "Both FC and FC-owned underglow receipts pending at510ms; exact FC receipt707.4ms. Actual GS pair batching confirmed at30000.1ms.",
+      "source": "146/147 reports delivered; oneFCBARO9210725541099583781 reachedRRLS but notTX. Elevenlate reports;maximum1703.7ms;PBvoltage/current both late.19/19canonical581.3ms.",
+      "codec_runtime": "Sixstreams0codecerrors;all7boards12samples0panic/TLSF/allocator/CANoverflow;zeroDAQpublication/storagefailures.",
+      "timing": "RRLS command extensions108.099/54.350ms;RF FCACK extension94.186ms;RRLS FCACK56.340ms. ActualfirstUND\u2192nextREADY quiet46.615ms below declared50ms idle; exactinternalclockjoin pending.",
+      "gates": "No thresholds, profiles or production budgets relaxed."
+    }
+  },
+  "clock_boundary_diagnostic": {
+    "gs_commit": "11e6c0691547c021cbb72530b7ec2f477afc8f19",
+    "ordered_guard_commit": "84bc4c15ffc632e054145d59439ce4f59e0bbcfc",
+    "scope": "Opt-in timing logs only, no clock/pacing/model change. Completed14s diagnostic is not fullqualification.",
+    "evidence": "FirmwareSimulator/build/schema-progress-cohort-20261027/relay-clock-closure-diagnostic-14s",
+    "fields": [
+      "wire_clock_ms",
+      "capacity_clock_ms",
+      "accumulatedstop_us",
+      "next_packet_ms",
+      "promoted",
+      "encoded_bytes",
+      "accepted_bytes",
+      "contract_ID"
+    ],
+    "image_id": "sha256:6cf287856b1bb3c2e4f825e0de9d52935bfbe09fac3ee8f3316a6581abddd5ec",
+    "native": "Normal609/0/3ignored;HITL585/0/2ignored;focusedactualvirtualpaths compile/run withtraceflag.",
+    "state": "Completed; strictactualSDKdecode andclock/HostInputjoin underway."
   }
 }
