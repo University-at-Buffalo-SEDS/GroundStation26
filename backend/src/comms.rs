@@ -242,6 +242,12 @@ pub trait CommsDevice: Send {
         Ok(())
     }
 
+    /// Background mode metadata may use ordinary capacity only after the TX
+    /// worker verifies no eligible SDK critical work is queued.
+    fn service_background_mode(&mut self) -> TelemetryResult<()> {
+        Ok(())
+    }
+
     /// True only when the last bounded receive exhausted its work budget.
     fn receive_budget_exhausted(&self) -> bool {
         false
@@ -534,6 +540,23 @@ fn macos_pty_fixture_never_changes_a_hardware_ports_baud() {
     }
 }
 impl UartComms {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn test_mesh_pty(inner: serialport::TTYPort, recovery: crate::rrls::Shared) -> Self {
+        Self {
+            inner,
+            side_id: None,
+            rx_buf: Vec::new(),
+            raw_uart_frame_wait: RawUartFrameWait::default(),
+            raw_uart_data_frames: VecDeque::new(),
+            radio_window_updates: VecDeque::new(),
+            protocol: SerialProtocol::RawUart,
+            recovery: Some(recovery),
+            write_lock: Default::default(),
+            baud_rate: 115200,
+            slow_start_deadline: None,
+        }
+    }
+
     pub fn open(cfg: &SerialLinkConfig) -> anyhow::Result<Self> {
         #[cfg(target_os = "linux")]
         let inner = serialport::new(&cfg.port, cfg.baud_rate as u32)
@@ -741,10 +764,17 @@ impl UartComms {
     }
 
     fn flush_recovery_output(&mut self, minimum_priority: u8) -> TelemetryResult<()> {
+        self.flush_recovery_selection(minimum_priority, false)
+    }
+    fn flush_recovery_selection(
+        &mut self,
+        minimum_priority: u8,
+        mode_only: bool,
+    ) -> TelemetryResult<()> {
         let shared = self.recovery.as_ref().unwrap().clone();
         self.enable_radio_capacity_control();
         let mut serviced_frames = 0;
-        while serviced_frames < 4 {
+        while serviced_frames < if mode_only { 1 } else { 4 } {
             // A bounded pair stays one retained owner until the full write
             // completes; refusal restores both original logical frames.
             #[cfg(target_os = "linux")]
@@ -770,21 +800,30 @@ impl UartComms {
                 .radio_capacity
                 .as_ref()
                 .is_some_and(|cap| !cap.ready(capacity_wall, capacity_clock));
+            if mode_only && !normal_ready {
+                break;
+            }
             let transmission = {
                 let mut mesh = shared.lock().unwrap();
                 let now = mesh.now();
                 #[cfg(target_os = "linux")]
                 {
-                    mesh.begin_bounded_transmission(
-                        now,
-                        minimum_priority,
-                        !normal_ready,
-                        4 - serviced_frames,
-                    )
+                    if mode_only {
+                        mesh.begin_mode_reply_transmission(now)
+                    } else {
+                        mesh.begin_bounded_transmission(
+                            now,
+                            minimum_priority,
+                            !normal_ready,
+                            4 - serviced_frames,
+                        )
+                    }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    if normal_ready {
+                    if mode_only {
+                        mesh.begin_mode_reply_transmission(now)
+                    } else if normal_ready {
                         mesh.begin_transmission_at_priority(now, minimum_priority)
                     } else {
                         mesh.begin_critical_transmission(now, minimum_priority)
@@ -2079,6 +2118,17 @@ impl CommsDevice for UartComms {
             }
         };
         self.flush_recovery_output(minimum_priority)
+    }
+    fn service_background_mode(&mut self) -> TelemetryResult<()> {
+        if matches!(self.protocol, SerialProtocol::RawUart)
+            && self
+                .recovery
+                .as_ref()
+                .is_some_and(|mesh| mesh.lock().unwrap().role == crate::rrls::Role::Primary)
+        {
+            self.flush_recovery_selection(0, true)?;
+        }
+        Ok(())
     }
     fn enable_radio_capacity_control(&mut self) {
         if matches!(self.protocol, SerialProtocol::RawUart) {
@@ -4174,7 +4224,7 @@ mod raw_uart_tests {
             let reader = std::thread::spawn(move || {
                 let mut out = vec![0; length];
                 peer.read_exact(&mut out).unwrap();
-                out
+                (out, peer)
             });
             uart.send_data_with_priority(&bytes, priority).unwrap();
             let completed = Instant::now();
@@ -4191,7 +4241,7 @@ mod raw_uart_tests {
                 "only completed ordinary IO funds another close, including on wall-clock UART"
             );
             assert_eq!(
-                reader.join().unwrap(),
+                reader.join().unwrap().0,
                 build_raw_uart_frame(&bytes).unwrap()
             );
         }
@@ -4307,6 +4357,49 @@ mod raw_uart_tests {
         (uart, shared, expected)
     }
 
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn background_mode_reply_uses_existing_shared_quota_without_early_loan() {
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(10)).unwrap();
+        let (mut uart, shared, _) = recovery_uart_fixture(port);
+        {
+            let mut mesh = shared.lock().unwrap();
+            let health = mesh.begin_transmission(0).unwrap();
+            mesh.finish_transmission(health, true);
+            assert!(mesh.queue_operating_mode_reply(b"OM\x02reply", 0));
+            let owner = mesh
+                .begin_mode_reply_transmission(0)
+                .expect("mode is otherwise eligible");
+            mesh.finish_transmission(owner, false);
+        }
+        uart.enable_radio_capacity_control();
+        uart.write_lock
+            .lock()
+            .unwrap()
+            .radio_capacity
+            .as_mut()
+            .unwrap()
+            .committed(Instant::now(), None, u16::MAX as usize);
+        let mut tx = uart.try_clone_tx().unwrap().unwrap();
+        tx.service_background_mode().unwrap();
+        assert!(!tx.transmit_ready());
+        let error = tx.send_data(b"SDK").unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let mut byte = [0];
+        assert!(
+            peer.read(&mut byte).is_err(),
+            "neither mode nor SDK bypasses owed airtime"
+        );
+        let mut mesh = shared.lock().unwrap();
+        let owner = mesh
+            .begin_mode_reply_transmission(0)
+            .expect("quota refusal retains exact mode owner");
+        mesh.finish_transmission(owner, false);
+    }
     #[test]
     #[cfg(unix)]
     fn one_physical_quota_gates_both_mesh_reservation_and_sdk_offload() {

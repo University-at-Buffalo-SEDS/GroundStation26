@@ -394,6 +394,15 @@ impl WireBacklog {
             None
         }
     }
+    fn has_eligible_critical(&self) -> bool {
+        !self.receipts.is_empty()
+            || !self.routing.is_empty()
+            || self.priorities.iter().any(|(priority, queue)| {
+                queue.iter().any(|bytes| {
+                    *priority >= 254 || crate::comms::closes_radio_packet_batch(*priority, bytes)
+                })
+            })
+    }
     fn pop_critical(&mut self) -> Option<(u8, Vec<u8>)> {
         // Canonical controls are independent of the ordered SDT dictionaries.
         // Routine heartbeat/GPS/discovery must not hide one eligible loan.
@@ -1402,6 +1411,17 @@ pub(super) fn spawn_comms_worker_threads(
                         log_repeated_worker_error(
                             &format!("{worker_name} comms worker transport service failed"),
                             &error.to_string(), &mut last_send_error_log_ms,
+                            &mut suppressed_send_errors,
+                        );
+                        break;
+                    }
+                    if !backlog.has_eligible_critical()
+                        && let Err(error) = comms.service_background_mode()
+                    {
+                        log_repeated_worker_error(
+                            &format!("{worker_name} comms worker background mode service failed"),
+                            &error.to_string(),
+                            &mut last_send_error_log_ms,
                             &mut suppressed_send_errors,
                         );
                         break;
@@ -2747,6 +2767,141 @@ mod rfd_worker_tests {
     use super::*;
     use std::error::Error;
 
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn primary_actual_uart_worker_mode_reply_progresses_under_sdt_and_defers_to_command() {
+        use serialport::SerialPort;
+        use std::io::Read;
+        crate::telemetry_schema::initialize().unwrap();
+        let command = serialize::pack_packet(
+            &Packet::new(
+                crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+                &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
+                "GS",
+                1,
+                Arc::from([1u8]),
+            )
+            .unwrap(),
+        )
+        .to_vec();
+        let bulk = include_bytes!("../test-fixtures/mode-background-captured-sdt.bin").to_vec();
+        let shared = Arc::new(Mutex::new(crate::rrls::Mesh::new(
+            crate::rrls::Role::Primary,
+            42,
+        )));
+        let mut reply = b"OM\x02\x01".to_vec();
+        reply.extend(42u32.to_le_bytes());
+        reply.extend(123u128.to_le_bytes());
+        reply.push(0);
+        assert!(shared.lock().unwrap().queue_operating_mode_reply(&reply, 0));
+        let wrapped = {
+            let mut mesh = shared.lock().unwrap();
+            let owner = mesh.begin_mode_reply_transmission(0).unwrap();
+            let bytes = owner.frame().bytes.clone();
+            mesh.finish_transmission(owner, false);
+            bytes
+        };
+        let mut expected_wire = vec![0xA6, 0x5B];
+        expected_wire.extend((wrapped.len() as u16).to_le_bytes());
+        expected_wire.extend(wrapped);
+
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(10)).unwrap();
+        let mut uart = crate::comms::UartComms::test_mesh_pty(port, shared.clone());
+        uart.set_side_id(0);
+        let tx = uart.try_clone_tx().unwrap().unwrap();
+        let state = crate::state::tests::test_app_state().await;
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let budget = Arc::new(TxQueueBudget::new(32768));
+        budget.try_send(&sender, 255, &command).unwrap();
+        for _ in 0..64 {
+            budget.try_send(&sender, 0, &bulk).unwrap();
+        }
+        let workers = spawn_comms_worker_threads(
+            Arc::new(Router::new(Default::default())),
+            state.clone(),
+            CommsWorkerHandle {
+                transport_activity: None,
+                name: "rocket_comms",
+                tx_budget: Some(budget.clone()),
+                comms: Arc::new(Mutex::new(Box::new(uart))),
+                tx_comms: Some(Arc::new(Mutex::new(tx))),
+                side_id: 0,
+                tx_rx: receiver,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: false,
+            },
+        )
+        .unwrap();
+        let expected_frame = expected_wire.clone();
+        let (captured, _peer_guard) = tokio::task::spawn_blocking(move || {
+            let start = std::time::Instant::now();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 2048];
+            while start.elapsed() < Duration::from_secs(2) {
+                if let Ok(n) = peer.read(&mut chunk) {
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if bytes
+                        .windows(expected_frame.len())
+                        .any(|w| w == expected_frame)
+                    {
+                        break;
+                    }
+                }
+            }
+            (bytes, peer)
+        })
+        .await
+        .unwrap();
+        let pending = budget.pending.load(Ordering::Acquire);
+        state.request_shutdown();
+        drop(sender);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let mode = captured
+            .windows(reply.len())
+            .position(|w| w == reply)
+            .expect("mode reply starved behind sustained SDK SDT backlog");
+        let control = captured
+            .windows(command.len())
+            .position(|w| w == command)
+            .expect("canonical command missing");
+        let frame_start = captured
+            .windows(expected_wire.len())
+            .position(|w| w == expected_wire)
+            .expect("exact production Mesh envelope and CRC inside raw UART frame");
+        assert_eq!(mode, frame_start + 8);
+        assert_eq!(&captured[frame_start..frame_start + 2], &[0xA6, 0x5B]);
+        let framed_length = 4 + usize::from(u16::from_le_bytes(
+            captured[frame_start + 2..frame_start + 4]
+                .try_into()
+                .unwrap(),
+        ));
+        assert_eq!(
+            framed_length,
+            reply.len() + 12,
+            "charged wire includes raw4+Mesh8 overhead"
+        );
+        assert_eq!(framed_length, 37);
+        assert!(
+            captured.len() >= frame_start + framed_length,
+            "full owned frame including MeshCRC accepted"
+        );
+        println!(
+            "MODE_BACKGROUND_ACTUAL_UART wire_bytes={framed_length} payload_bytes={} sdk_pending_bytes={pending}",
+            reply.len()
+        );
+        assert!(
+            control < mode,
+            "eligible SDK critical command precedes background mode"
+        );
+        assert!(
+            pending > 0,
+            "mode progresses while ordinary SDK work remains pending"
+        );
+    }
     struct CaptureDevice {
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
         done: std::sync::mpsc::Sender<()>,

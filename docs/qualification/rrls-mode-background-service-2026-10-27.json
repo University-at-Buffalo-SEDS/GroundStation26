@@ -1,0 +1,76 @@
+{
+  "date": "2026-10-27",
+  "status": "full native profiles pass; combined simulator qualification still pending",
+  "base_gs_commit": "cebc8bd3653dbe1c25b98f9fdfead8c0735d12ac",
+  "sdk_revision": "a54020b7832f324f15ce2c9bcda2a14a460b77a5",
+  "isolated_prototype": "FirmwareSimulator/build/hardware-matched-latency-cohort-20261027/mode-background-service-prototype",
+  "source_sha256": {
+    "backend/src/comms.rs": "c283695e33e78b4ee356bebf3a7c037724aa1432b957a8eea08d3bed8006efce",
+    "backend/src/rrls.rs": "7655e2ef28c7c96a89cb7c3dfefe4d0fe907a5541e58344dda19c7dc30f4156a",
+    "backend/src/telemetry_task/radio_io.rs": "2e8a30f63ad26db962313e60ec79c9b4604f464cd071e6969fe3e7d7b798f6b0",
+    "backend/src/test-fixtures/mode-background-captured-sdt.bin": "c74440f189e05d81729a17e67abff258d235fb82ccac186c73d51b48e67eb774"
+  },
+  "profiles": {
+    "normal": {
+      "passed": 654,
+      "failed": 0,
+      "ignored": 3,
+      "log": "/tmp/mode-background-full-normal-20261027-final.log",
+      "warnings": 0
+    },
+    "hitl": {
+      "passed": 633,
+      "failed": 0,
+      "ignored": 2,
+      "log": "/tmp/mode-background-full-hitl-20261027-attempt3.log",
+      "warnings": 0
+    },
+    "test_fire": {
+      "passed": 655,
+      "failed": 0,
+      "ignored": 3,
+      "log": "/tmp/mode-background-full-testfire-20261027-final.log",
+      "warnings": 0
+    },
+    "firmware_sim": {
+      "passed": 656,
+      "failed": 0,
+      "ignored": 3,
+      "log": "/tmp/mode-background-full-firmware-sim-20261027.log",
+      "warnings": 0
+    }
+  },
+  "critical_regressions": {
+    "baseline_actual_worker": "RED /tmp/mode-background-actual-worker-red-20261027-attempt2.log; mode starved behind64capturedSDTfragments after2seconds",
+    "actual_worker": "GREEN /tmp/mode-background-actual-worker-bounds-20261027-attempt2.log; exact37wirebytes=25modepayload+12raw/Mesh/envelope/CRC, canonical command first,12288SDKbytes still pending",
+    "quota": "ActualPTY refusal retains ModeReply owner, rejects SDK too, no bytes emitted despite eligible mode pending",
+    "Mesh": "Only worker-tagged ModeReply selectable; legacy/magic-only frames isolated; pendingHEALTH first; no250ms expiry;5sec expiry andclockrollback bounded",
+    "test_fixture_lifetime": "Retain PTY peer until writer tcdrain/assertions complete; fixes previously observed baselineEIO race without sleeping or relaxing assertions"
+  },
+  "negative_evidence": [
+    "Initial unrestrictednetwork tests635pass19sandboxEPERMfail; approvedloopback rerun654pass",
+    "InitialHITL632pass1existingPTYpeer-closeEIOfailure; test-only lifetime correction, rerun633pass",
+    "Initialtransportframe assertion useddataA5/5AsyncinsteadcommandA6/5B; corrected test assertion, retained negative log"
+  ],
+  "invariants": [
+    "HEALTH9bytes andmodeprotocol unchanged",
+    "existing256B/s aggregate SETTINGSallowance unchanged",
+    "same physicalCapacity, fullframe acceptedbytecharging, airdebt andquiet guards",
+    "no commandprioritypromotion, no earlyloan or extra close credit",
+    "one mode pending class/one bounded Meshsettingsslot, no queue limit increase",
+    "no SDK/core/frame/dictionary edits",
+    "no state.rs or main.rs edits; callbackreactorfix separate"
+  ],
+  "limits": [
+    "Native/software evidence only; no hardware/deployments",
+    "Three ignored defaultnativefixtures (twoHITL) unchanged; not represented as executed",
+    "Actualnormal16clocked predecessor still failed509ms; no claim this modefix solves its RF244.4ms queue/turnaround or22.335msACKpacket extension",
+    "CombinedSDK4.3/AppIDmigration andsimulator source qualification remains root-owned"
+  ],
+  "integration_parent_commit": "5a954d21e1879d3dfe014871caacbcfb9d885a7c",
+  "production_focused": {
+    "actual_UART_worker_and_quota": "2 passed; /tmp/mode-background-production-focused-20261027.log",
+    "Mesh_isolation_expiry_and_quota": "2 passed; /tmp/mode-background-production-mesh-focused-20261027.log",
+    "closure": "copied3codefiles+192Bfixture byte-identical to isolated full-profile-tested prototype; parent runtimehandlefix separate commit5a954d2"
+  }
+}

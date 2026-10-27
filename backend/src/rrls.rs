@@ -167,6 +167,7 @@ pub struct Outgoing {
     pub bytes: Vec<u8>,
 }
 struct Queued {
+    mode_reply: bool,
     frame: Outgoing,
     at: u64,
     priority: u8,
@@ -581,6 +582,7 @@ impl Mesh {
         let independent_discovery = Self::independent_discovery(&frame);
         let (sdt_kind, sdt_template) = Self::sdt_dependency(&frame);
         self.queue.push_back(Queued {
+            mode_reply: false,
             frame,
             at: now,
             priority,
@@ -606,6 +608,38 @@ impl Mesh {
         minimum_priority: u8,
     ) -> Option<Transmission> {
         self.begin_matching_transmission(now, minimum_priority, true)
+    }
+    /// One independent background reply; it never takes critical capacity/loans.
+    pub(crate) fn begin_mode_reply_transmission(&mut self, now: u64) -> Option<Transmission> {
+        if self.role != Role::Primary
+            || self.active_transmission.is_some()
+            || self
+                .queue
+                .iter()
+                .enumerate()
+                .any(|(i, q)| q.priority >= 254 && self.dependency_ready(i))
+        {
+            return None;
+        }
+        let index = self.queue.iter().position(|q| q.mode_reply)?;
+        if now < self.queue[index].at || now.saturating_sub(self.queue[index].at) > 5_000 {
+            let expired = self.queue.remove(index).unwrap();
+            self.bytes -= expired.frame.bytes.len();
+            self.dropped += 1;
+            return None;
+        }
+        let id = self.next_transmission.checked_add(1)?;
+        let queued = self.queue.remove(index).unwrap();
+        self.next_transmission = id;
+        self.active_transmission = Some(id);
+        self.active_frame_count = 1;
+        self.active_survives_clear = true;
+        self.active_fair_delta_bytes = 0;
+        Some(Transmission {
+            queued,
+            follower: None,
+            id,
+        })
     }
     /// Reserve at most two already-owned canonical controls. The second is
     /// the existing normal protected winner: never search past a higher SDT,
@@ -758,7 +792,9 @@ impl Mesh {
                 return None;
             }
             if now.saturating_sub(q.at)
-                > if q.frame.bytes.get(3) == Some(&VOICE) {
+                > if q.mode_reply {
+                    5_000
+                } else if q.frame.bytes.get(3) == Some(&VOICE) {
                     180
                 } else if q.independent_discovery {
                     3_000
@@ -924,7 +960,14 @@ impl Mesh {
     /// Only the mode worker's validated query replies use this admission.
     /// It does not grant general settings presence, liveness or a command lease.
     pub(crate) fn queue_operating_mode_reply(&mut self, payload: &[u8], now: u64) -> bool {
-        self.queue_settings_inner(payload, now, self.role == Role::Primary)
+        if !self.queue_settings_inner(payload, now, self.role == Role::Primary) {
+            return false;
+        }
+        self.queue
+            .back_mut()
+            .expect("accepted settings owner")
+            .mode_reply = true;
+        true
     }
     fn queue_settings_inner(&mut self, payload: &[u8], now: u64, mode_reply: bool) -> bool {
         if !(mode_reply || self.settings_available(now))
@@ -1500,6 +1543,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn background_mode_reservation_is_bounded_mode_only_and_keeps_critical_precedence() {
+        let mut mesh = Mesh::new(Role::Primary, 7);
+        mesh.authenticated_settings_peer(0);
+        assert!(mesh.queue_settings(b"OM\x02not-worker-tagged", 0));
+        assert!(
+            mesh.begin_mode_reply_transmission(500).is_none(),
+            "background cannot promote documents or magic alone"
+        );
+        // The existing250ms document expiry remains unchanged.
+        assert!(mesh.begin_transmission(500).is_none());
+        assert!(mesh.queue_operating_mode_reply(b"OM\x02reply", 500));
+        mesh.tick(500);
+        assert!(
+            mesh.begin_mode_reply_transmission(800).is_none(),
+            "pending HEALTH is protected"
+        );
+        let health = mesh.begin_transmission_at_priority(800, 255).unwrap();
+        mesh.finish_transmission(health, true);
+        let mode = mesh
+            .begin_mode_reply_transmission(800)
+            .expect("mode remains owned after old250ms limit");
+        assert!(
+            decode(&mode.frame().bytes)
+                .unwrap()
+                .1
+                .starts_with(b"OM\x02")
+        );
+        mesh.finish_transmission(mode, false);
+        assert!(
+            mesh.begin_mode_reply_transmission(5501).is_none(),
+            "bounded5s expiry matches retry cadence"
+        );
+        assert_eq!(mesh.bytes, 0);
+        assert!(mesh.queue_operating_mode_reply(b"OM\x02reply", 6000));
+        assert!(
+            mesh.begin_mode_reply_transmission(5999).is_none(),
+            "clock reset cannot preserve future mode ownership indefinitely"
+        );
+        assert_eq!(mesh.bytes, 0);
+    }
     #[test]
     fn display_mode_session_requires_fresh_accepted_health_not_settings_presence() {
         let mut rr = Mesh::new(Role::Rrls, 99);
