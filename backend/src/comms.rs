@@ -149,6 +149,19 @@ pub(crate) fn radio_packet_boundary_contract(priority: u8, payload: &[u8]) -> Op
 }
 
 pub(crate) const RADIO_COMMAND_BATCH_MAX_BYTES: usize = 128;
+/// Relayed pairs include actual canonical end-to-end receipts. Sequenced,
+/// ACK-only, partial-request and SDT traffic keeps individual admissions.
+pub(crate) fn radio_batch_control_contract(priority: u8, payload: &[u8]) -> Option<(u64, bool)> {
+    let contract = radio_packet_boundary_contract(priority, payload)?;
+    let info = serialize::peek_frame_info(payload).ok()?;
+    if !info.reliable.is_none_or(|header| {
+        header.flags == serialize::RELIABLE_FLAG_UNSEQUENCED && header.seq == 0 && header.ack == 0
+    }) {
+        return None;
+    }
+    (contract.1 || is_radio_batch_command(priority, payload)).then_some(contract)
+}
+
 /// Only CRC-valid, self-contained application commands may share one admission.
 pub(crate) fn is_radio_batch_command(priority: u8, payload: &[u8]) -> bool {
     if !radio_packet_boundary_contract(priority, payload).is_some_and(|(_, receipt)| !receipt) {
@@ -730,9 +743,10 @@ impl UartComms {
     fn flush_recovery_output(&mut self, minimum_priority: u8) -> TelemetryResult<()> {
         let shared = self.recovery.as_ref().unwrap().clone();
         self.enable_radio_capacity_control();
-        for _ in 0..4 {
-            // Reserve only the frame being written. Do not pop a batch and lose
-            // its remaining members if the first write fails.
+        let mut serviced_frames = 0;
+        while serviced_frames < 4 {
+            // A bounded pair stays one retained owner until the full write
+            // completes; refusal restores both original logical frames.
             #[cfg(target_os = "linux")]
             let mut write_state = self.write_lock.lock().unwrap();
             #[cfg(not(target_os = "linux"))]
@@ -759,10 +773,22 @@ impl UartComms {
             let transmission = {
                 let mut mesh = shared.lock().unwrap();
                 let now = mesh.now();
-                if normal_ready {
-                    mesh.begin_transmission_at_priority(now, minimum_priority)
-                } else {
-                    mesh.begin_critical_transmission(now, minimum_priority)
+                #[cfg(target_os = "linux")]
+                {
+                    mesh.begin_bounded_transmission(
+                        now,
+                        minimum_priority,
+                        !normal_ready,
+                        4 - serviced_frames,
+                    )
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    if normal_ready {
+                        mesh.begin_transmission_at_priority(now, minimum_priority)
+                    } else {
+                        mesh.begin_critical_transmission(now, minimum_priority)
+                    }
                 }
             };
             let Some(transmission) = transmission else {
@@ -778,75 +804,148 @@ impl UartComms {
                 shared
                     .lock()
                     .unwrap()
-                    .finish_transmission(transmission, false);
+                    .finish_bounded_transmission(transmission, false);
                 break;
             }
+            let frame_count = 1 + usize::from(transmission.follower_frame().is_some());
             let result = (|| -> TelemetryResult<()> {
-                let frame = transmission.frame();
-                let framed = if frame.command {
-                    build_raw_uart_command_frame(&frame.bytes)
-                } else {
-                    build_raw_uart_frame(&frame.bytes)
+                let build = |frame: &crate::rrls::Outgoing| {
+                    if frame.command {
+                        build_raw_uart_command_frame(&frame.bytes)
+                    } else {
+                        build_raw_uart_frame(&frame.bytes)
+                    }
+                };
+                let mut framed = build(transmission.frame())
+                    .map_err(|_| TelemetryError::HandlerError("RRLS frame too large"))?;
+                let mut lengths = [framed.len(), 0];
+                let contracts = transmission.batch_contracts();
+                if let Some(follower) = transmission.follower_frame() {
+                    if contracts.is_none() {
+                        return Err(TelemetryError::HandlerError("invalid RRLS control pair"));
+                    }
+                    let second = build(follower)
+                        .map_err(|_| TelemetryError::HandlerError("RRLS frame too large"))?;
+                    lengths[1] = second.len();
+                    if framed.len() + second.len() > RADIO_COMMAND_BATCH_MAX_BYTES {
+                        return Err(TelemetryError::HandlerError("RRLS control pair too large"));
+                    }
+                    framed.extend_from_slice(&second);
                 }
-                .map_err(|_| TelemetryError::HandlerError("RRLS frame too large"))?;
+                let mut accepted = 0;
                 #[cfg(target_os = "linux")]
-                {
-                    write_all_fd_with_poll(self.inner.as_raw_fd(), &framed, UART_TX_POLL_TIMEOUT)?;
+                let io_result = write_all_fd_with_poll_counted(
+                    self.inner.as_raw_fd(),
+                    &framed,
+                    UART_TX_POLL_TIMEOUT,
+                    &mut accepted,
+                )
+                .and_then(|_| {
                     drain_fd_with_timeout(
                         self.inner.as_raw_fd(),
                         uart_wire_timeout(framed.len(), self.baud_rate),
-                    )?;
-                    if let Some(now) = virtual_wire_now {
-                        write_state
-                            .wire
-                            .committed(now, framed.len(), self.baud_rate);
-                    }
-                }
+                    )
+                });
                 #[cfg(not(target_os = "linux"))]
+                let io_result = self
+                    .inner
+                    .write_all(&framed)
+                    .and_then(|_| self.inner.flush())
+                    .map(|()| {
+                        accepted = framed.len();
+                    });
+                #[cfg(target_os = "linux")]
+                if let Some(now) = virtual_wire_now
+                    && accepted > 0
                 {
-                    self.inner.write_all(&framed)?;
-                    self.inner.flush()?;
+                    write_state.wire.committed(now, accepted, self.baud_rate);
                 }
                 #[cfg(target_os = "linux")]
                 let virtual_stop_us = virtual_wire_now.map(|_| write_state.wire.stop_us());
-                if let Some(capacity) = &mut write_state.radio_capacity {
-                    capacity.committed(capacity_wall, capacity_clock, framed.len());
+                if accepted > 0
+                    && let Some(capacity) = &mut write_state.radio_capacity
+                {
+                    if lengths[1] > 0 {
+                        capacity.committed_command_batch(
+                            capacity_wall,
+                            capacity_clock,
+                            lengths,
+                            accepted,
+                        );
+                    } else {
+                        capacity.committed(capacity_wall, capacity_clock, accepted);
+                    }
                     capacity.drained(Instant::now());
                     #[cfg(target_os = "linux")]
                     if let Some(stop_us) = virtual_stop_us {
                         capacity.drained_virtual(stop_us);
                     }
                     let mut promoted = false;
-                    let closes = transmission.closes_packet_batch();
-                    let contract = if closes {
-                        transmission.boundary_contract()
-                    } else {
-                        None
-                    };
-                    if closes {
-                        promoted = capacity.close_packet_batch_for_contract(
-                            capacity_wall, capacity_clock, contract,
-                        );
-                        if promoted && contract.is_some_and(|(_, receipt)| receipt) {
-                            shared.lock().unwrap().note_receipt_packet_boundary(
-                                capacity.packet_idle_service_bytes(),
+                    let mut receipt_promoted = false;
+                    let contract = transmission.boundary_contract();
+                    if io_result.is_ok() && transmission.closes_packet_batch() {
+                        if let Some(contracts) = contracts {
+                            (promoted, receipt_promoted) =
+                                capacity.close_control_batch(capacity_wall, capacity_clock, contracts);
+                        } else {
+                            promoted = capacity.close_packet_batch_for_contract(
+                                capacity_wall,
+                                capacity_clock,
+                                contract,
+                            );
+                            receipt_promoted = promoted && contract.is_some_and(|(_, receipt)| receipt);
+                        }
+                    }
+                    if receipt_promoted {
+                        shared
+                            .lock()
+                            .unwrap()
+                            .note_receipt_packet_boundary(capacity.packet_idle_service_bytes());
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        if let Some(contracts) = contracts {
+                            for contract in contracts {
+                                trace_virtual_uart_admission(
+                                    "mesh-pair",
+                                    self.side_id,
+                                    Some(contract),
+                                    virtual_wire_now,
+                                    capacity_clock,
+                                    virtual_stop_us,
+                                    capacity.next_packet_virtual_ms(),
+                                    promoted,
+                                    framed.len(),
+                                    accepted,
+                                    io_result.is_ok(),
+                                );
+                            }
+                        } else {
+                            trace_virtual_uart_admission(
+                                "mesh",
+                                self.side_id,
+                                contract,
+                                virtual_wire_now,
+                                capacity_clock,
+                                virtual_stop_us,
+                                capacity.next_packet_virtual_ms(),
+                                promoted,
+                                framed.len(),
+                                accepted,
+                                io_result.is_ok(),
                             );
                         }
                     }
-                    #[cfg(target_os = "linux")]
-                    trace_virtual_uart_admission(
-                        "mesh", self.side_id, contract, virtual_wire_now, capacity_clock,
-                        virtual_stop_us, capacity.next_packet_virtual_ms(), promoted,
-                        framed.len(), framed.len(), true,
-                    );
                 }
+                io_result?;
                 Ok(())
             })();
             shared
                 .lock()
                 .unwrap()
-                .finish_transmission(transmission, result.is_ok());
+                .finish_bounded_transmission(transmission, result.is_ok());
             result?;
+            serviced_frames += frame_count;
         }
         Ok(())
     }
@@ -4142,6 +4241,98 @@ mod raw_uart_tests {
             "combined close retains actual UART quiet"
         );
     }
+    #[cfg(target_os = "linux")]
+    fn mesh_receipt_pair_fixture(
+        port: serialport::TTYPort,
+    ) -> (UartComms, crate::rrls::Shared, Vec<u8>) {
+        crate::telemetry_schema::initialize().unwrap();
+        let (uart, shared, _) = recovery_uart_fixture(port);
+        let mut mesh = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 2);
+        let mut health = b"RR\x01\x00".to_vec();
+        health.extend_from_slice(&1u32.to_le_bytes());
+        health.extend_from_slice(&1u32.to_le_bytes());
+        health.push(0);
+        health.extend_from_slice(&crc32fast::hash(&health).to_le_bytes());
+        mesh.incoming(true, &health, 0);
+        for id in [10u64, 11] {
+            let bytes = serialize::pack_packet(
+                &Packet::new(
+                    sedsnet::config::DataType::ReliableAck,
+                    &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                    "RF",
+                    1,
+                    std::sync::Arc::from(id.to_le_bytes()),
+                )
+                .unwrap(),
+            );
+            mesh.incoming(false, &bytes, 0);
+        }
+        let tx = mesh.begin_bounded_transmission(0, 0, false, 2).unwrap();
+        assert!(tx.follower_frame().is_some());
+        let mut expected = build_raw_uart_command_frame(&tx.frame().bytes).unwrap();
+        expected.extend_from_slice(
+            &build_raw_uart_command_frame(&tx.follower_frame().unwrap().bytes).unwrap(),
+        );
+        mesh.finish_bounded_transmission(tx, false);
+        *shared.lock().unwrap() = mesh;
+        uart.write_lock.lock().unwrap().radio_capacity =
+            Some(rfd_capacity::Capacity::new(64_000, 35, 16));
+        (uart, shared, expected)
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn mesh_receipt_pair_uart_writes_both_original_frames_in_one_owned_admission() {
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(100)).unwrap();
+        let (mut uart, shared, expected) = mesh_receipt_pair_fixture(port);
+        let len = expected.len();
+        assert!(len <= 128);
+        let reader = std::thread::spawn(move || {
+            let mut actual = vec![0; len];
+            peer.read_exact(&mut actual).unwrap();
+            (peer, actual)
+        });
+        uart.flush_recovery_output(0).unwrap();
+        let (_peer, actual) = reader.join().unwrap();
+        assert_eq!(actual, expected);
+        assert!(shared.lock().unwrap().begin_transmission(0).is_none());
+        assert!(
+            !uart
+                .write_lock
+                .lock()
+                .unwrap()
+                .radio_capacity
+                .as_ref()
+                .unwrap()
+                .ready(Instant::now(), None)
+        );
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn mesh_receipt_pair_uart_failure_restores_both_original_frames() {
+        let (peer, port) = serialport::TTYPort::pair().unwrap();
+        let (mut uart, shared, expected) = mesh_receipt_pair_fixture(port);
+        drop(peer);
+        assert!(uart.flush_recovery_output(0).is_err());
+        let mut mesh = shared.lock().unwrap();
+        let tx = mesh.begin_bounded_transmission(0, 0, false, 2).unwrap();
+        let mut actual = build_raw_uart_command_frame(&tx.frame().bytes).unwrap();
+        actual.extend_from_slice(
+            &build_raw_uart_command_frame(&tx.follower_frame().unwrap().bytes).unwrap(),
+        );
+        assert_eq!(actual, expected);
+        mesh.finish_bounded_transmission(tx, false);
+        assert!(
+            uart.write_lock
+                .lock()
+                .unwrap()
+                .radio_capacity
+                .as_ref()
+                .unwrap()
+                .ready(Instant::now(), None)
+        );
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn counted_uart_error_reports_the_physical_prefix_without_completing_logical_packets() {

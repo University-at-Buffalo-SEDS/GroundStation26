@@ -125,16 +125,35 @@ impl Capacity {
         clock: Option<u64>,
         ids: [u64; 2],
     ) -> bool {
-        let promoted = ids
-            .into_iter()
-            .any(|id| self.close_packet_batch_for_contract(wall, clock, Some((id, false))));
-        if promoted {
-            for id in ids {
-                self.remember_promotion(id, false);
+        self.close_control_batch(wall, clock, ids.map(|id| (id, false)))
+            .0
+    }
+
+    /// One physical close may serve two already-owned commands/receipts.
+    /// Prefer an eligible receipt's existing permit, then ordinary commands.
+    /// No new permit is created; mark both contracts only after actual close.
+    pub(crate) fn close_control_batch(
+        &mut self,
+        wall: Instant,
+        clock: Option<u64>,
+        contracts: [(u64, bool); 2],
+    ) -> (bool, bool) {
+        for receipt in [true, false] {
+            for contract in contracts
+                .into_iter()
+                .filter(|(_, is_receipt)| *is_receipt == receipt)
+            {
+                if self.close_packet_batch_for_contract(wall, clock, Some(contract)) {
+                    for (id, receipt) in contracts {
+                        self.remember_promotion(id, receipt);
+                    }
+                    return (true, receipt);
+                }
             }
         }
-        promoted
+        (false, false)
     }
+
     /// Charged ordinary bytes displaced by one modem idle gap. This is a
     /// scheduler-service allowance only, never UART or airtime readiness.
     pub(crate) fn packet_idle_service_bytes(&self) -> usize {
@@ -371,6 +390,35 @@ impl Capacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn paired_receipt_and_command_share_one_existing_permit_with_distinct_dedup_bits() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64_000, 35, 16);
+        assert!(cap.close_packet_batch_for_contract(wall, Some(0), Some((1, false))));
+        assert_eq!(
+            cap.close_control_batch(wall, Some(60), [(1, false), (1, true)]),
+            (true, true)
+        );
+        assert_eq!(cap.last_forced_boundary.unwrap().1, Some(60));
+        assert_eq!(cap.last_receipt_boundary.unwrap().1, Some(60));
+        assert_eq!(
+            cap.close_control_batch(wall, Some(100), [(2, true), (3, true)]),
+            (false, false)
+        );
+        assert_eq!(
+            cap.close_control_batch(wall, Some(216), [(1, false), (1, true)]),
+            (false, false)
+        );
+        assert_eq!(
+            cap.close_control_batch(wall, Some(216), [(2, true), (3, true)]),
+            (true, true)
+        );
+        assert_eq!(
+            cap.close_control_batch(wall, Some(400), [(2, true), (3, true)]),
+            (false, false)
+        );
+    }
+
     #[test]
     fn diagnostic_packet_deadline_snapshot_keeps_exact_admission_state() {
         let wall=Instant::now();let mut cap=Capacity::new(64_000,35,16);

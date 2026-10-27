@@ -258,44 +258,61 @@ fn captured_bidirectional_relay_burst_retains_source_and_canonical_deadlines() {
         capacity.apply_recovery_share(relay.recovery_air_share(now), wall, Some(now));
         peak = peak.max(relay.queue.len());
         assert!(relay.queue.len() <= MAX_FRAMES && relay.bytes <= MAX_BYTES);
-        for _ in 0..4 {
+        let mut serviced_frames = 0;
+        while serviced_frames < 4 {
             if !wire.ready(now) {
                 break;
             }
-            let candidate = if capacity.ready(wall, Some(now)) {
-                relay.begin_transmission(now)
-            } else {
-                relay.begin_critical_transmission(now, 0)
-            };
+            let candidate = relay.begin_bounded_transmission(
+                now,
+                0,
+                !capacity.ready(wall, Some(now)),
+                4 - serviced_frames,
+            );
             let Some(transmission) = candidate else {
                 break;
             };
             if !capacity.ready_for(wall, Some(now), transmission.closes_packet_batch()) {
-                relay.finish_transmission(transmission, false);
+                relay.finish_bounded_transmission(transmission, false);
                 break;
             }
-            let frame = transmission.frame();
-            let framed_len = frame.bytes.len() + 4;
-            if decode(&frame.bytes).is_some_and(|(kind, _)| kind == READY) {
-                ready_times.push(now);
+            let frames = [Some(transmission.frame()), transmission.follower_frame()];
+            let mut lengths = [0; 2];
+            for (i, frame) in frames.into_iter().enumerate() {
+                let Some(frame) = frame else { continue };
+                lengths[i] = frame.bytes.len() + 4;
+                if decode(&frame.bytes).is_some_and(|(kind, _)| kind == READY) {
+                    ready_times.push(now);
+                }
+                if let Some((kind, body)) = decode(&frame.bytes)
+                    && let Some(indices) = pending.get_mut(&(kind, body.to_vec()))
+                    && let Some(index) = indices.pop_front()
+                {
+                    outcomes.insert(index, now);
+                }
             }
-            if let Some((kind, body)) = decode(&frame.bytes)
-                && let Some(indices) = pending.get_mut(&(kind, body.to_vec()))
-                && let Some(index) = indices.pop_front()
-            {
-                outcomes.insert(index, now);
+            let count = 1 + usize::from(lengths[1] > 0);
+            wire.committed(now, lengths.iter().sum(), 115_200);
+            if lengths[1] > 0 {
+                capacity.committed_command_batch(wall, Some(now), lengths, lengths.iter().sum());
+            } else {
+                capacity.committed(wall, Some(now), lengths[0]);
             }
-            wire.committed(now, framed_len, 115_200);
-            capacity.committed(wall, Some(now), framed_len);
             capacity.drained_virtual(wire.stop_us());
             if transmission.closes_packet_batch() {
-                let contract = transmission.boundary_contract();
-                let promoted = capacity.close_packet_batch_for_contract(wall, Some(now), contract);
-                if promoted && contract.is_some_and(|(_, receipt)| receipt) {
+                let receipt_promoted = if let Some(contracts) = transmission.batch_contracts() {
+                    capacity.close_control_batch(wall, Some(now), contracts).1
+                } else {
+                    let contract = transmission.boundary_contract();
+                    capacity.close_packet_batch_for_contract(wall, Some(now), contract)
+                        && contract.is_some_and(|(_, receipt)| receipt)
+                };
+                if receipt_promoted {
                     relay.note_receipt_packet_boundary(capacity.packet_idle_service_bytes());
                 }
             }
-            relay.finish_transmission(transmission, true);
+            relay.finish_bounded_transmission(transmission, true);
+            serviced_frames += count;
         }
     }
     let mut failures = Vec::new();

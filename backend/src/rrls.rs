@@ -144,7 +144,7 @@ pub fn status() -> Status {
             forwarding: m.active(now),
             relay_requested: m.fallback,
             direct_age_ms: m.last_direct.map(|v| now.saturating_sub(v)),
-            queued_frames: m.queue.len() + usize::from(m.active_transmission.is_some()),
+            queued_frames: m.queue.len() + usize::from(m.active_frame_count),
             dropped_frames: m.dropped,
             forwarded_frames: m.forwarded,
         }
@@ -193,11 +193,28 @@ impl Queued {
 /// Keeping metadata with the frame permits retry without copying its payload.
 pub(crate) struct Transmission {
     queued: Queued,
+    follower: Option<Queued>,
     id: u64,
 }
 impl Transmission {
     pub(crate) fn frame(&self) -> &Outgoing {
         &self.queued.frame
+    }
+    pub(crate) fn follower_frame(&self) -> Option<&Outgoing> {
+        self.follower.as_ref().map(|queued| &queued.frame)
+    }
+    pub(crate) fn batch_contracts(&self) -> Option<[(u64, bool); 2]> {
+        Some([
+            Self::batch_contract(&self.queued)?,
+            Self::batch_contract(self.follower.as_ref()?)?,
+        ])
+    }
+    fn batch_contract(queued: &Queued) -> Option<(u64, bool)> {
+        if queued.priority < 254 || queued.independent_discovery {
+            return None;
+        }
+        let (_, body) = decode(&queued.frame.bytes)?;
+        crate::comms::radio_batch_control_contract(queued.priority, body)
     }
     pub(crate) fn closes_packet_batch(&self) -> bool {
         self.queued.closes_packet_batch()
@@ -241,6 +258,7 @@ pub struct Mesh {
     forwarded: u64,
     templates: VecDeque<TemplateClass>,
     active_transmission: Option<u64>,
+    active_frame_count: u8,
     active_cancelled: bool,
     active_survives_clear: bool,
     next_transmission: u64,
@@ -280,6 +298,7 @@ impl Mesh {
             forwarded: 0,
             templates: VecDeque::new(),
             active_transmission: None,
+            active_frame_count: 0,
             active_cancelled: false,
             active_survives_clear: false,
             next_transmission: 0,
@@ -519,7 +538,7 @@ impl Mesh {
                 self.dropped += 1;
             }
         }
-        while self.queue.len() + usize::from(self.active_transmission.is_some()) >= MAX_FRAMES
+        while self.queue.len() + usize::from(self.active_frame_count) >= MAX_FRAMES
             || self.bytes + frame.bytes.len() > MAX_BYTES
         {
             let Some((i, p)) = self
@@ -572,6 +591,54 @@ impl Mesh {
     ) -> Option<Transmission> {
         self.begin_matching_transmission(now, minimum_priority, true)
     }
+    /// Reserve at most two already-owned canonical controls. The second is
+    /// the existing normal protected winner: never search past a higher SDT,
+    /// READY or GPS entry, and never consume an ordinary/metadata service turn.
+    pub(crate) fn begin_bounded_transmission(
+        &mut self,
+        now: u64,
+        minimum_priority: u8,
+        critical_only: bool,
+        frame_budget: usize,
+    ) -> Option<Transmission> {
+        if frame_budget == 0 {
+            return None;
+        }
+        let mut transmission =
+            self.begin_matching_transmission(now, minimum_priority, critical_only)?;
+        if frame_budget < 2
+            || self.active_fair_delta_bytes != 0
+            || Transmission::batch_contract(&transmission.queued).is_none()
+        {
+            return Some(transmission);
+        }
+        let candidate = self
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(index, item)| {
+                !item.independent_discovery && item.priority >= 254 && self.dependency_ready(*index)
+            })
+            .max_by_key(|(index, item)| (item.priority, std::cmp::Reverse(*index)))
+            .map(|(index, _)| index);
+        if let Some(index) = candidate {
+            let queued = &self.queue[index];
+            let wire_bytes = transmission.queued.frame.bytes.len() + queued.frame.bytes.len() + 8;
+            let expired =
+                now.saturating_sub(queued.at) > if queued.priority == 255 { 1500 } else { 250 };
+            if queued.priority >= minimum_priority
+                && !expired
+                && wire_bytes <= crate::comms::RADIO_COMMAND_BATCH_MAX_BYTES
+                && Transmission::batch_contract(queued).is_some()
+            {
+                transmission.follower = self.queue.remove(index);
+                self.active_frame_count = 2;
+                self.active_survives_clear = false;
+            }
+        }
+        Some(transmission)
+    }
+
     fn begin_matching_transmission(
         &mut self,
         now: u64,
@@ -711,11 +778,12 @@ impl Mesh {
             };
             self.next_transmission = id;
             self.active_transmission = Some(id);
+            self.active_frame_count = 1;
             self.active_survives_clear = matches!(
                 queued.frame.bytes.get(3),
                 Some(&POSITION) | Some(&VOICE) | Some(&SETTINGS)
             );
-            return Some(Transmission { queued, id });
+            return Some(Transmission { queued, follower: None, id });
         }
     }
 
@@ -724,21 +792,41 @@ impl Mesh {
         transmission: Transmission,
         sent: bool,
     ) -> Option<Outgoing> {
+        assert!(
+            transmission.follower.is_none(),
+            "paired owner requires paired completion"
+        );
+        self.finish_bounded_transmission(transmission, sent)
+            .map(|(first, _)| first)
+    }
+
+    pub(crate) fn finish_bounded_transmission(
+        &mut self,
+        transmission: Transmission,
+        sent: bool,
+    ) -> Option<(Outgoing, Option<Outgoing>)> {
         assert_eq!(self.active_transmission, Some(transmission.id));
+        let count = 1 + usize::from(transmission.follower.is_some());
+        assert_eq!(usize::from(self.active_frame_count), count);
         self.active_transmission = None;
+        self.active_frame_count = 0;
         let fair_delta = std::mem::take(&mut self.active_fair_delta_bytes);
+        let owned_bytes = transmission.queued.frame.bytes.len()
+            + transmission
+                .follower
+                .as_ref()
+                .map_or(0, |queued| queued.frame.bytes.len());
         if !sent && self.active_cancelled {
-            // A topology transition invalidated this write while IO was outside
-            // the mesh lock. Do not resurrect its old relay frame on retry.
             self.active_cancelled = false;
-            self.bytes -= transmission.queued.frame.bytes.len();
-            self.dropped += 1;
+            self.bytes -= owned_bytes;
+            self.dropped += count as u64;
             return None;
         }
         self.active_cancelled = false;
         if !sent {
-            // Keep the original timestamp, priority, payload and reservation.
-            // The next selection may choose a newly queued higher-priority frame.
+            if let Some(follower) = transmission.follower {
+                self.queue.push_front(follower);
+            }
             self.queue.push_front(transmission.queued);
             return None;
         }
@@ -746,11 +834,14 @@ impl Mesh {
         if transmission.queued.independent_discovery {
             self.receipt_service_pending = false;
         }
-        let frame = transmission.queued.frame;
-        self.bytes -= frame.bytes.len();
-        self.forwarded += 1;
-        Some(frame)
+        self.bytes -= owned_bytes;
+        self.forwarded += count as u64;
+        Some((
+            transmission.queued.frame,
+            transmission.follower.map(|queued| queued.frame),
+        ))
     }
+
 
     /// Replacing a live ordinary/metadata batch with a receipt idle gap costs
     /// ordinary service. Reserve only that charged-byte service before the next
@@ -804,7 +895,7 @@ impl Mesh {
     pub fn queue_settings(&mut self, payload: &[u8], now: u64) -> bool {
         if !self.settings_available(now)
             || payload.len() > paired_settings::auth::MAX_WIRE
-            || self.queue.len() + usize::from(self.active_transmission.is_some()) >= MAX_FRAMES
+            || self.queue.len() + usize::from(self.active_frame_count) >= MAX_FRAMES
             || self.bytes + payload.len() + 8 > MAX_BYTES
             || self
                 .queue
@@ -2777,3 +2868,182 @@ mod captured_replay;
 #[cfg(test)]
 #[path = "rrls/shared_air.rs"]
 mod shared_air;
+
+#[cfg(test)]
+mod pair_tests {
+    use super::*;
+    use sedsnet::{packet::Packet, wire_format as serialize};
+    use std::sync::Arc;
+
+    fn control(receipt: bool, value: u64) -> Vec<u8> {
+        crate::telemetry_schema::initialize().unwrap();
+        let ty = if receipt {
+            sedsnet::config::DataType::ReliableAck
+        } else {
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND")
+        };
+        let payload: Arc<[u8]> = if receipt {
+            Arc::from(value.to_le_bytes())
+        } else {
+            Arc::from([1u8])
+        };
+        serialize::pack_packet(
+            &Packet::new(
+                ty,
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "RF",
+                value,
+                payload,
+            )
+            .unwrap(),
+        )
+        .to_vec()
+    }
+    fn enqueue(mesh: &mut Mesh, bytes: &[u8], now: u64) {
+        mesh.enqueue(Outgoing { command: true, bytes: encode(DOWN_DATA, bytes) }, 254, now);
+    }
+    #[test]
+    fn bounded_pair_retains_two_owners_bytes_and_stats_through_refusal() {
+        let a = control(true, 10);
+        let b = control(true, 11);
+        let mut mesh = Mesh::new(Role::Rrls, 2);
+        enqueue(&mut mesh, &a, 0);
+        enqueue(&mut mesh, &b, 0);
+        let bytes = mesh.bytes;
+        let tx = mesh.begin_bounded_transmission(0, 0, false, 2).unwrap();
+        assert!(tx.follower_frame().is_some());
+        assert_eq!(mesh.active_frame_count, 2);
+        assert_eq!(mesh.bytes, bytes);
+        assert_eq!(mesh.forwarded, 0);
+        assert!(mesh.begin_transmission(0).is_none());
+        mesh.finish_bounded_transmission(tx, false);
+        assert_eq!(mesh.active_frame_count, 0);
+        assert_eq!(mesh.bytes, bytes);
+        let tx = mesh.begin_bounded_transmission(1, 0, false, 2).unwrap();
+        assert_eq!(decode(&tx.frame().bytes).unwrap().1, a);
+        assert_eq!(decode(&tx.follower_frame().unwrap().bytes).unwrap().1, b);
+        let (first, second) = mesh.finish_bounded_transmission(tx, true).unwrap();
+        assert_eq!(decode(&first.bytes).unwrap().1, a);
+        assert_eq!(decode(&second.unwrap().bytes).unwrap().1, b);
+        assert_eq!(mesh.forwarded, 2);
+        assert_eq!(mesh.bytes, 0);
+        assert!(mesh.queue.is_empty());
+    }
+    #[test]
+    fn bounded_pair_never_searches_past_protected_ready_or_sdt() {
+        let command = control(false, 10);
+        for (blocker, priority) in [
+            (encode(READY, &[0; 8]), 255),
+            (encode(DOWN_DATA, b"SDT\x03opaque"), 255),
+            (encode(DOWN_DATA, b"SDT\x03opaque"), 254),
+        ] {
+            let mut mesh = Mesh::new(Role::Rrls, 2);
+            enqueue(&mut mesh, &command, 0);
+            mesh.enqueue(
+                Outgoing {
+                    command: true,
+                    bytes: blocker.clone(),
+                },
+                priority,
+                0,
+            );
+            enqueue(&mut mesh, &control(true, 12), 0);
+            let tx = mesh.begin_bounded_transmission(0, 0, true, 2).unwrap();
+            assert!(tx.follower_frame().is_none());
+            assert_eq!(decode(&tx.frame().bytes).unwrap().1, command);
+            mesh.finish_bounded_transmission(tx, true);
+            assert!(mesh.queue.iter().any(|item| item.frame.bytes == blocker));
+        }
+    }
+    #[test]
+    fn bounded_pair_rejects_ordered_corrupt_and_oversized_followers_without_reordering() {
+        let command = control(false, 10);
+        let packet = serialize::unpack_packet(&command).unwrap();
+        let ordered = serialize::pack_packet_with_reliable(
+            &packet,
+            serialize::ReliableHeader {
+                flags: 0,
+                seq: 7,
+                ack: 0,
+            },
+        )
+        .to_vec();
+        let mut corrupt = command.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let oversized = serialize::pack_packet(
+            &Packet::new(
+                crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+                &std::array::from_fn::<_, 32, _>(|i| {
+                    sedsnet::config::DataEndpoint(u32::MAX - i as u32)
+                }),
+                "RF",
+                11,
+                Arc::from([1u8]),
+            )
+            .unwrap(),
+        )
+        .to_vec();
+        for follower in [ordered, corrupt, oversized] {
+            let mut mesh = Mesh::new(Role::Rrls, 2);
+            enqueue(&mut mesh, &command, 0);
+            enqueue(&mut mesh, &follower, 0);
+            let tx = mesh.begin_bounded_transmission(0, 0, false, 2).unwrap();
+            assert!(tx.follower_frame().is_none());
+            assert_eq!(
+                decode(&mesh.queue.front().unwrap().frame.bytes).unwrap().1,
+                follower
+            );
+            mesh.finish_bounded_transmission(tx, true);
+        }
+    }
+    #[test]
+    fn bounded_pair_clear_accounts_both_reserved_slots_at_full_queue() {
+        let mut mesh = Mesh::new(Role::Rrls, 2);
+        enqueue(&mut mesh, &control(false, 1), 0);
+        enqueue(&mut mesh, &control(true, 2), 0);
+        for _ in 2..MAX_FRAMES {
+            mesh.enqueue(
+                Outgoing {
+                    command: false,
+                    bytes: encode(DOWN_DATA, b"ordinary"),
+                },
+                0,
+                0,
+            );
+        }
+        let tx = mesh.begin_bounded_transmission(0, 0, false, 2).unwrap();
+        assert!(tx.follower_frame().is_some());
+        assert_eq!(
+            mesh.queue.len() + usize::from(mesh.active_frame_count),
+            MAX_FRAMES
+        );
+        enqueue(&mut mesh, &control(true, 3), 0);
+        assert_eq!(
+            mesh.queue.len() + usize::from(mesh.active_frame_count),
+            MAX_FRAMES
+        );
+        let retained = tx.frame().bytes.len() + tx.follower_frame().unwrap().bytes.len();
+        mesh.clear();
+        assert_eq!(mesh.bytes, retained);
+        assert!(mesh.queue.is_empty());
+        mesh.finish_bounded_transmission(tx, false);
+        assert_eq!(mesh.bytes, 0);
+        assert_eq!(mesh.active_frame_count, 0);
+        assert_eq!(mesh.forwarded, 0);
+        assert_eq!(mesh.dropped, MAX_FRAMES as u64 + 1);
+    }
+    #[test]
+    fn bounded_pair_honors_remaining_frame_budget_and_never_waits_for_future_data() {
+        let mut mesh = Mesh::new(Role::Rrls, 2);
+        enqueue(&mut mesh, &control(false, 1), 0);
+        enqueue(&mut mesh, &control(true, 2), 0);
+        assert!(mesh.begin_bounded_transmission(0, 0, false, 0).is_none());
+        let tx = mesh.begin_bounded_transmission(0, 0, false, 1).unwrap();
+        assert!(tx.follower_frame().is_none());
+        mesh.finish_bounded_transmission(tx, true);
+        let tx = mesh.begin_bounded_transmission(0, 0, false, 2).unwrap();
+        assert!(tx.follower_frame().is_none());
+        mesh.finish_bounded_transmission(tx, true);
+        assert!(mesh.begin_bounded_transmission(0, 0, false, 2).is_none());
+    }
+}

@@ -34,6 +34,29 @@ fn driver_send(
     contract: Option<(u64, bool)>,
     mesh: Option<&Shared>,
 ) -> sedsnet::TelemetryResult<()> {
+    driver_send_with_pair(
+        air,
+        drivers,
+        node,
+        now,
+        bytes,
+        close_batch,
+        contract,
+        mesh,
+        None,
+    )
+}
+fn driver_send_with_pair(
+    air: &Arc<Mutex<SharedAir>>,
+    drivers: &Drivers,
+    node: usize,
+    now: u64,
+    bytes: Vec<u8>,
+    close_batch: bool,
+    contract: Option<(u64, bool)>,
+    mesh: Option<&Shared>,
+    pair: Option<([usize; 2], [(u64, bool); 2])>,
+) -> sedsnet::TelemetryResult<()> {
     let mut driver = drivers.lock().unwrap();
     if !driver[node].wire.ready(now)
         || !driver[node]
@@ -57,21 +80,35 @@ fn driver_send(
         }
     }
     driver[node].wire.committed(now, length, 115_200);
-    driver[node]
-        .capacity
-        .committed(std::time::Instant::now(), Some(now), length);
+    if let Some((lengths, _)) = pair {
+        driver[node].capacity.committed_command_batch(
+            std::time::Instant::now(),
+            Some(now),
+            lengths,
+            length,
+        );
+    } else {
+        driver[node]
+            .capacity
+            .committed(std::time::Instant::now(), Some(now), length);
+    }
     let stop_us = driver[node].wire.stop_us();
     driver[node].capacity.drained_virtual(stop_us);
     if close_batch {
-        let promoted = driver[node].capacity.close_packet_batch_for_contract(
-            std::time::Instant::now(),
-            Some(now),
-            contract,
-        );
-        if promoted
-            && contract.is_some_and(|(_, receipt)| receipt)
-            && let Some(mesh) = mesh
-        {
+        let receipt_promoted = if let Some((_, contracts)) = pair {
+            driver[node]
+                .capacity
+                .close_control_batch(std::time::Instant::now(), Some(now), contracts)
+                .1
+        } else {
+            let promoted = driver[node].capacity.close_packet_batch_for_contract(
+                std::time::Instant::now(),
+                Some(now),
+                contract,
+            );
+            promoted && contract.is_some_and(|(_, receipt)| receipt)
+        };
+        if receipt_promoted && let Some(mesh) = mesh {
             mesh.lock()
                 .unwrap()
                 .note_receipt_packet_boundary(driver[node].capacity.packet_idle_service_bytes());
@@ -106,38 +143,53 @@ fn flush_mesh(
     node: usize,
     now: u64,
 ) {
-    for _ in 0..4 {
+    let mut serviced_frames = 0;
+    while serviced_frames < 4 {
         if !drivers.lock().unwrap()[node].wire.ready(now) {
             break;
         }
         let normal_ready = drivers.lock().unwrap()[node]
             .capacity
             .ready(std::time::Instant::now(), Some(now));
-        let candidate = if normal_ready {
-            mesh.lock().unwrap().begin_transmission(now)
-        } else {
-            mesh.lock().unwrap().begin_critical_transmission(now, 0)
-        };
+        let candidate = mesh.lock().unwrap().begin_bounded_transmission(
+            now,
+            0,
+            !normal_ready,
+            4 - serviced_frames,
+        );
         let Some(transmission) = candidate else {
             break;
         };
-        let accepted = driver_send(
+        let mut bytes = serial(transmission.frame());
+        let mut lengths = [bytes.len(), 0];
+        if let Some(frame) = transmission.follower_frame() {
+            let second = serial(frame);
+            lengths[1] = second.len();
+            bytes.extend_from_slice(&second);
+        }
+        let count = 1 + usize::from(lengths[1] > 0);
+        let pair = transmission
+            .batch_contracts()
+            .map(|contracts| (lengths, contracts));
+        let accepted = driver_send_with_pair(
             air,
             drivers,
             node,
             now,
-            serial(transmission.frame()),
+            bytes,
             transmission.closes_packet_batch(),
             transmission.boundary_contract(),
             Some(mesh),
+            pair,
         )
         .is_ok();
         mesh.lock()
             .unwrap()
-            .finish_transmission(transmission, accepted);
+            .finish_bounded_transmission(transmission, accepted);
         if !accepted {
             break;
         }
+        serviced_frames += count;
     }
 }
 fn run_case(mode: ReliableMode, fifo: usize, overhead_bits: u32, duration: u64) {
