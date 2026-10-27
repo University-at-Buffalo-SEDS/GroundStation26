@@ -1,0 +1,103 @@
+{
+  "scope": "Native qualification of bounded host-only opportunistic command pairs. Integrated command500ms gate remains unqualified pending a new linked execution. No physical-radio hardware qualification.",
+  "date": "2026-10-27",
+  "base_gs_commit": "46c0cd5dae0813c1fb5fdc840b1344e07e76b476",
+  "sdk_commit": "d82b5526c56a20f65f6257478ae32f3ff9af5674",
+  "rf_commit": "728b9c0",
+  "source_sha256": {
+    "backend/src/comms.rs": "5a8b5c79058524724bcf3c3c60ad4b1c94daf417bff804120b8f55243ee6190a",
+    "backend/src/comms/rfd_capacity.rs": "930077a648e5c2d5c4917d701a20eb7c73752c81bc8a8c6926db4a62e7bb5539",
+    "backend/src/telemetry_task/radio_io.rs": "4361d5554bb26c113de76e6ecf90143a88652fa6c161a4affbb850f354efe14d"
+  },
+  "policy": {
+    "max_already_owned_frames": 2,
+    "max_actual_framed_bytes": 128,
+    "eligibility": "CRC-valid fully decoded independent canonical application commands; no receipts, SDT, discovery or future-command waiting",
+    "selection": "Second frame must be the next existing ordinary-fairness selection. Refused/ineligible selection restores its checkpoint and queue ownership.",
+    "io": "One routing-clock snapshot and shared UART write lock. Both original frames preserved. Complete per-frame activity/budget/logging only after full write and drain; error retains both original IDs/order. Counted accepted prefix remains charged even on error.",
+    "air_charge": "Sum of each original frame overhead and integer rounding, including each actually begun partial frame. One unpaid-loan admission and one packet close; unchanged share/quiet/burst/byte/queue bounds.",
+    "dedup": "Both command IDs recorded only when physical boundary promoted. First returning receipt retains separate protection.",
+    "retained_queue_or_state_growth": false,
+    "platform": "Linux RawUart override only; unsupported devices use existing single-frame path."
+  },
+  "native_tests": {
+    "normal": {
+      "passed": 607,
+      "failed": 0,
+      "ignored_existing": 3
+    },
+    "test_fire_mode": {
+      "passed": 608,
+      "failed": 0,
+      "ignored_existing": 3
+    },
+    "new_regressions": [
+      "already-owned pair/no future wait",
+      "fair metadata turn and1000iteration sustained commands",
+      "oversized/opaque/corrupt/receipt follower refusal",
+      "CRC-valid malformed payload rejected before any IO/capacity",
+      "failure restores both payloads/order/fairness checkpoint",
+      "actual PTY exact original framed byte stream",
+      "counted partial UART prefix remains charged",
+      "original55B+61B per-frame cost and all boundary partial costs",
+      "both logical close IDs and independent returning receipt"
+    ],
+    "logs": {
+      "normal": {
+        "path": "/tmp/command-batch-final-native-full-20261027.log",
+        "sha256": "605848367861128a6b86097aa2f49437239ed20367f806479adf46fce8a13eb4"
+      },
+      "test_fire_mode": {
+        "path": "/tmp/command-batch-final-testfire-full-20261027.log",
+        "sha256": "f8fc7a3caa3ee33c0b844fa8b51c007eac26031eb4f896397dbf0aacaba0b6cf"
+      },
+      "captured_replay": {
+        "path": "/tmp/command-batch-current-old-capture-replay-20261027.log",
+        "sha256": "ce16d248b3556ca10cdf7ebe0fd7b618e15ae2cce03471d5a14ce130128f9bcc"
+      },
+      "final_source_smoke": {
+        "path": "/tmp/command-batch-final-source-smoke-20261027.log",
+        "sha256": "8691ed495b172e0d9fdae747265ad1e345e3e12db2845e4f83bb1fc260afa23d"
+      }
+    },
+    "note": "Final source smoke additionally compiles final formatting/comment/log-order edits. Native capture replay measures offload before air, not end-to-end receipt latency."
+  },
+  "captures": {
+    "old14915": {
+      "source_retained": 149,
+      "canonical_retained": 15,
+      "original_limits_preserved": true
+    },
+    "current14911": {
+      "source_retained": 149,
+      "canonical_retained": 11,
+      "max_source_rf_to_offload_us": 953800,
+      "max_canonical_to_offload_us": 1373300,
+      "routine_upstream_heartbeat_expiry": 10,
+      "original_limits_preserved": true,
+      "codec_proof": "FirmwareSimulator/build/schema-progress-cohort-20261027/native-current14911-replay-v2/heartbeat-codec-audit/audit.json",
+      "codec_note": "Same frozenSDKd82 and unchanged current fixture/expiry set; existing exact10 omitted-HB proof remains applicable."
+    }
+  },
+  "causal_native_audit": {
+    "path": "FirmwareSimulator/build/schema-progress-cohort-20261027/native-command-batch-audit",
+    "baseline_next_FC_eligible_ms": 30091,
+    "baseline_next_tick_ms": 30100,
+    "batch_assumed_coavailable_ms": 30001,
+    "original_per_frame_cost_ms": [
+      60,
+      65
+    ],
+    "health_cost_ms": 31,
+    "full_debt_paid_ms": 30156,
+    "baseline_first_hop_arrival_us": 30223200,
+    "open_loop_batch_first_hop_arrival_us": 30093700,
+    "improvement_us": 129500,
+    "limitations": "Only captured GS FC61B moved immediately after UND55B. Other TX stays open-loop. Baseline first-hop arrival reproduced exactly through unchanged production C#medium; queue coavailability and final ACK improvement need integrated execution. Initial aggregate-overhead rebate hypothesis was rejected and corrected; future captured GS30170.1ms is after corrected full debt30156ms."
+  },
+  "remaining": [
+    "New closed-loop exact60s command500ms and source149/11 gates with candidate GS host image.",
+    "Hardware active proprietary RFD framing/ACK/MAC latency remains separately unqualified."
+  ],
+  "release": "Local source commit only; no push, SDK/RF mutation, deploy or publication."
+}

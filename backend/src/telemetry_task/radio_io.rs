@@ -346,6 +346,54 @@ impl WireBacklog {
             backlog_push(&mut self.priorities, priority, payload, front);
         }
     }
+    fn selection_state(&self) -> (usize, bool, usize, usize) {
+        (
+            self.application_bytes,
+            self.ordered_metadata_next,
+            self.priority_bytes,
+            self.control_bytes,
+        )
+    }
+    fn restore_selection(&mut self, state: (usize, bool, usize, usize)) {
+        (
+            self.application_bytes,
+            self.ordered_metadata_next,
+            self.priority_bytes,
+            self.control_bytes,
+        ) = state;
+    }
+    fn restore_selected(
+        &mut self,
+        state: (usize, bool, usize, usize),
+        first: (u8, Vec<u8>),
+        second: Option<(u8, Vec<u8>)>,
+    ) {
+        self.restore_selection(state);
+        if let Some((priority, payload)) = second {
+            self.push(priority, payload, true);
+        }
+        self.push(first.0, first.1, true);
+    }
+    /// Apply ordinary selection/fairness first. Only a command that would be
+    /// selected next anyway may join the already selected command.
+    fn batch_follower(&mut self, comms: &dyn CommsDevice, first: (u8, &[u8])) -> Option<(u8, Vec<u8>)> {
+        let first_bytes = comms.command_batch_frame_len(first.0, first.1)?;
+        let state = self.selection_state();
+        let Some(second) = self.pop() else {
+            self.restore_selection(state);
+            return None;
+        };
+        let eligible = comms
+            .command_batch_frame_len(second.0, &second.1)
+            .is_some_and(|size| size + first_bytes <= crate::comms::RADIO_COMMAND_BATCH_MAX_BYTES);
+        if eligible {
+            Some(second)
+        } else {
+            self.restore_selection(state);
+            self.push(second.0, second.1, true);
+            None
+        }
+    }
     fn pop_critical(&mut self) -> Option<(u8, Vec<u8>)> {
         // Canonical controls are independent of the ordered SDT dictionaries.
         // Routine heartbeat/GPS/discovery must not hide one eligible loan.
@@ -427,6 +475,164 @@ impl WireBacklog {
 #[cfg(test)]
 mod priority_tests {
     use super::*;
+    struct BatchTestComms;
+    impl CommsDevice for BatchTestComms {
+        fn command_batch_frame_len(&self, priority:u8, payload:&[u8]) -> Option<usize> {
+            crate::comms::is_radio_batch_command(priority,payload).then_some(payload.len()+12)
+        }
+        fn send_data(&mut self,_:&[u8])->Result<(),Box<dyn std::error::Error+Send+Sync>> { unreachable!() }
+        fn set_side_id(&mut self,_:RouterSideId) {}
+        fn recv_packet(&mut self,_:&Router,_:&mut dyn FnMut(&Packet))->sedsnet::TelemetryResult<()> { unreachable!() }
+    }
+    fn batch_test_command(name: &str, payload: &[u8]) -> Vec<u8> {
+        crate::telemetry_schema::initialize().unwrap();
+        serialize::pack_packet(
+            &Packet::new(
+                crate::telemetry_schema::data_type(name),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "GS",
+                1,
+                Arc::from(payload),
+            )
+            .unwrap(),
+        )
+        .to_vec()
+    }
+    #[test]
+    fn existing_worker_backlog_coavailable_commands_form_bounded_pair_without_waiting() {
+        let first = batch_test_command("AV_BAY_UNDERGLOW", &[1]);
+        let second = batch_test_command("FLIGHT_COMMAND", &[1]);
+        let mut q = WireBacklog::new(true);
+        q.push(255, first.clone(), false);
+        q.push(255, second.clone(), false);
+        let selected = q.pop().unwrap();
+        assert_eq!(selected.1, first);
+        assert_eq!(
+            q.batch_follower(&BatchTestComms, (selected.0, &selected.1))
+                .unwrap()
+                .1,
+            second
+        );
+        assert!(q.pop().is_none());
+        assert!(
+            q.batch_follower(&BatchTestComms, (selected.0, &selected.1))
+                .is_none(),
+            "never wait for future producer callbacks"
+        );
+    }
+    #[test]
+    fn command_pair_does_not_bypass_metadata_fair_turn_or_consume_invalid_follower() {
+        let command = batch_test_command("FLIGHT_COMMAND", &[1]);
+        for follower in [
+            b"SDT\x03opaque".to_vec(),
+            serialize::pack_packet(
+                &Packet::new(
+                    sedsnet::config::DataType::ReliableAck,
+                    &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                    "RF",
+                    1,
+                    Arc::from(1u64.to_le_bytes()),
+                )
+                .unwrap(),
+            )
+            .to_vec(),
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+                    &std::array::from_fn::<_, 32, _>(|i| {
+                        sedsnet::config::DataEndpoint(u32::MAX - i as u32)
+                    }),
+                    "GS",
+                    1,
+                    Arc::from([1u8]),
+                )
+                .unwrap(),
+            )
+            .to_vec(),
+            {
+                let mut b = command.clone();
+                *b.last_mut().unwrap() ^= 1;
+                b
+            },
+        ] {
+            let mut q = WireBacklog::new(true);
+            q.push(255, command.clone(), false);
+            q.push(255, follower.clone(), false);
+            let first = q.pop().unwrap();
+            let counters = q.selection_state();
+            assert!(
+                q.batch_follower(&BatchTestComms, (first.0, &first.1))
+                    .is_none()
+            );
+            assert_eq!(q.selection_state(), counters);
+            assert_eq!(q.pop().unwrap().1, follower);
+        }
+        let mut q = WireBacklog::new(true);
+        q.push(255, command.clone(), false);
+        q.push(255, command.clone(), false);
+        q.push(253, b"SDT\x03metadata".to_vec(), false);
+        q.control_bytes = MAX_CONTROL_BYTES - 1;
+        let first = q.pop().unwrap();
+        assert!(q.control_bytes >= MAX_CONTROL_BYTES);
+        assert!(
+            q.batch_follower(&BatchTestComms, (first.0, &first.1))
+                .is_none()
+        );
+        assert_eq!(q.pop().unwrap().1, b"SDT\x03metadata");
+        assert_eq!(q.pop().unwrap().1, command);
+    }
+
+
+    #[test]
+    fn failed_command_pair_restores_both_original_owners_and_fairness_checkpoint() {
+        let a = batch_test_command("AV_BAY_UNDERGLOW", &[1]);
+        let b = batch_test_command("FLIGHT_COMMAND", &[1]);
+        let mut q = WireBacklog::new(true);
+        q.push(255, a.clone(), false);
+        q.push(255, b.clone(), false);
+        let before = q.selection_state();
+        let first = q.pop().unwrap();
+        let second = q.batch_follower(&BatchTestComms, (first.0, &first.1));
+        assert!(second.is_some());
+        q.restore_selected(before, first, second);
+        assert_eq!(q.selection_state(), before);
+        assert_eq!(q.pop().unwrap().1, a);
+        assert_eq!(q.pop().unwrap().1, b);
+        assert!(q.pop().is_none());
+    }
+    #[test]
+    fn continuous_command_pairs_preserve_existing_metadata_service_turn() {
+        let command = batch_test_command("FLIGHT_COMMAND", &[1]);
+        let mut q = WireBacklog::new(true);
+        let mut metadata = 0;
+        let mut commands = 0;
+        let mut since_metadata = 0;
+        for _ in 0..1000 {
+            while q.priorities.values().map(VecDeque::len).sum::<usize>() < 4 {
+                q.push(255, command.clone(), false);
+            }
+            if q.ordered.is_empty() {
+                q.push(253, b"SDT\x03owned".to_vec(), false);
+            }
+            let first = q.pop().unwrap();
+            if first.1.starts_with(b"SDT") {
+                metadata += 1;
+                since_metadata = 0;
+            } else {
+                since_metadata += first.1.len();
+                commands += 1;
+                if let Some(second) = q.batch_follower(&BatchTestComms, (first.0, &first.1)) {
+                    since_metadata += second.1.len();
+                    commands += 1;
+                }
+                assert!(
+                    since_metadata <= MAX_CONTROL_BYTES + command.len(),
+                    "batch cannot add an extra command after the existing fair turn becomes due"
+                );
+            }
+        }
+        assert!(commands > 1000 && metadata > 20);
+    }
 
     #[test]
     fn rf_receive_dictionary_retains_interleaved_control_flows() {
@@ -1179,15 +1385,33 @@ pub(super) fn spawn_comms_worker_threads(
                     if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some() {
                         log::info!("full-bay transport selected side={worker_name} sim={:?} priority={priority} len={} type={:?}", crate::simulation_clock_ms(), payload.len(), serialize::peek_frame_info_unchecked(&payload).map(|info| info.envelope.ty));
                     }
-                    match comms.send_data_with_priority(&payload, priority) {
+                    let follower = backlog.batch_follower(&**comms, (priority, &payload));
+                    let result = if let Some((next_priority, next_payload)) = follower.as_ref() {
+                        comms.send_command_batch(&[(priority, &payload), (*next_priority, next_payload)])
+                    } else {
+                        comms.send_data_with_priority(&payload, priority)
+                    };
+                    match result {
                         Ok(()) => {
                             if let Some(budget) = &comms_handle.tx_budget {
                                 budget.complete(priority, &payload);
                             }
-                            if let Some(activity) = &comms_handle.transport_activity { activity.complete(); }
-                            sent_any = true;
+                            if let Some(activity) = &comms_handle.transport_activity {
+                                activity.complete();
+                            }
                             log_link_control_send(worker_name, &payload);
                             log_radio_command_event("radio TX sent", worker_name, &payload);
+                            if let Some((next_priority, next_payload)) = follower.as_ref() {
+                                if let Some(budget) = &comms_handle.tx_budget {
+                                    budget.complete(*next_priority, next_payload);
+                                }
+                                if let Some(activity) = &comms_handle.transport_activity {
+                                    activity.complete();
+                                }
+                                log_link_control_send(worker_name, next_payload);
+                                log_radio_command_event("radio TX sent", worker_name, next_payload);
+                            }
+                            sent_any = true;
                             if suppressed_send_errors > 0 {
                                 eprintln!(
                                     "{worker_name} comms worker send_data recovered after suppressing {suppressed_send_errors} repeated errors"
@@ -1201,16 +1425,10 @@ pub(super) fn spawn_comms_worker_threads(
                             next_tx_allowed_at = TxDeadline::now();
                         }
                         Err(e) => {
-                            // A transport error means the packet never reached
-                            // Pico-Fi. Preserve queue ordering and retry the
-                            // entire logical packet from a new START slot.
-                            (
-                            backlog.application_bytes,
-                            backlog.ordered_metadata_next,
-                            backlog.priority_bytes,
-                            backlog.control_bytes,
-                        ) = selection_state;
-                            backlog.push(priority, payload, true);
+                            // Logical completion is unconfirmed: a partial UART
+                            // write may already be on wire. Preserve both owners
+                            // and retry their original IDs in the original order.
+                            backlog.restore_selected(selection_state, (priority, payload), follower);
                             next_tx_allowed_at = TxDeadline::now().after(Duration::from_millis(COMMS_TX_GAP_MS));
                             log_repeated_worker_error(
                                 &format!("{worker_name} comms worker send_data failed"),

@@ -100,19 +100,40 @@ impl Capacity {
         if receipt {
             self.last_receipt_boundary = Some((wall, virtual_ms));
         }
-        if let Some((id, _)) = contract {
-            let slot = slot.unwrap_or_else(|| {
+        if let Some((id, _)) = contract { self.remember_promotion(id, receipt); }
+        true
+    }
+    fn remember_promotion(&mut self, id: u64, receipt: bool) {
+        let slot = self.promotion_contracts[..usize::from(self.promotion_contract_count)]
+            .iter()
+            .position(|stored| *stored == id)
+            .unwrap_or_else(|| {
                 let slot = usize::from(self.promotion_contract_cursor);
                 self.promotion_contracts[slot] = id;
                 self.promotion_flags &= !((1 << slot) | (1 << (slot + 4)));
                 self.promotion_contract_cursor = (self.promotion_contract_cursor + 1) % 4;
-                self.promotion_contract_count =
-                    self.promotion_contract_count.saturating_add(1).min(4);
+                self.promotion_contract_count = self.promotion_contract_count.saturating_add(1).min(4);
                 slot
             });
-            self.promotion_flags |= 1 << (slot + if receipt { 4 } else { 0 });
+        self.promotion_flags |= 1 << (slot + if receipt { 4 } else { 0 });
+    }
+    /// A single physical boundary serves both already-owned commands. Record
+    /// both logical IDs only when a boundary was actually promoted.
+    pub(crate) fn close_command_batch(
+        &mut self,
+        wall: Instant,
+        clock: Option<u64>,
+        ids: [u64; 2],
+    ) -> bool {
+        let promoted = ids
+            .into_iter()
+            .any(|id| self.close_packet_batch_for_contract(wall, clock, Some((id, false))));
+        if promoted {
+            for id in ids {
+                self.remember_promotion(id, false);
+            }
         }
-        true
+        promoted
     }
     /// Charged ordinary bytes displaced by one modem idle gap. This is a
     /// scheduler-service allowance only, never UART or airtime readiness.
@@ -260,6 +281,38 @@ impl Capacity {
         }
     }
 
+    /// One loan admission still charges every original frame's overhead and
+    /// individual rounding. A failed prefix charges only frames actually begun.
+    pub(crate) fn committed_command_batch(
+        &mut self,
+        wall: Instant,
+        clock: Option<u64>,
+        lengths: [usize; 2],
+        accepted: usize,
+    ) {
+        if accepted == 0 {
+            return;
+        }
+        let accepted = accepted.min(lengths[0].saturating_add(lengths[1]));
+        let cost = |bytes: usize| {
+            if bytes == 0 {
+                0
+            } else {
+                ((bytes as u128 + u128::from(self.overhead_bytes)) * 8 * 1000)
+                    .div_ceil((u128::from(self.air_bps) * u128::from(self.share_percent) / 100).max(1))
+                    as u64
+            }
+        };
+        let separate = cost(accepted.min(lengths[0])) + cost(accepted.saturating_sub(lengths[0]));
+        let extra = separate.saturating_sub(cost(accepted));
+        self.committed(wall, clock, accepted);
+        if let Some((next_wall, next_virtual)) = self.next.as_mut() {
+            *next_wall = next_wall
+                .checked_add(Duration::from_millis(extra))
+                .unwrap_or(*next_wall);
+            *next_virtual = next_virtual.map(|next| next.saturating_add(extra));
+        }
+    }
     pub(crate) fn committed(
         &mut self,
         wall: Instant,
@@ -312,6 +365,47 @@ impl Capacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn already_queued_command_pair_uses_one_fully_charged_loan_and_one_close() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64_000, 15, 16);
+        cap.committed(wall, Some(30000), 21);
+        cap.drained_virtual(30_001_823);
+        assert!(cap.ready_for(wall, Some(30001), true));
+        cap.committed_command_batch(wall, Some(30001), [55, 61], 116);
+        cap.drained_virtual(30_011_893);
+        assert!(cap.close_command_batch(wall, Some(30001), [1, 2]));
+        assert_eq!(cap.next.unwrap().1, Some(30156));
+        assert!(cap.early_frame_outstanding);
+        assert!(!cap.ready_for(wall, Some(30061), true));
+        assert!(!cap.ready(wall, Some(30155)));
+        assert!(cap.ready(wall, Some(30156)));
+        assert!(!cap.close_packet_batch_for_contract(wall, Some(30200), Some((1, false))));
+        assert!(!cap.close_packet_batch_for_contract(wall, Some(30200), Some((2, false))));
+        assert!(
+            cap.close_packet_batch_for_contract(wall, Some(30200), Some((2, true))),
+            "receipt has independent first-return protection"
+        );
+    }
+
+    #[test]
+    fn partial_command_batch_keeps_per_frame_air_charges_without_rebating_overhead() {
+        let wall = Instant::now();
+        for accepted in [1, 54, 55, 56, 115, 116] {
+            let mut batch = Capacity::new(64_000, 15, 16);
+            batch.committed_command_batch(wall, Some(0), [55, 61], accepted);
+            let mut original = Capacity::new(64_000, 15, 16);
+            original.committed(wall, Some(0), accepted.min(55));
+            if accepted > 55 {
+                original.committed(wall, Some(0), accepted - 55);
+            }
+            assert_eq!(
+                batch.next.unwrap().1,
+                original.next.unwrap().1,
+                "accepted={accepted}"
+            );
+        }
+    }
     #[test]
     fn accumulated_uart_stop_preserves_quiet_after_captured_75_and_55_byte_close() {
         let wall = Instant::now();
