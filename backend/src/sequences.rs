@@ -66,7 +66,10 @@ fn is_recording_command(cmd: &str) -> bool {
 }
 
 pub(crate) fn is_station_utility_command(cmd: &str) -> bool {
-    matches!(cmd, "ToggleAvBayUnderglow" | "ToggleFlightBuzzer" | "ResetTClock")
+    matches!(
+        cmd,
+        "ToggleAvBayUnderglow" | "ToggleFlightBuzzer" | "ResetTClock"
+    )
 }
 
 #[cfg_attr(feature = "hitl_mode", allow(dead_code))]
@@ -783,8 +786,9 @@ pub fn default_action_policy() -> ActionPolicyMsg {
         let controls = all_command_names()
             .into_iter()
             .map(|cmd| {
-                let enabled = is_station_utility_command(cmd) || default_recording_command_enabled(cmd)
-                    .unwrap_or_else(|| matches!(cmd, "Abort" | "Postinit" | "ResetSim"));
+                let enabled = is_station_utility_command(cmd)
+                    || default_recording_command_enabled(cmd)
+                        .unwrap_or_else(|| matches!(cmd, "Abort" | "Postinit" | "ResetSim"));
                 ActionControl {
                     cmd: cmd.to_string(),
                     enabled,
@@ -2348,6 +2352,60 @@ pub fn refresh_action_policy_now(state: &Arc<AppState>) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn captured_normal_startup_reset_policy_republishes_idle_but_hitl_preserves_startup() {
+        crate::telemetry_schema::initialize().unwrap();
+        let state = crate::state::tests::test_app_state().await;
+        for board in crate::types::Board::ALL {
+            state.mark_board_seen(board.sender_id(), 1);
+        }
+        assert!(state.all_required_boards_seen());
+        let router = std::sync::Arc::new(sedsnet::router::Router::new(Default::default()));
+        let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
+        router
+            .enable_network_variable(ty, sedsnet::router::NetworkVariablePermissions::READ_WRITE)
+            .unwrap();
+        state
+            .topology_router
+            .set(router.clone())
+            .unwrap_or_else(|_| panic!("empty router slot"));
+        assert_eq!(
+            state.local_flight_state_snapshot(),
+            crate::types::FlightState::Startup
+        );
+        let next = super::maybe_drive_local_prelaunch_state(
+            &state,
+            &super::SequenceRuntime::default(),
+            super::ValveSnapshot::default(),
+            crate::types::FlightState::Startup,
+        );
+        if cfg!(feature = "hitl_mode") || cfg!(feature = "test_fire_mode") {
+            assert_eq!(next, crate::types::FlightState::Startup);
+            assert_eq!(
+                state.local_flight_state_snapshot(),
+                crate::types::FlightState::Startup
+            );
+            assert!(router.get_cached_network_variable(ty).unwrap().is_none());
+            println!("POLICY_PROOF operator-mode keepsStartup0; no automaticIdle1 publication");
+        } else {
+            assert_eq!(next, crate::types::FlightState::Idle);
+            assert_eq!(
+                state.local_flight_state_snapshot(),
+                crate::types::FlightState::Idle
+            );
+            assert_eq!(
+                router
+                    .get_cached_network_variable(ty)
+                    .unwrap()
+                    .unwrap()
+                    .payload(),
+                &[1]
+            );
+            println!(
+                "POLICY_PROOF normal ready Startup0->Idle1 invokes real AppState+managedpublisher; no output side or hardware"
+            );
+        }
+    }
     #[test]
     fn one_button_fill_uses_main_target_and_plateau_rules() {
         let mut monitor = super::FillCutoff::default();

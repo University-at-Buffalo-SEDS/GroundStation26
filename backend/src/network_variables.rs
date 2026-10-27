@@ -252,19 +252,29 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
 }
 
 pub fn publish_current(router: &Router) -> Result<()> {
-    router.set_network_variable(packet(
-        UNDERGLOW_TYPE,
-        "AV_BAY_UNDERGLOW_OWNER",
-        u8::from(underglow_enabled()),
-    )?)?;
-    router.set_network_variable(packet(
-        FLIGHT_BUZZER_TYPE,
-        "FLIGHT_CONTROLLER",
-        u8::from(flight_buzzer_enabled()),
-    )?)?;
-    router.set_network_variable(packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", flight_state())?)?;
+    let request = crate::qualification_requests::Request::begin("publish_current");
+    request.submit(
+        router,
+        packet(
+            UNDERGLOW_TYPE,
+            "AV_BAY_UNDERGLOW_OWNER",
+            u8::from(underglow_enabled()),
+        )?,
+    )?;
+    request.submit(
+        router,
+        packet(
+            FLIGHT_BUZZER_TYPE,
+            "FLIGHT_CONTROLLER",
+            u8::from(flight_buzzer_enabled()),
+        )?,
+    )?;
+    request.submit(
+        router,
+        packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", flight_state())?,
+    )?;
     set_daq_calibration(router, &crate::loadcell::load_or_default())?;
-    router.set_network_variable(cached_daq_log_clock_packet()?)?;
+    request.submit(router, cached_daq_log_clock_packet()?)?;
     Ok(())
 }
 
@@ -275,6 +285,7 @@ pub fn toggle_underglow(router: &Router) -> Result<bool> {
 }
 
 pub fn set_underglow(router: &Router, enabled: bool) -> Result<()> {
+    let request = crate::qualification_requests::Request::begin("set_underglow");
     {
         let mut guard = store()
             .lock()
@@ -283,11 +294,10 @@ pub fn set_underglow(router: &Router, enabled: bool) -> Result<()> {
         next.av_bay_underglow = enabled;
         guard.commit(next)?;
     }
-    router.set_network_variable(packet(
-        UNDERGLOW_TYPE,
-        "AV_BAY_UNDERGLOW_OWNER",
-        u8::from(enabled),
-    )?)?;
+    request.submit(
+        router,
+        packet(UNDERGLOW_TYPE, "AV_BAY_UNDERGLOW_OWNER", u8::from(enabled))?,
+    )?;
     Ok(())
 }
 
@@ -299,6 +309,7 @@ pub fn toggle_flight_buzzer(router: &Router) -> Result<bool> {
 }
 
 pub fn set_flight_buzzer(router: &Router, enabled: bool) -> Result<()> {
+    let request = crate::qualification_requests::Request::begin("set_flight_buzzer");
     {
         let mut guard = store()
             .lock()
@@ -307,15 +318,15 @@ pub fn set_flight_buzzer(router: &Router, enabled: bool) -> Result<()> {
         next.flight_buzzer = enabled;
         guard.commit(next)?;
     }
-    router.set_network_variable(packet(
-        FLIGHT_BUZZER_TYPE,
-        "FLIGHT_CONTROLLER",
-        u8::from(enabled),
-    )?)?;
+    request.submit(
+        router,
+        packet(FLIGHT_BUZZER_TYPE, "FLIGHT_CONTROLLER", u8::from(enabled))?,
+    )?;
     Ok(())
 }
 
 pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
+    let request = crate::qualification_requests::Request::begin("set_flight_state");
     anyhow::ensure!(state <= 15, "invalid flight-state value {state}");
     {
         let mut guard = store()
@@ -325,7 +336,7 @@ pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
         next.flight_state = state;
         guard.commit(next)?;
     }
-    router.set_network_variable(packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", state)?)?;
+    request.submit(router, packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", state)?)?;
     Ok(())
 }
 
@@ -387,17 +398,21 @@ pub fn set_daq_calibration(
     router: &Router,
     cfg: &crate::loadcell::LoadcellCalibrationFile,
 ) -> Result<()> {
+    let request = crate::qualification_requests::Request::begin("set_daq_calibration");
     let selected_input = cfg.kg50_input;
     let amp2 = crate::loadcell::amp2_calibration(cfg);
     let cfg = &amp2;
     let thermal = thermal_packet(cfg)?;
     let filter = filter_packet(cfg)?;
     let kg50 = kg50_calibration_packet(cfg)?;
-    router.set_network_variable(calibration_packet(cfg)?)?;
-    router.set_network_variable(kg50)?;
-    router.set_network_variable(thermal)?;
-    router.set_network_variable(filter)?;
-    router.set_network_variable(packet("DAQ_KG50_INPUT", "SD_CARD", selected_input.wire())?)?;
+    request.submit(router, calibration_packet(cfg)?)?;
+    request.submit(router, kg50)?;
+    request.submit(router, thermal)?;
+    request.submit(router, filter)?;
+    request.submit(
+        router,
+        packet("DAQ_KG50_INPUT", "SD_CARD", selected_input.wire())?,
+    )?;
     Ok(())
 }
 
@@ -471,6 +486,7 @@ pub fn set_daq_log_clock(
     session: u64,
     clock: &crate::telemetry_db::LaunchClockMsg,
 ) -> Result<()> {
+    let request = crate::qualification_requests::Request::begin("set_daq_log_clock");
     let launch_now = crate::telemetry_task::procedure_clock::timestamp_ms();
     let network_now = usable_daq_utc(
         router.network_time().and_then(|t| t.unix_time_ms),
@@ -492,11 +508,10 @@ pub fn set_daq_log_clock(
         next.daq_log_last_session = next.daq_log_last_session.max(session);
         guard.commit(next)?;
     }
-    router.set_network_variable(packet_bytes(
-        "DAQ_LOG_CLOCK",
-        "SD_CARD",
-        Arc::from(payload),
-    )?)?;
+    request.submit(
+        router,
+        packet_bytes("DAQ_LOG_CLOCK", "SD_CARD", Arc::from(payload))?,
+    )?;
     Ok(())
 }
 
@@ -1116,6 +1131,164 @@ mod thermal_wire_tests {
 #[cfg(test)]
 mod persistence_callback_tests {
     use super::*;
+    #[test]
+    fn policy_qualified_actual_sdk_all_owner_receipts() {
+        const NAME: &str = "network_variables::persistence_callback_tests::policy_qualified_actual_sdk_all_owner_receipts";
+        if !isolated(NAME) {
+            return;
+        }
+        use sedsnet::router::{EndpointHandler, RouterConfig};
+        crate::telemetry_schema::initialize().unwrap();
+        let clock = || Box::new(|| crate::simulation_clock_ms().unwrap_or(0));
+        let source = Arc::new(Router::new_with_clock(
+            RouterConfig::new([]).with_sender("GS"),
+            clock(),
+        ));
+        let ty = crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE);
+        for name in [FLIGHT_STATE_TYPE, UNDERGLOW_TYPE, FLIGHT_BUZZER_TYPE] {
+            source
+                .enable_network_variable(
+                    crate::telemetry_schema::data_type(name),
+                    NetworkVariablePermissions::READ_WRITE,
+                )
+                .unwrap();
+        }
+        let mut peers = Vec::new();
+        for (side, name) in ["RF", "FC"].into_iter().enumerate() {
+            let cosmetic = if name == "RF" {
+                "AV_BAY_UNDERGLOW_OWNER"
+            } else {
+                "FLIGHT_CONTROLLER"
+            };
+            let handlers = [
+                EndpointHandler::new_packet_handler(
+                    crate::telemetry_schema::endpoint("FLIGHT_STATE"),
+                    |_| Ok(()),
+                ),
+                EndpointHandler::new_packet_handler(
+                    crate::telemetry_schema::endpoint(cosmetic),
+                    |_| Ok(()),
+                ),
+            ];
+            let peer = Arc::new(Router::new_with_clock(
+                RouterConfig::new(handlers).with_sender(name),
+                clock(),
+            ));
+            for kind in [FLIGHT_STATE_TYPE, UNDERGLOW_TYPE, FLIGHT_BUZZER_TYPE] {
+                peer.enable_network_variable(
+                    crate::telemetry_schema::data_type(kind),
+                    NetworkVariablePermissions::READ_ONLY,
+                )
+                .unwrap();
+            }
+            let remote = peer.clone();
+            source.add_side_packed(name, move |bytes| remote.rx_packed_from_side(bytes, 0));
+            let primary = source.clone();
+            peer.add_side_packed("GS", move |bytes| primary.rx_packed_from_side(bytes, side));
+            peers.push(peer);
+        }
+        for p in &peers {
+            p.announce_discovery().unwrap();
+        }
+        source.announce_discovery().unwrap();
+        for _ in 0..8 {
+            source.process_all_queues().unwrap();
+            for p in &peers {
+                p.process_all_queues().unwrap();
+            }
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        let states =
+            crate::qualification_requests::policy_states(cfg!(feature = "hitl_mode"), &[1, 0, 1])
+                .unwrap();
+        for (round, state) in states.into_iter().enumerate() {
+            crate::qualification_requests::in_controlled_round(round + 1, || {
+                set_flight_state(&source, state).unwrap();
+                set_underglow(&source, round != 1).unwrap();
+                set_flight_buzzer(&source, round != 1).unwrap();
+            });
+            ids.insert(
+                source
+                    .get_cached_network_variable(ty)
+                    .unwrap()
+                    .unwrap()
+                    .packet_id(),
+            );
+            for _ in 0..8 {
+                source.process_all_queues().unwrap();
+                for p in &peers {
+                    p.process_all_queues().unwrap();
+                }
+            }
+            assert!(source.export_reliable_pending_stats().is_empty());
+            for p in &peers {
+                assert_eq!(
+                    p.get_cached_network_variable(ty)
+                        .unwrap()
+                        .unwrap()
+                        .payload(),
+                    &[state]
+                );
+            }
+        }
+        assert_eq!(ids.len(), 3);
+    }
+    #[test]
+    fn policy_qualified_real_setters_publish_distinct_stable_idle_and_cosmetics() {
+        const NAME: &str = "network_variables::persistence_callback_tests::policy_qualified_real_setters_publish_distinct_stable_idle_and_cosmetics";
+        if !isolated(NAME) {
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let router = Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([]).with_sender("GS"),
+            Box::new(|| crate::simulation_clock_ms().unwrap_or(0)),
+        );
+        initialize_for_role(&router, false).unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let output = sent.clone();
+        router.add_side_packet("captured-owner", move |packet| {
+            output.lock().unwrap().push(packet.clone());
+            Ok(())
+        });
+        router.clear_queues();
+        sent.lock().unwrap().clear();
+        let states =
+            crate::qualification_requests::policy_states(cfg!(feature = "hitl_mode"), &[1, 0, 1])
+                .unwrap();
+        for (round, (state, enabled)) in states.iter().zip([true, false, true]).enumerate() {
+            crate::qualification_requests::in_controlled_round(round + 1, || {
+                set_flight_state(&router, *state).unwrap();
+                set_underglow(&router, enabled).unwrap();
+                set_flight_buzzer(&router, enabled).unwrap();
+            });
+        }
+        let packets = sent.lock().unwrap();
+        for (name, expected) in [
+            (FLIGHT_STATE_TYPE, states),
+            (UNDERGLOW_TYPE, vec![1, 0, 1]),
+            (FLIGHT_BUZZER_TYPE, vec![1, 0, 1]),
+        ] {
+            let selected = packets
+                .iter()
+                .filter(|p| p.data_type() == crate::telemetry_schema::data_type(name))
+                .collect::<Vec<_>>();
+            assert_eq!(selected.len(), 3);
+            assert_eq!(
+                selected.iter().map(|p| p.payload()[0]).collect::<Vec<_>>(),
+                expected
+            );
+            let ids = selected
+                .iter()
+                .map(|p| p.packet_id())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                ids.len(),
+                3,
+                "unchanged stableIdle must never coalesce explicit control IDs"
+            );
+        }
+    }
     #[test]
     fn repeated_sdk_flight_state_refreshes_keep_the_successfully_persisted_cache() {
         const CHILD: &str = "GS_NETWORK_VARIABLE_PERSISTENCE_PROOF_CHILD";

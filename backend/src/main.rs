@@ -42,6 +42,7 @@ mod mission_sync;
 mod network_health;
 mod network_traffic;
 mod network_variables;
+mod qualification_requests;
 mod recording_export;
 mod recording_range;
 mod recording_report;
@@ -519,8 +520,13 @@ mod router_link_policy_tests {
             .args(["--exact", NAME, "--test-threads=1"])
             .env("GS_NO_MODEL_CLOCK_CHILD", "1")
             .env_remove("GS_SIM_CLOCK_FILE")
-            .output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -957,7 +963,7 @@ async fn main() -> anyhow::Result<()> {
             BoardStatus {
                 packet_count: 0,
                 last_seen_ms: None,
-                    last_seen_model_ms: None,
+                last_seen_model_ms: None,
                 last_seen_instant: None,
                 ema_gap_ms: None,
                 warned: false,
@@ -992,6 +998,24 @@ async fn main() -> anyhow::Result<()> {
     auth.ensure_file()
         .map_err(|e| anyhow::anyhow!("failed to initialize users.json: {e}"))?;
     let _ = auth.cleanup_expired_sessions(&auth_db).await;
+    if std::env::var("GS_SIM_POLICY_CORRECT_CONTROLS").as_deref() == Ok("1") {
+        assert!(
+            simulation_clock_ms().is_some(),
+            "qualification requires actual simulator clock"
+        );
+        assert_eq!(
+            std::env::var("GS_SIM_TRACE_API_REQUESTS").as_deref(),
+            Ok("1")
+        );
+        assert_eq!(std::env::var("SEDSNET_TRACE_RELIABLE").as_deref(), Ok("1"));
+        if !cfg!(feature = "hitl_mode") {
+            assert_eq!(
+                network_variables::flight_state(),
+                0,
+                "normal qualification must boot actual Startup0, with isolated fresh cache/default0"
+            );
+        }
+    }
     let state = Arc::new(AppState {
         ring_buffer: Arc::new(Mutex::new(RingBuffer::new(ring_buffer_capacity))),
         cmd_tx,
@@ -1562,7 +1586,9 @@ async fn main() -> anyhow::Result<()> {
         let opts = rocket_router_side_options(&comms_links.av_bay, rrls::is_rrls());
         router.add_side_packed_with_priority_and_options(
             "rocket_comms",
-            move |pkt, priority| activity.try_enqueue(|| budget.try_send(&rocket_tx, priority, pkt)),
+            move |pkt, priority| {
+                activity.try_enqueue(|| budget.try_send(&rocket_tx, priority, pkt))
+            },
             opts,
         )
     };
@@ -1793,6 +1819,36 @@ async fn main() -> anyhow::Result<()> {
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
+                    // Only this explicit qualification path substitutes a stable normal
+                    // policy value. HITL still exercises the original state sequence.
+                    let flight_states = if std::env::var("GS_SIM_POLICY_CORRECT_CONTROLS")
+                        .as_deref()
+                        == Ok("1")
+                    {
+                        if !cfg!(feature = "hitl_mode") {
+                            let boot_started = ValidationInstant::now();
+                            while validation_state.local_flight_state_snapshot()
+                                != types::FlightState::Idle
+                            {
+                                assert!(
+                                    validation_elapsed_ms(boot_started) < 30_000,
+                                    "normal boot did not actually advance Startup0 to Idle1"
+                                );
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                            assert!(
+                                wait_for_validation_idle(&validation_router).await,
+                                "normal boot accepted obligations must drain within original bound"
+                            );
+                        }
+                        qualification_requests::policy_states(
+                            cfg!(feature = "hitl_mode"),
+                            &flight_states,
+                        )
+                        .expect("qualification must use nonactuating prelaunch states")
+                    } else {
+                        flight_states
+                    };
                     let underglow = std::env::var("GS_SIM_UNDERGLOW_SEQUENCE")
                         .ok()
                         .map(|sequence| {
@@ -1855,7 +1911,9 @@ async fn main() -> anyhow::Result<()> {
                         .collect::<Vec<_>>();
                         if let Some(&state) = flight_states.get(round) {
                             if let Err(error) =
-                                network_variables::set_flight_state(&validation_router, state)
+                                qualification_requests::in_controlled_round(round + 1, || {
+                                    network_variables::set_flight_state(&validation_router, state)
+                                })
                             {
                                 log::error!("full-bay flight-state sequence failed: {error}");
                                 break;
@@ -1864,7 +1922,9 @@ async fn main() -> anyhow::Result<()> {
                         }
                         if let Some(&enabled) = underglow.get(round) {
                             if let Err(error) =
-                                network_variables::set_underglow(&validation_router, enabled)
+                                qualification_requests::in_controlled_round(round + 1, || {
+                                    network_variables::set_underglow(&validation_router, enabled)
+                                })
                             {
                                 log::error!("full-bay underglow sequence failed: {error}");
                                 break;
@@ -1873,7 +1933,12 @@ async fn main() -> anyhow::Result<()> {
                         }
                         if let Some(&enabled) = flight_buzzer.get(round) {
                             if let Err(error) =
-                                network_variables::set_flight_buzzer(&validation_router, enabled)
+                                qualification_requests::in_controlled_round(round + 1, || {
+                                    network_variables::set_flight_buzzer(
+                                        &validation_router,
+                                        enabled,
+                                    )
+                                })
                             {
                                 log::error!("full-bay Flight buzzer sequence failed: {error}");
                                 break;
@@ -1884,7 +1949,19 @@ async fn main() -> anyhow::Result<()> {
                             &validation_router,
                             "full-bay managed-variable validation tx",
                         );
-                        if !wait_for_validation_reliable_delivery(
+                        if std::env::var("GS_SIM_POLICY_CORRECT_CONTROLS").as_deref() == Ok("1") {
+                            // This is only a bounded global-settling barrier, never ACK
+                            // evidence (retry expiry can also remove a pending entry).
+                            // The mandatory audit_obligations.py gate charges every
+                            // accepted ID from its own API request to ALL owner receipts.
+                            if !wait_for_validation_idle(&validation_router).await {
+                                break;
+                            }
+                            log::info!(
+                                "full-bay qualified round {} settled; per-ID500ms ALL-owner audit remains REQUIRED, no latency pass inferred",
+                                round + 1
+                            );
+                        } else if !wait_for_validation_reliable_delivery(
                             &validation_router,
                             "managed-variable round",
                             &expected_types,
