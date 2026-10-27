@@ -1,5 +1,5 @@
 {
-  "updated_utc": "2026-10-26T22:09:10.830294+00:00",
+  "updated_utc": "2026-10-27T01:17:49.162775+00:00",
   "status": "media_verified_rrls_and_fc_followups_in_progress",
   "branch": "dev",
   "constraints": [
@@ -17,7 +17,7 @@
     {
       "id": "mobile_navigation",
       "status": "verified",
-      "scope": "Full-size mobile menu, direct Sign in, useful navigation without nested tiny dropdowns."
+      "scope": "Full-size mobile menu; Sign in/out remain in Tools with usable dropdown space."
     },
     {
       "id": "voice",
@@ -58,20 +58,32 @@
       "id": "validation_push",
       "status": "verified",
       "scope": "Relevant regression tests passed; source changes committed/pushed on existing branches; 12 valid repositories and 18 tracked branches aligned."
+    },
+    {
+      "id": "playback_lifecycle",
+      "status": "verified",
+      "scope": "Standalone camera audio/video tracks, stopped-session cleanup, restored-page reconnect, resumed program video/crew audio and retained mute choice."
+    },
+    {
+      "id": "remote_camera_audio",
+      "status": "verified",
+      "scope": "Preserve alternate HLS audio renditions through an authenticated loopback proxy; upload live Matroska codec headers; keep media uploads alive beyond control read deadlines; bound station probing and helper cluster buffering."
     }
   ],
   "verification": {
     "backend": "556 normal, 532 HITL, 557 test-fire passed; manual fixtures remain ignored",
     "frontend_native": "142 passed, 7 existing platform/manual tests ignored",
     "sender": "6 unit and 2 discovery CLI tests passed",
-    "helper": "3 unit tests passed; manual real-media roundtrip passed; Linux build and Clippy -D warnings passed",
-    "playback": "Actual MediaMTX: one/two viewers, disconnect, saved geometry and clean OBS passed on raw and remote H264/AAC feeds; no frozen samples",
-    "mobile": "Permission matrix, direct login, full-height menu, camera/mic/zoom/name, PTT and wake-lock lifetime passed",
+    "helper": "5 unit tests and Clippy -D warnings passed; real native fixture passed 108.17 s, including legacy video-only TS, sustained H264/AAC jobs and explicit disconnect fallback",
+    "playback": "Actual MediaMTX raw camera and remotely encoded H264/AAC: decoded non-silent camera/clean OBS audio, one/two viewers, independent disconnect, saved geometry and restored OBS; zero frozen samples. Final sustained encoded camera RMS 0.06303 / restored OBS 0.06206,30 fps. Legacy TS available 825 ms; Matroska audio/video 1,015 ms on loopback.",
+    "mobile": "Permission matrix, account actions in Tools, full-height menu, camera/mic/zoom/name, PTT and wake-lock lifetime passed; physical iOS camera/background behavior remains unqualified.",
     "voice": "Two real backend clients with synthetic audio, broadcast/archive permissions, range playback and stalled startup cleanup passed",
     "layout": "Ordering, sizing, stale revision rejection and live role revocation passed",
     "dashboard": "Full dashboard customization browser regression passed after correcting stale manager-label and viewer-only grant fixtures",
     "utilities": "Underglow, buzzer and T-clock reset: all 16 flight states in normal/HITL/test-fire; UTC HTTP authorization/revocation and post-launch browser control passed",
-    "repositories": "12 valid repositories clean; 18 tracked branches equal upstream; historical invalid worktrees preserved"
+    "repositories": "12 valid repositories clean; 18 tracked branches equal upstream; historical invalid worktrees preserved",
+    "playback_lifecycle": "Standalone synthetic WebRTC tracks and real synthetic H.264 browser regressions pass; original audio-negotiation and restore failures reproduced against unchanged assets. Existing publisher permission/revocation/PTT regression and 5 asset-catalog tests pass; restored clean OBS retains camera audio.",
+    "final_media_artifact": "target/media-roundtrip-verified-audio-lifecycle-streaming-final-20261026/result.json: raw viewers, encoded viewers and native worker all exit0; source asset digest checked"
   },
   "remaining_followups": [
     "Installed main GS systemd AV-bay configuration and reception failure",

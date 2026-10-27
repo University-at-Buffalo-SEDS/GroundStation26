@@ -355,14 +355,29 @@ async fn output(
         .set_password(Some(&state.relay_password))
         .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "Invalid receiver"))?;
     destination.set_path(&format!("/transcoded-{id}"));
+    let format = if headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| value.split(';').next() == Some("video/x-matroska"))
+    {
+        "matroska"
+    } else {
+        "mpegts"
+    };
     let mut child = tokio::process::Command::new("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",
-            "quiet",
+            if cfg!(test) { "warning" } else { "quiet" },
             "-nostdin",
+            // Both helper formats have known codecs and one-second keyframes.
+            // Bound probing so an available helper does not add a long startup wait.
+            "-analyzeduration",
+            "1000000",
+            "-probesize",
+            "1048576",
             "-f",
-            "mpegts",
+            format,
             "-i",
             "pipe:0",
             "-map",
@@ -379,7 +394,11 @@ async fn output(
         ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(if cfg!(test) {
+            std::process::Stdio::inherit()
+        } else {
+            std::process::Stdio::null()
+        })
         .kill_on_drop(true)
         .spawn()
         .map_err(|_| {

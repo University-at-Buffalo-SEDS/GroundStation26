@@ -9,13 +9,14 @@ use ring::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     num::NonZeroU32,
     process::Stdio,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc, task::JoinHandle};
+use tokio::{process::Command, sync::mpsc, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 #[derive(Clone, Default)]
@@ -64,6 +65,7 @@ impl Controller {
 #[derive(Clone)]
 struct Session {
     client: reqwest::Client,
+    upload_client: reqwest::Client,
     base: Url,
     token: String,
     host: Option<String>,
@@ -184,6 +186,13 @@ async fn connect(
         .read_timeout(Duration::from_secs(15))
         .danger_accept_invalid_certs(local_certificate)
         .build()?;
+    // Live uploads intentionally do not receive response headers until the
+    // stream ends. A control-request read timeout would terminate healthy media.
+    let upload_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(8))
+        .danger_accept_invalid_certs(local_certificate)
+        .build()?;
     let username = username.trim().to_lowercase();
     let challenge: Challenge = json(
         client
@@ -236,6 +245,7 @@ async fn connect(
         .to_owned();
     let session = Session {
         client,
+        upload_client,
         base,
         token,
         host: None,
@@ -381,117 +391,198 @@ async fn heartbeat(session: &Session, offered: bool) -> Result<Heartbeat> {
     )
     .await
 }
-fn playlist(text: &str) -> Result<(Option<String>, Vec<String>)> {
-    let mut init = None;
-    let mut files = Vec::new();
-    for line in text.lines().map(str::trim) {
-        if let Some(rest) = line.strip_prefix("#EXT-X-MAP:URI=\"") {
-            init = Some(
-                rest.split('"')
-                    .next()
-                    .context("Invalid HLS initialization")?
-                    .into(),
-            );
-        } else if !line.is_empty() && !line.starts_with('#') {
-            files.push(line.into());
-        }
-    }
-    ensure!(files.len() <= 256, "Playlist too large");
-    Ok((init, files))
-}
-async fn feed(
+// FFmpeg must see the complete HLS master, including alternate audio renditions.
+// Keep station credentials inside this bounded loopback proxy, never in argv.
+#[derive(Clone)]
+struct HlsProxy {
     session: Session,
-    input: String,
-    mut stdin: tokio::process::ChildStdin,
-) -> Result<()> {
-    let mut url = endpoint(&session.base, &input)?;
-    let mut seen = VecDeque::<String>::new();
-    let mut initialized = None;
-    let mut first = true;
-    loop {
+    prefix: String,
+    origin: String,
+    capability: String,
+    cancelled: CancellationToken,
+    requests: Arc<tokio::sync::Semaphore>,
+}
+impl HlsProxy {
+    fn validate(&self, base: &Url, path: &str) -> Result<Url> {
+        let url = endpoint(base, path)?;
+        ensure!(
+            url.path().starts_with(&self.prefix),
+            "Media address outside camera input"
+        );
+        ensure!(url.fragment().is_none(), "Invalid media fragment");
+        Ok(url)
+    }
+    fn address(&self, base: &Url, path: &str) -> Result<String> {
+        let url = self.validate(base, path)?;
+        let filename = url.path().rsplit('/').next().unwrap_or("media");
+        ensure!(
+            filename
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+            "Invalid media filename"
+        );
+        Ok(format!(
+            "{}/{}/{}/{}",
+            self.origin,
+            self.capability,
+            URL_SAFE_NO_PAD.encode(url.as_str()),
+            filename
+        ))
+    }
+    fn rewrite(&self, base: &Url, text: &str) -> Result<String> {
+        ensure!(text.starts_with("#EXTM3U"), "Invalid HLS playlist");
+        let mut output = String::new();
+        for line in text.lines().map(str::trim) {
+            if !line.is_empty() && !line.starts_with('#') {
+                output.push_str(&self.address(base, line)?);
+            } else {
+                let mut rest = line;
+                // URI attributes occur on rendition, map, key and low-latency tags.
+                while let Some(index) = rest.find("URI=") {
+                    output.push_str(&rest[..index + 4]);
+                    rest = &rest[index + 4..];
+                    ensure!(rest.starts_with('"'), "Unquoted HLS media address");
+                    rest = &rest[1..];
+                    let end = rest.find('"').context("Invalid HLS media address")?;
+                    output.push('"');
+                    output.push_str(&self.address(base, &rest[..end])?);
+                    output.push('"');
+                    rest = &rest[end + 1..];
+                }
+                output.push_str(rest);
+            }
+            output.push('\n');
+        }
+        Ok(output)
+    }
+    async fn response(
+        &self,
+        path: &str,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<axum::response::Response> {
+        let _permit = self.requests.acquire().await?;
+        let parts: Vec<_> = path.trim_start_matches('/').split('/').collect();
+        ensure!(
+            parts.len() == 3 && parts[0] == self.capability,
+            "Invalid media capability"
+        );
+        let decoded = URL_SAFE_NO_PAD.decode(parts[1])?;
+        let url = self.validate(&self.session.base, std::str::from_utf8(&decoded)?)?;
+        let playlist = url.path().ends_with(".m3u8");
+        let mut request = self
+            .session
+            .client
+            .get(url.clone())
+            .bearer_auth(&self.session.token);
+        if let Some(range) = headers.get(axum::http::header::RANGE) {
+            request = request.header("Range", range.to_str()?);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let range = response.headers().get("content-range").cloned();
         let data = bytes(
-            session
-                .client
-                .get(url.clone())
-                .bearer_auth(&session.token)
-                .send()
-                .await?,
-            1024 * 1024,
+            response,
+            if playlist {
+                1024 * 1024
+            } else {
+                8 * 1024 * 1024
+            },
         )
         .await?;
-        let text = std::str::from_utf8(&data)?;
-        let (init, files) = playlist(text)?;
-        if init.is_none()
-            && files
-                .first()
-                .is_some_and(|p| p.split('?').next().unwrap_or("").ends_with(".m3u8"))
-        {
-            url = endpoint(&url, &files[0])?;
-            continue;
-        }
-        if let Some(init) = init
-            && initialized.as_ref() != Some(&init)
-        {
-            let target = endpoint(&url, &init)?;
-            let data = bytes(
-                session
-                    .client
-                    .get(target)
-                    .bearer_auth(&session.token)
-                    .send()
-                    .await?,
-                8 * 1024 * 1024,
-            )
-            .await?;
-            stdin.write_all(&data).await?;
-            initialized = Some(init);
-        }
-        let start = if first {
-            files.len().saturating_sub(3)
+        let data = if playlist {
+            self.rewrite(&url, std::str::from_utf8(&data)?)?
+                .into_bytes()
         } else {
-            0
+            data
         };
-        for file in files.into_iter().skip(start) {
-            if seen.contains(&file) {
-                continue;
-            }
-            let target = endpoint(&url, &file)?;
-            let data = bytes(
-                session
-                    .client
-                    .get(target)
-                    .bearer_auth(&session.token)
-                    .send()
-                    .await?,
-                8 * 1024 * 1024,
-            )
-            .await?;
-            stdin.write_all(&data).await?;
-            seen.push_back(file);
-            if seen.len() > 256 {
-                seen.pop_front();
-            }
+        let mut result = axum::response::Response::builder()
+            .status(status.as_u16())
+            .header(
+                "Content-Type",
+                if playlist {
+                    "application/vnd.apple.mpegurl"
+                } else {
+                    "application/octet-stream"
+                },
+            );
+        if let Some(range) = range {
+            result = result.header("Content-Range", range);
         }
-        first = false;
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        Ok(result.body(axum::body::Body::from(data))?)
     }
 }
-struct Pump(JoinHandle<Result<()>>);
-impl Drop for Pump {
-    fn drop(&mut self) {
-        self.0.abort();
+async fn proxy_request(
+    axum::extract::State(proxy): axum::extract::State<HlsProxy>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    tokio::select! {
+        _ = proxy.cancelled.cancelled() => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        result = tokio::time::timeout(Duration::from_secs(15), proxy.response(uri.path(), &headers)) => {
+            match result {
+                Ok(Ok(response)) => response,
+                _ => axum::http::StatusCode::BAD_GATEWAY.into_response(),
+            }
+        }
     }
+}
+struct ProxyGuard(CancellationToken);
+impl Drop for ProxyGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+async fn proxy(session: Session, input: &str) -> Result<(ProxyGuard, String)> {
+    let input = endpoint(&session.base, input)?;
+    ensure!(
+        input.path().starts_with("/api/video/transcode/input/") && input.path().ends_with(".m3u8"),
+        "Invalid camera input"
+    );
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+    let mut random = [0u8; 24];
+    SystemRandom::new()
+        .fill(&mut random)
+        .map_err(|_| anyhow::anyhow!("Cannot secure media proxy"))?;
+    let state = HlsProxy {
+        prefix: format!(
+            "{}/",
+            input
+                .path()
+                .rsplit_once('/')
+                .context("Invalid camera input")?
+                .0
+        ),
+        origin: format!("http://{}", listener.local_addr()?),
+        capability: URL_SAFE_NO_PAD.encode(random),
+        session,
+        cancelled: CancellationToken::new(),
+        requests: Arc::new(tokio::sync::Semaphore::new(8)),
+    };
+    let url = state.address(&input, input.as_str())?;
+    let cancelled = state.cancelled.clone();
+    let guard = ProxyGuard(cancelled.clone());
+    let app = axum::Router::new()
+        .fallback(axum::routing::get(proxy_request))
+        .with_state(state);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(cancelled.cancelled_owned())
+            .await;
+    });
+    Ok((guard, url))
 }
 async fn transcode(session: Session, job: Job) -> Result<()> {
+    let (_proxy, input) = proxy(session.clone(), &job.input).await?;
     let mut child = Command::new("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",
-            "quiet",
+            if cfg!(test) { "warning" } else { "quiet" },
             "-nostdin",
             "-re",
             "-i",
-            "pipe:0",
+            &input,
             "-map",
             "0:v:0",
             "-map",
@@ -530,31 +621,38 @@ async fn transcode(session: Session, job: Job) -> Result<()> {
             "48000",
             "-ac",
             "2",
-            "-mpegts_flags",
-            "+resend_headers",
+            // Matroska preserves AAC AudioSpecificConfig for station RTSP copy.
             "-f",
-            "mpegts",
+            "matroska",
+            "-live",
+            "1",
+            "-cluster_time_limit",
+            "500",
+            "-flush_packets",
+            "1",
             "pipe:1",
         ])
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(if cfg!(test) {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
         .kill_on_drop(true)
         .spawn()
         .context("Cannot start FFmpeg")?;
-    let input = child.stdin.take().unwrap();
     let output = child.stdout.take().unwrap();
-    let mut pump = Pump(tokio::spawn(feed(session.clone(), job.input, input)));
     let upload = session
-        .client
+        .upload_client
         .post(endpoint(&session.base, &job.output)?)
         .bearer_auth(&session.token)
-        .header("Content-Type", "video/mp2t")
+        .header("Content-Type", "video/x-matroska")
         .body(reqwest::Body::wrap_stream(
             tokio_util::io::ReaderStream::new(output),
         ))
         .send();
-    let result = tokio::select! {response=upload=>{let response=response.context("Encoded upload interrupted")?;ensure!(response.status().is_success(),"Station rejected encoded video");Ok(())},status=child.wait()=>{status.context("Encoder stopped")?;bail!("Encoder stopped")},result=&mut pump.0=>{result.context("Camera input task stopped")??;Ok(())}};
+    let result = tokio::select! {response=upload=>{let response=response.context("Encoded upload interrupted")?;ensure!(response.status().is_success(),"Station rejected encoded video (HTTP {})", response.status().as_u16());Ok(())},status=child.wait()=>{status.context("Encoder stopped")?;bail!("Encoder stopped")}};
     let _ = child.kill().await;
     result
 }
@@ -622,11 +720,119 @@ mod tests {
             .await
             .unwrap();
         assert!(response.status().is_success());
+        // Exercise the old helper's video-only MPEG-TS upload against the same
+        // station route before starting current Matroska jobs.
+        let mut legacy_job = heartbeat(&session, true)
+            .await
+            .unwrap()
+            .jobs
+            .into_iter()
+            .find(|j| j.id == "front")
+            .unwrap();
+        // Isolate this qualification stream so retained HLS segments cannot
+        // mix its synthetic resolution with current camera outputs.
+        legacy_job.output = format!(
+            "{}/compatibility",
+            legacy_job.output.rsplit_once('/').unwrap().0
+        );
+        let receiver =
+            Url::parse(&std::env::var("GS_VIDEO_API_URL").expect("loopback fixture receiver URL"))
+                .unwrap();
+        assert_eq!(receiver.host_str(), Some("127.0.0.1"));
+        let mut legacy = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-re",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=30",
+                "-t",
+                "6",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-tune",
+                "zerolatency",
+                "-g",
+                "30",
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "mpegts",
+                "pipe:1",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let legacy_output = legacy.stdout.take().unwrap();
+        let legacy_session = session.clone();
+        let upload = tokio::spawn(async move {
+            legacy_session
+                .upload_client
+                .post(endpoint(&legacy_session.base, &legacy_job.output).unwrap())
+                .bearer_auth(&legacy_session.token)
+                .header("Content-Type", "video/mp2t")
+                .body(reqwest::Body::wrap_stream(
+                    tokio_util::io::ReaderStream::new(legacy_output),
+                ))
+                .send()
+                .await
+                .unwrap()
+        });
+        let legacy_start = Instant::now();
+        let mut legacy_ready = None;
+        while !upload.is_finished() {
+            let _ = heartbeat(&session, true).await.unwrap();
+            let response = session
+                .client
+                .get(
+                    receiver
+                        .join("/v3/paths/get/transcoded-compatibility")
+                        .unwrap(),
+                )
+                .basic_auth(
+                    "groundstation",
+                    Some(std::env::var("GS_VIDEO_PASSWORD").unwrap()),
+                )
+                .send()
+                .await
+                .unwrap();
+            if legacy_ready.is_none()
+                && response.status().is_success()
+                && json::<serde_json::Value>(response).await.unwrap()["ready"] == true
+            {
+                legacy_ready = Some(legacy_start.elapsed().as_millis());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(upload.await.unwrap().status().is_success());
+        assert!(legacy.wait().await.unwrap().success());
+        assert!(
+            legacy_ready.is_some(),
+            "Legacy MPEG-TS never reached the station receiver"
+        );
+        println!("LEGACY_VIDEO_TS_AVAILABLE_MS={}", legacy_ready.unwrap());
         let mut jobs = Vec::new();
         let start = Instant::now();
         let mut last_heartbeat = Instant::now() - Duration::from_secs(5);
         let mut encoded = false;
         while start.elapsed() < Duration::from_secs(45) {
+            if let Some(index) = jobs
+                .iter()
+                .position(|job: &JoinHandle<Result<()>>| job.is_finished())
+            {
+                let result = jobs.swap_remove(index).await;
+                panic!("Native encoding job stopped: {result:?}");
+            }
             if last_heartbeat.elapsed() > Duration::from_secs(3) {
                 let reply = heartbeat(&session, true).await.unwrap();
                 if jobs.is_empty() {
@@ -657,12 +863,22 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         assert!(encoded, "Encoded feed never became available");
+        println!(
+            "MATROSKA_AUDIO_VIDEO_AVAILABLE_MS={}",
+            start.elapsed().as_millis()
+        );
         // Keep the worker alive so a concurrent browser regression can use its feed.
         let hold = std::env::var("GS_TRANSCODE_TEST_HOLD_SECONDS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
         for _ in 0..hold {
+            if let Some(index) = jobs.iter().position(|job| job.is_finished()) {
+                panic!(
+                    "Native encoding job stopped during playback: {:?}",
+                    jobs.swap_remove(index).await
+                );
+            }
             let _ = heartbeat(&session, true).await.unwrap();
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
@@ -701,11 +917,126 @@ mod tests {
         assert!(endpoint(&base, "https://elsewhere.invalid/segment.mp4").is_err());
         assert!(endpoint(&base, "//elsewhere.invalid/segment.mp4").is_err());
     }
+    fn fixture_proxy() -> HlsProxy {
+        HlsProxy {
+            session: Session {
+                client: reqwest::Client::new(),
+                upload_client: reqwest::Client::new(),
+                base: Url::parse("http://127.0.0.1:19090").unwrap(),
+                token: "secret-token".into(),
+                host: None,
+            },
+            prefix: "/api/video/transcode/input/front/".into(),
+            origin: "http://127.0.0.1:12345".into(),
+            capability: "private-capability".into(),
+            cancelled: CancellationToken::new(),
+            requests: Arc::new(tokio::sync::Semaphore::new(8)),
+        }
+    }
     #[test]
-    fn fmp4_playlist_retains_initialization_and_order() {
-        let(init,segments)=playlist("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4?ticket=sample\"\n#EXTINF:1,\na.mp4\n#EXTINF:1,\nb.mp4\n").unwrap();
-        assert_eq!(init.as_deref(), Some("init.mp4?ticket=sample"));
-        assert_eq!(segments, ["a.mp4", "b.mp4"]);
+    fn hls_proxy_preserves_alternate_audio_and_initialization() {
+        let proxy = fixture_proxy();
+        let base = proxy
+            .session
+            .base
+            .join("/api/video/transcode/input/front/index.m3u8")
+            .unwrap();
+        let master = proxy.rewrite(&base, "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",URI=\"audio/index.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000,AUDIO=\"audio\"\nvideo.m3u8\n").unwrap();
+        assert!(master.contains(
+            "TYPE=AUDIO,GROUP-ID=\"audio\",URI=\"http://127.0.0.1:12345/private-capability/"
+        ));
+        assert!(master.contains("/index.m3u8\""));
+        assert!(master.contains("/video.m3u8\n"));
+        assert!(!master.contains("secret-token"));
+        let media = proxy
+            .rewrite(
+                &base,
+                "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4?ticket=sample\"\n#EXTINF:1,\na.m4s\n",
+            )
+            .unwrap();
+        assert!(media.contains("/init.mp4\""));
+        assert!(media.contains("/a.m4s\n"));
+    }
+    #[test]
+    fn hls_proxy_rejects_off_station_and_other_camera_addresses() {
+        let proxy = fixture_proxy();
+        let base = proxy
+            .session
+            .base
+            .join("/api/video/transcode/input/front/index.m3u8")
+            .unwrap();
+        for path in [
+            "https://elsewhere.invalid/a.m3u8",
+            "//elsewhere.invalid/a.m3u8",
+            "../side/a.m3u8",
+            "/api/video/password",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                proxy.rewrite(&base, &format!("#EXTM3U\n{path}\n")).is_err(),
+                "{path}"
+            );
+            assert!(
+                proxy
+                    .rewrite(
+                        &base,
+                        &format!("#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,URI=\"{path}\"\n")
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            proxy
+                .rewrite(&base, "#EXTM3U\n#EXT-X-MAP:URI=init.mp4\n")
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn hls_proxy_authenticates_upstream_and_closes_with_job() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let app = axum::Router::new().fallback(axum::routing::get(
+            move |headers: axum::http::HeaderMap| {
+                let calls = observed.clone();
+                async move {
+                    assert_eq!(headers.get("authorization").unwrap(), "Bearer secret-token");
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,URI=\"audio.m3u8\"\nvideo.m3u8\n"
+                }
+            },
+        ));
+        let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut session = fixture_proxy().session;
+        session.base = Url::parse(&format!("http://{address}")).unwrap();
+        let (guard, input) = proxy(session, "/api/video/transcode/input/front/index.m3u8")
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+        let response = client.get(&input).send().await.unwrap();
+        assert!(response.status().is_success());
+        let body = response.text().await.unwrap();
+        assert!(body.contains("/audio.m3u8\""));
+        assert!(body.contains("/video.m3u8\n"));
+        assert!(!body.contains("secret-token"));
+        let mut invalid = Url::parse(&input).unwrap();
+        invalid.set_path("/wrong-capability/target/index.m3u8");
+        assert_eq!(
+            client.get(invalid).send().await.unwrap().status(),
+            reqwest::StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert!(
+            client
+                .get(input)
+                .send()
+                .await
+                .map_or(true, |r| !r.status().is_success())
+        );
+        upstream.abort();
     }
     #[test]
     fn certificate_override_is_local_only() {
