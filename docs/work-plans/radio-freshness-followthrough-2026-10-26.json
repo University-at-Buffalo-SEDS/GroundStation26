@@ -209,6 +209,46 @@
     ],
     "image_id": "sha256:6cf287856b1bb3c2e4f825e0de9d52935bfbe09fac3ee8f3316a6581abddd5ec",
     "native": "Normal609/0/3ignored;HITL585/0/2ignored;focusedactualvirtualpaths compile/run withtraceflag.",
-    "state": "Completed; strictactualSDKdecode andclock/HostInputjoin underway."
+    "state": "Complete. Both observed UND merges promoted=false due155ms cooldown; all25 promoted boundaries met50ms quiet. Clocklagdidnotcauseobservedmerges."
+  },
+  "clock_publication_followthrough": {
+    "simulator_commit": "4061143",
+    "change": "Atomic1ms sharedclock publication only; unchangedairrates/cutoff/limits/10msUARTlookahead",
+    "actual_Renode_regression": "PASS3ms snapshot,hostpause,boardreset+2ms snapshot5",
+    "comparison_evidence": "FirmwareSimulator/build/schema-progress-cohort-20261027/relay-clock-publication-comparison-14s/clock-publication-comparison-analysis-final.json",
+    "comparison": "GSmaximumclock/HostInputskew10\u21921ms;RRLS8.2\u21920.5ms. Allpromotedboundaries>=50msquiet. BuzzerUARTsend\u2192ACK245.6ms;915.5msisanabsolutesendtimestamp,notrequestlatency. Applicationpublishtimingunavailable;500msgatenotqualified. Laterroundsblockeddiscovery.14sscopeonly,PBwatchdogshortthresholdfails."
+  },
+  "ordinary_fifo_followthrough": {
+    "gs_commit": "8224143efe6352157870b8f26121e5e9eca8e4d9",
+    "bug": "Withoutmetadata,newroutineHB253couldstarveacceptedFC/PBsource0",
+    "fix": "Preservehighestprioritylaneandprotected/schema/voice/settingssemantics;ordinarylaneusesdependency-safeFIFOevenwithoutmetadata",
+    "native": "66productRRLS/68prototype tests pass; all3captures retainrequiredsources/canonicalframes. REDcontinuous-HBstarvation\u2192GREENfirstturn. Exact22HBcodec omissionaudit0errors,remainingpacketJSONunchanged. Offloadmetricsnotendtoend.",
+    "full_run": "Complete: original60s, startup473/445/413ms anddirect416/352ms pass500. RelayFCpacket12840651766089389521pendingat505; actualACK577.2msafterfirstGSUART.2/6soakrounds; overallFAIL.",
+    "root_build_session": null,
+    "scope": "Simulatoronly; nohardware/release/deployment",
+    "source": "149/149source,max790.9ms;21/21canonical,max1312.8ms;allfourFC/PBstreams present;0decodeerrors;all6tracecompleteuncapped.",
+    "runtime": "All7boards12sampleszero panic/TLSF/allocator/CANFIFO gates;DAQ2399analog/0failure,14424loadcell/14983KG50,0SDwrite/rawdrops. TransientGWcan_queue_fail1,actuatortelemetry_rx_errors5,valveheartbeat_fail1 preserved separately.",
+    "evidence": "FirmwareSimulator/build/schema-progress-cohort-20261027/full-path-ordinary-fifo-60s-50ms/offline-analysis.json"
+  },
+  "mesh_pair_followthrough": {
+    "gs_commit": "90fa70087b12995b977744dd00193e5adbf9a574",
+    "validation": "Native618normal/619testfire andall3capturegatespass; fullperframecost/ownership/fairness guards unchanged. LinuxRawUARTonly.",
+    "image": "host-mesh-pair buildfailed focusedPTYfailurefixture; frozencontext/log retained. No integratedsimulationclaimed.",
+    "test_fix": "594128d self-reexecisolatesfailurePTYbeforecreation; actualinheritedmasterFDcounterexampleprovesfixturecause, no productionchange. HITL19receiptcohortpasseswithparallelairchild.",
+    "causal_limit": "LatestFIFOFCsample6 doesnotpresenttwoqueuedcommands/ACKs atfirstsend; paircannotdirectlyremoveits98.09msoutboundpacketextension. Full500qualificationstillpending."
+  },
+  "funded_close_followthrough": {
+    "state": "Isolatedprototypeonly; no productionintegration",
+    "rejected": "UnconditionalowedordinaryselectorcanstarveindependentdiscoveryandbypassREADY/SDT/voice; preservedrejectedproof.",
+    "current": "Bank-only: initial0/max55ms, extraquietspendsactualsuccessfulordinarychargedservice; all originalselectors unchanged. All4capturespass atappropriatecadence; incomplete176B-incompressible3lanestress/seededphase/wallclock/partialproofstillrequired.",
+    "limits": "No500msfullqualifiedresult. Preserveallpacket/air/queue/500/1500/3000limits."
+  },
+  "production_sdk_consumption": {
+    "gs_pin_commit": "7f49772",
+    "sdk_revision": "d82b5526c56a20f65f6257478ae32f3ff9af5674",
+    "source": "SDKorigin/main source-onlypushcompleted; no tags/packageReleaseworkflow. GSnormalmanifestGitrev+versionpinned, macroresolvedsameGitcommit.",
+    "validation": "6actualGitSDKschema+3Pythonrefresh tests;136Rust/manifestfilesmatchfrozenqualifiedarchive. stdGSruntimeJSONinitializationmeansnoembeddedschemaoverlayneeded.",
+    "lock": "RegeneratedlocalCargo.lockremainsignoredperexistingpolicy.",
+    "next": "Finalnormal/HITL/testfireandfullsimfromactualproductionGitdependencyaftercausalpolicyisqualified."
   }
 }
