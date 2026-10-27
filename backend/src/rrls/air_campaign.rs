@@ -60,6 +60,8 @@ fn driver_send(
     driver[node]
         .capacity
         .committed(std::time::Instant::now(), Some(now), length);
+    let stop_us = driver[node].wire.stop_us();
+    driver[node].capacity.drained_virtual(stop_us);
     if close_batch {
         let promoted = driver[node].capacity.close_packet_batch_for_contract(
             std::time::Instant::now(),

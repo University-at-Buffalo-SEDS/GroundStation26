@@ -21,6 +21,11 @@ impl WireDrain {
                 .saturating_add(Self::CLOCK_QUANTUM_US)
     }
 
+    /// Accumulated modeled stop bit, including previously accepted UART work.
+    pub(super) fn stop_us(&self) -> u64 {
+        self.ready_us
+    }
+
     pub(super) fn committed(&mut self, now_ms: u64, bytes: usize, baud: u32) {
         let wire_us = (bytes as u64)
             .saturating_mul(10_000_000) // start +8data +stop bits, in microseconds

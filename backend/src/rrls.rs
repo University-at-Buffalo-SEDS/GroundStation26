@@ -2283,6 +2283,7 @@ mod tests {
             let bytes = tx.frame().bytes.len() + 4;
             wire.committed(now, bytes, 115_200);
             cap.committed(wall, Some(now), bytes);
+            cap.drained_virtual(wire.stop_us());
             if tx.closes_packet_batch() {
                 let contract = tx.boundary_contract();
                 if cap.close_packet_batch_for_contract(wall, Some(now), contract)

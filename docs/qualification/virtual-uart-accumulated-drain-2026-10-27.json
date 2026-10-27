@@ -1,0 +1,70 @@
+{
+  "date": "2026-10-27",
+  "base_commit": "a4dfddb0a35a02bb89101f1597d58ef702df71c8",
+  "result": "Native qualification PASS; new linked cohort pending",
+  "change": "Anchor simulated packet quiet interval to accumulated UART stop bit",
+  "source_sha256": {
+    "backend/src/comms.rs": "58afeefd7fe22484141e3cafc29146310df434f2dca477b1c960ff649f6a4976",
+    "backend/src/comms/rfd_capacity.rs": "b225f9c76f2fb036e95d75318130cbc6e0e8046a354bcc1d59e613d730633c85",
+    "backend/src/comms/virtual_uart.rs": "507c984e9c2efc2eaad500272e5801ae74497c4e670510f0bf8003892b9d442a",
+    "backend/src/rrls.rs": "4b34efd0f83b0172940abd0b1301b590cd6ae9fd88deb6142ff64c93d248b9f2",
+    "backend/src/rrls/air_campaign.rs": "6b214dc9cb0c2423fddd39799918c0715b3987d1f5c6d5144cefd2f1b0b0b1c6",
+    "backend/src/rrls/captured_replay.rs": "0e5eb84847350711edce6e803edf15613c76eaa5f6bf598fa5644d8ef64e0055"
+  },
+  "aggregate_source_sha256": "a62a33d578b9328fe2ba47a185bf1db0c67706050b927116d7a9b577fb88cae2",
+  "cause": {
+    "captured_previous_IMU_bytes": 75,
+    "captured_command_bytes": 55,
+    "virtual_clock_ms": 9080,
+    "old_accumulated_wire_stop_us": 9091286,
+    "old_next_ordinary_ready_us": 9140000,
+    "old_actual_quiet_us": 48714,
+    "declared_modem_idle_us": 50000,
+    "red_evidence": "/tmp/gs-accumulated-wire-red-20261027.log"
+  },
+  "correction": {
+    "virtual_deadline": "max(existing virtual deadline, ceil(accumulated stop_us/1000)+55)",
+    "new_next_ordinary_ready_us": 9147000,
+    "new_actual_quiet_us": 55714,
+    "physical_path": "Existing physical tcdrain wall anchor unchanged",
+    "state_growth_bytes": 0,
+    "preserved": [
+      "10ms bounded UART lookahead",
+      "100ms batch burst",
+      "55ms quiet gap",
+      "airtime debt",
+      "one unpaid critical loan",
+      "all queue and freshness gates",
+      "SDK and firmware unchanged"
+    ]
+  },
+  "tests": {
+    "capacity": 18,
+    "raw_uart": 34,
+    "mesh": 43,
+    "isolated_HITL_PTY": "PASS both successful SDK direct and Mesh write paths, exact returned bytes, no ready before accumulated stop plus55ms",
+    "exact_capture": {
+      "source_reports": 149,
+      "canonical_reports": 15,
+      "max_source_rf_to_offload_us": 1469800,
+      "max_canonical_to_offload_us": 1869400,
+      "expired_heartbeat_count": 17,
+      "expired_labels_identical_to_prior_codec_audit": true,
+      "codec_audit": "rrls-receipt-packet-boundary-2026-10-27.json",
+      "codec_errors": 0
+    }
+  },
+  "receipt_latch_clarification": "One ordinary compensation allowance until successful independent metadata service OR cancellation/absence of the pending metadata lane. Failed writes and ordinary-lane flapping cannot rearm it; absent lanes earn no credit.",
+  "limits": [
+    "Specific defect is simulator virtual accounting; physical UART drain already used actual completion.",
+    "Native offload deadlines are lower bounds before modem and air transit.",
+    "Full linked500ms owner receipt gate remains unqualified."
+  ],
+  "evidence_logs": [
+    "/tmp/gs-accumulated-wire-capacity-20261027.log",
+    "/tmp/gs-accumulated-wire-uart-20261027.log",
+    "/tmp/gs-accumulated-wire-mesh-20261027.log",
+    "/tmp/gs-accumulated-wire-pty-20261027.log",
+    "/tmp/gs-accumulated-wire-captured-20261027.log"
+  ]
+}

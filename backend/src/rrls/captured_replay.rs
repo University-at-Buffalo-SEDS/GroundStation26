@@ -156,6 +156,7 @@ fn captured_control_can_borrow_after_184ms_bulk_debt_with_health_pending() {
         let mut wire = virtual_uart::WireDrain::default();
         capacity.committed(wall, Some(8990), 204);
         wire.committed(8990, 204, 115_200);
+        capacity.drained_virtual(wire.stop_us());
         for now in 9000..9300 {
             if !wire.ready(now) {
                 continue;
@@ -183,6 +184,7 @@ fn captured_control_can_borrow_after_184ms_bulk_debt_with_health_pending() {
             let length = transmission.frame().bytes.len() + 4;
             wire.committed(now, length, 115_200);
             capacity.committed(wall, Some(now), length);
+            capacity.drained_virtual(wire.stop_us());
             mesh.finish_transmission(transmission, true);
             if is_command {
                 return now;
@@ -285,6 +287,7 @@ fn captured_bidirectional_relay_burst_retains_source_and_canonical_deadlines() {
             }
             wire.committed(now, framed_len, 115_200);
             capacity.committed(wall, Some(now), framed_len);
+            capacity.drained_virtual(wire.stop_us());
             if transmission.closes_packet_batch() {
                 let contract = transmission.boundary_contract();
                 let promoted = capacity.close_packet_batch_for_contract(wall, Some(now), contract);

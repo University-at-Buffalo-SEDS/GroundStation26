@@ -251,6 +251,15 @@ impl Capacity {
         }
     }
 
+    /// PTYs complete writes before their modeled UART drains. Preserve the
+    /// same quiet interval as physical tcdrain, including accumulated lookahead.
+    pub(crate) fn drained_virtual(&mut self, stop_us: u64) {
+        let quiet_until = stop_us.div_ceil(1_000).saturating_add(self.packet_gap_ms);
+        if let Some((_, Some(deadline))) = self.next_packet.as_mut() {
+            *deadline = (*deadline).max(quiet_until);
+        }
+    }
+
     pub(crate) fn committed(
         &mut self,
         wall: Instant,
@@ -303,6 +312,79 @@ impl Capacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accumulated_uart_stop_preserves_quiet_after_captured_75_and_55_byte_close() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64_000, 35, 16);
+        let mut wire = super::super::virtual_uart::WireDrain::default();
+        for bytes in [75, 55] {
+            assert!(wire.ready(9080));
+            assert!(cap.ready_for(wall, Some(9080), bytes == 55));
+            wire.committed(9080, bytes, 115_200);
+            cap.committed(wall, Some(9080), bytes);
+            cap.drained_virtual(wire.stop_us());
+        }
+        assert!(cap.close_packet_batch_for_contract(wall, Some(9080), Some((1, false))));
+        assert_eq!(wire.stop_us(), 9_091_286);
+        assert!(
+            !cap.ready(wall, Some(9140)),
+            "48.714ms silence would merge the command with the next modem packet"
+        );
+        assert!(!cap.ready(wall, Some(9146)));
+        assert!(cap.ready(wall, Some(9147)));
+        assert!(9147_000 - wire.stop_us() >= 55_000);
+    }
+
+    #[test]
+    fn several_queued_uart_frames_anchor_the_final_stop_without_idle_credit() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64_000, 100, 16);
+        let mut wire = super::super::virtual_uart::WireDrain::default();
+        for bytes in [50, 50, 55] {
+            assert!(wire.ready(9080), "bounded10ms lookahead remains available");
+            wire.committed(9080, bytes, 115_200);
+            cap.committed(wall, Some(9080), bytes);
+            cap.drained_virtual(wire.stop_us());
+        }
+        assert!(wire.stop_us() > 9_093_000);
+        cap.close_packet_batch(wall, Some(9080));
+        assert!(!cap.ready(wall, Some(9148)));
+        assert!(cap.ready(wall, Some(9149)));
+        wire.committed(60_000, 55, 115_200);
+        cap.committed(wall, Some(60_000), 55);
+        cap.drained_virtual(wire.stop_us());
+        cap.close_packet_batch(wall, Some(60_000));
+        assert!(!cap.ready(wall, Some(60_059)));
+        assert!(
+            cap.ready(wall, Some(60_060)),
+            "idle time carries no queued wire debt"
+        );
+    }
+
+    #[test]
+    fn accumulated_uart_quiet_is_rounded_up_and_never_rewinds_or_forgives_debt() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64_000, 1, 16);
+        cap.committed(wall, Some(100), 55);
+        let debt = cap.next;
+        cap.drained_virtual(120_001);
+        cap.drained_virtual(110_000);
+        assert_eq!(cap.next_packet.unwrap().1, Some(176));
+        assert_eq!(cap.next, debt);
+        assert!(
+            !cap.ready(wall, Some(176)),
+            "quiet does not forgive airtime debt"
+        );
+        let mut physical = Capacity::new(64_000, 35, 16);
+        physical.committed(wall, None, 55);
+        let before = physical.next_packet;
+        physical.drained_virtual(1_000_000);
+        assert_eq!(
+            physical.next_packet, before,
+            "physical tcdrain remains authoritative"
+        );
+    }
+
     #[test]
     fn logical_command_and_receipt_each_promote_once_while_retries_keep_batching() {
         let wall = Instant::now();

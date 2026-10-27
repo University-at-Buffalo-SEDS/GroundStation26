@@ -751,9 +751,15 @@ impl UartComms {
                     self.inner.write_all(&framed)?;
                     self.inner.flush()?;
                 }
+                #[cfg(target_os = "linux")]
+                let virtual_stop_us = virtual_wire_now.map(|_| write_state.wire.stop_us());
                 if let Some(capacity) = &mut write_state.radio_capacity {
                     capacity.committed(capacity_wall, capacity_clock, framed.len());
                     capacity.drained(Instant::now());
+                    #[cfg(target_os = "linux")]
+                    if let Some(stop_us) = virtual_stop_us {
+                        capacity.drained_virtual(stop_us);
+                    }
                     if transmission.closes_packet_batch() {
                         if let Some(contract) = transmission.boundary_contract() {
                             let promoted = capacity.close_packet_batch_for_contract(
@@ -2079,6 +2085,8 @@ impl CommsDevice for UartComms {
                 }
             }
         }
+        #[cfg(target_os = "linux")]
+        let virtual_stop_us = virtual_wire_now.map(|_| write_state.wire.stop_us());
         if matches!(self.protocol, SerialProtocol::RawUart)
             && let Some(capacity) = &mut write_state.radio_capacity
         {
@@ -2088,6 +2096,10 @@ impl CommsDevice for UartComms {
                 len + RAW_UART_FRAME_HEADER_SIZE,
             );
             capacity.drained(Instant::now());
+            #[cfg(target_os = "linux")]
+            if let Some(stop_us) = virtual_stop_us {
+                capacity.drained_virtual(stop_us);
+            }
             if close_batch {
                 if contract.is_some() {
                     let promoted = capacity.close_packet_batch_for_contract(
@@ -3426,6 +3438,95 @@ mod raw_uart_tests {
             !is_radio_packet_receipt(255, &hop_ack),
             "the separate allowance is only for canonical ReliableAck receipts"
         );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "hitl_mode"))]
+    fn virtual_uart_direct_and_mesh_close_wait_for_accumulated_stop() {
+        const CHILD: &str = "GS_ACCUMULATED_UART_CHILD";
+        const NAME: &str =
+            "comms::raw_uart_tests::virtual_uart_direct_and_mesh_close_wait_for_accumulated_stop";
+        if std::env::var_os(CHILD).is_none() {
+            let path =
+                std::env::temp_dir().join(format!("gs-wire-clock-{}.txt", std::process::id()));
+            std::fs::write(&path, "9080").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("GS_SIM_CLOCK_FILE", &path)
+                .env("GS_SIMULATED_SERIAL_PTY", "1")
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_file(path);
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let packet = Packet::new(
+            sedsnet::config::DataType::ReliableAck,
+            &[sedsnet::config::DataEndpoint::TelemetryError],
+            "RF",
+            1,
+            42u64.to_le_bytes().to_vec().into(),
+        )
+        .unwrap();
+        let bytes = serialize::pack_packet(&packet);
+        for mesh_path in [false, true] {
+            let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+            peer.set_timeout(Duration::from_secs(1)).unwrap();
+            let (mut uart, _, _) = recovery_uart_fixture(port);
+            uart.recovery = None;
+            let expected = if mesh_path {
+                let mut mesh = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 1);
+                let mut health = b"RR\x01\x00".to_vec();
+                health.extend_from_slice(&1u32.to_le_bytes());
+                health.extend_from_slice(&0u32.to_le_bytes());
+                health.push(0);
+                health.extend_from_slice(&crc32fast::hash(&health).to_le_bytes());
+                mesh.incoming(true, &health, 9080);
+                mesh.incoming(false, &bytes, 9080);
+                let tx = mesh.begin_transmission(9080).unwrap();
+                let expected = build_raw_uart_command_frame(&tx.frame().bytes).unwrap();
+                mesh.finish_transmission(tx, false);
+                uart.recovery = Some(Arc::new(Mutex::new(mesh)));
+                expected
+            } else {
+                build_raw_uart_frame(&bytes).unwrap()
+            };
+            let length = expected.len();
+            let reader = std::thread::spawn(move || {
+                let mut out = vec![0; length];
+                peer.read_exact(&mut out).unwrap();
+                out
+            });
+            {
+                let mut state = uart.write_lock.lock().unwrap();
+                let mut cap = rfd_capacity::Capacity::new(64_000, 35, 16);
+                state.wire.committed(9080, 75, 115_200);
+                cap.committed(Instant::now(), Some(9080), 75);
+                cap.drained_virtual(state.wire.stop_us());
+                state.radio_capacity = Some(cap);
+            }
+            if mesh_path {
+                uart.flush_recovery_output(0).unwrap();
+            } else {
+                uart.send_data_with_priority(&bytes, 254).unwrap();
+            }
+            let state = uart.write_lock.lock().unwrap();
+            let until = state.wire.stop_us().div_ceil(1000) + 55;
+            let cap = state.radio_capacity.as_ref().unwrap();
+            assert!(
+                !cap.ready(Instant::now(), Some(until - 1)),
+                "path={mesh_path}"
+            );
+            assert!(cap.ready(Instant::now(), Some(until)), "path={mesh_path}");
+            assert_eq!(reader.join().unwrap(), expected);
+        }
     }
 
     #[test]
