@@ -170,6 +170,14 @@ struct Queued {
     sdt_kind: u8,
     sdt_template: u32,
 }
+impl Queued {
+    fn closes_packet_batch(&self) -> bool {
+        !self.independent_discovery
+            && decode(&self.frame.bytes).is_some_and(|(_, body)| {
+                crate::comms::closes_radio_packet_batch(self.priority, body)
+            })
+    }
+}
 /// One owned frame, still charged to the mesh until serial delivery finishes.
 /// Keeping metadata with the frame permits retry without copying its payload.
 pub(crate) struct Transmission {
@@ -181,10 +189,7 @@ impl Transmission {
         &self.queued.frame
     }
     pub(crate) fn closes_packet_batch(&self) -> bool {
-        !self.queued.independent_discovery
-            && decode(&self.queued.frame.bytes).is_some_and(|(_, body)| {
-                crate::comms::closes_radio_packet_batch(self.queued.priority, body)
-            })
+        self.queued.closes_packet_batch()
     }
 }
 
@@ -536,6 +541,21 @@ impl Mesh {
         now: u64,
         minimum_priority: u8,
     ) -> Option<Transmission> {
+        self.begin_matching_transmission(now, minimum_priority, false)
+    }
+    pub(crate) fn begin_critical_transmission(
+        &mut self,
+        now: u64,
+        minimum_priority: u8,
+    ) -> Option<Transmission> {
+        self.begin_matching_transmission(now, minimum_priority, true)
+    }
+    fn begin_matching_transmission(
+        &mut self,
+        now: u64,
+        minimum_priority: u8,
+        critical_only: bool,
+    ) -> Option<Transmission> {
         if self.active_transmission.is_some() {
             return None;
         }
@@ -550,33 +570,46 @@ impl Mesh {
                 .enumerate()
                 .filter(|(index, item)| {
                     !item.independent_discovery
-                        && item.priority >= 254
+                        && (if critical_only {
+                            item.priority >= minimum_priority && item.closes_packet_batch()
+                        } else {
+                            item.priority >= 254
+                        })
                         && self.dependency_ready(*index)
                 })
                 .max_by_key(|(index, item)| (item.priority, std::cmp::Reverse(*index)))
                 .map(|(index, _)| index);
-            let discovery = self
-                .queue
-                .iter()
-                .position(|item| item.independent_discovery);
+            if critical_only && protected.is_none() {
+                return None;
+            }
+            let discovery = if critical_only {
+                None
+            } else {
+                self.queue
+                    .iter()
+                    .position(|item| item.independent_discovery)
+            };
             // Only the ordinary head may yield into service: a later packet
             // must never leapfrog an earlier opaque SDT bootstrap or follower.
-            let ordinary = self
-                .queue
-                .iter()
-                .enumerate()
-                .find(|(index, item)| {
-                    item.priority < 254
-                        && !item.independent_discovery
-                        && matches!(
-                            item.frame.bytes.get(3),
-                            Some(&DOWN_DATA) | Some(&AV_BAY_DATA)
-                        )
-                        && self.dependency_ready(*index)
-                })
-                .map(|(index, _)| index);
+            let ordinary = if critical_only {
+                None
+            } else {
+                self.queue
+                    .iter()
+                    .enumerate()
+                    .find(|(index, item)| {
+                        item.priority < 254
+                            && !item.independent_discovery
+                            && matches!(
+                                item.frame.bytes.get(3),
+                                Some(&DOWN_DATA) | Some(&AV_BAY_DATA)
+                            )
+                            && self.dependency_ready(*index)
+                    })
+                    .map(|(index, _)| index)
+            };
             let lanes_ready = discovery.is_some() && ordinary.is_some();
-            if !lanes_ready {
+            if !critical_only && !lanes_ready {
                 self.discovery_balance_bytes = 0;
             }
             let contested = protected.is_none() && lanes_ready;

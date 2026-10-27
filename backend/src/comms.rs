@@ -136,6 +136,9 @@ pub trait CommsDevice: Send {
     fn transmit_ready(&self) -> bool {
         true
     }
+    fn transmit_ready_for(&self, _priority: u8, _payload: &[u8]) -> bool {
+        self.transmit_ready()
+    }
 
     /// Enable capacity backpressure on the actual radio UART only.
     fn enable_radio_capacity_control(&mut self) {}
@@ -669,21 +672,35 @@ impl UartComms {
             let capacity_wall = Instant::now();
             let capacity_clock = crate::simulation_clock_ms();
             self.refresh_recovery_capacity(&mut write_state, capacity_wall, capacity_clock);
-            if write_state
+            let normal_ready = !write_state
                 .radio_capacity
                 .as_ref()
-                .is_some_and(|cap| !cap.ready(capacity_wall, capacity_clock))
-            {
-                break;
-            }
+                .is_some_and(|cap| !cap.ready(capacity_wall, capacity_clock));
             let transmission = {
                 let mut mesh = shared.lock().unwrap();
                 let now = mesh.now();
-                mesh.begin_transmission_at_priority(now, minimum_priority)
+                if normal_ready {
+                    mesh.begin_transmission_at_priority(now, minimum_priority)
+                } else {
+                    mesh.begin_critical_transmission(now, minimum_priority)
+                }
             };
             let Some(transmission) = transmission else {
                 break;
             };
+            if write_state.radio_capacity.as_ref().is_some_and(|cap| {
+                !cap.ready_for(
+                    capacity_wall,
+                    capacity_clock,
+                    transmission.closes_packet_batch(),
+                )
+            }) {
+                shared
+                    .lock()
+                    .unwrap()
+                    .finish_transmission(transmission, false);
+                break;
+            }
             let result = (|| -> TelemetryResult<()> {
                 let frame = transmission.frame();
                 let framed = if frame.command {
@@ -1826,13 +1843,18 @@ impl CommsDevice for UartComms {
         }
     }
     fn transmit_ready(&self) -> bool {
+        self.transmit_ready_for(0, &[])
+    }
+    fn transmit_ready_for(&self, priority: u8, payload: &[u8]) -> bool {
         let mut state = self.write_lock.lock().unwrap();
         self.refresh_recovery_capacity(&mut state, Instant::now(), crate::simulation_clock_ms());
-        if state
-            .radio_capacity
-            .as_ref()
-            .is_some_and(|cap| !cap.ready(Instant::now(), crate::simulation_clock_ms()))
-        {
+        if state.radio_capacity.as_ref().is_some_and(|cap| {
+            !cap.ready_for(
+                Instant::now(),
+                crate::simulation_clock_ms(),
+                closes_radio_packet_batch(priority, payload),
+            )
+        }) {
             return false;
         }
         #[cfg(target_os = "linux")]
@@ -1914,7 +1936,7 @@ impl CommsDevice for UartComms {
         if self.recovery.is_some() {
             self.enable_radio_capacity_control();
         }
-        if !self.transmit_ready() {
+        if !self.transmit_ready_for(priority, payload) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "simulated UART wire is still transmitting",
@@ -1961,7 +1983,7 @@ impl CommsDevice for UartComms {
         if write_state
             .radio_capacity
             .as_ref()
-            .is_some_and(|cap| !cap.ready(capacity_wall, capacity_clock))
+            .is_some_and(|cap| !cap.ready_for(capacity_wall, capacity_clock, close_batch))
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -3397,6 +3419,53 @@ mod raw_uart_tests {
             );
         }
     }
+    #[test]
+    #[cfg(unix)]
+    fn critical_uart_borrows_bulk_debt_once_and_preserves_exact_wire_bytes() {
+        crate::telemetry_schema::initialize().unwrap();
+        let packet = Packet::new(
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
+            "GS",
+            1,
+            vec![0; 1].into(),
+        )
+        .unwrap();
+        let bytes = sedsnet::wire_format::pack_packet(&packet);
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_secs(1)).unwrap();
+        let (mut uart, _, _) = recovery_uart_fixture(port);
+        uart.recovery = None;
+        let base = Instant::now() - Duration::from_millis(35);
+        let mut capacity = rfd_capacity::Capacity::new(64_000, 15, 16);
+        capacity.committed(base, None, 204);
+        uart.write_lock.lock().unwrap().radio_capacity = Some(capacity);
+        assert!(!uart.transmit_ready());
+        assert!(uart.transmit_ready_for(200, &bytes));
+        assert!(
+            uart.transmit_ready_for(200, &bytes),
+            "readiness alone cannot consume the one loan"
+        );
+        let expected = build_raw_uart_frame(&bytes).unwrap();
+        let length = expected.len();
+        let reader = std::thread::spawn(move || {
+            let mut out = vec![0; length];
+            peer.read_exact(&mut out).unwrap();
+            out
+        });
+        uart.send_data_with_priority(&bytes, 200).unwrap();
+        assert!(
+            !uart.transmit_ready_for(200, &bytes),
+            "another critical frame cannot borrow before debt repayment"
+        );
+        let state = uart.write_lock.lock().unwrap();
+        let cap = state.radio_capacity.as_ref().unwrap();
+        let cost = ((length + 16) * 8000).div_ceil(9600) as u64;
+        assert!(!cap.ready(base + Duration::from_millis(183 + cost), None));
+        assert!(cap.ready(base + Duration::from_millis(184 + cost), None));
+        assert_eq!(reader.join().unwrap(), expected);
+    }
+
     #[test]
     #[cfg(unix)]
     fn rejected_critical_uart_write_cannot_close_or_charge_a_batch() {

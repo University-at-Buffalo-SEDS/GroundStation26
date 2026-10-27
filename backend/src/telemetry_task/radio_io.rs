@@ -346,6 +346,39 @@ impl WireBacklog {
             backlog_push(&mut self.priorities, priority, payload, front);
         }
     }
+    fn pop_critical(&mut self) -> Option<(u8, Vec<u8>)> {
+        // Canonical controls are independent of the ordered SDT dictionaries.
+        // Routine heartbeat/GPS/discovery must not hide one eligible loan.
+        let application = self.priorities.iter().rev().find_map(|(priority, queue)| {
+            queue
+                .iter()
+                .position(|bytes| crate::comms::closes_radio_packet_batch(*priority, bytes))
+                .map(|index| (*priority, index))
+        });
+        let receipt = self.receipts.front().is_some_and(|(priority, bytes)| {
+            crate::comms::closes_radio_packet_batch(*priority, bytes)
+        });
+        let packet = if let Some((priority, index)) =
+            application.filter(|_| !receipt || self.application_bytes < 256)
+        {
+            let queue = self.priorities.get_mut(&priority).unwrap();
+            let bytes = queue.remove(index).unwrap();
+            if queue.is_empty() {
+                self.priorities.remove(&priority);
+            }
+            self.application_bytes = self.application_bytes.saturating_add(bytes.len());
+            Some((priority, bytes))
+        } else if receipt {
+            self.application_bytes = 0;
+            self.receipts.pop_front()
+        } else {
+            None
+        };
+        if let Some((_, bytes)) = &packet {
+            self.control_bytes = self.control_bytes.saturating_add(bytes.len());
+        }
+        packet
+    }
     fn pop(&mut self) -> Option<(u8, Vec<u8>)> {
         if self.preserve_order {
             // Bound control bursts so schema/bootstrap still makes progress.
@@ -1119,14 +1152,30 @@ pub(super) fn spawn_comms_worker_threads(
                         );
                         break;
                     }
-                    if !comms.transmit_ready() {
-                        // Leave frames queued so a newly admitted command can
-                        // overtake bulk traffic when the UART finishes writing.
-                        break;
-                    }
-                    let Some((priority, payload)) = backlog.pop() else {
+                    let selection_state = (
+                        backlog.application_bytes,
+                        backlog.ordered_metadata_next,
+                        backlog.priority_bytes,
+                        backlog.control_bytes,
+                    );
+                    let selected = if comms.transmit_ready() {
+                        backlog.pop()
+                    } else {
+                        backlog.pop_critical()
+                    };
+                    let Some((priority, payload)) = selected else {
                         break;
                     };
+                    if !comms.transmit_ready_for(priority, &payload) {
+                        (
+                            backlog.application_bytes,
+                            backlog.ordered_metadata_next,
+                            backlog.priority_bytes,
+                            backlog.control_bytes,
+                        ) = selection_state;
+                        backlog.push(priority, payload, true);
+                        break;
+                    }
                     if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some() {
                         log::info!("full-bay transport selected side={worker_name} sim={:?} priority={priority} len={} type={:?}", crate::simulation_clock_ms(), payload.len(), serialize::peek_frame_info_unchecked(&payload).map(|info| info.envelope.ty));
                     }
@@ -1147,7 +1196,7 @@ pub(super) fn spawn_comms_worker_threads(
                                 last_send_error_log_ms = 0;
                             }
                             // RFD firmware owns MAC/turn scheduling. The UART
-                            // device enforces shared capacity before queue pop;
+                            // device enforces shared capacity before UART offload;
                             // no LoRa cooldown, AUX or receive window is used.
                             next_tx_allowed_at = TxDeadline::now();
                         }
@@ -1155,6 +1204,12 @@ pub(super) fn spawn_comms_worker_threads(
                             // A transport error means the packet never reached
                             // Pico-Fi. Preserve queue ordering and retry the
                             // entire logical packet from a new START slot.
+                            (
+                            backlog.application_bytes,
+                            backlog.ordered_metadata_next,
+                            backlog.priority_bytes,
+                            backlog.control_bytes,
+                        ) = selection_state;
                             backlog.push(priority, payload, true);
                             next_tx_allowed_at = TxDeadline::now().after(Duration::from_millis(COMMS_TX_GAP_MS));
                             log_repeated_worker_error(
@@ -2627,6 +2682,112 @@ mod rfd_worker_tests {
     struct ReadinessDevice {
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
         credit: Arc<AtomicUsize>,
+    }
+    #[tokio::test]
+    async fn critical_head_is_inspected_before_ordinary_capacity_refusal() {
+        struct LoanDevice {
+            sent: Arc<Mutex<Vec<Vec<u8>>>>,
+            unused: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl CommsDevice for LoanDevice {
+            fn transmit_ready(&self) -> bool {
+                false
+            }
+            fn transmit_ready_for(&self, priority: u8, payload: &[u8]) -> bool {
+                self.unused.load(Ordering::Acquire)
+                    && crate::comms::closes_radio_packet_batch(priority, payload)
+            }
+            fn recv_packet(
+                &mut self,
+                _: &Router,
+                _: &mut dyn FnMut(&Packet),
+            ) -> sedsnet::TelemetryResult<()> {
+                Ok(())
+            }
+            fn set_side_id(&mut self, _: RouterSideId) {}
+            fn send_data(&mut self, _: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+                panic!("trusted priority lost")
+            }
+            fn send_data_with_priority(
+                &mut self,
+                bytes: &[u8],
+                priority: u8,
+            ) -> Result<(), Box<dyn Error + Send + Sync>> {
+                assert!(crate::comms::closes_radio_packet_batch(priority, bytes));
+                assert!(self.unused.swap(false, Ordering::AcqRel));
+                self.sent.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            }
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let packet = Packet::new(
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
+            "GS",
+            1,
+            Arc::from([1]),
+        )
+        .unwrap();
+        let command = serialize::pack_packet(&packet).to_vec();
+        let bulk = b"SDT opaque schema retains FIFO ownership".to_vec();
+        let state = crate::state::tests::test_app_state().await;
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let unused = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let budget = Arc::new(TxQueueBudget::new(4096));
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let heartbeat = Packet::new(
+            crate::telemetry_schema::data_type("HEARTBEAT"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            "GS",
+            1,
+            Arc::from([]),
+        )
+        .unwrap();
+        let heartbeat = serialize::pack_packet(&heartbeat).to_vec();
+        budget.try_send(&sender, 253, &heartbeat).unwrap();
+        budget.try_send(&sender, 0, &bulk).unwrap();
+        budget.try_send(&sender, 200, &command).unwrap();
+        let device = || {
+            Box::new(LoanDevice {
+                sent: sent.clone(),
+                unused: unused.clone(),
+            }) as Box<dyn CommsDevice>
+        };
+        let workers = spawn_comms_worker_threads(
+            Arc::new(Router::new(Default::default())),
+            state.clone(),
+            CommsWorkerHandle {
+                transport_activity: None,
+                name: "rocket_comms",
+                tx_budget: Some(budget.clone()),
+                comms: Arc::new(Mutex::new(device())),
+                tx_comms: Some(Arc::new(Mutex::new(device()))),
+                side_id: 0,
+                tx_rx: receiver,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: false,
+            },
+        )
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            while sent.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await;
+        state.request_shutdown();
+        drop(sender);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        result.expect("ordinary readiness hid the eligible critical head");
+        assert_eq!(*sent.lock().unwrap(), vec![command]);
+        assert_eq!(
+            budget.pending.load(Ordering::Acquire),
+            bulk.len() + heartbeat.len(),
+            "refused bulk keeps its exact reservation"
+        );
     }
     impl CommsDevice for ReadinessDevice {
         fn transmit_ready(&self) -> bool {

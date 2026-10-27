@@ -125,6 +125,9 @@ impl CommsDevice for RecoveryRadio {
         )
     }
     fn transmit_ready(&self) -> bool {
+        self.transmit_ready_for(0, &[])
+    }
+    fn transmit_ready_for(&self, priority: u8, payload: &[u8]) -> bool {
         let device = {
             let state = self.shared.lock().unwrap();
             if self.tx {
@@ -133,7 +136,7 @@ impl CommsDevice for RecoveryRadio {
                 state.rx.clone()
             }
         };
-        device.is_none_or(|device| device.lock().unwrap().transmit_ready())
+        device.is_none_or(|device| device.lock().unwrap().transmit_ready_for(priority, payload))
     }
 
     fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {

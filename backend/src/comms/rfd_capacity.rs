@@ -9,6 +9,7 @@ pub(crate) struct Capacity {
     next_packet: Option<(Instant, Option<u64>)>,
     packet_started: Option<(Instant, Option<u64>)>,
     last_forced_boundary: Option<(Instant, Option<u64>)>,
+    early_frame_outstanding: bool,
     packet_burst_ms: u64,
     uart_baud: u32,
     packet_gap_ms: u64,
@@ -26,6 +27,21 @@ fn bounded_env(name: &str, default: u64, min: u64, max: u64) -> u64 {
         .unwrap_or(default)
 }
 impl Capacity {
+    pub(crate) fn ready_for(&self, wall: Instant, virtual_ms: Option<u64>, critical: bool) -> bool {
+        if self.ready(wall, virtual_ms) {
+            return true;
+        }
+        if !critical || self.early_frame_outstanding || !self.packet_ready(wall, virtual_ms) {
+            return false;
+        }
+        let limit = self.packet_burst_ms.saturating_add(self.packet_gap_ms);
+        self.next.is_some_and(
+            |(next_wall, next_virtual)| match (virtual_ms, next_virtual) {
+                (Some(now), Some(next)) => next.saturating_sub(now) <= limit,
+                _ => next_wall.saturating_duration_since(wall) <= Duration::from_millis(limit),
+            },
+        )
+    }
     /// Promote the first interactive completion per normal batch cycle. A
     /// retry/ACK burst must not turn all ordinary traffic into one-frame
     /// packets. Keep airtime debt and the stopbit/quiet deadline unchanged.
@@ -78,6 +94,7 @@ impl Capacity {
             next_packet: None,
             packet_started: None,
             last_forced_boundary: None,
+            early_frame_outstanding: false,
             packet_burst_ms: 100,
             uart_baud: 115_200,
             packet_gap_ms: 55,
@@ -127,6 +144,21 @@ impl Capacity {
         self.share_percent = share;
     }
     pub(crate) fn ready(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
+        Self::reached(self.next, wall, virtual_ms) && self.packet_ready(wall, virtual_ms)
+    }
+    fn reached(
+        deadline: Option<(Instant, Option<u64>)>,
+        wall: Instant,
+        virtual_ms: Option<u64>,
+    ) -> bool {
+        deadline.is_none_or(
+            |(next_wall, next_virtual)| match (virtual_ms, next_virtual) {
+                (Some(now), Some(next)) => now >= next,
+                _ => wall >= next_wall,
+            },
+        )
+    }
+    fn packet_ready(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
         let reached = |deadline: Option<(Instant, Option<u64>)>| {
             deadline.is_none_or(
                 |(next_wall, next_virtual)| match (virtual_ms, next_virtual) {
@@ -144,7 +176,7 @@ impl Capacity {
                 }
             }
         });
-        reached(self.next) && (within_burst || reached(self.next_packet))
+        within_burst || reached(self.next_packet)
     }
     /// A physical tcdrain may complete later than its nominal wire duration.
     /// Anchor the quiet gap to actual completion; virtual time still follows
@@ -184,16 +216,88 @@ impl Capacity {
                 .unwrap_or(wall),
             virtual_ms.map(|now| now.saturating_add(packet_ms)),
         ));
+        let previous = self.next;
+        self.early_frame_outstanding = !Self::reached(previous, wall, virtual_ms);
+        let base_wall = previous.map_or(wall, |(next, _)| next.max(wall));
+        let base_virtual = virtual_ms.map(|now| match previous {
+            Some((_, Some(next))) => next.max(now),
+            Some((next, None)) => now.saturating_add(
+                next.saturating_duration_since(wall)
+                    .as_nanos()
+                    .div_ceil(1_000_000)
+                    .min(u64::MAX as u128) as u64,
+            ),
+            None => now,
+        });
         let duration = Duration::from_millis(millis);
         self.next = Some((
-            wall.checked_add(duration).unwrap_or(wall),
-            virtual_ms.map(|now| now.saturating_add(millis)),
+            base_wall.checked_add(duration).unwrap_or(base_wall),
+            base_virtual.map(|now| now.saturating_add(millis)),
         ));
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn critical_head_can_borrow_one_bounded_lead_but_must_repay_all_airtime() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64_000, 15, 16);
+        cap.committed(wall, Some(8990), 204); //192-byteSDT +8RR +4UART =>184ms debt.
+        assert!(!cap.ready_for(wall + Duration::from_millis(10), Some(9000), true));
+        assert!(!cap.ready_for(wall + Duration::from_millis(28), Some(9018), true));
+        assert!(
+            cap.ready_for(wall + Duration::from_millis(29), Some(9019), true),
+            "critical head may take155ms finite lead instead of waiting behind the184ms bulk debt"
+        );
+        assert!(!cap.ready_for(wall + Duration::from_millis(29), Some(9019), false));
+        cap.committed(wall + Duration::from_millis(29), Some(9019), 42);
+        cap.close_packet_batch(wall + Duration::from_millis(29), Some(9019));
+        assert!(
+            !cap.ready_for(wall + Duration::from_millis(80), Some(9070), true),
+            "second early frame is refused until the entire loan is repaid"
+        );
+        assert!(!cap.ready_for(wall + Duration::from_millis(232), Some(9222), true));
+        assert!(!cap.ready(wall + Duration::from_millis(232), None));
+        assert!(cap.ready(wall + Duration::from_millis(233), None));
+        assert!(
+            cap.ready(wall, Some(9223)),
+            "184+49ms airtime is paid, not overwritten by the early send"
+        );
+    }
+    #[test]
+    fn critical_loan_respects_low_share_wire_quiet_and_clock_changes() {
+        let wall = Instant::now();
+        let mut low = Capacity::new(64_000, 1, 16);
+        low.committed(wall, Some(0), 42); //725ms debt, not an immediate critical credit.
+        assert!(!low.ready_for(wall, Some(569), true));
+        assert!(low.ready_for(wall, Some(570), true));
+        low.committed(wall + Duration::from_millis(570), Some(570), 42);
+        assert!(!low.ready_for(wall, Some(1295), true));
+        assert!(low.ready(wall, Some(1450)));
+
+        let mut quiet = Capacity::new(64_000, 15, 16);
+        quiet.packet_burst_ms = 0;
+        quiet.committed(wall, Some(0), 42);
+        assert!(!quiet.ready_for(wall, Some(58), true));
+        assert!(quiet.ready_for(wall, Some(59), true));
+        quiet.drained(wall + Duration::from_millis(100));
+        assert!(!quiet.ready_for(wall + Duration::from_millis(154), None, true));
+        assert!(quiet.ready_for(wall + Duration::from_millis(155), None, true));
+
+        let mut mixed = Capacity::new(64_000, 15, 16);
+        mixed.committed(wall, None, 204);
+        assert!(mixed.ready_for(wall + Duration::from_millis(29), Some(9000), true));
+        mixed.committed(wall + Duration::from_millis(29), Some(9000), 42);
+        assert!(!mixed.ready(wall + Duration::from_millis(232), None));
+        assert!(mixed.ready(wall + Duration::from_millis(233), None));
+        assert!(!mixed.ready(wall, Some(9203)));
+        assert!(
+            mixed.ready(wall, Some(9204)),
+            "translate remaining155ms wall debt before adding49ms new airtime"
+        );
+    }
+
     #[test]
     fn interactive_completion_ends_only_this_batch_without_forgiving_airtime_debt() {
         let wall = Instant::now();

@@ -36,7 +36,7 @@ fn driver_send(
     if !driver[node].wire.ready(now)
         || !driver[node]
             .capacity
-            .ready(std::time::Instant::now(), Some(now))
+            .ready_for(std::time::Instant::now(), Some(now), close_batch)
     {
         return Err(sedsnet::TelemetryError::Io("side tx busy"));
     }
@@ -93,14 +93,18 @@ fn flush_mesh(
     now: u64,
 ) {
     for _ in 0..4 {
-        if !drivers.lock().unwrap()[node].wire.ready(now)
-            || !drivers.lock().unwrap()[node]
-                .capacity
-                .ready(std::time::Instant::now(), Some(now))
-        {
+        if !drivers.lock().unwrap()[node].wire.ready(now) {
             break;
         }
-        let Some(transmission) = mesh.lock().unwrap().begin_transmission(now) else {
+        let normal_ready = drivers.lock().unwrap()[node]
+            .capacity
+            .ready(std::time::Instant::now(), Some(now));
+        let candidate = if normal_ready {
+            mesh.lock().unwrap().begin_transmission(now)
+        } else {
+            mesh.lock().unwrap().begin_critical_transmission(now, 0)
+        };
+        let Some(transmission) = candidate else {
             break;
         };
         let accepted = driver_send(

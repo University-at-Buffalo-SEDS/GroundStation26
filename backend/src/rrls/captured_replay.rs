@@ -70,13 +70,136 @@ fn captured_canonical_unsequenced_controls_preserve_the_interactive_boundary_tag
             .unwrap();
         relay.incoming(true, &health, 0);
         relay.incoming(false, body, 0);
-        let transmission = relay.begin_transmission(0).unwrap();
+        // HEALTH/discovery at255 may not hide a real control254 when only
+        // critical borrowing is available. Ordinary opaqueSDT retains ownership.
+        relay.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(HEALTH, &[0; 9]),
+            },
+            255,
+            0,
+        );
+        relay.enqueue(
+            Outgoing {
+                command: false,
+                bytes: encode(DOWN_DATA, b"SDT\x03opaque"),
+            },
+            253,
+            0,
+        );
+        let owned_before = relay.bytes;
+        let transmission = relay.begin_critical_transmission(0, 0).unwrap();
+        assert!(decode(&transmission.frame().bytes).is_some_and(|(_, raw)| raw == body));
+        relay.finish_transmission(transmission, false);
+        assert_eq!(relay.bytes, owned_before, "refusal retains byte ownership");
+        let transmission = relay.begin_critical_transmission(0, 0).unwrap();
         assert!(transmission.closes_packet_batch());
+        relay.finish_transmission(transmission, true);
+        let remaining = relay.bytes;
+        let dropped = relay.dropped;
+        assert!(relay.begin_critical_transmission(10_000, 0).is_none());
+        assert_eq!(
+            relay.bytes, remaining,
+            "critical-only selection cannot consume routine data"
+        );
+        assert_eq!(
+            relay.dropped, dropped,
+            "critical-only polling cannot expire ordinary data"
+        );
+        let transmission = relay.begin_transmission(0).unwrap();
+        assert!(!transmission.closes_packet_batch());
         verified += 1;
     }
     assert!(
         verified >= 6,
         "exercise multiple real captured commands/retries"
+    );
+}
+
+#[test]
+fn captured_control_can_borrow_after_184ms_bulk_debt_with_health_pending() {
+    crate::telemetry_schema::initialize().unwrap();
+    let fixture: Fixture =
+        serde_json::from_str(include_str!("fixtures/full-path-50ms-rx.json")).unwrap();
+    let command = fixture
+        .events
+        .iter()
+        .filter(|event| event.label.starts_with("AV_BAY_UNDERGLOW:"))
+        .find_map(|event| {
+            let bytes = STANDARD.decode(&event.payload).unwrap();
+            let (_, body) = decode(&bytes)?;
+            (!body.starts_with(b"SDT")).then(|| body.to_vec())
+        })
+        .unwrap();
+    assert!(crate::comms::closes_radio_packet_batch(254, &command));
+    let run = |borrow: bool| {
+        let wall = std::time::Instant::now();
+        let mut mesh = Mesh::new(Role::Rrls, 2);
+        mesh.enqueue(
+            Outgoing {
+                command: false,
+                bytes: encode(DOWN_DATA, &command),
+            },
+            254,
+            9000,
+        );
+        mesh.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(HEALTH, &[0; 9]),
+            },
+            255,
+            9000,
+        );
+        let mut capacity = crate::comms::rfd_capacity::Capacity::new(64_000, 15, 16);
+        let mut wire = virtual_uart::WireDrain::default();
+        capacity.committed(wall, Some(8990), 204);
+        wire.committed(8990, 204, 115_200);
+        for now in 9000..9300 {
+            if !wire.ready(now) {
+                continue;
+            }
+            let normal = capacity.ready(wall, Some(now));
+            let candidate = if normal {
+                mesh.begin_transmission(now)
+            } else if borrow {
+                mesh.begin_critical_transmission(now, 0)
+            } else {
+                None
+            };
+            let Some(transmission) = candidate else {
+                continue;
+            };
+            if !capacity.ready_for(
+                wall,
+                Some(now),
+                borrow && transmission.closes_packet_batch(),
+            ) {
+                mesh.finish_transmission(transmission, false);
+                continue;
+            }
+            let is_command = transmission.closes_packet_batch();
+            let length = transmission.frame().bytes.len() + 4;
+            wire.committed(now, length, 115_200);
+            capacity.committed(wall, Some(now), length);
+            mesh.finish_transmission(transmission, true);
+            if is_command {
+                return now;
+            }
+        }
+        panic!("captured control never admitted")
+    };
+    let baseline = run(false);
+    let borrowed = run(true);
+    eprintln!("CAPTURED_CRITICAL_BULK_DEBT baseline_ms={baseline} borrowed_ms={borrowed}");
+    assert!(
+        baseline >= 9200,
+        "HEALTH plus existing bulk debt reproduce delayed admission"
+    );
+    assert_eq!(
+        borrowed, 9019,
+        "one bounded155ms loan preserves the184ms debt and UART stopbit gate"
     );
 }
 
@@ -134,12 +257,21 @@ fn captured_bidirectional_relay_burst_retains_source_and_canonical_deadlines() {
         peak = peak.max(relay.queue.len());
         assert!(relay.queue.len() <= MAX_FRAMES && relay.bytes <= MAX_BYTES);
         for _ in 0..4 {
-            if !wire.ready(now) || !capacity.ready(wall, Some(now)) {
+            if !wire.ready(now) {
                 break;
             }
-            let Some(transmission) = relay.begin_transmission(now) else {
+            let candidate = if capacity.ready(wall, Some(now)) {
+                relay.begin_transmission(now)
+            } else {
+                relay.begin_critical_transmission(now, 0)
+            };
+            let Some(transmission) = candidate else {
                 break;
             };
+            if !capacity.ready_for(wall, Some(now), transmission.closes_packet_batch()) {
+                relay.finish_transmission(transmission, false);
+                break;
+            }
             let frame = transmission.frame();
             let framed_len = frame.bytes.len() + 4;
             if decode(&frame.bytes).is_some_and(|(kind, _)| kind == READY) {
