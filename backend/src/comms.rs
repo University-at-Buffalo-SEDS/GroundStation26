@@ -896,6 +896,11 @@ impl UartComms {
                             receipt_promoted = promoted && contract.is_some_and(|(_, receipt)| receipt);
                         }
                     }
+                    if io_result.is_ok() {
+                        capacity.note_successful_ordinary_service(
+                            transmission.successful_ordinary_service_bytes(),
+                        );
+                    }
                     if receipt_promoted {
                         shared
                             .lock()
@@ -2409,6 +2414,11 @@ impl CommsDevice for UartComms {
             #[cfg(target_os = "linux")]
             if let Some(stop_us) = virtual_stop_us {
                 capacity.drained_virtual(stop_us);
+            }
+            // Reached only after a complete write and platform drain/flush.
+            // Refusals and failed/partial logical frames cannot fund a close.
+            if priority < 254 && !close_batch {
+                capacity.note_successful_ordinary_service(len + RAW_UART_FRAME_HEADER_SIZE);
             }
             let mut promoted = false;
             if close_batch {
@@ -3960,6 +3970,8 @@ mod raw_uart_tests {
                 priority == 0
             );
             assert!(cap.ready(completed + Duration::from_millis(80), None));
+            assert_eq!(cap.ordinary_service_credit_ms() > 0, priority == 0,
+                "only completed ordinary IO funds another close, including on wall-clock UART");
             assert_eq!(
                 reader.join().unwrap(),
                 build_raw_uart_frame(&bytes).unwrap()
@@ -4336,6 +4348,7 @@ mod raw_uart_tests {
         let (mut uart, shared, expected) = mesh_receipt_pair_fixture(port);
         drop(peer);
         assert!(uart.flush_recovery_output(0).is_err());
+        assert_eq!(uart.write_lock.lock().unwrap().radio_capacity.as_ref().unwrap().ordinary_service_credit_ms(), 0);
         let mut mesh = shared.lock().unwrap();
         let tx = mesh.begin_bounded_transmission(0, 0, false, 2).unwrap();
         let mut actual = build_raw_uart_command_frame(&tx.frame().bytes).unwrap();
@@ -4377,6 +4390,7 @@ mod raw_uart_tests {
         let wall = Instant::now();
         let mut capacity = rfd_capacity::Capacity::new(64_000, 15, 16);
         capacity.committed(wall, Some(10), accepted);
+        assert_eq!(capacity.ordinary_service_credit_ms(), 0, "partial logical IO cannot fund a close");
         assert!(
             !capacity.ready(wall, Some(11)),
             "accepted partial bytes retain full airtime debt"
@@ -4419,6 +4433,58 @@ mod raw_uart_tests {
         uart.drain_recovery_frames().unwrap();
         let (_peer, actual) = reader.join().unwrap();
         assert_eq!(actual, expected);
+        assert!(shared.lock().unwrap().begin_transmission(0).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn completed_mesh_ordinary_uart_io_funds_only_the_written_frame() {
+        crate::telemetry_schema::initialize().unwrap();
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(100)).unwrap();
+        let (mut uart, shared, _) = recovery_uart_fixture(port);
+        let mut mesh = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 2);
+        let mut health = b"RR\x01\x00".to_vec();
+        health.extend_from_slice(&1u32.to_le_bytes());
+        health.extend_from_slice(&1u32.to_le_bytes());
+        health.push(0);
+        health.extend_from_slice(&crc32fast::hash(&health).to_le_bytes());
+        mesh.incoming(true, &health, 0);
+        let bytes = serialize::pack_packet(
+            &Packet::new(
+                crate::telemetry_schema::data_type("BAROMETER_DATA"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "FC",
+                1,
+                std::sync::Arc::from([0u8; 12]),
+            )
+            .unwrap(),
+        );
+        mesh.incoming(false, &bytes, 0);
+        let tx = mesh.begin_transmission(0).unwrap();
+        let expected = if tx.frame().command {
+            build_raw_uart_command_frame(&tx.frame().bytes).unwrap()
+        } else {
+            build_raw_uart_frame(&tx.frame().bytes).unwrap()
+        };
+        assert!(tx.successful_ordinary_service_bytes() > 0);
+        mesh.finish_transmission(tx, false);
+        *shared.lock().unwrap() = mesh;
+        uart.write_lock.lock().unwrap().radio_capacity =
+            Some(rfd_capacity::Capacity::new(64_000, 35, 16));
+        let length = expected.len();
+        let reader = std::thread::spawn(move || {
+            let mut actual = vec![0; length];
+            peer.read_exact(&mut actual).unwrap();
+            (peer, actual)
+        });
+        uart.flush_recovery_output(0).unwrap();
+        let (_peer, actual) = reader.join().unwrap();
+        assert_eq!(actual, expected);
+        let state = uart.write_lock.lock().unwrap();
+        let cap = state.radio_capacity.as_ref().unwrap();
+        let earned = ((length + 16) * 8000).div_ceil(22_400).min(55) as u8;
+        assert_eq!(cap.ordinary_service_credit_ms(), earned);
         assert!(shared.lock().unwrap().begin_transmission(0).is_none());
     }
 

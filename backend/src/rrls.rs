@@ -216,6 +216,22 @@ impl Transmission {
         let (_, body) = decode(&queued.frame.bytes)?;
         crate::comms::radio_batch_control_contract(queued.priority, body)
     }
+    /// Ordinary-lane wire bytes eligible for funding only after full successful IO.
+    /// Dependent SDT stays in its existing lane; independent discovery/control does not.
+    pub(crate) fn successful_ordinary_service_bytes(&self) -> usize {
+        if self.queued.priority < 254
+            && !self.queued.closes_packet_batch()
+            && !self.queued.independent_discovery
+            && matches!(
+                self.queued.frame.bytes.get(3),
+                Some(&DOWN_DATA) | Some(&AV_BAY_DATA)
+            )
+        {
+            self.queued.frame.bytes.len() + 4
+        } else {
+            0
+        }
+    }
     pub(crate) fn closes_packet_batch(&self) -> bool {
         self.queued.closes_packet_batch()
     }
@@ -3047,3 +3063,7 @@ mod pair_tests {
         assert!(mesh.begin_bounded_transmission(0, 0, false, 2).is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "rrls/continuous_service_audit.rs"]
+mod continuous_service_audit;

@@ -1,0 +1,127 @@
+{
+  "result": "PASS_NATIVE_CANDIDATE_INTEGRATION; CLOSED_LOOP_CONTROL_QUALIFICATION_PENDING",
+  "base_gs_commit": "155ebb61c0b3321c4e757f47d605079158c8877e",
+  "sdk_commit": "d82b5526c56a20f65f6257478ae32f3ff9af5674",
+  "problem": "In the frozen FIFO full60 capture FC command12840651766089389521 reaches RRLS after the previous UND was already forwarded. Its62B UART frame receives98.090ms of later dictionary/sensor/SDT data in the same modem group. The canonical command cannot use the existing155ms close permit yet; already-queued pairing cannot fix this non-coavailable case.",
+  "change": "An otherwise-denied unique control/receipt close may spend one entire configured idle gap from completed ordinary-service airtime. Bank starts0, caps55ms, earns no idle/callback/refusal/partial-IO credit. Only1..55ms gaps qualify. Full air debt, one unpaid early loan,55ms actual drain quiet, dedup and existing selector are preserved.",
+  "funding_eligibility": "Existing ordinary lane: priority<254, not independent DiscoveryAddress, not canonical closes_packet_batch (including priority200), and DOWN_DATA/AV_BAY_DATA. Dependent SDT253 remains in its existing ordinary lane and can earn funding; no codec/dependency/routing policy changes. Scalar SDK common path uses priority<254&&!close_batch after complete platform IO.",
+  "integration": "Mesh earns only io_result.is_ok after counted successful write/drain; macOS common flush-success path included. Scalar SDK common Linux/macOS post-IO block earns only after complete write and drain/flush. Control pairs earn0; per-original-frame overhead and ceil debt unchanged. Shared write_lock serializes all earning/spending.",
+  "known_existing_limit": "Scalar SDK partial/error writes already returned before debt accounting. This candidate grants no credit on that error but leaves existing skipped-prefix debt behavior unchanged; a separate isolated audit follows this frozen qualification.",
+  "boundedness": "Everyaddedquietgap<=earnedordinarychargedservice; cappedonebank. Zeroordinaryservicecannotrenewextra-closepermission. This is notanunconditionallivenessproofofexistingstrictpriorityunderoverload.",
+  "unchanged": [
+    "Fullairtimedebt andperframecost",
+    "oneunpaidairloan",
+    "55msdrainquiet",
+    "100msnormalbatch",
+    "10msWireDrainlookahead",
+    "allqueue/memorycaps",
+    "source1500ms/canonical3000ms/control500msgates",
+    "normalpriority/fairness/READY/SDT/VOICE/FIFOselectorbyteidentity"
+  ],
+  "memory": {
+    "baseline_host_bytes": 256,
+    "candidate_host_bytes": 256,
+    "alignment": 8,
+    "new_retained_queue_or_entry_state": false,
+    "normal_selector_byte_identical": true,
+    "selector_sha256": "4e0097470ce0f5f107ffde5c8be340766dc221041f3921a0aa0c7a03992652b0"
+  },
+  "native_validation": {
+    "normal": {
+      "passed": 625,
+      "ignored_existing": 3,
+      "failed": 0,
+      "log": "native-bank-close-runtime-integration/normal.log",
+      "sha256": "39df5dedf1c37d04ce00a800f5b70cbefcb7a49e8fe1fb39a5eae7e04a1031aa"
+    },
+    "test_fire": {
+      "passed": 626,
+      "ignored_existing": 3,
+      "failed": 0,
+      "log": "native-bank-close-runtime-integration/testfire.log",
+      "sha256": "3ad2bb1e4d0f422b59937aa7da77b66b35be94c5fbf7a3a0d9577124b42fa51c"
+    },
+    "hitl_receipt_exact_prior_failed_cohort": {
+      "passed": 19,
+      "failed": 0,
+      "log": "native-bank-close-runtime-integration/hitl-receipt.log",
+      "sha256": "7e61474875aada7cac4323a99d4c80f4894ea312b58e109120c1fa8a3d29a9c0"
+    },
+    "runtime_guards": "Actual ordinary Mesh PTY success exact bytes/earned cost; SDK wall-clock ordinary vs critical200 success; actual isolated closedPTY error and counted-prefix compositional no-credit; literal55/gap0/56/1000 guards.",
+    "additional_frozen_prototype": {
+      "rrls_pass": 77,
+      "capacity_pass": 25,
+      "proof": "native-bank-only-close-prototype/qualification.json",
+      "sha256": "cf121221abcfb9810e9c703e2b32fc1dadcd4d9120806fa116348b5e13d76550"
+    }
+  },
+  "capture_results": [
+    {
+      "fixture": "old149/15",
+      "step_ms": 10,
+      "source_delivered": 149,
+      "canonical_delivered": 15,
+      "max_source_RF_to_offload_ms": 1006,
+      "max_canonical_to_offload_ms": 1617.3
+    },
+    {
+      "fixture": "prior149/11",
+      "step_ms": 10,
+      "source_delivered": 149,
+      "canonical_delivered": 11,
+      "max_source_RF_to_offload_ms": 861.8,
+      "max_canonical_to_offload_ms": 1343.3
+    },
+    {
+      "fixture": "current147/19",
+      "step_ms": 10,
+      "source_delivered": 147,
+      "canonical_delivered": 19,
+      "max_source_RF_to_offload_ms": 872,
+      "max_canonical_to_offload_ms": 601.2
+    },
+    {
+      "fixture": "latest149/21",
+      "step_ms": 1,
+      "source_delivered": 149,
+      "canonical_delivered": 21,
+      "max_source_RF_to_offload_ms": 741.9,
+      "max_canonical_to_offload_ms": 1310.7,
+      "baseline_max_source_ms": 628.9,
+      "baseline_max_canonical_ms": 1408.7
+    }
+  ],
+  "continuous_load": {
+    "simple": "100/50msuniquecontrols+BARO200ms,41sources/81or161controlsallforwarded,no drops;source171ms/control20msmax inbankonlyrun.",
+    "large_three_lane": "10phases:control100/50ms,source200ms,canonicalmetadata1s;sourceincompressibleUARTframe>=176Basserted. Bothcold0/pre-earned55states, lattercreatedbyaccountedcompleted176Bnormalprelude. All41sources/80\u2013161controls/9metadata,no drops.",
+    "prototype_maxima_ms": {
+      "source": 396,
+      "control": 58,
+      "canonical": 190,
+      "ordinary_gap": 514
+    },
+    "matched_baseline_maxima_ms": {
+      "source": 1084,
+      "control": 57,
+      "canonical": 155,
+      "ordinary_gap": 388
+    },
+    "tradeoff": "Extraquietincreasesordinarygap514vs388andmetadata190vs155whileloweringworstsource1084\u2192396; alloriginalgatespass."
+  },
+  "causal_native_packetizer": "native-FC-packetization-budget.json: sameFC30149ms62Bwireframe; baselinecontaining322Bgroup extends98090us, bankonly62Bgroup extends0. OriginalRXbytes/timesunchanged; subsequentactualRFresponsesnotrecomputed.",
+  "independent_runtime_review": {
+    "path": "native-bank-only-close-prototype/runtime-hook-independent-review.json",
+    "sha256": "04b8085bcd196856e123349f92e3911bc1c1d92341ee8f3a2f32b08426faf779",
+    "result": "ACCEPT"
+  },
+  "limits": "Native capture ages are RF-to-UART-offload, not end-to-end hardware latency. SameFC firstTX/bytes and98.090\u21920ms grouping is an open-loop causal proof; downstream RF responses were not recomputed. Prior full60 retains149/149 source max790.9ms and21/21 canonical1312.8ms, but relayFC505ms control deadline failed. Final bank build must retain500/1500/3000ms gates in a new full60 run before qualification.",
+  "release": "Local source commit only. No new simulation/image/hardware deployment or SDK/RF source changes by this agent.",
+  "source_sha256": {
+    "backend/src/comms.rs": "087139d712492572c733c6c2f14eceb625b14fc77163361fd9a3a86b404daa2c",
+    "backend/src/comms/rfd_capacity.rs": "34f2241bb7c3028d96eca260082b8c6c4695c8c0d14bb3e9720772ae81db825e",
+    "backend/src/rrls.rs": "1cfb8a98f3249fd2101ee102bfa88a7573d5e42c9b6160a2a0a56df42b265659",
+    "backend/src/rrls/air_campaign.rs": "308eed0e8520bdaaf734a3658cfeddde9d0d81c8aff9d967b94230a9bf1188f0",
+    "backend/src/rrls/captured_replay.rs": "ff3c5e500f64ffd8a026e14bda8a1a949bc8a1da3500fffe4ff70e2cb2a1eb97",
+    "backend/src/rrls/continuous_service_audit.rs": "a1598ec456cfb26ccabee8ec2347a844a20c1c10c3e171213f6ef03d08a7424a"
+  }
+}

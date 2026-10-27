@@ -311,6 +311,7 @@ fn captured_bidirectional_relay_burst_retains_source_and_canonical_deadlines() {
                     relay.note_receipt_packet_boundary(capacity.packet_idle_service_bytes());
                 }
             }
+            capacity.note_successful_ordinary_service(transmission.successful_ordinary_service_bytes());
             relay.finish_bounded_transmission(transmission, true);
             serviced_frames += count;
         }

@@ -183,6 +183,11 @@ fn flush_mesh(
             pair,
         )
         .is_ok();
+        if accepted {
+            drivers.lock().unwrap()[node].capacity.note_successful_ordinary_service(
+                transmission.successful_ordinary_service_bytes(),
+            );
+        }
         mesh.lock()
             .unwrap()
             .finish_bounded_transmission(transmission, accepted);

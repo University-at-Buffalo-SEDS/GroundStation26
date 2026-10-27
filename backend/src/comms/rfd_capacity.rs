@@ -15,6 +15,8 @@ pub(crate) struct Capacity {
     promotion_contract_count: u8,
     promotion_contract_cursor: u8,
     early_frame_outstanding: bool,
+    ordinary_service_credit_ms: u8,
+    extra_close_owed: bool,
     packet_burst_ms: u64,
     uart_baud: u32,
     packet_gap_ms: u64,
@@ -74,14 +76,15 @@ impl Capacity {
                 .iter()
                 .position(|stored| *stored == id)
         });
-        if slot.is_some_and(|slot| {
-            self.promotion_flags & (1 << (slot + if receipt { 4 } else { 0 })) != 0
-        }) {
+        if slot
+            .is_some_and(|slot| self.promotion_flags & (1 << (slot + if receipt { 4 } else { 0 })) != 0)
+        {
             return false;
         }
         // The first returning receipt may override a recent uplink close, but
-        // updates the global cooldown so later commands yield. At most two
-        // boundaries fit a rolling normal cycle; neither retry gets new credit.
+        // updates the global cooldown so later commands yield. An extra unique
+        // close requires a whole idle gap funded by completed ordinary service;
+        // retries never get new credit.
         let previous = if receipt {
             self.last_receipt_boundary
         } else {
@@ -93,14 +96,24 @@ impl Capacity {
                 _ => wall.saturating_duration_since(last_wall) < Duration::from_millis(cycle_ms),
             },
         ) {
-            return false;
+            if contract.is_none()
+                || self.extra_close_owed
+                || !(1..=55).contains(&self.packet_gap_ms)
+                || u64::from(self.ordinary_service_credit_ms) < self.packet_gap_ms
+            {
+                return false;
+            }
+            self.ordinary_service_credit_ms = 0;
+            self.extra_close_owed = true;
         }
         self.packet_started = None;
         self.last_forced_boundary = Some((wall, virtual_ms));
         if receipt {
             self.last_receipt_boundary = Some((wall, virtual_ms));
         }
-        if let Some((id, _)) = contract { self.remember_promotion(id, receipt); }
+        if let Some((id, _)) = contract {
+            self.remember_promotion(id, receipt);
+        }
         true
     }
     fn remember_promotion(&mut self, id: u64, receipt: bool) {
@@ -162,6 +175,26 @@ impl Capacity {
             .min(usize::MAX as u128) as usize
     }
 
+    /// Bank actual completed ordinary airtime, capped at one 55ms idle gap.
+    /// This never changes readiness, air debt, or the early-frame loan.
+    pub(crate) fn note_successful_ordinary_service(&mut self, framed_bytes: usize) {
+        if framed_bytes == 0 {
+            return;
+        }
+        let bps = (u128::from(self.air_bps) * u128::from(self.share_percent) / 100).max(1);
+        let cost = ((framed_bytes as u128 + u128::from(self.overhead_bytes)) * 8000).div_ceil(bps);
+        self.ordinary_service_credit_ms =
+            (u128::from(self.ordinary_service_credit_ms) + cost).min(55) as u8;
+        self.extra_close_owed = false;
+    }
+    #[cfg(test)]
+    pub(crate) fn ordinary_service_credit_ms(&self) -> u8 {
+        self.ordinary_service_credit_ms
+    }
+    #[cfg(test)]
+    pub(crate) fn extra_close_owed(&self) -> bool {
+        self.extra_close_owed
+    }
     pub(crate) fn packetization(&self) -> (u64, u64) {
         (self.packet_burst_ms, self.packet_gap_ms)
     }
@@ -199,6 +232,8 @@ impl Capacity {
             promotion_contract_count: 0,
             promotion_contract_cursor: 0,
             early_frame_outstanding: false,
+            ordinary_service_credit_ms: 0,
+            extra_close_owed: false,
             packet_burst_ms: 100,
             uart_baud: 115_200,
             packet_gap_ms: 55,
@@ -966,5 +1001,109 @@ mod tests {
             bounded.0 <= 392 && bounded.1 <= 200,
             "keep commands before offload: {bounded:?}"
         );
+    }
+}
+#[cfg(test)]
+mod funded_extra_close_tests {
+    use super::*;
+    #[test]
+    fn extra_close_requires_actual_service_and_repayment_without_forgiving_air_debt() {
+        let wall = Instant::now();
+        let mut c = Capacity::new(64_000, 35, 16);
+        c.committed(wall, Some(0), 55);
+        c.drained_virtual(4786);
+        let debt = c.next.unwrap().1;
+        let quiet = c.next_packet.unwrap().1;
+        assert!(c.close_packet_batch_for_contract(wall, Some(0), Some((1, false))));
+        assert!(
+            !c.close_packet_batch_for_contract(wall, Some(60), Some((2, false))),
+            "no idle credit"
+        );
+        c.note_successful_ordinary_service(75);
+        assert!(
+            !c.close_packet_batch_for_contract(wall, Some(60), Some((2, false))),
+            "insufficient funded service"
+        );
+        c.note_successful_ordinary_service(48);
+        assert!(c.close_packet_batch_for_contract(wall, Some(60), Some((2, false))));
+        assert!(c.extra_close_owed());
+        assert_eq!(c.next.unwrap().1, debt, "no airtime forgiveness");
+        assert_eq!(c.next_packet.unwrap().1, quiet, "no new readiness");
+        assert!(
+            !c.close_packet_batch_for_contract(wall, Some(120), Some((3, false))),
+            "one unpaid extra close only"
+        );
+        c.note_successful_ordinary_service(48);
+        assert!(!c.extra_close_owed());
+        assert!(
+            !c.close_packet_batch_for_contract(wall, Some(120), Some((3, false))),
+            "refill still bounded"
+        );
+        c.note_successful_ordinary_service(75);
+        assert!(c.close_packet_batch_for_contract(wall, Some(120), Some((3, false))));
+    }
+}
+#[cfg(test)]
+mod funded_wall_and_partial_tests {
+    use super::*;
+    #[test]
+    fn wall_clock_funding_and_failed_prefix_keep_actual_debt_and_credit_ownership() {
+        let start = Instant::now();
+        let mut c = Capacity::new(64_000, 35, 16);
+        c.committed(start, None, 55);
+        c.drained(start + Duration::from_millis(5));
+        assert!(c.close_packet_batch_for_contract(start, None, Some((1, false))));
+        assert!(!c.close_packet_batch_for_contract(
+            start + Duration::from_millis(60),
+            None,
+            Some((2, false))
+        ));
+        c.note_successful_ordinary_service(176);
+        assert_eq!(c.ordinary_service_credit_ms, 55);
+        let debt = c.next.unwrap().0;
+        let quiet = c.next_packet.unwrap().0;
+        assert!(c.close_packet_batch_for_contract(
+            start + Duration::from_millis(60),
+            None,
+            Some((2, false))
+        ));
+        assert_eq!(c.next.unwrap().0, debt);
+        assert_eq!(c.next_packet.unwrap().0, quiet);
+        assert_eq!(c.ordinary_service_credit_ms, 0);
+        assert!(c.extra_close_owed());
+        // Counted physical acceptance of a failed prefix is still charged. It is
+        // not a successful logical ordinary frame and cannot fund/repay the bank.
+        c.committed(start + Duration::from_millis(70), None, 5);
+        c.note_successful_ordinary_service(0);
+        assert_eq!(c.ordinary_service_credit_ms, 0);
+        assert!(c.extra_close_owed());
+        assert!(!c.close_packet_batch_for_contract(
+            start + Duration::from_millis(80),
+            None,
+            Some((3, false))
+        ));
+        assert!(c.next.unwrap().0 > debt);
+    }
+}
+
+#[cfg(test)]
+mod funded_gap_scope_tests {
+    use super::*;
+    #[test]
+    fn unsupported_idle_gaps_never_expand_the_literal_55ms_bank() {
+        for gap in [0u64, 56, 1000] {
+            let wall = Instant::now();
+            let mut c = Capacity::new(64_000, 35, 16);
+            c.packet_gap_ms = gap;
+            assert!(c.close_packet_batch_for_contract(wall, Some(0), Some((1, false))));
+            c.note_successful_ordinary_service(4096);
+            assert_eq!(c.ordinary_service_credit_ms, 55);
+            assert!(
+                !c.close_packet_batch_for_contract(wall, Some(1), Some((2, false))),
+                "gap={gap} must retain original close policy"
+            );
+            assert_eq!(c.ordinary_service_credit_ms, 55);
+            assert!(!c.extra_close_owed());
+        }
     }
 }
