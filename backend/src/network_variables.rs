@@ -16,7 +16,7 @@ const FLIGHT_STATE_TYPE: &str = "FLIGHT_STATE";
 const DAQ_CALIBRATION_TYPE: &str = "DAQ_LOADCELL_CALIBRATION";
 const DAQ_KG50_CALIBRATION_TYPE: &str = "DAQ_KG50_CALIBRATION";
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 struct PersistentVariables {
     #[serde(default)]
     av_bay_underglow: bool,
@@ -33,6 +33,28 @@ struct PersistentVariables {
 struct VariableStore {
     path: PathBuf,
     values: PersistentVariables,
+    durable: bool,
+}
+
+impl VariableStore {
+    fn new(path: PathBuf) -> Self {
+        let persisted = read_persisted(&path);
+        Self {
+            path,
+            values: persisted.unwrap_or_else(default_values),
+            durable: persisted.is_some(),
+        }
+    }
+
+    fn commit(&mut self, values: PersistentVariables) -> Result<()> {
+        if self.durable && self.values == values {
+            return Ok(());
+        }
+        persist(&self.path, values)?;
+        self.values = values;
+        self.durable = true;
+        Ok(())
+    }
 }
 
 static STORE: OnceLock<Mutex<VariableStore>> = OnceLock::new();
@@ -68,14 +90,19 @@ fn default_cache_path() -> PathBuf {
     }
 }
 
-fn load(path: &Path) -> PersistentVariables {
-    if let Some(values) = fs::read(path)
+fn read_persisted(path: &Path) -> Option<PersistentVariables> {
+    fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .filter(|values: &PersistentVariables| values.flight_state <= 15)
-    {
-        return values;
-    }
+}
+
+#[cfg(test)]
+fn load(path: &Path) -> PersistentVariables {
+    read_persisted(path).unwrap_or_else(default_values)
+}
+
+fn default_values() -> PersistentVariables {
     PersistentVariables {
         av_bay_underglow: std::env::var("GS_AV_BAY_UNDERGLOW_DEFAULT")
             .ok()
@@ -94,13 +121,7 @@ fn load(path: &Path) -> PersistentVariables {
 }
 
 fn store() -> &'static Mutex<VariableStore> {
-    STORE.get_or_init(|| {
-        let path = cache_path();
-        Mutex::new(VariableStore {
-            values: load(&path),
-            path,
-        })
-    })
+    STORE.get_or_init(|| Mutex::new(VariableStore::new(cache_path())))
 }
 
 fn persist(path: &Path, values: PersistentVariables) -> Result<()> {
@@ -179,8 +200,9 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
             let mut guard = store()
                 .lock()
                 .expect("network-variable store lock poisoned");
-            guard.values.flight_state = state;
-            persist(&guard.path, guard.values).map_err(|err| {
+            let mut next = guard.values;
+            next.flight_state = state;
+            guard.commit(next).map_err(|err| {
                 log::warn!("failed to persist inbound flight-state network variable: {err}");
                 sedsnet::TelemetryError::HandlerError(
                     "persist inbound flight-state network variable",
@@ -195,11 +217,12 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
         return Ok(());
     }
     {
-        let guard = store()
+        let mut guard = store()
             .lock()
             .expect("network-variable store lock poisoned");
         if !guard.path.exists() {
             persist(&guard.path, guard.values)?;
+            guard.durable = true;
         }
     }
     router.seed_managed_variable(packet(
@@ -256,8 +279,9 @@ pub fn set_underglow(router: &Router, enabled: bool) -> Result<()> {
         let mut guard = store()
             .lock()
             .expect("network-variable store lock poisoned");
-        guard.values.av_bay_underglow = enabled;
-        persist(&guard.path, guard.values)?;
+        let mut next = guard.values;
+        next.av_bay_underglow = enabled;
+        guard.commit(next)?;
     }
     router.set_network_variable(packet(
         UNDERGLOW_TYPE,
@@ -279,8 +303,9 @@ pub fn set_flight_buzzer(router: &Router, enabled: bool) -> Result<()> {
         let mut guard = store()
             .lock()
             .expect("network-variable store lock poisoned");
-        guard.values.flight_buzzer = enabled;
-        persist(&guard.path, guard.values)?;
+        let mut next = guard.values;
+        next.flight_buzzer = enabled;
+        guard.commit(next)?;
     }
     router.set_network_variable(packet(
         FLIGHT_BUZZER_TYPE,
@@ -296,8 +321,9 @@ pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
         let mut guard = store()
             .lock()
             .expect("network-variable store lock poisoned");
-        guard.values.flight_state = state;
-        persist(&guard.path, guard.values)?;
+        let mut next = guard.values;
+        next.flight_state = state;
+        guard.commit(next)?;
     }
     router.set_network_variable(packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", state)?)?;
     Ok(())
@@ -458,12 +484,13 @@ pub fn set_daq_log_clock(
         let mut guard = store()
             .lock()
             .expect("network-variable store lock poisoned");
-        guard.values.daq_log_clock = [
+        let mut next = guard.values;
+        next.daq_log_clock = [
             u64::from_le_bytes(payload[..8].try_into().unwrap()),
             u64::from_le_bytes(payload[8..].try_into().unwrap()),
         ];
-        guard.values.daq_log_last_session = guard.values.daq_log_last_session.max(session);
-        persist(&guard.path, guard.values)?;
+        next.daq_log_last_session = next.daq_log_last_session.max(session);
+        guard.commit(next)?;
     }
     router.set_network_variable(packet_bytes(
         "DAQ_LOG_CLOCK",
@@ -475,16 +502,18 @@ pub fn set_daq_log_clock(
 
 #[cfg(test)]
 fn toggle_persisted(store: &mut VariableStore) -> Result<bool> {
-    store.values.av_bay_underglow = !store.values.av_bay_underglow;
-    persist(&store.path, store.values)?;
+    let mut next = store.values;
+    next.av_bay_underglow = !next.av_bay_underglow;
+    store.commit(next)?;
     Ok(store.values.av_bay_underglow)
 }
 
 #[cfg(test)]
 fn set_persisted_flight_state(store: &mut VariableStore, state: u8) -> Result<()> {
     anyhow::ensure!(state <= 15, "invalid flight-state value {state}");
-    store.values.flight_state = state;
-    persist(&store.path, store.values)
+    let mut next = store.values;
+    next.flight_state = state;
+    store.commit(next)
 }
 
 pub fn underglow_enabled() -> bool {
@@ -851,17 +880,11 @@ mod tests {
         )
         .unwrap();
 
-        let mut first_restart = VariableStore {
-            path: path.clone(),
-            values: load(&path),
-        };
+        let mut first_restart = VariableStore::new(path.clone());
         assert!(!toggle_persisted(&mut first_restart).unwrap());
         assert!(!load(&path).av_bay_underglow);
 
-        let mut second_restart = VariableStore {
-            path: path.clone(),
-            values: load(&path),
-        };
+        let mut second_restart = VariableStore::new(path.clone());
         assert!(toggle_persisted(&mut second_restart).unwrap());
         assert!(load(&path).av_bay_underglow);
         fs::remove_file(path).unwrap();
@@ -876,10 +899,7 @@ mod tests {
         persist(&path, PersistentVariables::default()).unwrap();
 
         for expected in [1, 0, 1] {
-            let mut restarted = VariableStore {
-                path: path.clone(),
-                values: load(&path),
-            };
+            let mut restarted = VariableStore::new(path.clone());
             set_persisted_flight_state(&mut restarted, expected).unwrap();
             assert_eq!(load(&path).flight_state, expected);
         }
@@ -1090,5 +1110,232 @@ mod thermal_wire_tests {
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
         assert_eq!(values, vec![20., 0.25, 0., 0.]);
+    }
+}
+
+#[cfg(test)]
+mod persistence_callback_tests {
+    use super::*;
+    #[test]
+    fn repeated_sdk_flight_state_refreshes_keep_the_successfully_persisted_cache() {
+        const CHILD: &str = "GS_NETWORK_VARIABLE_PERSISTENCE_PROOF_CHILD";
+        const NAME: &str = "network_variables::persistence_callback_tests::repeated_sdk_flight_state_refreshes_keep_the_successfully_persisted_cache";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env_remove("GS_NETWORK_VARIABLE_CACHE")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let router = Router::new(sedsnet::router::RouterConfig::new([]).with_sender("RRLS"));
+        initialize_for_role(&router, true).unwrap();
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = callbacks.clone();
+        router
+            .on_network_variable_update(
+                crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE),
+                move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        router
+            .rx(&packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", 1).unwrap())
+            .unwrap();
+        let path = store().lock().unwrap().path.clone();
+        assert_eq!(load(&path).flight_state, 1);
+        let mut rewrites = 0;
+        let mut callback_us = Vec::new();
+        for _ in 0..8 {
+            let mut tagged = fs::read(&path).unwrap();
+            tagged.extend_from_slice(b"     ");
+            fs::write(&path, &tagged).unwrap(); // Valid JSON whitespace detects an application replacement.
+            let now = std::time::Instant::now();
+            router
+                .rx(&packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", 1).unwrap())
+                .unwrap();
+            callback_us.push(now.elapsed().as_micros());
+            rewrites += usize::from(fs::read(&path).unwrap() != tagged);
+        }
+        println!(
+            "PERSISTENCE_PROOF {}",
+            serde_json::json!({"callbacks":callbacks.load(Ordering::SeqCst),"same_state_refreshes":8,"redundant_replacements":rewrites,"callback_us":callback_us})
+        );
+        assert_eq!(
+            callbacks.load(Ordering::SeqCst),
+            9,
+            "exercise actual unchanged SDK notifications"
+        );
+        assert_eq!(
+            rewrites, 0,
+            "successfully durable same-state refreshes must not rewrite the JSON cache"
+        );
+        // A same-value durable refresh must not even attempt the write path.
+        // A directory at the exact temporary-file name deterministically rejects writes.
+        let temporary = path.with_extension("json.tmp");
+        fs::create_dir(&temporary).unwrap();
+        router
+            .rx(&packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", 1).unwrap())
+            .unwrap();
+        let failed = router.rx(&packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", 2).unwrap());
+        assert!(
+            failed.is_err(),
+            "changed update must retain the existing SDK persistence failure"
+        );
+        assert_eq!(
+            flight_state(),
+            1,
+            "failed rename/write must not publish an uncommitted in-memory value"
+        );
+        assert_eq!(load(&path).flight_state, 1);
+        fs::remove_dir(&temporary).unwrap();
+        router
+            .rx(&packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", 2).unwrap())
+            .unwrap();
+        assert_eq!(
+            flight_state(),
+            2,
+            "same incoming value must retry after IO recovers"
+        );
+        assert_eq!(load(&path).flight_state, 2);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn isolated(name: &str) -> bool {
+        const CHILD: &str = "GS_VARIABLE_COMMIT_ISOLATED_TEST";
+        if std::env::var(CHILD).ok().as_deref() == Some(name) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, name)
+            .env_remove("GS_NETWORK_VARIABLE_CACHE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    #[test]
+    fn first_unchanged_sdk_state_still_creates_a_missing_durable_cache() {
+        const NAME: &str = "network_variables::persistence_callback_tests::first_unchanged_sdk_state_still_creates_a_missing_durable_cache";
+        if !isolated(NAME) {
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let router = Router::new(sedsnet::router::RouterConfig::new([]).with_sender("RRLS"));
+        initialize_for_role(&router, true).unwrap();
+        let path = store().lock().unwrap().path.clone();
+        assert!(!path.exists());
+        let current = flight_state();
+        assert!(!store().lock().unwrap().durable);
+        router
+            .rx(&packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", current).unwrap())
+            .unwrap();
+        assert!(path.exists());
+        assert_eq!(load(&path).flight_state, current);
+        assert!(store().lock().unwrap().durable);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn equal_durable_local_commands_still_publish_distinct_fresh_packets() {
+        const NAME: &str = "network_variables::persistence_callback_tests::equal_durable_local_commands_still_publish_distinct_fresh_packets";
+        if !isolated(NAME) {
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let router = Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS"));
+        initialize_for_role(&router, false).unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let output = sent.clone();
+        let ty = crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE);
+        router.add_side_packet("owner", move |packet| {
+            if packet.data_type() == ty {
+                output.lock().unwrap().push(packet.clone());
+            }
+            Ok(())
+        });
+        router.clear_queues();
+        sent.lock().unwrap().clear();
+        set_flight_state(&router, 1).unwrap();
+        set_flight_state(&router, 1).unwrap();
+        let packets = sent.lock().unwrap();
+        assert_eq!(
+            packets.len(),
+            2,
+            "disk suppression must never coalesce network commands"
+        );
+        assert_ne!(packets[0].packet_id(), packets[1].packet_id());
+        assert_eq!(packets[0].payload(), &[1]);
+        assert_eq!(packets[1].payload(), &[1]);
+        assert!(packets[1].timestamp() >= packets[0].timestamp());
+    }
+
+    #[test]
+    fn failed_store_commit_is_atomic_for_every_cached_field_and_retries() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "variable-atomic-{}-{}",
+                std::process::id(),
+                rand::random::<u128>()
+            ))
+            .join("cache.json");
+        let original = PersistentVariables {
+            av_bay_underglow: true,
+            flight_buzzer: true,
+            flight_state: 4,
+            daq_log_clock: [7, 123456],
+            daq_log_last_session: 7,
+        };
+        persist(&path, original).unwrap();
+        let mut state = VariableStore::new(path.clone());
+        assert!(state.durable);
+        let replacement = PersistentVariables {
+            av_bay_underglow: false,
+            flight_buzzer: false,
+            flight_state: 5,
+            daq_log_clock: [8, 123789],
+            daq_log_last_session: 8,
+        };
+        let temporary = path.with_extension("json.tmp");
+        fs::create_dir(&temporary).unwrap();
+        assert!(state.commit(replacement).is_err());
+        assert_eq!(state.values, original);
+        assert!(state.durable);
+        assert_eq!(load(&path), original);
+        fs::remove_dir(&temporary).unwrap();
+        state.commit(replacement).unwrap();
+        assert_eq!(state.values, replacement);
+        assert_eq!(load(&path), replacement);
+        // Also fail after a successful temporary-file write, at rename itself.
+        let saved = path.with_extension("saved");
+        fs::rename(&path, &saved).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(state.commit(original).is_err());
+        assert_eq!(state.values, replacement);
+        assert_eq!(load(&saved), replacement);
+        fs::remove_dir(&path).unwrap();
+        fs::rename(&saved, &path).unwrap();
+        state.commit(original).unwrap();
+        assert_eq!(state.values, original);
+        assert_eq!(load(&path), original);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
