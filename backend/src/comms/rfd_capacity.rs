@@ -263,6 +263,12 @@ impl Capacity {
         });
         within_burst || reached(self.next_packet)
     }
+    /// Read-only diagnostic snapshot; never samples a new clock or retires state.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn next_packet_virtual_ms(&self) -> Option<u64> {
+        self.next_packet.and_then(|(_, virtual_ms)| virtual_ms)
+    }
+
     /// A physical tcdrain may complete later than its nominal wire duration.
     /// Anchor the quiet gap to actual completion; virtual time still follows
     /// the modeled 8N1 duration, independently of host scheduling delays.
@@ -365,6 +371,19 @@ impl Capacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostic_packet_deadline_snapshot_keeps_exact_admission_state() {
+        let wall=Instant::now();let mut cap=Capacity::new(64_000,35,16);
+        assert_eq!(cap.next_packet_virtual_ms(),None);
+        cap.committed(wall,Some(30080),55);cap.drained_virtual(30_084_775);
+        assert!(cap.close_packet_batch_for_contract(wall,Some(30080),Some((1,false))));
+        assert_eq!(cap.next_packet_virtual_ms(),Some(30140));
+        assert_eq!(cap.next_packet_virtual_ms(),Some(30140));
+        assert!(!cap.ready(wall,Some(30139)));assert!(cap.ready(wall,Some(30140)));
+        let mut physical=Capacity::new(64_000,35,16);physical.committed(wall,None,55);
+        assert_eq!(physical.next_packet_virtual_ms(),None);
+    }
+
     #[test]
     fn already_queued_command_pair_uses_one_fully_charged_loan_and_one_close() {
         let wall = Instant::now();

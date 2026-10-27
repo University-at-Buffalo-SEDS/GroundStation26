@@ -1,0 +1,44 @@
+{
+  "scope": "Opt-in virtual RawUART admission diagnostics only. No pacing/clock/priority/rate/queue/budget or SDK/MCU changes.",
+  "base_gs_commit": "84bc4c15ffc632e054145d59439ce4f59e0bbcfc",
+  "gate": "Linux virtualPTY clock present AND existing GS_SIM_TRACE_RELIABLE environment flag present. No payloads/credentials; physical UART and normal disabled runs emit no new admission diagnostics.",
+  "log_prefix": "full-bay UART admission",
+  "fields": [
+    "path=mesh/sdk/batch",
+    "side",
+    "contract=(logicalID,receiptFlag)",
+    "wire_clock_ms actually passed toWireDrain.committed",
+    "capacity_clock_ms actually passed toCapacity.committed/close",
+    "stop_us accumulated WireDrain.stop_us afteracceptedbytes",
+    "next_packet_ms read-only virtualdeadline afterclose",
+    "promoted actualclose result",
+    "encoded_bytes",
+    "accepted_bytes",
+    "complete"
+  ],
+  "batch_note": "One diagnostic row peroriginal contract ID, sharing the samephysicaladmission/stop/deadline. Failureprefix keepscomplete=false andpromoted=false.",
+  "implementation": "Read-only Capacity.next_packet_virtual_ms getter; existing for_contract return value captured. FormerNone fallback close_packet_batch\u2192close_with_receipt(None)\u2192for_contract(None) is the same call now observed directly. No clock is resampled for logging.",
+  "validation": {
+    "normal_native": {
+      "passed": 609,
+      "failed": 0,
+      "ignored_existing": 3,
+      "log": "/tmp/uart-close-trace-native-full-20261027.log",
+      "sha256": "caa58827c71fbda2abcca16d760a78aac6e821addceb902660447ec758515ec8"
+    },
+    "HITL_virtual_direct_and_mesh_regression": {
+      "passed": 1,
+      "GS_SIM_TRACE_RELIABLE": "1",
+      "log": "/tmp/uart-close-trace-hitl-virtual-paths-20261027.log",
+      "sha256": "5243bfa35e31485f062a779468f59327ccfe43bb15396624272bc3f317b18722"
+    },
+    "getter": "Repeated diagnostic snapshot retains30140deadline and exact30139refusal/30140admission; no virtualdeadline forphysical-only state.",
+    "captures": "Old149/15 andcurrent149/11 included innormalnative suite withunchangedgates."
+  },
+  "source_sha256": {
+    "backend/src/comms.rs": "38edf9c5afa1fb9d0edca63236609d48b65de83ee9450e1eef9c8bbf6ca5958d",
+    "backend/src/comms/rfd_capacity.rs": "60bbecfd7bb31246c29e468046fe5163ad717fb42dd592a86158294068983e39"
+  },
+  "limits": "Native regression doesnotqualify a new linked500msrun or prove earlier coarseclockhypothesis. Root willbuildnew immutable hostimage and usebounded14s tracedrelay diagnostic to join logs toactualHostInput timestamps. Trace logging may perturb host scheduling; result iscausaldiagnostic, not untracedperformance qualification.",
+  "release": "Local commit/freeze only; rootworkplan unstaged, SDK/RFunchanged, no push or deployment."
+}

@@ -170,6 +170,28 @@ pub(crate) fn is_radio_batch_command(priority: u8, payload: &[u8]) -> bool {
     })
 }
 
+#[cfg(target_os = "linux")]
+fn trace_virtual_uart_admission(
+    path: &str,
+    side: Option<RouterSideId>,
+    contract: Option<(u64, bool)>,
+    wire_clock_ms: Option<u64>,
+    capacity_clock_ms: Option<u64>,
+    stop_us: Option<u64>,
+    next_packet_ms: Option<u64>,
+    promoted: bool,
+    encoded_bytes: usize,
+    accepted_bytes: usize,
+    complete: bool,
+) {
+    if wire_clock_ms.is_none() || std::env::var_os("GS_SIM_TRACE_RELIABLE").is_none() {
+        return;
+    }
+    log::info!(
+        "full-bay UART admission path={path} side={side:?} contract={contract:?} wire_clock_ms={wire_clock_ms:?} capacity_clock_ms={capacity_clock_ms:?} stop_us={stop_us:?} next_packet_ms={next_packet_ms:?} promoted={promoted} encoded_bytes={encoded_bytes} accepted_bytes={accepted_bytes} complete={complete}"
+    );
+}
+
 pub trait CommsDevice: Send {
     /// An independent writer for full-duplex transports. Shared-bus devices
     /// keep the default so reads and writes remain serialized.
@@ -794,22 +816,29 @@ impl UartComms {
                     if let Some(stop_us) = virtual_stop_us {
                         capacity.drained_virtual(stop_us);
                     }
-                    if transmission.closes_packet_batch() {
-                        if let Some(contract) = transmission.boundary_contract() {
-                            let promoted = capacity.close_packet_batch_for_contract(
-                                capacity_wall,
-                                capacity_clock,
-                                Some(contract),
+                    let mut promoted = false;
+                    let closes = transmission.closes_packet_batch();
+                    let contract = if closes {
+                        transmission.boundary_contract()
+                    } else {
+                        None
+                    };
+                    if closes {
+                        promoted = capacity.close_packet_batch_for_contract(
+                            capacity_wall, capacity_clock, contract,
+                        );
+                        if promoted && contract.is_some_and(|(_, receipt)| receipt) {
+                            shared.lock().unwrap().note_receipt_packet_boundary(
+                                capacity.packet_idle_service_bytes(),
                             );
-                            if promoted && contract.1 {
-                                shared.lock().unwrap().note_receipt_packet_boundary(
-                                    capacity.packet_idle_service_bytes(),
-                                );
-                            }
-                        } else {
-                            capacity.close_packet_batch(capacity_wall, capacity_clock);
                         }
                     }
+                    #[cfg(target_os = "linux")]
+                    trace_virtual_uart_admission(
+                        "mesh", self.side_id, contract, virtual_wire_now, capacity_clock,
+                        virtual_stop_us, capacity.next_packet_virtual_ms(), promoted,
+                        framed.len(), framed.len(), true,
+                    );
                 }
                 Ok(())
             })();
@@ -2050,8 +2079,17 @@ impl CommsDevice for UartComms {
                     if let Some(stop) = stop {
                         capacity.drained_virtual(stop);
                     }
-                    if result.is_ok() {
-                        capacity.close_command_batch(wall, clock, contracts);
+                    let promoted = if result.is_ok() {
+                        capacity.close_command_batch(wall, clock, contracts)
+                    } else {
+                        false
+                    };
+                    for contract in contracts {
+                        trace_virtual_uart_admission(
+                            "batch", self.side_id, Some((contract, false)), virtual_now, clock,
+                            stop, capacity.next_packet_virtual_ms(), promoted,
+                            bytes.len(), accepted, result.is_ok(),
+                        );
                     }
                 }
             }
@@ -2273,25 +2311,26 @@ impl CommsDevice for UartComms {
             if let Some(stop_us) = virtual_stop_us {
                 capacity.drained_virtual(stop_us);
             }
+            let mut promoted = false;
             if close_batch {
-                if contract.is_some() {
-                    let promoted = capacity.close_packet_batch_for_contract(
-                        capacity_wall,
-                        capacity_clock,
-                        contract,
+                promoted = capacity.close_packet_batch_for_contract(
+                    capacity_wall, capacity_clock, contract,
+                );
+                if promoted
+                    && contract.is_some_and(|(_, receipt)| receipt)
+                    && let Some(mesh) = &self.recovery
+                {
+                    mesh.lock().unwrap().note_receipt_packet_boundary(
+                        capacity.packet_idle_service_bytes(),
                     );
-                    if promoted
-                        && contract.is_some_and(|(_, receipt)| receipt)
-                        && let Some(mesh) = &self.recovery
-                    {
-                        mesh.lock()
-                            .unwrap()
-                            .note_receipt_packet_boundary(capacity.packet_idle_service_bytes());
-                    }
-                } else {
-                    capacity.close_packet_batch(capacity_wall, capacity_clock);
                 }
             }
+            #[cfg(target_os = "linux")]
+            trace_virtual_uart_admission(
+                "sdk", self.side_id, contract, virtual_wire_now, capacity_clock,
+                virtual_stop_us, capacity.next_packet_virtual_ms(), promoted,
+                len + RAW_UART_FRAME_HEADER_SIZE, len + RAW_UART_FRAME_HEADER_SIZE, true,
+            );
         }
         Ok(())
     }
