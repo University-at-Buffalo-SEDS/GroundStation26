@@ -109,11 +109,11 @@ def _configure_log_file(repo_root: Path, log_file_arg: Optional[str]) -> None:
 
 
 def refresh_sedsnet_dependency(repo_root: Path) -> None:
-    """Refresh within the manifest's v4 range without a patch-version pin."""
+    """Refresh the configured source while respecting the manifest's constraints."""
     if os.environ.get("CARGO_NET_OFFLINE", "").lower() in {"1", "true"}:
-        print("Offline build: keeping the cached SEDSnet v4 resolution.")
+        print("Offline build: keeping the cached SEDSnet resolution.")
         return
-    print("Refreshing SEDSnet within the configured v4 range...")
+    print("Checking the configured SEDSnet source...")
     try:
         result = subprocess.run(["cargo", "update", "--package", "SEDSnet"],
             cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

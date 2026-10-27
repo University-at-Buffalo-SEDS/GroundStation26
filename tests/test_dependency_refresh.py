@@ -13,7 +13,7 @@ SPEC.loader.exec_module(BUILD)
 
 class DependencyRefreshTests(unittest.TestCase):
     @mock.patch.dict(os.environ, {}, clear=True)
-    def test_refresh_uses_major_range_without_exact_version(self):
+    def test_refresh_respects_manifest_source_constraints(self):
         with mock.patch.object(BUILD.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "")) as run:
             BUILD.refresh_sedsnet_dependency(ROOT)
         self.assertEqual(run.call_args.args[0], ["cargo", "update", "--package", "SEDSnet"])

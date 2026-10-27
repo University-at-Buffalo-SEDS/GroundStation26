@@ -1,0 +1,41 @@
+{
+  "scope": "Production GS SDK source consumption; no package release or hardware action",
+  "sdk_git_revision": "d82b5526c56a20f65f6257478ae32f3ff9af5674",
+  "source_pushed_to": "origin/main (branch only; no tags)",
+  "package_sources": {
+    "SEDSnet": {
+      "version": "4.2.7",
+      "source": "git+https://github.com/Rylan-Meilutis/SEDSnet.git?rev=d82b5526c56a20f65f6257478ae32f3ff9af5674#d82b5526c56a20f65f6257478ae32f3ff9af5674"
+    },
+    "sedsnet_macros": {
+      "version": "2.1.1",
+      "source": "git+https://github.com/Rylan-Meilutis/SEDSnet.git?rev=d82b5526c56a20f65f6257478ae32f3ff9af5674#d82b5526c56a20f65f6257478ae32f3ff9af5674"
+    }
+  },
+  "features": [
+    "compression",
+    "cryptography",
+    "default",
+    "discovery",
+    "serde",
+    "serde_json",
+    "std",
+    "timesync",
+    "zstd-safe"
+  ],
+  "frozen_source_match": {
+    "rust_and_manifest_files": 136,
+    "frozen_manifest": "FirmwareSimulator/build/schema-progress-cohort-20261027/host-mesh-pair/sdk-git-archive-manifest.json",
+    "all_sha256_match": true
+  },
+  "schema": "Current std builds initialize checked-in runtime JSON before routers. SDK embedded schema overlay is unused; no schema env change needed. Six actual Git-source schema tests passed.",
+  "validation": {
+    "git_schema_tests": 6,
+    "dependency_refresh_tests": 3,
+    "full_compatibility": "Pending final runtime policy qualification; source-only pin does not claim500ms gate pass"
+  },
+  "local_lock_sha256": "5c8d4d0835739b6eb8e62dfdb9a1b465760ed866ef7b4f4dcb84b4176e7d236b",
+  "lock_policy": "Cargo.lock regenerated locally; remains ignored under existing repository policy. SDK and its macro are fixed by the manifest Git revision.",
+  "launch_helper": "Existing cargo update behavior retained; log wording now describes source constraints rather than an unpinned major range.",
+  "release_policy": "Main CI calls publish_crates.py without --publish (dry-run). Actual publication requires v* tag or manual Release workflow; neither invoked."
+}
