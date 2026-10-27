@@ -180,6 +180,12 @@ impl Transmission {
     pub(crate) fn frame(&self) -> &Outgoing {
         &self.queued.frame
     }
+    pub(crate) fn closes_packet_batch(&self) -> bool {
+        !self.queued.independent_discovery
+            && decode(&self.queued.frame.bytes).is_some_and(|(_, body)| {
+                crate::comms::closes_radio_packet_batch(self.queued.priority, body)
+            })
+    }
 }
 
 pub struct Mesh {

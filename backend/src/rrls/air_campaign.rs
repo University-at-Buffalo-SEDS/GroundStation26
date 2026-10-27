@@ -30,6 +30,7 @@ fn driver_send(
     node: usize,
     now: u64,
     bytes: Vec<u8>,
+    close_batch: bool,
 ) -> sedsnet::TelemetryResult<()> {
     let mut driver = drivers.lock().unwrap();
     if !driver[node].wire.ready(now)
@@ -57,6 +58,11 @@ fn driver_send(
     driver[node]
         .capacity
         .committed(std::time::Instant::now(), Some(now), length);
+    if close_batch {
+        driver[node]
+            .capacity
+            .close_packet_batch(std::time::Instant::now(), Some(now));
+    }
     Ok(())
 }
 fn process(router: &Router) {
@@ -97,7 +103,15 @@ fn flush_mesh(
         let Some(transmission) = mesh.lock().unwrap().begin_transmission(now) else {
             break;
         };
-        let accepted = driver_send(air, drivers, node, now, serial(transmission.frame())).is_ok();
+        let accepted = driver_send(
+            air,
+            drivers,
+            node,
+            now,
+            serial(transmission.frame()),
+            transmission.closes_packet_batch(),
+        )
+        .is_ok();
         mesh.lock()
             .unwrap()
             .finish_transmission(transmission, accepted);
@@ -192,21 +206,29 @@ fn run_case(mode: ReliableMode, fifo: usize, overhead_bits: u32, duration: u64) 
     let mesh = primary.clone();
     let time = clock.clone();
     let uart = drivers.clone();
-    let gs_side = gs.add_side_packed_small_packets(
+    let gs_side = gs.add_side_packed_with_priority_and_options(
         "rfd",
-        move |bytes| {
+        move |bytes, priority| {
             let now = time.load(Ordering::SeqCst) - 1000;
             let frame = mesh.lock().unwrap().local_tx(false, bytes, now).unwrap();
-            driver_send(&medium, &uart, 0, now, serial(&frame))
+            driver_send(
+                &medium,
+                &uart,
+                0,
+                now,
+                serial(&frame),
+                crate::comms::closes_radio_packet_batch(priority, bytes),
+            )
         },
-        crate::RADIO_SIDE_MAX_FRAME_BYTES,
+        sedsnet::router::RouterSideOptions::default()
+            .with_small_packet_transport(crate::RADIO_SIDE_MAX_FRAME_BYTES),
     );
     let medium = air.clone();
     let time = clock.clone();
     let uart = drivers.clone();
-    let rf_side = rf.add_side_packed_small_packets(
+    let rf_side = rf.add_side_packed_with_priority_and_options(
         "rfd",
-        move |bytes| {
+        move |bytes, priority| {
             driver_send(
                 &medium,
                 &uart,
@@ -216,9 +238,11 @@ fn run_case(mode: ReliableMode, fifo: usize, overhead_bits: u32, duration: u64) 
                     command: false,
                     bytes: bytes.to_vec(),
                 }),
+                crate::comms::closes_radio_packet_batch(priority, bytes),
             )
         },
-        crate::RADIO_SIDE_MAX_FRAME_BYTES,
+        sedsnet::router::RouterSideOptions::default()
+            .with_small_packet_transport(crate::RADIO_SIDE_MAX_FRAME_BYTES),
     );
     gs.announce_discovery().unwrap();
     rf.announce_discovery().unwrap();

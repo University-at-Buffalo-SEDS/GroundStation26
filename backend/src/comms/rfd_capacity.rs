@@ -8,6 +8,7 @@ pub(crate) struct Capacity {
     next: Option<(Instant, Option<u64>)>,
     next_packet: Option<(Instant, Option<u64>)>,
     packet_started: Option<(Instant, Option<u64>)>,
+    last_forced_boundary: Option<(Instant, Option<u64>)>,
     packet_burst_ms: u64,
     uart_baud: u32,
     packet_gap_ms: u64,
@@ -25,6 +26,27 @@ fn bounded_env(name: &str, default: u64, min: u64, max: u64) -> u64 {
         .unwrap_or(default)
 }
 impl Capacity {
+    /// Promote the first interactive completion per normal batch cycle. A
+    /// retry/ACK burst must not turn all ordinary traffic into one-frame
+    /// packets. Keep airtime debt and the stopbit/quiet deadline unchanged.
+    pub(crate) fn close_packet_batch(&mut self, wall: Instant, virtual_ms: Option<u64>) {
+        let cycle_ms = self.packet_burst_ms.saturating_add(self.packet_gap_ms);
+        if self
+            .last_forced_boundary
+            .is_some_and(
+                |(last_wall, last_virtual)| match (virtual_ms, last_virtual) {
+                    (Some(now), Some(last)) => now.saturating_sub(last) < cycle_ms,
+                    _ => {
+                        wall.saturating_duration_since(last_wall) < Duration::from_millis(cycle_ms)
+                    }
+                },
+            )
+        {
+            return;
+        }
+        self.packet_started = None;
+        self.last_forced_boundary = Some((wall, virtual_ms));
+    }
     pub(crate) fn packetization(&self) -> (u64, u64) {
         (self.packet_burst_ms, self.packet_gap_ms)
     }
@@ -55,6 +77,7 @@ impl Capacity {
             next: None,
             next_packet: None,
             packet_started: None,
+            last_forced_boundary: None,
             packet_burst_ms: 100,
             uart_baud: 115_200,
             packet_gap_ms: 55,
@@ -171,6 +194,46 @@ impl Capacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn interactive_completion_ends_only_this_batch_without_forgiving_airtime_debt() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64_000, 35, 16);
+        for now in [0, 21, 42, 63] {
+            assert!(cap.ready(wall, Some(now)));
+            cap.committed(wall, Some(now), 42);
+        }
+        cap.close_packet_batch(wall, Some(63));
+        assert!(
+            !cap.ready(wall, Some(84)),
+            "later bulk must leave the critical frame's stopbit +55ms quiet gap"
+        );
+        assert!(!cap.ready(wall, Some(121)));
+        assert!(cap.ready(wall, Some(122)));
+        cap.committed(wall, Some(122), 42);
+        cap.close_packet_batch(wall, Some(122));
+        assert!(
+            cap.ready(wall, Some(143)),
+            "ordinary traffic resumes unchanged100ms batches"
+        );
+        cap.committed(wall, Some(143), 42);
+        cap.close_packet_batch(wall, Some(143));
+        assert!(cap.ready(wall, Some(218)));
+        cap.committed(wall, Some(218), 42);
+        cap.close_packet_batch(wall, Some(218));
+        assert!(
+            !cap.ready(wall, Some(239)),
+            "a new normal155ms cycle can promote its next critical completion"
+        );
+        assert!(cap.ready(wall, Some(277)));
+        let mut low_share = Capacity::new(64_000, 1, 16);
+        low_share.committed(wall, Some(0), 42);
+        low_share.close_packet_batch(wall, Some(0));
+        assert!(
+            !low_share.ready(wall, Some(724)),
+            "closing a batch cannot release existing airtime debt"
+        );
+        assert!(low_share.ready(wall, Some(725)));
+    }
     #[test]
     fn bounded_batches_keep_small_frame_throughput_without_starving_packet_flush() {
         let wall = Instant::now();

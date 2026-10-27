@@ -184,6 +184,13 @@ impl CommsDevice for RecoveryRadio {
         )
     }
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.send_data_with_priority(payload, 0)
+    }
+    fn send_data_with_priority(
+        &mut self,
+        payload: &[u8],
+        priority: u8,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.with_device(
             "RRLS radio disconnected".into(),
             |error| {
@@ -194,7 +201,7 @@ impl CommsDevice for RecoveryRadio {
                     )
                 })
             },
-            |device| device.send_data(payload),
+            |device| device.send_data_with_priority(payload, priority),
         )
     }
     fn send_radio_scheduler_status(
@@ -374,6 +381,42 @@ mod tests {
             radio.connect().is_some(),
             "late failure must not close new session"
         );
+    }
+    #[test]
+    fn reconnecting_writer_preserves_trusted_priority_metadata() {
+        struct PrioritySpy(Arc<Mutex<Vec<(u8, Vec<u8>)>>>);
+        impl CommsDevice for PrioritySpy {
+            fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
+                Ok(Some(Box::new(Self(self.0.clone()))))
+            }
+            fn set_side_id(&mut self, _: RouterSideId) {}
+            fn recv_packet(
+                &mut self,
+                _: &Router,
+                _: &mut dyn FnMut(&Packet),
+            ) -> TelemetryResult<()> {
+                Ok(())
+            }
+            fn send_data(&mut self, _: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+                panic!("recovery wrapper discarded trusted priority")
+            }
+            fn send_data_with_priority(
+                &mut self,
+                bytes: &[u8],
+                priority: u8,
+            ) -> Result<(), Box<dyn Error + Send + Sync>> {
+                self.0.lock().unwrap().push((priority, bytes.to_vec()));
+                Ok(())
+            }
+        }
+        let radio = missing();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sent = observed.clone();
+        radio.shared.lock().unwrap().opener =
+            Box::new(move |_| Ok(Box::new(PrioritySpy(sent.clone()))));
+        let mut writer = radio.try_clone_tx().unwrap().unwrap();
+        writer.send_data_with_priority(&[1, 2, 3], 200).unwrap();
+        assert_eq!(*observed.lock().unwrap(), vec![(200, vec![1, 2, 3])]);
     }
     #[test]
     fn uart_backpressure_keeps_recovery_radio_connected_and_can_resume() {

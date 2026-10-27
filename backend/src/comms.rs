@@ -102,6 +102,28 @@ const DUMMY_UMBILICAL_TIMESYNC_SOURCES: &[&str] = &["GB", "VB", "AB", "DAQ"];
 // ======================================================================
 //  Comms Device Trait
 // ======================================================================
+/// A trusted command/receipt queue selection can request an immediate packet
+/// boundary. Header presence alone is insufficient: unsequenced SDK headers
+/// also occur on best-effort traffic. Stateful SDT stays opaque and ordered.
+pub(crate) fn closes_radio_packet_batch(priority: u8, payload: &[u8]) -> bool {
+    if priority < 200 || payload.starts_with(b"SDT") {
+        return false;
+    }
+    let Ok(info) = serialize::peek_frame_info(payload) else {
+        return false;
+    };
+    let ty = info.envelope.ty;
+    if sedsnet::discovery::is_discovery_type(ty) {
+        return false;
+    }
+    matches!(
+        ty,
+        sedsnet::config::DataType::ReliableAck
+            | sedsnet::config::DataType::ReliablePartialAck
+            | sedsnet::config::DataType::ReliablePacketRequest
+    ) || (sedsnet::is_reliable_type(ty) && sedsnet::message_priority(ty) >= 16)
+}
+
 pub trait CommsDevice: Send {
     /// An independent writer for full-duplex transports. Shared-bus devices
     /// keep the default so reads and writes remain serialized.
@@ -134,6 +156,15 @@ pub trait CommsDevice: Send {
         packet_tap: &mut dyn FnMut(&Packet),
     ) -> TelemetryResult<()>;
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>>;
+    /// Retain the actual queue selection through serial offload. Devices
+    /// without a packetizing radio keep their existing send implementation.
+    fn send_data_with_priority(
+        &mut self,
+        payload: &[u8],
+        _priority: u8,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.send_data(payload)
+    }
     fn set_side_id(&mut self, side_id: RouterSideId);
     fn recv_serialized_packets(
         &mut self,
@@ -682,6 +713,9 @@ impl UartComms {
                 if let Some(capacity) = &mut write_state.radio_capacity {
                     capacity.committed(capacity_wall, capacity_clock, framed.len());
                     capacity.drained(Instant::now());
+                    if transmission.closes_packet_batch() {
+                        capacity.close_packet_batch(capacity_wall, capacity_clock);
+                    }
                 }
                 Ok(())
             })();
@@ -1869,6 +1903,14 @@ impl CommsDevice for UartComms {
 
     /// Blocking send of serialized bytes.
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.send_data_with_priority(payload, 0)
+    }
+    fn send_data_with_priority(
+        &mut self,
+        payload: &[u8],
+        priority: u8,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let close_batch = closes_radio_packet_batch(priority, payload);
         if self.recovery.is_some() {
             self.enable_radio_capacity_control();
         }
@@ -1982,6 +2024,9 @@ impl CommsDevice for UartComms {
                 len + RAW_UART_FRAME_HEADER_SIZE,
             );
             capacity.drained(Instant::now());
+            if close_batch {
+                capacity.close_packet_batch(capacity_wall, capacity_clock);
+            }
         }
         Ok(())
     }
@@ -3263,6 +3308,126 @@ mod tests {
 mod raw_uart_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn packet_boundary_uses_trusted_command_priority_and_actual_schema_reliability() {
+        crate::telemetry_schema::initialize().unwrap();
+        let wire = |name: &str, size: usize| {
+            let packet = Packet::new(
+                crate::telemetry_schema::data_type(name),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "GS",
+                1,
+                vec![0; size].into(),
+            )
+            .unwrap();
+            sedsnet::wire_format::pack_packet(&packet)
+        };
+        for (name, size) in [
+            ("FLIGHT_COMMAND", 1),
+            ("FLIGHT_STATE", 1),
+            ("AV_BAY_UNDERGLOW", 1),
+            ("FLIGHT_BUZZER", 1),
+        ] {
+            let packet = wire(name, size);
+            assert!(
+                closes_radio_packet_batch(255, &packet),
+                "{name} unsequenced canonical commands retain schema delivery intent"
+            );
+            assert!(
+                !closes_radio_packet_batch(0, &packet),
+                "untrusted/default priority must not close {name}"
+            );
+        }
+        for (name, size) in [("HEARTBEAT", 0), ("GPS_DATA", 12), ("IMU_DATA", 24)] {
+            assert!(
+                !closes_radio_packet_batch(255, &wire(name, size)),
+                "routine {name} must keep batching"
+            );
+        }
+        let ack = sedsnet::wire_format::pack_reliable_ack(
+            "RF",
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            1,
+            1,
+        );
+        assert!(closes_radio_packet_batch(255, &ack));
+        assert!(!closes_radio_packet_batch(255, b"SDT opaque bootstrap"));
+        assert!(!closes_radio_packet_batch(255, b"RR\x01\x00 health"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn successful_critical_uart_write_flushes_without_changing_ordinary_batching() {
+        crate::telemetry_schema::initialize().unwrap();
+        let packet = Packet::new(
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
+            "GS",
+            1,
+            vec![0; 1].into(),
+        )
+        .unwrap();
+        let bytes = sedsnet::wire_format::pack_packet(&packet);
+        for priority in [0, 200] {
+            let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+            peer.set_timeout(Duration::from_secs(1)).unwrap();
+            let (mut uart, _, _) = recovery_uart_fixture(port);
+            uart.recovery = None;
+            uart.write_lock.lock().unwrap().radio_capacity =
+                Some(rfd_capacity::Capacity::new(64_000, 35, 16));
+            let length = bytes.len() + 4;
+            let reader = std::thread::spawn(move || {
+                let mut out = vec![0; length];
+                peer.read_exact(&mut out).unwrap();
+                out
+            });
+            uart.send_data_with_priority(&bytes, priority).unwrap();
+            let completed = Instant::now();
+            let state = uart.write_lock.lock().unwrap();
+            let cap = state.radio_capacity.as_ref().unwrap();
+            assert_eq!(
+                cap.ready(completed + Duration::from_millis(40), None),
+                priority == 0
+            );
+            assert!(cap.ready(completed + Duration::from_millis(80), None));
+            assert_eq!(
+                reader.join().unwrap(),
+                build_raw_uart_frame(&bytes).unwrap()
+            );
+        }
+    }
+    #[test]
+    #[cfg(unix)]
+    fn rejected_critical_uart_write_cannot_close_or_charge_a_batch() {
+        crate::telemetry_schema::initialize().unwrap();
+        let packet = Packet::new(
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
+            "GS",
+            1,
+            vec![0; 1].into(),
+        )
+        .unwrap();
+        let bytes = sedsnet::wire_format::pack_packet(&packet);
+        let (peer, port) = serialport::TTYPort::pair().unwrap();
+        let (mut uart, _, _) = recovery_uart_fixture(port);
+        uart.recovery = None;
+        uart.write_lock.lock().unwrap().radio_capacity =
+            Some(rfd_capacity::Capacity::new(64_000, 35, 16));
+        drop(peer);
+        assert!(uart.send_data_with_priority(&bytes, 200).is_err());
+        assert!(
+            uart.write_lock
+                .lock()
+                .unwrap()
+                .radio_capacity
+                .as_ref()
+                .unwrap()
+                .ready(Instant::now(), None),
+            "failed IO must not create airtime or a packet boundary reservation"
+        );
+    }
 
     #[cfg(unix)]
     fn recovery_uart_fixture(

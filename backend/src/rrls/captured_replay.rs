@@ -29,6 +29,58 @@ fn selected_source(event: &Event) -> bool {
 }
 
 #[test]
+fn captured_canonical_unsequenced_controls_preserve_the_interactive_boundary_tag() {
+    crate::telemetry_schema::initialize().unwrap();
+    let fixture: Fixture =
+        serde_json::from_str(include_str!("fixtures/full-path-50ms-rx.json")).unwrap();
+    let mut verified = 0;
+    for event in fixture.events.iter().filter(|event| {
+        [
+            "FLIGHT_STATE:",
+            "FLIGHT_COMMAND:",
+            "AV_BAY_UNDERGLOW:",
+            "FLIGHT_BUZZER:",
+        ]
+        .iter()
+        .any(|prefix| event.label.starts_with(prefix))
+    }) {
+        let bytes = STANDARD.decode(&event.payload).unwrap();
+        let Some((_, body)) = decode(&bytes) else {
+            continue;
+        };
+        if body.starts_with(b"SDT") {
+            continue;
+        }
+        let info = sedsnet::wire_format::peek_frame_info(body).unwrap();
+        assert!(sedsnet::is_reliable_type(info.envelope.ty));
+        assert!(info.reliable.is_some_and(|header| header.flags
+            & sedsnet::wire_format::RELIABLE_FLAG_UNSEQUENCED
+            != 0));
+        assert!(crate::comms::closes_radio_packet_batch(255, body));
+        let mut relay = Mesh::new(Role::Rrls, 2);
+        let health = fixture
+            .events
+            .iter()
+            .find_map(|event| {
+                let bytes = STANDARD.decode(&event.payload).unwrap();
+                decode(&bytes)
+                    .filter(|(kind, body)| *kind == HEALTH && body.len() == 9 && body[8] == 0)
+                    .map(|_| bytes.clone())
+            })
+            .unwrap();
+        relay.incoming(true, &health, 0);
+        relay.incoming(false, body, 0);
+        let transmission = relay.begin_transmission(0).unwrap();
+        assert!(transmission.closes_packet_batch());
+        verified += 1;
+    }
+    assert!(
+        verified >= 6,
+        "exercise multiple real captured commands/retries"
+    );
+}
+
+#[test]
 fn captured_bidirectional_relay_burst_retains_source_and_canonical_deadlines() {
     crate::telemetry_schema::initialize().unwrap();
     let fixture: Fixture =
@@ -101,6 +153,9 @@ fn captured_bidirectional_relay_burst_retains_source_and_canonical_deadlines() {
             }
             wire.committed(now, framed_len, 115_200);
             capacity.committed(wall, Some(now), framed_len);
+            if transmission.closes_packet_batch() {
+                capacity.close_packet_batch(wall, Some(now));
+            }
             relay.finish_transmission(transmission, true);
         }
     }

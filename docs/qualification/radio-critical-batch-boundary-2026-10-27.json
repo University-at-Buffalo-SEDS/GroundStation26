@@ -1,0 +1,79 @@
+{
+  "status": "targeted_native_gates_pass_full_linked_qualification_pending",
+  "scope": "Promote one successful actual interactive/receipt UART completion per existing normal batch cycle; preserve ordinary batching, airtime debt and stopbit gap. No physical modem configuration or hardware latency qualification.",
+  "source_sha256": {
+    "backend/src/comms.rs": "e0b6562074a399cb170a6ef0fbab97e70f3fb8aa3b67b04896bc884db55f864c",
+    "backend/src/comms/rfd_capacity.rs": "ffb82a428af2938b1bffa7767ac20fc07bcda8b657fc822c937c4f76d35c6411",
+    "backend/src/rrls.rs": "5ae1ac75f78fc5e3d4dc74c5f330d6dfe1aa749403f080f37b644f7c69f2a2cf",
+    "backend/src/rrls_radio.rs": "4683cf96784f3f7f078ca7c91b3d565970f04f8740aca076ecc170dce42085af",
+    "backend/src/telemetry_task/radio_io.rs": "a240a7141d5a97c640b1835f9497237f99d46cef105d9354cc52d6bb32be08de"
+  },
+  "policy": {
+    "critical_predicate": "Trusted queue priority>=200; canonical SDK schema-reliable type with schema application priority>=16, or explicit ReliableAck/PartialAck/PacketRequest type. Discovery, unknownSDT, routineHeartbeat/GPS and0-priority warning/telemetry do not qualify. Header presence/UNSEQUENCED flag alone is not a delivery-intent test.",
+    "cadence_ms": 155,
+    "cadence_derivation": "Existing100ms ordinary batch +55ms quiet interval, using authoritative virtual or wall clock. Repeated critical writes inside the cycle keep normal batching.",
+    "successful_io_only": true,
+    "constant_host_metadata_bytes": 32,
+    "dynamic_allocations_added": 0,
+    "host_capacity_size_before_bytes": 152,
+    "host_capacity_size_after_bytes": 184
+  },
+  "negative": {
+    "capacity": "Bulk remained eligible84ms after critical63ms despite required stopbit+55ms quiet deadline122ms.",
+    "per_hop_50ms_idle_us": 118100,
+    "unbounded_flush_each_frame": "Rejected experiment: fixed observed retry/ACK burst caused6selected source omissions and26totaldrops in exact capture replay. Strict assertions retained; no acceptance of this policy.",
+    "logs": [
+      "/tmp/gs-urgent-batch-before-20261027.log",
+      "/tmp/gs-urgent-per-hop-20261027.log",
+      "/tmp/gs-urgent-relay-tests-20261027.log"
+    ]
+  },
+  "positive": {
+    "per_hop_50ms_idle_us": 91900,
+    "per_hop_2ms_idle_us": 17200,
+    "offered_normal_probe_count_before": 350,
+    "offered_normal_probe_count_after": 350,
+    "offered_interval_ms": 10000,
+    "source_capture_reports_delivered": 149,
+    "canonical_capture_occurrences_delivered": 15,
+    "max_source_rf_to_uart_offload_ms": 1391.1,
+    "max_canonical_rx_to_uart_offload_ms": 2169.4,
+    "expired_routine_uplink_heartbeats": 16,
+    "capture_peak_queue_frames": 26,
+    "max_health_gap_ms": 770,
+    "max_ready_gap_ms": 570
+  },
+  "validation": {
+    "mesh_and_actual_sdk_three_radio_campaign": 57,
+    "raw_uart_including_success_and_failure_pty": 31,
+    "capacity": 8,
+    "worker_priority_and_ownership": 29,
+    "reconnect_wrapper": 5,
+    "per_hop_modem": "Positive/negative comparison PASS; actual productionCapacity generated writes and unmodifiedSedsRadioMedium modeled UART/air. Byte order and FIFO counters checked.",
+    "logs": [
+      "/tmp/gs-urgent-cadence-relay-tests-20261027.log",
+      "/tmp/gs-urgent-uart-tests-20261027.log",
+      "/tmp/gs-urgent-capacity-tests-20261027.log",
+      "/tmp/gs-urgent-recovery-wrapper-tests-20261027.log",
+      "/tmp/gs-urgent-cadence-per-hop-20261027.log"
+    ]
+  },
+  "unchanged": [
+    "Air rate and air-share debt",
+    "100ms ordinary batch horizon",
+    "Existing55ms gap after actual drained stopbit",
+    "SDK/wire protocol and retry settings",
+    "FIFO and queue limits",
+    "Source sampling rates",
+    "250/1500/3000ms queue expiries",
+    "500ms end-to-end command gate",
+    "1500ms end-to-end source gate",
+    "3000ms canonical gate"
+  ],
+  "limitations": [
+    "Targeted100ms per-hop regression is an additional test, not replacement or relaxation of existing end-to-end gates.",
+    "Capture replay measures serial offload before downstream air;1391.1ms does not establish1500ms full source-to-GS delivery.",
+    "No physical modem settings were read or changed; hardware remains unqualified.",
+    "Full linked campaign with matching RF priority fix and CAN trace remains necessary."
+  ]
+}

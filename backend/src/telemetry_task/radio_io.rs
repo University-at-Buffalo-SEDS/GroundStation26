@@ -1130,7 +1130,7 @@ pub(super) fn spawn_comms_worker_threads(
                     if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some() {
                         log::info!("full-bay transport selected side={worker_name} sim={:?} priority={priority} len={} type={:?}", crate::simulation_clock_ms(), payload.len(), serialize::peek_frame_info_unchecked(&payload).map(|info| info.envelope.ty));
                     }
-                    match comms.send_data(&payload) {
+                    match comms.send_data_with_priority(&payload, priority) {
                         Ok(()) => {
                             if let Some(budget) = &comms_handle.tx_budget {
                                 budget.complete(priority, &payload);
@@ -1267,7 +1267,7 @@ fn spawn_legacy_comms_worker_thread(
                     match selected {
                         Ok((priority, payload)) => {
                             sent_any = true;
-                            match comms.send_data(&payload) {
+                            match comms.send_data_with_priority(&payload, priority) {
                                 Ok(()) => {
                                     if let Some(budget) = &comms_handle.tx_budget { budget.complete(priority, &payload); }
                                     if let Some(activity) = &comms_handle.transport_activity { activity.complete(); }
@@ -1751,7 +1751,7 @@ fn spawn_rx_priority_comms_worker_thread(
                         if now >= next_tx_allowed_at
                             && let Some((priority, payload)) = pending_tx.take().or_else(|| comms_handle.tx_rx.try_recv().ok())
                         {
-                            match comms.send_data(&payload) {
+                            match comms.send_data_with_priority(&payload, priority) {
                                 Ok(()) => {
                                     if let Some(budget) = &comms_handle.tx_budget { budget.complete(priority, &payload); }
                                     if let Some(activity) = &comms_handle.transport_activity { activity.complete(); }
@@ -2384,7 +2384,7 @@ fn send_while_uplink_window_open(
         };
         log_radio_packet_event("radio TX pop", worker_name, &payload);
         maybe_log_green_radio_command_send(worker_name, &payload);
-        match comms.send_data(&payload) {
+        match comms.send_data_with_priority(&payload, priority) {
             Ok(()) => {
                 if let Some(budget) = tx_budget { budget.complete(priority, &payload); }
                 if let Some(activity) = transport_activity { activity.complete(); }
@@ -2741,13 +2741,17 @@ mod rfd_worker_tests {
 mod transport_pending_tests {
     use super::*;
     use std::error::Error;
-    struct BlockThenRetry { attempts: Arc<AtomicUsize>, release: Arc<AtomicUsize>, entered: std::sync::mpsc::Sender<usize> }
+    struct BlockThenRetry { expected_priority:u8, attempts: Arc<AtomicUsize>, release: Arc<AtomicUsize>, entered: std::sync::mpsc::Sender<usize> }
     impl CommsDevice for BlockThenRetry {
         fn recv_packet(&mut self, _: &Router, _: &mut dyn FnMut(&Packet)) -> sedsnet::TelemetryResult<()> { Ok(()) }
         fn send_data(&mut self, _: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
             let attempt=self.attempts.fetch_add(1,Ordering::AcqRel);self.entered.send(attempt).unwrap();
             while self.release.load(Ordering::Acquire)<=attempt { thread::sleep(Duration::from_millis(1)); }
             if attempt==0 { return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into()); } Ok(())
+        }
+        fn send_data_with_priority(&mut self, bytes:&[u8],priority:u8)->Result<(),Box<dyn Error+Send+Sync>> {
+            assert_eq!(priority,self.expected_priority,"worker lost the selected priority across retry");
+            self.send_data(bytes)
         }
         fn set_side_id(&mut self, _: RouterSideId) {}
     }
@@ -2768,7 +2772,7 @@ mod transport_pending_tests {
             assert!(state.has_pending_transport_tx(),"queued work must block clear");
             let workers=spawn_comms_worker_threads(Arc::new(Router::new(Default::default())),state.clone(),CommsWorkerHandle {
                 transport_activity:Some(activity.clone()),name:"pending_fixture",tx_budget:None,
-                comms:Arc::new(Mutex::new(Box::new(BlockThenRetry {attempts:attempts.clone(),release:release.clone(),entered}))),
+                comms:Arc::new(Mutex::new(Box::new(BlockThenRetry {expected_priority:16,attempts:attempts.clone(),release:release.clone(),entered}))),
                 tx_comms:None,side_id:0,tx_rx:receiver,legacy_single_worker:legacy,prioritize_rx,dedicated_radio_io:false,
             }).unwrap();
             let result=(||->Result<(),&'static str>{
@@ -2794,7 +2798,7 @@ mod transport_pending_tests {
         let mut commands=VecDeque::new();let mut telemetry=VecDeque::new();
         assert!(drain_radio_tx_queue(&mut receiver,"fixture",&mut commands,&mut telemetry,8,Some(&activity),Some(&budget)));
         let (entered,_observed)=std::sync::mpsc::channel();
-        let mut device=BlockThenRetry {attempts:Arc::new(AtomicUsize::new(0)),release:Arc::new(AtomicUsize::new(usize::MAX)),entered};
+        let mut device=BlockThenRetry {expected_priority:0,attempts:Arc::new(AtomicUsize::new(0)),release:Arc::new(AtomicUsize::new(usize::MAX)),entered};
         let now=std::time::Instant::now();let mut until=Some(now+Duration::from_secs(4));let mut uplink=true;
         let mut sent=0;let mut last=None;let mut next=None;let mut error_time=0;let mut suppressed=0;
         for round in 0..2 {
