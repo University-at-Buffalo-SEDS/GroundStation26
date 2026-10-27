@@ -392,5 +392,5 @@
     "firmware_ui_pico": "All existing source branches pushed. Duplicate gateway histories merged without source changes; both gateway checkouts share1dd5a06."
   },
   "current_qualification": "docs/work-plans/current-qualification-2026-10-25.json",
-  "final_ui_audit": "Seds-Ground-Station-Frontend/docs/qualification/final-ui-audit-2026-10-26.json"
+  "final_ui_audit": ".workspace-progress/qualification-artifact-archive-20261027/Seds-Ground-Station-Frontend/docs/qualification/final-ui-audit-2026-10-26.json"
 }

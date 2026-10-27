@@ -238,7 +238,7 @@
   "readiness_scope": "Software source and simulator qualification only; no physical hardware, RF propagation or physical actuation acceptance is claimed.",
   "ui_final_audit": {
     "status": "PASS",
-    "evidence": "Seds-Ground-Station-Frontend/docs/qualification/final-ui-audit-2026-10-26.json",
+    "evidence": ".workspace-progress/qualification-artifact-archive-20261027/Seds-Ground-Station-Frontend/docs/qualification/final-ui-audit-2026-10-26.json",
     "native_passed": 140,
     "native_ignored": 7,
     "browser_suites_passed": 10,

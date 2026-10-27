@@ -18,6 +18,6 @@ Audience snapshots resolve the configured calibrated fill source and reject stal
 
 ## Validation
 
-Backend full suite: 489 passed, 3 existing ignored on 2026-10-25; media subset 31 passed, 1 ignored. Actual loopback sockets test programme PCM cannot reach an admitted crew peer, a viewer cannot join programme ingest, and receive-only stream managers cannot forge crew transmission. Persistence tests cover rundown and selected recorded-replay round trips, restart, validation and 409/403 rejection. Frontend qualification is recorded in its `docs/qualification/broadcast-studio-2026-10-25.json`.
+Backend full suite: 489 passed, 3 existing ignored on 2026-10-25; media subset 31 passed, 1 ignored. Actual loopback sockets test programme PCM cannot reach an admitted crew peer, a viewer cannot join programme ingest, and receive-only stream managers cannot forge crew transmission. Persistence tests cover rundown and selected recorded-replay round trips, restart, validation and 409/403 rejection. Frontend run records are archived outside the source repositories in the workspace `.workspace-progress/qualification-artifact-archive-20261027/Seds-Ground-Station-Frontend/`; `source-manifest.json` records their source commits and hashes.
 
 Not yet qualified: live MediaMTX interview-audio conversion on deployed camera codecs, real microphones/acoustics, native mobile permission dialogs, and real radio performance. These features do not transmit operational output commands.
