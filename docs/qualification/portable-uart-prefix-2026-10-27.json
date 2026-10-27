@@ -1,0 +1,38 @@
+{
+  "result": "PASS_SOFTWARE_CHECKS",
+  "scope": "Count accepted std::Write prefixes on non-Linux RawUART scalar and Mesh fallback errors. No sampling/rate/queue/airtime-policy changes. Linux runtime writer branches remain unchanged. macOS native build and physical UART validation have not been performed.",
+  "baseline": "647d87339dfd9bdeb1c0f7e7ebbc63897d48f3d6",
+  "sdk_source": "Git d82b5526c56a20f65f6257478ae32f3ff9af5674, declared4.2.7",
+  "frontend_source": "59bf24745347ceb11cdbc3be06669bca548e19f2",
+  "problem": "write_all can accept a positive prefix before returning an error; assigning accepted only after full success leaves that physical work uncharged. Actual Linux TTYPort std::Write proof observed3584 of4100 frame bytes before TimedOut (1286ms declared35%64k air reservation).",
+  "change": "Generic counted helper preserves Write::write_all Interrupted and WriteZero semantics and original errors. Both cfg(notLinux) RawUART writers retain the count through flush failure. Their existing common accounting reserves nonzero accepted bytes before returning Err, while ordinary credit and forced close remain full-success-only. Complete framing, write/flush order and clocks are unchanged.",
+  "ownership": "The input frame remains borrowed and intact for same-ID retry after partial failure. No packet is logically completed by accepting its prefix.",
+  "tests": {
+    "focused": "3 production portable tests pass: Interrupted/WriteZero/error, full success/flush error, exactBox<dyn SerialPort> complete/actual partial IO.",
+    "normal": "629 passed,0failed,3ignored",
+    "hitl_mode": "607 passed,0failed,2ignored",
+    "test_fire_mode": "630 passed,0failed,3ignored",
+    "test_fire_fixture_repair": "First full test-fire run hit an existing peer-lifetime race: a receipt reader dropped its PTY master before writer tcdrain finished. Retaining(peer,bytes) through join fixed the test without changing runtime pacing or receipt/quiet assertions; the full test-fire suite then passed.",
+    "isolation": "Portable PTY test creates its ports in a dedicated exact-test child before any descriptor exists in parent, preventing unrelated air-test children from inheriting its non-CLOEXEC master. Fixture nonblocking mode forces bounded Linux partial writes; this is not macOS physical evidence."
+  },
+  "unchanged_limits": [
+    "500ms command qualification gate",
+    "1500ms RF_TX-to-GS source gate",
+    "3000ms canonical forwarding gate",
+    "existing UART framing, wire/debt/quiet accounting and bank eligibility",
+    "SDK and MCU memory quotas"
+  ],
+  "remaining": "Linked Linux qualification is separately owned and must not be called a macOS hardware qualification. Existing647d run passed149/149source745.1ms/canonical21/21 but failed502ms control; this cfg(nonLinux) fix does not address that RF ACK delay.",
+  "evidence_paths": [
+    "../FirmwareSimulator/build/schema-progress-cohort-20261027/portable-write-audit/qualification.json",
+    "../FirmwareSimulator/build/schema-progress-cohort-20261027/portable-write-audit/boxed-type-and-ownership-review.json",
+    "/tmp/portable-std-prefix-product-focused-20261027.log",
+    "/tmp/portable-std-prefix-normal-20261027.log",
+    "/tmp/portable-std-prefix-hitl-20261027.log",
+    "/tmp/portable-std-prefix-testfire-after-peer-lifetime-20261027.log"
+  ],
+  "source_sha256": {
+    "backend/src/comms.rs": "26e3bedb9432cc4e4cba89738e23db7e24b935e0ab55dedcaf8eb55c1aa579da",
+    "backend/src/comms/portable_write_tests.rs": "aab479eb8bce7edf12ef89ed11acb0032348646acd2622e61c71a42def0a1543"
+  }
+}

@@ -847,13 +847,8 @@ impl UartComms {
                     )
                 });
                 #[cfg(not(target_os = "linux"))]
-                let io_result = self
-                    .inner
-                    .write_all(&framed)
-                    .and_then(|_| self.inner.flush())
-                    .map(|()| {
-                        accepted = framed.len();
-                    });
+                let io_result = write_all_std_counted(&mut self.inner, &framed, &mut accepted)
+                    .and_then(|_| self.inner.flush());
                 #[cfg(target_os = "linux")]
                 if let Some(now) = virtual_wire_now
                     && accepted > 0
@@ -1157,6 +1152,38 @@ fn write_once_fd(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {
         return Err(err);
     }
     Ok(written as usize)
+}
+
+#[cfg(test)]
+#[path = "comms/portable_write_tests.rs"]
+mod portable_write_tests;
+
+/// Count accepted std::Write bytes even when a later write/flush fails.
+/// Keep flush at the call site, matching the original write_all/flush order.
+#[cfg(any(not(target_os = "linux"), test))]
+fn write_all_std_counted<W: Write + ?Sized>(
+    writer: &mut W,
+    mut bytes: &[u8],
+    accepted: &mut usize,
+) -> std::io::Result<()> {
+    *accepted = 0;
+    while !bytes.is_empty() {
+        match writer.write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(n) => {
+                *accepted += n;
+                bytes = &bytes[n..];
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2405,10 +2432,8 @@ impl CommsDevice for UartComms {
                         build_raw_uart_frame(payload)?
                     };
                     maybe_log_raw_uart_tx(&framed, &self.protocol);
-                    self.inner.write_all(&framed)?;
-                    self.inner.flush()?;
-                    accepted = framed.len();
-                    Ok(())
+                    write_all_std_counted(&mut self.inner, &framed, &mut accepted)
+                        .and_then(|_| self.inner.flush())
                 }
             }
         };
@@ -3887,7 +3912,7 @@ mod raw_uart_tests {
         let reader = std::thread::spawn(move || {
             let mut out = vec![0; length];
             peer.read_exact(&mut out).unwrap();
-            out
+            (peer, out)
         });
         let mut cap = rfd_capacity::Capacity::new(64_000, 35, 16);
         cap.close_packet_batch(Instant::now(), None);
@@ -3898,10 +3923,8 @@ mod raw_uart_tests {
         let cap = state.radio_capacity.as_ref().unwrap();
         assert!(!cap.ready(completed + Duration::from_millis(40), None));
         assert!(cap.ready(completed + Duration::from_millis(80), None));
-        assert_eq!(
-            reader.join().unwrap(),
-            build_raw_uart_frame(&bytes).unwrap()
-        );
+        let (_peer, actual) = reader.join().unwrap();
+        assert_eq!(actual, build_raw_uart_frame(&bytes).unwrap());
     }
 
     #[test]
