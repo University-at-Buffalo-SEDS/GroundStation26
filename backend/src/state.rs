@@ -452,6 +452,11 @@ impl AppState {
     }
 
     fn publish_daq_launch_clock(&self, clock: &LaunchClockMsg) {
+        // RRLS displays the primary's launch clock without creating a DAQ
+        // recording session or asking its read-only router to publish one.
+        if crate::rrls::is_rrls() {
+            return;
+        }
         let mut session = self.daq_log_session.lock().unwrap();
         if clock.kind == LaunchClockKind::Idle {
             *session = 0;
@@ -1770,6 +1775,165 @@ fn t_plus_anchor_timestamp(current: &LaunchClockMsg, timestamp_ms: i64) -> i64 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[tokio::test]
+    async fn rrls_all_received_states_project_clocks_without_daq_origination() {
+        const CHILD: &str = "GS_RRLS_CLOCK_OBSERVER_TEST_CHILD";
+        const NAME: &str =
+            "state::tests::rrls_all_received_states_project_clocks_without_daq_origination";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir().join(format!(
+                "rrls-clock-observer-{}-{}",
+                std::process::id(),
+                rand::random::<u128>()
+            ));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("GS_RRLS_ROLE", "rrls")
+                .env("GS_SIM_MODE", "0")
+                .env_remove("GS_SIM_CLOCK_FILE")
+                .env("GS_NETWORK_VARIABLE_CACHE", root.join("variables.json"))
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(root);
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        assert!(crate::rrls::is_rrls());
+        let mut state = test_app_state().await;
+        let (db_tx, mut db_rx) = mpsc::channel(4);
+        Arc::get_mut(&mut state).unwrap().db_queue_tx = db_tx;
+        let mut ui = state.state_tx.subscribe();
+        let mut clocks = state.launch_clock_tx.subscribe();
+        let preserved = state.add_notification("existing observer notification");
+        let router = Arc::new(Router::new(RouterConfig::new([]).with_sender("RRLS")));
+        let frames = Arc::new(AtomicUsize::new(0));
+        let output = frames.clone();
+        let side = router.add_side_packed("rocket_comms", move |_| {
+            output.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        router.set_side_egress_enabled(side, false).unwrap();
+        crate::network_variables::initialize(&router).unwrap();
+        state.topology_router.set(router.clone()).unwrap();
+        let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
+        let weak = Arc::downgrade(&state);
+        router
+            .on_network_variable_update(ty, move |packet| {
+                weak.upgrade().unwrap().set_local_flight_state(
+                    crate::types::u8_to_flight_state(packet.payload()[0]).unwrap(),
+                );
+                Ok(())
+            })
+            .unwrap();
+        let path = std::path::PathBuf::from(std::env::var_os("GS_NETWORK_VARIABLE_CACHE").unwrap());
+        let mut ascent_window = None;
+        for (index, code) in std::iter::once(1u8).chain(0u8..=15).enumerate() {
+            let packet = Packet::new(
+                ty,
+                &[crate::telemetry_schema::endpoint("FLIGHT_STATE")],
+                "GS",
+                1000 + index as u64,
+                Arc::<[u8]>::from([code]),
+            )
+            .unwrap();
+            let before = crate::telemetry_task::get_current_timestamp_ms() as i64;
+            let receiver = router.clone();
+            std::thread::spawn(move || receiver.rx_from_side(&packet, side).unwrap())
+                .join()
+                .unwrap();
+            let after = crate::telemetry_task::get_current_timestamp_ms() as i64;
+            if code == FlightState::Ascent as u8 {
+                ascent_window = Some((before, after));
+            }
+            assert_eq!(state.local_flight_state_snapshot() as u8, code);
+            assert_eq!(ui.try_recv().unwrap().state as u8, code);
+            let write = tokio::time::timeout(Duration::from_secs(2), db_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(write,DbQueueItem::Write(crate::telemetry_db::DbWrite::FlightState{state_code,..})if state_code==code as i64)
+            );
+            let disk: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(disk["flight_state"], code);
+            if code == FlightState::Launch as u8 {
+                assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::TMinus);
+            }
+            if code >= FlightState::Ascent as u8 {
+                assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::TPlus);
+            }
+        }
+        let minus = clocks.try_recv().unwrap();
+        let plus = clocks.try_recv().unwrap();
+        assert_eq!(minus.kind, LaunchClockKind::TMinus);
+        assert_eq!(plus.kind, LaunchClockKind::TPlus);
+        assert_eq!(minus.duration_ms, Some(LAUNCH_COUNTDOWN_DURATION_MS));
+        let deadline = minus.anchor_timestamp_ms.unwrap() + LAUNCH_COUNTDOWN_DURATION_MS;
+        let (before, after) = ascent_window.unwrap();
+        assert!(
+            (deadline.min(before)..=deadline.min(after))
+                .contains(&plus.anchor_timestamp_ms.unwrap()),
+            "early Ascent retains the existing receipt-time clamp"
+        );
+        assert!(
+            clocks.try_recv().is_err(),
+            "observer clock anchors should not be restarted by later states"
+        );
+        state.reset_launch_clock();
+        assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::Idle);
+        assert_eq!(clocks.try_recv().unwrap().kind, LaunchClockKind::Idle);
+        let notes = state.notifications_snapshot();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.id == preserved && n.message == "existing observer notification")
+        );
+        let false_notices = notes
+            .iter()
+            .filter(|n| {
+                n.message
+                    .contains("DAQ launch log clock could not be published")
+            })
+            .collect::<Vec<_>>();
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        println!(
+            "RRLS_CLOCK_PROOF {}",
+            serde_json::json!({"states_projected":17,"false_notices":false_notices.len(),"local_daq_session":*state.daq_log_session.lock().unwrap(),"cached_daq_log_clock":disk["daq_log_clock"]})
+        );
+        assert!(
+            false_notices.is_empty(),
+            "received primary state must not request a read-only DAQ publication: {false_notices:?}"
+        );
+        assert_eq!(*state.daq_log_session.lock().unwrap(), 0);
+        assert_eq!(disk["daq_log_clock"], serde_json::json!([0, 0]));
+        assert_eq!(disk["daq_log_last_session"], 0);
+        assert_eq!(frames.load(Ordering::SeqCst), 0);
+        let stats = router.export_runtime_stats();
+        assert_eq!(stats.queues.tx_len, 0);
+        assert_eq!(stats.queues.replay_len, 0);
+        let denied = Packet::new(
+            crate::telemetry_schema::data_type("DAQ_LOG_CLOCK"),
+            &[crate::telemetry_schema::endpoint("SD_CARD")],
+            "RRLS",
+            9999,
+            Arc::<[u8]>::from([0u8; 16]),
+        )
+        .unwrap();
+        assert!(matches!(
+            router.set_network_variable(denied),
+            Err(sedsnet::TelemetryError::PermissionDenied)
+        ));
+    }
+
     #[tokio::test]
     async fn rrls_received_primary_state_updates_local_views_without_republishing() {
         const CHILD: &str = "GS_RRLS_STATE_OBSERVER_TEST_CHILD";
