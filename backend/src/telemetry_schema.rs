@@ -1,177 +1,17 @@
 use std::sync::OnceLock;
 
-use std::collections::HashMap;
-
-use sedsnet::config::{
-    DataEndpoint, DataType, register_data_type_id_with_description_and_e2e_encryption,
-    register_endpoint_id_with_description,
-};
-use sedsnet::{E2eEncryptionPolicy, MessageClass, MessageDataType, MessageElement, ReliableMode};
-use serde_json::Value;
+use sedsnet::config::{DataEndpoint, DataType};
 
 const SCHEMA_JSON: &[u8] = include_bytes!("../config/telemetry_config.json");
 static INITIALIZED: OnceLock<Result<(), String>> = OnceLock::new();
 
-/// Stable application IDs assigned by the checked-in runtime schema.
-pub mod types {
-    use sedsnet::config::DataType;
-
-    pub const GPS_DATA: DataType = DataType::identity("GPS_DATA");
-    pub const BAROMETER_DATA: DataType = DataType::identity("BAROMETER_DATA");
-    pub const FUEL_FLOW: DataType = DataType::identity("FUEL_FLOW");
-    pub const FUEL_TANK_PRESSURE: DataType = DataType::identity("FUEL_TANK_PRESSURE");
-    pub const BATTERY_VOLTAGE: DataType = DataType::identity("BATTERY_VOLTAGE");
-    pub const BATTERY_CURRENT: DataType = DataType::identity("BATTERY_CURRENT");
-    pub const KG1000: DataType = DataType::identity("KG1000");
-    pub const KG50: DataType = DataType::identity("KG50");
-    pub const GPS_SATELLITE_NUMBER: DataType = DataType::identity("GPS_SATELLITE_NUMBER");
-    pub const ASCENT_STATE: DataType = DataType::identity("ASCENT_STATE");
-    pub const DESCENT_STATE: DataType = DataType::identity("DESCENT_STATE");
-    pub const IMU_DATA: DataType = DataType::identity("IMU_DATA");
-}
-
-pub mod endpoints {
-    use sedsnet::config::DataEndpoint;
-
-    pub const SD_CARD: DataEndpoint = DataEndpoint::identity("SD_CARD");
-    pub const GROUND_STATION: DataEndpoint = DataEndpoint::identity("GROUND_STATION");
-    pub const FLIGHT_CONTROLLER: DataEndpoint = DataEndpoint::identity("FLIGHT_CONTROLLER");
-    pub const VALVE_BOARD: DataEndpoint = DataEndpoint::identity("VALVE_BOARD");
-    pub const ABORT: DataEndpoint = DataEndpoint::identity("ABORT");
-    pub const FLIGHT_STATE: DataEndpoint = DataEndpoint::identity("FLIGHT_STATE");
-    pub const ACTUATOR_BOARD: DataEndpoint = DataEndpoint::identity("ACTUATOR_BOARD");
-}
-
-fn required_str<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("schema field `{key}` must be a string"))
-}
-
-fn message_data_type(name: &str) -> Result<MessageDataType, String> {
-    match name {
-        "Float64" => Ok(MessageDataType::Float64),
-        "Float32" => Ok(MessageDataType::Float32),
-        "UInt8" => Ok(MessageDataType::UInt8),
-        "UInt16" => Ok(MessageDataType::UInt16),
-        "UInt32" => Ok(MessageDataType::UInt32),
-        "UInt64" => Ok(MessageDataType::UInt64),
-        "UInt128" => Ok(MessageDataType::UInt128),
-        "Int8" => Ok(MessageDataType::Int8),
-        "Int16" => Ok(MessageDataType::Int16),
-        "Int32" => Ok(MessageDataType::Int32),
-        "Int64" => Ok(MessageDataType::Int64),
-        "Int128" => Ok(MessageDataType::Int128),
-        "Bool" => Ok(MessageDataType::Bool),
-        "String" => Ok(MessageDataType::String),
-        "Binary" => Ok(MessageDataType::Binary),
-        "NoData" => Ok(MessageDataType::NoData),
-        other => Err(format!("unsupported schema data type `{other}`")),
-    }
-}
-
-fn message_class(name: &str) -> Result<MessageClass, String> {
-    match name {
-        "Data" => Ok(MessageClass::Data),
-        "Error" => Ok(MessageClass::Error),
-        "Warning" => Ok(MessageClass::Warning),
-        other => Err(format!("unsupported schema message class `{other}`")),
-    }
-}
+// Build-time constants and runtime registration use the same checked-in schema
+// and the SDK's identity validation; configured wire IDs override default hashes.
+include!(concat!(env!("OUT_DIR"), "/telemetry_schema_ids.rs"));
 
 fn register_firmware_compatible_schema() -> Result<(), String> {
-    let schema: Value = serde_json::from_slice(SCHEMA_JSON)
-        .map_err(|err| format!("failed to parse telemetry schema: {err}"))?;
-    let endpoints = schema["endpoints"]
-        .as_array()
-        .ok_or_else(|| "schema endpoints must be an array".to_string())?;
-    let mut endpoint_ids = HashMap::new();
-
-    // Local seeding and runtime discovery share order-independent identities.
-    for endpoint in endpoints {
-        let name = required_str(endpoint, "name")?;
-        let id = DataEndpoint::identity(name);
-        let alias = endpoint["rust"].as_str().unwrap_or(name);
-        let description = endpoint["doc"]
-            .as_str()
-            .or_else(|| endpoint["description"].as_str())
-            .unwrap_or("");
-        let link_local = endpoint["link_local_only"].as_bool().unwrap_or(false)
-            || endpoint["broadcast_mode"].as_str() == Some("Never");
-        register_endpoint_id_with_description(id, name, description, link_local)
-            .map_err(|err| format!("failed to register endpoint {name} at {}: {err}", id.0))?;
-        endpoint_ids.insert(alias.to_string(), id);
-        endpoint_ids.insert(name.to_string(), id);
-    }
-
-    let types = schema["types"]
-        .as_array()
-        .ok_or_else(|| "schema types must be an array".to_string())?;
-    for ty in types {
-        let name = required_str(ty, "name")?;
-        let id = DataType::identity(name);
-        let description = ty["doc"]
-            .as_str()
-            .or_else(|| ty["description"].as_str())
-            .unwrap_or("");
-        let class = message_class(required_str(ty, "class")?)?;
-        let element_config = &ty["element"];
-        let data_type = message_data_type(required_str(element_config, "data_type")?)?;
-        let element = match required_str(element_config, "kind")? {
-            "Static" => MessageElement::Static(
-                element_config["count"].as_u64().unwrap_or(1) as usize,
-                data_type,
-                class,
-            ),
-            "Dynamic" => MessageElement::Dynamic(data_type, class),
-            other => return Err(format!("unsupported schema element kind `{other}`")),
-        };
-        if ty.get("reliable_mode").is_some() {
-            return Err("use a single reliable field".into());
-        }
-        let reliable = match required_str(ty, "reliable")? {
-            "Off" => ReliableMode::None,
-            "Ordered" => ReliableMode::Ordered,
-            "Unordered" => ReliableMode::Unordered,
-            other => return Err(format!("unsupported reliability `{other}`")),
-        };
-        let e2e = match ty["e2e_encryption"].as_str().unwrap_or("PreferOff") {
-            "PreferOff" | "prefer_off" | "off" | "false" => E2eEncryptionPolicy::PreferOff,
-            "PreferOn" | "prefer_on" | "preferred" | "true" => E2eEncryptionPolicy::PreferOn,
-            "RequireOn" | "require_on" | "required" => E2eEncryptionPolicy::RequireOn,
-            other => return Err(format!("unsupported e2e encryption policy `{other}`")),
-        };
-        let endpoint_names = ty["endpoints"]
-            .as_array()
-            .ok_or_else(|| format!("type {name} endpoints must be an array"))?;
-        let resolved_endpoints = endpoint_names
-            .iter()
-            .map(|endpoint| {
-                let endpoint = endpoint
-                    .as_str()
-                    .ok_or_else(|| format!("type {name} endpoint must be a string"))?;
-                Ok::<_, String>(
-                    endpoint_ids
-                        .get(endpoint)
-                        .copied()
-                        .unwrap_or_else(|| DataEndpoint::identity(endpoint)),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        register_data_type_id_with_description_and_e2e_encryption(
-            id,
-            name,
-            description,
-            element,
-            &resolved_endpoints,
-            reliable,
-            ty["priority"].as_u64().unwrap_or(0) as u8,
-            e2e,
-        )
-        .map_err(|err| format!("failed to register type {name} at {}: {err}", id.0))?;
-    }
-    Ok(())
+    sedsnet::config::register_schema_json_bytes(SCHEMA_JSON)
+        .map_err(|err| format!("failed to register telemetry schema: {err}"))
 }
 
 /// Registers the application telemetry schema with SEDSnet's v4 runtime registry.
@@ -382,5 +222,101 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod explicit_id_tests {
+    use super::*;
+    use sedsnet::config::DataType;
+    #[test]
+    fn configured_constants_registration_and_flight_specs_align() {
+        initialize().unwrap();
+        for (name, id) in [
+            ("GPS_DATA", types::GPS_DATA),
+            ("IMU_DATA", types::IMU_DATA),
+            ("BAROMETER_DATA", types::BAROMETER_DATA),
+        ] {
+            assert_eq!(data_type(name), id);
+            assert_ne!(DataType::identity(name), id);
+        }
+        assert_eq!(types::GPS_DATA.0, 100);
+        assert_eq!(types::IMU_DATA.0, 101);
+        assert_eq!(types::BAROMETER_DATA.0, 104);
+        assert_eq!(endpoint("SD_CARD"), endpoints::SD_CARD);
+        assert_eq!(endpoints::SD_CARD.0, 100);
+        let snapshot = sedsnet::config::schema_snapshot_from_json_bytes(include_bytes!(
+            "../config/telemetry_config.json"
+        ))
+        .unwrap();
+        for t in snapshot.types {
+            assert_eq!(data_type(&t.name), t.id);
+        }
+        for e in snapshot.endpoints {
+            assert_eq!(endpoint(&e.name), e.id);
+        }
+        // Same const-expression shape as flight_sim static RateSpec arrays.
+        const FLIGHT_TYPES: [DataType; 3] =
+            [types::IMU_DATA, types::BAROMETER_DATA, types::GPS_DATA];
+        assert_eq!(FLIGHT_TYPES.map(|t| t.0), [101, 104, 100]);
+    }
+    #[test]
+    fn malformed_or_conflicting_explicit_ids_fail_without_registry_changes() {
+        const CHILD: &str = "GS_SCHEMA_ID_REJECTION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Other backend tests legitimately add runtime schema definitions.
+            // Measure rollback in a process that owns its registry.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "telemetry_schema::explicit_id_tests::malformed_or_conflicting_explicit_ids_fail_without_registry_changes",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        initialize().unwrap();
+        let before = sedsnet::config::schema_fingerprint();
+        for id in [
+            serde_json::json!(-1),
+            serde_json::json!(4294967296u64),
+            serde_json::json!("100"),
+            serde_json::json!(null),
+            serde_json::json!(0),
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(include_bytes!("../config/telemetry_config.json")).unwrap();
+            value["types"][0]["id"] = id.clone();
+            // null is serde optional absence; it is legal and hashes normally.
+            if id.is_null() {
+                continue;
+            }
+            let bytes = serde_json::to_vec(&value).unwrap();
+            assert!(
+                sedsnet::config::schema_snapshot_from_json_bytes(&bytes).is_err(),
+                "{id}"
+            );
+            assert!(
+                sedsnet::config::register_schema_json_bytes(&bytes).is_err(),
+                "{id}"
+            );
+            assert_eq!(sedsnet::config::schema_fingerprint(), before);
+        }
+        let mut v: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../config/telemetry_config.json")).unwrap();
+        v["types"][0]["id"] = serde_json::json!(100);
+        let bytes = serde_json::to_vec(&v).unwrap();
+        assert!(sedsnet::config::schema_snapshot_from_json_bytes(&bytes).is_err());
+        assert!(sedsnet::config::register_schema_json_bytes(&bytes).is_err());
+        assert_eq!(sedsnet::config::schema_fingerprint(), before);
     }
 }
