@@ -1008,6 +1008,7 @@ async fn main() -> anyhow::Result<()> {
             Ok("1")
         );
         assert_eq!(std::env::var("SEDSNET_TRACE_RELIABLE").as_deref(), Ok("1"));
+        qualification_requests::trace_scope();
         if !cfg!(feature = "hitl_mode") {
             assert_eq!(
                 network_variables::flight_state(),

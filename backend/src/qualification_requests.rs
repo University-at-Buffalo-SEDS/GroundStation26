@@ -13,6 +13,23 @@ pub(crate) fn in_controlled_round<T>(round: usize, run: impl FnOnce() -> T) -> T
     let _restore = Restore(CONTROLLED_ROUND.with(|slot| slot.replace(Some(round))));
     run()
 }
+/// The audit covers every managed publication, not unrelated typed commands.
+/// IDs come from this process's actual loaded application schema.
+pub(crate) fn trace_scope() {
+    if !cfg!(any(feature = "hitl_mode", feature = "firmware_sim"))
+        || std::env::var("GS_SIM_TRACE_API_REQUESTS").as_deref() != Ok("1")
+    {
+        return;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let types=|names: &[&str]| names.iter().map(|name|serde_json::json!({"name":name,"id":crate::telemetry_schema::data_type(name).as_u32()})).collect::<Vec<_>>();
+        let covered=types(&["FLIGHT_STATE","AV_BAY_UNDERGLOW","FLIGHT_BUZZER","DAQ_LOADCELL_CALIBRATION","DAQ_KG50_CALIBRATION","DAQ_LOG_CLOCK","DAQ_THERMAL_CALIBRATION","DAQ_FILTER_CALIBRATION","DAQ_KG50_INPUT"]);
+        let excluded=types(&["FLIGHT_COMMAND","VALVE_COMMAND","ACTUATOR_COMMAND"]);
+        eprintln!("[gs-qualification-scope] {}",serde_json::json!({"version":1,"covered":covered,"excluded":excluded,"managed_limit_ms":500,"excluded_existing_gates":"Valve startup and Valve/Actuator soak physical status default 2500 ms; FC startup execution-counter assertion and existing RF-soak reliable 500 ms (FC+underglow). Original runner gates remain unchanged; excluded typed commands have no new per-packet 500 ms claim."}));
+    });
+}
+
 pub(crate) struct Request {
     token: Option<u64>,
     submissions: std::cell::Cell<u64>,
@@ -24,6 +41,7 @@ impl Request {
             && std::env::var("GS_SIM_TRACE_API_REQUESTS").as_deref() == Ok("1"))
         .then(|| NEXT.fetch_add(1, Ordering::Relaxed));
         if let Some(token) = token {
+            trace_scope();
             emit(
                 serde_json::json!({"event":"begin","token":token,"publisher":publisher,"request_ms":crate::simulation_clock_ms(),"controlled_round":CONTROLLED_ROUND.with(|slot|slot.get())}),
             );
