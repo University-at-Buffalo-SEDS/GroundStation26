@@ -29,6 +29,11 @@ const SETTINGS_PEER_AGE_MS: u64 = 15_000;
 struct FrameClass {
     priority: u8,
 }
+struct TemplateClass {
+    id: u32,
+    uplink: bool,
+    class: FrameClass,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -203,7 +208,7 @@ pub struct Mesh {
     bytes: usize,
     dropped: u64,
     forwarded: u64,
-    templates: VecDeque<(u32, FrameClass)>,
+    templates: VecDeque<TemplateClass>,
     active_transmission: Option<u64>,
     active_cancelled: bool,
     active_survives_clear: bool,
@@ -539,7 +544,7 @@ impl Mesh {
                 .enumerate()
                 .filter(|(index, item)| {
                     !item.independent_discovery
-                        && item.priority >= 253
+                        && item.priority >= 254
                         && self.dependency_ready(*index)
                 })
                 .max_by_key(|(index, item)| (item.priority, std::cmp::Reverse(*index)))
@@ -555,8 +560,12 @@ impl Mesh {
                 .iter()
                 .enumerate()
                 .find(|(index, item)| {
-                    item.priority < 253
-                        && item.frame.bytes.get(3) == Some(&DOWN_DATA)
+                    item.priority < 254
+                        && !item.independent_discovery
+                        && matches!(
+                            item.frame.bytes.get(3),
+                            Some(&DOWN_DATA) | Some(&AV_BAY_DATA)
+                        )
                         && self.dependency_ready(*index)
                 })
                 .map(|(index, _)| index);
@@ -750,6 +759,9 @@ impl Mesh {
         );
     }
     fn classify(&mut self, bytes: &[u8]) -> Option<FrameClass> {
+        self.classify_namespace(bytes, false)
+    }
+    fn classify_namespace(&mut self, bytes: &[u8], uplink: bool) -> Option<FrameClass> {
         fn id(bytes: &[u8], off: &mut usize) -> Option<u32> {
             let mut value = 0u32;
             for shift in (0..35).step_by(7) {
@@ -771,7 +783,11 @@ impl Mesh {
             Some(FrameClass {
                 priority: if gps {
                     255
-                } else if p.reliable.is_some() {
+                } else if sedsnet::is_reliable_type(p.envelope.ty)
+                    || p.reliable.is_some_and(|header| {
+                        header.flags & sedsnet::wire_format::RELIABLE_FLAG_UNSEQUENCED == 0
+                    })
+                {
                     254
                 } else {
                     sedsnet::transport_priority(p.envelope.ty).min(254)
@@ -794,13 +810,21 @@ impl Mesh {
                 let mut off = 0;
                 let template = id(body, &mut off)?;
                 if let Some(class) = canonical(&body[off..]) {
-                    if let Some(i) = self.templates.iter().position(|(key, _)| *key == template) {
+                    if let Some(i) = self
+                        .templates
+                        .iter()
+                        .position(|entry| entry.id == template && entry.uplink == uplink)
+                    {
                         self.templates.remove(i);
                     }
                     if self.templates.len() >= 256 {
                         self.templates.pop_front();
                     }
-                    self.templates.push_back((template, class));
+                    self.templates.push_back(TemplateClass {
+                        id: template,
+                        uplink,
+                        class,
+                    });
                     Some(class)
                 } else {
                     canonical(body)
@@ -811,8 +835,8 @@ impl Mesh {
                 let template = id(body, &mut off)?;
                 self.templates
                     .iter()
-                    .find(|(key, _)| *key == template)
-                    .map(|(_, class)| *class)
+                    .find(|entry| entry.id == template && entry.uplink == uplink)
+                    .map(|entry| entry.class)
             }
             3 => Some(FrameClass { priority: 253 }),
             _ => None,
@@ -922,23 +946,45 @@ impl Mesh {
                         bytes: data.to_vec(),
                     })
                 }
-                (Role::Rrls, UP_DATA | UP_COMMAND) if self.active(now) => {
-                    self.enqueue(
-                        Outgoing {
-                            command: true,
-                            bytes: encode(
-                                if kind == UP_COMMAND {
-                                    AV_BAY_COMMAND
-                                } else {
-                                    AV_BAY_DATA
-                                },
-                                data,
-                            ),
-                        },
-                        254,
-                        now,
-                    );
-                    None
+                (Role::Rrls, AV_BAY_DATA) => {
+                    // Observe the direct uplink's independent SDT namespace
+                    // before fallback; do not forward or manufacture traffic.
+                    self.classify_namespace(data, true);
+                    Some(Outgoing {
+                        command: false,
+                        bytes: data.to_vec(),
+                    })
+                }
+                (Role::Rrls, UP_DATA | UP_COMMAND) => {
+                    let priority = if kind == UP_COMMAND {
+                        254
+                    } else {
+                        self.classify_namespace(data, true)
+                            .map_or(if data.starts_with(b"SDT") { 254 } else { 128 }, |class| {
+                                class.priority
+                            })
+                    };
+                    if self.active(now) {
+                        self.enqueue(
+                            Outgoing {
+                                command: true,
+                                bytes: encode(
+                                    if kind == UP_COMMAND {
+                                        AV_BAY_COMMAND
+                                    } else {
+                                        AV_BAY_DATA
+                                    },
+                                    data,
+                                ),
+                            },
+                            priority,
+                            now,
+                        );
+                    }
+                    (kind == UP_DATA).then(|| Outgoing {
+                        command: false,
+                        bytes: data.to_vec(),
+                    })
                 }
                 _ => None,
             }
@@ -1036,8 +1082,10 @@ impl Mesh {
         TopologyObservation {
             peer_age_ms: self.topology_peer_seen.map(|last| now.saturating_sub(last)),
             direct_age_ms: self.last_direct.map(|last| now.saturating_sub(last)),
-            relaying: self.active(now) || self.topology_relay_rx
-                .is_some_and(|last| now.saturating_sub(last) < LOSS_MS),
+            relaying: self.active(now)
+                || self
+                    .topology_relay_rx
+                    .is_some_and(|last| now.saturating_sub(last) < LOSS_MS),
             command_ready: self.active(now),
         }
     }
@@ -1058,7 +1106,10 @@ mod tests {
         mesh.fallback = true;
         let mut payload = 42u32.to_le_bytes().to_vec();
         payload.extend_from_slice(&1u32.to_le_bytes());
-        assert!(mesh.incoming(true, &encode(READY, &payload), 10_000).is_none());
+        assert!(
+            mesh.incoming(true, &encode(READY, &payload), 10_000)
+                .is_none()
+        );
         let observed = mesh.topology_observation(10_000);
         assert_eq!(observed.peer_age_ms, Some(0));
         assert!(!observed.command_ready);
@@ -1517,8 +1568,92 @@ mod tests {
             .unwrap();
         assert!(f.command);
         assert_eq!(decode(&f.bytes).unwrap().0, AV_BAY_DATA);
-        assert!(r.incoming(f.command, &f.bytes, 0).is_none());
+        let observed = r.incoming(f.command, &f.bytes, 0).unwrap();
+        assert!(!observed.command);
+        assert_eq!(observed.bytes, b"ground-side compact template");
         assert!(r.pop(0).is_none());
+    }
+    #[test]
+    fn ground_data_is_observed_without_local_command_delivery_or_unleased_relay() {
+        let mut relay = Mesh::new(Role::Rrls, 2);
+        let data = encode(UP_DATA, b"opaque ground SDK data");
+        let observed = relay.incoming(true, &data, 0).unwrap();
+        assert!(!observed.command);
+        assert_eq!(observed.bytes, b"opaque ground SDK data");
+        assert!(
+            relay.queue.is_empty(),
+            "unleased observation never forwards"
+        );
+        assert!(
+            relay
+                .incoming(true, &encode(UP_COMMAND, b"command"), 0)
+                .is_none()
+        );
+        assert!(relay.queue.is_empty());
+        relay.incoming(true, &health(1, 0, false), 1);
+        let observed = relay.incoming(true, &data, 1).unwrap();
+        assert!(!observed.command);
+        assert_eq!(
+            decode(&relay.queue.back().unwrap().frame.bytes).unwrap().0,
+            AV_BAY_DATA
+        );
+        assert!(
+            relay
+                .incoming(true, &encode(UP_COMMAND, b"command"), 1)
+                .is_none()
+        );
+        assert_eq!(
+            decode(&relay.queue.back().unwrap().frame.bytes).unwrap().0,
+            AV_BAY_COMMAND
+        );
+    }
+    #[test]
+    fn shared_template_ids_are_classified_in_independent_radio_namespaces() {
+        crate::telemetry_schema::initialize().unwrap();
+        let canonical = |name: &str| {
+            let packet = sedsnet::packet::Packet::new(
+                crate::telemetry_schema::data_type(name),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "GS",
+                1,
+                vec![0; if name == "HEARTBEAT" { 0 } else { 12 }].into(),
+            )
+            .unwrap();
+            sedsnet::wire_format::pack_packet_with_reliable(
+                &packet,
+                sedsnet::wire_format::ReliableHeader {
+                    flags: sedsnet::wire_format::RELIABLE_FLAG_UNSEQUENCED,
+                    seq: 0,
+                    ack: 0,
+                },
+            )
+        };
+        let wrap = |kind: u8, body: &[u8]| {
+            let mut out = b"SDT".to_vec();
+            out.push(kind);
+            out.extend_from_slice(body);
+            out.extend_from_slice(&crc(&out).to_le_bytes());
+            out
+        };
+        let mut gps = vec![7];
+        gps.extend_from_slice(&canonical("GPS_DATA"));
+        let mut heartbeat = vec![7];
+        heartbeat.extend_from_slice(&canonical("HEARTBEAT"));
+        let compact = wrap(4, &[0, 7, 12, 1, 0, 0]);
+        let mut relay = Mesh::new(Role::Rrls, 2);
+        assert_eq!(relay.classify(&wrap(1, &gps)).unwrap().priority, 255);
+        relay.incoming(true, &encode(AV_BAY_DATA, &wrap(1, &heartbeat)), 0);
+        assert_eq!(relay.classify(&compact).unwrap().priority, 255);
+        assert_eq!(
+            relay.classify_namespace(&compact, true).unwrap().priority,
+            253
+        );
+        assert_eq!(
+            std::mem::size_of::<TemplateClass>(),
+            std::mem::size_of::<(u32, FrameClass)>(),
+            "namespace tag fits existing cache entry padding"
+        );
+        assert_eq!(relay.templates.len(), 2);
     }
     #[test]
     fn compact_gps_keeps_priority_without_decoding_or_coalescing_payloads() {
@@ -2361,6 +2496,9 @@ pub fn voice_status() -> (bool, bool) {
 #[cfg(test)]
 #[path = "rrls/air_campaign.rs"]
 mod air_campaign;
+#[cfg(test)]
+#[path = "rrls/captured_replay.rs"]
+mod captured_replay;
 #[cfg(test)]
 #[path = "rrls/shared_air.rs"]
 mod shared_air;

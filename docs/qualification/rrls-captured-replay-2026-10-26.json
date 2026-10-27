@@ -1,0 +1,119 @@
+{
+  "status": "native_source_and_canonical_gates_pass_full_air_path_pending",
+  "scope": "Capture-derived production Mesh + Capacity + WireDrain replay. This is serial offload evidence, not a physical radio or downstream air latency qualification.",
+  "production_rrls_sha256": "7834ee4bc63bf217ee47a3430f3efdfc7294944987f04f16002f6d1052208a72",
+  "fixture": {
+    "path": "backend/src/rrls/fixtures/full-path-50ms-rx.json",
+    "sha256": "fc31ef46a56cd50c7e53095b0c791e704841ef9b923bb70976d8d62aad402cce",
+    "events": 1151,
+    "bytes": 314665,
+    "scoring": "Original26-39s RF source emission identities and26-39s canonical RRLS input occurrences, both radio directions. Earlier capture preserves SDT/bootstrap and HEALTH state; RX through39.5s captures in-flight sources; remaining original HEALTH until41s supports drain.",
+    "provenance": "Original decoded/trace SHA256 values are inside fixture provenance. No fabricated packet IDs or source addresses."
+  },
+  "before": {
+    "source_reports": 149,
+    "canonical_occurrences": 15,
+    "peak_queue_frames": 25,
+    "drops": 3,
+    "missing": [
+      "PB BATTERY_CURRENT11344405509216228596",
+      "RF DiscoveryAddress9037398715004094298",
+      "GS DiscoveryAddress10479602526170013096"
+    ],
+    "maximum_source_rf_to_offload_ms": 1594.503,
+    "log": "/tmp/rrls-captured-replay-before-20261026.log"
+  },
+  "classify_only": {
+    "result": "FAIL",
+    "peak_queue_frames": 24,
+    "drops": 3,
+    "maximum_source_rf_to_offload_ms": 1581.1,
+    "effect": "PB current survives but another FC IMU expires; both canonical snapshots remain missing.",
+    "log": "/tmp/rrls-captured-replay-classified-20261026.log"
+  },
+  "fixed": {
+    "source_reports": 149,
+    "canonical_occurrences": 15,
+    "missing_source_or_canonical": 0,
+    "peak_queue_frames": 25,
+    "maximum_source_rf_to_offload_ms": 1479.8,
+    "maximum_canonical_rx_to_offload_ms": 1869.4,
+    "expired_routine_uplink_heartbeats": 18,
+    "heartbeat_sources": [
+      {
+        "source_address": 14161550,
+        "inputs": 13,
+        "expired": 3,
+        "outputs": 10,
+        "maximum_internal_offload_gap_ms": 3630
+      },
+      {
+        "source_address": 310625998,
+        "inputs": 13,
+        "expired": 3,
+        "outputs": 10,
+        "maximum_internal_offload_gap_ms": 3910
+      },
+      {
+        "source_address": 483403151,
+        "inputs": 13,
+        "expired": 4,
+        "outputs": 9,
+        "maximum_internal_offload_gap_ms": 5060
+      },
+      {
+        "source_address": 3561204631,
+        "source_name": "GS",
+        "inputs": 13,
+        "expired": 4,
+        "outputs": 9,
+        "maximum_internal_offload_gap_ms": 4770
+      },
+      {
+        "source_address": 3852079518,
+        "inputs": 13,
+        "expired": 4,
+        "outputs": 9,
+        "maximum_internal_offload_gap_ms": 5140
+      }
+    ],
+    "maximum_health_gap_ms": 770,
+    "maximum_ready_gap_ms": 570,
+    "log": "/tmp/rrls-captured-replay-after-20261026.log"
+  },
+  "changes": [
+    "Classify UP_DATA using SDK schema reliability/transport priority instead of always254; preserve UP_COMMAND254.",
+    "Protect actual reliable types/ACKs and GPS; routine253 traffic shares bidirectional ordinary service with existing per-namespace SDT dependency guards.",
+    "Keep independent canonical snapshots in the existing byte-fair lane; never classify them as ordinary simultaneously.",
+    "Separate GS/RF SDT template IDs using padding in existing8-byte entries; keep aggregate256-entry cap.",
+    "Deliver wrapped GS SDK data to local RRLS observer without relaying direct frames or locally delivering command envelopes."
+  ],
+  "validation": {
+    "mesh_and_real_sdk_air_campaign": "56 tests passed; includes real reliable command/receipt, chunk bootstrap/order, finite ownership and source-paced canonical fairness tests.",
+    "observer": "Actual primaryMesh.local_tx toRRLSMesh.incoming toSDK observer test passes with zeroSDKegress/queued output; root owns test in main.rs.",
+    "logs": [
+      "/tmp/rrls-captured-replay-suite-20261026.log",
+      "/tmp/rrls-managed-observer-ingress-before-20261026.log",
+      "/tmp/rrls-managed-observer-ingress-after-20261026.log"
+    ]
+  },
+  "unchanged": [
+    "64-frame/65536-byte queue budgets",
+    "250ms uplink expiry",
+    "1500ms sensor expiry",
+    "3000ms canonical expiry",
+    "500ms command gate",
+    "1500ms complete source-to-GS gate",
+    "3000ms canonical gate",
+    "source rates",
+    "air shares",
+    "100ms UART batches/55ms gap",
+    "SDK release/wire protocol"
+  ],
+  "limitations": [
+    "Accepted source offload1479.8ms leaves only20.2ms before the full1500ms gate; downstream air can exceed that. Full linked validation remains required.",
+    "18 expired uplink heartbeats are explicit counted losses under unchanged250ms policy, not erased evidence. They are decoded HEARTBEAT with no reliable header and schemaOff; sensor/metadata/control omissions fail the regression.",
+    "Hardware modem configuration, propagation and MAC behavior remain unqualified.",
+    "Automatic primary mode mirroring and authenticated sequence requests remain unresolved."
+  ]
+}
