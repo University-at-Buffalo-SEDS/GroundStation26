@@ -5,7 +5,8 @@ For browser push-to-talk and open-mic calls, see [crew voice](crew-voice.md).
 
 For test publishers, webcams, and instructions to find an existing receiver's
 secret, see the sender project's [macOS setup](../../video_sender/SETUP_MACOS.md)
-or [Linux setup](../../video_sender/SETUP_LINUX.md).
+or [Linux setup](../../video_sender/SETUP_LINUX.md). To set up a Pi that streams
+its USB cameras on boot, follow [Pi camera streamer setup](../../video_sender/SETUP_PI.md).
 
 The ground station receives H.264 over RTSP/TCP on **port 8554**, with a unique
 path per camera (`front`, `side`, `aft`, etc.). MediaMTX relays encoded video to
@@ -82,13 +83,38 @@ Native backend HTTP is port 3000; remote browser login needs the TLS reverse pro
 
 ## Build and install the sender on the Pi
 
-Use current Raspberry Pi OS. From this repository:
+For a beginner-friendly walkthrough from a blank SD card, see
+[Set up a Raspberry Pi camera streamer](../../video_sender/SETUP_PI.md).
+
+Use current Raspberry Pi OS or Ubuntu Server. The quickest route, from this repository on the Pi:
+
+```sh
+sh video_sender/install_pi.sh
+```
+
+It works on Raspberry Pi OS and Ubuntu Server. It installs FFmpeg and camera/audio
+tools (plus `rpicam-apps` where the OS provides it), installs Rust with rustup if
+needed, builds the sender (adding temporary swap on 1–2 GB Pis), creates the
+`gs-video` user with `video`, `render` and `audio` access, asks for the video
+password once, and enables the `gs-video-sender` service so it starts on every
+boot. A new config disables the CSI `front` stream when no CSI camera is
+detected; USB cameras are always picked up. Options:
+
+```sh
+GS_VIDEO_PASSWORD='THE_STATION_SECRET' sh video_sender/install_pi.sh   # no prompt
+sh video_sender/install_pi.sh --binary ./gs-video-sender               # skip the build
+```
+
+Re-running it upgrades the binary and unit, keeps the existing config and
+password, and adds `usb_cameras` to configs from before USB support. Change the
+password later with `sudoedit /etc/gs-video-sender/environment` followed by
+`sudo systemctl restart gs-video-sender`. The manual equivalent:
 
 ```sh
 sudo apt update
-sudo apt install rpicam-apps ffmpeg
+sudo apt install rpicam-apps ffmpeg v4l-utils
 cargo build --release -p gs-video-sender
-sudo useradd --system --user-group --groups video,render --no-create-home gs-video
+sudo useradd --system --user-group --groups video,render,audio --no-create-home gs-video
 sudo install -m 0755 target/release/gs-video-sender /usr/local/bin/gs-video-sender
 sudo install -d -m 0750 /etc/gs-video-sender
 sudo install -d -o gs-video -g gs-video -m 0750 /var/lib/gs-video-sender
@@ -118,8 +144,56 @@ The binary runs in the foreground under systemd, starts on boot, and stops its
 children on shutdown. Each pipeline retries independently after failure or a
 20-second progress stall, with a three-second retry delay. FFmpeg diagnostics are
 suppressed because they can contain credentials; daemon logs identify failed
-streams without logging authenticated URLs. Camera device access needs the
-`video` and `render` groups; the unit intentionally does not hide devices.
+streams without logging authenticated URLs. Camera and microphone access needs the
+`video`, `render` and `audio` groups; the unit intentionally does not hide devices.
+
+## USB cameras
+
+With the `usb_cameras` block in the config (included in the example), the daemon
+publishes **every connected USB/UVC camera** automatically, with no per-camera
+configuration. It rescans `/dev/v4l` every second, so cameras present at boot and
+cameras plugged in later both start; an unplugged camera's stream stops.
+
+```json
+"usb_cameras": {
+  "enabled": true,
+  "width": 1280,
+  "height": 720,
+  "fps": 30,
+  "bitrate": 2000000,
+  "input_format": "mjpeg",
+  "encoder": "libx264",
+  "audio": true
+}
+```
+
+With `audio` (on by default), a camera's built-in microphone streams with its
+video as 128 kb/s AAC. The daemon pairs them through sysfs: the ALSA card on the
+same physical USB device as the camera, addressed by card name (for example
+`plughw:CARD=C920,DEV=0`) so it survives reboots and other sound cards. Cameras
+without a microphone stream video only. Check what was found with
+`arecord -l`; a separate USB microphone is not paired with a camera. To use one,
+configure that stream explicitly with `audio_device`.
+
+Each camera publishes as `usb-<model>_<serial>` (from `/dev/v4l/by-id`), so its
+stream ID stays the same across reboots and USB ports. Cameras without a serial
+number that udev cannot distinguish use their physical port instead, e.g.
+`usb-port-0_1_2_1_0`; keep those in the same port. `gs-video-sender status` lists
+the IDs.
+
+All USB cameras share these settings and must support the chosen mode: check
+with `v4l2-ctl --list-devices` and `v4l2-ctl -d /dev/video0 --list-formats-ext`.
+Most webcams only reach 720p30 with `mjpeg`; `yuyv422` is uncompressed and
+usually limited to lower resolutions or frame rates. A camera that rejects the
+mode is retried every three seconds and logged as stopped. Unlike the CSI camera,
+USB frames are encoded by FFmpeg: `libx264` works on every Pi but costs CPU per
+camera (one 720p30 stream is comfortable on a Pi 4/5); `h264_v4l2m2m` uses the
+Pi 4 hardware encoder and does not exist on Pi 5. USB streams cannot be changed
+with `set`; edit `usb_cameras` and reload. A configured stream with the same ID
+as a USB camera takes precedence. Set `"enabled": false` on the `front` stream
+for a Pi with no CSI camera, otherwise it retries and logs every few seconds.
+Existing installs need the `usb_cameras` block added to their config; without
+it, USB cameras are ignored.
 
 ## Runtime controls
 
