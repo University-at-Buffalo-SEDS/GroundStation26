@@ -602,6 +602,8 @@ mod router_link_policy_tests {
             RouterConfig::new([]).with_sender("RRLS"),
             Box::new(move || now.load(Ordering::SeqCst)),
         );
+        let primary = rrls::Mesh::new(rrls::Role::Primary, 1);
+        let mut relay = rrls::Mesh::new(rrls::Role::Rrls, 2);
         let attempts = Arc::new(AtomicUsize::new(0));
         let seen = attempts.clone();
         let link: CommsLinkConfig = serde_json::from_value(serde_json::json!({
@@ -634,7 +636,12 @@ mod router_link_policy_tests {
                     vec![2].into(),
                 )
                 .unwrap();
-                observer.rx_from_side(&packet, side).unwrap();
+                let wire = sedsnet::wire_format::pack_packet(&packet);
+                let frame = primary.local_tx(false, &wire, tick).unwrap();
+                let observed = relay
+                    .incoming(frame.command, &frame.bytes, tick)
+                    .expect("RRLS must expose primary radio data to its read-only observer");
+                observer.rx_packed_from_side(&observed.bytes, side).unwrap();
                 observer.request_managed_variable(ty).unwrap();
             }
             observer.process_all_queues_with_timeout(0).unwrap();
