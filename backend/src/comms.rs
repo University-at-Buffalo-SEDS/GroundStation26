@@ -148,7 +148,8 @@ pub(crate) fn radio_packet_boundary_contract(priority: u8, payload: &[u8]) -> Op
     }
 }
 
-pub(crate) const RADIO_COMMAND_BATCH_MAX_BYTES: usize = 128;
+// Share one existing radio-frame-sized admission; never enlarge modem FIFOs.
+pub(crate) const RADIO_COMMAND_BATCH_MAX_BYTES: usize = 192;
 /// Relayed pairs include actual canonical end-to-end receipts. Sequenced,
 /// ACK-only, partial-request and SDT traffic keeps individual admissions.
 pub(crate) fn radio_batch_control_contract(priority: u8, payload: &[u8]) -> Option<(u64, bool)> {
@@ -2175,7 +2176,7 @@ impl CommsDevice for UartComms {
         }
         #[cfg(target_os = "linux")]
         {
-            if frames.len() != 2
+            if !(2..=3).contains(&frames.len())
                 || !matches!(self.protocol, SerialProtocol::RawUart)
                 || frames
                     .iter()
@@ -2183,15 +2184,12 @@ impl CommsDevice for UartComms {
             {
                 return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).into());
             }
-            let contracts = [
-                radio_packet_boundary_contract(frames[0].0, frames[0].1)
-                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?
-                    .0,
-                radio_packet_boundary_contract(frames[1].0, frames[1].1)
-                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?
-                    .0,
-            ];
-            let mut lengths = [0; 2];
+            let mut contracts = [0u64; 3];
+            for (index, (priority, payload)) in frames.iter().enumerate() {
+                contracts[index] = radio_packet_boundary_contract(*priority, payload)
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?.0;
+            }
+            let mut lengths = [0; 3];
             if self.recovery.is_some() {
                 self.enable_radio_capacity_control();
             }
@@ -2249,7 +2247,7 @@ impl CommsDevice for UartComms {
                 )
             });
             // Even a failed partial write consumed physical capacity. Retain
-            // both logical packets for same-ID retry, but never forgive bytes
+            // all logical packets for same-ID retry, but never forgive bytes
             // already accepted by the UART or spend their close contracts.
             if accepted > 0 {
                 if let Some(now) = virtual_now {
@@ -2257,17 +2255,25 @@ impl CommsDevice for UartComms {
                 }
                 let stop = virtual_now.map(|_| state.wire.stop_us());
                 if let Some(capacity) = state.radio_capacity.as_mut() {
-                    capacity.committed_command_batch(wall, clock, lengths, accepted);
+                    if frames.len() == 2 {
+                        capacity.committed_command_batch(wall, clock, [lengths[0], lengths[1]], accepted);
+                    } else {
+                        capacity.committed_command_batch(wall, clock, lengths, accepted);
+                    }
                     capacity.drained(Instant::now());
                     if let Some(stop) = stop {
                         capacity.drained_virtual(stop);
                     }
                     let promoted = if result.is_ok() {
-                        capacity.close_command_batch(wall, clock, contracts)
+                        if frames.len() == 2 {
+                            capacity.close_command_batch(wall, clock, [contracts[0], contracts[1]])
+                        } else {
+                            capacity.close_command_batch(wall, clock, contracts)
+                        }
                     } else {
                         false
                     };
-                    for contract in contracts {
+                    for &contract in &contracts[..frames.len()] {
                         trace_virtual_uart_admission(
                             "batch",
                             self.side_id,
@@ -4447,6 +4453,36 @@ mod raw_uart_tests {
         tx.service_transmit().unwrap();
         assert_eq!(reader.join().unwrap(), expected);
         assert!(shared.lock().unwrap().begin_transmission(0).is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn three_managed_commands_share_the_existing_radio_frame_bound() {
+        crate::telemetry_schema::initialize().unwrap();
+        let packets = ["FLIGHT_STATE", "AV_BAY_UNDERGLOW", "FLIGHT_BUZZER"].map(|name| {
+            serialize::pack_packet(&Packet::new(
+                crate::telemetry_schema::data_type(name),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")], "GS", 1,
+                std::sync::Arc::from([1u8]),
+            ).unwrap()).to_vec()
+        });
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(100)).unwrap();
+        let (mut uart, _, _) = recovery_uart_fixture(port);
+        let expected = packets.iter().flat_map(|p| {
+            let shared = uart.recovery.as_ref().unwrap().lock().unwrap();
+            build_raw_uart_command_frame(&shared.local_tx(false, p, shared.now()).unwrap().bytes).unwrap()
+        }).collect::<Vec<_>>();
+        assert!(expected.len() <= 192);
+        assert!(packets.iter().all(|p| is_radio_batch_command(255, p)));
+        let mut corrupt = packets[2].clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(uart.send_command_batch(&[(255, &packets[0]), (255, &packets[1]), (255, &corrupt)]).is_err());
+        assert_eq!(peer.bytes_to_read().unwrap(), 0);
+        uart.send_command_batch(&[(255, &packets[0]), (255, &packets[1]), (255, &packets[2])]).unwrap();
+        let mut received = vec![0; expected.len()];
+        std::io::Read::read_exact(&mut peer, &mut received).unwrap();
+        assert_eq!(received, expected);
     }
 
     #[test]

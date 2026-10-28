@@ -207,26 +207,26 @@ impl Capacity {
             });
         self.promotion_flags |= 1 << (slot + if receipt { 4 } else { 0 });
     }
-    /// A single physical boundary serves both already-owned commands. Record
-    /// both logical IDs only when a boundary was actually promoted.
-    pub(crate) fn close_command_batch(
+    /// A single physical boundary serves the already-owned commands. Record
+    /// every logical ID only when a boundary was actually promoted.
+    pub(crate) fn close_command_batch<const N: usize>(
         &mut self,
         wall: Instant,
         clock: Option<u64>,
-        ids: [u64; 2],
+        ids: [u64; N],
     ) -> bool {
         self.close_control_batch(wall, clock, ids.map(|id| (id, false)))
             .0
     }
 
-    /// One physical close may serve two already-owned commands/receipts.
+    /// One physical close may serve the already-owned commands/receipts.
     /// Prefer an eligible receipt's existing permit, then ordinary commands.
-    /// No new permit is created; mark both contracts only after actual close.
-    pub(crate) fn close_control_batch(
+    /// No new permit is created; mark every contract only after actual close.
+    pub(crate) fn close_control_batch<const N: usize>(
         &mut self,
         wall: Instant,
         clock: Option<u64>,
-        contracts: [(u64, bool); 2],
+        contracts: [(u64, bool); N],
     ) -> (bool, bool) {
         for receipt in [true, false] {
             for contract in contracts
@@ -437,17 +437,17 @@ impl Capacity {
 
     /// One loan admission still charges every original frame's overhead and
     /// individual rounding. A failed prefix charges only frames actually begun.
-    pub(crate) fn committed_command_batch(
+    pub(crate) fn committed_command_batch<const N: usize>(
         &mut self,
         wall: Instant,
         clock: Option<u64>,
-        lengths: [usize; 2],
+        lengths: [usize; N],
         accepted: usize,
     ) {
         if accepted == 0 {
             return;
         }
-        let accepted = accepted.min(lengths[0].saturating_add(lengths[1]));
+        let accepted = accepted.min(lengths.iter().fold(0usize, |total, &len| total.saturating_add(len)));
         let cost = |bytes: usize| {
             if bytes == 0 {
                 0
@@ -457,7 +457,12 @@ impl Capacity {
                 ) as u64
             }
         };
-        let separate = cost(accepted.min(lengths[0])) + cost(accepted.saturating_sub(lengths[0]));
+        let mut remaining = accepted;
+        let separate = lengths.iter().fold(0u64, |total, &length| {
+            let prefix = remaining.min(length);
+            remaining -= prefix;
+            total.saturating_add(cost(prefix))
+        });
         let extra = separate.saturating_sub(cost(accepted));
         self.committed(wall, clock, accepted);
         if let Some((next_wall, next_virtual)) = self.next.as_mut() {
@@ -609,6 +614,32 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn three_command_prefixes_charge_each_frame_and_share_only_one_close() {
+        let wall = Instant::now();
+        for accepted in [1, 62, 63, 64, 117, 118, 119, 172, 173] {
+            let mut batch = Capacity::new(64_000, 15, 16);
+            batch.committed_command_batch(wall, Some(0), [63, 55, 55], accepted);
+            let mut reference = Capacity::new(64_000, 15, 16);
+            let mut remaining = accepted;
+            for length in [63, 55, 55] {
+                let prefix = remaining.min(length);
+                if prefix > 0 { reference.committed(wall, Some(0), prefix); }
+                remaining -= prefix;
+            }
+            assert_eq!(batch.next.unwrap().1, reference.next.unwrap().1, "accepted={accepted}");
+        }
+        let mut cap = Capacity::new(64_000, 15, 16);
+        cap.committed(wall, Some(30_000), 21);
+        cap.committed_command_batch(wall, Some(30_001), [63, 55, 55], 173);
+        assert!(cap.early_frame_outstanding);
+        assert!(cap.close_command_batch(wall, Some(30_001), [1, 2, 3]));
+        for id in [1, 2, 3] {
+            assert!(!cap.close_packet_batch_for_contract(wall, Some(30_200), Some((id, false))));
+        }
+        assert!(!cap.ready_for(wall, Some(30_060), true));
+    }
+
     #[test]
     fn accumulated_uart_stop_preserves_quiet_after_captured_75_and_55_byte_close() {
         let wall = Instant::now();

@@ -378,6 +378,9 @@ impl WireBacklog {
     /// selected next anyway may join the already selected command.
     fn batch_follower(&mut self, comms: &dyn CommsDevice, first: (u8, &[u8])) -> Option<(u8, Vec<u8>)> {
         let first_bytes = comms.command_batch_frame_len(first.0, first.1)?;
+        self.batch_follower_after_bytes(comms, first_bytes)
+    }
+    fn batch_follower_after_bytes(&mut self, comms: &dyn CommsDevice, first_bytes: usize) -> Option<(u8, Vec<u8>)> {
         let state = self.selection_state();
         let Some(second) = self.pop() else {
             self.restore_selection(state);
@@ -555,6 +558,27 @@ mod priority_tests {
         )
         .to_vec()
     }
+    #[test]
+    fn three_command_batch_keeps_selection_and_retry_order() {
+        let packets = ["FLIGHT_STATE", "AV_BAY_UNDERGLOW", "FLIGHT_BUZZER"]
+            .map(|name| batch_test_command(name, &[1]));
+        let mut q = WireBacklog::new(true);
+        for packet in &packets { q.push(255, packet.clone(), false); }
+        let before = q.selection_state();
+        let first = q.pop().unwrap();
+        let second = q.batch_follower(&BatchTestComms, (first.0, &first.1)).unwrap();
+        let bytes = BatchTestComms.command_batch_frame_len(first.0, &first.1).unwrap()
+            + BatchTestComms.command_batch_frame_len(second.0, &second.1).unwrap();
+        let third = q.batch_follower_after_bytes(&BatchTestComms, bytes).unwrap();
+        assert!(q.pop().is_none());
+        // Any partial physical write retains all three original owners/IDs.
+        q.push(third.0, third.1, true);
+        q.restore_selected(before, first, Some(second));
+        assert_eq!(q.selection_state(), before);
+        for packet in packets { assert_eq!(q.pop().unwrap().1, packet); }
+        assert!(q.pop().is_none());
+    }
+
     #[test]
     fn existing_worker_backlog_coavailable_commands_form_bounded_pair_without_waiting() {
         let first = batch_test_command("AV_BAY_UNDERGLOW", &[1]);
@@ -1454,7 +1478,14 @@ pub(super) fn spawn_comms_worker_threads(
                         log::info!("full-bay transport selected side={worker_name} sim={:?} priority={priority} len={} type={:?}", crate::simulation_clock_ms(), payload.len(), serialize::peek_frame_info_unchecked(&payload).map(|info| info.envelope.ty));
                     }
                     let follower = backlog.batch_follower(&**comms, (priority, &payload));
-                    let result = if let Some((next_priority, next_payload)) = follower.as_ref() {
+                    let third = follower.as_ref().and_then(|(next_priority, next_payload)| {
+                        let bytes = comms.command_batch_frame_len(priority, &payload)?
+                            .checked_add(comms.command_batch_frame_len(*next_priority, next_payload)?)?;
+                        backlog.batch_follower_after_bytes(&**comms, bytes)
+                    });
+                    let result = if let (Some((p2, b2)), Some((p3, b3))) = (follower.as_ref(), third.as_ref()) {
+                        comms.send_command_batch(&[(priority, &payload), (*p2, b2), (*p3, b3)])
+                    } else if let Some((next_priority, next_payload)) = follower.as_ref() {
                         comms.send_command_batch(&[(priority, &payload), (*next_priority, next_payload)])
                     } else {
                         comms.send_data_with_priority(&payload, priority)
@@ -1469,7 +1500,7 @@ pub(super) fn spawn_comms_worker_threads(
                             }
                             log_link_control_send(worker_name, &payload);
                             log_radio_command_event("radio TX sent", worker_name, &payload);
-                            if let Some((next_priority, next_payload)) = follower.as_ref() {
+                            for (next_priority, next_payload) in follower.iter().chain(third.iter()) {
                                 if let Some(budget) = &comms_handle.tx_budget {
                                     budget.complete(*next_priority, next_payload);
                                 }
@@ -1494,8 +1525,11 @@ pub(super) fn spawn_comms_worker_threads(
                         }
                         Err(e) => {
                             // Logical completion is unconfirmed: a partial UART
-                            // write may already be on wire. Preserve both owners
+                            // write may already be on wire. Preserve every owner
                             // and retry their original IDs in the original order.
+                            if let Some((third_priority, third_payload)) = third {
+                                backlog.push(third_priority, third_payload, true);
+                            }
                             backlog.restore_selected(selection_state, (priority, payload), follower);
                             next_tx_allowed_at = TxDeadline::now().after(Duration::from_millis(COMMS_TX_GAP_MS));
                             log_repeated_worker_error(
