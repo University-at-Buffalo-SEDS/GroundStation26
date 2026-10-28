@@ -1234,8 +1234,24 @@ fn configure_linux_raw_serial(fd: RawFd, baud: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+// Test-only syscall pressure: bytes still go through the real PTY. Limit the
+// accepted prefix deterministically instead of racing the kernel's tty worker.
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static SCALAR_UART_WRITE_BUDGET: std::cell::Cell<Option<(RawFd, usize)>> = const { std::cell::Cell::new(None) };
+}
+
 #[cfg(target_os = "linux")]
 fn write_once_fd(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {
+    #[cfg(test)]
+    let bytes = {
+        let limit = SCALAR_UART_WRITE_BUDGET.with(|slot| slot.get().filter(|(target, _)| *target == fd).map(|(_, remaining)| remaining));
+        match limit {
+            Some(0) => return Err(std::io::ErrorKind::WouldBlock.into()),
+            Some(remaining) => &bytes[..bytes.len().min(remaining)],
+            None => bytes,
+        }
+    };
     let written = unsafe { libc::write(fd, bytes.as_ptr() as *const _, bytes.len()) };
     if written < 0 {
         let err = std::io::Error::last_os_error();
@@ -1244,6 +1260,12 @@ fn write_once_fd(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {
         }
         return Err(err);
     }
+    #[cfg(test)]
+    SCALAR_UART_WRITE_BUDGET.with(|slot| {
+        if let Some((target, remaining)) = slot.get().filter(|(target, _)| *target == fd) {
+            slot.set(Some((target, remaining.saturating_sub(written as usize))));
+        }
+    });
     Ok(written as usize)
 }
 
@@ -5231,93 +5253,39 @@ mod raw_uart_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn scalar_uart_short_write_must_retain_physical_prefix_debt() {
-        let mut saw_partial = false;
-        for space in [512usize, 1024, 2048, 3072] {
-            let (peer, port) = serialport::TTYPort::pair().unwrap();
+        struct ResetBudget;
+        impl Drop for ResetBudget {
+            fn drop(&mut self) { SCALAR_UART_WRITE_BUDGET.with(|slot| slot.set(None)); }
+        }
+        for accepted_limit in [512usize, 1024, 2048, 3072] {
+            let (mut peer, port) = serialport::TTYPort::pair().unwrap();
             configure_linux_raw_serial(port.as_raw_fd(), 115200).unwrap();
+            peer.set_timeout(Duration::from_secs(1)).unwrap();
             let (mut uart, _, _) = recovery_uart_fixture(port);
             uart.recovery = None;
-            uart.write_lock.lock().unwrap().radio_capacity =
-                Some(rfd_capacity::Capacity::new(64_000, 35, 16));
-            let padding = [0x55u8; 4096];
-            let mut filled = 0usize;
-            loop {
-                match write_once_fd(uart.inner.as_raw_fd(), &padding) {
-                    Ok(n) if n > 0 => filled += n,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    other => panic!("unexpected prefill {other:?}"),
-                }
-                assert!(filled < 1_000_000);
-            }
-            let mut released = vec![0u8; space];
-            let n = unsafe {
-                libc::read(
-                    peer.as_raw_fd(),
-                    released.as_mut_ptr().cast(),
-                    released.len(),
-                )
-            };
-            assert!(n > 0);
-            let released = n as usize;
-            let payload = vec![0x77u8; 4096];
-            let result = uart.send_data_with_priority(&payload, 0);
-            let flags = unsafe { libc::fcntl(peer.as_raw_fd(), libc::F_GETFL) };
-            assert!(
-                unsafe { libc::fcntl(peer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
-                    >= 0
-            );
-            let mut drained = Vec::new();
-            let mut buf = [0u8; 8192];
-            loop {
-                match read_fd_for_prefix_audit(peer.as_raw_fd(), &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => drained.extend_from_slice(&buf[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    other => panic!("unexpected drain {other:?}"),
-                }
-            }
-            let accepted = drained.len().saturating_sub(filled - released);
-            if result.is_err()
-                && accepted > 0
-                && accepted < payload.len() + RAW_UART_FRAME_HEADER_SIZE
-            {
-                saw_partial = true;
-                assert_eq!(
-                    &drained[filled - released..],
-                    &build_raw_uart_frame(&payload).unwrap()[..accepted]
-                );
-                assert_eq!(
-                    payload.len(),
-                    4096,
-                    "caller retains the complete logical frame for same-ID retry"
-                );
-                let state = uart.write_lock.lock().unwrap();
-                let cap = state.radio_capacity.as_ref().unwrap();
-                let next_debt = ((accepted + 16) * 8000).div_ceil(22_400);
-                eprintln!(
-                    "SCALAR_PARTIAL free={space} prefill={filled} released={released} accepted={accepted}/4100 required_air_ms={next_debt} result={result:?} ready={} bank={}",
-                    cap.ready(Instant::now(), None),
-                    cap.ordinary_service_credit_ms()
-                );
-                assert!(
-                    !cap.ready(Instant::now(), None),
-                    "actually accepted scalar prefix must remain charged despite logical failure"
-                );
-                assert_eq!(cap.ordinary_service_credit_ms(), 0);
-                if let Some(clock) = crate::simulation_clock_ms() {
-                    let stop = clock * 1000 + (accepted as u64 * 10_000_000).div_ceil(115_200);
-                    assert_eq!(state.wire.stop_us(), stop);
-                    assert_eq!(cap.next_packet_virtual_ms(), Some(stop.div_ceil(1000) + 55));
-                    assert!(!cap.ready(Instant::now(), Some(clock + next_debt as u64 - 1)));
-                    assert!(cap.ready(Instant::now(), Some(clock + next_debt as u64)));
-                }
-                break;
+            uart.write_lock.lock().unwrap().radio_capacity = Some(rfd_capacity::Capacity::new(64_000,35,16));
+            SCALAR_UART_WRITE_BUDGET.with(|slot| assert!(slot.replace(Some((uart.inner.as_raw_fd(), accepted_limit))).is_none()));
+            let _reset = ResetBudget;
+            let payload = vec![0x77u8;4096];
+            let result = uart.send_data_with_priority(&payload,0);
+            assert!(result.is_err(),"the complete logical frame must remain retryable");
+            let mut physical_prefix = vec![0;accepted_limit];
+            peer.read_exact(&mut physical_prefix).unwrap();
+            assert_eq!(physical_prefix,build_raw_uart_frame(&payload).unwrap()[..accepted_limit]);
+            assert!(accepted_limit > 0 && accepted_limit < payload.len()+RAW_UART_FRAME_HEADER_SIZE);
+            let state = uart.write_lock.lock().unwrap();
+            let cap = state.radio_capacity.as_ref().unwrap();
+            let debt_ms = ((accepted_limit+16)*8000).div_ceil(22_400);
+            assert!(!cap.ready(Instant::now(),None),"actual physical prefix stays charged after logical failure");
+            assert_eq!(cap.ordinary_service_credit_ms(),0);
+            if let Some(clock) = crate::simulation_clock_ms() {
+                let stop=clock*1000+(accepted_limit as u64*10_000_000).div_ceil(115_200);
+                assert_eq!(state.wire.stop_us(),stop);
+                assert_eq!(cap.next_packet_virtual_ms(),Some(stop.div_ceil(1000)+55));
+                assert!(!cap.ready(Instant::now(),Some(clock+debt_ms as u64-1)));
+                assert!(cap.ready(Instant::now(),Some(clock+debt_ms as u64)));
             }
         }
-        assert!(
-            saw_partial,
-            "fixture must actually admit a partial UART prefix"
-        );
     }
     #[test]
     #[cfg(all(target_os = "linux", feature = "hitl_mode"))]
@@ -5344,16 +5312,6 @@ mod raw_uart_tests {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    #[cfg(target_os = "linux")]
-    fn read_fd_for_prefix_audit(fd: RawFd, bytes: &mut [u8]) -> std::io::Result<usize> {
-        let n = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
-        if n < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(n as usize)
-        }
-    }
-
     #[test]
     fn i2c_adapter_passes_small_transport_fragments_to_router_reassembly() {
         let delivered = Arc::new(Mutex::new(Vec::<Packet>::new()));
@@ -5501,6 +5459,108 @@ mod raw_uart_tests {
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].data_type(), packet.data_type());
         assert_eq!(delivered[0].payload(), packet.payload());
+    }
+
+    #[test]
+    fn raw_uart_interleaved_radio_producers_recover_after_fragment_crc_loss() {
+        let endpoint = crate::telemetry_schema::endpoint("GROUND_STATION");
+        let ty = crate::telemetry_schema::data_type("GPS_DATA");
+        let delivered = Arc::new(Mutex::new(Vec::<Packet>::new()));
+        let sink = delivered.clone();
+        let receiver = Router::new(sedsnet::router::RouterConfig::new([
+            sedsnet::router::EndpointHandler::new_packet_handler(endpoint, move |packet| {
+                sink.lock().unwrap().push(packet.clone());
+                Ok(())
+            }),
+        ]));
+        let side = receiver.add_side_packed_small_packets("shared radio", |_| Ok(()), 32);
+        let mut streams = Vec::new();
+        for (index, name) in ["GS", "RF", "RRLS"].iter().enumerate() {
+            let output = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let wire = output.clone();
+            let sender = Router::new(sedsnet::router::RouterConfig::new([]).with_hostname(*name));
+            sender.add_side_packed_small_packets(
+                "radio",
+                move |bytes| {
+                    wire.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                },
+                32,
+            );
+            let payload = [index as f32, 2.0, 3.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>();
+            sender
+                .tx(Packet::new(ty, &[endpoint], name, 123, Arc::<[u8]>::from(payload)).unwrap())
+                .unwrap();
+            let frames = output.lock().unwrap().clone();
+            assert!(frames.len() > 1);
+            streams.push(frames);
+        }
+        let mut serial = Vec::new();
+        let count = streams.iter().map(Vec::len).max().unwrap();
+        // Independent producers can interleave complete transport fragments.
+        // Lose one fragment to CRC corruption, then replay the original frames.
+        for replay in 0..2 {
+            for index in 0..count {
+                for (producer, frames) in streams.iter().enumerate() {
+                    if let Some(frame) = frames.get(index) {
+                        let mut framed = build_raw_uart_frame(frame).unwrap();
+                        if replay == 0 && producer == 1 && index == 0 {
+                            *framed.last_mut().unwrap() ^= 0x40;
+                        }
+                        serial.extend_from_slice(&framed);
+                    }
+                }
+            }
+        }
+        let mut buffered = Vec::new();
+        let mut wait = RawUartFrameWait::default();
+        let mut corrupt = 0;
+        for bytes in serial.chunks(7) {
+            buffered.extend_from_slice(bytes);
+            loop {
+                match take_raw_uart_framed_payload_with_clock(
+                    &mut buffered,
+                    &mut wait,
+                    Instant::now(),
+                    Some(100),
+                ) {
+                    Ok(Some((RawUartFrameKind::Data, payload))) => {
+                        queue_uart_router_payload(
+                            &receiver,
+                            side,
+                            &payload,
+                            &SerialProtocol::RawUart,
+                            &mut |_| {},
+                        )
+                        .unwrap();
+                        receiver.process_all_queues().unwrap();
+                    }
+                    Ok(Some(_)) => panic!("unexpected command frame"),
+                    Ok(None) => break,
+                    Err(_) => corrupt += 1,
+                }
+            }
+        }
+        assert_eq!(corrupt, 1);
+        assert!(buffered.is_empty());
+        let received = delivered.lock().unwrap();
+        assert_eq!(
+            received.len(),
+            3,
+            "each original producer packet must arrive once after replay"
+        );
+        for index in 0..3 {
+            assert_eq!(
+                received
+                    .iter()
+                    .filter(|packet| packet.payload()[..4] == (index as f32).to_le_bytes())
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]

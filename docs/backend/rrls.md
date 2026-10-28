@@ -226,3 +226,12 @@ command readiness; stale peer observations become offline after 15 seconds.
 A previously observed RRLS remains visible in standby. A never-observed standby
 radio cannot be inferred from configuration alone because standby does not
 advertise SDK discovery. Downstream board connections still come from discovery.
+
+The status API's `forwarded_frames` is a cumulative count of all successful mesh
+transmissions, including presence and settings. It does not prove that RRLS is
+currently relaying application traffic. Compare `relayed_frames` and
+`relay_envelope_bytes` across samples to measure successfully transmitted RRLS
+application envelopes. These counters exclude presence/settings messages,
+failed writes, cancelled queued work, and the outer UART header. `forwarding`
+reports the current relay lease decision; inspect its freshness separately from
+cumulative counts.

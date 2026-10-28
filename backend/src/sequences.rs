@@ -526,18 +526,17 @@ impl ValveSnapshot {
     }
 
     fn actuated_for_cmd(&self, cmd: &str) -> Option<bool> {
-        match cmd {
-            "Dump" => self.pending_dump_open.or(self.dump_open),
-            "NormallyOpen" => self.pending_normally_open.or(self.normally_open),
-            "Nitrogen" => self.pending_nitrogen_open.or(self.nitrogen_open),
-            "Nitrous" => self.pending_nitrous_open.or(self.nitrous_open),
-            "ContinueFillSequence" => None,
-            "Pilot" => self.pending_pilot_open.or(self.pilot_open),
-            "Igniter" => self.pending_igniter_on.or(self.igniter_on),
-            "IgniterSequence" => None,
-            "RetractPlumbing" => self.pending_retract.or(self.retract),
-            _ => None,
-        }
+        let (confirmed, pending) = match cmd {
+            "Dump" => (self.dump_open, self.pending_dump_open),
+            "NormallyOpen" => (self.normally_open, self.pending_normally_open),
+            "Nitrogen" => (self.nitrogen_open, self.pending_nitrogen_open),
+            "Nitrous" => (self.nitrous_open, self.pending_nitrous_open),
+            "Pilot" => (self.pilot_open, self.pending_pilot_open),
+            "Igniter" => (self.igniter_on, self.pending_igniter_on),
+            "RetractPlumbing" => (self.retract, self.pending_retract),
+            _ => return None,
+        };
+        if pending.is_some() { None } else { confirmed }
     }
 }
 
@@ -2470,7 +2469,7 @@ mod tests {
             normally_open: Some(false),
             ..ValveSnapshot::default()
         }));
-        assert!(vent_closed_for_launch(ValveSnapshot {
+        assert!(!vent_closed_for_launch(ValveSnapshot {
             normally_open: Some(true),
             pending_normally_open: Some(false),
             ..ValveSnapshot::default()
@@ -2492,8 +2491,8 @@ mod tests {
     }
 
     #[test]
-    fn nitrous_pending_closed_prompts_vent_close() {
-        assert!(nitrous_close_accepted_for_vent_prompt(ValveSnapshot {
+    fn nitrous_pending_close_is_not_confirmed_closed() {
+        assert!(!nitrous_close_accepted_for_vent_prompt(ValveSnapshot {
             nitrous_open: Some(true),
             pending_nitrous_open: Some(false),
             ..ValveSnapshot::default()

@@ -4,7 +4,8 @@ use prelude::*;
 mod commands;
 use commands::log_command_dispatch;
 pub(crate) use commands::{
-    flush_command_tx, queue_abort_packet, queue_automatic_abort_packet, queue_locally_routed_flight_command,
+    flush_command_tx, queue_abort_packet, queue_automatic_abort_packet, queue_controller_command,
+    queue_locally_routed_flight_command,
 };
 mod periodic;
 pub(crate) mod procedure_clock;
@@ -27,7 +28,10 @@ const ROUTER_DECODE_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
 static ROUTER_DECODE_ERROR_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static ROUTER_DECODE_ERROR_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn command_at_dispatch(state: &AppState, command: TelemetryCommand) -> Option<TelemetryCommand> {
+pub(crate) fn command_at_dispatch(
+    state: &AppState,
+    command: TelemetryCommand,
+) -> Option<TelemetryCommand> {
     if matches!(command, TelemetryCommand::AutomaticAbort) {
         // A failed tare can enqueue before Fire commits and be consumed after
         // it. Preserve its automatic origin until this final policy check.
@@ -769,7 +773,7 @@ pub async fn telemetry_task(
                         #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::IgniterSequence => {
                                 let payload = [ActuatorBoardCommands::IgniterSequence as u8];
-                                if let Err(e) = router.log_queue(crate::telemetry_schema::data_type("ACTUATOR_COMMAND"), &payload) {
+                                if let Err(e) = queue_controller_command(&router, crate::telemetry_schema::data_type("ACTUATOR_COMMAND"), &payload) {
                                     log_telemetry_error("failed to log IgniterSequence command", e);
                                 } else {
                                     log_command_dispatch(
@@ -1165,6 +1169,8 @@ pub async fn telemetry_task(
                                     &[cmd_id],
                                 ) {
                                     log_telemetry_error("failed to log HITL flight command", e);
+                                } else {
+                                    flush_command_tx(&router, "HITL flight command tx");
                                 }
                                 gs_debug_println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
                             }
@@ -1330,6 +1336,16 @@ fn queue_guarded_fill_command(
     cmd_payload: u8,
     label: &str,
 ) {
+    if desired_state
+        && key_cmd_id != ValveBoardCommands::DumpOpen as u8
+        && state.get_umbilical_valve_state(key_cmd_id).is_none()
+    {
+        emit_warning(
+            state,
+            "Valve state is unconfirmed; wait for fresh board feedback or use an explicit close/abort action",
+        );
+        return;
+    }
     /* A second operator action must be able to reverse an unacknowledged
      * command. Previously any pending open suppressed the following close,
      * so the UI appeared to work in one direction only whenever the status
@@ -1340,7 +1356,7 @@ fn queue_guarded_fill_command(
     if effective_umbilical_valve_state(state, key_cmd_id) == Some(desired_state) {
         return;
     }
-    if let Err(err) = router.log_queue(data_type, &[cmd_payload]) {
+    if let Err(err) = queue_controller_command(router, data_type, &[cmd_payload]) {
         log_telemetry_error(&format!("failed to queue {label}"), err);
         return;
     }
@@ -2554,6 +2570,26 @@ mod tests {
                     .contains(&crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn pending_close_is_not_confirmation_for_a_new_open() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let router = Router::new(sedsnet::router::RouterConfig::new([]));
+        let key = ValveBoardCommands::PilotOpen as u8;
+        state.set_pending_umbilical_valve_state(key, false);
+        queue_guarded_fill_command(
+            &state,
+            &router,
+            crate::telemetry_schema::data_type("VALVE_COMMAND"),
+            key,
+            true,
+            ValveBoardCommands::PilotOpen as u8,
+            "Pilot open test",
+        );
+        assert_eq!(state.get_pending_umbilical_valve_state(key), Some(false));
+        assert_eq!(state.get_umbilical_valve_state(key), None);
     }
 
     #[tokio::test]
@@ -4085,9 +4121,16 @@ mod tests {
             if std::env::var_os(CHILD).is_none() {
                 let result = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
-                    .env(CHILD, "1").env("GS_SIM_MODE", "0").output().unwrap();
-                assert!(result.status.success(), "{}{}",
-                    String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+                    .env(CHILD, "1")
+                    .env("GS_SIM_MODE", "0")
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}{}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
                 return;
             }
             assert!(!flight_sim::sim_mode_enabled());
@@ -4098,21 +4141,37 @@ mod tests {
         let (delivered, mut received) = mpsc::unbounded_channel::<()>();
         let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([
             sedsnet::router::EndpointHandler::new_packet_handler(
-                crate::telemetry_schema::endpoint("ABORT"), move |packet| {
+                crate::telemetry_schema::endpoint("ABORT"),
+                move |packet| {
                     if packet.data_type() == crate::telemetry_schema::data_type("ABORT") {
-                        assert!(weak.upgrade().unwrap().gse.try_lock().is_ok(), "automatic router callback held GSE lock");
+                        assert!(
+                            weak.upgrade().unwrap().gse.try_lock().is_ok(),
+                            "automatic router callback held GSE lock"
+                        );
                         delivered.send(()).unwrap();
                     }
                     Ok(())
-                }),
+                },
+            ),
         ])));
         #[cfg(not(feature = "hitl_mode"))]
         let path = crate::gse::armed_fixture_for_test(&state, &router);
         #[cfg(feature = "hitl_mode")]
         state.set_local_flight_state(FlightState::Launch);
         let shutdown = state.shutdown_subscribe();
-        let worker = tokio::spawn(telemetry_task(state.clone(), router, Vec::new(), cmd_rx, db_rx, shutdown));
-        state.cmd_tx.send(TelemetryCommand::AutomaticAbort).await.unwrap();
+        let worker = tokio::spawn(telemetry_task(
+            state.clone(),
+            router,
+            Vec::new(),
+            cmd_rx,
+            db_rx,
+            shutdown,
+        ));
+        state
+            .cmd_tx
+            .send(TelemetryCommand::AutomaticAbort)
+            .await
+            .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), received.recv()).await;
         state.request_shutdown();
         worker.await.unwrap();
@@ -4120,9 +4179,13 @@ mod tests {
         assert!(state.is_command_allowed(&TelemetryCommand::Abort));
         #[cfg(not(feature = "hitl_mode"))]
         {
-            let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(record["automatic_abort_claimed"], true);
-            assert_eq!(state.gse.lock().unwrap().engine.status.phase, gse_sequence::Phase::Fault);
+            assert_eq!(
+                state.gse.lock().unwrap().engine.status.phase,
+                gse_sequence::Phase::Fault
+            );
             assert!(crate::gse::commit_fire_intent(&state).is_err());
             std::fs::remove_file(path).unwrap();
         }

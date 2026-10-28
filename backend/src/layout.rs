@@ -3,9 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 const DEFAULT_LAYOUT_PATH: &str = "layout/layout.json";
-#[cfg(feature = "hitl_mode")]
 const DEFAULT_HITL_LAYOUT_PATH: &str = "layout/layout_hitl.json";
-#[cfg(feature = "test_fire_mode")]
 const DEFAULT_TEST_FIRE_LAYOUT_PATH: &str = "layout/layout_test_fire.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -648,24 +646,47 @@ pub fn layout_path() -> PathBuf {
         return PathBuf::from(path);
     }
 
-    #[cfg(feature = "test_fire_mode")]
-    {
-        let test_fire =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_TEST_FIRE_LAYOUT_PATH);
-        if test_fire.exists() {
-            return test_fire;
+    default_layout_path(presentation_mode())
+}
+
+// A recovery station displays the primary's current/last-known mode. This
+// never changes local execution capabilities or the RRLS read-only command gate.
+fn presentation_mode() -> crate::station_mode::Mode {
+    if crate::rrls::is_rrls() {
+        crate::station_mode::snapshot()
+            .effective_mode
+            .unwrap_or(crate::station_mode::Mode::Normal)
+    } else {
+        crate::station_mode::local_mode()
+    }
+}
+pub(crate) fn default_layout_path(mode: crate::station_mode::Mode) -> PathBuf {
+    let relative = match mode {
+        crate::station_mode::Mode::Hitl => DEFAULT_HITL_LAYOUT_PATH,
+        crate::station_mode::Mode::TestFire => DEFAULT_TEST_FIRE_LAYOUT_PATH,
+        _ => DEFAULT_LAYOUT_PATH,
+    };
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
+
+#[cfg(test)]
+mod observer_mode_layout_tests {
+    use super::*;
+    #[test]
+    fn primary_mode_selects_actions_independently_of_observer_build() {
+        use crate::station_mode::Mode;
+        for (mode, file) in [
+            (Mode::Hitl, DEFAULT_HITL_LAYOUT_PATH),
+            (Mode::Normal, DEFAULT_LAYOUT_PATH),
+            (Mode::TestFire, DEFAULT_TEST_FIRE_LAYOUT_PATH),
+        ] {
+            let path = default_layout_path(mode);
+            assert!(path.ends_with(file));
+            let layout: LayoutConfig =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert!(!layout.actions_tab.actions.is_empty());
         }
     }
-
-    #[cfg(feature = "hitl_mode")]
-    {
-        let hitl = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_HITL_LAYOUT_PATH);
-        if hitl.exists() {
-            return hitl;
-        }
-    }
-
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_LAYOUT_PATH)
 }
 
 pub fn load_layout() -> Result<LayoutConfig, String> {
@@ -679,7 +700,8 @@ pub fn load_layout() -> Result<LayoutConfig, String> {
 }
 
 fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
-    layout.test_fire_mode = cfg!(feature = "test_fire_mode");
+    let mode = presentation_mode();
+    layout.test_fire_mode = mode == crate::station_mode::Mode::TestFire;
     if crate::rrls::is_rrls() {
         layout.branding.app_name = Some("RRLS".into());
         layout.branding.dashboard_title = Some("RRLS".into());
@@ -689,9 +711,11 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
         ("ToggleAvBayUnderglow", "AV Bay Underglow"),
         ("ToggleFlightBuzzer", "Flight Buzzer"),
         ("ResetTClock", "Reset T-clock"),
-        #[cfg(feature = "hitl_mode")]
         ("ResetFlightState", "Reset flight state to Idle"),
     ] {
+        if cmd == "ResetFlightState" && mode != crate::station_mode::Mode::Hitl {
+            continue;
+        }
         if !layout
             .actions_tab
             .actions
@@ -707,7 +731,7 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
             );
         }
     }
-    if !crate::flight_sim::sim_mode_enabled() {
+    if mode != crate::station_mode::Mode::Testing {
         return;
     }
     if layout

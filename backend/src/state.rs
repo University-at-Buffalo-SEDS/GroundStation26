@@ -32,9 +32,27 @@ const BOARD_STATUS_BROADCAST_MIN_INTERVAL_MS: u64 = 200;
 const BOARD_SEEN_TIMEOUT_MS: u64 = 12_000;
 
 #[derive(Debug, Clone, Copy)]
+pub struct ConfirmedUmbilicalValveState {
+    on: bool,
+    received_at: std::time::Instant,
+    simulation_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct PendingUmbilicalValveState {
     pub target: bool,
     pub set_at: std::time::Instant,
+    simulation_ms: Option<u64>,
+}
+impl PendingUmbilicalValveState {
+    fn expired(&self, timeout: std::time::Duration) -> bool {
+        match (self.simulation_ms, crate::simulation_clock_ms()) {
+            (Some(start), Some(now)) => now
+                .checked_sub(start)
+                .is_none_or(|elapsed| u128::from(elapsed) >= timeout.as_millis()),
+            _ => self.set_at.elapsed() >= timeout,
+        }
+    }
 }
 
 fn recording_command_state(cmd: &str, mode: RecordingModeWire) -> Option<(bool, bool)> {
@@ -145,7 +163,7 @@ pub struct AppState {
     pub last_packet_rx_ms: Arc<AtomicU64>,
 
     /// Umbilical valve states keyed by command id (u8)
-    pub umbilical_valve_states: Arc<Mutex<HashMap<u8, bool>>>,
+    pub umbilical_valve_states: Arc<Mutex<HashMap<u8, ConfirmedUmbilicalValveState>>>,
 
     /// Pending umbilical valve targets keyed by canonical command id (u8).
     pub pending_umbilical_valve_states: Arc<Mutex<HashMap<u8, PendingUmbilicalValveState>>>,
@@ -1073,11 +1091,18 @@ impl AppState {
         }
     }
 
-    /// Stores the most recent commanded umbilical valve state by command id.
+    /// Stores a board-confirmed umbilical valve state, never a requested target.
     pub fn set_umbilical_valve_state(&self, cmd_id: u8, on: bool) {
         self.gse.lock().unwrap().observe_valve(cmd_id, on);
         let mut map = self.umbilical_valve_states.lock().unwrap();
-        map.insert(cmd_id, on);
+        map.insert(
+            cmd_id,
+            ConfirmedUmbilicalValveState {
+                on,
+                received_at: std::time::Instant::now(),
+                simulation_ms: crate::simulation_clock_ms(),
+            },
+        );
     }
 
     /// Records when any telemetry packet last reached the backend router.
@@ -1095,7 +1120,14 @@ impl AppState {
     /// Looks up the cached state for a specific umbilical valve command id.
     pub fn get_umbilical_valve_state(&self, cmd_id: u8) -> Option<bool> {
         let map = self.umbilical_valve_states.lock().unwrap();
-        map.get(&cmd_id).copied()
+        let observed = map.get(&cmd_id)?;
+        let fresh = match (crate::simulation_clock_ms(), observed.simulation_ms) {
+            (Some(now), Some(then)) => now
+                .checked_sub(then)
+                .is_some_and(|age| age <= UMBILICAL_PENDING_VALVE_TIMEOUT.as_millis() as u64),
+            _ => observed.received_at.elapsed() <= UMBILICAL_PENDING_VALVE_TIMEOUT,
+        };
+        fresh.then_some(observed.on)
     }
 
     /// Subscribes a task to the app-wide shutdown broadcast channel.
@@ -1399,6 +1431,51 @@ impl AppState {
             }
         }
         crate::gse::decorate_policy(self, &mut policy);
+        // Expose idempotent supply closes using their backend command gate
+        // before unknown feedback disables ambiguous toggles.
+        for (toggle, close) in [("Nitrogen", "NitrogenClose"), ("Nitrous", "NitrousClose")] {
+            if !policy.controls.iter().any(|control| control.cmd == close)
+                && let Some(mut control) = policy
+                    .controls
+                    .iter()
+                    .find(|control| control.cmd == toggle)
+                    .cloned()
+            {
+                control.cmd = close.into();
+                control.enabled = self.is_command_allowed(match close {
+                    "NitrogenClose" => &TelemetryCommand::NitrogenClose,
+                    _ => &TelemetryCommand::NitrousClose,
+                });
+                control.actuated = None;
+                policy.controls.push(control);
+            }
+        }
+        for control in &mut policy.controls {
+            let key = match control.cmd.as_str() {
+                "Pilot" => Some(crate::rocket_commands::ValveBoardCommands::PilotOpen as u8),
+                "NormallyOpen" => {
+                    Some(crate::rocket_commands::ValveBoardCommands::NormallyOpenOpen as u8)
+                }
+                "Igniter" => Some(crate::rocket_commands::ActuatorBoardCommands::IgniterOn as u8),
+                "RetractPlumbing" => {
+                    Some(crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8)
+                }
+                "Nitrogen" => {
+                    Some(crate::rocket_commands::ActuatorBoardCommands::NitrogenOpen as u8)
+                }
+                "Nitrous" => Some(crate::rocket_commands::ActuatorBoardCommands::NitrousOpen as u8),
+                _ => None,
+            };
+            if let Some(key) = key {
+                if self.get_pending_umbilical_valve_state(key).is_none()
+                    && self.get_umbilical_valve_state(key).is_none()
+                {
+                    control.enabled = false;
+                    control.actuated = None;
+                    control.blink = crate::sequences::BlinkMode::None;
+                }
+            }
+        }
         for control in &mut policy.controls {
             if crate::sequences::is_station_utility_command(&control.cmd) {
                 control.enabled = true;
@@ -1550,11 +1627,15 @@ impl AppState {
     }
 
     pub fn set_pending_umbilical_valve_state(&self, cmd_id: u8, value: bool) {
+        // An old report cannot become confirmation again when a command times
+        // out. Preserve the requested target separately for operator reversal.
+        self.umbilical_valve_states.lock().unwrap().remove(&cmd_id);
         self.pending_umbilical_valve_states.lock().unwrap().insert(
             cmd_id,
             PendingUmbilicalValveState {
                 target: value,
                 set_at: std::time::Instant::now(),
+                simulation_ms: crate::simulation_clock_ms(),
             },
         );
     }
@@ -1570,7 +1651,14 @@ impl AppState {
     pub fn expire_pending_umbilical_valve_states(&self, max_age: std::time::Duration) -> bool {
         let mut pending = self.pending_umbilical_valve_states.lock().unwrap();
         let before = pending.len();
-        pending.retain(|_, state| state.set_at.elapsed() < max_age);
+        let mut confirmed = self.umbilical_valve_states.lock().unwrap();
+        pending.retain(|key, state| {
+            let fresh = !state.expired(max_age);
+            if !fresh {
+                confirmed.remove(key);
+            }
+            fresh
+        });
         pending.len() != before
     }
 
@@ -1584,8 +1672,11 @@ impl AppState {
         let Some(entry) = pending.get(&cmd_id).copied() else {
             return false;
         };
-        if entry.target == actual || entry.set_at.elapsed() >= mismatch_timeout {
+        if entry.target == actual || entry.expired(mismatch_timeout) {
             pending.remove(&cmd_id);
+            if entry.target != actual {
+                self.umbilical_valve_states.lock().unwrap().remove(&cmd_id);
+            }
             return true;
         }
         false
@@ -2237,6 +2328,79 @@ pub(crate) mod tests {
             std::time::Duration::ZERO,
         ));
         assert_eq!(state.get_pending_umbilical_valve_state(42), None);
+    }
+
+    #[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
+    #[tokio::test]
+    async fn pending_valve_expiry_uses_model_time() {
+        const CHILD: &str = "GS_VALVE_EXPIRY_CLOCK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let path =
+                std::env::temp_dir().join(format!("gs-valve-expiry-{}.clock", std::process::id()));
+            std::fs::write(&path, "100000").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "state::tests::pending_valve_expiry_uses_model_time",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("GS_SIM_CLOCK_FILE", &path)
+                .output()
+                .unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let state = test_app_state().await;
+        state.set_pending_umbilical_valve_state(9, true);
+        state
+            .pending_umbilical_valve_states
+            .lock()
+            .unwrap()
+            .get_mut(&9)
+            .unwrap()
+            .set_at -= std::time::Duration::from_secs(10);
+        let timeout = std::time::Duration::from_secs(2);
+        assert!(
+            !state.expire_pending_umbilical_valve_states(timeout),
+            "wall time cannot expire a paused simulator command"
+        );
+        let path = std::env::var_os("GS_SIM_CLOCK_FILE").unwrap();
+        std::fs::write(&path, "101999").unwrap();
+        assert!(!state.expire_pending_umbilical_valve_states(timeout));
+        std::fs::write(path, "102000").unwrap();
+        assert!(state.expire_pending_umbilical_valve_states(timeout));
+        assert_eq!(state.get_pending_umbilical_valve_state(9), None);
+        assert_eq!(state.get_umbilical_valve_state(9), None);
+    }
+
+    #[tokio::test]
+    async fn valve_command_timeout_does_not_restore_stale_confirmation() {
+        let state = test_app_state().await;
+        state.set_umbilical_valve_state(9, false);
+        assert_eq!(state.get_umbilical_valve_state(9), Some(false));
+        state.set_pending_umbilical_valve_state(9, true);
+        assert_eq!(state.get_umbilical_valve_state(9), None);
+        // A mismatching report arriving while the command is pending cannot
+        // become confirmation merely because the command times out.
+        state.set_umbilical_valve_state(9, false);
+        state.expire_pending_umbilical_valve_states(std::time::Duration::ZERO);
+        assert_eq!(state.get_umbilical_valve_state(9), None);
+        state.set_umbilical_valve_state(9, true);
+        assert_eq!(state.get_umbilical_valve_state(9), Some(true));
+        let mut states = state.umbilical_valve_states.lock().unwrap();
+        let observed = states.get_mut(&9).unwrap();
+        observed.received_at -= std::time::Duration::from_secs(3);
+        observed.simulation_ms = None;
+        drop(states);
+        assert_eq!(state.get_umbilical_valve_state(9), None);
     }
 
     #[tokio::test]
@@ -2956,8 +3120,10 @@ pub(crate) mod tests {
             ] {
                 let name = crate::sequences::command_name(&command);
                 assert!(state.is_command_allowed(&command), "{name}, state {value}");
-                assert!(policy.controls.iter().any(|c| c.cmd == name && c.enabled),
-                        "{name} missing or disabled in state {value}");
+                assert!(
+                    policy.controls.iter().any(|c| c.cmd == name && c.enabled),
+                    "{name} missing or disabled in state {value}"
+                );
             }
         }
     }
@@ -3214,6 +3380,24 @@ pub(crate) mod tests {
         // Simulated manual controls must not bypass the shared launch gate.
         assert!(!state.is_command_allowed(&TelemetryCommand::Launch));
         assert!(state.is_command_allowed(&TelemetryCommand::ResetSim));
+    }
+
+    #[tokio::test]
+    async fn unknown_supply_feedback_disables_toggles_and_preserves_close_policy() {
+        let state = test_app_state().await;
+        let mut original = crate::sequences::default_action_policy();
+        for control in &mut original.controls {
+            if matches!(control.cmd.as_str(), "Nitrogen" | "Nitrous") {
+                control.enabled = true;
+            }
+        }
+        state.set_action_policy(original);
+        let policy = state.action_policy_snapshot();
+        for (toggle, close) in [("Nitrogen", "NitrogenClose"), ("Nitrous", "NitrousClose")] {
+            assert_eq!(control_state(&policy, toggle), Some((false, None)));
+            assert!(control_state(&policy, close).is_some(), "missing {close}");
+            assert_eq!(control_state(&policy, close).unwrap().1, None);
+        }
     }
 
     #[tokio::test]

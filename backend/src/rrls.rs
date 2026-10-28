@@ -132,7 +132,12 @@ pub struct Status {
     pub direct_age_ms: Option<u64>,
     pub queued_frames: usize,
     pub dropped_frames: u64,
+    /// All mesh transmissions, including presence, voice and settings.
     pub forwarded_frames: u64,
+    /// Application envelopes actually transmitted by the recovery relay.
+    pub relayed_frames: u64,
+    /// Bytes in those RR envelopes; excludes the outer UART header.
+    pub relay_envelope_bytes: u64,
 }
 pub fn status() -> Status {
     if let Some((_, shared)) = RADIO.get() {
@@ -147,6 +152,8 @@ pub fn status() -> Status {
             queued_frames: m.queue.len() + usize::from(m.active_frame_count),
             dropped_frames: m.dropped,
             forwarded_frames: m.forwarded,
+            relayed_frames: m.relayed_frames,
+            relay_envelope_bytes: m.relay_envelope_bytes,
         }
     } else {
         Status {
@@ -158,6 +165,8 @@ pub fn status() -> Status {
             queued_frames: 0,
             dropped_frames: 0,
             forwarded_frames: 0,
+            relayed_frames: 0,
+            relay_envelope_bytes: 0,
         }
     }
 }
@@ -279,6 +288,8 @@ pub struct Mesh {
     bytes: usize,
     dropped: u64,
     forwarded: u64,
+    relayed_frames: u64,
+    relay_envelope_bytes: u64,
     templates: VecDeque<TemplateClass>,
     active_transmission: Option<u64>,
     active_frame_count: u8,
@@ -320,6 +331,8 @@ impl Mesh {
             bytes: 0,
             dropped: 0,
             forwarded: 0,
+            relayed_frames: 0,
+            relay_envelope_bytes: 0,
             templates: VecDeque::new(),
             active_transmission: None,
             active_frame_count: 0,
@@ -923,6 +936,16 @@ impl Mesh {
         }
         self.bytes -= owned_bytes;
         self.forwarded += count as u64;
+        if self.role == Role::Rrls {
+            for frame in core::iter::once(&transmission.queued.frame)
+                .chain(transmission.follower.iter().map(|queued| &queued.frame))
+            {
+                if matches!(frame.bytes.get(3), Some(&DOWN_DATA) | Some(&DOWN_COMMAND) | Some(&AV_BAY_DATA) | Some(&AV_BAY_COMMAND)) {
+                    self.relayed_frames += 1;
+                    self.relay_envelope_bytes += frame.bytes.len() as u64;
+                }
+            }
+        }
         Some((
             transmission.queued.frame,
             transmission.follower.map(|queued| queued.frame),
@@ -2981,6 +3004,27 @@ mod tests {
         }
         assert!(relayed > 550 && uplinks > 100 && downlinks > 2900);
         assert!(!p.active(599_950) && !r.active(599_950));
+    }
+
+    #[test]
+    fn relay_activity_counters_exclude_presence_and_cancelled_work() {
+        let mut relay = Mesh::new(Role::Rrls, 2);
+        relay.enqueue(Outgoing {command:true, bytes:encode(READY, &[0;8])},255,0);
+        assert!(relay.pop(0).is_some());
+        assert_eq!(relay.forwarded,1);
+        assert_eq!(relay.relayed_frames,0);
+        relay.incoming(true,&health(1,0,false),1);
+        relay.incoming(false,b"application",2);
+        let frame=relay.pop(2).unwrap();
+        assert_eq!(relay.relayed_frames,1);
+        assert_eq!(relay.relay_envelope_bytes,frame.bytes.len() as u64);
+        relay.incoming(false,b"queued before restore",3);
+        relay.incoming(true,&health(1,1,true),4);
+        assert!(relay.pop(4).is_none());
+        assert_eq!(relay.relayed_frames,1,"cancelled work is not transmitted relay traffic");
+        relay.incoming(false,b"standby traffic",5);
+        assert!(relay.pop(5).is_none());
+        assert_eq!(relay.relayed_frames,1);
     }
 
     #[test]

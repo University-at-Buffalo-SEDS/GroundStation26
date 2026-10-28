@@ -840,12 +840,20 @@ mod tests {
         );
         rr.receive(&wire, 102).unwrap();
         assert_eq!(rr.snapshot(102).effective_mode, Some(Mode::Hitl));
+        assert!(
+            crate::layout::default_layout_path(rr.snapshot(102).effective_mode.unwrap())
+                .ends_with("layout_hitl.json")
+        );
         assert!(rr.snapshot(102).synchronized);
         assert_eq!(rr.snapshot(102).authority, "mesh_session");
         assert!(rr.receive(&wire, 103).is_err());
         let restored = DisplayRuntime::new(true, path).unwrap();
         assert_eq!(restored.mode, Some(Mode::Hitl));
         assert!(!restored.snapshot(104).synchronized);
+        assert!(
+            crate::layout::default_layout_path(restored.snapshot(104).effective_mode.unwrap())
+                .ends_with("layout_hitl.json")
+        );
         rr.connect(None);
         assert!(!rr.snapshot(105).synchronized);
         assert!(rr.receive(&wire, 105).is_err());
@@ -863,6 +871,21 @@ mod tests {
         // Unchanged renewal performs no disk write, even with an unwritable destination.
         rr.receive(&display_frame(45, 555, Some(Mode::Hitl)), 109)
             .unwrap();
+        rr.path = root.join("display-transition.json");
+        rr.pending = Some((556, 110));
+        rr.receive(&display_frame(45, 556, Some(Mode::Normal)), 111)
+            .unwrap();
+        assert!(
+            crate::layout::default_layout_path(rr.snapshot(111).effective_mode.unwrap())
+                .ends_with("layout.json")
+        );
+        rr.pending = Some((557, 112));
+        rr.receive(&display_frame(45, 557, Some(Mode::Hitl)), 113)
+            .unwrap();
+        assert!(
+            crate::layout::default_layout_path(rr.snapshot(113).effective_mode.unwrap())
+                .ends_with("layout_hitl.json")
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

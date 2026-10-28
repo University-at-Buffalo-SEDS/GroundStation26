@@ -495,7 +495,7 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
                     "ACTUATOR_COMMAND"
                 });
                 let payload = if open { OPEN[index] } else { CLOSE[index] };
-                if let Err(err) = router.log_queue(kind, &[payload]) {
+                if let Err(err) = crate::telemetry_task::queue_controller_command(router, kind, &[payload]) {
                     log::error!("GSE command failed: {err}");
                     let recovery = {
                         let mut rt = state.gse.lock().unwrap();
@@ -514,7 +514,8 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
                     };
                     // Best effort closes only; never continue opening a supply after an error.
                     for (index, _) in recovery.valves.into_iter().filter(|(index, _)| *index >= 3) {
-                        let _ = router.log_queue(
+                        let _ = crate::telemetry_task::queue_controller_command(
+                            router,
                             crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
                             &[CLOSE[index]],
                         );
