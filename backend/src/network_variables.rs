@@ -555,10 +555,54 @@ pub fn flight_state() -> u8 {
         .flight_state
 }
 
+/// Qualification uses the engine's completed-sample marker to distinguish a
+/// fresh isolated boot from a process restart with intentionally retained data.
+/// Production startup never calls this check or changes the cached state.
+pub(crate) fn verify_normal_qualification_boot() -> Result<()> {
+    let marker = std::env::var_os("FIRMWARE_SIM_SAMPLE_FILE")
+        .context("normal qualification requires the engine sample marker")?;
+    let completed = fs::read_to_string(marker)
+        .context("read normal qualification sample marker")?
+        .trim().parse::<usize>().context("parse normal qualification sample marker")?;
+    verify_qualification_boot_cache(&cache_path(), completed, flight_state())
+}
+
+fn verify_qualification_boot_cache(path: &Path, completed: usize, actual: u8) -> Result<()> {
+    let cached = read_persisted(path);
+    if completed == 0 {
+        anyhow::ensure!(cached.is_none(), "fresh normal qualification requires an isolated empty cache");
+        anyhow::ensure!(actual == 0, "fresh normal qualification must boot actual Startup0");
+    } else {
+        let cached = cached.context("restarted normal qualification requires valid retained state")?;
+        anyhow::ensure!(actual == cached.flight_state,
+            "restarted normal qualification must restore the exact persisted flight state");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sedsnet::router::{EndpointHandler, RouterConfig};
+
+    #[test]
+    fn qualification_requires_fresh_startup_zero_and_exact_restart_restoration() {
+        let root = std::env::temp_dir().join(format!("gs-qualified-boot-{}-{}", std::process::id(), rand::random::<u64>()));
+        let path = root.join("variables.json");
+        assert!(verify_qualification_boot_cache(&path, 0, 0).is_ok());
+        assert!(verify_qualification_boot_cache(&path, 0, 1).is_err());
+        assert!(verify_qualification_boot_cache(&path, 4, 0).is_err());
+        let mut first = VariableStore::new(path.clone());
+        first.commit(PersistentVariables { flight_state: 1, ..PersistentVariables::default() }).unwrap();
+        let restored = VariableStore::new(path.clone());
+        assert!(verify_qualification_boot_cache(&path, 4, restored.values.flight_state).is_ok());
+        assert!(verify_qualification_boot_cache(&path, 8, 1).is_ok());
+        assert!(verify_qualification_boot_cache(&path, 4, 0).is_err());
+        assert!(verify_qualification_boot_cache(&path, 0, 1).is_err());
+        fs::write(&path, "invalid retained cache").unwrap();
+        assert!(verify_qualification_boot_cache(&path, 4, 0).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn default_cache_is_owned_by_each_test_process_and_explicit_paths_are_preserved() {

@@ -1076,11 +1076,7 @@ async fn main() -> anyhow::Result<()> {
         assert_eq!(std::env::var("SEDSNET_TRACE_RELIABLE").as_deref(), Ok("1"));
         qualification_requests::trace_scope();
         if !cfg!(feature = "hitl_mode") {
-            assert_eq!(
-                network_variables::flight_state(),
-                0,
-                "normal qualification must boot actual Startup0, with isolated fresh cache/default0"
-            );
+            network_variables::verify_normal_qualification_boot()?;
         }
     }
     let state = Arc::new(AppState {
