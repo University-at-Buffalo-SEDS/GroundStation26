@@ -2,7 +2,8 @@
   "endpoints": [
     {
       "name": "SD_CARD",
-      "doc": "On-board storage (e.g. SD card / flash)."
+      "doc": "On-board storage (e.g. SD card / flash).",
+      "id": 100
     },
     {
       "name": "GROUND_STATION",
@@ -69,7 +70,8 @@
         "FLIGHT_CONTROLLER"
       ],
       "reliable": "Off",
-      "priority": 255
+      "priority": 255,
+      "id": 100
     },
     {
       "name": "GYRO_DATA",
@@ -146,7 +148,8 @@
         "GROUND_STATION"
       ],
       "reliable": "Off",
-      "priority": 0
+      "priority": 0,
+      "id": 104
     },
     {
       "name": "ABORT",
@@ -260,7 +263,8 @@
         "FLIGHT_CONTROLLER"
       ],
       "reliable": "Off",
-      "priority": 255
+      "priority": 255,
+      "id": 106
     },
     {
       "name": "WARNING",
@@ -289,7 +293,8 @@
         "GROUND_STATION"
       ],
       "reliable": "Off",
-      "priority": 0
+      "priority": 0,
+      "id": 105
     },
     {
       "name": "ACTUATOR_COMMAND",
@@ -488,7 +493,8 @@
       },
       "endpoints": [
         "GROUND_STATION"
-      ]
+      ],
+      "id": 101
     },
     {
       "name": "IMU_LOCAL",
