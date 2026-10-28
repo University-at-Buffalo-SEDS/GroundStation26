@@ -613,6 +613,34 @@ impl Mesh {
     ) -> Option<Transmission> {
         self.begin_matching_transmission(now, minimum_priority, true)
     }
+    /// Returning owner receipts may pass only already-forwarded command
+    /// retries at the same priority. Fresh controls and opaque SDT/READY/GPS
+    /// entries remain barriers; ownership, age and service credits are unchanged.
+    pub(crate) fn prioritize_receipt_over_replays(&mut self, replayed: impl Fn(u64) -> bool) {
+        if self.active_transmission.is_some() { return; }
+        let Some(head) = self.queue.iter().enumerate()
+            .filter(|(i, item)| !item.independent_discovery && item.priority >= 254 && self.dependency_ready(*i))
+            .max_by_key(|(i, item)| (item.priority, std::cmp::Reverse(*i))).map(|(i, _)| i)
+        else { return; };
+        let priority = self.queue[head].priority;
+        if !Transmission::batch_contract(&self.queue[head])
+            .is_some_and(|(id, receipt)| !receipt && replayed(id)) { return; }
+        for index in head + 1..self.queue.len() {
+            let item = &self.queue[index];
+            if item.independent_discovery || item.priority < priority { continue; }
+            if item.priority != priority || !self.dependency_ready(index) { break; }
+            match Transmission::batch_contract(item) {
+                Some((_, true)) => {
+                    let receipt = self.queue.remove(index).unwrap();
+                    self.queue.insert(head, receipt);
+                    break;
+                }
+                Some((id, false)) if replayed(id) => {}
+                _ => break,
+            }
+        }
+    }
+
     /// One independent background reply; it never takes critical capacity/loans.
     pub(crate) fn begin_mode_reply_transmission(&mut self, now: u64) -> Option<Transmission> {
         if self.role != Role::Primary
@@ -3131,6 +3159,41 @@ mod pair_tests {
     fn enqueue(mesh: &mut Mesh, bytes: &[u8], now: u64) {
         mesh.enqueue(Outgoing { command: true, bytes: encode(DOWN_DATA, bytes) }, 254, now);
     }
+    #[test]
+    fn receipt_can_pass_only_replayed_controls_without_changing_ownership_or_age() {
+        let first = control(false, 10); let second = control(false, 11);
+        let receipt = control(true, 12);
+        let ids = [&first, &second].map(|p| crate::comms::radio_batch_control_contract(254, p).unwrap().0);
+        let mut mesh = Mesh::new(Role::Rrls, 2);
+        enqueue(&mut mesh, &first, 10); enqueue(&mut mesh, &second, 11); enqueue(&mut mesh, &receipt, 12);
+        let bytes = mesh.bytes;
+        mesh.prioritize_receipt_over_replays(|id| ids.contains(&id));
+        assert_eq!(mesh.bytes, bytes); assert_eq!(mesh.dropped, 0); assert_eq!(mesh.forwarded, 0);
+        assert_eq!(mesh.queue.iter().map(|q| q.at).collect::<Vec<_>>(), [12, 10, 11]);
+        let tx = mesh.begin_bounded_transmission(12, 0, true, 1).unwrap();
+        assert_eq!(decode(&tx.frame().bytes).unwrap().1, receipt);
+        mesh.finish_bounded_transmission(tx, false);
+        assert_eq!(mesh.bytes, bytes); assert_eq!(mesh.queue.len(), 3);
+    }
+    #[test]
+    fn receipt_retry_preference_preserves_fresh_controls_and_metadata_barriers() {
+        let retry = control(false, 10);
+        let id = crate::comms::radio_batch_control_contract(254, &retry).unwrap().0;
+        let gps = serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type("GPS_DATA"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "RF", 22,
+            Arc::from([0u8; 12])).unwrap()).to_vec();
+        for blocker in [encode(DOWN_DATA, &control(false, 11)), encode(READY, &[0; 8]),
+            encode(DOWN_DATA, b"SDT\x03opaque"), encode(DOWN_DATA, &gps)] {
+            let mut mesh = Mesh::new(Role::Rrls, 2);
+            enqueue(&mut mesh, &retry, 10);
+            mesh.enqueue(Outgoing { command: true, bytes: blocker.clone() }, 254, 11);
+            enqueue(&mut mesh, &control(true, 12), 12);
+            let before = mesh.queue.iter().map(|q| (q.frame.bytes.clone(), q.at, q.priority)).collect::<Vec<_>>();
+            mesh.prioritize_receipt_over_replays(|candidate| candidate == id);
+            assert_eq!(mesh.queue.iter().map(|q| (q.frame.bytes.clone(), q.at, q.priority)).collect::<Vec<_>>(), before);
+        }
+    }
+
     #[test]
     fn bounded_pair_retains_two_owners_bytes_and_stats_through_refusal() {
         let a = control(true, 10);

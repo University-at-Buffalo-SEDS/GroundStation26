@@ -805,6 +805,9 @@ impl UartComms {
             let transmission = {
                 let mut mesh = shared.lock().unwrap();
                 let now = mesh.now();
+                if !mode_only && let Some(capacity) = write_state.radio_capacity.as_ref() {
+                    mesh.prioritize_receipt_over_replays(|id| capacity.replayed_command(id));
+                }
                 #[cfg(target_os = "linux")]
                 {
                     if mode_only {
@@ -815,12 +818,26 @@ impl UartComms {
                         let frame_budget = if write_state.radio_capacity.as_ref().is_none_or(|cap| {
                             cap.ready_for(capacity_wall, capacity_clock, true)
                         }) { 4 - serviced_frames } else { 1 };
-                        mesh.begin_bounded_transmission(
+                        let selected = mesh.begin_bounded_transmission(
                             now,
                             minimum_priority,
                             !normal_ready,
                             frame_budget,
-                        )
+                        );
+                        if selected.as_ref().is_some_and(|tx| {
+                            tx.batch_contracts().is_some_and(|contracts| {
+                                contracts.iter().any(|(id, receipt)| !receipt && write_state
+                                    .radio_capacity.as_ref().is_some_and(|cap| cap.replayed_command(*id)))
+                            })
+                        }) {
+                            // Preserve both retained owners, then select just
+                            // one retry. A paired write must not bypass the
+                            // per-contract requirement for a real idle boundary.
+                            mesh.finish_bounded_transmission(selected.unwrap(), false);
+                            mesh.begin_bounded_transmission(now, minimum_priority, !normal_ready, 1)
+                        } else {
+                            selected
+                        }
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
@@ -4604,6 +4621,80 @@ mod raw_uart_tests {
         let error = uart.send_data_with_priority(&packets[2], 255).unwrap_err();
         assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(peer.bytes_to_read().unwrap(), 0);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", any(feature = "hitl_mode", feature = "firmware_sim")))]
+    fn relay_replayed_pair_yields_idle_boundary_and_keeps_owner_receipts_ahead() {
+        const CHILD: &str = "GS_REPLAYED_PAIR_PTY_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::relay_replayed_pair_yields_idle_boundary_and_keeps_owner_receipts_ahead";
+        if std::env::var_os(CHILD).is_none() {
+            let clock = std::env::temp_dir().join(format!("gs-replayed-pair-{}.clock", std::process::id()));
+            std::fs::write(&clock, "35000").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1").env("GS_SIM_CLOCK_FILE", &clock)
+                .env("GS_SIMULATED_SERIAL_PTY", "1").output().unwrap();
+            let _ = std::fs::remove_file(clock);
+            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let clock = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
+        let wrap = |kind: u8, payload: &[u8]| {
+            let mut bytes = vec![b'R', b'R', 1, kind]; bytes.extend_from_slice(payload);
+            bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes()); bytes
+        };
+        let packets = ["AV_BAY_UNDERGLOW", "FLIGHT_COMMAND"].map(|name| {
+            serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type(name),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")], "GS", 1,
+                std::sync::Arc::from([1u8])).unwrap()).to_vec()
+        });
+        let ids = packets.each_ref().map(|p| radio_packet_boundary_contract(255, p).unwrap().0);
+        let receipts = ids.map(|id| serialize::pack_packet(&Packet::new(
+            sedsnet::config::DataType::ReliableAck,
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "RF", 1,
+            std::sync::Arc::from(id.to_le_bytes())).unwrap()).to_vec());
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(100)).unwrap();
+        let (mut uart, shared, _) = recovery_uart_fixture(port);
+        let mut mesh = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 2);
+        let mut health = 1u32.to_le_bytes().to_vec(); health.extend_from_slice(&1u32.to_le_bytes()); health.push(0);
+        mesh.incoming(true, &wrap(0, &health), 35000);
+        *shared.lock().unwrap() = mesh;
+        uart.write_lock.lock().unwrap().radio_capacity = Some(rfd_capacity::Capacity::new(64000, 35, 16));
+        std::fs::write(&clock, "35088").unwrap();
+        for packet in &packets { shared.lock().unwrap().incoming(true, &wrap(2, packet), 35088); }
+        uart.flush_recovery_output(0).unwrap();
+        let expected = packets.iter().flat_map(|p| build_raw_uart_command_frame(&wrap(5, p)).unwrap()).collect::<Vec<_>>();
+        let mut actual = vec![0; expected.len()]; peer.read_exact(&mut actual).unwrap(); assert_eq!(actual, expected);
+        {
+            let mut state = uart.write_lock.lock().unwrap(); let cap = state.radio_capacity.as_mut().unwrap();
+            cap.committed(Instant::now(), Some(35210), 47);
+            cap.committed(Instant::now(), Some(35233), 59);
+            cap.committed(Instant::now(), Some(35294), 150);
+            cap.drained_virtual(35307021);
+        }
+        std::fs::write(&clock, "35344").unwrap();
+        for packet in &packets { shared.lock().unwrap().incoming(true, &wrap(2, packet), 35344); }
+        uart.flush_recovery_output(0).unwrap();
+        assert_eq!(peer.bytes_to_read().unwrap(), 0, "an already-owned retry pair must not bypass the actual quiet boundary");
+        std::fs::write(&clock, "35363").unwrap(); uart.flush_recovery_output(0).unwrap();
+        let expected = build_raw_uart_command_frame(&wrap(5, &packets[0])).unwrap();
+        let mut actual = vec![0; expected.len()]; peer.read_exact(&mut actual).unwrap(); assert_eq!(actual, expected);
+        assert_eq!(peer.bytes_to_read().unwrap(), 0, "only one replay enters this physical packet");
+        for (i, now) in [(0, 35381), (1, 35387)] {
+            std::fs::write(&clock, now.to_string()).unwrap();
+            shared.lock().unwrap().incoming(false, &receipts[i], now);
+            uart.flush_recovery_output(0).unwrap();
+            let expected = build_raw_uart_command_frame(&wrap(1, &receipts[i])).unwrap();
+            let mut actual = vec![0; expected.len()]; peer.read_exact(&mut actual).expect("return receipt must pass the retained replay"); assert_eq!(actual, expected);
+            assert_eq!(peer.bytes_to_read().unwrap(), 0);
+        }
+        let mut mesh = shared.lock().unwrap();
+        let retained = mesh.begin_transmission(35387).expect("second replay must remain owned");
+        assert_eq!(retained.frame().bytes, wrap(5, &packets[1]));
+        mesh.finish_transmission(retained, false);
     }
 
     #[test]

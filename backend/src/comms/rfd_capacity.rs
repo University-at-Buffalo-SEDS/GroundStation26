@@ -67,10 +67,23 @@ impl Capacity {
         encoded_len: usize,
         canonical_unsequenced: bool,
     ) -> bool {
+        if self.replayed_command(id) {
+            // A retry has already spent this contract's interactive turn. Do
+            // not glue it onto an ordinary packet or extend a previous retry's
+            // packet just before the returning owner receipt arrives. Normal
+            // airtime plus the actual UART-stop/quiet boundary remain required.
+            return encoded_len > 0 && self.ready(wall, clock)
+                && Self::reached(self.next_packet, wall, clock);
+        }
         encoded_len > 0
             && (self.ready_for(wall, clock, true)
                 || self.late_sibling_ready(wall, clock, id, encoded_len, canonical_unsequenced)
                 || self.batch_tail_ready(wall, clock, id, encoded_len, canonical_unsequenced))
+    }
+    pub(crate) fn replayed_command(&self, id: u64) -> bool {
+        self.promotion_contracts[..usize::from(self.promotion_contract_count)]
+            .iter().position(|stored| *stored == id)
+            .is_some_and(|slot| self.promotion_flags & (1 << slot) != 0)
     }
     fn batch_tail_ready(&self, wall: Instant, clock: Option<u64>, id: u64, bytes: usize, canonical: bool) -> bool {
         self.control_tail_ready(wall, clock, id, bytes, canonical, false)
@@ -614,6 +627,27 @@ impl Capacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replayed_commands_wait_for_the_real_quiet_boundary_before_ordinary_service() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 35, 16);
+        cap.committed_command_batch(wall, Some(35088), [55, 61], 116);
+        assert!(cap.close_command_batch(wall, Some(35088), [11, 12]));
+        cap.committed(wall, Some(35210), 47);
+        cap.committed(wall, Some(35233), 59);
+        cap.committed(wall, Some(35294), 150);
+        cap.drained_virtual(35307021);
+        assert!(cap.ready_for(wall, Some(35344), true), "the fresh interactive loan remains available");
+        assert!(!cap.ready_for_command(wall, Some(35344), 11, 55, true), "a replay must not glue retries to the current ordinary packet");
+        assert!(!cap.ready_for_command(wall, Some(35360), 11, 55, true), "funded airtime alone does not prove modem idle");
+        assert!(cap.ready_for_command(wall, Some(35363), 11, 55, true));
+        assert!(cap.ready_for_command(wall, Some(35344), 13, 55, true), "new command admission is unchanged");
+        assert!(cap.ready_for_receipt(wall, Some(35344), 11, 63), "a returning owner receipt retains its independent permit");
+        cap.committed_command(wall, Some(35363), (11, 55), true, 55, true);
+        cap.drained_virtual(35367775);
+        assert!(!cap.ready_for_command(wall, Some(35390), 12, 61, true), "a second replay cannot extend that new physical packet either");
+    }
+
     #[test]
     fn single_command_tail_keeps_the_unused_legacy_loan_after_the_quiet_gap() {
         let wall = Instant::now();
