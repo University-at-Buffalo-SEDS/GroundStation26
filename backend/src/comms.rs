@@ -2273,6 +2273,9 @@ impl CommsDevice for UartComms {
                     } else {
                         false
                     };
+                    if promoted && frames.len() == 2 {
+                        capacity.allow_command_batch_tail([contracts[0], contracts[1]], bytes.len());
+                    }
                     for &contract in &contracts[..frames.len()] {
                         trace_virtual_uart_admission(
                             "batch",
@@ -2535,8 +2538,10 @@ impl CommsDevice for UartComms {
             && let Some(capacity) = &mut write_state.radio_capacity
         {
             #[cfg(target_os = "linux")]
+            let mut joined_command_batch = false;
+            #[cfg(target_os = "linux")]
             if let Some(id) = command_id {
-                capacity.committed_command(
+                joined_command_batch = capacity.committed_command(
                     capacity_wall,
                     capacity_clock,
                     (id, len + RAW_UART_FRAME_HEADER_SIZE),
@@ -2561,11 +2566,17 @@ impl CommsDevice for UartComms {
             }
             let mut promoted = false;
             if io_result.is_ok() && close_batch {
+                #[cfg(target_os = "linux")]
+                let close_batch = !joined_command_batch;
+                #[cfg(not(target_os = "linux"))]
+                let close_batch = true;
+                if close_batch {
                 promoted = capacity.close_packet_batch_for_contract(
                     capacity_wall,
                     capacity_clock,
                     contract,
                 );
+                }
                 if promoted
                     && contract.is_some_and(|(_, receipt)| receipt)
                     && let Some(mesh) = &self.recovery
@@ -4453,6 +4464,62 @@ mod raw_uart_tests {
         tx.service_transmit().unwrap();
         assert_eq!(reader.join().unwrap(), expected);
         assert!(shared.lock().unwrap().begin_transmission(0).is_none());
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", any(feature = "hitl_mode", feature = "firmware_sim")))]
+    fn late_third_command_joins_only_the_open_bounded_uart_packet() {
+        const CHILD: &str = "GS_LATE_THIRD_PTY_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::late_third_command_joins_only_the_open_bounded_uart_packet";
+        if std::env::var_os(CHILD).is_none() {
+            let clock = std::env::temp_dir().join(format!("gs-late-third-{}.clock", std::process::id()));
+            std::fs::write(&clock, "30000").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1").env("GS_SIM_CLOCK_FILE", &clock)
+                .env("GS_SIMULATED_SERIAL_PTY", "1").output().unwrap();
+            let _ = std::fs::remove_file(clock);
+            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let clock = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
+        let packets = ["FLIGHT_STATE", "AV_BAY_UNDERGLOW", "FLIGHT_BUZZER", "FLIGHT_COMMAND"].map(|name| {
+            serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type(name),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")], "GS", 1,
+                std::sync::Arc::from([1u8])).unwrap()).to_vec()
+        });
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(100)).unwrap();
+        let (mut uart, _, _) = recovery_uart_fixture(port);
+        {
+            let mut state = uart.write_lock.lock().unwrap();
+            let mut capacity = rfd_capacity::Capacity::new(64000, 15, 16);
+            capacity.committed(Instant::now(), Some(30000), 21);
+            state.wire.committed(30000, 21, 115200);
+            capacity.drained_virtual(state.wire.stop_us());
+            state.radio_capacity = Some(capacity);
+        }
+        std::fs::write(&clock, "30002").unwrap();
+        uart.send_command_batch(&[(255, &packets[0]), (255, &packets[1])]).unwrap();
+        let expected = packets[..3].iter().flat_map(|p| {
+            let mesh = uart.recovery.as_ref().unwrap().lock().unwrap();
+            build_raw_uart_command_frame(&mesh.local_tx(false, p, mesh.now()).unwrap().bytes).unwrap()
+        }).collect::<Vec<_>>();
+        assert!(expected.len() <= RADIO_COMMAND_BATCH_MAX_BYTES);
+        assert!(!uart.transmit_ready_for(255, &packets[2]), "UART stop bit still gates a late sibling");
+        std::fs::write(&clock, "30018").unwrap();
+        assert!(!uart.transmit_ready_for(255, &packets[0]), "a retry must not reuse a batch slot");
+        assert!(uart.transmit_ready_for(255, &packets[2]), "third command arrived while the same modem packet is still open");
+        uart.send_data_with_priority(&packets[2], 255).unwrap();
+        let mut received = vec![0; expected.len()];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(received, expected);
+        assert!(!uart.transmit_ready_for(255, &packets[3]), "no fourth command may borrow capacity");
+        std::fs::write(&clock, "30025").unwrap();
+        assert!(!uart.transmit_ready_for(255, &packets[3]), "UART completion must not renew the third slot");
+        let state = uart.write_lock.lock().unwrap();
+        assert!(!state.radio_capacity.as_ref().unwrap().ready(Instant::now(), Some(30025)), "all original per-frame airtime debt remains owed");
     }
 
     #[test]

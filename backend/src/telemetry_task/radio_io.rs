@@ -354,6 +354,22 @@ impl WireBacklog {
             self.control_bytes,
         )
     }
+    /// Recheck producer handoffs around transport service and batch selection.
+    /// All rechecks share one drain allowance; an active producer cannot defer
+    /// UART service indefinitely. An empty channel never waits for a sibling.
+    fn refill(&mut self, receiver: &mut mpsc::UnboundedReceiver<(u8, Vec<u8>)>, remaining: &mut usize) -> bool {
+        while *remaining > 0 {
+            match receiver.try_recv() {
+                Ok((priority, payload)) => {
+                    *remaining -= 1;
+                    self.push(priority, payload, false);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => return false,
+            }
+        }
+        true
+    }
     fn restore_selection(&mut self, state: (usize, bool, usize, usize)) {
         (
             self.application_bytes,
@@ -558,6 +574,35 @@ mod priority_tests {
         )
         .to_vec()
     }
+    #[test]
+    fn batch_refill_catches_late_producer_without_waiting_or_exceeding_drain_budget() {
+        let packets = ["FLIGHT_STATE", "AV_BAY_UNDERGLOW", "FLIGHT_BUZZER"]
+            .map(|name| batch_test_command(name, &[1]));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut queue = WireBacklog::new(true);
+        let mut remaining = 3;
+        for packet in &packets[..2] { sender.send((255, packet.clone())).unwrap(); }
+        assert!(queue.refill(&mut receiver, &mut remaining));
+        assert_eq!(remaining, 1);
+        let before = queue.selection_state();
+        let first = queue.pop().unwrap();
+        let second = queue.batch_follower(&BatchTestComms, (first.0, &first.1)).unwrap();
+        // Producer crosses the original drain/batch-selection boundary.
+        sender.send((255, packets[2].clone())).unwrap();
+        sender.send((255, packets[0].clone())).unwrap();
+        assert!(queue.refill(&mut receiver, &mut remaining));
+        assert_eq!(remaining, 0);
+        assert_eq!(receiver.len(), 1, "refill must share the original drain bound");
+        let bytes = BatchTestComms.command_batch_frame_len(first.0, &first.1).unwrap()
+            + BatchTestComms.command_batch_frame_len(second.0, &second.1).unwrap();
+        let third = queue.batch_follower_after_bytes(&BatchTestComms, bytes).unwrap();
+        assert_eq!(third.1, packets[2]);
+        queue.push(third.0, third.1, true);
+        queue.restore_selected(before, first, Some(second));
+        for packet in packets { assert_eq!(queue.pop().unwrap().1, packet); }
+        assert!(queue.pop().is_none());
+    }
+
     #[test]
     fn three_command_batch_keeps_selection_and_retry_order() {
         let packets = ["FLIGHT_STATE", "AV_BAY_UNDERGLOW", "FLIGHT_BUZZER"]
@@ -1420,12 +1465,9 @@ pub(super) fn spawn_comms_worker_threads(
                     // Pick up newly queued commands before every frame, not
                     // after transmitting an entire burst of large schemas.
                     // Bound draining so a busy producer cannot starve writes.
-                    for _ in 0..256 {
-                        match comms_handle.tx_rx.try_recv() {
-                            Ok((priority, payload)) => backlog.push(priority, payload, false),
-                            Err(mpsc::error::TryRecvError::Empty) => break,
-                            Err(mpsc::error::TryRecvError::Disconnected) => return,
-                        }
+                    let mut drain_remaining = 256;
+                    if !backlog.refill(&mut comms_handle.tx_rx, &mut drain_remaining) {
+                        return;
                     }
                     let mut comms = tx_worker_comms.lock().expect("failed to get lock");
                     // Mesh HEALTH/READY must not depend on receiving another
@@ -1439,6 +1481,7 @@ pub(super) fn spawn_comms_worker_threads(
                         );
                         break;
                     }
+                    backlog.refill(&mut comms_handle.tx_rx, &mut drain_remaining);
                     if !backlog.has_eligible_critical()
                         && let Err(error) = comms.service_background_mode()
                     {
@@ -1478,6 +1521,7 @@ pub(super) fn spawn_comms_worker_threads(
                         log::info!("full-bay transport selected side={worker_name} sim={:?} priority={priority} len={} type={:?}", crate::simulation_clock_ms(), payload.len(), serialize::peek_frame_info_unchecked(&payload).map(|info| info.envelope.ty));
                     }
                     let follower = backlog.batch_follower(&**comms, (priority, &payload));
+                    backlog.refill(&mut comms_handle.tx_rx, &mut drain_remaining);
                     let third = follower.as_ref().and_then(|(next_priority, next_payload)| {
                         let bytes = comms.command_batch_frame_len(priority, &payload)?
                             .checked_add(comms.command_batch_frame_len(*next_priority, next_payload)?)?;
