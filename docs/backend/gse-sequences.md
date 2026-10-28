@@ -202,7 +202,7 @@ used for saved telemetry replay; live Dashboard and audience views use 2D art.
 See [model configuration](model-animations.md).
 
 The equipment preview's bundled model-viewer 4.3.1 is Apache-2.0 licensed; see
-`ui/station_ui/vendor/model-viewer.LICENSE`. Built-in uncompressed models require
+the frontend's [model-viewer license](https://github.com/Rylan-Meilutis/Seds-Ground-Station-Frontend/blob/main/station_ui/vendor/model-viewer.LICENSE). Built-in uncompressed models require
 no CDN. The replay renderer uses bundled Three.js (MIT).
 Uploaded models using compression may need additional decoder assets.
 # HITL button availability

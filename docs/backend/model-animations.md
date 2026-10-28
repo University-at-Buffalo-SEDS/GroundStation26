@@ -67,7 +67,9 @@ Uploaded GLBs must have suitable named nodes; do not expect the renderer to infe
 mechanical joints from arbitrary meshes. Built-ins are uncompressed and offline-ready;
 compressed third-party GLBs may require additional decoder support.
 
-Regenerate built-in assets with `(cd ui && node scripts/build_gse_models.mjs)`.
+From a checkout of the separate frontend repository, regenerate built-in assets
+with `node scripts/build_gse_models.mjs`.
 The bundled Three.js 0.180.0 is MIT licensed. Its GLTFLoader/BufferGeometryUtils import
-paths are patched to local relative modules; see `ui/station_ui/rendering/three/LICENSE`.
+paths are patched to local relative modules; see the frontend's
+[Three.js license](https://github.com/Rylan-Meilutis/Seds-Ground-Station-Frontend/blob/main/station_ui/rendering/three/LICENSE).
 Reference: [Three.js glTF and animation documentation](https://threejs.org/manual/en/animation-system.html).
