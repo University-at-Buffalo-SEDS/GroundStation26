@@ -497,7 +497,6 @@ pub struct UartComms {
     protocol: SerialProtocol,
     recovery: Option<crate::rrls::Shared>,
     write_lock: std::sync::Arc<std::sync::Mutex<UartWriteState>>,
-    #[cfg(target_os = "linux")]
     baud_rate: u32,
     slow_start_deadline: Option<Instant>,
 }
@@ -589,7 +588,6 @@ impl UartComms {
             protocol: cfg.protocol.clone(),
             recovery: crate::rrls::attach(&cfg.port),
             write_lock: Default::default(),
-            #[cfg(target_os = "linux")]
             baud_rate: cfg.baud_rate as u32,
             slow_start_deadline: Some(Instant::now() + UART_STARTUP_TIMEOUT),
         })
@@ -2342,7 +2340,6 @@ impl CommsDevice for UartComms {
             protocol: self.protocol.clone(),
             recovery: self.recovery.clone(),
             write_lock: self.write_lock.clone(),
-            #[cfg(target_os = "linux")]
             baud_rate: self.baud_rate,
             slow_start_deadline: None,
         })))
@@ -4350,7 +4347,6 @@ mod raw_uart_tests {
             protocol: SerialProtocol::RawUart,
             recovery: Some(shared.clone()),
             write_lock: Default::default(),
-            #[cfg(target_os = "linux")]
             baud_rate: 115200,
             slow_start_deadline: None,
         };
@@ -5048,7 +5044,6 @@ mod raw_uart_tests {
             protocol: SerialProtocol::RawUart,
             recovery: None,
             write_lock: Default::default(),
-            #[cfg(target_os = "linux")]
             baud_rate: 115200,
             slow_start_deadline: None,
         };
@@ -5131,7 +5126,6 @@ mod raw_uart_tests {
             protocol: SerialProtocol::RawUart,
             recovery: None,
             write_lock: Default::default(),
-            #[cfg(target_os = "linux")]
             baud_rate: 115200,
             slow_start_deadline: None,
         };
@@ -5872,7 +5866,6 @@ mod uart_duplex_tests {
             protocol: SerialProtocol::PacketFramed,
             recovery: None,
             write_lock: Default::default(),
-            #[cfg(target_os = "linux")]
             baud_rate: 57600,
             slow_start_deadline: None,
         };
