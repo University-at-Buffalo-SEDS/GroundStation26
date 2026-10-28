@@ -1,6 +1,14 @@
 name: macOS backend check
 
 on:
+  workflow_dispatch:
+  push:
+    branches: [dev]
+    paths:
+      - "backend/**"
+      - "shared/**"
+      - "Cargo.toml"
+      - ".github/workflows/macos-backend-check.yml"
   pull_request:
     branches: [dev, main]
     paths:
