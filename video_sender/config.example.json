@@ -12,5 +12,15 @@
       "bitrate": 2000000,
       "enabled": true
     }
-  ]
+  ],
+  "usb_cameras": {
+    "enabled": true,
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "bitrate": 2000000,
+    "input_format": "mjpeg",
+    "encoder": "libx264",
+    "audio": true
+  }
 }

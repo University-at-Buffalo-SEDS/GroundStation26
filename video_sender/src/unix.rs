@@ -18,6 +18,8 @@ use tokio::{
 
 const DEFAULT_SOCKET: &str = "/run/gs-video-sender/control.sock";
 const MAX_CONFIG: usize = 64 * 1024;
+const USB_BY_ID: &str = "/dev/v4l/by-id";
+const USB_BY_PATH: &str = "/dev/v4l/by-path";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +33,46 @@ struct StreamConfig {
     enabled: bool,
     #[serde(default)]
     audio_device: Option<String>,
+    /// Set only on streams synthesized for detected USB cameras.
+    #[serde(skip)]
+    usb: Option<UsbSource>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct UsbSource {
+    device: String,
+    input_format: String,
+    encoder: String,
+}
+
+/// Publishes every connected USB (UVC) camera with these settings.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct UsbCameras {
+    enabled: bool,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate: u32,
+    #[serde(default = "default_input_format")]
+    input_format: String,
+    #[serde(default = "default_encoder")]
+    encoder: String,
+    /// Also publish each camera's built-in microphone, when it has one.
+    #[serde(default = "default_audio")]
+    audio: bool,
+}
+
+fn default_audio() -> bool {
+    true
+}
+
+fn default_input_format() -> String {
+    "mjpeg".into()
+}
+
+fn default_encoder() -> String {
+    "libx264".into()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -45,10 +87,29 @@ struct Config {
     port: u16,
     username: String,
     streams: Vec<StreamConfig>,
+    #[serde(default)]
+    usb_cameras: Option<UsbCameras>,
 }
 
 fn default_discovery_port() -> u16 {
     gs_camera_discovery::PORT
+}
+
+fn validate_mode(width: u32, height: u32, fps: u32, bitrate: u32) -> Result<()> {
+    ensure!(
+        (160..=3840).contains(&width) && width % 2 == 0,
+        "width must be even, 160–3840"
+    );
+    ensure!(
+        (120..=2160).contains(&height) && height % 2 == 0,
+        "height must be even, 120–2160"
+    );
+    ensure!((1..=60).contains(&fps), "fps must be 1–60");
+    ensure!(
+        (100_000..=25_000_000).contains(&bitrate),
+        "bitrate must be 100000–25000000 bits/s"
+    );
+    Ok(())
 }
 
 impl Config {
@@ -99,21 +160,148 @@ impl Config {
                 s.camera
             );
             ensure!(s.camera <= 15, "camera index must be 0–15");
+            validate_mode(s.width, s.height, s.fps, s.bitrate)?;
+        }
+        if let Some(usb) = &self.usb_cameras {
+            validate_mode(usb.width, usb.height, usb.fps, usb.bitrate)?;
             ensure!(
-                (160..=3840).contains(&s.width) && s.width % 2 == 0,
-                "width must be even, 160–3840"
+                ["mjpeg", "yuyv422"].contains(&usb.input_format.as_str()),
+                "usb_cameras.input_format must be mjpeg or yuyv422"
             );
             ensure!(
-                (120..=2160).contains(&s.height) && s.height % 2 == 0,
-                "height must be even, 120–2160"
-            );
-            ensure!((1..=60).contains(&s.fps), "fps must be 1–60");
-            ensure!(
-                (100_000..=25_000_000).contains(&s.bitrate),
-                "bitrate must be 100000–25000000 bits/s"
+                ["libx264", "h264_v4l2m2m"].contains(&usb.encoder.as_str()),
+                "usb_cameras.encoder must be libx264 or h264_v4l2m2m"
             );
         }
         Ok(())
+    }
+}
+
+/// Stream ID for a `/dev/v4l/by-id` or `/dev/v4l/by-path` capture link name.
+fn usb_stream_id(name: &str) -> Option<String> {
+    let stem = name.strip_suffix("-video-index0")?;
+    let (prefix, label) = if let Some(label) = stem.strip_prefix("usb-") {
+        ("usb-", label)
+    } else {
+        ("usb-port-", stem.split_once("-usb-")?.1)
+    };
+    let label: String = label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    (!label.is_empty()).then(|| format!("{prefix}{label}").chars().take(64).collect())
+}
+
+/// Connected USB capture devices as (stream ID, device path), sorted by ID.
+/// Serial-qualified `by-id` names are preferred; cameras without a usable
+/// serial fall back to their physical port so identical models stay distinct.
+fn detect_usb_cameras(by_id: &Path, by_path: &Path, sys: &Path) -> Vec<UsbCamera> {
+    let mut found = BTreeMap::new();
+    let mut targets = HashSet::new();
+    for dir in [by_id, by_path] {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut names: Vec<_> = entries.flatten().map(|e| e.file_name()).collect();
+        names.sort();
+        for name in names {
+            let Some(name) = name.to_str() else { continue };
+            let link = dir.join(name);
+            let (Some(id), Ok(target)) = (usb_stream_id(name), std::fs::canonicalize(&link)) else {
+                continue;
+            };
+            if !found.contains_key(&id) && targets.insert(target.clone()) {
+                let camera = UsbCamera {
+                    id: id.clone(),
+                    device: link.to_string_lossy().into_owned(),
+                    microphone: usb_microphone(&target, sys),
+                };
+                found.insert(id, camera);
+            }
+        }
+    }
+    found.into_values().collect()
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct UsbCamera {
+    id: String,
+    device: String,
+    /// ALSA capture device on the same physical USB device, if any.
+    microphone: Option<String>,
+}
+
+/// Finds the ALSA card exposed by the same USB device as a `/dev/videoN` node,
+/// i.e. a webcam's built-in microphone, addressed by its stable card ID.
+fn usb_microphone(video: &Path, sys: &Path) -> Option<String> {
+    let usb_device = |interface: PathBuf| interface.parent().map(Path::to_path_buf);
+    let node = video.file_name()?;
+    let camera = usb_device(
+        std::fs::canonicalize(sys.join("class/video4linux").join(node).join("device")).ok()?,
+    )?;
+    let mut cards: Vec<_> = std::fs::read_dir(sys.join("class/sound"))
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("card"))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect();
+    cards.sort();
+    cards.into_iter().find_map(|card| {
+        let device = usb_device(std::fs::canonicalize(card.join("device")).ok()?)?;
+        let id = std::fs::read_to_string(card.join("id")).ok()?;
+        let id = id.trim();
+        (device == camera
+            && !id.is_empty()
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+        .then(|| format!("plughw:CARD={id},DEV=0"))
+    })
+}
+
+/// Adds a stream for each detected USB camera not already configured by ID.
+fn add_usb_streams(config: &mut Config, cameras: Vec<UsbCamera>) {
+    let Some(usb) = config.usb_cameras.clone().filter(|usb| usb.enabled) else {
+        return;
+    };
+    for UsbCamera {
+        id,
+        device,
+        microphone,
+    } in cameras
+    {
+        if config.streams.len() >= 16 {
+            break;
+        }
+        if config.streams.iter().any(|s| s.id == id) {
+            continue;
+        }
+        config.streams.push(StreamConfig {
+            id,
+            camera: 0,
+            width: usb.width,
+            height: usb.height,
+            fps: usb.fps,
+            bitrate: usb.bitrate,
+            enabled: true,
+            audio_device: microphone.filter(|_| usb.audio),
+            usb: Some(UsbSource {
+                device,
+                input_format: usb.input_format.clone(),
+                encoder: usb.encoder.clone(),
+            }),
+        });
     }
 }
 
@@ -217,23 +405,77 @@ fn ffmpeg_args(config: &Config, stream: &StreamConfig, password: &str) -> Vec<St
         config.port,
         stream.id
     );
-    let mut args: Vec<String> = [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-fflags",
-        "+genpts",
-        "-f",
-        "h264",
-        "-r",
-        &stream.fps.to_string(),
-        "-i",
-        "pipe:0",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect();
+    let fps = stream.fps.to_string();
+    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    // rpicam-vid already encodes H.264; USB cameras deliver raw/MJPEG frames.
+    let video: Vec<String> = if let Some(usb) = &stream.usb {
+        let size = format!("{}x{}", stream.width, stream.height);
+        args.extend(
+            [
+                "-thread_queue_size",
+                "512",
+                "-f",
+                "v4l2",
+                "-input_format",
+                &usb.input_format,
+                "-framerate",
+                &fps,
+                "-video_size",
+                &size,
+                "-i",
+                &usb.device,
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        let bitrate = stream.bitrate.to_string();
+        let mut video: Vec<String> = ["-c:v", &usb.encoder, "-pix_fmt", "yuv420p"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        if usb.encoder == "libx264" {
+            video.extend(
+                [
+                    "-preset",
+                    "ultrafast",
+                    "-tune",
+                    "zerolatency",
+                    "-profile:v",
+                    "baseline",
+                    "-maxrate",
+                    &bitrate,
+                    "-bufsize",
+                    &bitrate,
+                    "-keyint_min",
+                    &fps,
+                    "-sc_threshold",
+                    "0",
+                    "-bf",
+                    "0",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
+        video.extend(
+            ["-b:v", &bitrate, "-g", &fps]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        video
+    } else {
+        args.extend(
+            [
+                "-fflags", "+genpts", "-f", "h264", "-r", &fps, "-i", "pipe:0",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        vec!["-c:v".into(), "copy".into()]
+    };
     if let Some(device) = &stream.audio_device {
         args.extend(
             [
@@ -247,26 +489,20 @@ fn ffmpeg_args(config: &Config, stream: &StreamConfig, password: &str) -> Vec<St
                 "0:v:0",
                 "-map",
                 "1:a:0",
-                "-c:v",
-                "copy",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-ar",
-                "48000",
-                "-ac",
-                "2",
             ]
             .into_iter()
             .map(str::to_owned),
         );
-    } else {
+        args.extend(video);
         args.extend(
-            ["-map", "0:v:0", "-c:v", "copy", "-an"]
+            ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2"]
                 .into_iter()
                 .map(str::to_owned),
         );
+    } else {
+        args.extend(["-map".into(), "0:v:0".into()]);
+        args.extend(video);
+        args.push("-an".into());
     }
     args.extend(
         [
@@ -292,7 +528,8 @@ struct Pipeline {
     automatic: bool,
     config: Config,
     stream: StreamConfig,
-    camera: Child,
+    /// rpicam-vid; absent for USB cameras, which FFmpeg captures directly.
+    camera: Option<Child>,
     relay: Child,
     progress: Arc<Mutex<Instant>>,
     progress_task: tokio::task::JoinHandle<()>,
@@ -309,15 +546,27 @@ impl Pipeline {
             config.host != "auto",
             "receiver discovery has not completed"
         );
-        let mut camera = Command::new("rpicam-vid")
-            .args(camera_args(stream))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .context("starting rpicam-vid")?;
-        let output = camera.stdout.take().context("camera output pipe missing")?;
-        let input: Stdio = output.try_into()?;
+        let mut camera = if stream.usb.is_some() {
+            None
+        } else {
+            Some(
+                Command::new("rpicam-vid")
+                    .args(camera_args(stream))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .context("starting rpicam-vid")?,
+            )
+        };
+        let input: Stdio = match camera.as_mut() {
+            Some(camera) => camera
+                .stdout
+                .take()
+                .context("camera output pipe missing")?
+                .try_into()?,
+            None => Stdio::null(),
+        };
         let relay = Command::new("ffmpeg")
             .args(ffmpeg_args(config, stream, password))
             .stdin(input)
@@ -329,7 +578,9 @@ impl Pipeline {
         let mut relay = match relay {
             Ok(relay) => relay,
             Err(err) => {
-                let _ = camera.kill().await;
+                if let Some(camera) = camera.as_mut() {
+                    let _ = camera.kill().await;
+                }
                 return Err(err).context("starting ffmpeg");
             }
         };
@@ -371,13 +622,17 @@ impl Pipeline {
     }
 
     async fn healthy(&mut self) -> bool {
-        matches!(self.camera.try_wait(), Ok(None))
+        self.camera
+            .as_mut()
+            .is_none_or(|camera| matches!(camera.try_wait(), Ok(None)))
             && matches!(self.relay.try_wait(), Ok(None))
             && self.progress.lock().await.elapsed() < Duration::from_secs(20)
     }
 
     async fn stop(mut self) {
-        let _ = self.camera.kill().await;
+        if let Some(camera) = self.camera.as_mut() {
+            let _ = camera.kill().await;
+        }
         let _ = self.relay.kill().await;
         self.progress_task.abort();
     }
@@ -510,6 +765,15 @@ async fn run(path: PathBuf, socket_path: PathBuf) -> Result<()> {
             _ = tick.tick() => {},
         }
         let mut config = daemon.changes.borrow().clone();
+        // Rescanned every tick so cameras plugged in after boot start too.
+        add_usb_streams(
+            &mut config,
+            detect_usb_cameras(
+                Path::new(USB_BY_ID),
+                Path::new(USB_BY_PATH),
+                Path::new("/sys"),
+            ),
+        );
         let automatic = config.host == "auto";
         if config.discovery_interface != previous_discovery_interface {
             discovered = None;
@@ -770,6 +1034,139 @@ mod tests {
         assert!(
             ffmpeg_args(&config, &config.streams[0], "fixture-only").contains(&"-an".to_string())
         );
+    }
+
+    #[test]
+    fn usb_link_names_map_to_stable_stream_ids() {
+        assert_eq!(
+            usb_stream_id("usb-Logitech_HD_Webcam_C270_A1B2-video-index0").as_deref(),
+            Some("usb-Logitech_HD_Webcam_C270_A1B2")
+        );
+        assert_eq!(
+            usb_stream_id("platform-xhci-hcd.0-usb-0:1.2:1.0-video-index0").as_deref(),
+            Some("usb-port-0_1_2_1_0")
+        );
+        assert_eq!(usb_stream_id("usb-Cam_A1B2-video-index1"), None);
+        assert_eq!(
+            usb_stream_id("platform-xhci-hcd.0-usbv2-0:1:1.0-video-index0"),
+            None
+        );
+        assert_eq!(usb_stream_id("platform-1f00128000.csi-video-index0"), None);
+        let long = format!("usb-{}-video-index0", "x".repeat(100));
+        assert_eq!(usb_stream_id(&long).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn usb_detection_prefers_serial_names_and_falls_back_to_ports() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("gs-video-usb-{}", std::process::id()));
+        let (by_id, by_path) = (root.join("by-id"), root.join("by-path"));
+        std::fs::create_dir_all(&by_id).unwrap();
+        std::fs::create_dir_all(&by_path).unwrap();
+        for node in ["video0", "video1", "video2"] {
+            std::fs::write(root.join(node), b"").unwrap();
+        }
+        symlink(root.join("video0"), by_id.join("usb-Cam_A1-video-index0")).unwrap();
+        symlink(root.join("video0"), by_id.join("usb-Cam_A1-video-index1")).unwrap();
+        symlink(
+            root.join("video0"),
+            by_path.join("p-usb-0:1:1.0-video-index0"),
+        )
+        .unwrap();
+        symlink(
+            root.join("video1"),
+            by_path.join("p-usb-0:2:1.0-video-index0"),
+        )
+        .unwrap();
+        symlink(root.join("video2"), by_path.join("p-csi-video-index0")).unwrap();
+        // Fake sysfs: video0 and card1 share USB device 1-1; video1 (1-2) has
+        // no microphone; card0 is the Pi's onboard audio.
+        let sys = root.join("sys");
+        let devices = sys.join("devices");
+        for (link, interface) in [
+            ("class/video4linux/video0", "usb1/1-1/1-1:1.0"),
+            ("class/video4linux/video1", "usb1/1-2/1-2:1.0"),
+            ("class/sound/card0", "platform/bcm2835_audio"),
+            ("class/sound/card1", "usb1/1-1/1-1:1.2"),
+        ] {
+            std::fs::create_dir_all(devices.join(interface)).unwrap();
+            std::fs::create_dir_all(sys.join(link)).unwrap();
+            symlink(devices.join(interface), sys.join(link).join("device")).unwrap();
+        }
+        std::fs::write(sys.join("class/sound/card0/id"), "Headphones\n").unwrap();
+        std::fs::write(sys.join("class/sound/card1/id"), "C920\n").unwrap();
+        let found = detect_usb_cameras(&by_id, &by_path, &sys);
+        std::fs::remove_dir_all(&root).unwrap();
+        let ids: Vec<_> = found.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["usb-Cam_A1", "usb-port-0_2_1_0"]);
+        assert!(found[0].device.ends_with("usb-Cam_A1-video-index0"));
+        assert_eq!(
+            found[0].microphone.as_deref(),
+            Some("plughw:CARD=C920,DEV=0")
+        );
+        assert_eq!(found[1].microphone, None);
+    }
+
+    #[test]
+    fn usb_cameras_become_encoded_streams_without_overriding_configured_ids() {
+        let mut config = example();
+        config.validate().unwrap();
+        let cameras = vec![
+            UsbCamera {
+                id: "front".into(),
+                device: "/dev/video9".into(),
+                microphone: None,
+            },
+            UsbCamera {
+                id: "usb-Cam".into(),
+                device: "/dev/v4l/by-id/usb-Cam-video-index0".into(),
+                microphone: Some("plughw:CARD=Cam,DEV=0".into()),
+            },
+        ];
+        let mut disabled = config.clone();
+        disabled.usb_cameras.as_mut().unwrap().enabled = false;
+        add_usb_streams(&mut disabled, cameras.clone());
+        assert_eq!(disabled.streams.len(), 1);
+        add_usb_streams(&mut config, cameras);
+        assert_eq!(config.streams.len(), 2);
+        let usb = &config.streams[1];
+        assert_eq!(usb.id, "usb-Cam");
+        let args = ffmpeg_args(&config, usb, "fixture-only");
+        for expected in [
+            ["-f", "v4l2"],
+            ["-input_format", "mjpeg"],
+            ["-video_size", "1280x720"],
+            ["-i", "/dev/v4l/by-id/usb-Cam-video-index0"],
+            ["-c:v", "libx264"],
+            ["-g", "30"],
+        ] {
+            assert!(args.windows(2).any(|pair| pair == expected));
+        }
+        assert!(!args.contains(&"pipe:0".to_string()));
+        assert!(args.last().unwrap().ends_with(":8554/usb-Cam"));
+        for expected in [
+            ["-f", "alsa"],
+            ["-i", "plughw:CARD=Cam,DEV=0"],
+            ["-map", "1:a:0"],
+            ["-c:a", "aac"],
+        ] {
+            assert!(args.windows(2).any(|pair| pair == expected));
+        }
+        let mut muted = example();
+        muted.usb_cameras.as_mut().unwrap().audio = false;
+        add_usb_streams(
+            &mut muted,
+            vec![UsbCamera {
+                id: "usb-Cam".into(),
+                device: "/dev/video0".into(),
+                microphone: Some("plughw:CARD=Cam,DEV=0".into()),
+            }],
+        );
+        assert_eq!(muted.streams[1].audio_device, None);
+        assert!(ffmpeg_args(&muted, &muted.streams[1], "fixture-only").contains(&"-an".into()));
+        let mut bad = example();
+        bad.usb_cameras.as_mut().unwrap().encoder = "h265".into();
+        assert!(bad.validate().is_err());
     }
 
     #[tokio::test]
