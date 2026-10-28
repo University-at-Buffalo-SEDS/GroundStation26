@@ -4,6 +4,9 @@
 //! No AUX, GRANT, receive windows, accumulated idle credit or blocking sleep.
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TailKind { CommandPair, SingleCommand, Receipt }
+
 pub(crate) struct Capacity {
     next: Option<(Instant, Option<u64>)>,
     next_packet: Option<(Instant, Option<u64>)>,
@@ -19,7 +22,7 @@ pub(crate) struct Capacity {
     late_command_len: u8,
     late_command_virtual: bool,
     command_tail_open: bool,
-    tail_is_receipt: bool,
+    tail_kind: TailKind,
     ordinary_service_credit_ms: u8,
     extra_close_owed: bool,
     packet_burst_ms: u16,
@@ -75,7 +78,7 @@ impl Capacity {
     fn control_tail_ready(&self, wall: Instant, clock: Option<u64>, id: u64, bytes: usize, canonical: bool, receipt: bool) -> bool {
         let Some((quiet, quiet_clock)) = self.next_packet else { return false; };
         let gap = u64::from(self.packet_gap_ms);
-        if !self.command_tail_open || self.tail_is_receipt != receipt || !(2..=55).contains(&gap) { return false; }
+        if !self.command_tail_open || (self.tail_kind == TailKind::Receipt) != receipt || !(2..=55).contains(&gap) { return false; }
         let opened = (quiet - Duration::from_millis(gap), quiet_clock.map(|t| t.saturating_sub(gap)));
         let until = (opened.0 + Duration::from_millis(gap / 2), opened.1.map(|t| t.saturating_add(gap / 2)));
         let promoted_command = !receipt && self.promotion_contracts[..usize::from(self.promotion_contract_count)]
@@ -101,7 +104,7 @@ impl Capacity {
     /// packet. A partial write consumes the slot; no new close credit is given.
     pub(crate) fn allow_single_receipt_tail(&mut self, id: u64, bytes: usize) {
         self.allow_single_command_tail(id, bytes);
-        if self.command_tail_open { self.tail_is_receipt = true; }
+        if self.command_tail_open { self.tail_kind = TailKind::Receipt; }
     }
 
     /// A successful pair can accept its third command while the same modem
@@ -118,7 +121,7 @@ impl Capacity {
             self.late_command_len = bytes as u8;
             self.late_command_virtual = clock.is_some();
             self.command_tail_open = true;
-            self.tail_is_receipt = false;
+            self.tail_kind = TailKind::CommandPair;
         }
     }
     /// Air serialization can deliver the second relay command after the first
@@ -135,7 +138,7 @@ impl Capacity {
             self.late_command_len = bytes as u8;
             self.late_command_virtual = clock.is_some();
             self.command_tail_open = true;
-            self.tail_is_receipt = false;
+            self.tail_kind = TailKind::SingleCommand;
         }
     }
     fn late_sibling_ready(
@@ -149,7 +152,7 @@ impl Capacity {
         let first_id = self.late_command_id;
         let first_len = usize::from(self.late_command_len);
         let virtual_domain = self.late_command_virtual;
-        if first_len == 0 || self.command_tail_open {
+        if first_len == 0 || (self.command_tail_open && self.tail_kind != TailKind::SingleCommand) {
             return false;
         }
         canonical_unsequenced
@@ -399,7 +402,7 @@ impl Capacity {
             late_command_len: 0,
             late_command_virtual: false,
             command_tail_open: false,
-            tail_is_receipt: false,
+            tail_kind: TailKind::CommandPair,
             ordinary_service_credit_ms: 0,
             extra_close_owed: false,
             packet_burst_ms: 100,
@@ -611,6 +614,27 @@ impl Capacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn single_command_tail_keeps_the_unused_legacy_loan_after_the_quiet_gap() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 15, 16);
+        cap.committed(wall, Some(1000), 21);
+        cap.drained_virtual(1_001_824);
+        assert!(cap.ready_for_command(wall, Some(1002), 1, 55, true));
+        cap.committed_command(wall, Some(1002), (1, 55), true, 55, true);
+        cap.drained_virtual(1_006_775);
+        assert!(cap.close_packet_batch_for_contract(wall, Some(1002), Some((1, false))));
+        cap.allow_single_command_tail(1, 55);
+        assert!(cap.ready_for_command(wall, Some(1008), 2, 55, true));
+        assert!(!cap.ready_for_command(wall, Some(1036), 2, 55, true));
+        assert!(cap.ready_for_command(wall, Some(1063), 2, 55, true),
+            "an unused short window must retain the original post-gap loan");
+        let boundary = cap.last_forced_boundary;
+        assert!(cap.committed_command(wall, Some(1008), (2, 55), true, 55, true));
+        assert_eq!(cap.last_forced_boundary, boundary);
+        assert!(!cap.ready_for_command(wall, Some(1014), 3, 55, true));
+    }
+
     #[test]
     fn receipt_tail_preserves_debt_slot_and_command_identity() {
         let wall = Instant::now();

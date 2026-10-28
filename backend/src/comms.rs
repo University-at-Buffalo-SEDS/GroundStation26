@@ -2611,6 +2611,10 @@ impl CommsDevice for UartComms {
                     contract,
                 );
                 }
+                #[cfg(target_os = "linux")]
+                if promoted && let Some(id) = command_id {
+                    capacity.allow_single_command_tail(id, len + RAW_UART_FRAME_HEADER_SIZE);
+                }
                 if promoted
                     && contract.is_some_and(|(_, receipt)| receipt)
                     && let Some(mesh) = &self.recovery
@@ -4554,6 +4558,52 @@ mod raw_uart_tests {
         assert!(!uart.transmit_ready_for(255, &packets[3]), "UART completion must not renew the third slot");
         let state = uart.write_lock.lock().unwrap();
         assert!(!state.radio_capacity.as_ref().unwrap().ready(Instant::now(), Some(30025)), "all original per-frame airtime debt remains owed");
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", any(feature = "hitl_mode", feature = "firmware_sim")))]
+    fn primary_late_single_command_joins_only_one_existing_uart_packet() {
+        const CHILD: &str = "GS_PRIMARY_SINGLE_TAIL_PTY_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::primary_late_single_command_joins_only_one_existing_uart_packet";
+        if std::env::var_os(CHILD).is_none() {
+            let clock = std::env::temp_dir().join(format!("gs-primary-single-tail-{}.clock", std::process::id()));
+            std::fs::write(&clock, "35000").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1").env("GS_SIM_CLOCK_FILE", &clock)
+                .env("GS_SIMULATED_SERIAL_PTY", "1").output().unwrap();
+            let _ = std::fs::remove_file(clock);
+            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let clock = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
+        let packets = ["AV_BAY_UNDERGLOW", "FLIGHT_COMMAND", "FLIGHT_BUZZER"].map(|name| {
+            serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type(name),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")], "GS", 1,
+                std::sync::Arc::from([1u8])).unwrap()).to_vec()
+        });
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(100)).unwrap();
+        let (mut uart, shared, _) = recovery_uart_fixture(port);
+        uart.write_lock.lock().unwrap().radio_capacity = Some(rfd_capacity::Capacity::new(64000, 15, 16));
+        std::fs::write(&clock, "35002").unwrap();
+        uart.send_data_with_priority(&packets[0], 255).unwrap();
+        assert!(!uart.transmit_ready_for(255, &packets[1]), "actual UART stop bit still applies");
+        std::fs::write(&clock, "35008").unwrap();
+        assert!(uart.transmit_ready_for(255, &packets[1]), "late producer must use the primary's still-open packet");
+        uart.send_data_with_priority(&packets[1], 255).unwrap();
+        let expected = packets[..2].iter().flat_map(|p| {
+            let mesh = shared.lock().unwrap();
+            build_raw_uart_command_frame(&mesh.local_tx(false, p, mesh.now()).unwrap().bytes).unwrap()
+        }).collect::<Vec<_>>();
+        assert!(expected.len() <= RADIO_COMMAND_BATCH_MAX_BYTES);
+        let mut actual = vec![0; expected.len()];peer.read_exact(&mut actual).unwrap();assert_eq!(actual, expected);
+        std::fs::write(&clock, "35014").unwrap();
+        assert!(!uart.transmit_ready_for(255, &packets[2]), "the single continuation is consumed");
+        let error = uart.send_data_with_priority(&packets[2], 255).unwrap_err();
+        assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(peer.bytes_to_read().unwrap(), 0);
     }
 
     #[test]
