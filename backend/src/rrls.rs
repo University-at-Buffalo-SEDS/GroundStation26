@@ -257,6 +257,8 @@ pub struct Mesh {
     settings_peer_seen: Option<u64>,
     settings_inbox: VecDeque<Vec<u8>>,
     started: Instant,
+    // The shared simulation clock survives host process restarts.
+    clock_origin_ms: u64,
     session: u32,
     sequence: u32,
     last_health_sent: Option<u64>,
@@ -297,6 +299,7 @@ impl Mesh {
             settings_peer_seen: None,
             settings_inbox: VecDeque::new(),
             started: Instant::now(),
+            clock_origin_ms: crate::simulation_clock_ms().unwrap_or(0),
             session,
             sequence: 0,
             last_health_sent: None,
@@ -373,7 +376,7 @@ impl Mesh {
 
     pub fn tick(&mut self, now: u64) {
         if self.role == Role::Primary {
-            if self.last_direct.map_or(now, |v| now.saturating_sub(v)) >= LOSS_MS {
+            if self.last_direct.map_or(now.saturating_sub(self.clock_origin_ms), |v| now.saturating_sub(v)) >= LOSS_MS {
                 self.fallback = true;
             } else if self
                 .direct_since
@@ -1446,6 +1449,36 @@ mod tests {
             (DOWN_DATA, bytes.as_ref())
         );
     }
+    #[test]
+    #[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
+    fn process_restart_uses_its_boot_clock_for_the_initial_loss_deadline() {
+        const CHILD: &str = "GS_RELAY_BOOT_CLOCK_CHILD";
+        const NAME: &str = "rrls::tests::process_restart_uses_its_boot_clock_for_the_initial_loss_deadline";
+        if std::env::var_os(CHILD).is_none() {
+            let clock = std::env::temp_dir().join(format!("gs-relay-boot-{}.clock", std::process::id()));
+            std::fs::write(&clock, "80008").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1").env("GS_SIM_CLOCK_FILE", &clock).output().unwrap();
+            let _ = std::fs::remove_file(clock);
+            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let mut mesh = Mesh::new(Role::Primary, 3);
+        assert_eq!(mesh.now(), 80008);
+        for now in [80008, 81008, 83007] {
+            mesh.tick(now);
+            assert!(!mesh.fallback, "fresh process has not yet observed three seconds without a direct link");
+            assert_eq!(mesh.topology_observation(now).direct_age_ms, None, "boot clock must never fabricate observed direct traffic");
+        }
+        mesh.tick(83008);
+        assert!(mesh.fallback, "the original three-second loss threshold remains exact");
+        mesh.direct(83009);
+        for now in [83509, 84009, 84509, 85008] { mesh.direct(now); }
+        mesh.tick(85008); assert!(mesh.fallback);
+        mesh.tick(85009); assert!(!mesh.fallback, "the original two-second restoration hysteresis remains exact");
+    }
+
     #[test]
     fn delayed_ready_is_presence_without_extending_command_lease() {
         let mut mesh = Mesh::new(Role::Primary, 42);
