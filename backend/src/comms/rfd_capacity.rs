@@ -18,7 +18,7 @@ pub(crate) struct Capacity {
     late_command_id: u64,
     late_command_len: u8,
     late_command_virtual: bool,
-    late_command_is_pair: bool,
+    command_tail_open: bool,
     ordinary_service_credit_ms: u8,
     extra_close_owed: bool,
     packet_burst_ms: u16,
@@ -71,7 +71,7 @@ impl Capacity {
     fn batch_tail_ready(&self, wall: Instant, clock: Option<u64>, id: u64, bytes: usize, canonical: bool) -> bool {
         let Some((quiet, quiet_clock)) = self.next_packet else { return false; };
         let gap = u64::from(self.packet_gap_ms);
-        if !self.late_command_is_pair || !(2..=55).contains(&gap) { return false; }
+        if !self.command_tail_open || !(2..=55).contains(&gap) { return false; }
         // The quiet deadline already includes the physical/modelled UART
         // drain. Derive the collection interval without another clock/queue.
         let opened = (quiet - Duration::from_millis(gap), quiet_clock.map(|t| t.saturating_sub(gap)));
@@ -98,7 +98,23 @@ impl Capacity {
             self.late_command_id = ids[0];
             self.late_command_len = bytes as u8;
             self.late_command_virtual = clock.is_some();
-            self.late_command_is_pair = true;
+            self.command_tail_open = true;
+        }
+    }
+    /// Air serialization can deliver the second relay command after the first
+    /// was already written. Reserve only one continuation in that same packet;
+    /// it consumes no extra close permit and cannot authorize a fresh pair.
+    pub(crate) fn allow_single_command_tail(&mut self, id: u64, bytes: usize) {
+        if bytes == 0 || bytes >= super::RADIO_COMMAND_BATCH_MAX_BYTES
+            || !(2..=55).contains(&self.packet_gap_ms)
+            || !self.promotion_contracts[..usize::from(self.promotion_contract_count)].contains(&id) {
+            return;
+        }
+        if let Some((_, clock)) = self.next_packet {
+            self.late_command_id = id;
+            self.late_command_len = bytes as u8;
+            self.late_command_virtual = clock.is_some();
+            self.command_tail_open = true;
         }
     }
     fn late_sibling_ready(
@@ -112,7 +128,7 @@ impl Capacity {
         let first_id = self.late_command_id;
         let first_len = usize::from(self.late_command_len);
         let virtual_domain = self.late_command_virtual;
-        if first_len == 0 || self.late_command_is_pair {
+        if first_len == 0 || self.command_tail_open {
             return false;
         }
         canonical_unsequenced
@@ -158,7 +174,7 @@ impl Capacity {
             self.late_command_id = id;
             self.late_command_len = encoded_len as u8;
             self.late_command_virtual = clock.is_some();
-            self.late_command_is_pair = false;
+            self.command_tail_open = false;
         }
         if batch_tail && full_io_success && accepted == encoded_len {
             // This continues the pair's physical packet; it does not spend
@@ -361,7 +377,7 @@ impl Capacity {
             late_command_id: 0,
             late_command_len: 0,
             late_command_virtual: false,
-            late_command_is_pair: false,
+            command_tail_open: false,
             ordinary_service_credit_ms: 0,
             extra_close_owed: false,
             packet_burst_ms: 100,
@@ -412,7 +428,7 @@ impl Capacity {
         }
         if share != self.share_percent {
             self.late_command_len = 0;
-            self.late_command_is_pair = false;
+            self.command_tail_open = false;
         }
         self.share_percent = share;
     }
@@ -525,7 +541,7 @@ impl Capacity {
     ) {
         if framed_bytes > 0 {
             self.late_command_len = 0;
-            self.late_command_is_pair = false;
+            self.command_tail_open = false;
         }
         let bps = (self.air_bps as u128 * self.share_percent as u128 / 100).max(1);
         let millis = ((framed_bytes as u128 + self.overhead_bytes as u128) * 8 * 1000)
@@ -1413,6 +1429,27 @@ mod command_batch_tail_tests {
         cap.allow_command_batch_tail([1, 2], 118);
         (cap, wall)
     }
+    #[test]
+    fn late_single_relay_window_has_one_slot_and_needs_a_completed_close() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 15, 16);
+        cap.committed(wall, Some(30000), 21);
+        cap.committed_command(wall, Some(30002), (1, 55), true, 55, true);
+        cap.drained_virtual(30007000);
+        cap.allow_single_command_tail(1, 55);
+        assert!(!cap.command_tail_open, "unpromoted IO cannot grant a continuation");
+        assert!(cap.close_packet_batch_for_contract(wall, Some(30002), Some((1, false))));
+        cap.allow_single_command_tail(1, 55);
+        assert!(!cap.ready_for_command(wall, Some(30006), 2, 62, true));
+        assert!(cap.ready_for_command(wall, Some(30018), 2, 137, true));
+        assert!(!cap.ready_for_command(wall, Some(30018), 2, 138, true));
+        assert!(!cap.ready_for_command(wall, Some(30018), 1, 62, true));
+        assert!(!cap.ready_for_command(wall, Some(30034), 2, 62, true));
+        assert!(cap.committed_command(wall, Some(30018), (2, 62), true, 62, true));
+        assert!(!cap.ready_for_command(wall, Some(30018), 3, 1, true));
+        assert!(!cap.command_tail_open);
+    }
+
     #[test]
     fn late_third_retains_per_frame_airtime_and_one_boundary() {
         let (mut cap, wall) = pair();
