@@ -838,7 +838,11 @@ impl UartComms {
                 break;
             };
             if write_state.radio_capacity.as_ref().is_some_and(|cap| {
-                if let Some(id) = transmission.single_command_contract() {
+                if let Some((id, receipt)) = transmission.single_control_contract() {
+                    if receipt {
+                        return !cap.ready_for_receipt(capacity_wall, capacity_clock, id,
+                            transmission.frame().bytes.len() + RAW_UART_FRAME_HEADER_SIZE);
+                    }
                     return !cap.ready_for_command(
                         capacity_wall, capacity_clock, id,
                         transmission.frame().bytes.len() + RAW_UART_FRAME_HEADER_SIZE, true,
@@ -917,11 +921,16 @@ impl UartComms {
                             lengths,
                             accepted,
                         );
-                    } else if let Some(id) = transmission.single_command_contract() {
+                    } else if let Some((id, receipt)) = transmission.single_control_contract() {
+                        if receipt {
+                            joined_packet = capacity.committed_receipt(capacity_wall, capacity_clock,
+                                id, framed.len(), accepted, io_result.is_ok());
+                        } else {
                         joined_packet = capacity.committed_command(
                             capacity_wall, capacity_clock, (id, framed.len()), true,
                             accepted, io_result.is_ok(),
                         );
+                        }
                     } else {
                         capacity.committed(capacity_wall, capacity_clock, accepted);
                     }
@@ -951,8 +960,9 @@ impl UartComms {
                         }
                     }
                     if promoted {
-                        if let Some(id) = transmission.single_command_contract() {
-                            capacity.allow_single_command_tail(id, framed.len());
+                        if let Some((id, receipt)) = transmission.single_control_contract() {
+                            if receipt { capacity.allow_single_receipt_tail(id, framed.len()); }
+                            else { capacity.allow_single_command_tail(id, framed.len()); }
                         } else if let Some([(first, false), (second, false)]) = contracts {
                             capacity.allow_command_batch_tail([first, second], framed.len());
                         }
@@ -4610,6 +4620,76 @@ mod raw_uart_tests {
         std::fs::write(&clock, "35200").unwrap();
         uart.flush_recovery_output(0).unwrap();
         let expected = build_raw_uart_command_frame(&wrap(5, &packets[2])).unwrap();
+        let mut actual = vec![0; expected.len()];
+        peer.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert!(shared.lock().unwrap().begin_transmission(35200).is_none());
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", any(feature = "hitl_mode", feature = "firmware_sim")))]
+    fn relay_air_serialized_receipt_sibling_keeps_one_packet_and_retained_ownership() {
+        const CHILD: &str = "GS_RELAY_LATE_RECEIPT_PTY_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::relay_air_serialized_receipt_sibling_keeps_one_packet_and_retained_ownership";
+        if std::env::var_os(CHILD).is_none() {
+            let clock = std::env::temp_dir().join(format!("gs-relay-late-receipt-{}.clock", std::process::id()));
+            std::fs::write(&clock, "35000").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1").env("GS_SIM_CLOCK_FILE", &clock)
+                .env("GS_SIMULATED_SERIAL_PTY", "1").output().unwrap();
+            let _ = std::fs::remove_file(clock);
+            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let clock = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
+        let wrap = |kind: u8, payload: &[u8]| {
+            let mut bytes = vec![b'R', b'R', 1, kind];
+            bytes.extend_from_slice(payload);
+            bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
+            bytes
+        };
+        let packets = [101u64, 102, 103].map(|id| {
+            serialize::pack_packet(&Packet::new(sedsnet::config::DataType::ReliableAck,
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")], "RF", id,
+                std::sync::Arc::from(id.to_le_bytes())).unwrap()).to_vec()
+        });
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(100)).unwrap();
+        let (mut uart, shared, _) = recovery_uart_fixture(port);
+        let mut mesh = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 2);
+        let mut health = 1u32.to_le_bytes().to_vec();
+        health.extend_from_slice(&1u32.to_le_bytes());
+        health.push(0);
+        mesh.incoming(true, &wrap(0, &health), 35000);
+        assert!(mesh.active(35000));
+        *shared.lock().unwrap() = mesh;
+        uart.write_lock.lock().unwrap().radio_capacity = Some(rfd_capacity::Capacity::new(64000, 15, 16));
+        for (i, now) in [(0, 35089), (1, 35095)] {
+            std::fs::write(&clock, now.to_string()).unwrap();
+            shared.lock().unwrap().incoming(false, &packets[i], now);
+            uart.flush_recovery_output(0).unwrap();
+            let expected = build_raw_uart_command_frame(&wrap(1, &packets[i])).unwrap();
+            let mut actual = vec![0; expected.len()];
+            peer.read_exact(&mut actual).expect("second air-serialized receipt must join the still-open relay packet");
+            assert_eq!(actual, expected);
+        }
+        // One late sibling consumes the only remaining slot; no fresh loan,
+        // priority bypass or dropped owner is allowed for the next receipt.
+        std::fs::write(&clock, "35101").unwrap();
+        shared.lock().unwrap().incoming(false, &packets[2], 35101);
+        uart.flush_recovery_output(0).unwrap();
+        assert_eq!(peer.bytes_to_read().unwrap(), 0);
+        {
+            let mut mesh = shared.lock().unwrap();
+            let owned = mesh.begin_transmission(35101).expect("refused third receipt remains owned");
+            assert_eq!(owned.frame().bytes, wrap(1, &packets[2]));
+            mesh.finish_transmission(owned, false);
+        }
+        std::fs::write(&clock, "35200").unwrap();
+        uart.flush_recovery_output(0).unwrap();
+        let expected = build_raw_uart_command_frame(&wrap(1, &packets[2])).unwrap();
         let mut actual = vec![0; expected.len()];
         peer.read_exact(&mut actual).unwrap();
         assert_eq!(actual, expected);

@@ -210,12 +210,9 @@ impl Transmission {
             Self::batch_contract(self.follower.as_ref()?)?,
         ])
     }
-    pub(crate) fn single_command_contract(&self) -> Option<u64> {
-        if self.follower.is_some() {
-            return None;
-        }
+    pub(crate) fn single_control_contract(&self) -> Option<(u64, bool)> {
+        if self.follower.is_some() { return None; }
         Self::batch_contract(&self.queued)
-            .and_then(|(id, receipt)| (!receipt).then_some(id))
     }
     fn batch_contract(queued: &Queued) -> Option<(u64, bool)> {
         if queued.priority < 254 || queued.independent_discovery {

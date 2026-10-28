@@ -19,6 +19,7 @@ pub(crate) struct Capacity {
     late_command_len: u8,
     late_command_virtual: bool,
     command_tail_open: bool,
+    tail_is_receipt: bool,
     ordinary_service_credit_ms: u8,
     extra_close_owed: bool,
     packet_burst_ms: u16,
@@ -69,20 +70,38 @@ impl Capacity {
                 || self.batch_tail_ready(wall, clock, id, encoded_len, canonical_unsequenced))
     }
     fn batch_tail_ready(&self, wall: Instant, clock: Option<u64>, id: u64, bytes: usize, canonical: bool) -> bool {
+        self.control_tail_ready(wall, clock, id, bytes, canonical, false)
+    }
+    fn control_tail_ready(&self, wall: Instant, clock: Option<u64>, id: u64, bytes: usize, canonical: bool, receipt: bool) -> bool {
         let Some((quiet, quiet_clock)) = self.next_packet else { return false; };
         let gap = u64::from(self.packet_gap_ms);
-        if !self.command_tail_open || !(2..=55).contains(&gap) { return false; }
-        // The quiet deadline already includes the physical/modelled UART
-        // drain. Derive the collection interval without another clock/queue.
+        if !self.command_tail_open || self.tail_is_receipt != receipt || !(2..=55).contains(&gap) { return false; }
         let opened = (quiet - Duration::from_millis(gap), quiet_clock.map(|t| t.saturating_sub(gap)));
         let until = (opened.0 + Duration::from_millis(gap / 2), opened.1.map(|t| t.saturating_add(gap / 2)));
-        canonical && bytes > 0 && self.late_command_len > 0
-            && !self.promotion_contracts[..usize::from(self.promotion_contract_count)].contains(&id)
+        let promoted_command = !receipt && self.promotion_contracts[..usize::from(self.promotion_contract_count)]
+            .contains(&id);
+        canonical && bytes > 0 && self.late_command_len > 0 && !promoted_command
             && usize::from(self.late_command_len).checked_add(bytes)
                 .is_some_and(|total| total <= super::RADIO_COMMAND_BATCH_MAX_BYTES)
             && clock.is_some() == self.late_command_virtual
             && Self::reached(Some(opened), wall, clock)
             && !Self::reached(Some(until), wall, clock)
+    }
+    pub(crate) fn ready_for_receipt(&self, wall: Instant, clock: Option<u64>, id: u64, bytes: usize) -> bool {
+        self.ready_for(wall, clock, true) || self.control_tail_ready(wall, clock, id, bytes, true, true)
+    }
+    pub(crate) fn committed_receipt(&mut self, wall: Instant, clock: Option<u64>, id: u64, bytes: usize, accepted: usize, complete: bool) -> bool {
+        if accepted == 0 { return false; }
+        let joined = self.control_tail_ready(wall, clock, id, bytes, true, true);
+        self.committed(wall, clock, accepted);
+        if joined && complete && accepted == bytes { self.remember_promotion(id, true); }
+        joined
+    }
+    /// One later canonical receipt can share the first receipt's already-open
+    /// packet. A partial write consumes the slot; no new close credit is given.
+    pub(crate) fn allow_single_receipt_tail(&mut self, id: u64, bytes: usize) {
+        self.allow_single_command_tail(id, bytes);
+        if self.command_tail_open { self.tail_is_receipt = true; }
     }
 
     /// A successful pair can accept its third command while the same modem
@@ -99,6 +118,7 @@ impl Capacity {
             self.late_command_len = bytes as u8;
             self.late_command_virtual = clock.is_some();
             self.command_tail_open = true;
+            self.tail_is_receipt = false;
         }
     }
     /// Air serialization can deliver the second relay command after the first
@@ -115,6 +135,7 @@ impl Capacity {
             self.late_command_len = bytes as u8;
             self.late_command_virtual = clock.is_some();
             self.command_tail_open = true;
+            self.tail_is_receipt = false;
         }
     }
     fn late_sibling_ready(
@@ -378,6 +399,7 @@ impl Capacity {
             late_command_len: 0,
             late_command_virtual: false,
             command_tail_open: false,
+            tail_is_receipt: false,
             ordinary_service_credit_ms: 0,
             extra_close_owed: false,
             packet_burst_ms: 100,
@@ -589,6 +611,29 @@ impl Capacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn receipt_tail_preserves_debt_slot_and_command_identity() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 15, 16);
+        cap.committed(wall, Some(1000), 62);
+        cap.drained_virtual(1_005_400);
+        assert!(cap.close_packet_batch_for_contract(wall, Some(1000), Some((10, true))));
+        cap.allow_single_receipt_tail(10, 62);
+        let debt = cap.next;
+        assert!(cap.ready_for_receipt(wall, Some(1006), 11, 62));
+        assert!(!cap.ready_for_command(wall, Some(1006), 11, 55, true));
+        // Different owners may acknowledge the same logical packet. Joining
+        // this one existing packet gives duplicates no additional close credit.
+        assert!(cap.ready_for_receipt(wall, Some(1006), 10, 62));
+        assert!(!cap.ready_for_receipt(wall, Some(1006), 11, 131));
+        assert!(!cap.ready_for_receipt(wall, Some(1033), 11, 62));
+        assert!(!cap.committed_receipt(wall, Some(1006), 11, 62, 0, false));
+        assert!(cap.ready_for_receipt(wall, Some(1006), 11, 62));
+        assert!(cap.committed_receipt(wall, Some(1006), 11, 62, 1, false));
+        assert!(!cap.ready_for_receipt(wall, Some(1007), 12, 62));
+        assert!(cap.next.unwrap().1.unwrap() >= debt.unwrap().1.unwrap());
+    }
+
     #[test]
     fn paired_receipt_and_command_share_one_existing_permit_with_distinct_dedup_bits() {
         let wall = Instant::now();
