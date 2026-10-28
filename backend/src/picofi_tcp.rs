@@ -804,18 +804,28 @@ mod tests {
     }
     #[test]
     fn server_accepts_existing_pico_handshake_and_independent_writer() {
-        let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = reserved.local_addr().unwrap();
-        drop(reserved);
-        let config = PicoFiTcpConfig {
-            discovery: false,
-            discovery_port: discovery_wire::PORT,
-            discovery_interface: None,
-            mode: TcpMode::Server,
-            address: address.to_string(),
-            allowed_peer: None,
-        };
-        let device = PicoFiTcp::open(&config).unwrap();
+        // Manual configuration needs a nonzero port. Another parallel socket
+        // test can claim a released reservation before open binds it; retry
+        // only that setup race, keeping all handshake assertions unchanged.
+        let (device, address) = (0..16).find_map(|_| {
+            let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = reserved.local_addr().unwrap();
+            drop(reserved);
+            let config = PicoFiTcpConfig {
+                discovery: false,
+                discovery_port: discovery_wire::PORT,
+                discovery_interface: None,
+                mode: TcpMode::Server,
+                address: address.to_string(),
+                allowed_peer: None,
+            };
+            match PicoFiTcp::open(&config) {
+                Ok(device) => Some((device, address)),
+                Err(error) if error.downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse) => None,
+                Err(error) => panic!("{error:#}"),
+            }
+        }).expect("manual server could not acquire a port after sixteen reservations");
         let mut peer = TcpStream::connect(address).unwrap();
         handshake(&mut peer, true).unwrap();
         peer.set_nonblocking(false).unwrap();
