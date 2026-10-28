@@ -1,0 +1,50 @@
+name: macOS backend check
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev]
+    paths:
+      - "backend/**"
+      - "shared/**"
+      - "Cargo.toml"
+      - ".github/workflows/macos-backend-check.yml"
+  pull_request:
+    branches: [dev, main]
+    paths:
+      - "backend/**"
+      - "shared/**"
+      - "Cargo.toml"
+      - ".github/workflows/macos-backend-check.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  macos-backend:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      GS_FRONTEND_SOURCE_DIR: ${{ github.workspace }}/frontend-source
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: station
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: Rylan-Meilutis/Seds-Ground-Station-Frontend
+          ref: main
+          path: frontend-source
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          rustup toolchain install stable --profile minimal
+          brew install cmake opus pkg-config
+      - name: Check normal backend and test targets on macOS
+        working-directory: station
+        run: cargo +stable check -p groundstation_backend --all-targets
+      - name: Check HITL backend and test targets on macOS
+        working-directory: station
+        run: cargo +stable check -p groundstation_backend --all-targets --features hitl_mode
