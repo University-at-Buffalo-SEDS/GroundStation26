@@ -252,6 +252,14 @@ async fn wait_for_validation_reliable_delivery(
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(1_000);
+    // A 100 ms wall poll can report a sub-500 ms model receipt after its
+    // deadline. Sample more closely in simulation; keep the source clock,
+    // minimum observation period and delivery limit unchanged.
+    let poll_interval = if started.simulated_ms.is_some() {
+        Duration::from_millis(10)
+    } else {
+        Duration::from_millis(100)
+    };
     let mut delivery_ms = None;
     let mut last_pending = Vec::new();
     loop {
@@ -325,7 +333,7 @@ async fn wait_for_validation_reliable_delivery(
             );
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
