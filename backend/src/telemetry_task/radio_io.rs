@@ -761,7 +761,7 @@ mod priority_tests {
             for round in 0..2 {
                 for flow in 0..8 {
                     let packet = Packet::new(
-                        crate::telemetry_schema::data_type("BATTERY_VOLTAGE"),
+                        crate::telemetry_schema::data_type("FUEL_FLOW"),
                         &[endpoint],
                         &format!("FLOW{flow}"),
                         round * 8 + flow,

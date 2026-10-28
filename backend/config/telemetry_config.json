@@ -116,7 +116,7 @@
         "GROUND_STATION",
         "SD_CARD"
       ],
-      "reliable": "Off",
+      "reliable": "Unordered",
       "priority": 0
     },
     {
@@ -132,7 +132,7 @@
         "GROUND_STATION",
         "SD_CARD"
       ],
-      "reliable": "Off",
+      "reliable": "Unordered",
       "priority": 0
     },
     {

@@ -1070,10 +1070,13 @@ impl Mesh {
             Some(FrameClass {
                 priority: if gps {
                     255
-                } else if sedsnet::is_reliable_type(p.envelope.ty)
-                    || p.reliable.is_some_and(|header| {
-                        header.flags & sedsnet::wire_format::RELIABLE_FLAG_UNSEQUENCED == 0
-                    })
+                // Reliable low-priority telemetry keeps its schema priority and
+                // telemetry lifetime; use the UART batch-closing priority floor.
+                } else if sedsnet::message_priority(p.envelope.ty) >= 16
+                    && (sedsnet::is_reliable_type(p.envelope.ty)
+                        || p.reliable.is_some_and(|header| {
+                            header.flags & sedsnet::wire_format::RELIABLE_FLAG_UNSEQUENCED == 0
+                        }))
                 {
                     254
                 } else {
@@ -2322,6 +2325,49 @@ mod tests {
             assert_eq!(m.pop(1).unwrap().bytes, vec![b]);
         }
     }
+    #[test]
+    fn reliable_telemetry_headers_preserve_schema_priority() {
+        crate::telemetry_schema::initialize().unwrap();
+        for name in ["BATTERY_VOLTAGE", "BATTERY_CURRENT", "FLIGHT_COMMAND"] {
+            let ty = crate::telemetry_schema::data_type(name);
+            assert!(sedsnet::is_reliable_type(ty));
+            let payload = if name == "FLIGHT_COMMAND" {
+                vec![1]
+            } else {
+                vec![0; 4]
+            };
+            let packet = sedsnet::packet::Packet::new(
+                ty,
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "RF",
+                0,
+                payload.into(),
+            )
+            .unwrap();
+            for flags in [0, sedsnet::wire_format::RELIABLE_FLAG_UNSEQUENCED] {
+                let wire = sedsnet::wire_format::pack_packet_with_reliable(
+                    &packet,
+                    sedsnet::wire_format::ReliableHeader {
+                        flags,
+                        seq: 7,
+                        ack: 0,
+                    },
+                );
+                let mut relay = Mesh::new(Role::Rrls, 2);
+                let expected = if name == "FLIGHT_COMMAND" {
+                    254
+                } else {
+                    sedsnet::transport_priority(ty)
+                };
+                assert_eq!(
+                    relay.classify(&wire).unwrap().priority,
+                    expected,
+                    "{name} flags{flags}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn telemetry_retention_does_not_extend_reliable_control_deadlines() {
         crate::telemetry_schema::initialize().unwrap();
