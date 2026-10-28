@@ -442,8 +442,10 @@ impl ValvePowerFreshness {
 
 #[derive(Default)]
 struct StreamRateProbe {
-    last_timestamp_ms: Option<u64>,
-    consecutive_valid_intervals: u32,
+    // Source cadence is independent of unordered transport arrival order.
+    // Keep only the bounded window required by the existing cadence gates.
+    timestamps: [u64; 6],
+    count: usize,
 }
 
 impl StreamRateProbe {
@@ -454,19 +456,34 @@ impl StreamRateProbe {
         maximum_interval_ms: u64,
         required_intervals: u32,
     ) -> bool {
-        let Some(previous) = self.last_timestamp_ms.replace(timestamp_ms) else {
-            return false;
-        };
-        if timestamp_ms <= previous {
+        let needed = required_intervals as usize + 1;
+        if needed < 2 || needed > self.timestamps.len() {
             return false;
         }
-        let interval = timestamp_ms - previous;
-        if (minimum_interval_ms..=maximum_interval_ms).contains(&interval) {
-            self.consecutive_valid_intervals += 1;
-        } else {
-            self.consecutive_valid_intervals = 0;
+        if self.count > needed {
+            self.timestamps
+                .copy_within(self.count - needed..self.count, 0);
+            self.count = needed;
         }
-        self.consecutive_valid_intervals >= required_intervals
+        if self.timestamps[..self.count].contains(&timestamp_ms) {
+            return false;
+        }
+        if self.count == needed {
+            if timestamp_ms < self.timestamps[0] {
+                return false;
+            }
+            self.timestamps.copy_within(1..needed, 0);
+            self.count -= 1;
+        }
+        let position = self.timestamps[..self.count].partition_point(|&t| t < timestamp_ms);
+        self.timestamps
+            .copy_within(position..self.count, position + 1);
+        self.timestamps[position] = timestamp_ms;
+        self.count += 1;
+        self.count == needed
+            && self.timestamps[..needed].windows(2).all(|pair| {
+                (minimum_interval_ms..=maximum_interval_ms).contains(&(pair[1] - pair[0]))
+            })
     }
 }
 
@@ -704,6 +721,55 @@ mod router_link_policy_tests {
         assert!(!probe.observe(2_010, 750, 1_250, 2));
         assert!(probe.observe(3_020, 750, 1_250, 2));
         assert!(!probe.observe(5_000, 750, 1_250, 2));
+    }
+
+    #[test]
+    fn source_cadence_accepts_reordering_but_not_missing_samples_or_replays() {
+        let mut probe = StreamRateProbe::default();
+        // Unordered telemetry arrives late without changing its source cadence.
+        for timestamp in [1000, 1400, 1200, 1800, 1600] {
+            assert!(!probe.observe(timestamp, 150, 250, 5));
+        }
+        assert!(probe.observe(2000, 150, 250, 5));
+        assert!(!probe.observe(1400, 150, 250, 5));
+        assert!(!probe.observe(3000, 150, 250, 5));
+        let mut missing = StreamRateProbe::default();
+        for timestamp in [1000, 1200, 1600, 1800, 2000, 1000, 1200, 1600, 1800, 2000] {
+            assert!(!missing.observe(timestamp, 150, 250, 5));
+        }
+    }
+
+    #[test]
+    fn captured_unordered_flight_streams_retain_their_source_cadence() {
+        let mut probe = StreamRateProbe::default();
+        let mut passed = false;
+        for timestamp in [
+            2185, 2385, 2987, 2586, 2787, 3387, 3987, 3787, 5196, 4595, 6002, 6405, 6605, 6805,
+            7205, 7005, 7605, 7405, 8005, 8595, 8395, 8795, 9796, 9997, 10627, 9396, 10417, 10837,
+            11244, 11444, 11044, 11645, 11846, 12046, 12256, 12664, 12865, 12464, 13065, 13465,
+            13265, 13665, 14064, 13865, 14254, 14444, 14843, 14643, 15043,
+        ] {
+            passed |= probe.observe(timestamp, 150, 250, 5);
+        }
+        assert!(
+            passed,
+            "IMU_DATA source cadence was lost by arrival ordering"
+        );
+        let mut probe = StreamRateProbe::default();
+        let mut passed = false;
+        for timestamp in [
+            2393, 2837, 3072, 2632, 3688, 3889, 3473, 4359, 4119, 4559, 5160, 5399, 6240, 5839,
+            6440, 7040, 6640, 6840, 7241, 7682, 8346, 8144, 7922, 8546, 9147, 9386, 9786, 9987,
+            10405, 10616, 10195, 11112, 10868, 11312, 11512, 11712, 11912, 12117, 12570, 12368,
+            12770, 12972, 13410, 13611, 14051, 14279, 14469, 13210, 14908, 14708, 15109, 15348,
+            15548,
+        ] {
+            passed |= probe.observe(timestamp, 150, 250, 5);
+        }
+        assert!(
+            passed,
+            "BAROMETER_DATA source cadence was lost by arrival ordering"
+        );
     }
 
     #[test]
