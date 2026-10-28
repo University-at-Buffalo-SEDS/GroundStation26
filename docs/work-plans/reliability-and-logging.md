@@ -4,14 +4,52 @@ Earlier completed entries in `antenna-and-comms.json` describe their recorded
 baseline. They do not qualify the current source or replace the gates below.
 No hardware is available; use the approved Jupiter simulator workspace.
 
+## Current source checkpoint — 2026-10-28
+
+This checkpoint supersedes the status summaries in the historical campaign
+entries below; their failures remain recorded evidence.
+
+- All seven firmware repositories now default to TLSF and compact packet stores
+  in both build.py and fresh CMake configurations. Signed commits are pushed to
+  their existing migration/sedlaunch-sedsnet-mainline branches. Explicit
+  ThreadX/heap fallback options remain available. All seven full release test
+  pipelines passed before pushing; fresh factory builds had zero warnings.
+- The current normal/HITL/mixed radio cohorts retain the original 500 ms
+  API-to-all-owner receipt limits, per-window DAQ delivery limits and zero CAN
+  drops. The worst measured receipt across those short cohorts was 486 ms.
+  These simulator results do not establish physical RF performance.
+- Dedicated 70-second logging acceptance passes with prepared FC/DAQ cards:
+  17,100 valve-pressure rows, 165,302 raw DAQ rows, and 3,357 paired raw/converted
+  FC sensor vectors. Read-only card inspection checks metadata, sequence
+  continuity and firmware accepted/processed/flushed counters. Buffered rows
+  at abrupt simulator shutdown are not counted as durable records.
+- Current-source 600-second logging/throughput acceptance is running. Keep
+  valve-pressure-daq-sd and fc-raw-calibrated-sd open until it completes and the
+  recovered cards are inspected.
+- All five saved mission adapters and the paired-settings conflict UI are
+  implemented. Two real native backend processes transfer the saved fill target
+  over synthetic PTYs in about 121 seconds while checklist traffic shares the
+  256-byte/second allowance. The earlier 90-second bootstrap timeout remains a
+  failed harness attempt, not evidence of a stalled link. Full-catalog,
+  offline-edit and restart acceptance now passes in two real native processes.
+  Paired exchange through the complete firmware bay remains a separate gate.
+- GroundStation dev fetches the separately maintained frontend at build time;
+  the UI gitlink and submodule metadata are removed. Direct Cargo, backend-only,
+  immutable frontend snapshots and Docker build inputs are covered.
+- SEDSnet 4.3.1 and macros 2.2.0 are published. GroundStation dev, frontend dev,
+  simulator main and the seven firmware migration branches contain the
+  qualified changes. No further SDK version change is needed for this checkpoint.
+- Native macOS CI, physical Raspberry Pi/radio checks and field endurance remain
+  open. No hardware access or flashing is part of this simulator campaign.
+
 - [ ] **valve-pressure-daq-sd** (in_progress): Record250 valve pressure samples/second on DAQ SD, retaining source uptime/frequency/UTC/sequence, raw ADC and converted pressure; existing50Hz GS reports unchanged. Four samples per dedicated DAQ-only VALVE_PRESSURE_LOG batch; bounded DMA capture and SD queues.
-  Evidence / remaining validation: DAQ190 and Valve138 unit tests pass; factory builds pass. Late-IRQ rejection and the actual Renode500Hz TIM3/ADC/DMA half/full/circular contract pass. Updated SD inspector and pressure-rate gates pass the62-test simulator Python suite. C19 amplifier startup passed, but its pressure/P6 short gate failed: zero high-rate capture and startup gateway drops. C20 read-only registers prove a simulator ADC read-set bug (ADSTART set, ADEN incorrectly cleared), with correct TIM3 trigger and no pressure initialization failures. Exact old-model negative control fails; repaired HAL enable/start plus actual Renode500Hz DMA/stop contracts pass. C21 confirmed pressure capture/publication/DAQ acceptance with zero pressure drops but failed amplifier startup with19 auxiliary rejections. C22 moves pressure formatting/SD locks off network RX, copies a bounded batch/session and tracks written/flushed rows.190 DAQ tests, ASan/UBSan handoff/retry and macOS production factory pass;63 simulator Python tests and ADC/UART DMA contracts pass. C22 still failed five CAN ring drops, eight boot auxiliary refusals and four PT publish refusals. C23 unchanged-firmware probes reproduced fragmented final schema assembly headroom refusals; no long run is accepted. A descriptor-allocation optimization is being tested in an isolated SDK prototype, not applied/released.
+  Evidence / remaining validation: The published TLSF/compact cohort passes the original 70-second pressure/rate/queue gates. Read-only DAQ inspection finds 17,100 pressure rows with continuous source sequences and reconciled accepted/processed/flushed counters. The current 600-second run and recovered-card inspection remain pending.
 
 - [ ] **fc-raw-calibrated-sd** (in_progress): Retain raw sensor codes and corresponding converted values together on FC SD, alongside existing logs, at configured SD cadence with no extra radio traffic.
-  Evidence / remaining validation: Eight SD regression tests pass; production factory fits474356/474624 bytes. Full172-test FC suite passes. Shared formatter/append code passes172 FC tests and production factory fits473932/474624 bytes (692 bytes headroom); simulator FC factory now also fits. Recovered-card/throughput validation remains pending; very small flash headroom must remain explicit.
+  Evidence / remaining validation: The published cohort passes its full release pipeline and factory build. Dedicated prepared-card acceptance finds 5,551 FC rows including 3,357 raw/converted sensor vectors; the inspector checks metadata and firmware write/flush counters. The current 600-second recovered-card gate remains pending.
 
 - [ ] **paired-mission-settings** (in_progress): Synchronize mission calibration and settings between explicitly paired GS and RRLS. Warning confirmed on RRLS. Application signing trust independent of HTTPS; per-channel revisions, persistence/reconnect/offline merge; no hardware config, passwords or device identity sync.
-  Evidence / remaining validation: Causal revision, atomic persistence, replay, concurrent conflict, stale-resolution and bounded loss/reorder transport tests pass. Application signature tests are added; backend typed adapters, radio budget/integration, conflict UI, fresh-data warning and paired-system qualification remain required. A signed two-station integration regression passes loss/duplication/reordering, independent offline channel edits, restart with retained conflicts and explicit reviewed-head resolution;19 tests and strict Clippy pass. No synchronization is claimed from core tests alone.
+  Evidence / remaining validation: All five inert mission adapters, signed causal histories and the conflict UI are implemented. The reusable native service harness passes all nine initial documents, checklist progress, independent offline edits, concurrent same-setting conflict, both service restarts, exact reviewed-head resolution and stale rejection. The full native workspace passes 897 tests (three existing ignored); Python discovery passes 71 tests (two existing skips); strict paired-settings Clippy passes. Complete firmware-bay pairing and physical acceptance remain separate.
 
 - [x] **compact-pt-editor** (complete): Cap PT limit editor width and input width; About secondary/smaller than Save, preserve other settings on save.
   Evidence / remaining validation: UI108 passed/7 existing ignored; Wasm build; isolated real-component browser checks at1440/390 widths and screenshots, help/save flows pass. Pushed to UI dev in1e6fc81, followed by89763ec (Tools-only clear action).
@@ -25,8 +63,8 @@ No hardware is available; use the approved Jupiter simulator workspace.
 - [ ] **current-platform-release** (pending): Build current sources on macOS and RaspberryPi/Linux; strict SDK checks for heap/compact/embedded; all firmware factory builds; final paired GS/RRLS tests and long soak; manual multiarch simulator build.
   Evidence / remaining validation: No relaxed drop/latency/freshness gates. Firmware main and GS version4 selectors retained. Hardware unavailable.
 
-- [ ] **publish-qualified-changes** (pending): Commit/push owned files, update SDK README/changelog/docs, release SDK4.2.5 locally on crates/PyPI and GitHub, manually publish simulator0.4.15 then push dependent board image refs and GS/UI.
-  Evidence / remaining validation: No public release before qualification. Exclude credentials/runtime/user spreadsheets. No physical flashing. SDK main pushed before dependent resolution; final registry/package checks required.
+- [ ] **publish-qualified-changes** (in_progress): Publish only qualified source and package changes, excluding credentials, runtime state, generated qualification JSON and user files.
+  Evidence / remaining validation: SDK4.3.1/macros2.2.0 are published; GS dev, UI dev, simulator main and all seven firmware migration branches are pushed. Hardware-test handoff is complete. Any further public simulator image release remains gated on its own complete qualification; no hardware flashing is authorized.
 
 - [ ] **Gateway/RF root repair:** C13 P6 short/long passes are retained, C13
   amplifier restart and C14 enlarged-queue failures remain failed evidence.
@@ -156,7 +194,7 @@ Tools clear-graphs UI acceptance remains complete but uncommitted.
   viewing. Add recording selection, timeline/speed/seek and saved-sample binding;
   live dashboards/programs use cameras/2D. Do not silently bind missing saved
   attitude or phases to live telemetry. Test saved-data isolation and time bounds.
-- [ ] **frontend-source-ownership**: Move browser UI HTML/JS and rendering assets
+- [x] **frontend-source-ownership** (complete): Move browser UI HTML/JS and rendering assets
   out of backend/src/backend assets into the frontend repository; keep approved
   microservices separate. Move frontend source-folder JS helpers into frontend
   assets. Fetch the separate frontend at build time through a reproducible
