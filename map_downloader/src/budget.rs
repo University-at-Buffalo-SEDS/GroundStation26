@@ -22,6 +22,13 @@ pub(crate) struct DatasetBudget {
     max_database: u64,
     _lock: File,
 }
+impl Drop for DatasetBudget {
+    fn drop(&mut self) {
+        // Release ownership explicitly: a concurrent process spawn can retain
+        // a duplicate descriptor until exec, delaying a close-only unlock.
+        let _ = self._lock.unlock();
+    }
+}
 impl DatasetBudget {
     pub(crate) fn open(database: &Path) -> Result<Arc<Self>> {
         Self::open_limits(database, MAX_DATASET_BYTES, MAX_DATABASE_BYTES)
@@ -200,6 +207,24 @@ mod tests {
         drop(DatasetBudget::open(&path).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
+    #[cfg(unix)]
+    #[test]
+    fn last_dataset_owner_unlocks_even_while_a_duplicate_descriptor_is_alive() {
+        let root = scratch("inherited-lock");
+        let path = root.join("tiles.sqlite3");
+        let first = DatasetBudget::open(&path).unwrap();
+        // A concurrent Command spawn can briefly inherit this open file
+        // description before exec applies close-on-exec.
+        let inherited = first._lock.try_clone().unwrap();
+        let owner = first.clone();
+        drop(first);
+        assert!(DatasetBudget::open(&path).is_err(), "live dataset owner still excludes another downloader");
+        drop(owner);
+        drop(DatasetBudget::open(&path).expect("last owner releases the lock without waiting for an unrelated child exec"));
+        drop(inherited);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlink_escape_is_rejected() {
