@@ -26,7 +26,7 @@ pub(crate) fn trace_scope() {
         let types=|names: &[&str]| names.iter().map(|name|serde_json::json!({"name":name,"id":crate::telemetry_schema::data_type(name).as_u32()})).collect::<Vec<_>>();
         let covered=types(&["FLIGHT_STATE","AV_BAY_UNDERGLOW","FLIGHT_BUZZER","DAQ_LOADCELL_CALIBRATION","DAQ_KG50_CALIBRATION","DAQ_LOG_CLOCK","DAQ_THERMAL_CALIBRATION","DAQ_FILTER_CALIBRATION","DAQ_KG50_INPUT"]);
         let excluded=types(&["FLIGHT_COMMAND","VALVE_COMMAND","ACTUATOR_COMMAND"]);
-        eprintln!("[gs-qualification-scope] {}",serde_json::json!({"version":1,"covered":covered,"excluded":excluded,"managed_limit_ms":500,"excluded_existing_gates":"Valve startup and Valve/Actuator soak physical status default 2500 ms; FC startup execution-counter assertion and existing RF-soak reliable 500 ms (FC+underglow). Original runner gates remain unchanged; excluded typed commands have no new per-packet 500 ms claim."}));
+        eprintln!("[gs-qualification-scope] {}",serde_json::json!({"version":1,"process_id":std::process::id(),"process_started_ms":crate::simulation_clock_ms(),"covered":covered,"excluded":excluded,"managed_limit_ms":500,"excluded_existing_gates":"Valve startup and Valve/Actuator soak physical status default 2500 ms; FC startup execution-counter assertion and existing RF-soak reliable 500 ms (FC+underglow). Original runner gates remain unchanged; excluded typed commands have no new per-packet 500 ms claim."}));
     });
 }
 
