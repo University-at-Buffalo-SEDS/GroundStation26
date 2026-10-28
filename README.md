@@ -195,17 +195,27 @@ under `backend/data/maps/<region>/tiles.sqlite3`.
 RRLS recovery receiver/mesh relay: [setup and radio firmware requirements](docs/backend/rrls.md).
 
 
-Browser pages, scripts, rendering assets and their license files live in the
-frontend repository under `station_ui`. The `ui` submodule tracks its main
-branch for direct Cargo builds; initialize it with
-`git submodule update --init ui`.
+Browser pages, scripts, rendering assets and their licenses live in the
+[frontend repository](https://github.com/Rylan-Meilutis/Seds-Ground-Station-Frontend)
+under `station_ui`. GroundStation fetches that repository at build time into
+an external cache; it contains no frontend submodule or pinned frontend commit.
 
-`build.py` selects one frontend checkout before building the WebUI and backend.
-`--frontend-dev` selects dev for both. The launchers reuse the source recorded
-by the successful WebUI build and reject changed station-asset bytes. For a
-local or source-archive build, set `GS_FRONTEND_SOURCE_DIR` to a frontend checkout
-containing `station_ui/manifest.json`. Backend auth, APIs, MIME types and
-browser URLs are unchanged. See `ui/tests/station-*` for the relocated browser
-and artwork checks.
+`build.py` fetches `main` by default; `--frontend-dev` selects `dev`. One immutable
+checkout supplies both the WebUI and backend assets for that build. Updating
+the UI only requires rebuilding, without a GroundStation source commit.
+Launchers reuse the source recorded by the successful WebUI build and reject
+changed station-asset bytes. Direct Cargo builds reuse that receipt, or fetch
+`main` when no WebUI has been built yet. Use `python3 build.py` to refresh and
+build both halves together.
+
+`python3 build.py docker` also resolves the selected frontend branch before
+building, so a newer UI invalidates Docker's cached application build layer.
+When invoking Docker directly, pass a current `FRONTEND_SOURCE_REVISION` build
+argument or use `--no-cache` to refresh that layer.
+
+Set `GS26_FRONTEND_CHECKOUT_DIR` to move the managed cache, or
+`GS_FRONTEND_SOURCE_DIR` to use an explicit local checkout (including offline
+or source-archive builds). The frontend's `tests/station-*` files contain its
+browser and artwork checks.
 
 Camera permissions, mobile sharing, broadcast layouts and clean OBS output are documented in [Camera access and broadcast operation](docs/media/access-and-broadcast.md). Remote encoding uses the separate [native Video Transcoder](video_transcoder/README.md).

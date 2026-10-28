@@ -19,16 +19,9 @@ struct Export {
 }
 fn main() {
     println!("cargo:rerun-if-env-changed=GS_FRONTEND_SOURCE_DIR");
-    let source = env::var_os("GS_FRONTEND_SOURCE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(
-                env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory missing"),
-            )
-            .join("../../ui")
-        });
+    let source = selected_frontend_source();
     let source = source.canonicalize().unwrap_or_else(|error| {
-        panic!("Frontend source {} missing: {error}. Initialize the ui submodule with git submodule update --init ui, or set GS_FRONTEND_SOURCE_DIR to its checkout.", source.display())
+        panic!("Frontend source {} missing: {error}. Run python3 build.py backend_only to fetch it, or set GS_FRONTEND_SOURCE_DIR to a frontend checkout.", source.display())
     });
     prepare_browser_assets(&source);
     let generated = generate(&source);
@@ -37,6 +30,79 @@ fn main() {
         generated,
     )
     .unwrap();
+}
+
+// The build wrapper supplies one immutable external checkout to both the
+// WebUI and backend. Direct Cargo reuses that WebUI receipt, or fetches main
+// into the same external cache when no WebUI has been built yet.
+fn selected_frontend_source() -> PathBuf {
+    if let Some(source) = env::var_os("GS_FRONTEND_SOURCE_DIR") {
+        return PathBuf::from(source);
+    }
+    let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../..");
+    let script = root.join("scripts/prepare_frontend_source.py");
+    println!("cargo:rerun-if-changed={}", script.display());
+    println!("cargo:rerun-if-changed={}", root.join("build.py").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("frontend/dist/station-source.json").display()
+    );
+    println!("cargo:rerun-if-env-changed=GS26_FRONTEND_CHECKOUT_DIR");
+    println!("cargo:rerun-if-env-changed=GS_PYTHON");
+    let receipt = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("frontend-source.json");
+    let output = python_command()
+        .arg(&script)
+        .arg("--output")
+        .arg(&receipt)
+        .output()
+        .expect("Unable to resolve the external frontend source");
+    assert!(
+        output.status.success(),
+        "Frontend source preparation failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    #[derive(Deserialize)]
+    struct Source {
+        version: u32,
+        source_dir: PathBuf,
+    }
+    let source: Source =
+        serde_json::from_slice(&fs::read(receipt).expect("Frontend source receipt missing"))
+            .expect("Invalid frontend source receipt");
+    assert_eq!(source.version, 1, "Unsupported frontend source receipt");
+    source.source_dir
+}
+
+fn python_command() -> std::process::Command {
+    let candidates = env::var_os("GS_PYTHON")
+        .map(|python| vec![python])
+        .unwrap_or_else(|| vec!["python3".into(), "python".into(), "py".into()]);
+    for python in candidates {
+        let mut probe = std::process::Command::new(&python);
+        if python == "py" {
+            probe.arg("-3");
+        }
+        match probe
+            .args([
+                "-c",
+                "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)",
+            ])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let mut command = std::process::Command::new(python);
+                if command.get_program() == "py" {
+                    command.arg("-3");
+                }
+                return command;
+            }
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("Unable to find Python3.10+ for browser assets: {error}"),
+        }
+    }
+    panic!("Python3.10+ is required for frontend assets; set GS_PYTHON to its executable");
 }
 
 // Backend-only cargo builds must prepare the selected frontend's generated
@@ -57,42 +123,16 @@ pub fn prepare_browser_assets(source: &Path) {
         // generate() retains its explicit missing-asset error for older sources.
         return;
     }
-    let candidates = env::var_os("GS_PYTHON")
-        .map(|python| vec![python])
-        .unwrap_or_else(|| vec!["python3".into(), "python".into(), "py".into()]);
-    for python in candidates {
-        let mut probe = std::process::Command::new(&python);
-        if python == "py" {
-            probe.arg("-3");
-        }
-        match probe
-            .args([
-                "-c",
-                "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)",
-            ])
-            .output()
-        {
-            Ok(output) if output.status.success() => {}
-            Ok(_) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => panic!("Unable to find Python3.10+ for browser assets: {error}"),
-        }
-        let mut command = std::process::Command::new(&python);
-        if python == "py" {
-            command.arg("-3");
-        }
-        match command.arg(&script).arg("--root").arg(source).output() {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => panic!("Unable to prepare selected frontend browser assets: {error}"),
-            Ok(output) if output.status.success() => return,
-            Ok(output) => panic!(
-                "Selected frontend browser asset preparation failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        }
-    }
-    panic!(
-        "Python3.10+ is required to prepare selected frontend browser assets; set GS_PYTHON to its executable"
+    let output = python_command()
+        .arg(&script)
+        .arg("--root")
+        .arg(source)
+        .output()
+        .expect("Unable to prepare selected frontend browser assets");
+    assert!(
+        output.status.success(),
+        "Selected frontend browser asset preparation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

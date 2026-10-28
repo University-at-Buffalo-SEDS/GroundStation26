@@ -1,5 +1,7 @@
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -92,23 +94,30 @@ class BrowserAssetSourceTests(unittest.TestCase):
             self.assertEqual((source/'generated.js').read_text(),'prepared by selected frontend')
             self.assertEqual(build._browser_asset_digest(source),digest)
 
-    def test_first_backend_only_run_initializes_pinned_ui_without_building_webui(self):
+    def test_first_backend_only_run_fetches_main_and_ignores_legacy_ui(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
-            root=Path(tmp);source=self.source(root);source.rename(root/'ui')
-            with patch.object(build,'run') as run:
-                self.assertEqual(build.prepare_browser_asset_source(root,refresh=False),(root/'ui').resolve())
-                run.assert_not_called()
+            root=Path(tmp);source=self.source(root);(root/'ui').mkdir()
+            cache=root/'external-cache'
+            with patch.object(build,'_frontend_checkout_dir',return_value=cache), patch.object(build,'_immutable_frontend_checkout',return_value=source) as checkout:
+                self.assertEqual(build.prepare_browser_asset_source(root,refresh=False),source.resolve())
+                checkout.assert_called_once_with(cache,'main')
 
-    def test_missing_pinned_source_is_initialized_once(self):
+    def test_fresh_backend_source_can_select_dev_without_a_submodule(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
             root=Path(tmp);source=self.source(root)
-            def initialize(command, cwd):
-                self.assertEqual(command,['git','submodule','update','--init','--','ui'])
-                self.assertEqual(cwd,root)
-                source.rename(root/'ui')
-            with patch.object(build,'run',side_effect=initialize) as run:
-                self.assertEqual(build.prepare_browser_asset_source(root,refresh=False),(root/'ui').resolve())
-                run.assert_called_once()
+            cache=root/'external-cache'
+            with patch.object(build,'_frontend_checkout_dir',return_value=cache), patch.object(build,'_immutable_frontend_checkout',return_value=source) as checkout:
+                self.assertEqual(build.prepare_browser_asset_source(root,True,refresh=False),source.resolve())
+                checkout.assert_called_once_with(cache,'dev')
+
+    def test_cargo_helper_returns_selected_archive_path_with_spaces(self):
+        with tempfile.TemporaryDirectory(prefix='frontend source ') as tmp:
+            root=Path(tmp);source=self.source(root);receipt=root/'result.json'
+            environment=os.environ.copy()
+            environment[build.BROWSER_ASSET_SOURCE_ENV]=str(source)
+            helper=Path(build.__file__).parent/'scripts/prepare_frontend_source.py'
+            subprocess.run([sys.executable,str(helper),'--output',str(receipt)],env=environment,check=True,capture_output=True,text=True)
+            self.assertEqual(json.loads(receipt.read_text()),{'version':1,'source_dir':str(source.resolve())})
 
 
 if __name__=='__main__': unittest.main()

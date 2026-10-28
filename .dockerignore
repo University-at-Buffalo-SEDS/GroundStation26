@@ -47,3 +47,6 @@ backend/users/**
 **/credentials.json
 **/*.key
 **/*.pem
+
+# Legacy local frontend checkouts are external build inputs, never vendored.
+/ui/

@@ -7,6 +7,24 @@ import build
 
 
 class FrontendBranchTests(unittest.TestCase):
+    def test_docker_cache_tracks_selected_frontend_branch_tip(self) -> None:
+        for dev, branch in [(False, 'main'), (True, 'dev')]:
+            with self.subTest(branch=branch), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                revision = 'a' * 40
+                with patch.object(build, 'get_compose_base_cmd', return_value=['docker', 'compose']), patch.object(build, 'run_capture', return_value=f'{revision}\trefs/heads/{branch}') as capture, patch.object(build, 'run') as run:
+                    build.build_docker(root, False, False, False, dev)
+                capture.assert_called_once_with(['git', 'ls-remote', '--heads', build.FRONTEND_REPO_URL, f'refs/heads/{branch}'], cwd=root)
+                command = run.call_args.args[0]
+                self.assertIn(f'FRONTEND_SOURCE_REVISION={revision}', command)
+                self.assertEqual('FRONTEND_DEV=TRUE' in command, dev)
+
+    def test_docker_rejects_missing_frontend_branch_before_build(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(build, 'get_compose_base_cmd', return_value=['docker', 'compose']), patch.object(build, 'run_capture', return_value=''), patch.object(build, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, 'Unable to resolve frontend branch'):
+                build.build_docker(Path(tmp), False, False, False, False)
+            run.assert_not_called()
+
     def test_frontend_source_defaults_to_stable_main(self) -> None:
         self.assertEqual(build._frontend_branch(False), "main")
 

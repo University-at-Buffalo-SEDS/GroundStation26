@@ -159,12 +159,13 @@ Tools clear-graphs UI acceptance remains complete but uncommitted.
 - [ ] **frontend-source-ownership**: Move browser UI HTML/JS and rendering assets
   out of backend/src/backend assets into the frontend repository; keep approved
   microservices separate. Move frontend source-folder JS helpers into frontend
-  assets. Provide a frontend submodule and reproducible source/asset build path;
+  assets. Fetch the separate frontend at build time through a reproducible
+  source/asset build path;
   frontend-dev must select matching current dev UI/assets, backend-only and
   direct Cargo/Docker/RRLS/native builds must remain supported. Preserve auth,
   voice/worklets, camera/program behavior and offline assets during relocation.
 - [ ] **repository-layout**: Organize GroundStation runtime/API/config, tooling,
-  docs and frontend submodule coherently, update build scripts/CI/container copy
+  docs and external frontend build inputs coherently, update build scripts/CI/container copy
   paths and docs together. Preserve user files/runtime state and git history.
 
 C33 all-seven simulator factories now pass with the FC outlining options. Strict

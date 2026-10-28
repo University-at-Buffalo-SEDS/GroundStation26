@@ -33,3 +33,6 @@ Cargo.lock
 
 # Station locations are local administrator settings.
 /backend/config/station_positions.json
+
+# Legacy local frontend checkouts are external build inputs, never vendored.
+/ui/

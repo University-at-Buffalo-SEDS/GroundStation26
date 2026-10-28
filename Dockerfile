@@ -50,6 +50,7 @@ COPY shared shared
 # Top-level workspace manifest and main build script
 COPY Cargo.toml ./
 COPY build.py ./
+COPY scripts/prepare_frontend_source.py scripts/
 COPY entrypoint.sh ./
 
 # Run all builds for the workspace
@@ -61,7 +62,9 @@ RUN cargo update && cargo fetch
 # - PI_BUILD="pi_build" -> ./build.py pi_build
 # - TESTING="testing"  -> ./build.py testing
 # - both set           -> ./build.py pi_build testing
+ARG FRONTEND_SOURCE_REVISION=""
 RUN set -e; \
+    echo "Frontend cache revision: ${FRONTEND_SOURCE_REVISION}"; \
     args=""; \
     if [ -n "${PI_BUILD}" ] && [ "${PI_BUILD}" = "TRUE" ]; then \
         echo "PI_BUILD='${PI_BUILD}' → enabling pi_build"; \

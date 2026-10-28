@@ -173,6 +173,14 @@ def build_docker(
     if frontend_dev:
         print("Frontend development source (docker) → passing --build-arg FRONTEND_DEV=TRUE")
         cmd.extend(["--build-arg", "FRONTEND_DEV=TRUE"])
+    # Docker cannot see remote UI changes when deciding whether to reuse a
+    # build layer. Include the selected branch tip in that layer's cache key.
+    branch = _frontend_branch(frontend_dev)
+    tip = run_capture(["git", "ls-remote", "--heads", FRONTEND_REPO_URL, f"refs/heads/{branch}"], cwd=repo_root)
+    fields = tip.split()
+    if len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{40}", fields[0]) or fields[1] != f"refs/heads/{branch}":
+        raise RuntimeError(f"Unable to resolve frontend branch {branch} for the Docker build")
+    cmd.extend(["--build-arg", f"FRONTEND_SOURCE_REVISION={fields[0]}"])
     run(cmd, cwd=repo_root)
 
 
@@ -505,11 +513,6 @@ def prepare_browser_asset_source(repo_root: Path, frontend_dev: bool = False, re
         source = Path(receipt["source_dir"]).resolve()
         if receipt.get("version") != 1 or _browser_asset_digest(source) != receipt.get("asset_digest"):
             raise RuntimeError("Frontend station assets changed since the WebUI build. Rebuild the WebUI before reusing it.")
-    elif not refresh:
-        source = repo_root / "ui"
-        if not (source / "station_ui/manifest.json").is_file():
-            run(["git", "submodule", "update", "--init", "--", "ui"], cwd=repo_root)
-        _browser_asset_digest(source)
     else:
         source = _frontend_checkout_dir()
         branch = _frontend_branch(frontend_dev)
