@@ -19,9 +19,8 @@ const MAGIC: &[u8] = b"OM\x01";
 const DISPLAY_MAGIC: &[u8] = b"OM\x02";
 const DOMAIN: &[u8] = b"gs-primary-operating-mode-v1\0";
 const MAX_WIRE: usize = 1024;
-const REFRESH_MS: u64 = 30_000;
+const CHALLENGE_TTL_MS: u64 = 30_000;
 const RETRY_MS: u64 = 5_000;
-const FRESH_MS: u64 = 90_000;
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
@@ -186,6 +185,7 @@ struct Runtime {
     pending: Option<(String, u64)>,
     last_sent: Option<u64>,
     connected: bool,
+    mesh_session: Option<u32>,
     reply: Option<Vec<u8>>,
     error: Option<String>,
 }
@@ -212,6 +212,7 @@ impl Runtime {
             pending: None,
             last_sent: None,
             connected: false,
+            mesh_session: None,
             reply: None,
             error: None,
         };
@@ -258,10 +259,7 @@ impl Runtime {
             effective_mode: self.mode,
             local_build_mode: local_mode(),
             primary_station: self.primary.clone(),
-            synchronized: self.connected
-                && self
-                    .last_verified
-                    .is_some_and(|v| now >= v && now - v < FRESH_MS),
+            synchronized: self.connected && self.last_verified.is_some_and(|v| now >= v),
             persisted: self.persisted,
             local_capabilities_match: self.mode == Some(local_mode()),
             error: self.error.clone(),
@@ -285,10 +283,9 @@ impl Runtime {
             };
             anyhow::ensure!(
                 self.connected
-                    && self
-                        .pending
-                        .as_ref()
-                        .is_some_and(|(n, at)| *n == nonce && now >= *at && now - *at < REFRESH_MS),
+                    && self.pending.as_ref().is_some_and(|(n, at)| *n == nonce
+                        && now >= *at
+                        && now - *at < CHALLENGE_TTL_MS),
                 "Stale/replayed mode challenge"
             );
             anyhow::ensure!(
@@ -349,6 +346,13 @@ impl Runtime {
         }
         self.connected = connected;
     }
+    fn connect_mesh(&mut self, connected: bool, session: Option<u32>) {
+        if self.mesh_session != session {
+            self.connect(false);
+            self.mesh_session = session;
+        }
+        self.connect(connected);
+    }
     fn step(&mut self, pairing: &Pairing, connected: bool, now: u64) -> anyhow::Result<()> {
         self.connect(connected);
         if !connected {
@@ -368,14 +372,13 @@ impl Runtime {
         if self
             .pending
             .as_ref()
-            .is_some_and(|(_, at)| now < *at || now - *at >= REFRESH_MS)
+            .is_some_and(|(_, at)| now < *at || now - *at >= CHALLENGE_TTL_MS)
         {
             self.pending = None;
         }
-        let refresh = self
-            .last_verified
-            .is_none_or(|v| now < v || now - v >= REFRESH_MS);
-        if refresh
+        // Build mode stays fixed until this connection ends. Retry the
+        // challenge only until the first verified reply.
+        if self.last_verified.is_none()
             && self
                 .last_sent
                 .is_none_or(|v| now < v || now - v >= RETRY_MS)
@@ -486,7 +489,7 @@ impl DisplayRuntime {
             );
             anyhow::ensure!(
                 self.pending
-                    .is_some_and(|(n, at)| n == nonce && now >= at && now - at < REFRESH_MS),
+                    .is_some_and(|(n, at)| n == nonce && now >= at && now - at < CHALLENGE_TTL_MS),
                 "Stale/replayed display challenge"
             );
             let mode = match wire[24] {
@@ -531,13 +534,11 @@ impl DisplayRuntime {
         }
         if self
             .pending
-            .is_some_and(|(_, at)| now < at || now - at >= REFRESH_MS)
+            .is_some_and(|(_, at)| now < at || now - at >= CHALLENGE_TTL_MS)
         {
             self.pending = None;
         }
-        if self
-            .verified
-            .is_none_or(|v| now < v || now - v >= REFRESH_MS)
+        if self.verified.is_none()
             && self
                 .last_sent
                 .is_none_or(|v| now < v || now - v >= RETRY_MS)
@@ -558,10 +559,7 @@ impl DisplayRuntime {
             effective_mode: self.mode,
             local_build_mode: local_mode(),
             primary_station: None,
-            synchronized: self.session.is_some()
-                && self
-                    .verified
-                    .is_some_and(|v| now >= v && now - v < FRESH_MS),
+            synchronized: self.session.is_some() && self.verified.is_some_and(|v| now >= v),
             persisted: self.persisted,
             local_capabilities_match: self.mode == Some(local_mode()),
             error: self.error.clone(),
@@ -602,7 +600,7 @@ impl WorkerRuntime {
                 let pairing =
                     pairing.ok_or_else(|| anyhow::anyhow!("Signed runtime has no pairing"))?;
                 // Invalidate the old challenge before receiving any buffered reply.
-                rt.connect(connected);
+                rt.connect_mesh(connected, session);
                 for wire in frames {
                     if let Err(error) = rt.receive(pairing, &wire, now) {
                         rt.error = Some(error.to_string());
@@ -889,6 +887,62 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn synchronized_mode_stays_latched_until_disconnect_or_session_replacement() {
+        let root = root();
+        let gs = fixture(&root, "gs", 1);
+        let pair = fixture(&root, "rrls", 1);
+        let mut signed = Runtime::new(&pair, true, root.join("signed-latch")).unwrap();
+        signed.connect_mesh(true, Some(42));
+        let nonce = "a".repeat(32);
+        signed.pending = Some((nonce.clone(), 1));
+        let wire = seal(
+            &gs,
+            "rrls",
+            Message::Reply {
+                nonce,
+                generation: 1,
+                mode: Mode::Hitl,
+            },
+        )
+        .unwrap();
+        signed.receive(&pair, &wire, 2).unwrap();
+        let mut display = DisplayRuntime::new(true, root.join("display-latch")).unwrap();
+        display.connect(Some(42));
+        display.pending = Some((123, 1));
+        display
+            .receive(&display_frame(42, 123, Some(Mode::Hitl)), 2)
+            .unwrap();
+        for now in [30_002, 90_002, 3_600_002] {
+            signed.step(&pair, true, now).unwrap();
+            display.step(now);
+            assert!(signed.pending.is_none(), "no periodic signed mode query");
+            assert!(display.pending.is_none(), "no periodic display mode query");
+            assert!(signed.last_sent.is_none());
+            assert!(display.last_sent.is_none());
+            assert!(signed.snapshot(now).synchronized);
+            assert!(display.snapshot(now).synchronized);
+            assert_eq!(signed.mode, Some(Mode::Hitl));
+            assert_eq!(display.mode, Some(Mode::Hitl));
+        }
+        signed.connect_mesh(false, None);
+        display.connect(None);
+        assert!(!signed.snapshot(3_600_003).synchronized);
+        assert!(!display.snapshot(3_600_003).synchronized);
+        assert_eq!(signed.mode, Some(Mode::Hitl));
+        assert_eq!(display.mode, Some(Mode::Hitl));
+        signed.connect_mesh(true, Some(43));
+        display.connect(Some(43));
+        assert!(signed.last_verified.is_none());
+        assert!(display.verified.is_none());
+        assert!(signed.persisted && display.persisted);
+        // A new boot session must invalidate the latch even if no worker tick
+        // happened to sample the disconnected interval.
+        signed.last_verified = Some(3_600_004);
+        signed.connect_mesh(true, Some(44));
+        assert!(signed.last_verified.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn unpaired_primary_only_answers_current_session_query_and_cannot_change_build() {
         let root = root();
         let mut gs = DisplayRuntime::new(false, root.join("primary")).unwrap();
@@ -1043,8 +1097,12 @@ mod tests {
         );
         waiting(&mut rt, &nonce, 15);
         assert!(
-            rt.receive(&rr, &signed(&gs, nonce, 3, Mode::Normal), REFRESH_MS + 16)
-                .is_err()
+            rt.receive(
+                &rr,
+                &signed(&gs, nonce, 3, Mode::Normal),
+                CHALLENGE_TTL_MS + 16
+            )
+            .is_err()
         );
         let mut primary = Runtime::new(&gs, false, root.join("primary-generation")).unwrap();
         let illegal = seal(
