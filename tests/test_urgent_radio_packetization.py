@@ -1,6 +1,7 @@
 """Production Capacity and actual emulator packetizer, without an alternate modem."""
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -15,10 +16,14 @@ SIM = Path(os.environ.get('FIRMWARE_SIM_SOURCE', ROOT.parent / 'FirmwareSimulato
                      'Explicit existing offline .NET image and Rust compiler required')
 class UrgentPacketization(unittest.TestCase):
     def test_critical_completion_flushes_real_modem_without_disabling_normal_batches(self):
+        wire_limit = re.search(
+            r'pub\(crate\) const RADIO_COMMAND_BATCH_MAX_BYTES: usize = [^;]+;',
+            (ROOT / 'backend/src/comms.rs').read_text())
+        self.assertIsNotNone(wire_limit, 'production radio batch limit is required')
         with tempfile.TemporaryDirectory(prefix='gs-urgent-packetization-') as directory:
             fixture = Path(directory)
             (fixture / 'schedule.rs').write_text(
-                '#[path = ' + json.dumps(str(ROOT / 'backend/src/comms/rfd_capacity.rs'))
+                wire_limit.group() + '\n#[path = ' + json.dumps(str(ROOT / 'backend/src/comms/rfd_capacity.rs'))
                 + '] mod capacity;\n' + r'''
 fn main() {
     let close = std::env::var("CLOSE_CRITICAL_BATCH").as_deref() == Ok("1");
@@ -31,7 +36,7 @@ fn main() {
             times.push(now.to_string());
             // Only one rare critical frame closes its batch. All subsequent
             // offered traffic follows the unchanged ordinary100ms batching.
-            if close && times.len() == 4 { cap.close_packet_batch(wall, Some(now)); }
+            if close && times.len() == 4 { cap.close_packet_batch_for_contract(wall, Some(now), None); }
         }
     }
     println!("[{}]", times.join(","));

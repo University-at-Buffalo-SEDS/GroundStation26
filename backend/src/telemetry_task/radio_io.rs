@@ -93,6 +93,10 @@ pub struct TxQueueBudget {
     pending: AtomicUsize,
     pending_control: AtomicUsize,
     limit: usize,
+    // Exact canonical command bytes, bounded by the same accepted-byte budget.
+    // Keep this owner through queue pop and active/failed writes. Stateful SDT
+    // and sequenced traffic must never be suppressed by a payload comparison.
+    pending_commands: Mutex<Vec<(u8, Vec<u8>)>>,
 }
 
 impl TxQueueBudget {
@@ -101,6 +105,7 @@ impl TxQueueBudget {
             pending: AtomicUsize::new(0),
             pending_control: AtomicUsize::new(0),
             limit,
+            pending_commands: Mutex::new(Vec::new()),
         }
     }
 
@@ -111,6 +116,18 @@ impl TxQueueBudget {
         payload: &[u8],
     ) -> sedsnet::TelemetryResult<()> {
         let priority = radio_transport_priority(priority, payload);
+        let mut commands = (priority >= 16
+            && payload.len() <= crate::comms::RADIO_COMMAND_BATCH_MAX_BYTES
+            && crate::comms::is_radio_batch_command(255, payload))
+            .then(|| self.pending_commands.lock().expect("pending radio commands poisoned"));
+        if commands.as_ref().is_some_and(|commands| commands.iter()
+            .any(|(queued_priority, bytes)| *queued_priority == priority && bytes == payload))
+        {
+            // The router retains this retry on transient refusal. Reporting
+            // success here would invent another accepted transport owner;
+            // discarding the original would risk losing the command.
+            return Err(sedsnet::TelemetryError::Io("side tx busy"));
+        }
         // Side callbacks receive schema chunks individually. Once the first
         // chunk is admitted, finish that transfer even when it crosses the
         // normal queue target; otherwise every retry can stall at chunk two.
@@ -172,6 +189,10 @@ impl TxQueueBudget {
             }
             return Err(error);
         }
+        if let Some(commands) = &mut commands {
+            commands.push((priority, payload.to_vec()));
+        }
+        drop(commands);
         if sender.send((priority, payload.to_vec())).is_err() {
             self.complete(priority, &payload);
             return Err(sedsnet::TelemetryError::HandlerError(
@@ -191,6 +212,14 @@ impl TxQueueBudget {
     }
 
     fn complete(&self, priority: u8, payload: &[u8]) {
+        if priority >= 16 && payload.len() <= crate::comms::RADIO_COMMAND_BATCH_MAX_BYTES {
+            let mut commands = self.pending_commands.lock().expect("pending radio commands poisoned");
+            if let Some(index) = commands.iter()
+                .position(|(queued_priority, bytes)| *queued_priority == priority && bytes == payload)
+            {
+                commands.swap_remove(index);
+            }
+        }
         let len = payload.len();
         self.pending.fetch_sub(len, Ordering::AcqRel);
         if uses_command_reserve(priority, payload) {
@@ -548,6 +577,17 @@ mod priority_tests {
                 !crate::comms::is_radio_batch_command(255, &bytes),
                 "sequenced or piggyback receipt header must not share command admission: {header:?}"
             );
+            let budget = TxQueueBudget::new(2048);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            for _ in 0..2 {
+                budget.try_send(&tx, 255, &bytes).unwrap();
+            }
+            for _ in 0..2 {
+                let (priority, bytes) = rx.try_recv().unwrap();
+                budget.complete(priority, &bytes);
+            }
+            assert!(rx.try_recv().is_err());
+            assert!(budget.pending_commands.lock().unwrap().is_empty());
         }
     }
 
@@ -1142,7 +1182,74 @@ mod priority_tests {
     }
 
     #[test]
-    fn radio_budget_stays_charged_until_write_completion() {
+    fn pending_command_retries_do_not_fill_the_uart_queue() {
+        crate::telemetry_schema::initialize().unwrap();
+        let command = |stamp| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+                    &[crate::telemetry_schema::endpoint("AV_BAY_UNDERGLOW_OWNER")],
+                    "GS",
+                    stamp,
+                    Arc::from([1_u8]),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let first = command(1);
+        let next = command(2);
+        assert_ne!(
+            first, next,
+            "separate operator commands retain separate identities"
+        );
+        let budget = TxQueueBudget::new(2048);
+        let activity = TransportTxActivity::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        activity
+            .try_enqueue(|| budget.try_send(&tx, 16, &first))
+            .unwrap();
+        // A stalled UART must retain one copy instead of offloading every
+        // 250ms SDK retry into a FIFO the modem cannot reprioritize.
+        for _ in 0..18 {
+            assert!(matches!(
+                activity.try_enqueue(|| budget.try_send(&tx, 16, &first)),
+                Err(sedsnet::TelemetryError::Io("side tx busy"))
+            ));
+        }
+        let (priority, active) = rx.try_recv().unwrap();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(budget.pending.load(Ordering::Acquire), first.len());
+        assert_eq!(activity.pending.load(Ordering::Acquire), 1);
+        // Queue pop and an active/failed physical write still own the copy.
+        assert!(
+            activity
+                .try_enqueue(|| budget.try_send(&tx, 16, &first))
+                .is_err()
+        );
+        activity
+            .try_enqueue(|| budget.try_send(&tx, 16, &next))
+            .unwrap();
+        budget.complete(priority, &active);
+        activity.complete();
+        // A retry after physical completion remains available for a lost ACK.
+        activity
+            .try_enqueue(|| budget.try_send(&tx, 16, &first))
+            .unwrap();
+        let mut completed = Vec::new();
+        while let Ok((priority, bytes)) = rx.try_recv() {
+            completed.push(bytes.clone());
+            budget.complete(priority, &bytes);
+            activity.complete();
+        }
+        assert_eq!(completed, vec![next, first]);
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+        assert_eq!(budget.pending_control.load(Ordering::Acquire), 0);
+        assert!(!activity.has_pending());
+    }
+
+    #[test]
+    fn pending_command_admission_is_atomic_and_closed_channel_releases_it() {
         crate::telemetry_schema::initialize().unwrap();
         let frame = serialize::pack_packet(
             &Packet::new(
@@ -1155,10 +1262,134 @@ mod priority_tests {
             .unwrap(),
         )
         .to_vec();
-        let size = frame.len();
-        let budget = TxQueueBudget::new(2 * size);
+        let budget = TxQueueBudget::new(2048);
+        let (closed, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        assert!(budget.try_send(&closed, 16, &frame).is_err());
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+        assert!(budget.pending_commands.lock().unwrap().is_empty());
         let (tx, mut rx) = mpsc::unbounded_channel();
-        budget.try_send(&tx, 255, &frame).unwrap();
+        let accepted = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| budget.try_send(&tx, 16, &frame).is_ok()))
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .filter(|accepted| *accepted)
+                .count()
+        });
+        assert_eq!(accepted, 1);
+        let (priority, bytes) = rx.try_recv().unwrap();
+        assert!(rx.try_recv().is_err());
+        budget.complete(priority, &bytes);
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+        assert!(budget.pending_commands.lock().unwrap().is_empty());
+        // Stateful transport history retains every accepted frame, including
+        // identical bytes. Its decoder ordering contract is unchanged.
+        let sdt = include_bytes!("../test-fixtures/mode-background-captured-sdt.bin");
+        for _ in 0..2 {
+            budget.try_send(&tx, 254, sdt).unwrap();
+        }
+        for _ in 0..2 {
+            let (priority, bytes) = rx.try_recv().unwrap();
+            assert_eq!(bytes, sdt);
+            budget.complete(priority, &bytes);
+        }
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn sdk_retry_keeps_its_owner_while_the_original_uart_copy_is_pending() {
+        use sedsnet::router::{RouterConfig, RouterSideOptions};
+        crate::telemetry_schema::initialize().unwrap();
+        let ty = crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW");
+        let endpoint = crate::telemetry_schema::endpoint("AV_BAY_UNDERGLOW_OWNER");
+        let time = Arc::new(std::sync::atomic::AtomicU64::new(1000));
+        let tick = time.clone();
+        let router = Router::new_with_clock(
+            RouterConfig::default()
+                .with_sender("GS")
+                .with_reliable_enabled(true),
+            Box::new(move || tick.load(Ordering::Acquire)),
+        );
+        let budget = Arc::new(TxQueueBudget::new(2048));
+        let callback_budget = budget.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let side = router.add_side_packed_with_options(
+            "radio",
+            move |bytes| {
+                if serialize::peek_frame_info(bytes).is_ok_and(|info| info.envelope.ty == ty) {
+                    callback_budget.try_send(&tx, 16, bytes)
+                } else {
+                    Ok(())
+                }
+            },
+            RouterSideOptions::default(),
+        );
+        router
+            .rx_from_side(
+                &sedsnet::discovery::build_discovery_announce("RF", 0, &[endpoint]).unwrap(),
+                side,
+            )
+            .unwrap();
+        let packet = Packet::new(ty, &[endpoint], "GS", 1000, Arc::from([1_u8])).unwrap();
+        router.tx(packet.clone()).unwrap();
+        for now in [2000, 3000, 4000] {
+            time.store(now, Ordering::Release);
+            router.process_tx_queue().unwrap();
+        }
+        let (priority, first) = rx.try_recv().expect("original command retained for UART");
+        assert!(
+            rx.try_recv().is_err(),
+            "SDK retries must not accumulate UART copies"
+        );
+        assert_eq!(
+            serialize::unpack_packet(&first).unwrap().packet_id(),
+            packet.packet_id()
+        );
+        assert_eq!(
+            router
+                .export_runtime_stats()
+                .reliable
+                .end_to_end_pending_destination_count,
+            1,
+            "transport backpressure must not fabricate an owner receipt"
+        );
+        budget.complete(priority, &first);
+        time.store(4001, Ordering::Release);
+        router.process_tx_queue().unwrap();
+        let (priority, retry) = rx
+            .try_recv()
+            .expect("SDK retry resumes after physical completion");
+        assert_eq!(retry, first);
+        budget.complete(priority, &retry);
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn radio_budget_stays_charged_until_write_completion() {
+        crate::telemetry_schema::initialize().unwrap();
+        let command = |stamp| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+                    &[crate::telemetry_schema::endpoint("AV_BAY_UNDERGLOW_OWNER")],
+                    "GS",
+                    stamp,
+                    Arc::from([1_u8]),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let frame = command(1);
+        let second = command(2);
+        let size = frame.len();
+        let total = frame.len() + second.len();
+        let budget = TxQueueBudget::new(total);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        budget.try_send(&tx, 255, &second).unwrap();
         budget.try_send(&tx, 255, &frame).unwrap();
         let (priority, first) = rx.try_recv().unwrap();
         assert!(matches!(
@@ -1166,7 +1397,7 @@ mod priority_tests {
             Err(sedsnet::TelemetryError::Io("side tx busy"))
         ));
         // Moving to a worker backlog or retrying a failed write frees nothing.
-        assert_eq!(budget.pending.load(Ordering::Acquire), 2 * size);
+        assert_eq!(budget.pending.load(Ordering::Acquire), total);
         budget.complete(priority, &first);
         budget.try_send(&tx, 0, &[2]).unwrap();
         assert_eq!(budget.pending.load(Ordering::Acquire), size + 1);
