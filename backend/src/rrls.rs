@@ -357,7 +357,9 @@ impl Mesh {
             .unwrap_or_else(|| self.started.elapsed().as_millis().min(u64::MAX as u128) as u64)
     }
     fn direct(&mut self, now: u64) {
-        if self.last_direct.is_none_or(|v| now.saturating_sub(v) > 750) {
+        // Use the same loss boundary as tick(): slower valid reports must
+        // not restart restoration while the direct link is still live.
+        if self.last_direct.is_none_or(|v| now.saturating_sub(v) >= LOSS_MS) {
             self.direct_since = Some(now);
         }
         self.last_direct = Some(now);
@@ -3112,6 +3114,34 @@ mod tests {
         assert_eq!(primary.recovery_air_share(5_100), None);
         relay.incoming(true, &health(1, 1, true), 5_100);
         assert_eq!(relay.recovery_air_share(5_100), None);
+    }
+
+    #[test]
+    fn one_hz_direct_reports_restore_without_a_false_relay_request() {
+        let mut primary = Mesh::new(Role::Primary, 1);
+        primary.tick(3_000);
+        assert!(primary.fallback);
+        for now in [3_100, 4_100, 5_099] {
+            primary.direct(now);
+            primary.tick(now);
+            assert!(primary.fallback, "restoration still requires two seconds");
+        }
+        primary.tick(5_100);
+        assert!(!primary.fallback, "one-Hz reports keep the direct link live and must restore it");
+        primary.tick(8_099);
+        assert!(primary.fallback, "the original three-second loss threshold remains exact");
+    }
+
+    #[test]
+    fn direct_loss_gap_restarts_the_restoration_hysteresis() {
+        let mut primary = Mesh::new(Role::Primary, 1);
+        primary.tick(3_000);
+        primary.direct(3_100);
+        primary.direct(3_100 + LOSS_MS);
+        primary.tick(3_100 + LOSS_MS + RESTORE_MS - 1);
+        assert!(primary.fallback, "a real loss must restart restoration");
+        primary.tick(3_100 + LOSS_MS + RESTORE_MS);
+        assert!(!primary.fallback);
     }
 
     #[test]
