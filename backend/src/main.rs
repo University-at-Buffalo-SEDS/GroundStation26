@@ -495,6 +495,49 @@ impl StreamRateProbe {
     }
 }
 
+/// Source-cadence expectation for the simulator observer only. This never
+/// changes acquisition/publication rates or transport/receipt/freshness gates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DaqLoadcellCadence {
+    hz: u32,
+    minimum_interval_ms: u64,
+    maximum_interval_ms: u64,
+}
+
+impl DaqLoadcellCadence {
+    const ENV: &'static str = "GS_SIM_DAQ_LOADCELL_HZ";
+
+    fn parse(raw: Option<&str>) -> anyhow::Result<Self> {
+        let hz = match raw {
+            None => 250,
+            Some(value) => value.parse::<u32>().map_err(|_| {
+                anyhow::anyhow!("{} must be an integer from 1 through 1000", Self::ENV)
+            })?,
+        };
+        anyhow::ensure!(
+            (1..=1000).contains(&hz),
+            "{} must be from 1 through 1000",
+            Self::ENV
+        );
+        // The source timestamp is an integer number of milliseconds. Retain
+        // the original +/-50% period bounds (250Hz =>2..6ms), quantized down.
+        Ok(Self {
+            hz,
+            minimum_interval_ms: 500 / u64::from(hz),
+            maximum_interval_ms: 1500 / u64::from(hz),
+        })
+    }
+
+    fn from_env() -> anyhow::Result<Self> {
+        let raw = match std::env::var(Self::ENV) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(anyhow::anyhow!("{}: {error}", Self::ENV)),
+        };
+        Self::parse(raw.as_deref())
+    }
+}
+
 fn request_startup_topology(router: &sedsnet::router::Router) -> sedsnet::TelemetryResult<()> {
     router.request_topology()
 }
@@ -720,6 +763,60 @@ mod router_link_policy_tests {
         };
 
         assert!(!router_hop_reliable_enabled(&link));
+    }
+
+    #[test]
+    fn daq_source_cadence_preserves250_default_and_requires_five_intervals() {
+        let legacy = super::DaqLoadcellCadence::parse(None).unwrap();
+        assert_eq!(
+            (
+                legacy.hz,
+                legacy.minimum_interval_ms,
+                legacy.maximum_interval_ms
+            ),
+            (250, 2, 6)
+        );
+        for (raw, period) in [("40", 25), ("250", 4)] {
+            let expected = super::DaqLoadcellCadence::parse(Some(raw)).unwrap();
+            let mut probe = super::StreamRateProbe::default();
+            for index in 0..=5 {
+                assert_eq!(
+                    probe.observe(
+                        index * period,
+                        expected.minimum_interval_ms,
+                        expected.maximum_interval_ms,
+                        5
+                    ),
+                    index == 5
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn daq_source_cadence_rejects_the_other_publication_rate() {
+        for (expected_hz, wrong_period) in [("40", 4), ("250", 25)] {
+            let expected = super::DaqLoadcellCadence::parse(Some(expected_hz)).unwrap();
+            let mut probe = super::StreamRateProbe::default();
+            for index in 0..100 {
+                assert!(!probe.observe(
+                    index * wrong_period,
+                    expected.minimum_interval_ms,
+                    expected.maximum_interval_ms,
+                    5
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn daq_source_cadence_rejects_invalid_configuration() {
+        for raw in ["", "0", "-1", "1001", "NaN", "1.5", "forty", " 40"] {
+            assert!(
+                super::DaqLoadcellCadence::parse(Some(raw)).is_err(),
+                "accepted {raw:?}"
+            );
+        }
     }
 
     #[test]
@@ -971,6 +1068,7 @@ fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevic
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let daq_loadcell_cadence = DaqLoadcellCadence::from_env()?;
     telemetry_schema::initialize()?;
     sedsnet::config::set_runtime_tuning_config(network_delivery_tuning())?;
 
@@ -1415,13 +1513,17 @@ async fn main() -> anyhow::Result<()> {
                 if board == Some(Board::DaqBoard)
                     && pkt.data_type() == telemetry_schema::data_type("KG1000")
                 {
-                    let valid =
-                        daq_loadcell_rate_handler
-                            .lock()
-                            .unwrap()
-                            .observe(pkt.timestamp(), 2, 6, 5);
+                    let valid = daq_loadcell_rate_handler.lock().unwrap().observe(
+                        pkt.timestamp(),
+                        daq_loadcell_cadence.minimum_interval_ms,
+                        daq_loadcell_cadence.maximum_interval_ms,
+                        5,
+                    );
                     if valid && !daq_loadcell_rate_reported_handler.swap(true, Ordering::AcqRel) {
-                        log::info!("full-bay DAQ raw loadcell 250 Hz stream reached GroundStation");
+                        log::info!(
+                            "full-bay DAQ raw loadcell {} Hz stream reached GroundStation",
+                            daq_loadcell_cadence.hz
+                        );
                     }
                 }
                 if let Some(
