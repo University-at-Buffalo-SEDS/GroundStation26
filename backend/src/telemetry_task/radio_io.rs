@@ -2986,6 +2986,16 @@ mod rfd_worker_tests {
         fail_first: Arc<std::sync::atomic::AtomicBool>,
     }
     impl CommsDevice for CaptureDevice {
+        fn take_radio_window_update(&mut self) -> Option<crate::comms::RadioWindowUpdate> {
+            panic!("the RFD worker must not consult legacy LoRa turn grants");
+        }
+        fn send_radio_scheduler_status(
+            &mut self,
+            _: u8,
+            _: bool,
+        ) -> Result<(), Box<dyn Error + Send + Sync>> {
+            panic!("the RFD worker must not emit legacy LoRa scheduler handshakes");
+        }
         fn recv_packet(
             &mut self,
             _: &Router,
