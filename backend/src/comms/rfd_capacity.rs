@@ -223,9 +223,11 @@ impl Capacity {
     /// Promote the first interactive completion per normal batch cycle. A
     /// retry/ACK burst must not turn all ordinary traffic into one-frame
     /// packets. Keep airtime debt and the stopbit/quiet deadline unchanged.
+    #[cfg(test)]
     pub(crate) fn close_packet_batch(&mut self, wall: Instant, virtual_ms: Option<u64>) {
         self.close_packet_batch_with_receipt(wall, virtual_ms, None);
     }
+    #[cfg(test)]
     pub(crate) fn close_packet_batch_with_receipt(
         &mut self,
         wall: Instant,

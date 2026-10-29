@@ -617,6 +617,7 @@ impl Mesh {
     pub(crate) fn begin_transmission(&mut self, now: u64) -> Option<Transmission> {
         self.begin_transmission_at_priority(now, 0)
     }
+    #[cfg(test)]
     pub(crate) fn begin_transmission_at_priority(
         &mut self,
         now: u64,
@@ -624,6 +625,7 @@ impl Mesh {
     ) -> Option<Transmission> {
         self.begin_matching_transmission(now, minimum_priority, false)
     }
+    #[cfg(test)]
     pub(crate) fn begin_critical_transmission(
         &mut self,
         now: u64,
@@ -889,6 +891,7 @@ impl Mesh {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn finish_transmission(
         &mut self,
         transmission: Transmission,
