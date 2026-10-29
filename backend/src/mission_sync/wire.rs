@@ -5,12 +5,14 @@ pub(crate) enum Class {
     Legacy,
     ModeQuery,
     ModeReply,
+    ClockQuery,
+    ClockReply,
     #[cfg(not(feature = "hitl_mode"))]
     Checklist,
 }
 #[derive(Default)]
 struct Outbox {
-    pending: [Option<(Class, Vec<u8>)>; 3],
+    pending: [Option<(Class, Vec<u8>)>; 4],
     next: u64,
     exhausted: bool,
     cursor: usize,
@@ -23,6 +25,7 @@ impl Outbox {
         let index = match class {
             Class::Legacy => 0,
             Class::ModeQuery | Class::ModeReply => 2,
+            Class::ClockQuery | Class::ClockReply => 3,
             #[cfg(not(feature = "hitl_mode"))]
             Class::Checklist => 1,
         };
@@ -37,9 +40,9 @@ impl Outbox {
         if self.exhausted || now < self.next {
             return;
         }
-        for _ in 0..3 {
+        for _ in 0..self.pending.len() {
             let index = self.cursor;
-            self.cursor = (index + 1) % 3;
+            self.cursor = (index + 1) % self.pending.len();
             let Some((class, wire)) = self.pending[index].as_ref() else {
                 continue;
             };
@@ -67,7 +70,7 @@ pub(crate) fn offer(class: Class, wire: &[u8]) -> bool {
 pub(crate) fn flush(mesh: &crate::rrls::Shared, now: u64) {
     outbox().lock().unwrap().flush(now, |class, wire| {
         let mut mesh = mesh.lock().unwrap();
-        if matches!(class, Class::ModeReply) {
+        if matches!(class, Class::ModeReply | Class::ClockReply) {
             mesh.queue_operating_mode_reply(wire, now)
         } else {
             mesh.queue_settings(wire, now)

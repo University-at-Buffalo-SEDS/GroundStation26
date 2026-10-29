@@ -281,6 +281,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::checklists::routes())
         .merge(crate::mission_sync::routes())
         .merge(crate::station_mode::routes())
+        .merge(crate::launch_history::api::routes())
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)
         .with_state(state)
@@ -2066,7 +2067,32 @@ async fn send_command(
     let now_ms = software_command_clock_ms();
     if !state.record_software_command_if_fresh(&cmd, now_ms, software_command_dedup_ms()) {
         gs_debug_println!("Ignored duplicate software command {cmd:?}");
+        if matches!(cmd,TelemetryCommand::ResetTClock) {
+            if crate::rrls::is_rrls(){return match crate::launch_clock_sync::await_existing_reset().await {Ok(true)=>(StatusCode::OK,"primary T clock reset saved"),Ok(false)=>(StatusCode::ACCEPTED,"primary reset pending; retained clock unchanged"),Err(_)=>(StatusCode::CONFLICT,"primary reset was not confirmed")};}
+            let waiter=state.launch_history.lock().unwrap().waiter();
+            if crate::launch_history::flush(waiter).await.is_err(){return (StatusCode::INSUFFICIENT_STORAGE,"T clock reset was not saved");}
+        }
         return (StatusCode::OK, "duplicate ignored");
+    }
+    if matches!(cmd, TelemetryCommand::ResetTClock) {
+        if crate::rrls::is_rrls() {
+            return match crate::launch_clock_sync::request_reset(&state).await {
+                Ok(true)=>(StatusCode::OK,"primary T clock reset saved"),
+                Ok(false)=>(StatusCode::ACCEPTED,"primary reset pending; retained clock unchanged"),
+                Err(error)=>{emit_notification_warning(&state,format!("Primary T clock reset not confirmed: {error}"));(StatusCode::CONFLICT,"primary reset was not confirmed")},
+            };
+        }
+        let work=state.clone();
+        if let Err(error)=tokio::task::spawn_blocking(move||work.try_reset_launch_clock()).await.map_err(anyhow::Error::from).and_then(|result|result) {
+            emit_notification_warning(&state,format!("T clock reset failed: {error}"));
+            return (StatusCode::CONFLICT,"T clock reset failed");
+        }
+        let waiter=state.launch_history.lock().unwrap().waiter();
+        if let Err(error)=crate::launch_history::flush(waiter).await {
+            emit_notification_warning(&state,format!("T clock reset is not durable: {error}"));
+            return (StatusCode::INSUFFICIENT_STORAGE,"T clock reset was not saved");
+        }
+        return (StatusCode::OK,"ok");
     }
     if state.cmd_tx.send(cmd).await.is_err() {
         emit_notification_warning(&state, "Command worker unavailable; command was not queued");
@@ -2782,6 +2808,21 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             software_command_dedup_ms(),
                         ) {
                             gs_debug_println!("Ignored duplicate websocket command {:?}", cmd.cmd);
+                            continue;
+                        }
+                        if matches!(cmd.cmd,TelemetryCommand::ResetTClock) {
+                            let reset_state=state_for_recv.clone();
+                            // Do not stall this WebSocket's Abort/command receiver on disk or radio.
+                            tokio::spawn(async move {
+                                let result=if crate::rrls::is_rrls(){crate::launch_clock_sync::request_reset(&reset_state).await}else{
+                                    let work=reset_state.clone();
+                                    match tokio::task::spawn_blocking(move||work.try_reset_launch_clock()).await {
+                                        Ok(Ok(()))=>{let waiter=reset_state.launch_history.lock().unwrap().waiter();crate::launch_history::flush(waiter).await.map(|_|true)},
+                                        Ok(Err(error))=>Err(error),Err(error)=>Err(error.into()),
+                                    }
+                                };
+                                match result {Ok(true)=>{reset_state.add_notification("Primary T clock reset saved");},Ok(false)=>{reset_state.add_notification("Primary T clock reset pending; retained clock unchanged");},Err(error)=>{reset_state.add_notification(format!("T clock reset not confirmed: {error}"));}}
+                            });
                             continue;
                         }
                         let received_cmd = cmd.cmd;

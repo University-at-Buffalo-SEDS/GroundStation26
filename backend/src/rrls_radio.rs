@@ -247,6 +247,8 @@ mod tests {
     fn missing() -> RecoveryRadio {
         RecoveryRadio::new(CommsLinkConfig::Serial {
             serial: SerialLinkConfig {
+                hardware_flow_control: false,
+                rfd_profile: None,
                 port: "/missing-rrls-radio-for-test".into(),
                 baud_rate: 115200,
                 protocol: SerialProtocol::RawUart,

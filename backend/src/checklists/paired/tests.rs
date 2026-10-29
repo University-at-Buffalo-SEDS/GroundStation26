@@ -63,6 +63,7 @@ fn complete_backend_pairing_lifecycle_is_isolated() {
 fn legacy() -> Document {
     Document {
         revision: 42,
+        signoffs: Vec::new(),
         completion_events: Vec::new(),
         enforce_before_launch: true,
         checklists: vec![Checklist {
@@ -175,6 +176,89 @@ async fn suite() {
     let root = PathBuf::from(std::env::var_os("GS_PAIRED_CHECKLIST_ROOT").unwrap());
     let state_a = crate::state::tests::test_app_state().await;
     let state_b = crate::state::tests::test_app_state().await;
+    // Local approvals survive paired materialization/restart and are invalidated
+    // by causal progress updates; replication never invents remote qualification.
+    let mut approval = Service::open(
+        root.join("approval.sqlite3"),
+        root.join("approval.selector"),
+        "test".into(),
+        "gs".into(),
+        vec!["gs".into(), "rrls".into()],
+        legacy(),
+        true,
+    )
+    .await
+    .unwrap();
+    approval.publish().await.unwrap();
+    for item_id in ["manual", "nitrogen"] {
+        approval
+            .check(
+                &Check {
+                    checklist_id: "setup".into(),
+                    item_id: item_id.into(),
+                    checked: true,
+                },
+                "operator",
+                10,
+            )
+            .await
+            .unwrap();
+    }
+    let request = Sign {
+        checklist_id: "setup".into(),
+        revision: approval.document.revision,
+    };
+    access(|store| store.update(|doc| doc.sign(&request, "reviewer", 20))).unwrap();
+    approval.publish().await.unwrap();
+    assert!(
+        approval
+            .document
+            .signed_off(&approval.document.checklists[0])
+    );
+    let audit_path = access(|store| Ok(store.path.clone())).unwrap();
+    assert_eq!(
+        Store::open(audit_path).unwrap().document.signoffs[0].signed_by,
+        "reviewer"
+    );
+    approval.journal.close().await;
+    approval.storage.pool.close().await;
+    let mut approval = Service::open(
+        root.join("approval.sqlite3"),
+        root.join("approval.selector"),
+        "test".into(),
+        "gs".into(),
+        vec!["gs".into(), "rrls".into()],
+        legacy(),
+        true,
+    )
+    .await
+    .unwrap();
+    approval.publish().await.unwrap();
+    assert!(
+        approval
+            .document
+            .signed_off(&approval.document.checklists[0])
+    );
+    approval
+        .check(
+            &Check {
+                checklist_id: "setup".into(),
+                item_id: "manual".into(),
+                checked: false,
+            },
+            "operator",
+            30,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !approval
+            .document
+            .signed_off(&approval.document.checklists[0])
+    );
+    assert!(approval.document.signoffs[0].invalidated_at_ms.is_some());
+    approval.journal.close().await;
+    approval.storage.pool.close().await;
     // A failed first primary seed has a durable migration marker. Restart
     // finishes that same selected catalog before accepting any remote frames.
     let seed = Service::open(

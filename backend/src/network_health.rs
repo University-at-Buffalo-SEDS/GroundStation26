@@ -75,6 +75,13 @@ pub(crate) fn decode_diagnostics(w: &[u32]) -> Option<BoardDiagnostics> {
         }
     };
     Some(BoardDiagnostics {
+        die_temperature_centi_c: if w[1] & 0x100 != 0 && ((w[1] >> 9) & 0x7f) <= 60 {
+            let centi = i32::from((w[1] >> 16) as i16);
+            (-4000..=15000).contains(&centi).then_some(centi)
+        } else {
+            None
+        },
+        die_temperature_sample_age_ms: ((w[1] >> 9) & 0x7f) * 100,
         version: w[0],
         received_age_ms: 0,
         uptime_ticks: u64::from(w[2]) | (u64::from(w[3]) << 32),
@@ -197,6 +204,8 @@ impl Tracker {
                 age.saturating_sub(TIMEOUT_MS)
             };
             rows.push(NetworkBoardHealthEntry {
+                cpu_temperature_centi_c: None,
+                cpu_temperature_age_ms: 0,
                 diagnostics: r.diagnostics.as_ref().map(|(report, received)| {
                     let mut report = report.clone();
                     report.received_age_ms = elapsed(now, *received);
@@ -225,6 +234,29 @@ mod tests {
     use std::time::Duration;
     fn at(t: Instant, ms: u64) -> Instant {
         t + Duration::from_millis(ms)
+    }
+    #[test]
+    fn signed_temperature_extension_preserves_legacy_diagnostics() {
+        let mut words = [0_u32; 24];
+        words[0] = 1;
+        words[4] = 1000;
+        words[1] = 0xff;
+        words[7] = 12345;
+        words[23] = 42;
+        let old = decode_diagnostics(&words).unwrap();
+        assert_eq!(old.die_temperature_centi_c, None);
+        words[1] |= (u32::from((-1234_i16) as u16) << 16) | 0x100 | (2 << 9);
+        let mut extended = decode_diagnostics(&words).unwrap();
+        assert_eq!(extended.die_temperature_centi_c, Some(-1234));
+        assert_eq!(extended.die_temperature_sample_age_ms, 200);
+        extended.die_temperature_centi_c = None;
+        extended.die_temperature_sample_age_ms = 0;
+        assert_eq!(old, extended); // every prior counter survives bit-for-bit
+        words[1] = (u32::from(30000_u16) << 16) | 0x100;
+        assert_eq!(
+            decode_diagnostics(&words).unwrap().die_temperature_centi_c,
+            None
+        );
     }
     #[test]
     fn dynamic_rows_count_outages_once_and_survive_snapshot_reload() {

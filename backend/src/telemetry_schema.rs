@@ -71,6 +71,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chamber_wire_roundtrip_is_additive_float_triplet() {
+        initialize().unwrap();
+        assert_eq!(data_type("DAQ_LOADCELL_CHAMBER"), DataType(259346466));
+        let payload: Vec<u8> = [4.25_f32, 500.0, 2.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let packet = sedsnet::packet::Packet::new(
+            data_type("DAQ_LOADCELL_CHAMBER"),
+            &[endpoint("GROUND_STATION")],
+            "DAQ",
+            123456,
+            std::sync::Arc::from(payload),
+        )
+        .unwrap();
+        let bytes = sedsnet::wire_format::pack_packet(&packet);
+        let decoded = sedsnet::wire_format::unpack_packet(&bytes).unwrap();
+        assert_eq!(decoded.data_as_f32().unwrap(), vec![4.25, 500.0, 2.5]);
+        assert_eq!(decoded.timestamp(), 123456);
+    }
+
+    #[test]
     fn runtime_schema_uses_embedded_firmware_wire_ids() {
         initialize().expect("schema registration");
         assert_eq!(endpoint("SD_CARD"), DataEndpoint(100));

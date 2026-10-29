@@ -8,6 +8,7 @@ pub(crate) use commands::{
     queue_locally_routed_flight_command,
 };
 mod periodic;
+mod heartbeat;
 pub(crate) mod procedure_clock;
 mod radio_io;
 pub use radio_io::{CommsWorkerHandle, TransportTxActivity, TxQueueBudget};
@@ -333,6 +334,7 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
         return;
     }
     let now_ms = procedure_clock::timestamp_ms();
+    state.confirm_new_launch_cycle();
     state.set_launch_clock(launch_countdown_clock(now_ms));
     let flight_command_sent = if let Err(e) = queue_locally_routed_flight_command(
         &router,
@@ -1179,7 +1181,7 @@ pub async fn telemetry_task(
                 }
                 _ = heartbeat_interval.tick() => {
                     if !heartbeat_cadence.due(crate::simulation_clock_ms()) { continue; }
-                    if router.log_queue::<u8>(crate::telemetry_schema::data_type("HEARTBEAT"), &[]).is_ok() {
+                    if heartbeat::queue_station_heartbeat(&router).is_ok() {
                         state.mark_board_seen(
                             Board::GroundStation.sender_id(),
                             get_current_timestamp_ms(),
@@ -1828,6 +1830,9 @@ async fn handle_packet(
         } else {
             get_current_timestamp_ms() as i64
         };
+        // Only an actually received prelaunch phase can re-arm a reset clock;
+        // a process's initial local Idle is not a new launch transition.
+        if matches!(new_flight_state,FlightState::Startup|FlightState::Idle|FlightState::PreFill|FlightState::FillTest|FlightState::NitrogenFill|FlightState::NitrousFill|FlightState::Armed){state.confirm_new_launch_cycle();}
         state.update_launch_clock_for_state(new_flight_state, launch_clock_ts_ms);
         queue_db_write(
             state,
@@ -2098,7 +2103,7 @@ async fn reset_testing_simulation(state: &Arc<AppState>) {
         let mut flight_state = state.state.lock().unwrap();
         *flight_state = FlightState::Idle;
     }
-    state.reset_launch_clock();
+    // Simulation data/state reset is separate from the explicit ResetTClock utility.
     state.broadcast_fill_targets_snapshot();
 
     let now_ms = get_current_timestamp_ms() as i64;
@@ -2339,6 +2344,9 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&qualification).unwrap()).unwrap();
         assert_eq!(saved["qualification"]["fire_started"], true);
         state.reset_launch_clock();
+        start_launch_clock_from_valve_sequence_status(&state);
+        assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::Idle,"old sequence status cannot re-arm a reset launch clock");
+        state.confirm_new_launch_cycle();
         start_launch_clock_from_valve_sequence_status(&state);
         assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::TMinus);
         std::fs::remove_file(qualification).unwrap();
@@ -4308,6 +4316,7 @@ mod tests {
             action_policy_tx,
             fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
             fill_targets_tx,
+            launch_history: Arc::new(Mutex::new(crate::launch_history::Store::ephemeral())),
             launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
             launch_clock_tx,
             launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
@@ -4687,6 +4696,52 @@ mod tests {
                 .iter()
                 .any(|r| r.data_type == loadcell::DERIVED_WEIGHT_50_DATA_TYPE)
         );
+    }
+
+    #[tokio::test]
+    async fn chamber_packet_keeps_loadcell_calibration_and_persists_pressure_with_both_clocks() {
+        let (db_tx, mut db_rx) = mpsc::channel(16);
+        let state = test_app_state(db_tx.clone()).await;
+        let pkt = Packet::new(
+            crate::telemetry_schema::data_type("DAQ_LOADCELL_CHAMBER"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            "DAQ",
+            987654,
+            f32_payload(&[4.25, 1000.0, 5.0]),
+        )
+        .unwrap();
+        let rows = handle_packet(&state, &db_tx, &test_db_overflow(), pkt).await;
+        assert!(rows.iter().any(
+            |r| r.data_type == "COMBUSTION_CHAMBER_PRESSURE" && r.values == vec![Some(1000.0)]
+        ));
+        assert!(
+            rows.iter()
+                .any(|r| r.data_type == "KG1000" && r.values == vec![Some(4.25)])
+        );
+        let db = crate::telemetry_db::open_in_memory_telemetry_db()
+            .await
+            .unwrap();
+        let mut writes = Vec::new();
+        while let Ok(DbQueueItem::Write(write)) = db_rx.try_recv() {
+            writes.push(write);
+        }
+        assert!(
+            writes.len() >= 5,
+            "combined,raw loadcell,derived mass,pressure,voltage"
+        );
+        insert_db_batch_once(&db, &writes).await.unwrap();
+        let saved:(i64,i64,String,String,String)=sqlx::query_as(
+            "SELECT timestamp_ms,source_timestamp_ms,sender_id,values_json,payload_json FROM telemetry WHERE data_type='COMBUSTION_CHAMBER_PRESSURE'")
+            .fetch_one(&db).await.unwrap();
+        assert!(saved.0 > 0);
+        assert_eq!(saved.1, 987654);
+        assert_eq!(saved.2, "DAQ");
+        assert_eq!(
+            serde_json::from_str::<Vec<f32>>(&saved.3).unwrap(),
+            vec![1000.0]
+        );
+        assert!(!saved.4.is_empty());
+        db.close().await;
     }
 
     #[tokio::test]

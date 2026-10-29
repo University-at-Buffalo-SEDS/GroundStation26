@@ -283,11 +283,40 @@ pub async fn discovery_preflight(headers: axum::http::HeaderMap) -> axum::respon
     }
     axum::http::StatusCode::FORBIDDEN.into_response()
 }
-/// Only paired installations advertise; responses contain no session or key material.
-pub async fn serve_discovery(pairing: Pairing) -> anyhow::Result<()> {
+/// Public address hints never establish trust or authorize credential handover.
+fn public_discovery(nonce: &str, scheme: &str, port: u16) -> Option<serde_json::Value> {
+    if !(16..=64).contains(&nonce.len())
+        || !nonce.bytes().all(|b| b.is_ascii_alphanumeric())
+        || port == 0
+    {
+        return None;
+    }
+    let role = if crate::rrls::is_rrls() {
+        "rrls"
+    } else {
+        "primary"
+    };
+    Some(serde_json::json!({"protocol":"GS26-FIND1", "nonce":nonce,
+        "name":if role == "rrls" { "RRLS" } else { "GroundStation" },
+        "role":role, "scheme":scheme, "port":port}))
+}
+/// One listener handles public address selection and separately signed paired handover.
+pub async fn serve_discovery(
+    pairing: Option<Pairing>,
+    scheme: &'static str,
+    address: std::net::SocketAddr,
+) -> anyhow::Result<()> {
     let addr =
         std::env::var("GS_STATION_DISCOVERY_BIND").unwrap_or_else(|_| format!("0.0.0.0:{PORT}"));
     let socket = tokio::net::UdpSocket::bind(addr).await?;
+    serve_discovery_socket(socket, pairing, scheme, address).await
+}
+async fn serve_discovery_socket(
+    socket: tokio::net::UdpSocket,
+    pairing: Option<Pairing>,
+    scheme: &'static str,
+    address: std::net::SocketAddr,
+) -> anyhow::Result<()> {
     let mut bytes = [0; 128];
     let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
     loop {
@@ -298,10 +327,22 @@ pub async fn serve_discovery(pairing: Pairing) -> anyhow::Result<()> {
         let Ok(request) = std::str::from_utf8(&bytes[..len]) else {
             continue;
         };
-        let Some(nonce) = request.strip_prefix("GS26-STATION1 ") else {
-            continue;
+        let response = if let Some(nonce) = request.strip_prefix("GS26-FIND1 ") {
+            if address.ip().is_loopback() && !from.ip().is_loopback() {
+                continue;
+            }
+            public_discovery(nonce, scheme, address.port())
+        } else if let (Some(nonce), Some(pairing)) =
+            (request.strip_prefix("GS26-STATION1 "), pairing.as_ref())
+        {
+            pairing
+                .discovery(nonce)
+                .ok()
+                .and_then(|e| serde_json::to_value(e).ok())
+        } else {
+            None
         };
-        if let Ok(response) = pairing.discovery(nonce) {
+        if let Some(response) = response {
             last = std::time::Instant::now();
             socket
                 .send_to(&serde_json::to_vec(&response)?, from)
@@ -329,6 +370,63 @@ mod tests {
             port: 443,
             scheme: "https".into(),
         }
+    }
+    #[tokio::test]
+    async fn unpaired_public_discovery_replies_but_does_not_create_handover_trust() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = server.local_addr().unwrap();
+        let task = tokio::spawn(serve_discovery_socket(
+            server,
+            None,
+            "https",
+            "127.0.0.1:8443".parse().unwrap(),
+        ));
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(b"GS26-FIND1 0123456789abcdef", endpoint)
+            .await
+            .unwrap();
+        let mut buffer = [0; 1024];
+        let (length, from) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut buffer),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(from, endpoint);
+        let response: serde_json::Value = serde_json::from_slice(&buffer[..length]).unwrap();
+        assert_eq!(response["protocol"], "GS26-FIND1");
+        assert_eq!(response["port"], 8443);
+        assert_eq!(response["scheme"], "https");
+        assert_eq!(response["nonce"], "0123456789abcdef");
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        client
+            .send_to(b"GS26-STATION1 0123456789abcdef", endpoint)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(80),
+                client.recv_from(&mut buffer)
+            )
+            .await
+            .is_err()
+        );
+        task.abort();
+        let _ = task.await;
+    }
+    #[test]
+    fn public_discovery_is_nonce_bound_address_only() {
+        assert!(public_discovery("short", "https", 443).is_none());
+        assert!(public_discovery("0123456789abcdef?", "https", 443).is_none());
+        assert!(public_discovery(&"a".repeat(65), "https", 443).is_none());
+        assert!(public_discovery("0123456789abcdef", "https", 0).is_none());
+        let d = public_discovery("0123456789abcdef", "https", 8443).unwrap();
+        assert_eq!(d["port"], 8443);
+        assert_eq!(d["nonce"], "0123456789abcdef");
+        assert!(d.get("token").is_none());
+        assert!(d.get("verify_key").is_none());
     }
     #[test]
     fn paired_sessions_reject_wrong_keys_groups_issuers_tampering_and_expiry() {

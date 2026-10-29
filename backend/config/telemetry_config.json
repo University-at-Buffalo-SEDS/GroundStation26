@@ -806,6 +806,21 @@
       ],
       "reliable": "Off",
       "priority": 0
+    },
+    {
+      "name": "DAQ_LOADCELL_CHAMBER",
+      "doc": "One KG1000 network slot: [uncalibrated KG1000, OMEGA PX309-1KG5V chamber psig (connector V * 200), chamber connector volts]. Only fresh assigned pressure; no extra packet slot.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 3
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable": "Off",
+      "priority": 16
     }
   ]
 }

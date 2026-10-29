@@ -92,7 +92,10 @@ impl TxDeadline {
 pub struct TxQueueBudget {
     pending: AtomicUsize,
     pending_control: AtomicUsize,
+    pending_ordinary: AtomicUsize,
     limit: usize,
+    ordinary_limit: usize,
+    short_lookahead: bool,
     // Exact canonical command bytes, bounded by the same accepted-byte budget.
     // Keep this owner through queue pop and active/failed writes. Stateful SDT
     // and sequenced traffic must never be suppressed by a payload comparison.
@@ -104,8 +107,19 @@ impl TxQueueBudget {
         Self {
             pending: AtomicUsize::new(0),
             pending_control: AtomicUsize::new(0),
+            pending_ordinary: AtomicUsize::new(0),
             limit,
+            ordinary_limit: limit,
+            short_lookahead: false,
             pending_commands: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn new_radio(control_limit: usize, ordinary_limit: usize) -> Self {
+        Self {
+            ordinary_limit: ordinary_limit.max(1).min(control_limit),
+            short_lookahead: true,
+            ..Self::new(control_limit)
         }
     }
 
@@ -119,10 +133,16 @@ impl TxQueueBudget {
         let mut commands = (priority >= 16
             && payload.len() <= crate::comms::RADIO_COMMAND_BATCH_MAX_BYTES
             && crate::comms::is_radio_batch_command(255, payload))
-            .then(|| self.pending_commands.lock().expect("pending radio commands poisoned"));
-        if commands.as_ref().is_some_and(|commands| commands.iter()
-            .any(|(queued_priority, bytes)| *queued_priority == priority && bytes == payload))
-        {
+        .then(|| {
+            self.pending_commands
+                .lock()
+                .expect("pending radio commands poisoned")
+        });
+        if commands.as_ref().is_some_and(|commands| {
+            commands
+                .iter()
+                .any(|(queued_priority, bytes)| *queued_priority == priority && bytes == payload)
+        }) {
             // The router retains this retry on transient refusal. Reporting
             // success here would invent another accepted transport owner;
             // discarding the original would risk losing the command.
@@ -167,8 +187,25 @@ impl TxQueueBudget {
                         .filter(|total| *total <= allowance)
                 })
                 .map_err(|_| sedsnet::TelemetryError::Io("side tx busy"))?;
+        } else {
+            let allowance =
+                self.ordinary_limit
+                    .saturating_add(if continuation && !self.short_lookahead {
+                        64 * 1024
+                    } else {
+                        0
+                    });
+            self.pending_ordinary
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                    pending
+                        .checked_add(payload.len())
+                        .filter(|total| *total <= allowance)
+                })
+                .map_err(|_| sedsnet::TelemetryError::Io("side tx busy"))?;
         }
-        let ceiling = if control {
+        let ceiling = if self.short_lookahead {
+            self.limit.saturating_add(self.ordinary_limit)
+        } else if control {
             self.limit.saturating_mul(2).saturating_add(64 * 1024)
         } else {
             self.limit
@@ -185,6 +222,9 @@ impl TxQueueBudget {
         if let Err(error) = reserved {
             if control {
                 self.pending_control
+                    .fetch_sub(payload.len(), Ordering::AcqRel);
+            } else {
+                self.pending_ordinary
                     .fetch_sub(payload.len(), Ordering::AcqRel);
             }
             return Err(error);
@@ -213,10 +253,13 @@ impl TxQueueBudget {
 
     fn complete(&self, priority: u8, payload: &[u8]) {
         if priority >= 16 && payload.len() <= crate::comms::RADIO_COMMAND_BATCH_MAX_BYTES {
-            let mut commands = self.pending_commands.lock().expect("pending radio commands poisoned");
-            if let Some(index) = commands.iter()
-                .position(|(queued_priority, bytes)| *queued_priority == priority && bytes == payload)
-            {
+            let mut commands = self
+                .pending_commands
+                .lock()
+                .expect("pending radio commands poisoned");
+            if let Some(index) = commands.iter().position(|(queued_priority, bytes)| {
+                *queued_priority == priority && bytes == payload
+            }) {
                 commands.swap_remove(index);
             }
         }
@@ -224,6 +267,8 @@ impl TxQueueBudget {
         self.pending.fetch_sub(len, Ordering::AcqRel);
         if uses_command_reserve(priority, payload) {
             self.pending_control.fetch_sub(len, Ordering::AcqRel);
+        } else {
+            self.pending_ordinary.fetch_sub(len, Ordering::AcqRel);
         }
     }
 }
@@ -235,8 +280,14 @@ pub struct TransportTxActivity {
     pending: AtomicUsize,
 }
 impl TransportTxActivity {
-    pub fn try_enqueue(&self, send: impl FnOnce() -> sedsnet::TelemetryResult<()>) -> sedsnet::TelemetryResult<()> {
-        self.pending.try_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_add(1))
+    pub fn try_enqueue(
+        &self,
+        send: impl FnOnce() -> sedsnet::TelemetryResult<()>,
+    ) -> sedsnet::TelemetryResult<()> {
+        self.pending
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
             .map_err(|_| sedsnet::TelemetryError::Io("side tx busy"))?;
         if let Err(error) = send() {
             self.complete();
@@ -386,7 +437,11 @@ impl WireBacklog {
     /// Recheck producer handoffs around transport service and batch selection.
     /// All rechecks share one drain allowance; an active producer cannot defer
     /// UART service indefinitely. An empty channel never waits for a sibling.
-    fn refill(&mut self, receiver: &mut mpsc::UnboundedReceiver<(u8, Vec<u8>)>, remaining: &mut usize) -> bool {
+    fn refill(
+        &mut self,
+        receiver: &mut mpsc::UnboundedReceiver<(u8, Vec<u8>)>,
+        remaining: &mut usize,
+    ) -> bool {
         while *remaining > 0 {
             match receiver.try_recv() {
                 Ok((priority, payload)) => {
@@ -421,11 +476,19 @@ impl WireBacklog {
     }
     /// Apply ordinary selection/fairness first. Only a command that would be
     /// selected next anyway may join the already selected command.
-    fn batch_follower(&mut self, comms: &dyn CommsDevice, first: (u8, &[u8])) -> Option<(u8, Vec<u8>)> {
+    fn batch_follower(
+        &mut self,
+        comms: &dyn CommsDevice,
+        first: (u8, &[u8]),
+    ) -> Option<(u8, Vec<u8>)> {
         let first_bytes = comms.command_batch_frame_len(first.0, first.1)?;
         self.batch_follower_after_bytes(comms, first_bytes)
     }
-    fn batch_follower_after_bytes(&mut self, comms: &dyn CommsDevice, first_bytes: usize) -> Option<(u8, Vec<u8>)> {
+    fn batch_follower_after_bytes(
+        &mut self,
+        comms: &dyn CommsDevice,
+        first_bytes: usize,
+    ) -> Option<(u8, Vec<u8>)> {
         let state = self.selection_state();
         let Some(second) = self.pop() else {
             self.restore_selection(state);
@@ -441,6 +504,40 @@ impl WireBacklog {
             self.push(second.0, second.1, true);
             None
         }
+    }
+    /// Finish an already selected pair in the same bounded UART packet. A
+    /// receipt turn may move behind this one third command, then remains due.
+    /// No waiting, extra byte allowance, or metadata-service bypass is granted.
+    fn batch_tail_follower_after_bytes(
+        &mut self,
+        comms: &dyn CommsDevice,
+        first_bytes: usize,
+    ) -> Option<(u8, Vec<u8>)> {
+        if let Some(packet) = self.batch_follower_after_bytes(comms, first_bytes) {
+            return Some(packet);
+        }
+        if !self.preserve_order
+            || self.receipts.is_empty()
+            || self.application_bytes < 256
+            || (self.control_bytes >= MAX_CONTROL_BYTES
+                && (!self.ordered.is_empty() || !self.routing.is_empty()))
+        {
+            return None;
+        }
+        let state = self.selection_state();
+        let packet = backlog_pop(&mut self.priorities, &mut self.priority_bytes)?;
+        let eligible = comms
+            .command_batch_frame_len(packet.0, &packet.1)
+            .and_then(|size| first_bytes.checked_add(size))
+            .is_some_and(|total| total <= crate::comms::RADIO_COMMAND_BATCH_MAX_BYTES);
+        if !eligible {
+            self.restore_selection(state);
+            self.push(packet.0, packet.1, true);
+            return None;
+        }
+        self.application_bytes = self.application_bytes.saturating_add(packet.1.len());
+        self.control_bytes = self.control_bytes.saturating_add(packet.1.len());
+        Some(packet)
     }
     fn has_eligible_critical(&self) -> bool {
         !self.receipts.is_empty()
@@ -593,12 +690,20 @@ mod priority_tests {
 
     struct BatchTestComms;
     impl CommsDevice for BatchTestComms {
-        fn command_batch_frame_len(&self, priority:u8, payload:&[u8]) -> Option<usize> {
-            crate::comms::is_radio_batch_command(priority,payload).then_some(payload.len()+12)
+        fn command_batch_frame_len(&self, priority: u8, payload: &[u8]) -> Option<usize> {
+            crate::comms::is_radio_batch_command(priority, payload).then_some(payload.len() + 12)
         }
-        fn send_data(&mut self,_:&[u8])->Result<(),Box<dyn std::error::Error+Send+Sync>> { unreachable!() }
-        fn set_side_id(&mut self,_:RouterSideId) {}
-        fn recv_packet(&mut self,_:&Router,_:&mut dyn FnMut(&Packet))->sedsnet::TelemetryResult<()> { unreachable!() }
+        fn send_data(&mut self, _: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            unreachable!()
+        }
+        fn set_side_id(&mut self, _: RouterSideId) {}
+        fn recv_packet(
+            &mut self,
+            _: &Router,
+            _: &mut dyn FnMut(&Packet),
+        ) -> sedsnet::TelemetryResult<()> {
+            unreachable!()
+        }
     }
     fn batch_test_command(name: &str, payload: &[u8]) -> Vec<u8> {
         crate::telemetry_schema::initialize().unwrap();
@@ -621,25 +726,41 @@ mod priority_tests {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let mut queue = WireBacklog::new(true);
         let mut remaining = 3;
-        for packet in &packets[..2] { sender.send((255, packet.clone())).unwrap(); }
+        for packet in &packets[..2] {
+            sender.send((255, packet.clone())).unwrap();
+        }
         assert!(queue.refill(&mut receiver, &mut remaining));
         assert_eq!(remaining, 1);
         let before = queue.selection_state();
         let first = queue.pop().unwrap();
-        let second = queue.batch_follower(&BatchTestComms, (first.0, &first.1)).unwrap();
+        let second = queue
+            .batch_follower(&BatchTestComms, (first.0, &first.1))
+            .unwrap();
         // Producer crosses the original drain/batch-selection boundary.
         sender.send((255, packets[2].clone())).unwrap();
         sender.send((255, packets[0].clone())).unwrap();
         assert!(queue.refill(&mut receiver, &mut remaining));
         assert_eq!(remaining, 0);
-        assert_eq!(receiver.len(), 1, "refill must share the original drain bound");
-        let bytes = BatchTestComms.command_batch_frame_len(first.0, &first.1).unwrap()
-            + BatchTestComms.command_batch_frame_len(second.0, &second.1).unwrap();
-        let third = queue.batch_follower_after_bytes(&BatchTestComms, bytes).unwrap();
+        assert_eq!(
+            receiver.len(),
+            1,
+            "refill must share the original drain bound"
+        );
+        let bytes = BatchTestComms
+            .command_batch_frame_len(first.0, &first.1)
+            .unwrap()
+            + BatchTestComms
+                .command_batch_frame_len(second.0, &second.1)
+                .unwrap();
+        let third = queue
+            .batch_follower_after_bytes(&BatchTestComms, bytes)
+            .unwrap();
         assert_eq!(third.1, packets[2]);
         queue.push(third.0, third.1, true);
         queue.restore_selected(before, first, Some(second));
-        for packet in packets { assert_eq!(queue.pop().unwrap().1, packet); }
+        for packet in packets {
+            assert_eq!(queue.pop().unwrap().1, packet);
+        }
         assert!(queue.pop().is_none());
     }
 
@@ -648,19 +769,31 @@ mod priority_tests {
         let packets = ["FLIGHT_STATE", "AV_BAY_UNDERGLOW", "FLIGHT_BUZZER"]
             .map(|name| batch_test_command(name, &[1]));
         let mut q = WireBacklog::new(true);
-        for packet in &packets { q.push(255, packet.clone(), false); }
+        for packet in &packets {
+            q.push(255, packet.clone(), false);
+        }
         let before = q.selection_state();
         let first = q.pop().unwrap();
-        let second = q.batch_follower(&BatchTestComms, (first.0, &first.1)).unwrap();
-        let bytes = BatchTestComms.command_batch_frame_len(first.0, &first.1).unwrap()
-            + BatchTestComms.command_batch_frame_len(second.0, &second.1).unwrap();
-        let third = q.batch_follower_after_bytes(&BatchTestComms, bytes).unwrap();
+        let second = q
+            .batch_follower(&BatchTestComms, (first.0, &first.1))
+            .unwrap();
+        let bytes = BatchTestComms
+            .command_batch_frame_len(first.0, &first.1)
+            .unwrap()
+            + BatchTestComms
+                .command_batch_frame_len(second.0, &second.1)
+                .unwrap();
+        let third = q
+            .batch_follower_after_bytes(&BatchTestComms, bytes)
+            .unwrap();
         assert!(q.pop().is_none());
         // Any partial physical write retains all three original owners/IDs.
         q.push(third.0, third.1, true);
         q.restore_selected(before, first, Some(second));
         assert_eq!(q.selection_state(), before);
-        for packet in packets { assert_eq!(q.pop().unwrap().1, packet); }
+        for packet in packets {
+            assert_eq!(q.pop().unwrap().1, packet);
+        }
         assert!(q.pop().is_none());
     }
 
@@ -748,6 +881,84 @@ mod priority_tests {
         assert_eq!(q.pop().unwrap().1, command);
     }
 
+    #[test]
+    fn already_owned_triad_finishes_one_bounded_packet_before_receipt_turn() {
+        let commands = ["FLIGHT_STATE", "AV_BAY_UNDERGLOW", "FLIGHT_BUZZER"]
+            .map(|name| batch_test_command(name, &[1]));
+        let receipt = serialize::pack_packet(
+            &Packet::new(
+                sedsnet::config::DataType::ReliableAck,
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "RF",
+                1,
+                Arc::from(42_u64.to_le_bytes()),
+            )
+            .unwrap(),
+        )
+        .to_vec();
+        let mut q = WireBacklog::new(true);
+        for command in &commands {
+            q.push(255, command.clone(), false);
+        }
+        q.push(255, receipt.clone(), false);
+        q.application_bytes = 256 - commands[0].len() - commands[1].len();
+        let first = q.pop().unwrap();
+        let second = q
+            .batch_follower(&BatchTestComms, (first.0, &first.1))
+            .unwrap();
+        let bytes = first.1.len() + second.1.len() + 24;
+        let third = q
+            .batch_tail_follower_after_bytes(&BatchTestComms, bytes)
+            .expect("fresh third command must finish the existing <=192B batch");
+        assert_eq!(third.1, commands[2]);
+        assert!(bytes + third.1.len() + 12 <= crate::comms::RADIO_COMMAND_BATCH_MAX_BYTES);
+        assert_eq!(
+            q.pop().unwrap().1,
+            receipt,
+            "receipt gets the immediate next service turn"
+        );
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn triad_tail_does_not_bypass_metadata_or_enlarge_byte_budget() {
+        let command = batch_test_command("FLIGHT_BUZZER", &[1]);
+        let receipt = serialize::pack_packet(
+            &Packet::new(
+                sedsnet::config::DataType::ReliableAck,
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "RF",
+                1,
+                Arc::from(42_u64.to_le_bytes()),
+            )
+            .unwrap(),
+        )
+        .to_vec();
+        let mut q = WireBacklog::new(true);
+        q.push(255, command.clone(), false);
+        q.push(255, receipt.clone(), false);
+        q.application_bytes = 256;
+        let state = q.selection_state();
+        assert!(
+            q.batch_tail_follower_after_bytes(
+                &BatchTestComms,
+                crate::comms::RADIO_COMMAND_BATCH_MAX_BYTES
+            )
+            .is_none()
+        );
+        assert_eq!(q.selection_state(), state);
+        q.push(253, b"SDT\x03owned".to_vec(), false);
+        q.control_bytes = MAX_CONTROL_BYTES;
+        let state = q.selection_state();
+        assert!(
+            q.batch_tail_follower_after_bytes(&BatchTestComms, 100)
+                .is_none()
+        );
+        assert_eq!(q.selection_state(), state);
+        assert_eq!(q.pop().unwrap().1, b"SDT\x03owned");
+        assert_eq!(q.pop().unwrap().1, receipt);
+        assert_eq!(q.pop().unwrap().1, command);
+    }
 
     #[test]
     fn failed_command_pair_restores_both_original_owners_and_fairness_checkpoint() {
@@ -1368,6 +1579,87 @@ mod priority_tests {
     }
 
     #[test]
+    fn short_radio_lookahead_preserves_schema_prefix_and_separate_command_credit() {
+        let budget = TxQueueBudget::new_radio(2048, 256);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut chunk = vec![0u8; 192];
+        chunk[..4].copy_from_slice(b"SDT\x03");
+        chunk[10..12].copy_from_slice(&18u16.to_le_bytes());
+        budget.try_send(&tx, 254, &chunk).unwrap();
+        chunk[8..10].copy_from_slice(&1u16.to_le_bytes());
+        assert!(budget.try_send(&tx, 254, &chunk).is_err());
+        // The same protected allowance survives a full ordinary lookahead.
+        for id in 0..64 {
+            let mut control = [0xff; 32];
+            control[31] = id;
+            budget.try_send(&tx, 255, &control).unwrap();
+        }
+        let (priority, prefix) = rx.try_recv().unwrap();
+        assert_eq!(&prefix[8..10], &[0, 0]);
+        assert!(budget.try_send(&tx, 254, &chunk).is_err());
+        budget.complete(priority, &prefix);
+        budget.try_send(&tx, 254, &chunk).unwrap();
+        assert_eq!(budget.pending_ordinary.load(Ordering::Acquire), 192);
+        while let Ok((priority, bytes)) = rx.try_recv() {
+            budget.complete(priority, &bytes);
+        }
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+        assert_eq!(budget.pending_control.load(Ordering::Acquire), 0);
+        assert_eq!(budget.pending_ordinary.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn actual_sdk_schema_progresses_through_one_frame_radio_lookahead() {
+        use sedsnet::router::{RouterConfig, RouterSideOptions};
+        crate::telemetry_schema::initialize().unwrap();
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(1000));
+        let clock = now.clone();
+        let source = Router::new_with_clock(
+            RouterConfig::default().with_sender("GS"),
+            Box::new(move || clock.load(Ordering::Acquire)),
+        );
+        let budget = Arc::new(TxQueueBudget::new_radio(2048, 256));
+        let callback = budget.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        source.add_side_packed_with_priority_and_options(
+            "radio",
+            move |bytes, priority| callback.try_send(&tx, priority, bytes),
+            RouterSideOptions::default().with_small_packet_transport(192),
+        );
+        let startup = source.announce_discovery();
+        let mut transfers = std::collections::BTreeMap::<u32, (u16, Vec<u16>)>::new();
+        let mut completed = false;
+        for step in 0..2000 {
+            now.store(1000 + step, Ordering::Release);
+            source.process_all_queues_with_timeout(0).unwrap();
+            while let Ok((priority, bytes)) = rx.try_recv() {
+                if bytes.starts_with(b"SDT\x03") {
+                    let id = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                    let index = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
+                    let total = u16::from_le_bytes(bytes[10..12].try_into().unwrap());
+                    assert_eq!(
+                        crc32fast::hash(&bytes[..bytes.len() - 4]),
+                        u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap())
+                    );
+                    let entry = transfers.entry(id).or_insert((total, Vec::new()));
+                    assert_eq!(entry.0, total);
+                    entry.1.push(index);
+                    completed |= total > 1 && entry.1 == (0..total).collect::<Vec<_>>();
+                }
+                budget.complete(priority, &bytes);
+            }
+            assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+            if completed {
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "partial schema cursor stranded by backpressure; startup={startup:?}, transfers={transfers:?}"
+        );
+    }
+
+    #[test]
     fn radio_budget_stays_charged_until_write_completion() {
         crate::telemetry_schema::initialize().unwrap();
         let command = |stamp| {
@@ -1756,7 +2048,7 @@ pub(super) fn spawn_comms_worker_threads(
                     let third = follower.as_ref().and_then(|(next_priority, next_payload)| {
                         let bytes = comms.command_batch_frame_len(priority, &payload)?
                             .checked_add(comms.command_batch_frame_len(*next_priority, next_payload)?)?;
-                        backlog.batch_follower_after_bytes(&**comms, bytes)
+                        backlog.batch_tail_follower_after_bytes(&**comms, bytes)
                     });
                     let result = if let (Some((p2, b2)), Some((p3, b3))) = (follower.as_ref(), third.as_ref()) {
                         comms.send_command_batch(&[(priority, &payload), (*p2, b2), (*p3, b3)])
@@ -2923,8 +3215,12 @@ fn drain_radio_tx_queue(
                 }
                 while telemetry_backlog.len() > radio_tx_backlog_limit {
                     if let Some((priority, payload)) = telemetry_backlog.pop_front() {
-                        if let Some(budget) = tx_budget { budget.complete(priority, &payload); }
-                        if let Some(activity) = transport_activity { activity.complete(); }
+                        if let Some(budget) = tx_budget {
+                            budget.complete(priority, &payload);
+                        }
+                        if let Some(activity) = transport_activity {
+                            activity.complete();
+                        }
                     }
                 }
             }
@@ -3036,8 +3332,12 @@ fn send_while_uplink_window_open(
         maybe_log_green_radio_command_send(worker_name, &payload);
         match comms.send_data_with_priority(&payload, priority) {
             Ok(()) => {
-                if let Some(budget) = tx_budget { budget.complete(priority, &payload); }
-                if let Some(activity) = transport_activity { activity.complete(); }
+                if let Some(budget) = tx_budget {
+                    budget.complete(priority, &payload);
+                }
+                if let Some(activity) = transport_activity {
+                    activity.complete();
+                }
                 log_radio_command_event("radio TX sent", worker_name, &payload);
                 *sent_in_current_uplink_window += 1;
                 let sent_at = std::time::Instant::now();
@@ -3642,80 +3942,234 @@ mod rfd_worker_tests {
 mod transport_pending_tests {
     use super::*;
     use std::error::Error;
-    struct BlockThenRetry { expected_priority:u8, attempts: Arc<AtomicUsize>, release: Arc<AtomicUsize>, entered: std::sync::mpsc::Sender<usize> }
+    struct BlockThenRetry {
+        expected_priority: u8,
+        attempts: Arc<AtomicUsize>,
+        release: Arc<AtomicUsize>,
+        entered: std::sync::mpsc::Sender<usize>,
+    }
     impl CommsDevice for BlockThenRetry {
-        fn recv_packet(&mut self, _: &Router, _: &mut dyn FnMut(&Packet)) -> sedsnet::TelemetryResult<()> { Ok(()) }
-        fn send_data(&mut self, _: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-            let attempt=self.attempts.fetch_add(1,Ordering::AcqRel);self.entered.send(attempt).unwrap();
-            while self.release.load(Ordering::Acquire)<=attempt { thread::sleep(Duration::from_millis(1)); }
-            if attempt==0 { return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into()); } Ok(())
+        fn recv_packet(
+            &mut self,
+            _: &Router,
+            _: &mut dyn FnMut(&Packet),
+        ) -> sedsnet::TelemetryResult<()> {
+            Ok(())
         }
-        fn send_data_with_priority(&mut self, bytes:&[u8],priority:u8)->Result<(),Box<dyn Error+Send+Sync>> {
-            assert_eq!(priority,self.expected_priority,"worker lost the selected priority across retry");
+        fn send_data(&mut self, _: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+            let attempt = self.attempts.fetch_add(1, Ordering::AcqRel);
+            self.entered.send(attempt).unwrap();
+            while self.release.load(Ordering::Acquire) <= attempt {
+                thread::sleep(Duration::from_millis(1));
+            }
+            if attempt == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+            }
+            Ok(())
+        }
+        fn send_data_with_priority(
+            &mut self,
+            bytes: &[u8],
+            priority: u8,
+        ) -> Result<(), Box<dyn Error + Send + Sync>> {
+            assert_eq!(
+                priority, self.expected_priority,
+                "worker lost the selected priority across retry"
+            );
             self.send_data(bytes)
         }
         fn set_side_id(&mut self, _: RouterSideId) {}
     }
     #[test]
     fn rejected_enqueue_does_not_leave_phantom_transport_ownership() {
-        let activity=TransportTxActivity::default();
-        assert!(activity.try_enqueue(||Err(sedsnet::TelemetryError::Io("side tx busy"))).is_err());assert!(!activity.has_pending());
-        activity.try_enqueue(||{assert!(activity.has_pending(),"ownership must precede handoff");Ok(())}).unwrap();
-        assert!(activity.has_pending());activity.complete();assert!(!activity.has_pending());
+        let activity = TransportTxActivity::default();
+        assert!(
+            activity
+                .try_enqueue(|| Err(sedsnet::TelemetryError::Io("side tx busy")))
+                .is_err()
+        );
+        assert!(!activity.has_pending());
+        activity
+            .try_enqueue(|| {
+                assert!(activity.has_pending(), "ownership must precede handoff");
+                Ok(())
+            })
+            .unwrap();
+        assert!(activity.has_pending());
+        activity.complete();
+        assert!(!activity.has_pending());
     }
     #[tokio::test]
     async fn software_owner_survives_queue_pop_active_write_and_retry_in_all_workers() {
-        for (legacy,prioritize_rx) in [(false,false),(true,false),(false,true)] {
-            let state=crate::state::tests::test_app_state().await;let activity=state.transport_tx_activity.clone();
-            let attempts=Arc::new(AtomicUsize::new(0));let release=Arc::new(AtomicUsize::new(0));
-            let (entered,observed)=std::sync::mpsc::channel();let (sender,receiver)=mpsc::unbounded_channel();
-            activity.try_enqueue(||sender.send((16,vec![1,2,3])).map_err(|_|sedsnet::TelemetryError::Io("test queue closed"))).unwrap();
-            assert!(state.has_pending_transport_tx(),"queued work must block clear");
-            let workers=spawn_comms_worker_threads(Arc::new(Router::new(Default::default())),state.clone(),CommsWorkerHandle {
-                transport_activity:Some(activity.clone()),name:"pending_fixture",tx_budget:None,
-                comms:Arc::new(Mutex::new(Box::new(BlockThenRetry {expected_priority:16,attempts:attempts.clone(),release:release.clone(),entered}))),
-                tx_comms:None,side_id:0,tx_rx:receiver,legacy_single_worker:legacy,prioritize_rx,dedicated_radio_io:false,
-            }).unwrap();
-            let result=(||->Result<(),&'static str>{
-                if observed.recv_timeout(Duration::from_secs(2))!=Ok(0){return Err("first write not reached");}
-                if !state.has_pending_transport_tx(){return Err("ownership disappeared during active write");}
-                release.store(1,Ordering::Release);
-                if observed.recv_timeout(Duration::from_secs(2))!=Ok(1){return Err("failed write dropped instead of retried");}
-                if !state.has_pending_transport_tx(){return Err("ownership disappeared across retry");}
-                release.store(2,Ordering::Release);
-                for _ in 0..2000 {if !activity.has_pending(){return Ok(());}thread::sleep(Duration::from_millis(1));}
+        for (legacy, prioritize_rx) in [(false, false), (true, false), (false, true)] {
+            let state = crate::state::tests::test_app_state().await;
+            let activity = state.transport_tx_activity.clone();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let release = Arc::new(AtomicUsize::new(0));
+            let (entered, observed) = std::sync::mpsc::channel();
+            let (sender, receiver) = mpsc::unbounded_channel();
+            activity
+                .try_enqueue(|| {
+                    sender
+                        .send((16, vec![1, 2, 3]))
+                        .map_err(|_| sedsnet::TelemetryError::Io("test queue closed"))
+                })
+                .unwrap();
+            assert!(
+                state.has_pending_transport_tx(),
+                "queued work must block clear"
+            );
+            let workers = spawn_comms_worker_threads(
+                Arc::new(Router::new(Default::default())),
+                state.clone(),
+                CommsWorkerHandle {
+                    transport_activity: Some(activity.clone()),
+                    name: "pending_fixture",
+                    tx_budget: None,
+                    comms: Arc::new(Mutex::new(Box::new(BlockThenRetry {
+                        expected_priority: 16,
+                        attempts: attempts.clone(),
+                        release: release.clone(),
+                        entered,
+                    }))),
+                    tx_comms: None,
+                    side_id: 0,
+                    tx_rx: receiver,
+                    legacy_single_worker: legacy,
+                    prioritize_rx,
+                    dedicated_radio_io: false,
+                },
+            )
+            .unwrap();
+            let result = (|| -> Result<(), &'static str> {
+                if observed.recv_timeout(Duration::from_secs(2)) != Ok(0) {
+                    return Err("first write not reached");
+                }
+                if !state.has_pending_transport_tx() {
+                    return Err("ownership disappeared during active write");
+                }
+                release.store(1, Ordering::Release);
+                if observed.recv_timeout(Duration::from_secs(2)) != Ok(1) {
+                    return Err("failed write dropped instead of retried");
+                }
+                if !state.has_pending_transport_tx() {
+                    return Err("ownership disappeared across retry");
+                }
+                release.store(2, Ordering::Release);
+                for _ in 0..2000 {
+                    if !activity.has_pending() {
+                        return Ok(());
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
                 Err("successful write did not release ownership")
             })();
-            release.store(usize::MAX,Ordering::Release);state.request_shutdown();drop(sender);
-            for worker in workers {worker.join().unwrap();}
-            assert!(result.is_ok(),"legacy={legacy} rx_priority={prioritize_rx}: {result:?}");assert!(!activity.has_pending());
+            release.store(usize::MAX, Ordering::Release);
+            state.request_shutdown();
+            drop(sender);
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            assert!(
+                result.is_ok(),
+                "legacy={legacy} rx_priority={prioritize_rx}: {result:?}"
+            );
+            assert!(!activity.has_pending());
         }
     }
     #[test]
     fn dedicated_retry_retains_software_owner_and_exact_capacity_priority() {
-        let activity=TransportTxActivity::default();let budget=TxQueueBudget::new(2048);
-        let (sender,mut receiver)=mpsc::unbounded_channel();
-        activity.try_enqueue(||budget.try_send(&sender,0,&[1,2,3])).unwrap();
-        let mut commands=VecDeque::new();let mut telemetry=VecDeque::new();
-        assert!(drain_radio_tx_queue(&mut receiver,"fixture",&mut commands,&mut telemetry,8,Some(&activity),Some(&budget)));
-        let (entered,_observed)=std::sync::mpsc::channel();
-        let mut device=BlockThenRetry {expected_priority:0,attempts:Arc::new(AtomicUsize::new(0)),release:Arc::new(AtomicUsize::new(usize::MAX)),entered};
-        let now=std::time::Instant::now();let mut until=Some(now+Duration::from_secs(4));let mut uplink=true;
-        let mut sent=0;let mut last=None;let mut next=None;let mut error_time=0;let mut suppressed=0;
+        let activity = TransportTxActivity::default();
+        let budget = TxQueueBudget::new(2048);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        activity
+            .try_enqueue(|| budget.try_send(&sender, 0, &[1, 2, 3]))
+            .unwrap();
+        let mut commands = VecDeque::new();
+        let mut telemetry = VecDeque::new();
+        assert!(drain_radio_tx_queue(
+            &mut receiver,
+            "fixture",
+            &mut commands,
+            &mut telemetry,
+            8,
+            Some(&activity),
+            Some(&budget)
+        ));
+        let (entered, _observed) = std::sync::mpsc::channel();
+        let mut device = BlockThenRetry {
+            expected_priority: 0,
+            attempts: Arc::new(AtomicUsize::new(0)),
+            release: Arc::new(AtomicUsize::new(usize::MAX)),
+            entered,
+        };
+        let now = std::time::Instant::now();
+        let mut until = Some(now + Duration::from_secs(4));
+        let mut uplink = true;
+        let mut sent = 0;
+        let mut last = None;
+        let mut next = None;
+        let mut error_time = 0;
+        let mut suppressed = 0;
         for round in 0..2 {
-            let wrote=send_while_uplink_window_open(&mut device,"fixture",&mut commands,&mut telemetry,8,Duration::from_secs(5),true,Some(now),Some(now),Duration::ZERO,Duration::ZERO,&mut until,&mut uplink,&mut sent,&mut last,&mut next,&mut error_time,&mut suppressed,Some(&activity),Some(&budget));
-            assert_eq!(wrote,round==1);
-            assert_eq!(activity.has_pending(),round==0);
-            assert_eq!(budget.pending.load(Ordering::Acquire),if round==0 {3}else{0});
-            assert_eq!(telemetry.len(),if round==0 {1}else{0});
+            let wrote = send_while_uplink_window_open(
+                &mut device,
+                "fixture",
+                &mut commands,
+                &mut telemetry,
+                8,
+                Duration::from_secs(5),
+                true,
+                Some(now),
+                Some(now),
+                Duration::ZERO,
+                Duration::ZERO,
+                &mut until,
+                &mut uplink,
+                &mut sent,
+                &mut last,
+                &mut next,
+                &mut error_time,
+                &mut suppressed,
+                Some(&activity),
+                Some(&budget),
+            );
+            assert_eq!(wrote, round == 1);
+            assert_eq!(activity.has_pending(), round == 0);
+            assert_eq!(
+                budget.pending.load(Ordering::Acquire),
+                if round == 0 { 3 } else { 0 }
+            );
+            assert_eq!(telemetry.len(), if round == 0 { 1 } else { 0 });
         }
     }
     #[test]
     fn dedicated_backlog_eviction_releases_only_discarded_telemetry() {
-        let activity=TransportTxActivity::default();let (sender,mut receiver)=mpsc::unbounded_channel();
-        for byte in 1..=3 {activity.try_enqueue(||sender.send((0,vec![byte])).map_err(|_|sedsnet::TelemetryError::Io("closed"))).unwrap();}
-        let mut commands=VecDeque::new();let mut telemetry=VecDeque::new();
-        assert!(drain_radio_tx_queue(&mut receiver,"fixture",&mut commands,&mut telemetry,1,Some(&activity),None));
-        assert_eq!(telemetry.len(),1);assert!(activity.has_pending());activity.complete();assert!(!activity.has_pending());
+        let activity = TransportTxActivity::default();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        for byte in 1..=3 {
+            activity
+                .try_enqueue(|| {
+                    sender
+                        .send((0, vec![byte]))
+                        .map_err(|_| sedsnet::TelemetryError::Io("closed"))
+                })
+                .unwrap();
+        }
+        let mut commands = VecDeque::new();
+        let mut telemetry = VecDeque::new();
+        assert!(drain_radio_tx_queue(
+            &mut receiver,
+            "fixture",
+            &mut commands,
+            &mut telemetry,
+            1,
+            Some(&activity),
+            None
+        ));
+        assert_eq!(telemetry.len(), 1);
+        assert!(activity.has_pending());
+        activity.complete();
+        assert!(!activity.has_pending());
     }
 }

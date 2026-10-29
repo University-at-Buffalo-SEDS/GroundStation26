@@ -8,10 +8,14 @@ normal recording. This endpoint does not represent storage on Actuator.
 
 Launch acceptance starts a DAQ launch file. Valve's sequence confirmation and
 Pilot-open T0 correct the deadline without changing the session ID. The deadline
-is T+120 seconds, not two minutes after pressing Launch. Persisting the absolute
+is T0+20seconds, including the countdown before T0. Persisting the absolute
 deadline prevents a GroundStation service restart from extending the run.
 DAQ subscribes using SEDSNet network variables, so reconnects retrieve the cached
-value. Duplicate values do not create another file. Update DAQ firmware as well
+value. DAQ accepts only newer authoritative T0 revisions before closure. Retained
+replays cannot extend or reopen a completed session. At the cutoff
+it drains admitted launch rows, closes the launch files, and routes new records
+to ordinary SD files while acquisition and network telemetry continue. Duplicate
+values do not create another file. Update DAQ firmware as well
 as GroundStation to use this protocol.
 
 Flight Computer is now an available OTA target, but first needs the new combined
@@ -25,3 +29,11 @@ router recreation, disk-cache restart, T-minus/T-plus deadline conversion and OT
 target eligibility. Firmware tests cover the receiver and real LaunchCore delta
 installer independently. Physical SD power loss and hardware OTA still require
 hardware qualification.
+
+The retained `daq_log_clock_stamp` is a dedicated packet revision saved with
+the16-byte value. Changed values advance it monotonically even if UTC moves
+backwards; cached publications reuse it exactly. Startup restoration from the
+launch-clock journal must restore the literal pair and stamp before the initial
+network-variable seed. Conflicting existing revisions fail closed rather than
+being overwritten or relabelled with a new timestamp. No new SDK/application
+type IDs or DAQ clock payload schema are introduced.

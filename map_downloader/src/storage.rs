@@ -195,6 +195,9 @@ pub(crate) fn ensure_space(directory: &Path, required: u64) -> Result<()> {
         }
         // SAFETY: successful statvfs initialized stat.
         let stat = unsafe { stat.assume_init() };
+        // statvfs field widths vary across supported Unix targets, including
+        // 32-bit Raspberry Pi builds. Widen before multiplying on those targets.
+        #[allow(clippy::unnecessary_cast)]
         let free = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
         anyhow::ensure!(
             free >= required,

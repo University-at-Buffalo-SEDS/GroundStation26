@@ -268,6 +268,11 @@ pub struct NetworkTopologyLink {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
 pub struct BoardDiagnostics {
+    /// Internal MCU die temperature, not ambient. Absent on older firmware.
+    #[serde(default)]
+    pub die_temperature_centi_c: Option<i32>,
+    #[serde(default)]
+    pub die_temperature_sample_age_ms: u32,
     pub version: u32,
     pub received_age_ms: u64,
     pub uptime_ticks: u64,
@@ -295,6 +300,11 @@ pub struct BoardDiagnostics {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
 pub struct NetworkBoardHealthEntry {
+    /// Host CPU/package sensor; unsupported platforms report unavailable.
+    #[serde(default)]
+    pub cpu_temperature_centi_c: Option<i32>,
+    #[serde(default)]
+    pub cpu_temperature_age_ms: u64,
     #[serde(default)]
     pub diagnostics: Option<BoardDiagnostics>,
     pub sender_id: String,

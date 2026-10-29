@@ -35,6 +35,8 @@ pub struct Permissions {
     pub voice_transmit: bool,
     #[serde(default)]
     pub camera_publish: bool,
+    #[serde(default)]
+    pub sign_checklists: bool,
 }
 
 impl Permissions {
@@ -46,6 +48,7 @@ impl Permissions {
                 set_system_time: true,
                 voice_transmit: true,
                 camera_publish: true,
+                sign_checklists: true,
             }
         } else {
             self.normalized()
@@ -66,6 +69,7 @@ impl Permissions {
             Permission::SetSystemTime => normalized.set_system_time,
             Permission::VoiceTransmit => normalized.view_data && normalized.voice_transmit,
             Permission::CameraPublish => normalized.view_data && normalized.camera_publish,
+            Permission::SignChecklists => normalized.view_data && normalized.sign_checklists,
         }
     }
 }
@@ -118,6 +122,7 @@ pub enum Permission {
     SetSystemTime,
     VoiceTransmit,
     CameraPublish,
+    SignChecklists,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,7 +221,9 @@ pub struct AuthPrincipal {
 
 impl AuthPrincipal {
     pub fn can_publish_camera(&self) -> bool {
-        !self.anonymous && (self.roles.contains(&StreamRole::Admin) || self.permissions.allows(Permission::CameraPublish))
+        !self.anonymous
+            && (self.roles.contains(&StreamRole::Admin)
+                || self.permissions.allows(Permission::CameraPublish))
     }
 
     pub fn can_manage_stream(&self) -> bool {
@@ -305,6 +312,7 @@ mod stream_role_tests {
                 set_system_time: false,
                 voice_transmit: false,
                 camera_publish: false,
+                sign_checklists: false,
             },
             expires_at_ms: None,
             anonymous,
@@ -624,6 +632,7 @@ impl AuthManager {
             set_system_time: claims.permissions.set_system_time && local.set_system_time,
             voice_transmit: claims.permissions.voice_transmit && local.voice_transmit,
             camera_publish: claims.permissions.camera_publish && local.camera_publish,
+            sign_checklists: claims.permissions.sign_checklists && local.sign_checklists,
         };
         if !permissions.allows(required) {
             return Err(AuthFailure::Forbidden(
@@ -722,6 +731,7 @@ impl AuthManager {
                 set_system_time: false,
                 voice_transmit: false,
                 camera_publish: false,
+                sign_checklists: false,
             }
             .normalized();
 
@@ -745,6 +755,7 @@ impl AuthManager {
                 permissions.set_system_time = current.set_system_time;
                 permissions.voice_transmit = current.voice_transmit && current.view_data;
                 permissions.camera_publish = current.camera_publish && current.view_data;
+                permissions.sign_checklists = current.sign_checklists && current.view_data;
             }
             if !permissions.allows(required) {
                 return Err(AuthFailure::Forbidden(
@@ -772,6 +783,7 @@ impl AuthManager {
         permissions.set_system_time = false;
         permissions.voice_transmit = false;
         permissions.camera_publish = false;
+        permissions.sign_checklists = false;
         if !permissions.allows(required) {
             return Err(AuthFailure::Unauthorized(
                 "authentication required".to_string(),
@@ -806,7 +818,8 @@ impl AuthManager {
                     username: None,
                     permissions: Permissions {
                         voice_transmit: false,
-                camera_publish: false,
+                        camera_publish: false,
+                        sign_checklists: false,
                         ..config.anonymous.normalized()
                     },
                     expires_at_ms: None,

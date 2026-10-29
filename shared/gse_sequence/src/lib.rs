@@ -918,14 +918,16 @@ mod tests {
     }
     impl Rig {
         fn new() -> Self {
-            let mut engine = Engine::default();
-            engine.config = Config {
-                nitrogen_target_psi: 120.0,
-                pressure_step_psi: 50.0,
-                pressure_ceiling_psi: Some(200.0),
-                maximum_zero_offset_psi: Some(8.0),
-                dry_self_test_confirmed: true,
-                grouped_panel: true,
+            let engine = Engine {
+                config: Config {
+                    nitrogen_target_psi: 120.0,
+                    pressure_step_psi: 50.0,
+                    pressure_ceiling_psi: Some(200.0),
+                    maximum_zero_offset_psi: Some(8.0),
+                    dry_self_test_confirmed: true,
+                    grouped_panel: true,
+                },
+                ..Engine::default()
             };
             Self {
                 engine,

@@ -232,6 +232,7 @@ pub struct AppState {
     pub fill_targets_tx: broadcast::Sender<FillTargetsConfig>,
 
     /// Current launch clock snapshot used by reconnect seeds and live UI updates.
+    pub launch_history: crate::launch_history::Shared,
     pub launch_clock: Arc<Mutex<LaunchClockMsg>>,
 
     /// Broadcast whenever the launch clock changes.
@@ -440,12 +441,21 @@ impl AppState {
     }
 
     pub fn set_launch_clock(&self, launch_clock: LaunchClockMsg) {
+        if crate::rrls::is_rrls() { return; }
+        let clock_now=telemetry_task::procedure_clock::now();
         let mut current = self.launch_clock.lock().unwrap();
         let next = monotonic_launch_clock_update(&current, launch_clock);
         if *current == next {
             return;
         }
 
+        let committed = {
+            let mut history=self.launch_history.lock().unwrap();
+            let mono=history.monotonic_ms(clock_now.model_monotonic_ms());
+            history.update_primary(next.clone(),clock_now.timestamp_ms(),mono)
+        };
+        let next=match committed {Ok(record)=>record.clock,Err(error)=>{drop(current);self.add_notification(format!("Launch clock was not saved: {error}"));return;}};
+        if *current==next{return;}
         *current = next.clone();
         drop(current);
         self.publish_daq_launch_clock(&next);
@@ -453,15 +463,39 @@ impl AppState {
     }
 
     pub fn reset_launch_clock(&self) {
+        if let Err(error)=self.try_reset_launch_clock(){self.add_notification(format!("T clock reset failed: {error}"));}
+    }
+    pub fn try_reset_launch_clock(&self)->anyhow::Result<()> {self.reset_clock_if_expected(None)}
+    pub fn try_reset_expected_launch_clock(&self,expected:&crate::launch_history::ClockRecord)->anyhow::Result<()> {self.reset_clock_if_expected(Some(expected))}
+    fn reset_clock_if_expected(&self,expected:Option<&crate::launch_history::ClockRecord>)->anyhow::Result<()> {
+        anyhow::ensure!(!crate::rrls::is_rrls(),"Only the primary GroundStation can reset T clock");
+        let clock_now=telemetry_task::procedure_clock::now();
+        let mut current=self.launch_clock.lock().unwrap();
+        let next={let mut history=self.launch_history.lock().unwrap();let mono=history.monotonic_ms(clock_now.model_monotonic_ms());match expected {Some(expected)=>history.reset_expected_primary(expected,clock_now.timestamp_ms(),mono)?,None=>history.reset_primary(clock_now.timestamp_ms(),mono)?}.clock};
         self.clear_launch_sequence_command_pending();
-        let next = LaunchClockMsg::idle();
-        *self.launch_clock.lock().unwrap() = next.clone();
+        *current=next.clone();drop(current);
         self.publish_daq_launch_clock(&next);
-        let _ = self.launch_clock_tx.send(next);
+        let _=self.launch_clock_tx.send(next);
+        Ok(())
     }
 
+    pub fn apply_primary_launch_clock(&self, record:crate::launch_history::ClockRecord)->anyhow::Result<bool> {
+        let clock_now=telemetry_task::procedure_clock::now();
+        let mut current=self.launch_clock.lock().unwrap();
+        let changed={let mut history=self.launch_history.lock().unwrap();let mono=history.monotonic_ms(clock_now.model_monotonic_ms());history.apply_primary(record.clone(),true,clock_now.timestamp_ms(),mono)?};
+        if changed {*current=record.clock.clone();drop(current);let _=self.launch_clock_tx.send(record.clock);}
+        Ok(changed)
+    }
+
+    pub fn confirm_new_launch_cycle(&self) {
+        if crate::rrls::is_rrls(){return;}
+        let clock_now=telemetry_task::procedure_clock::now();
+        let result={let mut history=self.launch_history.lock().unwrap();let mono=history.monotonic_ms(clock_now.model_monotonic_ms());history.confirm_new_launch_cycle(clock_now.timestamp_ms(),mono)};
+        if let Err(error)=result{self.add_notification(format!("New launch clock session was not saved: {error}"));}
+    }
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     pub fn begin_daq_launch_log(&self) {
+        self.confirm_new_launch_cycle();
         // Rotate at command acceptance, without starting the UI clock before
         // Valve confirms the sequence. Its ACK/pilot report corrects T0 later.
         self.publish_daq_launch_clock(&launch_countdown_clock(
@@ -489,6 +523,13 @@ impl AppState {
                 self.add_notification(format!(
                     "DAQ launch log clock could not be published: {error}"
                 ));
+            }
+        }
+        if let Some((snapshot,stamp))=crate::network_variables::persisted_daq_log_clock_with_revision() {
+            let clock_now=telemetry_task::procedure_clock::now();
+            let mut history=self.launch_history.lock().unwrap();let mono=history.monotonic_ms(clock_now.model_monotonic_ms());
+            if let Err(error)=history.retain_daq(snapshot,stamp,clock_now.timestamp_ms(),mono) {
+                drop(history);self.add_notification(format!("DAQ launch clock snapshot was not saved: {error}"));
             }
         }
     }
@@ -861,11 +902,12 @@ impl AppState {
                 nodes: Vec::new(),
                 links: Vec::new(),
                 traffic: None,
-                health: self
-                    .network_health
-                    .lock()
-                    .unwrap()
-                    .snapshot(std::time::Instant::now(), cfg!(feature = "test_fire_mode")),
+                health: {
+                    let mut rows = self.network_health.lock().unwrap()
+                        .snapshot(std::time::Instant::now(), cfg!(feature = "test_fire_mode"));
+                    crate::host_temperature::append_local(&mut rows, now_ms, simulated);
+                    rows
+                },
             };
         };
         let exported = router.export_topology();
@@ -887,7 +929,10 @@ impl AppState {
                     }
                 }
             }
-            tracker.snapshot(now, cfg!(feature = "test_fire_mode"))
+            let mut rows = tracker.snapshot(now, cfg!(feature = "test_fire_mode"));
+            drop(tracker);
+            crate::host_temperature::append_local(&mut rows, now_ms, simulated);
+            rows
         };
         let mut traffic_sampler = self.network_traffic.lock().unwrap();
         let runtime = router.export_runtime_stats();
@@ -1160,8 +1205,10 @@ impl AppState {
         if *slot == next_state {
             return;
         }
+        let previous_state=*slot;
         *slot = next_state;
         drop(slot);
+        if next_state==FlightState::Launch && matches!(previous_state,FlightState::Startup|FlightState::Idle|FlightState::PreFill|FlightState::FillTest|FlightState::NitrogenFill|FlightState::NitrousFill|FlightState::Armed){self.confirm_new_launch_cycle();}
         // Keep the simulator in lock-step with the real backend state machine.
         crate::flight_sim::sync_local_flight_state(next_state);
         self.queue_router_flight_state_update(next_state);
@@ -1525,7 +1572,8 @@ impl AppState {
         if crate::rrls::is_rrls() {
             return matches!(
                 cmd,
-                TelemetryCommand::StartWritingNow
+                TelemetryCommand::ResetTClock
+                    | TelemetryCommand::StartWritingNow
                     | TelemetryCommand::StartWritingLastTwoMinutes
                     | TelemetryCommand::PauseWritingDb
                     | TelemetryCommand::StopWritingDb
@@ -1827,7 +1875,7 @@ fn launch_clock_for_transition(
     })
 }
 
-fn monotonic_launch_clock_update(
+pub(crate) fn monotonic_launch_clock_update(
     current: &LaunchClockMsg,
     requested: LaunchClockMsg,
 ) -> LaunchClockMsg {
@@ -1867,10 +1915,10 @@ fn t_plus_anchor_timestamp(current: &LaunchClockMsg, timestamp_ms: i64) -> i64 {
 #[cfg(test)]
 pub(crate) mod tests {
     #[tokio::test]
-    async fn rrls_all_received_states_project_clocks_without_daq_origination() {
+    async fn rrls_received_states_retain_authoritative_clock_without_daq_origination() {
         const CHILD: &str = "GS_RRLS_CLOCK_OBSERVER_TEST_CHILD";
         const NAME: &str =
-            "state::tests::rrls_all_received_states_project_clocks_without_daq_origination";
+            "state::tests::rrls_received_states_retain_authoritative_clock_without_daq_origination";
         if std::env::var_os(CHILD).is_none() {
             let root = std::env::temp_dir().join(format!(
                 "rrls-clock-observer-{}-{}",
@@ -1902,6 +1950,12 @@ pub(crate) mod tests {
         Arc::get_mut(&mut state).unwrap().db_queue_tx = db_tx;
         let mut ui = state.state_tx.subscribe();
         let mut clocks = state.launch_clock_tx.subscribe();
+        let history_path=std::path::PathBuf::from(std::env::var_os("GS_NETWORK_VARIABLE_CACHE").unwrap()).with_file_name("clock.json");
+        Arc::get_mut(&mut state).unwrap().launch_history=Arc::new(Mutex::new(crate::launch_history::Store::open(history_path,true,None,10000,0).unwrap()));
+        let mut primary=crate::launch_history::Store::ephemeral();
+        let retained=primary.update_primary(LaunchClockMsg{kind:LaunchClockKind::TPlus,anchor_timestamp_ms:Some(9000),duration_ms:None},10000,0).unwrap();
+        state.apply_primary_launch_clock(retained.clone()).unwrap();
+        assert_eq!(clocks.try_recv().unwrap(),retained.clock);
         let preserved = state.add_notification("existing observer notification");
         let router = Arc::new(Router::new(RouterConfig::new([]).with_sender("RRLS")));
         let frames = Arc::new(AtomicUsize::new(0));
@@ -1924,7 +1978,6 @@ pub(crate) mod tests {
             })
             .unwrap();
         let path = std::path::PathBuf::from(std::env::var_os("GS_NETWORK_VARIABLE_CACHE").unwrap());
-        let mut ascent_window = None;
         for (index, code) in std::iter::once(1u8).chain(0u8..=15).enumerate() {
             let packet = Packet::new(
                 ty,
@@ -1934,15 +1987,10 @@ pub(crate) mod tests {
                 Arc::<[u8]>::from([code]),
             )
             .unwrap();
-            let before = crate::telemetry_task::get_current_timestamp_ms() as i64;
             let receiver = router.clone();
             std::thread::spawn(move || receiver.rx_from_side(&packet, side).unwrap())
                 .join()
                 .unwrap();
-            let after = crate::telemetry_task::get_current_timestamp_ms() as i64;
-            if code == FlightState::Ascent as u8 {
-                ascent_window = Some((before, after));
-            }
             assert_eq!(state.local_flight_state_snapshot() as u8, code);
             assert_eq!(ui.try_recv().unwrap().state as u8, code);
             let write = tokio::time::timeout(Duration::from_secs(2), db_rx.recv())
@@ -1955,32 +2003,15 @@ pub(crate) mod tests {
             let disk: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(disk["flight_state"], code);
-            if code == FlightState::Launch as u8 {
-                assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::TMinus);
-            }
-            if code >= FlightState::Ascent as u8 {
-                assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::TPlus);
-            }
+            assert_eq!(state.launch_clock_snapshot(),retained.clock,"FC state observations must not author or clear the primary clock");
         }
-        let minus = clocks.try_recv().unwrap();
-        let plus = clocks.try_recv().unwrap();
-        assert_eq!(minus.kind, LaunchClockKind::TMinus);
-        assert_eq!(plus.kind, LaunchClockKind::TPlus);
-        assert_eq!(minus.duration_ms, Some(LAUNCH_COUNTDOWN_DURATION_MS));
-        let deadline = minus.anchor_timestamp_ms.unwrap() + LAUNCH_COUNTDOWN_DURATION_MS;
-        let (before, after) = ascent_window.unwrap();
-        assert!(
-            (deadline.min(before)..=deadline.min(after))
-                .contains(&plus.anchor_timestamp_ms.unwrap()),
-            "early Ascent retains the existing receipt-time clamp"
-        );
-        assert!(
-            clocks.try_recv().is_err(),
-            "observer clock anchors should not be restarted by later states"
-        );
+        assert!(clocks.try_recv().is_err());
         state.reset_launch_clock();
-        assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::Idle);
-        assert_eq!(clocks.try_recv().unwrap().kind, LaunchClockKind::Idle);
+        assert_eq!(state.launch_clock_snapshot(),retained.clock,"RRLS local reset cannot override the primary");
+        let reset=primary.reset_primary(12000,2000).unwrap();
+        state.apply_primary_launch_clock(reset).unwrap();
+        assert_eq!(clocks.try_recv().unwrap(),LaunchClockMsg::idle());
+        assert_eq!(state.launch_clock_snapshot(),LaunchClockMsg::idle());
         let notes = state.notifications_snapshot();
         assert!(
             notes
@@ -3326,6 +3357,7 @@ pub(crate) mod tests {
             action_policy_tx,
             fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
             fill_targets_tx,
+            launch_history: Arc::new(Mutex::new(crate::launch_history::Store::ephemeral())),
             launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
             launch_clock_tx,
             launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),

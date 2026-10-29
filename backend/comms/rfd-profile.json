@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "name": "rfd-async-64k-compatible",
+  "modem": {
+    "serial_baud": 115200,
+    "air_bps": 64000,
+    "max_data_bytes": 3968,
+    "max_retries": 10,
+    "broadcast_retries": 10,
+    "serial_break_ms": 50,
+    "tx_encapsulation": 0,
+    "rx_encapsulation": 0
+  },
+  "transport": {
+    "usable_air_bps": 32000,
+    "frame_overhead_bytes": 16,
+    "packet_burst_ms": 100,
+    "packet_gap_ms": 55,
+    "idle_margin_ms": 5,
+    "rf_share_percent": 40,
+    "host_default_share_percent": 25
+  }
+}

@@ -49,8 +49,12 @@ async fn close(state: &MediaState, publisher: &Publisher) {
 }
 
 pub(super) async fn reap(state: Arc<MediaState>) {
+    let mut shutdown = state.app.shutdown_subscribe();
     loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+        }
         let expired = {
             let mut publishers = state.publishers.lock().await;
             let mut expired = Vec::new();
@@ -71,11 +75,20 @@ pub(super) async fn reap(state: Arc<MediaState>) {
 }
 
 #[derive(Default, serde::Deserialize)]
-struct PublishOptions { name: Option<String> }
+struct PublishOptions {
+    name: Option<String>,
+}
 fn camera_label(value: &str) -> ApiResult<String> {
-    let value=value.trim();
-    if value.is_empty() || value.len()>256 || value.chars().count()>80 || value.chars().any(char::is_control) {
-        return Err(error(StatusCode::BAD_REQUEST,"Camera name must be 1–80 characters without control characters"));
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 256
+        || value.chars().count() > 80
+        || value.chars().any(char::is_control)
+    {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "Camera name must be 1–80 characters without control characters",
+        ));
     }
     Ok(value.to_owned())
 }
@@ -116,12 +129,19 @@ async fn offer(
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     );
-    let mut publishers = state.publishers.lock().await;
-    if publishers.len() >= 64 || publishers.iter().filter(|p| p.owner == username).count() >= 2 {
-        return Err(error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Camera publishing limit reached",
-        ));
+    // Serialize new offers to preserve the limits without holding the registry
+    // across a slow relay request. Existing cameras must still renew their leases
+    // and appear in stream lists while another camera is connecting.
+    let _offer = state.publish_offer.lock().await;
+    {
+        let publishers = state.publishers.lock().await;
+        if publishers.len() >= 64 || publishers.iter().filter(|p| p.owner == username).count() >= 2
+        {
+            return Err(error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Camera publishing limit reached",
+            ));
+        }
     }
     let upstream = state
         .client
@@ -164,7 +184,7 @@ async fn offer(
         close(&state, &publisher).await;
         return Err(err);
     }
-    publishers.push(publisher);
+    state.publishers.lock().await.push(publisher);
     Ok((
         status,
         [
@@ -182,13 +202,25 @@ async fn offer(
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CameraName { name: String }
-async fn rename(State(state): State<Arc<MediaState>>, Path((id,session)): Path<(String,String)>, headers: HeaderMap, axum::Json(body): axum::Json<CameraName>) -> ApiResult<StatusCode> {
-    let username=owner(&state,&headers).await?;
-    let label=camera_label(&body.name)?;
-    let mut publishers=state.publishers.lock().await;
-    let publisher=publishers.iter_mut().find(|p|p.owner==username && p.id==id && p.session==session && p.expires>Instant::now()).ok_or_else(||error(StatusCode::NOT_FOUND,"Camera session not found"))?;
-    publisher.label=label;
+struct CameraName {
+    name: String,
+}
+async fn rename(
+    State(state): State<Arc<MediaState>>,
+    Path((id, session)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<CameraName>,
+) -> ApiResult<StatusCode> {
+    let username = owner(&state, &headers).await?;
+    let label = camera_label(&body.name)?;
+    let mut publishers = state.publishers.lock().await;
+    let publisher = publishers
+        .iter_mut()
+        .find(|p| {
+            p.owner == username && p.id == id && p.session == session && p.expires > Instant::now()
+        })
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "Camera session not found"))?;
+    publisher.label = label;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -253,17 +285,37 @@ mod tests {
             sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,allowed_commands_json,created_at_ms,expires_at_ms) VALUES(?,?,'session',1,0,'[]',0,9999999999999)")
                 .bind(format!("test-{name}")).bind(name).execute(&app.auth_db).await.unwrap();
         }
+        let block_offer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let offer_started = Arc::new(tokio::sync::Notify::new());
+        let release_offer = Arc::new(tokio::sync::Notify::new());
         let relay = Router::new()
             .route(
                 "/{id}/whip",
-                post(|Path(id): Path<String>, headers: HeaderMap| async move {
-                    assert_eq!(headers[header::AUTHORIZATION], "Basic Y2FtZXJhOnNlY3JldA==");
-                    assert!(id.starts_with("browser-"));
-                    (
-                        StatusCode::CREATED,
-                        [(header::LOCATION, format!("/{id}/whip/session-1"))],
-                        "answer",
-                    )
+                post({
+                    let block_offer = block_offer.clone();
+                    let offer_started = offer_started.clone();
+                    let release_offer = release_offer.clone();
+                    move |Path(id): Path<String>, headers: HeaderMap| {
+                        let block_offer = block_offer.clone();
+                        let offer_started = offer_started.clone();
+                        let release_offer = release_offer.clone();
+                        async move {
+                            if block_offer.load(std::sync::atomic::Ordering::SeqCst) {
+                                offer_started.notify_one();
+                                release_offer.notified().await;
+                            }
+                            assert_eq!(
+                                headers[header::AUTHORIZATION],
+                                "Basic Y2FtZXJhOnNlY3JldA=="
+                            );
+                            assert!(id.starts_with("browser-"));
+                            (
+                                StatusCode::CREATED,
+                                [(header::LOCATION, format!("/{id}/whip/session-1"))],
+                                "answer",
+                            )
+                        }
+                    }
                 }),
             )
             .route(
@@ -293,6 +345,7 @@ mod tests {
             hls_segments: Mutex::new(std::collections::HashMap::new()),
             preview_sessions: Mutex::new(Vec::new()),
             publishers: Mutex::new(Vec::new()),
+            publish_offer: Mutex::new(()),
             transcoding: Mutex::default(),
             recorded_vehicle_cache: Mutex::new(Default::default()),
         });
@@ -318,14 +371,21 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         assert!(
-            offer(State(state.clone()), HeaderMap::new(), Query(PublishOptions::default()), Bytes::from("offer"))
-                .await
-                .is_err()
+            offer(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(PublishOptions::default()),
+                Bytes::from("offer")
+            )
+            .await
+            .is_err()
         );
         let response = offer(
             State(state.clone()),
             headers("producer"),
-            Query(PublishOptions {name:Some("Pad interview".into())}),
+            Query(PublishOptions {
+                name: Some("Pad interview".into()),
+            }),
             Bytes::from("offer"),
         )
         .await
@@ -358,6 +418,91 @@ mod tests {
                 .unwrap(),
             StatusCode::NO_CONTENT
         );
+        // A pending upstream offer cannot hold up existing cameras' lease
+        // renewals or stream-list reads of publisher labels.
+        block_offer.store(true, std::sync::atomic::Ordering::SeqCst);
+        let pending_state = state.clone();
+        let pending = tokio::spawn(async move {
+            offer(
+                State(pending_state),
+                headers("other"),
+                Query(PublishOptions::default()),
+                Bytes::from("offer"),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), offer_started.notified())
+            .await
+            .expect("second camera reached relay");
+        let responsive = tokio::time::timeout(Duration::from_secs(1), async {
+            assert_eq!(
+                renew(State(state.clone()), path(), headers("producer"))
+                    .await
+                    .unwrap(),
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(state.publishers.lock().await.len(), 1);
+        })
+        .await;
+        release_offer.notify_one();
+        assert!(
+            responsive.is_ok(),
+            "slow camera offer blocked active camera registry"
+        );
+        assert_eq!(
+            pending.await.unwrap().unwrap().status(),
+            StatusCode::CREATED
+        );
+        block_offer.store(false, std::sync::atomic::Ordering::SeqCst);
+        let second_camera = offer(
+            State(state.clone()),
+            headers("producer"),
+            Query(PublishOptions::default()),
+            Bytes::from("offer"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_camera.status(), StatusCode::CREATED);
+        assert_eq!(
+            offer(
+                State(state.clone()),
+                headers("producer"),
+                Query(PublishOptions::default()),
+                Bytes::from("offer")
+            )
+            .await
+            .unwrap_err()
+            .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let second_id = {
+            let all = state.publishers.lock().await;
+            all.iter()
+                .find(|p| p.owner == "producer" && p.id != id)
+                .unwrap()
+                .id
+                .clone()
+        };
+        stop(
+            State(state.clone()),
+            Path((second_id, "session-1".into())),
+            headers("producer"),
+        )
+        .await
+        .unwrap();
+        let (other_id, other_session) = {
+            let all = state.publishers.lock().await;
+            let other = all.iter().find(|p| p.owner == "other").unwrap();
+            (other.id.clone(), other.session.clone())
+        };
+        stop(
+            State(state.clone()),
+            Path((other_id, other_session)),
+            headers("other"),
+        )
+        .await
+        .unwrap();
+
         // Revoking the user's role immediately rejects the next lease renewal.
         let mut users: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("users.json")).unwrap()).unwrap();
@@ -376,6 +521,13 @@ mod tests {
             StatusCode::NO_CONTENT
         );
         assert!(state.publishers.lock().await.is_empty());
+        // A normal application shutdown releases the reaper's retained state.
+        let reaper = tokio::spawn(reap(state.clone()));
+        state.app.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(1), reaper)
+            .await
+            .expect("publisher reaper did not stop")
+            .unwrap();
         relay_task.abort();
         std::fs::remove_dir_all(dir).unwrap();
     }

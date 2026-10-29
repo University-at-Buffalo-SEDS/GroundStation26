@@ -1058,7 +1058,11 @@ impl Mesh {
         let index = self
             .settings_inbox
             .iter()
-            .position(|wire| !crate::station_mode::recognizes(wire))?;
+            .position(|wire| !crate::station_mode::recognizes(wire) && !crate::launch_clock_sync::recognizes(wire))?;
+        self.settings_inbox.remove(index)
+    }
+    pub(crate) fn take_launch_clock(&mut self) -> Option<Vec<u8>> {
+        let index=self.settings_inbox.iter().position(|wire|crate::launch_clock_sync::recognizes(wire))?;
         self.settings_inbox.remove(index)
     }
     pub(crate) fn take_operating_mode(&mut self) -> Option<Vec<u8>> {
@@ -3453,3 +3457,7 @@ mod pair_tests {
 #[cfg(test)]
 #[path = "rrls/continuous_service_audit.rs"]
 mod continuous_service_audit;
+
+#[cfg(test)]
+#[path = "rrls/heartbeat_owner_relay_regression.rs"]
+mod heartbeat_owner_relay_regression;

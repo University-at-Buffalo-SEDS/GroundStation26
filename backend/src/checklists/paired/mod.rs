@@ -230,6 +230,7 @@ fn projected(
 ) {
     let mut document = Document {
         revision: 0,
+        signoffs: Vec::new(),
         completion_events: Vec::new(),
         enforce_before_launch: projection.policy.enforce_before_launch,
         checklists: Vec::new(),
@@ -401,20 +402,22 @@ impl Service {
         })
     }
     async fn publish(&mut self) -> Result<Document, String> {
-        self.document.revision = self.storage.next_revision(self.document.revision).await?;
-        let next = self.document.clone();
+        let revision =
+            access(|store| Ok(store.document.revision)).unwrap_or(self.document.revision);
+        self.document.revision = self
+            .storage
+            .next_revision(revision.max(self.document.revision))
+            .await?;
         let mut global = store().lock().map_err(|_| "Checklist store unavailable")?;
-        let path = match global.as_ref() {
-            Ok(store) => store.path.clone(),
-            Err(_) => std::env::var_os("GS_CHECKLISTS_FILE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("backend/data/checklists.json")),
-        };
-        *global = Ok(Store {
-            path,
-            document: next.clone(),
-        });
-        Ok(next)
+        let mut next = self.document.clone();
+        let store = global.as_mut().map_err(|error| error.clone())?;
+        next.preserve_signoffs(
+            &store.document,
+            crate::telemetry_task::get_current_timestamp_ms() as i64,
+        );
+        let saved = store.persist(next)?;
+        self.document = saved.clone();
+        Ok(saved)
     }
     async fn refresh_progress(
         &mut self,
@@ -679,9 +682,18 @@ impl Service {
             .map_err(anyhow::Error::msg)?;
         next_document.revision = self
             .storage
-            .next_revision(self.document.revision)
+            .next_revision(
+                access(|store| Ok(store.document.revision))
+                    .unwrap_or(self.document.revision)
+                    .max(self.document.revision),
+            )
             .await
             .map_err(anyhow::Error::msg)?;
+        let old = access(|store| Ok(store.document.clone())).map_err(anyhow::Error::msg)?;
+        next_document.preserve_signoffs(
+            &old,
+            crate::telemetry_task::get_current_timestamp_ms() as i64,
+        );
         let global_document = next_document.clone();
         let next_generations = prepared.generations.clone();
         let legacy_path = access(|store| Ok(store.path.clone())).unwrap_or_else(|_| {
@@ -727,6 +739,7 @@ impl Service {
         }
         // Retiring old allocations and directory durability never hold GSE locks.
         drop(retired);
+        access(|store| store.persist(store.document.clone())).map_err(anyhow::Error::msg)?;
         self.finish_selection(&snapshot).await
     }
     async fn stage_template(&mut self, request: Document) -> Result<(), String> {
@@ -928,6 +941,20 @@ pub(crate) fn start(
             }
         }
     })
+}
+pub(super) async fn sign(request: &Sign, actor: &str, now: i64) -> Result<Document, String> {
+    let mut service = SERVICE
+        .get()
+        .ok_or("Shared checklists are initializing")?
+        .lock()
+        .await;
+    if let Some(reason) = extra_launch_block() {
+        return Err(reason);
+    }
+    let document = access(|store| store.update(|doc| doc.sign(request, actor, now)))?;
+    service.document.signoffs = document.signoffs.clone();
+    service.document.revision = document.revision;
+    Ok(document)
 }
 pub(super) async fn check(request: &Check, actor: &str, now: i64) -> Result<Document, String> {
     let service = SERVICE.get().ok_or("Shared checklists are initializing")?;
