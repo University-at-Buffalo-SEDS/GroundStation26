@@ -100,6 +100,8 @@ pub struct TxQueueBudget {
     // Keep this owner through queue pop and active/failed writes. Stateful SDT
     // and sequenced traffic must never be suppressed by a payload comparison.
     pending_commands: Mutex<Vec<(u8, Vec<u8>)>>,
+    // Keys identify the accepted Vec allocation, never equal application bytes.
+    write_leases: Mutex<Vec<(usize, usize, sedsnet::router::PackedWriteLease)>>,
 }
 
 impl TxQueueBudget {
@@ -112,6 +114,7 @@ impl TxQueueBudget {
             ordinary_limit: limit,
             short_lookahead: false,
             pending_commands: Mutex::new(Vec::new()),
+            write_leases: Mutex::new(Vec::new()),
         }
     }
 
@@ -123,12 +126,37 @@ impl TxQueueBudget {
         }
     }
 
+    #[cfg(test)]
     pub fn try_send(
         &self,
         sender: &mpsc::UnboundedSender<(u8, Vec<u8>)>,
         priority: u8,
         payload: &[u8],
     ) -> sedsnet::TelemetryResult<()> {
+        self.try_send_inner(sender, priority, payload, None)
+    }
+
+    pub fn try_send_leased(
+        &self,
+        sender: &mpsc::UnboundedSender<(u8, Vec<u8>)>,
+        priority: u8,
+        lease: sedsnet::router::PackedWriteLease,
+    ) -> sedsnet::TelemetryResult<()> {
+        self.try_send_inner(sender, priority, lease.bytes(), Some(&lease))
+    }
+
+    fn try_send_inner(
+        &self,
+        sender: &mpsc::UnboundedSender<(u8, Vec<u8>)>,
+        priority: u8,
+        payload: &[u8],
+        lease: Option<&sedsnet::router::PackedWriteLease>,
+    ) -> sedsnet::TelemetryResult<()> {
+        if payload.is_empty() {
+            return Err(sedsnet::TelemetryError::HandlerError(
+                "empty transport write",
+            ));
+        }
         let priority = radio_transport_priority(priority, payload);
         let mut commands = (priority >= 16
             && payload.len() <= crate::comms::RADIO_COMMAND_BATCH_MAX_BYTES
@@ -233,12 +261,26 @@ impl TxQueueBudget {
             commands.push((priority, payload.to_vec()));
         }
         drop(commands);
-        if sender.send((priority, payload.to_vec())).is_err() {
-            self.complete(priority, &payload);
-            return Err(sedsnet::TelemetryError::HandlerError(
-                "radio tx queue closed",
-            ));
+        let owned = payload.to_vec();
+        let identity = (owned.as_ptr() as usize, owned.len());
+        // The receiver may pop immediately, but every worker takes this lock
+        // before IO. Publish admission/progress atomically with actual channel
+        // acceptance; a closed channel never admits the SDK offer.
+        let mut records = self.write_leases.lock().unwrap();
+        if let Err(error) = sender.send((priority, owned)) {
+            drop(records);
+            self.complete(error.0.0, &error.0.1);
+            return Err(sedsnet::TelemetryError::HandlerError("radio tx queue closed"));
         }
+        if let Some(lease) = lease {
+            match lease.admit() {
+                Ok(()) => records.push((identity.0, identity.1, lease.clone())),
+                // Queue acceptance is irrevocable. A future tracker error may
+                // disable pruning, never manufacture a failed physical owner.
+                Err(error) => log::warn!("radio write tracking unavailable: {error}"),
+            }
+        }
+        drop(records);
         if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some() {
             log::info!(
                 "full-bay transport admitted sim={:?} priority={} len={} type={:?}",
@@ -251,7 +293,25 @@ impl TxQueueBudget {
         Ok(())
     }
 
+    fn write_lease(&self, payload: &[u8]) -> Option<sedsnet::router::PackedWriteLease> {
+        self.write_leases
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(address, len, _)| {
+                *address == payload.as_ptr() as usize && *len == payload.len()
+            })
+            .map(|(_, _, lease)| lease.clone())
+    }
+
     fn complete(&self, priority: u8, payload: &[u8]) {
+        let mut leases = self.write_leases.lock().unwrap();
+        if let Some(index) = leases.iter().position(|(address, len, _)| {
+            *address == payload.as_ptr() as usize && *len == payload.len()
+        }) {
+            leases.swap_remove(index);
+        }
+        drop(leases);
         if priority >= 16 && payload.len() <= crate::comms::RADIO_COMMAND_BATCH_MAX_BYTES {
             let mut commands = self
                 .pending_commands
@@ -271,6 +331,35 @@ impl TxQueueBudget {
             self.pending_ordinary.fetch_sub(len, Ordering::AcqRel);
         }
     }
+}
+
+fn discard_retired_write(
+    budget: Option<&TxQueueBudget>,
+    activity: Option<&TransportTxActivity>,
+    priority: u8,
+    payload: &[u8],
+) -> bool {
+    if let Some(budget) = budget
+        && budget.write_lease(payload).is_some_and(|lease| lease.discard_if_retired())
+    {
+        budget.complete(priority, payload);
+        if let Some(activity) = activity {
+            activity.complete();
+        }
+        true
+    } else {
+        false
+    }
+}
+
+fn send_owned_write(
+    comms: &mut dyn CommsDevice,
+    budget: Option<&TxQueueBudget>,
+    priority: u8,
+    payload: &[u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let lease = budget.and_then(|budget| budget.write_lease(payload));
+    comms.send_tracked(&[(priority, payload)], lease.as_slice())
 }
 
 /// Accepted software TX ownership, including queue-pop and active-write windows.
@@ -426,6 +515,28 @@ impl WireBacklog {
             backlog_push(&mut self.priorities, priority, payload, front);
         }
     }
+    fn prune_retired(&mut self, budget: &TxQueueBudget, activity: Option<&TransportTxActivity>) {
+        let retain = |priority: u8, bytes: &[u8]| {
+            let retired = budget
+                .write_lease(bytes)
+                .is_some_and(|lease| lease.discard_if_retired());
+            if retired {
+                budget.complete(priority, bytes);
+                if let Some(activity) = activity {
+                    activity.complete();
+                }
+            }
+            !retired
+        };
+        self.ordered.retain(|(p, b)| retain(*p, b));
+        self.routing.retain(|(p, b)| retain(*p, b));
+        self.receipts.retain(|(p, b)| retain(*p, b));
+        self.priorities.retain(|p, q| {
+            q.retain(|b| retain(*p, b));
+            !q.is_empty()
+        });
+    }
+
     fn selection_state(&self) -> (usize, bool, usize, usize) {
         (
             self.application_bytes,
@@ -629,6 +740,122 @@ impl WireBacklog {
 #[cfg(test)]
 mod priority_tests {
     use super::*;
+    #[test]
+    fn retry_queue_allocation_identity_survives_backlog_requeue_and_releases_exact_budget() {
+        use crate::comms::retry_tracker_tests::Fixture;
+        use sedsnet::router::WriteStart;
+        let fixture = Fixture::new(false);
+        let first = fixture.publish(1);
+        first.admit().unwrap();
+        assert_eq!(first.try_start(), WriteStart::Ready);
+        first.report_drained().unwrap();
+        let retry = fixture.retry();
+        let budget = TxQueueBudget::new_radio(2048, 256);
+        let activity = TransportTxActivity::default();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        activity
+            .try_enqueue(|| budget.try_send_leased(&sender, 255, retry.clone()))
+            .unwrap();
+        let (priority, bytes) = receiver.try_recv().unwrap();
+        assert!(
+            budget.write_lease(&bytes.clone()).is_none(),
+            "equal bytes are not the accepted owner"
+        );
+        assert!(budget.write_lease(&bytes).is_some());
+        let mut backlog = WireBacklog::new(true);
+        backlog.push(priority, bytes, false);
+        let baseline = backlog.selection_state();
+        let selected = backlog.pop().unwrap();
+        let identity = selected.1.as_ptr();
+        backlog.restore_selected((0, false, 0, 0), selected, None);
+        let selected = backlog.pop().unwrap();
+        assert_eq!(
+            selected.1.as_ptr(),
+            identity,
+            "failed write requeue keeps allocation"
+        );
+        backlog.restore_selected(baseline, selected, None);
+        fixture.finish(first.bytes());
+        backlog.prune_retired(&budget, Some(&activity));
+        assert_eq!(
+            backlog.selection_state(),
+            baseline,
+            "retirement cannot invent physical service or cross a metadata barrier"
+        );
+        assert!(backlog.pop().is_none());
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+        assert_eq!(budget.pending_control.load(Ordering::Acquire), 0);
+        assert_eq!(budget.pending_ordinary.load(Ordering::Acquire), 0);
+        assert!(budget.write_leases.lock().unwrap().is_empty());
+        assert!(budget.pending_commands.lock().unwrap().is_empty());
+        assert!(!activity.has_pending());
+        backlog.prune_retired(&budget, Some(&activity));
+        assert_eq!(
+            budget.pending.load(Ordering::Acquire),
+            0,
+            "pruning releases once"
+        );
+    }
+
+    #[test]
+    fn retry_queue_closed_channel_and_priority_remap_leave_no_owner_record() {
+        use crate::comms::retry_tracker_tests::Fixture;
+        let fixture = Fixture::new(false);
+        let first = fixture.publish(1);
+        let budget = TxQueueBudget::new_radio(2048, 256);
+        let activity = TransportTxActivity::default();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        assert!(
+            activity
+                .try_enqueue(|| budget.try_send_leased(&sender, 255, first.clone()))
+                .is_err()
+        );
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+        assert!(budget.write_leases.lock().unwrap().is_empty());
+        assert!(budget.pending_commands.lock().unwrap().is_empty());
+        assert!(!activity.has_pending());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        assert_eq!(first.try_start(), sedsnet::router::WriteStart::PendingAdmission,
+            "failed queue acceptance cannot admit an SDK offer");
+        activity
+            .try_enqueue(|| budget.try_send_leased(&sender, 255, first))
+            .unwrap();
+        let (priority, bytes) = receiver.try_recv().unwrap();
+        assert_eq!(priority, radio_transport_priority(255, &bytes));
+        assert!(budget.write_lease(&bytes).is_some());
+        budget.complete(priority, &bytes);
+        activity.complete();
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+        assert!(budget.write_leases.lock().unwrap().is_empty());
+        assert!(!activity.has_pending());
+    }
+
+    #[test]
+    fn retry_queue_failed_then_late_acceptance_cannot_inherit_old_admission() {
+        use crate::comms::retry_tracker_tests::Fixture;
+        use sedsnet::router::WriteStart;
+        let fixture = Fixture::new(false);
+        let first = fixture.publish(1);
+        first.admit().unwrap();
+        assert_eq!(first.try_start(), WriteStart::Ready);
+        first.report_drained().unwrap();
+        let retry = fixture.retry();
+        let budget = TxQueueBudget::new_radio(2048, 256);
+        let (closed, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        assert!(budget.try_send_leased(&closed, 255, retry.clone()).is_err());
+        assert_eq!(retry.try_start(), WriteStart::PendingAdmission);
+        fixture.finish(first.bytes());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        budget.try_send_leased(&sender, 255, retry.clone()).unwrap();
+        let (priority, bytes) = receiver.try_recv().unwrap();
+        assert!(!retry.discard_if_retired(), "accepted after ACK cutoff must remain a real queued owner");
+        assert_eq!(retry.try_start(), WriteStart::Ready);
+        budget.complete(priority, &bytes);
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn ordered_and_piggyback_controls_keep_individual_admissions() {
         crate::telemetry_schema::initialize().unwrap();
@@ -1992,6 +2219,9 @@ pub(super) fn spawn_comms_worker_threads(
                     if !backlog.refill(&mut comms_handle.tx_rx, &mut drain_remaining) {
                         return;
                     }
+                    if let Some(budget) = &comms_handle.tx_budget {
+                        backlog.prune_retired(budget, comms_handle.transport_activity.as_deref());
+                    }
                     let mut comms = tx_worker_comms.lock().expect("failed to get lock");
                     // Mesh HEALTH/READY must not depend on receiving another
                     // radio byte. Service protected egress before SDK queue
@@ -2050,13 +2280,11 @@ pub(super) fn spawn_comms_worker_threads(
                             .checked_add(comms.command_batch_frame_len(*next_priority, next_payload)?)?;
                         backlog.batch_tail_follower_after_bytes(&**comms, bytes)
                     });
-                    let result = if let (Some((p2, b2)), Some((p3, b3))) = (follower.as_ref(), third.as_ref()) {
-                        comms.send_command_batch(&[(priority, &payload), (*p2, b2), (*p3, b3)])
-                    } else if let Some((next_priority, next_payload)) = follower.as_ref() {
-                        comms.send_command_batch(&[(priority, &payload), (*next_priority, next_payload)])
-                    } else {
-                        comms.send_data_with_priority(&payload, priority)
-                    };
+                    let mut frames = vec![(priority, &payload[..])];
+                    frames.extend(follower.iter().chain(third.iter()).map(|(p, b)| (*p, &b[..])));
+                    let leases: Vec<_> = frames.iter().filter_map(|(_, bytes)|
+                        comms_handle.tx_budget.as_ref().and_then(|budget| budget.write_lease(bytes))).collect();
+                    let result = comms.send_tracked(&frames, &leases);
                     match result {
                         Ok(()) => {
                             if let Some(budget) = &comms_handle.tx_budget {
@@ -2209,7 +2437,8 @@ fn spawn_legacy_comms_worker_thread(
                     match selected {
                         Ok((priority, payload)) => {
                             sent_any = true;
-                            match comms.send_data_with_priority(&payload, priority) {
+                            if discard_retired_write(comms_handle.tx_budget.as_deref(), comms_handle.transport_activity.as_deref(), priority, &payload) { continue; }
+                            match send_owned_write(&mut **comms, comms_handle.tx_budget.as_deref(), priority, &payload) {
                                 Ok(()) => {
                                     if let Some(budget) = &comms_handle.tx_budget { budget.complete(priority, &payload); }
                                     if let Some(activity) = &comms_handle.transport_activity { activity.complete(); }
@@ -2693,7 +2922,8 @@ fn spawn_rx_priority_comms_worker_thread(
                         if now >= next_tx_allowed_at
                             && let Some((priority, payload)) = pending_tx.take().or_else(|| comms_handle.tx_rx.try_recv().ok())
                         {
-                            match comms.send_data_with_priority(&payload, priority) {
+                            if discard_retired_write(comms_handle.tx_budget.as_deref(), comms_handle.transport_activity.as_deref(), priority, &payload) { continue; }
+                            match send_owned_write(&mut **comms, comms_handle.tx_budget.as_deref(), priority, &payload) {
                                 Ok(()) => {
                                     if let Some(budget) = &comms_handle.tx_budget { budget.complete(priority, &payload); }
                                     if let Some(activity) = &comms_handle.transport_activity { activity.complete(); }
@@ -3252,6 +3482,8 @@ fn send_while_uplink_window_open(
     transport_activity: Option<&TransportTxActivity>,
     tx_budget: Option<&TxQueueBudget>,
 ) -> bool {
+    command_backlog.retain(|(priority, bytes)| !discard_retired_write(tx_budget, transport_activity, *priority, bytes));
+    telemetry_backlog.retain(|(priority, bytes)| !discard_retired_write(tx_budget, transport_activity, *priority, bytes));
     let mut sent_any = false;
     loop {
         let now = std::time::Instant::now();
@@ -3330,7 +3562,8 @@ fn send_while_uplink_window_open(
         };
         log_radio_packet_event("radio TX pop", worker_name, &payload);
         maybe_log_green_radio_command_send(worker_name, &payload);
-        match comms.send_data_with_priority(&payload, priority) {
+        if discard_retired_write(tx_budget, transport_activity, priority, &payload) { continue; }
+        match send_owned_write(comms, tx_budget, priority, &payload) {
             Ok(()) => {
                 if let Some(budget) = tx_budget {
                     budget.complete(priority, &payload);

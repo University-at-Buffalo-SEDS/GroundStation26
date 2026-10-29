@@ -10,6 +10,9 @@ pub(crate) mod rfd_profile;
 #[cfg(any(target_os = "linux", test))]
 #[path = "comms/virtual_uart.rs"]
 mod virtual_uart;
+#[cfg(test)]
+#[path = "comms/retry_tracker_tests.rs"]
+pub(crate) mod retry_tracker_tests;
 use crate::comms_config::{
     CanLinkConfig, CommsLinkConfig, I2cLinkConfig, SerialLinkConfig, SerialProtocol, SpiLinkConfig,
 };
@@ -209,6 +212,29 @@ fn trace_virtual_uart_admission(
 }
 
 pub trait CommsDevice: Send {
+    fn bind_retry_tracker(
+        &mut self,
+        _tracker: sedsnet::router::RetryTracker,
+    ) -> TelemetryResult<()> {
+        Ok(())
+    }
+
+    /// Unsupported transports retain ownership but never manufacture physical-drain proof.
+    fn send_tracked(
+        &mut self,
+        frames: &[(u8, &[u8])],
+        leases: &[sedsnet::router::PackedWriteLease],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        // Unknown transports may fail after a physical prefix. Conservatively
+        // start before delegated IO, but never claim a platform drain here.
+        start_write_leases(leases)?;
+        if frames.len() == 1 {
+            self.send_data_with_priority(frames[0].1, frames[0].0)
+        } else {
+            self.send_command_batch(frames)
+        }
+    }
+
     /// An independent writer for full-duplex transports. Shared-bus devices
     /// keep the default so reads and writes remain serialized.
     fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
@@ -484,6 +510,8 @@ impl RawUartFrameWait {
 struct UartWriteState {
     radio_capacity: Option<rfd_capacity::Capacity>,
     cts_ready: bool,
+    retry_tracker: Option<sedsnet::router::RetryTracker>,
+    retry_peer_session: Option<Option<u32>>,
     #[cfg(target_os = "linux")]
     wire: virtual_uart::WireDrain,
 }
@@ -544,6 +572,36 @@ fn macos_pty_fixture_never_changes_a_hardware_ports_baud() {
     }
 }
 impl UartComms {
+    fn observe_retry_peer_session(&self, session: Option<u32>) {
+        let mut state = self.write_lock.lock().unwrap();
+        if state.retry_peer_session.is_some_and(|old| old != session)
+            && let Some(tracker) = &state.retry_tracker
+            && let Err(error) = tracker.invalidate_generation()
+        {
+            log::warn!("radio retry fence unavailable: {error}");
+        }
+        state.retry_peer_session = Some(session);
+    }
+    fn invalidate_retry_on_metadata(&self, bytes: &[u8]) {
+        // A cheap envelope check keeps ordinary telemetry off this CRC/parse path.
+        // Only a complete protocol-valid Leave proves a peer epoch change.
+        if serialize::peek_envelope(bytes)
+            .is_ok_and(|env| env.ty == sedsnet::config::DataType::DiscoveryLeave)
+            && serialize::unpack_packet(bytes).is_ok_and(|packet| {
+                packet.data_type() == sedsnet::config::DataType::DiscoveryLeave
+                    && packet.payload().is_empty()
+                    && !packet.sender().is_empty()
+                    && packet
+                        .endpoints()
+                        .contains(&sedsnet::config::DataEndpoint::Discovery)
+            })
+            && let Some(tracker) = &self.write_lock.lock().unwrap().retry_tracker
+            && let Err(error) = tracker.invalidate_generation()
+        {
+            log::warn!("radio retry fence unavailable: {error}");
+        }
+    }
+
     fn poll_hardware_flow_control(&mut self) -> std::io::Result<bool> {
         if !self.hardware_flow_control {
             return Ok(true);
@@ -771,6 +829,9 @@ impl UartComms {
                 }
             }
             mesh.tick(now);
+            let session = mesh.operating_mode_session(now);
+            drop(mesh);
+            self.observe_retry_peer_session(session);
         }
         self.flush_recovery_output(0)
     }
@@ -1166,6 +1227,7 @@ impl UartComms {
             // Transport fragments and compact references are not standalone
             // canonical packets. The owning router validates/reassembles them.
             maybe_log_raw_uart_decoded(&payload, &self.protocol);
+            self.invalidate_retry_on_metadata(&payload);
             packet_sink(payload);
         }
 
@@ -1187,6 +1249,7 @@ impl UartComms {
             // sides configured with `with_small_packet_transport` carry fragments
             // here, and the router owns their validation and reassembly.  Rejecting
             // fragments here prevents discovery from ever crossing the radio link.
+            self.invalidate_retry_on_metadata(&payload);
             queue_uart_router_payload(router, side_id, &payload, &self.protocol, packet_tap)?;
         }
         Ok(processed_any)
@@ -2243,87 +2306,33 @@ fn hex_preview(bytes: &[u8], limit: usize) -> String {
     }
 }
 
-impl CommsDevice for UartComms {
-    fn service_transmit(&mut self) -> TelemetryResult<()> {
-        if !self.poll_hardware_flow_control()? {
-            return Ok(());
-        }
-        let Some(shared) = &self.recovery else {
-            return Ok(());
-        };
-        let minimum_priority = {
-            let mut mesh = shared.lock().unwrap();
-            let now = mesh.now();
-            mesh.tick(now);
-            // The primary's HEALTH is protected ahead of SDK traffic. Lower
-            // priority voice/settings keep their existing RX-side service.
-            // RRLS has no local SDK output: its mesh owns the entire egress.
-            if mesh.role == crate::rrls::Role::Primary {
-                255
-            } else {
-                0
-            }
-        };
-        self.flush_recovery_output(minimum_priority)
+fn start_write_leases(leases: &[sedsnet::router::PackedWriteLease]) -> std::io::Result<()> {
+    let leases: Vec<_> = leases.iter().collect();
+    match sedsnet::router::PackedWriteLease::try_start_batch(&leases) {
+        Ok(sedsnet::router::WriteStart::Ready) => Ok(()),
+        Ok(_) => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+        Err(error) => Err(std::io::Error::other(error.to_string())),
     }
-    fn service_background_mode(&mut self) -> TelemetryResult<()> {
-        if matches!(self.protocol, SerialProtocol::RawUart)
-            && self
-                .recovery
-                .as_ref()
-                .is_some_and(|mesh| mesh.lock().unwrap().role == crate::rrls::Role::Primary)
-        {
-            self.flush_recovery_selection(0, true)?;
-        }
-        Ok(())
-    }
-    fn enable_radio_capacity_control(&mut self) {
-        if matches!(self.protocol, SerialProtocol::RawUart) {
-            self.write_lock
-                .lock()
-                .unwrap()
-                .radio_capacity
-                .get_or_insert_with(|| {
-                    let capacity = rfd_profile::capacity(self.baud_rate);
-                    let (burst_ms, gap_ms) = capacity.packetization();
-                    let (usable_air_bps, share_percent) = capacity.airtime_config();
-                    log::info!("RFD UART pacing: baud={} usable_air_bps={usable_air_bps} initial_share_percent={share_percent} packet_burst_ms={burst_ms} packet_gap_ms={gap_ms} hardware_flow_control={}", self.baud_rate, self.hardware_flow_control);
-                    capacity
-                });
+}
+fn report_write_leases_drained(leases: &[sedsnet::router::PackedWriteLease]) {
+    for lease in leases {
+        if let Err(error) = lease.report_drained() {
+            log::warn!("radio write progress unavailable: {error}");
         }
     }
-    fn command_batch_frame_len(&self, priority: u8, payload: &[u8]) -> Option<usize> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (priority, payload);
-            return None;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            if !matches!(self.protocol, SerialProtocol::RawUart)
-                || !is_radio_batch_command(priority, payload)
-            {
-                return None;
-            }
-            let recovery_bytes = if let Some(shared) = &self.recovery {
-                let mesh = shared.lock().unwrap();
-                mesh.local_tx(false, payload, mesh.now())?.bytes.len()
-            } else {
-                payload.len()
-            };
-            Some(recovery_bytes + RAW_UART_FRAME_HEADER_SIZE)
-        }
-    }
-    fn send_command_batch(
+}
+impl UartComms {
+    fn send_command_batch_tracked(
         &mut self,
         frames: &[(u8, &[u8])],
+        leases: &[sedsnet::router::PackedWriteLease],
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         if !self.poll_hardware_flow_control()? {
             return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = frames;
+            let _ = (frames, leases);
             return Err(std::io::Error::from(std::io::ErrorKind::Unsupported).into());
         }
         #[cfg(target_os = "linux")]
@@ -2386,6 +2395,7 @@ impl CommsDevice for UartComms {
             {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
             }
+            start_write_leases(leases)?;
             let mut accepted = 0;
             let result = write_all_fd_with_poll_counted(
                 self.inner.as_raw_fd(),
@@ -2452,8 +2462,348 @@ impl CommsDevice for UartComms {
                     }
                 }
             }
+            if result.is_ok() {
+                report_write_leases_drained(leases);
+            }
             result.map_err(Into::into)
         }
+    }
+    fn send_data_with_priority_tracked(
+        &mut self,
+        payload: &[u8],
+        priority: u8,
+        leases: &[sedsnet::router::PackedWriteLease],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if !self.poll_hardware_flow_control()? {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+        }
+        let close_batch = closes_radio_packet_batch(priority, payload);
+        let contract = if close_batch {
+            radio_packet_boundary_contract(priority, payload)
+        } else {
+            None
+        };
+        // Only canonical, CRC-valid unsequenced commands may use the remaining
+        // slot. Receipts, ordered packets and opaque SDT retain regular pacing.
+        #[cfg(target_os = "linux")]
+        let command_id = matches!(self.protocol, SerialProtocol::RawUart)
+            .then(|| is_radio_batch_command(priority, payload).then_some(contract))
+            .flatten()
+            .flatten()
+            .map(|(id, _)| id);
+        if self.recovery.is_some() {
+            self.enable_radio_capacity_control();
+        }
+        if !self.transmit_ready_for(priority, payload) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "simulated UART wire is still transmitting",
+            )
+            .into());
+        }
+        let routed = if let Some(shared) = &self.recovery {
+            let mesh = shared.lock().unwrap();
+            let Some(frame) = mesh.local_tx(false, payload, mesh.now()) else {
+                return Ok(());
+            };
+            Some(frame)
+        } else {
+            None
+        };
+        let recovery_command = routed.as_ref().is_some_and(|frame| frame.command);
+        let payload = routed.as_ref().map_or(payload, |frame| &frame.bytes[..]);
+        #[cfg(target_os = "linux")]
+        let mut write_state = self.write_lock.lock().unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let mut write_state = self.write_lock.lock().unwrap();
+        #[cfg(target_os = "linux")]
+        let virtual_wire_now =
+            if simulated_serial_pty() && matches!(self.protocol, SerialProtocol::RawUart) {
+                crate::simulation_clock_ms()
+            } else {
+                None
+            };
+        #[cfg(target_os = "linux")]
+        if let Some(now) = virtual_wire_now
+            && !write_state.wire.ready(now)
+        {
+            // A second writer may have committed while this call wrapped the
+            // recovery envelope. This refusal occurs before any serial bytes.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "simulated UART wire is still transmitting",
+            )
+            .into());
+        }
+        let capacity_wall = Instant::now();
+        let capacity_clock = crate::simulation_clock_ms();
+        self.refresh_recovery_capacity(&mut write_state, capacity_wall, capacity_clock);
+        if write_state.radio_capacity.as_ref().is_some_and(|cap| {
+            #[cfg(target_os = "linux")]
+            if let Some(id) = command_id {
+                return !cap.ready_for_command(
+                    capacity_wall,
+                    capacity_clock,
+                    id,
+                    payload.len() + RAW_UART_FRAME_HEADER_SIZE,
+                    true,
+                );
+            }
+            !cap.ready_for(capacity_wall, capacity_clock, close_batch)
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "radio modem capacity is still draining",
+            )
+            .into());
+        }
+        let len = payload.len();
+
+        if len == 0 || len > u16::MAX as usize {
+            return Err(format!("packet too large to send over comms: {len} bytes").into());
+        }
+
+        let mut accepted = 0;
+        let io_result: std::io::Result<()> = match self.protocol {
+            SerialProtocol::PacketFramed => {
+                let len_bytes = (len as u16).to_le_bytes();
+                start_write_leases(leases)?;
+                self.inner.write_all(&len_bytes)?;
+                self.inner.write_all(payload)?;
+                self.inner.flush()?;
+                Ok(())
+            }
+            SerialProtocol::RawUart => {
+                #[cfg(target_os = "linux")]
+                {
+                    let framed = if recovery_command {
+                        build_raw_uart_command_frame(payload)?
+                    } else {
+                        build_raw_uart_frame(payload)?
+                    };
+                    maybe_log_raw_uart_tx(&framed, &self.protocol);
+                    start_write_leases(leases)?;
+                    let result = write_all_fd_with_poll_counted(
+                        self.inner.as_raw_fd(),
+                        &framed,
+                        UART_TX_POLL_TIMEOUT,
+                        &mut accepted,
+                    )
+                    .and_then(|_| {
+                        drain_fd_with_timeout(
+                            self.inner.as_raw_fd(),
+                            uart_wire_timeout(framed.len(), self.baud_rate),
+                        )
+                    });
+                    if let Some(now) = virtual_wire_now
+                        && accepted > 0
+                    {
+                        write_state.wire.committed(now, accepted, self.baud_rate);
+                    }
+                    result
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let framed = if recovery_command {
+                        build_raw_uart_command_frame(payload)?
+                    } else {
+                        build_raw_uart_frame(payload)?
+                    };
+                    maybe_log_raw_uart_tx(&framed, &self.protocol);
+                    start_write_leases(leases)?;
+                    write_all_std_counted(&mut self.inner, &framed, &mut accepted)
+                        .and_then(|_| self.inner.flush())
+                }
+            }
+        };
+        #[cfg(target_os = "linux")]
+        let virtual_stop_us = virtual_wire_now.map(|_| write_state.wire.stop_us());
+        if matches!(self.protocol, SerialProtocol::RawUart)
+            && accepted > 0
+            && let Some(capacity) = &mut write_state.radio_capacity
+        {
+            #[cfg(target_os = "linux")]
+            let mut joined_command_batch = false;
+            #[cfg(target_os = "linux")]
+            if let Some(id) = command_id {
+                joined_command_batch = capacity.committed_command(
+                    capacity_wall,
+                    capacity_clock,
+                    (id, len + RAW_UART_FRAME_HEADER_SIZE),
+                    true,
+                    accepted,
+                    io_result.is_ok(),
+                );
+            } else {
+                capacity.committed(capacity_wall, capacity_clock, accepted);
+            }
+            #[cfg(not(target_os = "linux"))]
+            capacity.committed(capacity_wall, capacity_clock, accepted);
+            capacity.drained(Instant::now());
+            #[cfg(target_os = "linux")]
+            if let Some(stop_us) = virtual_stop_us {
+                capacity.drained_virtual(stop_us);
+            }
+            // Only complete writes and platform drains/flushes fund a close.
+            // Accepted prefixes still consume debt on a failed logical frame.
+            if io_result.is_ok() && priority < 254 && !close_batch {
+                capacity.note_successful_ordinary_service(len + RAW_UART_FRAME_HEADER_SIZE);
+            }
+            let mut promoted = false;
+            if io_result.is_ok() && close_batch {
+                #[cfg(target_os = "linux")]
+                let close_batch = !joined_command_batch;
+                #[cfg(not(target_os = "linux"))]
+                let close_batch = true;
+                if close_batch {
+                    promoted = capacity.close_packet_batch_for_contract(
+                        capacity_wall,
+                        capacity_clock,
+                        contract,
+                    );
+                }
+                #[cfg(target_os = "linux")]
+                if promoted && let Some(id) = command_id {
+                    capacity.allow_single_command_tail(id, len + RAW_UART_FRAME_HEADER_SIZE);
+                }
+                if promoted
+                    && contract.is_some_and(|(_, receipt)| receipt)
+                    && let Some(mesh) = &self.recovery
+                {
+                    mesh.lock()
+                        .unwrap()
+                        .note_receipt_packet_boundary(capacity.packet_idle_service_bytes());
+                }
+            }
+            #[cfg(target_os = "linux")]
+            trace_virtual_uart_admission(
+                "sdk",
+                self.side_id,
+                contract,
+                virtual_wire_now,
+                capacity_clock,
+                virtual_stop_us,
+                capacity.next_packet_virtual_ms(),
+                promoted,
+                len + RAW_UART_FRAME_HEADER_SIZE,
+                accepted,
+                io_result.is_ok(),
+            );
+        }
+        if io_result.is_ok() && matches!(self.protocol, SerialProtocol::RawUart) {
+            report_write_leases_drained(leases);
+        }
+        io_result.map_err(Into::into)
+    }
+}
+impl CommsDevice for UartComms {
+    fn bind_retry_tracker(
+        &mut self,
+        tracker: sedsnet::router::RetryTracker,
+    ) -> TelemetryResult<()> {
+        let mut state = self.write_lock.lock().unwrap();
+        if state.retry_tracker.as_ref() == Some(&tracker) {
+            return Ok(());
+        }
+        if let Some(old) = &state.retry_tracker {
+            old.invalidate_generation()?;
+        }
+        tracker.invalidate_generation()?;
+        state.retry_tracker = Some(tracker);
+        state.retry_peer_session = None;
+        Ok(())
+    }
+    fn send_tracked(
+        &mut self,
+        frames: &[(u8, &[u8])],
+        leases: &[sedsnet::router::PackedWriteLease],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if frames.len() == 1 {
+            self.send_data_with_priority_tracked(frames[0].1, frames[0].0, leases)
+        } else {
+            self.send_command_batch_tracked(frames, leases)
+        }
+    }
+
+    fn service_transmit(&mut self) -> TelemetryResult<()> {
+        if !self.poll_hardware_flow_control()? {
+            return Ok(());
+        }
+        let Some(shared) = &self.recovery else {
+            return Ok(());
+        };
+        let (minimum_priority, peer_session) = {
+            let mut mesh = shared.lock().unwrap();
+            let now = mesh.now();
+            mesh.tick(now);
+            // The primary's HEALTH is protected ahead of SDK traffic. Lower
+            // priority voice/settings keep their existing RX-side service.
+            // RRLS has no local SDK output: its mesh owns the entire egress.
+            (
+                if mesh.role == crate::rrls::Role::Primary {
+                    255
+                } else {
+                    0
+                },
+                mesh.operating_mode_session(now),
+            )
+        };
+        self.observe_retry_peer_session(peer_session);
+        self.flush_recovery_output(minimum_priority)
+    }
+    fn service_background_mode(&mut self) -> TelemetryResult<()> {
+        if matches!(self.protocol, SerialProtocol::RawUart)
+            && self
+                .recovery
+                .as_ref()
+                .is_some_and(|mesh| mesh.lock().unwrap().role == crate::rrls::Role::Primary)
+        {
+            self.flush_recovery_selection(0, true)?;
+        }
+        Ok(())
+    }
+    fn enable_radio_capacity_control(&mut self) {
+        if matches!(self.protocol, SerialProtocol::RawUart) {
+            self.write_lock
+                .lock()
+                .unwrap()
+                .radio_capacity
+                .get_or_insert_with(|| {
+                    let capacity = rfd_profile::capacity(self.baud_rate);
+                    let (burst_ms, gap_ms) = capacity.packetization();
+                    let (usable_air_bps, share_percent) = capacity.airtime_config();
+                    log::info!("RFD UART pacing: baud={} usable_air_bps={usable_air_bps} initial_share_percent={share_percent} packet_burst_ms={burst_ms} packet_gap_ms={gap_ms} hardware_flow_control={}", self.baud_rate, self.hardware_flow_control);
+                    capacity
+                });
+        }
+    }
+    fn command_batch_frame_len(&self, priority: u8, payload: &[u8]) -> Option<usize> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (priority, payload);
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if !matches!(self.protocol, SerialProtocol::RawUart)
+                || !is_radio_batch_command(priority, payload)
+            {
+                return None;
+            }
+            let recovery_bytes = if let Some(shared) = &self.recovery {
+                let mesh = shared.lock().unwrap();
+                mesh.local_tx(false, payload, mesh.now())?.bytes.len()
+            } else {
+                payload.len()
+            };
+            Some(recovery_bytes + RAW_UART_FRAME_HEADER_SIZE)
+        }
+    }
+    fn send_command_batch(
+        &mut self,
+        frames: &[(u8, &[u8])],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.send_command_batch_tracked(frames, &[])
     }
     fn transmit_ready(&self) -> bool {
         self.transmit_ready_for(0, &[])
@@ -2558,220 +2908,7 @@ impl CommsDevice for UartComms {
         payload: &[u8],
         priority: u8,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        if !self.poll_hardware_flow_control()? {
-            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
-        }
-        let close_batch = closes_radio_packet_batch(priority, payload);
-        let contract = if close_batch {
-            radio_packet_boundary_contract(priority, payload)
-        } else {
-            None
-        };
-        // Only canonical, CRC-valid unsequenced commands may use the remaining
-        // slot. Receipts, ordered packets and opaque SDT retain regular pacing.
-        #[cfg(target_os = "linux")]
-        let command_id = matches!(self.protocol, SerialProtocol::RawUart)
-            .then(|| is_radio_batch_command(priority, payload).then_some(contract))
-            .flatten()
-            .flatten()
-            .map(|(id, _)| id);
-        if self.recovery.is_some() {
-            self.enable_radio_capacity_control();
-        }
-        if !self.transmit_ready_for(priority, payload) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "simulated UART wire is still transmitting",
-            )
-            .into());
-        }
-        let routed = if let Some(shared) = &self.recovery {
-            let mesh = shared.lock().unwrap();
-            let Some(frame) = mesh.local_tx(false, payload, mesh.now()) else {
-                return Ok(());
-            };
-            Some(frame)
-        } else {
-            None
-        };
-        let recovery_command = routed.as_ref().is_some_and(|frame| frame.command);
-        let payload = routed.as_ref().map_or(payload, |frame| &frame.bytes[..]);
-        #[cfg(target_os = "linux")]
-        let mut write_state = self.write_lock.lock().unwrap();
-        #[cfg(not(target_os = "linux"))]
-        let mut write_state = self.write_lock.lock().unwrap();
-        #[cfg(target_os = "linux")]
-        let virtual_wire_now =
-            if simulated_serial_pty() && matches!(self.protocol, SerialProtocol::RawUart) {
-                crate::simulation_clock_ms()
-            } else {
-                None
-            };
-        #[cfg(target_os = "linux")]
-        if let Some(now) = virtual_wire_now
-            && !write_state.wire.ready(now)
-        {
-            // A second writer may have committed while this call wrapped the
-            // recovery envelope. This refusal occurs before any serial bytes.
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "simulated UART wire is still transmitting",
-            )
-            .into());
-        }
-        let capacity_wall = Instant::now();
-        let capacity_clock = crate::simulation_clock_ms();
-        self.refresh_recovery_capacity(&mut write_state, capacity_wall, capacity_clock);
-        if write_state.radio_capacity.as_ref().is_some_and(|cap| {
-            #[cfg(target_os = "linux")]
-            if let Some(id) = command_id {
-                return !cap.ready_for_command(
-                    capacity_wall,
-                    capacity_clock,
-                    id,
-                    payload.len() + RAW_UART_FRAME_HEADER_SIZE,
-                    true,
-                );
-            }
-            !cap.ready_for(capacity_wall, capacity_clock, close_batch)
-        }) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "radio modem capacity is still draining",
-            )
-            .into());
-        }
-        let len = payload.len();
-
-        if len == 0 || len > u16::MAX as usize {
-            return Err(format!("packet too large to send over comms: {len} bytes").into());
-        }
-
-        let mut accepted = 0;
-        let io_result: std::io::Result<()> = match self.protocol {
-            SerialProtocol::PacketFramed => {
-                let len_bytes = (len as u16).to_le_bytes();
-                self.inner.write_all(&len_bytes)?;
-                self.inner.write_all(payload)?;
-                self.inner.flush()?;
-                Ok(())
-            }
-            SerialProtocol::RawUart => {
-                #[cfg(target_os = "linux")]
-                {
-                    let framed = if recovery_command {
-                        build_raw_uart_command_frame(payload)?
-                    } else {
-                        build_raw_uart_frame(payload)?
-                    };
-                    maybe_log_raw_uart_tx(&framed, &self.protocol);
-                    let result = write_all_fd_with_poll_counted(
-                        self.inner.as_raw_fd(),
-                        &framed,
-                        UART_TX_POLL_TIMEOUT,
-                        &mut accepted,
-                    )
-                    .and_then(|_| {
-                        drain_fd_with_timeout(
-                            self.inner.as_raw_fd(),
-                            uart_wire_timeout(framed.len(), self.baud_rate),
-                        )
-                    });
-                    if let Some(now) = virtual_wire_now
-                        && accepted > 0
-                    {
-                        write_state.wire.committed(now, accepted, self.baud_rate);
-                    }
-                    result
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    let framed = if recovery_command {
-                        build_raw_uart_command_frame(payload)?
-                    } else {
-                        build_raw_uart_frame(payload)?
-                    };
-                    maybe_log_raw_uart_tx(&framed, &self.protocol);
-                    write_all_std_counted(&mut self.inner, &framed, &mut accepted)
-                        .and_then(|_| self.inner.flush())
-                }
-            }
-        };
-        #[cfg(target_os = "linux")]
-        let virtual_stop_us = virtual_wire_now.map(|_| write_state.wire.stop_us());
-        if matches!(self.protocol, SerialProtocol::RawUart)
-            && accepted > 0
-            && let Some(capacity) = &mut write_state.radio_capacity
-        {
-            #[cfg(target_os = "linux")]
-            let mut joined_command_batch = false;
-            #[cfg(target_os = "linux")]
-            if let Some(id) = command_id {
-                joined_command_batch = capacity.committed_command(
-                    capacity_wall,
-                    capacity_clock,
-                    (id, len + RAW_UART_FRAME_HEADER_SIZE),
-                    true,
-                    accepted,
-                    io_result.is_ok(),
-                );
-            } else {
-                capacity.committed(capacity_wall, capacity_clock, accepted);
-            }
-            #[cfg(not(target_os = "linux"))]
-            capacity.committed(capacity_wall, capacity_clock, accepted);
-            capacity.drained(Instant::now());
-            #[cfg(target_os = "linux")]
-            if let Some(stop_us) = virtual_stop_us {
-                capacity.drained_virtual(stop_us);
-            }
-            // Only complete writes and platform drains/flushes fund a close.
-            // Accepted prefixes still consume debt on a failed logical frame.
-            if io_result.is_ok() && priority < 254 && !close_batch {
-                capacity.note_successful_ordinary_service(len + RAW_UART_FRAME_HEADER_SIZE);
-            }
-            let mut promoted = false;
-            if io_result.is_ok() && close_batch {
-                #[cfg(target_os = "linux")]
-                let close_batch = !joined_command_batch;
-                #[cfg(not(target_os = "linux"))]
-                let close_batch = true;
-                if close_batch {
-                    promoted = capacity.close_packet_batch_for_contract(
-                        capacity_wall,
-                        capacity_clock,
-                        contract,
-                    );
-                }
-                #[cfg(target_os = "linux")]
-                if promoted && let Some(id) = command_id {
-                    capacity.allow_single_command_tail(id, len + RAW_UART_FRAME_HEADER_SIZE);
-                }
-                if promoted
-                    && contract.is_some_and(|(_, receipt)| receipt)
-                    && let Some(mesh) = &self.recovery
-                {
-                    mesh.lock()
-                        .unwrap()
-                        .note_receipt_packet_boundary(capacity.packet_idle_service_bytes());
-                }
-            }
-            #[cfg(target_os = "linux")]
-            trace_virtual_uart_admission(
-                "sdk",
-                self.side_id,
-                contract,
-                virtual_wire_now,
-                capacity_clock,
-                virtual_stop_us,
-                capacity.next_packet_virtual_ms(),
-                promoted,
-                len + RAW_UART_FRAME_HEADER_SIZE,
-                accepted,
-                io_result.is_ok(),
-            );
-        }
-        io_result.map_err(Into::into)
+        self.send_data_with_priority_tracked(payload, priority, &[])
     }
 
     fn send_radio_scheduler_status(
@@ -4542,7 +4679,7 @@ mod raw_uart_tests {
     }
 
     #[cfg(unix)]
-    fn recovery_uart_fixture(
+    pub(super) fn recovery_uart_fixture(
         port: serialport::TTYPort,
     ) -> (UartComms, crate::rrls::Shared, Vec<u8>) {
         let mut mesh = crate::rrls::Mesh::new(crate::rrls::Role::Primary, 1);

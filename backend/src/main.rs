@@ -1772,18 +1772,19 @@ async fn main() -> anyhow::Result<()> {
     } else {
         TxQueueBudget::new(2048)
     });
-    let rocket_side = {
+    let (rocket_side, rocket_retry_tracker) = {
         let rocket_tx = rocket_tx.clone();
         let budget = rocket_tx_budget.clone();
         let activity = state.transport_tx_activity.clone();
         let opts = rocket_router_side_options(&comms_links.av_bay, rrls::is_rrls());
-        router.add_side_packed_with_priority_and_options(
+        router.add_side_packed_leased_with_priority_and_options(
             "rocket_comms",
             move |pkt, priority| {
-                activity.try_enqueue(|| budget.try_send(&rocket_tx, priority, pkt))
+                activity.try_enqueue(|| budget.try_send_leased(&rocket_tx, priority, pkt))
             },
             opts,
-        )
+            sedsnet::router::RetryTrackerLimits::default(),
+        )?
     };
 
     let umbilical_side = if umbilical_comms.is_none() {
@@ -1811,6 +1812,10 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
+    rocket_comms
+        .lock()
+        .unwrap()
+        .bind_retry_tracker(rocket_retry_tracker)?;
     rocket_comms
         .lock()
         .expect("failed to get rocket comms lock")
