@@ -2409,8 +2409,8 @@
           "Ascent",
           "Coast",
           "Apogee",
-          "ParachuteDeploy",
-          "Descent"
+          "Descent",
+          "Reefing"
         ],
         "sections": [
           {
@@ -2746,5 +2746,6 @@
         "curve_exponent": 1.0
       }
     ]
-  }
+  },
+  "flight_phase_version": 1
 }

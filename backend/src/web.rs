@@ -1531,7 +1531,7 @@ mod live_flight_state_tests {
         Arc::get_mut(&mut state).unwrap().auth =
             Arc::new(crate::auth::AuthManager::new(auth_path.clone()));
         for expected in [
-            FlightState::ParachuteDeploy,
+            FlightState::Descent,
             FlightState::Startup,
             FlightState::Armed,
         ] {
