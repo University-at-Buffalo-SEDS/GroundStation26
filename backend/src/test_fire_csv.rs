@@ -1,10 +1,28 @@
 use crate::loadcell::LoadcellCalibrationFile;
 use anyhow::Result;
 use sqlx::{Row, SqlitePool};
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 const TEST_FIRE_HEADER: u16 = 172;
+
+#[derive(Default)]
+struct ChamberSample {
+    pressure: Option<Option<f32>>,
+    voltage: Option<Option<f32>>,
+    conflicting: bool,
+}
+
+impl ChamberSample {
+    fn values(&self) -> (Option<f32>, Option<f32>) {
+        if self.conflicting {
+            (None, None)
+        } else {
+            (self.pressure.flatten(), self.voltage.flatten())
+        }
+    }
+}
 
 #[derive(Default)]
 struct ExportState {
@@ -28,6 +46,7 @@ pub async fn export_recording_csv(
         SELECT
             id,
             timestamp_ms,
+            source_timestamp_ms AS original_source_timestamp_ms,
             COALESCE(source_timestamp_ms, timestamp_ms) AS source_timestamp_ms,
             strftime('%Y-%m-%dT%H:%M:%f', timestamp_ms / 1000.0, 'unixepoch') AS rx_timestamp,
             data_type,
@@ -38,6 +57,8 @@ pub async fn export_recording_csv(
         WHERE data_type IN (
             'KG1000',
             'KG50',
+            'COMBUSTION_CHAMBER_PRESSURE',
+            'COMBUSTION_CHAMBER_VOLTAGE',
             'DAQ_ADC_TEMPERATURE',
             'FUEL_TANK_PRESSURE',
             'IADC',
@@ -51,6 +72,37 @@ pub async fn export_recording_csv(
     .fetch_all(&db)
     .await?;
 
+    // Canonical PT rows and KG1000 share the original packet's two clocks and
+    // payload. Join only that identity, never the previous pressure observation.
+    // The raw combined row is not another load-cell sample.
+    let mut chamber_samples: HashMap<_, ChamberSample> = HashMap::new();
+    for row in &rows {
+        let kind: &str = row.get("data_type");
+        if !matches!(
+            kind,
+            "COMBUSTION_CHAMBER_PRESSURE" | "COMBUSTION_CHAMBER_VOLTAGE"
+        ) || row.get::<&str, _>("sender_id") != "DAQ"
+        {
+            continue;
+        }
+        let value = parse_values_json(row.get::<Option<String>, _>("values_json").as_deref())
+            .first()
+            .copied()
+            .flatten()
+            .filter(|value| value.is_finite());
+        let sample = chamber_samples.entry(chamber_packet_key(row)).or_default();
+        let slot = if kind == "COMBUSTION_CHAMBER_PRESSURE" {
+            &mut sample.pressure
+        } else {
+            &mut sample.voltage
+        };
+        match slot {
+            Some(previous) if *previous != value => sample.conflicting = true,
+            None => *slot = Some(value),
+            _ => {}
+        }
+    }
+
     if let Some(parent) = csv_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -58,11 +110,11 @@ pub async fn export_recording_csv(
     let mut writer = std::io::BufWriter::new(std::fs::File::create(csv_path)?);
     writeln!(
         writer,
-        "Rx_Timestamp,Header,Seq,Timestamp,1000kg Raw,Tank Pressure Raw,Battery Voltage,CRC,1000kg Calibrated,Weight,Thrust,Tank Pressure Calibrated,50kg Raw,50kg Calibrated,ADC Temperature C"
+        "Rx_Timestamp,Header,Seq,Timestamp,1000kg Raw,Tank Pressure Raw,Battery Voltage,CRC,1000kg Calibrated,Weight,Thrust,Tank Pressure Calibrated,50kg Raw,50kg Calibrated,ADC Temperature C,Chamber Pressure (psig),Chamber Connector Voltage (V)"
     )?;
     writeln!(
         writer,
-        "CALIBRATION,,,,\"{}\",\"{}\",,,,,,,,",
+        "CALIBRATION,,,,\"{}\",\"{}\",,,,,,,,,,",
         linear_formula(calibration.ch1.m, calibration.ch1.b),
         linear_formula(calibration.iadc.m, calibration.iadc.b)
     )?;
@@ -70,7 +122,7 @@ pub async fn export_recording_csv(
     let kg50 = crate::loadcell::kg50_daq_coefficients(calibration).map_err(anyhow::Error::msg)?;
     writeln!(
         writer,
-        "CALIBRATION_50KG,,,,,,,,,,,,\"c0={};c1={};c2={};c3={};c4={};x0={};tare={}\",",
+        "CALIBRATION_50KG,,,,,,,,,,,,\"c0={};c1={};c2={};c3={};c4={};x0={};tare={}\",,,,",
         kg50[0], kg50[1], kg50[2], kg50[3], kg50[4], kg50[5], kg50[6]
     )?;
     let mut state = ExportState::default();
@@ -133,7 +185,7 @@ pub async fn export_recording_csv(
                     });
                 writeln!(
                     writer,
-                    "{},{},{},{},,,,,,,,,{},{},{}",
+                    "{},{},{},{},,,,,,,,,{},{},{},,",
                     rx_timestamp,
                     TEST_FIRE_HEADER,
                     seq % 256,
@@ -145,6 +197,10 @@ pub async fn export_recording_csv(
                 seq = seq.wrapping_add(1);
             }
             "KG1000" => {
+                let chamber = chamber_samples
+                    .get(&chamber_packet_key(&row))
+                    .map(ChamberSample::values)
+                    .unwrap_or_default();
                 let rx_timestamp: String = row.get("rx_timestamp");
                 let source_timestamp_ms: i64 = row.get("source_timestamp_ms");
                 let payload_json: String = row.get("payload_json");
@@ -173,7 +229,7 @@ pub async fn export_recording_csv(
                 let crc = crc16_ccitt_false(&parse_payload_json(&payload_json));
                 writeln!(
                     writer,
-                    "{},{},{},{},{},{},{},{},{},{},{},{},,,{}",
+                    "{},{},{},{},{},{},{},{},{},{},{},{},,,{},{},{}",
                     rx_timestamp,
                     TEST_FIRE_HEADER,
                     seq % 256,
@@ -187,6 +243,8 @@ pub async fn export_recording_csv(
                     display_opt(calibrated),
                     display_opt(state.pressure_calibrated),
                     display_opt(temperature),
+                    display_opt(chamber.0),
+                    display_opt(chamber.1),
                 )?;
                 seq = seq.wrapping_add(1);
             }
@@ -197,6 +255,15 @@ pub async fn export_recording_csv(
     writer.flush()?;
     db.close().await;
     Ok(())
+}
+
+fn chamber_packet_key(row: &sqlx::sqlite::SqliteRow) -> (String, i64, Option<i64>, String) {
+    (
+        row.get("sender_id"),
+        row.get("timestamp_ms"),
+        row.get("original_source_timestamp_ms"),
+        row.get("payload_json"),
+    )
 }
 
 fn calibrated_loadcell(calibration: &LoadcellCalibrationFile, raw_value: f32) -> Option<f32> {
@@ -293,7 +360,9 @@ mod tests {
             .map(|line| line.split(',').collect())
             .collect();
         assert_eq!(samples.len(), 2);
-        assert_eq!(samples[0].len(), 15);
+        assert_eq!(samples[0].len(), 17);
+        assert_eq!(samples[0][15..], ["", ""]);
+        assert_eq!(samples[1][15..], ["", ""]);
         assert_eq!(samples[0][3], "9000");
         assert_eq!(samples[0][12..14], ["2", "5"]);
         assert_eq!(samples[0][14], ""); // No invented ADC temperature.

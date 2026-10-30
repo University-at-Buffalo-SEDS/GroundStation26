@@ -4698,6 +4698,182 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test_fire_mode")]
+    #[tokio::test]
+    async fn chamber_testfire_csv_joins_actual_recorded_rows_without_duplicates_or_old_pressure() {
+        let (db_tx, mut db_rx) = mpsc::channel(128);
+        let state = test_app_state(db_tx.clone()).await;
+        let directory = std::env::temp_dir().join(format!(
+            "gs-chamber-csv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("samples.db");
+        let csv_path = directory.join("samples.csv");
+        let (db, _) = crate::telemetry_db::open_telemetry_db(&db_path)
+            .await
+            .unwrap();
+        for (kind, source, values) in [
+            ("KG1000", 100_u64, vec![1.0_f32]),
+            ("DAQ_LOADCELL_CHAMBER", 200, vec![4.25, 1000.0, 5.0]),
+            ("KG1000", 300, vec![2.0]),
+            ("DAQ_LOADCELL_CHAMBER", 400, vec![3.0, f32::NAN, 5.0]),
+        ] {
+            let packet = Packet::new(
+                crate::telemetry_schema::data_type(kind),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "DAQ",
+                source,
+                f32_payload(&values),
+            )
+            .unwrap();
+            handle_packet(&state, &db_tx, &test_db_overflow(), packet).await;
+        }
+        let mut writes = Vec::new();
+        while let Ok(DbQueueItem::Write(write)) = db_rx.try_recv() {
+            writes.push(write);
+        }
+        insert_db_batch_once(&db, &writes).await.unwrap();
+        let combined: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM telemetry WHERE data_type='DAQ_LOADCELL_CHAMBER'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let projected: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM telemetry WHERE data_type='COMBUSTION_CHAMBER_PRESSURE'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            (combined, projected),
+            (2, 1),
+            "actual ingestion stored both valid representations but no invalid PT projection"
+        );
+        let received: i64 = sqlx::query_scalar(
+            "SELECT timestamp_ms FROM telemetry WHERE data_type='COMBUSTION_CHAMBER_PRESSURE'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let expected_rx: String =
+            sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%f', ? / 1000.0, 'unixepoch')")
+                .bind(received)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        // Duplicate projections are the same observation, not extra samples.
+        sqlx::query("INSERT INTO telemetry(timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json) SELECT timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json FROM telemetry WHERE data_type IN ('COMBUSTION_CHAMBER_PRESSURE','COMBUSTION_CHAMBER_VOLTAGE')")
+            .execute(&db).await.unwrap();
+        // Equal clocks alone cannot join an unrelated original payload.
+        sqlx::query("INSERT INTO telemetry(timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json) SELECT timestamp_ms,source_timestamp_ms,sender_id,data_type,'[1234.0]','[255]' FROM telemetry WHERE data_type='COMBUSTION_CHAMBER_PRESSURE' LIMIT 1")
+            .execute(&db).await.unwrap();
+        db.close().await;
+        let mut calibration = crate::loadcell::LoadcellCalibrationFile::default();
+        calibration.extra_channels.insert(
+            "kg50".into(),
+            crate::loadcell::GenericCalibrationChannel {
+                linear: crate::loadcell::ChannelLinear {
+                    m: Some(1.0),
+                    b: Some(0.0),
+                },
+                ..Default::default()
+            },
+        );
+        crate::test_fire_csv::export_recording_csv(
+            db_path.to_str().unwrap(),
+            &csv_path,
+            &calibration,
+        )
+        .await
+        .unwrap();
+        let csv = std::fs::read_to_string(&csv_path).unwrap();
+        let header: Vec<_> = csv.lines().next().unwrap().split(',').collect();
+        assert_eq!(
+            header[..15].join(","),
+            "Rx_Timestamp,Header,Seq,Timestamp,1000kg Raw,Tank Pressure Raw,Battery Voltage,CRC,1000kg Calibrated,Weight,Thrust,Tank Pressure Calibrated,50kg Raw,50kg Calibrated,ADC Temperature C"
+        );
+        assert_eq!(
+            &header[15..],
+            &["Chamber Pressure (psig)", "Chamber Connector Voltage (V)"]
+        );
+        let data: Vec<Vec<_>> = csv
+            .lines()
+            .skip(3)
+            .map(|line| line.split(',').collect())
+            .collect();
+        assert_eq!(
+            data.len(),
+            4,
+            "one original loadcell sample each; combined and projection are not extra samples"
+        );
+        assert!(data.iter().all(|row| row.len() == 17));
+        assert_eq!(&data[0][15..], &["", ""], "absent pressure is not zero");
+        assert_eq!(&data[1][15..], &["1000", "5"]);
+        assert_eq!(
+            data[1][0], expected_rx,
+            "actual PT packet receive clock retained"
+        );
+        assert_eq!(data[1][3], "200", "actual PT packet source clock retained");
+        assert_eq!(
+            data[1][4], "4.25",
+            "existing raw loadcell remains unchanged"
+        );
+        assert_eq!(
+            &data[2][15..],
+            &["", ""],
+            "previous PT must not carry into a later independent sample"
+        );
+        assert_eq!(data[2][3], "300");
+        assert_eq!(
+            &data[3][15..],
+            &["", ""],
+            "invalid PT does not become a pressure or voltage measurement"
+        );
+        assert_eq!(
+            data[3][4], "3",
+            "invalid PT retains the independent loadcell sample"
+        );
+        // Conflicting values for the exact original sample cannot be resolved
+        // by row order. Both PT columns must remain unknown, not last-writer-wins.
+        let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", db_path.display()))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO telemetry(timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json) SELECT timestamp_ms,source_timestamp_ms,sender_id,data_type,'[999.0]',payload_json FROM telemetry WHERE data_type='COMBUSTION_CHAMBER_PRESSURE' AND payload_json != '[255]' LIMIT 1")
+            .execute(&db).await.unwrap();
+        db.close().await;
+        crate::test_fire_csv::export_recording_csv(
+            db_path.to_str().unwrap(),
+            &csv_path,
+            &calibration,
+        )
+        .await
+        .unwrap();
+        let conflict_csv = std::fs::read_to_string(&csv_path).unwrap();
+        let conflict_rows: Vec<Vec<_>> = conflict_csv
+            .lines()
+            .skip(3)
+            .map(|line| line.split(',').collect())
+            .collect();
+        assert_eq!(conflict_rows.len(), 4);
+        assert_eq!(
+            &conflict_rows[1][15..],
+            &["", ""],
+            "ambiguous same-packet PT is unknown"
+        );
+        assert_eq!(
+            &conflict_rows[1][..15],
+            &data[1][..15],
+            "existing loadcell/calibration/clocks unchanged by PT ambiguity"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[tokio::test]
     async fn chamber_packet_keeps_loadcell_calibration_and_persists_pressure_with_both_clocks() {
         let (db_tx, mut db_rx) = mpsc::channel(16);
