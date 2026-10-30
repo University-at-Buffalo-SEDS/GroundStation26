@@ -89,6 +89,11 @@ pub fn start() -> tokio::task::JoinHandle<()> {
         }
     })
 }
+pub(crate) fn mirror_sample() -> Option<(i32, u64)> {
+    let (value, at) = cache().read().ok().and_then(|v| *v)?;
+    let age = at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    (age <= 15000).then_some((value, age))
+}
 pub fn append_local(rows: &mut Vec<NetworkBoardHealthEntry>, wall_ms: u64, simulated: bool) {
     if simulated || !STARTED.load(Ordering::Relaxed) {
         return;

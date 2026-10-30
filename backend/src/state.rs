@@ -889,14 +889,16 @@ impl AppState {
             });
         }
 
-        BoardStatusMsg { boards }
+        let mut out = BoardStatusMsg { boards };
+        crate::primary_mirror::project_board_status(self, &mut out, now_ms);
+        out
     }
 
     /// Projects the topology and traffic counters reported by SEDSnet into the dashboard graph.
     pub fn network_topology_snapshot(&self, now_ms: u64) -> NetworkTopologyMsg {
         let simulated = crate::flight_sim::sim_mode_enabled();
         let Some(router) = self.topology_router.get() else {
-            return NetworkTopologyMsg {
+            let mut out = NetworkTopologyMsg {
                 generated_ms: now_ms,
                 simulated,
                 nodes: Vec::new(),
@@ -909,6 +911,8 @@ impl AppState {
                     rows
                 },
             };
+            crate::primary_mirror::project_topology(self, &mut out);
+            return out;
         };
         let exported = router.export_topology();
         let health = {
@@ -1126,14 +1130,16 @@ impl AppState {
         }
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
 
-        NetworkTopologyMsg {
+        let mut out = NetworkTopologyMsg {
             generated_ms: now_ms,
             simulated,
             nodes,
             links,
             traffic: Some(traffic),
             health,
-        }
+        };
+        crate::primary_mirror::project_topology(self, &mut out);
+        out
     }
 
     /// Stores a board-confirmed umbilical valve state, never a requested target.
@@ -1160,6 +1166,12 @@ impl AppState {
     #[allow(dead_code)]
     pub fn last_packet_received_ms(&self) -> u64 {
         self.last_packet_rx_ms.load(Ordering::Relaxed)
+    }
+
+    /// Monotonic receipt provenance for remote presentation admission barriers.
+    pub(crate) fn umbilical_report_after(&self, cmd_id: u8, barrier: std::time::Instant) -> bool {
+        self.umbilical_valve_states.lock().unwrap().get(&cmd_id)
+            .is_some_and(|sample| sample.received_at > barrier)
     }
 
     /// Looks up the cached state for a specific umbilical valve command id.
@@ -1383,7 +1395,15 @@ impl AppState {
 
     /// Returns the latest action-policy snapshot used by the dashboard and command gate.
     pub fn action_policy_snapshot(&self) -> ActionPolicyMsg {
-        self.action_policy.lock().unwrap().clone()
+        let local = self.action_policy.lock().unwrap().clone();
+        if !crate::rrls::is_rrls() { return local; }
+        let mut mirrored = crate::primary_mirror::action_policy(self).unwrap_or_else(|| ActionPolicyMsg {
+            key_enabled: false, software_buttons_enabled: false, controls: Vec::new(),
+        });
+        // Recording and durable clock reset retain their separate local paths.
+        mirrored.controls.extend(local.controls.into_iter().filter(|control|matches!(control.cmd.as_str(),
+            "StartWritingNow" | "StartWritingLastTwoMinutes" | "PauseWritingDb" | "StopWritingDb" | "ResetTClock")));
+        mirrored
     }
 
     /// Returns the latest fill-target snapshot used by the dashboard.
@@ -1543,7 +1563,14 @@ impl AppState {
         }
         *slot = policy.clone();
         drop(slot);
-        let _ = self.action_policy_tx.send(policy);
+        // RRLS-local sequence policy is not the paired primary's policy. Keep
+        // WebSocket and HTTP presentation on the same authoritative projection.
+        let published = if crate::rrls::is_rrls() {
+            self.action_policy_snapshot()
+        } else {
+            policy
+        };
+        let _ = self.action_policy_tx.send(published);
     }
 
     /// Rebroadcasts the current action-policy snapshot without requiring a state change.

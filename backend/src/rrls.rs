@@ -27,6 +27,8 @@ const READY: u8 = 7;
 const POSITION: u8 = 8;
 const VOICE: u8 = 9;
 const SETTINGS: u8 = 10;
+// Host application control; kind12 is reserved for independent radio-budget negotiation.
+const HOST_CONTROL: u8 = 11;
 const MAX_SETTINGS_INBOX: usize = 4;
 const SETTINGS_PEER_AGE_MS: u64 = 15_000;
 #[derive(Clone, Copy)]
@@ -186,12 +188,19 @@ struct Queued {
 }
 impl Queued {
     fn closes_packet_batch(&self) -> bool {
+        if self.frame.bytes.get(3) == Some(&HOST_CONTROL) {
+            return true;
+        }
         !self.independent_discovery
             && decode(&self.frame.bytes).is_some_and(|(_, body)| {
                 crate::comms::closes_radio_packet_batch(self.priority, body)
             })
     }
     fn boundary_contract(&self) -> Option<(u64, bool)> {
+        if self.frame.bytes.get(3) == Some(&HOST_CONTROL) {
+            let (_, body) = decode(&self.frame.bytes)?;
+            return crate::command_proxy::wire_boundary(body).map(|id| (id, false));
+        }
         if self.independent_discovery {
             return None;
         }
@@ -220,12 +229,17 @@ impl Transmission {
         ])
     }
     pub(crate) fn single_control_contract(&self) -> Option<(u64, bool)> {
-        if self.follower.is_some() { return None; }
+        if self.follower.is_some() {
+            return None;
+        }
         Self::batch_contract(&self.queued)
     }
     fn batch_contract(queued: &Queued) -> Option<(u64, bool)> {
         if queued.priority < 254 || queued.independent_discovery {
             return None;
+        }
+        if queued.frame.bytes.get(3) == Some(&HOST_CONTROL) {
+            return queued.boundary_contract();
         }
         let (_, body) = decode(&queued.frame.bytes)?;
         crate::comms::radio_batch_control_contract(queued.priority, body)
@@ -265,6 +279,7 @@ pub struct Mesh {
     voice_enabled: bool,
     settings_peer_seen: Option<u64>,
     settings_inbox: VecDeque<Vec<u8>>,
+    command_proxy_inbox: VecDeque<Vec<u8>>,
     started: Instant,
     // The shared simulation clock survives host process restarts.
     clock_origin_ms: u64,
@@ -309,6 +324,7 @@ impl Mesh {
             voice_enabled: false,
             settings_peer_seen: None,
             settings_inbox: VecDeque::new(),
+            command_proxy_inbox: VecDeque::new(),
             started: Instant::now(),
             clock_origin_ms: crate::simulation_clock_ms().unwrap_or(0),
             session,
@@ -391,7 +407,13 @@ impl Mesh {
 
     pub fn tick(&mut self, now: u64) {
         if self.role == Role::Primary {
-            if self.last_direct.map_or(now.saturating_sub(self.clock_origin_ms), |v| now.saturating_sub(v)) >= LOSS_MS {
+            if self
+                .last_direct
+                .map_or(now.saturating_sub(self.clock_origin_ms), |v| {
+                    now.saturating_sub(v)
+                })
+                >= LOSS_MS
+            {
                 self.fallback = true;
             } else if self
                 .direct_since
@@ -474,7 +496,7 @@ impl Mesh {
         self.queue.retain(|q| {
             let keep = matches!(
                 q.frame.bytes.get(3),
-                Some(&POSITION) | Some(&VOICE) | Some(&SETTINGS)
+                Some(&POSITION) | Some(&VOICE) | Some(&SETTINGS) | Some(&HOST_CONTROL)
             );
             if !keep {
                 removed_bytes += q.frame.bytes.len();
@@ -637,18 +659,35 @@ impl Mesh {
     /// retries at the same priority. Fresh controls and opaque SDT/READY/GPS
     /// entries remain barriers; ownership, age and service credits are unchanged.
     pub(crate) fn prioritize_receipt_over_replays(&mut self, replayed: impl Fn(u64) -> bool) {
-        if self.active_transmission.is_some() { return; }
-        let Some(head) = self.queue.iter().enumerate()
-            .filter(|(i, item)| !item.independent_discovery && item.priority >= 254 && self.dependency_ready(*i))
-            .max_by_key(|(i, item)| (item.priority, std::cmp::Reverse(*i))).map(|(i, _)| i)
-        else { return; };
+        if self.active_transmission.is_some() {
+            return;
+        }
+        let Some(head) = self
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(i, item)| {
+                !item.independent_discovery && item.priority >= 254 && self.dependency_ready(*i)
+            })
+            .max_by_key(|(i, item)| (item.priority, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
+        else {
+            return;
+        };
         let priority = self.queue[head].priority;
         if !Transmission::batch_contract(&self.queue[head])
-            .is_some_and(|(id, receipt)| !receipt && replayed(id)) { return; }
+            .is_some_and(|(id, receipt)| !receipt && replayed(id))
+        {
+            return;
+        }
         for index in head + 1..self.queue.len() {
             let item = &self.queue[index];
-            if item.independent_discovery || item.priority < priority { continue; }
-            if item.priority != priority || !self.dependency_ready(index) { break; }
+            if item.independent_discovery || item.priority < priority {
+                continue;
+            }
+            if item.priority != priority || !self.dependency_ready(index) {
+                break;
+            }
             match Transmission::batch_contract(item) {
                 Some((_, true)) => {
                     let receipt = self.queue.remove(index).unwrap();
@@ -885,9 +924,13 @@ impl Mesh {
             self.active_frame_count = 1;
             self.active_survives_clear = matches!(
                 queued.frame.bytes.get(3),
-                Some(&POSITION) | Some(&VOICE) | Some(&SETTINGS)
+                Some(&POSITION) | Some(&VOICE) | Some(&SETTINGS) | Some(&HOST_CONTROL)
             );
-            return Some(Transmission { queued, follower: None, id });
+            return Some(Transmission {
+                queued,
+                follower: None,
+                id,
+            });
         }
     }
 
@@ -995,6 +1038,48 @@ impl Mesh {
     pub fn authenticated_settings_peer(&mut self, now: u64) {
         self.settings_peer_seen = Some(now);
     }
+    /// Link freshness only; signed proxy capability and actor policy remain independent.
+    pub(crate) fn command_proxy_transport(
+        &self,
+        now: u64,
+    ) -> Option<crate::command_proxy::Transport> {
+        let session = self.operating_mode_session(now)?;
+        Some(crate::command_proxy::Transport {
+            session,
+            sequence: if self.role == Role::Primary {
+                self.sequence
+            } else {
+                self.primary_sequence
+            },
+        })
+    }
+    pub(crate) fn queue_command_proxy(&mut self, payload: &[u8], now: u64) -> bool {
+        if payload.len() > crate::command_proxy::MAX_WIRE
+            || crate::command_proxy::wire_boundary(payload).is_none()
+            || self.queue.len() + usize::from(self.active_frame_count) >= MAX_FRAMES
+            || self.bytes + payload.len() + 8 > MAX_BYTES
+            || self
+                .queue
+                .iter()
+                .any(|queued| queued.frame.bytes.get(3) == Some(&HOST_CONTROL))
+        {
+            return false;
+        }
+        // Independent bounded operator control, below owner/HEALTH receipts255.
+        // No extra capacity, eviction, or lease/presence renewal is introduced.
+        self.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(HOST_CONTROL, payload),
+            },
+            254,
+            now,
+        );
+        true
+    }
+    pub(crate) fn take_command_proxy(&mut self) -> Option<Vec<u8>> {
+        self.command_proxy_inbox.pop_front()
+    }
     /// Display metadata only: never grants settings authentication or control.
     pub(crate) fn operating_mode_session(&self, now: u64) -> Option<u32> {
         match self.role {
@@ -1055,14 +1140,16 @@ impl Mesh {
         true
     }
     pub fn take_settings(&mut self) -> Option<Vec<u8>> {
-        let index = self
-            .settings_inbox
-            .iter()
-            .position(|wire| !crate::station_mode::recognizes(wire) && !crate::launch_clock_sync::recognizes(wire))?;
+        let index = self.settings_inbox.iter().position(|wire| {
+            !crate::station_mode::recognizes(wire) && !crate::launch_clock_sync::recognizes(wire)
+        })?;
         self.settings_inbox.remove(index)
     }
     pub(crate) fn take_launch_clock(&mut self) -> Option<Vec<u8>> {
-        let index=self.settings_inbox.iter().position(|wire|crate::launch_clock_sync::recognizes(wire))?;
+        let index = self
+            .settings_inbox
+            .iter()
+            .position(|wire| crate::launch_clock_sync::recognizes(wire))?;
         self.settings_inbox.remove(index)
     }
     pub(crate) fn take_operating_mode(&mut self) -> Option<Vec<u8>> {
@@ -1295,6 +1382,16 @@ impl Mesh {
                     }
                     None
                 }
+                (_, HOST_CONTROL) => {
+                    // Verify signatures in the bounded dedicated worker, never in a
+                    // radio callback. This metadata grants no HEALTH/settings lease.
+                    if data.len() <= crate::command_proxy::MAX_WIRE
+                        && self.command_proxy_inbox.len() < 4
+                    {
+                        self.command_proxy_inbox.push_back(data.to_vec());
+                    }
+                    None
+                }
                 (Role::Primary, DOWN_DATA | DOWN_COMMAND) => {
                     self.topology_peer_seen = Some(now);
                     self.topology_relay_rx = Some(now);
@@ -1456,6 +1553,29 @@ pub(crate) fn topology_observation() -> Option<TopologyObservation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn host_control_is_bounded_independent_and_retains_serial_ownership() {
+        let mut payload = vec![0;132];
+        payload[..4].copy_from_slice(b"CP\x01\x00");
+        let mut mesh = Mesh::new(Role::Primary,1);
+        assert!(mesh.queue_command_proxy(&payload,0));
+        assert!(!mesh.queue_command_proxy(&payload,0));
+        let control = mesh.begin_transmission(0).unwrap();
+        assert!(control.closes_packet_batch());
+        assert!(!control.is_receipt());
+        let original = control.frame().bytes.clone();
+        mesh.clear();
+        assert!(mesh.finish_transmission(control,false).is_none());
+        let retry = mesh.begin_transmission(1).unwrap();
+        assert_eq!(retry.frame().bytes,original);
+        mesh.finish_transmission(retry,true);
+        assert_eq!(mesh.bytes,0);
+        for _ in 0..10 { mesh.incoming(true,&encode(HOST_CONTROL,&payload),2); }
+        assert_eq!(mesh.command_proxy_inbox.len(),4);
+        assert!(mesh.take_command_proxy().is_some());
+        assert!(mesh.queue_command_proxy(&payload,3));
+        assert!(!mesh.queue_command_proxy(&vec![0;257],3));
+    }
     #[test]
     fn receipt_boundary_metadata_survives_downlink_wrapping_and_priority_cap() {
         crate::telemetry_schema::initialize().unwrap();
@@ -3018,22 +3138,32 @@ mod tests {
     #[test]
     fn relay_activity_counters_exclude_presence_and_cancelled_work() {
         let mut relay = Mesh::new(Role::Rrls, 2);
-        relay.enqueue(Outgoing {command:true, bytes:encode(READY, &[0;8])},255,0);
+        relay.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(READY, &[0; 8]),
+            },
+            255,
+            0,
+        );
         assert!(relay.pop(0).is_some());
-        assert_eq!(relay.forwarded,1);
-        assert_eq!(relay.relayed_frames,0);
-        relay.incoming(true,&health(1,0,false),1);
-        relay.incoming(false,b"application",2);
-        let frame=relay.pop(2).unwrap();
-        assert_eq!(relay.relayed_frames,1);
-        assert_eq!(relay.relay_envelope_bytes,frame.bytes.len() as u64);
-        relay.incoming(false,b"queued before restore",3);
-        relay.incoming(true,&health(1,1,true),4);
+        assert_eq!(relay.forwarded, 1);
+        assert_eq!(relay.relayed_frames, 0);
+        relay.incoming(true, &health(1, 0, false), 1);
+        relay.incoming(false, b"application", 2);
+        let frame = relay.pop(2).unwrap();
+        assert_eq!(relay.relayed_frames, 1);
+        assert_eq!(relay.relay_envelope_bytes, frame.bytes.len() as u64);
+        relay.incoming(false, b"queued before restore", 3);
+        relay.incoming(true, &health(1, 1, true), 4);
         assert!(relay.pop(4).is_none());
-        assert_eq!(relay.relayed_frames,1,"cancelled work is not transmitted relay traffic");
-        relay.incoming(false,b"standby traffic",5);
+        assert_eq!(
+            relay.relayed_frames, 1,
+            "cancelled work is not transmitted relay traffic"
+        );
+        relay.incoming(false, b"standby traffic", 5);
         assert!(relay.pop(5).is_none());
-        assert_eq!(relay.relayed_frames,1);
+        assert_eq!(relay.relayed_frames, 1);
     }
 
     #[test]
@@ -3271,40 +3401,91 @@ mod pair_tests {
         .to_vec()
     }
     fn enqueue(mesh: &mut Mesh, bytes: &[u8], now: u64) {
-        mesh.enqueue(Outgoing { command: true, bytes: encode(DOWN_DATA, bytes) }, 254, now);
+        mesh.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(DOWN_DATA, bytes),
+            },
+            254,
+            now,
+        );
     }
     #[test]
     fn receipt_can_pass_only_replayed_controls_without_changing_ownership_or_age() {
-        let first = control(false, 10); let second = control(false, 11);
+        let first = control(false, 10);
+        let second = control(false, 11);
         let receipt = control(true, 12);
-        let ids = [&first, &second].map(|p| crate::comms::radio_batch_control_contract(254, p).unwrap().0);
+        let ids = [&first, &second].map(|p| {
+            crate::comms::radio_batch_control_contract(254, p)
+                .unwrap()
+                .0
+        });
         let mut mesh = Mesh::new(Role::Rrls, 2);
-        enqueue(&mut mesh, &first, 10); enqueue(&mut mesh, &second, 11); enqueue(&mut mesh, &receipt, 12);
+        enqueue(&mut mesh, &first, 10);
+        enqueue(&mut mesh, &second, 11);
+        enqueue(&mut mesh, &receipt, 12);
         let bytes = mesh.bytes;
         mesh.prioritize_receipt_over_replays(|id| ids.contains(&id));
-        assert_eq!(mesh.bytes, bytes); assert_eq!(mesh.dropped, 0); assert_eq!(mesh.forwarded, 0);
-        assert_eq!(mesh.queue.iter().map(|q| q.at).collect::<Vec<_>>(), [12, 10, 11]);
+        assert_eq!(mesh.bytes, bytes);
+        assert_eq!(mesh.dropped, 0);
+        assert_eq!(mesh.forwarded, 0);
+        assert_eq!(
+            mesh.queue.iter().map(|q| q.at).collect::<Vec<_>>(),
+            [12, 10, 11]
+        );
         let tx = mesh.begin_bounded_transmission(12, 0, true, 1).unwrap();
         assert_eq!(decode(&tx.frame().bytes).unwrap().1, receipt);
         mesh.finish_bounded_transmission(tx, false);
-        assert_eq!(mesh.bytes, bytes); assert_eq!(mesh.queue.len(), 3);
+        assert_eq!(mesh.bytes, bytes);
+        assert_eq!(mesh.queue.len(), 3);
     }
     #[test]
     fn receipt_retry_preference_preserves_fresh_controls_and_metadata_barriers() {
         let retry = control(false, 10);
-        let id = crate::comms::radio_batch_control_contract(254, &retry).unwrap().0;
-        let gps = serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type("GPS_DATA"),
-            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "RF", 22,
-            Arc::from([0u8; 12])).unwrap()).to_vec();
-        for blocker in [encode(DOWN_DATA, &control(false, 11)), encode(READY, &[0; 8]),
-            encode(DOWN_DATA, b"SDT\x03opaque"), encode(DOWN_DATA, &gps)] {
+        let id = crate::comms::radio_batch_control_contract(254, &retry)
+            .unwrap()
+            .0;
+        let gps = serialize::pack_packet(
+            &Packet::new(
+                crate::telemetry_schema::data_type("GPS_DATA"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "RF",
+                22,
+                Arc::from([0u8; 12]),
+            )
+            .unwrap(),
+        )
+        .to_vec();
+        for blocker in [
+            encode(DOWN_DATA, &control(false, 11)),
+            encode(READY, &[0; 8]),
+            encode(DOWN_DATA, b"SDT\x03opaque"),
+            encode(DOWN_DATA, &gps),
+        ] {
             let mut mesh = Mesh::new(Role::Rrls, 2);
             enqueue(&mut mesh, &retry, 10);
-            mesh.enqueue(Outgoing { command: true, bytes: blocker.clone() }, 254, 11);
+            mesh.enqueue(
+                Outgoing {
+                    command: true,
+                    bytes: blocker.clone(),
+                },
+                254,
+                11,
+            );
             enqueue(&mut mesh, &control(true, 12), 12);
-            let before = mesh.queue.iter().map(|q| (q.frame.bytes.clone(), q.at, q.priority)).collect::<Vec<_>>();
+            let before = mesh
+                .queue
+                .iter()
+                .map(|q| (q.frame.bytes.clone(), q.at, q.priority))
+                .collect::<Vec<_>>();
             mesh.prioritize_receipt_over_replays(|candidate| candidate == id);
-            assert_eq!(mesh.queue.iter().map(|q| (q.frame.bytes.clone(), q.at, q.priority)).collect::<Vec<_>>(), before);
+            assert_eq!(
+                mesh.queue
+                    .iter()
+                    .map(|q| (q.frame.bytes.clone(), q.at, q.priority))
+                    .collect::<Vec<_>>(),
+                before
+            );
         }
     }
 

@@ -16,6 +16,8 @@ mod auth;
 mod auto_zero;
 mod checklists;
 mod command_probe;
+mod command_proxy;
+mod primary_mirror;
 mod comms;
 mod comms_config;
 #[cfg(feature = "testing")]
@@ -2629,6 +2631,7 @@ async fn main() -> anyhow::Result<()> {
     let _mission_sync = mission_sync::start(state.clone());
     let _station_mode = station_mode::start(state.clone());
     let _launch_clock_sync = launch_clock_sync::start(state.clone());
+    let _command_proxy = command_proxy::start(state.clone());
 
     // --- Webserver ---
     let mut video_runtime = media_runtime::VideoRuntime::start();

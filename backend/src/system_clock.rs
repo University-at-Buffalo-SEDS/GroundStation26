@@ -116,13 +116,6 @@ pub async fn sync_network(
         Ok(_) => return (StatusCode::UNAUTHORIZED, "Sign in to set network UTC.").into_response(),
         Err(error) => return error,
     };
-    if crate::rrls::is_rrls() {
-        return (
-            StatusCode::CONFLICT,
-            "Network UTC is owned by the primary GroundStation.",
-        )
-            .into_response();
-    }
     let SyncRequest::Client { utc_ms } = request else {
         return (
             StatusCode::BAD_REQUEST,
@@ -130,6 +123,35 @@ pub async fn sync_network(
         )
             .into_response();
     };
+    if crate::rrls::is_rrls() {
+        let token = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        return crate::command_proxy::submit(
+            &state,
+            &principal,
+            token,
+            crate::command_proxy::Operation::NetworkUtc(utc_ms),
+        )
+        .await;
+    }
+    apply_authorized_network_utc(state, principal, utc_ms).await
+}
+
+/// The primary owns UTC policy for both local and authenticated proxy calls.
+pub(crate) async fn apply_authorized_network_utc(
+    state: Arc<AppState>,
+    principal: crate::auth::AuthPrincipal,
+    utc_ms: i64,
+) -> Response {
+    if crate::rrls::is_rrls() || principal.anonymous || !principal.permissions.set_system_time {
+        return (
+            StatusCode::FORBIDDEN,
+            "Primary network UTC authority required.",
+        )
+            .into_response();
+    }
     let Some(router) = state.topology_router.get() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,

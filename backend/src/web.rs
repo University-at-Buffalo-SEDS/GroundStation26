@@ -176,7 +176,8 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         )
         .route("/api/auth/logout", post(logout))
         .route("/api/recent", get(get_recent))
-        .route("/api/command", post(send_command))
+        .route("/api/command", post(send_command_entry))
+        .route("/api/rrls/control", get(crate::command_proxy::get_status))
         .route("/api/auto_zero", get(get_auto_zero).post(set_auto_zero))
         .route("/api/alerts", get(get_alerts))
         .route("/api/boards", get(get_boards))
@@ -223,7 +224,10 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/calibration/capture_zero", post(capture_loadcell_zero))
         .route("/api/calibration/capture_span", post(capture_loadcell_span))
         .route("/api/calibration/refit", post(refit_loadcell_channel))
-        .route("/api/network_time", get(get_network_time).post(crate::system_clock::sync_network))
+        .route(
+            "/api/network_time",
+            get(get_network_time).post(crate::system_clock::sync_network),
+        )
         .route("/api/launch_clock", get(get_launch_clock))
         .route("/api/network_topology", get(get_network_topology))
         .route("/api/network_diagnostics", get(get_network_diagnostics))
@@ -2032,6 +2036,44 @@ async fn cancel_firmware_update(
     }
 }
 
+/// RRLS forwards opaque operation names, so a normal RRLS build does not need
+/// to compile primary HITL variants or execute them locally.
+async fn send_command_entry(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(value): Json<serde_json::Value>,
+) -> Response {
+    let Some(name) = value.as_str() else {
+        return (StatusCode::BAD_REQUEST, "Expected a command name.").into_response();
+    };
+    if crate::rrls::is_rrls() && !crate::command_proxy::local_operation(name) {
+        let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
+            Ok(principal) => principal,
+            Err(error) => return error,
+        };
+        return crate::command_proxy::submit(
+            &state,
+            &principal,
+            bearer_token_from_headers(&headers),
+            crate::command_proxy::Operation::Command(name.into()),
+        )
+        .await;
+    }
+    let command = match serde_json::from_value(value) {
+        Ok(command) => command,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Unknown command for this station build.",
+            )
+                .into_response();
+        }
+    };
+    send_command(State(state), headers, Json(command))
+        .await
+        .into_response()
+}
+
 /// Validates and forwards a frontend command into the backend command channel.
 async fn send_command(
     State(state): State<Arc<AppState>>,
@@ -2049,6 +2091,31 @@ async fn send_command(
             };
         }
     };
+    dispatch_authorized_command(state, principal, cmd).await
+}
+
+/// Shared primary/local authorization and dispatch. A proxy must supply a
+/// freshly resolved local principal; this never changes RRLS execution policy.
+pub(crate) async fn dispatch_authorized_command(
+    state: Arc<AppState>,
+    principal: crate::auth::AuthPrincipal,
+    cmd: TelemetryCommand,
+) -> (StatusCode, &'static str) {
+    dispatch_command(state, principal, cmd, false).await
+}
+pub(crate) async fn dispatch_proxied_command(
+    state: Arc<AppState>,
+    principal: crate::auth::AuthPrincipal,
+    cmd: TelemetryCommand,
+) -> (StatusCode, &'static str) {
+    dispatch_command(state, principal, cmd, true).await
+}
+async fn dispatch_command(
+    state: Arc<AppState>,
+    principal: crate::auth::AuthPrincipal,
+    cmd: TelemetryCommand,
+    immediate_admission: bool,
+) -> (StatusCode, &'static str) {
     let cmd_name = command_name(&cmd);
     if !principal.allows_command_name(cmd_name) {
         emit_warning(
@@ -2064,35 +2131,84 @@ async fn send_command(
         );
         return (StatusCode::FORBIDDEN, "command disabled");
     }
+    // A bounded proxy must not wait behind a full command channel after its
+    // signed contract expires, or record an unadmitted intent as a duplicate.
+    let permit = if immediate_admission && !matches!(cmd, TelemetryCommand::ResetTClock) {
+        match state.cmd_tx.clone().try_reserve_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "primary command queue is busy",
+                );
+            }
+        }
+    } else {
+        None
+    };
     let now_ms = software_command_clock_ms();
     if !state.record_software_command_if_fresh(&cmd, now_ms, software_command_dedup_ms()) {
         gs_debug_println!("Ignored duplicate software command {cmd:?}");
-        if matches!(cmd,TelemetryCommand::ResetTClock) {
-            if crate::rrls::is_rrls(){return match crate::launch_clock_sync::await_existing_reset().await {Ok(true)=>(StatusCode::OK,"primary T clock reset saved"),Ok(false)=>(StatusCode::ACCEPTED,"primary reset pending; retained clock unchanged"),Err(_)=>(StatusCode::CONFLICT,"primary reset was not confirmed")};}
-            let waiter=state.launch_history.lock().unwrap().waiter();
-            if crate::launch_history::flush(waiter).await.is_err(){return (StatusCode::INSUFFICIENT_STORAGE,"T clock reset was not saved");}
+        if matches!(cmd, TelemetryCommand::ResetTClock) {
+            if crate::rrls::is_rrls() {
+                return match crate::launch_clock_sync::await_existing_reset().await {
+                    Ok(true) => (StatusCode::OK, "primary T clock reset saved"),
+                    Ok(false) => (
+                        StatusCode::ACCEPTED,
+                        "primary reset pending; retained clock unchanged",
+                    ),
+                    Err(_) => (StatusCode::CONFLICT, "primary reset was not confirmed"),
+                };
+            }
+            let waiter = state.launch_history.lock().unwrap().waiter();
+            if crate::launch_history::flush(waiter).await.is_err() {
+                return (
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "T clock reset was not saved",
+                );
+            }
         }
         return (StatusCode::OK, "duplicate ignored");
     }
     if matches!(cmd, TelemetryCommand::ResetTClock) {
         if crate::rrls::is_rrls() {
             return match crate::launch_clock_sync::request_reset(&state).await {
-                Ok(true)=>(StatusCode::OK,"primary T clock reset saved"),
-                Ok(false)=>(StatusCode::ACCEPTED,"primary reset pending; retained clock unchanged"),
-                Err(error)=>{emit_notification_warning(&state,format!("Primary T clock reset not confirmed: {error}"));(StatusCode::CONFLICT,"primary reset was not confirmed")},
+                Ok(true) => (StatusCode::OK, "primary T clock reset saved"),
+                Ok(false) => (
+                    StatusCode::ACCEPTED,
+                    "primary reset pending; retained clock unchanged",
+                ),
+                Err(error) => {
+                    emit_notification_warning(
+                        &state,
+                        format!("Primary T clock reset not confirmed: {error}"),
+                    );
+                    (StatusCode::CONFLICT, "primary reset was not confirmed")
+                }
             };
         }
-        let work=state.clone();
-        if let Err(error)=tokio::task::spawn_blocking(move||work.try_reset_launch_clock()).await.map_err(anyhow::Error::from).and_then(|result|result) {
-            emit_notification_warning(&state,format!("T clock reset failed: {error}"));
-            return (StatusCode::CONFLICT,"T clock reset failed");
+        let work = state.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || work.try_reset_launch_clock())
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
+        {
+            emit_notification_warning(&state, format!("T clock reset failed: {error}"));
+            return (StatusCode::CONFLICT, "T clock reset failed");
         }
-        let waiter=state.launch_history.lock().unwrap().waiter();
-        if let Err(error)=crate::launch_history::flush(waiter).await {
-            emit_notification_warning(&state,format!("T clock reset is not durable: {error}"));
-            return (StatusCode::INSUFFICIENT_STORAGE,"T clock reset was not saved");
+        let waiter = state.launch_history.lock().unwrap().waiter();
+        if let Err(error) = crate::launch_history::flush(waiter).await {
+            emit_notification_warning(&state, format!("T clock reset is not durable: {error}"));
+            return (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "T clock reset was not saved",
+            );
         }
-        return (StatusCode::OK,"ok");
+        return (StatusCode::OK, "ok");
+    }
+    if let Some(permit) = permit {
+        permit.send(cmd);
+        return (StatusCode::OK, "ok");
     }
     if state.cmd_tx.send(cmd).await.is_err() {
         emit_notification_warning(&state, "Command worker unavailable; command was not queued");
@@ -2203,7 +2319,7 @@ async fn ws_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WsAuthQuery>,
 ) -> impl IntoResponse {
-    let principal = match state
+    let _principal = match state
         .auth
         .authorize_token(&state.auth_db, query.token.as_deref(), Permission::ViewData)
         .await
@@ -2211,7 +2327,7 @@ async fn ws_handler(
         Ok(principal) => principal,
         Err(err) => return auth_failure_response(err),
     };
-    ws.on_upgrade(move |socket| handle_ws(socket, state, principal))
+    ws.on_upgrade(move |socket| handle_ws(socket, state, query.token))
 }
 
 /// Shape of commands sent from the frontend over WebSocket:
@@ -2221,7 +2337,7 @@ struct WsCommand {
     cmd: TelemetryCommand,
 }
 
-async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::auth::AuthPrincipal) {
+async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String>) {
     // Subscribe to all three broadcast channels
     let mut telemetry_rx = state.ws_tx.subscribe();
     let mut warnings_rx = state.warnings_tx.subscribe();
@@ -2768,6 +2884,46 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
     let recv_task = async move {
         while let Some(Ok(msg)) = receiver.next().await {
             if let Message::Text(text) = msg {
+                let principal = match state_for_recv
+                    .auth
+                    .authorize_token(
+                        &state_for_recv.auth_db,
+                        token.as_deref(),
+                        Permission::SendCommands,
+                    )
+                    .await
+                {
+                    Ok(principal) => principal,
+                    Err(_) => {
+                        emit_notification_warning(
+                            &state_for_recv,
+                            "Command session expired or no longer has permission.",
+                        );
+                        continue;
+                    }
+                };
+                if crate::rrls::is_rrls() {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(name) = value.get("cmd").and_then(|value| value.as_str()) {
+                            if !crate::command_proxy::local_operation(name) {
+                                let response = crate::command_proxy::submit(
+                                    &state_for_recv,
+                                    &principal,
+                                    token.as_deref(),
+                                    crate::command_proxy::Operation::Command(name.into()),
+                                )
+                                .await;
+                                if !response.status().is_success() {
+                                    emit_notification_warning(
+                                        &state_for_recv,
+                                        "Primary command request was not admitted; inspect RRLS control status.",
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
                 match serde_json::from_str::<WsCommand>(&text) {
                     Ok(cmd) => {
                         if !principal.permissions.send_commands {
@@ -2810,18 +2966,41 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             gs_debug_println!("Ignored duplicate websocket command {:?}", cmd.cmd);
                             continue;
                         }
-                        if matches!(cmd.cmd,TelemetryCommand::ResetTClock) {
-                            let reset_state=state_for_recv.clone();
+                        if matches!(cmd.cmd, TelemetryCommand::ResetTClock) {
+                            let reset_state = state_for_recv.clone();
                             // Do not stall this WebSocket's Abort/command receiver on disk or radio.
                             tokio::spawn(async move {
-                                let result=if crate::rrls::is_rrls(){crate::launch_clock_sync::request_reset(&reset_state).await}else{
-                                    let work=reset_state.clone();
-                                    match tokio::task::spawn_blocking(move||work.try_reset_launch_clock()).await {
-                                        Ok(Ok(()))=>{let waiter=reset_state.launch_history.lock().unwrap().waiter();crate::launch_history::flush(waiter).await.map(|_|true)},
-                                        Ok(Err(error))=>Err(error),Err(error)=>Err(error.into()),
+                                let result = if crate::rrls::is_rrls() {
+                                    crate::launch_clock_sync::request_reset(&reset_state).await
+                                } else {
+                                    let work = reset_state.clone();
+                                    match tokio::task::spawn_blocking(move || {
+                                        work.try_reset_launch_clock()
+                                    })
+                                    .await
+                                    {
+                                        Ok(Ok(())) => {
+                                            let waiter =
+                                                reset_state.launch_history.lock().unwrap().waiter();
+                                            crate::launch_history::flush(waiter).await.map(|_| true)
+                                        }
+                                        Ok(Err(error)) => Err(error),
+                                        Err(error) => Err(error.into()),
                                     }
                                 };
-                                match result {Ok(true)=>{reset_state.add_notification("Primary T clock reset saved");},Ok(false)=>{reset_state.add_notification("Primary T clock reset pending; retained clock unchanged");},Err(error)=>{reset_state.add_notification(format!("T clock reset not confirmed: {error}"));}}
+                                match result {
+                                    Ok(true) => {
+                                        reset_state.add_notification("Primary T clock reset saved");
+                                    }
+                                    Ok(false) => {
+                                        reset_state.add_notification("Primary T clock reset pending; retained clock unchanged");
+                                    }
+                                    Err(error) => {
+                                        reset_state.add_notification(format!(
+                                            "T clock reset not confirmed: {error}"
+                                        ));
+                                    }
+                                }
                             });
                             continue;
                         }

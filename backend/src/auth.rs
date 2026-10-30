@@ -195,6 +195,7 @@ pub struct SessionStatus {
     pub station_role: &'static str,
     pub station_pairing: Option<crate::station_pairing::Public>,
     pub operating_mode: crate::station_mode::Snapshot,
+    pub command_proxy: crate::command_proxy::Status,
     pub roles: Vec<StreamRole>,
     pub authenticated: bool,
     pub username: Option<String>,
@@ -257,6 +258,7 @@ impl AuthPrincipal {
             },
             station_pairing: crate::station_pairing::public(),
             operating_mode: crate::station_mode::snapshot(),
+            command_proxy: crate::command_proxy::status(),
             roles: self.roles.clone(),
             authenticated: !self.anonymous,
             username: self.username.clone(),
@@ -678,6 +680,41 @@ impl AuthManager {
                 view: claims.calibration_access.view && local_calibration.view,
                 edit: claims.calibration_access.edit && local_calibration.edit,
             },
+        })
+    }
+
+    /// Resolve the primary's CURRENT local grant for one authenticated paired
+    /// proxy assertion. The caller must already verify the narrowly signed
+    /// actor/operation envelope; this method creates no login or session.
+    pub(crate) fn paired_proxy_actor(
+        &self,
+        username: &str,
+        required: Permission,
+    ) -> Result<AuthPrincipal, AuthFailure> {
+        let config = self
+            .load_users_file()
+            .map_err(|_| AuthFailure::Internal("could not load accounts".into()))?;
+        let user = config
+            .users
+            .iter()
+            .find(|user| !user.disabled && user.username.eq_ignore_ascii_case(username))
+            .ok_or_else(|| AuthFailure::Forbidden("paired actor is unavailable".into()))?;
+        let permissions = user.permissions.for_roles(&user.roles);
+        if !permissions.allows(required) {
+            return Err(AuthFailure::Forbidden(
+                "paired actor lacks local permission".into(),
+            ));
+        }
+        let (command_access, calibration_access) = configured_user_access(&config, &user.username);
+        Ok(AuthPrincipal {
+            roles: user.roles.clone(),
+            username: Some(user.username.clone()),
+            permissions,
+            expires_at_ms: None,
+            anonymous: false,
+            session_type: Some("paired_command_assertion".into()),
+            command_access,
+            calibration_access,
         })
     }
 

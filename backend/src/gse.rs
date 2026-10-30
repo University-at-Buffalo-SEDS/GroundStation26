@@ -77,6 +77,12 @@ fn sequence_clock_ms(elapsed_ms: u64, simulated_ms: Option<u64>) -> u64 {
 }
 
 impl Runtime {
+    /// Actual valve reports and their source ages; command intent is never evidence.
+    pub(crate) fn mirror_valves(&self) -> [Option<(bool, u64)>; 5] {
+        let now = self.now();
+        self.valves.map(|value| value.map(|v| (v.open, now.saturating_sub(v.at_ms))))
+    }
+
     /// Imported calibration must not invalidate an active or already-qualified
     /// procedure. Retain it as pending until the operator returns to Idle and
     /// explicitly clears qualification. Never clear evidence automatically.
@@ -791,6 +797,9 @@ async fn get_config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     if let Err(e) = crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {
         return e;
     }
+    if crate::rrls::is_rrls() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Primary GSE configuration is not mirrored; use the primary ground station.").into_response();
+    }
     Json(state.gse.lock().unwrap().engine.config.clone()).into_response()
 }
 async fn save_config(
@@ -853,6 +862,12 @@ async fn save_config(
 async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(e) = crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {
         return e;
+    }
+    if crate::rrls::is_rrls() {
+        return match crate::primary_mirror::gse_status(&state) {
+            Some(observation) => Json(observation).into_response(),
+            None => (StatusCode::SERVICE_UNAVAILABLE, "Fresh primary GSE observations are unavailable; valve states are unknown.").into_response(),
+        };
     }
     let flight_state = *state.state.lock().unwrap();
     let prelaunch = prelaunch_flight_state(flight_state);
