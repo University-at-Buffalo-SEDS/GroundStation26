@@ -889,13 +889,15 @@ pub(super) fn split_imu_values(
 // Keep the original vector for raw exports plus canonical KG1000 so existing
 // calibration, derived mass, charts and recordings retain their exact path.
 fn chamber_pressure_rows(sender: &str, values: &[Option<f32>]) -> Vec<(String, Vec<Option<f32>>)> {
-    if sender != "DAQ" || values.len() != 3 || !values[0].is_some_and(f32::is_finite) {
+    if sender != "DAQ" || values.len() != 3 {
         return Vec::new();
     }
-    let mut rows = vec![
-        ("DAQ_LOADCELL_CHAMBER".into(), values.to_vec()),
-        ("KG1000".into(), vec![values[0]]),
-    ];
+    let mut rows = vec![("DAQ_LOADCELL_CHAMBER".into(), values.to_vec())];
+    // The pressure input is independent of the load cell. A failed load-cell
+    // conversion must not hide an otherwise valid chamber-pressure sample.
+    if values[0].is_some_and(f32::is_finite) {
+        rows.push(("KG1000".into(), vec![values[0]]));
+    }
     if values[1].is_some_and(|x| x.is_finite() && (-5280.0..=5280.0).contains(&x))
         && values[2].is_some_and(|x| x.is_finite() && (-26.4..=26.4).contains(&x))
     {
@@ -932,6 +934,14 @@ mod chamber_pressure_tests {
         );
         assert!(rows.iter().any(|(kind,v)|kind=="COMBUSTION_CHAMBER_RANGE_STATUS"&&v==&vec![Some(1.0)]));
     }
+    #[test]
+    fn invalid_loadcell_does_not_hide_valid_chamber_pressure() {
+        let rows = chamber_pressure_rows("DAQ", &[None, Some(500.0), Some(2.5)]);
+        assert!(!rows.iter().any(|(kind, _)| kind == "KG1000"));
+        assert!(rows.iter().any(|(kind, values)| kind == "COMBUSTION_CHAMBER_PRESSURE" && values == &vec![Some(500.0)]));
+        assert!(rows.iter().any(|(kind, _)| kind == "COMBUSTION_CHAMBER_VOLTAGE"));
+    }
+
     #[test]
     fn malformed_or_other_sender_cannot_fabricate_pressure() {
         assert!(chamber_pressure_rows("VB", &[Some(1.0); 3]).is_empty());

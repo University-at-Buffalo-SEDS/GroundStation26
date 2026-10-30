@@ -27,6 +27,7 @@ pub fn initialize() -> anyhow::Result<()> {
                 ("BATTERY_VOLTAGE", types::BATTERY_VOLTAGE),
                 ("BATTERY_CURRENT", types::BATTERY_CURRENT),
                 ("KG1000", types::KG1000),
+                ("DAQ_LOADCELL_CHAMBER", types::DAQ_LOADCELL_CHAMBER),
                 ("KG50", types::KG50),
                 ("GPS_SATELLITE_NUMBER", types::GPS_SATELLITE_NUMBER),
                 ("ASCENT_STATE", types::ASCENT_STATE),

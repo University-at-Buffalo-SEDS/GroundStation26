@@ -1,10 +1,12 @@
 # Ground support equipment sequences
 
-Routine pause, cancel, nitrogen-pass and self-test completion notifications use
-`persistent: false`; sequence faults remain persistent until acknowledged.
-HTTP/WebSocket notification snapshots restore existing entries, not new events.
-Clients should deduplicate by `(id, timestamp_ms)` per backend and avoid replaying
-already-seen transient notices on reload, without hiding unresolved faults.
+Operator notifications are live events: `Notification` WebSocket messages may
+show a five-second popup once. HTTP and `Notifications` WebSocket snapshots only
+restore Notification Center history, including notices missed while disconnected;
+they never replay popups, even for older entries carrying `persistent: true`.
+The backend retains at most 200 recent notices in memory. Closing or expiring a
+popup is local and preserves shared history. Warnings and errors retain their
+separate persistent acknowledgement behavior.
 
 The Actions tab keeps its original controls and contains the new **GSE sequence
 actions** in the main button area. Individual valves remain in the **Manual GSE

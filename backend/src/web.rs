@@ -400,6 +400,7 @@ pub enum WsOutMsg {
     BoardStatus(BoardStatusMsg),
     NetworkTopology(NetworkTopologyMsg),
     Notifications(Vec<PersistentNotification>),
+    Notification(PersistentNotification),
     Messages(Vec<PersistentNotification>),
     ActionPolicy(ActionPolicyMsg),
     FillTargets(FillTargetsConfig),
@@ -2337,6 +2338,36 @@ struct WsCommand {
     cmd: TelemetryCommand,
 }
 
+fn new_notification_events(history: &[PersistentNotification], last_id: &mut u64) -> Vec<PersistentNotification> {
+    let mut events: Vec<_> = history.iter().filter(|n| n.id > *last_id).cloned().collect();
+    events.sort_by_key(|n| n.id);
+    if let Some(event) = events.last() { *last_id = event.id; }
+    events
+}
+
+#[cfg(test)]
+mod notification_delivery_tests {
+    use super::*;
+    fn notice(id: u64) -> PersistentNotification {
+        PersistentNotification {id, timestamp_ms:id as i64, message:"T clock reset".into(), persistent:false, action_label:None, action_cmd:None}
+    }
+    #[test]
+    fn connection_history_and_repeated_snapshots_do_not_replay_events() {
+        let mut history = vec![notice(1), notice(2)];
+        let mut connection_cutoff = history.last().unwrap().id;
+        assert!(new_notification_events(&history, &mut connection_cutoff).is_empty());
+        history.push(notice(3));
+        let events = new_notification_events(&history, &mut connection_cutoff);
+        assert_eq!(events.iter().map(|n| n.id).collect::<Vec<_>>(), vec![3]);
+        assert!(new_notification_events(&history, &mut connection_cutoff).is_empty());
+        let mut reconnect_cutoff = history.last().unwrap().id;
+        assert!(new_notification_events(&history, &mut reconnect_cutoff).is_empty());
+        let live = serde_json::to_value(WsOutMsg::Notification(notice(4))).unwrap();
+        assert_eq!(live["ty"], "Notification");
+        assert_eq!(serde_json::to_value(WsOutMsg::Notifications(history)).unwrap()["ty"], "Notifications");
+    }
+}
+
 async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String>) {
     // Subscribe to all three broadcast channels
     let mut telemetry_rx = state.ws_tx.subscribe();
@@ -2379,8 +2410,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
 
     // Task: collect, batch, and enqueue outbound messages.
     let send_task = async move {
+        let notification_history = state_for_send.notifications_snapshot();
+        let mut last_notification_id = notification_history.iter().map(|n| n.id).max().unwrap_or(0);
         let initial_notifications = serde_json::to_string(&WsOutMsg::Notifications(
-            state_for_send.notifications_snapshot(),
+            notification_history,
         ))
         .unwrap_or_default();
         if ws_out_tx.send(initial_notifications).await.is_err() {
@@ -2650,6 +2683,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
                 recv = notifications_rx.recv() => {
                     match recv {
                         Ok(snapshot) => {
+                            // A snapshot is history, never a popup. Announce only
+                            // events observed live after this connection began.
+                            for event in new_notification_events(&snapshot, &mut last_notification_id) {
+                                let text = serde_json::to_string(&WsOutMsg::Notification(event)).unwrap_or_default();
+                                if ws_out_tx.send(text).await.is_err() { return; }
+                            }
                             let msg = WsOutMsg::Notifications(snapshot);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
@@ -2657,7 +2696,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            let msg = WsOutMsg::Notifications(state_for_send.notifications_snapshot());
+                            let snapshot = state_for_send.notifications_snapshot();
+                            // Events missed by a slow client belong only in its
+                            // Notification Center, not a burst of stale popups.
+                            last_notification_id = snapshot.iter().map(|n| n.id).max().unwrap_or(last_notification_id);
+                            let msg = WsOutMsg::Notifications(snapshot);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
                                 break;

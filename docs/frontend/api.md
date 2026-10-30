@@ -491,7 +491,7 @@ reboot; boot confirmation happens on the board after restart.
 
 Purpose:
 
-- Seed the current operator-notification set.
+- Seed the latest 200 in-memory operator events into Notification Center. Never show these snapshot entries as popups.
 
 Expected response:
 
@@ -585,7 +585,7 @@ points use `{ "expected": number, "raw": number }`.
 
 Purpose:
 
-- Dismiss a persistent notification for all connected clients.
+- Explicitly remove a Notification Center history entry on the server. Closing or auto-expiring a popup must not call this endpoint.
 
 Expected behavior:
 
@@ -674,6 +674,7 @@ The backend sends tagged JSON objects:
 { "ty": "BoardStatus", "data": { ... } }
 { "ty": "NetworkTopology", "data": { ... } }
 { "ty": "Notifications", "data": [ ... ] }
+{ "ty": "Notification", "data": { ... } }
 { "ty": "Messages", "data": [ ... ] }
 { "ty": "ActionPolicy", "data": { ... } }
 { "ty": "NetworkTime", "data": { ... } }
@@ -702,8 +703,13 @@ Notes:
 - `NetworkTopology`
   Replaces the current topology snapshot.
 - `Notifications`
-  Replaces the current active operator-notification set. This is for backend/operator workflow
-  notifications such as fill completion or action-required notices.
+  Restores Notification Center history. Initial connection, reconnect, HTTP bootstrap and
+  lag recovery never create popups; this holds even for legacy `persistent: true` entries.
+- `Notification`
+  A single event received live after this connection began. Deduplicate by `(id, timestamp_ms)`
+  and show a popup for five seconds. Keep it in Notification Center afterward. Closing or
+  expiring the popup is client-local. A hidden/disconnected client sees missed notices only
+  in Notification Center when it returns. Warnings/errors keep their own persistent semantics.
 - `Messages`
   Replaces the current telemetry/backend message set. This is for telemetry-network text
   messages such as flight-computer or router status strings.

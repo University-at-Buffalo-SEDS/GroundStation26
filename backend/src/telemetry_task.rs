@@ -648,10 +648,7 @@ pub async fn telemetry_task(
                         Vec::new()
                     }
                 };
-                for row in rows {
-                    state.cache_recent_telemetry(row.clone());
-                    let _ = state.ws_tx.send(row);
-                }
+                publish_received_telemetry_rows(&state, rows);
             }
         })
     };
@@ -1702,6 +1699,14 @@ async fn persist_umbilical_status(
         },
     )
     .await;
+}
+
+// The same fan-out feeds live clients and /api/recent after reconnect.
+fn publish_received_telemetry_rows(state: &AppState, rows: Vec<TelemetryRow>) {
+    for row in rows {
+        state.cache_recent_telemetry(row.clone());
+        let _ = state.ws_tx.send(row);
+    }
 }
 
 async fn handle_packet(
@@ -4886,7 +4891,18 @@ mod tests {
             f32_payload(&[4.25, 1000.0, 5.0]),
         )
         .unwrap();
+        // Exercise the DAQ's actual packed f32 triplet before backend ingestion.
+        let packed = sedsnet::wire_format::pack_packet(&pkt);
+        let pkt = sedsnet::wire_format::unpack_packet(&packed).unwrap();
         let rows = handle_packet(&state, &db_tx, &test_db_overflow(), pkt).await;
+        let mut ws = state.ws_tx.subscribe();
+        publish_received_telemetry_rows(&state, rows.clone());
+        let mut broadcast = Vec::new();
+        while let Ok(row) = ws.try_recv() { broadcast.push(row); }
+        for kind in ["KG1000", "COMBUSTION_CHAMBER_PRESSURE", "COMBUSTION_CHAMBER_VOLTAGE"] {
+            assert!(broadcast.iter().any(|row| row.data_type == kind), "missing live {kind}");
+            assert!(state.recent_telemetry_snapshot().iter().any(|row| row.data_type == kind), "missing reconnect {kind}");
+        }
         assert!(rows.iter().any(
             |r| r.data_type == "COMBUSTION_CHAMBER_PRESSURE" && r.values == vec![Some(1000.0)]
         ));

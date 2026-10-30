@@ -198,7 +198,7 @@ pub struct AppState {
     /// Notifies waiters when pending DB writes changes.
     pub db_write_notify: Arc<Notify>,
 
-    /// Persistent operator notifications shown to all clients until dismissed.
+    /// Bounded notification-center history; live popups are separate WS events.
     pub notifications: Arc<Mutex<Vec<PersistentNotification>>>,
 
     /// Broadcast whenever notifications list changes.
@@ -1296,9 +1296,9 @@ impl AppState {
         let _ = self.messages_tx.send(snapshot);
     }
 
-    /// Adds a persistent operator notification and returns its assigned id.
+    /// Adds an operator event to notification history and live subscribers.
     pub fn add_notification<S: Into<String>>(&self, message: S) -> u64 {
-        self.add_notification_with_persistence(message, true)
+        self.add_notification_with_persistence(message, false)
     }
 
     /// Adds a transient operator notification and returns its assigned id.
@@ -1325,7 +1325,7 @@ impl AppState {
     ) -> u64 {
         let message = message.into();
         let mut notifications = self.notifications.lock().unwrap();
-        if let Some(existing) = notifications.iter().find(|n| n.message == message) {
+        if let Some(existing) = notifications.iter().find(|n| persistent && n.message == message) {
             return existing.id;
         }
         let id = self.next_notification_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1337,17 +1337,14 @@ impl AppState {
             action_label,
             action_cmd,
         };
-        // Transient confirmations go only to currently connected subscribers.
-        // Keeping them in server state replays them on reload and on later
-        // notification broadcasts, including contradictory toggle messages.
-        let snapshot = if persistent {
-            notifications.push(notification);
-            notifications.clone()
-        } else {
-            let mut snapshot = notifications.clone();
-            snapshot.push(notification);
-            snapshot
-        };
+        // Keep recent events for Notification Center, including events a client
+        // missed while offline. Only the live WS event may create a popup.
+        notifications.push(notification);
+        if notifications.len() > 200 {
+            let excess = notifications.len() - 200;
+            notifications.drain(..excess);
+        }
+        let snapshot = notifications.clone();
         drop(notifications);
         let _ = self.notifications_tx.send(snapshot);
         id
@@ -2322,23 +2319,24 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn temporary_notifications_are_live_only_and_do_not_replay() {
+    async fn notifications_retain_bounded_center_history_including_offline_events() {
         let state = test_app_state().await;
         let mut live = state.notifications_tx.subscribe();
-        let alarm = state.add_notification("persistent fault");
-        live.try_recv().unwrap();
-        state.add_temporary_notification("toggle enabled");
-        let update = live.try_recv().unwrap();
-        assert_eq!(update.len(), 2);
-        assert!(!update[1].persistent);
-        let reload = state.notifications_snapshot();
-        assert_eq!(reload.len(), 1);
-        assert_eq!(reload[0].id, alarm);
-        state.add_temporary_notification("toggle disabled");
-        let update = live.try_recv().unwrap();
-        assert_eq!(update.len(), 2);
-        assert_eq!(update[1].message, "toggle disabled");
-        assert!(update.iter().all(|n| n.message != "toggle enabled"));
+        let first = state.add_notification("T clock reset");
+        let second = state.add_temporary_notification("toggle enabled");
+        let third = state.add_notification("T clock reset");
+        assert_ne!(first, third, "a later reset is a new event");
+        assert_eq!(live.try_recv().unwrap().len(), 1);
+        assert_eq!(live.try_recv().unwrap().len(), 2);
+        let snapshot = live.try_recv().unwrap();
+        assert_eq!(snapshot.len(), 3);
+        assert!(snapshot.iter().all(|n| !n.persistent));
+        assert_eq!(state.notifications_snapshot().iter().map(|n| n.id).collect::<Vec<_>>(), vec![first, second, third]);
+        for index in 0..205 { state.add_temporary_notification(format!("offline {index}")); }
+        let history = state.notifications_snapshot();
+        assert_eq!(history.len(), 200);
+        assert_eq!(history.first().unwrap().message, "offline 5");
+        assert_eq!(history.last().unwrap().message, "offline 204");
     }
 
     use super::*;
