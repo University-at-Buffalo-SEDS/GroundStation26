@@ -2,6 +2,8 @@
 mod rrls_http_tests;
 mod automatic_abort;
 pub(crate) use automatic_abort::claim_automatic_abort;
+#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
+pub(crate) use automatic_abort::{claim_liveness_abort, AutomaticAbortClaim, LivenessAbortDecision};
 #[cfg(not(feature = "hitl_mode"))]
 mod operational_policy;
 #[cfg(not(feature = "hitl_mode"))]
