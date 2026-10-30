@@ -307,10 +307,14 @@ pub fn action_policy(state: &AppState) -> Option<ActionPolicyMsg> {
                 .take(64)
                 .enumerate()
                 .map(|(i, name)| {
-                    let actuated = VALVES
-                        .iter()
-                        .position(|v| v == name)
-                        .and_then(|index| valve_observation(r, index, elapsed));
+                    let actuated = match *name {
+                        "NitrogenClose" => valve_observation(r, 3, elapsed).map(|open| !open),
+                        "NitrousClose" => valve_observation(r, 4, elapsed).map(|open| !open),
+                        _ => VALVES
+                            .iter()
+                            .position(|v| v == name)
+                            .and_then(|index| valve_observation(r, index, elapsed)),
+                    };
                     ActionControl {
                         cmd: (*name).into(),
                         enabled: fresh && r.enabled & (1 << i) != 0,

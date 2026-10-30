@@ -527,3 +527,119 @@ async fn recovery_websocket_policy_uses_primary_projection_and_new_signed_observ
     assert!(!expired.key_enabled && !expired.software_buttons_enabled);
     state.request_shutdown();
 }
+
+#[tokio::test]
+async fn explicit_supply_close_authenticated_snapshot_keeps_inverse_pending_unknown_and_age_bounds()
+{
+    if !child(
+        "command_proxy::handler_tests::explicit_supply_close_authenticated_snapshot_keeps_inverse_pending_unknown_and_age_bounds",
+        "primary",
+    ) {
+        return;
+    }
+    let (_root, p, r) = super::tests::fixtures();
+    let source = crate::state::tests::test_app_state().await;
+    let receiver = crate::state::tests::test_app_state().await;
+    source.set_action_policy(crate::sequences::default_action_policy());
+    let report = |key: u8, on: bool| {
+        let packet = sedsnet::packet::Packet::new(
+            crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            "AB",
+            crate::telemetry_task::get_current_timestamp_ms(),
+            Arc::<[u8]>::from(vec![key, u8::from(on)]),
+        )
+        .unwrap();
+        crate::telemetry_task::apply_umbilical_status_at_ingress(&source, &packet).unwrap();
+    };
+    let view = Transport {
+        session: 7,
+        sequence: 21,
+    };
+    let remote = Transport {
+        session: 7,
+        sequence: 20,
+    };
+    let mut primary = Runtime::new(Role::Primary);
+    let mut recovery = Runtime::new(Role::Rrls);
+    primary.connect(Some(view));
+    let mut receive_snapshot = || {
+        recovery.connect(None);
+        recovery.connect(Some(remote));
+        primary.observation = crate::primary_mirror::encode_control_observation(&source, 96);
+        let query = recovery.query(&r, remote).unwrap();
+        let Received::Reply(capability) = primary
+            .receive(&p, view, crate::station_mode::local_mode(), &query)
+            .unwrap()
+        else {
+            panic!("actual signed capability")
+        };
+        let mut altered = capability.clone();
+        altered[80] ^= 1;
+        assert!(
+            recovery
+                .receive(&r, remote, Mode::Normal, &altered)
+                .is_err(),
+            "altered snapshot must fail signature before projection"
+        );
+        let Received::Capability { observation, .. } = recovery
+            .receive(&r, remote, Mode::Normal, &capability)
+            .unwrap()
+        else {
+            panic!("verified capability")
+        };
+        assert!(crate::primary_mirror::accept_control_observation(
+            &receiver,
+            &observation,
+            60
+        ));
+        observation
+    };
+    let close = |name: &str| {
+        crate::primary_mirror::action_policy(&receiver)
+            .unwrap()
+            .controls
+            .into_iter()
+            .find(|c| c.cmd == name)
+            .unwrap()
+    };
+    for on in [true, false] {
+        for key in [9, 10] {
+            report(key, on);
+        }
+        receive_snapshot();
+        for name in ["NitrogenClose", "NitrousClose"] {
+            assert_eq!(
+                close(name).actuated,
+                Some(!on),
+                "authenticated {name} follows fresh actual source"
+            );
+        }
+    }
+    for key in [9, 10] {
+        source.set_pending_umbilical_valve_state(key, false);
+    }
+    source.set_action_policy(crate::sequences::default_action_policy());
+    receive_snapshot();
+    for name in ["NitrogenClose", "NitrousClose"] {
+        assert_eq!(
+            close(name).actuated,
+            None,
+            "pending desired close is not physical confirmation"
+        );
+    }
+    for key in [9, 10] {
+        report(key, false);
+    }
+    let known = receive_snapshot();
+    assert!(crate::primary_mirror::accept_control_observation(
+        &receiver, &known, 1501
+    ));
+    for name in ["NitrogenClose", "NitrousClose"] {
+        assert_eq!(
+            close(name).actuated,
+            None,
+            "expired signed source/RTT remains unknown"
+        );
+    }
+}

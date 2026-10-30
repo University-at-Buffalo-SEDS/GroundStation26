@@ -1518,6 +1518,26 @@ impl AppState {
             }
         }
         for control in &mut policy.controls {
+            let close_key = match control.cmd.as_str() {
+                "NitrogenClose" => {
+                    Some(crate::rocket_commands::ActuatorBoardCommands::NitrogenOpen as u8)
+                }
+                "NitrousClose" => {
+                    Some(crate::rocket_commands::ActuatorBoardCommands::NitrousOpen as u8)
+                }
+                _ => None,
+            };
+            if let Some(key) = close_key {
+                // Explicit closes describe the independently observed CLOSED position.
+                // Pending intent and absent/expired feedback never confirm that position.
+                control.actuated = if self.get_pending_umbilical_valve_state(key).is_none() {
+                    self.get_umbilical_valve_state(key).map(|open| !open)
+                } else {
+                    None
+                };
+            }
+        }
+        for control in &mut policy.controls {
             let key = match control.cmd.as_str() {
                 "Pilot" => Some(crate::rocket_commands::ValveBoardCommands::PilotOpen as u8),
                 "NormallyOpen" => {
@@ -3296,6 +3316,90 @@ pub(crate) mod tests {
         );
         state.clear_runtime_data_for_sim_reset();
         assert!(state.network_topology_snapshot(12).health.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_supply_close_uses_only_fresh_confirmed_inverse_without_changing_gates() {
+        const CHILD: &str = "GS_CLOSE_PRESENTATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let result=std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact","state::tests::explicit_supply_close_uses_only_fresh_confirmed_inverse_without_changing_gates","--nocapture","--test-threads=1"])
+                    .env(CHILD,"1").env("GS_RRLS_ROLE","primary").env("GS_SIM_MODE","0").env_remove("GS_SIM_CLOCK_FILE").output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let state = test_app_state().await;
+        let report = |key: u8, on: bool| {
+            let packet = sedsnet::packet::Packet::new(
+                crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "AB",
+                crate::telemetry_task::get_current_timestamp_ms(),
+                Arc::<[u8]>::from(vec![key, u8::from(on)]),
+            )
+            .unwrap();
+            crate::telemetry_task::apply_umbilical_status_at_ingress(&state, &packet).unwrap();
+        };
+        let close = |name: &str| {
+            state
+                .action_policy_snapshot()
+                .controls
+                .into_iter()
+                .find(|c| c.cmd == name)
+                .unwrap()
+        };
+        state.set_action_policy(crate::sequences::default_action_policy());
+        for (key, name) in [(9, "NitrogenClose"), (10, "NitrousClose")] {
+            let initial = close(name);
+            assert_eq!(initial.actuated, None, "absence is not CLOSED");
+            for on in [true, false] {
+                report(key, on);
+                let current = close(name);
+                assert_eq!(
+                    current.actuated,
+                    Some(!on),
+                    "{name} follows actual fresh position"
+                );
+                assert_eq!(
+                    current.enabled, initial.enabled,
+                    "presentation cannot change command gate"
+                );
+            }
+            state.set_pending_umbilical_valve_state(key, false);
+            state.set_action_policy(crate::sequences::default_action_policy());
+            assert_eq!(
+                close(name).actuated,
+                None,
+                "pending CLOSE cannot confirm its own target"
+            );
+            report(key, true);
+            assert_eq!(state.get_pending_umbilical_valve_state(key), Some(false));
+            assert_eq!(
+                close(name).actuated,
+                None,
+                "contradictory report remains pending"
+            );
+            report(key, false);
+            assert_eq!(state.get_pending_umbilical_valve_state(key), None);
+            assert_eq!(close(name).actuated, Some(true));
+            state
+                .umbilical_valve_states
+                .lock()
+                .unwrap()
+                .get_mut(&key)
+                .unwrap()
+                .received_at = std::time::Instant::now()
+                - UMBILICAL_PENDING_VALVE_TIMEOUT
+                - std::time::Duration::from_millis(1);
+            state.set_action_policy(crate::sequences::default_action_policy());
+            assert_eq!(close(name).actuated, None, "expired feedback is not CLOSED");
+            assert_eq!(close(name).enabled, initial.enabled);
+        }
     }
 
     pub(crate) async fn test_app_state() -> Arc<AppState> {
