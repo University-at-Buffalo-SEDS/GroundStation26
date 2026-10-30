@@ -305,3 +305,12 @@ mod tests {
         outbox.flush(u64::MAX, |_, _| panic!("overflow cannot refill allowance"));
     }
 }
+
+#[cfg(all(test,target_os="linux",any(feature="firmware_sim",feature="hitl_mode")))]
+#[derive(Default)]
+pub(crate) struct NativeOutbox(Outbox);
+#[cfg(all(test,target_os="linux",any(feature="firmware_sim",feature="hitl_mode")))]
+impl NativeOutbox {
+    pub(crate) fn offer(&mut self,class:Class,wire:&[u8])->bool{self.0.offer(class,wire)}
+    pub(crate) fn flush(&mut self,mesh:&crate::rrls::Shared,now:u64){self.0.flush_mesh(mesh,now)}
+}

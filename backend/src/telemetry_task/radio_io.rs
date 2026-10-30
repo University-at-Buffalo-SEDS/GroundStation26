@@ -414,6 +414,34 @@ const COMMS_TX_GAP_MS: u64 = 10;
 const GENERAL_COMMS_TX_BURST: usize = 16;
 const COMMS_IDLE_SLEEP_MS: u64 = 1;
 
+/// Bounded completed-byte service history; never an airtime allowance.
+#[derive(Default)]
+struct OrdinaryServiceBalance { bytes: i32 }
+impl OrdinaryServiceBalance {
+    fn observe(&mut self, mesh: crate::comms::OrdinaryLaneState) {
+        // An empty accepted SDK channel is not Router-idle proof: a canonical
+        // cursor may still own the next fragment. Only the explicit Mesh owner
+        // inventory proves a genuinely empty opposite lane here.
+        if mesh == crate::comms::OrdinaryLaneState::Empty { self.bytes = 0; }
+    }
+    fn allow_mesh(&self, sdk_ready: bool) -> bool { !sdk_ready || self.bytes > 0 }
+    fn adjust(&mut self, charge: usize, sdk: bool) {
+        let limit = i32::try_from(crate::comms::MAX_ORDINARY_SERVICE_CHARGE).unwrap_or(i32::MAX);
+        let cost = i32::try_from(charge).unwrap_or(i32::MAX);
+        self.bytes = if sdk { self.bytes.saturating_add(cost) }
+            else { self.bytes.saturating_sub(cost) }.clamp(-limit, limit);
+    }
+    fn sdk_complete(&mut self, charge: usize, mesh: crate::comms::OrdinaryLaneState) {
+        // A handshake/refusal/partial owner is retained, not an empty lane.
+        // Do not bank extra service while that lane cannot compete.
+        if mesh == crate::comms::OrdinaryLaneState::Ready && charge > 0 { self.adjust(charge, true); }
+    }
+    fn mesh_complete(&mut self, charge: usize, sdk_ready: bool) {
+        if sdk_ready && charge > 0 { self.adjust(charge, false); }
+    }
+}
+const _: () = assert!(std::mem::size_of::<OrdinaryServiceBalance>() == 4);
+
 type PriorityBacklog = BTreeMap<u8, VecDeque<Vec<u8>>>;
 
 fn backlog_push(backlog: &mut PriorityBacklog, priority: u8, payload: Vec<u8>, front: bool) {
@@ -650,6 +678,11 @@ impl WireBacklog {
         self.control_bytes = self.control_bytes.saturating_add(packet.1.len());
         Some(packet)
     }
+    fn background_admission_allowed(&self, budget: Option<&TxQueueBudget>) -> bool {
+        !self.has_eligible_critical()
+            && budget.is_none_or(|b| b.pending_control.load(Ordering::Acquire) == 0)
+    }
+
     fn has_eligible_critical(&self) -> bool {
         !self.receipts.is_empty()
             || !self.routing.is_empty()
@@ -946,6 +979,29 @@ mod priority_tests {
         )
         .to_vec()
     }
+    #[test]
+    fn background_admission_keeps_channel_tail_and_active_control_charged() {
+        crate::telemetry_schema::initialize().unwrap();
+        let budget = TxQueueBudget::new_radio(2048, 256);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut backlog = WireBacklog::new(true);
+        let payload = batch_test_command("AV_BAY_UNDERGLOW", &[1]);
+        budget.try_send(&sender, 255, &payload).unwrap();
+        assert!(!backlog.has_eligible_critical(), "actual accepted owner is still in the channel tail");
+        assert!(!backlog.background_admission_allowed(Some(&budget)));
+        let mut no_refill_work = 0;
+        assert!(backlog.refill(&mut receiver, &mut no_refill_work));
+        assert!(!backlog.background_admission_allowed(Some(&budget)), "an exhausted bounded refill cannot hide accepted critical bytes");
+        let (priority, owner) = receiver.try_recv().unwrap();
+        assert!(!backlog.background_admission_allowed(Some(&budget)), "popping an active owner does not complete it");
+        budget.complete(priority, &owner);
+        assert!(backlog.background_admission_allowed(Some(&budget)), "finite completed cohort allows ordinary progress");
+        drop(receiver);
+        assert!(budget.try_send(&sender, 255, &payload).is_err());
+        assert!(backlog.background_admission_allowed(Some(&budget)), "closed-channel rollback cannot leave background permanently held");
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn batch_refill_catches_late_producer_without_waiting_or_exceeding_drain_budget() {
         let packets = ["FLIGHT_STATE", "AV_BAY_UNDERGLOW", "FLIGHT_BUZZER"]
@@ -2197,6 +2253,7 @@ pub(super) fn spawn_comms_worker_threads(
             // Pico-Fi and radio sides both use stateful SDT dictionaries.
             // Preserve their relative order on every generic packed link.
             let mut backlog = WireBacklog::new(true);
+            let mut ordinary_balance = OrdinaryServiceBalance::default();
             loop {
                 match comms_shutdown_rx.try_recv() {
                     Ok(_)
@@ -2235,17 +2292,50 @@ pub(super) fn spawn_comms_worker_threads(
                         break;
                     }
                     backlog.refill(&mut comms_handle.tx_rx, &mut drain_remaining);
-                    if !backlog.has_eligible_critical()
-                        && let Err(error) = comms.service_background_mode()
-                    {
-                        log_repeated_worker_error(
-                            &format!("{worker_name} comms worker background mode service failed"),
-                            &error.to_string(),
-                            &mut last_send_error_log_ms,
-                            &mut suppressed_send_errors,
-                        );
-                        break;
+                    // Include accepted channel-tail and active owners, whose
+                    // byte charge survives until completion or retirement.
+                    let sdk_ordinary_ready = !backlog.ordered.is_empty() || !backlog.priorities.is_empty();
+                    #[cfg(all(test, target_os="linux", any(feature="firmware_sim",feature="hitl_mode")))]
+                    let sdk_ordinary_owned = sdk_ordinary_ready || comms_handle.tx_budget.as_ref()
+                        .is_some_and(|budget| budget.pending_ordinary.load(Ordering::Acquire) != 0);
+                    let mesh_ordinary_state = comms.ordinary_background_state();
+                    if backlog.background_admission_allowed(comms_handle.tx_budget.as_deref()) {
+                        // A critical-only cohort is not an ordinary idle period:
+                        // it may neither spend nor erase completed ordinary service.
+                        if let Some(state) = mesh_ordinary_state {
+                            // An unavailable shared UART is backpressure, not a
+                            // genuine idle lane between SDK cursor offers.
+                            if comms.transmit_ready() {
+                                #[cfg(all(test, target_os="linux", any(feature="firmware_sim",feature="hitl_mode")))]
+                                let before = ordinary_balance.bytes;
+                                ordinary_balance.observe(state);
+                                #[cfg(all(test, target_os="linux", any(feature="firmware_sim",feature="hitl_mode")))]
+                                if before != ordinary_balance.bytes {
+                                    root_ordinary_turn_tests::record_service("ordinary_idle_reset",serde_json::json!({"before":before,"after":ordinary_balance.bytes,"sdk_owned":sdk_ordinary_owned,"sdk_ready":sdk_ordinary_ready,"mesh_state":format!("{state:?}"),"transport_ready":true}));
+                                }
+                            }
+                        }
+                        let allow_mesh = ordinary_balance.allow_mesh(sdk_ordinary_ready);
+                        match comms.service_background_transmit_counted(allow_mesh) {
+                            Ok(Some(progress)) if progress.physical_completed => {
+                                ordinary_balance.mesh_complete(progress.ordinary_charge, sdk_ordinary_ready);
+                                #[cfg(all(test, target_os="linux", any(feature="firmware_sim",feature="hitl_mode")))]
+                                root_ordinary_turn_tests::record_service("mesh_completed_service",serde_json::json!({"ordinary_charge":progress.ordinary_charge,"sdk_ready":sdk_ordinary_ready,"balance":ordinary_balance.bytes}));
+                                // Refill and recheck critical/tail ownership after EACH physical owner.
+                                continue;
+                            }
+                            Ok(_) => {},
+                            Err(error) => {
+                                log_repeated_worker_error(
+                                    &format!("{worker_name} comms worker background transmit service failed"),
+                                    &error.to_string(), &mut last_send_error_log_ms,
+                                    &mut suppressed_send_errors,
+                                );
+                                break;
+                            }
+                        }
                     }
+                    let selected_ordinary = backlog.background_admission_allowed(comms_handle.tx_budget.as_deref());
                     let selection_state = (
                         backlog.application_bytes,
                         backlog.ordered_metadata_next,
@@ -2284,9 +2374,17 @@ pub(super) fn spawn_comms_worker_threads(
                     frames.extend(follower.iter().chain(third.iter()).map(|(p, b)| (*p, &b[..])));
                     let leases: Vec<_> = frames.iter().filter_map(|(_, bytes)|
                         comms_handle.tx_budget.as_ref().and_then(|budget| budget.write_lease(bytes))).collect();
-                    let result = comms.send_tracked(&frames, &leases);
+                    let result = comms.send_tracked_counted(&frames, &leases);
                     match result {
-                        Ok(()) => {
+                        Ok(completed_charge) => {
+                            // None already sent through the generic path; never send twice.
+                            if selected_ordinary {
+                                if let (Some(charge), Some(state)) = (completed_charge, mesh_ordinary_state) {
+                                    ordinary_balance.sdk_complete(charge, state);
+                                }
+                            }
+                            #[cfg(all(test, target_os="linux", any(feature="firmware_sim",feature="hitl_mode")))]
+                            root_ordinary_turn_tests::record_service("sdk_completed_service",serde_json::json!({"priority":priority,"ordinary":selected_ordinary,"actual_charge":completed_charge,"mesh_state":format!("{mesh_ordinary_state:?}"),"balance":ordinary_balance.bytes,"prefix":&payload[..payload.len().min(4)],"payload_bytes":payload.len()}));
                             if let Some(budget) = &comms_handle.tx_budget {
                                 budget.complete(priority, &payload);
                             }
@@ -4406,3 +4504,11 @@ mod transport_pending_tests {
         assert!(!activity.has_pending());
     }
 }
+
+#[cfg(all(test, target_os = "linux", any(feature = "firmware_sim", feature = "hitl_mode")))]
+#[path = "root_ordinary_turn_tests.rs"]
+mod root_ordinary_turn_tests;
+
+#[cfg(test)]
+#[path = "ordinary_balance_tests.rs"]
+mod ordinary_balance_tests;

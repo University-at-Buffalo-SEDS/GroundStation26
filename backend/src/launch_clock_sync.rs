@@ -850,3 +850,6 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test,target_os="linux",any(feature="firmware_sim",feature="hitl_mode")))]
+pub(crate) mod pipeline_fixture;

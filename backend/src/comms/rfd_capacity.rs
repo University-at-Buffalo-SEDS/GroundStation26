@@ -622,6 +622,13 @@ impl Capacity {
         self.next_packet.and_then(|(_, virtual_ms)| virtual_ms)
     }
 
+    /// Read-only native-test ledger observation; never advances clocks/readiness.
+    #[cfg(test)]
+    pub(crate) fn next_air_virtual_ms(&self) -> Option<u64> {
+        self.next.and_then(|(_, value)| value)
+    }
+
+
     /// A physical tcdrain may complete later than its nominal wire duration.
     /// Anchor the quiet gap to actual completion; virtual time still follows
     /// the modeled 8N1 duration, independently of host scheduling delays.
