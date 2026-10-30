@@ -1,12 +1,29 @@
 use super::*;
 #[test]
 fn complete_backend_pairing_lifecycle_is_isolated() {
+    run_isolated(
+        "checklists::paired::tests::complete_backend_pairing_lifecycle_is_isolated",
+        suite,
+    );
+}
+#[test]
+fn startup_reconciles_before_readiness_and_retries_initial_sync_failure() {
+    run_isolated(
+        "checklists::paired::tests::startup_reconciles_before_readiness_and_retries_initial_sync_failure",
+        startup_suite,
+    );
+}
+fn run_isolated<F, Fut>(name: &str, body: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     if std::env::var_os("GS_PAIRED_CHECKLIST_CHILD").is_some() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(suite());
+            .block_on(body());
         return;
     }
     let root = std::env::temp_dir().join(format!(
@@ -16,12 +33,7 @@ fn complete_backend_pairing_lifecycle_is_isolated() {
     ));
     std::fs::create_dir_all(&root).unwrap();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "checklists::paired::tests::complete_backend_pairing_lifecycle_is_isolated",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
         .env("GS_PAIRED_CHECKLIST_CHILD", "1")
         .env("GS_PAIRED_CHECKLIST_ROOT", &root)
         .env("GS_CHECKLISTS_FILE", root.join("legacy.json"))
@@ -789,7 +801,7 @@ async fn suite() {
     };
     assert!(!deliver_event(&event).unwrap());
     let mut signed_wire = false;
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let completion = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             // Simulate the normal continuous UART drain; low-priority Mesh
             // frames intentionally expire if a consumer stops for250ms.
@@ -810,8 +822,14 @@ async fn suite() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    if completion.is_err() {
+        let (saved,queued,error)={let status=binding().lock().unwrap();(status.saved_events.contains(&event.id),status.queued_events.contains(&event.id),status.error.clone())};
+        let persisted=SERVICE.get().unwrap().lock().await.storage.event_saved(&event).await.unwrap();
+        let (mesh_now,peer)={let link=mesh.lock().unwrap();let now=link.now();(now,link.settings_available(now))};
+        eprintln!("JOURNAL_TIMEOUT signed_wire={signed_wire} binding_saved={saved} queued={queued} persisted={persisted} worker_finished={} mesh_now={mesh_now} peer={peer} error={error:?}",worker.is_finished());
+    }
+    completion.unwrap();
     let live = SERVICE.get().unwrap().lock().await;
     assert!(live.storage.event_saved(&event).await.unwrap());
     assert!(live.document.checklists[0].items[1].checked);
@@ -822,4 +840,123 @@ async fn suite() {
         .unwrap()
         .unwrap();
     println!("PAIRED_CHECKLIST_LIVE_LIFECYCLE_PASS");
+}
+
+async fn startup_candidate(root: &std::path::Path, name: &str) -> Service {
+    let mut service = Service::open(
+        root.join(format!("{name}.sqlite3")),
+        root.join(format!("{name}.selector")),
+        "test".into(),
+        "gs".into(),
+        vec!["gs".into(), "rrls".into()],
+        legacy(),
+        true,
+    )
+    .await
+    .unwrap();
+    let mut next = service.document.clone();
+    next.checklists[0].title = format!("Journal definition after {name} selector");
+    service.stage_template(next).await.unwrap();
+    service
+}
+async fn startup_suite() {
+    let root = PathBuf::from(std::env::var_os("GS_PAIRED_CHECKLIST_ROOT").unwrap());
+    let state = crate::state::tests::test_app_state().await;
+    REQUESTED.store(true, Ordering::Release);
+    READY.store(false, Ordering::Release);
+    *binding().lock().unwrap() = BindingState::default();
+    let mut service = startup_candidate(&root, "recovered").await;
+    let recovered = service.selector.digest.clone();
+    service
+        .storage
+        .fail_directory_sync
+        .store(true, Ordering::Relaxed);
+    let mut startup = Startup::default();
+    let advanced = startup.advance(&mut service, &state).await;
+    eprintln!(
+        "STARTUP_BARRIER advanced={advanced} ready={} old_binding_allowed={} selected_changed={}",
+        ready(),
+        qualification_allowed(Some(&recovered), true),
+        service.selector.digest != recovered
+    );
+    assert!(
+        !advanced,
+        "READY must wait for the initial journal projection and durable selector sync"
+    );
+    assert!(!ready());
+    assert!(!startup.ready);
+    assert!(!qualification_allowed(Some(&recovered), true));
+    assert!(extra_launch_block().is_some());
+    assert!(binding().lock().unwrap().durability_pending);
+    let invalid = CompletionEvent {
+        id: completion_event_id(),
+        sequence: Sequence::NitrogenTest,
+        at_ms: 1,
+        action: CompletionAction::Passed,
+    };
+    assert_eq!(
+        invalid.id.len(),
+        32,
+        "a caller cannot obtain a qualified template ID while startup is blocked"
+    );
+    assert!(service.event(&invalid).await.is_err());
+    assert!(!service.storage.event_saved(&invalid).await.unwrap());
+    // Keep the same service owner and original500ms retry path; a transient
+    // initial directory-fsync error must not strand the worker permanently.
+    service
+        .storage
+        .fail_directory_sync
+        .store(false, Ordering::Relaxed);
+    assert!(startup.advance(&mut service, &state).await);
+    assert!(ready());
+    assert!(startup.ready);
+    assert_ne!(service.selector.digest, recovered);
+    assert_eq!(
+        binding().lock().unwrap().digest.as_deref(),
+        Some(service.selector.digest.as_str())
+    );
+    assert!(!binding().lock().unwrap().durability_pending);
+    assert!(qualification_allowed(Some(&service.selector.digest), true));
+    let old = CompletionEvent {
+        id: format!("{recovered}{:016x}", 1u64),
+        sequence: Sequence::NitrogenTest,
+        at_ms: 2,
+        action: CompletionAction::Passed,
+    };
+    assert!(
+        service.event(&old).await.is_err(),
+        "old-template receipts stay strictly rejected after activation"
+    );
+    assert!(!service.storage.event_saved(&old).await.unwrap());
+    let current = CompletionEvent {
+        id: completion_event_id(),
+        sequence: Sequence::NitrogenTest,
+        at_ms: 3,
+        action: CompletionAction::Passed,
+    };
+    assert!(current.id.starts_with(&service.selector.digest));
+    service.event(&current).await.unwrap();
+    assert!(service.storage.event_saved(&current).await.unwrap());
+    service.journal.close().await;
+    service.storage.pool.close().await;
+    // Existing active procedures legitimately retain their selected template.
+    // Readiness can publish this pending-definition state, but not qualification.
+    READY.store(false, Ordering::Release);
+    *binding().lock().unwrap() = BindingState::default();
+    let mut pending = startup_candidate(&root, "pending").await;
+    let retained = pending.selector.digest.clone();
+    state.gse.lock().unwrap().engine.status.phase = gse_sequence::Phase::Filling;
+    let mut startup = Startup::default();
+    assert!(startup.advance(&mut pending, &state).await);
+    assert!(ready());
+    assert_eq!(pending.selector.digest, retained);
+    assert!(binding().lock().unwrap().definition_pending);
+    assert!(!qualification_allowed(Some(&retained), false));
+    assert!(extra_launch_block().is_some());
+    state.gse.lock().unwrap().engine.status.phase = gse_sequence::Phase::Idle;
+    pending.activate(&state).await.unwrap();
+    assert_ne!(pending.selector.digest, retained);
+    assert!(!binding().lock().unwrap().definition_pending);
+    pending.journal.close().await;
+    pending.storage.pool.close().await;
 }

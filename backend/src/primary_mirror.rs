@@ -82,6 +82,11 @@ fn age(value: Option<u64>) -> u16 {
 fn aged(source: u16, elapsed: u64) -> Option<u64> {
     (source != UNKNOWN).then(|| u64::from(source).saturating_add(elapsed))
 }
+fn valve_observation(r: &Observation, index: usize, elapsed: u64) -> Option<bool> {
+    (r.valve_known & (1 << index) != 0
+        && aged(r.valve_ages[index], elapsed).is_some_and(|age| age <= SOURCE_FRESH_MS))
+    .then_some(r.valve_open & (1 << index) != 0)
+}
 impl Observation {
     fn encode(&self) -> Vec<u8> {
         let mut out = vec![VERSION, self.flags];
@@ -302,11 +307,10 @@ pub fn action_policy(state: &AppState) -> Option<ActionPolicyMsg> {
                 .take(64)
                 .enumerate()
                 .map(|(i, name)| {
-                    let actuated = VALVES.iter().position(|v| v == name).and_then(|v| {
-                        (r.valve_known & (1 << v) != 0
-                            && aged(r.valve_ages[v], elapsed).is_some_and(|a| a <= SOURCE_FRESH_MS))
-                        .then_some(r.valve_open & (1 << v) != 0)
-                    });
+                    let actuated = VALVES
+                        .iter()
+                        .position(|v| v == name)
+                        .and_then(|index| valve_observation(r, index, elapsed));
                     ActionControl {
                         cmd: (*name).into(),
                         enabled: fresh && r.enabled & (1 << i) != 0,
@@ -440,6 +444,106 @@ mod tests {
         assert!(action_policy(&state).is_none());
     }
     #[test]
+    fn five_second_health_reports_keep_twelve_second_liveness_and_fifteen_second_cpu_age() {
+        use crate::types::{BoardStatusEntry, BoardStatusMsg, NetworkTopologyMsg};
+        let mut snapshot = example();
+        snapshot.valve_ages = [0; 5];
+        snapshot.valve_open = 1;
+        assert_eq!(valve_observation(&snapshot, 0, 1500), Some(true));
+        assert_eq!(
+            valve_observation(&snapshot, 0, 1501),
+            None,
+            "health cadence must never extend actual valve-state confirmation"
+        );
+        snapshot.board_ages = [5000, 5000, 5000, UNKNOWN];
+        snapshot.cpu_age = 5000;
+        snapshot.edges = 1; // Only the actually observed GS-to-gateway link.
+        let project = |elapsed| {
+            let mut boards = BoardStatusMsg {
+                boards: FILL
+                    .iter()
+                    .map(|board| BoardStatusEntry {
+                        board: *board,
+                        board_label: board.as_str().into(),
+                        sender_id: board.sender_id().into(),
+                        seen: false,
+                        packet_count: 0,
+                        last_seen_ms: None,
+                        age_ms: None,
+                    })
+                    .collect(),
+            };
+            let mut topology = NetworkTopologyMsg {
+                generated_ms: 30_000,
+                ..Default::default()
+            };
+            project_board_observation(&snapshot, elapsed, &mut boards, 30_000);
+            project_topology_observation(&snapshot, elapsed, &mut topology);
+            (boards, topology)
+        };
+        // The sample was already five seconds old at the primary; include the
+        // full request RTT instead of requiring a new health packet every1.5s.
+        let (boards, graph) = project(600);
+        assert!(
+            boards.boards[..3]
+                .iter()
+                .all(|row| row.seen && row.age_ms == Some(5600))
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .filter(|node| node.sender_id.as_deref() != Some("GS"))
+                .all(|node| node.status == NetworkTopologyStatus::Online
+                    && node.age_ms == Some(5600))
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|node| node.sender_id.as_deref() != Some("DAQ")),
+            "absent board evidence must not create a node"
+        );
+        assert_eq!(graph.links.len(), 1);
+        assert_eq!(graph.links[0].status, NetworkTopologyStatus::Online);
+        assert_eq!(graph.health[0].cpu_temperature_centi_c, Some(4532));
+        assert_eq!(graph.health[0].cpu_temperature_age_ms, 5600);
+        // Source age keeps advancing even if the same observation is inspected again.
+        let (boards, graph) = project(7000);
+        assert!(
+            boards.boards[..3]
+                .iter()
+                .all(|row| row.seen && row.age_ms == Some(12000))
+        );
+        assert_eq!(graph.links[0].status, NetworkTopologyStatus::Online);
+        let (boards, graph) = project(7001);
+        assert!(
+            boards.boards[..3]
+                .iter()
+                .all(|row| !row.seen && row.age_ms == Some(12001))
+        );
+        assert_eq!(graph.links[0].status, NetworkTopologyStatus::Offline);
+        assert_eq!(graph.health[0].cpu_temperature_centi_c, Some(4532));
+        let (_, graph) = project(10_000);
+        assert_eq!(graph.health[0].cpu_temperature_centi_c, Some(4532));
+        assert_eq!(graph.health[0].cpu_temperature_age_ms, 15000);
+        let (_, graph) = project(10_001);
+        assert_eq!(graph.health[0].cpu_temperature_centi_c, None);
+        assert_eq!(graph.health[0].cpu_temperature_age_ms, 15001);
+        assert!(
+            graph.health[0].healthy,
+            "unsupported/stale temperature is not evidence that the primary disconnected"
+        );
+        let (_, graph) = project(12_001);
+        assert!(!graph.health[0].healthy);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|node| node.status == NetworkTopologyStatus::Offline)
+        );
+    }
+    #[test]
     fn age_is_conservative_unknown_and_overflow_stay_expired() {
         assert_eq!(aged(UNKNOWN, 0), None);
         assert_eq!(aged(1499, 2), Some(1501));
@@ -459,125 +563,142 @@ pub fn project_board_status(
         return;
     }
     let _ = with_received(state, |r, elapsed| {
-        for (index, board) in FILL.iter().enumerate() {
-            let Some(source_age) = aged(r.board_ages[index], elapsed) else {
-                continue;
-            };
-            if let Some(row) = out.boards.iter_mut().find(|row| row.board == *board)
-                && row.age_ms.is_none_or(|local| source_age < local)
-            {
-                row.age_ms = Some(source_age);
-                row.last_seen_ms = Some(wall_ms.saturating_sub(source_age));
-                row.seen = source_age <= SOURCE_FRESH_MS;
-            }
-        }
+        project_board_observation(r, elapsed, out, wall_ms)
     });
 }
+// These ages include the original query/request RTT and local cache residence.
+// A newly signed envelope does not reset an unchanged five-second health sample.
+fn project_board_observation(
+    r: &Observation,
+    elapsed: u64,
+    out: &mut crate::types::BoardStatusMsg,
+    wall_ms: u64,
+) {
+    for (index, board) in FILL.iter().enumerate() {
+        let Some(source_age) = aged(r.board_ages[index], elapsed) else {
+            continue;
+        };
+        if let Some(row) = out.boards.iter_mut().find(|row| row.board == *board)
+            && row.age_ms.is_none_or(|local| source_age < local)
+        {
+            row.age_ms = Some(source_age);
+            row.last_seen_ms = Some(wall_ms.saturating_sub(source_age));
+            row.seen = source_age <= crate::state::BOARD_SEEN_TIMEOUT_MS;
+        }
+    }
+}
 pub fn project_topology(state: &AppState, out: &mut crate::types::NetworkTopologyMsg) {
-    use crate::types::{
-        NetworkBoardHealthEntry, NetworkTopologyLink, NetworkTopologyNode, NetworkTopologyNodeKind,
-    };
     if !crate::rrls::is_rrls() || out.simulated {
         return;
     }
     let _ = with_received(state, |r, elapsed| {
-        let wall = out.generated_ms;
-        let mut selected: [Option<(String, bool)>; 5] = std::array::from_fn(|_| None);
-        for i in 0..5 {
-            let source_age = if i == 0 {
-                Some(elapsed)
-            } else {
-                aged(r.board_ages[i - 1], elapsed)
-            };
-            let Some(source_age) = source_age else {
-                continue;
-            };
-            let fresh = source_age <= SOURCE_FRESH_MS;
-            let status = if fresh {
-                NetworkTopologyStatus::Online
-            } else {
-                NetworkTopologyStatus::Offline
-            };
-            let id = format!("board_{}", SENDERS[i].to_ascii_lowercase());
-            if let Some(node) = out
-                .nodes
-                .iter_mut()
-                .find(|n| n.sender_id.as_deref() == Some(SENDERS[i]))
-            {
-                if node.age_ms.is_none_or(|local| source_age < local) {
-                    node.age_ms = Some(source_age);
-                    node.last_seen_ms = Some(wall.saturating_sub(source_age));
-                    node.status = status;
-                    node.detail = Some("Observed by primary ground station".into());
-                }
-                selected[i] = Some((
-                    node.id.clone(),
-                    node.status != NetworkTopologyStatus::Offline,
-                ));
-            } else {
-                let label = Board::from_sender_id(SENDERS[i])
-                    .map(|b| b.as_str())
-                    .unwrap_or(SENDERS[i]);
-                out.nodes.push(NetworkTopologyNode {
-                    id: id.clone(),
-                    label: label.into(),
-                    kind: NetworkTopologyNodeKind::Board,
-                    status,
-                    group: "primary observations".into(),
-                    sender_id: Some(SENDERS[i].into()),
-                    last_seen_ms: Some(wall.saturating_sub(source_age)),
-                    age_ms: Some(source_age),
-                    endpoints: Vec::new(),
-                    show_in_details: true,
-                    detail: Some("Observed by primary ground station".into()),
-                    stats: None,
-                });
-                selected[i] = Some((id, fresh));
-            }
-        }
-        let mut bit = 0;
-        for a in 0..5 {
-            for b in a + 1..5 {
-                if r.edges & (1 << bit) != 0
-                    && let (Some((left, lf)), Some((right, rf))) = (&selected[a], &selected[b])
-                    && !out.links.iter().any(|e| {
-                        (&e.source == left && &e.target == right)
-                            || (&e.source == right && &e.target == left)
-                    })
-                {
-                    out.links.push(NetworkTopologyLink {
-                        source: left.clone(),
-                        target: right.clone(),
-                        label: Some("Observed by primary".into()),
-                        status: if elapsed <= SOURCE_FRESH_MS && *lf && *rf {
-                            NetworkTopologyStatus::Online
-                        } else {
-                            NetworkTopologyStatus::Offline
-                        },
-                    });
-                }
-                bit += 1;
-            }
-        }
-        let cpu_age = aged(r.cpu_age, elapsed);
-        let temperature = cpu_age
-            .filter(|age| *age <= 15000)
-            .map(|_| i32::from(r.cpu));
-        if let Some(row) = out.health.iter_mut().find(|h| h.sender_id == "GS") {
-            row.cpu_temperature_centi_c = temperature;
-            row.cpu_temperature_age_ms = cpu_age.unwrap_or(0);
-        } else {
-            out.health.push(NetworkBoardHealthEntry {
-                sender_id: "GS".into(),
-                healthy: elapsed <= SOURCE_FRESH_MS,
-                age_ms: elapsed,
-                last_seen_ms: wall.saturating_sub(elapsed),
-                cpu_temperature_centi_c: temperature,
-                cpu_temperature_age_ms: cpu_age.unwrap_or(0),
-                ..Default::default()
-            });
-        }
+        project_topology_observation(r, elapsed, out)
     });
+}
+fn project_topology_observation(
+    r: &Observation,
+    elapsed: u64,
+    out: &mut crate::types::NetworkTopologyMsg,
+) {
+    use crate::types::{
+        NetworkBoardHealthEntry, NetworkTopologyLink, NetworkTopologyNode, NetworkTopologyNodeKind,
+    };
+    let wall = out.generated_ms;
+    let mut selected: [Option<(String, bool)>; 5] = std::array::from_fn(|_| None);
+    for i in 0..5 {
+        let source_age = if i == 0 {
+            Some(elapsed)
+        } else {
+            aged(r.board_ages[i - 1], elapsed)
+        };
+        let Some(source_age) = source_age else {
+            continue;
+        };
+        let fresh = source_age <= crate::state::BOARD_SEEN_TIMEOUT_MS;
+        let status = if fresh {
+            NetworkTopologyStatus::Online
+        } else {
+            NetworkTopologyStatus::Offline
+        };
+        let id = format!("board_{}", SENDERS[i].to_ascii_lowercase());
+        if let Some(node) = out
+            .nodes
+            .iter_mut()
+            .find(|n| n.sender_id.as_deref() == Some(SENDERS[i]))
+        {
+            if node.age_ms.is_none_or(|local| source_age < local) {
+                node.age_ms = Some(source_age);
+                node.last_seen_ms = Some(wall.saturating_sub(source_age));
+                node.status = status;
+                node.detail = Some("Observed by primary ground station".into());
+            }
+            selected[i] = Some((
+                node.id.clone(),
+                node.status != NetworkTopologyStatus::Offline,
+            ));
+        } else {
+            let label = Board::from_sender_id(SENDERS[i])
+                .map(|b| b.as_str())
+                .unwrap_or(SENDERS[i]);
+            out.nodes.push(NetworkTopologyNode {
+                id: id.clone(),
+                label: label.into(),
+                kind: NetworkTopologyNodeKind::Board,
+                status,
+                group: "primary observations".into(),
+                sender_id: Some(SENDERS[i].into()),
+                last_seen_ms: Some(wall.saturating_sub(source_age)),
+                age_ms: Some(source_age),
+                endpoints: Vec::new(),
+                show_in_details: true,
+                detail: Some("Observed by primary ground station".into()),
+                stats: None,
+            });
+            selected[i] = Some((id, fresh));
+        }
+    }
+    let mut bit = 0;
+    for a in 0..5 {
+        for b in a + 1..5 {
+            if r.edges & (1 << bit) != 0
+                && let (Some((left, lf)), Some((right, rf))) = (&selected[a], &selected[b])
+                && !out.links.iter().any(|e| {
+                    (&e.source == left && &e.target == right)
+                        || (&e.source == right && &e.target == left)
+                })
+            {
+                out.links.push(NetworkTopologyLink {
+                    source: left.clone(),
+                    target: right.clone(),
+                    label: Some("Observed by primary".into()),
+                    status: if elapsed <= crate::state::BOARD_SEEN_TIMEOUT_MS && *lf && *rf {
+                        NetworkTopologyStatus::Online
+                    } else {
+                        NetworkTopologyStatus::Offline
+                    },
+                });
+            }
+            bit += 1;
+        }
+    }
+    let cpu_age = aged(r.cpu_age, elapsed);
+    let temperature = cpu_age
+        .filter(|age| *age <= 15000)
+        .map(|_| i32::from(r.cpu));
+    if let Some(row) = out.health.iter_mut().find(|h| h.sender_id == "GS") {
+        row.cpu_temperature_centi_c = temperature;
+        row.cpu_temperature_age_ms = cpu_age.unwrap_or(0);
+    } else {
+        out.health.push(NetworkBoardHealthEntry {
+            sender_id: "GS".into(),
+            healthy: elapsed <= crate::state::BOARD_SEEN_TIMEOUT_MS,
+            age_ms: elapsed,
+            last_seen_ms: wall.saturating_sub(elapsed),
+            cpu_temperature_centi_c: temperature,
+            cpu_temperature_age_ms: cpu_age.unwrap_or(0),
+            ..Default::default()
+        });
+    }
 }
 
 /// A sparse primary status is returned only while the authenticated capture is fresh.
@@ -585,10 +706,7 @@ pub fn project_topology(state: &AppState, out: &mut crate::types::NetworkTopolog
 pub fn gse_status(state: &AppState) -> Option<serde_json::Value> {
     with_received(state, |r, elapsed| {
         if elapsed > SOURCE_FRESH_MS { return None; }
-        let valves:[Option<bool>;5]=std::array::from_fn(|i| {
-            (r.valve_known&(1<<i)!=0 && aged(r.valve_ages[i],elapsed).is_some_and(|age|age<=SOURCE_FRESH_MS))
-                .then_some(r.valve_open&(1<<i)!=0)
-        });
+        let valves:[Option<bool>;5]=std::array::from_fn(|index|valve_observation(r, index, elapsed));
         Some(serde_json::json!({
             "phase":PHASES[r.phase as usize],
             "message":"Observed at primary; configuration and qualification details must be viewed at the primary.",

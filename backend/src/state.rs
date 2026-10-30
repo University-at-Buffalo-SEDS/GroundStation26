@@ -29,7 +29,7 @@ use tokio::time::{Duration, Instant};
 pub const LAUNCH_COUNTDOWN_DURATION_MS: i64 = 10_000;
 pub const UMBILICAL_PENDING_VALVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const BOARD_STATUS_BROADCAST_MIN_INTERVAL_MS: u64 = 200;
-const BOARD_SEEN_TIMEOUT_MS: u64 = 12_000;
+pub(crate) const BOARD_SEEN_TIMEOUT_MS: u64 = 12_000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConfirmedUmbilicalValveState {

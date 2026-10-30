@@ -803,6 +803,44 @@ impl Service {
     }
 }
 
+#[derive(Default)]
+struct Startup {
+    published: bool,
+    ready: bool,
+}
+impl Startup {
+    async fn advance(&mut self, service: &mut Service, state: &Arc<AppState>) -> bool {
+        let result: anyhow::Result<()> = async {
+            if !self.published {
+                service.publish().await.map_err(anyhow::Error::msg)?;
+                self.published = true;
+            }
+            // Reconcile the entire recovered journal before granting readiness.
+            // A pending definition is published as a block; uncertain selection
+            // remains unready and retries on this same owner's500ms cadence.
+            service.activate(state).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            READY.store(false, Ordering::Release);
+            let mut status = binding().lock().unwrap();
+            status.durability_pending = true;
+            status.error = Some(format!("Shared checklist initialization deferred: {error}"));
+            return false;
+        }
+        let mut status = binding().lock().unwrap();
+        status.digest = Some(service.selector.digest.clone());
+        status.durability_pending =
+            service.selection_pending || !service.failed_progress.is_empty();
+        status.error = None;
+        drop(status);
+        self.ready = true;
+        READY.store(true, Ordering::Release);
+        true
+    }
+}
+
 pub(crate) fn start(
     state: Arc<AppState>,
     pairing: Arc<crate::station_pairing::Pairing>,
@@ -877,15 +915,7 @@ pub(crate) fn start(
         };
         let service = Arc::new(tokio::sync::Mutex::new(service));
         let _ = SERVICE.set(service.clone());
-        {
-            let mut service = service.lock().await;
-            if let Err(error) = service.publish().await {
-                binding().lock().unwrap().error = Some(error);
-                return;
-            }
-            binding().lock().unwrap().digest = Some(service.selector.digest.clone());
-        }
-        READY.store(true, Ordering::Release);
+        let mut startup = Startup::default();
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut shutdown = state.shutdown_subscribe();
@@ -894,6 +924,9 @@ pub(crate) fn start(
                 _ = shutdown.recv() => break,
                 _ = interval.tick() => {
                     let mut service = service.lock().await;
+                    if !startup.ready && !startup.advance(&mut service, &state).await {
+                        continue;
+                    }
                     let now = mesh.lock().unwrap().now();
                     let mut error = None;
                     for _ in 0..8 {
