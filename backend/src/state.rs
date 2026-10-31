@@ -1156,6 +1156,29 @@ impl AppState {
         );
     }
 
+    /// Physical source freshness controls ACK admission; display storage and
+    /// requested targets never upgrade an old capture into a new confirmation.
+    pub(crate) fn set_umbilical_valve_state_source(
+        &self,
+        cmd_id: u8,
+        on: bool,
+        source_ms: i64,
+        receipt_ms: i64,
+    ) -> bool {
+        if !self.gse.lock().unwrap().observe_valve_source(cmd_id, on, source_ms, receipt_ms) {
+            return false;
+        }
+        self.umbilical_valve_states.lock().unwrap().insert(
+            cmd_id,
+            ConfirmedUmbilicalValveState {
+                on,
+                received_at: std::time::Instant::now(),
+                simulation_ms: crate::simulation_clock_ms(),
+            },
+        );
+        true
+    }
+
     /// Records when any telemetry packet last reached the backend router.
     pub fn mark_packet_received(&self, timestamp_ms: u64) {
         self.last_packet_rx_ms

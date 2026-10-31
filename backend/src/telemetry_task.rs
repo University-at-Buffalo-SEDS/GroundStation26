@@ -1640,19 +1640,24 @@ pub(crate) fn apply_umbilical_status_at_ingress(
             return None;
         }
         if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
-            state.set_umbilical_valve_state(key_cmd_id, key_on);
-            crate::gse::qd_confirmation(state, &sender_id, key_cmd_id, key_on, pkt.timestamp());
-            crate::gse::report_safety(state);
-            state.reconcile_pending_umbilical_valve_state(
-                key_cmd_id,
-                key_on,
-                crate::state::UMBILICAL_PENDING_VALVE_TIMEOUT,
+            let fresh_confirmation = state.set_umbilical_valve_state_source(
+                key_cmd_id, key_on, pkt.timestamp() as i64,
+                recording_network_utc_ms().unwrap_or_else(|| get_current_timestamp_ms() as i64),
             );
-            if key_cmd_id == ValveBoardCommands::PilotOpen as u8
-                && key_on
-                && crate::gse::pilot_report_can_advance_launch_clock(state)
-            {
-                transition_launch_clock_to_t_plus_from_pilot_open(state);
+            if fresh_confirmation {
+                crate::gse::qd_confirmation(state, &sender_id, key_cmd_id, key_on, pkt.timestamp());
+                crate::gse::report_safety(state);
+                state.reconcile_pending_umbilical_valve_state(
+                    key_cmd_id,
+                    key_on,
+                    crate::state::UMBILICAL_PENDING_VALVE_TIMEOUT,
+                );
+                if key_cmd_id == ValveBoardCommands::PilotOpen as u8
+                    && key_on
+                    && crate::gse::pilot_report_can_advance_launch_clock(state)
+                {
+                    transition_launch_clock_to_t_plus_from_pilot_open(state);
+                }
             }
             sequences::refresh_action_policy_now(state);
             state.broadcast_action_policy_snapshot();

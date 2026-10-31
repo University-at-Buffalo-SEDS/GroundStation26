@@ -1,9 +1,11 @@
+mod automatic_abort;
 #[cfg(test)]
 mod rrls_http_tests;
-mod automatic_abort;
 pub(crate) use automatic_abort::claim_automatic_abort;
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
-pub(crate) use automatic_abort::{claim_liveness_abort, AutomaticAbortClaim, LivenessAbortDecision};
+pub(crate) use automatic_abort::{
+    AutomaticAbortClaim, LivenessAbortDecision, claim_liveness_abort,
+};
 #[cfg(not(feature = "hitl_mode"))]
 mod operational_policy;
 #[cfg(not(feature = "hitl_mode"))]
@@ -29,7 +31,14 @@ use gse_sequence::{
     qd_wait::{QdStatus, QdWait},
     qualification::{Fault, Milestone},
 };
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
+
+// Serialize effect preparation/admission with manual handoff. Transport
+// processing happens after this gate is released (callbacks may reenter GSE).
+static DISPATCH_GATE: Mutex<()> = Mutex::new(());
 
 const KEYS: [u8; 5] = [0, 1, 2, 9, 10];
 const OPEN: [u8; 5] = [0, 1, 2, 9, 10];
@@ -50,8 +59,14 @@ pub struct Runtime {
     pressure: Option<Sample>,
     valves: [Option<ValveState>; 5],
     mass: Option<Sample>,
+    last_mass_source_ms: Option<i64>,
+    last_pressure_source_ms: Option<i64>,
+    last_valve_source_ms: [Option<i64>; 5],
     fill_cutoff: crate::sequences::FillCutoff,
+    fill_trim: Option<gse_sequence::fill_trim::Controller>,
     ground_station_control: bool,
+    manual_control: bool,
+    effects_queued: bool,
     #[cfg(not(feature = "hitl_mode"))]
     automatic_abort_in_flight: bool,
 }
@@ -67,18 +82,78 @@ impl Default for Runtime {
             pressure: None,
             valves: [None; 5],
             mass: None,
+            last_mass_source_ms: None,
+            last_pressure_source_ms: None,
+            last_valve_source_ms: [None; 5],
             fill_cutoff: Default::default(),
+            fill_trim: None,
             ground_station_control: true,
+            manual_control: false,
+            effects_queued: false,
             #[cfg(not(feature = "hitl_mode"))]
             automatic_abort_in_flight: false,
         }
     }
+}
+// Valid network UTC captures retain their source age. Unsynchronized boot
+// counters retain receipt-time compatibility, but replaying the same capture
+// must never manufacture a new settled sample or renew its freshness.
+fn source_sample_at(
+    source: Option<i64>,
+    receipt: i64,
+    now: u64,
+    previous: &mut Option<i64>,
+) -> Option<u64> {
+    const UTC_2020_MS: i64 = 1_577_836_800_000;
+    let Some(source) = source.filter(|v| *v >= 0) else {
+        return Some(now);
+    };
+    if *previous == Some(source) {
+        return None;
+    }
+    let at = if source >= UTC_2020_MS && receipt >= UTC_2020_MS {
+        let delta = receipt.checked_sub(source)?;
+        // Network clocks may lead by a small synchronization/receipt jitter.
+        // Clamp only a bounded100 ms lead, never a materially future capture.
+        if delta < -100 {
+            return None;
+        }
+        let age = delta.max(0) as u64;
+        if age > 2_000 || previous.is_some_and(|old| old >= UTC_2020_MS && source < old) {
+            return None;
+        }
+        now.checked_sub(age)?
+    } else {
+        now
+    };
+    *previous = Some(source);
+    Some(at)
 }
 fn sequence_clock_ms(elapsed_ms: u64, simulated_ms: Option<u64>) -> u64 {
     simulated_ms.unwrap_or(elapsed_ms)
 }
 
 impl Runtime {
+    fn cancel_automation_for_manual(&mut self) {
+        self.manual_control = true;
+        let faulted = self.engine.status.phase == Phase::Fault;
+        self.engine.manual_override();
+        if faulted {
+            self.engine.status.phase = Phase::Fault;
+            self.engine.claimed = true;
+        }
+        self.fill_cutoff.reset();
+        if let Some(mut controller) = self.fill_trim.take() {
+            controller.cancel();
+        }
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            self.operational.running = false;
+            self.operational.target_reached = None;
+            self.operational.last_correction_ms = None;
+            self.operational.qd = QdWait::default();
+        }
+    }
     /// Actual valve reports and their source ages; command intent is never evidence.
     pub(crate) fn mirror_valves(&self) -> [Option<(bool, u64)>; 5] {
         let now = self.now();
@@ -127,10 +202,45 @@ impl Runtime {
             .filter(|m| m.at_ms <= now_ms && now_ms - m.at_ms <= 2000)
     }
     pub fn observe_mass(&mut self, value: Option<f32>) {
+        self.last_mass_source_ms = None;
         self.mass = value.filter(|v| v.is_finite()).map(|value| Sample {
             value,
             at_ms: self.now(),
         });
+    }
+    pub(crate) fn observe_mass_source(
+        &mut self,
+        value: Option<f32>,
+        source_ms: Option<i64>,
+        receipt_ms: i64,
+    ) {
+        if let Some(at_ms) = source_sample_at(
+            source_ms,
+            receipt_ms,
+            self.now(),
+            &mut self.last_mass_source_ms,
+        ) {
+            self.mass = value
+                .filter(|v| v.is_finite())
+                .map(|value| Sample { value, at_ms });
+        }
+    }
+    pub(crate) fn observe_pressure_source(
+        &mut self,
+        value: Option<f32>,
+        source_ms: Option<i64>,
+        receipt_ms: i64,
+    ) {
+        if let Some(at_ms) = source_sample_at(
+            source_ms,
+            receipt_ms,
+            self.now(),
+            &mut self.last_pressure_source_ms,
+        ) {
+            self.pressure = value
+                .filter(|v| v.is_finite())
+                .map(|value| Sample { value, at_ms });
+        }
     }
     fn now(&self) -> u64 {
         sequence_clock_ms(
@@ -143,6 +253,28 @@ impl Runtime {
             value,
             at_ms: self.now(),
         });
+    }
+    pub(crate) fn observe_valve_source(
+        &mut self,
+        key: u8,
+        open: bool,
+        source_ms: i64,
+        receipt_ms: i64,
+    ) -> bool {
+        let Some(index) = KEYS.iter().position(|candidate| *candidate == key) else {
+            return true;
+        };
+        let now = self.now();
+        let Some(at_ms) = source_sample_at(
+            Some(source_ms),
+            receipt_ms,
+            now,
+            &mut self.last_valve_source_ms[index],
+        ) else {
+            return false;
+        };
+        self.valves[index] = Some(ValveState { open, at_ms });
+        true
     }
     pub fn observe_valve(&mut self, key: u8, open: bool) {
         if let Some(i) = KEYS.iter().position(|k| *k == key) {
@@ -279,7 +411,8 @@ pub fn initialize(state: &AppState) {
     }
 }
 pub fn claimed(state: &AppState) -> bool {
-    state.gse.lock().unwrap().engine.claimed
+    let rt = state.gse.lock().unwrap();
+    rt.engine.claimed || rt.manual_control
 }
 pub fn active(state: &AppState) -> bool {
     state.gse.lock().unwrap().engine.active()
@@ -352,6 +485,24 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
             TelemetryCommand::NitrogenClose | TelemetryCommand::NitrousClose
         ));
     }
+    // A manual handoff never grants an opening that the retained physical
+    // supply interlock forbids. Explicit/toggle closes remain available.
+    let now = rt.now();
+    let closed = |index: usize| {
+        rt.valves[index].is_some_and(|v| !v.open && v.at_ms <= now && now - v.at_ms <= 2_000)
+    };
+    if matches!(cmd, TelemetryCommand::Nitrogen)
+        && !rt.valves[3].is_some_and(|v| v.open)
+        && (rt.engine.nitrous_session() || !closed(4))
+    {
+        return Some(false);
+    }
+    if matches!(cmd, TelemetryCommand::Nitrous)
+        && !rt.valves[4].is_some_and(|v| v.open)
+        && !closed(3)
+    {
+        return Some(false);
+    }
     #[cfg(not(feature = "hitl_mode"))]
     if matches!(
         crate::sequences::command_name(cmd),
@@ -372,7 +523,6 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
     if rt.engine.active()
         && (["GroundStationLaunch", "IgniterSequence"]
             .contains(&crate::sequences::command_name(cmd))
-            || valve_command(cmd)
             || matches!(
                 cmd,
                 TelemetryCommand::Launch
@@ -449,11 +599,6 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
     if rt.engine.active() {
         for c in &mut policy.controls {
             if [
-                "Dump",
-                "NormallyOpen",
-                "Pilot",
-                "Nitrogen",
-                "Nitrous",
                 "Launch",
                 "GroundStationLaunch",
                 "Igniter",
@@ -495,6 +640,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
 
 fn apply(state: &Arc<AppState>, effects: Effects) {
     if !effects.valves.is_empty() {
+        state.gse.lock().unwrap().effects_queued = true;
         if let Some(router) = state.topology_router.get() {
             for (index, open) in effects.valves {
                 let kind = crate::telemetry_schema::data_type(if index < 3 {
@@ -518,6 +664,7 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
                             rt.operational.qd = QdWait::default();
                             let _ = rt.operational.persist();
                         }
+                        rt.fill_trim = None;
                         rt.engine.fault(now, "Command transport failed")
                     };
                     // Best effort closes only; never continue opening a supply after an error.
@@ -531,7 +678,6 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
                     state.add_notification(
                         "GSE command transport failed. Verify supply valves are closed.",
                     );
-                    crate::telemetry_task::flush_command_tx(router, "GSE supply close recovery");
                     return;
                 }
                 log::info!(
@@ -548,7 +694,6 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
                 );
                 state.set_pending_umbilical_valve_state(KEYS[index], open);
             }
-            crate::telemetry_task::flush_command_tx(router, "GSE sequence");
         } else {
             let mut rt = state.gse.lock().unwrap();
             let now = rt.now();
@@ -577,6 +722,30 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
     }
 }
 pub fn handle_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
+    let handled = {
+        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        handle_command_inner(state, cmd)
+    };
+    flush_effects(state);
+    handled
+}
+fn flush_effects(state: &Arc<AppState>) {
+    if !std::mem::take(&mut state.gse.lock().unwrap().effects_queued) {
+        return;
+    }
+    if let Some(router) = state.topology_router.get() {
+        crate::telemetry_task::flush_command_tx(router, "GSE sequence");
+    }
+}
+fn handle_command_inner(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
+    // Admission and handoff share the effect gate: a supply report may have
+    // changed since the outer command worker checked the policy.
+    if valve_command(cmd) && !state.is_command_allowed(cmd) {
+        state.add_temporary_notification(
+            "Manual valve command blocked: current interlock or supply safety state changed",
+        );
+        return true;
+    }
     #[cfg(not(feature = "hitl_mode"))]
     if handle_operational_command(state, cmd) {
         return true;
@@ -586,6 +755,12 @@ pub fn handle_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
         let enabled = {
             let mut rt = state.gse.lock().unwrap();
             rt.ground_station_control = !rt.ground_station_control;
+            if !rt.ground_station_control && rt.fill_trim.is_some() {
+                rt.cancel_automation_for_manual();
+                rt.engine.status.message =
+                    "Automatic mass trim disabled; operator controls the current valve states"
+                        .into();
+            }
             rt.fill_cutoff.reset();
             rt.ground_station_control
         };
@@ -613,6 +788,12 @@ pub fn handle_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
                 rt.engine.nitrous_target_psi = nitrous_target;
             }
             let input = rt.input(is_prelaunch, interlock(state, &policy));
+            if matches!(action, Action::PauseFill | Action::CancelFill) && rt.fill_trim.is_some() {
+                if let Some(mut controller) = rt.fill_trim.take() {
+                    controller.cancel();
+                }
+                rt.engine.status.phase = Phase::Filling;
+            }
             if action == Action::StartFill
                 && rt.ground_station_control
                 && rt.fresh_mass(input.now_ms).is_none()
@@ -620,6 +801,9 @@ pub fn handle_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
                 Err("Automatic fill requires fresh calibrated fill weight before starting".into())
             } else {
                 let result = rt.engine.request(action, input);
+                if result.is_ok() {
+                    rt.manual_control = false;
+                }
                 #[cfg(not(feature = "hitl_mode"))]
                 if result.is_ok() {
                     rt.operational.running = true;
@@ -657,24 +841,44 @@ pub fn handle_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
         let effects = {
             let mut rt = state.gse.lock().unwrap();
             let now = rt.now();
+            rt.fill_trim = None;
             rt.engine.fault(now, "Operator abort")
         };
         apply(state, effects);
     } else if valve_command(cmd) {
-        #[cfg(feature = "hitl_mode")]
-        state.gse.lock().unwrap().engine.manual_override();
+        let mut rt = state.gse.lock().unwrap();
+        rt.cancel_automation_for_manual();
     }
     false
+}
+fn fill_mass_in_band(config: &Config, mass: f32, target: f32) -> bool {
+    mass.is_finite()
+        && target.is_finite()
+        && target != 0.0
+        && (mass - target).abs() <= config.fill_tolerance_kg
+}
+fn fill_stop_reached(config: &Config, mass: f32, target: f32) -> bool {
+    mass.is_finite()
+        && target.is_finite()
+        && target != 0.0
+        && mass * target.signum() >= target.abs() + config.fill_overfill_kg
 }
 #[cfg(not(feature = "hitl_mode"))]
 fn remember_automatic_cutoff_target(runtime: &mut Runtime, mass: f32, target: f32) {
     // The stop and qualification candidate must agree on the existing target
     // tolerance. A pressure plateau alone must never qualify a short fill.
-    if target.is_finite() && target > 0.0 && runtime.fill_cutoff.target_met(mass, target) {
+    if fill_mass_in_band(&runtime.engine.config, mass, target) {
         runtime.operational.target_reached = Some(target);
     }
 }
 pub fn tick(state: &Arc<AppState>, interlock: bool) {
+    {
+        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        tick_inner(state, interlock);
+    }
+    flush_effects(state);
+}
+fn tick_inner(state: &Arc<AppState>, interlock: bool) {
     #[cfg(not(feature = "hitl_mode"))]
     if operational_tick(state, interlock) {
         return;
@@ -686,37 +890,83 @@ pub fn tick(state: &Arc<AppState>, interlock: bool) {
         let input = rt.input(is_prelaunch, interlock);
         #[cfg(not(feature = "hitl_mode"))]
         let previous_phase = rt.engine.status.phase;
-        let effects = rt.engine.tick(input);
-        #[cfg(not(feature = "hitl_mode"))]
-        complete_operational_milestones(&mut rt, previous_phase);
-        if rt.engine.status.phase != Phase::Filling || !rt.ground_station_control {
-            rt.fill_cutoff.reset();
-            effects
-        } else {
+        if let Some(mut controller) = rt.fill_trim.take() {
             let mass = rt.fresh_mass(input.now_ms);
-            match (mass, input.pressure) {
-                (Some(m), Some(p)) => {
-                    if rt
-                        .fill_cutoff
-                        .reached(Instant::now(), m.value, p.value, target)
-                    {
-                        #[cfg(not(feature = "hitl_mode"))]
-                        remember_automatic_cutoff_target(&mut rt, m.value, target);
-                        match rt.engine.request(Action::PauseFill, input) {
-                            Ok(mut stopped) => {
-                                stopped.notification = Some("Automatic fill cutoff: target weight reached or fill stabilized. Closing supplies and vent; waiting for valve acknowledgements.".into());
-                                stopped
-                            }
-                            Err(_) => effects,
-                        }
-                    } else {
-                        effects
-                    }
+            let update = controller.tick(input, mass);
+            if let Some(message) = update.fault {
+                #[cfg(not(feature = "hitl_mode"))]
+                {
+                    rt.operational
+                        .saved
+                        .qualification
+                        .latch(Fault::ValveMismatch);
+                    rt.operational.running = false;
+                    let _ = rt.operational.persist();
                 }
-                _ => rt.engine.fault(
+                // Backend owns the established emergency relief policy:
+                // close both supplies and open vent/dump without ACK gating.
+                rt.engine.fault(input.now_ms, &message)
+            } else if update.completed {
+                rt.engine.status.phase = Phase::Paused;
+                rt.engine.status.message =
+                    "Fill mass settled within tolerance; all valves confirmed closed".into();
+                #[cfg(not(feature = "hitl_mode"))]
+                {
+                    if let Some(mass) = mass {
+                        remember_automatic_cutoff_target(&mut rt, mass.value, target);
+                    }
+                    complete_operational_milestones(&mut rt, Phase::PauseSetup);
+                }
+                let mut effects = update.effects;
+                effects.notification = Some("Fill complete: settled mass is within tolerance and all valves are confirmed closed".into());
+                effects
+            } else {
+                rt.engine.status.message =
+                    format!("Final fill mass verification: {:?}", controller.phase());
+                rt.fill_trim = Some(controller);
+                update.effects
+            }
+        } else {
+            let effects = rt.engine.tick(input);
+            #[cfg(not(feature = "hitl_mode"))]
+            complete_operational_milestones(&mut rt, previous_phase);
+            if rt.engine.status.phase != Phase::Filling || !rt.ground_station_control {
+                rt.fill_cutoff.reset();
+                effects
+            } else if let Some(mass) = rt.fresh_mass(input.now_ms) {
+                if fill_stop_reached(&rt.engine.config, mass.value, target) {
+                    match rt
+                        .engine
+                        .config
+                        .pressure_limit(rt.engine.nitrous_target_psi, 50.0)
+                        .and_then(|limit| {
+                            gse_sequence::fill_trim::Controller::start(
+                                input.now_ms,
+                                target,
+                                limit,
+                                &rt.engine.config,
+                            )
+                        }) {
+                        Ok((controller, mut effects)) => {
+                            rt.engine.manual_override();
+                            rt.engine.status.phase = Phase::PauseSetup;
+                            rt.engine.claimed = true;
+                            rt.engine.status.message =
+                                "Closing supplies and vent before settled mass verification".into();
+                            rt.fill_trim = Some(controller);
+                            effects.notification = Some("Automatic fill cutoff: closing valves, then settling and verifying final mass".into());
+                            effects
+                        }
+                        Err(error) => rt.engine.fault(input.now_ms, &error),
+                    }
+                } else {
+                    effects
+                }
+            } else {
+                rt.engine.fault(
                     input.now_ms,
                     "Automatic fill stopped: fresh calibrated fill weight is required",
-                ),
+                )
             }
         }
     };
@@ -800,9 +1050,89 @@ async fn get_config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         return e;
     }
     if crate::rrls::is_rrls() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "Primary GSE configuration is not mirrored; use the primary ground station.").into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Primary GSE configuration is not mirrored; use the primary ground station.",
+        )
+            .into_response();
     }
     Json(state.gse.lock().unwrap().engine.config.clone()).into_response()
+}
+fn nitrogen_configuration_changed(before: &Config, after: &Config) -> bool {
+    before.nitrogen_plan() != after.nitrogen_plan()
+        || before.pressure_ceiling_psi != after.pressure_ceiling_psi
+        || before.maximum_zero_offset_psi != after.maximum_zero_offset_psi
+}
+fn fill_configuration_changed(before: &Config, after: &Config) -> bool {
+    before.fill_overfill_kg != after.fill_overfill_kg
+        || before.fill_tolerance_kg != after.fill_tolerance_kg
+        || before.fill_settle_ms != after.fill_settle_ms
+}
+fn invalidate_changed_configuration(rt: &mut Runtime, config: &Config) -> Result<(), String> {
+    let nitrogen = nitrogen_configuration_changed(&rt.engine.config, config);
+    let fill = fill_configuration_changed(&rt.engine.config, config);
+    if !nitrogen && !fill {
+        return Ok(());
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    {
+        if !rt.operational.saved.pending_checklists.is_empty() {
+            return Err(
+                "Save pending checklist progress before changing procedure settings".into(),
+            );
+        }
+        let affected = if nitrogen {
+            rt.operational.saved.qualification.nitrogen_satisfied()
+                || rt
+                    .operational
+                    .saved
+                    .qualification
+                    .completed(Milestone::FillTarget)
+        } else {
+            rt.operational
+                .saved
+                .qualification
+                .completed(Milestone::FillTarget)
+        };
+        if affected {
+            if nitrogen {
+                rt.operational.saved.qualification.invalidate_nitrogen()
+            } else {
+                rt.operational.saved.qualification.invalidate_fill()
+            }
+            .map_err(str::to_owned)?;
+            rt.operational.saved.fill_target_kg = None;
+            rt.operational.target_reached = None;
+            let sequences: &[crate::checklists::Sequence] = if nitrogen {
+                &[
+                    crate::checklists::Sequence::NitrogenTest,
+                    crate::checklists::Sequence::FillTarget,
+                ]
+            } else {
+                &[crate::checklists::Sequence::FillTarget]
+            };
+            for sequence in sequences {
+                rt.operational
+                    .saved
+                    .pending_checklists
+                    .push(crate::checklists::CompletionEvent {
+                        id: crate::checklists::paired::completion_event_id(),
+                        sequence: *sequence,
+                        at_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+                        action: crate::checklists::CompletionAction::Clear,
+                    });
+            }
+            // Evidence is revoked durably before edited settings can be saved.
+            // Any failure remains fail-closed and never dispatches outputs.
+            rt.operational.persist()?;
+            rt.operational.flush_checklists()?;
+        }
+    }
+    if nitrogen {
+        rt.engine.status.nitrogen_passed = false;
+        rt.engine.status.nitrogen_overridden = false;
+    }
+    Ok(())
 }
 async fn save_config(
     State(state): State<Arc<AppState>>,
@@ -819,38 +1149,24 @@ async fn save_config(
     let result = (|| -> Result<(), (StatusCode, String)> {
         let mut rt = state.gse.lock().unwrap();
         if rt.engine.active() {
-            return Err((StatusCode::CONFLICT, "Stop the active sequence before editing GSE configuration".into()));
+            return Err((
+                StatusCode::CONFLICT,
+                "Stop the active sequence before editing GSE configuration".into(),
+            ));
         }
         // Bulk settings may preserve or revoke consent, but never grant it.
         // Compare and assign under this same lock so an intervening nitrogen
         // test cannot have its invalidated confirmation revived by stale UI.
         if config.dry_self_test_confirmed && !rt.engine.config.dry_self_test_confirmed {
-            return Err((StatusCode::FORBIDDEN,
-                "Grant dry self-test confirmation through its dedicated control".into()));
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Grant dry self-test confirmation through its dedicated control".into(),
+            ));
         }
-        #[cfg(not(feature = "hitl_mode"))]
-        {
-            let mut before = rt.engine.config.clone();
-            let mut after = config.clone();
-            before.dry_self_test_confirmed = false;
-            after.dry_self_test_confirmed = false;
-            before.grouped_panel = after.grouped_panel;
-            if before != after
-                && rt
-                    .operational
-                    .saved
-                    .qualification
-                    .completed(Milestone::SelfTest)
-            {
-                return Err((StatusCode::CONFLICT, "Reset operation checks before changing test pressure limits".into()));
-            }
-        }
+        invalidate_changed_configuration(&mut rt, &config)
+            .map_err(|error| (StatusCode::CONFLICT, error))?;
         persist_settings(&config).map_err(|error| (StatusCode::CONFLICT, error))?;
         rt.engine.config = config;
-        #[cfg(feature = "hitl_mode")]
-        {
-            rt.engine.status.nitrogen_passed = false;
-        }
         Ok(())
     })();
     match result {
@@ -868,7 +1184,11 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     if crate::rrls::is_rrls() {
         return match crate::primary_mirror::gse_status(&state) {
             Some(observation) => Json(observation).into_response(),
-            None => (StatusCode::SERVICE_UNAVAILABLE, "Fresh primary GSE observations are unavailable; valve states are unknown.").into_response(),
+            None => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Fresh primary GSE observations are unavailable; valve states are unknown.",
+            )
+                .into_response(),
         };
     }
     let flight_state = *state.state.lock().unwrap();
@@ -993,11 +1313,77 @@ mod tests {
             (5.0, f32::NAN),
             (5.0, f32::INFINITY),
             (0.0, 0.0),
-            (-5.0, -5.0),
+            (-4.0, -5.0),
         ] {
             let mut runtime = Runtime::default();
             remember_automatic_cutoff_target(&mut runtime, mass, target);
             assert_eq!(runtime.operational.target_reached, None, "{mass}/{target}");
+        }
+    }
+    #[test]
+    fn precision_inputs_keep_source_age_and_replays_cannot_create_settled_samples() {
+        let utc = 1_798_000_000_000;
+        let mut previous = None;
+        assert_eq!(
+            source_sample_at(Some(utc - 1500), utc, 5000, &mut previous),
+            Some(3500)
+        );
+        assert_eq!(
+            source_sample_at(Some(utc - 1500), utc + 100, 5100, &mut previous),
+            None
+        );
+        assert_eq!(
+            source_sample_at(Some(utc - 3000), utc, 5000, &mut previous),
+            None
+        );
+        assert_eq!(
+            source_sample_at(Some(utc + 101), utc, 5000, &mut previous),
+            None
+        );
+        assert_eq!(
+            source_sample_at(Some(utc - 100), utc, 5000, &mut previous),
+            Some(4900)
+        );
+        assert_eq!(
+            source_sample_at(Some(utc - 200), utc, 5000, &mut previous),
+            None
+        );
+        let mut previous = None;
+        assert_eq!(
+            source_sample_at(Some(1234), utc, 5000, &mut previous),
+            Some(5000)
+        );
+        assert_eq!(
+            source_sample_at(Some(1234), utc + 100, 5100, &mut previous),
+            None
+        );
+        assert_eq!(
+            source_sample_at(Some(1235), utc + 100, 5100, &mut previous),
+            Some(5100)
+        );
+    }
+    #[tokio::test]
+    async fn replayed_valve_capture_does_not_acknowledge_a_new_target() {
+        let state = crate::state::tests::test_app_state().await;
+        state.gse.lock().unwrap().clock = Instant::now() - std::time::Duration::from_secs(5);
+        let utc = 1_798_000_000_000;
+        assert!(state.set_umbilical_valve_state_source(0, false, utc - 1000, utc));
+        let before = state.gse.lock().unwrap().valves[0].unwrap().at_ms;
+        state.set_pending_umbilical_valve_state(0, false);
+        assert!(!state.set_umbilical_valve_state_source(0, false, utc - 1000, utc + 100));
+        assert_eq!(state.gse.lock().unwrap().valves[0].unwrap().at_ms, before);
+        assert_eq!(state.get_pending_umbilical_valve_state(0), Some(false));
+        assert!(!state.set_umbilical_valve_state_source(0, true, utc - 3000, utc));
+        assert!(state.set_umbilical_valve_state_source(0, false, utc + 1, utc + 1));
+    }
+    #[test]
+    fn precision_band_and_overshoot_are_absolute_and_signed_not_percentage() {
+        let config = Config::default();
+        for sign in [1.0, -1.0] {
+            assert!(fill_mass_in_band(&config, 100.06 * sign, 100.0 * sign));
+            assert!(!fill_mass_in_band(&config, 99.6 * sign, 100.0 * sign));
+            assert!(!fill_stop_reached(&config, 100.0 * sign, 100.0 * sign));
+            assert!(fill_stop_reached(&config, 100.06 * sign, 100.0 * sign));
         }
     }
     #[test]
@@ -1178,6 +1564,63 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn manual_handoff_fences_prepared_effects_before_the_requested_command() {
+        let (state, sent, peer) = button_test_state().await;
+        let prepared = DISPATCH_GATE.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let manual_state = state.clone();
+        let manual = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let handled = handle_command(&manual_state, &TelemetryCommand::NitrogenClose);
+            finished_tx.send(handled).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            finished_rx.try_recv().is_err(),
+            "manual cancellation must wait for prepared admission"
+        );
+        apply(
+            &state,
+            Effects {
+                valves: vec![(3, true)],
+                notification: None,
+            },
+        );
+        drop(prepared);
+        assert!(
+            !finished_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        );
+        manual.join().unwrap();
+        // Model the existing outer command dispatch after handle_command(false).
+        crate::telemetry_task::queue_controller_command(
+            state.topology_router.get().unwrap(),
+            crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
+            &[12],
+        )
+        .unwrap();
+        pump_test_link(&state, &peer);
+        let before = sent.lock().unwrap().clone();
+        assert_eq!(
+            before,
+            vec![
+                ("ACTUATOR_COMMAND".into(), vec![9]),
+                ("ACTUATOR_COMMAND".into(), vec![12])
+            ]
+        );
+        tick(&state, true);
+        pump_test_link(&state, &peer);
+        assert_eq!(
+            *sent.lock().unwrap(),
+            before,
+            "cancelled ACK queues and startup must stay inert"
+        );
+    }
+
+    #[cfg(not(feature = "hitl_mode"))]
     pub(super) fn confirm_test_valves(state: &AppState, valves: [bool; 5]) {
         let mut rt = state.gse.lock().unwrap();
         for (key, open) in KEYS.into_iter().zip(valves) {
@@ -1187,115 +1630,149 @@ mod tests {
         rt.observe_mass(Some(0.0));
     }
 
+    #[cfg(feature = "hitl_mode")]
+    fn drive_button_phase(
+        state: &Arc<AppState>,
+        sent: &TestCommands,
+        peer: &sedsnet::router::Router,
+        done: Phase,
+        mass: f32,
+    ) {
+        let mut valves = gse_sequence::CLOSED;
+        let mut consumed = 0;
+        for _ in 0..200 {
+            pump_test_link(state, peer);
+            {
+                let commands = sent.lock().unwrap();
+                for (kind, bytes) in &commands[consumed..] {
+                    let indices = if kind == "VALVE_COMMAND" { 0..3 } else { 3..5 };
+                    let i = indices
+                        .into_iter()
+                        .find(|i| bytes[0] == OPEN[*i] || bytes[0] == CLOSE[*i])
+                        .unwrap();
+                    valves[i] = bytes[0] == OPEN[i];
+                }
+                consumed = commands.len();
+            }
+            {
+                let mut rt = state.gse.lock().unwrap();
+                let next = rt.now() + 100;
+                rt.clock = Instant::now() - std::time::Duration::from_millis(next);
+                for (key, open) in KEYS.into_iter().zip(valves) {
+                    rt.observe_valve(key, open);
+                }
+                rt.observe_pressure(Some(0.));
+                rt.observe_mass(Some(mass));
+            }
+            tick(state, true);
+            let rt = state.gse.lock().unwrap();
+            assert_ne!(
+                rt.engine.status.phase,
+                Phase::Fault,
+                "{}",
+                rt.engine.status.message
+            );
+            if rt.engine.status.phase == done && (done != Phase::Filling || valves[4]) {
+                return;
+            }
+        }
+        panic!("routed sequence did not reach {done:?}");
+    }
     #[tokio::test]
     #[cfg(feature = "hitl_mode")]
     async fn nitrogen_button_enters_baseline_and_requests_safe_valve_configuration() {
         let (state, sent, peer) = button_test_state().await;
-        // Decode the command name emitted by the frontend button.
-        let cmd: TelemetryCommand = serde_json::from_str("\"NitrogenTest\"").unwrap();
-        assert_eq!(command_allowed(&state, &cmd), Some(true));
-        assert!(handle_command(&state, &cmd));
+        assert_eq!(
+            command_allowed(&state, &TelemetryCommand::NitrogenTest),
+            Some(true)
+        );
+        assert!(handle_command(&state, &TelemetryCommand::NitrogenTest));
         pump_test_link(&state, &peer);
         assert_eq!(
-            state.gse.lock().unwrap().engine.status.phase,
-            Phase::BaselineSetup
-        );
-        assert_eq!(
             *sent.lock().unwrap(),
-            vec![
-                ("ACTUATOR_COMMAND".into(), vec![12]),
-                ("ACTUATOR_COMMAND".into(), vec![13]),
-                ("VALVE_COMMAND".into(), vec![3]),
-                ("VALVE_COMMAND".into(), vec![1]),
-                ("VALVE_COMMAND".into(), vec![2]),
-            ]
+            vec![("ACTUATOR_COMMAND".into(), vec![12])],
+            "serial close admission must precede later targets"
         );
-        for (key, expected) in KEYS.into_iter().zip(gse_sequence::RELIEVED) {
-            assert_eq!(state.get_pending_umbilical_valve_state(key), Some(expected));
-        }
-        confirm_test_valves(&state, gse_sequence::RELIEVED);
-        tick(&state, true);
+        drive_button_phase(&state, &sent, &peer, Phase::Baseline, 0.);
         assert_eq!(
-            state.gse.lock().unwrap().engine.status.phase,
-            Phase::Baseline
+            sent.lock().unwrap().len(),
+            5,
+            "all physical targets require reports"
         );
     }
-
     #[tokio::test]
     #[cfg(feature = "hitl_mode")]
     async fn fill_button_requires_nitrogen_pass_then_opens_only_after_confirmations_and_stops_at_mass()
      {
         let (state, sent, peer) = button_test_state().await;
-        let cmd: TelemetryCommand = serde_json::from_str("\"StartFill\"").unwrap();
-        assert!(handle_command(&state, &cmd));
-        pump_test_link(&state, &peer);
-        assert_eq!(state.gse.lock().unwrap().engine.status.phase, Phase::Idle);
-        assert!(state.get_pending_umbilical_valve_state(10).is_none());
+        assert!(handle_command(&state, &TelemetryCommand::StartFill));
         assert!(sent.lock().unwrap().is_empty());
         {
-            // The full nitrogen progression is covered by the sequence-engine test.
             let mut rt = state.gse.lock().unwrap();
             rt.engine.status.phase = Phase::Passed;
             rt.engine.status.nitrogen_passed = true;
             rt.engine.status.baseline = Some(gse_sequence::Baseline {
-                average_psi: 0.0,
-                min_psi: 0.0,
-                max_psi: 0.0,
+                average_psi: 0.,
+                min_psi: 0.,
+                max_psi: 0.,
                 noise_psi: 0.1,
                 samples: 50,
             });
         }
-        assert!(handle_command(&state, &cmd));
+        assert!(handle_command(&state, &TelemetryCommand::StartFill));
+        drive_button_phase(&state, &sent, &peer, Phase::Filling, 0.);
         pump_test_link(&state, &peer);
-        {
-            let rt = state.gse.lock().unwrap();
-            assert_eq!(rt.engine.status.phase, Phase::FillSetup);
-            assert_eq!(
-                rt.engine.nitrous_target_psi,
-                state.fill_targets_snapshot().nitrous.target_pressure_psi
-            );
-        }
-        assert_eq!(state.get_pending_umbilical_valve_state(10), Some(false));
-        tick(&state, true);
-        assert_eq!(
-            state.gse.lock().unwrap().engine.status.phase,
-            Phase::FillSetup
-        );
-        confirm_test_valves(&state, gse_sequence::FILL_READY);
-        tick(&state, true);
-        pump_test_link(&state, &peer);
-        assert_eq!(
-            state.gse.lock().unwrap().engine.status.phase,
-            Phase::Filling
-        );
-        assert_eq!(state.get_pending_umbilical_valve_state(10), Some(true));
         assert!(
             sent.lock()
                 .unwrap()
                 .contains(&("ACTUATOR_COMMAND".into(), vec![10]))
         );
         let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
-        state.gse.lock().unwrap().observe_mass(Some(target));
+        {
+            let mut rt = state.gse.lock().unwrap();
+            let stop = target + target.signum() * rt.engine.config.fill_overfill_kg;
+            rt.observe_mass(Some(stop));
+        }
         tick(&state, true);
-        pump_test_link(&state, &peer);
+        assert!(state.gse.lock().unwrap().fill_trim.is_some());
         assert_eq!(
             state.gse.lock().unwrap().engine.status.phase,
             Phase::PauseSetup
         );
-        assert_eq!(state.get_pending_umbilical_valve_state(10), Some(false));
-        assert!(
-            sent.lock()
-                .unwrap()
-                .iter()
-                .rev()
-                .take(5)
-                .any(|(kind, data)| kind == "ACTUATOR_COMMAND" && data == &[13])
-        );
-        confirm_test_valves(&state, gse_sequence::CLOSED);
-        tick(&state, true);
-        assert_eq!(state.gse.lock().unwrap().engine.status.phase, Phase::Paused);
+        drive_button_phase(&state, &sent, &peer, Phase::Paused, target);
+        assert!(state.gse.lock().unwrap().fill_trim.is_none());
     }
 
+    #[tokio::test]
+    #[cfg(feature = "hitl_mode")]
+    async fn disabling_mass_control_cancels_trim_without_changing_valves() {
+        let (state, sent, peer) = button_test_state().await;
+        {
+            let mut rt = state.gse.lock().unwrap();
+            let (controller, _) =
+                gse_sequence::fill_trim::Controller::start(rt.now(), 5., 200., &rt.engine.config)
+                    .unwrap();
+            rt.fill_trim = Some(controller);
+            rt.engine.status.phase = Phase::PauseSetup;
+        }
+        assert!(handle_command(
+            &state,
+            &TelemetryCommand::ToggleGroundStationControl
+        ));
+        {
+            let rt = state.gse.lock().unwrap();
+            assert!(!rt.ground_station_control);
+            assert!(rt.fill_trim.is_none());
+            assert_eq!(rt.engine.status.phase, Phase::Idle);
+            assert!(rt.manual_control);
+        }
+        tick(&state, true);
+        pump_test_link(&state, &peer);
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "turning off must not retain vent pulses or force other outputs"
+        );
+    }
     #[tokio::test]
     #[cfg(feature = "hitl_mode")]
     async fn button_rejections_are_visible_and_do_not_enqueue_valve_actions() {
@@ -1452,7 +1929,13 @@ mod tests {
 /// seconds to react to an incompatible supply opening during nitrous fill.
 pub fn report_safety(state: &Arc<AppState>) {
     #[cfg(not(feature = "hitl_mode"))]
-    check_report_safety(state);
+    {
+        {
+            let _dispatch = DISPATCH_GATE.lock().unwrap();
+            check_report_safety(state);
+        }
+        flush_effects(state);
+    }
     #[cfg(feature = "hitl_mode")]
     let _ = state;
 }
@@ -1478,7 +1961,10 @@ pub fn qd_confirmation(state: &AppState, sender: &str, key: u8, open: bool, sour
 /// RRLS relays telemetry and shared settings but cannot change live operation.
 fn require_primary_operational_station() -> Result<(), (StatusCode, String)> {
     if crate::rrls::is_rrls() {
-        Err((StatusCode::FORBIDDEN, "Live GSE operations are read-only on RRLS".into()))
+        Err((
+            StatusCode::FORBIDDEN,
+            "Live GSE operations are read-only on RRLS".into(),
+        ))
     } else {
         Ok(())
     }
@@ -1500,17 +1986,26 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
     #[cfg(not(feature = "hitl_mode"))]
     {
         if rt.automatic_abort_in_flight {
-            return Err((StatusCode::CONFLICT, "Automatic abort dispatch is still in progress".into()));
+            return Err((
+                StatusCode::CONFLICT,
+                "Automatic abort dispatch is still in progress".into(),
+            ));
         }
         _clear_reservation = automatic_abort::reserve_abort_clear(state, &mut rt);
     }
     // Preserve the existing validation priority even before a router exists.
     if rt.engine.active() {
-        return Err((StatusCode::CONFLICT, "Stop the active sequence first".into()));
+        return Err((
+            StatusCode::CONFLICT,
+            "Stop the active sequence first".into(),
+        ));
     }
     #[cfg(not(feature = "hitl_mode"))]
     if rt.operational.running {
-        return Err((StatusCode::CONFLICT, "Stop the active sequence first".into()));
+        return Err((
+            StatusCode::CONFLICT,
+            "Stop the active sequence first".into(),
+        ));
     }
     // Reservation excludes new automatic producers and Fire while ownership is
     // inspected. Do not hold GSE across router/transport locks or callbacks.
@@ -1522,8 +2017,10 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
     if router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT"))
         || state.has_pending_transport_tx()
     {
-        return Err((StatusCode::CONFLICT,
-            "Abort delivery is still pending; retry after the network drains".into()));
+        return Err((
+            StatusCode::CONFLICT,
+            "Abort delivery is still pending; retry after the network drains".into(),
+        ));
     }
     #[allow(unused_mut)] // Operational recovery mutates this guard outside HITL.
     let mut rt = state.gse.lock().unwrap();
@@ -1575,6 +2072,8 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let config = rt.engine.config.clone();
     rt.engine = Engine::default();
+    rt.manual_control = false;
+    rt.fill_trim = None;
     rt.engine.config = config;
     rt.engine.config.dry_self_test_confirmed = false;
     drop(rt);
@@ -1650,6 +2149,8 @@ async fn reset_qualification(State(state): State<Arc<AppState>>, headers: Header
         rt.engine.config = config;
         rt.engine.config.dry_self_test_confirmed = false;
         rt.operational.startup_configured = false;
+        rt.manual_control = false;
+        rt.fill_trim = None;
         if let Err(error) = rt.operational.persist() {
             return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
         }

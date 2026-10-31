@@ -44,7 +44,7 @@ pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool
         && rt.operational.saved.fill_target_kg == Some(target)
         && rt
             .fresh_mass(now)
-            .is_some_and(|mass| rt.fill_cutoff.target_met(mass.value, target))
+            .is_some_and(|mass| fill_mass_in_band(&rt.engine.config, mass.value, target))
         && matches!(
             rt.engine.status.phase,
             Phase::Passed | Phase::Paused | Phase::Idle
@@ -114,6 +114,7 @@ fn fault(rt: &mut Runtime, reason: Fault, message: &str) -> Effects {
     rt.operational.running = false;
     rt.operational.qd = QdWait::default();
     let _ = rt.operational.persist();
+    rt.fill_trim = None;
     rt.engine.fault(rt.now(), message)
 }
 pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase) {
@@ -131,7 +132,7 @@ pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase)
         && phase == Phase::Paused
         && rt.operational.target_reached.is_some_and(|target| {
             rt.fresh_mass(rt.now())
-                .is_some_and(|mass| rt.fill_cutoff.target_met(mass.value, target))
+                .is_some_and(|mass| fill_mass_in_band(&rt.engine.config, mass.value, target))
         })
     {
         rt.operational.saved.fill_target_kg = rt.operational.target_reached;
@@ -230,7 +231,8 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
     if !rt.operational.running {
         rt.engine.nitrous_target_psi = state.fill_targets_snapshot().nitrous.target_pressure_psi;
     }
-    if !rt.operational.startup_configured
+    if !rt.manual_control
+        && !rt.operational.startup_configured
         && rt.operational.topology_stable
         && interlock
         && rt.operational.saved.qualification.fault().is_none()
@@ -322,6 +324,7 @@ pub(super) fn handle_operational_command(state: &Arc<AppState>, cmd: &TelemetryC
             &[crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8],
         ) {
             Ok(()) => {
+                rt.effects_queued = true;
                 let now = rt.now();
                 rt.operational.qd.dispatched(now);
                 rt.operational.qd_dispatch_utc_ms = Some(qd_dispatch_timestamp_ms());
@@ -330,7 +333,6 @@ pub(super) fn handle_operational_command(state: &Arc<AppState>, cmd: &TelemetryC
                     crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8,
                     true,
                 );
-                crate::telemetry_task::flush_command_tx(router, "QD retract");
             }
             Err(error) => {
                 drop(rt);
@@ -395,16 +397,16 @@ pub(super) fn check_report_safety(state: &Arc<AppState>) {
         return;
     }
     let phase = rt.engine.status.phase;
-    let nitrous_session = matches!(
-        phase,
-        Phase::FillSetup | Phase::Filling | Phase::PauseSetup | Phase::Paused
-    );
+    let nitrous_session = rt.engine.nitrous_session()
+        || matches!(
+            phase,
+            Phase::FillSetup | Phase::Filling | Phase::PauseSetup | Phase::Paused
+        );
     let unexpected_supply = if nitrous_session && rt.valves[3].is_some_and(|v| v.open) {
         Some("Nitrogen opened during nitrous fill")
-    } else if matches!(
-        phase,
-        Phase::Raising | Phase::Settling | Phase::Holding | Phase::Paused
-    ) && rt.valves[4].is_some_and(|v| v.open)
+    } else if (!nitrous_session && rt.valves[3].is_some_and(|v| v.open)
+        || matches!(phase, Phase::Raising | Phase::Settling | Phase::Holding))
+        && rt.valves[4].is_some_and(|v| v.open)
     {
         Some("Nitrous opened outside nitrous fill")
     } else {
@@ -523,6 +525,146 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn trim_failure_uses_existing_emergency_relief_without_waiting_for_ack() {
+        let state = fixture().await;
+        {
+            let mut rt = state.gse.lock().unwrap();
+            let (controller, _) =
+                gse_sequence::fill_trim::Controller::start(rt.now(), 5., 200., &rt.engine.config)
+                    .unwrap();
+            rt.fill_trim = Some(controller);
+            rt.engine.status.phase = Phase::PauseSetup;
+            rt.operational.running = true;
+            rt.observe_mass(None);
+        }
+        tick(&state, true);
+        assert_eq!(state.gse.lock().unwrap().engine.status.phase, Phase::Fault);
+        for (key, requested) in KEYS.into_iter().zip(gse_sequence::RELIEVED) {
+            assert_eq!(
+                state.get_pending_umbilical_valve_state(key),
+                Some(requested)
+            );
+        }
+        assert!(state.gse.lock().unwrap().fill_trim.is_none());
+        cleanup(&state);
+    }
+    #[tokio::test]
+    async fn changed_plans_revoke_only_affected_qualification_without_outputs() {
+        let state = fixture().await;
+        let path = armed_fixture_for_test(&state, state.topology_router.get().unwrap());
+        let mut rt = state.gse.lock().unwrap();
+        // A representation-only editor round trip preserves the proven plan.
+        let mut config = rt.engine.config.clone();
+        config.nitrogen_steps = config.nitrogen_plan().unwrap();
+        assert!(!nitrogen_configuration_changed(&rt.engine.config, &config));
+        config.fill_settle_ms += 1000;
+        invalidate_changed_configuration(&mut rt, &config).unwrap();
+        let saved = operational::Saved::load(&path).unwrap();
+        assert!(saved.qualification.completed(Milestone::SelfTest));
+        assert!(saved.qualification.nitrogen_satisfied());
+        assert!(!saved.qualification.completed(Milestone::FillTarget));
+        rt.engine.config = config.clone();
+        config.nitrogen_steps[0].hold_ms += 1000;
+        invalidate_changed_configuration(&mut rt, &config).unwrap();
+        let saved = operational::Saved::load(&path).unwrap();
+        assert!(saved.qualification.completed(Milestone::SelfTest));
+        assert!(!saved.qualification.nitrogen_satisfied());
+        assert!(!saved.qualification.completed(Milestone::FillTarget));
+        assert!(
+            state
+                .pending_umbilical_valve_states
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        drop(rt);
+        cleanup(&state);
+    }
+    #[tokio::test]
+    async fn manual_handoff_preserves_reports_and_nitrous_crossflow_guard() {
+        let state = fixture().await;
+        apply_cold_flow_test_prerequisites(&state);
+        {
+            let mut rt = state.gse.lock().unwrap();
+            let input = rt.input(true, true);
+            rt.engine.request(Action::StartFill, input).unwrap();
+            rt.engine.status.phase = Phase::Filling;
+            rt.observe_valve(10, true);
+            rt.operational.running = true;
+        }
+        state.set_umbilical_valve_state(0, false);
+        let mut policy = state.action_policy_snapshot();
+        policy.controls.retain(|control| control.cmd != "Pilot");
+        policy.controls.push(ActionControl {
+            cmd: "Pilot".into(),
+            enabled: true,
+            blink: BlinkMode::None,
+            actuated: Some(false),
+        });
+        state.set_action_policy(policy);
+        assert!(
+            state.is_command_allowed(&TelemetryCommand::Pilot),
+            "manual override must be reachable during fill: gate={:?} policy={:?}",
+            command_allowed(&state, &TelemetryCommand::Pilot),
+            state.action_policy_snapshot()
+        );
+        let before = state.gse.lock().unwrap().valves;
+        assert!(!handle_command(&state, &TelemetryCommand::Pilot));
+        {
+            let rt = state.gse.lock().unwrap();
+            assert_eq!(rt.engine.status.phase, Phase::Idle);
+            assert!(!rt.engine.claimed);
+            assert!(rt.manual_control);
+            assert!(!rt.operational.running);
+            assert_eq!(
+                rt.valves.map(|v| v.map(|v| (v.open, v.at_ms))),
+                before.map(|v| v.map(|v| (v.open, v.at_ms)))
+            );
+            assert!(rt.engine.nitrous_session());
+            assert!(rt.engine.status.nitrogen_passed);
+            assert!(rt.engine.status.self_test_locked);
+        }
+        assert!(
+            state
+                .pending_umbilical_valve_states
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "handoff must not issue CLOSED/RELIEVED"
+        );
+        assert_eq!(
+            command_allowed(&state, &TelemetryCommand::Nitrogen),
+            Some(false)
+        );
+        tick(&state, true);
+        assert_eq!(
+            state.gse.lock().unwrap().engine.status.phase,
+            Phase::Idle,
+            "no startup or legacy takeover"
+        );
+        state.gse.lock().unwrap().observe_valve(9, true);
+        report_safety(&state);
+        assert_eq!(
+            state.gse.lock().unwrap().engine.status.phase,
+            Phase::Fault,
+            "manual mode must retain crossflow protection"
+        );
+        cleanup(&state);
+    }
+    fn apply_cold_flow_test_prerequisites(state: &AppState) {
+        let mut rt = state.gse.lock().unwrap();
+        rt.engine.status.nitrogen_passed = true;
+        rt.engine.status.self_test_locked = true;
+        rt.engine.status.phase = Phase::Passed;
+        rt.engine.status.baseline = Some(gse_sequence::Baseline {
+            average_psi: 0.,
+            min_psi: 0.,
+            max_psi: 0.,
+            noise_psi: 0.1,
+            samples: 50,
+        });
+    }
+    #[tokio::test]
     async fn operator_procedure_completes_over_routed_commands_and_persists_each_check() {
         use crate::gse::tests::{button_test_state, confirm_test_valves, pump_test_link};
         let (state, sent, peer) = button_test_state().await;
@@ -621,16 +763,16 @@ mod tests {
                             0.0
                         };
                     rt.observe_pressure(Some(pressure));
-                    let mass = if phase == Phase::Filling
-                        || phase == Phase::PauseSetup
-                        || phase == Phase::Paused
-                    {
-                        state.fill_targets_snapshot().nitrous.target_mass_kg
+                    let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
+                    let mass = if phase == Phase::Filling {
+                        target + target.signum() * rt.engine.config.fill_overfill_kg
+                    } else if matches!(phase, Phase::PauseSetup | Phase::Paused) {
+                        target
                     } else {
                         0.0
                     };
                     rt.observe_mass(Some(mass));
-                    if phase == Phase::Raising {
+                    if phase == Phase::Raising && valves[3] {
                         assert_eq!(valves, [false, false, false, true, false]);
                     }
                     if phase == Phase::Holding {

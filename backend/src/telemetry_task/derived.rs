@@ -679,11 +679,11 @@ pub(super) async fn emit_derived_loadcell_rows(
             vec![Some(calibrated_value)],
         )],
         loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
-            state
-                .gse
-                .lock()
-                .unwrap()
-                .observe_pressure(Some(calibrated_value));
+            state.gse.lock().unwrap().observe_pressure_source(
+                Some(calibrated_value),
+                sample.source_timestamp_ms,
+                super::recording_network_utc_ms().unwrap_or(sample.ts_ms),
+            );
             {
                 let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
                 *pressure = Some(calibrated_value);
@@ -706,7 +706,11 @@ pub(super) async fn emit_derived_loadcell_rows(
         let flight_state = *state.state.lock().unwrap();
         let target = loadcell::active_fill_target_mass_kg(&fill_targets, flight_state);
         *state.latest_fill_mass_kg.lock().unwrap() = mass;
-        state.gse.lock().unwrap().observe_mass(mass);
+        state.gse.lock().unwrap().observe_mass_source(
+            mass,
+            sample.source_timestamp_ms,
+            super::recording_network_utc_ms().unwrap_or(sample.ts_ms),
+        );
         rows.push((
             loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
             vec![mass.map(|mass| loadcell::fill_percent(target, mass))],

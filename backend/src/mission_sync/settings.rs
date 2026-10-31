@@ -22,15 +22,36 @@ pub struct Settings {
 #[serde(deny_unknown_fields)]
 struct Limits {
     nitrogen_target_psi: f32,
+    #[serde(default)]
+    nitrogen_steps: Vec<gse_sequence::NitrogenStep>,
+    #[serde(default = "default_fill_overfill")]
+    fill_overfill_kg: f32,
+    #[serde(default = "default_fill_tolerance")]
+    fill_tolerance_kg: f32,
+    #[serde(default = "default_fill_settle")]
+    fill_settle_ms: u64,
     pressure_step_psi: f32,
     pressure_ceiling_psi: Option<f32>,
     maximum_zero_offset_psi: Option<f32>,
     grouped_panel: bool,
 }
+fn default_fill_overfill() -> f32 {
+    gse_sequence::Config::default().fill_overfill_kg
+}
+fn default_fill_tolerance() -> f32 {
+    gse_sequence::Config::default().fill_tolerance_kg
+}
+fn default_fill_settle() -> u64 {
+    gse_sequence::Config::default().fill_settle_ms
+}
 impl Limits {
     fn from_config(c: &gse_sequence::Config) -> Self {
         Self {
             nitrogen_target_psi: c.nitrogen_target_psi,
+            nitrogen_steps: c.nitrogen_steps.clone(),
+            fill_overfill_kg: c.fill_overfill_kg,
+            fill_tolerance_kg: c.fill_tolerance_kg,
+            fill_settle_ms: c.fill_settle_ms,
             pressure_step_psi: c.pressure_step_psi,
             pressure_ceiling_psi: c.pressure_ceiling_psi,
             maximum_zero_offset_psi: c.maximum_zero_offset_psi,
@@ -39,6 +60,10 @@ impl Limits {
     }
     fn install(self, c: &mut gse_sequence::Config) {
         c.nitrogen_target_psi = self.nitrogen_target_psi;
+        c.nitrogen_steps = self.nitrogen_steps;
+        c.fill_overfill_kg = self.fill_overfill_kg;
+        c.fill_tolerance_kg = self.fill_tolerance_kg;
+        c.fill_settle_ms = self.fill_settle_ms;
         c.pressure_step_psi = self.pressure_step_psi;
         c.pressure_ceiling_psi = self.pressure_ceiling_psi;
         c.maximum_zero_offset_psi = self.maximum_zero_offset_psi;
@@ -100,7 +125,26 @@ impl Settings {
             _ => anyhow::bail!("Unsupported inert mission document"),
         };
         // Reject missing/unknown fields and values that saving would silently change.
-        anyhow::ensure!(&canonical == value, "Noncanonical saved mission settings");
+        // Older paired installations omit these additive inert settings. Only
+        // those exact omissions receive defaults; all original fields remain
+        // mandatory and unknown/noncanonical values still fail closed.
+        let mut expected = value.clone();
+        if key == LIMITS {
+            for field in [
+                "nitrogen_steps",
+                "fill_overfill_kg",
+                "fill_tolerance_kg",
+                "fill_settle_ms",
+            ] {
+                if !expected
+                    .as_object()
+                    .is_some_and(|object| object.contains_key(field))
+                {
+                    expected[field] = canonical[field].clone();
+                }
+            }
+        }
+        anyhow::ensure!(canonical == expected, "Noncanonical saved mission settings");
         Ok(next)
     }
     pub fn validate_document(
@@ -190,6 +234,68 @@ mod tests {
             &peers(),
         )
         .unwrap()
+    }
+    #[test]
+    fn nitrogen_plan_and_fill_precision_pair_without_local_evidence_or_outputs() {
+        let mut source = model();
+        source.limits.nitrogen_steps = vec![
+            gse_sequence::NitrogenStep {
+                target_psi: 35.,
+                settle_ms: 4000,
+                hold_ms: 7000,
+            },
+            gse_sequence::NitrogenStep {
+                target_psi: 135.,
+                settle_ms: 6000,
+                hold_ms: 9000,
+            },
+        ];
+        source.limits.fill_overfill_kg = 0.09;
+        source.limits.fill_tolerance_kg = 0.06;
+        source.limits.fill_settle_ms = 4500;
+        let document = source.snapshot().unwrap()[LIMITS].clone();
+        let mut destination = model();
+        destination.limits.dry_self_test_confirmed = true;
+        let imported = destination.decode(LIMITS, &document).unwrap();
+        assert_eq!(imported.limits.nitrogen_steps, source.limits.nitrogen_steps);
+        assert_eq!(imported.limits.nitrogen_target_psi(), 135.);
+        assert_eq!(imported.limits.fill_overfill_kg, 0.09);
+        assert_eq!(imported.limits.fill_tolerance_kg, 0.06);
+        assert_eq!(imported.limits.fill_settle_ms, 4500);
+        assert!(
+            imported.limits.dry_self_test_confirmed,
+            "local evidence is not imported"
+        );
+        for (field, bad) in [
+            ("fill_overfill_kg", json!(0.11)),
+            ("fill_tolerance_kg", json!(0.08)),
+            ("fill_settle_ms", json!(999)),
+        ] {
+            let mut invalid = document.clone();
+            invalid[field] = bad;
+            assert!(destination.decode(LIMITS, &invalid).is_err());
+        }
+        let mut invalid = document.clone();
+        invalid["nitrogen_steps"][1]["target_psi"] = json!(20.);
+        assert!(destination.decode(LIMITS, &invalid).is_err());
+    }
+    #[test]
+    fn legacy_paired_limits_get_only_additive_defaults() {
+        let destination = model();
+        let mut legacy = destination.snapshot().unwrap()[LIMITS].clone();
+        for field in [
+            "nitrogen_steps",
+            "fill_overfill_kg",
+            "fill_tolerance_kg",
+            "fill_settle_ms",
+        ] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        let imported = destination.decode(LIMITS, &legacy).unwrap();
+        assert!(imported.limits.nitrogen_steps.is_empty());
+        assert_eq!(imported.limits.fill_settle_ms, 3000);
+        legacy.as_object_mut().unwrap().remove("pressure_step_psi");
+        assert!(destination.decode(LIMITS, &legacy).is_err());
     }
     #[test]
     fn catalog_contains_only_inert_fields_and_preserves_local_dry_confirmation() {
