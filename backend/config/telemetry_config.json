@@ -821,6 +821,36 @@
       ],
       "reliable": "Off",
       "priority": 16
+    },
+    {
+      "name": "DAQ_SD_HEALTH",
+      "doc": "DAQ-only SD status companion: flags, write/flush ages, init stage/retry count, accepted/completed retry tokens and init failures; ages UINT32_MAX mean never.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt32",
+        "count": 8
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable": "Off",
+      "priority": 0
+    },
+    {
+      "name": "DAQ_SD_RETRY",
+      "doc": "One-shot nonzero manual SD reinitialization token; never a retained variable or a format request.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt32",
+        "count": 1
+      },
+      "endpoints": [
+        "SD_CARD"
+      ],
+      "reliable": "Unordered",
+      "priority": 240
     }
   ]
 }

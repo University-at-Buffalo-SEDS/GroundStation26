@@ -72,6 +72,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn daq_storage_types_keep_distinct_canonical_ids_and_shapes() {
+        initialize().unwrap();
+        assert_eq!(data_type("DAQ_SD_HEALTH").as_u32(), 92486907);
+        assert_eq!(data_type("DAQ_SD_RETRY").as_u32(), 24116261);
+        for (name, count) in [
+            ("BOARD_HEALTH", 24),
+            ("DAQ_SD_HEALTH", 8),
+            ("DAQ_SD_RETRY", 1),
+        ] {
+            let good = vec![0u8; count * 4];
+            assert!(
+                sedsnet::packet::Packet::new(
+                    data_type(name),
+                    &[endpoint("GROUND_STATION")],
+                    "DAQ",
+                    1,
+                    good.into()
+                )
+                .is_ok()
+            );
+            let bad = vec![0u8; (count + 1) * 4];
+            assert!(
+                sedsnet::packet::Packet::new(
+                    data_type(name),
+                    &[endpoint("GROUND_STATION")],
+                    "DAQ",
+                    1,
+                    bad.into()
+                )
+                .is_err()
+            );
+        }
+        let config: serde_json::Value = serde_json::from_slice(SCHEMA_JSON).unwrap();
+        let retry = config["types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|ty| ty["name"] == "DAQ_SD_RETRY")
+            .unwrap();
+        assert_eq!(retry["reliable"], "Unordered");
+        assert_eq!(retry["class"], "Data");
+    }
+
+    #[test]
     fn chamber_wire_roundtrip_is_additive_float_triplet() {
         initialize().unwrap();
         assert_eq!(data_type("DAQ_LOADCELL_CHAMBER"), DataType(259346466));

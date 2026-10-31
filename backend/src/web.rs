@@ -346,6 +346,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/auth/logout", post(logout))
         .route("/api/recent", get(get_recent))
         .route("/api/command", post(send_command_entry))
+        .route("/api/network-health/daq/sd/retry", post(crate::daq_sd::retry))
         .route("/api/rrls/control", get(crate::command_proxy::get_status))
         .route("/api/auto_zero", get(get_auto_zero).post(set_auto_zero))
         .route("/api/alerts", get(get_alerts))

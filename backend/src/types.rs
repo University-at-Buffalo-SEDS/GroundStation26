@@ -297,6 +297,25 @@ pub struct BoardDiagnostics {
     pub sd_max_write_ms: Option<u32>,
     pub adc_overruns: Option<u32>,
     pub diagnostic_send_failures: u32,
+    /// DAQ-only SD companion report. Missing on older firmware/other boards.
+    #[serde(default)]
+    pub sd_status_received_age_ms: Option<u64>,
+    #[serde(default)]
+    pub sd_flags: Option<u32>,
+    #[serde(default)]
+    pub sd_last_write_age_ms: Option<u32>,
+    #[serde(default)]
+    pub sd_last_flush_age_ms: Option<u32>,
+    #[serde(default)]
+    pub sd_init_stage: Option<u32>,
+    #[serde(default)]
+    pub sd_retry_count: Option<u32>,
+    #[serde(default)]
+    pub sd_retry_requested_token: Option<u32>,
+    #[serde(default)]
+    pub sd_retry_completed_token: Option<u32>,
+    #[serde(default)]
+    pub sd_init_failures: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]

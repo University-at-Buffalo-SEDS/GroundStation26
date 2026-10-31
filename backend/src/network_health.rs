@@ -5,9 +5,11 @@ pub const TIMEOUT_MS: u64 = 12_000;
 #[derive(Default)]
 pub struct Tracker {
     boards: HashMap<String, Record>,
+    pub(crate) sd_retry_gate: crate::daq_sd::RetryGate,
 }
 struct Record {
     diagnostics: Option<(BoardDiagnostics, Instant)>,
+    sd_status: Option<(crate::daq_sd::SdStatus, Instant)>,
     first: Instant,
     last: Instant,
     healthy: bool,
@@ -105,6 +107,7 @@ pub(crate) fn decode_diagnostics(w: &[u32]) -> Option<BoardDiagnostics> {
         sd_max_write_ms: value(21, 128),
         adc_overruns: value(22, 32),
         diagnostic_send_failures: w[23],
+        ..Default::default()
     })
 }
 
@@ -116,6 +119,7 @@ impl Tracker {
                 sender.to_owned(),
                 Record {
                     diagnostics: None,
+                    sd_status: None,
                     first: now,
                     last: now,
                     healthy: true,
@@ -150,6 +154,31 @@ impl Tracker {
         self.record(&sender, now, wall_ms).diagnostics = Some((report, now));
         true
     }
+    pub fn observe_sd_status(
+        &mut self,
+        sender: &str,
+        words: &[u32],
+        now: Instant,
+        wall_ms: u64,
+    ) -> bool {
+        if canonical_sender_id(sender.trim()) != "DAQ" {
+            return false;
+        }
+        let Some(status) = crate::daq_sd::SdStatus::decode(words) else {
+            return false;
+        };
+        self.record("DAQ", now, wall_ms).sd_status = Some((status, now));
+        true
+    }
+
+    pub(crate) fn daq_sd_status(&self, now: Instant) -> Option<(crate::daq_sd::SdStatus, u64)> {
+        self.boards
+            .get("DAQ")?
+            .sd_status
+            .as_ref()
+            .map(|(status, received)| (status.clone(), elapsed(now, *received)))
+    }
+
     pub fn observe(&mut self, sender: &str, now: Instant, wall_ms: u64) {
         let sender = canonical_sender_id(sender.trim());
         if sender.is_empty() || sender == "GS" || sender.starts_with('@') {
@@ -209,6 +238,9 @@ impl Tracker {
                 diagnostics: r.diagnostics.as_ref().map(|(report, received)| {
                     let mut report = report.clone();
                     report.received_age_ms = elapsed(now, *received);
+                    if let Some((status, received)) = &r.sd_status {
+                        status.overlay(&mut report, elapsed(now, *received));
+                    }
                     report
                 }),
                 sender_id: sender.clone(),
@@ -325,6 +357,9 @@ mod tests {
 #[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+    fn at(t: Instant, ms: u64) -> Instant {
+        t + std::time::Duration::from_millis(ms)
+    }
     #[test]
     fn exact_uptime_optional_capabilities_and_invalid_versions() {
         let mut words = [0; 24];
@@ -363,5 +398,47 @@ mod diagnostic_tests {
         assert!(!rows[0].healthy);
         assert_eq!(rows[0].diagnostics.as_ref().unwrap().received_age_ms, 16000);
         assert!(tracker.snapshot(at, true).is_empty());
+    }
+    #[test]
+    fn sd_companion_has_independent_freshness_and_cannot_replace_base_health() {
+        let mut tracker = Tracker::default();
+        let now = Instant::now();
+        let mut base = [0; 24];
+        base[0] = 1;
+        base[4] = 1000;
+        base[2] = 123;
+        assert!(tracker.observe_diagnostics("DAQ", &base, now, 1000));
+        let sd = [3, u32::MAX, 10, 5, 2, 42, 41, 1];
+        assert!(!tracker.observe_sd_status("FC", &sd, now, 1000));
+        assert!(tracker.observe_sd_status("DAQ", &sd, at(now, 100), 1100));
+        let row = tracker.snapshot(at(now, 500), false).remove(0);
+        let report = row.diagnostics.unwrap();
+        assert_eq!(report.version, 1);
+        assert_eq!(report.uptime_ticks, 123);
+        assert_eq!(report.received_age_ms, 500);
+        assert_eq!(report.sd_status_received_age_ms, Some(400));
+        assert_eq!(report.sd_last_write_age_ms, None);
+        assert_eq!(report.sd_last_flush_age_ms, Some(10));
+        assert_eq!(
+            row.rx_observations, 0,
+            "diagnostics do not fabricate ordinary traffic"
+        );
+        base[2] = 456;
+        assert!(tracker.observe_diagnostics("DAQ", &base, at(now, 900), 1900));
+        let report = tracker
+            .snapshot(at(now, 1000), false)
+            .remove(0)
+            .diagnostics
+            .unwrap();
+        assert_eq!(report.uptime_ticks, 456);
+        assert_eq!(report.received_age_ms, 100);
+        assert_eq!(report.sd_status_received_age_ms, Some(900));
+        assert_eq!(report.sd_retry_requested_token, Some(42));
+        assert!(!tracker.observe_sd_status("DAQ", &[0; 7], at(now, 1100), 2100));
+        assert_eq!(tracker.daq_sd_status(at(now, 13_000)).unwrap().1, 12_900);
+        assert!(
+            decode_diagnostics(&[0; 32]).is_none(),
+            "BOARD_HEALTH remains exactly24 words/version1"
+        );
     }
 }
