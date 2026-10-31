@@ -145,7 +145,11 @@ Purpose:
 
 Expected response:
 
-- Default/fallback: JSON array of `TelemetryRow`.
+- UI bootstrap: `/api/recent?display=true&max_rows=12000` returns a JSON array
+  bounded to 12,000 rows (requested limits clamp to 512–20,000). Each sender/type
+  retains its first/latest samples and bucket extrema; sparse pressure streams
+  are not displaced by dense load-cell history. This is display sampling only.
+- Default/fallback without `display=true`: JSON array of `TelemetryRow`.
 - Preferred when the client sends `Accept: application/x-ndjson`: NDJSON stream with one `TelemetryRow` JSON object per line.
 
 Shape:
@@ -691,7 +695,12 @@ Notes:
 ### Live message semantics
 
 - `TelemetryBatch`
-  High-rate telemetry rows. This is the hot path for charts and latest-value caches.
+  High-rate live display rows. A slow client retains each `(sender_id, data_type)`
+  stream's newest unsent row in one bounded frame (up to 1024 streams), separate from
+  ordered warnings, confirmations and state changes. Unsent frames older than 250 ms
+  are skipped; socket writes stalled for two seconds close the session for reconnect.
+  This display coalescing does not change acquisition, database recording, exports or
+  `/api/recent` history. Use recorded/history data for complete analysis.
 - `Warning` and `Error`
   Append to the respective alert lists.
 - `FlightState`

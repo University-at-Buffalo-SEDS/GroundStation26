@@ -3160,7 +3160,10 @@ pub(super) fn spawn_router_worker_thread(
                 }
                 if timesync_enabled() {
                     if last_clock_refresh.elapsed() >= Duration::from_secs(1) {
-                        super::refresh_host_network_time(&router, get_current_timestamp_ms());
+                        crate::system_clock::refresh_network_source(
+                            &router,
+                            get_current_timestamp_ms(),
+                        );
                         last_clock_refresh = std::time::Instant::now();
                     }
                     if let Ok(queued) = router.poll_timesync() {

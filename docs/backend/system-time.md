@@ -15,7 +15,10 @@ Network UTC is also available in Actions and Settings in every flight state.
 `POST /api/network_time` accepts `{"source":"client","utc_ms":1793052000000}`
 with the same explicit `set_system_time` account permission. This updates the
 primary station's SEDSnet UTC source, without invoking systemd or changing the
-host wall clock. Existing network clocks converge using SEDSnet's bounded slew;
+host wall clock. The selected client source remains anchored to SEDSnet's
+monotonic clock; periodic host-clock fallback refreshes do not overwrite it.
+The API reports admission failures instead of claiming success. Existing network
+clocks converge using SEDSnet's bounded slew;
 they do not immediately jump to the requested value. Network time labels use
 the router's synchronized UTC when available. RRLS must receive its time from
 the primary; direct network-clock writes on RRLS return a conflict response.

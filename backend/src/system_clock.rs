@@ -25,6 +25,48 @@ pub enum SyncRequest {
     Network,
 }
 
+// SEDSnet already anchors a supplied full UTC reading to its monotonic clock
+// and slews corrections. Remember which router has an operator-selected source
+// so the one-second host-clock fallback cannot overwrite that selection.
+static CLIENT_TIME_ROUTERS: std::sync::Mutex<Vec<std::sync::Weak<sedsnet::router::Router>>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn retain_live_client_sources(sources: &mut Vec<std::sync::Weak<sedsnet::router::Router>>) {
+    sources.retain(|source| source.strong_count() != 0);
+}
+
+pub(crate) fn refresh_network_source(router: &sedsnet::router::Router, host_utc_ms: u64) {
+    let mut sources = CLIENT_TIME_ROUTERS.lock().unwrap();
+    retain_live_client_sources(&mut sources);
+    if sources
+        .iter()
+        .any(|source| std::ptr::eq(source.as_ptr(), router))
+    {
+        // Keep the SDK's monotonic anchor and normal GPS/remote election.
+        // A wall-clock refresh here would silently undo Use client time.
+        return;
+    }
+    crate::telemetry_task::refresh_host_network_time(router, host_utc_ms);
+}
+
+fn select_client_network_source(
+    router: &Arc<sedsnet::router::Router>,
+    utc_ms: i64,
+) -> Result<(), String> {
+    let mut sources = CLIENT_TIME_ROUTERS.lock().unwrap();
+    retain_live_client_sources(&mut sources);
+    // Hold policy selection through SDK admission so a concurrent periodic
+    // host refresh cannot win between the accepted update and source commit.
+    set_network_utc(router, utc_ms)?;
+    if !sources
+        .iter()
+        .any(|source| source.ptr_eq(&Arc::downgrade(router)))
+    {
+        sources.push(Arc::downgrade(router));
+    }
+    Ok(())
+}
+
 fn snapshot(can_set: bool) -> ClockStatus {
     ClockStatus {
         utc_ms: SystemTime::now()
@@ -159,8 +201,11 @@ pub(crate) async fn apply_authorized_network_utc(
         )
             .into_response();
     };
-    if let Err(error) = set_network_utc(router, utc_ms) {
+    if let Err(error) = time_argument(utc_ms) {
         return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+    if let Err(error) = select_client_network_source(router, utc_ms) {
+        return (StatusCode::SERVICE_UNAVAILABLE, error).into_response();
     }
     log::info!(
         "Network UTC source set by {:?} to {utc_ms} ms",
@@ -169,16 +214,57 @@ pub(crate) async fn apply_authorized_network_utc(
     Json(snapshot(true)).into_response()
 }
 
-fn set_network_utc(router: &sedsnet::router::Router, utc_ms: i64) -> Result<(), &'static str> {
-    time_argument(utc_ms)?;
-    router.set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(
-        utc_ms as u64,
-    ));
-    Ok(())
+fn set_network_utc(router: &sedsnet::router::Router, utc_ms: i64) -> Result<(), String> {
+    time_argument(utc_ms).map_err(str::to_string)?;
+    router
+        .try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(
+            utc_ms as u64,
+        ))
+        .map_err(|error| format!("Network UTC source was not admitted: {error}"))
 }
 
 #[cfg(test)]
 mod network_tests {
+    #[test]
+    fn client_source_survives_periodic_host_refresh_and_advances_monotonically() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+        let clock = Arc::new(AtomicU64::new(0));
+        let input = clock.clone();
+        let router = Arc::new(sedsnet::router::Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([]),
+            Box::new(move || input.load(Ordering::Relaxed)),
+        ));
+        let client = 1_800_000_000_000;
+        super::select_client_network_source(&router, client).unwrap();
+        for elapsed in 1..=5 {
+            clock.store(elapsed * 1000, Ordering::Relaxed);
+            super::refresh_network_source(&router, (client + 3_600_000) as u64);
+            assert_eq!(
+                router.network_time_ms(),
+                Some(client as u64 + elapsed * 1000)
+            );
+        }
+        // Failed input cannot replace the accepted source or its anchor.
+        assert!(super::select_client_network_source(&router, -1).is_err());
+        assert_eq!(router.network_time_ms(), Some(client as u64 + 5000));
+    }
+
+    #[test]
+    fn host_fallback_remains_available_on_other_routers() {
+        use std::sync::Arc;
+        let selected = Arc::new(sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([]),
+        ));
+        super::select_client_network_source(&selected, 1_800_000_000_000).unwrap();
+        let other = sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([]));
+        super::refresh_network_source(&other, 1_900_000_000_000);
+        let actual = other.network_time_ms().unwrap();
+        assert!((1_900_000_000_000..1_900_000_001_000).contains(&actual));
+    }
+
     #[test]
     fn utc_corrections_steer_the_existing_network_clock_without_a_hard_jump() {
         use std::sync::{
