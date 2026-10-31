@@ -9,6 +9,35 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+// One durable desired revision, not a periodic route/clock refresh. An older
+// in-flight submission must never clear or replace a newer T0/reset request.
+#[derive(Default)]
+struct PendingDaqClock {
+    desired: Option<([u64; 2], u64)>,
+    highest_revision: u64,
+}
+impl PendingDaqClock {
+    fn record(&mut self, pair: [u64; 2], revision: u64) {
+        if revision >= self.highest_revision {
+            self.highest_revision = revision;
+            self.desired = Some((pair, revision));
+        }
+    }
+    fn accepted(&mut self, snapshot: ([u64; 2], u64)) {
+        if self.desired == Some(snapshot) {
+            self.desired = None;
+        }
+    }
+}
+static PENDING_DAQ_CLOCK: Mutex<PendingDaqClock> = Mutex::new(PendingDaqClock {
+    desired: None,
+    highest_revision: 0,
+});
+static DAQ_CLOCK_RETRY_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static DAQ_CLOCK_RETRY_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 const DEFAULT_CACHE_PATH: &str = "backend/data/network_variables.json";
 const UNDERGLOW_TYPE: &str = "AV_BAY_UNDERGLOW";
 const FLIGHT_BUZZER_TYPE: &str = "FLIGHT_BUZZER";
@@ -584,10 +613,45 @@ pub fn set_daq_log_clock(
         let mut guard = store()
             .lock()
             .expect("network-variable store lock poisoned");
-        commit_daq_clock_pair(&mut guard, pair, get_current_timestamp_ms())?
+        let revision = commit_daq_clock_pair(&mut guard, pair, get_current_timestamp_ms())?;
+        // Publish ordering follows the durable commit; no SDK lock is taken
+        // while holding either application lock.
+        PENDING_DAQ_CLOCK.lock().unwrap().record(pair, revision);
+        revision
     };
     request.submit(router, daq_log_clock_packet(pair, stamp)?)?;
+    PENDING_DAQ_CLOCK.lock().unwrap().accepted((pair, stamp));
+    DAQ_CLOCK_RETRY_WARNED.store(false, Ordering::Relaxed);
     Ok(())
+}
+
+/// Retry only an unadmitted durable revision. Keep its original deadline/stamp.
+/// Once admitted, SDK reliable delivery and managed reconnect replay own it.
+/// Returns true only when an outstanding snapshot was admitted this call.
+pub fn retry_pending_daq_log_clock(router: &Router) -> Result<bool> {
+    if crate::rrls::is_rrls() || router.sender().as_ref() != "GS" {
+        return Ok(false);
+    }
+    let Some((pair, stamp)) = PENDING_DAQ_CLOCK.lock().unwrap().desired else {
+        return Ok(false);
+    };
+    let request = crate::qualification_requests::Request::begin("retry_pending_daq_log_clock");
+    match request.submit(router, daq_log_clock_packet(pair, stamp)?) {
+        Ok(()) => {
+            PENDING_DAQ_CLOCK.lock().unwrap().accepted((pair, stamp));
+            DAQ_CLOCK_RETRY_WARNED.store(false, Ordering::Relaxed);
+            Ok(true)
+        }
+        Err(error) => {
+            let failures = DAQ_CLOCK_RETRY_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+            if !DAQ_CLOCK_RETRY_WARNED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "DAQ launch-clock publication remains pending after SDK admission failure ({failures} retry failures): {error}"
+                );
+            }
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1937,3 +2001,7 @@ pub fn persisted_daq_log_clock()->Option<[u64;2]> {
     let guard=store().lock().expect("network-variable store lock poisoned");
     guard.durable.then_some(guard.values.daq_log_clock)
 }
+
+#[cfg(test)]
+#[path = "network_variables/daq_clock_tests.rs"]
+mod daq_clock_tests;

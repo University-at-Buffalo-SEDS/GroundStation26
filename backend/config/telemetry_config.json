@@ -644,7 +644,7 @@
     },
     {
       "name": "DAQ_LOG_CLOCK",
-      "doc": "Retained DAQ session ID and T+120s close deadline, two little-endian u64 values; zeros reset recording.",
+      "doc": "Retained DAQ session ID and T+20s close deadline, two little-endian u64 values; zeros reset recording.",
       "reliable": "Ordered",
       "priority": 16,
       "class": "Data",

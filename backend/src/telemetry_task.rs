@@ -1178,6 +1178,8 @@ pub async fn telemetry_task(
                 }
                 _ = heartbeat_interval.tick() => {
                     if !heartbeat_cadence.due(crate::simulation_clock_ms()) { continue; }
+                    // Retry only failed durable admission; stable clocks emit nothing.
+                    let _ = crate::network_variables::retry_pending_daq_log_clock(&router);
                     if heartbeat::queue_station_heartbeat(&router).is_ok() {
                         state.mark_board_seen(
                             Board::GroundStation.sender_id(),
