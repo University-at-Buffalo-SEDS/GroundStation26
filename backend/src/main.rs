@@ -1,6 +1,6 @@
 mod admin;
-mod daq_sd;
 mod daq_launch_log;
+mod daq_sd;
 mod radio_voice;
 mod recording_replay;
 // main.rs
@@ -19,7 +19,6 @@ mod auto_zero;
 mod checklists;
 mod command_probe;
 mod command_proxy;
-mod primary_mirror;
 mod comms;
 mod comms_config;
 #[cfg(feature = "testing")]
@@ -33,7 +32,10 @@ mod flight_sim;
 mod gpio;
 mod gpio_panel;
 mod gse;
+mod host_temperature;
 mod i18n;
+mod launch_clock_sync;
+mod launch_history;
 mod layout;
 mod loadcell;
 mod loadcell_zero;
@@ -44,9 +46,9 @@ mod media;
 mod media_runtime;
 mod mission_sync;
 mod network_health;
-mod host_temperature;
 mod network_traffic;
 mod network_variables;
+mod primary_mirror;
 mod qualification_requests;
 mod recording_export;
 mod recording_range;
@@ -59,9 +61,9 @@ mod rrls_topology;
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 mod safety_task;
 mod sequences;
+#[cfg(feature = "firmware_sim")]
+mod sim_daq_cadence;
 mod state;
-mod launch_history;
-mod launch_clock_sync;
 mod station_mode;
 mod station_pairing;
 mod system_clock;
@@ -85,9 +87,9 @@ use crate::safety_task::safety_task;
 use crate::sequences::{default_action_policy, start_sequence_task};
 use crate::state::{AppState, BoardStatus};
 use crate::telemetry_db::{
-    DEFAULT_TELEMETRY_DB_FILENAME, DbQueueItem, RecordingModeWire,
-    RecordingStatusMsg, apply_sqlite_pragmas, close_and_finalize_sqlite, delete_sqlite_if_empty,
-    ensure_sqlite_db_file, open_in_memory_telemetry_db, recover_sqlite_sidecars_in_dir,
+    DEFAULT_TELEMETRY_DB_FILENAME, DbQueueItem, RecordingModeWire, RecordingStatusMsg,
+    apply_sqlite_pragmas, close_and_finalize_sqlite, delete_sqlite_if_empty, ensure_sqlite_db_file,
+    open_in_memory_telemetry_db, recover_sqlite_sidecars_in_dir,
 };
 use crate::telemetry_task::{
     CommsWorkerHandle, TxQueueBudget, flush_command_tx, get_current_timestamp_ms,
@@ -1196,11 +1198,11 @@ async fn main() -> anyhow::Result<()> {
             network_variables::verify_normal_qualification_boot()?;
         }
     }
-    let launch_history=Arc::new(Mutex::new(launch_history::Store::environment()?));
-    let restored_clock=launch_history.lock().unwrap().snapshot().clock;
-    let (restored_daq,restored_stamp)=launch_history.lock().unwrap().daq_snapshot();
-    if network_variables::persisted_daq_log_clock_with_revision().is_none() && restored_stamp!=0 {
-        network_variables::restore_persisted_daq_log_clock_snapshot(restored_daq,restored_stamp)?;
+    let launch_history = Arc::new(Mutex::new(launch_history::Store::environment()?));
+    let restored_clock = launch_history.lock().unwrap().snapshot().clock;
+    let (restored_daq, restored_stamp) = launch_history.lock().unwrap().daq_snapshot();
+    if network_variables::persisted_daq_log_clock_with_revision().is_none() && restored_stamp != 0 {
+        network_variables::restore_persisted_daq_log_clock_snapshot(restored_daq, restored_stamp)?;
     }
     let state = Arc::new(AppState {
         ring_buffer: Arc::new(Mutex::new(RingBuffer::new(ring_buffer_capacity))),
@@ -1530,11 +1532,18 @@ async fn main() -> anyhow::Result<()> {
                         log::info!("full-bay Power 5-second stream reached GroundStation");
                     }
                 }
-                if board == Some(Board::DaqBoard)
-                    && pkt.data_type() == telemetry_schema::data_type("KG1000")
-                {
+                // The simulator observes incoming source packets, never the
+                // derived KG1000 row created from the combined pressure format.
+                #[cfg(feature = "firmware_sim")]
+                let daq_loadcell_timestamp = sim_daq_cadence::captured_loadcell(board, pkt)
+                    .map(|(_, source_timestamp)| source_timestamp);
+                #[cfg(not(feature = "firmware_sim"))]
+                let daq_loadcell_timestamp = (board == Some(Board::DaqBoard)
+                    && pkt.data_type() == telemetry_schema::data_type("KG1000"))
+                .then(|| pkt.timestamp());
+                if let Some(source_timestamp) = daq_loadcell_timestamp {
                     let valid = daq_loadcell_rate_handler.lock().unwrap().observe(
-                        pkt.timestamp(),
+                        source_timestamp,
                         daq_loadcell_cadence.minimum_interval_ms,
                         daq_loadcell_cadence.maximum_interval_ms,
                         5,
@@ -2627,9 +2636,19 @@ async fn main() -> anyhow::Result<()> {
 
     let _antenna_gpsd = antenna::start_gpsd(state.shutdown_subscribe());
 
-    let weak_state=Arc::downgrade(&state);
-    state.launch_history.lock().unwrap().set_reporter(Arc::new(move|error|{if let Some(state)=weak_state.upgrade(){state.add_notification(error);}}));
-    if let Some(error)=state.launch_history.lock().unwrap().persistence_error(){state.add_notification(format!("Saved T clock needs attention: {error}"));}
+    let weak_state = Arc::downgrade(&state);
+    state
+        .launch_history
+        .lock()
+        .unwrap()
+        .set_reporter(Arc::new(move |error| {
+            if let Some(state) = weak_state.upgrade() {
+                state.add_notification(error);
+            }
+        }));
+    if let Some(error) = state.launch_history.lock().unwrap().persistence_error() {
+        state.add_notification(format!("Saved T clock needs attention: {error}"));
+    }
     let _mission_sync = mission_sync::start(state.clone());
     let _station_mode = station_mode::start(state.clone());
     let _launch_clock_sync = launch_clock_sync::start(state.clone());
@@ -2693,8 +2712,10 @@ async fn main() -> anyhow::Result<()> {
         let _ = sequence_task.await;
     }
 
-    let clock_flush=state.launch_history.lock().unwrap().close_and_waiter();
-    if let Err(error)=launch_history::flush(clock_flush).await {log::error!("Launch history shutdown flush failed: {error}");}
+    let clock_flush = state.launch_history.lock().unwrap().close_and_waiter();
+    if let Err(error) = launch_history::flush(clock_flush).await {
+        log::error!("Launch history shutdown flush failed: {error}");
+    }
 
     let db_drain_timeout = Duration::from_secs(10);
     if !state.wait_for_db_writes(db_drain_timeout).await {

@@ -67,11 +67,19 @@ transport frames retain their order because timestamp deltas may depend on prior
 frames. A bounded 256-entry header classification cache recognizes compact GPS
 without expanding its payload. It is limited to 64
 frames / 64 KiB, drops lower-priority work first, and expires stale pending work.
-Forwarding is capped at 2,000 framed UART bytes/second, with a 4,160-byte burst,
-to leave airtime for the original rocket transmission and return traffic. This
-is an application budget; modem RF overhead is additional. Normal traffic
-expires after 250 ms; GPS after 1.5 seconds. Equal-priority work
-keeps FIFO order. Queue drops are observable rather than an allocation failure.
+Forwarding uses the shared UART capacity controller, including per-frame air
+cost, outstanding byte debt and the serial quiet interval. With the matched
+32 kbit/s application profile, RRLS starts at 35% and can negotiate 50% while
+the primary holds 15%; RF uses 35%. Returning to primary 25% requires a
+confirmed relay downshift. See [application airtime allocation](radio-budget-operation.md)
+for deployment compatibility, conservative startup and configuration faults.
+
+Sparse downlink telemetry and GPS normally expire after 1.5 seconds; other
+ordinary work and interactive control retain the default 250 ms deadline. Independent address discovery uses 3 seconds,
+operating-mode replies use 5 seconds, and context-bound budget negotiation uses
+8 seconds. Started settings transfers retain their existing ownership policy.
+Equal-priority work keeps FIFO order. Queue drops are observable rather than an
+allocation failure.
 
 RRLS local clients can view recovery telemetry, maps, and recordings and control
 local recording. Flight/GSE commands are issued at the main station and relayed;

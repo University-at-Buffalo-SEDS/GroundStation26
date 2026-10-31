@@ -37,6 +37,19 @@ pub(crate) struct Transport {
 static ACTIVE: OnceLock<Option<Profile>> = OnceLock::new();
 
 impl Profile {
+    pub(crate) fn recovery_budget_tuple(&self) -> Option<crate::rrls::budget_negotiation::Profile> {
+        // Derived only from this validated local application profile. This is
+        // not a claim about live modem AT values; RF must prove its own tuple.
+        Some(crate::rrls::budget_negotiation::Profile {
+            baud: self.modem.serial_baud.try_into().ok()?,
+            usable_bps: self.transport.usable_air_bps.try_into().ok()?,
+            rf_share: self.transport.rf_share_percent.try_into().ok()?,
+            overhead: self.transport.frame_overhead_bytes.try_into().ok()?,
+            burst_ms: self.transport.packet_burst_ms.try_into().ok()?,
+            gap_ms: self.transport.packet_gap_ms.try_into().ok()?,
+            flags: 0,
+        })
+    }
     pub(crate) fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
         let profile: Self = serde_json::from_slice(bytes)?;
         profile.validate()?;

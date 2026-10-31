@@ -17,7 +17,7 @@
     "packet_burst_ms": 100,
     "packet_gap_ms": 55,
     "idle_margin_ms": 5,
-    "rf_share_percent": 40,
+    "rf_share_percent": 35,
     "host_default_share_percent": 25
   }
 }
