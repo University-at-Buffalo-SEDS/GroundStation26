@@ -20,7 +20,8 @@ reserved flag bits are rejected. Companion receipt freshness is tracked
 separately from base diagnostics and ordinary traffic. Base reports cannot make
 old SD status fresh. Existing non-DAQ/older-board diagnostics remain unchanged.
 
-The `/api/boards` diagnostics object exposes optional `sd_flags`,
+The `/api/network_topology` health entries and NetworkTopology WebSocket snapshots
+expose optional diagnostics fields `sd_flags`,
 `sd_last_write_age_ms`, `sd_last_flush_age_ms`, `sd_init_stage`, `sd_retry_count`,
 `sd_retry_requested_token`, `sd_retry_completed_token`, `sd_init_failures`, and
 `sd_status_received_age_ms`. A never-written/flushed sentinel becomes a null age;
