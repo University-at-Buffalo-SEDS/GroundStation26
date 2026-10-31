@@ -1643,6 +1643,7 @@ pub(crate) fn apply_umbilical_status_at_ingress(
             let fresh_confirmation = state.set_umbilical_valve_state_source(
                 key_cmd_id, key_on, pkt.timestamp() as i64,
                 recording_network_utc_ms().unwrap_or_else(|| get_current_timestamp_ms() as i64),
+                pkt.packet_id(),
             );
             if fresh_confirmation {
                 crate::gse::qd_confirmation(state, &sender_id, key_cmd_id, key_on, pkt.timestamp());
@@ -5469,6 +5470,42 @@ mod tests {
                 let rows = handle_packet(&state, &db_tx, &overflow, pkt).await;
                 assert!(!rows.is_empty());
                 assert_eq!(state.get_umbilical_valve_state(key), Some(on != 0));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn same_tick_distinct_valve_packets_update_once_and_replays_never_roll_back_ui_or_pending() {
+        for stamp in [0, 1234] {
+            let (db_tx, _db_rx) = mpsc::channel(32);
+            let state = test_app_state(db_tx.clone()).await;
+            let overflow = test_db_overflow();
+            let key = ActuatorBoardCommands::NitrogenOpen as u8;
+            let make = |value, nonce| Packet::new_with_nonce(
+                crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "AB", stamp, nonce, Arc::from([key, value]),
+            ).unwrap();
+            let open = make(1, 11);
+            let close = make(0, 12);
+            let replay_new_nonce = make(1, 13);
+            assert_ne!(open.packet_id(), close.packet_id());
+            assert_ne!(open.packet_id(), replay_new_nonce.packet_id());
+            handle_packet(&state, &db_tx, &overflow, open.clone()).await;
+            assert_eq!(state.get_umbilical_valve_state(key), Some(true));
+            handle_packet(&state, &db_tx, &overflow, close).await;
+            assert_eq!(state.get_umbilical_valve_state(key), Some(false));
+            for replay in [open.clone(), replay_new_nonce.clone()] {
+                let rows = handle_packet(&state, &db_tx, &overflow, replay).await;
+                assert_eq!(rows[0].values[4], Some(0.0));
+                assert_eq!(state.get_umbilical_valve_state(key), Some(false));
+            }
+            state.set_pending_umbilical_valve_state(key, true);
+            for replay in [open, replay_new_nonce] {
+                let rows = handle_packet(&state, &db_tx, &overflow, replay).await;
+                assert_eq!(rows[0].values[4], None);
+                assert_eq!(state.get_umbilical_valve_state(key), None);
+                assert_eq!(state.get_pending_umbilical_valve_state(key), Some(true));
             }
         }
     }

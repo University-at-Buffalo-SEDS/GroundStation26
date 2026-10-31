@@ -1072,6 +1072,7 @@ fn mass_target_reached(current_mass_kg: f32, target_mass_kg: f32, epsilon_kg: f3
 /// The one-button GSE fill uses the same thresholds and signed mass target as
 /// the main fill: immediate target cutoff, or a pressure/weight plateau.
 pub(crate) struct FillCutoff {
+    #[cfg(test)]
     cfg: SequenceConfig,
     previous: Option<(f32, f32)>,
     level_since: Option<Instant>,
@@ -1079,6 +1080,7 @@ pub(crate) struct FillCutoff {
 impl Default for FillCutoff {
     fn default() -> Self {
         Self {
+            #[cfg(test)]
             cfg: SequenceConfig::from_env(),
             previous: None,
             level_since: None,
@@ -1086,6 +1088,7 @@ impl Default for FillCutoff {
     }
 }
 impl FillCutoff {
+    #[cfg(test)]
     pub fn target_met(&self, mass: f32, target: f32) -> bool {
         mass.is_finite()
             && target.is_finite()
@@ -1097,6 +1100,7 @@ impl FillCutoff {
         self.previous = None;
         self.level_since = None;
     }
+    #[cfg(test)]
     pub fn reached(&mut self, now: Instant, mass: f32, pressure: f32, target: f32) -> bool {
         if !mass.is_finite() || !pressure.is_finite() || !target.is_finite() || target == 0.0 {
             self.reset();

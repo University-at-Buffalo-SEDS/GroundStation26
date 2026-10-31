@@ -38,6 +38,25 @@ pub struct ConfirmedUmbilicalValveState {
     simulation_ms: Option<u64>,
 }
 
+impl ConfirmedUmbilicalValveState {
+    fn source_capture(
+        on: bool,
+        receipt_at: std::time::Instant,
+        receipt_simulation_ms: Option<u64>,
+        age_ms: u64,
+    ) -> Option<Self> {
+        if age_ms > UMBILICAL_PENDING_VALVE_TIMEOUT.as_millis() as u64 {
+            return None;
+        }
+        let captured_at = receipt_at.checked_sub(std::time::Duration::from_millis(age_ms))?;
+        let simulation_ms = match receipt_simulation_ms {
+            Some(now) => Some(now.checked_sub(age_ms)?),
+            None => None,
+        };
+        Some(Self { on, received_at: captured_at, simulation_ms })
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PendingUmbilicalValveState {
     pub target: bool,
@@ -1143,6 +1162,7 @@ impl AppState {
     }
 
     /// Stores a board-confirmed umbilical valve state, never a requested target.
+    #[cfg(test)]
     pub fn set_umbilical_valve_state(&self, cmd_id: u8, on: bool) {
         self.gse.lock().unwrap().observe_valve(cmd_id, on);
         let mut map = self.umbilical_valve_states.lock().unwrap();
@@ -1164,18 +1184,29 @@ impl AppState {
         on: bool,
         source_ms: i64,
         receipt_ms: i64,
+        packet_id: u64,
     ) -> bool {
-        if !self.gse.lock().unwrap().observe_valve_source(cmd_id, on, source_ms, receipt_ms) {
-            return false;
-        }
-        self.umbilical_valve_states.lock().unwrap().insert(
+        let receipt_at = std::time::Instant::now();
+        let receipt_simulation_ms = crate::simulation_clock_ms();
+        let Some(age_ms) = self.gse.lock().unwrap().observe_valve_source(
             cmd_id,
-            ConfirmedUmbilicalValveState {
-                on,
-                received_at: std::time::Instant::now(),
-                simulation_ms: crate::simulation_clock_ms(),
+            on,
+            source_ms,
+            packet_id,
+            crate::gse::ValveReceipt {
+                network_ms: receipt_ms,
+                monotonic_at: receipt_at,
+                simulation_ms: receipt_simulation_ms,
             },
-        );
+        ) else {
+            return false;
+        };
+        let Some(capture) = ConfirmedUmbilicalValveState::source_capture(
+            on, receipt_at, receipt_simulation_ms, age_ms,
+        ) else {
+            return false;
+        };
+        self.umbilical_valve_states.lock().unwrap().insert(cmd_id, capture);
         true
     }
 
@@ -1191,7 +1222,9 @@ impl AppState {
         self.last_packet_rx_ms.load(Ordering::Relaxed)
     }
 
-    /// Monotonic receipt provenance for remote presentation admission barriers.
+    /// Conservative capture-time estimate for remote presentation barriers.
+    /// A report received after a barrier may still represent an older capture;
+    /// this comparison never establishes causal command execution.
     pub(crate) fn umbilical_report_after(&self, cmd_id: u8, barrier: std::time::Instant) -> bool {
         self.umbilical_valve_states.lock().unwrap().get(&cmd_id)
             .is_some_and(|sample| sample.received_at > barrier)
@@ -3281,24 +3314,88 @@ pub(crate) mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn gse_active_sequence_blocks_manual_and_ignition_controls() {
+    async fn active_gse_with_enabled_manual_policy(confirmed_feedback: bool) -> Arc<AppState> {
         let state = test_app_state().await;
         *state.state.lock().unwrap() = FlightState::Idle;
+        if confirmed_feedback {
+            // Publish the policy only after real feedback exists: unknown
+            // positions must continue disabling ambiguous manual toggles.
+            for key in [0, 1, 2, 9, 10] {
+                state.set_umbilical_valve_state(key, false);
+            }
+        }
+        let mut policy = state.action_policy_snapshot();
+        policy.key_enabled = true;
+        policy.software_buttons_enabled = true;
+        for control in &mut policy.controls {
+            control.enabled = true;
+        }
+        state.set_action_policy(policy);
         state.gse.lock().unwrap().engine.status.phase = gse_sequence::Phase::Filling;
+        state
+    }
+
+    #[tokio::test]
+    async fn gse_active_sequence_blocks_ignition_and_retract_even_with_enabled_policy() {
+        let state = active_gse_with_enabled_manual_policy(true).await;
         for cmd in [
-            TelemetryCommand::Dump,
-            TelemetryCommand::Pilot,
-            TelemetryCommand::Nitrous,
-            TelemetryCommand::Nitrogen,
             TelemetryCommand::Launch,
+            #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+            TelemetryCommand::GroundStationLaunch,
             TelemetryCommand::Igniter,
+            #[cfg(feature = "hitl_mode")]
+            TelemetryCommand::IgniterSequence,
             TelemetryCommand::Postinit,
             TelemetryCommand::RetractPlumbing,
         ] {
-            assert!(!state.is_command_allowed(&cmd));
+            assert!(!state.is_command_allowed(&cmd), "active GSE must block {cmd:?}");
         }
         assert!(state.is_command_allowed(&TelemetryCommand::CancelFill));
+    }
+
+    #[tokio::test]
+    async fn gse_active_sequence_hands_admitted_manual_valves_to_operator_without_changing_reports() {
+        for cmd in [TelemetryCommand::Dump, TelemetryCommand::Pilot] {
+            let state = active_gse_with_enabled_manual_policy(true).await;
+            state.set_umbilical_valve_state(0, false);
+            state.set_umbilical_valve_state(2, false);
+            {
+                let mut rt = state.gse.lock().unwrap();
+                rt.engine.status.nitrogen_passed = true;
+                rt.engine.status.self_test_locked = true;
+            }
+            assert!(state.is_command_allowed(&cmd), "explicit manual policy must admit {cmd:?}");
+            assert!(!crate::gse::handle_command(&state, &cmd), "handoff leaves the requested command to normal dispatch");
+            {
+                let rt = state.gse.lock().unwrap();
+                assert!(!rt.engine.active());
+                assert_eq!(rt.engine.status.phase, gse_sequence::Phase::Idle);
+                assert!(!rt.engine.claimed);
+                assert!(rt.engine.status.nitrogen_passed);
+                assert!(rt.engine.status.self_test_locked);
+            }
+            assert!(crate::gse::claimed(&state), "operator handoff remains explicit");
+            assert_eq!(state.get_umbilical_valve_state(0), Some(false));
+            assert_eq!(state.get_umbilical_valve_state(2), Some(false));
+            assert!(state.pending_umbilical_valve_states.lock().unwrap().is_empty(),
+                "cancellation alone must not manufacture a valve command or report");
+        }
+    }
+
+    #[tokio::test]
+    async fn gse_active_sequence_preserves_supply_feedback_interlocks_and_explicit_closes() {
+        let state = active_gse_with_enabled_manual_policy(false).await;
+        for cmd in [TelemetryCommand::Nitrogen, TelemetryCommand::Nitrous] {
+            assert!(!state.is_command_allowed(&cmd), "unknown counterpart feedback blocks {cmd:?}");
+        }
+        state.set_umbilical_valve_state(10, true);
+        assert!(!state.is_command_allowed(&TelemetryCommand::Nitrogen), "nitrous supply open blocks nitrogen opening");
+        state.set_umbilical_valve_state(10, false);
+        state.set_umbilical_valve_state(9, true);
+        assert!(!state.is_command_allowed(&TelemetryCommand::Nitrous), "nitrogen supply open blocks nitrous opening");
+        for cmd in [TelemetryCommand::NitrogenClose, TelemetryCommand::NitrousClose] {
+            assert!(state.is_command_allowed(&cmd), "explicit supply closure remains available: {cmd:?}");
+        }
     }
 
     #[tokio::test]
@@ -3355,12 +3452,26 @@ pub(crate) mod tests {
             return;
         }
         let state = test_app_state().await;
+        // One controllable SDK clock supplies both the source captures and
+        // ingress receipt UTC. Wall-millisecond rounding must not turn a new
+        // capture into an older-than-runtime sample at backend startup.
+        let capture_clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let router_clock = capture_clock.clone();
+        let router = Arc::new(sedsnet::router::Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([]),
+            Box::new(move || router_clock.load(std::sync::atomic::Ordering::Relaxed)),
+        ));
+        router.set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(1_798_000_000_000));
+        crate::telemetry_task::set_network_time_router(router.clone());
         let report = |key: u8, on: bool| {
+            capture_clock.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let captured_ms = router.network_time().unwrap().unix_time_ms.unwrap();
+            assert_eq!(crate::telemetry_task::recording_network_utc_ms(), Some(captured_ms as i64));
             let packet = sedsnet::packet::Packet::new(
                 crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
                 &[crate::telemetry_schema::endpoint("GROUND_STATION")],
                 "AB",
-                crate::telemetry_task::get_current_timestamp_ms(),
+                captured_ms,
                 Arc::<[u8]>::from(vec![key, u8::from(on)]),
             )
             .unwrap();
@@ -3894,5 +4005,24 @@ pub(crate) mod tests {
         ] {
             assert_eq!(monotonic_launch_clock_update(&current, requested), current);
         }
+    }
+}
+
+#[cfg(test)]
+mod valve_source_clock_tests {
+    use super::*;
+
+    #[test]
+    fn source_capture_backdates_model_and_monotonic_clocks_without_fallback() {
+        let receipt = std::time::Instant::now();
+        let sample = ConfirmedUmbilicalValveState::source_capture(false, receipt, Some(3000), 1500).unwrap();
+        assert!(!sample.on);
+        assert_eq!(sample.simulation_ms, Some(1500));
+        assert_eq!(sample.received_at, receipt - std::time::Duration::from_millis(1500));
+        let unsynchronized = ConfirmedUmbilicalValveState::source_capture(true, receipt, None, 100).unwrap();
+        assert_eq!(unsynchronized.simulation_ms, None);
+        assert_eq!(unsynchronized.received_at, receipt - std::time::Duration::from_millis(100));
+        assert!(ConfirmedUmbilicalValveState::source_capture(true, receipt, Some(0), 1).is_none());
+        assert!(ConfirmedUmbilicalValveState::source_capture(true, receipt, Some(3000), 2001).is_none());
     }
 }

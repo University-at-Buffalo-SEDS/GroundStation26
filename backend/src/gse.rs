@@ -51,6 +51,79 @@ const ACTIONS: [(&str, Action); 5] = [
     ("NitrogenTest", Action::NitrogenTest),
 ];
 
+/// At most two semantic states can be admitted from one valve source tick.
+/// A changed packet nonce cannot turn the same capture into a new sample.
+/// At most one flip is admitted per source tick: A→B→A is conservatively
+/// withheld even if it was a real second flip, because it is indistinguishable
+/// from a re-nonced replay of the already-seen A capture.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ValveCaptureHistory {
+    source_ms: i64,
+    packet_ids: [u64; 2],
+    seen_values: u8,
+}
+
+pub(crate) struct ValveReceipt {
+    pub network_ms: i64,
+    pub monotonic_at: Instant,
+    pub simulation_ms: Option<u64>,
+}
+
+impl ValveCaptureHistory {
+    fn admit(
+        &mut self,
+        source_ms: i64,
+        receipt_ms: i64,
+        now: u64,
+        open: bool,
+        packet_id: u64,
+        previous_at: Option<u64>,
+    ) -> Option<u64> {
+        if source_ms < 0 {
+            return None;
+        }
+        let value = usize::from(open);
+        let bit = 1_u8 << value;
+        let same_tick = self.seen_values != 0 && self.source_ms == source_ms;
+        if (same_tick && self.seen_values & bit != 0)
+            || (0..2).any(|index| {
+                self.seen_values & (1 << index) != 0 && self.packet_ids[index] == packet_id
+            })
+        {
+            return None;
+        }
+        // Only the duplicate-timestamp part is bypassed for an unseen opposite
+        // value. The unchanged UTC age, future, backwards and underflow checks
+        // still run before either history or live state is committed.
+        let mut previous = if same_tick || self.seen_values == 0 {
+            None
+        } else {
+            Some(self.source_ms)
+        };
+        let mut at = source_sample_at(Some(source_ms), receipt_ms, now, &mut previous)?;
+        if same_tick {
+            let previous_at = previous_at?;
+            now.checked_sub(previous_at)?;
+            at = at.min(previous_at);
+        }
+        // Boot-time captures cannot be aged from UTC. An equal-tick exception
+        // still retains its first capture anchor and the existing two-second
+        // freshness bound; a late opposite value cannot rearm confirmation.
+        if now.checked_sub(at)? > 2_000 {
+            return None;
+        }
+        if !same_tick {
+            self.source_ms = source_ms;
+            self.seen_values = 0;
+            self.packet_ids = [0; 2];
+        }
+        self.seen_values |= bit;
+        self.packet_ids[value] = packet_id;
+        Some(at)
+    }
+}
+
 pub struct Runtime {
     pub engine: Engine,
     #[cfg(not(feature = "hitl_mode"))]
@@ -61,7 +134,7 @@ pub struct Runtime {
     mass: Option<Sample>,
     last_mass_source_ms: Option<i64>,
     last_pressure_source_ms: Option<i64>,
-    last_valve_source_ms: [Option<i64>; 5],
+    last_valve_captures: [ValveCaptureHistory; 5],
     fill_cutoff: crate::sequences::FillCutoff,
     fill_trim: Option<gse_sequence::fill_trim::Controller>,
     ground_station_control: bool,
@@ -84,7 +157,7 @@ impl Default for Runtime {
             mass: None,
             last_mass_source_ms: None,
             last_pressure_source_ms: None,
-            last_valve_source_ms: [None; 5],
+            last_valve_captures: [ValveCaptureHistory::default(); 5],
             fill_cutoff: Default::default(),
             fill_trim: None,
             ground_station_control: true,
@@ -259,23 +332,51 @@ impl Runtime {
         key: u8,
         open: bool,
         source_ms: i64,
-        receipt_ms: i64,
-    ) -> bool {
-        let Some(index) = KEYS.iter().position(|candidate| *candidate == key) else {
-            return true;
-        };
-        let now = self.now();
-        let Some(at_ms) = source_sample_at(
-            Some(source_ms),
-            receipt_ms,
-            now,
-            &mut self.last_valve_source_ms[index],
-        ) else {
-            return false;
-        };
-        self.valves[index] = Some(ValveState { open, at_ms });
-        true
+        packet_id: u64,
+        receipt: ValveReceipt,
+    ) -> Option<u64> {
+        let processing_now = self.now();
+        self.observe_valve_source_at(key, open, source_ms, packet_id, receipt, processing_now)
     }
+
+    fn observe_valve_source_at(
+        &mut self,
+        key: u8,
+        open: bool,
+        source_ms: i64,
+        packet_id: u64,
+        receipt: ValveReceipt,
+        processing_now: u64,
+    ) -> Option<u64> {
+        let Some(index) = KEYS.iter().position(|candidate| *candidate == key) else {
+            return Some(0);
+        };
+        // Use the receipt clock captured before waiting for the GSE mutex.
+        // Processing or lock delay must never renew capture freshness.
+        let now = match receipt.simulation_ms {
+            Some(now) => now,
+            None => u64::try_from(receipt.monotonic_at.checked_duration_since(self.clock)?.as_millis()).ok()?,
+        };
+        let mut history = self.last_valve_captures[index];
+        let at_ms = history.admit(
+            source_ms,
+            receipt.network_ms,
+            now,
+            open,
+            packet_id,
+            self.valves[index].map(|sample| sample.at_ms),
+        )?;
+        // Waiting for the mutex may have consumed the original freshness
+        // budget. Do not acknowledge or poison replay history with a capture
+        // that was fresh at receipt but stale (or future) at processing time.
+        if processing_now.checked_sub(at_ms)? > 2_000 {
+            return None;
+        }
+        self.last_valve_captures[index] = history;
+        self.valves[index] = Some(ValveState { open, at_ms });
+        now.checked_sub(at_ms)
+    }
+    #[cfg(test)]
     pub fn observe_valve(&mut self, key: u8, open: bool) {
         if let Some(i) = KEYS.iter().position(|k| *k == key) {
             self.valves[i] = Some(ValveState {
@@ -851,6 +952,7 @@ fn handle_command_inner(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
     }
     false
 }
+#[cfg(any(test, not(feature = "hitl_mode")))]
 fn fill_mass_in_band(config: &Config, mass: f32, target: f32) -> bool {
     mass.is_finite()
         && target.is_finite()
@@ -1367,14 +1469,14 @@ mod tests {
         let state = crate::state::tests::test_app_state().await;
         state.gse.lock().unwrap().clock = Instant::now() - std::time::Duration::from_secs(5);
         let utc = 1_798_000_000_000;
-        assert!(state.set_umbilical_valve_state_source(0, false, utc - 1000, utc));
+        assert!(state.set_umbilical_valve_state_source(0, false, utc - 1000, utc, 11));
         let before = state.gse.lock().unwrap().valves[0].unwrap().at_ms;
         state.set_pending_umbilical_valve_state(0, false);
-        assert!(!state.set_umbilical_valve_state_source(0, false, utc - 1000, utc + 100));
+        assert!(!state.set_umbilical_valve_state_source(0, false, utc - 1000, utc + 100, 11));
         assert_eq!(state.gse.lock().unwrap().valves[0].unwrap().at_ms, before);
         assert_eq!(state.get_pending_umbilical_valve_state(0), Some(false));
-        assert!(!state.set_umbilical_valve_state_source(0, true, utc - 3000, utc));
-        assert!(state.set_umbilical_valve_state_source(0, false, utc + 1, utc + 1));
+        assert!(!state.set_umbilical_valve_state_source(0, true, utc - 3000, utc, 22));
+        assert!(state.set_umbilical_valve_state_source(0, false, utc + 1, utc + 1, 33));
     }
     #[test]
     fn precision_band_and_overshoot_are_absolute_and_signed_not_percentage() {
@@ -2433,3 +2535,6 @@ mod mission_calibration_guard_tests {
         assert!(!Runtime::default().calibration_import_allowed());
     }
 }
+
+#[cfg(test)]
+mod valve_capture_tests;
