@@ -50,3 +50,28 @@ Host regression tests exercise actual AppState publication, SDK SD-side packets
 and a receiving managed-variable callback, including first-admission rejection,
 retry, corrected T0, superseding reset, late old revisions and literal restart
 seeding. They do not constitute a physical card or hardware qualification.
+
+DAQ firmware with `DAQ_LAUNCH_LOG_STATUS` reports application-level acceptance
+separately from transport delivery. Every 5 seconds it emits seven UInt32 words:
+actual SD session low/high, actual SD deadline UTC low/high, receiver-accepted
+revision low/high, then flags. Flag bits are 0 services initialized, 1 SD ready,
+2 deadline anchored, 3 cutoff reached, 4 current raw launch file open, 5 current
+telemetry launch file open, and 6 final flush pending. Integer values retain their
+full 64-bit precision; base `BOARD_HEALTH` and `DAQ_SD_HEALTH` formats are unchanged.
+
+`/api/network_topology` exposes this as DAQ diagnostics `launch_log`, including
+`session`, `deadline_utc_ms`, `revision`, `flags`, and independent
+`received_age_ms`. For valid network UTC captures this age includes transport
+queueing delay already present on arrival, then advances monotonically; a report
+captured 30 seconds ago cannot appear fresh when delivered now. Captures more
+than 100 ms ahead of selected SDK network UTC are rejected; a smaller lead is
+clamped to zero age. Unsynchronized boot timestamps retain receipt-time fallback.
+Optional `expected_session`, `expected_deadline_utc_ms`, and
+`expected_revision` are the exact persisted station intent. `matches_expected`
+compares the complete pair and revision, including an explicit reset; it is null
+when no persisted intent exists. A matching stale report is still stale, and
+ordinary/base/SD reports never refresh its receipt time. UI confirmation requires
+a fresh matching report, not merely an SDK ACK. Files-open/ready/cutoff/flush flags
+remain separate observations: acceptance is not proof of a successful card write,
+lossless capture, or completion of all queued flushes. Older firmware provides no
+application-level confirmation. This status adds no automatic launch gate.

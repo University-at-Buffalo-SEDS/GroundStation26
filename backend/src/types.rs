@@ -267,6 +267,20 @@ pub struct NetworkTopologyLink {
     pub status: NetworkTopologyStatus,
 }
 
+/// Application-level DAQ SD journal acknowledgement, independently aged.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
+pub struct DaqLaunchLogStatus {
+    pub session: u64,
+    pub deadline_utc_ms: u64,
+    pub revision: u64,
+    pub flags: u32,
+    pub received_age_ms: u64,
+    pub matches_expected: Option<bool>,
+    pub expected_session: Option<u64>,
+    pub expected_deadline_utc_ms: Option<u64>,
+    pub expected_revision: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
 pub struct BoardDiagnostics {
     /// Internal MCU die temperature, not ambient. Absent on older firmware.
@@ -316,6 +330,8 @@ pub struct BoardDiagnostics {
     pub sd_retry_completed_token: Option<u32>,
     #[serde(default)]
     pub sd_init_failures: Option<u32>,
+    #[serde(default)]
+    pub launch_log: Option<DaqLaunchLogStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]

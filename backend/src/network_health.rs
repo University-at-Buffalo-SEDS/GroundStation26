@@ -10,6 +10,7 @@ pub struct Tracker {
 struct Record {
     diagnostics: Option<(BoardDiagnostics, Instant)>,
     sd_status: Option<(crate::daq_sd::SdStatus, Instant)>,
+    launch_log: Option<(crate::daq_launch_log::Observation, Instant, u64)>,
     first: Instant,
     last: Instant,
     healthy: bool,
@@ -120,6 +121,7 @@ impl Tracker {
                 Record {
                     diagnostics: None,
                     sd_status: None,
+                    launch_log: None,
                     first: now,
                     last: now,
                     healthy: true,
@@ -168,6 +170,29 @@ impl Tracker {
             return false;
         };
         self.record("DAQ", now, wall_ms).sd_status = Some((status, now));
+        true
+    }
+
+    pub fn observe_launch_log_status(
+        &mut self,
+        sender: &str,
+        words: &[u32],
+        now: Instant,
+        wall_ms: u64,
+        source_ms: u64,
+        network_now_ms: u64,
+    ) -> bool {
+        if canonical_sender_id(sender.trim()) != "DAQ" {
+            return false;
+        }
+        let Some(status) = crate::daq_launch_log::Observation::decode(words) else {
+            return false;
+        };
+        let Some(initial_age) = crate::daq_launch_log::source_age_ms(source_ms, network_now_ms)
+        else {
+            return false;
+        };
+        self.record("DAQ", now, wall_ms).launch_log = Some((status, now, initial_age));
         true
     }
 
@@ -220,6 +245,19 @@ impl Tracker {
         self.boards.clear();
     }
     pub fn snapshot(&mut self, now: Instant, test_fire: bool) -> Vec<NetworkBoardHealthEntry> {
+        let expected = self
+            .boards
+            .get("DAQ")
+            .and_then(|r| r.launch_log.as_ref())
+            .and_then(|_| crate::network_variables::persisted_daq_log_clock_with_revision());
+        self.snapshot_with_launch_expected(now, test_fire, expected)
+    }
+    fn snapshot_with_launch_expected(
+        &mut self,
+        now: Instant,
+        test_fire: bool,
+        expected: Option<([u64; 2], u64)>,
+    ) -> Vec<NetworkBoardHealthEntry> {
         let mut rows = Vec::new();
         for (sender, r) in &mut self.boards {
             r.advance(now);
@@ -240,6 +278,12 @@ impl Tracker {
                     report.received_age_ms = elapsed(now, *received);
                     if let Some((status, received)) = &r.sd_status {
                         status.overlay(&mut report, elapsed(now, *received));
+                    }
+                    if let Some((status, received, initial_age)) = &r.launch_log {
+                        report.launch_log = Some(status.project(
+                            initial_age.saturating_add(elapsed(now, *received)),
+                            expected,
+                        ));
                     }
                     report
                 }),
@@ -398,6 +442,87 @@ mod diagnostic_tests {
         assert!(!rows[0].healthy);
         assert_eq!(rows[0].diagnostics.as_ref().unwrap().received_age_ms, 16000);
         assert!(tracker.snapshot(at, true).is_empty());
+    }
+    #[test]
+    fn launch_log_companion_requires_daq_and_ages_independently_of_all_other_health() {
+        let mut tracker = Tracker::default();
+        let now = Instant::now();
+        let mut base = [0; 24];
+        base[0] = 1;
+        base[4] = 1000;
+        let launch = [42, 0, 20_000, 0, 10, 0, 7];
+        let expected = Some(([42, 20_000], 10));
+        assert!(!tracker.observe_launch_log_status("FC", &launch, now, 1000, 0, 0));
+        assert!(!tracker.observe_launch_log_status("@123", &launch, now, 1000, 0, 0));
+        assert!(tracker.observe_diagnostics("DAQ", &base, now, 1000));
+        assert!(tracker.observe_launch_log_status("DAQB", &launch, at(now, 100), 1100, 0, 0));
+        let projected = |tracker: &mut Tracker, time, expected| {
+            tracker
+                .snapshot_with_launch_expected(time, false, expected)
+                .remove(0)
+                .diagnostics
+                .unwrap()
+                .launch_log
+                .unwrap()
+        };
+        let initial = projected(&mut tracker, at(now, 500), expected);
+        assert_eq!(initial.received_age_ms, 400);
+        assert_eq!(initial.matches_expected, Some(true));
+        assert_eq!(
+            initial.flags & (16 | 32),
+            0,
+            "matching clock is not evidence of open files"
+        );
+        assert!(tracker.observe_diagnostics("DAQ", &base, at(now, 1000), 2000));
+        assert!(tracker.observe_sd_status("DAQ", &[3, 0, 0, 0, 0, 0, 0, 0], at(now, 1200), 2200));
+        let stale = projected(&mut tracker, at(now, 13_000), expected);
+        assert_eq!(stale.received_age_ms, 12_900);
+        assert_eq!(stale.session, 42);
+        assert!(!tracker.observe_launch_log_status("DAQ", &[0; 6], at(now, 14_000), 15_000, 0, 0));
+        assert_eq!(
+            projected(&mut tracker, at(now, 14_000), Some(([0, 0], 11))).matches_expected,
+            Some(false)
+        );
+        let reset = [0, 0, 0, 0, 11, 0, 1];
+        assert!(tracker.observe_launch_log_status("DAQ", &reset, at(now, 15_000), 16_000, 0, 0));
+        let accepted_reset = projected(&mut tracker, at(now, 15_100), Some(([0, 0], 11)));
+        assert_eq!(accepted_reset.received_age_ms, 100);
+        assert_eq!(accepted_reset.matches_expected, Some(true));
+        assert_eq!(accepted_reset.session, 0);
+        let utc = 1_798_000_000_000;
+        assert!(tracker.observe_launch_log_status(
+            "DAQ",
+            &reset,
+            at(now, 16_000),
+            17_000,
+            utc - 30_000,
+            utc
+        ));
+        let delayed = projected(&mut tracker, at(now, 16_500), Some(([0, 0], 11)));
+        assert_eq!(delayed.received_age_ms, 30_500);
+        assert_eq!(
+            delayed.matches_expected,
+            Some(true),
+            "exact match never hides transport age"
+        );
+        assert!(!tracker.observe_launch_log_status(
+            "DAQ",
+            &launch,
+            at(now, 17_000),
+            18_000,
+            utc + 101,
+            utc
+        ));
+        assert_eq!(
+            projected(&mut tracker, at(now, 17_000), Some(([0, 0], 11))).received_age_ms,
+            31_000
+        );
+        tracker.clear();
+        assert!(
+            tracker
+                .snapshot_with_launch_expected(at(now, 16_000), false, expected)
+                .is_empty()
+        );
     }
     #[test]
     fn sd_companion_has_independent_freshness_and_cannot_replace_base_health() {

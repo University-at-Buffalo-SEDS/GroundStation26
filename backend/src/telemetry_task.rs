@@ -1734,6 +1734,17 @@ async fn handle_packet(
     }
     let sender_id = state.canonical_network_sender_id(pkt.sender());
 
+    if pkt.data_type() == crate::telemetry_schema::data_type("DAQ_LAUNCH_LOG_STATUS") {
+        if let Ok(words) = pkt.data_as_u32() {
+            state.network_health.lock().unwrap().observe_launch_log_status(
+                &sender_id, &words, std::time::Instant::now(), get_current_timestamp_ms(),
+                pkt.timestamp(), recording_network_utc_ms().and_then(|t| t.try_into().ok())
+                    .unwrap_or_else(get_current_timestamp_ms),
+            );
+        }
+        return Vec::new();
+    }
+
     if pkt.data_type() == crate::telemetry_schema::data_type("DAQ_SD_HEALTH") {
         if let Ok(words) = pkt.data_as_u32() {
             state.network_health.lock().unwrap().observe_sd_status(
@@ -5398,6 +5409,40 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn daq_launch_log_status_ingress_preserves_exact_storage_state_without_display_rows() {
+        let (db_tx, _db_rx) = mpsc::channel(32);
+        let state = test_app_state(db_tx.clone()).await;
+        let overflow = test_db_overflow();
+        for (name, words) in [
+            ("BOARD_HEALTH", { let mut words = vec![0; 24]; words[0] = 1; words[4] = 1000; words }),
+            ("DAQ_LAUNCH_LOG_STATUS", vec![u32::MAX - 1, 0x12345678, 99, 0xabcd, u32::MAX, 0xfedcba98, 0]),
+        ] {
+            let payload: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            let packet = Packet::new(crate::telemetry_schema::data_type(name),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")], "DAQ", 100, payload.into()).unwrap();
+            assert!(handle_packet(&state, &db_tx, &overflow, packet).await.is_empty());
+        }
+        let rows = state.network_health.lock().unwrap().snapshot(std::time::Instant::now(), false);
+        let status = rows.iter().find(|r| r.sender_id == "DAQ").unwrap()
+            .diagnostics.as_ref().unwrap().launch_log.as_ref().unwrap();
+        assert_eq!(status.session, 0x12345678_fffffffe);
+        assert_eq!(status.deadline_utc_ms, 0xabcd_00000063);
+        assert_eq!(status.revision, 0xfedcba98_ffffffff);
+        assert_eq!(status.flags, 0, "accepted clock must not invent recorder-ready/open flags");
+        let network_now = recording_network_utc_ms().and_then(|t| u64::try_from(t).ok())
+            .unwrap_or_else(get_current_timestamp_ms);
+        let words = [u32::MAX - 1, 0x12345678, 99, 0xabcd, u32::MAX, 0xfedcba98, 0x31];
+        let payload: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let packet = Packet::new(crate::telemetry_schema::data_type("DAQ_LAUNCH_LOG_STATUS"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "DAQ", network_now - 30_000, payload.into()).unwrap();
+        assert!(handle_packet(&state, &db_tx, &overflow, packet).await.is_empty());
+        let rows = state.network_health.lock().unwrap().snapshot(std::time::Instant::now(), false);
+        let delayed = rows.iter().find(|r| r.sender_id == "DAQ").unwrap().diagnostics.as_ref().unwrap().launch_log.as_ref().unwrap();
+        assert!(delayed.received_age_ms >= 30_000, "queued old open-file report must arrive already stale");
+        assert_eq!(delayed.flags, 0x31);
+
+    }
     #[tokio::test]
     async fn ordered_valve_confirmations_accept_rebooted_source_clock() {
         for (board, key) in [

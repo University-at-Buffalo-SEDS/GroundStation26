@@ -1,5 +1,6 @@
 mod admin;
 mod daq_sd;
+mod daq_launch_log;
 mod radio_voice;
 mod recording_replay;
 // main.rs

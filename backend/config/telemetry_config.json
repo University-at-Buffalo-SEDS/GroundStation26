@@ -851,6 +851,21 @@
       ],
       "reliable": "Unordered",
       "priority": 240
+    },
+    {
+      "name": "DAQ_LAUNCH_LOG_STATUS",
+      "doc": "DAQ SD application acknowledgement: actual session/deadline and accepted clock revision as low/high UInt32 pairs, followed by storage flags; independent from transport delivery.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt32",
+        "count": 7
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable": "Off",
+      "priority": 0
     }
   ]
 }

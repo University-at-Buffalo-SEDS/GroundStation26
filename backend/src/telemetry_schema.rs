@@ -76,10 +76,12 @@ mod tests {
         initialize().unwrap();
         assert_eq!(data_type("DAQ_SD_HEALTH").as_u32(), 92486907);
         assert_eq!(data_type("DAQ_SD_RETRY").as_u32(), 24116261);
+        assert_eq!(data_type("DAQ_LAUNCH_LOG_STATUS").as_u32(), 203505696);
         for (name, count) in [
             ("BOARD_HEALTH", 24),
             ("DAQ_SD_HEALTH", 8),
             ("DAQ_SD_RETRY", 1),
+            ("DAQ_LAUNCH_LOG_STATUS", 7),
         ] {
             let good = vec![0u8; count * 4];
             assert!(
