@@ -85,7 +85,7 @@ impl Saved {
         }
         if self
             .fill_target_kg
-            .is_some_and(|v| !v.is_finite() || v <= 0.0)
+            .is_some_and(|v| !v.is_finite() || v == 0.0)
             || (self.qualification.completed(Milestone::FillTarget)
                 && self.fill_target_kg.is_none())
         {

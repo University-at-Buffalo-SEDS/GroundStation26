@@ -222,13 +222,18 @@ pub async fn serve(app: Router, config: Config, shutdown: impl Future<Output = (
             self.0.abort();
         }
     }
-    let _discovery = crate::station_pairing::Pairing::load()?.map(|pairing| {
-        DiscoveryGuard(tokio::spawn(async move {
-            if let Err(error) = crate::station_pairing::serve_discovery(pairing).await {
-                log::warn!("paired station LAN discovery unavailable: {error}");
-            }
-        }))
-    });
+    let pairing = crate::station_pairing::Pairing::load()?;
+    let (scheme, address) = if let Some(listener) = &https {
+        ("https", listener.local_addr()?)
+    } else {
+        ("http", http.local_addr()?)
+    };
+    let _discovery = DiscoveryGuard(tokio::spawn(async move {
+        if let Err(error) = crate::station_pairing::serve_discovery(pairing, scheme, address).await
+        {
+            log::warn!("station LAN discovery unavailable: {error}");
+        }
+    }));
     let http_handle = Handle::new();
     let https_handle = Handle::new();
     let http_server = axum_server::from_tcp(http)?

@@ -5,7 +5,19 @@
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum TailKind { CommandPair, SingleCommand, Receipt }
+enum TailKind {
+    CommandPair,
+    SingleCommand,
+    Receipt,
+}
+
+pub(crate) struct Defaults {
+    pub air_bps: u64,
+    pub overhead_bytes: u64,
+    pub packet_burst_ms: u64,
+    pub packet_gap_ms: u64,
+    pub host_share_percent: u64,
+}
 
 pub(crate) struct Capacity {
     next: Option<(Instant, Option<u64>)>,
@@ -42,6 +54,9 @@ fn bounded_env(name: &str, default: u64, min: u64, max: u64) -> u64 {
         .unwrap_or(default)
 }
 impl Capacity {
+    pub(crate) fn airtime_config(&self) -> (u64, u64) {
+        (self.air_bps, self.share_percent)
+    }
     pub(crate) fn ready_for(&self, wall: Instant, virtual_ms: Option<u64>, critical: bool) -> bool {
         if self.ready(wall, virtual_ms) {
             return true;
@@ -72,7 +87,8 @@ impl Capacity {
             // not glue it onto an ordinary packet or extend a previous retry's
             // packet just before the returning owner receipt arrives. Normal
             // airtime plus the actual UART-stop/quiet boundary remain required.
-            return encoded_len > 0 && self.ready(wall, clock)
+            return encoded_len > 0
+                && self.ready(wall, clock)
                 && Self::reached(self.next_packet, wall, clock);
         }
         encoded_len > 0
@@ -82,42 +98,96 @@ impl Capacity {
     }
     pub(crate) fn replayed_command(&self, id: u64) -> bool {
         self.promotion_contracts[..usize::from(self.promotion_contract_count)]
-            .iter().position(|stored| *stored == id)
+            .iter()
+            .position(|stored| *stored == id)
             .is_some_and(|slot| self.promotion_flags & (1 << slot) != 0)
     }
-    fn batch_tail_ready(&self, wall: Instant, clock: Option<u64>, id: u64, bytes: usize, canonical: bool) -> bool {
+    fn batch_tail_ready(
+        &self,
+        wall: Instant,
+        clock: Option<u64>,
+        id: u64,
+        bytes: usize,
+        canonical: bool,
+    ) -> bool {
         self.control_tail_ready(wall, clock, id, bytes, canonical, false)
     }
-    fn control_tail_ready(&self, wall: Instant, clock: Option<u64>, id: u64, bytes: usize, canonical: bool, receipt: bool) -> bool {
-        let Some((quiet, quiet_clock)) = self.next_packet else { return false; };
+    fn control_tail_ready(
+        &self,
+        wall: Instant,
+        clock: Option<u64>,
+        id: u64,
+        bytes: usize,
+        canonical: bool,
+        receipt: bool,
+    ) -> bool {
+        let Some((quiet, quiet_clock)) = self.next_packet else {
+            return false;
+        };
         let gap = u64::from(self.packet_gap_ms);
-        if !self.command_tail_open || (self.tail_kind == TailKind::Receipt) != receipt || !(2..=55).contains(&gap) { return false; }
-        let opened = (quiet - Duration::from_millis(gap), quiet_clock.map(|t| t.saturating_sub(gap)));
-        let until = (opened.0 + Duration::from_millis(gap / 2), opened.1.map(|t| t.saturating_add(gap / 2)));
-        let promoted_command = !receipt && self.promotion_contracts[..usize::from(self.promotion_contract_count)]
-            .contains(&id);
-        canonical && bytes > 0 && self.late_command_len > 0 && !promoted_command
-            && usize::from(self.late_command_len).checked_add(bytes)
+        if !self.command_tail_open
+            || (self.tail_kind == TailKind::Receipt) != receipt
+            || !(2..=55).contains(&gap)
+        {
+            return false;
+        }
+        let opened = (
+            quiet - Duration::from_millis(gap),
+            quiet_clock.map(|t| t.saturating_sub(gap)),
+        );
+        let until = (
+            opened.0 + Duration::from_millis(gap / 2),
+            opened.1.map(|t| t.saturating_add(gap / 2)),
+        );
+        let promoted_command = !receipt
+            && self.promotion_contracts[..usize::from(self.promotion_contract_count)].contains(&id);
+        canonical
+            && bytes > 0
+            && self.late_command_len > 0
+            && !promoted_command
+            && usize::from(self.late_command_len)
+                .checked_add(bytes)
                 .is_some_and(|total| total <= super::RADIO_COMMAND_BATCH_MAX_BYTES)
             && clock.is_some() == self.late_command_virtual
             && Self::reached(Some(opened), wall, clock)
             && !Self::reached(Some(until), wall, clock)
     }
-    pub(crate) fn ready_for_receipt(&self, wall: Instant, clock: Option<u64>, id: u64, bytes: usize) -> bool {
-        self.ready_for(wall, clock, true) || self.control_tail_ready(wall, clock, id, bytes, true, true)
+    pub(crate) fn ready_for_receipt(
+        &self,
+        wall: Instant,
+        clock: Option<u64>,
+        id: u64,
+        bytes: usize,
+    ) -> bool {
+        self.ready_for(wall, clock, true)
+            || self.control_tail_ready(wall, clock, id, bytes, true, true)
     }
-    pub(crate) fn committed_receipt(&mut self, wall: Instant, clock: Option<u64>, id: u64, bytes: usize, accepted: usize, complete: bool) -> bool {
-        if accepted == 0 { return false; }
+    pub(crate) fn committed_receipt(
+        &mut self,
+        wall: Instant,
+        clock: Option<u64>,
+        id: u64,
+        bytes: usize,
+        accepted: usize,
+        complete: bool,
+    ) -> bool {
+        if accepted == 0 {
+            return false;
+        }
         let joined = self.control_tail_ready(wall, clock, id, bytes, true, true);
         self.committed(wall, clock, accepted);
-        if joined && complete && accepted == bytes { self.remember_promotion(id, true); }
+        if joined && complete && accepted == bytes {
+            self.remember_promotion(id, true);
+        }
         joined
     }
     /// One later canonical receipt can share the first receipt's already-open
     /// packet. A partial write consumes the slot; no new close credit is given.
     pub(crate) fn allow_single_receipt_tail(&mut self, id: u64, bytes: usize) {
         self.allow_single_command_tail(id, bytes);
-        if self.command_tail_open { self.tail_kind = TailKind::Receipt; }
+        if self.command_tail_open {
+            self.tail_kind = TailKind::Receipt;
+        }
     }
 
     /// A successful pair can accept its third command while the same modem
@@ -125,8 +195,11 @@ impl Capacity {
     /// Use only half the existing quiet gap (at most 27ms); the byte/frame
     /// limit and the separate UART stop-bit check still apply.
     pub(crate) fn allow_command_batch_tail(&mut self, ids: [u64; 2], bytes: usize) {
-        if ids[0] == ids[1] || bytes == 0 || bytes >= super::RADIO_COMMAND_BATCH_MAX_BYTES
-            || !(2..=55).contains(&self.packet_gap_ms) {
+        if ids[0] == ids[1]
+            || bytes == 0
+            || bytes >= super::RADIO_COMMAND_BATCH_MAX_BYTES
+            || !(2..=55).contains(&self.packet_gap_ms)
+        {
             return;
         }
         if let Some((_, clock)) = self.next_packet {
@@ -141,9 +214,11 @@ impl Capacity {
     /// was already written. Reserve only one continuation in that same packet;
     /// it consumes no extra close permit and cannot authorize a fresh pair.
     pub(crate) fn allow_single_command_tail(&mut self, id: u64, bytes: usize) {
-        if bytes == 0 || bytes >= super::RADIO_COMMAND_BATCH_MAX_BYTES
+        if bytes == 0
+            || bytes >= super::RADIO_COMMAND_BATCH_MAX_BYTES
             || !(2..=55).contains(&self.packet_gap_ms)
-            || !self.promotion_contracts[..usize::from(self.promotion_contract_count)].contains(&id) {
+            || !self.promotion_contracts[..usize::from(self.promotion_contract_count)].contains(&id)
+        {
             return;
         }
         if let Some((_, clock)) = self.next_packet {
@@ -200,7 +275,8 @@ impl Capacity {
         self.committed(wall, clock, accepted);
         // Keep the existing first-loan semantics; historical IDs do not
         // create another slot in the current outstanding loan epoch.
-        if !batch_tail && !late
+        if !batch_tail
+            && !late
             && admissible
             && canonical_unsequenced
             && full_io_success
@@ -381,22 +457,53 @@ impl Capacity {
             std::env::var("GS_RRLS_ROLE").as_deref(),
             Ok("primary" | "rrls")
         ) || std::env::var("GS_RRLS_VOICE").as_deref() == Ok("1");
-        let default_share = if recovery { 25 } else { 40 };
+        Self::from_defaults(
+            uart_baud,
+            Defaults {
+                air_bps: 64_000,
+                overhead_bytes: 16,
+                packet_burst_ms: 100,
+                packet_gap_ms: 55,
+                host_share_percent: if recovery { 25 } else { 40 },
+            },
+        )
+    }
+    pub(crate) fn from_defaults(uart_baud: u32, defaults: Defaults) -> Self {
+        let default_share = defaults.host_share_percent;
         let configured_share = std::env::var("GS_RADIO_AIR_SHARE_PERCENT")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| (1..=100).contains(value));
         let mut capacity = Self::new(
-            bounded_env("GS_RADIO_AIR_BIT_RATE_BPS", 64_000, 1_200, 1_000_000),
+            bounded_env(
+                "GS_RADIO_AIR_BIT_RATE_BPS",
+                defaults.air_bps,
+                1_200,
+                1_000_000,
+            ),
             configured_share.unwrap_or(default_share),
-            bounded_env("GS_RADIO_AIR_FRAME_OVERHEAD_BYTES", 16, 0, 256),
+            bounded_env(
+                "GS_RADIO_AIR_FRAME_OVERHEAD_BYTES",
+                defaults.overhead_bytes,
+                0,
+                256,
+            ),
         );
         capacity.uart_baud = uart_baud.max(1);
-        capacity.packet_burst_ms =
-            u16::try_from(bounded_env("GS_RADIO_PACKET_BURST_MS", 100, 0, 500))
-                .expect("bounded burst fits u16");
-        capacity.packet_gap_ms = u16::try_from(bounded_env("GS_RADIO_PACKET_GAP_MS", 55, 0, 1_000))
-            .expect("bounded gap fits u16");
+        capacity.packet_burst_ms = u16::try_from(bounded_env(
+            "GS_RADIO_PACKET_BURST_MS",
+            defaults.packet_burst_ms,
+            0,
+            500,
+        ))
+        .expect("bounded burst fits u16");
+        capacity.packet_gap_ms = u16::try_from(bounded_env(
+            "GS_RADIO_PACKET_GAP_MS",
+            defaults.packet_gap_ms,
+            0,
+            1_000,
+        ))
+        .expect("bounded gap fits u16");
         capacity.default_share_percent = default_share;
         capacity.fixed_share = configured_share.is_some();
         capacity
@@ -515,6 +622,13 @@ impl Capacity {
         self.next_packet.and_then(|(_, virtual_ms)| virtual_ms)
     }
 
+    /// Read-only native-test ledger observation; never advances clocks/readiness.
+    #[cfg(test)]
+    pub(crate) fn next_air_virtual_ms(&self) -> Option<u64> {
+        self.next.and_then(|(_, value)| value)
+    }
+
+
     /// A physical tcdrain may complete later than its nominal wire duration.
     /// Anchor the quiet gap to actual completion; virtual time still follows
     /// the modeled 8N1 duration, independently of host scheduling delays.
@@ -548,7 +662,11 @@ impl Capacity {
         if accepted == 0 {
             return;
         }
-        let accepted = accepted.min(lengths.iter().fold(0usize, |total, &len| total.saturating_add(len)));
+        let accepted = accepted.min(
+            lengths
+                .iter()
+                .fold(0usize, |total, &len| total.saturating_add(len)),
+        );
         let cost = |bytes: usize| {
             if bytes == 0 {
                 0
@@ -639,15 +757,33 @@ mod tests {
         cap.committed(wall, Some(35233), 59);
         cap.committed(wall, Some(35294), 150);
         cap.drained_virtual(35307021);
-        assert!(cap.ready_for(wall, Some(35344), true), "the fresh interactive loan remains available");
-        assert!(!cap.ready_for_command(wall, Some(35344), 11, 55, true), "a replay must not glue retries to the current ordinary packet");
-        assert!(!cap.ready_for_command(wall, Some(35360), 11, 55, true), "funded airtime alone does not prove modem idle");
+        assert!(
+            cap.ready_for(wall, Some(35344), true),
+            "the fresh interactive loan remains available"
+        );
+        assert!(
+            !cap.ready_for_command(wall, Some(35344), 11, 55, true),
+            "a replay must not glue retries to the current ordinary packet"
+        );
+        assert!(
+            !cap.ready_for_command(wall, Some(35360), 11, 55, true),
+            "funded airtime alone does not prove modem idle"
+        );
         assert!(cap.ready_for_command(wall, Some(35363), 11, 55, true));
-        assert!(cap.ready_for_command(wall, Some(35344), 13, 55, true), "new command admission is unchanged");
-        assert!(cap.ready_for_receipt(wall, Some(35344), 11, 63), "a returning owner receipt retains its independent permit");
+        assert!(
+            cap.ready_for_command(wall, Some(35344), 13, 55, true),
+            "new command admission is unchanged"
+        );
+        assert!(
+            cap.ready_for_receipt(wall, Some(35344), 11, 63),
+            "a returning owner receipt retains its independent permit"
+        );
         cap.committed_command(wall, Some(35363), (11, 55), true, 55, true);
         cap.drained_virtual(35367775);
-        assert!(!cap.ready_for_command(wall, Some(35390), 12, 61, true), "a second replay cannot extend that new physical packet either");
+        assert!(
+            !cap.ready_for_command(wall, Some(35390), 12, 61, true),
+            "a second replay cannot extend that new physical packet either"
+        );
     }
 
     #[test]
@@ -663,8 +799,10 @@ mod tests {
         cap.allow_single_command_tail(1, 55);
         assert!(cap.ready_for_command(wall, Some(1008), 2, 55, true));
         assert!(!cap.ready_for_command(wall, Some(1036), 2, 55, true));
-        assert!(cap.ready_for_command(wall, Some(1063), 2, 55, true),
-            "an unused short window must retain the original post-gap loan");
+        assert!(
+            cap.ready_for_command(wall, Some(1063), 2, 55, true),
+            "an unused short window must retain the original post-gap loan"
+        );
         let boundary = cap.last_forced_boundary;
         assert!(cap.committed_command(wall, Some(1008), (2, 55), true, 55, true));
         assert_eq!(cap.last_forced_boundary, boundary);
@@ -791,10 +929,16 @@ mod tests {
             let mut remaining = accepted;
             for length in [63, 55, 55] {
                 let prefix = remaining.min(length);
-                if prefix > 0 { reference.committed(wall, Some(0), prefix); }
+                if prefix > 0 {
+                    reference.committed(wall, Some(0), prefix);
+                }
                 remaining -= prefix;
             }
-            assert_eq!(batch.next.unwrap().1, reference.next.unwrap().1, "accepted={accepted}");
+            assert_eq!(
+                batch.next.unwrap().1,
+                reference.next.unwrap().1,
+                "accepted={accepted}"
+            );
         }
         let mut cap = Capacity::new(64_000, 15, 16);
         cap.committed(wall, Some(30_000), 21);
@@ -1542,7 +1686,10 @@ mod command_batch_tail_tests {
         cap.committed_command(wall, Some(30002), (1, 55), true, 55, true);
         cap.drained_virtual(30007000);
         cap.allow_single_command_tail(1, 55);
-        assert!(!cap.command_tail_open, "unpromoted IO cannot grant a continuation");
+        assert!(
+            !cap.command_tail_open,
+            "unpromoted IO cannot grant a continuation"
+        );
         assert!(cap.close_packet_batch_for_contract(wall, Some(30002), Some((1, false))));
         cap.allow_single_command_tail(1, 55);
         assert!(!cap.ready_for_command(wall, Some(30006), 2, 62, true));
@@ -1564,7 +1711,10 @@ mod command_batch_tail_tests {
         assert!(!cap.ready_for(wall, Some(30018), true));
         assert!(cap.ready_for_command(wall, Some(30018), 3, 55, true));
         assert!(cap.committed_command(wall, Some(30018), (3, 55), true, 55, true));
-        assert_eq!(cap.next.unwrap().1, Some(previous_debt + (71u64 * 8000).div_ceil(9600)));
+        assert_eq!(
+            cap.next.unwrap().1,
+            Some(previous_debt + (71u64 * 8000).div_ceil(9600))
+        );
         assert_eq!(cap.last_forced_boundary, boundary);
         assert_eq!(cap.ordinary_service_credit_ms, credit);
         assert!(!cap.close_packet_batch_for_contract(wall, Some(30018), Some((3, false))));
@@ -1575,7 +1725,13 @@ mod command_batch_tail_tests {
     #[test]
     fn tail_never_extends_ids_metadata_bounds_or_clock_domains() {
         let (cap, wall) = pair();
-        for (id, bytes, canonical) in [(1, 55, true), (2, 55, true), (3, 0, true), (3, 75, true), (3, 55, false)] {
+        for (id, bytes, canonical) in [
+            (1, 55, true),
+            (2, 55, true),
+            (3, 0, true),
+            (3, 75, true),
+            (3, 55, false),
+        ] {
             assert!(!cap.ready_for_command(wall, Some(30018), id, bytes, canonical));
         }
         assert!(cap.ready_for_command(wall, Some(30018), 3, 74, true));
@@ -1588,13 +1744,19 @@ mod command_batch_tail_tests {
         for accepted in [0, 1, 54, 55] {
             let (mut cap, wall) = pair();
             let debt = cap.next.unwrap().1.unwrap();
-            assert_eq!(cap.committed_command(wall, Some(30018), (3, 55), true, accepted, false), accepted > 0);
+            assert_eq!(
+                cap.committed_command(wall, Some(30018), (3, 55), true, accepted, false),
+                accepted > 0
+            );
             if accepted == 0 {
                 assert_eq!(cap.next.unwrap().1, Some(debt));
                 assert!(cap.ready_for_command(wall, Some(30039), 3, 55, true));
                 assert!(!cap.ready_for_command(wall, Some(30040), 3, 55, true));
             } else {
-                assert_eq!(cap.next.unwrap().1, Some(debt + ((accepted as u64 + 16) * 8000).div_ceil(9600)));
+                assert_eq!(
+                    cap.next.unwrap().1,
+                    Some(debt + ((accepted as u64 + 16) * 8000).div_ceil(9600))
+                );
                 assert!(!cap.ready_for_command(wall, Some(30018), 4, 1, true));
             }
         }

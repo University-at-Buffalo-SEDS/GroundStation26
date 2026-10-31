@@ -8,6 +8,7 @@ pub(crate) use commands::{
     queue_locally_routed_flight_command,
 };
 mod periodic;
+mod heartbeat;
 pub(crate) mod procedure_clock;
 mod radio_io;
 pub use radio_io::{CommsWorkerHandle, TransportTxActivity, TxQueueBudget};
@@ -79,8 +80,8 @@ const OPERATOR_MODE_FLIGHT_STATE_ORDER: [FlightState; 16] = [
     FlightState::Ascent,
     FlightState::Coast,
     FlightState::Apogee,
-    FlightState::ParachuteDeploy,
     FlightState::Descent,
+    FlightState::Reefing,
     FlightState::Landed,
     FlightState::Recovery,
     FlightState::Aborted,
@@ -333,6 +334,7 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
         return;
     }
     let now_ms = procedure_clock::timestamp_ms();
+    state.confirm_new_launch_cycle();
     state.set_launch_clock(launch_countdown_clock(now_ms));
     let flight_command_sent = if let Err(e) = queue_locally_routed_flight_command(
         &router,
@@ -646,10 +648,7 @@ pub async fn telemetry_task(
                         Vec::new()
                     }
                 };
-                for row in rows {
-                    state.cache_recent_telemetry(row.clone());
-                    let _ = state.ws_tx.send(row);
-                }
+                publish_received_telemetry_rows(&state, rows);
             }
         })
     };
@@ -1179,7 +1178,9 @@ pub async fn telemetry_task(
                 }
                 _ = heartbeat_interval.tick() => {
                     if !heartbeat_cadence.due(crate::simulation_clock_ms()) { continue; }
-                    if router.log_queue::<u8>(crate::telemetry_schema::data_type("HEARTBEAT"), &[]).is_ok() {
+                    // Retry only failed durable admission; stable clocks emit nothing.
+                    let _ = crate::network_variables::retry_pending_daq_log_clock(&router);
+                    if heartbeat::queue_station_heartbeat(&router).is_ok() {
                         state.mark_board_seen(
                             Board::GroundStation.sender_id(),
                             get_current_timestamp_ms(),
@@ -1639,19 +1640,25 @@ pub(crate) fn apply_umbilical_status_at_ingress(
             return None;
         }
         if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
-            state.set_umbilical_valve_state(key_cmd_id, key_on);
-            crate::gse::qd_confirmation(state, &sender_id, key_cmd_id, key_on, pkt.timestamp());
-            crate::gse::report_safety(state);
-            state.reconcile_pending_umbilical_valve_state(
-                key_cmd_id,
-                key_on,
-                crate::state::UMBILICAL_PENDING_VALVE_TIMEOUT,
+            let fresh_confirmation = state.set_umbilical_valve_state_source(
+                key_cmd_id, key_on, pkt.timestamp() as i64,
+                recording_network_utc_ms().unwrap_or_else(|| get_current_timestamp_ms() as i64),
+                pkt.packet_id(),
             );
-            if key_cmd_id == ValveBoardCommands::PilotOpen as u8
-                && key_on
-                && crate::gse::pilot_report_can_advance_launch_clock(state)
-            {
-                transition_launch_clock_to_t_plus_from_pilot_open(state);
+            if fresh_confirmation {
+                crate::gse::qd_confirmation(state, &sender_id, key_cmd_id, key_on, pkt.timestamp());
+                crate::gse::report_safety(state);
+                state.reconcile_pending_umbilical_valve_state(
+                    key_cmd_id,
+                    key_on,
+                    crate::state::UMBILICAL_PENDING_VALVE_TIMEOUT,
+                );
+                if key_cmd_id == ValveBoardCommands::PilotOpen as u8
+                    && key_on
+                    && crate::gse::pilot_report_can_advance_launch_clock(state)
+                {
+                    transition_launch_clock_to_t_plus_from_pilot_open(state);
+                }
             }
             sequences::refresh_action_policy_now(state);
             state.broadcast_action_policy_snapshot();
@@ -1702,6 +1709,14 @@ async fn persist_umbilical_status(
     .await;
 }
 
+// The same fan-out feeds live clients and /api/recent after reconnect.
+fn publish_received_telemetry_rows(state: &AppState, rows: Vec<TelemetryRow>) {
+    for row in rows {
+        state.cache_recent_telemetry(row.clone());
+        let _ = state.ws_tx.send(row);
+    }
+}
+
 async fn handle_packet(
     state: &Arc<AppState>,
     db_tx: &mpsc::Sender<DbQueueItem>,
@@ -1719,6 +1734,26 @@ async fn handle_packet(
         state.broadcast_action_policy_snapshot();
     }
     let sender_id = state.canonical_network_sender_id(pkt.sender());
+
+    if pkt.data_type() == crate::telemetry_schema::data_type("DAQ_LAUNCH_LOG_STATUS") {
+        if let Ok(words) = pkt.data_as_u32() {
+            state.network_health.lock().unwrap().observe_launch_log_status(
+                &sender_id, &words, std::time::Instant::now(), get_current_timestamp_ms(),
+                pkt.timestamp(), recording_network_utc_ms().and_then(|t| t.try_into().ok())
+                    .unwrap_or_else(get_current_timestamp_ms),
+            );
+        }
+        return Vec::new();
+    }
+
+    if pkt.data_type() == crate::telemetry_schema::data_type("DAQ_SD_HEALTH") {
+        if let Ok(words) = pkt.data_as_u32() {
+            state.network_health.lock().unwrap().observe_sd_status(
+                &sender_id, &words, std::time::Instant::now(), get_current_timestamp_ms(),
+            );
+        }
+        return Vec::new();
+    }
 
     if pkt.data_type() == crate::telemetry_schema::data_type("BOARD_HEALTH") {
         if let Ok(words) = pkt.data_as_u32() {
@@ -1828,6 +1863,9 @@ async fn handle_packet(
         } else {
             get_current_timestamp_ms() as i64
         };
+        // Only an actually received prelaunch phase can re-arm a reset clock;
+        // a process's initial local Idle is not a new launch transition.
+        if matches!(new_flight_state,FlightState::Startup|FlightState::Idle|FlightState::PreFill|FlightState::FillTest|FlightState::NitrogenFill|FlightState::NitrousFill|FlightState::Armed){state.confirm_new_launch_cycle();}
         state.update_launch_clock_for_state(new_flight_state, launch_clock_ts_ms);
         queue_db_write(
             state,
@@ -2098,7 +2136,7 @@ async fn reset_testing_simulation(state: &Arc<AppState>) {
         let mut flight_state = state.state.lock().unwrap();
         *flight_state = FlightState::Idle;
     }
-    state.reset_launch_clock();
+    // Simulation data/state reset is separate from the explicit ResetTClock utility.
     state.broadcast_fill_targets_snapshot();
 
     let now_ms = get_current_timestamp_ms() as i64;
@@ -2339,6 +2377,9 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&qualification).unwrap()).unwrap();
         assert_eq!(saved["qualification"]["fire_started"], true);
         state.reset_launch_clock();
+        start_launch_clock_from_valve_sequence_status(&state);
+        assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::Idle,"old sequence status cannot re-arm a reset launch clock");
+        state.confirm_new_launch_cycle();
         start_launch_clock_from_valve_sequence_status(&state);
         assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::TMinus);
         std::fs::remove_file(qualification).unwrap();
@@ -4308,6 +4349,7 @@ mod tests {
             action_policy_tx,
             fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
             fill_targets_tx,
+            launch_history: Arc::new(Mutex::new(crate::launch_history::Store::ephemeral())),
             launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
             launch_clock_tx,
             launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
@@ -4687,6 +4729,239 @@ mod tests {
                 .iter()
                 .any(|r| r.data_type == loadcell::DERIVED_WEIGHT_50_DATA_TYPE)
         );
+    }
+
+    #[cfg(feature = "test_fire_mode")]
+    #[tokio::test]
+    async fn chamber_testfire_csv_joins_actual_recorded_rows_without_duplicates_or_old_pressure() {
+        let (db_tx, mut db_rx) = mpsc::channel(128);
+        let state = test_app_state(db_tx.clone()).await;
+        let directory = std::env::temp_dir().join(format!(
+            "gs-chamber-csv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("samples.db");
+        let csv_path = directory.join("samples.csv");
+        let (db, _) = crate::telemetry_db::open_telemetry_db(&db_path)
+            .await
+            .unwrap();
+        for (kind, source, values) in [
+            ("KG1000", 100_u64, vec![1.0_f32]),
+            ("DAQ_LOADCELL_CHAMBER", 200, vec![4.25, 1000.0, 5.0]),
+            ("KG1000", 300, vec![2.0]),
+            ("DAQ_LOADCELL_CHAMBER", 400, vec![3.0, f32::NAN, 5.0]),
+        ] {
+            let packet = Packet::new(
+                crate::telemetry_schema::data_type(kind),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "DAQ",
+                source,
+                f32_payload(&values),
+            )
+            .unwrap();
+            handle_packet(&state, &db_tx, &test_db_overflow(), packet).await;
+        }
+        let mut writes = Vec::new();
+        while let Ok(DbQueueItem::Write(write)) = db_rx.try_recv() {
+            writes.push(write);
+        }
+        insert_db_batch_once(&db, &writes).await.unwrap();
+        let combined: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM telemetry WHERE data_type='DAQ_LOADCELL_CHAMBER'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let projected: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM telemetry WHERE data_type='COMBUSTION_CHAMBER_PRESSURE'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            (combined, projected),
+            (2, 1),
+            "actual ingestion stored both valid representations but no invalid PT projection"
+        );
+        let received: i64 = sqlx::query_scalar(
+            "SELECT timestamp_ms FROM telemetry WHERE data_type='COMBUSTION_CHAMBER_PRESSURE'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let expected_rx: String =
+            sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%f', ? / 1000.0, 'unixepoch')")
+                .bind(received)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        // Duplicate projections are the same observation, not extra samples.
+        sqlx::query("INSERT INTO telemetry(timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json) SELECT timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json FROM telemetry WHERE data_type IN ('COMBUSTION_CHAMBER_PRESSURE','COMBUSTION_CHAMBER_VOLTAGE')")
+            .execute(&db).await.unwrap();
+        // Equal clocks alone cannot join an unrelated original payload.
+        sqlx::query("INSERT INTO telemetry(timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json) SELECT timestamp_ms,source_timestamp_ms,sender_id,data_type,'[1234.0]','[255]' FROM telemetry WHERE data_type='COMBUSTION_CHAMBER_PRESSURE' LIMIT 1")
+            .execute(&db).await.unwrap();
+        db.close().await;
+        let mut calibration = crate::loadcell::LoadcellCalibrationFile::default();
+        calibration.extra_channels.insert(
+            "kg50".into(),
+            crate::loadcell::GenericCalibrationChannel {
+                linear: crate::loadcell::ChannelLinear {
+                    m: Some(1.0),
+                    b: Some(0.0),
+                },
+                ..Default::default()
+            },
+        );
+        crate::test_fire_csv::export_recording_csv(
+            db_path.to_str().unwrap(),
+            &csv_path,
+            &calibration,
+        )
+        .await
+        .unwrap();
+        let csv = std::fs::read_to_string(&csv_path).unwrap();
+        let header: Vec<_> = csv.lines().next().unwrap().split(',').collect();
+        assert_eq!(
+            header[..15].join(","),
+            "Rx_Timestamp,Header,Seq,Timestamp,1000kg Raw,Tank Pressure Raw,Battery Voltage,CRC,1000kg Calibrated,Weight,Thrust,Tank Pressure Calibrated,50kg Raw,50kg Calibrated,ADC Temperature C"
+        );
+        assert_eq!(
+            &header[15..],
+            &["Chamber Pressure (psig)", "Chamber Connector Voltage (V)"]
+        );
+        let data: Vec<Vec<_>> = csv
+            .lines()
+            .skip(3)
+            .map(|line| line.split(',').collect())
+            .collect();
+        assert_eq!(
+            data.len(),
+            4,
+            "one original loadcell sample each; combined and projection are not extra samples"
+        );
+        assert!(data.iter().all(|row| row.len() == 17));
+        assert_eq!(&data[0][15..], &["", ""], "absent pressure is not zero");
+        assert_eq!(&data[1][15..], &["1000", "5"]);
+        assert_eq!(
+            data[1][0], expected_rx,
+            "actual PT packet receive clock retained"
+        );
+        assert_eq!(data[1][3], "200", "actual PT packet source clock retained");
+        assert_eq!(
+            data[1][4], "4.25",
+            "existing raw loadcell remains unchanged"
+        );
+        assert_eq!(
+            &data[2][15..],
+            &["", ""],
+            "previous PT must not carry into a later independent sample"
+        );
+        assert_eq!(data[2][3], "300");
+        assert_eq!(
+            &data[3][15..],
+            &["", ""],
+            "invalid PT does not become a pressure or voltage measurement"
+        );
+        assert_eq!(
+            data[3][4], "3",
+            "invalid PT retains the independent loadcell sample"
+        );
+        // Conflicting values for the exact original sample cannot be resolved
+        // by row order. Both PT columns must remain unknown, not last-writer-wins.
+        let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", db_path.display()))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO telemetry(timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json) SELECT timestamp_ms,source_timestamp_ms,sender_id,data_type,'[999.0]',payload_json FROM telemetry WHERE data_type='COMBUSTION_CHAMBER_PRESSURE' AND payload_json != '[255]' LIMIT 1")
+            .execute(&db).await.unwrap();
+        db.close().await;
+        crate::test_fire_csv::export_recording_csv(
+            db_path.to_str().unwrap(),
+            &csv_path,
+            &calibration,
+        )
+        .await
+        .unwrap();
+        let conflict_csv = std::fs::read_to_string(&csv_path).unwrap();
+        let conflict_rows: Vec<Vec<_>> = conflict_csv
+            .lines()
+            .skip(3)
+            .map(|line| line.split(',').collect())
+            .collect();
+        assert_eq!(conflict_rows.len(), 4);
+        assert_eq!(
+            &conflict_rows[1][15..],
+            &["", ""],
+            "ambiguous same-packet PT is unknown"
+        );
+        assert_eq!(
+            &conflict_rows[1][..15],
+            &data[1][..15],
+            "existing loadcell/calibration/clocks unchanged by PT ambiguity"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn chamber_packet_keeps_loadcell_calibration_and_persists_pressure_with_both_clocks() {
+        let (db_tx, mut db_rx) = mpsc::channel(16);
+        let state = test_app_state(db_tx.clone()).await;
+        let pkt = Packet::new(
+            crate::telemetry_schema::data_type("DAQ_LOADCELL_CHAMBER"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            "DAQ",
+            987654,
+            f32_payload(&[4.25, 1000.0, 5.0]),
+        )
+        .unwrap();
+        // Exercise the DAQ's actual packed f32 triplet before backend ingestion.
+        let packed = sedsnet::wire_format::pack_packet(&pkt);
+        let pkt = sedsnet::wire_format::unpack_packet(&packed).unwrap();
+        let rows = handle_packet(&state, &db_tx, &test_db_overflow(), pkt).await;
+        let mut ws = state.ws_tx.subscribe();
+        publish_received_telemetry_rows(&state, rows.clone());
+        let mut broadcast = Vec::new();
+        while let Ok(row) = ws.try_recv() { broadcast.push(row); }
+        for kind in ["KG1000", "COMBUSTION_CHAMBER_PRESSURE", "COMBUSTION_CHAMBER_VOLTAGE"] {
+            assert!(broadcast.iter().any(|row| row.data_type == kind), "missing live {kind}");
+            assert!(state.recent_telemetry_snapshot().iter().any(|row| row.data_type == kind), "missing reconnect {kind}");
+        }
+        assert!(rows.iter().any(
+            |r| r.data_type == "COMBUSTION_CHAMBER_PRESSURE" && r.values == vec![Some(1000.0)]
+        ));
+        assert!(
+            rows.iter()
+                .any(|r| r.data_type == "KG1000" && r.values == vec![Some(4.25)])
+        );
+        let db = crate::telemetry_db::open_in_memory_telemetry_db()
+            .await
+            .unwrap();
+        let mut writes = Vec::new();
+        while let Ok(DbQueueItem::Write(write)) = db_rx.try_recv() {
+            writes.push(write);
+        }
+        assert!(
+            writes.len() >= 5,
+            "combined,raw loadcell,derived mass,pressure,voltage"
+        );
+        insert_db_batch_once(&db, &writes).await.unwrap();
+        let saved:(i64,i64,String,String,String)=sqlx::query_as(
+            "SELECT timestamp_ms,source_timestamp_ms,sender_id,values_json,payload_json FROM telemetry WHERE data_type='COMBUSTION_CHAMBER_PRESSURE'")
+            .fetch_one(&db).await.unwrap();
+        assert!(saved.0 > 0);
+        assert_eq!(saved.1, 987654);
+        assert_eq!(saved.2, "DAQ");
+        assert_eq!(
+            serde_json::from_str::<Vec<f32>>(&saved.3).unwrap(),
+            vec![1000.0]
+        );
+        assert!(!saved.4.is_empty());
+        db.close().await;
     }
 
     #[tokio::test]
@@ -5136,6 +5411,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daq_launch_log_status_ingress_preserves_exact_storage_state_without_display_rows() {
+        let (db_tx, _db_rx) = mpsc::channel(32);
+        let state = test_app_state(db_tx.clone()).await;
+        let overflow = test_db_overflow();
+        for (name, words) in [
+            ("BOARD_HEALTH", { let mut words = vec![0; 24]; words[0] = 1; words[4] = 1000; words }),
+            ("DAQ_LAUNCH_LOG_STATUS", vec![u32::MAX - 1, 0x12345678, 99, 0xabcd, u32::MAX, 0xfedcba98, 0]),
+        ] {
+            let payload: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            let packet = Packet::new(crate::telemetry_schema::data_type(name),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")], "DAQ", 100, payload.into()).unwrap();
+            assert!(handle_packet(&state, &db_tx, &overflow, packet).await.is_empty());
+        }
+        let rows = state.network_health.lock().unwrap().snapshot(std::time::Instant::now(), false);
+        let status = rows.iter().find(|r| r.sender_id == "DAQ").unwrap()
+            .diagnostics.as_ref().unwrap().launch_log.as_ref().unwrap();
+        assert_eq!(status.session, 0x12345678_fffffffe);
+        assert_eq!(status.deadline_utc_ms, 0xabcd_00000063);
+        assert_eq!(status.revision, 0xfedcba98_ffffffff);
+        assert_eq!(status.flags, 0, "accepted clock must not invent recorder-ready/open flags");
+        let network_now = recording_network_utc_ms().and_then(|t| u64::try_from(t).ok())
+            .unwrap_or_else(get_current_timestamp_ms);
+        let words = [u32::MAX - 1, 0x12345678, 99, 0xabcd, u32::MAX, 0xfedcba98, 0x31];
+        let payload: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let packet = Packet::new(crate::telemetry_schema::data_type("DAQ_LAUNCH_LOG_STATUS"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "DAQ", network_now - 30_000, payload.into()).unwrap();
+        assert!(handle_packet(&state, &db_tx, &overflow, packet).await.is_empty());
+        let rows = state.network_health.lock().unwrap().snapshot(std::time::Instant::now(), false);
+        let delayed = rows.iter().find(|r| r.sender_id == "DAQ").unwrap().diagnostics.as_ref().unwrap().launch_log.as_ref().unwrap();
+        assert!(delayed.received_age_ms >= 30_000, "queued old open-file report must arrive already stale");
+        assert_eq!(delayed.flags, 0x31);
+
+    }
+    #[tokio::test]
     async fn ordered_valve_confirmations_accept_rebooted_source_clock() {
         for (board, key) in [
             (
@@ -5161,6 +5470,42 @@ mod tests {
                 let rows = handle_packet(&state, &db_tx, &overflow, pkt).await;
                 assert!(!rows.is_empty());
                 assert_eq!(state.get_umbilical_valve_state(key), Some(on != 0));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn same_tick_distinct_valve_packets_update_once_and_replays_never_roll_back_ui_or_pending() {
+        for stamp in [0, 1234] {
+            let (db_tx, _db_rx) = mpsc::channel(32);
+            let state = test_app_state(db_tx.clone()).await;
+            let overflow = test_db_overflow();
+            let key = ActuatorBoardCommands::NitrogenOpen as u8;
+            let make = |value, nonce| Packet::new_with_nonce(
+                crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "AB", stamp, nonce, Arc::from([key, value]),
+            ).unwrap();
+            let open = make(1, 11);
+            let close = make(0, 12);
+            let replay_new_nonce = make(1, 13);
+            assert_ne!(open.packet_id(), close.packet_id());
+            assert_ne!(open.packet_id(), replay_new_nonce.packet_id());
+            handle_packet(&state, &db_tx, &overflow, open.clone()).await;
+            assert_eq!(state.get_umbilical_valve_state(key), Some(true));
+            handle_packet(&state, &db_tx, &overflow, close).await;
+            assert_eq!(state.get_umbilical_valve_state(key), Some(false));
+            for replay in [open.clone(), replay_new_nonce.clone()] {
+                let rows = handle_packet(&state, &db_tx, &overflow, replay).await;
+                assert_eq!(rows[0].values[4], Some(0.0));
+                assert_eq!(state.get_umbilical_valve_state(key), Some(false));
+            }
+            state.set_pending_umbilical_valve_state(key, true);
+            for replay in [open, replay_new_nonce] {
+                let rows = handle_packet(&state, &db_tx, &overflow, replay).await;
+                assert_eq!(rows[0].values[4], None);
+                assert_eq!(state.get_umbilical_valve_state(key), None);
+                assert_eq!(state.get_pending_umbilical_valve_state(key), Some(true));
             }
         }
     }

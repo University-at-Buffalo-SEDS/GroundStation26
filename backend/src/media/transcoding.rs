@@ -460,6 +460,7 @@ mod tests {
             hls_segments: Mutex::new(std::collections::HashMap::new()),
             program_history: Mutex::new(std::collections::VecDeque::new()),
             publishers: Mutex::new(Vec::new()),
+            publish_offer: Mutex::new(()),
             transcoding: Mutex::default(),
         });
         let headers = |name: &str| {

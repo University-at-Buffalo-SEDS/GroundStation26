@@ -522,6 +522,27 @@
         }
       },
       {
+        "id": "COMBUSTION_CHAMBER_PRESSURE",
+        "label": "Combustion chamber pressure",
+        "channels": [
+          "Pressure (psig)"
+        ],
+        "chart": {
+          "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
+        },
+        "channel_formatters": [
+          {
+            "precision": 2,
+            "suffix": " psig"
+          }
+        ]
+      },
+      {
         "id": "BATTERY_VOLTAGE",
         "label": "Battery Voltage",
         "channels": [
@@ -1200,6 +1221,76 @@
               "enabled": true,
               "kind": "low_pass",
               "cutoff_hz": 8.0
+            }
+          },
+          {
+            "id": "chamber_pressure",
+            "label": "Chamber pressure",
+            "data_type": "COMBUSTION_CHAMBER_PRESSURE",
+            "sender_id": "DAQ",
+            "channels": [
+              "Chamber pressure (psig)"
+            ],
+            "chart_groups": [
+              {
+                "title": "Pressure (psig)",
+                "data_type": "COMBUSTION_CHAMBER_PRESSURE",
+                "sender_id": "DAQ",
+                "labels": [
+                  "Pressure (psig)"
+                ],
+                "channels": [
+                  0
+                ]
+              },
+              {
+                "title": "Connector voltage (V)",
+                "data_type": "COMBUSTION_CHAMBER_VOLTAGE",
+                "sender_id": "DAQ",
+                "labels": [
+                  "Voltage (V)"
+                ],
+                "channels": [
+                  0
+                ]
+              }
+            ],
+            "summary_items": [
+              {
+                "label": "Chamber pressure",
+                "data_type": "COMBUSTION_CHAMBER_PRESSURE",
+                "sender_id": "DAQ",
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 2,
+                  "suffix": " psig"
+                }
+              },
+              {
+                "label": "Raw connector voltage",
+                "data_type": "COMBUSTION_CHAMBER_VOLTAGE",
+                "sender_id": "DAQ",
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4,
+                  "suffix": " V"
+                }
+              },
+              {
+                "label": "Outside rated 0\u20131000 psig range (1=yes)",
+                "data_type": "COMBUSTION_CHAMBER_RANGE_STATUS",
+                "sender_id": "DAQ",
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 0
+                }
+              }
+            ],
+            "chart": {
+              "enabled": true
             }
           }
         ],
@@ -2994,8 +3085,8 @@
       },
       {
         "states": [
-          "ParachuteDeploy",
-          "Descent"
+          "Descent",
+          "Reefing"
         ],
         "sections": [
           {
@@ -3570,5 +3661,6 @@
         "curve_exponent": 1.0
       }
     ]
-  }
+  },
+  "flight_phase_version": 1
 }

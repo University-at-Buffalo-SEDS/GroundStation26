@@ -10,6 +10,11 @@ use std::{
 #[path = "comms/virtual_uart.rs"]
 mod receipt_test_wire;
 
+#[path = "rrls/settings_framing.rs"]
+mod settings_framing;
+#[path = "rrls/continuous_clock.rs"]
+mod continuous_clock;
+
 const LOSS_MS: u64 = 3_000;
 const RESTORE_MS: u64 = 2_000;
 const LEASE_MS: u64 = 2_000;
@@ -27,6 +32,8 @@ const READY: u8 = 7;
 const POSITION: u8 = 8;
 const VOICE: u8 = 9;
 const SETTINGS: u8 = 10;
+// Host application control; kind12 is reserved for independent radio-budget negotiation.
+const HOST_CONTROL: u8 = 11;
 const MAX_SETTINGS_INBOX: usize = 4;
 const SETTINGS_PEER_AGE_MS: u64 = 15_000;
 #[derive(Clone, Copy)]
@@ -104,6 +111,10 @@ pub fn configure(link: &crate::comms_config::CommsLinkConfig) -> anyhow::Result<
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random)
         .map_err(|_| anyhow::anyhow!("cannot generate recovery session identity"))?;
     let mut mesh = Mesh::new(role, u32::from_le_bytes(random));
+    if crate::comms::rfd_profile::active().is_some_and(|p| p.transport.usable_air_bps == 32_000 && p.transport.frame_overhead_bytes == 16)
+        && std::env::var_os("GS_RADIO_AIR_SHARE_PERCENT").is_none() {
+        mesh.enable_settings_framing();
+    }
     mesh.voice_enabled = std::env::var("GS_RRLS_VOICE").ok().as_deref() == Some("1");
     RADIO
         .set((serial.port.clone(), Arc::new(Mutex::new(mesh))))
@@ -138,6 +149,8 @@ pub struct Status {
     pub relayed_frames: u64,
     /// Bytes in those RR envelopes; excludes the outer UART header.
     pub relay_envelope_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings_framing: Option<serde_json::Value>,
 }
 pub fn status() -> Status {
     if let Some((_, shared)) = RADIO.get() {
@@ -154,6 +167,7 @@ pub fn status() -> Status {
             forwarded_frames: m.forwarded,
             relayed_frames: m.relayed_frames,
             relay_envelope_bytes: m.relay_envelope_bytes,
+            settings_framing: m.settings_framing.as_ref().map(|state| state.diagnostics()),
         }
     } else {
         Status {
@@ -167,6 +181,7 @@ pub fn status() -> Status {
             forwarded_frames: 0,
             relayed_frames: 0,
             relay_envelope_bytes: 0,
+            settings_framing: None,
         }
     }
 }
@@ -175,8 +190,12 @@ pub struct Outgoing {
     pub command: bool,
     pub bytes: Vec<u8>,
 }
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsOrigin { None, Settings, Reply }
+
 struct Queued {
-    mode_reply: bool,
+    settings_origin: SettingsOrigin,
     frame: Outgoing,
     at: u64,
     priority: u8,
@@ -186,12 +205,19 @@ struct Queued {
 }
 impl Queued {
     fn closes_packet_batch(&self) -> bool {
+        if self.frame.bytes.get(3) == Some(&HOST_CONTROL) {
+            return true;
+        }
         !self.independent_discovery
             && decode(&self.frame.bytes).is_some_and(|(_, body)| {
                 crate::comms::closes_radio_packet_batch(self.priority, body)
             })
     }
     fn boundary_contract(&self) -> Option<(u64, bool)> {
+        if self.frame.bytes.get(3) == Some(&HOST_CONTROL) {
+            let (_, body) = decode(&self.frame.bytes)?;
+            return crate::command_proxy::wire_boundary(body).map(|id| (id, false));
+        }
         if self.independent_discovery {
             return None;
         }
@@ -205,10 +231,12 @@ pub(crate) struct Transmission {
     queued: Queued,
     follower: Option<Queued>,
     id: u64,
+    physical: Option<Outgoing>,
+    settings_action: Option<settings_framing::Action>,
 }
 impl Transmission {
     pub(crate) fn frame(&self) -> &Outgoing {
-        &self.queued.frame
+        self.physical.as_ref().unwrap_or(&self.queued.frame)
     }
     pub(crate) fn follower_frame(&self) -> Option<&Outgoing> {
         self.follower.as_ref().map(|queued| &queued.frame)
@@ -220,18 +248,31 @@ impl Transmission {
         ])
     }
     pub(crate) fn single_control_contract(&self) -> Option<(u64, bool)> {
-        if self.follower.is_some() { return None; }
+        if self.settings_action.is_some() || self.follower.is_some() {
+            return None;
+        }
         Self::batch_contract(&self.queued)
     }
     fn batch_contract(queued: &Queued) -> Option<(u64, bool)> {
         if queued.priority < 254 || queued.independent_discovery {
             return None;
         }
+        if queued.frame.bytes.get(3) == Some(&HOST_CONTROL) {
+            return queued.boundary_contract();
+        }
         let (_, body) = decode(&queued.frame.bytes)?;
         crate::comms::radio_batch_control_contract(queued.priority, body)
     }
     /// Ordinary-lane wire bytes eligible for funding only after full successful IO.
     /// Dependent SDT stays in its existing lane; independent discovery/control does not.
+    pub(crate) fn ordinary_background_service_bytes(&self) -> usize {
+        if self.queued.priority >= 254
+            || (self.queued.frame.bytes.get(3) == Some(&SETTINGS) && self.queued.settings_origin == SettingsOrigin::None)
+            || (self.settings_action.is_none() && self.queued.settings_origin == SettingsOrigin::None && self.queued.closes_packet_batch()) {
+            return 0;
+        }
+        self.frame().bytes.len() + 4
+    }
     pub(crate) fn successful_ordinary_service_bytes(&self) -> usize {
         if self.queued.priority < 254
             && !self.queued.closes_packet_batch()
@@ -247,9 +288,10 @@ impl Transmission {
         }
     }
     pub(crate) fn closes_packet_batch(&self) -> bool {
-        self.queued.closes_packet_batch()
+        self.settings_action.is_none() && self.queued.closes_packet_batch()
     }
     pub(crate) fn boundary_contract(&self) -> Option<(u64, bool)> {
+        if self.settings_action.is_some() { return None; }
         self.queued.boundary_contract()
     }
     #[cfg(test)]
@@ -265,6 +307,7 @@ pub struct Mesh {
     voice_enabled: bool,
     settings_peer_seen: Option<u64>,
     settings_inbox: VecDeque<Vec<u8>>,
+    command_proxy_inbox: VecDeque<Vec<u8>>,
     started: Instant,
     // The shared simulation clock survives host process restarts.
     clock_origin_ms: u64,
@@ -300,15 +343,18 @@ pub struct Mesh {
     receipt_service_pending: bool,
     active_fair_delta_bytes: i32,
     fair_overhead_bytes: u16,
+    settings_framing: Option<Box<settings_framing::State>>,
 }
 
 impl Mesh {
     pub fn new(role: Role, session: u32) -> Self {
         Self {
             role,
+            settings_framing: None,
             voice_enabled: false,
             settings_peer_seen: None,
             settings_inbox: VecDeque::new(),
+            command_proxy_inbox: VecDeque::new(),
             started: Instant::now(),
             clock_origin_ms: crate::simulation_clock_ms().unwrap_or(0),
             session,
@@ -390,8 +436,15 @@ impl Mesh {
     }
 
     pub fn tick(&mut self, now: u64) {
+        self.observe_settings_framing(now);
         if self.role == Role::Primary {
-            if self.last_direct.map_or(now.saturating_sub(self.clock_origin_ms), |v| now.saturating_sub(v)) >= LOSS_MS {
+            if self
+                .last_direct
+                .map_or(now.saturating_sub(self.clock_origin_ms), |v| {
+                    now.saturating_sub(v)
+                })
+                >= LOSS_MS
+            {
                 self.fallback = true;
             } else if self
                 .direct_since
@@ -467,6 +520,65 @@ impl Mesh {
             }
         }
     }
+    pub(crate) fn enable_settings_framing(&mut self) {
+        self.settings_framing = Some(Box::new(settings_framing::State::new(self.role == Role::Primary)));
+    }
+    fn settings_context(&self, now: u64) -> settings_framing::Context {
+        settings_framing::Context {
+            mesh_ms: now,
+            continuous_ms: continuous_clock::now(now),
+            session: self.operating_mode_session(now),
+            sequence: if self.role == Role::Primary { self.sequence.wrapping_sub(1) } else { self.primary_sequence },
+            peer_fresh: self.settings_available(now),
+        }
+    }
+    fn observe_settings_framing(&mut self, now: u64) {
+        let context = self.settings_context(now);
+        if let Some(state) = self.settings_framing.as_mut() { state.observe(context); }
+    }
+    fn settings_reserved_bytes(&self) -> usize {
+        if let Some(state) = self.settings_framing.as_ref() {
+            state.reserved_bytes() + self.settings_inbox.iter().map(Vec::capacity).sum::<usize>()
+        } else { 0 }
+    }
+    fn settings_parent(&self, queued: &Queued) -> bool {
+        queued.frame.bytes.get(3) == Some(&SETTINGS)
+            && self.settings_framing.as_ref().is_some_and(|state| state.owns(settings_framing::OwnerId::of(&queued.frame.bytes)))
+    }
+    fn retire_settings_parent(&mut self, queued: &Queued) {
+        if queued.frame.bytes.get(3) == Some(&SETTINGS) {
+            if let Some(state) = self.settings_framing.as_mut() { state.retire(settings_framing::OwnerId::of(&queued.frame.bytes)); }
+        }
+    }
+    fn prepare_settings_physical(&mut self, tx: &mut Transmission, now: u64) -> bool {
+        if !self.settings_parent(&tx.queued) { return true; }
+        let context = self.settings_context(now);
+        let Some((SETTINGS, inner)) = decode(&tx.queued.frame.bytes) else { return false; };
+        let Some(physical) = self.settings_framing.as_mut().and_then(|state|state.physical(inner,settings_framing::OwnerId::of(&tx.queued.frame.bytes),context)) else { return false; };
+        tx.settings_action = Some(physical.action);
+        if physical.action != settings_framing::Action::Legacy {
+            let bytes = settings_framing::wrap(&physical.body);
+            assert!(bytes.len()+4 <= settings_framing::QUANTUM);
+            tx.physical = Some(Outgoing { command: true, bytes });
+        }
+        true
+    }
+    pub(crate) fn note_settings_physical_prefix(&mut self, tx: &Transmission, accepted: usize) {
+        if tx.settings_action.is_some() {
+            if let Some(action)=tx.settings_action { if let Some(state) = self.settings_framing.as_mut() { state.note_accepted_prefix(settings_framing::OwnerId::of(&tx.queued.frame.bytes),accepted,action); } }
+        }
+    }
+    pub(crate) fn note_settings_counted_drain(&mut self,tx:&Transmission,model_stop_us:Option<u64>){
+        let Some(action)=tx.settings_action else{return;};
+        let context=self.settings_context(self.now());
+        let Some(now)=context.continuous_ms else{if let Some(s)=self.settings_framing.as_mut(){s.observe(context);}return;};
+        // Compare model timestamps only with model timestamps; add the
+        // remaining serialization DURATION to local continuous time.
+        let remaining=model_stop_us.map_or(0,|us|us.div_ceil(1000).saturating_sub(context.mesh_ms));
+        let Some(complete)=now.checked_add(remaining)else{return;};
+        if let Some(s)=self.settings_framing.as_mut(){s.note_counted_drain(settings_framing::OwnerId::of(&tx.queued.frame.bytes),action,complete);}
+    }
+
     fn clear(&mut self) {
         self.active_cancelled |= self.active_transmission.is_some() && !self.active_survives_clear;
         let old = self.queue.len();
@@ -474,7 +586,7 @@ impl Mesh {
         self.queue.retain(|q| {
             let keep = matches!(
                 q.frame.bytes.get(3),
-                Some(&POSITION) | Some(&VOICE) | Some(&SETTINGS)
+                Some(&POSITION) | Some(&VOICE) | Some(&SETTINGS) | Some(&HOST_CONTROL)
             );
             if !keep {
                 removed_bytes += q.frame.bytes.len();
@@ -542,7 +654,63 @@ impl Mesh {
         (2, 0)
     }
 
+    fn queued_expired(&self, q: &Queued, now: u64) -> bool {
+        if self.settings_parent(q) {
+            let state = self.settings_framing.as_ref().unwrap();
+            if state.failed(settings_framing::OwnerId::of(&q.frame.bytes), continuous_clock::now(now)) { return true; }
+            if state.started(settings_framing::OwnerId::of(&q.frame.bytes)) { return false; }
+        }
+        now.saturating_sub(q.at)
+                > if q.settings_origin == SettingsOrigin::Reply {
+                    5_000
+                } else if q.frame.bytes.get(3) == Some(&VOICE) {
+                    180
+                } else if q.independent_discovery {
+                    3_000
+                } else if q.priority == 255
+                    || (q.priority < 254 && q.frame.bytes.get(3) == Some(&DOWN_DATA))
+                {
+                    // Retain sparse reports through bounded sensor bursts. Reliable
+                    // interactive controls retain their 250 ms deadline at priority 254.
+                    // Stateful SDT fragments remain owned and ordered; never coalesce.
+                    1500
+                } else {
+                    250
+                }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_settings_parent_for_test(&self) -> bool {
+        self.queue.iter().any(|queued| self.settings_parent(queued))
+    }
+
+    pub(crate) fn ordinary_background_state(&self) -> crate::comms::OrdinaryLaneState {
+        use crate::comms::OrdinaryLaneState;
+        let mut owned = false;
+        for (index, queued) in self.queue.iter().enumerate() {
+            if queued.priority >= 254 { continue; }
+            if queued.frame.bytes.get(3) == Some(&SETTINGS) && queued.settings_origin == SettingsOrigin::None {
+                owned = true;
+                continue;
+            }
+            if queued.settings_origin == SettingsOrigin::None && queued.closes_packet_batch() {
+                // Unknown opaque ownership is retained conservatively; never
+                // infer a metadata service contract from TC/CP-looking bytes.
+                owned = true;
+                continue;
+            }
+            owned = true;
+            if self.dependency_ready(index) { return OrdinaryLaneState::Ready; }
+        }
+        if owned || self.active_transmission.is_some() { OrdinaryLaneState::Blocked }
+        else { OrdinaryLaneState::Empty }
+    }
+
     fn dependency_ready(&self, index: usize) -> bool {
+        if self.settings_parent(&self.queue[index])
+            && self.settings_framing.as_ref().is_some_and(|state| !state.selectable(settings_framing::OwnerId::of(&self.queue[index].frame.bytes))) {
+            return false;
+        }
         let item = &self.queue[index];
         item.sdt_kind == 0
             || !self.queue.iter().take(index).any(|earlier| {
@@ -578,12 +746,13 @@ impl Mesh {
             }
         }
         while self.queue.len() + usize::from(self.active_frame_count) >= MAX_FRAMES
-            || self.bytes + frame.bytes.len() > MAX_BYTES
+            || self.bytes + frame.bytes.len() + self.settings_reserved_bytes() > MAX_BYTES
         {
             let Some((i, p)) = self
                 .queue
                 .iter()
                 .enumerate()
+                .filter(|(_, q)| !self.settings_parent(q))
                 .min_by_key(|(_, q)| q.priority)
                 .map(|(i, q)| (i, q.priority))
             else {
@@ -604,7 +773,7 @@ impl Mesh {
         let independent_discovery = Self::independent_discovery(&frame);
         let (sdt_kind, sdt_template) = Self::sdt_dependency(&frame);
         self.queue.push_back(Queued {
-            mode_reply: false,
+            settings_origin: SettingsOrigin::None,
             frame,
             at: now,
             priority,
@@ -637,18 +806,35 @@ impl Mesh {
     /// retries at the same priority. Fresh controls and opaque SDT/READY/GPS
     /// entries remain barriers; ownership, age and service credits are unchanged.
     pub(crate) fn prioritize_receipt_over_replays(&mut self, replayed: impl Fn(u64) -> bool) {
-        if self.active_transmission.is_some() { return; }
-        let Some(head) = self.queue.iter().enumerate()
-            .filter(|(i, item)| !item.independent_discovery && item.priority >= 254 && self.dependency_ready(*i))
-            .max_by_key(|(i, item)| (item.priority, std::cmp::Reverse(*i))).map(|(i, _)| i)
-        else { return; };
+        if self.active_transmission.is_some() {
+            return;
+        }
+        let Some(head) = self
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(i, item)| {
+                !item.independent_discovery && item.priority >= 254 && self.dependency_ready(*i)
+            })
+            .max_by_key(|(i, item)| (item.priority, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
+        else {
+            return;
+        };
         let priority = self.queue[head].priority;
         if !Transmission::batch_contract(&self.queue[head])
-            .is_some_and(|(id, receipt)| !receipt && replayed(id)) { return; }
+            .is_some_and(|(id, receipt)| !receipt && replayed(id))
+        {
+            return;
+        }
         for index in head + 1..self.queue.len() {
             let item = &self.queue[index];
-            if item.independent_discovery || item.priority < priority { continue; }
-            if item.priority != priority || !self.dependency_ready(index) { break; }
+            if item.independent_discovery || item.priority < priority {
+                continue;
+            }
+            if item.priority != priority || !self.dependency_ready(index) {
+                break;
+            }
             match Transmission::batch_contract(item) {
                 Some((_, true)) => {
                     let receipt = self.queue.remove(index).unwrap();
@@ -663,6 +849,7 @@ impl Mesh {
 
     /// One independent background reply; it never takes critical capacity/loans.
     pub(crate) fn begin_mode_reply_transmission(&mut self, now: u64) -> Option<Transmission> {
+        self.observe_settings_framing(now);
         if self.role != Role::Primary
             || self.active_transmission.is_some()
             || self
@@ -673,25 +860,24 @@ impl Mesh {
         {
             return None;
         }
-        let index = self.queue.iter().position(|q| q.mode_reply)?;
+        let index = self.queue.iter().enumerate().find(|(index,q)| q.settings_origin == SettingsOrigin::Reply && self.dependency_ready(*index)).map(|(index,_)|index)?;
         if now < self.queue[index].at || now.saturating_sub(self.queue[index].at) > 5_000 {
             let expired = self.queue.remove(index).unwrap();
             self.bytes -= expired.frame.bytes.len();
+            self.retire_settings_parent(&expired);
             self.dropped += 1;
             return None;
         }
         let id = self.next_transmission.checked_add(1)?;
         let queued = self.queue.remove(index).unwrap();
+        let mut tx = Transmission { queued, follower: None, id, physical: None, settings_action: None };
+        if !self.prepare_settings_physical(&mut tx,now) { self.queue.push_back(tx.queued); return None; }
         self.next_transmission = id;
         self.active_transmission = Some(id);
         self.active_frame_count = 1;
         self.active_survives_clear = true;
         self.active_fair_delta_bytes = 0;
-        Some(Transmission {
-            queued,
-            follower: None,
-            id,
-        })
+        Some(tx)
     }
     /// Reserve at most two already-owned canonical controls. The second is
     /// the existing normal protected winner: never search past a higher SDT,
@@ -843,26 +1029,11 @@ impl Mesh {
             if q.priority < minimum_priority {
                 return None;
             }
-            if now.saturating_sub(q.at)
-                > if q.mode_reply {
-                    5_000
-                } else if q.frame.bytes.get(3) == Some(&VOICE) {
-                    180
-                } else if q.independent_discovery {
-                    3_000
-                } else if q.priority == 255
-                    || (q.priority < 254 && q.frame.bytes.get(3) == Some(&DOWN_DATA))
-                {
-                    // Retain sparse reports through bounded sensor bursts. Reliable
-                    // interactive controls retain their 250 ms deadline at priority 254.
-                    // Stateful SDT fragments remain owned and ordered; never coalesce.
-                    1500
-                } else {
-                    250
-                }
+            if self.queued_expired(q, now)
             {
                 let old = self.queue.remove(i).unwrap();
                 self.bytes -= old.frame.bytes.len();
+                self.retire_settings_parent(&old);
                 self.dropped += 1;
                 continue;
             }
@@ -880,14 +1051,16 @@ impl Mesh {
             } else {
                 0
             };
+            let mut tx = Transmission { queued, follower: None, id, physical: None, settings_action: None };
+            if !self.prepare_settings_physical(&mut tx, now) { self.queue.push_back(tx.queued); return None; }
             self.next_transmission = id;
             self.active_transmission = Some(id);
             self.active_frame_count = 1;
             self.active_survives_clear = matches!(
-                queued.frame.bytes.get(3),
-                Some(&POSITION) | Some(&VOICE) | Some(&SETTINGS)
+                tx.queued.frame.bytes.get(3),
+                Some(&POSITION) | Some(&VOICE) | Some(&SETTINGS) | Some(&HOST_CONTROL)
             );
-            return Some(Transmission { queued, follower: None, id });
+            return Some(tx);
         }
     }
 
@@ -924,6 +1097,7 @@ impl Mesh {
         if !sent && self.active_cancelled {
             self.active_cancelled = false;
             self.bytes -= owned_bytes;
+            self.retire_settings_parent(&transmission.queued);
             self.dropped += count as u64;
             return None;
         }
@@ -935,6 +1109,15 @@ impl Mesh {
             self.queue.push_front(transmission.queued);
             return None;
         }
+        if let Some(action) = transmission.settings_action {
+            let context = self.settings_context(self.now());
+            let complete = self.settings_framing.as_mut().is_some_and(|state|state.complete_physical(settings_framing::OwnerId::of(&transmission.queued.frame.bytes),action,true,context));
+            if !complete {
+                self.queue.push_back(transmission.queued);
+                return None;
+            }
+        }
+        self.retire_settings_parent(&transmission.queued);
         self.discovery_balance_bytes = self.discovery_balance_bytes.saturating_add(fair_delta);
         if transmission.queued.independent_discovery {
             self.receipt_service_pending = false;
@@ -995,6 +1178,48 @@ impl Mesh {
     pub fn authenticated_settings_peer(&mut self, now: u64) {
         self.settings_peer_seen = Some(now);
     }
+    /// Link freshness only; signed proxy capability and actor policy remain independent.
+    pub(crate) fn command_proxy_transport(
+        &self,
+        now: u64,
+    ) -> Option<crate::command_proxy::Transport> {
+        let session = self.operating_mode_session(now)?;
+        Some(crate::command_proxy::Transport {
+            session,
+            sequence: if self.role == Role::Primary {
+                self.sequence
+            } else {
+                self.primary_sequence
+            },
+        })
+    }
+    pub(crate) fn queue_command_proxy(&mut self, payload: &[u8], now: u64) -> bool {
+        if payload.len() > crate::command_proxy::MAX_WIRE
+            || crate::command_proxy::wire_boundary(payload).is_none()
+            || self.queue.len() + usize::from(self.active_frame_count) >= MAX_FRAMES
+            || self.bytes + payload.len() + 8 > MAX_BYTES
+            || self
+                .queue
+                .iter()
+                .any(|queued| queued.frame.bytes.get(3) == Some(&HOST_CONTROL))
+        {
+            return false;
+        }
+        // Independent bounded operator control, below owner/HEALTH receipts255.
+        // No extra capacity, eviction, or lease/presence renewal is introduced.
+        self.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(HOST_CONTROL, payload),
+            },
+            254,
+            now,
+        );
+        true
+    }
+    pub(crate) fn take_command_proxy(&mut self) -> Option<Vec<u8>> {
+        self.command_proxy_inbox.pop_front()
+    }
     /// Display metadata only: never grants settings authentication or control.
     pub(crate) fn operating_mode_session(&self, now: u64) -> Option<u32> {
         match self.role {
@@ -1029,7 +1254,7 @@ impl Mesh {
         self.queue
             .back_mut()
             .expect("accepted settings owner")
-            .mode_reply = true;
+            .settings_origin = SettingsOrigin::Reply;
         true
     }
     fn queue_settings_inner(&mut self, payload: &[u8], now: u64, mode_reply: bool) -> bool {
@@ -1044,21 +1269,45 @@ impl Mesh {
         {
             return false;
         }
-        self.enqueue(
-            Outgoing {
-                command: true,
-                bytes: encode(SETTINGS, payload),
-            },
-            0,
-            now,
-        );
-        true
+        let context = self.settings_context(now);
+        let original = Outgoing { command:true, bytes:encode(SETTINGS,payload) };
+        let owner = settings_framing::OwnerId::of(&original.bytes);
+        let lifetime = if mode_reply || crate::station_mode::recognizes(payload) { 5_000 }
+            else if crate::launch_clock_sync::recognizes(payload) { 30_000 } else { 5_000 };
+        let profile = crate::comms::rfd_profile::active();
+        let usable = profile.map_or(32_000, |p| p.transport.usable_air_bps);
+        let default_share = profile.map_or(25, |p| p.transport.host_default_share_percent as u8);
+        let share = self.recovery_air_share(now).unwrap_or(default_share);
+        let local_bytes_per_second = usable * u64::from(share) / 800;
+        // Conservative existing peer rates: Primary may use15%, standby RRLS25%.
+        let peer_min_bytes_per_second = usable * if self.role == Role::Primary {25} else {15} / 800;
+        if let Some(state) = self.settings_framing.as_mut() {
+            let own = local_bytes_per_second;
+            let peer = peer_min_bytes_per_second;
+            if state.admit(payload,owner,now,lifetime,context,own,peer) == settings_framing::Admission::Busy { return false; }
+        }
+        let before = self.queue.len();
+        self.enqueue(original, 0, now);
+        let admitted = self.queue.len() > before;
+        if admitted {
+            self.queue.back_mut().expect("accepted SETTINGS parent").settings_origin =
+                if mode_reply { SettingsOrigin::Reply } else { SettingsOrigin::Settings };
+        } else if let Some(state) = self.settings_framing.as_mut() {
+            state.cancel_unadmitted(owner);
+        }
+        admitted
     }
     pub fn take_settings(&mut self) -> Option<Vec<u8>> {
+        let index = self.settings_inbox.iter().position(|wire| {
+            !crate::station_mode::recognizes(wire) && !crate::launch_clock_sync::recognizes(wire)
+        })?;
+        self.settings_inbox.remove(index)
+    }
+    pub(crate) fn take_launch_clock(&mut self) -> Option<Vec<u8>> {
         let index = self
             .settings_inbox
             .iter()
-            .position(|wire| !crate::station_mode::recognizes(wire))?;
+            .position(|wire| crate::launch_clock_sync::recognizes(wire))?;
         self.settings_inbox.remove(index)
     }
     pub(crate) fn take_operating_mode(&mut self) -> Option<Vec<u8>> {
@@ -1220,6 +1469,19 @@ impl Mesh {
         if command && payload.starts_with(b"RR") {
             let (kind, data) = decode(payload)?;
             match (self.role, kind) {
+                (_, settings_framing::KIND) => {
+                    let context = self.settings_context(now);
+                    let free = MAX_BYTES.saturating_sub(self.bytes).saturating_sub(self.settings_reserved_bytes());
+                    let result = self.settings_framing.as_mut().map(|state| state.incoming(data, context, self.settings_inbox.len(), free));
+                    if let Some(result) = result {
+                        if let Some(reply) = result.reply { self.enqueue(Outgoing {command:true,bytes:settings_framing::wrap(&reply)},0,now); }
+                        if let Some(original) = result.complete {
+                            if self.settings_inbox.len() < MAX_SETTINGS_INBOX { self.settings_inbox.push_back(original); }
+                            else { self.dropped += 1; }
+                        }
+                    }
+                    None
+                }
                 (_, SETTINGS) => {
                     if data.len() <= paired_settings::auth::MAX_WIRE
                         && self.settings_inbox.len() < MAX_SETTINGS_INBOX
@@ -1288,6 +1550,16 @@ impl Mesh {
                     self.health_received = Some(now);
                     if !self.active(now) {
                         self.clear();
+                    }
+                    None
+                }
+                (_, HOST_CONTROL) => {
+                    // Verify signatures in the bounded dedicated worker, never in a
+                    // radio callback. This metadata grants no HEALTH/settings lease.
+                    if data.len() <= crate::command_proxy::MAX_WIRE
+                        && self.command_proxy_inbox.len() < 4
+                    {
+                        self.command_proxy_inbox.push_back(data.to_vec());
                     }
                     None
                 }
@@ -1452,6 +1724,29 @@ pub(crate) fn topology_observation() -> Option<TopologyObservation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn host_control_is_bounded_independent_and_retains_serial_ownership() {
+        let mut payload = vec![0;132];
+        payload[..4].copy_from_slice(b"CP\x01\x00");
+        let mut mesh = Mesh::new(Role::Primary,1);
+        assert!(mesh.queue_command_proxy(&payload,0));
+        assert!(!mesh.queue_command_proxy(&payload,0));
+        let control = mesh.begin_transmission(0).unwrap();
+        assert!(control.closes_packet_batch());
+        assert!(!control.is_receipt());
+        let original = control.frame().bytes.clone();
+        mesh.clear();
+        assert!(mesh.finish_transmission(control,false).is_none());
+        let retry = mesh.begin_transmission(1).unwrap();
+        assert_eq!(retry.frame().bytes,original);
+        mesh.finish_transmission(retry,true);
+        assert_eq!(mesh.bytes,0);
+        for _ in 0..10 { mesh.incoming(true,&encode(HOST_CONTROL,&payload),2); }
+        assert_eq!(mesh.command_proxy_inbox.len(),4);
+        assert!(mesh.take_command_proxy().is_some());
+        assert!(mesh.queue_command_proxy(&payload,3));
+        assert!(!mesh.queue_command_proxy(&vec![0;257],3));
+    }
     #[test]
     fn receipt_boundary_metadata_survives_downlink_wrapping_and_priority_cap() {
         crate::telemetry_schema::initialize().unwrap();
@@ -3014,22 +3309,32 @@ mod tests {
     #[test]
     fn relay_activity_counters_exclude_presence_and_cancelled_work() {
         let mut relay = Mesh::new(Role::Rrls, 2);
-        relay.enqueue(Outgoing {command:true, bytes:encode(READY, &[0;8])},255,0);
+        relay.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(READY, &[0; 8]),
+            },
+            255,
+            0,
+        );
         assert!(relay.pop(0).is_some());
-        assert_eq!(relay.forwarded,1);
-        assert_eq!(relay.relayed_frames,0);
-        relay.incoming(true,&health(1,0,false),1);
-        relay.incoming(false,b"application",2);
-        let frame=relay.pop(2).unwrap();
-        assert_eq!(relay.relayed_frames,1);
-        assert_eq!(relay.relay_envelope_bytes,frame.bytes.len() as u64);
-        relay.incoming(false,b"queued before restore",3);
-        relay.incoming(true,&health(1,1,true),4);
+        assert_eq!(relay.forwarded, 1);
+        assert_eq!(relay.relayed_frames, 0);
+        relay.incoming(true, &health(1, 0, false), 1);
+        relay.incoming(false, b"application", 2);
+        let frame = relay.pop(2).unwrap();
+        assert_eq!(relay.relayed_frames, 1);
+        assert_eq!(relay.relay_envelope_bytes, frame.bytes.len() as u64);
+        relay.incoming(false, b"queued before restore", 3);
+        relay.incoming(true, &health(1, 1, true), 4);
         assert!(relay.pop(4).is_none());
-        assert_eq!(relay.relayed_frames,1,"cancelled work is not transmitted relay traffic");
-        relay.incoming(false,b"standby traffic",5);
+        assert_eq!(
+            relay.relayed_frames, 1,
+            "cancelled work is not transmitted relay traffic"
+        );
+        relay.incoming(false, b"standby traffic", 5);
         assert!(relay.pop(5).is_none());
-        assert_eq!(relay.relayed_frames,1);
+        assert_eq!(relay.relayed_frames, 1);
     }
 
     #[test]
@@ -3267,40 +3572,91 @@ mod pair_tests {
         .to_vec()
     }
     fn enqueue(mesh: &mut Mesh, bytes: &[u8], now: u64) {
-        mesh.enqueue(Outgoing { command: true, bytes: encode(DOWN_DATA, bytes) }, 254, now);
+        mesh.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(DOWN_DATA, bytes),
+            },
+            254,
+            now,
+        );
     }
     #[test]
     fn receipt_can_pass_only_replayed_controls_without_changing_ownership_or_age() {
-        let first = control(false, 10); let second = control(false, 11);
+        let first = control(false, 10);
+        let second = control(false, 11);
         let receipt = control(true, 12);
-        let ids = [&first, &second].map(|p| crate::comms::radio_batch_control_contract(254, p).unwrap().0);
+        let ids = [&first, &second].map(|p| {
+            crate::comms::radio_batch_control_contract(254, p)
+                .unwrap()
+                .0
+        });
         let mut mesh = Mesh::new(Role::Rrls, 2);
-        enqueue(&mut mesh, &first, 10); enqueue(&mut mesh, &second, 11); enqueue(&mut mesh, &receipt, 12);
+        enqueue(&mut mesh, &first, 10);
+        enqueue(&mut mesh, &second, 11);
+        enqueue(&mut mesh, &receipt, 12);
         let bytes = mesh.bytes;
         mesh.prioritize_receipt_over_replays(|id| ids.contains(&id));
-        assert_eq!(mesh.bytes, bytes); assert_eq!(mesh.dropped, 0); assert_eq!(mesh.forwarded, 0);
-        assert_eq!(mesh.queue.iter().map(|q| q.at).collect::<Vec<_>>(), [12, 10, 11]);
+        assert_eq!(mesh.bytes, bytes);
+        assert_eq!(mesh.dropped, 0);
+        assert_eq!(mesh.forwarded, 0);
+        assert_eq!(
+            mesh.queue.iter().map(|q| q.at).collect::<Vec<_>>(),
+            [12, 10, 11]
+        );
         let tx = mesh.begin_bounded_transmission(12, 0, true, 1).unwrap();
         assert_eq!(decode(&tx.frame().bytes).unwrap().1, receipt);
         mesh.finish_bounded_transmission(tx, false);
-        assert_eq!(mesh.bytes, bytes); assert_eq!(mesh.queue.len(), 3);
+        assert_eq!(mesh.bytes, bytes);
+        assert_eq!(mesh.queue.len(), 3);
     }
     #[test]
     fn receipt_retry_preference_preserves_fresh_controls_and_metadata_barriers() {
         let retry = control(false, 10);
-        let id = crate::comms::radio_batch_control_contract(254, &retry).unwrap().0;
-        let gps = serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type("GPS_DATA"),
-            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "RF", 22,
-            Arc::from([0u8; 12])).unwrap()).to_vec();
-        for blocker in [encode(DOWN_DATA, &control(false, 11)), encode(READY, &[0; 8]),
-            encode(DOWN_DATA, b"SDT\x03opaque"), encode(DOWN_DATA, &gps)] {
+        let id = crate::comms::radio_batch_control_contract(254, &retry)
+            .unwrap()
+            .0;
+        let gps = serialize::pack_packet(
+            &Packet::new(
+                crate::telemetry_schema::data_type("GPS_DATA"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "RF",
+                22,
+                Arc::from([0u8; 12]),
+            )
+            .unwrap(),
+        )
+        .to_vec();
+        for blocker in [
+            encode(DOWN_DATA, &control(false, 11)),
+            encode(READY, &[0; 8]),
+            encode(DOWN_DATA, b"SDT\x03opaque"),
+            encode(DOWN_DATA, &gps),
+        ] {
             let mut mesh = Mesh::new(Role::Rrls, 2);
             enqueue(&mut mesh, &retry, 10);
-            mesh.enqueue(Outgoing { command: true, bytes: blocker.clone() }, 254, 11);
+            mesh.enqueue(
+                Outgoing {
+                    command: true,
+                    bytes: blocker.clone(),
+                },
+                254,
+                11,
+            );
             enqueue(&mut mesh, &control(true, 12), 12);
-            let before = mesh.queue.iter().map(|q| (q.frame.bytes.clone(), q.at, q.priority)).collect::<Vec<_>>();
+            let before = mesh
+                .queue
+                .iter()
+                .map(|q| (q.frame.bytes.clone(), q.at, q.priority))
+                .collect::<Vec<_>>();
             mesh.prioritize_receipt_over_replays(|candidate| candidate == id);
-            assert_eq!(mesh.queue.iter().map(|q| (q.frame.bytes.clone(), q.at, q.priority)).collect::<Vec<_>>(), before);
+            assert_eq!(
+                mesh.queue
+                    .iter()
+                    .map(|q| (q.frame.bytes.clone(), q.at, q.priority))
+                    .collect::<Vec<_>>(),
+                before
+            );
         }
     }
 
@@ -3453,3 +3809,11 @@ mod pair_tests {
 #[cfg(test)]
 #[path = "rrls/continuous_service_audit.rs"]
 mod continuous_service_audit;
+
+#[cfg(test)]
+#[path = "rrls/heartbeat_owner_relay_regression.rs"]
+mod heartbeat_owner_relay_regression;
+
+#[cfg(test)]
+#[path = "rrls/ordinary_provenance_tests.rs"]
+mod ordinary_provenance_tests;

@@ -644,7 +644,7 @@
     },
     {
       "name": "DAQ_LOG_CLOCK",
-      "doc": "Retained DAQ session ID and T+120s close deadline, two little-endian u64 values; zeros reset recording.",
+      "doc": "Retained DAQ session ID and T+20s close deadline, two little-endian u64 values; zeros reset recording.",
       "reliable": "Ordered",
       "priority": 16,
       "class": "Data",
@@ -800,6 +800,66 @@
         "kind": "Static",
         "data_type": "UInt32",
         "count": 24
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable": "Off",
+      "priority": 0
+    },
+    {
+      "name": "DAQ_LOADCELL_CHAMBER",
+      "doc": "One KG1000 network slot: [uncalibrated KG1000, OMEGA PX309-1KG5V chamber psig (connector V * 200), chamber connector volts]. Only fresh assigned pressure; no extra packet slot.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 3
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable": "Off",
+      "priority": 16
+    },
+    {
+      "name": "DAQ_SD_HEALTH",
+      "doc": "DAQ-only SD status companion: flags, write/flush ages, init stage/retry count, accepted/completed retry tokens and init failures; ages UINT32_MAX mean never.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt32",
+        "count": 8
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable": "Off",
+      "priority": 0
+    },
+    {
+      "name": "DAQ_SD_RETRY",
+      "doc": "One-shot nonzero manual SD reinitialization token; never a retained variable or a format request.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt32",
+        "count": 1
+      },
+      "endpoints": [
+        "SD_CARD"
+      ],
+      "reliable": "Unordered",
+      "priority": 240
+    },
+    {
+      "name": "DAQ_LAUNCH_LOG_STATUS",
+      "doc": "DAQ SD application acknowledgement: actual session/deadline and accepted clock revision as low/high UInt32 pairs, followed by storage flags; independent from transport delivery.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt32",
+        "count": 7
       },
       "endpoints": [
         "GROUND_STATION"

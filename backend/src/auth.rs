@@ -35,6 +35,8 @@ pub struct Permissions {
     pub voice_transmit: bool,
     #[serde(default)]
     pub camera_publish: bool,
+    #[serde(default)]
+    pub sign_checklists: bool,
 }
 
 impl Permissions {
@@ -46,6 +48,7 @@ impl Permissions {
                 set_system_time: true,
                 voice_transmit: true,
                 camera_publish: true,
+                sign_checklists: true,
             }
         } else {
             self.normalized()
@@ -66,6 +69,7 @@ impl Permissions {
             Permission::SetSystemTime => normalized.set_system_time,
             Permission::VoiceTransmit => normalized.view_data && normalized.voice_transmit,
             Permission::CameraPublish => normalized.view_data && normalized.camera_publish,
+            Permission::SignChecklists => normalized.view_data && normalized.sign_checklists,
         }
     }
 }
@@ -118,6 +122,7 @@ pub enum Permission {
     SetSystemTime,
     VoiceTransmit,
     CameraPublish,
+    SignChecklists,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +195,7 @@ pub struct SessionStatus {
     pub station_role: &'static str,
     pub station_pairing: Option<crate::station_pairing::Public>,
     pub operating_mode: crate::station_mode::Snapshot,
+    pub command_proxy: crate::command_proxy::Status,
     pub roles: Vec<StreamRole>,
     pub authenticated: bool,
     pub username: Option<String>,
@@ -216,7 +222,9 @@ pub struct AuthPrincipal {
 
 impl AuthPrincipal {
     pub fn can_publish_camera(&self) -> bool {
-        !self.anonymous && (self.roles.contains(&StreamRole::Admin) || self.permissions.allows(Permission::CameraPublish))
+        !self.anonymous
+            && (self.roles.contains(&StreamRole::Admin)
+                || self.permissions.allows(Permission::CameraPublish))
     }
 
     pub fn can_manage_stream(&self) -> bool {
@@ -250,6 +258,7 @@ impl AuthPrincipal {
             },
             station_pairing: crate::station_pairing::public(),
             operating_mode: crate::station_mode::snapshot(),
+            command_proxy: crate::command_proxy::status(),
             roles: self.roles.clone(),
             authenticated: !self.anonymous,
             username: self.username.clone(),
@@ -305,6 +314,7 @@ mod stream_role_tests {
                 set_system_time: false,
                 voice_transmit: false,
                 camera_publish: false,
+                sign_checklists: false,
             },
             expires_at_ms: None,
             anonymous,
@@ -624,6 +634,7 @@ impl AuthManager {
             set_system_time: claims.permissions.set_system_time && local.set_system_time,
             voice_transmit: claims.permissions.voice_transmit && local.voice_transmit,
             camera_publish: claims.permissions.camera_publish && local.camera_publish,
+            sign_checklists: claims.permissions.sign_checklists && local.sign_checklists,
         };
         if !permissions.allows(required) {
             return Err(AuthFailure::Forbidden(
@@ -669,6 +680,41 @@ impl AuthManager {
                 view: claims.calibration_access.view && local_calibration.view,
                 edit: claims.calibration_access.edit && local_calibration.edit,
             },
+        })
+    }
+
+    /// Resolve the primary's CURRENT local grant for one authenticated paired
+    /// proxy assertion. The caller must already verify the narrowly signed
+    /// actor/operation envelope; this method creates no login or session.
+    pub(crate) fn paired_proxy_actor(
+        &self,
+        username: &str,
+        required: Permission,
+    ) -> Result<AuthPrincipal, AuthFailure> {
+        let config = self
+            .load_users_file()
+            .map_err(|_| AuthFailure::Internal("could not load accounts".into()))?;
+        let user = config
+            .users
+            .iter()
+            .find(|user| !user.disabled && user.username.eq_ignore_ascii_case(username))
+            .ok_or_else(|| AuthFailure::Forbidden("paired actor is unavailable".into()))?;
+        let permissions = user.permissions.for_roles(&user.roles);
+        if !permissions.allows(required) {
+            return Err(AuthFailure::Forbidden(
+                "paired actor lacks local permission".into(),
+            ));
+        }
+        let (command_access, calibration_access) = configured_user_access(&config, &user.username);
+        Ok(AuthPrincipal {
+            roles: user.roles.clone(),
+            username: Some(user.username.clone()),
+            permissions,
+            expires_at_ms: None,
+            anonymous: false,
+            session_type: Some("paired_command_assertion".into()),
+            command_access,
+            calibration_access,
         })
     }
 
@@ -722,6 +768,7 @@ impl AuthManager {
                 set_system_time: false,
                 voice_transmit: false,
                 camera_publish: false,
+                sign_checklists: false,
             }
             .normalized();
 
@@ -745,6 +792,7 @@ impl AuthManager {
                 permissions.set_system_time = current.set_system_time;
                 permissions.voice_transmit = current.voice_transmit && current.view_data;
                 permissions.camera_publish = current.camera_publish && current.view_data;
+                permissions.sign_checklists = current.sign_checklists && current.view_data;
             }
             if !permissions.allows(required) {
                 return Err(AuthFailure::Forbidden(
@@ -772,6 +820,7 @@ impl AuthManager {
         permissions.set_system_time = false;
         permissions.voice_transmit = false;
         permissions.camera_publish = false;
+        permissions.sign_checklists = false;
         if !permissions.allows(required) {
             return Err(AuthFailure::Unauthorized(
                 "authentication required".to_string(),
@@ -806,7 +855,8 @@ impl AuthManager {
                     username: None,
                     permissions: Permissions {
                         voice_transmit: false,
-                camera_publish: false,
+                        camera_publish: false,
+                        sign_checklists: false,
                         ..config.anonymous.normalized()
                     },
                     expires_at_ms: None,

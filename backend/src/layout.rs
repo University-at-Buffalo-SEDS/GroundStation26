@@ -9,6 +9,8 @@ const DEFAULT_TEST_FIRE_LAYOUT_PATH: &str = "layout/layout_test_fire.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutConfig {
     #[serde(default)]
+    pub flight_phase_version: u8,
+    #[serde(default)]
     pub test_fire_mode: bool,
     pub version: u32,
     #[serde(default)]
@@ -695,8 +697,23 @@ pub fn load_layout() -> Result<LayoutConfig, String> {
         .map_err(|e| format!("Failed to read layout file {path:?}: {e}"))?;
     let mut layout: LayoutConfig =
         serde_json::from_str(&raw).map_err(|e| format!("Invalid layout JSON: {e}"))?;
+    normalize_flight_phases(&mut layout)?;
     apply_runtime_layout_overrides(&mut layout);
     Ok(layout)
+}
+
+fn normalize_flight_phases(layout: &mut LayoutConfig) -> Result<(), String> {
+    let version = layout.flight_phase_version;
+    if version > crate::types::FLIGHT_PHASE_VERSION {
+        return Err("Unsupported flight phase version".into());
+    }
+    for group in &mut layout.state_tab.states {
+        for phase in &mut group.states {
+            *phase = crate::types::canonical_phase_key(phase, version).to_owned();
+        }
+    }
+    layout.flight_phase_version = crate::types::FLIGHT_PHASE_VERSION;
+    Ok(())
 }
 
 fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
@@ -859,6 +876,21 @@ fn ensure_gse_sequence_actions(layout: &mut LayoutConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_layout_phase_groups_keep_their_wire_meaning() {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!("../layout/layout.json")).unwrap();
+        value.as_object_mut().unwrap().remove("flight_phase_version");
+        value["state_tab"]["states"][0]["states"] = serde_json::json!(["ParachuteDeploy", "Descent"]);
+        let mut layout: LayoutConfig = serde_json::from_value(value).unwrap();
+        let original_data = serde_json::to_value(&layout.data_tab).unwrap();
+        normalize_flight_phases(&mut layout).unwrap();
+        assert_eq!(layout.state_tab.states[0].states, ["Descent", "Reefing"]);
+        assert_eq!(layout.flight_phase_version, 1);
+        assert_eq!(serde_json::to_value(&layout.data_tab).unwrap(), original_data);
+        normalize_flight_phases(&mut layout).unwrap();
+        assert_eq!(layout.state_tab.states[0].states, ["Descent", "Reefing"]);
+    }
 
     #[test]
     fn gse_commands_are_available_in_all_layouts_and_prelaunch_valve_widgets() {

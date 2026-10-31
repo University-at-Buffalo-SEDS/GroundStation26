@@ -145,7 +145,11 @@ Purpose:
 
 Expected response:
 
-- Default/fallback: JSON array of `TelemetryRow`.
+- UI bootstrap: `/api/recent?display=true&max_rows=12000` returns a JSON array
+  bounded to 12,000 rows (requested limits clamp to 512–20,000). Each sender/type
+  retains its first/latest samples and bucket extrema; sparse pressure streams
+  are not displaced by dense load-cell history. This is display sampling only.
+- Default/fallback without `display=true`: JSON array of `TelemetryRow`.
 - Preferred when the client sends `Accept: application/x-ndjson`: NDJSON stream with one `TelemetryRow` JSON object per line.
 
 Shape:
@@ -491,7 +495,7 @@ reboot; boot confirmation happens on the board after restart.
 
 Purpose:
 
-- Seed the current operator-notification set.
+- Seed the latest 200 in-memory operator events into Notification Center. Never show these snapshot entries as popups.
 
 Expected response:
 
@@ -585,7 +589,7 @@ points use `{ "expected": number, "raw": number }`.
 
 Purpose:
 
-- Dismiss a persistent notification for all connected clients.
+- Explicitly remove a Notification Center history entry on the server. Closing or auto-expiring a popup must not call this endpoint.
 
 Expected behavior:
 
@@ -674,6 +678,7 @@ The backend sends tagged JSON objects:
 { "ty": "BoardStatus", "data": { ... } }
 { "ty": "NetworkTopology", "data": { ... } }
 { "ty": "Notifications", "data": [ ... ] }
+{ "ty": "Notification", "data": { ... } }
 { "ty": "Messages", "data": [ ... ] }
 { "ty": "ActionPolicy", "data": { ... } }
 { "ty": "NetworkTime", "data": { ... } }
@@ -690,7 +695,12 @@ Notes:
 ### Live message semantics
 
 - `TelemetryBatch`
-  High-rate telemetry rows. This is the hot path for charts and latest-value caches.
+  High-rate live display rows. A slow client retains each `(sender_id, data_type)`
+  stream's newest unsent row in one bounded frame (up to 1024 streams), separate from
+  ordered warnings, confirmations and state changes. Unsent frames older than 250 ms
+  are skipped; socket writes stalled for two seconds close the session for reconnect.
+  This display coalescing does not change acquisition, database recording, exports or
+  `/api/recent` history. Use recorded/history data for complete analysis.
 - `Warning` and `Error`
   Append to the respective alert lists.
 - `FlightState`
@@ -702,8 +712,13 @@ Notes:
 - `NetworkTopology`
   Replaces the current topology snapshot.
 - `Notifications`
-  Replaces the current active operator-notification set. This is for backend/operator workflow
-  notifications such as fill completion or action-required notices.
+  Restores Notification Center history. Initial connection, reconnect, HTTP bootstrap and
+  lag recovery never create popups; this holds even for legacy `persistent: true` entries.
+- `Notification`
+  A single event received live after this connection began. Deduplicate by `(id, timestamp_ms)`
+  and show a popup for five seconds. Keep it in Notification Center afterward. Closing or
+  expiring the popup is client-local. A hidden/disconnected client sees missed notices only
+  in Notification Center when it returns. Warnings/errors keep their own persistent semantics.
 - `Messages`
   Replaces the current telemetry/backend message set. This is for telemetry-network text
   messages such as flight-computer or router status strings.

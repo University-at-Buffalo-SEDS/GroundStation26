@@ -97,11 +97,11 @@ fn default_discovery_port() -> u16 {
 
 fn validate_mode(width: u32, height: u32, fps: u32, bitrate: u32) -> Result<()> {
     ensure!(
-        (160..=3840).contains(&width) && width % 2 == 0,
+        (160..=3840).contains(&width) && width.is_multiple_of(2),
         "width must be even, 160–3840"
     );
     ensure!(
-        (120..=2160).contains(&height) && height % 2 == 0,
+        (120..=2160).contains(&height) && height.is_multiple_of(2),
         "height must be even, 120–2160"
     );
     ensure!((1..=60).contains(&fps), "fps must be 1–60");

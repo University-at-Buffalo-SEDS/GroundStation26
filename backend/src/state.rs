@@ -29,13 +29,32 @@ use tokio::time::{Duration, Instant};
 pub const LAUNCH_COUNTDOWN_DURATION_MS: i64 = 10_000;
 pub const UMBILICAL_PENDING_VALVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const BOARD_STATUS_BROADCAST_MIN_INTERVAL_MS: u64 = 200;
-const BOARD_SEEN_TIMEOUT_MS: u64 = 12_000;
+pub(crate) const BOARD_SEEN_TIMEOUT_MS: u64 = 12_000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConfirmedUmbilicalValveState {
     on: bool,
     received_at: std::time::Instant,
     simulation_ms: Option<u64>,
+}
+
+impl ConfirmedUmbilicalValveState {
+    fn source_capture(
+        on: bool,
+        receipt_at: std::time::Instant,
+        receipt_simulation_ms: Option<u64>,
+        age_ms: u64,
+    ) -> Option<Self> {
+        if age_ms > UMBILICAL_PENDING_VALVE_TIMEOUT.as_millis() as u64 {
+            return None;
+        }
+        let captured_at = receipt_at.checked_sub(std::time::Duration::from_millis(age_ms))?;
+        let simulation_ms = match receipt_simulation_ms {
+            Some(now) => Some(now.checked_sub(age_ms)?),
+            None => None,
+        };
+        Some(Self { on, received_at: captured_at, simulation_ms })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -198,7 +217,7 @@ pub struct AppState {
     /// Notifies waiters when pending DB writes changes.
     pub db_write_notify: Arc<Notify>,
 
-    /// Persistent operator notifications shown to all clients until dismissed.
+    /// Bounded notification-center history; live popups are separate WS events.
     pub notifications: Arc<Mutex<Vec<PersistentNotification>>>,
 
     /// Broadcast whenever notifications list changes.
@@ -232,6 +251,7 @@ pub struct AppState {
     pub fill_targets_tx: broadcast::Sender<FillTargetsConfig>,
 
     /// Current launch clock snapshot used by reconnect seeds and live UI updates.
+    pub launch_history: crate::launch_history::Shared,
     pub launch_clock: Arc<Mutex<LaunchClockMsg>>,
 
     /// Broadcast whenever the launch clock changes.
@@ -440,12 +460,21 @@ impl AppState {
     }
 
     pub fn set_launch_clock(&self, launch_clock: LaunchClockMsg) {
+        if crate::rrls::is_rrls() { return; }
+        let clock_now=telemetry_task::procedure_clock::now();
         let mut current = self.launch_clock.lock().unwrap();
         let next = monotonic_launch_clock_update(&current, launch_clock);
         if *current == next {
             return;
         }
 
+        let committed = {
+            let mut history=self.launch_history.lock().unwrap();
+            let mono=history.monotonic_ms(clock_now.model_monotonic_ms());
+            history.update_primary(next.clone(),clock_now.timestamp_ms(),mono)
+        };
+        let next=match committed {Ok(record)=>record.clock,Err(error)=>{drop(current);self.add_notification(format!("Launch clock was not saved: {error}"));return;}};
+        if *current==next{return;}
         *current = next.clone();
         drop(current);
         self.publish_daq_launch_clock(&next);
@@ -453,15 +482,39 @@ impl AppState {
     }
 
     pub fn reset_launch_clock(&self) {
+        if let Err(error)=self.try_reset_launch_clock(){self.add_notification(format!("T clock reset failed: {error}"));}
+    }
+    pub fn try_reset_launch_clock(&self)->anyhow::Result<()> {self.reset_clock_if_expected(None)}
+    pub fn try_reset_expected_launch_clock(&self,expected:&crate::launch_history::ClockRecord)->anyhow::Result<()> {self.reset_clock_if_expected(Some(expected))}
+    fn reset_clock_if_expected(&self,expected:Option<&crate::launch_history::ClockRecord>)->anyhow::Result<()> {
+        anyhow::ensure!(!crate::rrls::is_rrls(),"Only the primary GroundStation can reset T clock");
+        let clock_now=telemetry_task::procedure_clock::now();
+        let mut current=self.launch_clock.lock().unwrap();
+        let next={let mut history=self.launch_history.lock().unwrap();let mono=history.monotonic_ms(clock_now.model_monotonic_ms());match expected {Some(expected)=>history.reset_expected_primary(expected,clock_now.timestamp_ms(),mono)?,None=>history.reset_primary(clock_now.timestamp_ms(),mono)?}.clock};
         self.clear_launch_sequence_command_pending();
-        let next = LaunchClockMsg::idle();
-        *self.launch_clock.lock().unwrap() = next.clone();
+        *current=next.clone();drop(current);
         self.publish_daq_launch_clock(&next);
-        let _ = self.launch_clock_tx.send(next);
+        let _=self.launch_clock_tx.send(next);
+        Ok(())
     }
 
+    pub fn apply_primary_launch_clock(&self, record:crate::launch_history::ClockRecord)->anyhow::Result<bool> {
+        let clock_now=telemetry_task::procedure_clock::now();
+        let mut current=self.launch_clock.lock().unwrap();
+        let changed={let mut history=self.launch_history.lock().unwrap();let mono=history.monotonic_ms(clock_now.model_monotonic_ms());history.apply_primary(record.clone(),true,clock_now.timestamp_ms(),mono)?};
+        if changed {*current=record.clock.clone();drop(current);let _=self.launch_clock_tx.send(record.clock);}
+        Ok(changed)
+    }
+
+    pub fn confirm_new_launch_cycle(&self) {
+        if crate::rrls::is_rrls(){return;}
+        let clock_now=telemetry_task::procedure_clock::now();
+        let result={let mut history=self.launch_history.lock().unwrap();let mono=history.monotonic_ms(clock_now.model_monotonic_ms());history.confirm_new_launch_cycle(clock_now.timestamp_ms(),mono)};
+        if let Err(error)=result{self.add_notification(format!("New launch clock session was not saved: {error}"));}
+    }
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     pub fn begin_daq_launch_log(&self) {
+        self.confirm_new_launch_cycle();
         // Rotate at command acceptance, without starting the UI clock before
         // Valve confirms the sequence. Its ACK/pilot report corrects T0 later.
         self.publish_daq_launch_clock(&launch_countdown_clock(
@@ -489,6 +542,13 @@ impl AppState {
                 self.add_notification(format!(
                     "DAQ launch log clock could not be published: {error}"
                 ));
+            }
+        }
+        if let Some((snapshot,stamp))=crate::network_variables::persisted_daq_log_clock_with_revision() {
+            let clock_now=telemetry_task::procedure_clock::now();
+            let mut history=self.launch_history.lock().unwrap();let mono=history.monotonic_ms(clock_now.model_monotonic_ms());
+            if let Err(error)=history.retain_daq(snapshot,stamp,clock_now.timestamp_ms(),mono) {
+                drop(history);self.add_notification(format!("DAQ launch clock snapshot was not saved: {error}"));
             }
         }
     }
@@ -848,25 +908,30 @@ impl AppState {
             });
         }
 
-        BoardStatusMsg { boards }
+        let mut out = BoardStatusMsg { boards };
+        crate::primary_mirror::project_board_status(self, &mut out, now_ms);
+        out
     }
 
     /// Projects the topology and traffic counters reported by SEDSnet into the dashboard graph.
     pub fn network_topology_snapshot(&self, now_ms: u64) -> NetworkTopologyMsg {
         let simulated = crate::flight_sim::sim_mode_enabled();
         let Some(router) = self.topology_router.get() else {
-            return NetworkTopologyMsg {
+            let mut out = NetworkTopologyMsg {
                 generated_ms: now_ms,
                 simulated,
                 nodes: Vec::new(),
                 links: Vec::new(),
                 traffic: None,
-                health: self
-                    .network_health
-                    .lock()
-                    .unwrap()
-                    .snapshot(std::time::Instant::now(), cfg!(feature = "test_fire_mode")),
+                health: {
+                    let mut rows = self.network_health.lock().unwrap()
+                        .snapshot(std::time::Instant::now(), cfg!(feature = "test_fire_mode"));
+                    crate::host_temperature::append_local(&mut rows, now_ms, simulated);
+                    rows
+                },
             };
+            crate::primary_mirror::project_topology(self, &mut out);
+            return out;
         };
         let exported = router.export_topology();
         let health = {
@@ -887,7 +952,10 @@ impl AppState {
                     }
                 }
             }
-            tracker.snapshot(now, cfg!(feature = "test_fire_mode"))
+            let mut rows = tracker.snapshot(now, cfg!(feature = "test_fire_mode"));
+            drop(tracker);
+            crate::host_temperature::append_local(&mut rows, now_ms, simulated);
+            rows
         };
         let mut traffic_sampler = self.network_traffic.lock().unwrap();
         let runtime = router.export_runtime_stats();
@@ -1081,17 +1149,20 @@ impl AppState {
         }
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
 
-        NetworkTopologyMsg {
+        let mut out = NetworkTopologyMsg {
             generated_ms: now_ms,
             simulated,
             nodes,
             links,
             traffic: Some(traffic),
             health,
-        }
+        };
+        crate::primary_mirror::project_topology(self, &mut out);
+        out
     }
 
     /// Stores a board-confirmed umbilical valve state, never a requested target.
+    #[cfg(test)]
     pub fn set_umbilical_valve_state(&self, cmd_id: u8, on: bool) {
         self.gse.lock().unwrap().observe_valve(cmd_id, on);
         let mut map = self.umbilical_valve_states.lock().unwrap();
@@ -1105,6 +1176,40 @@ impl AppState {
         );
     }
 
+    /// Physical source freshness controls ACK admission; display storage and
+    /// requested targets never upgrade an old capture into a new confirmation.
+    pub(crate) fn set_umbilical_valve_state_source(
+        &self,
+        cmd_id: u8,
+        on: bool,
+        source_ms: i64,
+        receipt_ms: i64,
+        packet_id: u64,
+    ) -> bool {
+        let receipt_at = std::time::Instant::now();
+        let receipt_simulation_ms = crate::simulation_clock_ms();
+        let Some(age_ms) = self.gse.lock().unwrap().observe_valve_source(
+            cmd_id,
+            on,
+            source_ms,
+            packet_id,
+            crate::gse::ValveReceipt {
+                network_ms: receipt_ms,
+                monotonic_at: receipt_at,
+                simulation_ms: receipt_simulation_ms,
+            },
+        ) else {
+            return false;
+        };
+        let Some(capture) = ConfirmedUmbilicalValveState::source_capture(
+            on, receipt_at, receipt_simulation_ms, age_ms,
+        ) else {
+            return false;
+        };
+        self.umbilical_valve_states.lock().unwrap().insert(cmd_id, capture);
+        true
+    }
+
     /// Records when any telemetry packet last reached the backend router.
     pub fn mark_packet_received(&self, timestamp_ms: u64) {
         self.last_packet_rx_ms
@@ -1115,6 +1220,14 @@ impl AppState {
     #[allow(dead_code)]
     pub fn last_packet_received_ms(&self) -> u64 {
         self.last_packet_rx_ms.load(Ordering::Relaxed)
+    }
+
+    /// Conservative capture-time estimate for remote presentation barriers.
+    /// A report received after a barrier may still represent an older capture;
+    /// this comparison never establishes causal command execution.
+    pub(crate) fn umbilical_report_after(&self, cmd_id: u8, barrier: std::time::Instant) -> bool {
+        self.umbilical_valve_states.lock().unwrap().get(&cmd_id)
+            .is_some_and(|sample| sample.received_at > barrier)
     }
 
     /// Looks up the cached state for a specific umbilical valve command id.
@@ -1160,8 +1273,10 @@ impl AppState {
         if *slot == next_state {
             return;
         }
+        let previous_state=*slot;
         *slot = next_state;
         drop(slot);
+        if next_state==FlightState::Launch && matches!(previous_state,FlightState::Startup|FlightState::Idle|FlightState::PreFill|FlightState::FillTest|FlightState::NitrogenFill|FlightState::NitrousFill|FlightState::Armed){self.confirm_new_launch_cycle();}
         // Keep the simulator in lock-step with the real backend state machine.
         crate::flight_sim::sync_local_flight_state(next_state);
         self.queue_router_flight_state_update(next_state);
@@ -1237,9 +1352,9 @@ impl AppState {
         let _ = self.messages_tx.send(snapshot);
     }
 
-    /// Adds a persistent operator notification and returns its assigned id.
+    /// Adds an operator event to notification history and live subscribers.
     pub fn add_notification<S: Into<String>>(&self, message: S) -> u64 {
-        self.add_notification_with_persistence(message, true)
+        self.add_notification_with_persistence(message, false)
     }
 
     /// Adds a transient operator notification and returns its assigned id.
@@ -1266,7 +1381,7 @@ impl AppState {
     ) -> u64 {
         let message = message.into();
         let mut notifications = self.notifications.lock().unwrap();
-        if let Some(existing) = notifications.iter().find(|n| n.message == message) {
+        if let Some(existing) = notifications.iter().find(|n| persistent && n.message == message) {
             return existing.id;
         }
         let id = self.next_notification_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1278,17 +1393,14 @@ impl AppState {
             action_label,
             action_cmd,
         };
-        // Transient confirmations go only to currently connected subscribers.
-        // Keeping them in server state replays them on reload and on later
-        // notification broadcasts, including contradictory toggle messages.
-        let snapshot = if persistent {
-            notifications.push(notification);
-            notifications.clone()
-        } else {
-            let mut snapshot = notifications.clone();
-            snapshot.push(notification);
-            snapshot
-        };
+        // Keep recent events for Notification Center, including events a client
+        // missed while offline. Only the live WS event may create a popup.
+        notifications.push(notification);
+        if notifications.len() > 200 {
+            let excess = notifications.len() - 200;
+            notifications.drain(..excess);
+        }
+        let snapshot = notifications.clone();
         drop(notifications);
         let _ = self.notifications_tx.send(snapshot);
         id
@@ -1336,7 +1448,15 @@ impl AppState {
 
     /// Returns the latest action-policy snapshot used by the dashboard and command gate.
     pub fn action_policy_snapshot(&self) -> ActionPolicyMsg {
-        self.action_policy.lock().unwrap().clone()
+        let local = self.action_policy.lock().unwrap().clone();
+        if !crate::rrls::is_rrls() { return local; }
+        let mut mirrored = crate::primary_mirror::action_policy(self).unwrap_or_else(|| ActionPolicyMsg {
+            key_enabled: false, software_buttons_enabled: false, controls: Vec::new(),
+        });
+        // Recording and durable clock reset retain their separate local paths.
+        mirrored.controls.extend(local.controls.into_iter().filter(|control|matches!(control.cmd.as_str(),
+            "StartWritingNow" | "StartWritingLastTwoMinutes" | "PauseWritingDb" | "StopWritingDb" | "ResetTClock")));
+        mirrored
     }
 
     /// Returns the latest fill-target snapshot used by the dashboard.
@@ -1451,6 +1571,26 @@ impl AppState {
             }
         }
         for control in &mut policy.controls {
+            let close_key = match control.cmd.as_str() {
+                "NitrogenClose" => {
+                    Some(crate::rocket_commands::ActuatorBoardCommands::NitrogenOpen as u8)
+                }
+                "NitrousClose" => {
+                    Some(crate::rocket_commands::ActuatorBoardCommands::NitrousOpen as u8)
+                }
+                _ => None,
+            };
+            if let Some(key) = close_key {
+                // Explicit closes describe the independently observed CLOSED position.
+                // Pending intent and absent/expired feedback never confirm that position.
+                control.actuated = if self.get_pending_umbilical_valve_state(key).is_none() {
+                    self.get_umbilical_valve_state(key).map(|open| !open)
+                } else {
+                    None
+                };
+            }
+        }
+        for control in &mut policy.controls {
             let key = match control.cmd.as_str() {
                 "Pilot" => Some(crate::rocket_commands::ValveBoardCommands::PilotOpen as u8),
                 "NormallyOpen" => {
@@ -1496,7 +1636,14 @@ impl AppState {
         }
         *slot = policy.clone();
         drop(slot);
-        let _ = self.action_policy_tx.send(policy);
+        // RRLS-local sequence policy is not the paired primary's policy. Keep
+        // WebSocket and HTTP presentation on the same authoritative projection.
+        let published = if crate::rrls::is_rrls() {
+            self.action_policy_snapshot()
+        } else {
+            policy
+        };
+        let _ = self.action_policy_tx.send(published);
     }
 
     /// Rebroadcasts the current action-policy snapshot without requiring a state change.
@@ -1525,7 +1672,8 @@ impl AppState {
         if crate::rrls::is_rrls() {
             return matches!(
                 cmd,
-                TelemetryCommand::StartWritingNow
+                TelemetryCommand::ResetTClock
+                    | TelemetryCommand::StartWritingNow
                     | TelemetryCommand::StartWritingLastTwoMinutes
                     | TelemetryCommand::PauseWritingDb
                     | TelemetryCommand::StopWritingDb
@@ -1827,7 +1975,7 @@ fn launch_clock_for_transition(
     })
 }
 
-fn monotonic_launch_clock_update(
+pub(crate) fn monotonic_launch_clock_update(
     current: &LaunchClockMsg,
     requested: LaunchClockMsg,
 ) -> LaunchClockMsg {
@@ -1867,10 +2015,10 @@ fn t_plus_anchor_timestamp(current: &LaunchClockMsg, timestamp_ms: i64) -> i64 {
 #[cfg(test)]
 pub(crate) mod tests {
     #[tokio::test]
-    async fn rrls_all_received_states_project_clocks_without_daq_origination() {
+    async fn rrls_received_states_retain_authoritative_clock_without_daq_origination() {
         const CHILD: &str = "GS_RRLS_CLOCK_OBSERVER_TEST_CHILD";
         const NAME: &str =
-            "state::tests::rrls_all_received_states_project_clocks_without_daq_origination";
+            "state::tests::rrls_received_states_retain_authoritative_clock_without_daq_origination";
         if std::env::var_os(CHILD).is_none() {
             let root = std::env::temp_dir().join(format!(
                 "rrls-clock-observer-{}-{}",
@@ -1902,6 +2050,12 @@ pub(crate) mod tests {
         Arc::get_mut(&mut state).unwrap().db_queue_tx = db_tx;
         let mut ui = state.state_tx.subscribe();
         let mut clocks = state.launch_clock_tx.subscribe();
+        let history_path=std::path::PathBuf::from(std::env::var_os("GS_NETWORK_VARIABLE_CACHE").unwrap()).with_file_name("clock.json");
+        Arc::get_mut(&mut state).unwrap().launch_history=Arc::new(Mutex::new(crate::launch_history::Store::open(history_path,true,None,10000,0).unwrap()));
+        let mut primary=crate::launch_history::Store::ephemeral();
+        let retained=primary.update_primary(LaunchClockMsg{kind:LaunchClockKind::TPlus,anchor_timestamp_ms:Some(9000),duration_ms:None},10000,0).unwrap();
+        state.apply_primary_launch_clock(retained.clone()).unwrap();
+        assert_eq!(clocks.try_recv().unwrap(),retained.clock);
         let preserved = state.add_notification("existing observer notification");
         let router = Arc::new(Router::new(RouterConfig::new([]).with_sender("RRLS")));
         let frames = Arc::new(AtomicUsize::new(0));
@@ -1924,7 +2078,6 @@ pub(crate) mod tests {
             })
             .unwrap();
         let path = std::path::PathBuf::from(std::env::var_os("GS_NETWORK_VARIABLE_CACHE").unwrap());
-        let mut ascent_window = None;
         for (index, code) in std::iter::once(1u8).chain(0u8..=15).enumerate() {
             let packet = Packet::new(
                 ty,
@@ -1934,15 +2087,10 @@ pub(crate) mod tests {
                 Arc::<[u8]>::from([code]),
             )
             .unwrap();
-            let before = crate::telemetry_task::get_current_timestamp_ms() as i64;
             let receiver = router.clone();
             std::thread::spawn(move || receiver.rx_from_side(&packet, side).unwrap())
                 .join()
                 .unwrap();
-            let after = crate::telemetry_task::get_current_timestamp_ms() as i64;
-            if code == FlightState::Ascent as u8 {
-                ascent_window = Some((before, after));
-            }
             assert_eq!(state.local_flight_state_snapshot() as u8, code);
             assert_eq!(ui.try_recv().unwrap().state as u8, code);
             let write = tokio::time::timeout(Duration::from_secs(2), db_rx.recv())
@@ -1955,32 +2103,15 @@ pub(crate) mod tests {
             let disk: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(disk["flight_state"], code);
-            if code == FlightState::Launch as u8 {
-                assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::TMinus);
-            }
-            if code >= FlightState::Ascent as u8 {
-                assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::TPlus);
-            }
+            assert_eq!(state.launch_clock_snapshot(),retained.clock,"FC state observations must not author or clear the primary clock");
         }
-        let minus = clocks.try_recv().unwrap();
-        let plus = clocks.try_recv().unwrap();
-        assert_eq!(minus.kind, LaunchClockKind::TMinus);
-        assert_eq!(plus.kind, LaunchClockKind::TPlus);
-        assert_eq!(minus.duration_ms, Some(LAUNCH_COUNTDOWN_DURATION_MS));
-        let deadline = minus.anchor_timestamp_ms.unwrap() + LAUNCH_COUNTDOWN_DURATION_MS;
-        let (before, after) = ascent_window.unwrap();
-        assert!(
-            (deadline.min(before)..=deadline.min(after))
-                .contains(&plus.anchor_timestamp_ms.unwrap()),
-            "early Ascent retains the existing receipt-time clamp"
-        );
-        assert!(
-            clocks.try_recv().is_err(),
-            "observer clock anchors should not be restarted by later states"
-        );
+        assert!(clocks.try_recv().is_err());
         state.reset_launch_clock();
-        assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::Idle);
-        assert_eq!(clocks.try_recv().unwrap().kind, LaunchClockKind::Idle);
+        assert_eq!(state.launch_clock_snapshot(),retained.clock,"RRLS local reset cannot override the primary");
+        let reset=primary.reset_primary(12000,2000).unwrap();
+        state.apply_primary_launch_clock(reset).unwrap();
+        assert_eq!(clocks.try_recv().unwrap(),LaunchClockMsg::idle());
+        assert_eq!(state.launch_clock_snapshot(),LaunchClockMsg::idle());
         let notes = state.notifications_snapshot();
         assert!(
             notes
@@ -2244,23 +2375,24 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn temporary_notifications_are_live_only_and_do_not_replay() {
+    async fn notifications_retain_bounded_center_history_including_offline_events() {
         let state = test_app_state().await;
         let mut live = state.notifications_tx.subscribe();
-        let alarm = state.add_notification("persistent fault");
-        live.try_recv().unwrap();
-        state.add_temporary_notification("toggle enabled");
-        let update = live.try_recv().unwrap();
-        assert_eq!(update.len(), 2);
-        assert!(!update[1].persistent);
-        let reload = state.notifications_snapshot();
-        assert_eq!(reload.len(), 1);
-        assert_eq!(reload[0].id, alarm);
-        state.add_temporary_notification("toggle disabled");
-        let update = live.try_recv().unwrap();
-        assert_eq!(update.len(), 2);
-        assert_eq!(update[1].message, "toggle disabled");
-        assert!(update.iter().all(|n| n.message != "toggle enabled"));
+        let first = state.add_notification("T clock reset");
+        let second = state.add_temporary_notification("toggle enabled");
+        let third = state.add_notification("T clock reset");
+        assert_ne!(first, third, "a later reset is a new event");
+        assert_eq!(live.try_recv().unwrap().len(), 1);
+        assert_eq!(live.try_recv().unwrap().len(), 2);
+        let snapshot = live.try_recv().unwrap();
+        assert_eq!(snapshot.len(), 3);
+        assert!(snapshot.iter().all(|n| !n.persistent));
+        assert_eq!(state.notifications_snapshot().iter().map(|n| n.id).collect::<Vec<_>>(), vec![first, second, third]);
+        for index in 0..205 { state.add_temporary_notification(format!("offline {index}")); }
+        let history = state.notifications_snapshot();
+        assert_eq!(history.len(), 200);
+        assert_eq!(history.first().unwrap().message, "offline 5");
+        assert_eq!(history.last().unwrap().message, "offline 204");
     }
 
     use super::*;
@@ -3182,24 +3314,88 @@ pub(crate) mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn gse_active_sequence_blocks_manual_and_ignition_controls() {
+    async fn active_gse_with_enabled_manual_policy(confirmed_feedback: bool) -> Arc<AppState> {
         let state = test_app_state().await;
         *state.state.lock().unwrap() = FlightState::Idle;
+        if confirmed_feedback {
+            // Publish the policy only after real feedback exists: unknown
+            // positions must continue disabling ambiguous manual toggles.
+            for key in [0, 1, 2, 9, 10] {
+                state.set_umbilical_valve_state(key, false);
+            }
+        }
+        let mut policy = state.action_policy_snapshot();
+        policy.key_enabled = true;
+        policy.software_buttons_enabled = true;
+        for control in &mut policy.controls {
+            control.enabled = true;
+        }
+        state.set_action_policy(policy);
         state.gse.lock().unwrap().engine.status.phase = gse_sequence::Phase::Filling;
+        state
+    }
+
+    #[tokio::test]
+    async fn gse_active_sequence_blocks_ignition_and_retract_even_with_enabled_policy() {
+        let state = active_gse_with_enabled_manual_policy(true).await;
         for cmd in [
-            TelemetryCommand::Dump,
-            TelemetryCommand::Pilot,
-            TelemetryCommand::Nitrous,
-            TelemetryCommand::Nitrogen,
             TelemetryCommand::Launch,
+            #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+            TelemetryCommand::GroundStationLaunch,
             TelemetryCommand::Igniter,
+            #[cfg(feature = "hitl_mode")]
+            TelemetryCommand::IgniterSequence,
             TelemetryCommand::Postinit,
             TelemetryCommand::RetractPlumbing,
         ] {
-            assert!(!state.is_command_allowed(&cmd));
+            assert!(!state.is_command_allowed(&cmd), "active GSE must block {cmd:?}");
         }
         assert!(state.is_command_allowed(&TelemetryCommand::CancelFill));
+    }
+
+    #[tokio::test]
+    async fn gse_active_sequence_hands_admitted_manual_valves_to_operator_without_changing_reports() {
+        for cmd in [TelemetryCommand::Dump, TelemetryCommand::Pilot] {
+            let state = active_gse_with_enabled_manual_policy(true).await;
+            state.set_umbilical_valve_state(0, false);
+            state.set_umbilical_valve_state(2, false);
+            {
+                let mut rt = state.gse.lock().unwrap();
+                rt.engine.status.nitrogen_passed = true;
+                rt.engine.status.self_test_locked = true;
+            }
+            assert!(state.is_command_allowed(&cmd), "explicit manual policy must admit {cmd:?}");
+            assert!(!crate::gse::handle_command(&state, &cmd), "handoff leaves the requested command to normal dispatch");
+            {
+                let rt = state.gse.lock().unwrap();
+                assert!(!rt.engine.active());
+                assert_eq!(rt.engine.status.phase, gse_sequence::Phase::Idle);
+                assert!(!rt.engine.claimed);
+                assert!(rt.engine.status.nitrogen_passed);
+                assert!(rt.engine.status.self_test_locked);
+            }
+            assert!(crate::gse::claimed(&state), "operator handoff remains explicit");
+            assert_eq!(state.get_umbilical_valve_state(0), Some(false));
+            assert_eq!(state.get_umbilical_valve_state(2), Some(false));
+            assert!(state.pending_umbilical_valve_states.lock().unwrap().is_empty(),
+                "cancellation alone must not manufacture a valve command or report");
+        }
+    }
+
+    #[tokio::test]
+    async fn gse_active_sequence_preserves_supply_feedback_interlocks_and_explicit_closes() {
+        let state = active_gse_with_enabled_manual_policy(false).await;
+        for cmd in [TelemetryCommand::Nitrogen, TelemetryCommand::Nitrous] {
+            assert!(!state.is_command_allowed(&cmd), "unknown counterpart feedback blocks {cmd:?}");
+        }
+        state.set_umbilical_valve_state(10, true);
+        assert!(!state.is_command_allowed(&TelemetryCommand::Nitrogen), "nitrous supply open blocks nitrogen opening");
+        state.set_umbilical_valve_state(10, false);
+        state.set_umbilical_valve_state(9, true);
+        assert!(!state.is_command_allowed(&TelemetryCommand::Nitrous), "nitrogen supply open blocks nitrous opening");
+        for cmd in [TelemetryCommand::NitrogenClose, TelemetryCommand::NitrousClose] {
+            assert!(state.is_command_allowed(&cmd), "explicit supply closure remains available: {cmd:?}");
+        }
     }
 
     #[tokio::test]
@@ -3238,6 +3434,104 @@ pub(crate) mod tests {
         );
         state.clear_runtime_data_for_sim_reset();
         assert!(state.network_topology_snapshot(12).health.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_supply_close_uses_only_fresh_confirmed_inverse_without_changing_gates() {
+        const CHILD: &str = "GS_CLOSE_PRESENTATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let result=std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact","state::tests::explicit_supply_close_uses_only_fresh_confirmed_inverse_without_changing_gates","--nocapture","--test-threads=1"])
+                    .env(CHILD,"1").env("GS_RRLS_ROLE","primary").env("GS_SIM_MODE","0").env_remove("GS_SIM_CLOCK_FILE").output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let state = test_app_state().await;
+        // One controllable SDK clock supplies both the source captures and
+        // ingress receipt UTC. Wall-millisecond rounding must not turn a new
+        // capture into an older-than-runtime sample at backend startup.
+        let capture_clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let router_clock = capture_clock.clone();
+        let router = Arc::new(sedsnet::router::Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([]),
+            Box::new(move || router_clock.load(std::sync::atomic::Ordering::Relaxed)),
+        ));
+        router.set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(1_798_000_000_000));
+        crate::telemetry_task::set_network_time_router(router.clone());
+        let report = |key: u8, on: bool| {
+            capture_clock.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let captured_ms = router.network_time().unwrap().unix_time_ms.unwrap();
+            assert_eq!(crate::telemetry_task::recording_network_utc_ms(), Some(captured_ms as i64));
+            let packet = sedsnet::packet::Packet::new(
+                crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "AB",
+                captured_ms,
+                Arc::<[u8]>::from(vec![key, u8::from(on)]),
+            )
+            .unwrap();
+            crate::telemetry_task::apply_umbilical_status_at_ingress(&state, &packet).unwrap();
+        };
+        let close = |name: &str| {
+            state
+                .action_policy_snapshot()
+                .controls
+                .into_iter()
+                .find(|c| c.cmd == name)
+                .unwrap()
+        };
+        state.set_action_policy(crate::sequences::default_action_policy());
+        for (key, name) in [(9, "NitrogenClose"), (10, "NitrousClose")] {
+            let initial = close(name);
+            assert_eq!(initial.actuated, None, "absence is not CLOSED");
+            for on in [true, false] {
+                report(key, on);
+                let current = close(name);
+                assert_eq!(
+                    current.actuated,
+                    Some(!on),
+                    "{name} follows actual fresh position"
+                );
+                assert_eq!(
+                    current.enabled, initial.enabled,
+                    "presentation cannot change command gate"
+                );
+            }
+            state.set_pending_umbilical_valve_state(key, false);
+            state.set_action_policy(crate::sequences::default_action_policy());
+            assert_eq!(
+                close(name).actuated,
+                None,
+                "pending CLOSE cannot confirm its own target"
+            );
+            report(key, true);
+            assert_eq!(state.get_pending_umbilical_valve_state(key), Some(false));
+            assert_eq!(
+                close(name).actuated,
+                None,
+                "contradictory report remains pending"
+            );
+            report(key, false);
+            assert_eq!(state.get_pending_umbilical_valve_state(key), None);
+            assert_eq!(close(name).actuated, Some(true));
+            state
+                .umbilical_valve_states
+                .lock()
+                .unwrap()
+                .get_mut(&key)
+                .unwrap()
+                .received_at = std::time::Instant::now()
+                - UMBILICAL_PENDING_VALVE_TIMEOUT
+                - std::time::Duration::from_millis(1);
+            state.set_action_policy(crate::sequences::default_action_policy());
+            assert_eq!(close(name).actuated, None, "expired feedback is not CLOSED");
+            assert_eq!(close(name).enabled, initial.enabled);
+        }
     }
 
     pub(crate) async fn test_app_state() -> Arc<AppState> {
@@ -3326,6 +3620,7 @@ pub(crate) mod tests {
             action_policy_tx,
             fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
             fill_targets_tx,
+            launch_history: Arc::new(Mutex::new(crate::launch_history::Store::ephemeral())),
             launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
             launch_clock_tx,
             launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
@@ -3710,5 +4005,24 @@ pub(crate) mod tests {
         ] {
             assert_eq!(monotonic_launch_clock_update(&current, requested), current);
         }
+    }
+}
+
+#[cfg(test)]
+mod valve_source_clock_tests {
+    use super::*;
+
+    #[test]
+    fn source_capture_backdates_model_and_monotonic_clocks_without_fallback() {
+        let receipt = std::time::Instant::now();
+        let sample = ConfirmedUmbilicalValveState::source_capture(false, receipt, Some(3000), 1500).unwrap();
+        assert!(!sample.on);
+        assert_eq!(sample.simulation_ms, Some(1500));
+        assert_eq!(sample.received_at, receipt - std::time::Duration::from_millis(1500));
+        let unsynchronized = ConfirmedUmbilicalValveState::source_capture(true, receipt, None, 100).unwrap();
+        assert_eq!(unsynchronized.simulation_ms, None);
+        assert_eq!(unsynchronized.received_at, receipt - std::time::Duration::from_millis(100));
+        assert!(ConfirmedUmbilicalValveState::source_capture(true, receipt, Some(0), 1).is_none());
+        assert!(ConfirmedUmbilicalValveState::source_capture(true, receipt, Some(3000), 2001).is_none());
     }
 }

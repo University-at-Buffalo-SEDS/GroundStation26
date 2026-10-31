@@ -381,8 +381,8 @@ fn valve_board_disconnected_for_state(state: FlightState) -> bool {
             | FlightState::Ascent
             | FlightState::Coast
             | FlightState::Apogee
-            | FlightState::ParachuteDeploy
             | FlightState::Descent
+            | FlightState::Reefing
             | FlightState::Landed
             | FlightState::Recovery
     )
@@ -1080,14 +1080,14 @@ impl FlightSimState {
         } else if t < 54.0 {
             let chute_terminal_fps = -55.0;
             (
-                FlightState::ParachuteDeploy,
+                FlightState::Descent,
                 (chute_terminal_fps - self.velocity_fps) * 1.4,
                 0.0,
             )
         } else if self.altitude_ft > 4.0 {
             let terminal_fps = -52.0;
             (
-                FlightState::Descent,
+                FlightState::Reefing,
                 (terminal_fps - self.velocity_fps) * 0.65,
                 0.0,
             )
@@ -1271,8 +1271,8 @@ fn sensor_sequence_for_state(state: FlightState, link: SimLink) -> &'static [Sim
             | FlightState::Ascent
             | FlightState::Coast
             | FlightState::Apogee => AV_BAY_ASCENT_SENSOR_SEQUENCE,
-            FlightState::ParachuteDeploy
-            | FlightState::Descent
+            FlightState::Descent
+            | FlightState::Reefing
             | FlightState::Landed
             | FlightState::Recovery => AV_BAY_DESCENT_SENSOR_SEQUENCE,
             _ => AV_BAY_GROUND_SENSOR_SEQUENCE,
@@ -1665,8 +1665,8 @@ mod tests {
         }
 
         for state in [
-            FlightState::ParachuteDeploy,
             FlightState::Descent,
+            FlightState::Reefing,
             FlightState::Landed,
             FlightState::Recovery,
         ] {

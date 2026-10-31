@@ -17,7 +17,7 @@ The default **Dashboard** displays the single-stage model with aft fins only;
 Settings → General → Viewing mode offers **Ground Station view** (instruments and
 controls on this device) and **Streamer** (delayed program). Watching does not require
 a stream-manager role. See the [frontend contract](../frontend/api.md).
-Open **`https://GROUND_STATION_IP:3000/media`** for
+Open **`https://GROUND_STATION_IP/media`** for
 model upload/download, model selection, and a standalone multi-camera monitor.
 
 The initial sender settings are 720p, 30 fps, 2 Mbit/s per camera. Tune them for
@@ -53,7 +53,7 @@ docker compose -f docker-compose.yml -f docker-compose.video.yml up -d --no-buil
 ```
 
 The overlay adds MediaMTX 1.21.0 and publishes TCP 8554 (camera input), UDP 8189
-(WebRTC), and TCP 8189 (fallback). The existing UI stays on HTTPS port 3000. Use a
+(WebRTC), and TCP 8189 (fallback). The existing UI stays on HTTPS port 443. Use a
 LAN IP, not the container IP, for `GS_VIDEO_HOST`. MediaMTX's API (9997) and
 signaling (8889) and HLS (8888) stay inside Docker. Without the overlay, existing deployments
 continue to work and the media page reports the receiver as unavailable.
@@ -68,6 +68,8 @@ follows the existing backend configuration. Mission's iframe player and Dashboar
 GLB loader receive stable, expiring, resource-scoped capability URLs, so they work
 without bearer headers or cross-origin cookies. These tickets do not expose the
 login token, are reauthorized on access, and cannot grant upload/control access.
+Browser camera publishers renew a 45-second lease; expired publishers are removed every five seconds. Connecting another camera does not block existing camera lease renewals or stream-list reads while its relay offer is pending.
+
 Treat returned media URLs as private. RTSP is unencrypted: use the trusted camera
 network or a VPN.
 
@@ -79,7 +81,7 @@ with `MTX_APIADDRESS=127.0.0.1:9997`, `MTX_WEBRTCADDRESS=127.0.0.1:8889`, and
 `MTX_HLSADDRESS=127.0.0.1:8888`. Set
 `GS_VIDEO_PASSWORD` on the backend. Its default relay URLs are those loopback
 addresses; override `GS_VIDEO_API_URL`, `GS_VIDEO_WEBRTC_URL`, and `GS_VIDEO_HLS_URL` if necessary.
-Native backend HTTP is port 3000; remote browser login needs the TLS reverse proxy.
+Native backend HTTP is port 3000 and HTTPS is port 443; remote browser login uses HTTPS.
 
 ## Build and install the sender on the Pi
 

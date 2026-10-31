@@ -2,16 +2,7 @@ use super::*;
 use crate::{Revision, journal::Limits};
 use ring::signature::KeyPair;
 fn path(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir()
-        .join(format!(
-            "gs-journal-replication-{}-{}-{}",
-            std::process::id(),
-            name,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+    crate::test_directory::reserve(&format!("gs-journal-replication-{name}"))
         .join("journal.sqlite3")
 }
 fn doc(actor: &str, n: u64, value: serde_json::Value) -> Document {

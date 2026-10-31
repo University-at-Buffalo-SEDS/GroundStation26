@@ -1,5 +1,6 @@
 //! Deterministic ground-fill sequencing. This crate performs no hardware I/O.
 use serde::{Deserialize, Serialize};
+pub mod fill_trim;
 pub mod qd_wait;
 pub mod qualification;
 
@@ -10,10 +11,23 @@ pub const VALVE_ACK_TIMEOUT_MS: u64 = 5000;
 pub const CLOSED: [bool; 5] = [false; 5];
 pub const FILL_READY: [bool; 5] = [false, true, false, false, false];
 
+pub const MAX_NITROGEN_STEPS: usize = 32;
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NitrogenStep {
+    pub target_psi: f32,
+    pub settle_ms: u64,
+    pub hold_ms: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub nitrogen_target_psi: f32,
+    pub nitrogen_steps: Vec<NitrogenStep>,
+    pub fill_overfill_kg: f32,
+    pub fill_tolerance_kg: f32,
+    pub fill_settle_ms: u64,
     pub pressure_step_psi: f32,
     pub pressure_ceiling_psi: Option<f32>,
     pub maximum_zero_offset_psi: Option<f32>,
@@ -24,6 +38,10 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             nitrogen_target_psi: 120.0,
+            nitrogen_steps: Vec::new(),
+            fill_overfill_kg: 0.05,
+            fill_tolerance_kg: 0.07,
+            fill_settle_ms: 3000,
             pressure_step_psi: 50.0,
             pressure_ceiling_psi: None,
             maximum_zero_offset_psi: None,
@@ -33,6 +51,74 @@ impl Default for Config {
     }
 }
 impl Config {
+    pub fn nitrogen_target_psi(&self) -> f32 {
+        self.nitrogen_steps
+            .last()
+            .map_or(self.nitrogen_target_psi, |step| step.target_psi)
+    }
+    pub fn nitrogen_plan(&self) -> Result<Vec<NitrogenStep>, String> {
+        let steps = if self.nitrogen_steps.is_empty() {
+            if !self.nitrogen_target_psi.is_finite()
+                || self.nitrogen_target_psi <= 0.0
+                || !self.pressure_step_psi.is_finite()
+                || self.pressure_step_psi <= 0.0
+            {
+                return Err("Nitrogen target and step must be finite and positive".into());
+            }
+            let count = (self.nitrogen_target_psi / self.pressure_step_psi).ceil();
+            if !count.is_finite() || count > MAX_NITROGEN_STEPS as f32 {
+                return Err("Nitrogen test supports at most 32 steps".into());
+            }
+            (1..=count as usize)
+                .map(|index| NitrogenStep {
+                    target_psi: (index as f32 * self.pressure_step_psi)
+                        .min(self.nitrogen_target_psi),
+                    settle_ms: 2000,
+                    hold_ms: 5000,
+                })
+                .collect()
+        } else {
+            self.nitrogen_steps.clone()
+        };
+        if steps.is_empty() || steps.len() > MAX_NITROGEN_STEPS {
+            return Err("Configure 1 to 32 nitrogen steps".into());
+        }
+        let mut previous = 0.0;
+        let mut total = 0u64;
+        for step in &steps {
+            if !step.target_psi.is_finite()
+                || step.target_psi <= previous
+                || !(1000..=600000).contains(&step.settle_ms)
+                || !(1000..=600000).contains(&step.hold_ms)
+            {
+                return Err(
+                    "Nitrogen targets must ascend; settle and hold waits must be 1 to 600 seconds"
+                        .into(),
+                );
+            }
+            previous = step.target_psi;
+            total = total
+                .saturating_add(step.settle_ms)
+                .saturating_add(step.hold_ms);
+        }
+        if total > 3_600_000 {
+            return Err("Nitrogen settle/hold waits must total at most 1 hour".into());
+        }
+        Ok(steps)
+    }
+    pub fn validate_fill_trim(&self) -> Result<(), String> {
+        if !self.fill_overfill_kg.is_finite()
+            || !(0.0..=0.1).contains(&self.fill_overfill_kg)
+            || !self.fill_tolerance_kg.is_finite()
+            || self.fill_tolerance_kg <= 0.0
+            || self.fill_tolerance_kg > 0.07
+            || !(1000..=600000).contains(&self.fill_settle_ms)
+        {
+            return Err("Fill overshoot must be 0 to 0.1 kg, tolerance above 0 and at most 0.07 kg, and settling 1 to 600 seconds".into());
+        }
+        Ok(())
+    }
+
     pub fn pressure_limit(&self, target: f32, margin: f32) -> Result<f32, String> {
         let limit = target + margin;
         if !target.is_finite() || target <= 0.0 || !limit.is_finite() {
@@ -48,6 +134,8 @@ impl Config {
     }
     /// Incomplete limits may be saved, but cannot enable automatic operations.
     pub fn validate_settings(&self) -> Result<(), String> {
+        self.nitrogen_plan()?;
+        self.validate_fill_trim()?;
         if !self.nitrogen_target_psi.is_finite()
             || !self.pressure_step_psi.is_finite()
             || self.pressure_step_psi <= 0.0
@@ -67,7 +155,10 @@ impl Config {
         Ok(())
     }
     pub fn validate(&self) -> Result<(), String> {
-        let ceiling = self.pressure_limit(self.nitrogen_target_psi, 100.0)?;
+        self.nitrogen_plan()?;
+        self.validate_fill_trim()?;
+        let target = self.nitrogen_target_psi();
+        let ceiling = self.pressure_limit(target, 100.0)?;
         let zero = self
             .maximum_zero_offset_psi
             .ok_or("Set the maximum acceptable empty-tank PT offset")?;
@@ -79,7 +170,7 @@ impl Config {
             || zero < 0.0
             || ceiling <= zero
             || self.nitrogen_target_psi <= 0.0
-            || self.nitrogen_target_psi + zero >= ceiling
+            || target + zero >= ceiling
         {
             return Err("Target plus zero-offset allowance must be below the pressure ceiling; all limits must be finite and positive".into());
         }
@@ -187,6 +278,8 @@ pub struct Engine {
     self_ack_since: [u64; 5],
     self_pending: u8,
     self_waiting: Option<usize>,
+    nitrogen_plan: Vec<NitrogenStep>,
+    nitrogen_step_index: usize,
     hold_reference: Option<f32>,
     hold_samples: usize,
 }
@@ -217,6 +310,8 @@ impl Default for Engine {
             self_ack_since: [0; 5],
             self_pending: 0,
             self_waiting: None,
+            nitrogen_plan: Vec::new(),
+            nitrogen_step_index: 0,
             hold_reference: None,
             hold_samples: 0,
         }
@@ -299,31 +394,28 @@ impl Engine {
         self.status.message = message.into();
     }
     fn configure(&mut self, phase: Phase, desired: [bool; 5], now: u64, message: &str) -> Effects {
-        self.self_pending = 0;
         self.self_waiting = None;
         self.command_since = now;
         self.target = desired;
         self.transition(phase, now, message);
-        // Close supply valves before any other reconfiguration; opening a supply
-        // happens only in a subsequent phase after all prerequisites are acknowledged.
-        Effects {
-            valves: [3, 4, 0, 1, 2]
-                .into_iter()
-                .map(|i| (i, desired[i]))
-                .collect(),
-            notification: None,
+        if phase == Phase::Fault {
+            self.self_pending = 0;
+            return Effects {
+                valves: [3, 4, 0, 1, 2]
+                    .into_iter()
+                    .map(|i| (i, desired[i]))
+                    .collect(),
+                notification: None,
+            };
         }
+        // Each new target gets fresh board valve confirmation, independent of the
+        // cached command. Only one operation is outstanding at a time.
+        self.self_pending = 0b11111;
+        self.self_ack_since = [now; 5];
+        self.next_self_command(now)
     }
     fn self_confirmation_phase(&self) -> bool {
-        self.testing_valves
-            && matches!(
-                self.status.phase,
-                Phase::BaselineSetup
-                    | Phase::SelfSetup
-                    | Phase::SelfOpen
-                    | Phase::SelfClose
-                    | Phase::SelfFinish
-            )
+        self.status.phase != Phase::Fault
     }
     fn configure_self(
         &mut self,
@@ -357,9 +449,15 @@ impl Engine {
     }
     fn next_self_command(&mut self, now: u64) -> Effects {
         // Establish safe supply states first; never burst both vent/dump moves.
-        let next = [3, 4, 0, 1, 2]
+        let order = [3, 4, 0, 1, 2];
+        let next = order
             .into_iter()
-            .find(|i| self.self_pending & (1 << i) != 0);
+            .find(|i| self.self_pending & (1 << i) != 0 && !self.target[*i])
+            .or_else(|| {
+                order
+                    .into_iter()
+                    .find(|i| self.self_pending & (1 << i) != 0)
+            });
         self.self_waiting = next;
         if let Some(i) = next {
             self.self_pending &= !(1 << i);
@@ -428,6 +526,8 @@ impl Engine {
             }
             Action::SelfTest | Action::NitrogenTest => {
                 self.nitrous_session = false;
+                self.nitrogen_plan = self.config.nitrogen_plan()?;
+                self.nitrogen_step_index = 0;
                 self.status.nitrogen_passed = false;
                 self.status.nitrogen_overridden = false;
                 self.status.baseline = None;
@@ -464,8 +564,30 @@ impl Engine {
         effects
     }
     pub fn manual_override(&mut self) {
-        self.status.nitrogen_passed = false;
-        self.status.nitrogen_overridden = false;
+        self.claimed = false;
+        self.testing_valves = false;
+        self.self_pending = 0;
+        self.self_waiting = None;
+        self.hold_reference = None;
+        self.hold_samples = 0;
+        self.samples.clear();
+        if self.status.phase != Phase::Fault {
+            self.status.phase = Phase::Idle;
+            self.status.message = "Automation cancelled; manual valve control".into();
+        }
+    }
+    pub fn nitrous_session(&self) -> bool {
+        self.nitrous_session
+    }
+    fn nitrogen_step(&self) -> NitrogenStep {
+        self.nitrogen_plan
+            .get(self.nitrogen_step_index)
+            .cloned()
+            .unwrap_or(NitrogenStep {
+                target_psi: self.status.current_step_psi,
+                settle_ms: 2000,
+                hold_ms: 5000,
+            })
     }
     fn confirmed(&self, input: Inputs) -> bool {
         input
@@ -476,6 +598,8 @@ impl Engine {
             .all(|(i, (v, target))| {
                 v.is_some_and(|v| {
                     v.open == target
+                        && v.at_ms <= input.now_ms
+                        && input.now_ms - v.at_ms <= 2000
                         && v.at_ms
                             >= if self.self_confirmation_phase() {
                                 self.self_ack_since[i]
@@ -503,8 +627,12 @@ impl Engine {
                 } else {
                     self.command_since
                 };
-                !v.is_some_and(|v| v.open == target && v.at_ms >= since)
-                    && input.now_ms.saturating_sub(since) >= VALVE_ACK_TIMEOUT_MS
+                !v.is_some_and(|v| {
+                    v.open == target
+                        && v.at_ms >= since
+                        && v.at_ms <= input.now_ms
+                        && input.now_ms - v.at_ms <= 2000
+                }) && input.now_ms.saturating_sub(since) >= VALVE_ACK_TIMEOUT_MS
             })
     }
     fn valve_ack_timeout(&mut self, input: Inputs) -> Effects {
@@ -518,6 +646,9 @@ impl Engine {
                 let wanted = if target { "open" } else { "closed" };
                 let reason = match observed {
                     None => "no report",
+                    Some(v) if v.at_ms > input.now_ms || input.now_ms - v.at_ms > 2000 => {
+                        "no fresh report"
+                    }
                     Some(v)
                         if v.at_ms
                             < if self.self_confirmation_phase() {
@@ -566,11 +697,28 @@ impl Engine {
         if !self.active() {
             return Effects::default();
         }
-        let elapsed = input.now_ms.saturating_sub(self.phase_since);
         if matches!(
             self.status.phase,
             Phase::CancelSetup | Phase::PauseSetup | Phase::SelfFinish
         ) {
+            if self.valve_ack_expired(input) {
+                return self.valve_ack_timeout(input);
+            }
+            if self.self_confirmation_phase()
+                && let Some(i) = self.self_waiting
+                && input.valves[i].is_some_and(|v| {
+                    v.open == self.target[i]
+                        && v.at_ms >= self.self_ack_since[i]
+                        && v.at_ms <= input.now_ms
+                        && input.now_ms - v.at_ms <= 2000
+                })
+            {
+                self.self_waiting = None;
+                if self.self_pending != 0 {
+                    return self.next_self_command(input.now_ms);
+                }
+                self.phase_since = input.now_ms;
+            }
             if self.confirmed(input) {
                 let phase = match self.status.phase {
                     Phase::CancelSetup => Phase::Cancelled,
@@ -618,7 +766,7 @@ impl Engine {
             self.config.pressure_limit(self.nitrous_target_psi, 50.0)
         } else {
             self.config
-                .pressure_limit(self.config.nitrogen_target_psi, 100.0)
+                .pressure_limit(self.config.nitrogen_target_psi(), 100.0)
         };
         if limit.is_err() || limit.is_ok_and(|limit| pressure >= limit) {
             return self.fault(input.now_ms, "Pressure ceiling reached");
@@ -647,14 +795,19 @@ impl Engine {
         }
         if self.self_confirmation_phase()
             && let Some(i) = self.self_waiting
-            && input.valves[i]
-                .is_some_and(|v| v.open == self.target[i] && v.at_ms >= self.self_ack_since[i])
+            && input.valves[i].is_some_and(|v| {
+                v.open == self.target[i]
+                    && v.at_ms >= self.self_ack_since[i]
+                    && v.at_ms <= input.now_ms
+            })
         {
             self.self_waiting = None;
             if self.self_pending != 0 {
                 return self.next_self_command(input.now_ms);
             }
+            self.phase_since = input.now_ms;
         }
+        let elapsed = input.now_ms.saturating_sub(self.phase_since);
         match self.status.phase {
             Phase::BaselineSetup if self.confirmed(input) => {
                 self.samples.clear();
@@ -701,10 +854,7 @@ impl Engine {
                     samples: self.samples.len(),
                 });
                 self.self_index = 0;
-                self.status.current_step_psi = self
-                    .config
-                    .pressure_step_psi
-                    .min(self.config.nitrogen_target_psi);
+                self.status.current_step_psi = self.nitrogen_plan[0].target_psi;
                 if self.testing_valves {
                     return self.configure_self(
                         Phase::SelfSetup,
@@ -769,7 +919,7 @@ impl Engine {
                     Phase::Raising,
                     target,
                     input.now_ms,
-                    "Raising nitrogen pressure to the next 50 psi step",
+                    "Raising nitrogen pressure to the next configured step",
                 );
             }
             Phase::Raising => {
@@ -789,7 +939,7 @@ impl Engine {
                 }
             }
             Phase::Settling => {
-                if elapsed >= 2000
+                if elapsed >= self.nitrogen_step().settle_ms
                     && self.confirmed(input)
                     && let Some(mean) = self.sample_mean(input.now_ms.saturating_sub(1000))
                 {
@@ -806,11 +956,7 @@ impl Engine {
                     }
                     self.hold_reference = Some(mean);
                     self.hold_samples = 0;
-                    self.transition(
-                        Phase::Holding,
-                        input.now_ms,
-                        "Checking for pressure loss over 5 seconds",
-                    );
+                    self.transition(Phase::Holding, input.now_ms, "Checking pressure hold");
                 }
             }
             Phase::Holding => {
@@ -826,7 +972,7 @@ impl Engine {
                         );
                     }
                 }
-                if elapsed >= 5000 {
+                if elapsed >= self.nitrogen_step().hold_ms {
                     if self.hold_samples < 10 {
                         return self.fault(input.now_ms, "Too few samples to verify pressure hold");
                     }
@@ -834,7 +980,7 @@ impl Engine {
                     if self.hold_reference.unwrap() - hold_mean > 3.0 {
                         return self.fault(input.now_ms, "Sustained mean pressure loss exceeds 3 psi; leak or inconclusive noisy hold, test not passed");
                     }
-                    if self.status.current_step_psi >= self.config.nitrogen_target_psi {
+                    if self.nitrogen_step_index + 1 >= self.nitrogen_plan.len() {
                         return self.configure(
                             Phase::Dumping,
                             RELIEVED,
@@ -842,9 +988,8 @@ impl Engine {
                             "Nitrogen holds passed; dumping tank before enabling fill",
                         );
                     }
-                    self.status.current_step_psi = (self.status.current_step_psi
-                        + self.config.pressure_step_psi)
-                        .min(self.config.nitrogen_target_psi);
+                    self.nitrogen_step_index += 1;
+                    self.status.current_step_psi = self.nitrogen_step().target_psi;
                     return self.configure(
                         Phase::NitrogenSetup,
                         CLOSED,
@@ -918,14 +1063,20 @@ mod tests {
     }
     impl Rig {
         fn new() -> Self {
-            let mut engine = Engine::default();
-            engine.config = Config {
-                nitrogen_target_psi: 120.0,
-                pressure_step_psi: 50.0,
-                pressure_ceiling_psi: Some(200.0),
-                maximum_zero_offset_psi: Some(8.0),
-                dry_self_test_confirmed: true,
-                grouped_panel: true,
+            let engine = Engine {
+                config: Config {
+                    nitrogen_target_psi: 120.0,
+                    nitrogen_steps: Vec::new(),
+                    fill_overfill_kg: 0.05,
+                    fill_tolerance_kg: 0.07,
+                    fill_settle_ms: 3000,
+                    pressure_step_psi: 50.0,
+                    pressure_ceiling_psi: Some(200.0),
+                    maximum_zero_offset_psi: Some(8.0),
+                    dry_self_test_confirmed: true,
+                    grouped_panel: true,
+                },
+                ..Engine::default()
             };
             Self {
                 engine,
@@ -967,7 +1118,10 @@ mod tests {
         }
         fn until(&mut self, phase: Phase) {
             for _ in 0..1000 {
-                if self.engine.status.phase == phase {
+                if self.engine.status.phase == phase
+                    && self.engine.self_pending == 0
+                    && self.engine.self_waiting.is_none()
+                {
                     return;
                 }
                 self.tick();
@@ -976,7 +1130,7 @@ mod tests {
         }
         fn baseline(&mut self) {
             self.request(Action::NitrogenTest);
-            self.tick();
+            self.until(Phase::Baseline);
             for i in 0..50 {
                 self.pressure = if i % 2 == 0 { 3.0 } else { 7.0 };
                 self.tick();
@@ -994,8 +1148,8 @@ mod tests {
             rig.valves = std::array::from_fn(|i| !desired[i]);
             let effects = rig.engine.prepare_startup(rig.now, hold_filled);
             rig.effects(effects);
-            assert_eq!(rig.valves, desired);
             rig.until(settled);
+            assert_eq!(rig.valves, desired);
             for _ in 0..100 {
                 rig.tick();
                 assert_eq!(rig.engine.status.phase, settled);
@@ -1054,7 +1208,7 @@ mod tests {
         rig.engine.config.maximum_zero_offset_psi = Some(3.0);
         rig.pressure = 0.0;
         rig.request(Action::NitrogenTest);
-        rig.tick();
+        rig.until(Phase::Baseline);
         for i in 0..50 {
             rig.pressure = if i % 2 == 0 { -3.0 } else { 3.0 };
             rig.tick();
@@ -1142,6 +1296,7 @@ mod tests {
             rig.tick();
         }
         assert_eq!(rig.engine.status.phase, Phase::Dumping);
+        rig.until(Phase::Dumping);
         assert_eq!(rig.valves, RELIEVED);
         assert!(!rig.engine.status.nitrogen_passed);
         rig.pressure = 5.0;
@@ -1151,14 +1306,13 @@ mod tests {
         // This fixture has a 200 psi hardware cap, so use a compatible fill target.
         rig.engine.nitrous_target_psi = 140.0;
         rig.request(Action::StartFill);
-        assert_eq!(rig.valves, FILL_READY);
-        rig.tick();
+        rig.until(Phase::Filling);
         assert_eq!(rig.valves, [false, true, false, false, true]);
         rig.request(Action::PauseFill);
-        rig.tick();
+        rig.until(Phase::Paused);
         assert_eq!(rig.valves, CLOSED);
         rig.request(Action::CancelFill);
-        rig.tick();
+        rig.until(Phase::Cancelled);
         assert_eq!(rig.valves, RELIEVED);
     }
     #[test]
@@ -1188,7 +1342,7 @@ mod tests {
                 assert_eq!(rig.engine.status.current_step_psi, target);
             }
             rig.pressure = target + 2.0;
-            rig.tick();
+            rig.until(Phase::Holding);
             assert_eq!(rig.engine.status.phase, Phase::Holding);
             let reference = rig.engine.hold_reference.unwrap();
             assert!((reference - (target + 2.0)).abs() < 0.1);
@@ -1204,7 +1358,7 @@ mod tests {
             if target < 120.0 {
                 assert_eq!(rig.engine.status.phase, Phase::NitrogenSetup);
                 assert_eq!(rig.valves, CLOSED);
-                rig.tick();
+                rig.until(Phase::Raising);
                 assert_eq!(rig.engine.status.phase, Phase::Raising);
             }
         }
@@ -1360,13 +1514,18 @@ mod tests {
         for _ in 0..300 {
             input.now_ms += 100;
             input.pressure.as_mut().unwrap().at_ms = input.now_ms;
+            // Boards publish full physical snapshots every second, even if no valve changed.
+            if input.now_ms % 1000 == 0 {
+                for state in input.valves.iter_mut().flatten() {
+                    state.at_ms = input.now_ms;
+                }
+            }
             let effects = rig.engine.tick(input);
             assert_ne!(rig.engine.status.phase, Phase::Fault);
             assert!(effects.valves.len() <= 1);
             for (i, open) in effects.valves {
                 commands.push((i, open));
-                // Only commanded valves send a new reply. Other cached reports
-                // retain their original timestamp throughout this session.
+                // A command also produces its own fresh physical reply.
                 input.valves[i] = Some(ValveState {
                     open,
                     at_ms: input.now_ms,
@@ -1439,6 +1598,7 @@ mod tests {
         assert_eq!(rig.engine.tick(input).valves, vec![(4, false)]);
         input.now_ms += 4999;
         input.pressure.as_mut().unwrap().at_ms = input.now_ms;
+        input.valves[3].as_mut().unwrap().at_ms = input.now_ms;
         assert!(rig.engine.tick(input).valves.is_empty());
         assert_ne!(rig.engine.status.phase, Phase::Fault);
         input.now_ms += 1;
@@ -1505,5 +1665,170 @@ mod tests {
         assert_eq!(seen, vec![0, 1, 2, 3, 4]);
         assert_eq!(rig.valves, RELIEVED);
         assert_eq!(rig.engine.status.phase, Phase::Idle);
+    }
+    #[test]
+    fn explicit_nitrogen_steps_survive_serialization_and_use_each_wait() {
+        let mut rig = Rig::new();
+        rig.engine.config.pressure_ceiling_psi = Some(700.0);
+        rig.engine.config.nitrogen_steps = vec![
+            NitrogenStep {
+                target_psi: 100.0,
+                settle_ms: 3000,
+                hold_ms: 1000,
+            },
+            NitrogenStep {
+                target_psi: 300.0,
+                settle_ms: 1000,
+                hold_ms: 2000,
+            },
+            NitrogenStep {
+                target_psi: 500.0,
+                settle_ms: 2000,
+                hold_ms: 3000,
+            },
+        ];
+        let json = serde_json::to_string(&rig.engine.config).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Config>(&json).unwrap(),
+            rig.engine.config
+        );
+        assert_eq!(rig.engine.config.nitrogen_target_psi(), 500.0);
+        rig.pressure = 0.0;
+        rig.request(Action::NitrogenTest);
+        for step in rig.engine.config.nitrogen_steps.clone() {
+            rig.until(Phase::Raising);
+            assert_eq!(rig.engine.status.current_step_psi, step.target_psi);
+            rig.pressure = step.target_psi;
+            rig.until(Phase::Settling);
+            let settled_at = rig.engine.phase_since;
+            rig.until(Phase::Holding);
+            assert!(rig.now - settled_at >= step.settle_ms);
+            let held_at = rig.now;
+            while rig.engine.status.phase == Phase::Holding {
+                rig.tick();
+            }
+            assert!(rig.now - held_at >= step.hold_ms);
+            assert_ne!(rig.engine.status.phase, Phase::Fault);
+        }
+        rig.pressure = 0.0;
+        rig.until(Phase::Passed);
+        assert!(rig.engine.status.nitrogen_passed);
+    }
+    #[test]
+    fn explicit_steps_and_fill_settings_reject_unsafe_bounds() {
+        let mut config = Config::default();
+        let good = NitrogenStep {
+            target_psi: 100.0,
+            settle_ms: 1000,
+            hold_ms: 1000,
+        };
+        for bad in [
+            NitrogenStep {
+                target_psi: f32::NAN,
+                ..good.clone()
+            },
+            NitrogenStep {
+                settle_ms: 0,
+                ..good.clone()
+            },
+            NitrogenStep {
+                hold_ms: 600001,
+                ..good.clone()
+            },
+        ] {
+            config.nitrogen_steps = vec![bad];
+            assert!(config.validate_settings().is_err());
+        }
+        config.nitrogen_steps = vec![good.clone(), good];
+        assert!(config.validate_settings().is_err());
+        config.nitrogen_steps = (1..=33)
+            .map(|i| NitrogenStep {
+                target_psi: i as f32,
+                settle_ms: 1000,
+                hold_ms: 1000,
+            })
+            .collect();
+        assert!(config.validate_settings().is_err());
+        config.nitrogen_steps = (1..=4)
+            .map(|i| NitrogenStep {
+                target_psi: i as f32,
+                settle_ms: 600000,
+                hold_ms: 600000,
+            })
+            .collect();
+        assert!(config.validate_settings().is_err());
+        config.nitrogen_steps.clear();
+        config.fill_overfill_kg = 0.101;
+        assert!(config.validate_settings().is_err());
+        config.fill_overfill_kg = 0.1;
+        config.fill_tolerance_kg = 0.071;
+        assert!(config.validate_settings().is_err());
+        config.fill_tolerance_kg = 0.07;
+        config.fill_settle_ms = 999;
+        assert!(config.validate_settings().is_err());
+    }
+    #[test]
+    fn ordinary_targets_wait_for_board_acks_and_settle_after_last_ack() {
+        let mut rig = Rig::new();
+        rig.engine.status.phase = Phase::Raising;
+        let mut effects = rig
+            .engine
+            .configure(Phase::Settling, CLOSED, rig.now, "settle");
+        for index in [3, 4, 0, 1, 2] {
+            assert_eq!(effects.valves, vec![(index, false)]);
+            // Old cached CLOSED feedback cannot release the next command.
+            let mut stale = rig.input();
+            stale.valves[index].as_mut().unwrap().at_ms =
+                rig.engine.self_ack_since[index].saturating_sub(1);
+            assert!(rig.engine.tick(stale).valves.is_empty());
+            rig.effects(effects);
+            rig.now += 1000;
+            effects = rig.engine.tick(rig.input());
+        }
+        assert_eq!(rig.engine.status.phase, Phase::Settling);
+        assert_eq!(rig.engine.phase_since, rig.now);
+        assert!(effects.valves.is_empty());
+    }
+    #[test]
+    fn manual_override_cancels_automation_without_clearing_safety_or_test_evidence() {
+        let mut rig = Rig::new();
+        rig.engine.status.nitrogen_passed = true;
+        rig.engine.status.self_test_locked = true;
+        rig.engine.nitrous_session = true;
+        let _ = rig
+            .engine
+            .configure(Phase::FillSetup, FILL_READY, rig.now, "fill");
+        rig.engine.manual_override();
+        assert!(
+            rig.engine.status.nitrogen_passed
+                && rig.engine.status.self_test_locked
+                && rig.engine.nitrous_session()
+        );
+        for _ in 0..100 {
+            rig.now += 100;
+            assert!(rig.engine.tick(rig.input()).valves.is_empty());
+        }
+        rig.engine.fault(rig.now, "latched");
+        rig.engine.manual_override();
+        assert_eq!(rig.engine.status.phase, Phase::Fault);
+    }
+    #[test]
+    fn previously_acked_but_now_stale_board_reports_cannot_sustain_automation() {
+        let mut rig = Rig::new();
+        rig.engine.status.phase = Phase::Holding;
+        rig.engine.target = CLOSED;
+        rig.engine.self_ack_since = [100; 5];
+        rig.now = 10000;
+        let mut input = rig.input();
+        input.valves = input.valves.map(|v| {
+            v.map(|mut v| {
+                v.open = false;
+                v.at_ms = 7000;
+                v
+            })
+        });
+        let effects = rig.engine.tick(input);
+        assert_eq!(rig.engine.status.phase, Phase::Fault);
+        assert!(effects.notification.unwrap().contains("no fresh report"));
     }
 }

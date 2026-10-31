@@ -19,6 +19,7 @@ pub(super) struct Broadcast {
     tiles: Vec<CameraTile>,
     pub(super) revision: u64,
     replay: Option<replay::Plan>,
+    #[serde(default = "legacy_rundown")]
     rundown: super::rundown::Rundown,
     commentary_audio_enabled: bool,
     interview: Interview,
@@ -31,6 +32,13 @@ struct CameraTile { stream_id:String, x:f64, y:f64, width:f64, height:f64 }
 fn valid_tiles(tiles:&[CameraTile])->bool {
  let mut ids=std::collections::HashSet::new();
  tiles.len()<=8 && tiles.iter().all(|t|valid_id(&t.stream_id)&&ids.insert(&t.stream_id)&&[t.x,t.y,t.width,t.height].iter().all(|v|v.is_finite())&&t.x>=0.0&&t.y>=0.0&&t.width>=10.0&&t.height>=10.0&&t.x+t.width<=100.001&&t.y+t.height<=100.001)
+}
+
+fn legacy_rundown() -> super::rundown::Rundown {
+    super::rundown::Rundown {
+        flight_phase_version: 0,
+        ..Default::default()
+    }
 }
 
 impl Default for Broadcast {
@@ -94,6 +102,17 @@ pub(super) struct Binding {
     #[serde(default)]
     pub(super) offset: f32,
 }
+fn require_current_phase_version(version: u8) -> ApiResult<()> {
+    match version {
+        crate::types::FLIGHT_PHASE_VERSION => Ok(()),
+        0 => Err(error(
+            StatusCode::BAD_REQUEST,
+            "Reload the updated UI before editing flight-phase settings",
+        )),
+        _ => Err(error(StatusCode::BAD_REQUEST, "Unsupported flight phase version")),
+    }
+}
+
 fn one() -> f32 {
     1.0
 }
@@ -164,6 +183,7 @@ fn default_stats() -> Vec<BroadcastStat> {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct Vehicle {
+    flight_phase_version: u8,
     motions: Vec<Motion>,
     title: String,
     model_url: String,
@@ -175,6 +195,18 @@ pub(super) struct Vehicle {
     attitude: Attitude,
     stages: Vec<Stage>,
     ground_systems: Vec<Component>,
+}
+
+impl Vehicle {
+    fn normalize_flight_phases(&mut self) -> Result<(), &'static str> {
+        let version = self.flight_phase_version;
+        crate::types::normalize_phase_map(&mut self.phase_animations, version)?;
+        for motion in &mut self.motions {
+            crate::types::normalize_phase_map(&mut motion.phase_values, version)?;
+        }
+        self.flight_phase_version = crate::types::FLIGHT_PHASE_VERSION;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -294,6 +326,10 @@ pub(super) async fn read_presentation(state: &MediaState) -> ApiResult<Presentat
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Presentation::default()),
             Err(err) => Err(io_error(err)),
         }?;
+    presentation.vehicle.normalize_flight_phases()
+        .map_err(|message| error(StatusCode::INTERNAL_SERVER_ERROR, message))?;
+    presentation.broadcast.rundown.normalize_flight_phases()
+        .map_err(|message| error(StatusCode::INTERNAL_SERVER_ERROR, message))?;
     presentation
         .broadcast
         .rundown
@@ -591,6 +627,9 @@ async fn control_broadcast_inner(
             "Stream-master permission required",
         ));
     }
+    require_current_phase_version(broadcast.rundown.flight_phase_version)?;
+    broadcast.rundown.normalize_flight_phases()
+        .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
     broadcast
         .rundown
         .validate()
@@ -757,7 +796,7 @@ async fn load_vehicle(state: Arc<MediaState>, headers: HeaderMap) -> ApiResult<V
                     binding: None,
                     phase_values: BTreeMap::from([
                         ("*".into(), 0.0),
-                        ("ParachuteDeploy".into(), 1.0),
+                        ("Descent".into(), 1.0),
                     ]),
                 },
                 Motion {
@@ -769,7 +808,7 @@ async fn load_vehicle(state: Arc<MediaState>, headers: HeaderMap) -> ApiResult<V
                     binding: None,
                     phase_values: BTreeMap::from([
                         ("*".into(), 0.0),
-                        ("Descent".into(), 1.0),
+                        ("Reefing".into(), 1.0),
                         ("Landed".into(), 1.0),
                         ("Recovery".into(), 1.0),
                     ]),
@@ -797,9 +836,12 @@ async fn load_vehicle(state: Arc<MediaState>, headers: HeaderMap) -> ApiResult<V
 async fn save_vehicle(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
-    axum::Json(vehicle): axum::Json<Vehicle>,
+    axum::Json(mut vehicle): axum::Json<Vehicle>,
 ) -> ApiResult<StatusCode> {
     authorize(&state, &headers, Permission::SendCommands).await?;
+    require_current_phase_version(vehicle.flight_phase_version)?;
+    vehicle.normalize_flight_phases()
+        .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
     if !vehicle.ground_model_url.is_empty()
         && vehicle.ground_model_url != "/assets/models/gse-site.glb"
     {
@@ -937,6 +979,24 @@ async fn model_asset(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_vehicle_phase_maps_upgrade_once_without_changing_chute_identity() {
+        let mut vehicle: super::Vehicle = serde_json::from_value(serde_json::json!({
+            "phase_animations": {"ParachuteDeploy":"drogue", "Descent":"main"},
+            "motions": [{"node":"drogue", "transform":"visible", "axis":[0,1,0],
+                "from":0, "to":1, "phase_values":{"ParachuteDeploy":1}},
+                {"node":"main", "transform":"visible", "axis":[0,1,0],
+                "from":0, "to":1, "phase_values":{"Descent":1}}]
+        })).unwrap();
+        vehicle.normalize_flight_phases().unwrap();
+        assert_eq!(vehicle.phase_animations["Descent"], "drogue");
+        assert_eq!(vehicle.phase_animations["Reefing"], "main");
+        assert_eq!(vehicle.motions[0].phase_values["Descent"], 1.0);
+        assert_eq!(vehicle.motions[1].phase_values["Reefing"], 1.0);
+        let once = serde_json::to_value(&vehicle).unwrap();
+        vehicle.normalize_flight_phases().unwrap();
+        assert_eq!(serde_json::to_value(vehicle).unwrap(), once);
+    }
     use super::*;
     #[test]
     fn saved_tiles_reject_duplicate_ids_and_out_of_canvas_geometry() {

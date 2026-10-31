@@ -679,11 +679,11 @@ pub(super) async fn emit_derived_loadcell_rows(
             vec![Some(calibrated_value)],
         )],
         loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
-            state
-                .gse
-                .lock()
-                .unwrap()
-                .observe_pressure(Some(calibrated_value));
+            state.gse.lock().unwrap().observe_pressure_source(
+                Some(calibrated_value),
+                sample.source_timestamp_ms,
+                super::recording_network_utc_ms().unwrap_or(sample.ts_ms),
+            );
             {
                 let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
                 *pressure = Some(calibrated_value);
@@ -706,7 +706,11 @@ pub(super) async fn emit_derived_loadcell_rows(
         let flight_state = *state.state.lock().unwrap();
         let target = loadcell::active_fill_target_mass_kg(&fill_targets, flight_state);
         *state.latest_fill_mass_kg.lock().unwrap() = mass;
-        state.gse.lock().unwrap().observe_mass(mass);
+        state.gse.lock().unwrap().observe_mass_source(
+            mass,
+            sample.source_timestamp_ms,
+            super::recording_network_utc_ms().unwrap_or(sample.ts_ms),
+        );
         rows.push((
             loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
             vec![mass.map(|mass| loadcell::fill_percent(target, mass))],
@@ -885,12 +889,82 @@ pub(super) fn split_imu_values(
     Some((values[..3].to_vec(), values[3..6].to_vec()))
 }
 
+// Combined publication occupies one existing DAQ load-cell packet slot.
+// Keep the original vector for raw exports plus canonical KG1000 so existing
+// calibration, derived mass, charts and recordings retain their exact path.
+fn chamber_pressure_rows(sender: &str, values: &[Option<f32>]) -> Vec<(String, Vec<Option<f32>>)> {
+    if sender != "DAQ" || values.len() != 3 {
+        return Vec::new();
+    }
+    let mut rows = vec![("DAQ_LOADCELL_CHAMBER".into(), values.to_vec())];
+    // The pressure input is independent of the load cell. A failed load-cell
+    // conversion must not hide an otherwise valid chamber-pressure sample.
+    if values[0].is_some_and(f32::is_finite) {
+        rows.push(("KG1000".into(), vec![values[0]]));
+    }
+    if values[1].is_some_and(|x| x.is_finite() && (-5280.0..=5280.0).contains(&x))
+        && values[2].is_some_and(|x| x.is_finite() && (-26.4..=26.4).contains(&x))
+    {
+        rows.push(("COMBUSTION_CHAMBER_PRESSURE".into(), vec![values[1]]));
+        rows.push(("COMBUSTION_CHAMBER_VOLTAGE".into(), vec![values[2]]));
+        let outside_nominal = values[1].is_some_and(|x| !(0.0..=1000.0).contains(&x));
+        rows.push((
+            "COMBUSTION_CHAMBER_RANGE_STATUS".into(),
+            vec![Some(if outside_nominal { 1.0 } else { 0.0 })],
+        ));
+    }
+    rows
+}
+
+#[cfg(test)]
+mod chamber_pressure_tests {
+    use super::chamber_pressure_rows;
+    #[test]
+    fn combined_preserves_loadcell_and_valid_zero_pressure() {
+        let rows = chamber_pressure_rows("DAQ", &[Some(-0.125), Some(0.0), Some(0.0)]);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[1], ("KG1000".into(), vec![Some(-0.125)]));
+        assert_eq!(
+            rows[2],
+            ("COMBUSTION_CHAMBER_PRESSURE".into(), vec![Some(0.0)])
+        );
+    }
+    #[test]
+    fn omega_overrange_remains_visible_and_is_flagged() {
+        let rows = chamber_pressure_rows("DAQ", &[Some(1.0), Some(1020.0), Some(5.1)]);
+        assert!(
+            rows.iter()
+                .any(|(kind, v)| kind == "COMBUSTION_CHAMBER_PRESSURE" && v == &vec![Some(1020.0)])
+        );
+        assert!(rows.iter().any(|(kind,v)|kind=="COMBUSTION_CHAMBER_RANGE_STATUS"&&v==&vec![Some(1.0)]));
+    }
+    #[test]
+    fn invalid_loadcell_does_not_hide_valid_chamber_pressure() {
+        let rows = chamber_pressure_rows("DAQ", &[None, Some(500.0), Some(2.5)]);
+        assert!(!rows.iter().any(|(kind, _)| kind == "KG1000"));
+        assert!(rows.iter().any(|(kind, values)| kind == "COMBUSTION_CHAMBER_PRESSURE" && values == &vec![Some(500.0)]));
+        assert!(rows.iter().any(|(kind, _)| kind == "COMBUSTION_CHAMBER_VOLTAGE"));
+    }
+
+    #[test]
+    fn malformed_or_other_sender_cannot_fabricate_pressure() {
+        assert!(chamber_pressure_rows("VB", &[Some(1.0); 3]).is_empty());
+        assert!(chamber_pressure_rows("DAQ", &[Some(1.0); 2]).is_empty());
+        let rows = chamber_pressure_rows("DAQ", &[Some(1.0), None, Some(f32::NAN)]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].0, "KG1000");
+    }
+}
+
 pub(super) fn telemetry_rows_from_packet_values(
     state: &Arc<AppState>,
     pkt: &Packet,
     sender_id: &str,
     mut values: Vec<Option<f32>>,
 ) -> Vec<(String, Vec<Option<f32>>)> {
+    if &*pkt.data_type().as_str() == "DAQ_LOADCELL_CHAMBER" {
+        return chamber_pressure_rows(sender_id, &values);
+    }
     if matches!(&*pkt.data_type().as_str(), "KG50" | "DAQ_KG50_SELECTED") {
         if sender_id != "DAQ" {
             return Vec::new();

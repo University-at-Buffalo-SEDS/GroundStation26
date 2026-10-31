@@ -432,6 +432,28 @@ pub(crate) mod tests {
         assert_eq!(text_cell("[0.001,-570,null]"), "\"[0.001,-570,null]\"");
     }
     #[tokio::test]
+    async fn chamber_pressure_export_preserves_units_channels_and_both_clocks() {
+        let db = crate::telemetry_db::open_in_memory_telemetry_db()
+            .await
+            .unwrap();
+        for (kind, value) in [
+            ("COMBUSTION_CHAMBER_PRESSURE", "[1000.0]"),
+            ("COMBUSTION_CHAMBER_VOLTAGE", "[5.0]"),
+        ] {
+            sqlx::query("INSERT INTO telemetry(timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json) VALUES(123456,98765,'DAQ',?,?,'[0,1,2,3]')")
+                .bind(kind).bind(value).execute(&db).await.unwrap();
+        }
+        let (csv, _) = csv_page(&db, 0, 2).await.unwrap();
+        assert!(csv.contains("123456,98765"));
+        assert!(csv.contains("DAQ"));
+        assert!(csv.contains("COMBUSTION_CHAMBER_PRESSURE"));
+        assert!(csv.contains("COMBUSTION_CHAMBER_VOLTAGE"));
+        assert!(csv.contains("[1000.0]"));
+        assert!(csv.contains("[5.0]"));
+        db.close().await;
+    }
+
+    #[tokio::test]
     async fn nullable_metadata_and_empty_recordings_export_cleanly() {
         let db = crate::telemetry_db::open_in_memory_telemetry_db()
             .await

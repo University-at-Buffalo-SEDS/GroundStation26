@@ -1,10 +1,12 @@
 # Ground support equipment sequences
 
-Routine pause, cancel, nitrogen-pass and self-test completion notifications use
-`persistent: false`; sequence faults remain persistent until acknowledged.
-HTTP/WebSocket notification snapshots restore existing entries, not new events.
-Clients should deduplicate by `(id, timestamp_ms)` per backend and avoid replaying
-already-seen transient notices on reload, without hiding unresolved faults.
+Operator notifications are live events: `Notification` WebSocket messages may
+show a five-second popup once. HTTP and `Notifications` WebSocket snapshots only
+restore Notification Center history, including notices missed while disconnected;
+they never replay popups, even for older entries carrying `persistent: true`.
+The backend retains at most 200 recent notices in memory. Closing or expiring a
+popup is local and preserves shared history. Warnings and errors retain their
+separate persistent acknowledgement behavior.
 
 The Actions tab keeps its original controls and contains the new **GSE sequence
 actions** in the main button area. Individual valves remain in the **Manual GSE
@@ -107,10 +109,13 @@ The existing `/api/fill_targets` payload now includes `fill_source`.
 | Nitrogen test | Closed | Closed | Closed | Controlled | Closed |
 | Self-test completion / nitrogen dump | Closed | Open | Open | Closed | Closed |
 
-The nitrogen test calibrates zero, closes all valves, and raises pressure in configured
-`pressure_step_psi` increments (50 psi by default), with a final smaller step to the
-configured target. Each step closes nitrogen,
-allows at least two seconds to settle, and holds for five seconds. Rolling averages
+The nitrogen test calibrates zero, closes all valves, and follows saved
+`nitrogen_steps`, each containing `target_psi`, `settle_ms`, and `hold_ms`.
+Targets must ascend, with at most 32 steps; each wait is1–600 seconds and combined
+waits are at most one hour. An empty plan preserves legacy `pressure_step_psi`
+increments (50 psi by default) through `nitrogen_target_psi` (120 psi by default),
+with 2 seconds settling and 5 seconds holding. The final explicit step is the
+nitrogen target. Each step closes nitrogen before settling and holding. Rolling averages
 filter isolated noisy samples. A drop greater than 3 psi plus the two-reading noise
 envelope fails immediately; a sustained five-second mean loss greater than 3 psi
 also fails (possibly inconclusive noise), never passes. This is not a certified leak
@@ -125,10 +130,15 @@ starts, self-test stays locked. Operational builds preserve successful tests acr
 restarts until explicit reset; Fire consumes the cold-flow requirement. HITL keeps
 its existing runtime-only test status.
 
-HITL manual valve changes invalidate its runtime nitrogen-pass status. Operational
-qualification remains persisted until reset or Fire, while live unsafe supply
-reports latch a fault. Manual valve, launch and retraction controls remain subject
-to active-sequence ownership and backend interlocks.
+An admitted manual valve command cancels pending automation and hands control to
+the operator without changing any other valve. Nitrogen qualification and the
+nitrous-session hazard latch survive this handoff. Existing command interlocks,
+unknown-feedback rejection and fault close-only controls still apply. Incompatible
+supply reports still latch a fault after handoff. Editing an effective nitrogen
+plan or pressure limits revokes nitrogen and fill qualification; editing fill
+precision revokes only fill qualification. Linked checklist completion is cleared
+without erasing unrelated manual items. Equivalent legacy/explicit plans retain
+qualification. Settings edits are inert and rejected during an active sequence.
 Missing/stale PT (2 s), invalid PT, pressure ceiling, lost interlock, command transport
 errors, missing acknowledgements (5 s), and step/dump timeouts (60 s) stop sequencing.
 Before Fire, faults request supply closure and dump/vent opening. Operational
@@ -227,21 +237,27 @@ Interlock; its state is authoritative in the action policy. It controls automati
 cutoff for the one-button Start Fill, not arbitrary manual valve actions.
 Regular/test-fire one-button fills always use automatic cutoff.
 
-The cutoff uses the main fill's signed nitrous mass target and
-`GS_SEQUENCE_NITROUS_WEIGHT_RISE_EPSILON_KG` (default 0.03 kg), including its
-99.5% threshold. Reaching that target closes immediately; alternatively, the main
-pressure minimum and pressure/weight plateau rule stop filling after
-`GS_SEQUENCE_NITROUS_LEVEL_SEC` (default 3 seconds). It uses the same shared
-plateau calculation as the main sequence. It does not leave a supply open while
-waiting for a weight plateau after reaching target.
+The cutoff uses the main fill's signed nitrous mass target. Saved
+`fill_overfill_kg` defaults to 0.05 kg and is capped at 0.1 kg. At that threshold,
+supplies, pilot, vent and dump are physically confirmed closed in sequence.
+`fill_settle_ms` defaults to 3000 ms (1–600 seconds). After settling, a fresh stable
+one-second mass window must meet `fill_tolerance_kg` (default and maximum ±0.07 kg).
+An overweight result opens only the vent for an ACK-timed 100 ms pulse, closes it,
+then settles again. At most 20 pulses are allowed; an underweight or unstable
+result remains unqualified. Completion requires closed valve reports, never
+merely transport delivery or an open vent. The old 99.5%/plateau heuristic does not
+qualify this precision-fill path; the separate legacy procedure is unchanged.
 
-Automatic cutoff requests Pause Fill (supplies, pilot, dump and vent closed),
-then waits for acknowledgements. Fresh calibrated loadcell data (at most 2 seconds
-old) is required before starting; losing it during automatic filling faults and
-closes supplies. OFF disables only this weight/plateau cutoff; nitrogen-test,
-pressure-ceiling, PT freshness and interlock checks remain. OFF requires the
-operator to stop fill. Switching ON during filling immediately evaluates the
-current weight; switching modes resets accumulated plateau time.
+Fresh calibrated mass and PT data are required (at most 2 seconds old). Network-UTC
+capture age is retained rather than reset at receipt; repeated captures cannot
+renew freshness or form a settled sample. A clock lead of at most 100 ms is clamped
+to receipt time; materially future or older-than-2-second captures are excluded
+from control, without removing display/history/export records. Unsynchronized
+boot timestamps retain receipt compatibility. Physical valve reports use the
+same source-age guard before acknowledging an automated target. Faults retain the
+existing emergency supply-close and dump/vent-open policy without waiting for ACKs.
+HITL Ground station control OFF disables automatic mass cutoff only; other
+interlocks remain active and the operator must stop fill.
 
 The action panel places sequence actions first and groups Igniter/Igniter Sequence
 with manual valve controls. Only Valve Self-test uses the confirmation checkbox.

@@ -135,6 +135,175 @@ fn compact_recent_rows(rows: Vec<TelemetryRow>, cutoff: i64) -> Vec<TelemetryRow
     rows
 }
 
+#[derive(Default, Deserialize)]
+struct RecentDisplayParams {
+    #[serde(default)]
+    display: bool,
+    max_rows: Option<usize>,
+}
+
+/// Display-only envelope: balanced history keeps every active stream's newest
+/// sample and each bucket's extrema. Recording/export rows are never changed.
+fn bounded_display_history(rows: Vec<TelemetryRow>, max_rows: usize) -> Vec<TelemetryRow> {
+    let mut streams: HashMap<(String, String), Vec<TelemetryRow>> = HashMap::new();
+    for row in rows {
+        streams
+            .entry((row.sender_id.clone(), row.data_type.clone()))
+            .or_default()
+            .push(row);
+    }
+    let mut streams: Vec<_> = streams.into_values().collect();
+    // If an adversarial runtime schema alone exceeds the entire envelope,
+    // retain its newest streams. Normal applications preserve all streams.
+    streams.sort_by_key(|rows| std::cmp::Reverse(rows.last().map(|row| row.timestamp_ms)));
+    streams.truncate(max_rows);
+    let per_stream = (max_rows / streams.len().max(1)).max(1);
+    let mut output = Vec::with_capacity(max_rows);
+    for mut stream in streams {
+        stream.sort_by_key(|row| row.timestamp_ms);
+        if stream.len() <= per_stream {
+            output.extend(stream);
+            continue;
+        }
+        if per_stream == 1 {
+            output.push(stream.pop().unwrap());
+            continue;
+        }
+        let count = stream.len();
+        let mut selected = std::collections::BTreeSet::from([0, count - 1]);
+        let buckets = (per_stream.saturating_sub(2) / 2).max(1);
+        if per_stream > 2 {
+            for bucket in 0..buckets {
+                let start = 1 + bucket * (count - 2) / buckets;
+                let end = 1 + (bucket + 1) * (count - 2) / buckets;
+                let value = |row: &TelemetryRow| {
+                    row.values
+                        .iter()
+                        .flatten()
+                        .copied()
+                        .find(|v| v.is_finite())
+                        .unwrap_or(0.0)
+                };
+                if let Some((index, _)) = stream[start..end]
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| value(a).total_cmp(&value(b)))
+                {
+                    selected.insert(start + index);
+                }
+                if selected.len() < per_stream {
+                    if let Some((index, _)) = stream[start..end]
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| value(a).total_cmp(&value(b)))
+                    {
+                        selected.insert(start + index);
+                    }
+                }
+            }
+        }
+        output.extend(
+            stream
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, row)| selected.contains(&index).then_some(row)),
+        );
+    }
+    output.sort_by_key(|row| row.timestamp_ms);
+    output
+}
+
+fn recent_rows_for_request(
+    rows: Vec<TelemetryRow>,
+    cutoff: i64,
+    params: &RecentDisplayParams,
+) -> Vec<TelemetryRow> {
+    let rows = compact_recent_rows(rows, cutoff);
+    if params.display {
+        bounded_display_history(rows, params.max_rows.unwrap_or(12_000).clamp(512, 20_000))
+    } else {
+        rows
+    }
+}
+
+#[cfg(test)]
+mod display_history_tests {
+    use super::*;
+    #[test]
+    fn large_reseed_preserves_latest_sparse_pressure_and_extrema_with_a_fixed_payload_bound() {
+        let mut input = Vec::new();
+        let names = [
+            "KG1000",
+            "KG50",
+            "COMBUSTION_CHAMBER_PRESSURE",
+            "COMBUSTION_CHAMBER_VOLTAGE",
+            "LOADCELL_WEIGHT_KG",
+            "LOADCELL_50_WEIGHT_KG",
+            "DAQ_ADC_TEMPERATURE",
+            "DAQ_SAR_VOLTAGES",
+            "DAQ_CURRENT_SENSE",
+            "DAQ_POWER_MONITOR",
+            "BATTERY_VOLTAGE",
+            "BATTERY_CURRENT",
+        ];
+        for sample in 0..175_000i64 {
+            input.push(TelemetryRow {
+                timestamp_ms: sample * 5,
+                sender_id: "DAQ".into(),
+                data_type: names[(sample % 12) as usize].into(),
+                values: vec![Some(if sample == 77_772 {
+                    9999.0
+                } else {
+                    (sample % 100) as f32
+                })],
+            });
+        }
+        input.push(TelemetryRow {
+            timestamp_ms: 1,
+            sender_id: "VB".into(),
+            data_type: "FUEL_TANK_PRESSURE".into(),
+            values: vec![Some(12.0)],
+        });
+        input.push(TelemetryRow {
+            timestamp_ms: 874_998,
+            sender_id: "VB".into(),
+            data_type: "FUEL_TANK_PRESSURE".into(),
+            values: vec![Some(42.0)],
+        });
+        input.sort_by_key(|row| row.timestamp_ms);
+        let mut latest = HashMap::new();
+        for row in &input {
+            latest.insert(
+                (row.sender_id.clone(), row.data_type.clone()),
+                row.timestamp_ms,
+            );
+        }
+        let full = recent_rows_for_request(input.clone(), i64::MIN, &RecentDisplayParams::default());
+        assert_eq!(full.len(), input.len(), "analysis history remains unchanged without display mode");
+        let sampled = recent_rows_for_request(input, i64::MIN, &RecentDisplayParams {display:true, max_rows:Some(12_000)});
+        assert!(sampled.len() <= 12_000);
+        for ((sender, ty), timestamp) in latest {
+            assert!(
+                sampled.iter().any(|row| row.sender_id == sender
+                    && row.data_type == ty
+                    && row.timestamp_ms == timestamp),
+                "latest missing: {sender}/{ty}"
+            );
+        }
+        assert_eq!(
+            sampled
+                .iter()
+                .filter(|row| row.data_type == "FUEL_TANK_PRESSURE")
+                .count(),
+            2
+        );
+        assert!(sampled.iter().any(|row| row.values == vec![Some(9999.0)]));
+        if let Ok(path) = std::env::var("GS_DISPLAY_HISTORY_FIXTURE") {
+            std::fs::write(path, serde_json::to_vec(&sampled).unwrap()).unwrap();
+        }
+    }
+}
+
 fn wants_ndjson(headers: &HeaderMap) -> bool {
     headers
         .get(header::ACCEPT)
@@ -176,7 +345,9 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         )
         .route("/api/auth/logout", post(logout))
         .route("/api/recent", get(get_recent))
-        .route("/api/command", post(send_command))
+        .route("/api/command", post(send_command_entry))
+        .route("/api/network-health/daq/sd/retry", post(crate::daq_sd::retry))
+        .route("/api/rrls/control", get(crate::command_proxy::get_status))
         .route("/api/auto_zero", get(get_auto_zero).post(set_auto_zero))
         .route("/api/alerts", get(get_alerts))
         .route("/api/boards", get(get_boards))
@@ -223,7 +394,10 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/calibration/capture_zero", post(capture_loadcell_zero))
         .route("/api/calibration/capture_span", post(capture_loadcell_span))
         .route("/api/calibration/refit", post(refit_loadcell_channel))
-        .route("/api/network_time", get(get_network_time).post(crate::system_clock::sync_network))
+        .route(
+            "/api/network_time",
+            get(get_network_time).post(crate::system_clock::sync_network),
+        )
         .route("/api/launch_clock", get(get_launch_clock))
         .route("/api/network_topology", get(get_network_topology))
         .route("/api/network_diagnostics", get(get_network_diagnostics))
@@ -281,6 +455,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::checklists::routes())
         .merge(crate::mission_sync::routes())
         .merge(crate::station_mode::routes())
+        .merge(crate::launch_history::api::routes())
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)
         .with_state(state)
@@ -395,6 +570,7 @@ pub enum WsOutMsg {
     BoardStatus(BoardStatusMsg),
     NetworkTopology(NetworkTopologyMsg),
     Notifications(Vec<PersistentNotification>),
+    Notification(PersistentNotification),
     Messages(Vec<PersistentNotification>),
     ActionPolicy(ActionPolicyMsg),
     FillTargets(FillTargetsConfig),
@@ -1232,11 +1408,15 @@ fn synthesize_zoom_tile_from_ancestor(
 }
 
 /// Returns the recent telemetry window, preferring the in-memory cache to cover DB write lag.
-async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+async fn get_recent(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<RecentDisplayParams>,
+) -> Response {
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
-    if wants_ndjson(&headers) {
+    if wants_ndjson(&headers) && !params.display {
         return stream_recent_rows_response(state).await;
     }
 
@@ -1250,7 +1430,7 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
             oldest_cache_ts.is_some_and(|oldest| oldest <= cutoff + RECENT_BUCKET_MS);
         if cache_covers_window {
             let rows = recalibrate_recent_rows(&state, cache_snapshot);
-            return Json(compact_recent_rows(rows, cutoff)).into_response();
+            return Json(recent_rows_for_request(rows, cutoff, &params)).into_response();
         }
 
         let db_end_ms = oldest_cache_ts.unwrap_or(now_ms).saturating_sub(1);
@@ -1266,7 +1446,7 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
                 .filter(|row| row.timestamp_ms >= cutoff && row.timestamp_ms <= now_ms),
         );
         let rows = recalibrate_recent_rows(&state, merged_rows);
-        return Json(compact_recent_rows(rows, cutoff)).into_response();
+        return Json(recent_rows_for_request(rows, cutoff, &params)).into_response();
     }
 
     let db = state.telemetry_db_pool();
@@ -1281,9 +1461,10 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     };
     let cutoff = now_ms.saturating_sub(RECENT_HISTORY_MS);
     let rows = load_recent_rows_from_db(&state, cutoff, now_ms).await;
-    Json(compact_recent_rows(
+    Json(recent_rows_for_request(
         recalibrate_recent_rows(&state, rows),
         cutoff,
+        &params,
     ))
     .into_response()
 }
@@ -1526,7 +1707,7 @@ mod live_flight_state_tests {
         Arc::get_mut(&mut state).unwrap().auth =
             Arc::new(crate::auth::AuthManager::new(auth_path.clone()));
         for expected in [
-            FlightState::ParachuteDeploy,
+            FlightState::Descent,
             FlightState::Startup,
             FlightState::Armed,
         ] {
@@ -2031,6 +2212,44 @@ async fn cancel_firmware_update(
     }
 }
 
+/// RRLS forwards opaque operation names, so a normal RRLS build does not need
+/// to compile primary HITL variants or execute them locally.
+async fn send_command_entry(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(value): Json<serde_json::Value>,
+) -> Response {
+    let Some(name) = value.as_str() else {
+        return (StatusCode::BAD_REQUEST, "Expected a command name.").into_response();
+    };
+    if crate::rrls::is_rrls() && !crate::command_proxy::local_operation(name) {
+        let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
+            Ok(principal) => principal,
+            Err(error) => return error,
+        };
+        return crate::command_proxy::submit(
+            &state,
+            &principal,
+            bearer_token_from_headers(&headers),
+            crate::command_proxy::Operation::Command(name.into()),
+        )
+        .await;
+    }
+    let command = match serde_json::from_value(value) {
+        Ok(command) => command,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Unknown command for this station build.",
+            )
+                .into_response();
+        }
+    };
+    send_command(State(state), headers, Json(command))
+        .await
+        .into_response()
+}
+
 /// Validates and forwards a frontend command into the backend command channel.
 async fn send_command(
     State(state): State<Arc<AppState>>,
@@ -2048,6 +2267,31 @@ async fn send_command(
             };
         }
     };
+    dispatch_authorized_command(state, principal, cmd).await
+}
+
+/// Shared primary/local authorization and dispatch. A proxy must supply a
+/// freshly resolved local principal; this never changes RRLS execution policy.
+pub(crate) async fn dispatch_authorized_command(
+    state: Arc<AppState>,
+    principal: crate::auth::AuthPrincipal,
+    cmd: TelemetryCommand,
+) -> (StatusCode, &'static str) {
+    dispatch_command(state, principal, cmd, false).await
+}
+pub(crate) async fn dispatch_proxied_command(
+    state: Arc<AppState>,
+    principal: crate::auth::AuthPrincipal,
+    cmd: TelemetryCommand,
+) -> (StatusCode, &'static str) {
+    dispatch_command(state, principal, cmd, true).await
+}
+async fn dispatch_command(
+    state: Arc<AppState>,
+    principal: crate::auth::AuthPrincipal,
+    cmd: TelemetryCommand,
+    immediate_admission: bool,
+) -> (StatusCode, &'static str) {
     let cmd_name = command_name(&cmd);
     if !principal.allows_command_name(cmd_name) {
         emit_warning(
@@ -2063,10 +2307,84 @@ async fn send_command(
         );
         return (StatusCode::FORBIDDEN, "command disabled");
     }
+    // A bounded proxy must not wait behind a full command channel after its
+    // signed contract expires, or record an unadmitted intent as a duplicate.
+    let permit = if immediate_admission && !matches!(cmd, TelemetryCommand::ResetTClock) {
+        match state.cmd_tx.clone().try_reserve_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "primary command queue is busy",
+                );
+            }
+        }
+    } else {
+        None
+    };
     let now_ms = software_command_clock_ms();
     if !state.record_software_command_if_fresh(&cmd, now_ms, software_command_dedup_ms()) {
         gs_debug_println!("Ignored duplicate software command {cmd:?}");
+        if matches!(cmd, TelemetryCommand::ResetTClock) {
+            if crate::rrls::is_rrls() {
+                return match crate::launch_clock_sync::await_existing_reset().await {
+                    Ok(true) => (StatusCode::OK, "primary T clock reset saved"),
+                    Ok(false) => (
+                        StatusCode::ACCEPTED,
+                        "primary reset pending; retained clock unchanged",
+                    ),
+                    Err(_) => (StatusCode::CONFLICT, "primary reset was not confirmed"),
+                };
+            }
+            let waiter = state.launch_history.lock().unwrap().waiter();
+            if crate::launch_history::flush(waiter).await.is_err() {
+                return (
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "T clock reset was not saved",
+                );
+            }
+        }
         return (StatusCode::OK, "duplicate ignored");
+    }
+    if matches!(cmd, TelemetryCommand::ResetTClock) {
+        if crate::rrls::is_rrls() {
+            return match crate::launch_clock_sync::request_reset(&state).await {
+                Ok(true) => (StatusCode::OK, "primary T clock reset saved"),
+                Ok(false) => (
+                    StatusCode::ACCEPTED,
+                    "primary reset pending; retained clock unchanged",
+                ),
+                Err(error) => {
+                    emit_notification_warning(
+                        &state,
+                        format!("Primary T clock reset not confirmed: {error}"),
+                    );
+                    (StatusCode::CONFLICT, "primary reset was not confirmed")
+                }
+            };
+        }
+        let work = state.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || work.try_reset_launch_clock())
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
+        {
+            emit_notification_warning(&state, format!("T clock reset failed: {error}"));
+            return (StatusCode::CONFLICT, "T clock reset failed");
+        }
+        let waiter = state.launch_history.lock().unwrap().waiter();
+        if let Err(error) = crate::launch_history::flush(waiter).await {
+            emit_notification_warning(&state, format!("T clock reset is not durable: {error}"));
+            return (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "T clock reset was not saved",
+            );
+        }
+        return (StatusCode::OK, "ok");
+    }
+    if let Some(permit) = permit {
+        permit.send(cmd);
+        return (StatusCode::OK, "ok");
     }
     if state.cmd_tx.send(cmd).await.is_err() {
         emit_notification_warning(&state, "Command worker unavailable; command was not queued");
@@ -2177,7 +2495,7 @@ async fn ws_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WsAuthQuery>,
 ) -> impl IntoResponse {
-    let principal = match state
+    let _principal = match state
         .auth
         .authorize_token(&state.auth_db, query.token.as_deref(), Permission::ViewData)
         .await
@@ -2185,7 +2503,7 @@ async fn ws_handler(
         Ok(principal) => principal,
         Err(err) => return auth_failure_response(err),
     };
-    ws.on_upgrade(move |socket| handle_ws(socket, state, principal))
+    ws.on_upgrade(move |socket| handle_ws(socket, state, query.token))
 }
 
 /// Shape of commands sent from the frontend over WebSocket:
@@ -2195,7 +2513,204 @@ struct WsCommand {
     cmd: TelemetryCommand,
 }
 
-async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::auth::AuthPrincipal) {
+fn new_notification_events(history: &[PersistentNotification], last_id: &mut u64) -> Vec<PersistentNotification> {
+    let mut events: Vec<_> = history.iter().filter(|n| n.id > *last_id).cloned().collect();
+    events.sort_by_key(|n| n.id);
+    if let Some(event) = events.last() { *last_id = event.id; }
+    events
+}
+
+#[cfg(test)]
+mod notification_delivery_tests {
+    use super::*;
+    fn notice(id: u64) -> PersistentNotification {
+        PersistentNotification {id, timestamp_ms:id as i64, message:"T clock reset".into(), persistent:false, action_label:None, action_cmd:None}
+    }
+    #[test]
+    fn connection_history_and_repeated_snapshots_do_not_replay_events() {
+        let mut history = vec![notice(1), notice(2)];
+        let mut connection_cutoff = history.last().unwrap().id;
+        assert!(new_notification_events(&history, &mut connection_cutoff).is_empty());
+        history.push(notice(3));
+        let events = new_notification_events(&history, &mut connection_cutoff);
+        assert_eq!(events.iter().map(|n| n.id).collect::<Vec<_>>(), vec![3]);
+        assert!(new_notification_events(&history, &mut connection_cutoff).is_empty());
+        let mut reconnect_cutoff = history.last().unwrap().id;
+        assert!(new_notification_events(&history, &mut reconnect_cutoff).is_empty());
+        let live = serde_json::to_value(WsOutMsg::Notification(notice(4))).unwrap();
+        assert_eq!(live["ty"], "Notification");
+        assert_eq!(serde_json::to_value(WsOutMsg::Notifications(history)).unwrap()["ty"], "Notifications");
+    }
+}
+
+/// One bounded live display frame, retaining each stream's latest row. Raw
+/// telemetry remains in DB/recent; a slow browser cannot queue seconds of frames.
+#[derive(Default)]
+struct LatestWsTelemetry {
+    pending: std::sync::Mutex<Option<PendingWsTelemetry>>,
+    ready: tokio::sync::Notify,
+}
+struct PendingWsTelemetry {
+    updated: Instant,
+    rows: HashMap<(String, String), TelemetryRow>,
+}
+const WS_LIVE_STREAM_CAP: usize = 1024;
+const WS_LIVE_FRAME_MAX_AGE: StdDuration = StdDuration::from_millis(250);
+const WS_WRITE_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+
+impl LatestWsTelemetry {
+    fn publish(&self, rows: Vec<TelemetryRow>) -> bool {
+        let mut slot = self.pending.lock().unwrap();
+        let coalesced = slot.is_some();
+        let pending = slot.get_or_insert_with(|| PendingWsTelemetry {
+            updated: Instant::now(),
+            rows: HashMap::new(),
+        });
+        for row in rows {
+            let key = (row.sender_id.clone(), row.data_type.clone());
+            if !pending.rows.contains_key(&key) && pending.rows.len() >= WS_LIVE_STREAM_CAP {
+                // A hostile/unbounded runtime schema cannot grow the display
+                // slot forever. Retire only its oldest telemetry stream.
+                if let Some(oldest) = pending
+                    .rows
+                    .iter()
+                    .min_by_key(|(_, row)| row.timestamp_ms)
+                    .map(|(key, _)| key.clone())
+                {
+                    pending.rows.remove(&oldest);
+                }
+            }
+            match pending.rows.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if row.timestamp_ms >= entry.get().timestamp_ms {
+                        entry.insert(row);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(row);
+                }
+            }
+        }
+        pending.updated = Instant::now();
+        drop(slot);
+        self.ready.notify_one();
+        coalesced
+    }
+    async fn recv(&self) -> (Instant, Vec<TelemetryRow>) {
+        loop {
+            self.ready.notified().await;
+            let frame = self.pending.lock().unwrap().take();
+            if let Some(frame) = frame {
+                let mut rows: Vec<_> = frame.rows.into_values().collect();
+                rows.sort_by_key(|row| row.timestamp_ms);
+                return (frame.updated, rows);
+            }
+        }
+    }
+}
+
+async fn next_ws_output(
+    control: &mut mpsc::Receiver<String>,
+    telemetry: &LatestWsTelemetry,
+) -> Option<String> {
+    loop {
+        tokio::select! {
+            biased;
+            // Ordered warnings, confirmations and state changes never compete
+            // for FIFO space with high-rate chart data.
+            message = control.recv() => return message,
+            (queued, rows) = telemetry.recv() => {
+                if queued.elapsed() <= WS_LIVE_FRAME_MAX_AGE {
+                    return Some(serde_json::to_string(&WsOutMsg::TelemetryBatch(rows)).unwrap_or_default());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ws_freshness_tests {
+    use super::*;
+    fn row(ty: &str, timestamp_ms: i64) -> TelemetryRow {
+        TelemetryRow {
+            timestamp_ms,
+            data_type: ty.into(),
+            sender_id: "DAQ".into(),
+            values: vec![Some(timestamp_ms as f32)],
+        }
+    }
+    #[tokio::test]
+    async fn slow_display_coalesces_telemetry_but_preserves_ordered_controls() {
+        let latest = LatestWsTelemetry::default();
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send("warning".into()).await.unwrap();
+        tx.send("confirmation".into()).await.unwrap();
+        assert!(!latest.publish(vec![row("KG1000", 0)]));
+        for sequence in 1..1000 {
+            assert!(latest.publish(vec![row("KG1000", sequence)]));
+        }
+        assert_eq!(
+            next_ws_output(&mut rx, &latest).await.as_deref(),
+            Some("warning")
+        );
+        assert_eq!(
+            next_ws_output(&mut rx, &latest).await.as_deref(),
+            Some("confirmation")
+        );
+        let frame: serde_json::Value =
+            serde_json::from_str(&next_ws_output(&mut rx, &latest).await.unwrap()).unwrap();
+        assert_eq!(frame["ty"], "TelemetryBatch");
+        assert_eq!(frame["data"].as_array().unwrap().len(), 1);
+        assert_eq!(frame["data"][0]["timestamp_ms"], 999);
+        assert!(latest.pending.lock().unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn sparse_pressure_survives_loadcell_bursts_and_stream_count_is_bounded() {
+        let latest = LatestWsTelemetry::default();
+        latest.publish(vec![row("COMBUSTION_CHAMBER_PRESSURE", 50)]);
+        for sequence in 51..1000 {
+            latest.publish(vec![row("KG50", sequence), row("KG1000", sequence)]);
+        }
+        // Older retransmissions cannot roll a stream backward.
+        latest.publish(vec![row("KG1000", 10)]);
+        let (_, rows) = latest.recv().await;
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .any(|r| r.data_type == "COMBUSTION_CHAMBER_PRESSURE" && r.timestamp_ms == 50)
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.data_type == "KG1000" && r.timestamp_ms == 999)
+        );
+        for sequence in 0..2048 {
+            latest.publish(vec![row(&format!("stream{sequence}"), sequence)]);
+        }
+        assert_eq!(latest.recv().await.1.len(), WS_LIVE_STREAM_CAP);
+    }
+    #[tokio::test]
+    async fn expired_unsent_display_frame_is_not_replayed() {
+        let latest = LatestWsTelemetry::default();
+        let (tx, mut rx) = mpsc::channel(1);
+        latest.publish(vec![row("KG1000", 1)]);
+        latest.pending.lock().unwrap().as_mut().unwrap().updated =
+            Instant::now() - StdDuration::from_secs(30);
+        assert!(
+            tokio::time::timeout(
+                StdDuration::from_millis(10),
+                next_ws_output(&mut rx, &latest)
+            )
+            .await
+            .is_err()
+        );
+        latest.publish(vec![row("KG1000", 2)]);
+        let frame = next_ws_output(&mut rx, &latest).await.unwrap();
+        assert!(frame.contains("\"timestamp_ms\":2"));
+        drop(tx);
+    }
+}
+
+async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String>) {
     // Subscribe to all three broadcast channels
     let mut telemetry_rx = state.ws_tx.subscribe();
     let mut warnings_rx = state.warnings_tx.subscribe();
@@ -2222,14 +2737,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         .clamp(32, 8192);
     let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<String>(ws_out_queue_cap);
 
-    // Dedicated writer: continuously drains queued outbound messages.
-    let write_task = tokio::spawn(async move {
-        while let Some(text) = ws_out_rx.recv().await {
-            if socket_sender
-                .send(Message::Text(Utf8Bytes::from(text)))
-                .await
-                .is_err()
-            {
+    let live_telemetry = Arc::new(LatestWsTelemetry::default());
+    let live_telemetry_writer = live_telemetry.clone();
+    // One live display slot plus the ordered control queue. Bound a stalled
+    // socket write so reconnect can reseed rather than replay an old backlog.
+    let mut write_task = tokio::spawn(async move {
+        while let Some(text) = next_ws_output(&mut ws_out_rx, &live_telemetry_writer).await {
+            if !matches!(
+                tokio::time::timeout(
+                    WS_WRITE_TIMEOUT,
+                    socket_sender.send(Message::Text(Utf8Bytes::from(text)))
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
@@ -2237,8 +2758,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
 
     // Task: collect, batch, and enqueue outbound messages.
     let send_task = async move {
+        let notification_history = state_for_send.notifications_snapshot();
+        let mut last_notification_id = notification_history.iter().map(|n| n.id).max().unwrap_or(0);
         let initial_notifications = serde_json::to_string(&WsOutMsg::Notifications(
-            state_for_send.notifications_snapshot(),
+            notification_history,
         ))
         .unwrap_or_default();
         if ws_out_tx.send(initial_notifications).await.is_err() {
@@ -2508,6 +3031,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                 recv = notifications_rx.recv() => {
                     match recv {
                         Ok(snapshot) => {
+                            // A snapshot is history, never a popup. Announce only
+                            // events observed live after this connection began.
+                            for event in new_notification_events(&snapshot, &mut last_notification_id) {
+                                let text = serde_json::to_string(&WsOutMsg::Notification(event)).unwrap_or_default();
+                                if ws_out_tx.send(text).await.is_err() { return; }
+                            }
                             let msg = WsOutMsg::Notifications(snapshot);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
@@ -2515,7 +3044,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            let msg = WsOutMsg::Notifications(state_for_send.notifications_snapshot());
+                            let snapshot = state_for_send.notifications_snapshot();
+                            // Events missed by a slow client belong only in its
+                            // Notification Center, not a burst of stale popups.
+                            last_notification_id = snapshot.iter().map(|n| n.id).max().unwrap_or(last_notification_id);
+                            let msg = WsOutMsg::Notifications(snapshot);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
                                 break;
@@ -2699,8 +3232,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     rows.sort_by_key(|r| r.timestamp_ms);
                     let row_count = rows.len();
 
-                    let msg = WsOutMsg::TelemetryBatch(rows);
-                    let text = serde_json::to_string(&msg).unwrap_or_default();
                     if ws_diagnostics && last_ws_diag_log.elapsed() >= ws_diag_interval {
                         eprintln!(
                             "ws telemetry flush: rows={} pending_before={} dynamic_max_per_flush={}",
@@ -2710,17 +3241,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                         );
                         last_ws_diag_log = Instant::now();
                     }
-                    let send_started = Instant::now();
-                    if ws_out_tx.send(text).await.is_err() {
-                        break;
-                    }
-                    let send_wait = send_started.elapsed();
-                    let queue_was_full = send_wait >= StdDuration::from_millis(5);
+                    let queue_was_full = live_telemetry.publish(rows);
                     if ws_diagnostics && queue_was_full {
                         eprintln!(
-                            "ws telemetry backpressure: rows={} send_wait_ms={}",
-                            row_count,
-                            send_wait.as_millis()
+                            "ws telemetry coalesced unsent display batch: rows={}",
+                            row_count
                         );
                     }
 
@@ -2742,6 +3267,46 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
     let recv_task = async move {
         while let Some(Ok(msg)) = receiver.next().await {
             if let Message::Text(text) = msg {
+                let principal = match state_for_recv
+                    .auth
+                    .authorize_token(
+                        &state_for_recv.auth_db,
+                        token.as_deref(),
+                        Permission::SendCommands,
+                    )
+                    .await
+                {
+                    Ok(principal) => principal,
+                    Err(_) => {
+                        emit_notification_warning(
+                            &state_for_recv,
+                            "Command session expired or no longer has permission.",
+                        );
+                        continue;
+                    }
+                };
+                if crate::rrls::is_rrls() {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(name) = value.get("cmd").and_then(|value| value.as_str()) {
+                            if !crate::command_proxy::local_operation(name) {
+                                let response = crate::command_proxy::submit(
+                                    &state_for_recv,
+                                    &principal,
+                                    token.as_deref(),
+                                    crate::command_proxy::Operation::Command(name.into()),
+                                )
+                                .await;
+                                if !response.status().is_success() {
+                                    emit_notification_warning(
+                                        &state_for_recv,
+                                        "Primary command request was not admitted; inspect RRLS control status.",
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
                 match serde_json::from_str::<WsCommand>(&text) {
                     Ok(cmd) => {
                         if !principal.permissions.send_commands {
@@ -2784,6 +3349,44 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             gs_debug_println!("Ignored duplicate websocket command {:?}", cmd.cmd);
                             continue;
                         }
+                        if matches!(cmd.cmd, TelemetryCommand::ResetTClock) {
+                            let reset_state = state_for_recv.clone();
+                            // Do not stall this WebSocket's Abort/command receiver on disk or radio.
+                            tokio::spawn(async move {
+                                let result = if crate::rrls::is_rrls() {
+                                    crate::launch_clock_sync::request_reset(&reset_state).await
+                                } else {
+                                    let work = reset_state.clone();
+                                    match tokio::task::spawn_blocking(move || {
+                                        work.try_reset_launch_clock()
+                                    })
+                                    .await
+                                    {
+                                        Ok(Ok(())) => {
+                                            let waiter =
+                                                reset_state.launch_history.lock().unwrap().waiter();
+                                            crate::launch_history::flush(waiter).await.map(|_| true)
+                                        }
+                                        Ok(Err(error)) => Err(error),
+                                        Err(error) => Err(error.into()),
+                                    }
+                                };
+                                match result {
+                                    Ok(true) => {
+                                        reset_state.add_notification("Primary T clock reset saved");
+                                    }
+                                    Ok(false) => {
+                                        reset_state.add_notification("Primary T clock reset pending; retained clock unchanged");
+                                    }
+                                    Err(error) => {
+                                        reset_state.add_notification(format!(
+                                            "T clock reset not confirmed: {error}"
+                                        ));
+                                    }
+                                }
+                            });
+                            continue;
+                        }
                         let received_cmd = cmd.cmd;
                         eprintln!("Accepted websocket command: {:?}", received_cmd);
                         gs_debug_println!(
@@ -2808,8 +3411,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         }
     };
 
-    // Run both directions until one side ends
-    tokio::join!(send_task, recv_task);
+    // Dropping the other futures closes this session when either direction
+    // or the bounded writer fails. The client reconnects and reseeds history.
+    tokio::select! {
+        _ = send_task => {},
+        _ = recv_task => {},
+        _ = &mut write_task => {},
+    }
     write_task.abort();
 }
 

@@ -235,3 +235,45 @@ application envelopes. These counters exclude presence/settings messages,
 failed writes, cancelled queued work, and the outer UART header. `forwarding`
 reports the current relay lease decision; inspect its freshness separately from
 cumulative counts.
+
+### Requests through the primary station
+
+With the existing pairing configured on both stations, RRLS automatically negotiates
+signed control capabilities from its paired primary. Each station must have exactly
+one paired counterparty of the expected role. No additional feature flag is needed.
+A connected RRLS sends operator requests through the primary; it does not execute
+those hardware commands locally. A normal RRLS build can request commands supported
+by a HITL primary without running local HITL behavior.
+
+Both stations check the operator's current enabled account and permissions. The
+primary also checks its current mode and interlocks before admitting a command.
+Network UTC changes use the primary's existing time-setting policy. Local bearer
+tokens are never sent over the radio. Only one request can be pending; radio retries
+retain its exact identity and cannot dispatch the same request twice.
+
+`GET /api/rrls/control` distinguishes a pending request, acceptance by the primary,
+rejection and an unknown outcome. Acceptance means the primary admitted the request,
+not that a board actuated or acknowledged it. A timeout or disconnect must be resolved
+by inspecting actual state before issuing a new request; unknown commands are not
+replayed automatically. Temporary capability-discovery loss uses bounded retry
+bursts with a cooldown and stops after negotiation succeeds.
+
+The UI polls this local status endpoint without sending radio traffic. Existing
+policy controls remain subject to fresh displayed state. The separate **Request
+execution at primary** action can actuate if the primary permits it; it uses the
+current local account allowlist and signed command catalog while the primary checks
+its live policy. It does not claim that an expired displayed interlock is enabled.
+
+Primary valve, fill-board, topology and host-temperature observations can accompany
+signed capability and command replies. They retain source ages, add the original
+request's whole elapsed time, and expire instead of confirming a requested target.
+These are sparse observations, not a continuous telemetry stream. Host temperature
+currently travels from primary to RRLS only. Unknown pressures,
+baselines and primary configuration are not replaced by RRLS-local values. A later
+host receipt is not proof that a board generated its report after a command.
+
+Standalone physical command authority is unavailable: the existing RRLS identity
+and board GS-heartbeat ownership do not provide a safe takeover/handover protocol.
+Local recording and the separate durable T-clock reset workflow retain their
+existing policies. Display-mode synchronization alone does not grant hardware
+control authority.

@@ -1,16 +1,7 @@
 use super::*;
 use crate::{Revision, checklists};
 fn temp() -> std::path::PathBuf {
-    std::env::temp_dir()
-        .join(format!(
-            "gs-paired-journal-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
-        .join("journal.sqlite3")
+    crate::test_directory::reserve("gs-paired-journal").join("journal.sqlite3")
 }
 fn peers() -> Vec<String> {
     vec!["gs".into(), "rrls".into()]
@@ -26,7 +17,7 @@ fn doc(actor: &str, n: u64, value: serde_json::Value) -> Document {
 async fn open(path: &Path, limits: Limits) -> Journal {
     Journal::open(path, "test".into(), peers(), limits)
         .await
-        .unwrap()
+        .unwrap_or_else(|error| panic!("paired journal fixture {}: {error:#}", path.display()))
 }
 #[tokio::test]
 async fn only_changed_row_is_persisted_and_replay_is_a_noop() {

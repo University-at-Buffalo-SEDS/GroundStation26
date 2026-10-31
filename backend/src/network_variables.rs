@@ -9,6 +9,35 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+// One durable desired revision, not a periodic route/clock refresh. An older
+// in-flight submission must never clear or replace a newer T0/reset request.
+#[derive(Default)]
+struct PendingDaqClock {
+    desired: Option<([u64; 2], u64)>,
+    highest_revision: u64,
+}
+impl PendingDaqClock {
+    fn record(&mut self, pair: [u64; 2], revision: u64) {
+        if revision >= self.highest_revision {
+            self.highest_revision = revision;
+            self.desired = Some((pair, revision));
+        }
+    }
+    fn accepted(&mut self, snapshot: ([u64; 2], u64)) {
+        if self.desired == Some(snapshot) {
+            self.desired = None;
+        }
+    }
+}
+static PENDING_DAQ_CLOCK: Mutex<PendingDaqClock> = Mutex::new(PendingDaqClock {
+    desired: None,
+    highest_revision: 0,
+});
+static DAQ_CLOCK_RETRY_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static DAQ_CLOCK_RETRY_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 const DEFAULT_CACHE_PATH: &str = "backend/data/network_variables.json";
 const UNDERGLOW_TYPE: &str = "AV_BAY_UNDERGLOW";
 const FLIGHT_BUZZER_TYPE: &str = "FLIGHT_BUZZER";
@@ -26,6 +55,8 @@ struct PersistentVariables {
     flight_state: u8,
     #[serde(default)]
     daq_log_clock: [u64; 2],
+    #[serde(default)]
+    daq_log_clock_stamp: u64,
     #[serde(default)]
     daq_log_last_session: u64,
 }
@@ -116,6 +147,7 @@ fn default_values() -> PersistentVariables {
             .filter(|value| *value <= 15)
             .unwrap_or(0),
         daq_log_clock: [0, 0],
+        daq_log_clock_stamp: 0,
         daq_log_last_session: 0,
     }
 }
@@ -220,7 +252,10 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
         let mut guard = store()
             .lock()
             .expect("network-variable store lock poisoned");
-        if !guard.path.exists() {
+        if guard.values.daq_log_clock_stamp == 0 {
+            let pair = guard.values.daq_log_clock;
+            commit_daq_clock_pair(&mut guard, pair, get_current_timestamp_ms())?;
+        } else if !guard.path.exists() {
             persist(&guard.path, guard.values)?;
             guard.durable = true;
         }
@@ -437,7 +472,7 @@ fn daq_log_clock_payload(
         let deadline = network_now
             .saturating_add(anchor.saturating_sub(launch_now))
             .saturating_add(countdown)
-            .saturating_add(120_000);
+            .saturating_add(20_000);
         anyhow::ensure!(
             (315_532_800_000..4_354_819_200_000).contains(&deadline),
             "Set GroundStation/network UTC before timestamped DAQ launch logging"
@@ -452,16 +487,90 @@ fn daq_log_clock_payload(
     Ok([session.to_le_bytes(), deadline.to_le_bytes()].concat())
 }
 
+fn daq_log_clock_packet(pair: [u64; 2], stamp: u64) -> Result<Packet> {
+    Ok(Packet::new(
+        crate::telemetry_schema::data_type("DAQ_LOG_CLOCK"),
+        &[crate::telemetry_schema::endpoint("SD_CARD")],
+        Board::GroundStation.sender_id(),
+        stamp,
+        Arc::<[u8]>::from([pair[0].to_le_bytes(), pair[1].to_le_bytes()].concat()),
+    )?
+    .with_nonce(NETWORK_VARIABLE_NONCE.fetch_add(1, Ordering::Relaxed)))
+}
+
+/* A control revision, independent of UTC corrections. Commit it atomically
+ * with the unchanged16-byte value; replays must never create a new revision. */
+fn commit_daq_clock_pair(guard: &mut VariableStore, pair: [u64; 2], wall_ms: u64) -> Result<u64> {
+    let mut next = guard.values;
+    if next.daq_log_clock != pair || next.daq_log_clock_stamp == 0 {
+        next.daq_log_clock_stamp = next
+            .daq_log_clock_stamp
+            .checked_add(1)
+            .context("DAQ launch-clock revision exhausted")?
+            .max(wall_ms);
+    }
+    next.daq_log_clock = pair;
+    next.daq_log_last_session = next.daq_log_last_session.max(pair[0]);
+    guard.commit(next)?;
+    Ok(next.daq_log_clock_stamp)
+}
+
 fn cached_daq_log_clock_packet() -> Result<Packet> {
     let values = store()
         .lock()
         .expect("network-variable store lock poisoned")
-        .values
-        .daq_log_clock;
-    packet_bytes(
-        "DAQ_LOG_CLOCK",
-        "SD_CARD",
-        Arc::from([values[0].to_le_bytes(), values[1].to_le_bytes()].concat()),
+        .values;
+    daq_log_clock_packet(values.daq_log_clock, values.daq_log_clock_stamp)
+}
+
+/// Exact retained payload/revision for the launch-clock journal. No disk I/O.
+pub fn persisted_daq_log_clock_with_revision() -> Option<([u64; 2], u64)> {
+    let values = store()
+        .lock()
+        .expect("network-variable store lock poisoned")
+        .values;
+    (values.daq_log_clock_stamp != 0).then_some((values.daq_log_clock, values.daq_log_clock_stamp))
+}
+
+fn restore_daq_clock_snapshot(
+    guard: &mut VariableStore,
+    pair: [u64; 2],
+    stamp: u64,
+) -> Result<bool> {
+    anyhow::ensure!(
+        stamp != 0
+            && ((pair[0] == 0 && pair[1] == 0)
+                || (pair[0] != 0 && (315_532_800_000..4_354_819_200_000).contains(&pair[1]))),
+        "Invalid retained DAQ launch-clock snapshot"
+    );
+    if guard.values.daq_log_clock_stamp != 0 {
+        anyhow::ensure!(
+            guard.values.daq_log_clock == pair && guard.values.daq_log_clock_stamp == stamp,
+            "Existing DAQ launch-clock revision differs from the journal"
+        );
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        guard.values.daq_log_clock == [0, 0] || guard.values.daq_log_clock == pair,
+        "Legacy DAQ launch-clock value differs from the journal"
+    );
+    let mut next = guard.values;
+    next.daq_log_clock = pair;
+    next.daq_log_clock_stamp = stamp;
+    next.daq_log_last_session = next.daq_log_last_session.max(pair[0]);
+    guard.commit(next)?;
+    Ok(true)
+}
+
+/// Restore only a missing/unstamped matching cache. Preserve the literal stamp;
+/// never refresh it from wall time, publish, or roll back a conflicting revision.
+pub fn restore_persisted_daq_log_clock_snapshot(pair: [u64; 2], stamp: u64) -> Result<bool> {
+    restore_daq_clock_snapshot(
+        &mut store()
+            .lock()
+            .expect("network-variable store lock poisoned"),
+        pair,
+        stamp,
     )
 }
 
@@ -494,25 +603,55 @@ pub fn set_daq_log_clock(
     );
 
     let payload = daq_log_clock_payload(session, clock, launch_now, network_now)?;
-    // Preserve the absolute deadline, not a fresh countdown on service restart.
-    // Drop the disk-cache lock before entering SEDSNet (callbacks may use it).
-    {
+    // Body and revision share one durable cache commit. UTC rollback and
+    // primary restart cannot make an older launch/T0/reset appear newer.
+    let pair = [
+        u64::from_le_bytes(payload[..8].try_into().unwrap()),
+        u64::from_le_bytes(payload[8..].try_into().unwrap()),
+    ];
+    let stamp = {
         let mut guard = store()
             .lock()
             .expect("network-variable store lock poisoned");
-        let mut next = guard.values;
-        next.daq_log_clock = [
-            u64::from_le_bytes(payload[..8].try_into().unwrap()),
-            u64::from_le_bytes(payload[8..].try_into().unwrap()),
-        ];
-        next.daq_log_last_session = next.daq_log_last_session.max(session);
-        guard.commit(next)?;
-    }
-    request.submit(
-        router,
-        packet_bytes("DAQ_LOG_CLOCK", "SD_CARD", Arc::from(payload))?,
-    )?;
+        let revision = commit_daq_clock_pair(&mut guard, pair, get_current_timestamp_ms())?;
+        // Publish ordering follows the durable commit; no SDK lock is taken
+        // while holding either application lock.
+        PENDING_DAQ_CLOCK.lock().unwrap().record(pair, revision);
+        revision
+    };
+    request.submit(router, daq_log_clock_packet(pair, stamp)?)?;
+    PENDING_DAQ_CLOCK.lock().unwrap().accepted((pair, stamp));
+    DAQ_CLOCK_RETRY_WARNED.store(false, Ordering::Relaxed);
     Ok(())
+}
+
+/// Retry only an unadmitted durable revision. Keep its original deadline/stamp.
+/// Once admitted, SDK reliable delivery and managed reconnect replay own it.
+/// Returns true only when an outstanding snapshot was admitted this call.
+pub fn retry_pending_daq_log_clock(router: &Router) -> Result<bool> {
+    if crate::rrls::is_rrls() || router.sender().as_ref() != "GS" {
+        return Ok(false);
+    }
+    let Some((pair, stamp)) = PENDING_DAQ_CLOCK.lock().unwrap().desired else {
+        return Ok(false);
+    };
+    let request = crate::qualification_requests::Request::begin("retry_pending_daq_log_clock");
+    match request.submit(router, daq_log_clock_packet(pair, stamp)?) {
+        Ok(()) => {
+            PENDING_DAQ_CLOCK.lock().unwrap().accepted((pair, stamp));
+            DAQ_CLOCK_RETRY_WARNED.store(false, Ordering::Relaxed);
+            Ok(true)
+        }
+        Err(error) => {
+            let failures = DAQ_CLOCK_RETRY_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+            if !DAQ_CLOCK_RETRY_WARNED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "DAQ launch-clock publication remains pending after SDK admission failure ({failures} retry failures): {error}"
+                );
+            }
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -563,19 +702,30 @@ pub(crate) fn verify_normal_qualification_boot() -> Result<()> {
         .context("normal qualification requires the engine sample marker")?;
     let completed = fs::read_to_string(marker)
         .context("read normal qualification sample marker")?
-        .trim().parse::<usize>().context("parse normal qualification sample marker")?;
+        .trim()
+        .parse::<usize>()
+        .context("parse normal qualification sample marker")?;
     verify_qualification_boot_cache(&cache_path(), completed, flight_state())
 }
 
 fn verify_qualification_boot_cache(path: &Path, completed: usize, actual: u8) -> Result<()> {
     let cached = read_persisted(path);
     if completed == 0 {
-        anyhow::ensure!(cached.is_none(), "fresh normal qualification requires an isolated empty cache");
-        anyhow::ensure!(actual == 0, "fresh normal qualification must boot actual Startup0");
+        anyhow::ensure!(
+            cached.is_none(),
+            "fresh normal qualification requires an isolated empty cache"
+        );
+        anyhow::ensure!(
+            actual == 0,
+            "fresh normal qualification must boot actual Startup0"
+        );
     } else {
-        let cached = cached.context("restarted normal qualification requires valid retained state")?;
-        anyhow::ensure!(actual == cached.flight_state,
-            "restarted normal qualification must restore the exact persisted flight state");
+        let cached =
+            cached.context("restarted normal qualification requires valid retained state")?;
+        anyhow::ensure!(
+            actual == cached.flight_state,
+            "restarted normal qualification must restore the exact persisted flight state"
+        );
     }
     Ok(())
 }
@@ -587,13 +737,22 @@ mod tests {
 
     #[test]
     fn qualification_requires_fresh_startup_zero_and_exact_restart_restoration() {
-        let root = std::env::temp_dir().join(format!("gs-qualified-boot-{}-{}", std::process::id(), rand::random::<u64>()));
+        let root = std::env::temp_dir().join(format!(
+            "gs-qualified-boot-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
         let path = root.join("variables.json");
         assert!(verify_qualification_boot_cache(&path, 0, 0).is_ok());
         assert!(verify_qualification_boot_cache(&path, 0, 1).is_err());
         assert!(verify_qualification_boot_cache(&path, 4, 0).is_err());
         let mut first = VariableStore::new(path.clone());
-        first.commit(PersistentVariables { flight_state: 1, ..PersistentVariables::default() }).unwrap();
+        first
+            .commit(PersistentVariables {
+                flight_state: 1,
+                ..PersistentVariables::default()
+            })
+            .unwrap();
         let restored = VariableStore::new(path.clone());
         assert!(verify_qualification_boot_cache(&path, 4, restored.values.flight_state).is_ok());
         assert!(verify_qualification_boot_cache(&path, 8, 1).is_ok());
@@ -720,7 +879,7 @@ mod tests {
                 u64::from_le_bytes(bytes[8..].try_into().unwrap()),
             )
         };
-        let expected = (17, (now + 130_000) as u64);
+        let expected = (17, (now + 30_000) as u64);
         assert_eq!(
             decode(daq_log_clock_payload(17, &clock, now, now).unwrap()),
             expected
@@ -756,7 +915,7 @@ mod tests {
             let bytes = daq_log_clock_payload(17, clock, now, now).unwrap();
             u64::from_le_bytes(bytes[8..].try_into().unwrap())
         };
-        let expected = (start + 130_000) as u64;
+        let expected = (start + 30_000) as u64;
         assert_eq!(deadline(&clock, start), expected);
         assert_eq!(deadline(&clock, start + 833), expected);
         assert_eq!(deadline(&clock, start + 833), expected); // paused model
@@ -767,6 +926,98 @@ mod tests {
         };
         assert_eq!(deadline(&ascent, start + 10_000), expected);
         assert_eq!(deadline(&ascent, start + 12_500), expected);
+    }
+
+    #[test]
+    fn daq_revision_survives_restart_wall_rollback_and_replay_without_restamping() {
+        crate::telemetry_schema::initialize().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "daq-revisions-{}-{}.json",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let pair = [10, 1_800_000_030_000];
+        let mut first = VariableStore::new(path.clone());
+        let initial = commit_daq_clock_pair(&mut first, pair, 1_800_000_000_000).unwrap();
+        let original = fs::read(&path).unwrap();
+        let mut restarted = VariableStore::new(path.clone());
+        assert_eq!(restarted.values.daq_log_clock_stamp, initial);
+        let blocker = path.with_extension("json.tmp");
+        fs::create_dir(&blocker).unwrap();
+        assert_eq!(
+            commit_daq_clock_pair(&mut restarted, pair, initial + 99999).unwrap(),
+            initial
+        );
+        assert_eq!(fs::read(&path).unwrap(), original); // identical replay needs no write
+        fs::remove_dir(&blocker).unwrap();
+        let later_t0 = [10, pair[1] + 5000];
+        let correction = commit_daq_clock_pair(&mut restarted, later_t0, initial - 10000).unwrap();
+        assert_eq!(correction, initial + 1); // wall clock went backwards
+        let reset = commit_daq_clock_pair(&mut restarted, [0, 0], 0).unwrap();
+        assert_eq!(reset, correction + 1);
+        let mut second_restart = VariableStore::new(path.clone());
+        assert_eq!(second_restart.values.daq_log_last_session, 10);
+        assert_eq!(second_restart.values.daq_log_clock, [0, 0]);
+        let next = commit_daq_clock_pair(&mut second_restart, [11, pair[1] + 30000], 0).unwrap();
+        assert_eq!(next, reset + 1);
+        for _ in 0..3 {
+            let replay = daq_log_clock_packet(second_restart.values.daq_log_clock, next).unwrap();
+            assert_eq!(replay.timestamp(), next);
+            assert_eq!(replay.payload().len(), 16);
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn daq_revision_upgrade_and_overflow_are_atomic() {
+        let path = std::env::temp_dir().join(format!(
+            "daq-revision-atomic-{}-{}.json",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::write(
+            &path,
+            r#"{"daq_log_clock":[7,1800000030000],"daq_log_last_session":7}"#,
+        )
+        .unwrap();
+        let mut legacy = VariableStore::new(path.clone());
+        assert_eq!(legacy.values.daq_log_clock_stamp, 0);
+        assert_eq!(
+            commit_daq_clock_pair(&mut legacy, [7, 1_800_000_030_000], 1234).unwrap(),
+            1234
+        );
+        let mut maximum = legacy.values;
+        maximum.daq_log_clock_stamp = u64::MAX;
+        legacy.commit(maximum).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(commit_daq_clock_pair(&mut legacy, [0, 0], 0).is_err());
+        assert_eq!(legacy.values, maximum);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(
+            commit_daq_clock_pair(&mut legacy, maximum.daq_log_clock, 0).unwrap(),
+            u64::MAX
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn journal_daq_snapshot_restore_preserves_literal_revision_and_refuses_conflict() {
+        let path = std::env::temp_dir().join(format!(
+            "daq-journal-restore-{}-{}.json",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut missing = VariableStore::new(path.clone());
+        let pair = [17, 1_800_000_030_000];
+        assert!(restore_daq_clock_snapshot(&mut missing, pair, 4321).unwrap());
+        assert_eq!(missing.values.daq_log_clock_stamp, 4321);
+        assert_eq!(VariableStore::new(path.clone()).values, missing.values);
+        assert!(!restore_daq_clock_snapshot(&mut missing, pair, 4321).unwrap());
+        assert!(restore_daq_clock_snapshot(&mut missing, [0, 0], 4322).is_err());
+        assert!(restore_daq_clock_snapshot(&mut missing, pair, 4320).is_err());
+        assert_eq!(missing.values.daq_log_clock, pair);
+        assert!(restore_daq_clock_snapshot(&mut missing, pair, 0).is_err());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -790,13 +1041,19 @@ mod tests {
         let ground_link: Arc<Mutex<Option<Arc<Router>>>> = Default::default();
         let daq_link: Arc<Mutex<Option<Arc<Router>>>> = Default::default();
         let observed: Arc<Mutex<Vec<Vec<u8>>>> = Default::default();
+        let revisions: Arc<Mutex<Vec<u64>>> = Default::default();
+        let saved_revision = std::sync::atomic::AtomicU64::new(1_800_000_000_000);
         let expected: Vec<u8> = [123u64.to_le_bytes(), 1_800_000_130_000u64.to_le_bytes()].concat();
         let make_ground = || {
             let r = Arc::new(Router::new(RouterConfig::new([]).with_sender("GS")));
             r.enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)
                 .unwrap();
             r.seed_managed_variable(
-                packet_bytes("DAQ_LOG_CLOCK", "SD_CARD", Arc::from(expected.clone())).unwrap(),
+                daq_log_clock_packet(
+                    [123, 1_800_000_130_000],
+                    saved_revision.load(Ordering::Relaxed),
+                )
+                .unwrap(),
             )
             .unwrap();
             let link = daq_link.clone();
@@ -811,8 +1068,10 @@ mod tests {
             r.enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
                 .unwrap();
             let observations = observed.clone();
+            let stamps = revisions.clone();
             r.on_network_variable_update(ty, move |p| {
                 observations.lock().unwrap().push(p.payload().to_vec());
+                stamps.lock().unwrap().push(p.timestamp());
                 Ok(())
             })
             .unwrap();
@@ -851,13 +1110,22 @@ mod tests {
                 Some(&expected),
                 "restart round {round}"
             );
+            assert_eq!(
+                revisions.lock().unwrap().last().copied(),
+                Some(saved_revision.load(Ordering::Relaxed)),
+                "replay must keep the saved revision"
+            );
             // Also prove the new GS instance can deliver a changed clock, not
             // merely that DAQ still remembers the value from before restart.
             let changed: Vec<u8> =
                 [124u64.to_le_bytes(), 1_800_000_140_000u64.to_le_bytes()].concat();
             ground
                 .set_network_variable(
-                    packet_bytes("DAQ_LOG_CLOCK", "SD_CARD", Arc::from(changed.clone())).unwrap(),
+                    daq_log_clock_packet(
+                        [124, 1_800_000_140_000],
+                        saved_revision.fetch_add(1, Ordering::Relaxed) + 1,
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             for _ in 0..32 {
@@ -868,7 +1136,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
             ground
                 .set_network_variable(
-                    packet_bytes("DAQ_LOG_CLOCK", "SD_CARD", Arc::from(expected.clone())).unwrap(),
+                    daq_log_clock_packet(
+                        [123, 1_800_000_130_000],
+                        saved_revision.fetch_add(1, Ordering::Relaxed) + 1,
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             for _ in 0..32 {
@@ -914,6 +1186,7 @@ mod tests {
                 flight_buzzer: true,
                 flight_state: 6,
                 daq_log_clock: [0, 0],
+                daq_log_clock_stamp: 0,
                 daq_log_last_session: 0,
             },
         )
@@ -1683,6 +1956,7 @@ mod persistence_callback_tests {
             flight_buzzer: true,
             flight_state: 4,
             daq_log_clock: [7, 123456],
+            daq_log_clock_stamp: 0,
             daq_log_last_session: 7,
         };
         persist(&path, original).unwrap();
@@ -1693,6 +1967,7 @@ mod persistence_callback_tests {
             flight_buzzer: false,
             flight_state: 5,
             daq_log_clock: [8, 123789],
+            daq_log_clock_stamp: 0,
             daq_log_last_session: 8,
         };
         let temporary = path.with_extension("json.tmp");
@@ -1720,3 +1995,13 @@ mod persistence_callback_tests {
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
+
+/// Read a legacy durable pair without stamping or inferring its launch T0.
+pub fn persisted_daq_log_clock()->Option<[u64;2]> {
+    let guard=store().lock().expect("network-variable store lock poisoned");
+    guard.durable.then_some(guard.values.daq_log_clock)
+}
+
+#[cfg(test)]
+#[path = "network_variables/daq_clock_tests.rs"]
+mod daq_clock_tests;

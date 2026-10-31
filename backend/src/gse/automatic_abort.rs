@@ -30,6 +30,13 @@ pub(super) fn stage_allows_automatic_abort(rt: &Runtime, stage: FlightState) -> 
         )
 }
 
+#[cfg(not(feature = "hitl_mode"))]
+pub(crate) enum LivenessAbortDecision {
+    Claimed(AutomaticAbortClaim),
+    IdleOrStartup(FlightState),
+    Unavailable,
+}
+
 pub(crate) fn claim_automatic_abort(state: &AppState) -> Option<AutomaticAbortClaim> {
     #[cfg(feature = "hitl_mode")]
     {
@@ -38,12 +45,40 @@ pub(crate) fn claim_automatic_abort(state: &AppState) -> Option<AutomaticAbortCl
     }
     #[cfg(not(feature = "hitl_mode"))]
     {
+        match claim_from_source(state, false) {
+            LivenessAbortDecision::Claimed(claim) => Some(claim),
+            LivenessAbortDecision::IdleOrStartup(stage) => {
+                debug_assert!(matches!(stage, FlightState::Startup | FlightState::Idle));
+                None
+            }
+            LivenessAbortDecision::Unavailable => None,
+        }
+    }
+}
+
+#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
+pub(crate) fn claim_liveness_abort(state: &AppState) -> LivenessAbortDecision {
+    claim_from_source(state, true)
+}
+
+#[cfg(not(feature = "hitl_mode"))]
+fn claim_from_source(state: &AppState, liveness: bool) -> LivenessAbortDecision {
+    #[cfg(not(feature = "hitl_mode"))]
+    {
         let mut rt = state.gse.lock().unwrap();
-        if rt.automatic_abort_in_flight
-            || rt.operational.saved.automatic_abort_claimed
-            || !stage_allows_automatic_abort(&rt, state.local_flight_state_snapshot())
-        {
-            return None;
+        // Preserve the original general-claim short circuit: a held/latched
+        // claim must not acquire the flight-state mutex unnecessarily.
+        if rt.automatic_abort_in_flight || rt.operational.saved.automatic_abort_claimed {
+            return LivenessAbortDecision::Unavailable;
+        }
+        let stage = state.local_flight_state_snapshot();
+        // Source-specific eligibility is checked at the same serialized claim
+        // decision as the durable latch. Other producers retain Idle policy.
+        if liveness && matches!(stage, FlightState::Startup | FlightState::Idle) {
+            return LivenessAbortDecision::IdleOrStartup(stage);
+        }
+        if !stage_allows_automatic_abort(&rt, stage) {
+            return LivenessAbortDecision::Unavailable;
         }
         rt.automatic_abort_in_flight = true;
         rt.operational.saved.automatic_abort_claimed = true;
@@ -60,7 +95,7 @@ pub(crate) fn claim_automatic_abort(state: &AppState) -> Option<AutomaticAbortCl
             );
         }
         drop(rt);
-        Some(AutomaticAbortClaim {
+        LivenessAbortDecision::Claimed(AutomaticAbortClaim {
             runtime: state.gse.clone(),
         })
     }
@@ -157,6 +192,78 @@ mod tests {
         }
         router.process_all_queues_with_timeout(0).unwrap();
     }
+    #[cfg(not(feature = "test_fire_mode"))]
+    #[tokio::test]
+    async fn liveness_claim_rechecks_idle_without_weakening_general_fault_claims() {
+        let (state, _router, _seen, path) = fixture().await;
+        state.set_local_flight_state(FlightState::Idle);
+        assert!(matches!(
+            claim_liveness_abort(&state),
+            LivenessAbortDecision::IdleOrStartup(FlightState::Idle)
+        ));
+        assert!(
+            !state
+                .gse
+                .lock()
+                .unwrap()
+                .operational
+                .saved
+                .automatic_abort_claimed
+        );
+        // GENERIC_ERROR and automatic ADC failure use this unchanged general path.
+        let claim = claim_automatic_abort(&state).expect("general fault remains eligible in Idle");
+        assert!(
+            state
+                .gse
+                .lock()
+                .unwrap()
+                .operational
+                .saved
+                .automatic_abort_claimed
+        );
+        drop(claim);
+        assert!(
+            claim_automatic_abort(&state).is_none(),
+            "durable claim remains latched"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn latched_general_claim_returns_without_waiting_for_flight_state_mutex() {
+        let (state, _router, _seen, path) = fixture().await;
+        drop(claim_automatic_abort(&state).unwrap());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker_state = state.clone();
+        let held_state = state.state.lock().unwrap();
+        let worker = std::thread::spawn(move || {
+            let _ = started_tx.send(());
+            let unavailable = matches!(
+                claim_from_source(&worker_state, false),
+                LivenessAbortDecision::Unavailable
+            );
+            let _ = result_tx.send(unavailable);
+        });
+        let started = started_rx.recv_timeout(std::time::Duration::from_secs(1));
+        let outcome = if started.is_ok() {
+            result_rx.recv_timeout(std::time::Duration::from_secs(1))
+        } else {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        };
+        // Always release the lock and join before asserting, including the
+        // old-order negative path, so the regression cannot strand a worker.
+        drop(held_state);
+        let joined = worker.join();
+        let _ = std::fs::remove_file(path);
+        assert!(started.is_ok(), "claim worker started");
+        assert!(joined.is_ok(), "claim worker completed after cleanup");
+        assert!(
+            matches!(outcome, Ok(true)),
+            "latched claim returns Unavailable without reading state"
+        );
+    }
+
     #[tokio::test]
     async fn abort_claim_first_blocks_fire_and_clear_until_dispatch_finishes() {
         let (state, router, seen, path) = fixture().await;

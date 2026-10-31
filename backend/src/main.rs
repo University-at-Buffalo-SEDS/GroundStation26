@@ -1,4 +1,6 @@
 mod admin;
+mod daq_sd;
+mod daq_launch_log;
 mod radio_voice;
 mod recording_replay;
 // main.rs
@@ -16,6 +18,8 @@ mod auth;
 mod auto_zero;
 mod checklists;
 mod command_probe;
+mod command_proxy;
+mod primary_mirror;
 mod comms;
 mod comms_config;
 #[cfg(feature = "testing")]
@@ -40,6 +44,7 @@ mod media;
 mod media_runtime;
 mod mission_sync;
 mod network_health;
+mod host_temperature;
 mod network_traffic;
 mod network_variables;
 mod qualification_requests;
@@ -55,6 +60,8 @@ mod rrls_topology;
 mod safety_task;
 mod sequences;
 mod state;
+mod launch_history;
+mod launch_clock_sync;
 mod station_mode;
 mod station_pairing;
 mod system_clock;
@@ -78,7 +85,7 @@ use crate::safety_task::safety_task;
 use crate::sequences::{default_action_policy, start_sequence_task};
 use crate::state::{AppState, BoardStatus};
 use crate::telemetry_db::{
-    DEFAULT_TELEMETRY_DB_FILENAME, DbQueueItem, LaunchClockMsg, RecordingModeWire,
+    DEFAULT_TELEMETRY_DB_FILENAME, DbQueueItem, RecordingModeWire,
     RecordingStatusMsg, apply_sqlite_pragmas, close_and_finalize_sqlite, delete_sqlite_if_empty,
     ensure_sqlite_db_file, open_in_memory_telemetry_db, recover_sqlite_sidecars_in_dir,
 };
@@ -495,6 +502,49 @@ impl StreamRateProbe {
     }
 }
 
+/// Source-cadence expectation for the simulator observer only. This never
+/// changes acquisition/publication rates or transport/receipt/freshness gates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DaqLoadcellCadence {
+    hz: u32,
+    minimum_interval_ms: u64,
+    maximum_interval_ms: u64,
+}
+
+impl DaqLoadcellCadence {
+    const ENV: &'static str = "GS_SIM_DAQ_LOADCELL_HZ";
+
+    fn parse(raw: Option<&str>) -> anyhow::Result<Self> {
+        let hz = match raw {
+            None => 250,
+            Some(value) => value.parse::<u32>().map_err(|_| {
+                anyhow::anyhow!("{} must be an integer from 1 through 1000", Self::ENV)
+            })?,
+        };
+        anyhow::ensure!(
+            (1..=1000).contains(&hz),
+            "{} must be from 1 through 1000",
+            Self::ENV
+        );
+        // The source timestamp is an integer number of milliseconds. Retain
+        // the original +/-50% period bounds (250Hz =>2..6ms), quantized down.
+        Ok(Self {
+            hz,
+            minimum_interval_ms: 500 / u64::from(hz),
+            maximum_interval_ms: 1500 / u64::from(hz),
+        })
+    }
+
+    fn from_env() -> anyhow::Result<Self> {
+        let raw = match std::env::var(Self::ENV) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(anyhow::anyhow!("{}: {error}", Self::ENV)),
+        };
+        Self::parse(raw.as_deref())
+    }
+}
+
 fn request_startup_topology(router: &sedsnet::router::Router) -> sedsnet::TelemetryResult<()> {
     router.request_topology()
 }
@@ -693,6 +743,8 @@ mod router_link_policy_tests {
     fn raw_uart_radio_matches_rf_hop_policy() {
         let link = CommsLinkConfig::Serial {
             serial: crate::comms_config::SerialLinkConfig {
+                hardware_flow_control: false,
+                rfd_profile: None,
                 port: "sim://av-bay".to_owned(),
                 baud_rate: 57_600,
                 protocol: crate::comms_config::SerialProtocol::RawUart,
@@ -720,6 +772,60 @@ mod router_link_policy_tests {
         };
 
         assert!(!router_hop_reliable_enabled(&link));
+    }
+
+    #[test]
+    fn daq_source_cadence_preserves250_default_and_requires_five_intervals() {
+        let legacy = super::DaqLoadcellCadence::parse(None).unwrap();
+        assert_eq!(
+            (
+                legacy.hz,
+                legacy.minimum_interval_ms,
+                legacy.maximum_interval_ms
+            ),
+            (250, 2, 6)
+        );
+        for (raw, period) in [("40", 25), ("250", 4)] {
+            let expected = super::DaqLoadcellCadence::parse(Some(raw)).unwrap();
+            let mut probe = super::StreamRateProbe::default();
+            for index in 0..=5 {
+                assert_eq!(
+                    probe.observe(
+                        index * period,
+                        expected.minimum_interval_ms,
+                        expected.maximum_interval_ms,
+                        5
+                    ),
+                    index == 5
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn daq_source_cadence_rejects_the_other_publication_rate() {
+        for (expected_hz, wrong_period) in [("40", 4), ("250", 25)] {
+            let expected = super::DaqLoadcellCadence::parse(Some(expected_hz)).unwrap();
+            let mut probe = super::StreamRateProbe::default();
+            for index in 0..100 {
+                assert!(!probe.observe(
+                    index * wrong_period,
+                    expected.minimum_interval_ms,
+                    expected.maximum_interval_ms,
+                    5
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn daq_source_cadence_rejects_invalid_configuration() {
+        for raw in ["", "0", "-1", "1001", "NaN", "1.5", "forty", " 40"] {
+            assert!(
+                super::DaqLoadcellCadence::parse(Some(raw)).is_err(),
+                "accepted {raw:?}"
+            );
+        }
     }
 
     #[test]
@@ -971,10 +1077,12 @@ fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevic
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let daq_loadcell_cadence = DaqLoadcellCadence::from_env()?;
     telemetry_schema::initialize()?;
     sedsnet::config::set_runtime_tuning_config(network_delivery_tuning())?;
 
     logger::init()?;
+    let _host_temperature = host_temperature::start();
     log::info!(
         "groundstation backend starting features testing={} hitl_mode={} test_fire_mode={}",
         cfg!(feature = "testing"),
@@ -1048,6 +1156,7 @@ async fn main() -> anyhow::Result<()> {
     let ring_buffer_capacity = env_usize("GS_RING_BUFFER_CAPACITY", 65_536, 1024, 1_000_000);
     let loadcell_calibration = loadcell::load_or_default();
     let comms_links = comms_config::load_or_default();
+    comms::rfd_profile::initialize(&comms_links.av_bay)?;
     if let comms_config::CommsLinkConfig::PicoFiTcp { tcp } = &comms_links.fill_box {
         ethernet_autoconfig::prepare(tcp.discovery_interface.clone()).await;
     } else if rrls::is_rrls() {
@@ -1087,6 +1196,12 @@ async fn main() -> anyhow::Result<()> {
             network_variables::verify_normal_qualification_boot()?;
         }
     }
+    let launch_history=Arc::new(Mutex::new(launch_history::Store::environment()?));
+    let restored_clock=launch_history.lock().unwrap().snapshot().clock;
+    let (restored_daq,restored_stamp)=launch_history.lock().unwrap().daq_snapshot();
+    if network_variables::persisted_daq_log_clock_with_revision().is_none() && restored_stamp!=0 {
+        network_variables::restore_persisted_daq_log_clock_snapshot(restored_daq,restored_stamp)?;
+    }
     let state = Arc::new(AppState {
         ring_buffer: Arc::new(Mutex::new(RingBuffer::new(ring_buffer_capacity))),
         cmd_tx,
@@ -1122,7 +1237,7 @@ async fn main() -> anyhow::Result<()> {
         network_health: Arc::new(Mutex::new(crate::network_health::Tracker::default())),
         loadcell_calibration: Arc::new(Mutex::new(loadcell_calibration)),
         auto_zero: Default::default(),
-        daq_log_session: Default::default(),
+        daq_log_session: Arc::new(Mutex::new(restored_daq[0])),
         shutdown_tx,
         shutdown_requested: Arc::new(AtomicBool::new(false)),
         pending_db_writes: Arc::new(AtomicUsize::new(0)),
@@ -1141,7 +1256,8 @@ async fn main() -> anyhow::Result<()> {
         action_policy_tx,
         fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
         fill_targets_tx,
-        launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
+        launch_history: launch_history.clone(),
+        launch_clock: Arc::new(Mutex::new(restored_clock)),
         launch_clock_tx,
         launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
         launch_indicator_latched: Arc::new(AtomicBool::new(false)),
@@ -1259,7 +1375,9 @@ async fn main() -> anyhow::Result<()> {
                     ground_station_handler_state_clone.board_from_network_sender(pkt.sender());
                 let ty = pkt.data_type();
                 let channel = if board == Some(Board::DaqBoard) {
-                    if ty == telemetry_schema::data_type("KG1000") {
+                    if ty == telemetry_schema::data_type("KG1000")
+                        || ty == telemetry_schema::data_type("DAQ_LOADCELL_CHAMBER")
+                    {
                         Some(0)
                     } else {
                         let input = ground_station_handler_state_clone
@@ -1415,13 +1533,17 @@ async fn main() -> anyhow::Result<()> {
                 if board == Some(Board::DaqBoard)
                     && pkt.data_type() == telemetry_schema::data_type("KG1000")
                 {
-                    let valid =
-                        daq_loadcell_rate_handler
-                            .lock()
-                            .unwrap()
-                            .observe(pkt.timestamp(), 2, 6, 5);
+                    let valid = daq_loadcell_rate_handler.lock().unwrap().observe(
+                        pkt.timestamp(),
+                        daq_loadcell_cadence.minimum_interval_ms,
+                        daq_loadcell_cadence.maximum_interval_ms,
+                        5,
+                    );
                     if valid && !daq_loadcell_rate_reported_handler.swap(true, Ordering::AcqRel) {
-                        log::info!("full-bay DAQ raw loadcell 250 Hz stream reached GroundStation");
+                        log::info!(
+                            "full-bay DAQ raw loadcell {} Hz stream reached GroundStation",
+                            daq_loadcell_cadence.hz
+                        );
                     }
                 }
                 if let Some(
@@ -1649,19 +1771,24 @@ async fn main() -> anyhow::Result<()> {
     let (umbilical_tx, umbilical_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
 
     // Bound queued radio work independently of the much faster Pico link.
-    let rocket_tx_budget = Arc::new(TxQueueBudget::new(2048));
-    let rocket_side = {
+    let rocket_tx_budget = Arc::new(if comms::rfd_profile::active().is_some() {
+        TxQueueBudget::new_radio(2048, 256)
+    } else {
+        TxQueueBudget::new(2048)
+    });
+    let (rocket_side, rocket_retry_tracker) = {
         let rocket_tx = rocket_tx.clone();
         let budget = rocket_tx_budget.clone();
         let activity = state.transport_tx_activity.clone();
         let opts = rocket_router_side_options(&comms_links.av_bay, rrls::is_rrls());
-        router.add_side_packed_with_priority_and_options(
+        router.add_side_packed_leased_with_priority_and_options(
             "rocket_comms",
             move |pkt, priority| {
-                activity.try_enqueue(|| budget.try_send(&rocket_tx, priority, pkt))
+                activity.try_enqueue(|| budget.try_send_leased(&rocket_tx, priority, pkt))
             },
             opts,
-        )
+            sedsnet::router::RetryTrackerLimits::default(),
+        )?
     };
 
     let umbilical_side = if umbilical_comms.is_none() {
@@ -1689,6 +1816,10 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
+    rocket_comms
+        .lock()
+        .unwrap()
+        .bind_retry_tracker(rocket_retry_tracker)?;
     rocket_comms
         .lock()
         .expect("failed to get rocket comms lock")
@@ -2496,8 +2627,13 @@ async fn main() -> anyhow::Result<()> {
 
     let _antenna_gpsd = antenna::start_gpsd(state.shutdown_subscribe());
 
+    let weak_state=Arc::downgrade(&state);
+    state.launch_history.lock().unwrap().set_reporter(Arc::new(move|error|{if let Some(state)=weak_state.upgrade(){state.add_notification(error);}}));
+    if let Some(error)=state.launch_history.lock().unwrap().persistence_error(){state.add_notification(format!("Saved T clock needs attention: {error}"));}
     let _mission_sync = mission_sync::start(state.clone());
     let _station_mode = station_mode::start(state.clone());
+    let _launch_clock_sync = launch_clock_sync::start(state.clone());
+    let _command_proxy = command_proxy::start(state.clone());
 
     // --- Webserver ---
     let mut video_runtime = media_runtime::VideoRuntime::start();
@@ -2556,6 +2692,9 @@ async fn main() -> anyhow::Result<()> {
         sequence_task.abort();
         let _ = sequence_task.await;
     }
+
+    let clock_flush=state.launch_history.lock().unwrap().close_and_waiter();
+    if let Err(error)=launch_history::flush(clock_flush).await {log::error!("Launch history shutdown flush failed: {error}");}
 
     let db_drain_timeout = Duration::from_secs(10);
     if !state.wait_for_db_writes(db_drain_timeout).await {
