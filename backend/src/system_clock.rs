@@ -33,6 +33,25 @@ pub enum SyncRequest {
 static CLIENT_TIME_ROUTERS: std::sync::Mutex<Vec<std::sync::Weak<sedsnet::router::Router>>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Recovery replay floors use canonical network UTC, never receipt wall time.
+/// Missing UTC must not produce a recovery request with a different clock domain.
+pub(crate) fn required_control_network_utc_ms(
+    router: &sedsnet::router::Router,
+) -> sedsnet::TelemetryResult<u64> {
+    router
+        .network_time_ms()
+        .filter(|timestamp| *timestamp != 0)
+        .ok_or(sedsnet::TelemetryError::Io("network UTC is not available"))
+}
+
+/// Ordinary controls share the board's network clock once it is established.
+/// Retain boot-time wall fallback so a manual Stop never needs clock sync.
+/// This does not change receipt timestamps used for UI freshness or recording.
+pub(crate) fn control_packet_timestamp_ms(router: &sedsnet::router::Router) -> u64 {
+    required_control_network_utc_ms(router)
+        .unwrap_or_else(|_| crate::telemetry_task::get_current_timestamp_ms())
+}
+
 fn retain_live_client_sources(sources: &mut Vec<std::sync::Weak<sedsnet::router::Router>>) {
     sources.retain(|source| source.strong_count() != 0);
 }
@@ -262,6 +281,59 @@ fn set_network_utc(router: &sedsnet::router::Router, utc_ms: i64) -> Result<(), 
 
 #[cfg(test)]
 mod network_tests {
+    #[test]
+    fn controller_headers_follow_client_network_utc_without_changing_receipt_clock() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+        let monotonic = Arc::new(AtomicU64::new(0));
+        let input = monotonic.clone();
+        let router = Arc::new(sedsnet::router::Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([]).with_sender("GS"),
+            Box::new(move || input.load(Ordering::Relaxed)),
+        ));
+        assert!(super::required_control_network_utc_ms(&router).is_err());
+        let receipt_before = crate::telemetry_task::get_current_timestamp_ms();
+        let client = receipt_before + 3_600_000;
+        // This is the same admitted-source operation used by Set Network UTC.
+        super::select_client_network_source(&router, client as i64).unwrap();
+        super::refresh_network_source(&router, receipt_before);
+        monotonic.store(1250, Ordering::Relaxed);
+        let expected = client + 1250;
+        assert_eq!(
+            super::required_control_network_utc_ms(&router).unwrap(),
+            expected
+        );
+        let packet = crate::telemetry_task::controller_packet(
+            &router,
+            crate::telemetry_schema::data_type("VALVE_COMMAND"),
+            &[1],
+        )
+        .unwrap();
+        assert_eq!(packet.timestamp(), expected);
+        let receipt_after = crate::telemetry_task::get_current_timestamp_ms();
+        assert!(receipt_after >= receipt_before);
+        assert!(
+            receipt_after < client,
+            "network UTC must not replace receipt wall time"
+        );
+    }
+
+    #[test]
+    fn unsynchronized_control_fallback_does_not_authorize_recovery() {
+        let router = sedsnet::router::Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([]),
+            Box::new(|| 0),
+        );
+        let before = crate::telemetry_task::get_current_timestamp_ms();
+        let fallback = super::control_packet_timestamp_ms(&router);
+        let after = crate::telemetry_task::get_current_timestamp_ms();
+        assert!((before..=after).contains(&fallback));
+        assert!(super::required_control_network_utc_ms(&router).is_err());
+        assert_eq!(router.network_time_ms(), None);
+    }
+
     #[test]
     fn client_source_survives_periodic_host_refresh_and_advances_monotonically() {
         use std::sync::{

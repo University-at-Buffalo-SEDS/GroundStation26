@@ -211,9 +211,7 @@ fn build_launch_packet(
             crate::telemetry_schema::endpoint(owner),
         ],
         &router.sender(),
-        router
-            .network_time_ms()
-            .unwrap_or_else(get_current_timestamp_ms),
+        crate::system_clock::control_packet_timestamp_ms(router),
         Arc::from(payload),
     )
 }

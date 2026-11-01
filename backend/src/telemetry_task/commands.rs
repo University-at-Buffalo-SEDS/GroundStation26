@@ -1,5 +1,5 @@
 use super::prelude::*;
-use super::{ROUTER_TX_BUDGET_MS, get_current_timestamp_ms, log_telemetry_error};
+use super::{ROUTER_TX_BUDGET_MS, log_telemetry_error};
 
 pub(super) fn log_command_dispatch(context: &str, side: &str, ty: DataType, payload: &[u8]) {
     let payload_preview = payload
@@ -60,7 +60,7 @@ pub(crate) fn controller_packet(
             crate::telemetry_schema::endpoint(owner),
         ],
         &router.sender(),
-        get_current_timestamp_ms(),
+        crate::system_clock::control_packet_timestamp_ms(router),
         Arc::from(payload),
     )
 }
@@ -123,11 +123,11 @@ pub(crate) fn queue_locally_routed_flight_command(
 
 /// SDK owns the full unchanged manual Abort before local bookkeeping runs.
 pub(crate) fn queue_priority_manual_abort_packet(router: &Router) -> sedsnet::TelemetryResult<()> {
-    router.tx_queue(abort_packet("Manual Abort Command Issued")?)
+    router.tx_queue(abort_packet(router, "Manual Abort Command Issued")?)
 }
 
 pub(crate) fn queue_abort_packet(router: &Router, reason: &str) -> sedsnet::TelemetryResult<()> {
-    router.rx_queue(abort_packet(reason)?)
+    router.rx_queue(abort_packet(router, reason)?)
 }
 
 /// Locally generated automatic aborts retain accepted TX ownership until handoff.
@@ -136,10 +136,10 @@ pub(crate) fn queue_automatic_abort_packet(
     reason: &str,
 ) -> sedsnet::TelemetryResult<()> {
     let marked = format!("SEDS_AUTO_ABORT_V1:{reason}");
-    router.tx_queue(abort_packet(&marked)?)
+    router.tx_queue(abort_packet(router, &marked)?)
 }
 
-fn abort_packet(reason: &str) -> sedsnet::TelemetryResult<Packet> {
+fn abort_packet(router: &Router, reason: &str) -> sedsnet::TelemetryResult<Packet> {
     Packet::new(
         crate::telemetry_schema::data_type("ABORT"),
         &[
@@ -152,9 +152,46 @@ fn abort_packet(reason: &str) -> sedsnet::TelemetryResult<Packet> {
             crate::telemetry_schema::endpoint("SD_CARD"),
         ],
         Board::GroundStation.sender_id(),
-        get_current_timestamp_ms(),
+        crate::system_clock::control_packet_timestamp_ms(router),
         Arc::from(reason.as_bytes()),
     )
+}
+
+#[cfg(test)]
+mod control_clock_tests {
+    use super::*;
+
+    #[test]
+    fn manual_and_marked_abort_headers_use_the_same_network_clock_as_controllers() {
+        let router = Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([]).with_sender("GS"),
+            Box::new(|| 0),
+        );
+        let network_utc = 1_800_000_000_123;
+        router
+            .try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(
+                network_utc,
+            ))
+            .unwrap();
+        for reason in [
+            "Manual Abort Command Issued",
+            "SEDS_AUTO_ABORT_V1:pressure ceiling",
+        ] {
+            let packet = abort_packet(&router, reason).unwrap();
+            assert_eq!(packet.timestamp(), network_utc);
+            assert_eq!(packet.payload(), reason.as_bytes());
+        }
+    }
+
+    #[test]
+    fn manual_abort_remains_constructible_before_network_utc_is_available() {
+        let router = Router::new_with_clock(sedsnet::router::RouterConfig::new([]), Box::new(|| 0));
+        let before = crate::telemetry_task::get_current_timestamp_ms();
+        let packet = abort_packet(&router, "Manual Abort Command Issued").unwrap();
+        let after = crate::telemetry_task::get_current_timestamp_ms();
+        assert!((before..=after).contains(&packet.timestamp()));
+        assert!(crate::system_clock::required_control_network_utc_ms(&router).is_err());
+    }
 }
 
 pub(crate) fn flush_command_tx(router: &Router, context: &str) {
