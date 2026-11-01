@@ -199,6 +199,7 @@ pub struct AppState {
     pub(crate) operator_dispatch_inflight: Arc<AtomicUsize>,
     pub(crate) manual_abort_intent: Arc<crate::manual_abort_intent::ManualAbortIntent>,
     pub(crate) deferred_abort: Arc<crate::deferred_abort::Inbox>,
+    pub(crate) board_recovery: Arc<crate::board_recovery::Runtime>,
 
     /// Latest calibrated fill-mass estimate from 1000kg loadcell.
     pub latest_fill_mass_kg: Arc<Mutex<Option<f32>>>,
@@ -3781,6 +3782,7 @@ pub(crate) mod tests {
             operator_dispatch_inflight: Arc::new(AtomicUsize::new(0)),
             manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
             deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
+            board_recovery: Arc::new(crate::board_recovery::Runtime::default()),
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
             loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
             network_traffic: Arc::new(Mutex::new(crate::network_traffic::Sampler::default())),
