@@ -121,9 +121,16 @@ pub(crate) fn queue_locally_routed_flight_command(
     Ok(())
 }
 
-/// SDK owns the full unchanged manual Abort before local bookkeeping runs.
+pub(crate) const MANUAL_ABORT_PREFIX: &str = "SEDS_MANUAL_ABORT_V1:";
+
+/// SDK owns the marked manual Abort before local bookkeeping runs.
+/// The actual logical router sender also owns its fallback ACK return path.
 pub(crate) fn queue_priority_manual_abort_packet(router: &Router) -> sedsnet::TelemetryResult<()> {
-    router.tx_queue(abort_packet(router, "Manual Abort Command Issued")?)
+    router.tx_queue(abort_packet_from(
+        router,
+        MANUAL_ABORT_PREFIX,
+        &router.sender(),
+    )?)
 }
 
 pub(crate) fn queue_abort_packet(router: &Router, reason: &str) -> sedsnet::TelemetryResult<()> {
@@ -140,6 +147,14 @@ pub(crate) fn queue_automatic_abort_packet(
 }
 
 fn abort_packet(router: &Router, reason: &str) -> sedsnet::TelemetryResult<Packet> {
+    abort_packet_from(router, reason, Board::GroundStation.sender_id())
+}
+
+fn abort_packet_from(
+    router: &Router,
+    reason: &str,
+    sender: &str,
+) -> sedsnet::TelemetryResult<Packet> {
     Packet::new(
         crate::telemetry_schema::data_type("ABORT"),
         &[
@@ -151,7 +166,7 @@ fn abort_packet(router: &Router, reason: &str) -> sedsnet::TelemetryResult<Packe
             crate::telemetry_schema::endpoint("FLIGHT_STATE"),
             crate::telemetry_schema::endpoint("SD_CARD"),
         ],
-        Board::GroundStation.sender_id(),
+        sender,
         crate::system_clock::control_packet_timestamp_ms(router),
         Arc::from(reason.as_bytes()),
     )
@@ -365,6 +380,195 @@ mod automatic_provenance_tests {
                     "{kind}/{command}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod manual_stop_owner_tests {
+    use super::*;
+    use sedsnet::router::{EndpointHandler, RouterConfig, RouterSideOptions};
+
+    #[test]
+    fn marked_manual_stop_retires_distinct_owners_for_primary_and_rrls_senders() {
+        crate::telemetry_schema::initialize().unwrap();
+        assert_eq!(MANUAL_ABORT_PREFIX.as_bytes().len(), 21);
+        let abort = crate::telemetry_schema::data_type("ABORT");
+        let endpoints = [
+            "GROUND_STATION",
+            "FLIGHT_CONTROLLER",
+            "VALVE_BOARD",
+            "ACTUATOR_BOARD",
+            "ABORT",
+            "FLIGHT_STATE",
+            "SD_CARD",
+        ]
+        .map(crate::telemetry_schema::endpoint);
+        for station_name in ["GS", "RRLS"] {
+            let now = Arc::new(AtomicU64::new(0));
+            let received = Arc::new(Mutex::new(HashMap::<String, Vec<u64>>::new()));
+            let station_out = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let to_station = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let to_can = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let from_can = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let make = |name: &str, owners: &[DataEndpoint]| {
+                let handlers = owners
+                    .iter()
+                    .map(|&endpoint| {
+                        let received = received.clone();
+                        let name = name.to_string();
+                        EndpointHandler::new_packet_handler(endpoint, move |packet| {
+                            if packet.data_type() == abort {
+                                assert_eq!(packet.payload(), MANUAL_ABORT_PREFIX.as_bytes());
+                                let mut rows = received.lock().unwrap();
+                                let ids = rows.entry(name.clone()).or_default();
+                                if !ids.contains(&packet.packet_id()) {
+                                    ids.push(packet.packet_id());
+                                }
+                            }
+                            Ok(())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let clock = now.clone();
+                Router::new_with_clock(
+                    RouterConfig::new(handlers).with_sender(name),
+                    Box::new(move || clock.load(Ordering::Relaxed)),
+                )
+            };
+            let station = make(station_name, &[endpoints[0], endpoints[4], endpoints[5]]);
+            let rf = make("RF", &[]);
+            let options = || RouterSideOptions {
+                reliable_enabled: true,
+                ..Default::default()
+            };
+            let output = station_out.clone();
+            let station_side = station.add_side_packed_with_options(
+                "radio",
+                move |bytes| {
+                    output.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                },
+                options(),
+            );
+            let output = to_station.clone();
+            let rf_radio = rf.add_side_packed_with_options(
+                "radio",
+                move |bytes| {
+                    output.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                },
+                options(),
+            );
+            let output = to_can.clone();
+            let rf_can = rf.add_side_packed_with_options(
+                "can",
+                move |bytes| {
+                    output.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                },
+                options(),
+            );
+            let mut nodes = Vec::new();
+            for (name, owned) in [
+                ("FC", vec![endpoints[1], endpoints[4]]),
+                ("VB", vec![endpoints[2], endpoints[4]]),
+                ("AB", vec![endpoints[3], endpoints[4]]),
+                ("DAQ", vec![endpoints[6], endpoints[5]]),
+            ] {
+                let node = make(name, &owned);
+                let output = from_can.clone();
+                let side = node.add_side_packed_with_options(
+                    "can",
+                    move |bytes| {
+                        output.lock().unwrap().push(bytes.to_vec());
+                        Ok(())
+                    },
+                    options(),
+                );
+                let announcement =
+                    sedsnet::discovery::build_discovery_announce(name, 1, &owned).unwrap();
+                station.rx_from_side(&announcement, station_side).unwrap();
+                rf.rx_from_side(&announcement, rf_can).unwrap();
+                let announcement = sedsnet::discovery::build_discovery_announce(
+                    station_name,
+                    1,
+                    &[endpoints[0], endpoints[4], endpoints[5]],
+                )
+                .unwrap();
+                node.rx_from_side(&announcement, side).unwrap();
+                nodes.push((node, side));
+            }
+            rf.rx_from_side(
+                &sedsnet::discovery::build_discovery_announce(
+                    station_name,
+                    1,
+                    &[endpoints[0], endpoints[4], endpoints[5]],
+                )
+                .unwrap(),
+                rf_radio,
+            )
+            .unwrap();
+            let intent = Arc::new(crate::manual_abort_intent::ManualAbortIntent::default());
+            intent.request();
+            let claim = intent.try_claim().unwrap();
+            queue_priority_manual_abort_packet(&station).unwrap();
+            claim.accepted();
+            assert!(station.has_pending_reliable_tx_type(abort));
+            let mut transmitted = Vec::new();
+            for at in (0..=1000).step_by(10) {
+                now.store(at, Ordering::Relaxed);
+                for _ in 0..8 {
+                    station.process_all_queues_with_timeout(0).unwrap();
+                    for wire in std::mem::take(&mut *station_out.lock().unwrap()) {
+                        if let Ok(packet) = serialize::unpack_packet(&wire) {
+                            if packet.data_type() == abort {
+                                transmitted.push(packet);
+                            }
+                        }
+                        rf.rx_packed_from_side(&wire, rf_radio).unwrap();
+                    }
+                    rf.process_all_queues_with_timeout(0).unwrap();
+                    for wire in std::mem::take(&mut *to_can.lock().unwrap()) {
+                        for (node, side) in &nodes {
+                            node.rx_packed_from_side(&wire, *side).unwrap();
+                        }
+                    }
+                    for (node, _) in &nodes {
+                        node.process_all_queues_with_timeout(0).unwrap();
+                    }
+                    for wire in std::mem::take(&mut *from_can.lock().unwrap()) {
+                        rf.rx_packed_from_side(&wire, rf_can).unwrap();
+                    }
+                    rf.process_all_queues_with_timeout(0).unwrap();
+                    for wire in std::mem::take(&mut *to_station.lock().unwrap()) {
+                        station.rx_packed_from_side(&wire, station_side).unwrap();
+                    }
+                }
+            }
+            assert!(!transmitted.is_empty());
+            let packet_id = transmitted[0].packet_id();
+            for packet in &transmitted {
+                assert_eq!(packet.sender(), station_name);
+                assert_eq!(packet.packet_id(), packet_id);
+                assert_eq!(packet.payload(), MANUAL_ABORT_PREFIX.as_bytes());
+                assert_eq!(packet.endpoints().len(), endpoints.len());
+                for endpoint in endpoints {
+                    assert!(packet.endpoints().contains(&endpoint));
+                }
+            }
+            let rows = received.lock().unwrap();
+            for owner in [station_name, "FC", "AB", "VB", "DAQ"] {
+                assert_eq!(
+                    rows.get(owner),
+                    Some(&vec![packet_id]),
+                    "{station_name}: {owner}"
+                );
+            }
+            assert!(
+                !station.has_pending_reliable_tx_type(abort),
+                "ACKs must retire the {station_name} sender's SDK owner"
+            );
         }
     }
 }

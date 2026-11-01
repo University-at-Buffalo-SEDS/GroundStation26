@@ -2094,7 +2094,11 @@ fn bound_raw_uart_buffer(rx_buf: &mut Vec<u8>, failed_prefix: &mut usize) {
 }
 
 fn raw_uart_requires_inner_crc(kind: RawUartFrameKind, body: &[u8]) -> bool {
-    (kind == RawUartFrameKind::Data && body.starts_with(b"SDT"))
+    // Native SDK packets have no SDT magic. Recognize their envelope without
+    // trusting it, then require integrity before consuming the UART length.
+    // Unrecognized opaque payloads retain the legacy framing contract.
+    (kind == RawUartFrameKind::Data
+        && (body.starts_with(b"SDT") || serialize::peek_frame_info_unchecked(body).is_ok()))
         || (matches!(kind, RawUartFrameKind::Data | RawUartFrameKind::Command)
             && body.starts_with(b"RR\x01"))
 }
@@ -2104,7 +2108,215 @@ fn raw_uart_inner_crc_valid(body: &[u8]) -> bool {
             == u32::from_le_bytes(body[body.len() - 4..].try_into().unwrap())
 }
 
-// Only known-rejected bytes permit lookahead. A complete CRC-valid SDT/RR-v1 frame
+#[cfg(test)]
+mod native_uart_integrity_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn native_heartbeat(timestamp: u64) -> Vec<u8> {
+        let packet = Packet::new(
+            crate::telemetry_schema::data_type("HEARTBEAT"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            "RF",
+            timestamp,
+            Arc::from([]),
+        )
+        .unwrap();
+        let bytes = serialize::pack_packet(&packet).to_vec();
+        assert!(!bytes.starts_with(b"SDT"));
+        assert_eq!(
+            serialize::unpack_packet(&bytes).unwrap().timestamp(),
+            timestamp
+        );
+        bytes
+    }
+
+    #[test]
+    fn native_crc_rejection_preserves_following_frame_inside_damaged_uart_length() {
+        let first = native_heartbeat(41);
+        let following = native_heartbeat(42);
+        let following_frame = build_raw_uart_frame(&following).unwrap();
+        let mut stream = build_raw_uart_frame(&first).unwrap();
+        // The corrupt outer length incorrectly claims both packets as one.
+        let damaged_length = u16::try_from(first.len() + following_frame.len()).unwrap();
+        stream[2..4].copy_from_slice(&damaged_length.to_le_bytes());
+        stream.extend_from_slice(&following_frame);
+        let now = Instant::now();
+        let mut wait = RawUartFrameWait::default();
+        assert!(
+            matches!(
+                take_raw_uart_framed_payload_with_clock(&mut stream, &mut wait, now, Some(0)),
+                Err(TelemetryError::Unpack(_))
+            ),
+            "corrupt native length must be rejected before consuming the next frame"
+        );
+        let (kind, recovered) =
+            take_raw_uart_framed_payload_with_clock(&mut stream, &mut wait, now, Some(0))
+                .unwrap()
+                .expect("following CRC-valid frame must recover without a timeout");
+        assert!(matches!(kind, RawUartFrameKind::Data));
+        assert_eq!(recovered, following);
+        assert_eq!(
+            serialize::unpack_packet(&recovered).unwrap().timestamp(),
+            42
+        );
+        assert!(stream.is_empty());
+    }
+
+    #[test]
+    fn valid_native_payload_can_contain_an_entire_other_uart_frame() {
+        let nested = build_raw_uart_frame(&native_heartbeat(44)).unwrap();
+        let mut payload = vec![0u8; 24 * 4];
+        assert!(24 + nested.len() <= payload.len());
+        payload[24..24 + nested.len()].copy_from_slice(&nested);
+        let packet = Packet::new(
+            crate::telemetry_schema::data_type("BOARD_HEALTH"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            "RF",
+            45,
+            Arc::from(payload),
+        )
+        .unwrap();
+        let wire = serialize::pack_packet(&packet).to_vec();
+        assert_eq!(serialize::unpack_packet(&wire).unwrap().timestamp(), 45);
+        let framed = build_raw_uart_frame(&wire).unwrap();
+        let nested_at = framed
+            .windows(nested.len())
+            .position(|bytes| bytes == nested)
+            .unwrap();
+        let split = nested_at + nested.len();
+        assert!(split < framed.len());
+        let now = Instant::now();
+        let mut wait = RawUartFrameWait::default();
+        let mut received = framed[..split].to_vec();
+        assert!(
+            take_raw_uart_framed_payload_with_clock(&mut received, &mut wait, now, Some(100),)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(received, framed[..split]);
+        received.extend_from_slice(&framed[split..]);
+        let (_, actual) =
+            take_raw_uart_framed_payload_with_clock(&mut received, &mut wait, now, Some(101))
+                .unwrap()
+                .unwrap();
+        assert_eq!(actual, wire);
+        assert!(received.is_empty());
+    }
+
+    #[test]
+    fn native_crc_corruption_does_not_lose_the_next_independent_packet() {
+        let mut corrupt = native_heartbeat(46);
+        let crc = corrupt.len() - 1;
+        corrupt[crc] ^= 1;
+        let next = native_heartbeat(47);
+        let mut received = build_raw_uart_frame(&corrupt).unwrap();
+        received.extend_from_slice(&build_raw_uart_frame(&next).unwrap());
+        let now = Instant::now();
+        let mut wait = RawUartFrameWait::default();
+        assert!(matches!(
+            take_raw_uart_framed_payload_with_clock(&mut received, &mut wait, now, Some(0),),
+            Err(TelemetryError::Unpack("raw UART native crc32 mismatch"))
+        ));
+        let (_, actual) =
+            take_raw_uart_framed_payload_with_clock(&mut received, &mut wait, now, Some(0))
+                .unwrap()
+                .unwrap();
+        assert_eq!(actual, next);
+        assert!(received.is_empty());
+    }
+
+    #[test]
+    fn partial_native_producer_interleaving_rejects_corruption_and_recovers_each_retry() {
+        // Model an asynchronous radio burst boundary inside one UART frame,
+        // then another producer's complete frame. This is deliberate byte
+        // corruption, not a claim about the proprietary modem's MAC behavior.
+        crate::telemetry_schema::initialize().unwrap();
+        let endpoint = crate::telemetry_schema::endpoint("GROUND_STATION");
+        let packet = |sender, stamp| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type("HEARTBEAT"),
+                    &[endpoint],
+                    sender,
+                    stamp,
+                    Arc::from([]),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let a = packet("RF", 51);
+        let b = packet("RRLS", 52);
+        let c = packet("GS", 53);
+        let a_frame = build_raw_uart_frame(&a).unwrap();
+        let b_frame = build_raw_uart_frame(&b).unwrap();
+        let c_frame = build_raw_uart_frame(&c).unwrap();
+        let split = RAW_UART_FRAME_HEADER_SIZE + a.len() / 2;
+        let stream = [
+            &a_frame[..split],
+            &b_frame,
+            &a_frame[split..],
+            &c_frame,
+            &a_frame,
+            &b_frame,
+        ]
+        .concat();
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = received.clone();
+        let receiver = Router::new(sedsnet::router::RouterConfig::new([
+            sedsnet::router::EndpointHandler::new_packet_handler(endpoint, move |p| {
+                sink.lock().unwrap().push(p.timestamp());
+                Ok(())
+            }),
+        ]));
+        let side = receiver.add_side_packed("shared UART", |_| Ok(()));
+        let now = Instant::now();
+        let mut buffer = Vec::new();
+        let mut wait = RawUartFrameWait::default();
+        let mut rejected = 0;
+        for chunk in stream.chunks(7) {
+            buffer.extend_from_slice(chunk);
+            loop {
+                match take_raw_uart_framed_payload_with_clock(
+                    &mut buffer,
+                    &mut wait,
+                    now,
+                    Some(0),
+                ) {
+                    Ok(Some((RawUartFrameKind::Data, bytes))) => {
+                        match receiver.rx_packed_from_side(&bytes, side) {
+                            Ok(()) => {},
+                            // Interleaving may damage the native header itself
+                            // beyond recognition by the outer UART classifier.
+                            // The actual SDK must still reject those bytes.
+                            Err(TelemetryError::Unpack("crc32 mismatch")) => rejected += 1,
+                            Err(error) => panic!("unexpected SDK rejection: {error:?}"),
+                        }
+                    }
+                    Ok(Some(_)) => panic!("unexpected command frame"),
+                    Ok(None) => break,
+                    Err(_) => rejected += 1,
+                }
+            }
+        }
+        assert!(rejected >= 1, "interleaved first frame must be rejected");
+        assert!(buffer.is_empty());
+        let mut delivered = received.lock().unwrap().clone();
+        // Depending on the wire header length, B may survive the damaged
+        // span immediately or arrive on its retry. These independent senders
+        // have no cross-producer ordering contract, but none may be lost or
+        // delivered twice.
+        delivered.sort_unstable();
+        assert_eq!(
+            delivered,
+            [51, 52, 53],
+            "each original producer must arrive exactly once without a timeout"
+        );
+    }
+}
+
+// Only known-rejected bytes permit lookahead. A complete CRC-valid SDK/RR-v1 frame
 // can restore framing inside that span. The first candidate outside the span
 // is handled normally, even when incomplete: never inspect its payload for a
 // nested frame. Unexpired ordinary frames never enter this recovery path.
@@ -2212,8 +2424,10 @@ fn take_raw_uart_framed_payload_recovering(
             // checksum before consuming that frame, preserving bytes for resync.
             let error = if body.starts_with(b"SDT") {
                 "raw UART SDT crc32 mismatch"
-            } else {
+            } else if body.starts_with(b"RR\x01") {
                 "raw UART RR-v1 crc32 mismatch"
+            } else {
+                "raw UART native crc32 mismatch"
             };
             discard_raw_uart_prefix(rx_buf, 1, failed_prefix);
             *failed_prefix = total_len - 1;
@@ -5367,10 +5581,12 @@ mod raw_uart_tests {
         let reader = std::thread::spawn(move || {
             let mut bytes = vec![0; length];
             peer.read_exact(&mut bytes).unwrap();
-            bytes
+            // Keep the stable PTY peer alive through the writer's final
+            // drain/ioctl; closing it immediately after read races EIO.
+            (bytes, peer)
         });
         tx.service_background_transmit().unwrap();
-        assert_eq!(reader.join().unwrap(), expected);
+        assert_eq!(reader.join().unwrap().0, expected);
         assert!(shared.lock().unwrap().begin_transmission(0).is_none());
     }
 
@@ -5514,7 +5730,9 @@ mod raw_uart_tests {
         let reader = std::thread::spawn(move || {
             let mut bytes = vec![0; length];
             peer.read_exact(&mut bytes).unwrap();
-            bytes
+            // Keep the stable PTY peer alive through the writer's final
+            // drain/ioctl; closing it immediately after read races EIO.
+            (bytes, peer)
         });
         let deadline = Instant::now() + Duration::from_secs(1);
         while !tx.transmit_ready() {
@@ -5525,7 +5743,7 @@ mod raw_uart_tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         tx.service_background_transmit().unwrap();
-        assert_eq!(reader.join().unwrap(), expected_mode);
+        assert_eq!(reader.join().unwrap().0, expected_mode);
         assert!(shared.lock().unwrap().begin_transmission(0).is_none());
     }
 
@@ -5618,10 +5836,12 @@ mod raw_uart_tests {
         let reader = std::thread::spawn(move || {
             let mut bytes = vec![0; length];
             peer.read_exact(&mut bytes).unwrap();
-            bytes
+            // Keep the stable PTY peer alive through the writer's final
+            // drain/ioctl; closing it immediately after read races EIO.
+            (bytes, peer)
         });
         tx.service_transmit().unwrap();
-        assert_eq!(reader.join().unwrap(), expected);
+        assert_eq!(reader.join().unwrap().0, expected);
         assert!(shared.lock().unwrap().begin_transmission(0).is_none());
     }
 
@@ -7026,7 +7246,19 @@ mod raw_uart_tests {
         // its claimed length absorbs the next frame's sync and payload.
         let mut damaged = vec![b'S', b'D', b'T', 3];
         damaged.resize(162, 0x31);
-        let good = (0..92).collect::<Vec<u8>>();
+        // The following data frame must itself be a valid SDK packet. The
+        // historical arbitrary 0..92 fixture had no CRC and only happened to
+        // pass the old SDT-only integrity check.
+        let packet = Packet::new(
+            crate::telemetry_schema::data_type("BOARD_HEALTH"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            "RF",
+            99,
+            Arc::from((0u8..96).collect::<Vec<_>>()),
+        )
+        .unwrap();
+        let good = serialize::pack_packet(&packet).to_vec();
+        assert_eq!(serialize::unpack_packet(&good).unwrap().payload().len(), 96);
         let mut bytes = vec![0xa5, 0x5a, 192, 0];
         bytes.extend_from_slice(&damaged);
         bytes.extend_from_slice(&build_raw_uart_frame(&good).unwrap());
