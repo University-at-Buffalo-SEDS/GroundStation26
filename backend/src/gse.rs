@@ -2566,6 +2566,11 @@ fn abort_safe_control(kind: sedsnet::config::DataType, payload: &[u8]) -> bool {
     if payload.len() != 1 {
         return false;
     }
+    if kind == crate::telemetry_schema::data_type("FLIGHT_COMMAND") {
+        // Existing explicit manual FC stop only. The high bit is not an FC
+        // automatic provenance tag and must never alias this permission.
+        return payload[0] == crate::rocket_commands::FlightComputerCommands::EvaluationAbort as u8;
+    }
     let command = payload[0] & 0x7f;
     if kind == crate::telemetry_schema::data_type("VALVE_COMMAND") {
         command == ValveBoardCommands::PilotClose as u8
@@ -3473,5 +3478,46 @@ mod retained_stop_fence_tests {
             .is_none()
         );
         assert!(inhibit_automatic_actions_for_launch(&state).is_err());
+    }
+}
+
+#[cfg(test)]
+mod explicit_fc_stop_tests {
+    use super::*;
+    #[tokio::test]
+    async fn retained_stop_still_admits_exact_manual_fc_evaluation_abort_through_actual_sdk() {
+        use sedsnet::router::{Router, RouterConfig};
+        let state = crate::state::tests::test_app_state().await;
+        state.manual_abort_intent.request();
+        state.set_abort_indicator_latched(true);
+        let router = Arc::new(Router::new(RouterConfig::new([])));
+        state.topology_router.set(router.clone()).unwrap();
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = sent.clone();
+        router.add_side_packet("synthetic-flight-control", move |packet| {
+            if packet.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND") {
+                capture.lock().unwrap().push(packet.payload().to_vec());
+            }
+            Ok(())
+        });
+        let kind = crate::telemetry_schema::data_type("FLIGHT_COMMAND");
+        let stop = crate::rocket_commands::FlightComputerCommands::EvaluationAbort as u8;
+        assert_eq!(stop, 16);
+        crate::telemetry_task::queue_locally_routed_flight_command(
+            &state,
+            &router,
+            "explicit FC evaluation stop",
+            &[stop],
+        )
+        .unwrap();
+        assert!(router.has_pending_reliable_tx_type(kind));
+        for forbidden in [1u8, 12, 13, 0x90] {
+            assert!(
+                !queue_controller_with_stop_fence(&state, &router, kind, &[forbidden]).unwrap()
+            );
+        }
+        router.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(sent.lock().unwrap().as_slice(), [vec![16]]);
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
     }
 }

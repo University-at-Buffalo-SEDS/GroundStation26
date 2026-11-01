@@ -817,6 +817,7 @@ pub async fn telemetry_task(
                     }
                     if crate::gse::manual_stop_pending(&state)
                         && !matches!(cmd, TelemetryCommand::Abort | TelemetryCommand::NitrogenClose | TelemetryCommand::NitrousClose | TelemetryCommand::PauseFill | TelemetryCommand::CancelFill)
+                        && crate::sequences::command_name(&cmd) != "EvaluationAbort"
                         && !crate::sequences::is_station_utility_command(crate::sequences::command_name(&cmd)) {
                         emit_notification_warning(&state, "Manual Stop is pending; new control action was not dispatched");
                         continue;
@@ -4531,6 +4532,53 @@ mod tests {
         assert!(accepted.contains_key("Postinit"));
         assert_eq!(crate::gse::automatic_generation(&state), old + 1);
         assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(feature = "hitl_mode")]
+    #[tokio::test]
+    async fn explicit_fc_evaluation_abort_reaches_actual_worker_while_manual_stop_is_retained() {
+        let (db_tx, db_rx) = mpsc::channel(8);
+        let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
+        if state.hitl_button_interlock_enabled() {
+            state.toggle_hitl_button_interlock();
+        }
+        assert!(state.is_command_allowed(&TelemetryCommand::EvaluationAbort));
+        state.manual_abort_intent.request();
+        state.set_abort_indicator_latched(true);
+        let (sent, mut received) = mpsc::unbounded_channel();
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([
+            sedsnet::router::EndpointHandler::new_packet_handler(
+                crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"),
+                move |packet| {
+                    if packet.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND") {
+                        let _ = sent.send(packet.payload().to_vec());
+                    }
+                    Ok(())
+                },
+            ),
+        ])));
+        state.topology_router.set(router.clone()).unwrap();
+        let worker = tokio::spawn(telemetry_task(
+            state.clone(),
+            router,
+            Vec::new(),
+            cmd_rx,
+            db_rx,
+            state.shutdown_subscribe(),
+        ));
+        state
+            .cmd_tx
+            .send(TelemetryCommand::QueuedOperator {
+                generation: crate::gse::automatic_generation(&state),
+                command: Box::new(TelemetryCommand::EvaluationAbort),
+            })
+            .await
+            .unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(2), received.recv()).await;
+        state.request_shutdown();
+        worker.await.unwrap();
+        assert_eq!(delivered.unwrap(), Some(vec![16]));
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
     }
 
     async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {
