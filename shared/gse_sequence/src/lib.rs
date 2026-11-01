@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub mod fill_trim;
 pub mod qd_wait;
 pub mod qualification;
+pub mod turbocharge;
 
 /// Order is pilot, vent, dump, nitrogen, nitrous. Ignition/retraction are never tested.
 pub const RELIEVED: [bool; 5] = [false, true, true, false, false];
@@ -28,6 +29,9 @@ pub struct Config {
     pub fill_overfill_kg: f32,
     pub fill_tolerance_kg: f32,
     pub fill_settle_ms: u64,
+    /// Explicit additional nitrogen mass allowance, in calibrated kg.
+    /// None disables Turbocharge; this is not liquid overfill tolerance.
+    pub turbocharge_max_added_mass_kg: Option<f32>,
     pub pressure_step_psi: f32,
     pub pressure_ceiling_psi: Option<f32>,
     pub maximum_zero_offset_psi: Option<f32>,
@@ -42,6 +46,7 @@ impl Default for Config {
             fill_overfill_kg: 0.05,
             fill_tolerance_kg: 0.07,
             fill_settle_ms: 3000,
+            turbocharge_max_added_mass_kg: None,
             pressure_step_psi: 50.0,
             pressure_ceiling_psi: None,
             maximum_zero_offset_psi: None,
@@ -136,6 +141,15 @@ impl Config {
     pub fn validate_settings(&self) -> Result<(), String> {
         self.nitrogen_plan()?;
         self.validate_fill_trim()?;
+        if self
+            .turbocharge_max_added_mass_kg
+            .is_some_and(|v| !v.is_finite() || v <= 0.0)
+        {
+            return Err(
+                "Turbocharge maximum added nitrogen mass must be finite and positive, or unset"
+                    .into(),
+            );
+        }
         if !self.nitrogen_target_psi.is_finite()
             || !self.pressure_step_psi.is_finite()
             || self.pressure_step_psi <= 0.0
@@ -204,6 +218,7 @@ pub enum Action {
     CancelFill,
     SelfTest,
     NitrogenTest,
+    Turbocharge,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -230,6 +245,7 @@ pub enum Phase {
     CancelSetup,
     Cancelled,
     Fault,
+    Turbocharge,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Baseline {
@@ -498,6 +514,9 @@ impl Engine {
         }
         self.claimed = true;
         Ok(match action {
+            Action::Turbocharge => {
+                return Err("Turbocharge requires its qualified inventory controller".into());
+            }
             Action::CancelFill => {
                 self.status.nitrogen_passed = false;
                 self.status.nitrogen_overridden = false;
@@ -1085,6 +1104,7 @@ mod tests {
                     fill_overfill_kg: 0.05,
                     fill_tolerance_kg: 0.07,
                     fill_settle_ms: 3000,
+                    turbocharge_max_added_mass_kg: None,
                     pressure_step_psi: 50.0,
                     pressure_ceiling_psi: Some(200.0),
                     maximum_zero_offset_psi: Some(8.0),

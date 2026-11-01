@@ -7,7 +7,14 @@ mod capture_clock;
 use capture_clock::CaptureClock;
 
 const COUNT: usize = 200;
-const WINDOW: Duration = Duration::from_secs(5);
+// The live DAQ stream is nominally 40 Hz (39.86 Hz in the incident recording).
+// 200 samples consume five seconds before transport/scheduler jitter. Retain
+// the same sample/quality minimum with two bounded seconds of delivery margin.
+const NOMINAL_SAMPLES_PER_SECOND: u64 = 40;
+const TRANSPORT_MARGIN_MS: u64 = 2_000;
+const WINDOW: Duration = Duration::from_millis(
+    (COUNT as u64 * 1_000).div_ceil(NOMINAL_SAMPLES_PER_SECOND) + TRANSPORT_MARGIN_MS,
+);
 const ZERO_KG: f32 = 0.8;
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -24,6 +31,7 @@ impl Default for Settings {
 struct Sample {
     at: CaptureClock,
     raw: f32,
+    packet_id: Option<u64>,
 }
 #[derive(Default)]
 pub struct Runtime {
@@ -87,6 +95,12 @@ impl Runtime {
         self.generation = self.generation.wrapping_add(1);
         self.pending = false;
     }
+    #[cfg(test)]
+    pub(crate) fn invalidate_captures_for_verified_reset(&mut self) {
+        self.cancel();
+        self.kg50.clear();
+        self.kg1000.clear();
+    }
     pub fn cancel_for_command(&mut self, command: &TelemetryCommand) {
         if (self.pending && self.fill_pending && !matches!(command, TelemetryCommand::StartFill))
             || matches!(
@@ -106,7 +120,18 @@ impl Runtime {
             ..Self::default()
         }
     }
+    #[cfg(test)]
     pub fn observe(&mut self, sensor: &str, raw: f32) {
+        self.observe_sample(sensor, raw, None);
+    }
+    #[cfg(test)]
+    pub(crate) fn captured_source_counts_for_test(&self) -> [usize; 2] {
+        [self.kg50.len(), self.kg1000.len()]
+    }
+    pub fn observe_packet(&mut self, sensor: &str, raw: f32, packet_id: u64) {
+        self.observe_sample(sensor, raw, Some(packet_id));
+    }
+    fn observe_sample(&mut self, sensor: &str, raw: f32, packet_id: Option<u64>) {
         if !raw.is_finite() {
             return;
         }
@@ -115,9 +140,15 @@ impl Runtime {
             "KG1000" => &mut self.kg1000,
             _ => return,
         };
+        // A repeated network owner is not another independent stability
+        // observation and must not renew this stream's last-receipt clock.
+        if packet_id.is_some() && samples.iter().any(|sample| sample.packet_id == packet_id) {
+            return;
+        }
         samples.push_back(Sample {
             at: CaptureClock::now(),
             raw,
+            packet_id,
         });
         while samples.len() > COUNT {
             samples.pop_front();
@@ -195,13 +226,54 @@ pub fn launch(state: &Arc<AppState>) {
     begin(state, "KG1000", false);
 }
 
+fn commit_tare(
+    state: &AppState,
+    cfg: &loadcell::LoadcellCalibrationFile,
+    sensor: &str,
+    token: u64,
+    arm_generation: u64,
+    raw: f32,
+) -> Result<(), String> {
+    if crate::gse::manual_stop_pending(state) {
+        return Err("Automatic zero cancelled by manual Stop".into());
+    }
+    // Lock order: zero Runtime -> calibration. No DISPATCH/GSE acquisition or
+    // SDK calls while these locks are held. Verified reset must cancel and
+    // advance the global epoch while holding this same zero Runtime mutex.
+    let runtime = state.auto_zero.lock().unwrap();
+    if matches!(arm_generation, 0 | u64::MAX)
+        || crate::gse::automatic_generation(state) != arm_generation
+        || runtime.generation != token
+    {
+        return Err("Automatic zero cancelled by reset".into());
+    }
+    let mut current = state.loadcell_calibration.lock().unwrap();
+    if serde_json::to_value(&*current).ok() != serde_json::to_value(cfg).ok() {
+        return Err("Calibration changed during automatic zero; retry".into());
+    }
+    let mut updated = current.clone();
+    loadcell::capture_zero(
+        &mut updated,
+        if sensor == "KG50" { "kg50" } else { "ch1" },
+        raw,
+    );
+    loadcell::save(&updated)?;
+    *current = updated;
+    Ok(())
+}
+
 fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
+    let arm_generation = crate::gse::automatic_generation(state);
+    let stop_pending = crate::gse::manual_stop_pending(state);
     let cfg = state.loadcell_calibration.lock().unwrap().clone();
     let start = CaptureClock::now();
     let token = {
         let mut rt = state.auto_zero.lock().unwrap();
         if !rt.settings().enabled {
             return false;
+        }
+        if matches!(arm_generation, 0 | u64::MAX) || stop_pending {
+            return true;
         }
         if rt.pending {
             return true;
@@ -227,7 +299,10 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
         rt.generation
     };
     state.add_notification_with_persistence(
-        format!("Collecting 200 fresh {sensor} samples for automatic zero"),
+        format!(
+            "Collecting 200 fresh {sensor} samples for automatic zero (up to {} seconds)",
+            WINDOW.as_secs()
+        ),
         false,
     );
     let state = state.clone();
@@ -242,6 +317,15 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
                     return;
                 }
             }
+            if crate::gse::automatic_generation(&state) != arm_generation
+                || crate::gse::manual_stop_pending(&state)
+            {
+                let mut rt = state.auto_zero.lock().unwrap();
+                if rt.generation == token {
+                    rt.cancel();
+                }
+                return;
+            }
             let raw = {
                 let rt = state.auto_zero.lock().unwrap();
                 if rt.generation != token {
@@ -249,75 +333,78 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
                 }
                 rt.samples(sensor, start)
             };
-            // Never admit ignition/countdown samples after the idle window.
+            // Never extend a capture by retrying or accept samples after its bounded budget.
             if start.elapsed() >= WINDOW {
-                break Err(
-                    "200 stable samples were not captured within the first five seconds"
-                        .to_string(),
-                );
+                break Err(format!(
+                    "200 stable samples were not captured within the {}-second acquisition budget",
+                    WINDOW.as_secs()
+                ));
             }
             if raw.len() == COUNT {
                 break stable(&raw, &cfg, sensor).map(|v| v.0);
             }
         };
-        let result = result.and_then(|raw| {
-            let runtime = state.auto_zero.lock().unwrap();
-            if runtime.generation != token {
-                return Err("Automatic zero cancelled".into());
-            }
-            let mut current = state.loadcell_calibration.lock().unwrap();
-            if serde_json::to_value(&*current).ok() != serde_json::to_value(&cfg).ok() {
-                return Err("Calibration changed during automatic zero; retry".into());
-            }
-            let mut updated = current.clone();
-            loadcell::capture_zero(
-                &mut updated,
-                if sensor == "KG50" { "kg50" } else { "ch1" },
-                raw,
-            );
-            loadcell::save(&updated)?;
-            *current = updated;
-            Ok(())
-        });
+        let result =
+            result.and_then(|raw| commit_tare(&state, &cfg, sensor, token, arm_generation, raw));
         {
             let mut rt = state.auto_zero.lock().unwrap();
             if rt.generation != token {
                 return;
             }
+            if crate::gse::automatic_generation(&state) != arm_generation {
+                rt.cancel();
+                return;
+            }
             rt.pending = false;
+        }
+        if crate::gse::automatic_generation(&state) != arm_generation
+            || crate::gse::manual_stop_pending(&state)
+        {
+            return;
         }
         match result {
             Ok(()) => {
                 state.broadcast_fill_targets_snapshot();
                 let cfg = state.loadcell_calibration.lock().unwrap().clone();
-                if let Some(router) = state.topology_router.get() {
-                    if let Err(e) = crate::network_variables::set_daq_calibration(router, &cfg) {
-                        state.add_notification(format!(
-                            "Zero saved locally, but DAQ calibration sync failed: {e}"
-                        ));
+                if let Err(e) =
+                    crate::gse::sync_calibration_after_automatic_zero(&state, arm_generation, &cfg)
+                {
+                    if crate::gse::automatic_generation(&state) != arm_generation
+                        || crate::gse::manual_stop_pending(&state)
+                    {
+                        return;
                     }
+                    state.add_notification(format!(
+                        "Zero saved locally, but DAQ calibration sync failed: {e}"
+                    ));
                 }
                 state.add_notification_with_persistence(
                     format!("{sensor} automatic zero saved"),
                     false,
                 );
                 if fill && state.is_command_allowed(&TelemetryCommand::StartFill) {
-                    // Refresh the fill controller with the newly zeroed mass before start.
-                    state.gse.lock().unwrap().observe_mass(Some(0.0));
-                    *state.latest_fill_mass_kg.lock().unwrap() = Some(0.0);
-                    crate::gse::start_fill_after_automatic_zero(&state);
+                    crate::gse::start_fill_after_automatic_zero(&state, arm_generation);
                 }
             }
             Err(e) => {
                 state.add_notification(format!(
                     "Automatic zero failed: {e}. {}",
-                    if fill { "Fill was not started." } else { "Previous tare retained; manual zero required." }
+                    if fill {
+                        "Fill was not started."
+                    } else {
+                        "Previous tare retained; manual zero required."
+                    }
                 ));
                 crate::gse::cancel_fill_for_recoverable_fault(&state, "automatic zero failed");
             }
         }
     });
     true
+}
+
+#[cfg(test)]
+pub(crate) fn acquisition_budget_for_test() -> Duration {
+    WINDOW
 }
 
 #[cfg(test)]
@@ -330,6 +417,114 @@ mod tests {
         cfg.ch1_zero_raw = None;
         cfg
     }
+    #[test]
+    fn replayed_network_owner_does_not_renew_quality_or_freshness() {
+        let mut runtime = Runtime::default();
+        runtime.observe_packet("KG1000", 0.2, 0);
+        let original = runtime.kg1000[0].at;
+        runtime.observe_packet("KG1000", 0.7, 0);
+        assert_eq!(runtime.kg1000.len(), 1);
+        assert_eq!(runtime.kg1000[0].raw, 0.2);
+        assert_eq!(
+            runtime.kg1000[0].at.duration_since(original),
+            Duration::ZERO
+        );
+        // One logical packet may legitimately contain independent channels.
+        runtime.observe_packet("KG50", 0.3, 0);
+        assert_eq!(runtime.kg50.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn computed_zero_from_previous_reset_generation_cannot_save_or_start_fill() {
+        let state = crate::state::tests::test_app_state().await;
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "auto_zero/fixtures/incident-2026-10-31-kg1000.json"
+        ))
+        .unwrap();
+        let cfg: loadcell::LoadcellCalibrationFile =
+            serde_json::from_value(fixture["calibration"].clone()).unwrap();
+        let samples: Vec<f32> = fixture["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["raw"].as_f64().unwrap() as f32)
+            .collect();
+        let (computed_raw, _) = stable(&samples, &cfg, "KG1000").unwrap();
+        *state.loadcell_calibration.lock().unwrap() = cfg.clone();
+        let token = {
+            let mut runtime = state.auto_zero.lock().unwrap();
+            *runtime = Runtime::testing(true);
+            runtime.pending = true;
+            runtime.observe("KG50", 0.1);
+            runtime.observe("KG1000", 0.2);
+            runtime.generation
+        };
+        let calibration_file = loadcell::calibration_file_for_test();
+        let before_disk = std::fs::read(&calibration_file).ok();
+        let armed = crate::gse::automatic_generation(&state);
+        // The result has ALREADY passed the real 200-sample quality check.
+        // Hold its actual commit on another thread while the real staged reset
+        // helper wins DISPATCH -> zeroRuntime and invalidates the epoch/token.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let late_state = state.clone();
+        let late_cfg = cfg.clone();
+        let late = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            commit_tare(&late_state, &late_cfg, "KG1000", token, armed, computed_raw)
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let next = crate::gse::reset_generation::invalidate_capture_epoch(&state, armed).unwrap();
+        assert_eq!(next, armed + 1);
+        {
+            let runtime = state.auto_zero.lock().unwrap();
+            assert!(!runtime.pending && runtime.kg50.is_empty() && runtime.kg1000.is_empty());
+        }
+        resume_tx.send(()).unwrap();
+        assert!(late.join().unwrap().is_err());
+        let token_after_reset = state.auto_zero.lock().unwrap().generation;
+        assert!(
+            commit_tare(
+                &state,
+                &cfg,
+                "KG1000",
+                token_after_reset,
+                armed,
+                computed_raw
+            )
+            .is_err(),
+            "the global arm guard must reject even a matching local token"
+        );
+        assert!(
+            commit_tare(&state, &cfg, "KG1000", token, next, computed_raw).is_err(),
+            "the local arm guard must reject even a matching global epoch"
+        );
+        assert_eq!(
+            serde_json::to_value(&*state.loadcell_calibration.lock().unwrap()).unwrap(),
+            serde_json::to_value(&cfg).unwrap()
+        );
+        assert_eq!(std::fs::read(&calibration_file).ok(), before_disk);
+        *state.latest_fill_mass_kg.lock().unwrap() = Some(42.0);
+        crate::gse::start_fill_after_automatic_zero(&state, armed);
+        assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(42.0));
+        assert!(!crate::gse::active(&state));
+        // The current epoch also cannot commit while a real retained Stop owns safety.
+        state.manual_abort_intent.request();
+        assert!(
+            commit_tare(
+                &state,
+                &cfg,
+                "KG1000",
+                token,
+                crate::gse::automatic_generation(&state),
+                computed_raw
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&calibration_file).ok(), before_disk);
+    }
+
     #[test]
     fn zero_band_ignores_isolated_outliers() {
         let mut raw = vec![0.2; COUNT];

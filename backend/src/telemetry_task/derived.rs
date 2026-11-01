@@ -596,19 +596,20 @@ pub(super) struct DerivedLoadcellSample<'a> {
     pub(super) sensor_id: &'a str,
     pub(super) raw_value: f32,
     pub(super) payload_json: &'a str,
+    pub(super) receipt: crate::gse::ValveReceipt,
 }
 
-pub(super) async fn emit_derived_loadcell_rows(
+pub(super) struct PreparedLoadcellRows {
+    rows: Vec<(&'static str, Vec<Option<f32>>)>,
+    calibration_sensor_id: String,
+    config_json: String,
+}
+
+/// Perform live conversion exactly once, before any recording await.
+pub(super) fn prepare_derived_loadcell_rows(
     state: &Arc<AppState>,
-    db_tx: &mpsc::Sender<DbQueueItem>,
-    db_overflow: &DbOverflow,
-    sample: DerivedLoadcellSample<'_>,
-) {
-    state
-        .auto_zero
-        .lock()
-        .unwrap()
-        .observe(sample.sensor_id, sample.raw_value);
+    sample: &DerivedLoadcellSample<'_>,
+) -> Option<PreparedLoadcellRows> {
     let calibration_sensor_id = if sample.sensor_id
         == &*crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE").as_str()
     {
@@ -655,7 +656,10 @@ pub(super) async fn emit_derived_loadcell_rows(
             f32::NAN,
         );
         match calibration_sensor_id {
-            sensor if sensor == fill_source.sensor() => {
+            sensor
+                if sensor == fill_source.sensor()
+                    && sample.sender_id == crate::types::Board::DaqBoard.sender_id() =>
+            {
                 let mut latest = state.latest_fill_mass_kg.lock().unwrap();
                 *latest = None;
                 state.gse.lock().unwrap().observe_mass(None);
@@ -667,7 +671,7 @@ pub(super) async fn emit_derived_loadcell_rows(
             }
             _ => {}
         }
-        return;
+        return None;
     };
     let mut rows: Vec<(&str, Vec<Option<f32>>)> = match calibration_sensor_id {
         loadcell::RAW_LOADCELL_DATA_TYPE_1000KG => vec![(
@@ -705,18 +709,43 @@ pub(super) async fn emit_derived_loadcell_rows(
         };
         let flight_state = *state.state.lock().unwrap();
         let target = loadcell::active_fill_target_mass_kg(&fill_targets, flight_state);
-        *state.latest_fill_mass_kg.lock().unwrap() = mass;
-        state.gse.lock().unwrap().observe_mass_source(
-            mass,
-            sample.source_timestamp_ms,
-            super::recording_network_utc_ms().unwrap_or(sample.ts_ms),
-        );
+        if sample.sender_id == crate::types::Board::DaqBoard.sender_id() {
+            *state.latest_fill_mass_kg.lock().unwrap() = mass;
+            state.gse.lock().unwrap().observe_mass_source(
+                mass,
+                sample.source_timestamp_ms,
+                sample.receipt,
+                crate::gse::mass_calibration_signature(&cfg),
+            );
+        }
         rows.push((
             loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
             vec![mass.map(|mass| loadcell::fill_percent(target, mass))],
         ));
     }
 
+    let config_json = serde_json::json!({"calibration":cfg,
+        "fill_targets":fill_targets,"flight_state":format!("{:?}", *state.state.lock().unwrap())})
+    .to_string();
+    Some(PreparedLoadcellRows {
+        rows,
+        calibration_sensor_id: calibration_sensor_id.into(),
+        config_json,
+    })
+}
+
+pub(super) async fn emit_derived_loadcell_rows(
+    state: &Arc<AppState>,
+    db_tx: &mpsc::Sender<DbQueueItem>,
+    db_overflow: &DbOverflow,
+    sample: DerivedLoadcellSample<'_>,
+    prepared: PreparedLoadcellRows,
+) {
+    let PreparedLoadcellRows {
+        rows,
+        calibration_sensor_id,
+        config_json,
+    } = prepared;
     for (data_type, values) in rows {
         if should_persist_telemetry_sample(data_type, sample.sender_id, sample.ts_ms) {
             queue_db_write(
@@ -744,13 +773,7 @@ pub(super) async fn emit_derived_loadcell_rows(
         state.cache_recent_telemetry(row.clone());
         let _ = state.ws_tx.send(row);
     }
-    // Keep actual calibration provenance, never reconstruct it from today's
-    // settings at export time. Periodic snapshots also cover pre-roll recording.
     static RECORDED: OnceLock<Mutex<HashMap<String, (String, i64)>>> = OnceLock::new();
-    let config_json = serde_json::json!({"calibration":cfg,
-        "fill_targets":state.fill_targets_snapshot(),
-        "flight_state":format!("{:?}", *state.state.lock().unwrap())})
-    .to_string();
     let key = format!(
         "{}:{:?}:{}:{}",
         state.placeholder_db_path,

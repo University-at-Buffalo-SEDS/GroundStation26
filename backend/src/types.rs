@@ -87,6 +87,7 @@ pub enum TelemetryCommand {
     CancelFill,
     ValveSelfTest,
     NitrogenTest,
+    Turbocharge,
     /// Internal producer intent; never accepted as a client command.
     #[serde(skip)]
     // Production SafetyTask uses direct claimed TX; retain this queued-intent

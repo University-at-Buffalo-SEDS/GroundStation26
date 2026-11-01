@@ -19,6 +19,10 @@ pub struct Saved {
     pub baseline: Option<Baseline>,
     pub fill_target_kg: Option<f32>,
     #[serde(default)]
+    pub turbocharge: Option<gse_sequence::turbocharge::Evidence>,
+    #[serde(default)]
+    pub turbocharge_binding: Option<serde_json::Value>,
+    #[serde(default)]
     pub pending_checklists: Vec<crate::checklists::CompletionEvent>,
     #[serde(default)]
     pub checklist_digest: Option<String>,
@@ -68,6 +72,9 @@ impl Saved {
                 return Err("Invalid pending sequence completion event".into());
             }
         }
+        if self.turbocharge.as_ref().is_some_and(|e| !e.valid()) {
+            return Err("Invalid saved Turbocharge evidence".into());
+        }
         if let Some(b) = &self.baseline {
             if b.samples < 3
                 || ![b.average_psi, b.min_psi, b.max_psi, b.noise_psi]
@@ -113,12 +120,16 @@ impl Saved {
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {
         self.validate()?;
+        let bytes = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        if bytes.len() > 16384 {
+            return Err("Qualification record exceeds its existing16KiB bound".into());
+        }
         let parent = path.parent().ok_or("Missing qualification directory")?;
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         let temporary = path.with_extension("upload");
         let result = (|| -> std::io::Result<()> {
             let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&serde_json::to_vec_pretty(self)?)?;
+            file.write_all(&bytes)?;
             file.sync_all()?;
             std::fs::rename(&temporary, path)?;
             std::fs::File::open(parent)?.sync_all()

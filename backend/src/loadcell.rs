@@ -355,6 +355,11 @@ fn calibration_path() -> PathBuf {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn calibration_file_for_test() -> PathBuf {
+    calibration_path()
+}
+
 fn from_old_format(old: OldCalibrationFile) -> LoadcellCalibrationFile {
     let mut cfg = LoadcellCalibrationFile {
         full_mass_kg: Some(old.full_mass_kg.max(0.001)),

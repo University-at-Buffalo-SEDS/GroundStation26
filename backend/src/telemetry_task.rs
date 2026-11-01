@@ -853,7 +853,7 @@ pub async fn telemetry_task(
                         TelemetryCommand::QueuedOperator { .. } | TelemetryCommand::AutomaticAbort { .. } | TelemetryCommand::AutomaticNitrogenClose { .. } | TelemetryCommand::AutomaticNitrousClose { .. } => unreachable!("automatic intent checked before dispatch"),
                         TelemetryCommand::StartFill | TelemetryCommand::PauseFill
                         | TelemetryCommand::CancelFill | TelemetryCommand::ValveSelfTest
-                        | TelemetryCommand::NitrogenTest => unreachable!("GSE commands handled before dispatch"),
+                        | TelemetryCommand::NitrogenTest | TelemetryCommand::Turbocharge => unreachable!("GSE commands handled before dispatch"),
                         TelemetryCommand::Dump => {
                                 let key = ValveBoardCommands::DumpOpen as u8;
                                 let is_on = effective_umbilical_valve_state(&state, key).unwrap_or(false);
@@ -2117,9 +2117,77 @@ async fn handle_packet(
 
     if let Some(values_vec) = telemetry_f32_values(&pkt) {
         let rows = telemetry_rows_from_packet_values(state, &pkt, &sender_id, values_vec);
+        let live_receipt = crate::gse::ValveReceipt {
+            network_ms: recording_network_utc_ms().unwrap_or(ts_ms),
+            monotonic_at: std::time::Instant::now(),
+            simulation_ms: crate::simulation_clock_ms(),
+        };
+        // Known UTC data retains source age; receipt cannot turn a delayed
+        // network batch into fresh independent tare observations. Unsynced
+        // boot clocks retain receipt-time compatibility and PacketID dedup.
+        let tare_receipt = live_receipt.network_ms;
+        let tare_source_fresh = i64::try_from(pkt.timestamp()).ok().is_some_and(|source| {
+            if source >= 1_577_836_800_000 && tare_receipt >= 1_577_836_800_000 {
+                tare_receipt
+                    .checked_sub(source)
+                    .is_some_and(|age| (-100..=2000).contains(&age))
+            } else {
+                source >= 0
+            }
+        });
+        // Tare capture is live input, not a recording side effect. A full disk
+        // queue must not delay its receipt clock or hide a valid sample.
+        {
+            let mut zero = state.auto_zero.lock().unwrap();
+            for (kind, values) in &rows {
+                if tare_source_fresh
+                    && sender_id == Board::DaqBoard.sender_id()
+                    && matches!(kind.as_str(), "KG1000" | "KG50")
+                    && let Some(raw) = values.first().copied().flatten()
+                {
+                    zero.observe_packet(kind, raw, pkt.packet_id());
+                }
+            }
+        }
+        crate::gse::observe_valve_pressure_ingress(
+            state,
+            &sender_id,
+            &rows,
+            pkt.timestamp() as i64,
+            live_receipt,
+        );
+        // Prepare every live mass/PT row before even the composite raw row
+        // can await recorder capacity. Filters and calibration run once.
+        let prepared: Vec<_> = rows
+            .iter()
+            .map(|(kind, values)| {
+                if !matches!(
+                    kind.as_str(),
+                    loadcell::RAW_LOADCELL_DATA_TYPE_1000KG
+                        | loadcell::RAW_LOADCELL_DATA_TYPE_50KG
+                        | loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE
+                        | "FUEL_TANK_PRESSURE"
+                ) {
+                    return None;
+                }
+                let raw_value = values.first().copied().flatten()?;
+                prepare_derived_loadcell_rows(
+                    state,
+                    &DerivedLoadcellSample {
+                        ts_ms,
+                        source_timestamp_ms: Some(pkt.timestamp() as i64),
+                        sender_id: &sender_id,
+                        sensor_id: kind,
+                        raw_value,
+                        payload_json: &payload_json,
+                        receipt: live_receipt,
+                    },
+                )
+            })
+            .collect();
         let mut out = Vec::with_capacity(rows.len());
 
-        for (row_data_type, row_values) in rows {
+        for ((row_data_type, row_values), prepared) in rows.into_iter().zip(prepared) {
             if should_persist_telemetry_sample(&row_data_type, &sender_id, ts_ms) {
                 queue_db_write(
                     state,
@@ -2158,13 +2226,7 @@ async fn handle_packet(
                 )
                 .await;
 
-                if matches!(
-                    row_data_type.as_str(),
-                    loadcell::RAW_LOADCELL_DATA_TYPE_1000KG
-                        | loadcell::RAW_LOADCELL_DATA_TYPE_50KG
-                        | loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE
-                        | "FUEL_TANK_PRESSURE"
-                ) {
+                if let Some(prepared) = prepared {
                     emit_derived_loadcell_rows(
                         state,
                         db_tx,
@@ -2176,7 +2238,9 @@ async fn handle_packet(
                             sensor_id: &row_data_type,
                             raw_value: first_value,
                             payload_json: &payload_json,
+                            receipt: live_receipt,
                         },
+                        prepared,
                     )
                     .await;
                 }
@@ -4966,11 +5030,14 @@ mod tests {
         crate::auto_zero::launch(&state);
         assert!(start.elapsed() < Duration::from_millis(100));
         assert!(state.auto_zero.lock().unwrap().pending());
-        tokio::time::timeout(Duration::from_secs(6), async {
-            while state.auto_zero.lock().unwrap().pending() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+        tokio::time::timeout(
+            crate::auto_zero::acquisition_budget_for_test() + Duration::from_secs(1),
+            async {
+                while state.auto_zero.lock().unwrap().pending() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+        )
         .await
         .unwrap();
         assert!(
@@ -6060,4 +6127,9 @@ mod tests {
             messages[0].message
         );
     }
+    #[cfg(feature = "firmware_sim")]
+    mod zero_ingress {
+        include!("telemetry_task/loadcell_zero_ingress_tests.rs");
+    }
+
 }

@@ -46,23 +46,30 @@ pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool
         && rt.operational.persist_error.is_none()
         && rt.operational.topology_stable
         && rt.operational.saved.fill_target_kg == Some(target)
-        && rt
-            .fresh_mass(now)
-            .is_some_and(|mass| fill_mass_in_band(&rt.engine.config, mass.value, target))
+        && (!rt.turbo_inventory_pending || rt.turbo_evidence.is_some())
+        && rt.fresh_mass(now).is_some_and(|mass| {
+            (!rt.turbo_inventory_pending
+                && fill_mass_in_band(&rt.engine.config, mass.value, target))
+                || turbocharge::accepts_mass(state, rt, mass)
+        })
         && matches!(
             rt.engine.status.phase,
             Phase::Passed | Phase::Paused | Phase::Idle
         )
-        && rt.pressure.is_some_and(|p| {
-            p.value.is_finite()
-                && p.at_ms <= now
-                && now - p.at_ms <= 2_000
-                && rt
-                    .engine
-                    .config
-                    .pressure_limit(rt.engine.nitrous_target_psi, 50.0)
-                    .is_ok_and(|limit| p.value < limit)
-        })
+        && rt
+            .turbo_evidence
+            .as_ref()
+            .map_or(rt.pressure, |_| rt.valve_pressure)
+            .is_some_and(|p| {
+                p.value.is_finite()
+                    && p.at_ms <= now
+                    && now - p.at_ms <= 2_000
+                    && rt
+                        .engine
+                        .config
+                        .pressure_limit(rt.engine.nitrous_target_psi, 50.0)
+                        .is_ok_and(|limit| p.value < limit)
+            })
         && rt
             .valves
             .iter()
@@ -119,6 +126,8 @@ fn fault(rt: &mut Runtime, reason: Fault, message: &str) -> Effects {
     rt.operational.qd = QdWait::default();
     let _ = rt.operational.persist();
     rt.fill_trim = None;
+    rt.turbocharge = None;
+    rt.turbo_evidence = None;
     rt.engine.fault(rt.now(), message)
 }
 pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase) {
@@ -447,6 +456,31 @@ pub(super) fn check_report_safety(state: &Arc<AppState>) {
         return;
     }
     let phase = rt.engine.status.phase;
+    if let Some(controller) = rt.turbocharge.as_ref() {
+        use gse_sequence::turbocharge::Phase as TurboPhase;
+        let nitrogen_transition = matches!(
+            controller.phase(),
+            TurboPhase::Closing
+                | TurboPhase::OpeningNitrogen
+                | TurboPhase::Raising
+                | TurboPhase::ClosingNitrogen
+        );
+        let unsafe_supply = if rt.valves[4].is_some_and(|v| v.open) {
+            Some("Nitrous opened during Turbocharge")
+        } else if !nitrogen_transition && rt.valves[3].is_some_and(|v| v.open) {
+            Some("Nitrogen opened outside its Turbocharge ACK phase")
+        } else {
+            None
+        };
+        if let Some(message) = unsafe_supply {
+            let effects = fault(&mut rt, Fault::UnsafeSupplyFlow, message);
+            drop(rt);
+            apply(state, effects);
+        }
+        // The typed controller owns fresh ACKs and all five CLOSED contracts;
+        // resting nitrous-fill policy must not reject its intentional N2 step.
+        return;
+    }
     let nitrous_session = rt.engine.nitrous_session()
         || matches!(
             phase,

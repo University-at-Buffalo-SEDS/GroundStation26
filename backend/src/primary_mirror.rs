@@ -19,7 +19,7 @@ const FILL: [Board; 4] = [
     Board::DaqBoard,
 ];
 const SENDERS: [&str; 5] = ["GS", "GB", "AB", "VB", "DAQ"];
-const PHASES: [&str; 21] = [
+const PHASES: [&str; 22] = [
     "idle",
     "baseline_setup",
     "baseline",
@@ -41,6 +41,7 @@ const PHASES: [&str; 21] = [
     "cancel_setup",
     "cancelled",
     "fault",
+    "turbocharge",
 ];
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Observation {

@@ -579,6 +579,7 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::CancelFill => "CancelFill",
         TelemetryCommand::ValveSelfTest => "ValveSelfTest",
         TelemetryCommand::NitrogenTest => "NitrogenTest",
+        TelemetryCommand::Turbocharge => "Turbocharge",
         TelemetryCommand::MonitorAltitude => "MonitorAltitude",
         TelemetryCommand::RevokeMonitorAltitude => "RevokeMonitorAltitude",
         TelemetryCommand::ConsecutiveSamples => "ConsecutiveSamples",

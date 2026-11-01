@@ -1,7 +1,14 @@
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
+mod turbocharge;
+#[cfg(all(test, feature = "firmware_sim"))]
+pub(crate) use turbocharge::mass_ingress_snapshot;
+pub(crate) use turbocharge::{mass_calibration_signature, observe_valve_pressure_ingress};
 mod automatic_abort;
 #[cfg(test)]
 mod rrls_http_tests;
+// Staged, tested implementation only: no verified Reset API is exposed yet.
+#[cfg(test)]
+pub(crate) mod reset_generation;
 pub(crate) use automatic_abort::claim_automatic_abort;
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 pub(crate) use automatic_abort::{
@@ -65,6 +72,7 @@ struct ValveCaptureHistory {
     seen_values: u8,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct ValveReceipt {
     pub network_ms: i64,
     pub monotonic_at: Instant,
@@ -130,10 +138,23 @@ pub struct Runtime {
     #[cfg(not(feature = "hitl_mode"))]
     operational: operational::Operational,
     clock: Instant,
+    #[cfg(test)]
+    test_now_ms: Option<u64>,
     pressure: Option<Sample>,
+    valve_pressure: Option<Sample>,
+    last_valve_pressure_source_ms: Option<i64>,
+    valve_pressure_epoch: u64,
+    turbocharge: Option<gse_sequence::turbocharge::Controller>,
+    turbo_evidence: Option<gse_sequence::turbocharge::Evidence>,
+    turbo_inventory_pending: bool,
+    turbo_binding: Option<serde_json::Value>,
+    #[cfg(test)]
+    turbo_audit_path: Option<std::path::PathBuf>,
     valves: [Option<ValveState>; 5],
     mass: Option<Sample>,
+    mass_calibration: Option<[u8; 32]>,
     last_mass_source_ms: Option<i64>,
+    mass_source_epoch: u64,
     last_pressure_source_ms: Option<i64>,
     last_valve_captures: [ValveCaptureHistory; 5],
     fill_cutoff: crate::sequences::FillCutoff,
@@ -152,10 +173,23 @@ impl Default for Runtime {
             #[cfg(not(feature = "hitl_mode"))]
             operational: Default::default(),
             clock: Instant::now(),
+            #[cfg(test)]
+            test_now_ms: None,
             pressure: None,
+            valve_pressure: None,
+            last_valve_pressure_source_ms: None,
+            valve_pressure_epoch: 0,
+            turbocharge: None,
+            turbo_evidence: None,
+            turbo_inventory_pending: false,
+            turbo_binding: None,
+            #[cfg(test)]
+            turbo_audit_path: None,
             valves: [None; 5],
             mass: None,
+            mass_calibration: None,
             last_mass_source_ms: None,
+            mass_source_epoch: 0,
             last_pressure_source_ms: None,
             last_valve_captures: [ValveCaptureHistory::default(); 5],
             fill_cutoff: Default::default(),
@@ -201,12 +235,39 @@ fn source_sample_at(
     *previous = Some(source);
     Some(at)
 }
+fn scalar_capture_at(
+    clock: Instant,
+    processing_now: u64,
+    source: Option<i64>,
+    receipt: ValveReceipt,
+    previous: &mut Option<i64>,
+) -> Option<u64> {
+    let received_at = match receipt.simulation_ms {
+        Some(at) => at,
+        None => u64::try_from(
+            receipt
+                .monotonic_at
+                .checked_duration_since(clock)?
+                .as_millis(),
+        )
+        .ok()?,
+    };
+    let mut next = *previous;
+    let captured = source_sample_at(source, receipt.network_ms, received_at, &mut next)?;
+    if processing_now.checked_sub(captured)? > 2_000 {
+        return None;
+    }
+    *previous = next;
+    Some(captured)
+}
 fn sequence_clock_ms(elapsed_ms: u64, simulated_ms: Option<u64>) -> u64 {
     simulated_ms.unwrap_or(elapsed_ms)
 }
 
 impl Runtime {
     fn cancel_automation_for_manual(&mut self) {
+        self.turbocharge = None;
+        self.turbo_evidence = None;
         self.manual_control = true;
         let faulted = self.engine.status.phase == Phase::Fault;
         self.engine.manual_override();
@@ -275,6 +336,7 @@ impl Runtime {
             .filter(|m| m.at_ms <= now_ms && now_ms - m.at_ms <= 2000)
     }
     pub fn observe_mass(&mut self, value: Option<f32>) {
+        self.mass_calibration = None;
         self.last_mass_source_ms = None;
         self.mass = value.filter(|v| v.is_finite()).map(|value| Sample {
             value,
@@ -285,14 +347,31 @@ impl Runtime {
         &mut self,
         value: Option<f32>,
         source_ms: Option<i64>,
-        receipt_ms: i64,
+        receipt: ValveReceipt,
+        calibration: [u8; 32],
     ) {
-        if let Some(at_ms) = source_sample_at(
-            source_ms,
-            receipt_ms,
+        if source_ms.is_some_and(|value| value < 0) {
+            self.mass = None;
+            self.mass_calibration = None;
+            return;
+        }
+        if source_ms
+            .zip(self.last_mass_source_ms)
+            .is_some_and(|(new, old)| {
+                new < old && (new < 1_577_836_800_000 || old < 1_577_836_800_000)
+            })
+        {
+            self.mass_source_epoch = self.mass_source_epoch.saturating_add(1);
+            self.turbo_evidence = None;
+        }
+        if let Some(at_ms) = scalar_capture_at(
+            self.clock,
             self.now(),
+            source_ms,
+            receipt,
             &mut self.last_mass_source_ms,
         ) {
+            self.mass_calibration = value.filter(|v| v.is_finite()).map(|_| calibration);
             self.mass = value
                 .filter(|v| v.is_finite())
                 .map(|value| Sample { value, at_ms });
@@ -316,6 +395,10 @@ impl Runtime {
         }
     }
     fn now(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(now) = self.test_now_ms {
+            return now;
+        }
         sequence_clock_ms(
             self.clock.elapsed().as_millis() as u64,
             crate::simulation_clock_ms(),
@@ -394,7 +477,15 @@ impl Runtime {
     fn input(&self, prelaunch: bool, interlock: bool) -> Inputs {
         Inputs {
             now_ms: self.now(),
-            pressure: self.pressure,
+            pressure: if self.turbo_inventory_pending
+                && matches!(
+                    self.engine.status.phase,
+                    Phase::Turbocharge | Phase::PauseSetup | Phase::Paused
+                ) {
+                self.valve_pressure
+            } else {
+                self.pressure
+            },
             valves: self.valves,
             prelaunch,
             interlock,
@@ -443,6 +534,7 @@ pub(crate) fn persist_settings(config: &Config) -> Result<(), String> {
 }
 
 pub fn initialize(state: &AppState) {
+    turbocharge::restore_pending_inventory(state);
     #[cfg(not(feature = "hitl_mode"))]
     {
         let path = std::env::var_os("GS_GSE_QUALIFICATION")
@@ -570,6 +662,20 @@ pub fn valve_command(cmd: &TelemetryCommand) -> bool {
 }
 
 pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool> {
+    if matches!(cmd, TelemetryCommand::PauseFill) && state.gse.lock().unwrap().turbocharge.is_some()
+    {
+        return Some(prelaunch(state) && interlock(state, &state.action_policy_snapshot()));
+    }
+
+    if matches!(cmd, TelemetryCommand::Turbocharge) {
+        let rt = state.gse.lock().unwrap();
+        let input = rt.input(
+            prelaunch(state),
+            interlock(state, &state.action_policy_snapshot()),
+        );
+        return Some(turbocharge::allowed(state, &rt, input));
+    }
+
     let is_prelaunch = prelaunch(state);
     let policy = state.action_policy_snapshot();
     let rt = state.gse.lock().unwrap();
@@ -676,10 +782,21 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
     let is_prelaunch = prelaunch(state);
     let rt = state.gse.lock().unwrap();
     let input = rt.input(is_prelaunch, interlock(state, policy));
+    policy.controls.retain(|c| c.cmd != "Turbocharge");
+    policy.controls.push(ActionControl {
+        cmd: "Turbocharge".into(),
+        enabled: turbocharge::allowed(state, &rt, input),
+        blink: BlinkMode::None,
+        actuated: Some(rt.turbocharge.is_some()),
+    });
     for (cmd, action) in ACTIONS {
         // HITL buttons accept a sequence request whenever manual controls are
         // unlocked. Execution still goes through Engine::allows/request below.
-        let enabled = sequence_button_enabled(&rt.engine, action, input);
+        let enabled = if action == Action::PauseFill && rt.turbocharge.is_some() {
+            input.prelaunch && input.interlock
+        } else {
+            sequence_button_enabled(&rt.engine, action, input)
+        };
         #[cfg(not(feature = "hitl_mode"))]
         let enabled = enabled && operational_action_allowed(&rt, action);
         policy.controls.retain(|c| c.cmd != cmd);
@@ -854,6 +971,28 @@ fn flush_effects(state: &Arc<AppState>) {
     }
 }
 fn handle_command_inner(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
+    if matches!(cmd, TelemetryCommand::Turbocharge) {
+        turbocharge::request(state);
+        return true;
+    }
+    if matches!(
+        cmd,
+        TelemetryCommand::PauseFill | TelemetryCommand::CancelFill | TelemetryCommand::Abort
+    ) {
+        let mut rt = state.gse.lock().unwrap();
+        let turbo_active = rt.turbocharge.take().is_some();
+        if turbo_active {
+            rt.turbo_evidence = None;
+            if matches!(
+                cmd,
+                TelemetryCommand::PauseFill | TelemetryCommand::CancelFill
+            ) {
+                rt.engine.status.phase = Phase::Filling;
+            }
+        } else if !matches!(cmd, TelemetryCommand::PauseFill) {
+            rt.turbo_evidence = None;
+        }
+    }
     // Admission and handoff share the effect gate: a supply report may have
     // changed since the outer command worker checked the policy.
     if valve_command(cmd) && !state.is_command_allowed(cmd) {
@@ -911,6 +1050,18 @@ fn handle_command_inner(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
                 rt.engine.status.phase = Phase::Filling;
             }
             if action == Action::StartFill
+                && rt.ground_station_control
+                && rt.valve_pressure.is_some_and(|p| {
+                    p.value >= nitrous_target
+                        && p.at_ms <= input.now_ms
+                        && input.now_ms - p.at_ms <= 2000
+                })
+            {
+                Err(
+                    "Nitrous pressure is already at its target; automatic fill remains paused"
+                        .into(),
+                )
+            } else if action == Action::StartFill
                 && rt.ground_station_control
                 && rt.fresh_mass(input.now_ms).is_none()
             {
@@ -989,12 +1140,18 @@ fn remember_automatic_cutoff_target(runtime: &mut Runtime, mass: f32, target: f3
     }
 }
 /// Admit a late asynchronous fill completion through the same launch gate.
-pub(crate) fn start_fill_after_automatic_zero(state: &Arc<AppState>) {
+pub(crate) fn start_fill_after_automatic_zero(state: &Arc<AppState>, generation: u64) {
     {
         let _dispatch = DISPATCH_GATE.lock().unwrap();
-        if !automatic_abort_allowed(state) {
+        if matches!(generation, 0 | u64::MAX)
+            || generation != automatic_generation(state)
+            || manual_stop_pending(state)
+            || !automatic_abort_allowed(state)
+        {
             return;
         }
+        state.gse.lock().unwrap().observe_mass(Some(0.0));
+        *state.latest_fill_mass_kg.lock().unwrap() = Some(0.0);
         handle_command_inner(state, &TelemetryCommand::StartFill);
     }
     flush_effects(state);
@@ -1055,6 +1212,12 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
     {
         return;
     }
+    if turbocharge::tick(state, interlock) {
+        return;
+    }
+    if turbocharge::guard_closed_pressure(state) {
+        return;
+    }
     #[cfg(not(feature = "hitl_mode"))]
     if operational_tick(state, interlock) {
         return;
@@ -1083,6 +1246,11 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                 // close both supplies and open vent/dump without ACK gating.
                 rt.engine.fault(input.now_ms, &message)
             } else if update.completed {
+                if let Err(error) = turbocharge::liquid_inventory_requalified(&mut rt) {
+                    rt.engine.status.message = format!(
+                        "Fill closed; old Turbocharge inventory record could not be retired: {error}"
+                    );
+                }
                 rt.engine.status.phase = Phase::Paused;
                 rt.engine.status.message =
                     "Fill mass settled within tolerance; all valves confirmed closed".into();
@@ -1103,7 +1271,8 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                 update.effects
             }
         } else {
-            let effects = rt.engine.tick(input);
+            let effects = turbocharge::pressure_cutoff(&mut rt, input)
+                .unwrap_or_else(|| rt.engine.tick(input));
             #[cfg(not(feature = "hitl_mode"))]
             complete_operational_milestones(&mut rt, previous_phase);
             if rt.engine.status.phase != Phase::Filling || !rt.ground_station_control {
@@ -1240,11 +1409,13 @@ fn nitrogen_configuration_changed(before: &Config, after: &Config) -> bool {
         || before.maximum_zero_offset_psi != after.maximum_zero_offset_psi
 }
 fn fill_configuration_changed(before: &Config, after: &Config) -> bool {
-    before.fill_overfill_kg != after.fill_overfill_kg
+    before.turbocharge_max_added_mass_kg != after.turbocharge_max_added_mass_kg
+        || before.fill_overfill_kg != after.fill_overfill_kg
         || before.fill_tolerance_kg != after.fill_tolerance_kg
         || before.fill_settle_ms != after.fill_settle_ms
 }
 fn invalidate_changed_configuration(rt: &mut Runtime, config: &Config) -> Result<(), String> {
+    rt.turbo_evidence = None;
     let nitrogen = nitrogen_configuration_changed(&rt.engine.config, config);
     let fill = fill_configuration_changed(&rt.engine.config, config);
     if !nitrogen && !fill {
@@ -1406,6 +1577,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         response["launch_queued"] = serde_json::json!(rt.operational.qd.queued());
         response["qd"] = serde_json::json!(format!("{:?}", rt.operational.qd.status(rt.now())));
     }
+    turbocharge::decorate_status(&state, &mut response);
     Json(response).into_response()
 }
 
@@ -2891,6 +3063,26 @@ pub(crate) fn automatic_generation(state: &AppState) -> u64 {
     state
         .automatic_generation
         .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Calibration publication is bounded SDK admission, never calibration file IO.
+pub(crate) fn sync_calibration_after_automatic_zero(
+    state: &AppState,
+    generation: u64,
+    calibration: &crate::loadcell::LoadcellCalibrationFile,
+) -> Result<(), String> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if matches!(generation, 0 | u64::MAX)
+        || generation != automatic_generation(state)
+        || manual_stop_pending(state)
+    {
+        return Err("Automatic zero cancelled by reset/manual Stop".into());
+    }
+    if let Some(router) = state.topology_router.get() {
+        crate::network_variables::set_daq_calibration(router, calibration)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 pub(crate) fn queue_automatic_abort_for_generation(

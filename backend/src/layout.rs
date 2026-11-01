@@ -779,11 +779,12 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
     );
 }
 
-const GSE_SEQUENCE_ACTIONS: [(&str, &str); 5] = [
+const GSE_SEQUENCE_ACTIONS: [(&str, &str); 6] = [
     ("StartFill", "Start fill"),
     ("PauseFill", "Pause fill"),
     ("CancelFill", "Cancel fill"),
     ("NitrogenTest", "Nitrogen test"),
+    ("Turbocharge", "Turbocharge"),
     ("ValveSelfTest", "Valve self-test"),
 ];
 

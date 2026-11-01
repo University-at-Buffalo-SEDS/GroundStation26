@@ -193,7 +193,7 @@ const FILL_SYSTEM_SENSOR_SEQUENCE: &[SimSensorSpec] = &[
     },
     SimSensorSpec {
         dtype: crate::telemetry_schema::types::FUEL_TANK_PRESSURE,
-        sender: Board::DaqBoard,
+        sender: Board::ValveBoard,
     },
     SimSensorSpec {
         dtype: crate::telemetry_schema::types::BATTERY_VOLTAGE,
@@ -741,6 +741,7 @@ impl FlightSimState {
             | TelemetryCommand::CancelFill
             | TelemetryCommand::ValveSelfTest
             | TelemetryCommand::NitrogenTest
+            | TelemetryCommand::Turbocharge
             | TelemetryCommand::StartWritingNow
             | TelemetryCommand::StartWritingLastTwoMinutes
             | TelemetryCommand::PauseWritingDb
@@ -1337,7 +1338,7 @@ fn next_scheduled_pressure_transducer_packet(
     state.next_sensor_packet(
         SimSensorSpec {
             dtype: crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE"),
-            sender: Board::DaqBoard,
+            sender: Board::ValveBoard,
         },
         now_ms,
     )
@@ -1424,6 +1425,7 @@ pub fn handle_command(cmd: &TelemetryCommand) -> bool {
             | TelemetryCommand::CancelFill
             | TelemetryCommand::ValveSelfTest
             | TelemetryCommand::NitrogenTest
+            | TelemetryCommand::Turbocharge
     ) {
         // The shared backend sequence engine owns these controls. Never consume
         // one here or manufacture completion independently of its interlocks.
@@ -1748,10 +1750,9 @@ mod tests {
                     | crate::types::Board::ValveBoard
             )
         }));
-        assert!(
-            fill.iter()
-                .any(|spec| spec.dtype == crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE"))
-        );
+        assert!(fill.iter().any(|spec| spec.dtype
+            == crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE")
+            && spec.sender == crate::types::Board::ValveBoard));
         assert!(
             av_bay
                 .iter()

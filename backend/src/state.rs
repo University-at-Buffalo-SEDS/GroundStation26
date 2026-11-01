@@ -746,7 +746,6 @@ impl AppState {
 
     /// Procedure-only liveness: explicit firmware models use actual virtual
     /// packet receipt. UI board health and ordinary deployments keep wall age.
-    #[cfg(any(not(feature = "hitl_mode"), test))]
     pub(crate) fn operational_board_recent(&self, board: Board, maximum_age_ms: u64) -> bool {
         if let Some(now) = crate::simulation_clock_ms() {
             return self

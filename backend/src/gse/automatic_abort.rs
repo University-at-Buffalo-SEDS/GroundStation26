@@ -660,7 +660,10 @@ mod launch_inhibition_tests {
             );
             super::super::tick(&state, false);
             super::super::cancel_fill_for_recoverable_fault(&state, "late board error");
-            super::super::start_fill_after_automatic_zero(&state);
+            super::super::start_fill_after_automatic_zero(
+                &state,
+                crate::gse::automatic_generation(&state),
+            );
             super::super::report_safety(&state);
             assert_eq!(
                 state.gse.lock().unwrap().engine.status.phase,

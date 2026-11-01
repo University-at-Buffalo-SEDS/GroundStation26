@@ -1344,6 +1344,7 @@ pub(crate) fn command_catalog() -> &'static [&'static str] {
         "CancelFill",
         "ValveSelfTest",
         "NitrogenTest",
+        "Turbocharge",
     ]
 }
 fn supported_commands_mask() -> u64 {
