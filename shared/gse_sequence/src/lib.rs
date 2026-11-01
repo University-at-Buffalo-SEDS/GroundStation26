@@ -554,6 +554,17 @@ impl Engine {
             }
         })
     }
+    /// A failed qualification is recoverable: stop filling, verify the relief
+    /// configuration, and require a new test without globally aborting the vehicle.
+    pub fn cancel_failed_test(&mut self, now: u64, message: &str) -> Effects {
+        self.status.nitrogen_passed = false;
+        self.status.nitrogen_overridden = false;
+        let mut effects = self.configure(Phase::CancelSetup, RELIEVED, now, message);
+        effects.notification = Some(format!(
+            "GSE test cancelled: {message}. Verify pressure and correct the cause before repeating the test."
+        ));
+        effects
+    }
     pub fn fault(&mut self, now: u64, message: &str) -> Effects {
         self.status.nitrogen_passed = false;
         self.status.nitrogen_overridden = false;
@@ -819,7 +830,7 @@ impl Engine {
             }
             Phase::Baseline if elapsed >= 5000 => {
                 if self.samples.len() < 10 {
-                    return self.fault(
+                    return self.cancel_failed_test(
                         input.now_ms,
                         "Too few pressure samples for noise calibration",
                     );
@@ -935,7 +946,8 @@ impl Engine {
                     );
                 }
                 if elapsed > 60000 {
-                    return self.fault(input.now_ms, "Nitrogen pressure step timed out");
+                    return self
+                        .cancel_failed_test(input.now_ms, "Nitrogen pressure step timed out");
                 }
             }
             Phase::Settling => {
@@ -949,7 +961,7 @@ impl Engine {
                             - 3.0
                             - baseline.noise_psi
                     {
-                        return self.fault(
+                        return self.cancel_failed_test(
                             input.now_ms,
                             "Pressure fell below the test step while settling",
                         );
@@ -966,7 +978,7 @@ impl Engine {
                 if let Some(mean) = self.sample_mean(input.now_ms.saturating_sub(1000)) {
                     let noise = self.status.baseline.as_ref().unwrap();
                     if self.hold_reference.unwrap() - mean > 3.0 + 2.0 * noise.noise_psi {
-                        return self.fault(
+                        return self.cancel_failed_test(
                             input.now_ms,
                             "Pressure drop exceeds 3 psi beyond the measured noise envelope",
                         );
@@ -974,11 +986,14 @@ impl Engine {
                 }
                 if elapsed >= self.nitrogen_step().hold_ms {
                     if self.hold_samples < 10 {
-                        return self.fault(input.now_ms, "Too few samples to verify pressure hold");
+                        return self.cancel_failed_test(
+                            input.now_ms,
+                            "Too few samples to verify pressure hold",
+                        );
                     }
                     let hold_mean = self.sample_mean(self.phase_since).unwrap();
                     if self.hold_reference.unwrap() - hold_mean > 3.0 {
-                        return self.fault(input.now_ms, "Sustained mean pressure loss exceeds 3 psi; leak or inconclusive noisy hold, test not passed");
+                        return self.cancel_failed_test(input.now_ms, "Sustained mean pressure loss exceeds 3 psi; leak or inconclusive noisy hold, test not passed");
                     }
                     if self.nitrogen_step_index + 1 >= self.nitrogen_plan.len() {
                         return self.configure(
@@ -1245,9 +1260,13 @@ mod tests {
         rig.pressure = 55.0;
         rig.until(Phase::Holding);
         rig.pressure = 51.0;
-        rig.until(Phase::Fault);
+        rig.until(Phase::Cancelled);
         assert!(!rig.engine.status.nitrogen_passed);
         assert_eq!(rig.valves, RELIEVED);
+        assert!(!rig.engine.active());
+        rig.pressure = 0.0;
+        rig.request(Action::NitrogenTest);
+        assert_eq!(rig.engine.status.phase, Phase::BaselineSetup);
     }
     #[test]
     fn incomplete_settings_can_select_manual_panel_without_enabling_automation() {
@@ -1383,11 +1402,15 @@ mod tests {
             rig.pressure = 52.0 - index as f32 * 0.15;
             rig.tick();
             assert_eq!(rig.engine.status.current_step_psi, 50.0);
-            if rig.engine.status.phase == Phase::Fault {
+            if matches!(
+                rig.engine.status.phase,
+                Phase::CancelSetup | Phase::Cancelled
+            ) {
                 break;
             }
         }
-        assert_eq!(rig.engine.status.phase, Phase::Fault);
+        rig.until(Phase::Cancelled);
+        assert_eq!(rig.engine.status.phase, Phase::Cancelled);
         assert!(!rig.engine.status.nitrogen_passed);
         assert_eq!(rig.valves, RELIEVED);
     }
@@ -1428,8 +1451,12 @@ mod tests {
         rig.pressure = 55.0;
         rig.until(Phase::Holding);
         rig.pressure = 45.0;
-        rig.until(Phase::Fault);
+        rig.until(Phase::Cancelled);
         assert_eq!(rig.valves, RELIEVED);
+        assert!(!rig.engine.active());
+        rig.pressure = 0.0;
+        rig.request(Action::NitrogenTest);
+        assert_eq!(rig.engine.status.phase, Phase::BaselineSetup);
         assert!(!rig.engine.status.nitrogen_passed);
     }
     #[test]

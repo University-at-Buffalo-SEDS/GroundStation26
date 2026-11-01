@@ -20,10 +20,21 @@ class UrgentPacketization(unittest.TestCase):
             r'pub\(crate\) const RADIO_COMMAND_BATCH_MAX_BYTES: usize = [^;]+;',
             (ROOT / 'backend/src/comms.rs').read_text())
         self.assertIsNotNone(wire_limit, 'production radio batch limit is required')
+        # Compile the production capacity implementation with its actual
+        # neighboring record types as it gains diagnostics/profile integration.
+        # These are data declarations, not a substitute scheduling model.
+        budget = re.search(r'pub\(crate\) struct EffectiveRadioBudget \{.*?\n\}',
+                           (ROOT / 'backend/src/comms.rs').read_text(), re.S)
+        profile = re.search(r'pub\(crate\) struct Profile \{.*?\n\}',
+                            (ROOT / 'backend/src/rrls/budget_negotiation.rs').read_text(), re.S)
+        self.assertIsNotNone(budget)
+        self.assertIsNotNone(profile)
         with tempfile.TemporaryDirectory(prefix='gs-urgent-packetization-') as directory:
             fixture = Path(directory)
             (fixture / 'schedule.rs').write_text(
-                wire_limit.group() + '\n#[path = ' + json.dumps(str(ROOT / 'backend/src/comms/rfd_capacity.rs'))
+                wire_limit.group() + '\n' + budget.group() + '\n'
+                + 'mod rrls { pub(crate) mod budget_negotiation { '
+                + profile.group() + ' } }\n#[path = ' + json.dumps(str(ROOT / 'backend/src/comms/rfd_capacity.rs'))
                 + '] mod capacity;\n' + r'''
 fn main() {
     let close = std::env::var("CLOSE_CRITICAL_BATCH").as_deref() == Ok("1");

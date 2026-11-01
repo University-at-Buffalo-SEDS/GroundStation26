@@ -15,11 +15,33 @@ pub(super) fn log_command_dispatch(context: &str, side: &str, ty: DataType, payl
 /// Control completion depends on the controller, not on an unrelated SD logger.
 /// Keep the station's local audit endpoint; controller-side state/event logging
 /// remains independent of this command's end-to-end delivery obligation.
-pub(crate) fn queue_controller_command(
+/// App-level provenance survives ordered retries; controllers suppress these
+/// ordinary valve effects after launch while still accepting manual commands.
+pub(crate) fn queue_automatic_controller_command(
+    router: &Router,
+    data_type: DataType,
+    command: u8,
+) -> sedsnet::TelemetryResult<()> {
+    let ordinary_valve = if data_type == crate::telemetry_schema::data_type("VALVE_COMMAND") {
+        matches!(command, 0..=5)
+    } else if data_type == crate::telemetry_schema::data_type("ACTUATOR_COMMAND") {
+        matches!(command, 9 | 10 | 12 | 13)
+    } else {
+        false
+    };
+    if !ordinary_valve {
+        return Err(sedsnet::TelemetryError::Io(
+            "unsupported automatic valve command",
+        ));
+    }
+    queue_controller_command(router, data_type, &[command | 0x80])
+}
+
+pub(crate) fn controller_packet(
     router: &Router,
     data_type: DataType,
     payload: &[u8],
-) -> sedsnet::TelemetryResult<()> {
+) -> sedsnet::TelemetryResult<Packet> {
     let owner = if data_type == crate::telemetry_schema::data_type("FLIGHT_COMMAND") {
         "FLIGHT_CONTROLLER"
     } else if data_type == crate::telemetry_schema::data_type("ACTUATOR_COMMAND") {
@@ -31,7 +53,7 @@ pub(crate) fn queue_controller_command(
             "unsupported controller command",
         ));
     };
-    router.tx_queue(Packet::new(
+    Packet::new(
         data_type,
         &[
             crate::telemetry_schema::endpoint("GROUND_STATION"),
@@ -40,10 +62,19 @@ pub(crate) fn queue_controller_command(
         &router.sender(),
         get_current_timestamp_ms(),
         Arc::from(payload),
-    )?)
+    )
+}
+
+pub(crate) fn queue_controller_command(
+    router: &Router,
+    data_type: DataType,
+    payload: &[u8],
+) -> sedsnet::TelemetryResult<()> {
+    router.tx_queue(controller_packet(router, data_type, payload)?)
 }
 
 pub(crate) fn queue_locally_routed_flight_command(
+    state: &AppState,
     router: &Router,
     context: &str,
     payload: &[u8],
@@ -62,11 +93,16 @@ pub(crate) fn queue_locally_routed_flight_command(
                 .contains(&crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"))
     });
 
-    queue_controller_command(
+    if !crate::gse::queue_controller_with_stop_fence(
+        state,
         router,
         crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
         payload,
-    )?;
+    )? {
+        return Err(sedsnet::TelemetryError::Io(
+            "Manual Stop is pending; flight command was not queued",
+        ));
+    }
 
     log_command_dispatch(
         context,
@@ -85,6 +121,11 @@ pub(crate) fn queue_locally_routed_flight_command(
     Ok(())
 }
 
+/// SDK owns the full unchanged manual Abort before local bookkeeping runs.
+pub(crate) fn queue_priority_manual_abort_packet(router: &Router) -> sedsnet::TelemetryResult<()> {
+    router.tx_queue(abort_packet("Manual Abort Command Issued")?)
+}
+
 pub(crate) fn queue_abort_packet(router: &Router, reason: &str) -> sedsnet::TelemetryResult<()> {
     router.rx_queue(abort_packet(reason)?)
 }
@@ -94,7 +135,8 @@ pub(crate) fn queue_automatic_abort_packet(
     router: &Router,
     reason: &str,
 ) -> sedsnet::TelemetryResult<()> {
-    router.tx_queue(abort_packet(reason)?)
+    let marked = format!("SEDS_AUTO_ABORT_V1:{reason}");
+    router.tx_queue(abort_packet(&marked)?)
 }
 
 fn abort_packet(reason: &str) -> sedsnet::TelemetryResult<Packet> {
@@ -126,8 +168,9 @@ mod destination_latency_tests {
     use super::*;
     use sedsnet::router::{EndpointHandler, RouterConfig, RouterSideOptions};
 
-    #[test]
-    fn flight_actions_do_not_wait_for_an_unresponsive_recording_endpoint() {
+    #[tokio::test]
+    async fn flight_actions_do_not_wait_for_an_unresponsive_recording_endpoint() {
+        let state = crate::state::tests::test_app_state().await;
         let now = Arc::new(AtomicU64::new(0));
         let clock = now.clone();
         let audited = Arc::new(Mutex::new(Vec::new()));
@@ -216,12 +259,18 @@ mod destination_latency_tests {
                 flight_side,
             )
             .unwrap();
-        queue_locally_routed_flight_command(&station, "first fixture action", &[14]).unwrap();
+        queue_locally_routed_flight_command(&state, &station, "first fixture action", &[14])
+            .unwrap();
         for at in (0..=1000).step_by(10) {
             now.store(at, Ordering::Relaxed);
             if at == 100 {
-                queue_locally_routed_flight_command(&station, "synthetic deploy request", &[12])
-                    .unwrap();
+                queue_locally_routed_flight_command(
+                    &state,
+                    &station,
+                    "synthetic deploy request",
+                    &[12],
+                )
+                .unwrap();
             }
             for _ in 0..4 {
                 station.process_all_queues_with_timeout(0).unwrap();
@@ -252,5 +301,33 @@ mod destination_latency_tests {
                 .any(|&(command, at)| command == 12 && at <= 600),
             "a separate unresponsive SD owner must not hold an FC action behind its predecessor: {received:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod automatic_provenance_tests {
+    use super::*;
+    #[test]
+    fn only_ordinary_valves_can_have_automatic_wire_provenance() {
+        crate::telemetry_schema::initialize().unwrap();
+        for (kind, allowed) in [
+            ("ACTUATOR_COMMAND", &[9u8, 10, 12, 13][..]),
+            ("VALVE_COMMAND", &[0u8, 1, 2, 3, 4, 5][..]),
+            ("FLIGHT_COMMAND", &[][..]),
+        ] {
+            for command in 0u8..=127 {
+                let router = Router::new(sedsnet::router::RouterConfig::new([]));
+                let result = queue_automatic_controller_command(
+                    &router,
+                    crate::telemetry_schema::data_type(kind),
+                    command,
+                );
+                assert_eq!(
+                    result.is_ok(),
+                    allowed.contains(&command),
+                    "{kind}/{command}"
+                );
+            }
+        }
     }
 }

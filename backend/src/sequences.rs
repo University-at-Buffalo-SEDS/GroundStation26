@@ -552,11 +552,14 @@ fn is_fill_state(state: FlightState) -> bool {
 
 pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
     match cmd {
+        TelemetryCommand::QueuedOperator { command, .. } => command_name(command),
         TelemetryCommand::Postinit => "Postinit",
         TelemetryCommand::Launch => "Launch",
         TelemetryCommand::Dump => "Dump",
         TelemetryCommand::Abort => "Abort",
-        TelemetryCommand::AutomaticAbort => "AutomaticAbort",
+        TelemetryCommand::AutomaticAbort { .. } => "AutomaticAbort",
+        TelemetryCommand::AutomaticNitrogenClose { .. } => "AutomaticNitrogenClose",
+        TelemetryCommand::AutomaticNitrousClose { .. } => "AutomaticNitrousClose",
         TelemetryCommand::NormallyOpen => "NormallyOpen",
         TelemetryCommand::Pilot => "Pilot",
         TelemetryCommand::Igniter => "Igniter",
@@ -1300,7 +1303,11 @@ fn update_sequence_runtime(
             };
 
             if should_close && !runtime.auto_close_nitrogen_sent {
-                match state.cmd_tx.try_send(TelemetryCommand::NitrogenClose) {
+                match state
+                    .cmd_tx
+                    .try_send(TelemetryCommand::AutomaticNitrogenClose {
+                        generation: crate::gse::automatic_generation(state),
+                    }) {
                     Ok(_) => {
                         runtime.auto_close_nitrogen_sent = true;
                         match cfg.nitrogen_autoclose_mode {
@@ -1563,7 +1570,11 @@ fn update_sequence_runtime(
             });
             if let Some((target_mass_kg, fill_percent, true)) = nitrous_full_by_loadcell {
                 if !runtime.auto_close_nitrous_sent {
-                    match state.cmd_tx.try_send(TelemetryCommand::NitrousClose) {
+                    match state
+                        .cmd_tx
+                        .try_send(TelemetryCommand::AutomaticNitrousClose {
+                            generation: crate::gse::automatic_generation(state),
+                        }) {
                         Ok(_) => {
                             runtime.auto_close_nitrous_sent = true;
                             state.add_notification(format!(
@@ -1600,7 +1611,11 @@ fn update_sequence_runtime(
             ) {
                 runtime.notified_close_nitrous = false;
                 if !runtime.auto_close_nitrous_sent {
-                    match state.cmd_tx.try_send(TelemetryCommand::NitrousClose) {
+                    match state
+                        .cmd_tx
+                        .try_send(TelemetryCommand::AutomaticNitrousClose {
+                            generation: crate::gse::automatic_generation(state),
+                        }) {
                         Ok(_) => {
                             runtime.auto_close_nitrous_sent = true;
                             state.add_notification(

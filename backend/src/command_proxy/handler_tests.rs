@@ -123,7 +123,9 @@ async fn primary_actual_dispatch_rechecks_actor_policy_and_nonblocking_admission
     assert_eq!(execute_primary(state.clone(), &work).await, Outcome::Queued);
     assert!(matches!(
         rx.try_recv().unwrap(),
-        TelemetryCommand::ToggleAvBayUnderglow
+        TelemetryCommand::QueuedOperator { generation, command }
+            if generation == crate::gse::automatic_generation(&state)
+                && matches!(*command, TelemetryCommand::ToggleAvBayUnderglow)
     ));
     assert!(rx.try_recv().is_err());
     let reply = primary.finish(&p, work.clone(), Outcome::Queued).unwrap();
@@ -190,7 +192,9 @@ async fn primary_actual_dispatch_rechecks_actor_policy_and_nonblocking_admission
         Outcome::Queued
     );
     assert!(
-        matches!(rx.try_recv().unwrap(), TelemetryCommand::ToggleFlightBuzzer),
+        matches!(rx.try_recv().unwrap(), TelemetryCommand::QueuedOperator { generation, command }
+            if generation == crate::gse::automatic_generation(&state)
+                && matches!(*command, TelemetryCommand::ToggleFlightBuzzer)),
         "a refused queue slot must not be recorded as an accepted duplicate"
     );
     state.action_policy.lock().unwrap().software_buttons_enabled = false;

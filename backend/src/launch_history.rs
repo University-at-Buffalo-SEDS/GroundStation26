@@ -79,6 +79,9 @@ pub struct RecoveryEvent {
 #[serde(deny_unknown_fields)]
 struct Disk {
     version: u8,
+    /// Sticky across clock resets; only explicit board/startup recovery may clear it.
+    #[serde(default)]
+    automatic_actions_inhibited: bool,
     current: ClockRecord,
     past_sessions: Vec<ClockRecord>,
     events: Vec<RecoveryEvent>,
@@ -164,6 +167,7 @@ impl Store {
         } else {
             Disk {
                 version: 1,
+                automatic_actions_inhibited: false,
                 current: ClockRecord::fresh(),
                 past_sessions: Vec::new(),
                 events: Vec::new(),
@@ -211,6 +215,7 @@ impl Store {
             last_reset: None,
             data: Disk {
                 version: 1,
+                automatic_actions_inhibited: false,
                 current: ClockRecord::fresh(),
                 past_sessions: Vec::new(),
                 events: Vec::new(),
@@ -272,6 +277,8 @@ impl Store {
                 store.observer = role;
                 store.synchronized = false;
                 store.data.legacy_anchor_unknown = true;
+                // Unreadable launch history cannot safely re-arm automatic actions.
+                store.data.automatic_actions_inhibited = true;
                 store.error = Some(error.to_string());
                 Ok(store)
             }
@@ -288,6 +295,20 @@ impl Store {
     }
     pub fn clock_known(&self) -> bool {
         !self.data.legacy_anchor_unknown && self.error.is_none()
+    }
+    pub fn automatic_actions_inhibited(&self) -> bool {
+        self.data.automatic_actions_inhibited
+    }
+    /// Save before admitting any irreversible launch command. A failed save
+    /// still inhibits automation in RAM and prevents launch dispatch.
+    pub fn inhibit_automatic_actions(&mut self) -> Result<()> {
+        ensure!(!self.closed, "Launch journal is closed");
+        self.data.automatic_actions_inhibited = true;
+        if let Some(writer) = &self.writer {
+            self.last_write = writer.enqueue(self.data.clone())?;
+            writer.wait(self.last_write)?;
+        }
+        Ok(())
     }
     pub fn snapshot(&self) -> ClockRecord {
         self.data.current.clone()

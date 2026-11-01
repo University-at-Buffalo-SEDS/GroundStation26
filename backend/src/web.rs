@@ -278,9 +278,21 @@ mod display_history_tests {
                 row.timestamp_ms,
             );
         }
-        let full = recent_rows_for_request(input.clone(), i64::MIN, &RecentDisplayParams::default());
-        assert_eq!(full.len(), input.len(), "analysis history remains unchanged without display mode");
-        let sampled = recent_rows_for_request(input, i64::MIN, &RecentDisplayParams {display:true, max_rows:Some(12_000)});
+        let full =
+            recent_rows_for_request(input.clone(), i64::MIN, &RecentDisplayParams::default());
+        assert_eq!(
+            full.len(),
+            input.len(),
+            "analysis history remains unchanged without display mode"
+        );
+        let sampled = recent_rows_for_request(
+            input,
+            i64::MIN,
+            &RecentDisplayParams {
+                display: true,
+                max_rows: Some(12_000),
+            },
+        );
         assert!(sampled.len() <= 12_000);
         for ((sender, ty), timestamp) in latest {
             assert!(
@@ -346,7 +358,10 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/auth/logout", post(logout))
         .route("/api/recent", get(get_recent))
         .route("/api/command", post(send_command_entry))
-        .route("/api/network-health/daq/sd/retry", post(crate::daq_sd::retry))
+        .route(
+            "/api/network-health/daq/sd/retry",
+            post(crate::daq_sd::retry),
+        )
         .route("/api/rrls/control", get(crate::command_proxy::get_status))
         .route("/api/auto_zero", get(get_auto_zero).post(set_auto_zero))
         .route("/api/alerts", get(get_alerts))
@@ -2292,6 +2307,8 @@ async fn dispatch_command(
     cmd: TelemetryCommand,
     immediate_admission: bool,
 ) -> (StatusCode, &'static str) {
+    // Capture before any asynchronous reserve/send can outlive a verified reset.
+    let admission_generation = crate::gse::automatic_generation(&state);
     let cmd_name = command_name(&cmd);
     if !principal.allows_command_name(cmd_name) {
         emit_warning(
@@ -2299,6 +2316,15 @@ async fn dispatch_command(
             format!("Rejected software command {cmd:?}: session is not allowed to send {cmd_name}"),
         );
         return (StatusCode::FORBIDDEN, "command not allowed");
+    }
+    // Permission is resolved, but no ordinary-queue/GSE/disk wait may precede
+    // retention of a new manual emergency stop. The primary owns execution.
+    if matches!(cmd, TelemetryCommand::Abort) && !crate::rrls::is_rrls() {
+        state.manual_abort_intent.request();
+        return (
+            StatusCode::ACCEPTED,
+            "manual Abort intent retained; board readback required",
+        );
     }
     if !state.is_command_allowed(&cmd) {
         emit_notification_warning(
@@ -2383,10 +2409,21 @@ async fn dispatch_command(
         return (StatusCode::OK, "ok");
     }
     if let Some(permit) = permit {
-        permit.send(cmd);
+        permit.send(TelemetryCommand::QueuedOperator {
+            generation: admission_generation,
+            command: Box::new(cmd),
+        });
         return (StatusCode::OK, "ok");
     }
-    if state.cmd_tx.send(cmd).await.is_err() {
+    if state
+        .cmd_tx
+        .send(TelemetryCommand::QueuedOperator {
+            generation: admission_generation,
+            command: Box::new(cmd),
+        })
+        .await
+        .is_err()
+    {
         emit_notification_warning(&state, "Command worker unavailable; command was not queued");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2470,11 +2507,42 @@ mod command_dispatch_tests {
         )
         .await;
         assert_eq!(result.0, StatusCode::OK);
-        assert!(matches!(rx.try_recv(), Ok(TelemetryCommand::Postinit)));
+        let queued = rx.try_recv().unwrap();
+        assert!(
+            matches!(queued, TelemetryCommand::QueuedOperator { generation, command }
+            if generation == crate::gse::automatic_generation(&state)
+                && matches!(*command, TelemetryCommand::Postinit))
+        );
+        // Full ordinary capacity cannot delay authenticated emergency retention.
+        for _ in 0..4 {
+            state.cmd_tx.try_send(TelemetryCommand::Postinit).unwrap();
+        }
+        let principal = authorize_headers(&state, &headers, Permission::SendCommands)
+            .await
+            .unwrap();
+        use futures::FutureExt;
+        let retained =
+            dispatch_authorized_command(state.clone(), principal, TelemetryCommand::Abort)
+                .now_or_never()
+                .expect("manual intent retention must not await ordinary capacity");
+        assert_eq!(retained.0, StatusCode::ACCEPTED);
+        let epoch = state.manual_abort_intent.epoch();
+        assert!(epoch > 0);
         drop(rx);
-        // A separate command avoids the intentional button-repeat suppression.
-        let result = send_command(State(state), headers, Json(TelemetryCommand::Abort)).await;
-        assert_eq!(result.0, StatusCode::SERVICE_UNAVAILABLE);
+        state.last_command_ms.lock().unwrap().clear();
+        let lost = send_command(
+            State(state.clone()),
+            headers.clone(),
+            Json(TelemetryCommand::Postinit),
+        )
+        .await;
+        assert_eq!(lost.0, StatusCode::SERVICE_UNAVAILABLE);
+        // Abort owns an independent retained lane even when the ordinary worker
+        // has closed. Acceptance means retained intent, not board confirmation.
+        let result =
+            send_command(State(state.clone()), headers, Json(TelemetryCommand::Abort)).await;
+        assert_eq!(result.0, StatusCode::ACCEPTED);
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
     }
 }
 
@@ -2513,10 +2581,19 @@ struct WsCommand {
     cmd: TelemetryCommand,
 }
 
-fn new_notification_events(history: &[PersistentNotification], last_id: &mut u64) -> Vec<PersistentNotification> {
-    let mut events: Vec<_> = history.iter().filter(|n| n.id > *last_id).cloned().collect();
+fn new_notification_events(
+    history: &[PersistentNotification],
+    last_id: &mut u64,
+) -> Vec<PersistentNotification> {
+    let mut events: Vec<_> = history
+        .iter()
+        .filter(|n| n.id > *last_id)
+        .cloned()
+        .collect();
     events.sort_by_key(|n| n.id);
-    if let Some(event) = events.last() { *last_id = event.id; }
+    if let Some(event) = events.last() {
+        *last_id = event.id;
+    }
     events
 }
 
@@ -2524,7 +2601,14 @@ fn new_notification_events(history: &[PersistentNotification], last_id: &mut u64
 mod notification_delivery_tests {
     use super::*;
     fn notice(id: u64) -> PersistentNotification {
-        PersistentNotification {id, timestamp_ms:id as i64, message:"T clock reset".into(), persistent:false, action_label:None, action_cmd:None}
+        PersistentNotification {
+            id,
+            timestamp_ms: id as i64,
+            message: "T clock reset".into(),
+            persistent: false,
+            action_label: None,
+            action_cmd: None,
+        }
     }
     #[test]
     fn connection_history_and_repeated_snapshots_do_not_replay_events() {
@@ -2539,7 +2623,10 @@ mod notification_delivery_tests {
         assert!(new_notification_events(&history, &mut reconnect_cutoff).is_empty());
         let live = serde_json::to_value(WsOutMsg::Notification(notice(4))).unwrap();
         assert_eq!(live["ty"], "Notification");
-        assert_eq!(serde_json::to_value(WsOutMsg::Notifications(history)).unwrap()["ty"], "Notifications");
+        assert_eq!(
+            serde_json::to_value(WsOutMsg::Notifications(history)).unwrap()["ty"],
+            "Notifications"
+        );
     }
 }
 
@@ -2760,10 +2847,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
     let send_task = async move {
         let notification_history = state_for_send.notifications_snapshot();
         let mut last_notification_id = notification_history.iter().map(|n| n.id).max().unwrap_or(0);
-        let initial_notifications = serde_json::to_string(&WsOutMsg::Notifications(
-            notification_history,
-        ))
-        .unwrap_or_default();
+        let initial_notifications =
+            serde_json::to_string(&WsOutMsg::Notifications(notification_history))
+                .unwrap_or_default();
         if ws_out_tx.send(initial_notifications).await.is_err() {
             return;
         }
@@ -3309,6 +3395,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
                 }
                 match serde_json::from_str::<WsCommand>(&text) {
                     Ok(cmd) => {
+                        let admission_generation =
+                            crate::gse::automatic_generation(&state_for_recv);
                         if !principal.permissions.send_commands {
                             emit_warning(
                                 &state_for_recv,
@@ -3328,6 +3416,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
                                     cmd.cmd, cmd_name
                                 ),
                             );
+                            continue;
+                        }
+                        if matches!(cmd.cmd, TelemetryCommand::Abort) && !crate::rrls::is_rrls() {
+                            state_for_recv.manual_abort_intent.request();
                             continue;
                         }
                         if !state_for_recv.is_command_allowed(&cmd.cmd) {
@@ -3393,7 +3485,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
                             "\x1b[32mWebsocket command received: {:?}\x1b[0m",
                             received_cmd
                         );
-                        if let Err(e) = cmd_tx.send(received_cmd).await {
+                        if let Err(e) = cmd_tx
+                            .send(TelemetryCommand::QueuedOperator {
+                                generation: admission_generation,
+                                command: Box::new(received_cmd),
+                            })
+                            .await
+                        {
                             emit_notification_warning(
                                 &state_for_recv,
                                 "Command worker unavailable; command was not queued",

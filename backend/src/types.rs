@@ -89,7 +89,26 @@ pub enum TelemetryCommand {
     NitrogenTest,
     /// Internal producer intent; never accepted as a client command.
     #[serde(skip)]
-    AutomaticAbort,
+    // Production SafetyTask uses direct claimed TX; retain this queued-intent
+    // boundary for its real-worker regression without adding production delay.
+    #[cfg_attr(not(test), allow(dead_code))]
+    AutomaticAbort {
+        generation: u64,
+    },
+    /// Authenticated server admission envelope; never accepted from a client.
+    #[serde(skip)]
+    QueuedOperator {
+        generation: u64,
+        command: Box<TelemetryCommand>,
+    },
+    #[serde(skip)]
+    AutomaticNitrogenClose {
+        generation: u64,
+    },
+    #[serde(skip)]
+    AutomaticNitrousClose {
+        generation: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
@@ -422,7 +441,10 @@ pub(crate) fn normalize_phase_map<T: Clone>(
     let mut next = std::collections::BTreeMap::new();
     for (phase, value) in phases.iter() {
         if next
-            .insert(canonical_phase_key(phase, version).to_owned(), value.clone())
+            .insert(
+                canonical_phase_key(phase, version).to_owned(),
+                value.clone(),
+            )
             .is_some()
         {
             return Err("Conflicting legacy and current flight phase names");
@@ -439,11 +461,15 @@ mod flight_state_wire_tests {
 
     #[test]
     fn every_wire_state_matches_the_captured_fc_producer_contract() {
-        let contract: serde_json::Value = serde_json::from_str(include_str!(
-            "test-fixtures/fc-global-state-contract.json"
-        ))
-        .unwrap();
-        for (wire, expected) in contract["global_states"].as_array().unwrap().iter().enumerate() {
+        let contract: serde_json::Value =
+            serde_json::from_str(include_str!("test-fixtures/fc-global-state-contract.json"))
+                .unwrap();
+        for (wire, expected) in contract["global_states"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
             let state = u8_to_flight_state(wire as u8).unwrap();
             assert_eq!(state as usize, wire);
             assert_eq!(serde_json::to_value(state).unwrap(), *expected);
@@ -457,11 +483,12 @@ mod flight_state_wire_tests {
 
     #[test]
     fn legacy_phase_settings_preserve_numeric_meaning_without_repeated_migration() {
-        let mut phases = BTreeMap::from([
-            ("ParachuteDeploy".into(), 11), ("Descent".into(), 12),
-        ]);
+        let mut phases = BTreeMap::from([("ParachuteDeploy".into(), 11), ("Descent".into(), 12)]);
         normalize_phase_map(&mut phases, 0).unwrap();
-        assert_eq!(phases, BTreeMap::from([("Descent".into(), 11), ("Reefing".into(), 12)]));
+        assert_eq!(
+            phases,
+            BTreeMap::from([("Descent".into(), 11), ("Reefing".into(), 12)])
+        );
         let migrated = phases.clone();
         normalize_phase_map(&mut phases, FLIGHT_PHASE_VERSION).unwrap();
         assert_eq!(phases, migrated);
@@ -499,4 +526,15 @@ pub struct NetworkTrafficSide {
     pub totals: NetworkTopologyStats,
     /// Absent until two samples exist, or if the side/counters reset.
     pub delta: Option<NetworkTopologyStats>,
+}
+
+impl TelemetryCommand {
+    pub(crate) fn automatic_generation(&self) -> Option<u64> {
+        match self {
+            Self::AutomaticAbort { generation }
+            | Self::AutomaticNitrogenClose { generation }
+            | Self::AutomaticNitrousClose { generation } => Some(*generation),
+            _ => None,
+        }
+    }
 }

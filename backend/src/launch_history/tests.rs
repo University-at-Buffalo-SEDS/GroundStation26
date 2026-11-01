@@ -425,3 +425,20 @@ fn shutdown_barrier_flushes_all_prior_events_and_rejects_late_commits() {
     assert_eq!(reopened.events(), vec![event]);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn launch_inhibition_survives_clock_reset_and_process_restart() {
+    let path = path();
+    let mut store = Store::open(path.clone(), false, None, 10_000, 0).unwrap();
+    assert!(!store.automatic_actions_inhibited());
+    store.inhibit_automatic_actions().unwrap();
+    store.reset_primary(11_000, 1000).unwrap();
+    wait(&store);
+    drop(store);
+    let restored = Store::open(path.clone(), false, None, 12_000, 0).unwrap();
+    assert!(
+        restored.automatic_actions_inhibited(),
+        "resetting the countdown must not re-arm aborts"
+    );
+    std::fs::remove_file(path).unwrap();
+}

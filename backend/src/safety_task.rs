@@ -644,6 +644,10 @@ pub async fn safety_task(
                     pending_abort = None;
                     first_abort_reason = None;
                 }
+                SafetyDispatch::RecoverableFaultCancelled => {
+                    pending_abort = None;
+                    first_abort_reason = None;
+                }
                 SafetyDispatch::Unavailable => {}
             }
         }
@@ -664,6 +668,7 @@ pub(crate) fn dispatch_safety_abort(state: &Arc<AppState>, router: &Router) -> b
 enum SafetyDispatch {
     Claimed,
     IdleLivenessCancelled(FlightState),
+    RecoverableFaultCancelled,
     Unavailable,
 }
 
@@ -672,6 +677,12 @@ fn dispatch_safety_abort_reason(
     router: &Router,
     reason: &SafetyAbortReason,
 ) -> SafetyDispatch {
+    // GENERIC_ERROR has no severity contract. It is not evidence of a massive,
+    // unrecoverable hazard; preserve diagnostics and cancel fill, never global Abort.
+    if matches!(reason, SafetyAbortReason::GenericError { .. }) {
+        crate::gse::cancel_fill_for_recoverable_fault(state, "board reported an unclassified error");
+        return SafetyDispatch::RecoverableFaultCancelled;
+    }
     let claim = if matches!(reason, SafetyAbortReason::BoardOffline { .. }) {
         match crate::gse::claim_liveness_abort(state) {
             crate::gse::LivenessAbortDecision::Claimed(claim) => claim,
@@ -723,9 +734,9 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn actual_safety_task_preserves_faults_and_cancels_only_idle_liveness() {
+    async fn actual_safety_task_cancels_unclassified_faults_and_idle_liveness() {
         const CHILD: &str = "GS_ACTUAL_LIVENESS_POLICY_CHILD";
-        const NAME: &str = "safety_task::tests::actual_safety_task_preserves_faults_and_cancels_only_idle_liveness";
+        const NAME: &str = "safety_task::tests::actual_safety_task_cancels_unclassified_faults_and_idle_liveness";
         if std::env::var_os(CHILD).is_none() {
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
@@ -748,9 +759,9 @@ mod tests {
         for (stage, generic, transition_idle, expect_abort) in [
             (FlightState::Idle, false, false, false),
             (FlightState::PreFill, false, false, true),
-            (FlightState::Idle, true, false, true),
+            (FlightState::Idle, true, false, false),
             (FlightState::PreFill, false, true, false),
-            (FlightState::PreFill, true, true, true),
+            (FlightState::PreFill, true, true, false),
         ] {
             actual_safety_scene(stage, generic, transition_idle, expect_abort).await;
         }

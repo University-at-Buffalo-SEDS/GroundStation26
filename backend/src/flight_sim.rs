@@ -617,7 +617,10 @@ impl FlightSimState {
         match cmd {
             // Only telemetry_task may authorize and normalize this internal
             // intent; direct model calls must not bypass the dispatch check.
-            TelemetryCommand::AutomaticAbort => return false,
+            TelemetryCommand::QueuedOperator { .. }
+            | TelemetryCommand::AutomaticAbort { .. }
+            | TelemetryCommand::AutomaticNitrogenClose { .. }
+            | TelemetryCommand::AutomaticNitrousClose { .. } => return false,
             TelemetryCommand::Abort => {
                 self.launch_sequence_started_ms = None;
                 self.actuator_igniter_sequence_started_ms = None;
@@ -1516,12 +1519,49 @@ pub fn _next_state_aware_packet() -> TelemetryResult<Option<Packet>> {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn retained_stop_orders_actual_testing_model_launch_and_visual_idle_does_not_rearm() {
+        let state = crate::state::tests::test_app_state().await;
+        let mut model = super::FlightSimState::new();
+        model.flight_state = crate::types::FlightState::Armed;
+        let ticket = crate::gse::inhibit_automatic_actions_for_launch(&state).unwrap();
+        state.manual_abort_intent.request();
+        assert!(
+            crate::gse::admit_simulated_launch(&state, ticket, || model
+                .apply_command(&crate::types::TelemetryCommand::Launch, 1000))
+            .is_err()
+        );
+        assert_eq!(model.flight_state, crate::types::FlightState::Armed);
+        let current = crate::state::tests::test_app_state().await;
+        let ticket = crate::gse::inhibit_automatic_actions_for_launch(&current).unwrap();
+        crate::gse::admit_simulated_launch(&current, ticket, || {
+            model.apply_command(&crate::types::TelemetryCommand::Launch, 1000)
+        })
+        .unwrap();
+        assert_eq!(model.flight_state, crate::types::FlightState::Launch);
+        model.flight_state = crate::types::FlightState::Idle;
+        current.set_local_flight_state(crate::types::FlightState::Idle);
+        assert!(crate::gse::inhibit_automatic_actions_for_launch(&current).is_err());
+        assert!(
+            crate::telemetry_task::command_at_dispatch(
+                &current,
+                crate::types::TelemetryCommand::AutomaticAbort {
+                    generation: crate::gse::automatic_generation(&current)
+                }
+            )
+            .is_none()
+        );
+    }
+    #[cfg(feature = "testing")]
     #[test]
     fn automatic_abort_intent_requires_the_normal_dispatch_guard() {
         let mut sim = super::FlightSimState::new();
         let valves = sim.valves.clone();
         let flight_state = sim.flight_state;
-        assert!(!sim.apply_command(&crate::types::TelemetryCommand::AutomaticAbort, 1_000));
+        assert!(!sim.apply_command(
+            &crate::types::TelemetryCommand::AutomaticAbort { generation: 1 },
+            1_000
+        ));
         assert_eq!(sim.valves, valves);
         assert_eq!(sim.flight_state, flight_state);
     }

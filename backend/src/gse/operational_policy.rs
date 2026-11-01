@@ -12,10 +12,12 @@ pub(super) fn operational_action_allowed(rt: &Runtime, action: Action) -> bool {
         Action::StartFill => Milestone::FillTarget,
         _ => unreachable!(),
     };
-    !rt.operational.saved.automatic_abort_claimed && crate::checklists::paired::qualification_allowed(
-        rt.operational.saved.checklist_digest.as_deref(),
-        rt.operational.has_checklist_evidence(),
-    ) && rt.operational.saved.pending_checklists.is_empty()
+    !rt.operational.saved.automatic_abort_claimed
+        && crate::checklists::paired::qualification_allowed(
+            rt.operational.saved.checklist_digest.as_deref(),
+            rt.operational.has_checklist_evidence(),
+        )
+        && rt.operational.saved.pending_checklists.is_empty()
         && rt.operational.topology_stable
         && rt.operational.startup_configured
         && rt.operational.persist_error.is_none()
@@ -34,10 +36,12 @@ fn flight_routes(state: &AppState) -> bool {
 pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool {
     let now = rt.now();
     let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
-    !rt.operational.saved.automatic_abort_claimed && crate::checklists::paired::qualification_allowed(
-        rt.operational.saved.checklist_digest.as_deref(),
-        rt.operational.has_checklist_evidence(),
-    ) && rt.operational.saved.pending_checklists.is_empty()
+    !rt.operational.saved.automatic_abort_claimed
+        && crate::checklists::paired::qualification_allowed(
+            rt.operational.saved.checklist_digest.as_deref(),
+            rt.operational.has_checklist_evidence(),
+        )
+        && rt.operational.saved.pending_checklists.is_empty()
         && rt.operational.saved.qualification.launch_qualified()
         && rt.operational.persist_error.is_none()
         && rt.operational.topology_stable
@@ -121,6 +125,23 @@ pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase)
     let phase = rt.engine.status.phase;
     if previous == phase || !rt.operational.running {
         return;
+    }
+    if phase == Phase::CancelSetup
+        && matches!(
+            previous,
+            Phase::Baseline | Phase::Raising | Phase::Settling | Phase::Holding
+        )
+    {
+        // A cancelled/inconclusive nitrogen test cannot retain an older pass.
+        if let Err(error) = rt.operational.saved.qualification.invalidate_nitrogen() {
+            rt.operational
+                .saved
+                .qualification
+                .latch(Fault::MissingTelemetry);
+            rt.engine.status.message = error.into();
+        }
+        rt.operational.run_generation = rt.operational.saved.qualification.generation();
+        let _ = rt.operational.persist();
     }
     let milestone = if previous == Phase::SelfFinish && phase == Phase::Idle {
         rt.operational.saved.baseline = rt.engine.status.baseline.clone();
@@ -207,7 +228,9 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
             == gse_sequence::qualification::MissionStage::Fire
             || rt.operational.saved.automatic_abort_claimed
     };
-    if blocked { return true; }
+    if blocked {
+        return true;
+    }
     let stage = *state.state.lock().unwrap();
     // No GroundStation-generated abort or valve correction from Launch onward.
     if !matches!(
@@ -225,6 +248,8 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
     let (healthy, key) = topology(state);
     let mut effects = Effects::default();
     let mut launch = false;
+    // operational_tick executes under DISPATCH_GATE; never mint a later token.
+    let launch_generation = crate::gse::automatic_generation(state);
     let mut rt = state.gse.lock().unwrap();
     let now = rt.now();
     rt.operational.topology(now, healthy, key);
@@ -295,7 +320,15 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
     let skip = !rt.operational.running || !effects.valves.is_empty();
     drop(rt);
     apply(state, effects);
-    if launch && state.cmd_tx.try_send(TelemetryCommand::Launch).is_err() {
+    if launch
+        && state
+            .cmd_tx
+            .try_send(TelemetryCommand::QueuedOperator {
+                generation: launch_generation,
+                command: Box::new(TelemetryCommand::Launch),
+            })
+            .is_err()
+    {
         state.add_notification("Queued launch was not dispatched: command queue unavailable");
     }
     skip
@@ -366,7 +399,24 @@ pub(super) fn handle_operational_command(state: &Arc<AppState>, cmd: &TelemetryC
 }
 
 pub(super) fn check_report_safety(state: &Arc<AppState>) {
-    if state.gse.lock().unwrap().operational.saved.automatic_abort_claimed { return; }
+    if state
+        .launch_history
+        .lock()
+        .unwrap()
+        .automatic_actions_inhibited()
+    {
+        return;
+    }
+    if state
+        .gse
+        .lock()
+        .unwrap()
+        .operational
+        .saved
+        .automatic_abort_claimed
+    {
+        return;
+    }
     if state
         .gse
         .lock()
@@ -518,6 +568,62 @@ mod tests {
         policy.software_buttons_enabled = true;
         state.set_action_policy(policy);
         state
+    }
+    #[tokio::test]
+    async fn cancelled_leak_test_invalidates_old_pass_without_aborting_vehicle() {
+        let state = fixture().await;
+        {
+            let mut rt = state.gse.lock().unwrap();
+            let generation = rt.operational.saved.qualification.generation();
+            for milestone in [
+                Milestone::SelfTest,
+                Milestone::NitrogenTest,
+                Milestone::FillTarget,
+            ] {
+                rt.operational
+                    .saved
+                    .qualification
+                    .complete(milestone, generation)
+                    .unwrap();
+            }
+            rt.operational.running = true;
+            rt.engine.status.phase = Phase::Holding;
+            let now = rt.now();
+            let _ = rt.engine.cancel_failed_test(now, "small hold leak");
+            complete_operational_milestones(&mut rt, Phase::Holding);
+            assert!(rt.operational.saved.qualification.generation() > generation);
+            assert!(rt.operational.saved.qualification.fault().is_none());
+            assert!(
+                rt.operational
+                    .saved
+                    .qualification
+                    .completed(Milestone::SelfTest)
+            );
+            assert!(!rt.operational.saved.qualification.nitrogen_satisfied());
+            assert!(
+                !rt.operational
+                    .saved
+                    .qualification
+                    .completed(Milestone::FillTarget)
+            );
+            assert!(
+                rt.operational
+                    .saved
+                    .qualification
+                    .complete(Milestone::NitrogenTest, generation)
+                    .is_err(),
+                "a delayed completion from the cancelled test cannot restore its pass"
+            );
+            rt.engine.status.phase = Phase::Cancelled;
+            complete_operational_milestones(&mut rt, Phase::CancelSetup);
+            assert_eq!(
+                rt.engine.status.phase,
+                Phase::Cancelled,
+                "old pass must not restore Passed"
+            );
+        }
+        assert!(!state.abort_indicator_latched());
+        cleanup(&state);
     }
     fn cleanup(state: &AppState) {
         if let Some(path) = &state.gse.lock().unwrap().operational.path {
@@ -738,12 +844,18 @@ mod tests {
                     let commands = sent.lock().unwrap();
                     for (kind, bytes) in &commands[consumed..] {
                         assert_eq!(bytes.len(), 1);
+                        assert_ne!(
+                            bytes[0] & 0x80,
+                            0,
+                            "routed automatic valves retain their origin"
+                        );
+                        let command = bytes[0] & 0x7f;
                         let candidates = if kind == "VALVE_COMMAND" { 0..3 } else { 3..5 };
                         let index = candidates
                             .into_iter()
-                            .find(|&i| bytes[0] == OPEN[i] || bytes[0] == CLOSE[i])
+                            .find(|&i| command == OPEN[i] || command == CLOSE[i])
                             .expect("only GSE valves are actuated");
-                        valves[index] = bytes[0] == OPEN[index];
+                        valves[index] = command == OPEN[index];
                     }
                     consumed = commands.len();
                 }
@@ -1240,7 +1352,10 @@ mod tests {
             drop(rt);
             operational_tick(&state, true);
             if should_launch {
-                assert!(matches!(received.try_recv(), Ok(TelemetryCommand::Launch)));
+                assert!(matches!(received.try_recv(),
+                    Ok(TelemetryCommand::QueuedOperator { generation, command })
+                        if generation == crate::gse::automatic_generation(&state)
+                            && matches!(*command, TelemetryCommand::Launch)));
             } else {
                 assert!(received.try_recv().is_err());
             }
@@ -1381,8 +1496,13 @@ mod tests {
         state.set_local_flight_state(FlightState::Idle);
         assert!(!automatic_abort_allowed(&state));
         assert!(
-            crate::telemetry_task::command_at_dispatch(&state, TelemetryCommand::AutomaticAbort)
-                .is_none(),
+            crate::telemetry_task::command_at_dispatch(
+                &state,
+                TelemetryCommand::AutomaticAbort {
+                    generation: crate::gse::automatic_generation(&state)
+                }
+            )
+            .is_none(),
             "Delayed automatic abort must stay blocked after durable Fire even if local state restarted Idle"
         );
         assert!(

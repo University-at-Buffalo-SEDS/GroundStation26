@@ -305,24 +305,15 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
                     // Refresh the fill controller with the newly zeroed mass before start.
                     state.gse.lock().unwrap().observe_mass(Some(0.0));
                     *state.latest_fill_mass_kg.lock().unwrap() = Some(0.0);
-                    crate::gse::handle_command(&state, &TelemetryCommand::StartFill);
+                    crate::gse::start_fill_after_automatic_zero(&state);
                 }
             }
             Err(e) => {
-                let request_abort = !fill && crate::gse::automatic_abort_allowed(&state);
                 state.add_notification(format!(
                     "Automatic zero failed: {e}. {}",
-                    if fill {
-                        "Fill was not started."
-                    } else if request_abort {
-                        "Launch abort requested."
-                    } else {
-                        "Previous tare retained; no automatic abort after entering Launch."
-                    }
+                    if fill { "Fill was not started." } else { "Previous tare retained; manual zero required." }
                 ));
-                if request_abort {
-                    let _ = state.cmd_tx.send(TelemetryCommand::AutomaticAbort).await;
-                }
+                crate::gse::cancel_fill_for_recoverable_fault(&state, "automatic zero failed");
             }
         }
     });

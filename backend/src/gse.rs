@@ -1,3 +1,4 @@
+use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
 mod automatic_abort;
 #[cfg(test)]
 mod rrls_http_tests;
@@ -140,7 +141,6 @@ pub struct Runtime {
     ground_station_control: bool,
     manual_control: bool,
     effects_queued: bool,
-    #[cfg(not(feature = "hitl_mode"))]
     automatic_abort_in_flight: bool,
 }
 impl Default for Runtime {
@@ -163,7 +163,6 @@ impl Default for Runtime {
             ground_station_control: true,
             manual_control: false,
             effects_queued: false,
-            #[cfg(not(feature = "hitl_mode"))]
             automatic_abort_in_flight: false,
         }
     }
@@ -230,7 +229,8 @@ impl Runtime {
     /// Actual valve reports and their source ages; command intent is never evidence.
     pub(crate) fn mirror_valves(&self) -> [Option<(bool, u64)>; 5] {
         let now = self.now();
-        self.valves.map(|value| value.map(|v| (v.open, now.saturating_sub(v.at_ms))))
+        self.valves
+            .map(|value| value.map(|v| (v.open, now.saturating_sub(v.at_ms))))
     }
 
     /// Imported calibration must not invalidate an active or already-qualified
@@ -355,7 +355,13 @@ impl Runtime {
         // Processing or lock delay must never renew capture freshness.
         let now = match receipt.simulation_ms {
             Some(now) => now,
-            None => u64::try_from(receipt.monotonic_at.checked_duration_since(self.clock)?.as_millis()).ok()?,
+            None => u64::try_from(
+                receipt
+                    .monotonic_at
+                    .checked_duration_since(self.clock)?
+                    .as_millis(),
+            )
+            .ok()?,
         };
         let mut history = self.last_valve_captures[index];
         let at_ms = history.admit(
@@ -492,11 +498,15 @@ pub fn initialize(state: &AppState) {
                 rt.operational.startup_configured = true;
                 rt.engine.claimed = true;
                 rt.engine.status.phase = Phase::Fault;
-                rt.engine.status.message = "Automatic abort remains latched; clear GSE abort before another operation".into();
+                rt.engine.status.message =
+                    "Automatic abort remains latched; clear GSE abort before another operation"
+                        .into();
             }
             claimed
         };
-        if claimed { state.set_local_flight_state(FlightState::Aborted); }
+        if claimed {
+            state.set_local_flight_state(FlightState::Aborted);
+        }
     }
     match std::fs::read(config_path())
         .map_err(|e| e.to_string())
@@ -750,7 +760,12 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
                     "ACTUATOR_COMMAND"
                 });
                 let payload = if open { OPEN[index] } else { CLOSE[index] };
-                if let Err(err) = crate::telemetry_task::queue_controller_command(router, kind, &[payload]) {
+                let queued =
+                    queue_controller_with_stop_fence(state, router, kind, &[payload | 0x80]);
+                if matches!(queued, Ok(false)) {
+                    continue;
+                }
+                if let Err(err) = queued {
                     log::error!("GSE command failed: {err}");
                     let recovery = {
                         let mut rt = state.gse.lock().unwrap();
@@ -770,10 +785,10 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
                     };
                     // Best effort closes only; never continue opening a supply after an error.
                     for (index, _) in recovery.valves.into_iter().filter(|(index, _)| *index >= 3) {
-                        let _ = crate::telemetry_task::queue_controller_command(
+                        let _ = crate::telemetry_task::queue_automatic_controller_command(
                             router,
                             crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
-                            &[CLOSE[index]],
+                            CLOSE[index],
                         );
                     }
                     state.add_notification(
@@ -973,6 +988,57 @@ fn remember_automatic_cutoff_target(runtime: &mut Runtime, mass: f32, target: f3
         runtime.operational.target_reached = Some(target);
     }
 }
+/// Admit a late asynchronous fill completion through the same launch gate.
+pub(crate) fn start_fill_after_automatic_zero(state: &Arc<AppState>) {
+    {
+        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        if !automatic_abort_allowed(state) {
+            return;
+        }
+        handle_command_inner(state, &TelemetryCommand::StartFill);
+    }
+    flush_effects(state);
+}
+
+pub(crate) fn queue_automatic_supply_close(
+    state: &Arc<AppState>,
+    router: &sedsnet::router::Router,
+    command: u8,
+    generation: u64,
+) -> sedsnet::TelemetryResult<bool> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if generation != automatic_generation(state) || !automatic_abort_allowed(state) {
+        return Ok(false);
+    }
+    crate::telemetry_task::queue_automatic_controller_command(
+        router,
+        crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
+        command,
+    )?;
+    Ok(true)
+}
+
+/// Recoverable/unclassified faults cancel an active fill instead of latching
+/// the entire vehicle aborted. Serialize with launch so no delayed cancel can
+/// close a supply after Fire admission.
+pub(crate) fn cancel_fill_for_recoverable_fault(state: &Arc<AppState>, reason: &str) {
+    {
+        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        if !automatic_abort_allowed(state) {
+            return;
+        }
+        let active = {
+            let rt = state.gse.lock().unwrap();
+            rt.engine.active() || rt.fill_trim.is_some()
+        };
+        if active && prelaunch(state) {
+            handle_command_inner(state, &TelemetryCommand::CancelFill);
+            state.add_temporary_notification(format!("Fill cancelled: {reason}"));
+        }
+    }
+    flush_effects(state);
+}
+
 pub fn tick(state: &Arc<AppState>, interlock: bool) {
     {
         let _dispatch = DISPATCH_GATE.lock().unwrap();
@@ -981,6 +1047,14 @@ pub fn tick(state: &Arc<AppState>, interlock: bool) {
     flush_effects(state);
 }
 fn tick_inner(state: &Arc<AppState>, interlock: bool) {
+    if state
+        .launch_history
+        .lock()
+        .unwrap()
+        .automatic_actions_inhibited()
+    {
+        return;
+    }
     #[cfg(not(feature = "hitl_mode"))]
     if operational_tick(state, interlock) {
         return;
@@ -1327,7 +1401,8 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             serde_json::to_value(rt.operational.saved.qualification.stage()).unwrap();
         response["topology_stable"] = serde_json::json!(rt.operational.topology_stable);
         response["storage_error"] = serde_json::json!(rt.operational.persist_error);
-        response["automatic_abort_claimed"] = serde_json::json!(rt.operational.saved.automatic_abort_claimed);
+        response["automatic_abort_claimed"] =
+            serde_json::json!(rt.operational.saved.automatic_abort_claimed);
         response["launch_queued"] = serde_json::json!(rt.operational.qd.queued());
         response["qd"] = serde_json::json!(format!("{:?}", rt.operational.qd.status(rt.now())));
     }
@@ -1709,7 +1784,7 @@ mod tests {
         assert_eq!(
             before,
             vec![
-                ("ACTUATOR_COMMAND".into(), vec![9]),
+                ("ACTUATOR_COMMAND".into(), vec![9 | 0x80]),
                 ("ACTUATOR_COMMAND".into(), vec![12])
             ]
         );
@@ -1747,12 +1822,19 @@ mod tests {
             {
                 let commands = sent.lock().unwrap();
                 for (kind, bytes) in &commands[consumed..] {
+                    assert_eq!(bytes.len(), 1);
+                    assert_ne!(
+                        bytes[0] & 0x80,
+                        0,
+                        "automatic provenance must survive the wire"
+                    );
+                    let command = bytes[0] & 0x7f;
                     let indices = if kind == "VALVE_COMMAND" { 0..3 } else { 3..5 };
                     let i = indices
                         .into_iter()
-                        .find(|i| bytes[0] == OPEN[*i] || bytes[0] == CLOSE[*i])
+                        .find(|i| command == OPEN[*i] || command == CLOSE[*i])
                         .unwrap();
-                    valves[i] = bytes[0] == OPEN[i];
+                    valves[i] = command == OPEN[i];
                 }
                 consumed = commands.len();
             }
@@ -1792,7 +1874,7 @@ mod tests {
         pump_test_link(&state, &peer);
         assert_eq!(
             *sent.lock().unwrap(),
-            vec![("ACTUATOR_COMMAND".into(), vec![12])],
+            vec![("ACTUATOR_COMMAND".into(), vec![12 | 0x80])],
             "serial close admission must precede later targets"
         );
         drive_button_phase(&state, &sent, &peer, Phase::Baseline, 0.);
@@ -1827,7 +1909,7 @@ mod tests {
         assert!(
             sent.lock()
                 .unwrap()
-                .contains(&("ACTUATOR_COMMAND".into(), vec![10]))
+                .contains(&("ACTUATOR_COMMAND".into(), vec![10 | 0x80]))
         );
         let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
         {
@@ -2080,8 +2162,12 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
     let mut rt = state.gse.lock().unwrap();
     let aborted = *state.state.lock().unwrap() == FlightState::Aborted;
     #[cfg(not(feature = "hitl_mode"))]
-    let aborted = aborted || (rt.operational.saved.automatic_abort_claimed
-        && matches!(state.local_flight_state_snapshot(), FlightState::Startup | FlightState::Idle | FlightState::Armed));
+    let aborted = aborted
+        || (rt.operational.saved.automatic_abort_claimed
+            && matches!(
+                state.local_flight_state_snapshot(),
+                FlightState::Startup | FlightState::Idle | FlightState::Armed
+            ));
     if !aborted {
         return Err((StatusCode::CONFLICT, "GroundStation is not aborted".into()));
     }
@@ -2113,7 +2199,8 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
     // inspected. Do not hold GSE across router/transport locks or callbacks.
     drop(rt);
     let router = state.topology_router.get().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE, "Network is not initialized".into(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Network is not initialized".into(),
     ))?;
     #[cfg(not(feature = "hitl_mode"))]
     if router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT"))
@@ -2170,7 +2257,8 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut rt = state.gse.lock().unwrap();
     #[cfg(not(feature = "hitl_mode"))]
-    rt.operational.clear_automatic_abort_claim()
+    rt.operational
+        .clear_automatic_abort_claim()
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let config = rt.engine.config.clone();
     rt.engine = Engine::default();
@@ -2281,12 +2369,44 @@ pub(crate) fn set_operational_prerequisites_for_test(state: &AppState) {
 /// All GroundStation automatic abort producers share this stage boundary.
 /// Manual Abort remains a separate operator command.
 pub fn automatic_abort_allowed(state: &AppState) -> bool {
+    // A retained manual Stop supersedes new automatic intent. Do not use the
+    // shared indicator here: the already-claimed automatic path sets it before
+    // its own final SDK admission. Unsafe output admission has its own fence.
+    if state.manual_abort_intent.pending_epoch().is_some() || state.deferred_abort.manual_pending()
+    {
+        return false;
+    }
     #[cfg(feature = "hitl_mode")]
-    { let _ = state; true }
+    {
+        let _runtime = state.gse.lock().unwrap();
+        !state
+            .launch_history
+            .lock()
+            .unwrap()
+            .automatic_actions_inhibited()
+            && matches!(
+                state.local_flight_state_snapshot(),
+                FlightState::Startup
+                    | FlightState::Idle
+                    | FlightState::PreFill
+                    | FlightState::FillTest
+                    | FlightState::NitrogenFill
+                    | FlightState::NitrousFill
+                    | FlightState::Armed
+            )
+    }
     #[cfg(not(feature = "hitl_mode"))]
     {
         let rt = state.gse.lock().unwrap();
-        automatic_abort::stage_allows_automatic_abort(&rt, state.local_flight_state_snapshot())
+        !state
+            .launch_history
+            .lock()
+            .unwrap()
+            .automatic_actions_inhibited()
+            && automatic_abort::stage_allows_automatic_abort(
+                &rt,
+                state.local_flight_state_snapshot(),
+            )
     }
 }
 
@@ -2394,10 +2514,229 @@ fn apply_cold_flow_override(
         "Cold-flow requirement overridden by operator; fresh fill interlocks still apply".into();
     Ok(())
 }
+/// Accepted controller owners must retire before an irreversible launch is saved.
+/// This inspects SDK ownership, not modem airtime or physical output feedback.
+fn controller_delivery_pending(state: &AppState) -> bool {
+    if manual_stop_pending(state) {
+        return true;
+    }
+    state.topology_router.get().is_some_and(|router| {
+        ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND"]
+            .iter()
+            .any(|name| {
+                router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type(name))
+            })
+    })
+}
+
+/// Ownership snapshot taken before launch journal work. No intent lock is
+/// held across durable I/O; a changed Stop epoch invalidates final admission.
+#[derive(Debug)]
+pub(crate) struct LaunchAdmission {
+    generation: u64,
+    manual_epoch: u64,
+    observed_manual_epoch: u64,
+}
+impl LaunchAdmission {
+    fn trackable(&self) -> bool {
+        self.manual_epoch != u64::MAX && self.observed_manual_epoch != u64::MAX
+    }
+    fn capture(state: &AppState) -> Self {
+        Self {
+            generation: automatic_generation(state),
+            manual_epoch: state.manual_abort_intent.epoch(),
+            observed_manual_epoch: state.deferred_abort.manual_epoch(),
+        }
+    }
+}
+
+/// Retention is not physical confirmation. Keep unsafe new controls fenced
+/// until the pending Stop owner and its local observation have been handled.
+pub(crate) fn manual_stop_pending(state: &AppState) -> bool {
+    state.manual_abort_intent.epoch() == u64::MAX
+        || state.deferred_abort.manual_epoch() == u64::MAX
+        || state.manual_abort_intent.pending_epoch().is_some()
+        || state.deferred_abort.manual_pending()
+        || state.abort_indicator_latched()
+        || state.topology_router.get().is_some_and(|router| {
+            router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT"))
+        })
+}
+fn abort_safe_control(kind: sedsnet::config::DataType, payload: &[u8]) -> bool {
+    if payload.len() != 1 {
+        return false;
+    }
+    let command = payload[0] & 0x7f;
+    if kind == crate::telemetry_schema::data_type("VALVE_COMMAND") {
+        command == ValveBoardCommands::PilotClose as u8
+            || command == ValveBoardCommands::NormallyOpenOpen as u8
+            || command == ValveBoardCommands::DumpOpen as u8
+    } else if kind == crate::telemetry_schema::data_type("ACTUATOR_COMMAND") {
+        command == ActuatorBoardCommands::IgniterOff as u8
+            || command == ActuatorBoardCommands::NitrogenClose as u8
+            || command == ActuatorBoardCommands::NitrousClose as u8
+    } else {
+        false
+    }
+}
+/// Ordinary operators retain OperatorDispatchClaim through queue/flush; a
+/// verified Reset must quiesce those leases before advancing generation.
+/// Automatic apply already owns DISPATCH_GATE. Re-entering it here would
+/// deadlock; this unit exposes no reset API without that quiescence contract.
+pub(crate) fn queue_controller_with_stop_fence(
+    state: &AppState,
+    router: &sedsnet::router::Router,
+    kind: sedsnet::config::DataType,
+    payload: &[u8],
+) -> sedsnet::TelemetryResult<bool> {
+    let ticket = LaunchAdmission::capture(state);
+    let packet = crate::telemetry_task::controller_packet(router, kind, payload)?;
+    // Only the explicit hardware abort-safe directions bypass the fence.
+    if abort_safe_control(kind, payload) {
+        router.tx_queue(packet)?;
+        return Ok(true);
+    }
+    if manual_stop_pending(state) {
+        return Ok(false);
+    }
+    match with_stop_admission(state, ticket, || router.tx_queue(packet)) {
+        Ok(result) => result.map(|()| true),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Both physical SDK admission and the pure Testing model share this short
+/// Stop boundary. The callback must not flush, await, log, or lock GSE/journal/DB.
+fn with_stop_admission<T>(
+    state: &AppState,
+    ticket: LaunchAdmission,
+    admit: impl FnOnce() -> T,
+) -> Result<T, &'static str> {
+    if !ticket.trackable() {
+        return Err("Stop epoch exhausted; unsafe control/launch admission refused");
+    }
+    if ticket.generation != automatic_generation(state) {
+        return Err("Reset invalidated launch admission; no launch effect was admitted");
+    }
+    state
+        .manual_abort_intent
+        .admit_if_unchanged(ticket.manual_epoch, || {
+            state
+                .deferred_abort
+                .admit_if_no_manual_since(ticket.observed_manual_epoch, admit)
+        })
+        .flatten()
+        .ok_or("Manual Abort invalidated launch admission; no launch effect was admitted")
+}
+
+fn with_launch_admission<T>(
+    state: &AppState,
+    ticket: LaunchAdmission,
+    admit: impl FnOnce() -> T,
+) -> Result<T, &'static str> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    with_stop_admission(state, ticket, admit)
+}
+
+/// Public SDK435 tx_queue cannot invoke local/side callbacks. Packets are
+/// built before entering the short intent locks. A second admission can fail
+/// after the first succeeds; that is not an atomic batch or an automatic retry.
+pub(crate) fn queue_admitted_launch_packets(
+    state: &AppState,
+    router: &sedsnet::router::Router,
+    ticket: LaunchAdmission,
+    packets: Vec<sedsnet::packet::Packet>,
+) -> Result<usize, String> {
+    let total = packets.len();
+    let result = with_launch_admission(state, ticket, || {
+        let mut accepted = 0;
+        for packet in packets {
+            if let Err(error) = router.tx_queue(packet) {
+                return Err((accepted, error));
+            }
+            accepted += 1;
+        }
+        Ok(accepted)
+    })
+    .map_err(str::to_string)?;
+    result.map_err(|(accepted, error)| format!(
+        "Launch SDK admission accepted {accepted}/{total} packets: {error}; launch remains inhibited, manual recovery required"))
+}
+
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn admit_simulated_launch(
+    state: &AppState,
+    ticket: LaunchAdmission,
+    launch: impl FnOnce() -> bool,
+) -> Result<(), String> {
+    let accepted = with_launch_admission(state, ticket, launch).map_err(str::to_string)?;
+    if accepted {
+        Ok(())
+    } else {
+        Err(
+            "Testing model declined launch; inhibition retained, no physical fallback permitted"
+                .into(),
+        )
+    }
+}
+
+/// Serialize launch admission against automatic valve-effect preparation in every mode.
+/// T-clock reset and delayed flight-state packets cannot re-enable automation.
+#[cfg(any(test, feature = "hitl_mode", feature = "testing"))]
+pub(crate) fn inhibit_automatic_actions_for_launch(
+    state: &Arc<AppState>,
+) -> Result<LaunchAdmission, String> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let ticket = LaunchAdmission::capture(state);
+    if !ticket.trackable() {
+        return Err("Stop epoch exhausted; launch was not admitted".into());
+    }
+    if controller_delivery_pending(state) {
+        return Err("Controller command delivery is pending; launch was not dispatched".into());
+    }
+    let runtime = state.gse.lock().unwrap();
+    if state
+        .launch_history
+        .lock()
+        .unwrap()
+        .automatic_actions_inhibited()
+    {
+        return Err("Launch already admitted; explicit verified Startup reset is required".into());
+    }
+    if runtime.automatic_abort_in_flight {
+        return Err("Automatic abort is pending; launch was not dispatched".into());
+    }
+    state
+        .launch_history
+        .lock()
+        .unwrap()
+        .inhibit_automatic_actions()
+        .map(|()| ticket)
+        .map_err(|error| {
+            format!("Launch was not dispatched: cannot save automatic-action inhibition: {error}")
+        })
+}
+
 /// Commit once before dispatch, so service restart never repeats an irreversible Fire intent.
 #[cfg(not(feature = "hitl_mode"))]
-pub(crate) fn commit_fire_intent(state: &Arc<AppState>) -> Result<(), String> {
+pub(crate) fn commit_fire_intent(state: &Arc<AppState>) -> Result<LaunchAdmission, String> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let ticket = LaunchAdmission::capture(state);
+    if !ticket.trackable() {
+        return Err("Stop epoch exhausted; launch was not admitted".into());
+    }
+    if controller_delivery_pending(state) {
+        return Err("Controller command delivery is pending; launch was not dispatched".into());
+    }
     let mut rt = state.gse.lock().unwrap();
+    if state
+        .launch_history
+        .lock()
+        .unwrap()
+        .automatic_actions_inhibited()
+    {
+        return Err("Launch already admitted; explicit verified Startup reset is required".into());
+    }
     if rt.operational.saved.automatic_abort_claimed || rt.automatic_abort_in_flight {
         return Err("Automatic abort is pending; clear GSE abort before Fire".into());
     }
@@ -2413,12 +2752,14 @@ pub(crate) fn commit_fire_intent(state: &Arc<AppState>) -> Result<(), String> {
         return Err("Quick disconnect is not acknowledged and settled".into());
     }
     rt.operational.commit_fire()?;
+    state.launch_history.lock().unwrap().inhibit_automatic_actions()
+        .map_err(|error| format!("Fire intent saved, but launch inhibition could not be saved; launch was not dispatched: {error}"))?;
     rt.engine.claimed = true;
     // From this point even a checklist-storage failure must not re-arm the operation.
     let checklist_result = rt.operational.flush_checklists();
     drop(rt);
     state.set_local_flight_state(FlightState::Launch);
-    checklist_result.map_err(|error| {
+    checklist_result.map(|()| ticket).map_err(|error| {
         format!("Fire intent saved, but checklist update failed; manual recovery required: {error}")
     })
 }
@@ -2538,3 +2879,599 @@ mod mission_calibration_guard_tests {
 
 #[cfg(test)]
 mod valve_capture_tests;
+
+/// Lock-free producer snapshot: sequence producers may hold their own mutex.
+/// Only a verified explicit Startup reset may advance this value.
+pub(crate) fn automatic_generation(state: &AppState) -> u64 {
+    state
+        .automatic_generation
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn queue_automatic_abort_for_generation(
+    state: &Arc<AppState>,
+    router: &sedsnet::router::Router,
+    generation: u64,
+    reason: &str,
+) -> sedsnet::TelemetryResult<bool> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if generation != automatic_generation(state) || !automatic_abort_allowed(state) {
+        return Ok(false);
+    }
+    crate::telemetry_task::queue_automatic_abort_packet(router, reason)?;
+    Ok(true)
+}
+
+/// A generation-checked ordinary command owns its dispatch until this lease
+/// drops; reset must quiesce these owners before publishing any board floor.
+pub(crate) struct OperatorDispatchClaim(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for OperatorDispatchClaim {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+pub(crate) fn claim_operator_dispatch(
+    state: &AppState,
+    generation: u64,
+) -> Option<OperatorDispatchClaim> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if generation != automatic_generation(state) {
+        return None;
+    }
+    let count = &state.operator_dispatch_inflight;
+    let mut current = count.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        let next = current.checked_add(1)?;
+        match count.compare_exchange_weak(
+            current,
+            next,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(OperatorDispatchClaim(count.clone())),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// The SDK callback never takes these locks. Marked automatic observations must
+/// pass the same current launch/reset boundary as automatic command producers.
+pub(crate) fn accept_observed_abort(state: &AppState, automatic: bool, generation: u64) -> bool {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if automatic && (generation != automatic_generation(state) || !automatic_abort_allowed(state)) {
+        return false;
+    }
+    state.clear_launch_sequence_command_pending();
+    state.set_abort_indicator_latched(true);
+    true
+}
+
+#[cfg(test)]
+mod recovery_generation_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn operator_claims_reject_old_tokens_and_runtime_replacement_cannot_rewind_generation() {
+        let state = crate::state::tests::test_app_state().await;
+        let first = automatic_generation(&state);
+        let claim = claim_operator_dispatch(&state, first).unwrap();
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 1);
+        drop(claim);
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+        state
+            .automatic_generation
+            .store(first + 1, Ordering::Release);
+        *state.gse.lock().unwrap() = Runtime::default();
+        assert_eq!(automatic_generation(&state), first + 1);
+        assert!(claim_operator_dispatch(&state, first).is_none());
+        assert!(claim_operator_dispatch(&state, first + 1).is_some());
+        state
+            .operator_dispatch_inflight
+            .store(usize::MAX, Ordering::Release);
+        assert!(claim_operator_dispatch(&state, first + 1).is_none());
+        state.operator_dispatch_inflight.store(0, Ordering::Release);
+        for command in [
+            crate::types::TelemetryCommand::Postinit,
+            crate::types::TelemetryCommand::Launch,
+        ] {
+            assert!(
+                crate::telemetry_task::command_at_dispatch(
+                    &state,
+                    crate::types::TelemetryCommand::QueuedOperator {
+                        generation: first,
+                        command: Box::new(command)
+                    }
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_refuses_actual_sdk_controller_owners_before_journal_commit() {
+        use sedsnet::router::{EndpointHandler, Router, RouterConfig};
+        for name in ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND"] {
+            let state = crate::state::tests::test_app_state().await;
+            let endpoint = crate::telemetry_schema::endpoint("ACTUATOR_BOARD");
+            let router = Arc::new(Router::new(RouterConfig::new([
+                EndpointHandler::new_packet_handler(endpoint, |_| Ok(())),
+            ])));
+            state.topology_router.set(router.clone()).unwrap();
+            router
+                .tx_queue(
+                    sedsnet::packet::Packet::new(
+                        crate::telemetry_schema::data_type(name),
+                        &[endpoint],
+                        "GS",
+                        100,
+                        Arc::from(if name == "ABORT" {
+                            &b"manual"[..]
+                        } else {
+                            &b"\x00"[..]
+                        }),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            assert!(
+                controller_delivery_pending(&state),
+                "{name} queue must own delivery"
+            );
+            let result = inhibit_automatic_actions_for_launch(&state);
+            assert!(result.unwrap_err().contains("Controller command delivery"));
+            #[cfg(not(feature = "hitl_mode"))]
+            assert!(
+                commit_fire_intent(&state)
+                    .unwrap_err()
+                    .contains("Controller command delivery")
+            );
+            assert!(
+                !state
+                    .launch_history
+                    .lock()
+                    .unwrap()
+                    .automatic_actions_inhibited()
+            );
+            router.process_all_queues_with_timeout(0).unwrap();
+            assert!(
+                !controller_delivery_pending(&state),
+                "local delivery must retire {name}"
+            );
+            // Retirement removes this prerequisite; the existing independent
+            // state/interlock policy still decides whether real Fire is legal.
+            assert!(inhibit_automatic_actions_for_launch(&state).is_ok());
+        }
+    }
+}
+
+#[cfg(test)]
+mod final_launch_admission_tests {
+    use super::*;
+    use sedsnet::packet::Packet;
+    use sedsnet::router::{EndpointHandler, Router, RouterConfig};
+    fn launch_packet() -> Packet {
+        Packet::new(
+            crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            &[
+                crate::telemetry_schema::endpoint("GROUND_STATION"),
+                crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"),
+            ],
+            "GS",
+            100,
+            Arc::from(&[1u8][..]),
+        )
+        .unwrap()
+    }
+    fn manual_packet() -> Packet {
+        Packet::new(
+            crate::telemetry_schema::data_type("ABORT"),
+            &[crate::telemetry_schema::endpoint("ABORT")],
+            "GS",
+            100,
+            Arc::from(&b"manual"[..]),
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn exhausted_stop_epochs_never_certify_unchanged_launch_admission() {
+        for deferred in [false, true] {
+            let state = crate::state::tests::test_app_state().await;
+            if deferred {
+                state.deferred_abort.exhaust_manual_epoch_for_test();
+            } else {
+                state.manual_abort_intent.exhaust_epoch_for_test();
+            }
+            assert!(
+                inhibit_automatic_actions_for_launch(&state)
+                    .unwrap_err()
+                    .contains("epoch exhausted")
+            );
+            #[cfg(not(feature = "hitl_mode"))]
+            assert!(
+                commit_fire_intent(&state)
+                    .unwrap_err()
+                    .contains("epoch exhausted")
+            );
+            assert!(
+                !state
+                    .launch_history
+                    .lock()
+                    .unwrap()
+                    .automatic_actions_inhibited()
+            );
+            let router = Router::new(RouterConfig::new([]));
+            assert!(
+                queue_admitted_launch_packets(
+                    &state,
+                    &router,
+                    LaunchAdmission::capture(&state),
+                    vec![launch_packet()]
+                )
+                .unwrap_err()
+                .contains("epoch exhausted")
+            );
+            assert!(
+                !router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type(
+                    "FLIGHT_COMMAND"
+                ))
+            );
+            if !deferred {
+                assert_eq!(state.manual_abort_intent.request(), u64::MAX);
+                assert!(state.manual_abort_intent.pending_epoch().is_some());
+            }
+        }
+    }
+    #[tokio::test]
+    async fn retained_or_deferred_manual_abort_blocks_launch_before_sdk_admission() {
+        for deferred in [false, true] {
+            let state = crate::state::tests::test_app_state().await;
+            if deferred {
+                state
+                    .deferred_abort
+                    .observe(&manual_packet(), automatic_generation(&state));
+            } else {
+                state.manual_abort_intent.request();
+            }
+            assert!(
+                inhibit_automatic_actions_for_launch(&state)
+                    .unwrap_err()
+                    .contains("Controller command delivery")
+            );
+            #[cfg(not(feature = "hitl_mode"))]
+            assert!(
+                commit_fire_intent(&state)
+                    .unwrap_err()
+                    .contains("Controller command delivery")
+            );
+            assert!(
+                !state
+                    .launch_history
+                    .lock()
+                    .unwrap()
+                    .automatic_actions_inhibited()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn abort_between_durable_admission_and_final_sdk_queue_cannot_be_lost() {
+        for deferred in [false, true] {
+            let state = crate::state::tests::test_app_state().await;
+            let router = Router::new(RouterConfig::new([]));
+            let ticket = inhibit_automatic_actions_for_launch(&state).unwrap();
+            if deferred {
+                state
+                    .deferred_abort
+                    .observe(&manual_packet(), automatic_generation(&state));
+            } else {
+                state.manual_abort_intent.request();
+            }
+            assert!(
+                queue_admitted_launch_packets(&state, &router, ticket, vec![launch_packet()])
+                    .unwrap_err()
+                    .contains("Manual Abort")
+            );
+            assert!(
+                !router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type(
+                    "FLIGHT_COMMAND"
+                ))
+            );
+            assert!(
+                state
+                    .launch_history
+                    .lock()
+                    .unwrap()
+                    .automatic_actions_inhibited()
+            );
+        }
+        // A request accepted and fully handed off between the two checks must
+        // still invalidate the old epoch even when its pending bit is clear.
+        let state = crate::state::tests::test_app_state().await;
+        let router = Router::new(RouterConfig::new([]));
+        let ticket = inhibit_automatic_actions_for_launch(&state).unwrap();
+        state.manual_abort_intent.request();
+        state.manual_abort_intent.try_claim().unwrap().accepted();
+        assert!(state.manual_abort_intent.pending_epoch().is_none());
+        assert!(
+            queue_admitted_launch_packets(&state, &router, ticket, vec![launch_packet()]).is_err()
+        );
+    }
+    #[tokio::test]
+    async fn journal_wait_does_not_block_new_manual_intent_and_final_queue_rechecks_it() {
+        let state = crate::state::tests::test_app_state().await;
+        let journal = state.launch_history.lock().unwrap();
+        let worker_state = state.clone();
+        let worker =
+            std::thread::spawn(move || inhibit_automatic_actions_for_launch(&worker_state));
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if state.gse.try_lock().is_err() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < limit,
+                "launch must reach the actual journal wait"
+            );
+            std::thread::yield_now();
+        }
+        // The real launch function holds GSE and waits on the held journal.
+        // Stop admission remains an immediate independent RAM operation.
+        assert_eq!(state.manual_abort_intent.request(), 1);
+        drop(journal);
+        let ticket = worker.join().unwrap().unwrap();
+        let router = Router::new(RouterConfig::new([]));
+        assert!(
+            queue_admitted_launch_packets(&state, &router, ticket, vec![launch_packet()]).is_err()
+        );
+        assert!(
+            !router
+                .has_pending_reliable_tx_type(crate::telemetry_schema::data_type("FLIGHT_COMMAND"))
+        );
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+    }
+    #[tokio::test]
+    async fn final_sdk_queue_never_executes_local_callbacks_or_flushes_under_intent_lock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = crate::state::tests::test_app_state().await;
+        let local = Arc::new(AtomicUsize::new(0));
+        let seen = local.clone();
+        let router = Router::new(RouterConfig::new([EndpointHandler::new_packet_handler(
+            crate::telemetry_schema::endpoint("GROUND_STATION"),
+            move |_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )]));
+        let ticket = inhibit_automatic_actions_for_launch(&state).unwrap();
+        assert_eq!(
+            queue_admitted_launch_packets(&state, &router, ticket, vec![launch_packet()]).unwrap(),
+            1
+        );
+        assert_eq!(
+            local.load(Ordering::SeqCst),
+            0,
+            "tx_queue must remain queue-only"
+        );
+        router.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(local.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.manual_abort_intent.request(),
+            1,
+            "fresh Stop after linearization remains accepted"
+        );
+    }
+    #[tokio::test]
+    async fn sdk_admission_failure_reports_actual_partial_ownership_without_retry_or_unlatching() {
+        const NAME: &str = "gse::final_launch_admission_tests::sdk_admission_failure_reports_actual_partial_ownership_without_retry_or_unlatching";
+        if std::env::var_os("GS_FINAL_LAUNCH_BUDGET_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env("GS_FINAL_LAUNCH_BUDGET_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let state = crate::state::tests::test_app_state().await;
+        let _ticket = inhibit_automatic_actions_for_launch(&state).unwrap();
+        let make_router = |budget: usize| {
+            let memory =
+                sedsnet::config::RuntimeMemoryConfig::new(budget, 1, budget.min(128), 1.25)
+                    .unwrap();
+            Router::new(RouterConfig::new([]).with_memory_config(memory).unwrap())
+        };
+        // Find the real fixture's admission boundary rather than assuming its
+        // retained schema/discovery metadata cost. Production limits are untouched.
+        let fits = |budget| make_router(budget).tx_queue(launch_packet()).is_ok();
+        let mut lower = 16usize;
+        let mut upper = 16usize;
+        while !fits(upper) {
+            lower = upper;
+            upper *= 2;
+            assert!(upper <= 1_048_576, "bounded fixture must admit one owner");
+        }
+        while upper - lower > 1 {
+            let middle = lower + (upper - lower) / 2;
+            if fits(middle) {
+                upper = middle
+            } else {
+                lower = middle
+            }
+        }
+        let mut partial_seen = false;
+        for budget in upper..upper + 256 {
+            let router = make_router(budget);
+            let valve = Packet::new(
+                crate::telemetry_schema::data_type("VALVE_COMMAND"),
+                &[
+                    crate::telemetry_schema::endpoint("GROUND_STATION"),
+                    crate::telemetry_schema::endpoint("VALVE_BOARD"),
+                ],
+                "GS",
+                100,
+                Arc::from(&[crate::rocket_commands::ValveBoardCommands::Sequence as u8][..]),
+            )
+            .unwrap();
+            if let Err(message) = queue_admitted_launch_packets(
+                &state,
+                &router,
+                LaunchAdmission::capture(&state),
+                vec![launch_packet(), valve],
+            ) {
+                if message.contains("accepted 1/2") {
+                    assert!(message.contains("manual recovery required"));
+                    assert!(router.has_pending_reliable_tx_type(
+                        crate::telemetry_schema::data_type("FLIGHT_COMMAND")
+                    ));
+                    assert!(!router.has_pending_reliable_tx_type(
+                        crate::telemetry_schema::data_type("VALVE_COMMAND")
+                    ));
+                    partial_seen = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            partial_seen,
+            "actual SDK must retain the first admitted owner when second admission fails"
+        );
+        let refused = queue_admitted_launch_packets(
+            &state,
+            &make_router(16),
+            LaunchAdmission::capture(&state),
+            vec![launch_packet()],
+        )
+        .unwrap_err();
+        assert!(refused.contains("accepted 0/1"));
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .automatic_actions_inhibited()
+        );
+    }
+}
+
+#[cfg(test)]
+mod retained_stop_fence_tests {
+    use super::*;
+    use sedsnet::router::{Router, RouterConfig};
+    #[tokio::test]
+    async fn active_fill_cannot_refill_control_capacity_after_manual_abort_sdk_refusal() {
+        let state = crate::state::tests::test_app_state().await;
+        let control = crate::state::tests::test_app_state().await;
+        let router = Arc::new(Router::new(RouterConfig::new([])));
+        state.topology_router.set(router.clone()).unwrap();
+        state.set_local_flight_state(FlightState::Idle);
+        state.gse.lock().unwrap().engine.status.phase = Phase::Filling;
+        let kind = crate::telemetry_schema::data_type("ACTUATOR_COMMAND");
+        let mut saturated = false;
+        for _ in 0..10000 {
+            if crate::telemetry_task::queue_controller_command(
+                &router,
+                kind,
+                &[ActuatorBoardCommands::NitrogenOpen as u8],
+            )
+            .is_err()
+            {
+                saturated = true;
+                break;
+            }
+        }
+        assert!(
+            saturated,
+            "actual SDK queue must reach bounded backpressure"
+        );
+        state.manual_abort_intent.request();
+        let claim = state.manual_abort_intent.try_claim().unwrap();
+        assert!(crate::telemetry_task::queue_priority_manual_abort_packet(&router).is_err());
+        drop(claim);
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+        assert!(
+            !state.abort_indicator_latched(),
+            "retention is not observed/physical Abort confirmation"
+        );
+        // Test-only removal models a freed queue slot. Production does not
+        // cancel/drop these accepted owners, nor falsely accept the Stop claim.
+        router.clear_queues();
+        assert!(
+            queue_controller_with_stop_fence(
+                &control,
+                &router,
+                kind,
+                &[ActuatorBoardCommands::NitrogenOpen as u8]
+            )
+            .unwrap(),
+            "the freed actual SDK capacity can admit the same opening without Stop"
+        );
+        router.clear_queues();
+        apply(
+            &state,
+            Effects {
+                valves: vec![(0, true), (3, true), (4, true)],
+                ..Default::default()
+            },
+        );
+        assert!(!router.has_pending_reliable_tx_type(kind));
+        assert!(
+            !router
+                .has_pending_reliable_tx_type(crate::telemetry_schema::data_type("VALVE_COMMAND"))
+        );
+        assert!(
+            !queue_controller_with_stop_fence(
+                &state,
+                &router,
+                kind,
+                &[ActuatorBoardCommands::IgniterOn as u8]
+            )
+            .unwrap()
+        );
+        assert!(inhibit_automatic_actions_for_launch(&state).is_err());
+        // Explicit abort-safe supply closes remain possible under Stop.
+        assert!(
+            queue_controller_with_stop_fence(
+                &state,
+                &router,
+                kind,
+                &[ActuatorBoardCommands::NitrogenClose as u8]
+            )
+            .unwrap()
+        );
+        assert!(router.has_pending_reliable_tx_type(kind));
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+    }
+    #[tokio::test]
+    async fn declined_testing_model_never_falls_through_and_sticky_inhibit_survives_visual_idle() {
+        let state = crate::state::tests::test_app_state().await;
+        let ticket = inhibit_automatic_actions_for_launch(&state).unwrap();
+        assert!(
+            admit_simulated_launch(&state, ticket, || false)
+                .unwrap_err()
+                .contains("no physical fallback")
+        );
+        state.set_local_flight_state(FlightState::Idle);
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .automatic_actions_inhibited()
+        );
+        assert!(
+            crate::telemetry_task::command_at_dispatch(
+                &state,
+                TelemetryCommand::AutomaticAbort {
+                    generation: automatic_generation(&state)
+                }
+            )
+            .is_none()
+        );
+        assert!(inhibit_automatic_actions_for_launch(&state).is_err());
+    }
+}

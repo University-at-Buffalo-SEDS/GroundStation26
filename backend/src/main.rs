@@ -21,6 +21,7 @@ mod command_probe;
 mod command_proxy;
 mod comms;
 mod comms_config;
+mod deferred_abort;
 #[cfg(feature = "testing")]
 mod dummy_packets;
 mod ethernet_autoconfig;
@@ -41,6 +42,7 @@ mod loadcell;
 mod loadcell_zero;
 mod log_redaction;
 mod logger;
+mod manual_abort_intent;
 mod map;
 mod media;
 mod media_runtime;
@@ -116,7 +118,6 @@ use tokio::sync::Notify;
 use tokio::time::{Duration, Instant};
 
 use crate::web::AlertAckStateMsg;
-use crate::web::emit_error;
 use tokio::sync::{broadcast, mpsc};
 
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
@@ -1233,6 +1234,10 @@ async fn main() -> anyhow::Result<()> {
         pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
         latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
         gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
+        automatic_generation: Arc::new(AtomicU64::new(1)),
+        operator_dispatch_inflight: Arc::new(AtomicUsize::new(0)),
+        manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
+        deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
         latest_fill_mass_kg: Arc::new(Mutex::new(None)),
         loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
         network_traffic: Arc::new(Mutex::new(crate::network_traffic::Sampler::default())),
@@ -1634,20 +1639,10 @@ async fn main() -> anyhow::Result<()> {
     let abort_handler = EndpointHandler::new_packet_handler(
         telemetry_schema::endpoint("ABORT"),
         move |pkt: &Packet| {
-            abort_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
-            abort_handler_state_clone.clear_launch_sequence_command_pending();
-            abort_handler_state_clone.set_abort_indicator_latched(true);
-            crate::sequences::refresh_action_policy_now(&abort_handler_state_clone);
-            abort_handler_state_clone.broadcast_action_policy_snapshot();
-            let error_msg = pkt
-                .data_as_string()
-                .unwrap_or_else(|_| String::from_utf8_lossy(pkt.payload()).into_owned());
-            log::error!(
-                "abort packet received sender={} endpoints={:?} message={error_msg}",
-                pkt.sender(),
-                pkt.endpoints()
+            abort_handler_state_clone.deferred_abort.observe(
+                pkt,
+                crate::gse::automatic_generation(&abort_handler_state_clone),
             );
-            emit_error(&abort_handler_state_clone, error_msg);
             Ok(())
         },
     );
@@ -1775,6 +1770,7 @@ async fn main() -> anyhow::Result<()> {
     network_variables::initialize(&router)?;
     set_network_time_router(router.clone());
     let _ = state.topology_router.set(router.clone());
+    let _abort_observations = crate::deferred_abort::spawn(state.clone());
 
     let (rocket_tx, rocket_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
     let (umbilical_tx, umbilical_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
@@ -1926,6 +1922,28 @@ async fn main() -> anyhow::Result<()> {
         db_queue_rx,
         telemetry_shutdown_rx,
     ));
+    // A bounded retained E-stop publisher is independent of the ordinary cmd
+    // channel. Local SDK callbacks retain observations and never wait on GSE.
+    let stop_state = state.clone();
+    let stop_router = router.clone();
+    let _manual_stop_publisher = tokio::spawn(crate::manual_abort_intent::service(
+        state.manual_abort_intent.clone(),
+        state.shutdown_subscribe(),
+        move |epoch| match crate::telemetry_task::queue_priority_manual_abort_packet(&stop_router) {
+            Ok(()) => {
+                crate::telemetry_task::flush_command_tx(&stop_router, "Manual Abort priority tx");
+                log::info!(
+                    "manual Abort accepted by SDK epoch={epoch} current={} pending={:?}",
+                    stop_state.manual_abort_intent.epoch(),
+                    stop_state.manual_abort_intent.pending_epoch()
+                );
+                true
+            }
+            // Logger WriteMode::Direct can wait on disk. A refused admission
+            // keeps the bounded RAM intent and retries without synchronous I/O.
+            Err(_) => false,
+        },
+    ));
     let full_bay_discovery_ready = Arc::new(AtomicBool::new(false));
     // No allocation or command-path change outside simulator validation. Keep
     // the boot PilotOpen test from racing the soak's first PilotClose.
@@ -1998,6 +2016,7 @@ async fn main() -> anyhow::Result<()> {
                     {
                         let command = FlightComputerCommands::EvaluationRelax as u8;
                         match queue_locally_routed_flight_command(
+                            &validation_state,
                             &validation_router,
                             "full-bay Flight Computer validation",
                             &[command],
@@ -2459,6 +2478,7 @@ async fn main() -> anyhow::Result<()> {
         && let Ok(sample_path) = std::env::var("FIRMWARE_SIM_SAMPLE_FILE")
     {
         let soak_router = router.clone();
+        let soak_state = state.clone();
         let soak_status = command_status_probe.clone();
         let soak_discovery_ready = full_bay_discovery_ready.clone();
         let soak_startup_ack = valve_startup_ack.clone();
@@ -2545,6 +2565,7 @@ async fn main() -> anyhow::Result<()> {
                     if let Err(error) = network_variables::set_underglow(&soak_router, open)
                         .and_then(|_| {
                             queue_locally_routed_flight_command(
+                                &soak_state,
                                 &soak_router,
                                 "full-bay RF soak",
                                 &[command],

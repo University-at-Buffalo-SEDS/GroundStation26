@@ -3,12 +3,15 @@ use prelude::*;
 
 mod commands;
 use commands::log_command_dispatch;
+#[cfg(test)]
+pub(crate) use commands::queue_controller_command;
 pub(crate) use commands::{
-    flush_command_tx, queue_abort_packet, queue_automatic_abort_packet, queue_controller_command,
-    queue_locally_routed_flight_command,
+    controller_packet, flush_command_tx, queue_abort_packet, queue_automatic_abort_packet,
+    queue_automatic_controller_command, queue_locally_routed_flight_command,
+    queue_priority_manual_abort_packet,
 };
-mod periodic;
 mod heartbeat;
+mod periodic;
 pub(crate) mod procedure_clock;
 mod radio_io;
 pub use radio_io::{CommsWorkerHandle, TransportTxActivity, TxQueueBudget};
@@ -33,7 +36,27 @@ pub(crate) fn command_at_dispatch(
     state: &AppState,
     command: TelemetryCommand,
 ) -> Option<TelemetryCommand> {
-    if matches!(command, TelemetryCommand::AutomaticAbort) {
+    // Only the worker's generation-checked admission may unwrap operator intent.
+    if matches!(command, TelemetryCommand::QueuedOperator { .. }) {
+        return None;
+    }
+    if command
+        .automatic_generation()
+        .is_some_and(|generation| generation != crate::gse::automatic_generation(state))
+    {
+        return None;
+    }
+    if matches!(
+        command,
+        TelemetryCommand::AutomaticNitrogenClose { .. }
+            | TelemetryCommand::AutomaticNitrousClose { .. }
+    ) {
+        return crate::gse::automatic_abort_allowed(state).then_some(match command {
+            TelemetryCommand::AutomaticNitrogenClose { .. } => TelemetryCommand::NitrogenClose,
+            _ => TelemetryCommand::NitrousClose,
+        });
+    }
+    if matches!(command, TelemetryCommand::AutomaticAbort { .. }) {
         // A failed tare can enqueue before Fire commits and be consumed after
         // it. Preserve its automatic origin until this final policy check.
         crate::gse::automatic_abort_allowed(state).then_some(TelemetryCommand::Abort)
@@ -175,24 +198,24 @@ pub(crate) fn displayed_network_utc_ms() -> i64 {
     recording_network_utc_ms().unwrap_or_else(|| get_current_timestamp_ms() as i64)
 }
 
-fn send_valve_launch_sequence_command(router: &Router) -> bool {
-    let payload = [ValveBoardCommands::Sequence as u8];
-    if let Err(e) = router.log_queue(
-        crate::telemetry_schema::data_type("VALVE_COMMAND"),
-        &payload,
-    ) {
-        log_telemetry_error("failed to log valve launch sequence command", e);
-        false
-    } else {
-        log_command_dispatch(
-            "Valve launch sequence command",
-            "umbilical_comms",
-            crate::telemetry_schema::data_type("VALVE_COMMAND"),
-            &payload,
-        );
-        flush_command_tx(router, "Valve launch sequence command tx");
-        true
-    }
+fn build_launch_packet(
+    router: &Router,
+    kind: &str,
+    owner: &str,
+    payload: &[u8],
+) -> sedsnet::TelemetryResult<Packet> {
+    Packet::new(
+        crate::telemetry_schema::data_type(kind),
+        &[
+            crate::telemetry_schema::endpoint("GROUND_STATION"),
+            crate::telemetry_schema::endpoint(owner),
+        ],
+        &router.sender(),
+        router
+            .network_time_ms()
+            .unwrap_or_else(get_current_timestamp_ms),
+        Arc::from(payload),
+    )
 }
 
 fn vent_valve_known_open_for_launch(state: &Arc<AppState>) -> bool {
@@ -274,21 +297,54 @@ async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router
             .await;
         gs_debug_println!("Ground-station launch auto-started DB recording");
     }
+    #[cfg(feature = "hitl_mode")]
+    let ticket = match crate::gse::inhibit_automatic_actions_for_launch(&state) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            state.clear_launch_sequence_command_pending();
+            emit_notification_warning(&state, error);
+            return;
+        }
+    };
     #[cfg(not(feature = "hitl_mode"))]
-    if let Err(error) = crate::gse::commit_fire_intent(&state) {
+    let ticket = match crate::gse::commit_fire_intent(&state) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            state.clear_launch_sequence_command_pending();
+            emit_notification_warning(&state, error);
+            return;
+        }
+    };
+    let packet = match build_launch_packet(
+        &router,
+        "VALVE_COMMAND",
+        "VALVE_BOARD",
+        &[ValveBoardCommands::Sequence as u8],
+    ) {
+        Ok(packet) => packet,
+        Err(error) => {
+            state.clear_launch_sequence_command_pending();
+            emit_notification_warning(
+                &state,
+                format!("Launch packet preparation failed; inhibition retained: {error}"),
+            );
+            return;
+        }
+    };
+    if let Err(error) =
+        crate::gse::queue_admitted_launch_packets(&state, &router, ticket, vec![packet])
+    {
         state.clear_launch_sequence_command_pending();
         emit_notification_warning(&state, error);
         return;
     }
-    if !send_valve_launch_sequence_command(&router) {
-        state.clear_launch_sequence_command_pending();
-        #[cfg(not(feature = "hitl_mode"))]
-        emit_notification_warning(
-            &state,
-            "Fire intent saved, but valve command was not queued. Manual recovery required.",
-        );
-        return;
-    }
+    log_command_dispatch(
+        "Valve launch sequence command",
+        "umbilical_comms",
+        crate::telemetry_schema::data_type("VALVE_COMMAND"),
+        &[ValveBoardCommands::Sequence as u8],
+    );
+    flush_command_tx(&router, "Valve launch sequence command tx");
     #[cfg(not(feature = "hitl_mode"))]
     state.set_local_flight_state(FlightState::Launch);
     state.begin_daq_launch_log();
@@ -328,41 +384,79 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
             .await;
         gs_debug_println!("Launch auto-started DB recording");
     }
+    #[cfg(feature = "hitl_mode")]
+    let ticket = match crate::gse::inhibit_automatic_actions_for_launch(&state) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            state.clear_launch_sequence_command_pending();
+            emit_notification_warning(&state, error);
+            return;
+        }
+    };
     #[cfg(not(feature = "hitl_mode"))]
-    if let Err(error) = crate::gse::commit_fire_intent(&state) {
+    let ticket = match crate::gse::commit_fire_intent(&state) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            state.clear_launch_sequence_command_pending();
+            emit_notification_warning(&state, error);
+            return;
+        }
+    };
+    let packets = (|| -> sedsnet::TelemetryResult<Vec<Packet>> {
+        Ok(vec![
+            build_launch_packet(
+                &router,
+                "FLIGHT_COMMAND",
+                "FLIGHT_CONTROLLER",
+                &[FlightComputerCommands::Launch as u8],
+            )?,
+            build_launch_packet(
+                &router,
+                "VALVE_COMMAND",
+                "VALVE_BOARD",
+                &[ValveBoardCommands::Sequence as u8],
+            )?,
+        ])
+    })();
+    let packets = match packets {
+        Ok(packets) => packets,
+        Err(error) => {
+            emit_notification_warning(
+                &state,
+                format!("Launch packet preparation failed; inhibition retained: {error}"),
+            );
+            return;
+        }
+    };
+    if let Err(error) = crate::gse::queue_admitted_launch_packets(&state, &router, ticket, packets)
+    {
+        // An accepted first packet remains an honest SDK owner. Do not retry
+        // the second packet or undo durable inhibition after partial admission.
         emit_notification_warning(&state, error);
+        flush_command_tx(
+            &router,
+            "Launch admission failure: progress already accepted owners",
+        );
         return;
     }
     let now_ms = procedure_clock::timestamp_ms();
     state.confirm_new_launch_cycle();
     state.set_launch_clock(launch_countdown_clock(now_ms));
-    let flight_command_sent = if let Err(e) = queue_locally_routed_flight_command(
-        &router,
+    log_command_dispatch(
         "Launch command",
+        "broadcast",
+        crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
         &[FlightComputerCommands::Launch as u8],
-    ) {
-        log_telemetry_error("failed to log Launch command", e);
-        false
-    } else {
-        flush_command_tx(&router, "Launch command tx");
-        true
-    };
-    #[cfg(not(feature = "hitl_mode"))]
-    if !flight_command_sent {
-        emit_notification_warning(
-            &state,
-            "Fire intent saved, but FC command was not queued. Manual recovery required.",
-        );
-        return;
-    }
-    let valve_command_sent = send_valve_launch_sequence_command(&router);
-    #[cfg(not(feature = "hitl_mode"))]
-    if !valve_command_sent {
-        emit_notification_warning(
-            &state,
-            "Fire dispatch incomplete: valve command was not queued. Manual recovery required.",
-        );
-    }
+    );
+    log_command_dispatch(
+        "Valve launch sequence command",
+        "umbilical_comms",
+        crate::telemetry_schema::data_type("VALVE_COMMAND"),
+        &[ValveBoardCommands::Sequence as u8],
+    );
+    flush_command_tx(&router, "FC and valve Launch command tx");
+    let flight_command_sent = true;
+    let valve_command_sent = true;
     if flight_command_sent || valve_command_sent {
         #[cfg(not(feature = "hitl_mode"))]
         state.set_local_flight_state(FlightState::Launch);
@@ -678,7 +772,17 @@ pub async fn telemetry_task(
             biased;
 
                 Some(cmd) = rx.recv() => {
-                    let automatic_abort = matches!(cmd, TelemetryCommand::AutomaticAbort);
+                    let (cmd, _operator_claim) = match cmd {
+                        TelemetryCommand::QueuedOperator { generation, command } => {
+                            if command.automatic_generation().is_some() || matches!(*command, TelemetryCommand::QueuedOperator { .. }) { continue; }
+                            let Some(claim) = crate::gse::claim_operator_dispatch(&state, generation) else { continue; };
+                            (*command, Some(claim))
+                        }
+                        command => (command, None),
+                    };
+                    let automatic_generation = cmd.automatic_generation();
+                    let automatic_supply_close = matches!(cmd, TelemetryCommand::AutomaticNitrogenClose { .. } | TelemetryCommand::AutomaticNitrousClose { .. });
+                    let automatic_abort = matches!(cmd, TelemetryCommand::AutomaticAbort { .. });
                     let _automatic_abort_claim = if automatic_abort {
                         let Some(claim) = crate::gse::claim_automatic_abort(&state) else { continue; };
                         Some(claim)
@@ -697,6 +801,28 @@ pub async fn telemetry_task(
                         );
                         continue;
                     }
+                    if automatic_supply_close {
+                        let (key, close) = if matches!(cmd, TelemetryCommand::NitrogenClose) {
+                            (ActuatorBoardCommands::NitrogenOpen as u8, ActuatorBoardCommands::NitrogenClose as u8)
+                        } else {
+                            (ActuatorBoardCommands::NitrousOpen as u8, ActuatorBoardCommands::NitrousClose as u8)
+                        };
+                        match crate::gse::queue_automatic_supply_close(&state, &router, close, automatic_generation.expect("automatic close has generation")) {
+                            Ok(true) => {
+                                state.set_pending_umbilical_valve_state(key, false);
+                                flush_command_tx(&router, "Automatic supply close");
+                            }
+                            Ok(false) => {}
+                            Err(error) => log_telemetry_error("Automatic supply close", error),
+                        }
+                        continue;
+                    }
+                    if crate::gse::manual_stop_pending(&state)
+                        && !matches!(cmd, TelemetryCommand::Abort | TelemetryCommand::NitrogenClose | TelemetryCommand::NitrousClose | TelemetryCommand::PauseFill | TelemetryCommand::CancelFill)
+                        && !crate::sequences::is_station_utility_command(crate::sequences::command_name(&cmd)) {
+                        emit_notification_warning(&state, "Manual Stop is pending; new control action was not dispatched");
+                        continue;
+                    }
                     state.record_command_accepted(&cmd, get_current_timestamp_ms());
                     state.auto_zero.lock().unwrap().cancel_for_command(&cmd);
                     if crate::auto_zero::before_fill(&state, &cmd) { continue; }
@@ -708,11 +834,24 @@ pub async fn telemetry_task(
                         sequences::refresh_action_policy_now(&state);
                         state.broadcast_action_policy_snapshot();
                     }
+                    #[cfg(feature = "testing")]
+                    if matches!(crate::sequences::command_name(&cmd), "Launch" | "GroundStationLaunch") && flight_sim::sim_mode_enabled() {
+                        let ticket = match crate::gse::inhibit_automatic_actions_for_launch(&state) {
+                            Ok(ticket) => ticket,
+                            Err(error) => { emit_notification_warning(&state, error); continue; }
+                        };
+                        if let Err(error) = crate::gse::admit_simulated_launch(&state, ticket, || flight_sim::handle_command(&cmd)) {
+                            emit_notification_warning(&state, error);
+                        }
+                        // Even a declined model command cannot fall through
+                        // into physical dispatch after durable admission.
+                        continue;
+                    }
                     if flight_sim::handle_command(&cmd) {
                         continue;
                     }
                     match cmd {
-                        TelemetryCommand::AutomaticAbort => unreachable!("automatic abort checked before dispatch"),
+                        TelemetryCommand::QueuedOperator { .. } | TelemetryCommand::AutomaticAbort { .. } | TelemetryCommand::AutomaticNitrogenClose { .. } | TelemetryCommand::AutomaticNitrousClose { .. } => unreachable!("automatic intent checked before dispatch"),
                         TelemetryCommand::StartFill | TelemetryCommand::PauseFill
                         | TelemetryCommand::CancelFill | TelemetryCommand::ValveSelfTest
                         | TelemetryCommand::NitrogenTest => unreachable!("GSE commands handled before dispatch"),
@@ -737,11 +876,15 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::Abort => {
                                 state.clear_launch_sequence_command_pending();
-                                let enqueue_abort = if automatic_abort { queue_automatic_abort_packet } else { queue_abort_packet };
-                                if let Err(e) = enqueue_abort(
-                                    &router,
-                                    if automatic_abort { "Automatic zero failure abort" } else { "Manual Abort Command Issued" },
-                                ) {
+                                let queued = if automatic_abort {
+                                    crate::gse::queue_automatic_abort_for_generation(&state, &router,
+                                        automatic_generation.expect("automatic abort has generation"),
+                                        "Automatic zero failure abort")
+                                } else {
+                                    queue_abort_packet(&router, "Manual Abort Command Issued").map(|()| true)
+                                };
+                                if matches!(queued, Ok(false)) { continue; }
+                                if let Err(e) = queued {
                                     log_telemetry_error("failed to log Abort command", e);
                                 } else {
                                     flush_command_tx(&router, "Abort command tx");
@@ -772,9 +915,10 @@ pub async fn telemetry_task(
                         #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::IgniterSequence => {
                                 let payload = [ActuatorBoardCommands::IgniterSequence as u8];
-                                if let Err(e) = queue_controller_command(&router, crate::telemetry_schema::data_type("ACTUATOR_COMMAND"), &payload) {
-                                    log_telemetry_error("failed to log IgniterSequence command", e);
-                                } else {
+                                match crate::gse::queue_controller_with_stop_fence(&state, &router, crate::telemetry_schema::data_type("ACTUATOR_COMMAND"), &payload) {
+                                  Err(e) => log_telemetry_error("failed to log IgniterSequence command", e),
+                                  Ok(false) => emit_notification_warning(&state, "Manual Stop is pending; igniter sequence not queued"),
+                                  Ok(true) => {
                                     log_command_dispatch(
                                         "IgniterSequence command",
                                         "umbilical_comms",
@@ -782,8 +926,9 @@ pub async fn telemetry_task(
                                         &payload,
                                     );
                                     flush_command_tx(&router, "IgniterSequence command tx");
+                                  }
                                 }
-                                gs_debug_println!("IgniterSequence command sent");
+                                gs_debug_println!("IgniterSequence command processed");
                             }
                         TelemetryCommand::Pilot => {
                                 let key = ValveBoardCommands::PilotOpen as u8;
@@ -924,6 +1069,7 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::Postinit => {
                                 if let Err(e) = queue_locally_routed_flight_command(
+                                    &state,
                                     &router,
                                     "Postinit command",
                                     &[FlightComputerCommands::Postinit as u8],
@@ -946,6 +1092,7 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::MonitorAltitude => {
                                 if let Err(e) = queue_locally_routed_flight_command(
+                                    &state,
                                     &router,
                                     "MonitorAltitude command",
                                     &[FlightComputerCommands::MonitorAltitude as u8],
@@ -956,6 +1103,7 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::RevokeMonitorAltitude => {
                                 if let Err(e) = queue_locally_routed_flight_command(
+                                    &state,
                                     &router,
                                     "RevokeMonitorAltitude command",
                                     &[FlightComputerCommands::RevokeMonitorAltitude as u8],
@@ -966,6 +1114,7 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::ConsecutiveSamples => {
                                 if let Err(e) = queue_locally_routed_flight_command(
+                                    &state,
                                     &router,
                                     "ConsecutiveSamples command",
                                     &[FlightComputerCommands::ConsecutiveSamples as u8],
@@ -976,6 +1125,7 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::RevokeConsecutiveSamples => {
                                 if let Err(e) = queue_locally_routed_flight_command(
+                                    &state,
                                     &router,
                                     "RevokeConsecutiveSamples command",
                                     &[FlightComputerCommands::RevokeConsecutiveSamples as u8],
@@ -986,6 +1136,7 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::ResetFailures => {
                                 if let Err(e) = queue_locally_routed_flight_command(
+                                    &state,
                                     &router,
                                     "ResetFailures command",
                                     &[FlightComputerCommands::ResetFailures as u8],
@@ -996,6 +1147,7 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::RevokeResetFailures => {
                                 if let Err(e) = queue_locally_routed_flight_command(
+                                    &state,
                                     &router,
                                     "RevokeResetFailures command",
                                     &[FlightComputerCommands::RevokeResetFailures as u8],
@@ -1006,6 +1158,7 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::ValidateMeasms => {
                                 if let Err(e) = queue_locally_routed_flight_command(
+                                    &state,
                                     &router,
                                     "ValidateMeasms command",
                                     &[FlightComputerCommands::ValidateMeasms as u8],
@@ -1016,6 +1169,7 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::RevokeValidateMeasms => {
                                 if let Err(e) = queue_locally_routed_flight_command(
+                                    &state,
                                     &router,
                                     "RevokeValidateMeasms command",
                                     &[FlightComputerCommands::RevokeValidateMeasms as u8],
@@ -1099,6 +1253,7 @@ pub async fn telemetry_task(
                             let next = operator_mode_adjacent_flight_state(current, 1);
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
                                 if let Err(e) = queue_locally_routed_flight_command(
+                                    &state,
                                     &router,
                                     "AdvanceFlightState command",
                                     &[cmd_id],
@@ -1118,6 +1273,7 @@ pub async fn telemetry_task(
                             let next = operator_mode_adjacent_flight_state(current, -1);
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
                                 if let Err(e) = queue_locally_routed_flight_command(
+                                    &state,
                                     &router,
                                     "RewindFlightState command",
                                     &[cmd_id],
@@ -1163,6 +1319,7 @@ pub async fn telemetry_task(
                         | TelemetryCommand::ReinitAfter50 => {
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
                                 if let Err(e) = queue_locally_routed_flight_command(
+                                    &state,
                                     &router,
                                     "HITL flight command",
                                     &[cmd_id],
@@ -1357,9 +1514,19 @@ fn queue_guarded_fill_command(
     if effective_umbilical_valve_state(state, key_cmd_id) == Some(desired_state) {
         return;
     }
-    if let Err(err) = queue_controller_command(router, data_type, &[cmd_payload]) {
-        log_telemetry_error(&format!("failed to queue {label}"), err);
-        return;
+    match crate::gse::queue_controller_with_stop_fence(state, router, data_type, &[cmd_payload]) {
+        Ok(true) => {}
+        Ok(false) => {
+            emit_notification_warning(
+                state,
+                "Manual Stop is pending; control command was not queued",
+            );
+            return;
+        }
+        Err(err) => {
+            log_telemetry_error(&format!("failed to queue {label}"), err);
+            return;
+        }
     }
     log_command_dispatch(label, "umbilical_comms", data_type, &[cmd_payload]);
     state.set_pending_umbilical_valve_state(key_cmd_id, desired_state);
@@ -1641,7 +1808,9 @@ pub(crate) fn apply_umbilical_status_at_ingress(
         }
         if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
             let fresh_confirmation = state.set_umbilical_valve_state_source(
-                key_cmd_id, key_on, pkt.timestamp() as i64,
+                key_cmd_id,
+                key_on,
+                pkt.timestamp() as i64,
                 recording_network_utc_ms().unwrap_or_else(|| get_current_timestamp_ms() as i64),
                 pkt.packet_id(),
             );
@@ -1737,11 +1906,20 @@ async fn handle_packet(
 
     if pkt.data_type() == crate::telemetry_schema::data_type("DAQ_LAUNCH_LOG_STATUS") {
         if let Ok(words) = pkt.data_as_u32() {
-            state.network_health.lock().unwrap().observe_launch_log_status(
-                &sender_id, &words, std::time::Instant::now(), get_current_timestamp_ms(),
-                pkt.timestamp(), recording_network_utc_ms().and_then(|t| t.try_into().ok())
-                    .unwrap_or_else(get_current_timestamp_ms),
-            );
+            state
+                .network_health
+                .lock()
+                .unwrap()
+                .observe_launch_log_status(
+                    &sender_id,
+                    &words,
+                    std::time::Instant::now(),
+                    get_current_timestamp_ms(),
+                    pkt.timestamp(),
+                    recording_network_utc_ms()
+                        .and_then(|t| t.try_into().ok())
+                        .unwrap_or_else(get_current_timestamp_ms),
+                );
         }
         return Vec::new();
     }
@@ -1749,7 +1927,10 @@ async fn handle_packet(
     if pkt.data_type() == crate::telemetry_schema::data_type("DAQ_SD_HEALTH") {
         if let Ok(words) = pkt.data_as_u32() {
             state.network_health.lock().unwrap().observe_sd_status(
-                &sender_id, &words, std::time::Instant::now(), get_current_timestamp_ms(),
+                &sender_id,
+                &words,
+                std::time::Instant::now(),
+                get_current_timestamp_ms(),
             );
         }
         return Vec::new();
@@ -1865,7 +2046,18 @@ async fn handle_packet(
         };
         // Only an actually received prelaunch phase can re-arm a reset clock;
         // a process's initial local Idle is not a new launch transition.
-        if matches!(new_flight_state,FlightState::Startup|FlightState::Idle|FlightState::PreFill|FlightState::FillTest|FlightState::NitrogenFill|FlightState::NitrousFill|FlightState::Armed){state.confirm_new_launch_cycle();}
+        if matches!(
+            new_flight_state,
+            FlightState::Startup
+                | FlightState::Idle
+                | FlightState::PreFill
+                | FlightState::FillTest
+                | FlightState::NitrogenFill
+                | FlightState::NitrousFill
+                | FlightState::Armed
+        ) {
+            state.confirm_new_launch_cycle();
+        }
         state.update_launch_clock_for_state(new_flight_state, launch_clock_ts_ms);
         queue_db_write(
             state,
@@ -2378,7 +2570,11 @@ mod tests {
         assert_eq!(saved["qualification"]["fire_started"], true);
         state.reset_launch_clock();
         start_launch_clock_from_valve_sequence_status(&state);
-        assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::Idle,"old sequence status cannot re-arm a reset launch clock");
+        assert_eq!(
+            state.launch_clock_snapshot().kind,
+            LaunchClockKind::Idle,
+            "old sequence status cannot re-arm a reset launch clock"
+        );
         state.confirm_new_launch_cycle();
         start_launch_clock_from_valve_sequence_status(&state);
         assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::TMinus);
@@ -2521,8 +2717,10 @@ mod tests {
         assert_eq!(abort_packets[0].payload(), b"Manual Abort Command Issued");
     }
 
-    #[test]
-    fn exposed_flight_commands_transmit_to_the_discovered_rocket_side() {
+    #[tokio::test]
+    async fn exposed_flight_commands_transmit_to_the_discovered_rocket_side() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
         crate::telemetry_schema::initialize().unwrap();
         // Match FC's existing compatibility protocol, including every visible
         // threshold control. These are isolated packet captures, not outputs.
@@ -2589,8 +2787,13 @@ mod tests {
                 .process_all_queues_with_timeout(0)
                 .expect("failed to process RF discovery");
 
-            queue_locally_routed_flight_command(&router, "test flight command", &[command as u8])
-                .expect("failed to queue flight command");
+            queue_locally_routed_flight_command(
+                &state,
+                &router,
+                "test flight command",
+                &[command as u8],
+            )
+            .expect("failed to queue flight command");
             router
                 .process_all_queues_with_timeout(0)
                 .expect("failed to process router queues");
@@ -3135,6 +3338,7 @@ mod tests {
 
         #[cfg(feature = "testing")]
         queue_locally_routed_flight_command(
+            &state,
             &router,
             "MonitorAltitude test command",
             &[FlightComputerCommands::MonitorAltitude as u8],
@@ -4198,7 +4402,7 @@ mod tests {
         #[cfg(not(feature = "hitl_mode"))]
         let path = crate::gse::armed_fixture_for_test(&state, &router);
         #[cfg(feature = "hitl_mode")]
-        state.set_local_flight_state(FlightState::Launch);
+        state.set_local_flight_state(FlightState::Armed);
         let shutdown = state.shutdown_subscribe();
         let worker = tokio::spawn(telemetry_task(
             state.clone(),
@@ -4210,7 +4414,9 @@ mod tests {
         ));
         state
             .cmd_tx
-            .send(TelemetryCommand::AutomaticAbort)
+            .send(TelemetryCommand::AutomaticAbort {
+                generation: crate::gse::automatic_generation(&state),
+            })
             .await
             .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), received.recv()).await;
@@ -4238,23 +4444,95 @@ mod tests {
         let state = test_app_state(db_tx).await;
         *state.state.lock().unwrap() = FlightState::Idle;
         assert!(matches!(
-            command_at_dispatch(&state, TelemetryCommand::AutomaticAbort),
+            command_at_dispatch(
+                &state,
+                TelemetryCommand::AutomaticAbort {
+                    generation: crate::gse::automatic_generation(&state)
+                }
+            ),
             Some(TelemetryCommand::Abort)
         ));
         *state.state.lock().unwrap() = FlightState::Launch;
-        if cfg!(feature = "hitl_mode") {
-            assert!(matches!(
-                command_at_dispatch(&state, TelemetryCommand::AutomaticAbort),
-                Some(TelemetryCommand::Abort)
-            ));
-        } else {
-            assert!(command_at_dispatch(&state, TelemetryCommand::AutomaticAbort).is_none());
+        assert!(
+            command_at_dispatch(
+                &state,
+                TelemetryCommand::AutomaticAbort {
+                    generation: crate::gse::automatic_generation(&state)
+                }
+            )
+            .is_none(),
+            "all modes must suppress automatic abort after Launch"
+        );
+        for command in [
+            "AutomaticAbort",
+            "AutomaticNitrogenClose",
+            "AutomaticNitrousClose",
+        ] {
+            assert!(
+                serde_json::from_value::<TelemetryCommand>(serde_json::json!(command)).is_err()
+            );
         }
         assert!(matches!(
             command_at_dispatch(&state, TelemetryCommand::Abort),
             Some(TelemetryCommand::Abort)
         ));
         assert!(serde_json::from_str::<TelemetryCommand>("\"AutomaticAbort\"").is_err());
+    }
+
+    #[tokio::test]
+    async fn actual_worker_retires_old_operator_valve_and_launch_before_accepting_current_intent() {
+        let (db_tx, db_rx) = mpsc::channel(8);
+        let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
+        let old = crate::gse::automatic_generation(&state);
+        state.automatic_generation.store(old + 1, Ordering::Release);
+        *state.gse.lock().unwrap() = crate::gse::Runtime::default();
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let worker = tokio::spawn(telemetry_task(
+            state.clone(),
+            router,
+            Vec::new(),
+            cmd_rx,
+            db_rx,
+            state.shutdown_subscribe(),
+        ));
+        for command in [TelemetryCommand::Launch, TelemetryCommand::Nitrogen] {
+            state
+                .cmd_tx
+                .send(TelemetryCommand::QueuedOperator {
+                    generation: old,
+                    command: Box::new(command),
+                })
+                .await
+                .unwrap();
+        }
+        state
+            .cmd_tx
+            .send(TelemetryCommand::QueuedOperator {
+                generation: old + 1,
+                command: Box::new(TelemetryCommand::Postinit),
+            })
+            .await
+            .unwrap();
+        let progress = tokio::time::timeout(Duration::from_secs(2), async {
+            while !state
+                .last_command_ms
+                .lock()
+                .unwrap()
+                .contains_key("Postinit")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        state.request_shutdown();
+        worker.await.unwrap();
+        progress.expect("current intent must reach the actual command worker");
+        let accepted = state.last_command_ms.lock().unwrap();
+        assert!(!accepted.contains_key("Launch"));
+        assert!(!accepted.contains_key("Nitrogen"));
+        assert!(accepted.contains_key("Postinit"));
+        assert_eq!(crate::gse::automatic_generation(&state), old + 1);
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
     }
 
     async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {
@@ -4324,6 +4602,10 @@ mod tests {
             pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
             latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
             gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
+            automatic_generation: Arc::new(AtomicU64::new(1)),
+            operator_dispatch_inflight: Arc::new(AtomicUsize::new(0)),
+            manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
+            deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
             loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
             network_traffic: Arc::new(Mutex::new(crate::network_traffic::Sampler::default())),
@@ -4630,7 +4912,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn launch_zero_capture_is_nonblocking_and_times_out_to_abort_without_samples() {
+    async fn launch_zero_capture_is_nonblocking_and_retains_tare_without_automatic_abort() {
         let (db_tx, _) = mpsc::channel(4);
         let (state, mut commands) = test_app_state_with_cmd_rx(db_tx).await;
         *state.auto_zero.lock().unwrap() = crate::auto_zero::Runtime::testing(true);
@@ -4638,12 +4920,17 @@ mod tests {
         crate::auto_zero::launch(&state);
         assert!(start.elapsed() < Duration::from_millis(100));
         assert!(state.auto_zero.lock().unwrap().pending());
-        let command = tokio::time::timeout(Duration::from_secs(6), commands.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(command, TelemetryCommand::AutomaticAbort));
-        assert!(!state.auto_zero.lock().unwrap().pending());
+        tokio::time::timeout(Duration::from_secs(6), async {
+            while state.auto_zero.lock().unwrap().pending() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "missing tare samples must never enqueue an automatic Abort"
+        );
     }
 
     #[tokio::test]
@@ -4926,10 +5213,25 @@ mod tests {
         let mut ws = state.ws_tx.subscribe();
         publish_received_telemetry_rows(&state, rows.clone());
         let mut broadcast = Vec::new();
-        while let Ok(row) = ws.try_recv() { broadcast.push(row); }
-        for kind in ["KG1000", "COMBUSTION_CHAMBER_PRESSURE", "COMBUSTION_CHAMBER_VOLTAGE"] {
-            assert!(broadcast.iter().any(|row| row.data_type == kind), "missing live {kind}");
-            assert!(state.recent_telemetry_snapshot().iter().any(|row| row.data_type == kind), "missing reconnect {kind}");
+        while let Ok(row) = ws.try_recv() {
+            broadcast.push(row);
+        }
+        for kind in [
+            "KG1000",
+            "COMBUSTION_CHAMBER_PRESSURE",
+            "COMBUSTION_CHAMBER_VOLTAGE",
+        ] {
+            assert!(
+                broadcast.iter().any(|row| row.data_type == kind),
+                "missing live {kind}"
+            );
+            assert!(
+                state
+                    .recent_telemetry_snapshot()
+                    .iter()
+                    .any(|row| row.data_type == kind),
+                "missing reconnect {kind}"
+            );
         }
         assert!(rows.iter().any(
             |r| r.data_type == "COMBUSTION_CHAMBER_PRESSURE" && r.values == vec![Some(1000.0)]
@@ -5416,33 +5718,108 @@ mod tests {
         let state = test_app_state(db_tx.clone()).await;
         let overflow = test_db_overflow();
         for (name, words) in [
-            ("BOARD_HEALTH", { let mut words = vec![0; 24]; words[0] = 1; words[4] = 1000; words }),
-            ("DAQ_LAUNCH_LOG_STATUS", vec![u32::MAX - 1, 0x12345678, 99, 0xabcd, u32::MAX, 0xfedcba98, 0]),
+            ("BOARD_HEALTH", {
+                let mut words = vec![0; 24];
+                words[0] = 1;
+                words[4] = 1000;
+                words
+            }),
+            (
+                "DAQ_LAUNCH_LOG_STATUS",
+                vec![
+                    u32::MAX - 1,
+                    0x12345678,
+                    99,
+                    0xabcd,
+                    u32::MAX,
+                    0xfedcba98,
+                    0,
+                ],
+            ),
         ] {
             let payload: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
-            let packet = Packet::new(crate::telemetry_schema::data_type(name),
-                &[crate::telemetry_schema::endpoint("GROUND_STATION")], "DAQ", 100, payload.into()).unwrap();
-            assert!(handle_packet(&state, &db_tx, &overflow, packet).await.is_empty());
+            let packet = Packet::new(
+                crate::telemetry_schema::data_type(name),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "DAQ",
+                100,
+                payload.into(),
+            )
+            .unwrap();
+            assert!(
+                handle_packet(&state, &db_tx, &overflow, packet)
+                    .await
+                    .is_empty()
+            );
         }
-        let rows = state.network_health.lock().unwrap().snapshot(std::time::Instant::now(), false);
-        let status = rows.iter().find(|r| r.sender_id == "DAQ").unwrap()
-            .diagnostics.as_ref().unwrap().launch_log.as_ref().unwrap();
+        let rows = state
+            .network_health
+            .lock()
+            .unwrap()
+            .snapshot(std::time::Instant::now(), false);
+        let status = rows
+            .iter()
+            .find(|r| r.sender_id == "DAQ")
+            .unwrap()
+            .diagnostics
+            .as_ref()
+            .unwrap()
+            .launch_log
+            .as_ref()
+            .unwrap();
         assert_eq!(status.session, 0x12345678_fffffffe);
         assert_eq!(status.deadline_utc_ms, 0xabcd_00000063);
         assert_eq!(status.revision, 0xfedcba98_ffffffff);
-        assert_eq!(status.flags, 0, "accepted clock must not invent recorder-ready/open flags");
-        let network_now = recording_network_utc_ms().and_then(|t| u64::try_from(t).ok())
+        assert_eq!(
+            status.flags, 0,
+            "accepted clock must not invent recorder-ready/open flags"
+        );
+        let network_now = recording_network_utc_ms()
+            .and_then(|t| u64::try_from(t).ok())
             .unwrap_or_else(get_current_timestamp_ms);
-        let words = [u32::MAX - 1, 0x12345678, 99, 0xabcd, u32::MAX, 0xfedcba98, 0x31];
+        let words = [
+            u32::MAX - 1,
+            0x12345678,
+            99,
+            0xabcd,
+            u32::MAX,
+            0xfedcba98,
+            0x31,
+        ];
         let payload: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
-        let packet = Packet::new(crate::telemetry_schema::data_type("DAQ_LAUNCH_LOG_STATUS"),
-            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "DAQ", network_now - 30_000, payload.into()).unwrap();
-        assert!(handle_packet(&state, &db_tx, &overflow, packet).await.is_empty());
-        let rows = state.network_health.lock().unwrap().snapshot(std::time::Instant::now(), false);
-        let delayed = rows.iter().find(|r| r.sender_id == "DAQ").unwrap().diagnostics.as_ref().unwrap().launch_log.as_ref().unwrap();
-        assert!(delayed.received_age_ms >= 30_000, "queued old open-file report must arrive already stale");
+        let packet = Packet::new(
+            crate::telemetry_schema::data_type("DAQ_LAUNCH_LOG_STATUS"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            "DAQ",
+            network_now - 30_000,
+            payload.into(),
+        )
+        .unwrap();
+        assert!(
+            handle_packet(&state, &db_tx, &overflow, packet)
+                .await
+                .is_empty()
+        );
+        let rows = state
+            .network_health
+            .lock()
+            .unwrap()
+            .snapshot(std::time::Instant::now(), false);
+        let delayed = rows
+            .iter()
+            .find(|r| r.sender_id == "DAQ")
+            .unwrap()
+            .diagnostics
+            .as_ref()
+            .unwrap()
+            .launch_log
+            .as_ref()
+            .unwrap();
+        assert!(
+            delayed.received_age_ms >= 30_000,
+            "queued old open-file report must arrive already stale"
+        );
         assert_eq!(delayed.flags, 0x31);
-
     }
     #[tokio::test]
     async fn ordered_valve_confirmations_accept_rebooted_source_clock() {
@@ -5475,17 +5852,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_tick_distinct_valve_packets_update_once_and_replays_never_roll_back_ui_or_pending() {
+    async fn same_tick_distinct_valve_packets_update_once_and_replays_never_roll_back_ui_or_pending()
+     {
         for stamp in [0, 1234] {
             let (db_tx, _db_rx) = mpsc::channel(32);
             let state = test_app_state(db_tx.clone()).await;
             let overflow = test_db_overflow();
             let key = ActuatorBoardCommands::NitrogenOpen as u8;
-            let make = |value, nonce| Packet::new_with_nonce(
-                crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
-                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
-                "AB", stamp, nonce, Arc::from([key, value]),
-            ).unwrap();
+            let make = |value, nonce| {
+                Packet::new_with_nonce(
+                    crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
+                    &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                    "AB",
+                    stamp,
+                    nonce,
+                    Arc::from([key, value]),
+                )
+                .unwrap()
+            };
             let open = make(1, 11);
             let close = make(0, 12);
             let replay_new_nonce = make(1, 13);
