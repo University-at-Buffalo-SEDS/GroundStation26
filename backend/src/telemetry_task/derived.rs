@@ -583,8 +583,15 @@ pub(super) async fn emit_derived_battery_rows(
                 sender_id: sender_id.to_string(),
                 values,
             };
-            crate::telemetry_provenance::note(&row,source_timestamp_ms.and_then(|source|
-                crate::telemetry_provenance::canonical_source(source,super::procedure_clock::timestamp_ms())));
+            crate::telemetry_provenance::note(
+                &row,
+                source_timestamp_ms.and_then(|source| {
+                    crate::telemetry_provenance::canonical_source(
+                        source,
+                        super::procedure_clock::timestamp_ms(),
+                    )
+                }),
+            );
             state.cache_recent_telemetry(row.clone());
             let _ = state.ws_tx.send(row);
         }
@@ -772,8 +779,15 @@ pub(super) async fn emit_derived_loadcell_rows(
             sender_id: sample.sender_id.to_string(),
             values,
         };
-        crate::telemetry_provenance::note(&row,sample.source_timestamp_ms.and_then(|source|
-            crate::telemetry_provenance::canonical_source(source,super::procedure_clock::timestamp_ms())));
+        crate::telemetry_provenance::note(
+            &row,
+            sample.source_timestamp_ms.and_then(|source| {
+                crate::telemetry_provenance::canonical_source(
+                    source,
+                    super::procedure_clock::timestamp_ms(),
+                )
+            }),
+        );
         state.cache_recent_telemetry(row.clone());
         let _ = state.ws_tx.send(row);
     }
@@ -852,8 +866,15 @@ pub(super) async fn emit_derived_vehicle_speed_row(
         sender_id: String::new(),
         values,
     };
-    crate::telemetry_provenance::note(&row,source_timestamp_ms.and_then(|source|
-        crate::telemetry_provenance::canonical_source(source,super::procedure_clock::timestamp_ms())));
+    crate::telemetry_provenance::note(
+        &row,
+        source_timestamp_ms.and_then(|source| {
+            crate::telemetry_provenance::canonical_source(
+                source,
+                super::procedure_clock::timestamp_ms(),
+            )
+        }),
+    );
     state.cache_recent_telemetry(row.clone());
     let _ = state.ws_tx.send(row);
 }
@@ -936,7 +957,10 @@ fn chamber_pressure_rows(sender: &str, values: &[Option<f32>]) -> Vec<(String, V
     {
         rows.push(("COMBUSTION_CHAMBER_PRESSURE".into(), vec![values[1]]));
         rows.push(("COMBUSTION_CHAMBER_VOLTAGE".into(), vec![values[2]]));
-        let outside_nominal = values[1].is_some_and(|x| !(0.0..=1000.0).contains(&x));
+        // Source-owned idle suppression may report zero pressure while its
+        // raw connector voltage still reveals an electrical range fault.
+        let outside_nominal = values[1].is_some_and(|x| !(0.0..=1000.0).contains(&x))
+            || values[2].is_some_and(|x| !(0.0..=5.0).contains(&x));
         rows.push((
             "COMBUSTION_CHAMBER_RANGE_STATUS".into(),
             vec![Some(if outside_nominal { 1.0 } else { 0.0 })],
@@ -971,8 +995,77 @@ mod chamber_pressure_tests {
     fn invalid_loadcell_does_not_hide_valid_chamber_pressure() {
         let rows = chamber_pressure_rows("DAQ", &[None, Some(500.0), Some(2.5)]);
         assert!(!rows.iter().any(|(kind, _)| kind == "KG1000"));
-        assert!(rows.iter().any(|(kind, values)| kind == "COMBUSTION_CHAMBER_PRESSURE" && values == &vec![Some(500.0)]));
-        assert!(rows.iter().any(|(kind, _)| kind == "COMBUSTION_CHAMBER_VOLTAGE"));
+        assert!(
+            rows.iter()
+                .any(|(kind, values)| kind == "COMBUSTION_CHAMBER_PRESSURE"
+                    && values == &vec![Some(500.0)])
+        );
+        assert!(
+            rows.iter()
+                .any(|(kind, _)| kind == "COMBUSTION_CHAMBER_VOLTAGE")
+        );
+    }
+
+    #[test]
+    fn conditioned_zero_does_not_hide_raw_electrical_range_faults() {
+        for raw_voltage in [-0.03, 5.01] {
+            let rows = chamber_pressure_rows("DAQ", &[Some(1.25), Some(0.0), Some(raw_voltage)]);
+            assert!(
+                rows.iter()
+                    .any(|(kind, values)| kind == "COMBUSTION_CHAMBER_PRESSURE"
+                        && values == &vec![Some(0.0)])
+            );
+            assert!(
+                rows.iter()
+                    .any(|(kind, values)| kind == "COMBUSTION_CHAMBER_VOLTAGE"
+                        && values == &vec![Some(raw_voltage)])
+            );
+            assert!(
+                rows.iter()
+                    .any(|(kind, values)| kind == "COMBUSTION_CHAMBER_RANGE_STATUS"
+                        && values == &vec![Some(1.0)])
+            );
+            assert_eq!(rows[1], ("KG1000".into(), vec![Some(1.25)]));
+        }
+    }
+
+    #[test]
+    fn source_pressure_is_forwarded_without_a_second_cutoff_or_offset() {
+        for (pressure, raw_voltage) in [(3.0, 0.015), (0.0, 0.0224), (4.5, 0.0225), (500.0, 2.5)] {
+            let rows =
+                chamber_pressure_rows("DAQ", &[Some(1.25), Some(pressure), Some(raw_voltage)]);
+            // Historical/older-source readings stay as recorded; conditioning
+            // belongs to the DAQ firmware and is not silently applied twice.
+            assert_eq!(
+                rows[0].1,
+                vec![Some(1.25), Some(pressure), Some(raw_voltage)]
+            );
+            assert!(
+                rows.iter()
+                    .any(|(kind, values)| kind == "COMBUSTION_CHAMBER_PRESSURE"
+                        && values == &vec![Some(pressure)])
+            );
+            assert!(
+                rows.iter()
+                    .any(|(kind, values)| kind == "COMBUSTION_CHAMBER_RANGE_STATUS"
+                        && values == &vec![Some(0.0)])
+            );
+        }
+    }
+
+    #[test]
+    fn missing_or_nonfinite_chamber_source_is_never_fabricated_zero() {
+        for (pressure, voltage) in [
+            (None, None),
+            (Some(f32::NAN), Some(0.015)),
+            (Some(f32::INFINITY), Some(0.015)),
+            (Some(0.0), Some(f32::NAN)),
+            (Some(0.0), Some(f32::INFINITY)),
+        ] {
+            let rows = chamber_pressure_rows("DAQ", &[Some(1.25), pressure, voltage]);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[1], ("KG1000".into(), vec![Some(1.25)]));
+        }
     }
 
     #[test]
