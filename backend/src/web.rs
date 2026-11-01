@@ -2414,21 +2414,21 @@ async fn dispatch_command(
             };
         }
         let work = state.clone();
-        if let Err(error) = tokio::task::spawn_blocking(move || work.try_reset_launch_clock())
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|result| result)
-        {
+        let result = tokio::task::spawn_blocking(move || {
+            reset_primary_clock_for_origin(&work, admission_generation)
+        })
+        .await
+        .unwrap_or_else(|error| Err((StatusCode::CONFLICT, error.into())));
+        if let Err((status, error)) = result {
+            if status == StatusCode::INSUFFICIENT_STORAGE {
+                emit_notification_warning(&state, format!("T clock reset is not durable: {error}"));
+                return (
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "T clock reset was not saved",
+                );
+            }
             emit_notification_warning(&state, format!("T clock reset failed: {error}"));
             return (StatusCode::CONFLICT, "T clock reset failed");
-        }
-        let waiter = state.launch_history.lock().unwrap().waiter();
-        if let Err(error) = crate::launch_history::flush(waiter).await {
-            emit_notification_warning(&state, format!("T clock reset is not durable: {error}"));
-            return (
-                StatusCode::INSUFFICIENT_STORAGE,
-                "T clock reset was not saved",
-            );
         }
         return (StatusCode::OK, "ok");
     }
@@ -2455,6 +2455,39 @@ async fn dispatch_command(
         );
     }
     (StatusCode::OK, "ok")
+}
+
+/// Called inside the actual blocking worker, never around its async caller.
+/// HTTP/WS cancellation must not release the worker's mutation or durability
+/// wait. The claim is a lease; no dispatch/history mutex crosses writer.wait.
+fn reset_primary_clock_for_origin(
+    state: &AppState,
+    generation: u64,
+) -> Result<(), (StatusCode, anyhow::Error)> {
+    #[cfg(test)]
+    let _completion = clock_worker_tests::completion(state);
+    #[cfg(test)]
+    clock_worker_tests::pause_worker(state, clock_worker_tests::Phase::BeforeClaim);
+    let _claim = crate::gse::claim_operator_dispatch(state, generation).ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            anyhow::anyhow!("T clock reset cancelled by recovery"),
+        )
+    })?;
+    #[cfg(test)]
+    clock_worker_tests::pause_worker(state, clock_worker_tests::Phase::BeforeMutation);
+    state
+        .try_reset_launch_clock()
+        .map_err(|error| (StatusCode::CONFLICT, error))?;
+    let waiter = state.launch_history.lock().unwrap().waiter();
+    if let Some((writer, ticket)) = waiter {
+        // A timeout reports failure, not writer quiescence. Recovery must still
+        // verify the actual journal prefix before publishing its completion.
+        writer
+            .wait(ticket)
+            .map_err(|error| (StatusCode::INSUFFICIENT_STORAGE, error))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2589,7 +2622,7 @@ mod command_dispatch_tests {
         }
     }
 
-    async fn preauth_fixture() -> (
+    pub(super) async fn preauth_fixture() -> (
         TestDirectory,
         Arc<AppState>,
         tokio::sync::mpsc::Receiver<TelemetryCommand>,
@@ -2881,6 +2914,442 @@ mod command_dispatch_tests {
         *WS_COMMAND_RECEIVED.get().unwrap().lock().unwrap() = None;
         socket.close(None).await.unwrap();
         server.abort();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod clock_worker_tests {
+    use super::*;
+    use crate::telemetry_db::{LaunchClockKind, LaunchClockMsg};
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Phase {
+        BeforeClaim,
+        BeforeMutation,
+        Unpaused,
+    }
+    struct Pause {
+        entered: tokio::sync::Notify,
+        released: Mutex<bool>,
+        changed: Condvar,
+    }
+    impl Pause {
+        fn new() -> Self {
+            Self {
+                entered: tokio::sync::Notify::new(),
+                released: Mutex::new(false),
+                changed: Condvar::new(),
+            }
+        }
+        fn block(&self) {
+            self.entered.notify_one();
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.changed.wait(released).unwrap();
+            }
+        }
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+        async fn entered(&self) {
+            tokio::time::timeout(StdDuration::from_secs(3), self.entered.notified())
+                .await
+                .expect("actual worker must reach its pause");
+        }
+    }
+    struct Probe {
+        phase: Phase,
+        pause: Pause,
+        completed: tokio::sync::Notify,
+    }
+    static WORKER: OnceLock<Mutex<Option<(usize, Arc<Probe>)>>> = OnceLock::new();
+    static WRITER: OnceLock<Mutex<Option<(PathBuf, Arc<Pause>)>>> = OnceLock::new();
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(crate) struct Completion(Arc<Probe>);
+    impl Drop for Completion {
+        fn drop(&mut self) {
+            self.0.completed.notify_one();
+        }
+    }
+    fn probe(state: &AppState) -> Option<Arc<Probe>> {
+        WORKER
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(key, _)| *key == state as *const AppState as usize)
+            .map(|(_, p)| p.clone())
+    }
+    pub(crate) fn completion(state: &AppState) -> Option<Completion> {
+        probe(state).map(Completion)
+    }
+    pub(crate) fn pause_worker(state: &AppState, phase: Phase) {
+        if let Some(p) = probe(state)
+            && p.phase == phase
+        {
+            p.pause.block();
+        }
+    }
+    pub(crate) fn pause_journal_before_save(path: &std::path::Path) {
+        let p = WRITER
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(key, _)| key == path)
+            .map(|(_, p)| p.clone());
+        if let Some(p) = p {
+            p.block();
+        }
+    }
+    struct WorkerGuard {
+        key: usize,
+        probe: Arc<Probe>,
+    }
+    impl WorkerGuard {
+        fn install(state: &Arc<AppState>, phase: Phase) -> Self {
+            let key = Arc::as_ptr(state) as usize;
+            let probe = Arc::new(Probe {
+                phase,
+                pause: Pause::new(),
+                completed: tokio::sync::Notify::new(),
+            });
+            *WORKER.get_or_init(Default::default).lock().unwrap() = Some((key, probe.clone()));
+            Self { key, probe }
+        }
+        async fn completed(&self) {
+            tokio::time::timeout(StdDuration::from_secs(3), self.probe.completed.notified())
+                .await
+                .expect("actual blocking closure must complete");
+        }
+    }
+    impl Drop for WorkerGuard {
+        fn drop(&mut self) {
+            self.probe.pause.release();
+            let mut current = WORKER.get().unwrap().lock().unwrap();
+            if current.as_ref().is_some_and(|(key, _)| *key == self.key) {
+                *current = None;
+            }
+        }
+    }
+    struct WriterGuard {
+        path: PathBuf,
+        pause: Arc<Pause>,
+    }
+    impl WriterGuard {
+        fn install(path: PathBuf) -> Self {
+            let pause = Arc::new(Pause::new());
+            *WRITER.get_or_init(Default::default).lock().unwrap() =
+                Some((path.clone(), pause.clone()));
+            Self { path, pause }
+        }
+    }
+    impl Drop for WriterGuard {
+        fn drop(&mut self) {
+            self.pause.release();
+            let mut current = WRITER.get().unwrap().lock().unwrap();
+            if current.as_ref().is_some_and(|(path, _)| *path == self.path) {
+                *current = None;
+            }
+        }
+    }
+    async fn fixture() -> (
+        crate::recording_export::tests::TestDirectory,
+        Arc<AppState>,
+        HeaderMap,
+        PathBuf,
+    ) {
+        let (root, state, _rx, headers) = command_dispatch_tests::preauth_fixture().await;
+        let path = root.0.join("actual-clock.json");
+        let now = crate::telemetry_task::get_current_timestamp_ms() as i64;
+        *state.launch_history.lock().unwrap() =
+            crate::launch_history::Store::open(path.clone(), false, None, now, 0).unwrap();
+        state.set_launch_clock(LaunchClockMsg {
+            kind: LaunchClockKind::TPlus,
+            anchor_timestamp_ms: Some(now - 1_000),
+            duration_ms: None,
+        });
+        flush(&state).await;
+        (root, state, headers, path)
+    }
+    async fn flush(state: &AppState) {
+        let waiter = state.launch_history.lock().unwrap().waiter();
+        crate::launch_history::flush(waiter).await.unwrap();
+    }
+    fn http(
+        state: Arc<AppState>,
+        headers: HeaderMap,
+    ) -> tokio::task::JoinHandle<(StatusCode, &'static str)> {
+        tokio::spawn(async move {
+            send_command(State(state), headers, Json(TelemetryCommand::ResetTClock)).await
+        })
+    }
+    async fn manual_stop(state: &Arc<AppState>, headers: HeaderMap) {
+        let result = tokio::time::timeout(
+            StdDuration::from_secs(3),
+            send_command(State(state.clone()), headers, Json(TelemetryCommand::Abort)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.0, StatusCode::ACCEPTED);
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+    }
+    #[tokio::test]
+    async fn clock_worker_cancelled_http_keeps_actual_mutation_owned() {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, headers, path) = fixture().await;
+        let before = state.launch_history.lock().unwrap().snapshot();
+        let disk_before = std::fs::read(&path).unwrap();
+        let origin = crate::gse::automatic_generation(&state);
+        let guard = WorkerGuard::install(&state, Phase::BeforeMutation);
+        let request = http(state.clone(), headers.clone());
+        guard.probe.pause.entered().await;
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        let inflight = state.operator_dispatch_inflight.load(Ordering::Acquire);
+        let boundary = crate::gse::reset_generation::invalidate_capture_epoch(&state, origin);
+        manual_stop(&state, headers).await;
+        guard.probe.pause.release();
+        guard.completed().await;
+        flush(&state).await;
+        let after = state.launch_history.lock().unwrap().snapshot();
+        let disk_after = std::fs::read(&path).unwrap();
+        eprintln!(
+            "actual cancelled HTTP: inflight={inflight}, epoch_advanced={}, RAM_changed={}, journal_changed={}",
+            boundary.is_ok(),
+            after != before,
+            disk_after != disk_before
+        );
+        assert_eq!(after.clock, LaunchClockMsg::idle());
+        assert_ne!(
+            disk_after, disk_before,
+            "actual accepted worker must complete its journal write"
+        );
+        assert!(
+            boundary.is_err(),
+            "cancelled HTTP must not release the actual mutating worker's ownership"
+        );
+        assert_eq!(inflight, 1);
+        assert!(crate::gse::reset_generation::invalidate_capture_epoch(&state, origin).is_ok());
+    }
+    #[tokio::test]
+    async fn clock_worker_cancelled_http_keeps_actual_journal_flush_owned() {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, headers, path) = fixture().await;
+        let origin = crate::gse::automatic_generation(&state);
+        let worker = WorkerGuard::install(&state, Phase::Unpaused);
+        let writer = WriterGuard::install(path);
+        let request = http(state.clone(), headers.clone());
+        writer.pause.entered().await;
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        let inflight = state.operator_dispatch_inflight.load(Ordering::Acquire);
+        let boundary = crate::gse::reset_generation::invalidate_capture_epoch(&state, origin);
+        manual_stop(&state, headers).await;
+        writer.pause.release();
+        worker.completed().await;
+        flush(&state).await;
+        eprintln!(
+            "actual cancelled HTTP journal flush: inflight={inflight}, epoch_advanced={}",
+            boundary.is_ok()
+        );
+        assert!(
+            boundary.is_err(),
+            "journal ticket still writing must retain the worker claim through HTTP cancellation"
+        );
+        assert_eq!(inflight, 1);
+        assert!(crate::gse::reset_generation::invalidate_capture_epoch(&state, origin).is_ok());
+    }
+    #[tokio::test]
+    async fn clock_worker_websocket_spawn_before_epoch_cannot_write_late() {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, _headers, path) = fixture().await;
+        let before = state.launch_history.lock().unwrap().snapshot();
+        let disk_before = std::fs::read(&path).unwrap();
+        let origin = crate::gse::automatic_generation(&state);
+        let guard = WorkerGuard::install(&state, Phase::BeforeClaim);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/ws?token=preauth-test"))
+                .await
+                .unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"ResetTClock"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        guard.probe.pause.entered().await;
+        assert!(crate::gse::reset_generation::invalidate_capture_epoch(&state, origin).is_ok());
+        // Actual WS task has already spawned actual blocking work. Closing the
+        // socket must not make that old origin acquire fresh authority later.
+        socket.close(None).await.unwrap();
+        guard.probe.pause.release();
+        guard.completed().await;
+        flush(&state).await;
+        let after = state.launch_history.lock().unwrap().snapshot();
+        let disk_after = std::fs::read(&path).unwrap();
+        eprintln!(
+            "actual detached WS: RAM_changed={}, journal_changed={}",
+            after != before,
+            disk_after != disk_before
+        );
+        server.abort();
+        assert!(
+            after == before && disk_after == disk_before,
+            "spawned old-origin WS reset must not mutate RAM or journal after the epoch boundary"
+        );
+    }
+    #[tokio::test]
+    async fn clock_worker_http_spawn_before_epoch_returns409_without_mutation() {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, headers, path) = fixture().await;
+        let before = state.launch_history.lock().unwrap().snapshot();
+        let disk_before = std::fs::read(&path).unwrap();
+        let origin = crate::gse::automatic_generation(&state);
+        let worker = WorkerGuard::install(&state, Phase::BeforeClaim);
+        let request = http(state.clone(), headers);
+        worker.probe.pause.entered().await;
+        assert!(crate::gse::reset_generation::invalidate_capture_epoch(&state, origin).is_ok());
+        worker.probe.pause.release();
+        worker.completed().await;
+        assert_eq!(request.await.unwrap().0, StatusCode::CONFLICT);
+        flush(&state).await;
+        assert_eq!(state.launch_history.lock().unwrap().snapshot(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+    }
+
+    #[tokio::test]
+    async fn clock_worker_current_http_and_websocket_remain_durable_and_authorized() {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, headers, path) = fixture().await;
+        let before = state.launch_history.lock().unwrap().snapshot();
+        let disk_before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            send_command(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(TelemetryCommand::ResetTClock)
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(state.launch_history.lock().unwrap().snapshot(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+        assert_eq!(
+            http(state.clone(), headers).await.unwrap().0,
+            StatusCode::OK
+        );
+        let clock = state.launch_history.lock().unwrap().snapshot();
+        assert_eq!(clock.clock, LaunchClockMsg::idle());
+        assert_eq!(clock.revision, before.revision + 1);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()["current"],
+            serde_json::to_value(&clock).unwrap()
+        );
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+
+        let (_root_ws, ws_state, _headers, ws_path) = fixture().await;
+        let before = ws_state.launch_history.lock().unwrap().snapshot();
+        let worker = WorkerGuard::install(&ws_state, Phase::Unpaused);
+        let mut notices = ws_state.notifications_tx.subscribe();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .with_state(ws_state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/ws?token=preauth-test"))
+                .await
+                .unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"ResetTClock"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        worker.completed().await;
+        let saved = tokio::time::timeout(StdDuration::from_secs(3), notices.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            saved
+                .iter()
+                .any(|n| n.message == "Primary T clock reset saved")
+        );
+        let clock = ws_state.launch_history.lock().unwrap().snapshot();
+        assert_eq!(clock.clock, LaunchClockMsg::idle());
+        assert_eq!(clock.revision, before.revision + 1);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(ws_path).unwrap()).unwrap()
+                ["current"],
+            serde_json::to_value(&clock).unwrap()
+        );
+        assert_eq!(
+            ws_state.operator_dispatch_inflight.load(Ordering::Acquire),
+            0
+        );
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn clock_worker_writer_timeout_is507_and_not_writer_quiescence() {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, headers, path) = fixture().await;
+        let disk_before = std::fs::read(&path).unwrap();
+        let worker = WorkerGuard::install(&state, Phase::Unpaused);
+        let writer = WriterGuard::install(path.clone());
+        let request = http(state.clone(), headers.clone());
+        writer.pause.entered().await;
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 1);
+        manual_stop(&state, headers).await;
+        // Exercise the production ten-second wait deadline unchanged. The
+        // separate journal thread stays paused after this HTTP failure.
+        let response = tokio::time::timeout(StdDuration::from_secs(15), request)
+            .await
+            .unwrap()
+            .unwrap();
+        worker.completed().await;
+        assert_eq!(
+            response,
+            (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "T clock reset was not saved"
+            )
+        );
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+        assert!(
+            !*writer.pause.released.lock().unwrap(),
+            "the actual writer is still blocked after timeout"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+        assert_eq!(
+            state.launch_history.lock().unwrap().snapshot().clock,
+            LaunchClockMsg::idle()
+        );
+        eprintln!(
+            "actual timeout: HTTP507, claim_released=true, actual_writer_still_paused=true, journal_unchanged=true; NOT quiescent"
+        );
+        // No epoch advance is attempted: the full coordinator must inspect
+        // its journal prefix rather than use a timeout/zero owner count as proof.
+        writer.pause.release();
+        flush(&state).await;
+        assert_ne!(std::fs::read(path).unwrap(), disk_before);
     }
 }
 
@@ -3805,16 +4274,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
                                 } else {
                                     let work = reset_state.clone();
                                     match tokio::task::spawn_blocking(move || {
-                                        work.try_reset_launch_clock()
+                                        reset_primary_clock_for_origin(&work, admission_generation)
                                     })
                                     .await
                                     {
-                                        Ok(Ok(())) => {
-                                            let waiter =
-                                                reset_state.launch_history.lock().unwrap().waiter();
-                                            crate::launch_history::flush(waiter).await.map(|_| true)
-                                        }
-                                        Ok(Err(error)) => Err(error),
+                                        Ok(Ok(())) => Ok(true),
+                                        Ok(Err((_, error))) => Err(error),
                                         Err(error) => Err(error.into()),
                                     }
                                 };

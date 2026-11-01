@@ -152,6 +152,9 @@ fn paired_clock_requires_signature_primary_identity_and_current_challenge() {
 async fn observer_reset_roundtrip_requires_expected_contract_durable_primary_and_keeps_offline_clock()
  {
     *broker().lock().unwrap() = ResetBroker::default();
+    let root = crate::recording_export::tests::TestDirectory::new();
+    let primary = paired(&root.0, "gs", 7);
+    let observer = paired(&root.0, "rrls", 7);
     let state = crate::state::tests::test_app_state().await;
     state.set_launch_clock(LaunchClockMsg {
         kind: LaunchClockKind::TPlus,
@@ -160,22 +163,25 @@ async fn observer_reset_roundtrip_requires_expected_contract_durable_primary_and
     });
     let clock = state.launch_history.lock().unwrap().snapshot();
     let nonce = queue_reset(clock.clone()).unwrap();
-    let mut rr = Runtime::new(None, true).unwrap();
+    let mut rr = Runtime::new(Some(&observer), true).unwrap();
     rr.connect(false, None);
-    rr.offer_reset(None, &clock, 0, |_| panic!("offline reset must not send"))
-        .unwrap();
+    rr.offer_reset(Some(&observer), &clock, 0, |_| {
+        panic!("offline reset must not send")
+    })
+    .unwrap();
     assert!(reset_status().pending);
     assert_eq!(state.launch_history.lock().unwrap().snapshot(), clock);
     rr.connect(true, Some(42));
     let mut request = Vec::new();
-    rr.offer_reset(None, &clock, 1, |w| {
+    rr.offer_reset(Some(&observer), &clock, 1, |w| {
         request = w.to_vec();
         true
     })
     .unwrap();
-    let mut gs = Runtime::new(None, false).unwrap();
+    let mut gs = Runtime::new(Some(&primary), false).unwrap();
     gs.connect(false, Some(42));
-    let Some(Outcome::Reset { expected, .. }) = gs.receive(None, &request, 2, &clock).unwrap()
+    let Some(Outcome::Reset { expected, .. }) =
+        gs.receive(Some(&primary), &request, 2, &clock).unwrap()
     else {
         panic!("missing reset request")
     };
@@ -184,8 +190,8 @@ async fn observer_reset_roundtrip_requires_expected_contract_durable_primary_and
     assert_eq!(reset.clock, LaunchClockMsg::idle());
     assert_ne!(reset.session, clock.session);
     let reply = seal(
-        None,
-        "",
+        Some(&primary),
+        "rrls",
         42,
         Message::ResetReply {
             nonce: nonce.clone(),
@@ -196,7 +202,7 @@ async fn observer_reset_roundtrip_requires_expected_contract_durable_primary_and
     )
     .unwrap();
     assert!(
-        matches!(rr.receive(None,&reply,3,&clock).unwrap(),Some(Outcome::Clock(value)) if value==reset)
+        matches!(rr.receive(Some(&observer),&reply,3,&clock).unwrap(),Some(Outcome::Clock(value)) if value==reset)
     );
     assert!(!reset_status().pending);
     assert!(
@@ -219,10 +225,11 @@ async fn observer_reset_roundtrip_requires_expected_contract_durable_primary_and
     assert!(state.try_reset_expected_launch_clock(&expected).is_err());
     assert_eq!(state.launch_history.lock().unwrap().snapshot(), new_launch);
     let nonce = queue_reset(new_launch.clone()).unwrap();
-    rr.offer_reset(None, &new_launch, 4, |_| true).unwrap();
+    rr.offer_reset(Some(&observer), &new_launch, 4, |_| true)
+        .unwrap();
     let failed = seal(
-        None,
-        "",
+        Some(&primary),
+        "rrls",
         42,
         Message::ResetReply {
             nonce,
@@ -233,20 +240,22 @@ async fn observer_reset_roundtrip_requires_expected_contract_durable_primary_and
     )
     .unwrap();
     assert!(
-        rr.receive(None, &failed, 5, &new_launch).is_err(),
+        rr.receive(Some(&observer), &failed, 5, &new_launch)
+            .is_err(),
         "older reset reply never clears a new launch"
     );
-    rr.offer_reset(None, &clock, 6, |_| {
+    rr.offer_reset(Some(&observer), &clock, 6, |_| {
         panic!("superseded request must not send")
     })
     .unwrap();
     assert!(!reset_status().pending);
     assert!(reset_status().error.is_some());
     let nonce = queue_reset(new_launch.clone()).unwrap();
-    rr.offer_reset(None, &new_launch, 7, |_| true).unwrap();
+    rr.offer_reset(Some(&observer), &new_launch, 7, |_| true)
+        .unwrap();
     let failed = seal(
-        None,
-        "",
+        Some(&primary),
+        "rrls",
         42,
         Message::ResetReply {
             nonce,
@@ -256,7 +265,11 @@ async fn observer_reset_roundtrip_requires_expected_contract_durable_primary_and
         },
     )
     .unwrap();
-    assert!(rr.receive(None, &failed, 8, &new_launch).unwrap().is_none());
+    assert!(
+        rr.receive(Some(&observer), &failed, 8, &new_launch)
+            .unwrap()
+            .is_none()
+    );
     assert!(broker().lock().unwrap().result.as_ref().unwrap().1.is_err());
 }
 #[test]
@@ -635,4 +648,250 @@ fn negotiated_dirty_hint_crosses_real_direct_mesh_without_creating_a_lease() {
     assert_eq!(observer.operating_mode_session(0), None);
     assert!(!observer.settings_available(0));
     assert!(!observer.active(0));
+}
+
+async fn authority_fixture() -> (
+    crate::recording_export::tests::TestDirectory,
+    Arc<AppState>,
+    std::path::PathBuf,
+) {
+    let root = crate::recording_export::tests::TestDirectory::new();
+    let state = crate::state::tests::test_app_state().await;
+    let path = root.0.join("actual-authority-clock.json");
+    let now = crate::telemetry_task::get_current_timestamp_ms() as i64;
+    *state.launch_history.lock().unwrap() =
+        crate::launch_history::Store::open(path.clone(), false, None, now, 0).unwrap();
+    state.set_launch_clock(LaunchClockMsg {
+        kind: LaunchClockKind::TPlus,
+        anchor_timestamp_ms: Some(now - 1000),
+        duration_ms: None,
+    });
+    let waiter = state.launch_history.lock().unwrap().waiter();
+    crate::launch_history::flush(waiter).await.unwrap();
+    (root, state, path)
+}
+async fn authority_apply(
+    state: &AppState,
+    primary: &mut Runtime,
+    pairing: Option<&Pairing>,
+    wire: &[u8],
+) -> Result<()> {
+    let current = state.launch_history.lock().unwrap().snapshot();
+    let Some(Outcome::Reset { expected, .. }) = primary.receive(pairing, wire, 2, &current)? else {
+        anyhow::bail!("not a reset outcome");
+    };
+    // Exercise the actual authoritative RAM mutation and actual journal write,
+    // rather than turning a decoder rejection into a modeled callback result.
+    state.try_reset_expected_launch_clock(&expected)?;
+    let waiter = state.launch_history.lock().unwrap().waiter();
+    crate::launch_history::flush(waiter).await
+}
+#[tokio::test]
+async fn authority_unsigned_remote_reset_changes_neither_ram_nor_real_journal() {
+    let (_root, state, path) = authority_fixture().await;
+    let before = state.launch_history.lock().unwrap().snapshot();
+    let disk_before = std::fs::read(&path).unwrap();
+    let request = seal(
+        None,
+        "",
+        42,
+        Message::ResetRequest {
+            nonce: "a".repeat(32),
+            expected: before.clone(),
+        },
+    )
+    .unwrap();
+    let mut primary = Runtime::new(None, false).unwrap();
+    primary.connect(false, Some(42));
+    let accepted = authority_apply(&state, &mut primary, None, &request)
+        .await
+        .is_ok();
+    let ram_changed = state.launch_history.lock().unwrap().snapshot() != before;
+    let journal_changed = std::fs::read(path).unwrap() != disk_before;
+    eprintln!(
+        "actual unsigned reset: accepted={accepted}, RAM_changed={ram_changed}, journal_changed={journal_changed}"
+    );
+    assert!(
+        !accepted && !ram_changed && !journal_changed,
+        "unsigned legacy frame must not authorize a real clock reset"
+    );
+}
+#[tokio::test]
+async fn authority_paired_retry_replay_and_invalid_contracts_preserve_real_journal() {
+    let (root, state, path) = authority_fixture().await;
+    let mut primary_pairing = paired(&root.0, "gs", 7);
+    let mut observer = paired(&root.0, "rrls", 7);
+    let impostor = paired(&root.0, "rrls", 8);
+    let before = state.launch_history.lock().unwrap().snapshot();
+    let disk_before = std::fs::read(&path).unwrap();
+    let mut primary = Runtime::new(Some(&primary_pairing), false).unwrap();
+    primary.connect(false, Some(42));
+    let message = || Message::ResetRequest {
+        nonce: "b".repeat(32),
+        expected: before.clone(),
+    };
+    let mut invalid = vec![
+        seal(Some(&impostor), "gs", 42, message()).unwrap(),
+        seal(Some(&observer), "other", 42, message()).unwrap(),
+        seal(Some(&observer), "gs", 41, message()).unwrap(),
+        seal(
+            Some(&observer),
+            "gs",
+            42,
+            Message::ResetRequest {
+                nonce: "bad".into(),
+                expected: before.clone(),
+            },
+        )
+        .unwrap(),
+    ];
+    let mut expected_other_revision = before.clone();
+    expected_other_revision.revision += 1;
+    invalid.push(
+        seal(
+            Some(&observer),
+            "gs",
+            42,
+            Message::ResetRequest {
+                nonce: "c".repeat(32),
+                expected: expected_other_revision,
+            },
+        )
+        .unwrap(),
+    );
+    observer.public.installation_id = "other-installation".into();
+    invalid.push(seal(Some(&observer), "gs", 42, message()).unwrap());
+    observer.public.installation_id = "launch-test".into();
+    observer.public.station_id = "unknown-peer".into();
+    invalid.push(seal(Some(&observer), "gs", 42, message()).unwrap());
+    observer.public.station_id = "rrls".into();
+    for wire in invalid {
+        assert!(
+            authority_apply(&state, &mut primary, Some(&primary_pairing), &wire)
+                .await
+                .is_err()
+        );
+        assert_eq!(state.launch_history.lock().unwrap().snapshot(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+    }
+    let request = seal(Some(&observer), "gs", 42, message()).unwrap();
+    primary_pairing.public.peers[0].role = "primary".into();
+    assert!(
+        authority_apply(&state, &mut primary, Some(&primary_pairing), &request)
+            .await
+            .is_err()
+    );
+    assert_eq!(state.launch_history.lock().unwrap().snapshot(), before);
+    assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+    primary_pairing.public.peers[0].role = "rrls".into();
+    authority_apply(&state, &mut primary, Some(&primary_pairing), &request)
+        .await
+        .unwrap();
+    let reset = state.launch_history.lock().unwrap().snapshot();
+    let disk_reset = std::fs::read(&path).unwrap();
+    assert_eq!(reset.clock, LaunchClockMsg::idle());
+    assert_eq!(reset.authority, before.authority);
+    assert_eq!(reset.revision, before.revision + 1);
+    assert_ne!(reset.session, before.session);
+    authority_apply(&state, &mut primary, Some(&primary_pairing), &request)
+        .await
+        .unwrap();
+    assert_eq!(state.launch_history.lock().unwrap().snapshot(), reset);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        disk_reset,
+        "exact same request retry is idempotent"
+    );
+    state.confirm_new_launch_cycle();
+    let now = crate::telemetry_task::get_current_timestamp_ms() as i64;
+    state.set_launch_clock(LaunchClockMsg {
+        kind: LaunchClockKind::TMinus,
+        anchor_timestamp_ms: Some(now + 1000),
+        duration_ms: Some(1000),
+    });
+    state.set_launch_clock(LaunchClockMsg {
+        kind: LaunchClockKind::TPlus,
+        anchor_timestamp_ms: Some(now + 1000),
+        duration_ms: None,
+    });
+    let waiter = state.launch_history.lock().unwrap().waiter();
+    crate::launch_history::flush(waiter).await.unwrap();
+    let current = state.launch_history.lock().unwrap().snapshot();
+    let disk_current = std::fs::read(&path).unwrap();
+    assert_ne!(current, reset);
+    assert!(
+        authority_apply(&state, &mut primary, Some(&primary_pairing), &request)
+            .await
+            .is_err(),
+        "old expected contract cannot reset a later launch"
+    );
+    assert_eq!(state.launch_history.lock().unwrap().snapshot(), current);
+    assert_eq!(std::fs::read(path).unwrap(), disk_current);
+    eprintln!(
+        "actual paired reset: durable=true, exact_retry_idempotent=true, invalid_contracts_and_later_revision_replay_no_RAM_no_journal=true"
+    );
+}
+struct AuthorityBrokerCleanup;
+impl Drop for AuthorityBrokerCleanup {
+    fn drop(&mut self) {
+        *broker().lock().unwrap() = ResetBroker::default();
+    }
+}
+#[tokio::test]
+async fn authority_unpaired_request_fails_before_wait_and_without_clock_change() {
+    use futures::FutureExt;
+    let _cleanup = AuthorityBrokerCleanup;
+    *broker().lock().unwrap() = ResetBroker::default();
+    assert!(
+        Pairing::load().unwrap().is_none(),
+        "test runner selects isolated unpaired default"
+    );
+    let (_root, state, path) = authority_fixture().await;
+    let before = state.launch_history.lock().unwrap().snapshot();
+    let disk_before = std::fs::read(&path).unwrap();
+    let result = request_reset(&state).now_or_never();
+    let immediate_error = result.as_ref().is_some_and(|r| r.is_err());
+    let intent_pending = reset_status().pending;
+    eprintln!(
+        "actual unpaired reset API: immediate_error={immediate_error}, pending={intent_pending}"
+    );
+    assert_eq!(state.launch_history.lock().unwrap().snapshot(), before);
+    assert_eq!(std::fs::read(path).unwrap(), disk_before);
+    assert!(
+        immediate_error && !intent_pending,
+        "unpaired reset must fail promptly without a queued/hanging intent"
+    );
+    let text = result.unwrap().unwrap_err().to_string();
+    assert!(text.contains("paired station") && text.contains("primary"));
+}
+#[tokio::test]
+async fn authority_unpaired_offline_intent_finishes_visibly_without_sending() {
+    let _cleanup = AuthorityBrokerCleanup;
+    *broker().lock().unwrap() = ResetBroker::default();
+    let (_root, state, path) = authority_fixture().await;
+    let before = state.launch_history.lock().unwrap().snapshot();
+    let disk_before = std::fs::read(&path).unwrap();
+    queue_reset(before.clone()).unwrap();
+    let mut observer = Runtime::new(None, true).unwrap();
+    observer.connect(false, None);
+    observer
+        .offer_reset(None, &before, 0, |_| {
+            panic!("unpaired intent must never send")
+        })
+        .unwrap();
+    let status = reset_status();
+    eprintln!(
+        "actual unpaired offline intent: pending={}, actionable_error={}",
+        status.pending,
+        status
+            .error
+            .as_ref()
+            .is_some_and(|e| e.contains("paired station"))
+    );
+    assert_eq!(state.launch_history.lock().unwrap().snapshot(), before);
+    assert_eq!(std::fs::read(path).unwrap(), disk_before);
+    assert!(
+        !status.pending && status.error.is_some_and(|e| e.contains("paired station")),
+        "unpaired intent must finish with an actionable failure even while offline"
+    );
 }

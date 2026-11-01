@@ -12,6 +12,7 @@ const DOMAIN: &[u8] = b"gs-primary-launch-clock-v1\0";
 const MAX_WIRE: usize = 1024;
 const TTL: u64 = 30_000;
 const RETRY: u64 = 5_000;
+const RESET_PAIRING_REQUIRED: &str = "Remote T clock reset requires a paired station. Pair this recovery station with the primary, or reset T clock on the primary GroundStation.";
 pub(crate) fn recognizes(wire: &[u8]) -> bool {
     wire.starts_with(SIGNED)
         || wire.starts_with(DISPLAY)
@@ -159,6 +160,9 @@ pub fn reset_status() -> ResetStatus {
 }
 /// Authenticated HTTP caller only. A queued request never clears the local clock.
 pub async fn request_reset(state: &Arc<AppState>) -> Result<bool> {
+    // Legacy DISPLAY remains useful without pairing, but grants no write authority.
+    let pairing = Pairing::load()?.ok_or_else(|| anyhow::anyhow!(RESET_PAIRING_REQUIRED))?;
+    Runtime::new(Some(&pairing), true)?;
     let expected = state.launch_history.lock().unwrap().snapshot();
     let nonce = queue_reset(expected)?;
     await_reset_nonce(nonce).await
@@ -491,6 +495,7 @@ impl Runtime {
                     Ok(None)
                 }
                 Message::ResetRequest { nonce, expected } => {
+                    ensure!(pairing.is_some(), RESET_PAIRING_REQUIRED);
                     ensure!(valid_nonce(&nonce), "Invalid reset challenge");
                     expected.validate()?;
                     Ok(Some(Outcome::Reset {
@@ -525,7 +530,22 @@ impl Runtime {
         now: u64,
         mut send: impl FnMut(&[u8]) -> bool,
     ) -> Result<()> {
-        if !self.observer || !self.connected {
+        if !self.observer {
+            return Ok(());
+        }
+        if pairing.is_none() {
+            let nonce = broker()
+                .lock()
+                .unwrap()
+                .intent
+                .as_ref()
+                .map(|intent| intent.nonce.clone());
+            if let Some(nonce) = nonce {
+                complete_reset(&nonce, Some(RESET_PAIRING_REQUIRED.into()));
+            }
+            return Ok(());
+        }
+        if !self.connected {
             return Ok(());
         }
         let Some(session) = self.session else {

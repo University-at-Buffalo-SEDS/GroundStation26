@@ -63,6 +63,8 @@ impl Writer {
                             std::fs::File::open(&backup)?.sync_all()?;
                             preserve_unreadable = false;
                         }
+                        #[cfg(test)]
+                        crate::web::clock_worker_tests::pause_journal_before_save(&path);
                         atomic_save(&path, &data)
                     })();
                     let report = {
