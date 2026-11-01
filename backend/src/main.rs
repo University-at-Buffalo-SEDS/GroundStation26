@@ -17,6 +17,7 @@ mod antenna;
 mod auth;
 mod auto_zero;
 mod board_recovery;
+mod actuator_plumbing;
 mod checklists;
 mod command_probe;
 mod command_proxy;
@@ -1239,10 +1240,12 @@ async fn main() -> anyhow::Result<()> {
         latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
         gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
         automatic_generation: Arc::new(AtomicU64::new(1)),
+        operator_admission_barrier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         operator_dispatch_inflight: Arc::new(AtomicUsize::new(0)),
         manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
         deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
         board_recovery: Arc::new(crate::board_recovery::Runtime::default()),
+        plumbing_drive: Arc::new(crate::actuator_plumbing::Runtime::default()),
         latest_fill_mass_kg: Arc::new(Mutex::new(None)),
         loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
         network_traffic: Arc::new(Mutex::new(crate::network_traffic::Sampler::default())),
@@ -1587,6 +1590,10 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                 }
+            }
+            if pkt.data_type() == telemetry_schema::data_type("AB_FILL_DRIVE_STATUS") {
+                crate::actuator_plumbing::receive_status(&ground_station_handler_state_clone, pkt);
+                return Ok(());
             }
             if pkt.data_type() == telemetry_schema::data_type("BOARD_STATE_STATUS") {
                 // Correlated actual board readbacks bypass DB/GSE work.

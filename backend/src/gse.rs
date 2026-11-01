@@ -1014,9 +1014,16 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
     }
 }
 pub fn handle_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
+    handle_command_with_motion_origin(state, cmd, None)
+}
+pub(crate) fn handle_command_with_motion_origin(
+    state: &Arc<AppState>,
+    cmd: &TelemetryCommand,
+    plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+) -> bool {
     let handled = {
         let _dispatch = DISPATCH_GATE.lock().unwrap();
-        handle_command_inner(state, cmd)
+        handle_command_inner(state, cmd, plumbing_origin)
     };
     flush_effects(state);
     handled
@@ -1029,7 +1036,13 @@ fn flush_effects(state: &Arc<AppState>) {
         crate::telemetry_task::flush_command_tx(router, "GSE sequence");
     }
 }
-fn handle_command_inner(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
+fn handle_command_inner(
+    state: &Arc<AppState>,
+    cmd: &TelemetryCommand,
+    plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+) -> bool {
+    #[cfg(feature = "hitl_mode")]
+    let _ = plumbing_origin;
     if matches!(cmd, TelemetryCommand::Turbocharge) {
         turbocharge::request(state);
         return true;
@@ -1061,7 +1074,7 @@ fn handle_command_inner(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
         return true;
     }
     #[cfg(not(feature = "hitl_mode"))]
-    if handle_operational_command(state, cmd) {
+    if handle_operational_command(state, cmd, plumbing_origin) {
         return true;
     }
     #[cfg(feature = "hitl_mode")]
@@ -1211,7 +1224,7 @@ pub(crate) fn start_fill_after_automatic_zero(state: &Arc<AppState>, generation:
         }
         state.gse.lock().unwrap().observe_mass(Some(0.0));
         *state.latest_fill_mass_kg.lock().unwrap() = Some(0.0);
-        handle_command_inner(state, &TelemetryCommand::StartFill);
+        handle_command_inner(state, &TelemetryCommand::StartFill, None);
     }
     flush_effects(state);
 }
@@ -1248,7 +1261,7 @@ pub(crate) fn cancel_fill_for_recoverable_fault(state: &Arc<AppState>, reason: &
             rt.engine.active() || rt.fill_trim.is_some()
         };
         if active && prelaunch(state) {
-            handle_command_inner(state, &TelemetryCommand::CancelFill);
+            handle_command_inner(state, &TelemetryCommand::CancelFill, None);
             state.add_temporary_notification(format!("Fill cancelled: {reason}"));
         }
     }
@@ -1904,7 +1917,10 @@ mod tests {
         assert!(error.1.contains("synchronized network time"));
         assert_eq!(state.local_flight_state_snapshot(), FlightState::Aborted);
         #[cfg(not(feature = "hitl_mode"))]
-        assert_eq!(serde_json::to_value(&state.gse.lock().unwrap().operational.saved).unwrap(), saved);
+        assert_eq!(
+            serde_json::to_value(&state.gse.lock().unwrap().operational.saved).unwrap(),
+            saved
+        );
     }
 
     pub(super) type TestCommands = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
@@ -1936,7 +1952,10 @@ mod tests {
         let router = Arc::new(sedsnet::router::Router::new(
             sedsnet::router::RouterConfig::new([]).with_sender("GS"),
         ));
-        crate::telemetry_task::refresh_host_network_time(&router, crate::telemetry_task::get_current_timestamp_ms());
+        crate::telemetry_task::refresh_host_network_time(
+            &router,
+            crate::telemetry_task::get_current_timestamp_ms(),
+        );
         let ground_weak = Arc::downgrade(&router);
         let ground_ingress = Arc::new(std::sync::OnceLock::new());
         let ingress = ground_ingress.clone();
@@ -2461,10 +2480,12 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
             "Abort delivery is still pending; retry after the network drains".into(),
         ));
     }
-    crate::system_clock::required_control_network_utc_ms(router).map_err(|error| (
-        StatusCode::SERVICE_UNAVAILABLE,
-        format!("Recovery requires synchronized network time: {error}"),
-    ))?;
+    crate::system_clock::required_control_network_utc_ms(router).map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("Recovery requires synchronized network time: {error}"),
+        )
+    })?;
     #[allow(unused_mut)] // Operational recovery mutates this guard outside HITL.
     let mut rt = state.gse.lock().unwrap();
     if rt.engine.active() {
@@ -2775,17 +2796,20 @@ fn controller_delivery_pending(state: &AppState) -> bool {
         return true;
     }
     state.topology_router.get().is_some_and(|router| {
-        ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND"]
-            .iter()
-            .any(|name| {
-                router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type(name))
-            })
+        [
+            "ABORT",
+            "VALVE_COMMAND",
+            "ACTUATOR_COMMAND",
+            "FLIGHT_COMMAND",
+        ]
+        .iter()
+        .any(|name| router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type(name)))
     })
 }
 
 /// Ownership snapshot taken before launch journal work. No intent lock is
 /// held across durable I/O; a changed Stop epoch invalidates final admission.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct LaunchAdmission {
     generation: u64,
     manual_epoch: u64,
@@ -2842,6 +2866,44 @@ fn abort_safe_control(kind: sedsnet::config::DataType, payload: &[u8]) -> bool {
 /// verified Reset must quiesce those leases before advancing generation.
 /// Automatic apply already owns DISPATCH_GATE. Re-entering it here would
 /// deadlock; this unit exposes no reset API without that quiescence contract.
+pub(crate) fn plumbing_admission_ticket(state: &AppState) -> LaunchAdmission {
+    LaunchAdmission::capture(state)
+}
+pub(crate) fn with_plumbing_admission<T>(
+    state: &AppState,
+    ticket: LaunchAdmission,
+    admit: impl FnOnce() -> T,
+) -> Result<T, &'static str> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if manual_stop_pending(state) {
+        return Err("Manual Stop is pending; plumbing admission refused");
+    }
+    with_stop_admission(state, ticket, admit)
+}
+pub(crate) fn queue_plumbing_under_dispatch_with_stop_fence(
+    state: &AppState,
+    router: &sedsnet::router::Router,
+    origin: Option<crate::actuator_plumbing::MotionOrigin>,
+    logged: bool,
+) -> Result<(), String> {
+    if manual_stop_pending(state) {
+        return Err("Manual Stop is pending; plumbing motion was not queued".into());
+    }
+    let ticket = LaunchAdmission::capture(state);
+    with_stop_admission(state, ticket, || {
+        crate::actuator_plumbing::queue_motion_under_dispatch(state, router, origin, logged)
+    })
+    .map_err(str::to_string)?
+}
+pub(crate) fn queue_plumbing_with_stop_fence(
+    state: &AppState,
+    router: &sedsnet::router::Router,
+    origin: Option<crate::actuator_plumbing::MotionOrigin>,
+) -> Result<(), String> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    queue_plumbing_under_dispatch_with_stop_fence(state, router, origin, false)
+}
+
 pub(crate) fn queue_controller_with_stop_fence(
     state: &AppState,
     router: &sedsnet::router::Router,
@@ -3029,7 +3091,10 @@ pub(crate) fn armed_fixture_for_test(
     router: &Arc<sedsnet::router::Router>,
 ) -> std::path::PathBuf {
     use crate::types::Board;
-    crate::telemetry_task::refresh_host_network_time(router, crate::telemetry_task::get_current_timestamp_ms());
+    crate::telemetry_task::refresh_host_network_time(
+        router,
+        crate::telemetry_task::get_current_timestamp_ms(),
+    );
     state.set_local_flight_state(FlightState::Armed);
     let side = router.add_side_packed("test_fixture_other_boards", |_| Ok(()));
     let mut endpoints = vec![crate::telemetry_schema::endpoint("ACTUATOR_BOARD")];
@@ -3106,6 +3171,25 @@ pub(crate) fn armed_fixture_for_test(
     policy.software_buttons_enabled = true;
     state.set_action_policy(policy);
     path
+}
+
+#[cfg(all(test, not(feature = "hitl_mode")))]
+pub(crate) fn reset_plumbing_qd_for_test(state: &AppState) {
+    state.gse.lock().unwrap().operational.qd = QdWait::default();
+}
+
+#[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
+pub(crate) fn plumbing_qd_probe_for_test(state: &AppState, advance_ms: u64) -> (QdStatus, u64) {
+    assert!(
+        crate::simulation_clock_ms().is_none(),
+        "test explicitly models monotonic elapsed time"
+    );
+    let mut rt = state.gse.lock().unwrap();
+    rt.clock -= std::time::Duration::from_millis(advance_ms);
+    (
+        rt.operational.qd.status(rt.now()),
+        rt.operational.qd_dispatch_utc_ms.unwrap(),
+    )
 }
 
 #[cfg(test)]
@@ -3202,7 +3286,12 @@ pub(crate) fn record_operator_command(
     duplicate_window_ms: u64,
 ) -> OperatorCommandAdmission {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
-    if generation != automatic_generation(state) {
+    if generation != automatic_generation(state)
+        || state
+            .operator_admission_barrier
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    {
         return OperatorCommandAdmission::Stale;
     }
     if state.record_software_command_if_fresh(command, now_ms, duplicate_window_ms) {
@@ -3280,12 +3369,43 @@ impl Drop for OperatorDispatchClaim {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
     }
 }
+/// Capture before authentication/IO awaits; closed admission has no origin.
+pub(crate) fn capture_operator_origin(state: &AppState) -> Option<u64> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    (state
+        .operator_admission_barrier
+        .load(std::sync::atomic::Ordering::Acquire)
+        == 0)
+        .then(|| automatic_generation(state))
+}
 pub(crate) fn claim_operator_dispatch(
     state: &AppState,
     generation: u64,
 ) -> Option<OperatorDispatchClaim> {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
-    if generation != automatic_generation(state) {
+    claim_operator_dispatch_under_gate(state, generation)
+}
+/// Only this RAM flag is published under the dispatch gate; file IO remains
+/// entirely in the settings worker after this helper returns.
+pub(crate) fn claim_plumbing_settings_dispatch(
+    state: &AppState,
+    generation: u64,
+) -> Option<OperatorDispatchClaim> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let claim = claim_operator_dispatch_under_gate(state, generation)?;
+    state.plumbing_drive.begin_settings();
+    Some(claim)
+}
+fn claim_operator_dispatch_under_gate(
+    state: &AppState,
+    generation: u64,
+) -> Option<OperatorDispatchClaim> {
+    if generation != automatic_generation(state)
+        || state
+            .operator_admission_barrier
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    {
         return None;
     }
     let count = &state.operator_dispatch_inflight;
@@ -3349,6 +3469,7 @@ mod recovery_generation_tests {
                 crate::telemetry_task::command_at_dispatch(
                     &state,
                     crate::types::TelemetryCommand::QueuedOperator {
+                        plumbing_origin: None,
                         generation: first,
                         command: Box::new(command)
                     }

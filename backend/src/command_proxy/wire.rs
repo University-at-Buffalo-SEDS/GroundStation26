@@ -38,6 +38,7 @@ pub(super) enum Message {
         mode: Mode,
         actor: String,
         operation: Operation,
+        plumbing_origin_utc_ms: Option<u64>,
     },
     Reply {
         digest: [u8; 16],
@@ -132,6 +133,7 @@ pub(super) fn seal(pairing: &Pairing, recipient: &str, envelope: &Envelope) -> R
             mode,
             actor,
             operation,
+            plumbing_origin_utc_ms,
         } => {
             ensure!(
                 !actor.is_empty()
@@ -153,6 +155,14 @@ pub(super) fn seal(pairing: &Pairing, recipient: &str, envelope: &Envelope) -> R
                     wire.push(1);
                     wire.extend(utc.to_le_bytes());
                 }
+            }
+            if let Some(stamp) = plumbing_origin_utc_ms {
+                ensure!(
+                    matches!(operation, Operation::Command(name) if name=="RetractPlumbing")
+                        && !matches!(*stamp, 0 | u64::MAX),
+                    "Invalid plumbing origin extension"
+                );
+                wire.extend(stamp.to_le_bytes());
             }
         }
         Message::Reply {
@@ -283,10 +293,23 @@ pub(super) fn open(pairing: &Pairing, wire: &[u8], issuer_role: &str) -> Result<
                 1 => Operation::NetworkUtc(i64::from_le_bytes(cursor.array()?)),
                 _ => bail!("Unknown control operation"),
             };
+            let plumbing_origin_utc_ms = match end - cursor.at {
+                0 => None,
+                8 if matches!(&operation, Operation::Command(name) if name=="RetractPlumbing") => {
+                    let stamp = u64::from_le_bytes(cursor.array()?);
+                    ensure!(
+                        !matches!(stamp, 0 | u64::MAX),
+                        "Invalid plumbing origin timestamp"
+                    );
+                    Some(stamp)
+                }
+                _ => bail!("Unexpected control request extension"),
+            };
             Message::Request {
                 mode,
                 actor,
                 operation,
+                plumbing_origin_utc_ms,
             }
         }
         3 => Message::Reply {
@@ -313,4 +336,185 @@ pub(super) fn open(pairing: &Pairing, wire: &[u8], issuer_role: &str) -> Result<
         boot,
         message,
     })
+}
+
+#[cfg(test)]
+#[path = "legacy_plumbing_compat.rs"]
+mod legacy;
+#[cfg(test)]
+mod plumbing_compatibility_tests {
+    use super::*;
+    fn envelope(message: Message) -> Envelope {
+        Envelope {
+            issuer: "rrls".into(),
+            session: 7,
+            sequence: 20,
+            request: [1; 16],
+            boot: [2; 16],
+            message,
+        }
+    }
+    fn old_envelope(message: legacy::Message) -> legacy::Envelope {
+        legacy::Envelope {
+            issuer: "rrls".into(),
+            session: 7,
+            sequence: 20,
+            request: [1; 16],
+            boot: [2; 16],
+            message,
+        }
+    }
+    #[test]
+    fn unmarked_messages_keep_exact_old_signed_bytes() {
+        let (_root, _primary, recovery) = crate::command_proxy::tests::fixtures();
+        let pairs = vec![
+            (Message::Query, legacy::Message::Query),
+            (
+                Message::Capability {
+                    mode: Mode::Hitl,
+                    commands: 7,
+                    observation: vec![1, 2],
+                },
+                legacy::Message::Capability {
+                    mode: Mode::Hitl,
+                    commands: 7,
+                    observation: vec![1, 2],
+                },
+            ),
+            (
+                Message::Request {
+                    mode: Mode::Hitl,
+                    actor: "operator".into(),
+                    operation: Operation::Command("RetractPlumbing".into()),
+                    plumbing_origin_utc_ms: None,
+                },
+                legacy::Message::Request {
+                    mode: Mode::Hitl,
+                    actor: "operator".into(),
+                    operation: legacy::Operation::Command("RetractPlumbing".into()),
+                },
+            ),
+            (
+                Message::Request {
+                    mode: Mode::Hitl,
+                    actor: "operator".into(),
+                    operation: Operation::NetworkUtc(1000),
+                    plumbing_origin_utc_ms: None,
+                },
+                legacy::Message::Request {
+                    mode: Mode::Hitl,
+                    actor: "operator".into(),
+                    operation: legacy::Operation::NetworkUtc(1000),
+                },
+            ),
+            (
+                Message::Reply {
+                    digest: [3; 16],
+                    outcome: Outcome::Queued,
+                    observation: vec![],
+                },
+                legacy::Message::Reply {
+                    digest: [3; 16],
+                    outcome: legacy::Outcome::Queued,
+                    observation: vec![],
+                },
+            ),
+        ];
+        for (new, old) in pairs {
+            let bytes = seal(&recovery, "primary", &envelope(new)).unwrap();
+            assert_eq!(
+                bytes,
+                legacy::seal(&recovery, "primary", &old_envelope(old)).unwrap()
+            );
+            assert_eq!(contract_digest(&bytes), legacy::contract_digest(&bytes));
+        }
+    }
+    #[test]
+    fn marked_retract_binds_original_utc_and_old_decoder_rejects_it() {
+        let (_root, primary, recovery) = crate::command_proxy::tests::fixtures();
+        let request = envelope(Message::Request {
+            mode: Mode::Hitl,
+            actor: "operator".into(),
+            operation: Operation::Command("RetractPlumbing".into()),
+            plumbing_origin_utc_ms: Some(1_800_000_000_123),
+        });
+        let bytes = seal(&recovery, "primary", &request).unwrap();
+        assert_eq!(open(&primary, &bytes, "rrls").unwrap(), request);
+        assert!(
+            legacy::open(&primary, &bytes, "rrls")
+                .unwrap_err()
+                .to_string()
+                .contains("Trailing control bytes")
+        );
+        let mut tampered = bytes.clone();
+        let at = tampered.len() - 64 - 8;
+        tampered[at] ^= 1;
+        assert!(open(&primary, &tampered, "rrls").is_err());
+        let unmarked = seal(
+            &recovery,
+            "primary",
+            &envelope(Message::Request {
+                mode: Mode::Hitl,
+                actor: "operator".into(),
+                operation: Operation::Command("RetractPlumbing".into()),
+                plumbing_origin_utc_ms: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(bytes.len(), unmarked.len() + 8);
+    }
+    #[test]
+    fn extensions_on_other_operations_or_wrong_sizes_are_rejected_even_when_signed() {
+        let (_root, primary, recovery) = crate::command_proxy::tests::fixtures();
+        let signed_extra = |message: Message, extra: &[u8]| {
+            let mut wire = seal(&recovery, "primary", &envelope(message)).unwrap();
+            wire.truncate(wire.len() - 64);
+            wire.extend_from_slice(extra);
+            let signature = recovery
+                .mission_signing_key()
+                .sign(&signed_bytes(&recovery, "rrls", "primary", &wire));
+            wire.extend_from_slice(signature.as_ref());
+            wire
+        };
+        for operation in [
+            Operation::Command("Abort".into()),
+            Operation::NetworkUtc(1000),
+        ] {
+            assert!(
+                seal(
+                    &recovery,
+                    "primary",
+                    &envelope(Message::Request {
+                        mode: Mode::Hitl,
+                        actor: "operator".into(),
+                        operation: operation.clone(),
+                        plumbing_origin_utc_ms: Some(1000)
+                    })
+                )
+                .is_err()
+            );
+            let wire = signed_extra(
+                Message::Request {
+                    mode: Mode::Hitl,
+                    actor: "operator".into(),
+                    operation,
+                    plumbing_origin_utc_ms: None,
+                },
+                &1000u64.to_le_bytes(),
+            );
+            assert!(open(&primary, &wire, "rrls").is_err());
+        }
+        for extra in [vec![1; 7], vec![1; 9], vec![0; 8], vec![255; 8]] {
+            let wire = signed_extra(
+                Message::Request {
+                    mode: Mode::Hitl,
+                    actor: "operator".into(),
+                    operation: Operation::Command("RetractPlumbing".into()),
+                    plumbing_origin_utc_ms: None,
+                },
+                &extra,
+            );
+            assert!(open(&primary, &wire, "rrls").is_err());
+        }
+    }
 }

@@ -367,6 +367,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/alerts", get(get_alerts))
         .route("/api/boards", get(get_boards))
         .merge(crate::board_recovery::routes())
+        .merge(crate::actuator_plumbing::routes())
         .route("/api/layout", get(get_layout))
         .route("/api/i18n/catalog", get(get_translation_catalog))
         .route("/api/i18n/translate", post(post_translate_texts))
@@ -1568,8 +1569,16 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
                     sender_id: row.get::<String, _>("sender_id"),
                     values: values_from_row(&row),
                 };
-                crate::telemetry_provenance::note(&telemetry_row,row.get::<Option<i64>,_>("source_timestamp_ms")
-                    .and_then(|source|crate::telemetry_provenance::canonical_source(source,crate::telemetry_task::procedure_clock::timestamp_ms())));
+                crate::telemetry_provenance::note(
+                    &telemetry_row,
+                    row.get::<Option<i64>, _>("source_timestamp_ms")
+                        .and_then(|source| {
+                            crate::telemetry_provenance::canonical_source(
+                                source,
+                                crate::telemetry_task::procedure_clock::timestamp_ms(),
+                            )
+                        }),
+                );
                 for row in replay.project(telemetry_row) {
                     if send_ndjson_row(&tx, &row).await.is_err() {
                         return;
@@ -1643,14 +1652,22 @@ async fn load_recent_rows_from_db(
 
     let mut out = Vec::with_capacity(rows_db.len());
     for row in rows_db {
-        let telemetry_row=TelemetryRow {
+        let telemetry_row = TelemetryRow {
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
             data_type: row.get::<String, _>("data_type"),
             sender_id: row.get::<String, _>("sender_id"),
             values: values_from_row(&row),
         };
-        crate::telemetry_provenance::note(&telemetry_row,row.get::<Option<i64>,_>("source_timestamp_ms")
-            .and_then(|source|crate::telemetry_provenance::canonical_source(source,crate::telemetry_task::procedure_clock::timestamp_ms())));
+        crate::telemetry_provenance::note(
+            &telemetry_row,
+            row.get::<Option<i64>, _>("source_timestamp_ms")
+                .and_then(|source| {
+                    crate::telemetry_provenance::canonical_source(
+                        source,
+                        crate::telemetry_task::procedure_clock::timestamp_ms(),
+                    )
+                }),
+        );
         out.push(telemetry_row);
     }
     out
@@ -2245,16 +2262,25 @@ async fn send_command_entry(
     let Some(name) = value.as_str() else {
         return (StatusCode::BAD_REQUEST, "Expected a command name.").into_response();
     };
+    let plumbing_source_ms = if name == "RetractPlumbing" {
+        state
+            .topology_router
+            .get()
+            .and_then(|r| crate::system_clock::required_control_network_utc_ms(r).ok())
+    } else {
+        None
+    };
     if crate::rrls::is_rrls() && !crate::command_proxy::local_operation(name) {
         let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
             Ok(principal) => principal,
             Err(error) => return error,
         };
-        return crate::command_proxy::submit(
+        return crate::command_proxy::submit_with_plumbing_origin(
             &state,
             &principal,
             bearer_token_from_headers(&headers),
             crate::command_proxy::Operation::Command(name.into()),
+            plumbing_source_ms,
         )
         .await;
     }
@@ -2280,7 +2306,8 @@ async fn send_command(
     Json(cmd): Json<TelemetryCommand>,
 ) -> (StatusCode, &'static str) {
     // Request origin must precede authentication/database waits across recovery.
-    let admission_generation = crate::gse::automatic_generation(&state);
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
+    let plumbing_origin = crate::actuator_plumbing::capture_motion_origin(&state, &cmd);
     let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
         Ok(principal) => principal,
         Err(response) => {
@@ -2292,7 +2319,7 @@ async fn send_command(
             };
         }
     };
-    dispatch_authorized_command(state, principal, cmd, admission_generation).await
+    dispatch_authorized_command(state, principal, cmd, admission_generation, plumbing_origin).await
 }
 
 /// Shared primary/local authorization and dispatch. A proxy must supply a
@@ -2302,23 +2329,51 @@ pub(crate) async fn dispatch_authorized_command(
     principal: crate::auth::AuthPrincipal,
     cmd: TelemetryCommand,
     admission_generation: u64,
+    plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
 ) -> (StatusCode, &'static str) {
-    dispatch_command(state, principal, cmd, false, admission_generation).await
+    dispatch_command(
+        state,
+        principal,
+        cmd,
+        false,
+        admission_generation,
+        plumbing_origin,
+    )
+    .await
 }
 pub(crate) async fn dispatch_proxied_command(
     state: Arc<AppState>,
     principal: crate::auth::AuthPrincipal,
     cmd: TelemetryCommand,
 ) -> (StatusCode, &'static str) {
-    let admission_generation = crate::gse::automatic_generation(&state);
-    dispatch_command(state, principal, cmd, true, admission_generation).await
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
+    dispatch_command(state, principal, cmd, true, admission_generation, None).await
 }
+pub(crate) async fn dispatch_proxied_command_with_origin(
+    state: Arc<AppState>,
+    principal: crate::auth::AuthPrincipal,
+    cmd: TelemetryCommand,
+    plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+) -> (StatusCode, &'static str) {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
+    dispatch_command(
+        state,
+        principal,
+        cmd,
+        true,
+        admission_generation,
+        plumbing_origin,
+    )
+    .await
+}
+
 async fn dispatch_command(
     state: Arc<AppState>,
     principal: crate::auth::AuthPrincipal,
     cmd: TelemetryCommand,
     immediate_admission: bool,
     admission_generation: u64,
+    plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
 ) -> (StatusCode, &'static str) {
     let cmd_name = command_name(&cmd);
     if !principal.allows_command_name(cmd_name) {
@@ -2343,6 +2398,17 @@ async fn dispatch_command(
             format!("Ignored software command {cmd:?}: command is currently disabled"),
         );
         return (StatusCode::FORBIDDEN, "command disabled");
+    }
+    if matches!(cmd, TelemetryCommand::RetractPlumbing) {
+        if let Err(message) =
+            crate::actuator_plumbing::validate_motion_origin(&state, plumbing_origin)
+        {
+            emit_notification_warning(&state, message);
+            return (
+                StatusCode::CONFLICT,
+                "plumbing motion context is stale or unavailable",
+            );
+        }
     }
     // A bounded proxy must not wait behind a full command channel after its
     // signed contract expires, or record an unadmitted intent as a duplicate.
@@ -2434,6 +2500,7 @@ async fn dispatch_command(
     }
     if let Some(permit) = permit {
         permit.send(TelemetryCommand::QueuedOperator {
+            plumbing_origin,
             generation: admission_generation,
             command: Box::new(cmd),
         });
@@ -2442,6 +2509,7 @@ async fn dispatch_command(
     if state
         .cmd_tx
         .send(TelemetryCommand::QueuedOperator {
+            plumbing_origin,
             generation: admission_generation,
             command: Box::new(cmd),
         })
@@ -2566,7 +2634,7 @@ mod command_dispatch_tests {
         assert_eq!(result.0, StatusCode::OK);
         let queued = rx.try_recv().unwrap();
         assert!(
-            matches!(queued, TelemetryCommand::QueuedOperator { generation, command }
+            matches!(queued, TelemetryCommand::QueuedOperator { generation, command , .. }
             if generation == crate::gse::automatic_generation(&state)
                 && matches!(*command, TelemetryCommand::Postinit))
         );
@@ -2583,6 +2651,7 @@ mod command_dispatch_tests {
             principal,
             TelemetryCommand::Abort,
             crate::gse::automatic_generation(&state),
+            None,
         )
         .now_or_never()
         .expect("manual intent retention must not await ordinary capacity");
@@ -2663,6 +2732,7 @@ mod command_dispatch_tests {
         let TelemetryCommand::QueuedOperator {
             generation,
             command,
+            ..
         } = queued
         else {
             panic!("expected existing operator envelope");
@@ -3350,6 +3420,447 @@ pub(crate) mod clock_worker_tests {
         writer.pause.release();
         flush(&state).await;
         assert_ne!(std::fs::read(path).unwrap(), disk_before);
+    }
+
+    #[tokio::test]
+    async fn recovery_admission_journal_blocks_epoch_until_actual_prefix_and_preserves_manual_stop()
+    {
+        use crate::gse::reset_generation::{
+            advance_with_clock_fence, close_operator_admission,
+            reopen_operator_admission_and_journal,
+        };
+        let _serial = SERIAL.lock().await;
+        let (_root, state, headers, _path) = fixture().await;
+        let generation = crate::gse::automatic_generation(&state);
+        let inflight = crate::gse::claim_operator_dispatch(&state, generation).unwrap();
+        close_operator_admission(&state, generation, 71).unwrap();
+        assert!(close_operator_admission(&state, generation, 72).is_err());
+        close_operator_admission(&state, generation, 71).unwrap();
+        assert!(crate::gse::claim_operator_dispatch(&state, generation).is_none());
+        assert_eq!(
+            crate::gse::record_operator_command(
+                &state,
+                generation,
+                &TelemetryCommand::Postinit,
+                10_000,
+                500
+            ),
+            crate::gse::OperatorCommandAdmission::Stale
+        );
+        assert!(
+            crate::telemetry_task::command_at_dispatch(&state, TelemetryCommand::Nitrogen)
+                .is_none()
+        );
+        assert!(matches!(
+            crate::telemetry_task::command_at_dispatch(&state, TelemetryCommand::Abort),
+            Some(TelemetryCommand::Abort)
+        ));
+        // The real authenticated HTTP clock mutation is also refused while closed.
+        let rejected = http(state.clone(), headers.clone()).await.unwrap();
+        manual_stop(&state, headers).await;
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
+        state
+            .launch_history
+            .lock()
+            .unwrap()
+            .inhibit_automatic_actions()
+            .unwrap();
+        let fence = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .close_for_recovery(71)
+            .unwrap();
+        assert!(
+            advance_with_clock_fence(&state, generation, 71, &fence).is_err(),
+            "old unstaged prefix cannot publish"
+        );
+        let writer = WriterGuard::install(_path.clone());
+        let staged = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .stage_recovery_revision(&fence)
+            .unwrap();
+        writer.pause.entered().await;
+        assert!(
+            advance_with_clock_fence(&state, generation, 71, &staged).is_err(),
+            "pending real writer cannot publish"
+        );
+        assert!(reopen_operator_admission_and_journal(&state, generation, 71, &staged).is_err());
+        writer.pause.release();
+        flush(&state).await;
+        assert!(
+            advance_with_clock_fence(&state, generation, 71, &staged).is_err(),
+            "inflight owner still blocks publication"
+        );
+        drop(inflight);
+        assert!(advance_with_clock_fence(&state, generation, 72, &staged).is_err());
+        assert_eq!(
+            advance_with_clock_fence(&state, generation, 71, &staged).unwrap(),
+            generation + 1
+        );
+        assert!(crate::gse::claim_operator_dispatch(&state, generation + 1).is_none());
+        assert!(crate::gse::capture_operator_origin(&state).is_none());
+        assert!(advance_with_clock_fence(&state, generation, 71, &staged).is_err());
+        assert!(reopen_operator_admission_and_journal(&state, generation, 72, &staged).is_err());
+        reopen_operator_admission_and_journal(&state, generation, 71, &staged).unwrap();
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .automatic_actions_inhibited()
+        );
+        assert!(crate::gse::claim_operator_dispatch(&state, generation).is_none());
+        assert!(crate::gse::claim_operator_dispatch(&state, generation + 1).is_some());
+        assert_eq!(
+            crate::gse::record_operator_command(
+                &state,
+                generation,
+                &TelemetryCommand::Postinit,
+                10_001,
+                500
+            ),
+            crate::gse::OperatorCommandAdmission::Stale
+        );
+        assert_eq!(
+            crate::gse::record_operator_command(
+                &state,
+                generation + 1,
+                &TelemetryCommand::Postinit,
+                10_002,
+                500
+            ),
+            crate::gse::OperatorCommandAdmission::Fresh
+        );
+        assert!(reopen_operator_admission_and_journal(&state, generation, 71, &staged).is_err());
+    }
+
+    #[tokio::test]
+    async fn recovery_remote_clock_keeps_receive_origin_and_actual_worker_lease_through_save() {
+        use crate::gse::reset_generation::{
+            advance_with_clock_fence, close_operator_admission,
+            reopen_operator_admission_and_journal,
+        };
+        let _serial = SERIAL.lock().await;
+        let (_root, state, _headers, path) = fixture().await;
+        let original = crate::gse::capture_operator_origin(&state).unwrap();
+        close_operator_admission(&state, original, 91).unwrap();
+        let closed_origin = crate::gse::capture_operator_origin(&state);
+        assert!(closed_origin.is_none());
+        state
+            .launch_history
+            .lock()
+            .unwrap()
+            .inhibit_automatic_actions()
+            .unwrap();
+        let fence = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .close_for_recovery(91)
+            .unwrap();
+        let staged = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .stage_recovery_revision(&fence)
+            .unwrap();
+        flush(&state).await;
+        advance_with_clock_fence(&state, original, 91, &staged).unwrap();
+        reopen_operator_admission_and_journal(&state, original, 91, &staged).unwrap();
+        let expected = state.launch_history.lock().unwrap().snapshot();
+        let disk = std::fs::read(&path).unwrap();
+        // Even a request carrying the newly visible record cannot become a
+        // new request if it was received while admission was closed.
+        for rejected_origin in [closed_origin, Some(original)] {
+            assert!(
+                crate::launch_clock_sync::reset_primary_for_origin(
+                    &state,
+                    rejected_origin,
+                    &expected
+                )
+                .is_err()
+            );
+            assert_eq!(state.launch_history.lock().unwrap().snapshot(), expected);
+            assert_eq!(std::fs::read(&path).unwrap(), disk);
+        }
+        let fresh = crate::gse::capture_operator_origin(&state);
+        let writer = WriterGuard::install(path.clone());
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let work = state.clone();
+        let actual = tokio::task::spawn_blocking(move || {
+            let result =
+                crate::launch_clock_sync::reset_primary_for_origin(&work, fresh, &expected);
+            let _ = done_tx.send(result);
+        });
+        writer.pause.entered().await;
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 1);
+        actual.abort();
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), disk);
+        writer.pause.release();
+        tokio::time::timeout(StdDuration::from_secs(3), done_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+        assert_ne!(std::fs::read(&path).unwrap(), disk);
+    }
+
+    #[tokio::test]
+    async fn recovery_journal_timeout_never_proves_quiescence_and_closed_store_blocks_late_reset() {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, headers, path) = fixture().await;
+        state
+            .launch_history
+            .lock()
+            .unwrap()
+            .inhibit_automatic_actions()
+            .unwrap();
+        let worker = WorkerGuard::install(&state, Phase::Unpaused);
+        let writer = WriterGuard::install(path.clone());
+        let request = http(state.clone(), headers.clone());
+        writer.pause.entered().await;
+        let response = tokio::time::timeout(StdDuration::from_secs(15), request)
+            .await
+            .unwrap()
+            .unwrap();
+        worker.completed().await;
+        assert_eq!(response.0, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+        let disk = std::fs::read(&path).unwrap();
+        let fence = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .close_for_recovery(7)
+            .unwrap();
+        assert!(
+            !state
+                .launch_history
+                .lock()
+                .unwrap()
+                .recovery_quiescent(&fence)
+                .unwrap()
+        );
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .reopen_after_recovery(&fence)
+                .is_err()
+        );
+        let clock = state.launch_history.lock().unwrap().snapshot();
+        let late = tokio::time::timeout(StdDuration::from_secs(3), http(state.clone(), headers))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(late.0, StatusCode::CONFLICT);
+        assert_eq!(state.launch_history.lock().unwrap().snapshot(), clock);
+        assert_eq!(std::fs::read(&path).unwrap(), disk);
+        writer.pause.release();
+        flush(&state).await;
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .recovery_quiescent(&fence)
+                .unwrap()
+        );
+        assert_ne!(std::fs::read(&path).unwrap(), disk);
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .reopen_after_recovery(&fence)
+                .is_err()
+        );
+        let staged = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .stage_recovery_revision(&fence)
+            .unwrap();
+        flush(&state).await;
+        state
+            .launch_history
+            .lock()
+            .unwrap()
+            .reopen_after_recovery(&staged)
+            .unwrap();
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .automatic_actions_inhibited()
+        );
+        eprintln!(
+            "actual timed-out worker: claim0 whilewriterpaused => fencePending; actual lateHTTP409 noRAM/noJournal; release+realflush => exactprefixDurable; inhibitionretained"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_journal_wrong_owner_and_shutdown_cannot_reopen_a_recovery_fence() {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, _headers, _path) = fixture().await;
+        let mut history = state.launch_history.lock().unwrap();
+        assert!(
+            history.close_for_recovery(7).is_err(),
+            "inhibition is a required precondition"
+        );
+        history.inhibit_automatic_actions().unwrap();
+        let fence = history.close_for_recovery(7).unwrap();
+        assert!(history.recovery_quiescent(&fence).unwrap());
+        assert!(history.close_for_recovery(8).is_err());
+        assert!(history.reset_primary(123456, 0).is_err());
+        history.close_and_waiter();
+        assert!(history.recovery_quiescent(&fence).is_err());
+        assert!(history.reopen_after_recovery(&fence).is_err());
+        assert!(history.automatic_actions_inhibited());
+    }
+
+    #[tokio::test]
+    async fn recovery_journal_failed_atomic_write_remains_closed_and_never_formats_the_path() {
+        let _serial = SERIAL.lock().await;
+        let (root, state, _headers, path) = fixture().await;
+        // Occupy the exact target with a directory in this disposable
+        // fixture; the actual writer must fail rather than reformat it.
+        let saved = std::fs::read(&path).unwrap();
+        let sibling = root.0.join("saved-before-write-failure");
+        std::fs::write(&sibling, &saved).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("sentinel"), b"keep this directory").unwrap();
+        let mut history = state.launch_history.lock().unwrap();
+        assert!(history.inhibit_automatic_actions().is_err());
+        let fence = history.close_for_recovery(7).unwrap();
+        assert!(history.recovery_quiescent(&fence).is_err());
+        assert!(history.reopen_after_recovery(&fence).is_err());
+        assert!(history.reset_primary(123456, 0).is_err());
+        assert!(path.is_dir());
+        assert_eq!(
+            std::fs::read(path.join("sentinel")).unwrap(),
+            b"keep this directory"
+        );
+        assert_eq!(std::fs::read(sibling).unwrap(), saved);
+        drop(history);
+        // Only this explicit repair+retry of the known snapshot resumes IO.
+        std::fs::remove_dir_all(&path).unwrap();
+        let retried = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .retry_recovery_save(&fence)
+            .unwrap();
+        flush(&state).await;
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .recovery_quiescent(&retried)
+                .unwrap()
+        );
+        let staged = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .stage_recovery_revision(&retried)
+            .unwrap();
+        flush(&state).await;
+        state
+            .launch_history
+            .lock()
+            .unwrap()
+            .reopen_after_recovery(&staged)
+            .unwrap();
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .automatic_actions_inhibited()
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_journal_revision_preserves_time_but_rejects_preboundary_remote_reset_contract()
+     {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, _headers, path) = fixture().await;
+        state
+            .launch_history
+            .lock()
+            .unwrap()
+            .inhibit_automatic_actions()
+            .unwrap();
+        let original = state.launch_history.lock().unwrap().snapshot();
+        let fence = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .close_for_recovery(7)
+            .unwrap();
+        let staged = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .stage_recovery_revision(&fence)
+            .unwrap();
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .recovery_quiescent(&fence)
+                .is_err()
+        );
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .stage_recovery_revision(&staged)
+                .is_err()
+        );
+        flush(&state).await;
+        state
+            .launch_history
+            .lock()
+            .unwrap()
+            .reopen_after_recovery(&staged)
+            .unwrap();
+        let current = state.launch_history.lock().unwrap().snapshot();
+        assert_eq!(current.clock, original.clock);
+        assert_eq!(current.t0_utc_ms, original.t0_utc_ms);
+        assert_eq!(current.session, original.session);
+        assert_eq!(current.authority, original.authority);
+        assert_eq!(current.revision, original.revision + 1);
+        let disk = std::fs::read(&path).unwrap();
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .reset_expected_primary(&original, 123456, 0)
+                .is_err()
+        );
+        assert_eq!(state.launch_history.lock().unwrap().snapshot(), current);
+        assert_eq!(std::fs::read(&path).unwrap(), disk);
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .automatic_actions_inhibited()
+        );
     }
 }
 
@@ -4161,7 +4672,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
         while let Some(Ok(msg)) = receiver.next().await {
             if let Message::Text(text) = msg {
                 // Each frame retains its origin across authentication/database waits.
-                let admission_generation = crate::gse::automatic_generation(&state_for_recv);
+                let admission_generation =
+                    crate::gse::capture_operator_origin(&state_for_recv).unwrap_or(0);
+                let plumbing_source_ms = state_for_recv.topology_router.get().and_then(|router| {
+                    crate::system_clock::required_control_network_utc_ms(router).ok()
+                });
+                let plumbing_origin =
+                    serde_json::from_str::<WsCommand>(&text)
+                        .ok()
+                        .and_then(|command| {
+                            crate::actuator_plumbing::capture_motion_origin(
+                                &state_for_recv,
+                                &command.cmd,
+                            )
+                        });
                 #[cfg(test)]
                 command_dispatch_tests::notify_ws_command_received(&state_for_recv);
                 let principal = match state_for_recv
@@ -4186,11 +4710,16 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                         if let Some(name) = value.get("cmd").and_then(|value| value.as_str()) {
                             if !crate::command_proxy::local_operation(name) {
-                                let response = crate::command_proxy::submit(
+                                let response = crate::command_proxy::submit_with_plumbing_origin(
                                     &state_for_recv,
                                     &principal,
                                     token.as_deref(),
                                     crate::command_proxy::Operation::Command(name.into()),
+                                    if name == "RetractPlumbing" {
+                                        plumbing_source_ms
+                                    } else {
+                                        None
+                                    },
                                 )
                                 .await;
                                 if !response.status().is_success() {
@@ -4307,6 +4836,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
                         );
                         if let Err(e) = cmd_tx
                             .send(TelemetryCommand::QueuedOperator {
+                                plumbing_origin,
                                 generation: admission_generation,
                                 command: Box::new(received_cmd),
                             })

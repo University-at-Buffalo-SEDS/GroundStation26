@@ -123,7 +123,7 @@ async fn primary_actual_dispatch_rechecks_actor_policy_and_nonblocking_admission
     assert_eq!(execute_primary(state.clone(), &work).await, Outcome::Queued);
     assert!(matches!(
         rx.try_recv().unwrap(),
-        TelemetryCommand::QueuedOperator { generation, command }
+        TelemetryCommand::QueuedOperator { generation, command , .. }
             if generation == crate::gse::automatic_generation(&state)
                 && matches!(*command, TelemetryCommand::ToggleAvBayUnderglow)
     ));
@@ -192,7 +192,7 @@ async fn primary_actual_dispatch_rechecks_actor_policy_and_nonblocking_admission
         Outcome::Queued
     );
     assert!(
-        matches!(rx.try_recv().unwrap(), TelemetryCommand::QueuedOperator { generation, command }
+        matches!(rx.try_recv().unwrap(), TelemetryCommand::QueuedOperator { generation, command , .. }
             if generation == crate::gse::automatic_generation(&state)
                 && matches!(*command, TelemetryCommand::ToggleFlightBuzzer)),
         "a refused queue slot must not be recorded as an accepted duplicate"
@@ -775,4 +775,178 @@ async fn authorized_rrls_stop_retains_without_primary_capability_or_clock_but_re
         broker().lock().unwrap().pending.is_none(),
         "Stop does not depend on the ordinary proxy queue"
     );
+}
+
+#[cfg(not(feature = "hitl_mode"))]
+#[tokio::test]
+async fn signed_plumbing_origin_preserves_actor_policy_and_rejects_old_peer_or_mode_cutoff() {
+    const NAME: &str = "command_proxy::handler_tests::signed_plumbing_origin_preserves_actor_policy_and_rejects_old_peer_or_mode_cutoff";
+    if !child(NAME, "primary") {
+        return;
+    }
+    let (_root, p, r) = super::tests::fixtures();
+    let mesh = configure();
+    let pv = {
+        let m = mesh.lock().unwrap();
+        m.command_proxy_transport(m.now()).unwrap()
+    };
+    let (mut primary, rr, rv) = clients(&p, &r, pv);
+    let mut fixture = crate::actuator_plumbing::http_tests::Fixture::new().await;
+    fixture.prime().await;
+    assert_eq!(
+        fixture
+            .http(
+                "POST",
+                "/api/actuator/plumbing/settings",
+                Some("operator"),
+                fixture.body("auxiliary", true)
+            )
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    fixture.pump();
+    let state = fixture.state.clone();
+    let path = crate::gse::armed_fixture_for_test(&state, &fixture.host);
+    crate::gse::reset_plumbing_qd_for_test(&state);
+    user(&state.auth, true, false, false, &["RetractPlumbing"]);
+    let stale = request(
+        &p,
+        &r,
+        &mut primary,
+        &rr,
+        pv,
+        rv,
+        171,
+        Operation::Command("RetractPlumbing".into()),
+    );
+    assert_eq!(execute_primary(state.clone(), &stale).await, Outcome::Stale);
+    assert!(fixture.cmd_rx.as_mut().unwrap().try_recv().is_err());
+    let mut make = |id, stamp| {
+        let bytes = rr
+            .request_with_plumbing_origin(
+                &r,
+                rv,
+                crate::station_mode::local_mode(),
+                [id; 16],
+                "operator".into(),
+                Operation::Command("RetractPlumbing".into()),
+                Some(stamp),
+            )
+            .unwrap();
+        let Received::Execute(work) = primary
+            .receive(&p, pv, crate::station_mode::local_mode(), &bytes)
+            .unwrap()
+        else {
+            panic!("signed execution")
+        };
+        work
+    };
+    let stale = make(172, 1);
+    assert_eq!(execute_primary(state.clone(), &stale).await, Outcome::Stale);
+    assert!(fixture.cmd_rx.as_mut().unwrap().try_recv().is_err());
+    let stamp = fixture.host.network_time_ms().unwrap();
+    user(&state.auth, true, false, false, &["Abort"]);
+    let denied = make(173, stamp);
+    assert_eq!(
+        execute_primary(state.clone(), &denied).await,
+        Outcome::Denied
+    );
+    assert!(fixture.cmd_rx.as_mut().unwrap().try_recv().is_err());
+    user(&state.auth, true, false, false, &["RetractPlumbing"]);
+    let fresh = make(174, stamp);
+    assert_eq!(
+        execute_primary(state.clone(), &fresh).await,
+        Outcome::Queued
+    );
+    let TelemetryCommand::QueuedOperator {
+        plumbing_origin: Some(origin),
+        generation,
+        command,
+    } = fixture.cmd_rx.as_mut().unwrap().try_recv().unwrap()
+    else {
+        panic!("original plumbing context")
+    };
+    assert!(matches!(*command, TelemetryCommand::RetractPlumbing));
+    assert_eq!(origin.source_ms, Some(stamp));
+    assert!(crate::gse::claim_operator_dispatch(&state, generation).is_some());
+    crate::actuator_plumbing::validate_motion_origin(&state, Some(origin)).unwrap();
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(not(feature = "hitl_mode"))]
+#[tokio::test]
+async fn signed_plumbing_paused_handler_cannot_rebind_local_mode_revision() {
+    const NAME: &str = "command_proxy::handler_tests::signed_plumbing_paused_handler_cannot_rebind_local_mode_revision";
+    if !child(NAME, "primary") {
+        return;
+    }
+    let (_root, p, r) = super::tests::fixtures();
+    let mesh = configure();
+    let pv = {
+        let m = mesh.lock().unwrap();
+        m.command_proxy_transport(m.now()).unwrap()
+    };
+    let (mut primary, rr, rv) = clients(&p, &r, pv);
+    let mut fixture = crate::actuator_plumbing::http_tests::Fixture::new().await;
+    fixture.prime().await;
+    let state = fixture.state.clone();
+    user(&state.auth, true, false, false, &["RetractPlumbing"]);
+    // Within permitted clock skew, yet later than the ensuing SET cutoff. A
+    // primary-side origin resample would incorrectly admit this old revision.
+    let source = fixture.host.network_time_ms().unwrap() + 800;
+    let bytes = rr
+        .request_with_plumbing_origin(
+            &r,
+            rv,
+            crate::station_mode::local_mode(),
+            [181; 16],
+            "operator".into(),
+            Operation::Command("RetractPlumbing".into()),
+            Some(source),
+        )
+        .unwrap();
+    let Received::Execute(work) = primary
+        .receive(&p, pv, crate::station_mode::local_mode(), &bytes)
+        .unwrap()
+    else {
+        panic!("signed request")
+    };
+    struct Release(Arc<AdmissionPause>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.resume.notify_one();
+            *ADMISSION_PAUSE.get().unwrap().lock().unwrap() = None;
+        }
+    }
+    let pause = Arc::new(AdmissionPause::default());
+    *ADMISSION_PAUSE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap() = Some(pause.clone());
+    let _release = Release(pause.clone());
+    let copy = state.clone();
+    let task = tokio::spawn(async move { execute_primary(copy, &work).await });
+    tokio::time::timeout(std::time::Duration::from_secs(3), pause.reached.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .http(
+                "POST",
+                "/api/actuator/plumbing/settings",
+                Some("operator"),
+                fixture.body("auxiliary", true)
+            )
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    fixture.pump();
+    let path = crate::gse::armed_fixture_for_test(&state, &fixture.host);
+    crate::gse::reset_plumbing_qd_for_test(&state);
+    pause.resume.notify_one();
+    assert_eq!(task.await.unwrap(), Outcome::Stale);
+    assert!(fixture.cmd_rx.as_mut().unwrap().try_recv().is_err());
+    let _ = std::fs::remove_file(path);
 }

@@ -2,7 +2,7 @@
 //! Signed installations require signed peers. Legacy display-only installations use
 //! the current primary HEALTH session plus a fresh challenge, never control authority.
 use crate::{launch_history::ClockRecord, state::AppState, station_pairing::Pairing};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use ring::signature::{self, KeyPair};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
@@ -13,6 +13,23 @@ const MAX_WIRE: usize = 1024;
 const TTL: u64 = 30_000;
 const RETRY: u64 = 5_000;
 const RESET_PAIRING_REQUIRED: &str = "Remote T clock reset requires a paired station. Pair this recovery station with the primary, or reset T clock on the primary GroundStation.";
+/// Executed by the real blocking worker. Its lease survives cancellation of
+/// the async synchronization task through mutation and the exact writer wait.
+pub(crate) fn reset_primary_for_origin(
+    state: &AppState,
+    origin: Option<u64>,
+    expected: &ClockRecord,
+) -> Result<()> {
+    let origin = origin.context("Remote T clock reset rejected during recovery")?;
+    let _claim = crate::gse::claim_operator_dispatch(state, origin)
+        .context("Remote T clock reset cancelled by recovery")?;
+    state.try_reset_expected_launch_clock(expected)?;
+    let waiter = state.launch_history.lock().unwrap().waiter();
+    if let Some((writer, ticket)) = waiter {
+        writer.wait(ticket)?;
+    }
+    Ok(())
+}
 pub(crate) fn recognizes(wire: &[u8]) -> bool {
     wire.starts_with(SIGNED)
         || wire.starts_with(DISPLAY)
@@ -732,6 +749,7 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {_=shutdown.recv()=>break,_=interval.tick()=>{}}
+            let reset_origin = crate::gse::capture_operator_origin(&state);
             let (now, connected, session, frames) = {
                 let mut mesh = mesh.lock().unwrap();
                 let now = mesh.now();
@@ -798,7 +816,7 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
                     })) => {
                         let work = state.clone();
                         let reset = tokio::task::spawn_blocking(move || {
-                            work.try_reset_expected_launch_clock(&expected)
+                            reset_primary_for_origin(&work, reset_origin, &expected)
                         })
                         .await;
                         let mut error = match reset {
@@ -871,5 +889,9 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test,target_os="linux",any(feature="firmware_sim",feature="hitl_mode")))]
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(feature = "firmware_sim", feature = "hitl_mode")
+))]
 pub(crate) mod pipeline_fixture;

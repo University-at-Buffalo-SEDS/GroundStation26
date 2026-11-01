@@ -333,6 +333,7 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
         && state
             .cmd_tx
             .try_send(TelemetryCommand::QueuedOperator {
+                plumbing_origin: None,
                 generation: launch_generation,
                 command: Box::new(TelemetryCommand::Launch),
             })
@@ -345,9 +346,17 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
 fn qd_dispatch_timestamp_ms() -> u64 {
     crate::telemetry_task::procedure_clock::now().utc_ms()
 }
-pub(super) fn handle_operational_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
+pub(super) fn handle_operational_command(
+    state: &Arc<AppState>,
+    cmd: &TelemetryCommand,
+    plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+) -> bool {
     let name = crate::sequences::command_name(cmd);
     if name == "RetractPlumbing" && !cfg!(feature = "test_fire_mode") {
+        if let Err(message) = crate::actuator_plumbing::motion_ready(state) {
+            state.add_notification(message);
+            return true;
+        }
         let Some(router) = state.topology_router.get() else {
             return true;
         };
@@ -361,14 +370,19 @@ pub(super) fn handle_operational_command(state: &Arc<AppState>, cmd: &TelemetryC
         ) {
             return true;
         }
-        match router.log_queue(
-            crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
-            &[crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8],
+        match crate::gse::queue_plumbing_under_dispatch_with_stop_fence(
+            state,
+            router,
+            plumbing_origin,
+            true,
         ) {
             Ok(()) => {
                 rt.effects_queued = true;
                 let now = rt.now();
-                rt.operational.qd.dispatched(now);
+                rt.operational.qd.dispatched_with_timeout(
+                    now,
+                    crate::actuator_plumbing::completion_timeout_ms(state),
+                );
                 rt.operational.qd_dispatch_utc_ms = Some(qd_dispatch_timestamp_ms());
                 drop(rt);
                 state.set_pending_umbilical_valve_state(
@@ -1278,11 +1292,13 @@ mod tests {
         ));
         assert!(handle_operational_command(
             &state,
-            &TelemetryCommand::RetractPlumbing
+            &TelemetryCommand::RetractPlumbing,
+            None
         ));
         assert!(handle_operational_command(
             &state,
-            &TelemetryCommand::Launch
+            &TelemetryCommand::Launch,
+            None
         ));
         assert!(
             received.try_recv().is_err(),
@@ -1313,7 +1329,8 @@ mod tests {
         let acknowledged_at = state.gse.lock().unwrap().now();
         assert!(handle_operational_command(
             &state,
-            &TelemetryCommand::Launch
+            &TelemetryCommand::Launch,
+            None
         ));
         let mut seen = Vec::new();
         while let Ok(messages) = notices.try_recv() {
@@ -1387,7 +1404,7 @@ mod tests {
             operational_tick(&state, true);
             if should_launch {
                 assert!(matches!(received.try_recv(),
-                    Ok(TelemetryCommand::QueuedOperator { generation, command })
+                    Ok(TelemetryCommand::QueuedOperator { generation, command , .. })
                         if generation == crate::gse::automatic_generation(&state)
                             && matches!(*command, TelemetryCommand::Launch)));
             } else {

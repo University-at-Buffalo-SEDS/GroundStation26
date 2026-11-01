@@ -328,6 +328,35 @@ fn principal_context(
     context.update(format!("{:?}", principal).as_bytes());
     hex(&context.finish().as_ref()[..16])
 }
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ActuatorIdleProof {
+    pub(crate) boot: u64,
+    pub(crate) epoch: u32,
+    pub(crate) outputs: u32,
+}
+pub(crate) fn actuator_idle_proof(state: &AppState) -> Option<ActuatorIdleProof> {
+    let router = state.topology_router.get()?;
+    if !endpoint_verified(state, Board::ActuatorBoard, &router.export_topology()) {
+        return None;
+    }
+    let inner = state.board_recovery.inner.lock().unwrap();
+    let row = inner.values[index(Board::ActuatorBoard)?].as_ref()?;
+    let value = &row.value;
+    if !row.fresh(Stamp::now())
+        || value.result != 0
+        || value.state != Some(crate::types::FlightState::Idle as u8)
+        || value.flags & OUTPUTS_VALID == 0
+        || matches!(value.boot, 0 | u64::MAX)
+        || matches!(value.epoch, 0 | u32::MAX)
+    {
+        return None;
+    }
+    Some(ActuatorIdleProof {
+        boot: value.boot,
+        epoch: value.epoch,
+        outputs: value.outputs,
+    })
+}
 pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let principal =
         match crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {

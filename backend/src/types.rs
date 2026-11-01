@@ -101,6 +101,7 @@ pub enum TelemetryCommand {
     QueuedOperator {
         generation: u64,
         command: Box<TelemetryCommand>,
+        plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
     },
     #[serde(skip)]
     AutomaticNitrogenClose {
@@ -512,15 +513,18 @@ pub struct TelemetryRow {
 }
 
 impl Serialize for TelemetryRow {
-    fn serialize<S:serde::Serializer>(&self,serializer:S)->Result<S::Ok,S::Error> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let source=crate::telemetry_provenance::source(self);
-        let mut row=serializer.serialize_struct("TelemetryRow",if source.is_some(){5}else{4})?;
-        row.serialize_field("timestamp_ms",&self.timestamp_ms)?;
-        row.serialize_field("data_type",&self.data_type)?;
-        row.serialize_field("sender_id",&self.sender_id)?;
-        row.serialize_field("values",&self.values)?;
-        if let Some(source)=source {row.serialize_field("source_timestamp_ms",&source)?;}
+        let source = crate::telemetry_provenance::source(self);
+        let mut row =
+            serializer.serialize_struct("TelemetryRow", if source.is_some() { 5 } else { 4 })?;
+        row.serialize_field("timestamp_ms", &self.timestamp_ms)?;
+        row.serialize_field("data_type", &self.data_type)?;
+        row.serialize_field("sender_id", &self.sender_id)?;
+        row.serialize_field("values", &self.values)?;
+        if let Some(source) = source {
+            row.serialize_field("source_timestamp_ms", &source)?;
+        }
         row.end()
     }
 }

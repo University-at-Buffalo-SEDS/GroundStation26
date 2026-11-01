@@ -1,6 +1,6 @@
+mod prelude;
 #[cfg(test)]
 mod umbilical_owner_tests;
-mod prelude;
 use prelude::*;
 
 mod commands;
@@ -38,6 +38,12 @@ pub(crate) fn command_at_dispatch(
     state: &AppState,
     command: TelemetryCommand,
 ) -> Option<TelemetryCommand> {
+    // Recovery closes ordinary dispatch independently of the manual Stop path.
+    if state.operator_admission_barrier.load(Ordering::Acquire) != 0
+        && !matches!(command, TelemetryCommand::Abort)
+    {
+        return None;
+    }
     // Only the worker's generation-checked admission may unwrap operator intent.
     if matches!(command, TelemetryCommand::QueuedOperator { .. }) {
         return None;
@@ -772,13 +778,13 @@ pub async fn telemetry_task(
             biased;
 
                 Some(cmd) = rx.recv() => {
-                    let (cmd, _operator_claim) = match cmd {
-                        TelemetryCommand::QueuedOperator { generation, command } => {
+                    let (cmd, _operator_claim, plumbing_origin) = match cmd {
+                        TelemetryCommand::QueuedOperator { generation, command, plumbing_origin } => {
                             if command.automatic_generation().is_some() || matches!(*command, TelemetryCommand::QueuedOperator { .. }) { continue; }
                             let Some(claim) = crate::gse::claim_operator_dispatch(&state, generation) else { continue; };
-                            (*command, Some(claim))
+                            (*command, Some(claim), plumbing_origin)
                         }
-                        command => (command, None),
+                        command => (command, None, None),
                     };
                     let automatic_generation = cmd.automatic_generation();
                     let automatic_supply_close = matches!(cmd, TelemetryCommand::AutomaticNitrogenClose { .. } | TelemetryCommand::AutomaticNitrousClose { .. });
@@ -824,10 +830,17 @@ pub async fn telemetry_task(
                         emit_notification_warning(&state, "Manual Stop is pending; new control action was not dispatched");
                         continue;
                     }
+                    if matches!(cmd, TelemetryCommand::RetractPlumbing) {
+                        if let Err(message) = crate::actuator_plumbing::validate_motion_origin(&state, plumbing_origin) {
+                            emit_notification_warning(&state, &message);
+                            continue;
+                        }
+                    }
                     state.record_command_accepted(&cmd, get_current_timestamp_ms());
                     state.auto_zero.lock().unwrap().cancel_for_command(&cmd);
                     if crate::auto_zero::before_fill(&state, &cmd) { continue; }
-                    if crate::gse::handle_command(&state, &cmd) {
+                    let gse_handled = if matches!(cmd, TelemetryCommand::RetractPlumbing) { crate::gse::handle_command_with_motion_origin(&state, &cmd, plumbing_origin) } else { crate::gse::handle_command(&state, &cmd) };
+                    if gse_handled {
                         continue;
                     }
                     if matches!(cmd, TelemetryCommand::Abort) {
@@ -1005,17 +1018,8 @@ pub async fn telemetry_task(
                                 gs_debug_println!("Nitrogen explicit close command sent");
                             }
                         TelemetryCommand::RetractPlumbing => {
-                                queue_guarded_fill_command(
-                                    &state,
-                                    &router,
-                                    crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
-                                    ActuatorBoardCommands::RetractPlumbing as u8,
-                                    true,
-                                    ActuatorBoardCommands::RetractPlumbing as u8,
-                                    "RetractPlumbing command",
-                                );
-                                gs_debug_println!("RetractPlumbing command sent");
-                            }
+                            queue_guarded_plumbing_motion(&state, &router, plumbing_origin);
+                        }
                         TelemetryCommand::Nitrous => {
                                 let cmd_id = ActuatorBoardCommands::NitrousOpen as u8;
                                 let is_on = effective_umbilical_valve_state(&state, cmd_id).unwrap_or(false);
@@ -1486,6 +1490,37 @@ fn effective_umbilical_valve_state(state: &Arc<AppState>, key_cmd_id: u8) -> Opt
         .or_else(|| state.get_umbilical_valve_state(key_cmd_id))
 }
 
+fn queue_guarded_plumbing_motion(
+    state: &Arc<AppState>,
+    router: &Router,
+    origin: Option<crate::actuator_plumbing::MotionOrigin>,
+) {
+    let key = ActuatorBoardCommands::RetractPlumbing as u8;
+    if state.get_umbilical_valve_state(key).is_none() {
+        emit_notification_warning(
+            state,
+            "Plumbing state is unconfirmed; wait for fresh board feedback.",
+        );
+        return;
+    }
+    if state.get_pending_umbilical_valve_state(key) == Some(true)
+        || effective_umbilical_valve_state(state, key) == Some(true)
+    {
+        return;
+    }
+    match crate::gse::queue_plumbing_with_stop_fence(state, router, origin) {
+        Ok(()) => {}
+        Err(message) => {
+            emit_notification_warning(state, message);
+            return;
+        }
+    }
+    state.set_pending_umbilical_valve_state(key, true);
+    flush_command_tx(router, "RetractPlumbing command tx");
+    sequences::refresh_action_policy_now(state);
+    state.broadcast_action_policy_snapshot();
+}
+
 fn queue_guarded_fill_command(
     state: &Arc<AppState>,
     router: &Router,
@@ -1791,7 +1826,10 @@ async fn queue_db_write(
 // Status ownership follows the raw firmware command, before close aliases are
 // normalized. Relays preserve the original sender; compact addresses resolve
 // through the router's discovered hostname before the owner comparison.
-fn owned_umbilical_status(state: &AppState, pkt: &Packet) -> Result<(Board, u8, bool), &'static str> {
+fn owned_umbilical_status(
+    state: &AppState,
+    pkt: &Packet,
+) -> Result<(Board, u8, bool), &'static str> {
     let data = pkt
         .data_as_u8()
         .map_err(|_| "expected 2-byte umbilical status payload")?;
@@ -1823,10 +1861,17 @@ pub(crate) struct ValidatedUmbilicalStatus {
     receipt: crate::gse::ValveReceipt,
 }
 impl ValidatedUmbilicalStatus {
-    pub(crate) fn owner(&self) -> Board { self.owner }
-    pub(crate) fn received_ms(&self) -> u64 { self.received_ms }
+    pub(crate) fn owner(&self) -> Board {
+        self.owner
+    }
+    pub(crate) fn received_ms(&self) -> u64 {
+        self.received_ms
+    }
 }
-fn validate_umbilical_status(state: &AppState, pkt: &Packet) -> Result<ValidatedUmbilicalStatus, &'static str> {
+fn validate_umbilical_status(
+    state: &AppState,
+    pkt: &Packet,
+) -> Result<ValidatedUmbilicalStatus, &'static str> {
     let monotonic_at = std::time::Instant::now();
     let simulation_ms = crate::simulation_clock_ms();
     let received_ms = get_current_timestamp_ms();
@@ -1836,7 +1881,14 @@ fn validate_umbilical_status(state: &AppState, pkt: &Packet) -> Result<Validated
         simulation_ms,
     };
     let (owner, command, on) = owned_umbilical_status(state, pkt)?;
-    Ok(ValidatedUmbilicalStatus { packet: pkt.clone(), owner, command, on, received_ms, receipt })
+    Ok(ValidatedUmbilicalStatus {
+        packet: pkt.clone(),
+        owner,
+        command,
+        on,
+        received_ms,
+        receipt,
+    })
 }
 #[cfg(test)]
 fn umbilical_status_is_owned(state: &AppState, pkt: &Packet) -> bool {
@@ -1845,7 +1897,10 @@ fn umbilical_status_is_owned(state: &AppState, pkt: &Packet) -> bool {
 
 /// Rejections use the existing recording-only envelope and retain their exact
 /// packet/arrival decision even if discovery learns the owner before recording.
-pub(crate) fn capture_umbilical_status_at_ingress(state: &Arc<AppState>, pkt: &Packet) -> Option<ValidatedUmbilicalStatus> {
+pub(crate) fn capture_umbilical_status_at_ingress(
+    state: &Arc<AppState>,
+    pkt: &Packet,
+) -> Option<ValidatedUmbilicalStatus> {
     match validate_umbilical_status(state, pkt) {
         Ok(capture) => Some(capture),
         Err(detail) => {
@@ -1857,9 +1912,12 @@ pub(crate) fn capture_umbilical_status_at_ingress(state: &Arc<AppState>, pkt: &P
                 sender_id,
                 values: Vec::new(),
             };
-            state.ring_buffer.lock().unwrap().push(crate::ring_buffer::ReceivedPacket::AppliedStatus {
-                packet: pkt.clone(), row,
-            });
+            state.ring_buffer.lock().unwrap().push(
+                crate::ring_buffer::ReceivedPacket::AppliedStatus {
+                    packet: pkt.clone(),
+                    row,
+                },
+            );
             None
         }
     }
@@ -1881,13 +1939,30 @@ pub(crate) fn apply_umbilical_status_at_ingress(
     }
 }
 
-pub(crate) fn apply_captured_umbilical_status(state: &Arc<AppState>, capture: ValidatedUmbilicalStatus) -> Option<TelemetryRow> {
-    state.mark_board_seen_at(capture.owner.sender_id(), capture.received_ms,
-        capture.receipt.monotonic_at, capture.receipt.simulation_ms);
+pub(crate) fn apply_captured_umbilical_status(
+    state: &Arc<AppState>,
+    capture: ValidatedUmbilicalStatus,
+) -> Option<TelemetryRow> {
+    state.mark_board_seen_at(
+        capture.owner.sender_id(),
+        capture.received_ms,
+        capture.receipt.monotonic_at,
+        capture.receipt.simulation_ms,
+    );
     apply_captured_status_inner(state, capture)
 }
-fn apply_captured_status_inner(state: &Arc<AppState>, capture: ValidatedUmbilicalStatus) -> Option<TelemetryRow> {
-    let ValidatedUmbilicalStatus { packet: pkt, owner, command: cmd_id, on, received_ms, receipt } = capture;
+fn apply_captured_status_inner(
+    state: &Arc<AppState>,
+    capture: ValidatedUmbilicalStatus,
+) -> Option<TelemetryRow> {
+    let ValidatedUmbilicalStatus {
+        packet: pkt,
+        owner,
+        command: cmd_id,
+        on,
+        received_ms,
+        receipt,
+    } = capture;
     let sender_id = owner.sender_id().to_string();
     {
         if cmd_id == ValveBoardCommands::Sequence as u8 {
@@ -1898,7 +1973,11 @@ fn apply_captured_status_inner(state: &Arc<AppState>, capture: ValidatedUmbilica
         }
         if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
             let fresh_confirmation = state.set_umbilical_valve_state_captured(
-                key_cmd_id, key_on, pkt.timestamp() as i64, pkt.packet_id(), receipt,
+                key_cmd_id,
+                key_on,
+                pkt.timestamp() as i64,
+                pkt.packet_id(),
+                receipt,
             );
             if fresh_confirmation {
                 crate::gse::qd_confirmation(state, &sender_id, key_cmd_id, key_on, pkt.timestamp());
@@ -1978,10 +2057,13 @@ async fn handle_packet(
     db_overflow: &DbOverflow,
     pkt: Packet,
 ) -> Vec<TelemetryRow> {
-    let source = i64::try_from(pkt.timestamp()).ok().and_then(|source|
-        crate::telemetry_provenance::canonical_source(source,procedure_clock::timestamp_ms()));
-    let rows=handle_packet_inner(state,db_tx,db_overflow,pkt).await;
-    for row in &rows {crate::telemetry_provenance::note(row,source);}
+    let source = i64::try_from(pkt.timestamp()).ok().and_then(|source| {
+        crate::telemetry_provenance::canonical_source(source, procedure_clock::timestamp_ms())
+    });
+    let rows = handle_packet_inner(state, db_tx, db_overflow, pkt).await;
+    for row in &rows {
+        crate::telemetry_provenance::note(row, source);
+    }
     rows
 }
 
@@ -1991,26 +2073,39 @@ async fn handle_packet_inner(
     db_overflow: &DbOverflow,
     pkt: Packet,
 ) -> Vec<TelemetryRow> {
-    let umbilical_capture = if pkt.data_type() == crate::telemetry_schema::data_type("UMBILICAL_STATUS") {
-        match validate_umbilical_status(state, &pkt) {
-            Ok(capture) => Some(capture),
-            Err(detail) => {
-                report_parse_error(state, pkt.sender(), &pkt.data_type().as_str(), detail);
-                queue_db_write(state, db_tx, db_overflow, DbWrite::Telemetry {
-                    timestamp_ms: get_current_timestamp_ms() as i64,
-                    source_timestamp_ms: Some(pkt.timestamp() as i64),
-                    data_type: pkt.data_type().as_str().to_string(),
-                    sender_id: pkt.sender().to_string(),
-                    values_json: None,
-                    payload_json: payload_json_from_pkt(&pkt),
-                }).await;
-                return Vec::new();
+    let umbilical_capture =
+        if pkt.data_type() == crate::telemetry_schema::data_type("UMBILICAL_STATUS") {
+            match validate_umbilical_status(state, &pkt) {
+                Ok(capture) => Some(capture),
+                Err(detail) => {
+                    report_parse_error(state, pkt.sender(), &pkt.data_type().as_str(), detail);
+                    queue_db_write(
+                        state,
+                        db_tx,
+                        db_overflow,
+                        DbWrite::Telemetry {
+                            timestamp_ms: get_current_timestamp_ms() as i64,
+                            source_timestamp_ms: Some(pkt.timestamp() as i64),
+                            data_type: pkt.data_type().as_str().to_string(),
+                            sender_id: pkt.sender().to_string(),
+                            values_json: None,
+                            payload_json: payload_json_from_pkt(&pkt),
+                        },
+                    )
+                    .await;
+                    return Vec::new();
+                }
             }
-        }
-    } else { None };
+        } else {
+            None
+        };
     if let Some(capture) = &umbilical_capture {
-        state.mark_board_seen_at(capture.owner.sender_id(), capture.received_ms,
-            capture.receipt.monotonic_at, capture.receipt.simulation_ms);
+        state.mark_board_seen_at(
+            capture.owner.sender_id(),
+            capture.received_ms,
+            capture.receipt.monotonic_at,
+            capture.receipt.simulation_ms,
+        );
     } else {
         state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
     }
@@ -2023,7 +2118,8 @@ async fn handle_packet_inner(
         sequences::refresh_action_policy_now(state);
         state.broadcast_action_policy_snapshot();
     }
-    let sender_id = umbilical_capture.as_ref()
+    let sender_id = umbilical_capture
+        .as_ref()
         .map(|capture| capture.owner.sender_id().to_string())
         .unwrap_or_else(|| state.canonical_network_sender_id(pkt.sender()));
 
@@ -4689,6 +4785,7 @@ mod tests {
             state
                 .cmd_tx
                 .send(TelemetryCommand::QueuedOperator {
+                    plumbing_origin: None,
                     generation: old,
                     command: Box::new(command),
                 })
@@ -4698,6 +4795,7 @@ mod tests {
         state
             .cmd_tx
             .send(TelemetryCommand::QueuedOperator {
+                plumbing_origin: None,
                 generation: old + 1,
                 command: Box::new(TelemetryCommand::Postinit),
             })
@@ -4760,6 +4858,7 @@ mod tests {
         state
             .cmd_tx
             .send(TelemetryCommand::QueuedOperator {
+                plumbing_origin: None,
                 generation: crate::gse::automatic_generation(&state),
                 command: Box::new(TelemetryCommand::EvaluationAbort),
             })
@@ -4840,6 +4939,7 @@ mod tests {
             latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
             gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
             automatic_generation: Arc::new(AtomicU64::new(1)),
+            operator_admission_barrier: Arc::new(AtomicU64::new(0)),
             operator_dispatch_inflight: Arc::new(AtomicUsize::new(0)),
             manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
             deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
@@ -4869,6 +4969,7 @@ mod tests {
             action_policy_tx,
             fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
             fill_targets_tx,
+            plumbing_drive: Arc::new(crate::actuator_plumbing::Runtime::default()),
             launch_history: Arc::new(Mutex::new(crate::launch_history::Store::ephemeral())),
             launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
             launch_clock_tx,
@@ -6258,5 +6359,4 @@ mod tests {
         use super::*;
         include!("telemetry_task/eval_abort_launch_diagnostic.rs");
     }
-
 }

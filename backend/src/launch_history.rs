@@ -97,11 +97,15 @@ struct Disk {
 }
 
 pub struct Store {
-    analytics:crate::launch_analytics::Journal,
+    analytics: crate::launch_analytics::Journal,
     path: Option<PathBuf>,
     writer: Option<Arc<Writer>>,
     last_write: u64,
     closed: bool,
+    #[cfg(test)]
+    recovery_owner: u64,
+    #[cfg(test)]
+    recovery_revision_staged: bool,
     last_reset: Option<(ClockRecord, ClockRecord)>,
     data: Disk,
     observer: bool,
@@ -110,6 +114,17 @@ pub struct Store {
     born: Instant,
     baseline_mono_ms: u64,
     baseline_elapsed_ms: Option<i64>,
+}
+/// Test-gated until the complete verified board coordinator consumes it.
+/// This is a journal fence only, never permission to reset physical boards.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct RecoveryFence {
+    owner: u64,
+    ticket: u64,
+    clock: ClockRecord,
+    writer: Arc<Writer>,
+    revision_staged: bool,
 }
 pub type Shared = Arc<Mutex<Store>>;
 
@@ -193,11 +208,17 @@ impl Store {
         let baseline_elapsed_ms = data.current.t0_utc_ms.map(|t0| now.saturating_sub(t0));
         let writer = Writer::start(path.clone(), false)?;
         Ok(Self {
-            analytics:crate::launch_analytics::Journal::open(path.with_extension("analytics.json")),
+            analytics: crate::launch_analytics::Journal::open(
+                path.with_extension("analytics.json"),
+            ),
             path: Some(path),
             writer: Some(writer),
             last_write: 0,
             closed: false,
+            #[cfg(test)]
+            recovery_owner: 0,
+            #[cfg(test)]
+            recovery_revision_staged: false,
             last_reset: None,
             data,
             observer,
@@ -210,11 +231,15 @@ impl Store {
     }
     pub fn ephemeral() -> Self {
         Self {
-            analytics:Default::default(),
+            analytics: Default::default(),
             path: None,
             writer: None,
             last_write: 0,
             closed: false,
+            #[cfg(test)]
+            recovery_owner: 0,
+            #[cfg(test)]
+            recovery_revision_staged: false,
             last_reset: None,
             data: Disk {
                 version: 1,
@@ -313,14 +338,168 @@ impl Store {
         }
         Ok(())
     }
-    pub fn launch_action_utc_ms(&self)->Option<i64> {self.analytics.action(&self.data.current)}
+    pub fn launch_action_utc_ms(&self) -> Option<i64> {
+        self.analytics.action(&self.data.current)
+    }
     pub fn snapshot(&self) -> ClockRecord {
         self.data.current.clone()
     }
     /// Shutdown linearization: no later clock/recovery commit can escape this ticket.
     pub fn close_and_waiter(&mut self) -> Option<(Arc<Writer>, u64)> {
         self.closed = true;
+        #[cfg(test)]
+        {
+            self.recovery_owner = 0;
+            self.recovery_revision_staged = false;
+        } // Shutdown supersedes recovery.
         self.waiter()
+    }
+    #[cfg(test)]
+    pub(crate) fn close_for_recovery(&mut self, owner: u64) -> Result<RecoveryFence> {
+        ensure!(
+            owner != 0 && owner != u64::MAX,
+            "Recovery owner is unavailable"
+        );
+        ensure!(
+            !self.closed || self.recovery_owner == owner,
+            "Journal belongs to another close owner"
+        );
+        ensure!(
+            self.data.automatic_actions_inhibited,
+            "Automation must be inhibited before journal fencing"
+        );
+        ensure!(
+            self.path.is_some(),
+            "A durable journal is required for recovery"
+        );
+        let writer = self
+            .writer
+            .clone()
+            .context("A journal writer is required for recovery")?;
+        let fence = RecoveryFence {
+            owner,
+            ticket: self.last_write,
+            clock: self.snapshot(),
+            writer,
+            revision_staged: self.closed && self.recovery_revision_staged,
+        };
+        if !self.closed {
+            self.recovery_revision_staged = false;
+        }
+        self.closed = true;
+        self.recovery_owner = owner;
+        Ok(fence)
+    }
+    #[cfg(test)]
+    pub(crate) fn recovery_quiescent(&self, fence: &RecoveryFence) -> Result<bool> {
+        ensure!(
+            self.closed && self.recovery_owner == fence.owner,
+            "Journal recovery owner changed"
+        );
+        ensure!(
+            self.last_write == fence.ticket && self.data.current == fence.clock,
+            "Journal capture changed"
+        );
+        ensure!(
+            self.writer
+                .as_ref()
+                .is_some_and(|writer| Arc::ptr_eq(writer, &fence.writer)),
+            "Journal writer changed"
+        );
+        fence.writer.quiescent_through(fence.ticket)
+    }
+    #[cfg(test)]
+    pub(crate) fn recovery_publication_ready(
+        &self,
+        fence: &RecoveryFence,
+        owner: u64,
+    ) -> Result<bool> {
+        ensure!(
+            owner != 0 && owner == fence.owner,
+            "Recovery admission owner changed"
+        );
+        ensure!(
+            self.recovery_revision_staged && fence.revision_staged,
+            "Recovery authority revision is not staged"
+        );
+        self.recovery_quiescent(fence)
+    }
+    /// Advance only the existing authority revision; never reset T0/session.
+    /// Old paired reset intents then fail their existing expected-record check.
+    #[cfg(test)]
+    pub(crate) fn stage_recovery_revision(
+        &mut self,
+        fence: &RecoveryFence,
+    ) -> Result<RecoveryFence> {
+        ensure!(
+            self.recovery_quiescent(fence)?,
+            "Old journal prefix is still pending"
+        );
+        ensure!(
+            !self.recovery_revision_staged && !fence.revision_staged,
+            "Recovery revision already staged"
+        );
+        let mut next = self.data.clone();
+        next.current.revision = next
+            .current
+            .revision
+            .checked_add(1)
+            .context("Clock revision exhausted")?;
+        next.current.validate()?;
+        let ticket = fence.writer.enqueue(next.clone())?;
+        self.last_write = ticket;
+        self.data = next;
+        self.recovery_revision_staged = true;
+        Ok(RecoveryFence {
+            owner: fence.owner,
+            ticket,
+            clock: self.snapshot(),
+            writer: fence.writer.clone(),
+            revision_staged: true,
+        })
+    }
+    /// Explicit retry of the same known in-memory snapshot, after terminal IO
+    /// failure. Does not format, change time, or clear automatic inhibition.
+    #[cfg(test)]
+    pub(crate) fn retry_recovery_save(&mut self, fence: &RecoveryFence) -> Result<RecoveryFence> {
+        ensure!(
+            self.closed && self.recovery_owner == fence.owner,
+            "Recovery owner changed"
+        );
+        ensure!(
+            self.last_write == fence.ticket && self.data.current == fence.clock,
+            "Journal capture changed"
+        );
+        ensure!(
+            self.writer
+                .as_ref()
+                .is_some_and(|writer| Arc::ptr_eq(writer, &fence.writer)),
+            "Journal writer changed"
+        );
+        fence.writer.failed_terminal_prefix(fence.ticket)?;
+        let ticket = fence.writer.enqueue(self.data.clone())?;
+        self.last_write = ticket;
+        Ok(RecoveryFence {
+            ticket,
+            ..fence.clone()
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn reopen_after_recovery(&mut self, fence: &RecoveryFence) -> Result<()> {
+        ensure!(
+            self.recovery_quiescent(fence)?,
+            "Journal writer is still pending"
+        );
+        ensure!(
+            self.recovery_revision_staged && fence.revision_staged,
+            "Recovery authority revision is not durable"
+        );
+        self.recovery_owner = 0;
+        self.recovery_revision_staged = false;
+        self.closed = false;
+        // The separate board coordinator must authorize any later rearm.
+        // Reopening the journal never clears the durable inhibition flag.
+        Ok(())
     }
     pub fn waiter(&self) -> Option<(Arc<Writer>, u64)> {
         self.writer
@@ -422,10 +601,16 @@ impl Store {
         if clock.kind == LaunchClockKind::TMinus {
             next.awaiting_new_launch = false;
         }
-        let launch_action=if clock.kind==LaunchClockKind::TMinus {clock.anchor_timestamp_ms}else{None};
+        let launch_action = if clock.kind == LaunchClockKind::TMinus {
+            clock.anchor_timestamp_ms
+        } else {
+            None
+        };
         next.current.clock = clock;
         self.commit(next, now, mono)?;
-        if let Some(anchor)=launch_action {self.analytics.record(&self.data.current,anchor);}
+        if let Some(anchor) = launch_action {
+            self.analytics.record(&self.data.current, anchor);
+        }
         Ok(self.snapshot())
     }
     pub fn reset_primary(&mut self, now: i64, mono: u64) -> Result<ClockRecord> {

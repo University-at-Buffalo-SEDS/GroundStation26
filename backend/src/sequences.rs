@@ -453,7 +453,10 @@ impl Default for SequenceRuntime {
 
 impl SequenceRuntime {
     fn for_generation(generation: u64) -> Self {
-        Self { generation, ..Self::default() }
+        Self {
+            generation,
+            ..Self::default()
+        }
     }
 
     fn bind_generation(&mut self, generation: u64) -> bool {
@@ -508,7 +511,10 @@ mod generation_lifecycle_tests {
         if std::env::var("GS_SEQUENCE_GATE_CHILD").as_deref() == Ok("1") {
             let state = crate::state::tests::test_app_state().await;
             assert!(state.topology_router.get().is_none());
-            assert!(crate::gse::handle_command(&state, &TelemetryCommand::CancelFill));
+            assert!(crate::gse::handle_command(
+                &state,
+                &TelemetryCommand::CancelFill
+            ));
             assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
             return;
         }
@@ -522,24 +528,40 @@ mod generation_lifecycle_tests {
             .spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if child.try_wait().unwrap().is_some() { break; }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let output = child.wait_with_output().unwrap();
-                panic!("GSE refresh re-entered the dispatch gate: {}{}",
-                    String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                panic!(
+                    "GSE refresh re-entered the dispatch gate: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         let output = child.wait_with_output().unwrap();
-        assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn fill_decision(
         state: &AppState,
         generation: u64,
         branch: usize,
-    ) -> (SequenceRuntime, SequenceConfig, ValveSnapshot, Option<f32>, Option<f32>) {
+    ) -> (
+        SequenceRuntime,
+        SequenceConfig,
+        ValveSnapshot,
+        Option<f32>,
+        Option<f32>,
+    ) {
         let mut cfg = SequenceConfig::from_env();
         cfg.nitrogen_autoclose_mode = NitrogenAutocloseMode::Pressure;
         cfg.nitrogen_pressure_target_psi = 100.0;
@@ -563,7 +585,11 @@ mod generation_lifecycle_tests {
         } else {
             None
         };
-        let pressure = if branch == 0 { 101.0 } else { cfg.nitrous_pressure_min_psi + 1.0 };
+        let pressure = if branch == 0 {
+            101.0
+        } else {
+            cfg.nitrous_pressure_min_psi + 1.0
+        };
         (runtime, cfg, valves, Some(pressure), mass)
     }
 
@@ -576,15 +602,32 @@ mod generation_lifecycle_tests {
         let before = crate::gse::automatic_generation(&state);
         // These decisions originated before the reset; no outputs or transport
         // are present in this fixture. Advance the actual owner generation.
-        state.automatic_generation.store(before + 1, Ordering::Release);
-            let (mut runtime, cfg, valves, pressure, mass) = fill_decision(&state, before, branch);
-            update_sequence_runtime(&state, &mut runtime, &cfg, valves, pressure, mass, Instant::now());
-            let queued = rx.try_recv().expect("actual automatic close was queued");
-            let origin = queued.automatic_generation().expect("automatic origin retained");
-            assert!(crate::telemetry_task::command_at_dispatch(&state, queued).is_none(),
-                "pre-reset branch {branch} acquired the post-reset dispatch generation");
-            assert_eq!(origin, before, "no new origin may be minted from old observations");
-            assert!(rx.try_recv().is_err());
+        state
+            .automatic_generation
+            .store(before + 1, Ordering::Release);
+        let (mut runtime, cfg, valves, pressure, mass) = fill_decision(&state, before, branch);
+        update_sequence_runtime(
+            &state,
+            &mut runtime,
+            &cfg,
+            valves,
+            pressure,
+            mass,
+            Instant::now(),
+        );
+        let queued = rx.try_recv().expect("actual automatic close was queued");
+        let origin = queued
+            .automatic_generation()
+            .expect("automatic origin retained");
+        assert!(
+            crate::telemetry_task::command_at_dispatch(&state, queued).is_none(),
+            "pre-reset branch {branch} acquired the post-reset dispatch generation"
+        );
+        assert_eq!(
+            origin, before,
+            "no new origin may be minted from old observations"
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -609,15 +652,64 @@ mod generation_lifecycle_tests {
         state.set_local_flight_state(FlightState::NitrogenFill);
         let generation = crate::gse::automatic_generation(&state);
         for branch in 0..3 {
-            let (mut runtime, cfg, valves, pressure, mass) = fill_decision(&state, generation, branch);
-            update_sequence_runtime(&state, &mut runtime, &cfg, valves, pressure, mass, Instant::now());
+            let (mut runtime, cfg, valves, pressure, mass) =
+                fill_decision(&state, generation, branch);
+            update_sequence_runtime(
+                &state,
+                &mut runtime,
+                &cfg,
+                valves,
+                pressure,
+                mass,
+                Instant::now(),
+            );
             let queued = rx.try_recv().expect("fresh automatic close was queued");
             assert_eq!(queued.automatic_generation(), Some(generation));
-            let expected = if branch == 0 { TelemetryCommand::NitrogenClose } else { TelemetryCommand::NitrousClose };
-            let actual = crate::telemetry_task::command_at_dispatch(&state, queued).expect("fresh decision allowed");
-            assert_eq!(std::mem::discriminant(&actual), std::mem::discriminant(&expected));
+            let expected = if branch == 0 {
+                TelemetryCommand::NitrogenClose
+            } else {
+                TelemetryCommand::NitrousClose
+            };
+            let actual = crate::telemetry_task::command_at_dispatch(&state, queued)
+                .expect("fresh decision allowed");
+            assert_eq!(
+                std::mem::discriminant(&actual),
+                std::mem::discriminant(&expected)
+            );
             assert!(rx.try_recv().is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn closed_admission_blocks_actual_sequence_tick_without_state_publication() {
+        let state = crate::state::tests::test_app_state().await;
+        let generation = crate::gse::automatic_generation(&state);
+        let mut runtime = SequenceRuntime::for_generation(generation);
+        runtime.step = SequenceStep::NitrogenLeakCheck;
+        let mut previous = Some(FlightState::NitrogenFill);
+        let before = state.local_flight_state_snapshot();
+        crate::gse::reset_generation::close_operator_admission(&state, generation, 83).unwrap();
+        assert!(begin_sequence_tick(&state, &mut runtime, &mut previous).is_none());
+        assert_eq!(runtime.generation, generation);
+        assert!(matches!(runtime.step, SequenceStep::NitrogenLeakCheck));
+        assert_eq!(previous, Some(FlightState::NitrogenFill));
+        assert_eq!(state.local_flight_state_snapshot(), before);
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+        state.manual_abort_intent.request();
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+        // Model only the completed journal/epoch/reopen boundary here. Actual
+        // durable-prefix ownership is covered by the clock-worker regressions.
+        state
+            .automatic_generation
+            .store(generation + 1, Ordering::Release);
+        assert!(begin_sequence_tick(&state, &mut runtime, &mut previous).is_none());
+        state.operator_admission_barrier.store(0, Ordering::Release);
+        let claim = begin_sequence_tick(&state, &mut runtime, &mut previous).unwrap();
+        assert_eq!(runtime.generation, generation + 1);
+        assert!(matches!(runtime.step, SequenceStep::SetupValves));
+        assert!(previous.is_none());
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+        drop(claim);
     }
 
     #[tokio::test]
@@ -629,9 +721,12 @@ mod generation_lifecycle_tests {
         let mut previous = Some(FlightState::NitrogenFill);
         let claim = begin_sequence_tick(&state, &mut runtime, &mut previous).unwrap();
         assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 1);
-        assert!(crate::gse::reset_generation::invalidate_capture_epoch(&state, generation).is_err());
+        assert!(
+            crate::gse::reset_generation::invalidate_capture_epoch(&state, generation).is_err()
+        );
         drop(claim);
-        let next = crate::gse::reset_generation::invalidate_capture_epoch(&state, generation).unwrap();
+        let next =
+            crate::gse::reset_generation::invalidate_capture_epoch(&state, generation).unwrap();
         let claim = begin_sequence_tick(&state, &mut runtime, &mut previous).unwrap();
         assert_eq!(runtime.generation, next);
         assert!(matches!(runtime.step, SequenceStep::SetupValves));
@@ -648,11 +743,16 @@ mod generation_lifecycle_tests {
         let mut old = SequenceRuntime::for_generation(generation);
         old.step = SequenceStep::ArmedReady;
         state.set_sequence_policy_state(old.policy_state());
-        state.automatic_generation.store(generation + 1, Ordering::Release);
+        state
+            .automatic_generation
+            .store(generation + 1, Ordering::Release);
         state.set_local_flight_state(FlightState::Idle);
         refresh_action_policy_now(&state);
-        assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle,
-            "old policy must not republish Armed after recovery");
+        assert_eq!(
+            state.local_flight_state_snapshot(),
+            FlightState::Idle,
+            "old policy must not republish Armed after recovery"
+        );
         let snapshot = state.sequence_policy_state_snapshot();
         assert_eq!(snapshot.generation, generation + 1);
         assert!(matches!(snapshot.step, SequenceStep::SetupValves));
@@ -682,7 +782,11 @@ mod generation_lifecycle_tests {
         assert!(matches!(runtime.step, SequenceStep::SetupValves));
         assert!(runtime.step_started_at.is_none() && runtime.pressure_at_close_psi.is_none());
         assert!(runtime.mass_at_close_kg.is_none() && runtime.nitrous_level_since.is_none());
-        assert!(!runtime.calibration_ready && !runtime.auto_close_nitrogen_sent && !runtime.auto_close_nitrous_sent);
+        assert!(
+            !runtime.calibration_ready
+                && !runtime.auto_close_nitrogen_sent
+                && !runtime.auto_close_nitrous_sent
+        );
     }
 }
 
@@ -2481,7 +2585,9 @@ pub fn start_sequence_task(
 
             // Acquire before observations/GSE waits. Recovery cannot advance
             // the epoch while this tick can still publish managed state.
-            let Some(_sequence_claim) = begin_sequence_tick(&state, &mut runtime, &mut last_flight_state) else {
+            let Some(_sequence_claim) =
+                begin_sequence_tick(&state, &mut runtime, &mut last_flight_state)
+            else {
                 continue;
             };
             let generation = runtime.generation;
@@ -2624,7 +2730,10 @@ mod tests {
         }
         assert!(state.all_required_boards_seen());
         let router = std::sync::Arc::new(sedsnet::router::Router::new(Default::default()));
-        crate::telemetry_task::refresh_host_network_time(&router, crate::telemetry_task::get_current_timestamp_ms());
+        crate::telemetry_task::refresh_host_network_time(
+            &router,
+            crate::telemetry_task::get_current_timestamp_ms(),
+        );
         let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
         router
             .enable_network_variable(ty, sedsnet::router::NetworkVariablePermissions::READ_WRITE)

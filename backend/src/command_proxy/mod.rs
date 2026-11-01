@@ -53,6 +53,7 @@ struct VerifiedRequest {
     digest: [u8; 16],
     pub actor: String,
     pub operation: Operation,
+    plumbing_origin_utc_ms: Option<u64>,
 }
 enum Received {
     Reply(Vec<u8>),
@@ -172,6 +173,18 @@ impl Runtime {
         actor: String,
         operation: Operation,
     ) -> Result<Vec<u8>> {
+        self.request_with_plumbing_origin(pairing, transport, mode, request, actor, operation, None)
+    }
+    pub(crate) fn request_with_plumbing_origin(
+        &self,
+        pairing: &Pairing,
+        transport: Transport,
+        mode: Mode,
+        request: [u8; 16],
+        actor: String,
+        operation: Operation,
+        plumbing_origin_utc_ms: Option<u64>,
+    ) -> Result<Vec<u8>> {
         ensure!(
             self.role == Role::Rrls && self.session == Some(transport.session),
             "Only connected recovery requests primary control"
@@ -193,6 +206,7 @@ impl Runtime {
                     mode,
                     actor,
                     operation,
+                    plumbing_origin_utc_ms,
                 },
             },
         )
@@ -258,6 +272,7 @@ impl Runtime {
                 mode,
                 actor,
                 operation,
+                plumbing_origin_utc_ms,
             } => {
                 ensure!(
                     primary && envelope.boot == self.boot && mode == local_mode,
@@ -302,6 +317,7 @@ impl Runtime {
                     digest,
                     actor,
                     operation,
+                    plumbing_origin_utc_ms,
                 }))
             }
             Message::Reply {
@@ -688,6 +704,11 @@ async fn execute_primary(
             .is_some_and(|view| view.accepts(&request.envelope, true))
             && matches!(request.envelope.message,Message::Request{mode,..} if mode==crate::station_mode::local_mode())
     }
+    // Preserve the signed remote source time and snapshot the local mode revision
+    // before actor/config authentication can wait across a drive change.
+    let plumbing_origin = request
+        .plumbing_origin_utc_ms
+        .map(|stamp| crate::actuator_plumbing::capture_remote_motion_origin(&state, stamp));
     use crate::auth::Permission;
     if crate::rrls::is_rrls() {
         return Outcome::Denied;
@@ -730,9 +751,20 @@ async fn execute_primary(
             ) else {
                 return Outcome::Invalid;
             };
-            crate::web::dispatch_proxied_command(state, principal, command)
+            if name == "RetractPlumbing" {
+                crate::web::dispatch_proxied_command_with_origin(
+                    state,
+                    principal,
+                    command,
+                    plumbing_origin,
+                )
                 .await
                 .0
+            } else {
+                crate::web::dispatch_proxied_command(state, principal, command)
+                    .await
+                    .0
+            }
         }
         Operation::NetworkUtc(utc) => {
             crate::system_clock::apply_authorized_network_utc(state, principal, *utc)
@@ -790,6 +822,7 @@ struct Pending {
     actor: String,
     token: String,
     operation: Operation,
+    plumbing_origin_utc_ms: Option<u64>,
     session: u32,
     sequence: u32,
     wire: Option<Vec<u8>>,
@@ -861,7 +894,25 @@ pub(crate) async fn submit(
     token: Option<&str>,
     operation: Operation,
 ) -> Response {
+    submit_with_plumbing_origin(state, principal, token, operation, None).await
+}
+pub(crate) async fn submit_with_plumbing_origin(
+    state: &Arc<crate::state::AppState>,
+    principal: &crate::auth::AuthPrincipal,
+    token: Option<&str>,
+    operation: Operation,
+    plumbing_origin_utc_ms: Option<u64>,
+) -> Response {
     use crate::auth::Permission;
+    if plumbing_origin_utc_ms.is_some()
+        && !matches!(&operation,Operation::Command(name) if name=="RetractPlumbing")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Motion origin is only valid for plumbing retract.",
+        )
+            .into_response();
+    }
     let permission = match operation {
         Operation::Command(_) => Permission::SendCommands,
         Operation::NetworkUtc(_) => Permission::SetSystemTime,
@@ -985,6 +1036,7 @@ pub(crate) async fn submit(
         actor: actor.into(),
         token: token.into(),
         operation: operation.clone(),
+        plumbing_origin_utc_ms,
         session: view.session,
         sequence: view.sequence,
         wire: None,
@@ -1306,17 +1358,33 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                             let Some(mode) = mode.effective_mode else {
                                 continue;
                             };
-                            match runtime.request(
-                                &pairing,
-                                Transport {
-                                    session: pending.session,
-                                    sequence: pending.sequence,
-                                },
-                                mode,
-                                pending.id,
-                                pending.actor.clone(),
-                                pending.operation.clone(),
-                            ) {
+                            let encoded = if pending.plumbing_origin_utc_ms.is_some() {
+                                runtime.request_with_plumbing_origin(
+                                    &pairing,
+                                    Transport {
+                                        session: pending.session,
+                                        sequence: pending.sequence,
+                                    },
+                                    mode,
+                                    pending.id,
+                                    pending.actor.clone(),
+                                    pending.operation.clone(),
+                                    pending.plumbing_origin_utc_ms,
+                                )
+                            } else {
+                                runtime.request(
+                                    &pairing,
+                                    Transport {
+                                        session: pending.session,
+                                        sequence: pending.sequence,
+                                    },
+                                    mode,
+                                    pending.id,
+                                    pending.actor.clone(),
+                                    pending.operation.clone(),
+                                )
+                            };
+                            match encoded {
                                 Ok(bytes) => pending.wire = Some(bytes),
                                 Err(_) => {
                                     finish_pending(

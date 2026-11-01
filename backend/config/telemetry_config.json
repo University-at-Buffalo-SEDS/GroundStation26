@@ -933,6 +933,34 @@
       ],
       "reliable": "Ordered",
       "priority": 200
+    },
+    {
+      "name": "AB_FILL_DRIVE_SETTINGS",
+      "doc": "Explicit application drive QUERY/SET v1; exact32LE. Address ACTUATOR_BOARD explicitly. SET binds original timestamp, boot generation, abort epoch, nonce and primary issuer.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 32
+      },
+      "endpoints": [],
+      "reliable": "Ordered",
+      "priority": 200
+    },
+    {
+      "name": "AB_FILL_DRIVE_STATUS",
+      "doc": "Actual actuator drive setting and nonblocking timed motion v1; exact40LE. Board confirmation is distinct from SDK delivery ACK and physical position verification.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 40
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable": "Ordered",
+      "priority": 200
     }
   ]
 }

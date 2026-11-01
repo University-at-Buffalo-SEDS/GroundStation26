@@ -14,6 +14,12 @@ struct Pending {
     error: Option<(u64, String)>,
     stopped: bool,
 }
+#[cfg(test)]
+enum PrefixState {
+    Pending,
+    Durable,
+    Failed(String),
+}
 type Reporter = Arc<dyn Fn(String) + Send + Sync>;
 struct Inner {
     state: Mutex<Pending>,
@@ -136,6 +142,43 @@ impl Writer {
             if timeout.timed_out() && state.written < ticket {
                 return Err(anyhow!("Timed out saving launch clock/recovery history"));
             }
+        }
+    }
+    /// Inspect the actual queued/writing/durable prefix. No IO or callback.
+    #[cfg(test)]
+    fn prefix_state(&self, ticket: u64) -> Result<PrefixState> {
+        let state = self.inner.state.lock().unwrap();
+        if state.next != ticket {
+            return Err(anyhow!("Launch journal prefix changed"));
+        }
+        if state.writing || state.snapshot.is_some() {
+            return Ok(PrefixState::Pending);
+        }
+        if state.written >= ticket {
+            return Ok(PrefixState::Durable);
+        }
+        if let Some((failed, message)) = &state.error
+            && *failed >= ticket
+        {
+            return Ok(PrefixState::Failed(message.clone()));
+        }
+        Err(anyhow!("Launch journal prefix is not durably complete"))
+    }
+    #[cfg(test)]
+    pub(super) fn quiescent_through(&self, ticket: u64) -> Result<bool> {
+        match self.prefix_state(ticket)? {
+            PrefixState::Pending => Ok(false),
+            PrefixState::Durable => Ok(true),
+            PrefixState::Failed(message) => Err(anyhow!(message)),
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn failed_terminal_prefix(&self, ticket: u64) -> Result<()> {
+        match self.prefix_state(ticket)? {
+            PrefixState::Failed(_) => Ok(()),
+            _ => Err(anyhow!(
+                "Only a terminal failed prefix can be explicitly retried"
+            )),
         }
     }
     pub fn error(&self) -> Option<String> {

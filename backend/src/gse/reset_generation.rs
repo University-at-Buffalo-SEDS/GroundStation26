@@ -12,6 +12,13 @@ pub(crate) fn invalidate_capture_epoch(
 ) -> Result<u64, &'static str> {
     // Non-reentrant: callers must not already hold DISPATCH_GATE.
     let _dispatch = DISPATCH_GATE.lock().unwrap();
+    invalidate_capture_epoch_under_dispatch(state, expected_generation)
+}
+
+fn invalidate_capture_epoch_under_dispatch(
+    state: &AppState,
+    expected_generation: u64,
+) -> Result<u64, &'static str> {
     if state
         .operator_dispatch_inflight
         .load(std::sync::atomic::Ordering::Acquire)
@@ -46,6 +53,98 @@ pub(crate) fn invalidate_capture_epoch(
         )
         .map_err(|_| "Reset epoch changed during invalidation")?;
     Ok(next)
+}
+
+/// This stage closes host admission only. Board proofs and the full recovery
+/// coordinator remain prerequisites for exposing any recovery endpoint.
+pub(crate) fn close_operator_admission(
+    state: &AppState,
+    expected_generation: u64,
+    owner: u64,
+) -> Result<(), &'static str> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if matches!(owner, 0 | u64::MAX) || automatic_generation(state) != expected_generation {
+        return Err("Recovery admission ticket is unavailable or stale");
+    }
+    match state.operator_admission_barrier.compare_exchange(
+        0,
+        owner,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(()),
+        Err(current) if current == owner => Ok(()),
+        Err(_) => Err("Recovery admission belongs to another owner"),
+    }
+}
+
+pub(crate) fn advance_with_clock_fence(
+    state: &AppState,
+    expected_generation: u64,
+    owner: u64,
+    fence: &crate::launch_history::RecoveryFence,
+) -> Result<u64, &'static str> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if owner == 0
+        || state
+            .operator_admission_barrier
+            .load(std::sync::atomic::Ordering::Acquire)
+            != owner
+    {
+        return Err("Recovery admission owner changed");
+    }
+    let history = state
+        .launch_history
+        .try_lock()
+        .map_err(|_| "Clock journal is busy")?;
+    if !history
+        .recovery_publication_ready(fence, owner)
+        .map_err(|_| "Clock journal fence changed")?
+    {
+        return Err("Clock journal prefix is still pending");
+    }
+    let next = invalidate_capture_epoch_under_dispatch(state, expected_generation)?;
+    state.last_command_ms.lock().unwrap().clear();
+    Ok(next)
+}
+
+pub(crate) fn reopen_operator_admission_and_journal(
+    state: &AppState,
+    old_generation: u64,
+    owner: u64,
+    fence: &crate::launch_history::RecoveryFence,
+) -> Result<(), &'static str> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if owner == 0
+        || state
+            .operator_admission_barrier
+            .load(std::sync::atomic::Ordering::Acquire)
+            != owner
+        || old_generation.checked_add(1) != Some(automatic_generation(state))
+        || state
+            .operator_dispatch_inflight
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    {
+        return Err("Recovery publication is stale or still inflight");
+    }
+    let mut history = state
+        .launch_history
+        .try_lock()
+        .map_err(|_| "Clock journal is busy")?;
+    if !history
+        .recovery_publication_ready(fence, owner)
+        .map_err(|_| "Clock journal fence changed")?
+    {
+        return Err("Clock journal prefix is still pending");
+    }
+    history
+        .reopen_after_recovery(fence)
+        .map_err(|_| "Clock journal cannot reopen")?;
+    state
+        .operator_admission_barrier
+        .store(0, std::sync::atomic::Ordering::Release);
+    Ok(())
 }
 
 #[cfg(test)]
