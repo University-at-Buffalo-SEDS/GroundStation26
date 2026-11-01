@@ -156,9 +156,7 @@ impl Controller {
         };
         if let Some(i) = self.waiting {
             let acknowledged = input.valves[i].is_some_and(|v| {
-                v.open == self.desired[i]
-                    && v.at_ms >= self.command_since
-                    && v.at_ms <= input.now_ms
+                v.open == self.desired[i] && v.at_ms > self.command_since && v.at_ms <= input.now_ms
             });
             if !acknowledged {
                 if input.now_ms.saturating_sub(self.command_since) >= VALVE_ACK_TIMEOUT_MS {
@@ -268,6 +266,30 @@ impl Controller {
 mod tests {
     use super::*;
     use crate::ValveState;
+    #[test]
+    fn outstanding_command_requires_strictly_newer_observation() {
+        let mut rig = Rig::new(1.0, 1.0);
+        let i = rig.controller.waiting.unwrap();
+        let old = rig.controller.tick(
+            rig.input(),
+            Some(Sample {
+                value: rig.mass,
+                at_ms: rig.now,
+            }),
+        );
+        assert!(old.effects.valves.is_empty());
+        assert_eq!(rig.controller.waiting, Some(i));
+        rig.now += 1;
+        let fresh = rig.controller.tick(
+            rig.input(),
+            Some(Sample {
+                value: rig.mass,
+                at_ms: rig.now,
+            }),
+        );
+        assert_eq!(fresh.effects.valves.len(), 1);
+        assert_ne!(rig.controller.waiting, Some(i));
+    }
     struct Rig {
         controller: Controller,
         now: u64,

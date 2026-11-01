@@ -173,6 +173,11 @@ fn json<T: Serialize>(value: T) -> Response {
 }
 /// A finite, frozen saved-data export. Config is attached by the client from
 /// the same station; no live cache, authentication material or hardware actions.
+#[cfg(test)]
+pub(crate) async fn test_export_from(db: &SqlitePool) -> anyhow::Result<serde_json::Value> {
+    export_from(db).await
+}
+
 async fn export_from(db: &SqlitePool) -> anyhow::Result<serde_json::Value> {
     let snapshot = snapshot_from(db).await?;
     let mut samples = Vec::new();

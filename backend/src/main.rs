@@ -1379,9 +1379,16 @@ async fn main() -> anyhow::Result<()> {
     let ground_station_handler = EndpointHandler::new_packet_handler(
         telemetry_schema::endpoint("GROUND_STATION"),
         move |pkt: &Packet| {
+            let umbilical_capture = if pkt.data_type() == telemetry_schema::data_type("UMBILICAL_STATUS") {
+                match telemetry_task::capture_umbilical_status_at_ingress(&ground_station_handler_state_clone, pkt) {
+                    Some(capture) => Some(capture),
+                    None => return Ok(()),
+                }
+            } else { None };
+            let captured_owner = umbilical_capture.as_ref().map(|capture| capture.owner());
             if let Some(probe) = &fill_delivery {
                 let board =
-                    ground_station_handler_state_clone.board_from_network_sender(pkt.sender());
+                    captured_owner.or_else(|| ground_station_handler_state_clone.board_from_network_sender(pkt.sender()));
                 let ty = pkt.data_type();
                 let channel = if board == Some(Board::DaqBoard) {
                     if ty == telemetry_schema::data_type("KG1000")
@@ -1434,7 +1441,7 @@ async fn main() -> anyhow::Result<()> {
             }
             if std::env::var_os("GS_SIM_VALIDATE_TELEMETRY_RETURN").is_some() {
                 let board =
-                    ground_station_handler_state_clone.board_from_network_sender(pkt.sender());
+                    captured_owner.or_else(|| ground_station_handler_state_clone.board_from_network_sender(pkt.sender()));
                 if pkt.data_type() == telemetry_schema::data_type("GPS_SATELLITE_NUMBER")
                     || pkt.data_type() == telemetry_schema::data_type("IMU_DATA")
                     || pkt.data_type() == telemetry_schema::data_type("BAROMETER_DATA")
@@ -1591,7 +1598,7 @@ async fn main() -> anyhow::Result<()> {
                     pkt.payload()
                 );
                 let source =
-                    ground_station_handler_state_clone.board_from_network_sender(pkt.sender());
+                    captured_owner.or_else(|| ground_station_handler_state_clone.board_from_network_sender(pkt.sender()));
                 if let Some(source) = source {
                     command_status_probe_handler
                         .lock()
@@ -1604,11 +1611,11 @@ async fn main() -> anyhow::Result<()> {
                     pilot_open_ack_generation_handler.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            if pkt.data_type() == telemetry_schema::data_type("UMBILICAL_STATUS") {
-                ground_station_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
-                if let Some(row) = telemetry_task::apply_umbilical_status_at_ingress(
+            if let Some(capture) = umbilical_capture {
+                ground_station_handler_state_clone.mark_packet_received(capture.received_ms());
+                if let Some(row) = telemetry_task::apply_captured_umbilical_status(
                     &ground_station_handler_state_clone,
-                    pkt,
+                    capture,
                 ) {
                     ground_station_handler_state_clone.cache_recent_telemetry(row.clone());
                     let _ = ground_station_handler_state_clone.ws_tx.send(row.clone());

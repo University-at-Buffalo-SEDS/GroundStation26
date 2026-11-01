@@ -79,6 +79,13 @@ pub(crate) struct ValveReceipt {
     pub simulation_ms: Option<u64>,
 }
 
+/// Prepared while the runtime mutex is held; no live evidence is changed until
+/// the state-level command observation barrier admits this capture.
+pub(crate) struct PreparedValveSource {
+    pub age_ms: u64,
+    observation: Option<(usize, ValveCaptureHistory, ValveState, u64)>,
+}
+
 impl ValveCaptureHistory {
     fn admit(
         &mut self,
@@ -410,6 +417,7 @@ impl Runtime {
             at_ms: self.now(),
         });
     }
+    #[cfg(test)]
     pub(crate) fn observe_valve_source(
         &mut self,
         key: u8,
@@ -422,6 +430,37 @@ impl Runtime {
         self.observe_valve_source_at(key, open, source_ms, packet_id, receipt, processing_now)
     }
 
+    pub(crate) fn prepare_valve_source(
+        &self,
+        key: u8,
+        open: bool,
+        source_ms: i64,
+        packet_id: u64,
+        receipt: ValveReceipt,
+    ) -> Option<PreparedValveSource> {
+        self.prepare_valve_source_at(key, open, source_ms, packet_id, receipt, self.now())
+    }
+
+    pub(crate) fn commit_valve_source(&mut self, prepared: PreparedValveSource, admitted: bool) {
+        if let Some((index, mut history, sample, packet_id)) = prepared.observation {
+            if admitted {
+                self.valves[index] = Some(sample);
+            } else {
+                // A pre-target tick must not gain a new receipt anchor through
+                // another nonce or its opposite value. Keep only this bounded
+                // replay floor; prior live safety observations stay unchanged.
+                for value in 0..2 {
+                    if history.seen_values & (1 << value) == 0 {
+                        history.packet_ids[value] = packet_id;
+                    }
+                }
+                history.seen_values = 3;
+            }
+            self.last_valve_captures[index] = history;
+        }
+    }
+
+    #[cfg(test)]
     fn observe_valve_source_at(
         &mut self,
         key: u8,
@@ -431,8 +470,27 @@ impl Runtime {
         receipt: ValveReceipt,
         processing_now: u64,
     ) -> Option<u64> {
+        let prepared =
+            self.prepare_valve_source_at(key, open, source_ms, packet_id, receipt, processing_now)?;
+        let age = prepared.age_ms;
+        self.commit_valve_source(prepared, true);
+        Some(age)
+    }
+
+    fn prepare_valve_source_at(
+        &self,
+        key: u8,
+        open: bool,
+        source_ms: i64,
+        packet_id: u64,
+        receipt: ValveReceipt,
+        processing_now: u64,
+    ) -> Option<PreparedValveSource> {
         let Some(index) = KEYS.iter().position(|candidate| *candidate == key) else {
-            return Some(0);
+            return Some(PreparedValveSource {
+                age_ms: 0,
+                observation: None,
+            });
         };
         // Use the receipt clock captured before waiting for the GSE mutex.
         // Processing or lock delay must never renew capture freshness.
@@ -461,9 +519,10 @@ impl Runtime {
         if processing_now.checked_sub(at_ms)? > 2_000 {
             return None;
         }
-        self.last_valve_captures[index] = history;
-        self.valves[index] = Some(ValveState { open, at_ms });
-        now.checked_sub(at_ms)
+        Some(PreparedValveSource {
+            age_ms: now.checked_sub(at_ms)?,
+            observation: Some((index, history, ValveState { open, at_ms }, packet_id)),
+        })
     }
     #[cfg(test)]
     pub fn observe_valve(&mut self, key: u8, open: bool) {
@@ -3713,3 +3772,6 @@ mod explicit_fc_stop_tests {
         assert!(state.manual_abort_intent.pending_epoch().is_some());
     }
 }
+
+#[cfg(all(test, feature = "hitl_mode"))]
+mod pre_target_tests;

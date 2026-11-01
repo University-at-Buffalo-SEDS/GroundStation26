@@ -659,7 +659,11 @@ impl Engine {
                 };
                 !v.is_some_and(|v| {
                     v.open == target
-                        && v.at_ms >= since
+                        && if self.self_waiting == Some(i) {
+                            v.at_ms > since
+                        } else {
+                            v.at_ms >= since
+                        }
                         && v.at_ms <= input.now_ms
                         && input.now_ms - v.at_ms <= 2000
                 }) && input.now_ms.saturating_sub(since) >= VALVE_ACK_TIMEOUT_MS
@@ -678,6 +682,9 @@ impl Engine {
                     None => "no report",
                     Some(v) if v.at_ms > input.now_ms || input.now_ms - v.at_ms > 2000 => {
                         "no fresh report"
+                    }
+                    Some(v) if self.self_waiting == Some(i) && v.at_ms == self.self_ack_since[i] => {
+                        "no post-command report"
                     }
                     Some(v)
                         if v.at_ms
@@ -738,7 +745,7 @@ impl Engine {
                 && let Some(i) = self.self_waiting
                 && input.valves[i].is_some_and(|v| {
                     v.open == self.target[i]
-                        && v.at_ms >= self.self_ack_since[i]
+                        && v.at_ms > self.self_ack_since[i]
                         && v.at_ms <= input.now_ms
                         && input.now_ms - v.at_ms <= 2000
                 })
@@ -827,7 +834,7 @@ impl Engine {
             && let Some(i) = self.self_waiting
             && input.valves[i].is_some_and(|v| {
                 v.open == self.target[i]
-                    && v.at_ms >= self.self_ack_since[i]
+                    && v.at_ms > self.self_ack_since[i]
                     && v.at_ms <= input.now_ms
             })
         {

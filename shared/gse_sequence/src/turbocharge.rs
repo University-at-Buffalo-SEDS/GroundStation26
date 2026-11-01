@@ -325,7 +325,7 @@ impl Controller {
         }
         if let Some(i) = self.waiting {
             match input.valves[i].filter(|v| {
-                v.at_ms >= self.command_since
+                v.at_ms > self.command_since
                     && v.at_ms <= input.now_ms
                     && input.now_ms - v.at_ms <= 2000
             }) {
@@ -490,6 +490,37 @@ mod tests {
             qualification_generation: 2,
             configuration: [3; 32],
         }
+    }
+    #[test]
+    fn outstanding_command_requires_strictly_newer_observation() {
+        let mut rig = Rig::new(1.0);
+        let i = rig.c.waiting.unwrap();
+        rig.valves[i] = Some(ValveState {
+            open: rig.c.desired[i],
+            at_ms: rig.now,
+        });
+        let old = rig.c.tick(
+            rig.input(),
+            Some(Sample {
+                value: rig.mass,
+                at_ms: rig.now,
+            }),
+            context(),
+        );
+        assert!(old.effects.valves.is_empty());
+        assert_eq!(rig.c.waiting, Some(i));
+        rig.now += 1;
+        rig.valves[i].as_mut().unwrap().at_ms = rig.now;
+        let fresh = rig.c.tick(
+            rig.input(),
+            Some(Sample {
+                value: rig.mass,
+                at_ms: rig.now,
+            }),
+            context(),
+        );
+        assert_eq!(fresh.effects.valves.len(), 1);
+        assert_ne!(rig.c.waiting, Some(i));
     }
     struct Rig {
         c: Controller,

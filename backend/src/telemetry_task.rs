@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod umbilical_owner_tests;
 mod prelude;
 use prelude::*;
 
@@ -1786,19 +1788,108 @@ async fn queue_db_write(
     }
 }
 
+// Status ownership follows the raw firmware command, before close aliases are
+// normalized. Relays preserve the original sender; compact addresses resolve
+// through the router's discovered hostname before the owner comparison.
+fn owned_umbilical_status(state: &AppState, pkt: &Packet) -> Result<(Board, u8, bool), &'static str> {
+    let data = pkt
+        .data_as_u8()
+        .map_err(|_| "expected 2-byte umbilical status payload")?;
+    if data.len() != 2 {
+        return Err("expected 2-byte umbilical status payload");
+    }
+    if data[1] > 1 {
+        return Err("umbilical status state must be 0 or 1");
+    }
+    let owner = match data[0] {
+        0..=6 => Board::ValveBoard,
+        7..=13 => Board::ActuatorBoard,
+        _ => return Err("unknown umbilical status command"),
+    };
+    if state.board_from_network_sender(pkt.sender()) != Some(owner) {
+        return Err("umbilical status sender does not own command");
+    }
+    Ok((owner, data[0], data[1] == 1))
+}
+
+/// Validated once at physical ingress. Fields stay private so later discovery
+/// cannot replace its owner, command, packet identity or arrival clocks.
+pub(crate) struct ValidatedUmbilicalStatus {
+    packet: Packet,
+    owner: Board,
+    command: u8,
+    on: bool,
+    received_ms: u64,
+    receipt: crate::gse::ValveReceipt,
+}
+impl ValidatedUmbilicalStatus {
+    pub(crate) fn owner(&self) -> Board { self.owner }
+    pub(crate) fn received_ms(&self) -> u64 { self.received_ms }
+}
+fn validate_umbilical_status(state: &AppState, pkt: &Packet) -> Result<ValidatedUmbilicalStatus, &'static str> {
+    let monotonic_at = std::time::Instant::now();
+    let simulation_ms = crate::simulation_clock_ms();
+    let received_ms = get_current_timestamp_ms();
+    let receipt = crate::gse::ValveReceipt {
+        network_ms: recording_network_utc_ms().unwrap_or(received_ms as i64),
+        monotonic_at,
+        simulation_ms,
+    };
+    let (owner, command, on) = owned_umbilical_status(state, pkt)?;
+    Ok(ValidatedUmbilicalStatus { packet: pkt.clone(), owner, command, on, received_ms, receipt })
+}
+#[cfg(test)]
+fn umbilical_status_is_owned(state: &AppState, pkt: &Packet) -> bool {
+    owned_umbilical_status(state, pkt).is_ok()
+}
+
+/// Rejections use the existing recording-only envelope and retain their exact
+/// packet/arrival decision even if discovery learns the owner before recording.
+pub(crate) fn capture_umbilical_status_at_ingress(state: &Arc<AppState>, pkt: &Packet) -> Option<ValidatedUmbilicalStatus> {
+    match validate_umbilical_status(state, pkt) {
+        Ok(capture) => Some(capture),
+        Err(detail) => {
+            let sender_id = pkt.sender().to_string();
+            report_parse_error(state, &sender_id, &pkt.data_type().as_str(), detail);
+            let row = TelemetryRow {
+                timestamp_ms: get_current_timestamp_ms() as i64,
+                data_type: pkt.data_type().as_str().to_string(),
+                sender_id,
+                values: Vec::new(),
+            };
+            state.ring_buffer.lock().unwrap().push(crate::ring_buffer::ReceivedPacket::AppliedStatus {
+                packet: pkt.clone(), row,
+            });
+            None
+        }
+    }
+}
+
 /// Apply confirmations before the recording queue can delay them. Source
 /// clocks may reset: ordered delivery, not timestamp comparison, governs state.
+#[cfg(test)]
 pub(crate) fn apply_umbilical_status_at_ingress(
     state: &Arc<AppState>,
     pkt: &Packet,
 ) -> Option<TelemetryRow> {
-    let sender_id = state.canonical_network_sender_id(pkt.sender());
-    state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
-    if let Ok(data) = pkt.data_as_u8()
-        && data.len() == 2
+    match validate_umbilical_status(state, pkt) {
+        Ok(capture) => apply_captured_umbilical_status(state, capture),
+        Err(detail) => {
+            report_parse_error(state, pkt.sender(), &pkt.data_type().as_str(), detail);
+            None
+        }
+    }
+}
+
+pub(crate) fn apply_captured_umbilical_status(state: &Arc<AppState>, capture: ValidatedUmbilicalStatus) -> Option<TelemetryRow> {
+    state.mark_board_seen_at(capture.owner.sender_id(), capture.received_ms,
+        capture.receipt.monotonic_at, capture.receipt.simulation_ms);
+    apply_captured_status_inner(state, capture)
+}
+fn apply_captured_status_inner(state: &Arc<AppState>, capture: ValidatedUmbilicalStatus) -> Option<TelemetryRow> {
+    let ValidatedUmbilicalStatus { packet: pkt, owner, command: cmd_id, on, received_ms, receipt } = capture;
+    let sender_id = owner.sender_id().to_string();
     {
-        let cmd_id = data[0];
-        let on = data[1] != 0;
         if cmd_id == ValveBoardCommands::Sequence as u8 {
             if on {
                 start_launch_clock_from_valve_sequence_status(state);
@@ -1806,12 +1897,8 @@ pub(crate) fn apply_umbilical_status_at_ingress(
             return None;
         }
         if let Some((key_cmd_id, key_on)) = umbilical_state_key(cmd_id, on) {
-            let fresh_confirmation = state.set_umbilical_valve_state_source(
-                key_cmd_id,
-                key_on,
-                pkt.timestamp() as i64,
-                recording_network_utc_ms().unwrap_or_else(|| get_current_timestamp_ms() as i64),
-                pkt.packet_id(),
+            let fresh_confirmation = state.set_umbilical_valve_state_captured(
+                key_cmd_id, key_on, pkt.timestamp() as i64, pkt.packet_id(), receipt,
             );
             if fresh_confirmation {
                 crate::gse::qd_confirmation(state, &sender_id, key_cmd_id, key_on, pkt.timestamp());
@@ -1831,7 +1918,7 @@ pub(crate) fn apply_umbilical_status_at_ingress(
             sequences::refresh_action_policy_now(state);
             state.broadcast_action_policy_snapshot();
             return Some(TelemetryRow {
-                timestamp_ms: get_current_timestamp_ms() as i64,
+                timestamp_ms: received_ms as i64,
                 data_type: VALVE_STATE_DATA_TYPE.to_string(),
                 sender_id,
                 values: valve_state_values(state).into_iter().collect(),
@@ -1891,7 +1978,29 @@ async fn handle_packet(
     db_overflow: &DbOverflow,
     pkt: Packet,
 ) -> Vec<TelemetryRow> {
-    state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+    let umbilical_capture = if pkt.data_type() == crate::telemetry_schema::data_type("UMBILICAL_STATUS") {
+        match validate_umbilical_status(state, &pkt) {
+            Ok(capture) => Some(capture),
+            Err(detail) => {
+                report_parse_error(state, pkt.sender(), &pkt.data_type().as_str(), detail);
+                queue_db_write(state, db_tx, db_overflow, DbWrite::Telemetry {
+                    timestamp_ms: get_current_timestamp_ms() as i64,
+                    source_timestamp_ms: Some(pkt.timestamp() as i64),
+                    data_type: pkt.data_type().as_str().to_string(),
+                    sender_id: pkt.sender().to_string(),
+                    values_json: None,
+                    payload_json: payload_json_from_pkt(&pkt),
+                }).await;
+                return Vec::new();
+            }
+        }
+    } else { None };
+    if let Some(capture) = &umbilical_capture {
+        state.mark_board_seen_at(capture.owner.sender_id(), capture.received_ms,
+            capture.receipt.monotonic_at, capture.receipt.simulation_ms);
+    } else {
+        state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
+    }
     if cfg!(feature = "test_fire_mode")
         && *state.state.lock().unwrap() == FlightState::Startup
         && state.all_required_boards_seen()
@@ -1901,7 +2010,9 @@ async fn handle_packet(
         sequences::refresh_action_policy_now(state);
         state.broadcast_action_policy_snapshot();
     }
-    let sender_id = state.canonical_network_sender_id(pkt.sender());
+    let sender_id = umbilical_capture.as_ref()
+        .map(|capture| capture.owner.sender_id().to_string())
+        .unwrap_or_else(|| state.canonical_network_sender_id(pkt.sender()));
 
     if pkt.data_type() == crate::telemetry_schema::data_type("DAQ_LAUNCH_LOG_STATUS") {
         if let Ok(words) = pkt.data_as_u32() {
@@ -2095,8 +2206,8 @@ async fn handle_packet(
         return Vec::new();
     }
 
-    if pkt.data_type() == crate::telemetry_schema::data_type("UMBILICAL_STATUS") {
-        if let Some(row) = apply_umbilical_status_at_ingress(state, &pkt) {
+    if let Some(capture) = umbilical_capture {
+        if let Some(row) = apply_captured_status_inner(state, capture) {
             persist_umbilical_status(state, db_tx, db_overflow, &pkt, &row).await;
             return vec![row];
         }
@@ -6009,16 +6120,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_actuator_addresses_update_both_valves_without_hostname_lookup() {
+    async fn unresolved_compact_actuator_addresses_cannot_confirm_from_command_bytes() {
         let (db_tx, _db_rx) = mpsc::channel(32);
         let state = test_app_state(db_tx.clone()).await;
         let overflow = test_db_overflow();
-        for (key, command, channel) in [
-            (ActuatorBoardCommands::NitrogenOpen as u8, "Nitrogen", 4),
-            (ActuatorBoardCommands::NitrousOpen as u8, "Nitrous", 5),
+        for key in [
+            ActuatorBoardCommands::NitrogenOpen as u8,
+            ActuatorBoardCommands::NitrousOpen as u8,
         ] {
-            // Include an address change and missing discovery entry. Status
-            // matching uses the wire command ID, never the discovery hostname.
+            // Neither address has retained owner identity in this fixture,
+            // including the default AB wire hash. Command bytes cannot supply it.
             for (sender, on) in [("@addr:483403151", 1u8), ("@addr:483403152", 0u8)] {
                 state.set_pending_umbilical_valve_state(key, on != 0);
                 let packet = Packet::new(
@@ -6030,16 +6141,9 @@ mod tests {
                 )
                 .unwrap();
                 let rows = handle_packet(&state, &db_tx, &overflow, packet).await;
-                assert_eq!(rows[0].values[channel], Some(f32::from(on)));
-                assert_eq!(state.get_umbilical_valve_state(key), Some(on != 0));
-                assert_eq!(state.get_pending_umbilical_valve_state(key), None);
-                let control = state
-                    .action_policy_snapshot()
-                    .controls
-                    .into_iter()
-                    .find(|control| control.cmd == command)
-                    .unwrap();
-                assert_eq!(control.actuated, Some(on != 0));
+                assert!(rows.is_empty());
+                assert_eq!(state.get_umbilical_valve_state(key), None);
+                assert_eq!(state.get_pending_umbilical_valve_state(key), Some(on != 0));
             }
         }
     }

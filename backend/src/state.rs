@@ -39,6 +39,28 @@ pub struct ConfirmedUmbilicalValveState {
 }
 
 impl ConfirmedUmbilicalValveState {
+    fn fresh_at(&self, now: std::time::Instant, simulation_ms: Option<u64>) -> bool {
+        match (self.simulation_ms, simulation_ms) {
+            (Some(captured), Some(now)) => now.checked_sub(captured)
+                .is_some_and(|age| u128::from(age) <= UMBILICAL_PENDING_VALVE_TIMEOUT.as_millis()),
+            (None, None) => now.checked_duration_since(self.received_at)
+                .is_some_and(|age| age <= UMBILICAL_PENDING_VALVE_TIMEOUT),
+            _ => false,
+        }
+    }
+
+    // This is source-capture ordering, never proof of physical command execution.
+    fn after_pending(&self, pending: &PendingUmbilicalValveState,
+        now: std::time::Instant, simulation_ms: Option<u64>) -> bool {
+        self.fresh_at(now, simulation_ms)
+            && self.received_at > pending.set_at
+            && match (self.simulation_ms, pending.simulation_ms) {
+                (Some(captured), Some(target)) => captured > target,
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
     fn source_capture(
         on: bool,
         receipt_at: std::time::Instant,
@@ -108,6 +130,19 @@ pub struct BoardStatus {
 }
 
 impl BoardStatus {
+    fn accepts_packet_at(&self, received_at: std::time::Instant, simulation_ms: Option<u64>) -> bool {
+        if self.last_seen_instant.is_some_and(|last| received_at <= last) {
+            return false;
+        }
+        // Cached discovery has no actual packet clock-domain anchor yet.
+        if self.packet_count == 0 { return true; }
+        match (self.last_seen_model_ms, simulation_ms) {
+            (Some(last), Some(now)) => now >= last,
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     /// Route age must never replace more recent packet evidence. In particular,
     /// iterating several routes on one relay must not make the oldest win.
     fn observe_route_age(&mut self, now: std::time::Instant, age_ms: u64) {
@@ -767,53 +802,53 @@ impl AppState {
 
     /// Updates heartbeat tracking for a board after a packet arrives from that sender.
     pub fn mark_board_seen(&self, sender: &str, timestamp_ms: u64) {
+        self.mark_board_seen_at(sender, timestamp_ms, std::time::Instant::now(), crate::simulation_clock_ms());
+    }
+
+    /// Ingress captures retain their arrival clocks across probe/lock delays.
+    pub(crate) fn mark_board_seen_at(&self, sender: &str, timestamp_ms: u64,
+        received_at: std::time::Instant, simulation_ms: Option<u64>) {
         let board = self.board_from_network_sender(sender);
-        if let Some(board) = board {
-            self.network_health.lock().unwrap().observe(
-                board.sender_id(),
-                std::time::Instant::now(),
-                timestamp_ms,
-            );
-        } else {
+        let Some(board) = board else {
             let resolved = sender
                 .strip_prefix("@addr:")
                 .and_then(|address| address.parse::<u32>().ok())
                 .and_then(|address| self.topology_router.get()?.resolve_address(address))
                 .map(|address| address.hostname);
             self.network_health.lock().unwrap().observe(
-                resolved.as_deref().unwrap_or(sender),
-                std::time::Instant::now(),
-                timestamp_ms,
+                resolved.as_deref().unwrap_or(sender), received_at, timestamp_ms,
             );
-        }
-        let Some(board) = board else {
             return;
         };
         let mut map = self.board_status.lock().unwrap();
         let mut force_broadcast = false;
         if let Some(status) = map.get_mut(&board) {
-            status.last_seen_model_ms = crate::simulation_clock_ms();
-            status.packet_count = status.packet_count.saturating_add(1);
+            let advances = status.accepts_packet_at(received_at, simulation_ms);
+            if advances || status.packet_count != 0 {
+                status.packet_count = status.packet_count.saturating_add(1);
+            }
+            if !advances {
+                // Count an older valid packet without replacing newer contact,
+                // EMA or warning evidence. Never freshen it to processing time.
+                return;
+            }
+            status.last_seen_model_ms = simulation_ms;
             if let Some(last_seen) = status.last_seen_ms {
                 let observed_ms = timestamp_ms.max(last_seen);
                 let gap_ms = observed_ms.saturating_sub(last_seen);
-                // Smooth the inter-packet gap so the UI can reason about board health
-                // without reacting to every short burst or stall.
-                let ema = status
-                    .ema_gap_ms
-                    .map(|prev| ((prev * 7) + gap_ms) / 8)
-                    .unwrap_or(gap_ms);
+                let ema = status.ema_gap_ms
+                    .map(|prev| ((prev * 7) + gap_ms) / 8).unwrap_or(gap_ms);
                 status.ema_gap_ms = Some(ema.clamp(10, 60_000));
                 status.last_seen_ms = Some(observed_ms);
-                status.last_seen_instant = Some(std::time::Instant::now());
             } else {
                 status.last_seen_ms = Some(timestamp_ms);
-                status.last_seen_instant = Some(std::time::Instant::now());
                 force_broadcast = true;
             }
+            status.last_seen_instant = Some(received_at);
             status.warned = false;
         }
         drop(map);
+        self.network_health.lock().unwrap().observe(board.sender_id(), received_at, timestamp_ms);
         self.broadcast_board_status_snapshot(timestamp_ms, force_broadcast);
     }
 
@@ -1251,6 +1286,7 @@ impl AppState {
 
     /// Physical source freshness controls ACK admission; display storage and
     /// requested targets never upgrade an old capture into a new confirmation.
+    #[cfg(test)]
     pub(crate) fn set_umbilical_valve_state_source(
         &self,
         cmd_id: u8,
@@ -1259,40 +1295,68 @@ impl AppState {
         receipt_ms: i64,
         packet_id: u64,
     ) -> bool {
-        let receipt_at = std::time::Instant::now();
-        let receipt_simulation_ms = crate::simulation_clock_ms();
-        let Some(age_ms) = self.gse.lock().unwrap().observe_valve_source(
-            cmd_id,
-            on,
-            source_ms,
-            packet_id,
+        self.set_umbilical_valve_state_captured(cmd_id, on, source_ms, packet_id,
             crate::gse::ValveReceipt {
                 network_ms: receipt_ms,
-                monotonic_at: receipt_at,
-                simulation_ms: receipt_simulation_ms,
-            },
-        ) else {
+                monotonic_at: std::time::Instant::now(),
+                simulation_ms: crate::simulation_clock_ms(),
+            })
+    }
+
+    /// Apply one source capture using its original ingress clocks, not the time
+    /// spent waiting for probes, discovery or a contended state lock.
+    pub(crate) fn set_umbilical_valve_state_captured(
+        &self,
+        cmd_id: u8,
+        on: bool,
+        source_ms: i64,
+        packet_id: u64,
+        receipt: crate::gse::ValveReceipt,
+    ) -> bool {
+        let receipt_at = receipt.monotonic_at;
+        let receipt_simulation_ms = receipt.simulation_ms;
+        // GSE → pending → confirmed matches controller command insertion.
+        // Keep preparation and commit under this short ordered scope.
+        let mut runtime = self.gse.lock().unwrap();
+        let Some(prepared) =
+            runtime.prepare_valve_source(cmd_id, on, source_ms, packet_id, receipt)
+        else {
             return false;
         };
         let Some(capture) = ConfirmedUmbilicalValveState::source_capture(
             on,
             receipt_at,
             receipt_simulation_ms,
-            age_ms,
+            prepared.age_ms,
         ) else {
             return false;
         };
+        // Serialize target insertion with source confirmation using the same
+        // short pending→confirmed order as timeout/reconciliation paths.
+        let pending = self.pending_umbilical_valve_states.lock().unwrap();
+        let now = std::time::Instant::now();
+        let simulation_ms = crate::simulation_clock_ms();
+        if !capture.fresh_at(now, simulation_ms) {
+            return false;
+        }
+        if pending
+            .get(&cmd_id)
+            .is_some_and(|target| !capture.after_pending(target, now, simulation_ms))
+        {
+            runtime.commit_valve_source(prepared, false);
+            return false;
+        }
+        runtime.commit_valve_source(prepared, true);
         self.umbilical_valve_states
             .lock()
             .unwrap()
             .insert(cmd_id, capture);
         true
     }
-
     /// Records when any telemetry packet last reached the backend router.
     pub fn mark_packet_received(&self, timestamp_ms: u64) {
         self.last_packet_rx_ms
-            .store(timestamp_ms, Ordering::Relaxed);
+            .fetch_max(timestamp_ms, Ordering::Relaxed);
     }
 
     /// Returns the timestamp of the most recent telemetry packet seen by the backend.
@@ -1890,8 +1954,9 @@ impl AppState {
     pub fn set_pending_umbilical_valve_state(&self, cmd_id: u8, value: bool) {
         // An old report cannot become confirmation again when a command times
         // out. Preserve the requested target separately for operator reversal.
+        let mut pending = self.pending_umbilical_valve_states.lock().unwrap();
         self.umbilical_valve_states.lock().unwrap().remove(&cmd_id);
-        self.pending_umbilical_valve_states.lock().unwrap().insert(
+        pending.insert(
             cmd_id,
             PendingUmbilicalValveState {
                 target: value,
@@ -1933,11 +1998,18 @@ impl AppState {
         let Some(entry) = pending.get(&cmd_id).copied() else {
             return false;
         };
-        if entry.target == actual || entry.expired(mismatch_timeout) {
+        let mut confirmed = self.umbilical_valve_states.lock().unwrap();
+        let now = std::time::Instant::now();
+        let simulation_ms = crate::simulation_clock_ms();
+        let post_target = confirmed.get(&cmd_id).is_some_and(|capture|
+            capture.on == actual && capture.after_pending(&entry, now, simulation_ms));
+        if entry.target == actual && post_target {
             pending.remove(&cmd_id);
-            if entry.target != actual {
-                self.umbilical_valve_states.lock().unwrap().remove(&cmd_id);
-            }
+            return true;
+        }
+        if entry.expired(mismatch_timeout) {
+            pending.remove(&cmd_id);
+            confirmed.remove(&cmd_id);
             return true;
         }
         false
@@ -4222,5 +4294,68 @@ mod valve_source_clock_tests {
         assert!(
             ConfirmedUmbilicalValveState::source_capture(true, receipt, Some(3000), 2001).is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_order_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn liveness_observations_keep_clock_domain_and_reject_backsteps() {
+        let at=Instant::now();
+        let mut status=BoardStatus {packet_count:1,last_seen_ms:Some(100),last_seen_model_ms:Some(100),last_seen_instant:Some(at),ema_gap_ms:Some(20),warned:true};
+        assert!(!status.accepts_packet_at(at-Duration::from_millis(1),Some(200)));
+        assert!(!status.accepts_packet_at(at+Duration::from_millis(1),Some(99)));
+        assert!(!status.accepts_packet_at(at+Duration::from_millis(1),None));
+        assert!(status.accepts_packet_at(at+Duration::from_millis(1),Some(100)),"a later real receipt in the same model tick remains valid liveness");
+        status.last_seen_model_ms=None;
+        assert!(!status.accepts_packet_at(at+Duration::from_millis(1),Some(101)));
+        assert!(status.accepts_packet_at(at+Duration::from_millis(1),None));
+        status.packet_count=0;
+        assert!(status.accepts_packet_at(at+Duration::from_millis(1),Some(101)),"cached discovery is not an actual packet clock-domain anchor");
+    }
+
+    #[test]
+    fn pending_barrier_uses_source_capture_not_late_receipt() {
+        let at=Instant::now();
+        let pending=PendingUmbilicalValveState {target:true,set_at:at+Duration::from_millis(10),simulation_ms:None};
+        let old=ConfirmedUmbilicalValveState::source_capture(true,at+Duration::from_millis(20),None,15).unwrap();
+        assert!(!old.after_pending(&pending,at+Duration::from_millis(20),None),"source captured atT5 cannot confirm targetT10 even when receiptT20 is later");
+        let fresh=ConfirmedUmbilicalValveState::source_capture(true,at+Duration::from_millis(30),None,5).unwrap();
+        assert!(fresh.after_pending(&pending,at+Duration::from_millis(30),None));
+        assert!(!fresh.after_pending(&pending,at+Duration::from_secs(3),None),"expired source capture is not a new confirmation");
+        assert!(!fresh.fresh_at(at,None),"future capture is fail-closed");
+    }
+
+    #[test]
+    fn pending_barrier_rejects_model_domain_mismatch_equal_tick_and_backstep() {
+        let at=Instant::now();
+        let pending=PendingUmbilicalValveState {target:true,set_at:at,simulation_ms:Some(100)};
+        let fresh=ConfirmedUmbilicalValveState::source_capture(true,at+Duration::from_millis(1),Some(101),0).unwrap();
+        assert!(fresh.after_pending(&pending,at+Duration::from_millis(2),Some(102)));
+        assert!(!fresh.after_pending(&pending,at+Duration::from_millis(2),Some(100)));
+        assert!(!fresh.after_pending(&pending,at+Duration::from_millis(2),None));
+        let equal=ConfirmedUmbilicalValveState {simulation_ms:Some(100),..fresh};
+        assert!(!equal.after_pending(&pending,at+Duration::from_millis(2),Some(102)));
+        let wall=ConfirmedUmbilicalValveState {simulation_ms:None,..fresh};
+        assert!(!wall.after_pending(&pending,at+Duration::from_millis(2),None));
+        let wall_pending=PendingUmbilicalValveState {simulation_ms:None,..pending};
+        assert!(!fresh.after_pending(&wall_pending,at+Duration::from_millis(2),Some(102)));
+    }
+
+    #[tokio::test]
+    async fn replacement_target_cannot_be_reconciled_by_prior_confirmation() {
+        let state=super::tests::test_app_state().await;
+        state.set_pending_umbilical_valve_state(0,false);
+        state.set_umbilical_valve_state(0,false);
+        state.set_pending_umbilical_valve_state(0,false);
+        assert!(!state.reconcile_pending_umbilical_valve_state(0,false,Duration::from_secs(2)));
+        assert_eq!(state.get_pending_umbilical_valve_state(0),Some(false));
+        assert_eq!(state.get_umbilical_valve_state(0),None);
+        assert!(state.reconcile_pending_umbilical_valve_state(0,false,Duration::ZERO),"explicit original timeout semantics remain");
+        assert_eq!(state.get_pending_umbilical_valve_state(0),None);
+        assert_eq!(state.get_umbilical_valve_state(0),None);
     }
 }
