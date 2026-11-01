@@ -647,3 +647,132 @@ async fn explicit_supply_close_authenticated_snapshot_keeps_inverse_pending_unkn
         );
     }
 }
+
+#[tokio::test]
+async fn recovery_revokes_actual_handler_paused_after_auth_before_queue_admission() {
+    if !child(
+        "command_proxy::handler_tests::recovery_revokes_actual_handler_paused_after_auth_before_queue_admission",
+        "primary",
+    ) {
+        return;
+    }
+    let (root, p, r) = super::tests::fixtures();
+    let mesh = configure();
+    let pv = {
+        let m = mesh.lock().unwrap();
+        m.command_proxy_transport(m.now()).unwrap()
+    };
+    let (mut primary, rr, rv) = clients(&p, &r, pv);
+    let mut state = crate::recording_export::tests::export_state(&root.0, false).await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    Arc::get_mut(&mut state).unwrap().cmd_tx = tx;
+    state.action_policy.lock().unwrap().software_buttons_enabled = true;
+    user(&state.auth, true, false, false, &["ToggleAvBayUnderglow"]);
+    let work = request(
+        &p,
+        &r,
+        &mut primary,
+        &rr,
+        pv,
+        rv,
+        83,
+        Operation::Command("ToggleAvBayUnderglow".into()),
+    );
+    let pause = Arc::new(AdmissionPause::default());
+    *ADMISSION_PAUSE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap() = Some(pause.clone());
+    let copy = state.clone();
+    let task = tokio::spawn(async move { execute_primary(copy, &work).await });
+    pause.reached.notified().await;
+    recovery::register(&primary.admission).unwrap();
+    assert!(
+        recovery::register(&recovery::Admission::new()).is_err(),
+        "a second runtime cannot hide the original in-flight owner"
+    );
+    let barrier = begin_primary_recovery().unwrap().unwrap();
+    assert!(barrier.is_quiescent());
+    pause.resume.notify_one();
+    assert_eq!(task.await.unwrap(), Outcome::Stale);
+    assert!(rx.try_recv().is_err());
+    *ADMISSION_PAUSE.get().unwrap().lock().unwrap() = None;
+    barrier.reopen_after_verified_recovery().unwrap();
+}
+
+#[tokio::test]
+async fn authorized_rrls_stop_retains_without_primary_capability_or_clock_but_rechecks_auth() {
+    if !child(
+        "command_proxy::handler_tests::authorized_rrls_stop_retains_without_primary_capability_or_clock_but_rechecks_auth",
+        "rrls",
+    ) {
+        return;
+    }
+    let (root, _, _) = super::tests::fixtures();
+    let state = crate::recording_export::tests::export_state(&root.0, false).await;
+    user(&state.auth, true, false, false, &["Abort"]);
+    sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,allowed_commands_json,created_at_ms,expires_at_ms) VALUES ('fixture-token','operator','password',1,1,'[]',0,9223372036854775807)").execute(&state.auth_db).await.unwrap();
+    let principal = state
+        .auth
+        .authorize_token(
+            &state.auth_db,
+            Some("fixture-token"),
+            Permission::SendCommands,
+        )
+        .await
+        .unwrap();
+    let admission = recovery::Admission::new();
+    let oldboot = admission.boot();
+    let barrier = admission.begin().unwrap();
+    assert!(admission.admit(oldboot, false).is_err());
+    assert!(!status().available);
+    assert!(crate::rrls::settings_transport().is_none());
+    let op = || Operation::Command("Abort".into());
+    assert_eq!(
+        submit(&state, &principal, Some("wrong-token"), op())
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(state.manual_abort_intent.pending_epoch().is_none());
+    user(&state.auth, false, false, false, &["Abort"]);
+    assert_eq!(
+        submit(&state, &principal, Some("fixture-token"), op())
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(state.manual_abort_intent.pending_epoch().is_none());
+    user(&state.auth, true, false, false, &["Nitrogen"]);
+    assert_eq!(
+        submit(&state, &principal, Some("fixture-token"), op())
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(state.manual_abort_intent.pending_epoch().is_none());
+    user(&state.auth, true, false, false, &["Abort"]);
+    assert_eq!(
+        submit(&state, &principal, Some("fixture-token"), op())
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    let first = state.manual_abort_intent.pending_epoch().unwrap();
+    assert_eq!(
+        submit(&state, &principal, Some("fixture-token"), op())
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    assert!(state.manual_abort_intent.pending_epoch().unwrap() > first);
+    drop(barrier);
+    assert!(state.manual_abort_intent.pending_epoch().is_some());
+    let last = status().last.unwrap();
+    assert_eq!(last.phase, "local_stop_retained");
+    assert!(!last.primary_accepted && !last.device_confirmed);
+    assert!(
+        broker().lock().unwrap().pending.is_none(),
+        "Stop does not depend on the ordinary proxy queue"
+    );
+}

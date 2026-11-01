@@ -1547,6 +1547,7 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
                 r#"
                 SELECT
                     timestamp_ms,
+                    source_timestamp_ms,
                     data_type,
                     sender_id,
                     values_json,
@@ -1567,6 +1568,8 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
                     sender_id: row.get::<String, _>("sender_id"),
                     values: values_from_row(&row),
                 };
+                crate::telemetry_provenance::note(&telemetry_row,row.get::<Option<i64>,_>("source_timestamp_ms")
+                    .and_then(|source|crate::telemetry_provenance::canonical_source(source,crate::telemetry_task::procedure_clock::timestamp_ms())));
                 for row in replay.project(telemetry_row) {
                     if send_ndjson_row(&tx, &row).await.is_err() {
                         return;
@@ -1622,6 +1625,7 @@ async fn load_recent_rows_from_db(
         r#"
         SELECT
             timestamp_ms,
+            source_timestamp_ms,
             data_type,
             sender_id,
             values_json,
@@ -1639,12 +1643,15 @@ async fn load_recent_rows_from_db(
 
     let mut out = Vec::with_capacity(rows_db.len());
     for row in rows_db {
-        out.push(TelemetryRow {
+        let telemetry_row=TelemetryRow {
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
             data_type: row.get::<String, _>("data_type"),
             sender_id: row.get::<String, _>("sender_id"),
             values: values_from_row(&row),
-        });
+        };
+        crate::telemetry_provenance::note(&telemetry_row,row.get::<Option<i64>,_>("source_timestamp_ms")
+            .and_then(|source|crate::telemetry_provenance::canonical_source(source,crate::telemetry_task::procedure_clock::timestamp_ms())));
+        out.push(telemetry_row);
     }
     out
 }

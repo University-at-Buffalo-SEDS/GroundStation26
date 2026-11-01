@@ -502,13 +502,27 @@ mod flight_state_wire_tests {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TelemetryRow {
     pub timestamp_ms: i64,
     pub data_type: String,
     #[serde(default)]
     pub sender_id: String,
     pub values: Vec<Option<f32>>,
+}
+
+impl Serialize for TelemetryRow {
+    fn serialize<S:serde::Serializer>(&self,serializer:S)->Result<S::Ok,S::Error> {
+        use serde::ser::SerializeStruct;
+        let source=crate::telemetry_provenance::source(self);
+        let mut row=serializer.serialize_struct("TelemetryRow",if source.is_some(){5}else{4})?;
+        row.serialize_field("timestamp_ms",&self.timestamp_ms)?;
+        row.serialize_field("data_type",&self.data_type)?;
+        row.serialize_field("sender_id",&self.sender_id)?;
+        row.serialize_field("values",&self.values)?;
+        if let Some(source)=source {row.serialize_field("source_timestamp_ms",&source)?;}
+        row.end()
+    }
 }
 
 /// Ground Station router counters, sampled before WebSocket batching.

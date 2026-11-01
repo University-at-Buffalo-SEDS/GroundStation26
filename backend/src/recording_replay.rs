@@ -64,6 +64,8 @@ pub struct Sample {
     pub data_type: String,
     pub values: Vec<Option<f32>>,
     pub phase: Option<String>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub valid_until_ms: Option<i64>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Page {
@@ -75,7 +77,7 @@ pub struct Page {
 }
 async fn open(state: &AppState, id: &str) -> Result<SqlitePool, StatusCode> {
     let path = recording_export::recording_path(&recording_export::directory(state), id).await?;
-    SqlitePoolOptions::new()
+    let db = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(
             SqliteConnectOptions::new()
@@ -84,7 +86,9 @@ async fn open(state: &AppState, id: &str) -> Result<SqlitePool, StatusCode> {
                 .create_if_missing(false),
         )
         .await
-        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)
+        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    crate::recording_sd::activate_resolved(&db).await.map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    Ok(db)
 }
 async fn snapshot_from(db: &SqlitePool) -> anyhow::Result<Snapshot> {
     let row=sqlx::query("SELECT COALESCE(MAX(id),0) AS upper_id, MIN(timestamp_ms) AS start_ms, MAX(timestamp_ms) AS end_ms FROM telemetry").fetch_one(db).await?;
@@ -116,6 +120,8 @@ async fn page_from(db: &SqlitePool, window: &Window) -> anyhow::Result<Page> {
         }
     }
 
+    apply_sd_validity(db,&mut samples).await?;
+    apply_sd_validity(db,&mut seeds).await?;
     Ok(Page {
         upper_id: window.upper_id,
         next_id,
@@ -161,7 +167,18 @@ fn decode(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Sample> {
         data_type,
         values,
         phase,
+        valid_until_ms:None,
     })
+}
+
+async fn apply_sd_validity(db:&SqlitePool,samples:&mut [Sample])->anyhow::Result<()>{
+ let exists=sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM main.sqlite_master WHERE name='sd_coverage_segments'").fetch_one(db).await?;
+ if exists==0{return Ok(())}
+ for chunk in samples.chunks_mut(512){
+  let ids=serde_json::to_string(&chunk.iter().map(|s|s.id).collect::<Vec<_>>())?;
+  let bounds=sqlx::query_as::<_,(i64,i64)>("SELECT r.id,c.end_ms FROM main.sd_replay_telemetry r JOIN sd_coverage_segments c ON c.id=json_extract(r.provenance_json,'$.coverage_segment_id') WHERE r.id IN(SELECT value FROM json_each(?))").bind(ids).fetch_all(db).await?;
+  for sample in chunk{sample.valid_until_ms=bounds.iter().find(|(id,_)|*id==sample.id).map(|(_,end)|*end);}
+ }Ok(())
 }
 
 fn json<T: Serialize>(value: T) -> Response {
@@ -196,15 +213,22 @@ async fn export_from(db: &SqlitePool) -> anyhow::Result<serde_json::Value> {
             samples.push(sample);
         }
     }
-    Ok(serde_json::json!({"format":"seds-replay","version":1,"snapshot":snapshot,
-        "samples":samples,"schema":serde_json::from_str::<serde_json::Value>(include_str!("../config/telemetry_config.json"))?}))
+    apply_sd_validity(db,&mut samples).await?;
+    let sd_provenance=crate::recording_sd::bundle_provenance(db,(64*1024*1024usize).saturating_sub(bytes)).await?;
+    let mut value=serde_json::json!({"sd_provenance":sd_provenance,"format":"seds-replay","version":1,"snapshot":snapshot,
+        "samples":samples,"schema":serde_json::from_str::<serde_json::Value>(include_str!("../config/telemetry_config.json"))?});
+    if let Some(config)=value["sd_provenance"]["imports"][0]["manifest"]["config"].as_object().cloned(){
+        for field in ["schema","view_config","layout","valve_mappings"]{if let Some(saved)=config.get(field){value[field]=saved.clone();}}
+        value["configuration_provenance"]="Imported capture configuration; all source-specific snapshots retained in sd_provenance.imports".into();
+    }
+    Ok(value)
 }
 
 pub async fn export(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id): Path<String>) -> Response {
     if let Err(response) = crate::web::authorize_headers(&state, &headers, Permission::ViewData).await { return response; }
     let db = match open(&state, &id).await { Ok(db) => db, Err(code) => return code.into_response() };
     match export_from(&db).await {
-        Ok(mut value) => { value["recording"] = id.into(); json(value) },
+        Ok(mut value) => { value["recording"] = id.into(); if serde_json::to_vec(&value).map_or(true,|bytes|bytes.len()>64*1024*1024){return (StatusCode::UNPROCESSABLE_ENTITY,"Replay including SD provenance exceeds 64 MiB; select a smaller recording").into_response();} json(value) },
         Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     }
 }

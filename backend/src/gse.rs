@@ -1889,6 +1889,24 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn clear_abort_without_network_time_preserves_latched_state() {
+        let state = crate::state::tests::test_app_state().await;
+        state.set_local_flight_state(FlightState::Aborted);
+        let router = Arc::new(sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([]).with_sender("GS"),
+        ));
+        state.topology_router.set(router).unwrap();
+        #[cfg(not(feature = "hitl_mode"))]
+        let saved = serde_json::to_value(&state.gse.lock().unwrap().operational.saved).unwrap();
+        let error = clear_ground_abort(&state).unwrap_err();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.1.contains("synchronized network time"));
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Aborted);
+        #[cfg(not(feature = "hitl_mode"))]
+        assert_eq!(serde_json::to_value(&state.gse.lock().unwrap().operational.saved).unwrap(), saved);
+    }
+
     pub(super) type TestCommands = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
 
     pub(super) async fn button_test_state()
@@ -1918,6 +1936,7 @@ mod tests {
         let router = Arc::new(sedsnet::router::Router::new(
             sedsnet::router::RouterConfig::new([]).with_sender("GS"),
         ));
+        crate::telemetry_task::refresh_host_network_time(&router, crate::telemetry_task::get_current_timestamp_ms());
         let ground_weak = Arc::downgrade(&router);
         let ground_ingress = Arc::new(std::sync::OnceLock::new());
         let ingress = ground_ingress.clone();
@@ -2442,6 +2461,10 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
             "Abort delivery is still pending; retry after the network drains".into(),
         ));
     }
+    crate::system_clock::required_control_network_utc_ms(router).map_err(|error| (
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("Recovery requires synchronized network time: {error}"),
+    ))?;
     #[allow(unused_mut)] // Operational recovery mutates this guard outside HITL.
     let mut rt = state.gse.lock().unwrap();
     if rt.engine.active() {
@@ -2752,7 +2775,7 @@ fn controller_delivery_pending(state: &AppState) -> bool {
         return true;
     }
     state.topology_router.get().is_some_and(|router| {
-        ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND"]
+        ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND"]
             .iter()
             .any(|name| {
                 router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type(name))
@@ -3006,6 +3029,7 @@ pub(crate) fn armed_fixture_for_test(
     router: &Arc<sedsnet::router::Router>,
 ) -> std::path::PathBuf {
     use crate::types::Board;
+    crate::telemetry_task::refresh_host_network_time(router, crate::telemetry_task::get_current_timestamp_ms());
     state.set_local_flight_state(FlightState::Armed);
     let side = router.add_side_packed("test_fixture_other_boards", |_| Ok(()));
     let mut endpoints = vec![crate::telemetry_schema::endpoint("ACTUATOR_BOARD")];
@@ -3775,3 +3799,7 @@ mod explicit_fc_stop_tests {
 
 #[cfg(all(test, feature = "hitl_mode"))]
 mod pre_target_tests;
+
+#[cfg(test)]
+#[path = "gse/packed_owner_diagnostic.rs"]
+mod packed_owner_diagnostic;

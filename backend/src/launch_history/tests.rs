@@ -442,3 +442,42 @@ fn launch_inhibition_survives_clock_reset_and_process_restart() {
     );
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn analytics_action_is_retained_through_tplus_restart_and_never_added_to_clock_wire() {
+    let path=path();
+    let mut store=Store::open(path.clone(),false,None,10_000,0).unwrap();
+    let minus=LaunchClockMsg {kind:LaunchClockKind::TMinus,anchor_timestamp_ms:Some(10_000),duration_ms:Some(10_000)};
+    let first=store.update_primary(minus.clone(),10_000,0).unwrap();
+    assert!(serde_json::to_value(&first).unwrap().get("launch_action_utc_ms").is_none());
+    // Analytics is optional/background; a failed disk write cannot block Launch.
+    for _ in 0..100 {if store.launch_action_utc_ms().is_some(){break;} std::thread::sleep(std::time::Duration::from_millis(5));}
+    assert_eq!(store.launch_action_utc_ms(),Some(10_000));
+    store.update_primary(plus(20_000),20_000,10_000).unwrap();
+    assert_eq!(store.launch_action_utc_ms(),Some(10_000));
+    wait(&store);drop(store);
+    let mut restored=Store::open(path.clone(),false,None,30_000,0).unwrap();
+    assert_eq!(restored.launch_action_utc_ms(),Some(10_000));
+    restored.reset_primary(30_000,0).unwrap();
+    assert_eq!(restored.launch_action_utc_ms(),None);
+    wait(&restored);drop(restored);
+    std::fs::remove_file(path.with_extension("analytics.json")).unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+#[test]
+fn analytics_io_failure_cannot_change_launch_admission_or_safety_disk_shape() {
+    let path=path();
+    let mut store=Store::open(path.clone(),false,None,1000,0).unwrap();
+    // Turn the optional destination into a directory so its atomic rename fails.
+    std::fs::create_dir(path.with_extension("analytics.json")).unwrap();
+    let accepted=store.update_primary(LaunchClockMsg{kind:LaunchClockKind::TMinus,anchor_timestamp_ms:Some(1000),duration_ms:Some(10_000)},1000,0).unwrap();
+    assert_eq!(accepted.clock.kind,LaunchClockKind::TMinus);
+    assert_eq!(store.launch_action_utc_ms(),None);
+    wait(&store);drop(store);
+    let disk:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(disk.get("launch_action_utc_ms").is_none());
+    let restored=Store::open(path.clone(),false,None,2000,0).unwrap();
+    assert_eq!(restored.launch_action_utc_ms(),None);
+    std::fs::remove_dir(path.with_extension("analytics.json")).unwrap();
+    std::fs::remove_file(path).unwrap();
+}

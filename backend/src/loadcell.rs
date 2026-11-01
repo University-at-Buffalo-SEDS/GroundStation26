@@ -2065,6 +2065,12 @@ impl HistoryCalibration {
         }
     }
     pub fn project(&mut self, row: crate::types::TelemetryRow) -> Vec<crate::types::TelemetryRow> {
+        let source=crate::telemetry_provenance::source(&row);
+        let rows=self.project_inner(row);
+        for row in &rows {crate::telemetry_provenance::note(row,source);}
+        rows
+    }
+    fn project_inner(&mut self, row: crate::types::TelemetryRow) -> Vec<crate::types::TelemetryRow> {
         if matches!(
             row.data_type.as_str(),
             DERIVED_WEIGHT_DATA_TYPE

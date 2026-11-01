@@ -1978,6 +1978,19 @@ async fn handle_packet(
     db_overflow: &DbOverflow,
     pkt: Packet,
 ) -> Vec<TelemetryRow> {
+    let source = i64::try_from(pkt.timestamp()).ok().and_then(|source|
+        crate::telemetry_provenance::canonical_source(source,procedure_clock::timestamp_ms()));
+    let rows=handle_packet_inner(state,db_tx,db_overflow,pkt).await;
+    for row in &rows {crate::telemetry_provenance::note(row,source);}
+    rows
+}
+
+async fn handle_packet_inner(
+    state: &Arc<AppState>,
+    db_tx: &mpsc::Sender<DbQueueItem>,
+    db_overflow: &DbOverflow,
+    pkt: Packet,
+) -> Vec<TelemetryRow> {
     let umbilical_capture = if pkt.data_type() == crate::telemetry_schema::data_type("UMBILICAL_STATUS") {
         match validate_umbilical_status(state, &pkt) {
             Ok(capture) => Some(capture),
@@ -4315,6 +4328,9 @@ mod tests {
             ),
         ])));
         let gs_router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        // Production main establishes UTC before admitting state changes.
+        refresh_host_network_time(&gs_router, get_current_timestamp_ms());
+        assert!(crate::system_clock::required_control_network_utc_ms(&gs_router).is_ok());
 
         let gs_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
         let remote_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
@@ -6235,6 +6251,12 @@ mod tests {
     #[cfg(feature = "firmware_sim")]
     mod zero_ingress {
         include!("telemetry_task/loadcell_zero_ingress_tests.rs");
+    }
+
+    #[cfg(feature = "hitl_mode")]
+    mod eval_abort_launch_ingress {
+        use super::*;
+        include!("telemetry_task/eval_abort_launch_diagnostic.rs");
     }
 
 }

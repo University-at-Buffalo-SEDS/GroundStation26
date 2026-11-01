@@ -4053,6 +4053,7 @@ pub(crate) mod tests {
         let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let sent_clone = sent.clone();
         let router = Arc::new(Router::new(RouterConfig::new([])));
+        crate::telemetry_task::refresh_host_network_time(&router, crate::telemetry_task::get_current_timestamp_ms());
         router.add_side_packed_with_options(
             "umbilical_comms",
             move |bytes| {
@@ -4129,6 +4130,7 @@ pub(crate) mod tests {
             ),
         ])));
         let gs_router = Arc::new(sedsnet::router::Router::new(RouterConfig::new([])));
+        crate::telemetry_task::refresh_host_network_time(&gs_router, crate::telemetry_task::get_current_timestamp_ms());
 
         let gs_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));
         let remote_peer = Arc::new(Mutex::new(None::<(Arc<Router>, RouterSideId)>));

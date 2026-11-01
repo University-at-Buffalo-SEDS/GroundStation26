@@ -97,6 +97,7 @@ struct Disk {
 }
 
 pub struct Store {
+    analytics:crate::launch_analytics::Journal,
     path: Option<PathBuf>,
     writer: Option<Arc<Writer>>,
     last_write: u64,
@@ -192,6 +193,7 @@ impl Store {
         let baseline_elapsed_ms = data.current.t0_utc_ms.map(|t0| now.saturating_sub(t0));
         let writer = Writer::start(path.clone(), false)?;
         Ok(Self {
+            analytics:crate::launch_analytics::Journal::open(path.with_extension("analytics.json")),
             path: Some(path),
             writer: Some(writer),
             last_write: 0,
@@ -208,6 +210,7 @@ impl Store {
     }
     pub fn ephemeral() -> Self {
         Self {
+            analytics:Default::default(),
             path: None,
             writer: None,
             last_write: 0,
@@ -310,6 +313,7 @@ impl Store {
         }
         Ok(())
     }
+    pub fn launch_action_utc_ms(&self)->Option<i64> {self.analytics.action(&self.data.current)}
     pub fn snapshot(&self) -> ClockRecord {
         self.data.current.clone()
     }
@@ -418,8 +422,10 @@ impl Store {
         if clock.kind == LaunchClockKind::TMinus {
             next.awaiting_new_launch = false;
         }
+        let launch_action=if clock.kind==LaunchClockKind::TMinus {clock.anchor_timestamp_ms}else{None};
         next.current.clock = clock;
         self.commit(next, now, mono)?;
+        if let Some(anchor)=launch_action {self.analytics.record(&self.data.current,anchor);}
         Ok(self.snapshot())
     }
     pub fn reset_primary(&mut self, now: i64, mono: u64) -> Result<ClockRecord> {

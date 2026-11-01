@@ -492,6 +492,7 @@ mod tests {
                 sedsnet::router::RouterConfig::new([]),
             )))
             .unwrap();
+        crate::telemetry_task::refresh_host_network_time(restored.topology_router.get().unwrap(), crate::telemetry_task::get_current_timestamp_ms());
         clear_ground_abort(&restored).unwrap();
         assert!(
             !operational::Saved::load(&path)

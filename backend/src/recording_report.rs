@@ -35,6 +35,24 @@ fn valve_labels(layout: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Array(labels.into_values().collect())
 }
 
+fn channel_metadata(layout:&serde_json::Value)->serde_json::Value {
+    fn walk(value:&serde_json::Value,out:&mut Vec<serde_json::Value>) {
+        if let Some(kind)=value["data_type"].as_str().or_else(||value["id"].as_str()) {
+            if let Some(formatters)=value["channel_formatters"].as_array() {
+                for (index,formatter) in formatters.iter().enumerate() {
+                    if let Some(unit)=formatter["suffix"].as_str().map(str::trim).filter(|s|!s.is_empty() && s.len()<=64) {
+                        let mut item=serde_json::json!({"data_type":kind,"index":index,"unit":unit});
+                        if let Some(sender)=value["sender_id"].as_str(){item["sender_id"]=sender.into();}
+                        out.push(item);
+                    }
+                }
+            }
+        }
+        match value {serde_json::Value::Object(map)=>{for child in map.values(){walk(child,out);}},serde_json::Value::Array(list)=>{for child in list{walk(child,out);}},_=>{}}
+    }
+    let mut out=Vec::new();walk(layout,&mut out);serde_json::Value::Array(out)
+}
+
 pub async fn report(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -53,16 +71,17 @@ pub async fn report(
     let format = request["format"].as_str().unwrap_or("preview").to_owned();
     let content_type = match format.as_str() {
         "preview" => "application/json",
-        "csv" => "text/csv; charset=utf-8",
+        "csv" | "daq_csv" => "text/csv; charset=utf-8",
+        "daq_tsv" => "text/tab-separated-values; charset=utf-8",
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "pdf" => "application/pdf",
-        _ => return (StatusCode::BAD_REQUEST, "Choose CSV, Excel or PDF.").into_response(),
+        _ => return (StatusCode::BAD_REQUEST, "Choose CSV, DAQ SD CSV/TSV, Excel or PDF.").into_response(),
     };
     // These names are export-time station configuration, not historical state.
     // Override any client-supplied mapping; numeric saved values remain intact.
-    request["valve_mappings"] = crate::layout::load_layout().ok()
-        .and_then(|layout|serde_json::to_value(layout).ok())
-        .map(|layout|valve_labels(&layout)).unwrap_or_else(||serde_json::json!([]));
+    let export_layout=crate::layout::load_layout().ok().and_then(|layout|serde_json::to_value(layout).ok());
+    request["valve_mappings"]=export_layout.as_ref().map(valve_labels).unwrap_or_else(||serde_json::json!([]));
+    request["channel_metadata"]=export_layout.as_ref().map(channel_metadata).unwrap_or_else(||serde_json::json!([]));
     // The root is always server-controlled, regardless of request JSON.
     request["root"] = crate::recording_export::directory(&state)
         .to_string_lossy()
@@ -138,7 +157,7 @@ pub async fn report(
     if format != "preview" {
         response.headers_mut().insert(
             header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"telemetry-report.{format}\"")
+            format!("attachment; filename=\"{}\"",match format.as_str(){"daq_csv"=>"telemetry-daq-sd.csv".to_owned(),"daq_tsv"=>"telemetry-daq-sd.tsv".to_owned(),_=>format!("telemetry-report.{format}")})
                 .parse()
                 .unwrap(),
         );
@@ -201,4 +220,24 @@ mod tests {
         assert_eq!(result["recorded_rows"], 1);
         assert_eq!(result["channels"][0]["points"][0][1], 2.5);
     }
+    #[tokio::test]
+    async fn daq_formatter_formats_require_view_data_before_worker() {
+        let root=TestDirectory::new();
+        let state=export_state(&root.0,false).await;
+        for format in ["daq_csv","daq_tsv"] {
+            let response=report(State(state.clone()),HeaderMap::new(),Query(ReportQuery{
+                request:serde_json::json!({"recording":"groundstation_recording_1.db","format":format,"channels":["secret"]}).to_string(),
+            })).await;
+            assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
+        }
+    }
+    #[test]
+    fn units_are_only_explicit_layout_suffixes() {
+        let metadata=channel_metadata(&serde_json::json!({"tabs":[
+            {"id":"KG1000","channels":["Volts"],"channel_formatters":[{"suffix":" V"}]},
+            {"id":"UNKNOWN","channels":["Pressure (psi)"]}
+        ]}));
+        assert_eq!(metadata,serde_json::json!([{"data_type":"KG1000","index":0,"unit":"V"}]));
+    }
+
 }

@@ -2380,6 +2380,7 @@ mod tests {
         }
         assert!(state.all_required_boards_seen());
         let router = std::sync::Arc::new(sedsnet::router::Router::new(Default::default()));
+        crate::telemetry_task::refresh_host_network_time(&router, crate::telemetry_task::get_current_timestamp_ms());
         let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
         router
             .enable_network_variable(ty, sedsnet::router::NetworkVariablePermissions::READ_WRITE)

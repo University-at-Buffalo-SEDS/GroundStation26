@@ -53,6 +53,9 @@ struct PersistentVariables {
     flight_buzzer: bool,
     #[serde(default)]
     flight_state: u8,
+    /// Original network timestamp; zero denotes an unknown legacy origin.
+    #[serde(default)]
+    flight_state_stamp: u64,
     #[serde(default)]
     daq_log_clock: [u64; 2],
     #[serde(default)]
@@ -147,6 +150,7 @@ fn default_values() -> PersistentVariables {
             .filter(|value| *value <= 15)
             .unwrap_or(0),
         daq_log_clock: [0, 0],
+        flight_state_stamp: 0,
         daq_log_clock_stamp: 0,
         daq_log_last_session: 0,
     }
@@ -178,11 +182,20 @@ fn packet(data_type: &str, endpoint: &str, value: u8) -> Result<Packet> {
 }
 
 fn packet_bytes(data_type: &str, endpoint: &str, payload: Arc<[u8]>) -> Result<Packet> {
+    packet_bytes_at(data_type, endpoint, payload, get_current_timestamp_ms())
+}
+
+fn packet_bytes_at(
+    data_type: &str,
+    endpoint: &str,
+    payload: Arc<[u8]>,
+    timestamp: u64,
+) -> Result<Packet> {
     Ok(Packet::new(
         crate::telemetry_schema::data_type(data_type),
         &[crate::telemetry_schema::endpoint(endpoint)],
         Board::GroundStation.sender_id(),
-        get_current_timestamp_ms(),
+        timestamp,
         payload,
     )?
     .with_nonce(NETWORK_VARIABLE_NONCE.fetch_add(1, Ordering::Relaxed)))
@@ -233,6 +246,9 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
                 .lock()
                 .expect("network-variable store lock poisoned");
             let mut next = guard.values;
+            if next.flight_state != state || next.flight_state_stamp == 0 {
+                next.flight_state_stamp = packet.timestamp();
+            }
             next.flight_state = state;
             guard.commit(next).map_err(|err| {
                 log::warn!("failed to persist inbound flight-state network variable: {err}");
@@ -270,7 +286,7 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
         "FLIGHT_CONTROLLER",
         u8::from(flight_buzzer_enabled()),
     )?)?;
-    router.seed_managed_variable(packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", flight_state())?)?;
+    router.seed_managed_variable(cached_flight_state_packet()?)?;
     let selected = crate::loadcell::load_or_default();
     router.seed_managed_variable(packet(
         "DAQ_KG50_INPUT",
@@ -304,10 +320,7 @@ pub fn publish_current(router: &Router) -> Result<()> {
             u8::from(flight_buzzer_enabled()),
         )?,
     )?;
-    request.submit(
-        router,
-        packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", flight_state())?,
-    )?;
+    request.submit(router, cached_flight_state_packet()?)?;
     set_daq_calibration(router, &crate::loadcell::load_or_default())?;
     request.submit(router, cached_daq_log_clock_packet()?)?;
     Ok(())
@@ -363,16 +376,41 @@ pub fn set_flight_buzzer(router: &Router, enabled: bool) -> Result<()> {
 pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
     let request = crate::qualification_requests::Request::begin("set_flight_state");
     anyhow::ensure!(state <= 15, "invalid flight-state value {state}");
+    let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
+    let packet = packet_bytes_at(
+        FLIGHT_STATE_TYPE,
+        "FLIGHT_STATE",
+        Arc::from([state]),
+        timestamp,
+    )?;
     {
         let mut guard = store()
             .lock()
             .expect("network-variable store lock poisoned");
         let mut next = guard.values;
         next.flight_state = state;
+        next.flight_state_stamp = timestamp;
         guard.commit(next)?;
     }
-    request.submit(router, packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", state)?)?;
+    request.submit(router, packet)?;
     Ok(())
+}
+
+fn cached_flight_state_packet() -> Result<Packet> {
+    let guard = store()
+        .lock()
+        .expect("network-variable store lock poisoned");
+    flight_state_packet(guard.values)
+}
+
+fn flight_state_packet(values: PersistentVariables) -> Result<Packet> {
+    // Reconnect must not make a retained Abort newer than a recovery cutoff.
+    packet_bytes_at(
+        FLIGHT_STATE_TYPE,
+        "FLIGHT_STATE",
+        Arc::from([values.flight_state]),
+        values.flight_state_stamp,
+    )
 }
 
 fn filter_packet(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Result<Packet> {
@@ -1185,6 +1223,7 @@ mod tests {
                 av_bay_underglow: true,
                 flight_buzzer: true,
                 flight_state: 6,
+                flight_state_stamp: 0,
                 daq_log_clock: [0, 0],
                 daq_log_clock_stamp: 0,
                 daq_log_last_session: 0,
@@ -1590,6 +1629,7 @@ mod persistence_callback_tests {
         );
         phase.store(2, Ordering::Relaxed);
         now.store(1100, Ordering::Relaxed);
+        crate::telemetry_task::refresh_host_network_time(&source, get_current_timestamp_ms());
         set_flight_state(&source, 1).unwrap();
         let pending = source.export_reliable_pending_stats();
         assert_eq!(pending.len(), 1);
@@ -1682,6 +1722,7 @@ mod persistence_callback_tests {
         let states =
             crate::qualification_requests::policy_states(cfg!(feature = "hitl_mode"), &[1, 0, 1])
                 .unwrap();
+        crate::telemetry_task::refresh_host_network_time(&source, get_current_timestamp_ms());
         for (round, state) in states.into_iter().enumerate() {
             crate::qualification_requests::in_controlled_round(round + 1, || {
                 set_flight_state(&source, state).unwrap();
@@ -1737,6 +1778,7 @@ mod persistence_callback_tests {
         let states =
             crate::qualification_requests::policy_states(cfg!(feature = "hitl_mode"), &[1, 0, 1])
                 .unwrap();
+        crate::telemetry_task::refresh_host_network_time(&router, get_current_timestamp_ms());
         for (round, (state, enabled)) in states.iter().zip([true, false, true]).enumerate() {
             crate::qualification_requests::in_controlled_round(round + 1, || {
                 set_flight_state(&router, *state).unwrap();
@@ -1916,6 +1958,7 @@ mod persistence_callback_tests {
         }
         crate::telemetry_schema::initialize().unwrap();
         let router = Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS"));
+        crate::telemetry_task::refresh_host_network_time(&router, get_current_timestamp_ms());
         initialize_for_role(&router, false).unwrap();
         let sent = Arc::new(Mutex::new(Vec::new()));
         let output = sent.clone();
@@ -1943,6 +1986,76 @@ mod persistence_callback_tests {
     }
 
     #[test]
+    fn retained_flight_state_keeps_origin_through_disk_reload_and_sdk_seed() {
+        crate::telemetry_schema::initialize().unwrap();
+        let path =
+            std::env::temp_dir().join(format!("gs-state-origin-{}.json", rand::random::<u128>()));
+        let values = PersistentVariables {
+            flight_state: 15,
+            flight_state_stamp: 1000,
+            ..Default::default()
+        };
+        persist(&path, values).unwrap();
+        let restored = VariableStore::new(path.clone());
+        let router = Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS"));
+        crate::telemetry_task::refresh_host_network_time(&router, get_current_timestamp_ms());
+        let retained = flight_state_packet(restored.values).unwrap();
+        assert_eq!(retained.timestamp(), 1000);
+        assert_eq!(retained.payload(), &[15]);
+        router
+            .enable_network_variable(
+                crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE),
+                NetworkVariablePermissions::READ_WRITE,
+            )
+            .unwrap();
+        router.seed_managed_variable(retained).unwrap();
+        let cached = router
+            .get_cached_network_variable(crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cached.timestamp(),
+            1000,
+            "reseed must remain older than a later recovery cutoff"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_flight_state_origin_is_unknown_instead_of_freshened() {
+        crate::telemetry_schema::initialize().unwrap();
+        let values: PersistentVariables = serde_json::from_str(r#"{"flight_state":15}"#).unwrap();
+        assert_eq!(flight_state_packet(values).unwrap().timestamp(), 0);
+    }
+
+    #[test]
+    fn actual_primary_bootstrap_preserves_recorded_state_origin() {
+        const NAME: &str = "network_variables::persistence_callback_tests::actual_primary_bootstrap_preserves_recorded_state_origin";
+        if !isolated(NAME) { return; }
+        crate::telemetry_schema::initialize().unwrap();
+        let values = serde_json::from_str(r#"{"flight_state":15,"flight_state_stamp":1000}"#).unwrap();
+        persist(&cache_path(), values).unwrap();
+        let router = Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS"));
+        initialize_for_role(&router, false).unwrap();
+        let cached = router.get_cached_network_variable(crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE)).unwrap().unwrap();
+        assert_eq!(cached.payload(), &[15]);
+        assert_eq!(cached.timestamp(), 1000, "boot must not mint fresh time for a retained Abort");
+    }
+
+    #[test]
+    fn unsynchronized_state_change_does_not_modify_retained_state() {
+        const NAME: &str = "network_variables::persistence_callback_tests::unsynchronized_state_change_does_not_modify_retained_state";
+        if !isolated(NAME) {
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let router = Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS"));
+        let before = store().lock().unwrap().values;
+        assert!(set_flight_state(&router, 15).is_err());
+        assert_eq!(store().lock().unwrap().values, before);
+    }
+
+    #[test]
     fn failed_store_commit_is_atomic_for_every_cached_field_and_retries() {
         let path = std::env::temp_dir()
             .join(format!(
@@ -1955,6 +2068,7 @@ mod persistence_callback_tests {
             av_bay_underglow: true,
             flight_buzzer: true,
             flight_state: 4,
+            flight_state_stamp: 100,
             daq_log_clock: [7, 123456],
             daq_log_clock_stamp: 0,
             daq_log_last_session: 7,
@@ -1966,6 +2080,7 @@ mod persistence_callback_tests {
             av_bay_underglow: false,
             flight_buzzer: false,
             flight_state: 5,
+            flight_state_stamp: 200,
             daq_log_clock: [8, 123789],
             daq_log_clock_stamp: 0,
             daq_log_last_session: 8,
@@ -1997,8 +2112,10 @@ mod persistence_callback_tests {
 }
 
 /// Read a legacy durable pair without stamping or inferring its launch T0.
-pub fn persisted_daq_log_clock()->Option<[u64;2]> {
-    let guard=store().lock().expect("network-variable store lock poisoned");
+pub fn persisted_daq_log_clock() -> Option<[u64; 2]> {
+    let guard = store()
+        .lock()
+        .expect("network-variable store lock poisoned");
     guard.durable.then_some(guard.values.daq_log_clock)
 }
 

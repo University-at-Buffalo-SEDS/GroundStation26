@@ -583,6 +583,8 @@ pub(super) async fn emit_derived_battery_rows(
                 sender_id: sender_id.to_string(),
                 values,
             };
+            crate::telemetry_provenance::note(&row,source_timestamp_ms.and_then(|source|
+                crate::telemetry_provenance::canonical_source(source,super::procedure_clock::timestamp_ms())));
             state.cache_recent_telemetry(row.clone());
             let _ = state.ws_tx.send(row);
         }
@@ -770,6 +772,8 @@ pub(super) async fn emit_derived_loadcell_rows(
             sender_id: sample.sender_id.to_string(),
             values,
         };
+        crate::telemetry_provenance::note(&row,sample.source_timestamp_ms.and_then(|source|
+            crate::telemetry_provenance::canonical_source(source,super::procedure_clock::timestamp_ms())));
         state.cache_recent_telemetry(row.clone());
         let _ = state.ws_tx.send(row);
     }
@@ -848,6 +852,8 @@ pub(super) async fn emit_derived_vehicle_speed_row(
         sender_id: String::new(),
         values,
     };
+    crate::telemetry_provenance::note(&row,source_timestamp_ms.and_then(|source|
+        crate::telemetry_provenance::canonical_source(source,super::procedure_clock::timestamp_ms())));
     state.cache_recent_telemetry(row.clone());
     let _ = state.ws_tx.send(row);
 }

@@ -1,0 +1,5 @@
+timestamp_ms,monotonic_ms,sensor,value,raw_adc_code,raw_value,calibrated_value,time_source,adc_temperature_c,adc_temperature_code,uptime_ticks,uptime_frequency_hz,record_sequence
+1793491200000,4294967297,kg1000_network,"1.25000000e+00",,,,network,,,4294967297,1000,42
+4294967298,4294967298,Message,"a,""quoted""
+second line",,,,local,,,4294967298,1000,43
+1793491200001,4294967299,mcp3564r_raw,,-123,1.25000000e+00,2.50000000e+02,network,2.61250000e+01,-5,4294967299,1000,44

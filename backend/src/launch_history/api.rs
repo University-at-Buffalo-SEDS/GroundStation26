@@ -11,10 +11,16 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 #[derive(Serialize)]
+struct ClockWithAction {
+    #[serde(flatten)]
+    clock:ClockRecord,
+    launch_action_utc_ms:Option<i64>,
+}
+#[derive(Serialize)]
 struct Status {
     recovery_marker_supported: bool,
     clock_reset_request_supported: bool,
-    clock: ClockRecord,
+    clock: ClockWithAction,
     synchronized: bool,
     clock_known: bool,
     persistence_error: Option<String>,
@@ -43,7 +49,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     Json(Status {
         recovery_marker_supported: true,
         clock_reset_request_supported: true,
-        clock: history.snapshot(),
+        clock: ClockWithAction {clock:history.snapshot(),launch_action_utc_ms:history.launch_action_utc_ms()},
         synchronized: history.synchronized && history.clock_known(),
         clock_known: history.clock_known(),
         persistence_error: history.persistence_error(),

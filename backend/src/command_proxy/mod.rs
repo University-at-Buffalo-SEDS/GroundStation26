@@ -1,6 +1,12 @@
 //! Primary-owned control from an authenticated recovery station.
 //! Local RRLS hardware execution remains denied, including when offline.
+mod recovery;
 mod wire;
+// Staged coordinator seam; this module does not authorize reset completion.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn begin_primary_recovery() -> anyhow::Result<Option<recovery::Barrier>> {
+    recovery::begin_primary_recovery()
+}
 use crate::{rrls::Role, station_mode::Mode, station_pairing::Pairing};
 use anyhow::{Result, ensure};
 use std::collections::VecDeque;
@@ -42,6 +48,7 @@ struct Cached {
 }
 #[derive(Clone)]
 struct VerifiedRequest {
+    admission: std::sync::Arc<recovery::Admission>,
     envelope: Envelope,
     digest: [u8; 16],
     pub actor: String,
@@ -64,6 +71,7 @@ enum Received {
     Pending,
 }
 struct Runtime {
+    admission: std::sync::Arc<recovery::Admission>,
     role: Role,
     boot: [u8; 16],
     session: Option<u32>,
@@ -82,9 +90,11 @@ fn nonce() -> [u8; 16] {
 }
 impl Runtime {
     pub(crate) fn new(role: Role) -> Self {
+        let admission = recovery::Admission::new();
         Self {
+            boot: admission.boot(),
+            admission,
             role,
-            boot: nonce(),
             session: None,
             query: None,
             capability: None,
@@ -92,11 +102,23 @@ impl Runtime {
             observation: Vec::new(),
         }
     }
+    fn synchronize_recovery(&mut self) -> bool {
+        let boot = self.admission.boot();
+        if self.role != Role::Primary || self.boot == boot {
+            return false;
+        }
+        self.boot = boot;
+        self.query = None;
+        self.capability = None;
+        self.results.clear();
+        true
+    }
     pub(crate) fn connect(&mut self, transport: Option<Transport>) {
         let session = transport.map(|view| view.session);
         if self.session != session {
             if self.role == Role::Primary {
-                self.boot = nonce();
+                self.admission.rotate_transport();
+                self.boot = self.admission.boot();
             }
             self.session = session;
             self.query = None;
@@ -182,6 +204,7 @@ impl Runtime {
         local_mode: Mode,
         bytes: &[u8],
     ) -> Result<Received> {
+        self.synchronize_recovery();
         ensure!(
             self.session == Some(transport.session),
             "Disconnected control transport"
@@ -240,6 +263,11 @@ impl Runtime {
                     primary && envelope.boot == self.boot && mode == local_mode,
                     "Wrong primary boot or mode"
                 );
+                let manual_stop = matches!(&operation, Operation::Command(name) if name == "Abort");
+                ensure!(
+                    self.admission.request_allowed(envelope.boot, manual_stop),
+                    "Primary recovery is pending"
+                );
                 let digest = wire::contract_digest(bytes);
                 if let Some(previous) = self
                     .results
@@ -269,6 +297,7 @@ impl Runtime {
                     reply: None,
                 });
                 Ok(Received::Execute(VerifiedRequest {
+                    admission: self.admission.clone(),
                     envelope,
                     digest,
                     actor,
@@ -305,6 +334,11 @@ impl Runtime {
         ensure!(
             self.role == Role::Primary,
             "Only primary completes a request"
+        );
+        self.synchronize_recovery();
+        ensure!(
+            request.envelope.boot == self.boot,
+            "Proxy capability was revoked"
         );
         let reply = Envelope {
             issuer: pairing.public.station_id.clone(),
@@ -345,7 +379,7 @@ mod tests {
         let recovery = load("rrls", "primary", "primary");
         (root, primary, recovery)
     }
-    fn connected() -> (
+    pub(super) fn connected() -> (
         crate::recording_export::tests::TestDirectory,
         Pairing,
         Pairing,
@@ -619,6 +653,28 @@ pub(crate) fn local_operation(name: &str) -> bool {
             | "StopWritingDb"
     )
 }
+#[cfg(test)]
+#[derive(Default)]
+struct AdmissionPause {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+#[cfg(test)]
+static ADMISSION_PAUSE: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::Arc<AdmissionPause>>>,
+> = std::sync::OnceLock::new();
+#[cfg(test)]
+async fn pause_before_proxy_admission() {
+    let pause = ADMISSION_PAUSE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .clone();
+    if let Some(pause) = pause {
+        pause.reached.notify_one();
+        pause.resume.notified().await;
+    }
+}
 async fn execute_primary(
     state: std::sync::Arc<crate::state::AppState>,
     request: &VerifiedRequest,
@@ -655,6 +711,15 @@ async fn execute_primary(
     if !live(request) {
         return Outcome::Stale;
     }
+    // A request paused during authentication cannot acquire dispatch after
+    // recovery revoked its capability. Already acquired dispatch keeps the
+    // barrier non-quiescent until this async call returns; no mutex crosses it.
+    #[cfg(test)]
+    pause_before_proxy_admission().await;
+    let manual_stop = matches!(&request.operation, Operation::Command(name) if name == "Abort");
+    let Ok(_lease) = request.admission.admit(request.envelope.boot, manual_stop) else {
+        return Outcome::Stale;
+    };
     let status = match &request.operation {
         Operation::Command(name) => {
             if local_operation(name) || !principal.allows_command_name(name) {
@@ -850,6 +915,19 @@ pub(crate) async fn submit(
             return (StatusCode::FORBIDDEN, "Command permission was revoked.").into_response();
         }
     }
+    if matches!(&operation, Operation::Command(name) if name == "Abort") {
+        state.manual_abort_intent.request();
+        let mut broker = broker().lock().unwrap();
+        broker.status.last = Some(RequestStatus {
+            request_id: hex(&nonce()),
+            operation: "Abort".into(),
+            phase: "local_stop_retained",
+            primary_accepted: false,
+            device_confirmed: false,
+            error: Some("Primary observation and actual board readback are pending.".into()),
+        });
+        return (StatusCode::ACCEPTED, Json(broker.status.clone())).into_response();
+    }
     let Some(mesh) = crate::rrls::settings_transport() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -974,6 +1052,10 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
     };
     let role = { mesh.lock().unwrap().role };
     let mut runtime = Runtime::new(role);
+    if role == Role::Primary && recovery::register(&runtime.admission).is_err() {
+        log::error!("A primary proxy is already active; duplicate task was not started");
+        return None;
+    }
     if runtime.peer(&pairing).is_err() {
         let mut broker = broker().lock().unwrap();
         broker.status.paired = true;
@@ -984,7 +1066,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
     Some(tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(20));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut outbox = VecDeque::<Vec<u8>>::new();
+        let mut outbox = VecDeque::<([u8; 16], Vec<u8>)>::new();
         let mut query_attempts = 0u8;
         let mut last_query = None;
         let mut query_created_at = None;
@@ -1028,6 +1110,10 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                 }
             }
             runtime.connect(view);
+            if runtime.synchronize_recovery() {
+                outbox.clear();
+                invalidate_presentation(&state);
+            }
             let Some(view) = view else {
                 let mut broker = broker().lock().unwrap();
                 broker.status.paired = true;
@@ -1045,7 +1131,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                 match runtime.receive(&pairing, view, crate::station_mode::local_mode(), &bytes) {
                     Ok(Received::Reply(bytes)) => {
                         if outbox.len() < 4 {
-                            outbox.push_back(bytes);
+                            outbox.push_back((runtime.boot, bytes));
                         }
                     }
                     Ok(Received::Execute(request)) => {
@@ -1062,7 +1148,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                         );
                         if let Ok(reply) = runtime.finish(&pairing, request, outcome) {
                             if outbox.len() < 4 {
-                                outbox.push_back(reply);
+                                outbox.push_back((runtime.boot, reply));
                             }
                         }
                     }
@@ -1262,7 +1348,11 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                     }
                 }
             }
-            if let Some(bytes) = outbox.front() {
+            if role == Role::Primary {
+                let boot = runtime.admission.boot();
+                outbox.retain(|(created_boot, _)| *created_boot == boot);
+            }
+            if let Some((_, bytes)) = outbox.front() {
                 if mesh.lock().unwrap().queue_command_proxy(bytes, now) {
                     outbox.pop_front();
                 }
@@ -1361,3 +1451,70 @@ fn supported_commands_mask() -> u64 {
 }
 #[cfg(test)]
 mod handler_tests;
+
+#[cfg(test)]
+mod recovery_wire_tests {
+    use super::*;
+    #[test]
+    fn delayed_signed_request_and_cached_completion_are_revoked_by_barrier() {
+        let (_root, p, r, mut primary, mut rr, pv, rv) = tests::connected();
+        let bytes = rr
+            .request(
+                &r,
+                rv,
+                Mode::Hitl,
+                [71; 16],
+                "operator".into(),
+                Operation::Command("Launch".into()),
+            )
+            .unwrap();
+        let Received::Execute(work) = primary.receive(&p, pv, Mode::Hitl, &bytes).unwrap() else {
+            panic!("verified")
+        };
+        let barrier = primary.admission.begin().unwrap();
+        assert!(barrier.is_quiescent());
+        assert!(primary.receive(&p, pv, Mode::Hitl, &bytes).is_err());
+        assert!(primary.finish(&p, work, Outcome::Queued).is_err());
+        assert!(primary.results.is_empty());
+        let query_during = rr.query(&r, rv).unwrap();
+        let Received::Reply(cap_during) =
+            primary.receive(&p, pv, Mode::Hitl, &query_during).unwrap()
+        else {
+            panic!("barrier cap")
+        };
+        rr.receive(&r, rv, Mode::Normal, &cap_during).unwrap();
+        let during = rr
+            .request(
+                &r,
+                rv,
+                Mode::Hitl,
+                [73; 16],
+                "operator".into(),
+                Operation::Command("Launch".into()),
+            )
+            .unwrap();
+        assert!(primary.receive(&p, pv, Mode::Hitl, &during).is_err());
+        barrier.reopen_after_verified_recovery().unwrap();
+        assert!(primary.receive(&p, pv, Mode::Hitl, &during).is_err());
+        assert!(primary.receive(&p, pv, Mode::Hitl, &bytes).is_err());
+        let query = rr.query(&r, rv).unwrap();
+        let Received::Reply(cap) = primary.receive(&p, pv, Mode::Hitl, &query).unwrap() else {
+            panic!("new cap")
+        };
+        rr.receive(&r, rv, Mode::Normal, &cap).unwrap();
+        let fresh = rr
+            .request(
+                &r,
+                rv,
+                Mode::Hitl,
+                [72; 16],
+                "operator".into(),
+                Operation::Command("Launch".into()),
+            )
+            .unwrap();
+        assert!(matches!(
+            primary.receive(&p, pv, Mode::Hitl, &fresh).unwrap(),
+            Received::Execute(_)
+        ));
+    }
+}
