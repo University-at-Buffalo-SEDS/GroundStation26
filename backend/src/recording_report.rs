@@ -14,6 +14,27 @@ pub struct ReportQuery {
     pub request: String,
 }
 
+fn valve_labels(layout: &serde_json::Value) -> serde_json::Value {
+    fn walk(value: &serde_json::Value, labels: &mut std::collections::BTreeMap<u64, serde_json::Value>) {
+        if value["data_type"] == "VALVE_STATE" {
+            if let Some(items)=value["valves"].as_array().or_else(||value["items"].as_array()) {
+                for (ordinal,item) in items.iter().enumerate() {
+                    if let Some(index)=item["index"].as_u64().filter(|i|*i<7) {
+                        let mut mapping=serde_json::json!({"index":index});
+                        if let Some(label)=item["label"].as_str().filter(|s|s.len()<=128) {mapping["label"]=label.into();}
+                        let words=value["valve_labels"].get(ordinal).filter(|v|v.is_object()).unwrap_or(&value["boolean_labels"]);
+                        for field in ["true_label","false_label","unknown_label"] {if let Some(text)=words[field].as_str().filter(|s|s.len()<=128) {mapping[field]=text.into();}}
+                        labels.insert(index,mapping);
+                    }
+                }
+            }
+        }
+        match value {serde_json::Value::Object(map)=>{for child in map.values(){walk(child,labels);}},serde_json::Value::Array(list)=>{for child in list{walk(child,labels);}},_=>{}}
+    }
+    let mut labels=std::collections::BTreeMap::new();walk(layout,&mut labels);
+    serde_json::Value::Array(labels.into_values().collect())
+}
+
 pub async fn report(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -37,6 +58,11 @@ pub async fn report(
         "pdf" => "application/pdf",
         _ => return (StatusCode::BAD_REQUEST, "Choose CSV, Excel or PDF.").into_response(),
     };
+    // These names are export-time station configuration, not historical state.
+    // Override any client-supplied mapping; numeric saved values remain intact.
+    request["valve_mappings"] = crate::layout::load_layout().ok()
+        .and_then(|layout|serde_json::to_value(layout).ok())
+        .map(|layout|valve_labels(&layout)).unwrap_or_else(||serde_json::json!([]));
     // The root is always server-controlled, regardless of request JSON.
     request["root"] = crate::recording_export::directory(&state)
         .to_string_lossy()

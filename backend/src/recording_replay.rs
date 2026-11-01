@@ -171,6 +171,39 @@ fn json<T: Serialize>(value: T) -> Response {
         .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     response
 }
+/// A finite, frozen saved-data export. Config is attached by the client from
+/// the same station; no live cache, authentication material or hardware actions.
+async fn export_from(db: &SqlitePool) -> anyhow::Result<serde_json::Value> {
+    let snapshot = snapshot_from(db).await?;
+    let mut samples = Vec::new();
+    let mut bytes = 0usize;
+    let mut after = 0i64;
+    loop {
+        let rows = sqlx::query("SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json FROM telemetry WHERE id>? AND id<=? ORDER BY id LIMIT 512")
+            .bind(after).bind(snapshot.upper_id).fetch_all(db).await?;
+        if rows.is_empty() { break; }
+        for row in rows {
+            let sample = decode(row)?;
+            anyhow::ensure!(samples.len() < 200_000, "Replay exceeds 200,000 rows; select a smaller recording. No rows were truncated.");
+            bytes = bytes.saturating_add(serde_json::to_vec(&sample)?.len());
+            anyhow::ensure!(bytes <= 64 * 1024 * 1024, "Replay exceeds 64 MiB; select a smaller recording.");
+            after = sample.id;
+            samples.push(sample);
+        }
+    }
+    Ok(serde_json::json!({"format":"seds-replay","version":1,"snapshot":snapshot,
+        "samples":samples,"schema":serde_json::from_str::<serde_json::Value>(include_str!("../config/telemetry_config.json"))?}))
+}
+
+pub async fn export(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if let Err(response) = crate::web::authorize_headers(&state, &headers, Permission::ViewData).await { return response; }
+    let db = match open(&state, &id).await { Ok(db) => db, Err(code) => return code.into_response() };
+    match export_from(&db).await {
+        Ok(mut value) => { value["recording"] = id.into(); json(value) },
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
 pub async fn snapshot(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -586,6 +619,23 @@ pub(crate) async fn saved_trajectory(
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn offline_export_freezes_saved_rows_and_keeps_nulls_and_source_clocks() {
+        let db = db().await;
+        insert(&db, 1000, "VALVE_STATE", "[1,null,0]").await;
+        insert(&db, 2000, "ROLL", "[4]").await;
+        sqlx::query("UPDATE telemetry SET source_timestamp_ms=900 WHERE id=1").execute(&db).await.unwrap();
+        let exported = export_from(&db).await.unwrap();
+        assert_eq!(exported["format"], "seds-replay");
+        assert_eq!(exported["samples"].as_array().unwrap().len(), 2);
+        assert_eq!(exported["samples"][0]["values"], serde_json::json!([1.0,null,0.0]));
+        assert_eq!(exported["snapshot"]["upper_id"], 2);
+        assert_eq!(exported["samples"][0]["source_timestamp_ms"], 900);
+        assert!(exported["schema"].is_object());
+        insert(&db, 3000, "ROLL", "[99]").await;
+        assert_eq!(exported["samples"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn flight_selection_skips_fill_and_repeated_phase_samples_and_stops_after_landing() {
         let db = db().await;
         insert(&db, 1000, "ROLL", "[1]").await;
@@ -622,7 +672,7 @@ mod tests {
         let path = format!("/api/recordings/{id}/replay");
         let denied = recording_export::routes()
             .with_state(recording_export::tests::export_state(&root.0, false).await);
-        let response = denied
+        let response = denied.clone()
             .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -630,6 +680,8 @@ mod tests {
             response.status(),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
         ));
+        let response = denied.oneshot(Request::builder().uri(format!("{path}/export")).body(Body::empty()).unwrap()).await.unwrap();
+        assert!(matches!(response.status(),StatusCode::UNAUTHORIZED|StatusCode::FORBIDDEN));
         assert!(!root.0.join(id).exists());
         let (db, _) = crate::telemetry_db::open_telemetry_db(&root.0.join(id))
             .await
@@ -661,6 +713,13 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), 32768).await.unwrap()).unwrap();
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0].values[0], Some(1.));
+        let exported = app.clone().oneshot(Request::builder().uri(format!("{path}/export")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(exported.status(), StatusCode::OK);
+        assert_eq!(exported.headers()[header::CACHE_CONTROL], "no-store");
+        let exported: serde_json::Value=serde_json::from_slice(&to_bytes(exported.into_body(),1024*1024).await.unwrap()).unwrap();
+        assert_eq!(exported["recording"], id);
+        assert_eq!(exported["samples"].as_array().unwrap().len(),2);
+        assert!(exported["schema"].is_object());
         let response = app
             .oneshot(
                 Request::builder()

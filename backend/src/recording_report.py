@@ -186,20 +186,38 @@ def selected_streams(request, streams):
     return {key: streams[key] for key in selected}
 
 
+VALVE_CHANNELS = ["Pilot valve", "Normally-open valve", "Dump valve", "Igniter", "Nitrogen valve", "Nitrous valve", "Plumbing"]
+
+def channel_label(key):
+    sender, kind, index = json.loads(key)
+    if kind == "VALVE_STATE" and 0 <= index < len(VALVE_CHANNELS):
+        return VALVE_CHANNELS[index]
+    return f"{sender} / {kind} / {index}"
+
+def state_label(key, value, mapping=None):
+    _, kind, index = json.loads(key)
+    if kind != "VALVE_STATE" or index >= len(VALVE_CHANNELS):
+        return ""
+    if value not in (0, 1):
+        return (mapping or {}).get("unknown_label") or "Unknown"
+    labels = ("Off", "On") if index == 3 else (("Extended", "Retracted") if index == 6 else ("Closed", "Open"))
+    return (mapping or {}).get("true_label" if value else "false_label") or labels[int(value)]
+
+
 def export_csv(streams, regressions):
     if sum(len(json.dumps(regressions[key]))*len(samples) for key,samples in streams.items()) > 48_000_000:
         raise ValueError("Regression metadata makes this CSV too large. Narrow the selection or use Excel, which stores regressions separately.")
     out = io.StringIO(newline="")
     writer = csv.writer(out)
     writer.writerow(["recording", "row_id", "received_timestamp_ms", "source_timestamp_ms",
-                     "sender", "data_type", "channel", "value", "regression_json"])
+                     "sender", "data_type", "channel", "value", "regression_json", "channel_label", "state_label"])
     for key, samples in streams.items():
         sender, kind, index = json.loads(key)
         metadata = json.dumps(regressions[key], separators=(",", ":"))
         for t, value, source, recording, row_id in samples:
             # Spreadsheet formula protection for untrusted textual identities.
             safe = lambda s: "'"+s if s.startswith(("=", "+", "-", "@")) else s
-            writer.writerow([recording, row_id, t, source, safe(sender), safe(kind), index, value, metadata])
+            writer.writerow([recording, row_id, t, source, safe(sender), safe(kind), index, value, metadata, safe(regressions[key].get("channel_label",channel_label(key))), safe(state_label(key,value,regressions[key].get("boolean_labels")))])
     return out.getvalue().encode()
 
 
@@ -282,10 +300,16 @@ def run(request):
     all_streams = channels(rows)
     streams = selected_streams(request, all_streams)
     metadata = {key: regression(key, samples, all_streams, history) for key, samples in streams.items()}
+    for key, info in metadata.items():
+        _,kind,index=json.loads(key)
+        if kind=="VALVE_STATE":
+            mapping=next((m for m in request.get("valve_mappings",[]) if isinstance(m,dict) and m.get("index")==index),{})
+            info["channel_label"]=mapping.get("label") or channel_label(key)
+            info["boolean_labels"]={name:mapping[name] for name in ("true_label","false_label","unknown_label") if isinstance(mapping.get(name),str)}
     fmt = request.get("format", "preview")
     if fmt == "preview":
         return json.dumps({"start_ms": rows[0][2], "end_ms": rows[-1][2]+1,
-            "recorded_rows": len(rows), "channels": [{"key": key, "count": len(samples),
+            "recorded_rows": len(rows), "channels": [{"key": key, "label": metadata[key].get("channel_label",channel_label(key)), "count": len(samples),
                 "points": preview_points(samples), "regression": metadata[key]}
                 for key, samples in streams.items()]}).encode()
     if fmt == "csv":

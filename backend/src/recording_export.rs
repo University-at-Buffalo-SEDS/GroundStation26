@@ -33,6 +33,7 @@ struct Recording {
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/recordings", get(list))
+        .route("/api/recordings/{id}/replay/export", get(crate::recording_replay::export))
         .route(
             "/api/recordings/{id}/replay",
             get(crate::recording_replay::snapshot),

@@ -42,6 +42,22 @@ class Reports(unittest.TestCase):
         self.assertEqual([float(r["value"]) for r in rows],[1,3,5,7])
         self.assertTrue(all(r["regression_json"] for r in rows))
 
+    def test_named_valve_updates_keep_numeric_values_and_unknowns(self):
+        with sqlite3.connect(self.path) as db:
+            for t, values in [(3000,[1,None,0]),(4000,[0,1,1])]:
+                db.execute("INSERT INTO telemetry VALUES(NULL,?,?,?,?,?,?)",(t,t,"VB","VALVE_STATE",json.dumps(values),"[]"))
+        preview=json.loads(report.run(self.request))
+        pilot=next(c for c in preview["channels"] if c.get("label")=="Pilot valve")
+        rows=list(csv.DictReader(io.StringIO(report.run(dict(self.request,format="csv",channels=[pilot["key"]])).decode())))
+        self.assertEqual([r["state_label"] for r in rows],["Open","Closed"])
+        self.assertEqual([r["value"] for r in rows],["1","0"])
+        self.assertTrue(all(r["channel_label"]=="Pilot valve" for r in rows))
+        self.assertEqual(report.state_label('["VB","VALVE_STATE",1]',None),"Unknown")
+        custom=report.run(dict(self.request,format="csv",channels=[pilot["key"]],valve_mappings=[{"index":0,"label":"Main pilot","true_label":"Opened","false_label":"Shut"}]))
+        custom=list(csv.DictReader(io.StringIO(custom.decode())))
+        self.assertEqual([r["state_label"] for r in custom],["Opened","Shut"])
+        self.assertTrue(all(r["channel_label"]=="Main pilot" for r in custom))
+
     def test_invalid_selection_and_symlink_rejected(self):
         for extra in [{"recording":"../secrets.db"},{"start_ms":3,"end_ms":2},{"channels":[]},{"channels":["missing"]}]:
             with self.assertRaises(ValueError):report.run(dict(self.request,**extra))
