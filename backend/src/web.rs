@@ -2279,6 +2279,8 @@ async fn send_command(
     headers: HeaderMap,
     Json(cmd): Json<TelemetryCommand>,
 ) -> (StatusCode, &'static str) {
+    // Request origin must precede authentication/database waits across recovery.
+    let admission_generation = crate::gse::automatic_generation(&state);
     let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
         Ok(principal) => principal,
         Err(response) => {
@@ -2290,7 +2292,7 @@ async fn send_command(
             };
         }
     };
-    dispatch_authorized_command(state, principal, cmd).await
+    dispatch_authorized_command(state, principal, cmd, admission_generation).await
 }
 
 /// Shared primary/local authorization and dispatch. A proxy must supply a
@@ -2299,24 +2301,25 @@ pub(crate) async fn dispatch_authorized_command(
     state: Arc<AppState>,
     principal: crate::auth::AuthPrincipal,
     cmd: TelemetryCommand,
+    admission_generation: u64,
 ) -> (StatusCode, &'static str) {
-    dispatch_command(state, principal, cmd, false).await
+    dispatch_command(state, principal, cmd, false, admission_generation).await
 }
 pub(crate) async fn dispatch_proxied_command(
     state: Arc<AppState>,
     principal: crate::auth::AuthPrincipal,
     cmd: TelemetryCommand,
 ) -> (StatusCode, &'static str) {
-    dispatch_command(state, principal, cmd, true).await
+    let admission_generation = crate::gse::automatic_generation(&state);
+    dispatch_command(state, principal, cmd, true, admission_generation).await
 }
 async fn dispatch_command(
     state: Arc<AppState>,
     principal: crate::auth::AuthPrincipal,
     cmd: TelemetryCommand,
     immediate_admission: bool,
+    admission_generation: u64,
 ) -> (StatusCode, &'static str) {
-    // Capture before any asynchronous reserve/send can outlive a verified reset.
-    let admission_generation = crate::gse::automatic_generation(&state);
     let cmd_name = command_name(&cmd);
     if !principal.allows_command_name(cmd_name) {
         emit_warning(
@@ -2357,7 +2360,20 @@ async fn dispatch_command(
         None
     };
     let now_ms = software_command_clock_ms();
-    if !state.record_software_command_if_fresh(&cmd, now_ms, software_command_dedup_ms()) {
+    let duplicate = match crate::gse::record_operator_command(
+        &state,
+        admission_generation,
+        &cmd,
+        now_ms,
+        software_command_dedup_ms(),
+    ) {
+        crate::gse::OperatorCommandAdmission::Stale => {
+            return (StatusCode::CONFLICT, "command cancelled by recovery");
+        }
+        crate::gse::OperatorCommandAdmission::Duplicate => true,
+        crate::gse::OperatorCommandAdmission::Fresh => false,
+    };
+    if duplicate {
         gs_debug_println!("Ignored duplicate software command {cmd:?}");
         if matches!(cmd, TelemetryCommand::ResetTClock) {
             if crate::rrls::is_rrls() {
@@ -2529,10 +2545,14 @@ mod command_dispatch_tests {
             .await
             .unwrap();
         use futures::FutureExt;
-        let retained =
-            dispatch_authorized_command(state.clone(), principal, TelemetryCommand::Abort)
-                .now_or_never()
-                .expect("manual intent retention must not await ordinary capacity");
+        let retained = dispatch_authorized_command(
+            state.clone(),
+            principal,
+            TelemetryCommand::Abort,
+            crate::gse::automatic_generation(&state),
+        )
+        .now_or_never()
+        .expect("manual intent retention must not await ordinary capacity");
         assert_eq!(retained.0, StatusCode::ACCEPTED);
         let epoch = state.manual_abort_intent.epoch();
         assert!(epoch > 0);
@@ -2551,6 +2571,316 @@ mod command_dispatch_tests {
             send_command(State(state.clone()), headers, Json(TelemetryCommand::Abort)).await;
         assert_eq!(result.0, StatusCode::ACCEPTED);
         assert!(state.manual_abort_intent.pending_epoch().is_some());
+    }
+    // Receipt notification is test-only and scoped to one real socket state.
+    static WS_COMMAND_RECEIVED: std::sync::OnceLock<
+        std::sync::Mutex<Option<(usize, Arc<tokio::sync::Notify>)>>,
+    > = std::sync::OnceLock::new();
+
+    pub(super) fn notify_ws_command_received(state: &Arc<AppState>) {
+        let guard = WS_COMMAND_RECEIVED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap();
+        if let Some((owner, notify)) = guard.as_ref()
+            && *owner == Arc::as_ptr(state) as usize
+        {
+            notify.notify_one();
+        }
+    }
+
+    async fn preauth_fixture() -> (
+        TestDirectory,
+        Arc<AppState>,
+        tokio::sync::mpsc::Receiver<TelemetryCommand>,
+        HeaderMap,
+    ) {
+        let root = TestDirectory::new();
+        let mut state = export_state(&root.0, false).await;
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::ensure_auth_sessions_table(&db).await.unwrap();
+        sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,created_at_ms,expires_at_ms) VALUES('preauth-test','operator','session',1,1,0,9999999999999)")
+            .execute(&db).await.unwrap();
+        std::fs::write(
+            root.0.join("auth.json"),
+            serde_json::json!({"users":[{
+                "username":"operator", "roles":[], "password":{"salt_b64":"","hash_b64":""},
+                "permissions":{"view_data":true,"send_commands":true}
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.auth_db = db;
+        inner.cmd_tx = tx;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer preauth-test".parse().unwrap(),
+        );
+        (root, state, rx, headers)
+    }
+
+    fn assert_origin_rejected(state: &AppState, queued: TelemetryCommand, origin: u64) {
+        let TelemetryCommand::QueuedOperator {
+            generation,
+            command,
+        } = queued
+        else {
+            panic!("expected existing operator envelope");
+        };
+        assert!(matches!(*command, TelemetryCommand::Postinit));
+        assert!(
+            crate::gse::claim_operator_dispatch(state, generation).is_none(),
+            "pre-reset origin must never acquire dispatch after recovery"
+        );
+        assert_eq!(
+            generation, origin,
+            "authentication must not refresh a request's generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn preauth_http_request_retains_origin_across_sqlite_wait() {
+        use futures::FutureExt;
+        let (_root, state, mut rx, headers) = preauth_fixture().await;
+        let held = state.auth_db.acquire().await.unwrap();
+        assert_eq!(state.auth_db.size(), 1);
+        assert_eq!(state.auth_db.num_idle(), 0);
+        let origin = crate::gse::automatic_generation(&state);
+        let request = send_command(
+            State(state.clone()),
+            headers.clone(),
+            Json(TelemetryCommand::Postinit),
+        );
+        tokio::pin!(request);
+        assert!(
+            request.as_mut().now_or_never().is_none(),
+            "actual SQLite authorization must block"
+        );
+        state
+            .automatic_generation
+            .store(origin + 1, std::sync::atomic::Ordering::Release);
+        drop(held);
+        let stale = request.await;
+        if let Ok(queued) = rx.try_recv() {
+            // Predecessor runtime preserves the old envelope but still records
+            // dedup: exercise its actual owner rejection before the next check.
+            assert_origin_rejected(&state, queued, origin);
+        }
+        let fresh = send_command(
+            State(state.clone()),
+            headers.clone(),
+            Json(TelemetryCommand::Postinit),
+        )
+        .await;
+        let queued = rx
+            .try_recv()
+            .expect("stale authorization must not suppress the identical fresh command");
+        let TelemetryCommand::QueuedOperator { generation, .. } = queued else {
+            panic!("missing positive envelope");
+        };
+        assert!(crate::gse::claim_operator_dispatch(&state, generation).is_some());
+        // Check stale response only after the causal owner/dedup controls.
+        assert_eq!(stale.0, StatusCode::CONFLICT);
+        assert_eq!(fresh.0, StatusCode::OK);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            send_command(
+                State(state.clone()),
+                headers,
+                Json(TelemetryCommand::Postinit)
+            )
+            .await
+            .1,
+            "duplicate ignored"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn preauth_http_revocation_and_manual_stop_keep_authentication() {
+        use futures::FutureExt;
+        let (_root, state, mut rx, headers) = preauth_fixture().await;
+        let mut held = state.auth_db.acquire().await.unwrap();
+        let origin = crate::gse::automatic_generation(&state);
+        let request = send_command(
+            State(state.clone()),
+            headers.clone(),
+            Json(TelemetryCommand::Abort),
+        );
+        tokio::pin!(request);
+        assert!(request.as_mut().now_or_never().is_none());
+        state
+            .automatic_generation
+            .store(origin + 1, std::sync::atomic::Ordering::Release);
+        sqlx::query("DELETE FROM auth_sessions")
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        drop(held);
+        assert_eq!(request.await.0, StatusCode::UNAUTHORIZED);
+        assert!(state.manual_abort_intent.pending_epoch().is_none());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            send_command(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(TelemetryCommand::Abort)
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,created_at_ms,expires_at_ms) VALUES('preauth-test','operator','session',1,1,0,9999999999999)")
+            .execute(&state.auth_db).await.unwrap();
+        let held = state.auth_db.acquire().await.unwrap();
+        let stop = send_command(State(state.clone()), headers, Json(TelemetryCommand::Abort));
+        tokio::pin!(stop);
+        assert!(stop.as_mut().now_or_never().is_none());
+        state
+            .automatic_generation
+            .store(origin + 2, std::sync::atomic::Ordering::Release);
+        drop(held);
+        assert_eq!(stop.await.0, StatusCode::ACCEPTED);
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn preauth_websocket_frame_retains_origin_and_stop_is_independent() {
+        use futures::SinkExt;
+        let (_root, state, mut rx, _headers) = preauth_fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route("/ws", axum::routing::get(ws_handler))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/ws?token=preauth-test"))
+                .await
+                .unwrap();
+        let received = Arc::new(tokio::sync::Notify::new());
+        *WS_COMMAND_RECEIVED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap() = Some((Arc::as_ptr(&state) as usize, received.clone()));
+        let origin = crate::gse::automatic_generation(&state);
+        let mut stale_notifications = state.notifications_tx.subscribe();
+        let held = state.auth_db.acquire().await.unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"Postinit"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(StdDuration::from_secs(3), received.notified())
+            .await
+            .unwrap();
+        // Current-thread runtime: receiver runs through its notification into the
+        // actual SQLite wait before this test can resume; the sole DB owner is held.
+        state
+            .automatic_generation
+            .store(origin + 1, std::sync::atomic::Ordering::Release);
+        drop(held);
+        tokio::select! {
+            queued = rx.recv() => {
+                // Predecessor runtime still writes dedup despite this correct
+                // old-envelope owner rejection. The identical fresh frame below
+                // must be admitted without clearing that map in the test.
+                assert_origin_rejected(&state, queued.unwrap(), origin);
+            }
+            notices = stale_notifications.recv() => {
+                assert!(notices.unwrap().iter().any(|notice| notice.message == "Command cancelled by recovery."));
+            }
+            _ = tokio::time::sleep(StdDuration::from_secs(3)) => panic!("stale frame did not reach ordinary admission"),
+        }
+        assert!(rx.try_recv().is_err());
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"Postinit"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let TelemetryCommand::QueuedOperator { generation, .. } =
+            tokio::time::timeout(StdDuration::from_secs(3), rx.recv())
+                .await
+                .expect("stale authorization must not suppress the identical fresh frame")
+                .unwrap()
+        else {
+            panic!("missing positive envelope");
+        };
+        assert!(crate::gse::claim_operator_dispatch(&state, generation).is_some());
+        received.notified().await;
+        let held = state.auth_db.acquire().await.unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"Abort"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(StdDuration::from_secs(3), received.notified())
+            .await
+            .unwrap();
+        state
+            .automatic_generation
+            .store(origin + 2, std::sync::atomic::Ordering::Release);
+        let mut notifications = state.notifications_tx.subscribe();
+        // Revoke while authentication is genuinely held: even emergency
+        // retention requires a currently authorized session.
+        let mut held = held;
+        sqlx::query("DELETE FROM auth_sessions")
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        drop(held);
+        tokio::time::timeout(StdDuration::from_secs(3), notifications.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.manual_abort_intent.pending_epoch().is_none());
+        assert!(rx.try_recv().is_err());
+        sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,created_at_ms,expires_at_ms) VALUES('preauth-test','operator','session',1,1,0,9999999999999)")
+            .execute(&state.auth_db).await.unwrap();
+        let held = state.auth_db.acquire().await.unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"Abort"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(StdDuration::from_secs(3), received.notified())
+            .await
+            .unwrap();
+        state
+            .automatic_generation
+            .store(origin + 3, std::sync::atomic::Ordering::Release);
+        drop(held);
+        // Sending a following ordinary command gives a receiver-order completion
+        // barrier after Abort retention without timing sleeps.
+        state.last_command_ms.lock().unwrap().clear();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"Postinit"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(StdDuration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+        *WS_COMMAND_RECEIVED.get().unwrap().lock().unwrap() = None;
+        socket.close(None).await.unwrap();
+        server.abort();
     }
 }
 
@@ -3361,6 +3691,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
     let recv_task = async move {
         while let Some(Ok(msg)) = receiver.next().await {
             if let Message::Text(text) = msg {
+                // Each frame retains its origin across authentication/database waits.
+                let admission_generation = crate::gse::automatic_generation(&state_for_recv);
+                #[cfg(test)]
+                command_dispatch_tests::notify_ws_command_received(&state_for_recv);
                 let principal = match state_for_recv
                     .auth
                     .authorize_token(
@@ -3403,8 +3737,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
                 }
                 match serde_json::from_str::<WsCommand>(&text) {
                     Ok(cmd) => {
-                        let admission_generation =
-                            crate::gse::automatic_generation(&state_for_recv);
                         if !principal.permissions.send_commands {
                             emit_warning(
                                 &state_for_recv,
@@ -3441,13 +3773,28 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
                             continue;
                         }
                         let now_ms = software_command_clock_ms();
-                        if !state_for_recv.record_software_command_if_fresh(
+                        match crate::gse::record_operator_command(
+                            &state_for_recv,
+                            admission_generation,
                             &cmd.cmd,
                             now_ms,
                             software_command_dedup_ms(),
                         ) {
-                            gs_debug_println!("Ignored duplicate websocket command {:?}", cmd.cmd);
-                            continue;
+                            crate::gse::OperatorCommandAdmission::Stale => {
+                                emit_notification_warning(
+                                    &state_for_recv,
+                                    "Command cancelled by recovery.",
+                                );
+                                continue;
+                            }
+                            crate::gse::OperatorCommandAdmission::Duplicate => {
+                                gs_debug_println!(
+                                    "Ignored duplicate websocket command {:?}",
+                                    cmd.cmd
+                                );
+                                continue;
+                            }
+                            crate::gse::OperatorCommandAdmission::Fresh => {}
                         }
                         if matches!(cmd.cmd, TelemetryCommand::ResetTClock) {
                             let reset_state = state_for_recv.clone();

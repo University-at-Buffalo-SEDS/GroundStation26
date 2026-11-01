@@ -1083,7 +1083,7 @@ fn handle_command_inner(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
         } else {
             "Ground station automatic fill cutoff disabled; operator must stop filling"
         });
-        crate::sequences::refresh_action_policy_now(state);
+        crate::sequences::refresh_action_policy_under_dispatch(state);
         return true;
     }
     if let Some(action) = action(cmd) {
@@ -1160,7 +1160,7 @@ fn handle_command_inner(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
                 state.add_notification(err);
             }
         }
-        crate::sequences::refresh_action_policy_now(state);
+        crate::sequences::refresh_action_policy_under_dispatch(state);
         return true;
     }
     if matches!(cmd, TelemetryCommand::Abort) && active(state) {
@@ -3180,6 +3180,96 @@ pub(crate) fn queue_automatic_abort_for_generation(
     }
     crate::telemetry_task::queue_automatic_abort_packet(router, reason)?;
     Ok(true)
+}
+
+/// Admission bookkeeping shares the epoch gate with reset publication. A reset
+/// coordinator must clear ordinary dedup state under this SAME gate before
+/// reopening admission, so an older request cannot repopulate the new epoch.
+/// Authenticate and check command permissions first; manual Stop uses its
+/// independent retained-intent path before ordinary admission.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OperatorCommandAdmission {
+    Stale,
+    Duplicate,
+    Fresh,
+}
+
+pub(crate) fn record_operator_command(
+    state: &AppState,
+    generation: u64,
+    command: &TelemetryCommand,
+    now_ms: u64,
+    duplicate_window_ms: u64,
+) -> OperatorCommandAdmission {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if generation != automatic_generation(state) {
+        return OperatorCommandAdmission::Stale;
+    }
+    if state.record_software_command_if_fresh(command, now_ms, duplicate_window_ms) {
+        OperatorCommandAdmission::Fresh
+    } else {
+        OperatorCommandAdmission::Duplicate
+    }
+}
+
+#[cfg(test)]
+mod operator_admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ordinary_epoch_admission_preserves_duplicates_and_reset_reopens_same_command() {
+        let state = crate::state::tests::test_app_state().await;
+        let generation = automatic_generation(&state);
+        let command = TelemetryCommand::Postinit;
+        assert_eq!(
+            record_operator_command(&state, generation, &command, 10_000, 500),
+            OperatorCommandAdmission::Fresh
+        );
+        assert_eq!(
+            record_operator_command(&state, generation, &command, 10_001, 500),
+            OperatorCommandAdmission::Duplicate
+        );
+        // Model only the coordinator's in-memory publication boundary: no
+        // physical reset or board proof is authorized by this test helper.
+        {
+            let _dispatch = DISPATCH_GATE.lock().unwrap();
+            state.last_command_ms.lock().unwrap().clear();
+            state
+                .automatic_generation
+                .store(generation + 1, std::sync::atomic::Ordering::Release);
+        }
+        assert_eq!(
+            record_operator_command(&state, generation, &command, 10_002, 500),
+            OperatorCommandAdmission::Stale
+        );
+        assert!(state.last_command_ms.lock().unwrap().is_empty());
+        assert_eq!(
+            record_operator_command(&state, generation + 1, &command, 10_003, 500),
+            OperatorCommandAdmission::Fresh
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_epoch_does_not_refresh_existing_duplicate_entry() {
+        let state = crate::state::tests::test_app_state().await;
+        let generation = automatic_generation(&state);
+        assert_eq!(
+            record_operator_command(&state, generation, &TelemetryCommand::Postinit, 10_000, 500),
+            OperatorCommandAdmission::Fresh
+        );
+        let before = state.last_command_ms.lock().unwrap().clone();
+        assert_eq!(
+            record_operator_command(
+                &state,
+                generation + 1,
+                &TelemetryCommand::Postinit,
+                11_000,
+                500
+            ),
+            OperatorCommandAdmission::Stale
+        );
+        assert_eq!(*state.last_command_ms.lock().unwrap(), before);
+    }
 }
 
 /// A generation-checked ordinary command owns its dispatch until this lease
