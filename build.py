@@ -10,6 +10,7 @@ import multiprocessing as mp
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -188,16 +189,312 @@ def _run_script(repo_root: Path, script: Path, args: list[str]) -> None:
     run([sys.executable, str(script), *args], cwd=repo_root)
 
 
-def _run_frontend_script_with_wasm_opt_fallback(script: Path, checkout_dir: Path, args: list[str]) -> None:
+def _frontend_source_files(checkout: Path) -> list[Path]:
+    # Git's exclusions omit generated Cargo/Dioxus artifacts without modifying
+    # immutable inputs. Non-git source distributions use the same cache exclusions.
+    result = subprocess.run(["git", "-C", str(checkout), "rev-parse", "--show-toplevel"],
+                            capture_output=True, text=True)
+    if result.returncode == 0 and Path(result.stdout.strip()).resolve() == checkout:
+        names = subprocess.check_output(["git", "-C", str(checkout), "ls-files", "-z",
+                                         "--cached", "--others", "--exclude-standard"])
+        files = sorted({checkout / os.fsdecode(n) for n in names.split(b"\0") if n})
+        if len(files) > 100000:
+            raise RuntimeError("Frontend source exceeds 100000-file cache identity limit")
+        return [path for path in files if not any(part in {"target", "dist", ".git", "node_modules"} for part in path.relative_to(checkout).parts) and path.resolve().is_relative_to(checkout)]
+    ignored = {"target", "dist", ".git", "node_modules", "__pycache__"}
+    files = []
+    for base, dirs, names in os.walk(checkout):
+        dirs[:] = sorted(d for d in dirs if d not in ignored)
+        files.extend(Path(base) / name for name in sorted(names))
+        if len(files) > 100000:
+            raise RuntimeError("Frontend source exceeds 100000-file cache identity limit")
+    return sorted(path for path in files if path.resolve().is_relative_to(checkout))
+
+
+def _frontend_package(manifest: Path) -> dict:
+    # Cargo parses the manifest on Python 3.10 too. Unlike metadata/clean against
+    # the original graph, read-manifest does not resolve dependencies or write a lock.
+    if manifest.stat().st_size > 1024 * 1024:
+        raise RuntimeError("Frontend Cargo manifest exceeds 1 MiB")
+    with tempfile.TemporaryFile() as output:
+        subprocess.run(["cargo", "read-manifest", "--quiet", "--manifest-path", str(manifest)],
+                       stdout=output, check=True)
+        if output.tell() > 8 * 1024 * 1024:
+            raise RuntimeError("Frontend package metadata exceeds 8 MiB")
+        output.seek(0)
+        value = json.load(output)
+    package = {key: value[key] for key in ("name", "version")}
+    package["targets"] = [{key: item[key] for key in ("name", "kind", "crate_types")}
+                          for item in value["targets"]]
+    _validate_frontend_package(package)
+    return package
+
+
+def _validate_frontend_package(package: dict) -> None:
+    for field in ("name", "version"):
+        if not isinstance(package.get(field), str) or not re.fullmatch(r"[A-Za-z0-9_.+\-]{1,200}", package[field]):
+            raise RuntimeError("Invalid frontend package descriptor")
+    targets = package.get("targets")
+    if not isinstance(targets, list) or not 1 <= len(targets) <= 256:
+        raise RuntimeError("Invalid frontend target descriptor")
+    for item in targets:
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{1,200}", item.get("name", "")):
+            raise RuntimeError("Invalid frontend target name")
+        if item.get("kind") not in [[k] for k in ("bin", "lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro", "example", "test", "bench", "custom-build")]:
+            raise RuntimeError("Unsupported frontend target kind")
+        if not isinstance(item.get("crate_types"), list) or not all(k in ("bin", "lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro") for k in item["crate_types"]):
+            raise RuntimeError("Invalid frontend crate types")
+
+
+def _clean_frontend_package(target: Path, package: dict) -> None:
+    # Resolve no dependency graph and write no files in the immutable checkout.
+    # Cargo still owns artifact selection/removal, including custom target names.
+    _validate_frontend_package(package)
+    with tempfile.TemporaryDirectory(prefix="gs-frontend-clean-") as temporary:
+        root = Path(temporary)
+        lines = ["[package]", "name = " + json.dumps(package["name"]),
+                 "version = " + json.dumps(package["version"]), 'edition = "2021"']
+        for index, item in enumerate(package["targets"]):
+            kind = item["kind"][0]
+            if kind == "custom-build":
+                (root / "build.rs").write_text("fn main() {}\n", encoding="utf-8")
+                continue
+            section = {"bin": "[[bin]]", "example": "[[example]]", "test": "[[test]]",
+                       "bench": "[[bench]]"}.get(kind, "[lib]")
+            source = f"target{index}.rs"
+            (root / source).write_text("fn main() {}\n", encoding="utf-8")
+            lines.extend([section, "name = " + json.dumps(item["name"]), "path = " + json.dumps(source)])
+            if section == "[lib]":
+                lines.append("crate-type = " + json.dumps(item["crate_types"]))
+        (root / "Cargo.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        subprocess.run(["cargo", "clean", "--offline", "--manifest-path", str(root / "Cargo.toml"),
+                        "--package", package["name"], "--target-dir", str(target)], check=True)
+
+
+def _frontend_dependency_locks(checkout: Path, manifests: list[Path]) -> dict:
+    paths = {checkout / "Cargo.lock"} | {path.parent / "Cargo.lock" for path in manifests}
+    result = {}
+    for path in sorted(paths):
+        if not path.resolve().is_relative_to(checkout):
+            raise RuntimeError("Frontend lockfile resolves outside its checkout")
+        value = None
+        if path.is_file():
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            value = digest.hexdigest()
+        result[str(path.relative_to(checkout))] = value
+    return result
+
+
+@contextmanager
+def _frontend_public_attempt(checkout: Path, reuse: bool, lifecycle: dict, destination=None):
+    candidates = [checkout / "dist/public", checkout / "frontend/dist/public"]
+    # Validate all paths before moving any prior output.
+    for public in candidates:
+        if not public.resolve().is_relative_to(checkout) or public.is_symlink():
+            raise RuntimeError("Frontend public output must be a checkout-local directory")
+        if destination is not None and public.resolve() == destination.resolve():
+            raise RuntimeError("Frontend build output must differ from the published GS destination")
+        if public.exists() and not public.is_dir():
+            raise RuntimeError("Frontend public output is not a directory")
+    if reuse:
+        yield
+        return
+    backups = []
+    succeeded = False
+    attempt_started = False
+    try:
+        for public in candidates:
+            if public.exists():
+                backup = Path(tempfile.mkdtemp(prefix=".gs-public-prior-", dir=public.parent))
+                try:
+                    public.rename(backup / "public")
+                except BaseException:
+                    shutil.rmtree(backup)
+                    raise
+                backups.append((public, backup))
+        attempt_started = True
+        yield
+        succeeded = True
+    finally:
+        # An uncertain live writer retains its output/quarantine and marker for
+        # manual recovery. Never restore directories under a possible writer.
+        if succeeded or not attempt_started or lifecycle["stopped"]:
+            if not succeeded:
+                if attempt_started:
+                    for public in candidates:
+                        if not public.parent.resolve().is_relative_to(checkout):
+                            raise RuntimeError("Frontend output parent escaped its checkout")
+                        if public.is_symlink() or public.is_file():
+                            public.unlink()
+                        elif public.is_dir():
+                            shutil.rmtree(public)
+                for public, backup in backups:
+                    (backup / "public").rename(public)
+            for public, backup in backups:
+                shutil.rmtree(backup)
+
+
+def _run_frontend_script_with_wasm_opt_fallback(
+        script: Path, checkout_dir: Path, args: list[str], finish=None, publication_destination=None) -> None:
+    checkout = checkout_dir.resolve()
+    # Generated checkout output is shared even when callers choose different
+    # targets and publish to different destinations. Global order is always
+    # destination (public wrapper), checkout output, then compiler target.
+    lease = checkout.parent / ("." + checkout.name + ".gs-frontend-output.lock")
+    with _frontend_cache_lock(lease):
+        source_marker = checkout.parent / ("." + checkout.name + ".gs-frontend-output-in-progress.json")
+        if source_marker.exists():
+            raise RuntimeError(f"interrupted/uncertain frontend checkout output: {source_marker}. "
+                               "Use a separate checkout and CARGO_TARGET_DIR, or confirm all prior writers "
+                               "have stopped before removing its source/target markers and restoring quarantines.")
+        _run_frontend_script_with_source_lease(script, checkout, args, finish,
+                                               publication_destination, source_marker)
+
+
+def _run_frontend_script_with_source_lease(
+        script: Path, checkout: Path, args: list[str], finish, publication_destination, source_marker: Path) -> None:
+    manifest = script.resolve().parent / "Cargo.toml"
+    if not manifest.resolve().is_relative_to(checkout):
+        raise RuntimeError("Frontend application manifest must be inside its checkout")
+    application = _frontend_package(manifest)
+    explicit = os.environ.get("CARGO_TARGET_DIR")
+    target = Path(explicit).expanduser() if explicit else (_frontend_shared_target(checkout) or manifest.parent / "target")
+    if not target.is_absolute():
+        target = manifest.parent / target
+    target = target.resolve()
+    environment = os.environ.copy()
+    environment["CARGO_TARGET_DIR"] = str(target)
+    # One lease covers invalidation, compilation, fallback, destination sync and
+    # provenance. Direct callers and the normal wrapper use this same lock once.
+    with _frontend_cache_lock(target.parent / ("." + target.name + ".gs-frontend-build.lock")):
+        marker = target.parent / ("." + target.name + ".gs-frontend-in-progress.json")
+        if marker.exists():
+            raise RuntimeError(f"Frontend target has an interrupted/uncertain build: {marker}. "
+                               "Use a separate checkout and CARGO_TARGET_DIR, or confirm all prior build descendants "
+                               "have stopped before manually removing this marker. No stale PID is killed.")
+        files = _frontend_source_files(checkout)
+        digest = hashlib.sha256()
+        for path in files:
+            digest.update(str(path.relative_to(checkout)).encode() + b"\0")
+            if path.is_file():
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            else:
+                digest.update(b"missing")
+        manifests = [path for path in files if path.name == "Cargo.toml" and path.is_file()
+                     and path.resolve().is_relative_to(checkout)]
+        if len(manifests) > 128:
+            raise RuntimeError("Frontend exceeds 128 checkout-local Cargo packages")
+        packages = [_frontend_package(path) for path in manifests]
+        head = subprocess.run(["git", "-C", str(checkout), "rev-parse", "--verify", "HEAD"],
+                              capture_output=True, text=True)
+        revision = head.stdout.strip() if head.returncode == 0 else None
+        locks_before = _frontend_dependency_locks(checkout, manifests)
+        identity = {"version": 2, "source": str(checkout), "revision": revision,
+                    "digest": digest.hexdigest(), "application": application,
+                    "packages": packages, "dependency_locks": locks_before}
+        receipt = target / ".gs-frontend-source.json"
+        try:
+            if receipt.stat().st_size > 2 * 1024 * 1024:
+                raise RuntimeError("Frontend provenance exceeds 2 MiB")
+            previous = json.loads(receipt.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = None
+        previous_identity = dict(previous) if isinstance(previous, dict) else previous
+        if isinstance(previous_identity, dict):
+            previous_identity.pop("lock_before_build", None)
+        reuse = "existing" in args
+        if reuse and previous_identity != identity:
+            raise RuntimeError("Existing frontend output has no matching source/dependency provenance; rebuild without existing")
+        lifecycle = {"stopped": False}
+        for ownership_marker in (marker, source_marker):
+            with ownership_marker.open("x", encoding="utf-8") as output:
+                json.dump({"version": 1, "source": str(checkout), "target": str(target), "pid": os.getpid()}, output)
+                output.flush()
+                os.fsync(output.fileno())
+        try:
+            receipt.unlink(missing_ok=True)
+            if previous is not None:
+                if not isinstance(previous, dict) or not isinstance(previous.get("packages"), list) or len(previous["packages"]) > 128:
+                    raise RuntimeError("Invalid previous frontend provenance")
+                for package in previous["packages"] + [previous.get("application", {})]:
+                    _validate_frontend_package(package)
+            if previous_identity != identity:
+                selected = packages + ((previous or {}).get("packages", []))
+                seen = set()
+                for package in selected:
+                    key = json.dumps(package, sort_keys=True)
+                    if key not in seen:
+                        _clean_frontend_package(target, package)
+                        seen.add(key)
+                names = {application["name"]}
+                if previous:
+                    names.add(previous["application"]["name"])
+                for name in names:
+                    cache = target / "dx" / name
+                    if cache.exists():
+                        shutil.rmtree(cache)
+            with _frontend_public_attempt(checkout, reuse, lifecycle, publication_destination):
+                _execute_frontend_script_with_wasm_opt_fallback(script, checkout, args, environment, lifecycle, allow_fallback=not reuse)
+                if finish is not None:
+                    finish()
+                identity["lock_before_build"] = locks_before
+                identity["dependency_locks"] = _frontend_dependency_locks(checkout, manifests)
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(mode="w", dir=target, prefix=".gs-source-", delete=False,
+                                                     encoding="utf-8") as output:
+                        temporary = Path(output.name)
+                        json.dump(identity, output, sort_keys=True)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    temporary.replace(receipt)
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+        finally:
+            if lifecycle["stopped"]:
+                marker.unlink(missing_ok=True)
+                source_marker.unlink(missing_ok=True)
+
+
+def _stop_frontend_process_tree(proc) -> None:
+    if os.name == "nt":
+        # Only this owned PID/tree; never kill tools or services by name.
+        result = subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                                stdout=DEVNULL, stderr=subprocess.STDOUT)
+        if result.returncode and proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        raise RuntimeError("Windows frontend tree cleanup is unqualified; target remains interrupted")
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        # The group leader can already have exited while a descendant still
+        # writes Cargo artifacts. Always retire the owned group before unlocking.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+
+
+def _execute_frontend_script_with_wasm_opt_fallback(script: Path, checkout_dir: Path, args: list[str], environment: dict[str, str], lifecycle: dict, allow_fallback: bool = True) -> None:
     cmd = [sys.executable, str(script), *args]
     cmd_line = f"Running: {' '.join(str(part) for part in cmd)} (cwd={checkout_dir})"
     print(cmd_line)
     _append_log(cmd_line + "\n")
 
-    environment = os.environ.copy()
-    target = _frontend_shared_target(checkout_dir)
-    if target is not None:
-        environment.setdefault("CARGO_TARGET_DIR", str(target))
     proc = subprocess.Popen(
         [str(part) for part in cmd],
         env=environment,
@@ -206,6 +503,8 @@ def _run_frontend_script_with_wasm_opt_fallback(script: Path, checkout_dir: Path
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=os.name != "nt",
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
     )
     assert proc.stdout is not None
 
@@ -217,22 +516,23 @@ def _run_frontend_script_with_wasm_opt_fallback(script: Path, checkout_dir: Path
             if any(hint in line.lower() for hint in WASM_OPT_FAILURE_HINTS):
                 wasm_opt_failed = True
         rc = proc.wait()
-    except KeyboardInterrupt:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+    except BaseException:
+        _stop_frontend_process_tree(proc)
+        lifecycle["stopped"] = True
         raise
     finally:
         proc.stdout.close()
 
+    if os.name != "nt":
+        _stop_frontend_process_tree(proc)
+    lifecycle["stopped"] = True
     if rc == 0:
         return
 
-    public_dir = _resolve_external_public_dir(checkout_dir)
-    if public_dir.is_dir() and wasm_opt_failed:
+    if not allow_fallback:
+        raise subprocess.CalledProcessError(rc, [str(part) for part in cmd])
+    public_dir = _resolve_external_public_dir(checkout_dir) if wasm_opt_failed else None
+    if public_dir is not None and public_dir.is_dir() and any(public_dir.iterdir()) and wasm_opt_failed:
         warning = (
             "Warning: frontend build completed but wasm-opt post-processing failed. "
             "Continuing with the unoptimized wasm bundle because dist/public was produced."
@@ -559,14 +859,15 @@ def _run_frontend_build(
             log_path = repo_root / log_path
         args.append(f"log={log_path}")
 
-    # Revisions share compiler artifacts, but Dioxus output generation and sync
-    # must complete together. Backend compilation reads immutable input files.
-    target = _frontend_shared_target(checkout_dir)
-    lock = target.parent / ".web-build.lock" if target is not None else checkout_dir.with_name(checkout_dir.name + ".web-build.lock")
-    with _frontend_cache_lock(lock):
-        _run_frontend_script_with_wasm_opt_fallback(script, checkout_dir, args)
+    def finish() -> None:
         _sync_frontend_public_assets(repo_root, checkout_dir)
         _record_browser_asset_source(repo_root, checkout_dir)
+
+    # Global order: destination, checkout output, then target lease. The callback takes
+    # neither lock. Different targets cannot race while publishing one WebUI.
+    with _frontend_cache_lock(repo_root / "frontend" / ".web-build.lock"):
+        _run_frontend_script_with_wasm_opt_fallback(script, checkout_dir, args, finish,
+                                                     publication_destination=_frontend_sync_public_dir(repo_root))
 
 
 def _backend_script(repo_root: Path) -> Path:

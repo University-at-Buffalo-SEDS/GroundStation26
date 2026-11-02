@@ -117,10 +117,13 @@ source=build.prepare_browser_asset_source(root,sys.argv[2]=='dev')
                         child.wait()
 
     def test_compiler_cache_is_shared_without_changing_parent_environment(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"]}, clear=True):
             root = Path(tmp)
             checkout = root / 'source-revisions' / ('a' * 40)
             checkout.mkdir(parents=True)
+            (checkout / 'Cargo.toml').write_text('[package]\nname="script_fixture"\nversion="0.1.0"\nedition="2021"\n')
+            (checkout / 'src').mkdir()
+            (checkout / 'src/main.rs').write_text('fn main() {}')
             script = checkout / 'build.py'
             output = checkout / 'selected-target.txt'
             script.write_text('import os\nfrom pathlib import Path\nPath("selected-target.txt").write_text(os.environ["CARGO_TARGET_DIR"])\n')
@@ -134,6 +137,9 @@ source=build.prepare_browser_asset_source(root,sys.argv[2]=='dev')
     def test_frontend_build_closes_output_and_limits_fallback_to_wasm_opt(self):
         with tempfile.TemporaryDirectory() as tmp:
             checkout = Path(tmp)
+            (checkout / 'Cargo.toml').write_text('[package]\nname="script_fixture"\nversion="0.1.0"\nedition="2021"\n')
+            (checkout / 'src').mkdir()
+            (checkout / 'src/main.rs').write_text('fn main() {}')
             script = checkout / 'build.py'
             public = checkout / 'dist/public'
             public.mkdir(parents=True)
@@ -141,16 +147,18 @@ source=build.prepare_browser_asset_source(root,sys.argv[2]=='dev')
             children = []
             def capture_process(*args, **kwargs):
                 child = real_popen(*args, **kwargs)
-                children.append(child)
+                if str(args[0][0]) == sys.executable:
+                    children.append(child)
                 return child
             with patch.object(build.subprocess, 'Popen', side_effect=capture_process), patch('builtins.print'):
-                script.write_text('print("wasm-opt failed")\nraise SystemExit(1)\n')
+                script.write_text('from pathlib import Path\nPath("dist/public").mkdir(parents=True)\nPath("dist/public/index.html").write_text("fresh")\nprint("wasm-opt failed")\nraise SystemExit(1)\n')
                 build._run_frontend_script_with_wasm_opt_fallback(script, checkout, [])
                 script.write_text('print("compiler error")\nraise SystemExit(2)\n')
                 with self.assertRaises(subprocess.CalledProcessError) as failure:
                     build._run_frontend_script_with_wasm_opt_fallback(script, checkout, [])
                 self.assertEqual(failure.exception.returncode, 2)
                 script.write_text('print("wasm-opt failed")\nraise SystemExit(1)\n')
+                (public / "index.html").unlink()
                 public.rmdir()
                 with self.assertRaises(FileNotFoundError):
                     build._run_frontend_script_with_wasm_opt_fallback(script, checkout, [])
