@@ -666,7 +666,7 @@ pub fn set_daq_log_clock(
 /// Retry only an unadmitted durable revision. Keep its original deadline/stamp.
 /// Once admitted, SDK reliable delivery and managed reconnect replay own it.
 /// Returns true only when an outstanding snapshot was admitted this call.
-pub fn retry_pending_daq_log_clock(router: &Router) -> Result<bool> {
+fn retry_pending_daq_log_clock(router: &Router) -> Result<bool> {
     if crate::rrls::is_rrls() || router.sender().as_ref() != "GS" {
         return Ok(false);
     }
@@ -2031,15 +2031,25 @@ mod persistence_callback_tests {
     #[test]
     fn actual_primary_bootstrap_preserves_recorded_state_origin() {
         const NAME: &str = "network_variables::persistence_callback_tests::actual_primary_bootstrap_preserves_recorded_state_origin";
-        if !isolated(NAME) { return; }
+        if !isolated(NAME) {
+            return;
+        }
         crate::telemetry_schema::initialize().unwrap();
-        let values = serde_json::from_str(r#"{"flight_state":15,"flight_state_stamp":1000}"#).unwrap();
+        let values =
+            serde_json::from_str(r#"{"flight_state":15,"flight_state_stamp":1000}"#).unwrap();
         persist(&cache_path(), values).unwrap();
         let router = Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS"));
         initialize_for_role(&router, false).unwrap();
-        let cached = router.get_cached_network_variable(crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE)).unwrap().unwrap();
+        let cached = router
+            .get_cached_network_variable(crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE))
+            .unwrap()
+            .unwrap();
         assert_eq!(cached.payload(), &[15]);
-        assert_eq!(cached.timestamp(), 1000, "boot must not mint fresh time for a retained Abort");
+        assert_eq!(
+            cached.timestamp(),
+            1000,
+            "boot must not mint fresh time for a retained Abort"
+        );
     }
 
     #[test]
@@ -2122,3 +2132,18 @@ pub fn persisted_daq_log_clock() -> Option<[u64; 2]> {
 #[cfg(test)]
 #[path = "network_variables/daq_clock_tests.rs"]
 mod daq_clock_tests;
+
+/// Retry the current durable metadata only with a live host admission lease.
+/// Closing admission pauses retries without changing their original revision.
+pub(crate) fn retry_pending_daq_log_clock_for_state(
+    state: &crate::state::AppState,
+    router: &Router,
+) -> Result<bool> {
+    let generation = crate::gse::automatic_generation(state);
+    let Some(_claim) = crate::gse::claim_operator_dispatch(state, generation) else {
+        return Ok(false);
+    };
+    retry_pending_daq_log_clock(router)
+}
+#[cfg(test)]
+mod clock_admission_tests;

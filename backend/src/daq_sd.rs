@@ -160,6 +160,7 @@ fn local_authorization(
 }
 
 pub async fn retry(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal =
         match crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await {
             Ok(principal) => principal,
@@ -172,6 +173,13 @@ pub async fn retry(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
     ) {
         return error.into_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     let Some(router) = state.topology_router.get() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,

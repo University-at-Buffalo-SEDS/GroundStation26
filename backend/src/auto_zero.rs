@@ -226,6 +226,28 @@ pub fn launch(state: &Arc<AppState>) {
     begin(state, "KG1000", false);
 }
 
+
+#[cfg(test)]
+type CommitSaveHook = (usize, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static COMMIT_SAVE_HOOK: std::sync::Mutex<Option<CommitSaveHook>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+fn pause_commit_save_for_test(state: &AppState) {
+    let mut slot = COMMIT_SAVE_HOOK.lock().unwrap();
+    let hook = if slot
+        .as_ref()
+        .is_some_and(|(owner, _)| *owner == state as *const AppState as usize)
+    {
+        slot.take().map(|(_, hook)| hook)
+    } else {
+        None
+    };
+    drop(slot);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 fn commit_tare(
     state: &AppState,
     cfg: &loadcell::LoadcellCalibrationFile,
@@ -234,6 +256,9 @@ fn commit_tare(
     arm_generation: u64,
     raw: f32,
 ) -> Result<(), String> {
+    // Acquire before zero Runtime; retain the lease across save without holding DISPATCH.
+    let _claim = crate::gse::claim_operator_dispatch(state, arm_generation)
+        .ok_or_else(|| "Automatic zero cancelled by closed admission/reset".to_string())?;
     if crate::gse::manual_stop_pending(state) {
         return Err("Automatic zero cancelled by manual Stop".into());
     }
@@ -257,9 +282,19 @@ fn commit_tare(
         if sensor == "KG50" { "kg50" } else { "ch1" },
         raw,
     );
+    #[cfg(test)]
+    pause_commit_save_for_test(state);
     loadcell::save(&updated)?;
     *current = updated;
     Ok(())
+}
+
+fn cancel_after_capture_failure(state: &Arc<AppState>, arm_generation: u64) {
+    crate::gse::cancel_fill_for_recoverable_fault_for_generation(
+        state,
+        "automatic zero failed",
+        arm_generation,
+    );
 }
 
 fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
@@ -395,7 +430,7 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
                         "Previous tare retained; manual zero required."
                     }
                 ));
-                crate::gse::cancel_fill_for_recoverable_fault(&state, "automatic zero failed");
+                cancel_after_capture_failure(&state, arm_generation);
             }
         }
     });
@@ -610,6 +645,158 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&dir).unwrap();
     }
+    struct ReleaseCommitSave(Option<std::sync::mpsc::Sender<()>>, usize);
+    impl Drop for ReleaseCommitSave {
+        fn drop(&mut self) {
+            let mut slot = COMMIT_SAVE_HOOK.lock().unwrap();
+            if slot.as_ref().is_some_and(|(owner, _)| *owner == self.1) {
+                slot.take();
+            }
+            drop(slot);
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+    #[tokio::test]
+    async fn closed_commit_tare_does_not_change_actual_file_or_calibration() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "closed_commit_tare_does_not_change_actual_file_or_calibration",
+        ) {
+            return;
+        }
+        let state = crate::state::tests::test_app_state().await;
+        let cfg = config();
+        *state.loadcell_calibration.lock().unwrap() = cfg.clone();
+        let token = state.auto_zero.lock().unwrap().generation;
+        let armed = crate::gse::automatic_generation(&state);
+        let path = loadcell::calibration_file_for_test();
+        let before = std::fs::read(&path).ok();
+        state
+            .operator_admission_barrier
+            .store(77, std::sync::atomic::Ordering::Release);
+        let result = commit_tare(&state, &cfg, "KG1000", token, armed, 0.123);
+        let after = std::fs::read(&path).ok();
+        if let Some(bytes) = &before {
+            std::fs::write(&path, bytes).unwrap();
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+        assert!(
+            result.is_err(),
+            "closed worker must not start disk/RAM effects"
+        );
+        assert_eq!(before, after);
+        assert_eq!(
+            serde_json::to_value(&*state.loadcell_calibration.lock().unwrap()).unwrap(),
+            serde_json::to_value(&cfg).unwrap()
+        );
+    }
+    #[tokio::test]
+    async fn held_save_worker_claim_survives_awaiter_cancellation_and_blocks_drain() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "held_save_worker_claim_survives_awaiter_cancellation_and_blocks_drain",
+        ) {
+            return;
+        }
+        let state = crate::state::tests::test_app_state().await;
+        let cfg = config();
+        *state.loadcell_calibration.lock().unwrap() = cfg.clone();
+        let token = state.auto_zero.lock().unwrap().generation;
+        let armed = crate::gse::automatic_generation(&state);
+        let path = loadcell::calibration_file_for_test();
+        let before = std::fs::read(&path).ok();
+        let (ready, reached) = tokio::sync::oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let release = ReleaseCommitSave(Some(release), Arc::as_ptr(&state) as usize);
+        *COMMIT_SAVE_HOOK.lock().unwrap() = Some((
+            Arc::as_ptr(&state) as usize,
+            Box::new(move || {
+                let _ = ready.send(());
+                resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            }),
+        ));
+        let (finished, done) = tokio::sync::oneshot::channel();
+        let worker_state = state.clone();
+        let outer = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let result = commit_tare(&worker_state, &cfg, "KG1000", token, armed, 0.123);
+                let _ = finished.send(result);
+            })
+            .await
+            .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), reached)
+            .await
+            .unwrap()
+            .unwrap();
+        outer.abort();
+        let _ = outer.await;
+        state
+            .operator_admission_barrier
+            .store(77, std::sync::atomic::Ordering::Release);
+        let fence = crate::operator_queue::Token::capture(&state, 77);
+        let inflight = state
+            .operator_dispatch_inflight
+            .load(std::sync::atomic::Ordering::Acquire);
+        let drain_allowed = crate::gse::with_closed_operator_queue(&state, fence, || ()).is_some();
+        let disk_while_paused = std::fs::read(&path).ok();
+        state.manual_abort_intent.request();
+        drop(release); // RAII releases on every assertion/early-return path too
+        let outcome = tokio::time::timeout(Duration::from_secs(2), done)
+            .await
+            .unwrap()
+            .unwrap();
+        let after = std::fs::read(&path).ok();
+        if let Some(bytes) = &before {
+            std::fs::write(&path, bytes).unwrap();
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+        outcome.unwrap();
+        assert_eq!(
+            inflight, 1,
+            "claim must belong to real blocking save worker"
+        );
+        assert!(!drain_allowed, "cancelled awaiter is not worker quiescence");
+        assert_eq!(disk_while_paused, before);
+        assert_ne!(after, before, "actual save still completes under its lease");
+        assert_eq!(
+            state
+                .operator_dispatch_inflight
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+        assert!(crate::gse::with_closed_operator_queue(&state, fence, || ()).is_none());
+    }
+
+    #[tokio::test]
+    async fn late_capture_error_cannot_cancel_new_run_but_fresh_error_still_cancels() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "late_capture_error_cannot_cancel_new_run_but_fresh_error_still_cancels",
+        ) {
+            return;
+        }
+        let state = crate::state::tests::test_app_state().await;
+        state.set_local_flight_state(crate::types::FlightState::Idle);
+        let old = crate::gse::automatic_generation(&state);
+        state
+            .automatic_generation
+            .store(old + 1, std::sync::atomic::Ordering::Release);
+        state.gse.lock().unwrap().engine.status.phase = gse_sequence::Phase::Filling;
+        cancel_after_capture_failure(&state, old);
+        let after_old = state.gse.lock().unwrap().engine.status.phase;
+        // Also exercise the unchanged fresh/current fault path even in oldRED.
+        state.gse.lock().unwrap().engine.status.phase = gse_sequence::Phase::Filling;
+        cancel_after_capture_failure(&state, old + 1);
+        let after_fresh = state.gse.lock().unwrap().engine.status.phase;
+        assert_ne!(after_fresh, gse_sequence::Phase::Filling);
+        assert_eq!(after_old, gse_sequence::Phase::Filling);
+    }
 }
 
 #[cfg(all(test, any(feature = "hitl_mode", feature = "firmware_sim")))]
@@ -629,4 +816,5 @@ pub(crate) async fn verify_paused_capture_cancellation_and_shutdown(state: &Arc<
     state.request_shutdown();
     tokio::time::sleep(Duration::from_millis(25)).await;
     assert!(!state.auto_zero.lock().unwrap().pending());
+
 }

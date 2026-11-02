@@ -108,6 +108,47 @@ pub(crate) fn advance_with_clock_fence(
     Ok(next)
 }
 
+/// Staged supervisor handoff. The complete coordinator must first join its
+/// old board workers and revoke the old proxy lease. This helper transfers
+/// only host admission/journal ownership; it grants no board permission.
+pub(crate) fn transfer_closed_recovery_owner(
+    state: &AppState,
+    expected_generation: u64,
+    old_owner: u64,
+    new_owner: u64,
+    fence: &crate::launch_history::RecoveryFence,
+) -> Result<crate::launch_history::RecoveryFence, &'static str> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if matches!(old_owner, 0 | u64::MAX)
+        || matches!(new_owner, 0 | u64::MAX)
+        || new_owner == old_owner
+        || automatic_generation(state) != expected_generation
+        || state
+            .operator_admission_barrier
+            .load(std::sync::atomic::Ordering::Acquire)
+            != old_owner
+        || state
+            .operator_dispatch_inflight
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    {
+        return Err("Recovery handoff is stale or still inflight");
+    }
+    let mut history = state
+        .launch_history
+        .try_lock()
+        .map_err(|_| "Clock journal is busy")?;
+    // The journal compares the fence owner too: a mismatched journal ticket
+    // must not transfer the barrier independently of its durable prefix.
+    let transferred = history
+        .transfer_recovery_owner(fence, old_owner, new_owner)
+        .map_err(|_| "Clock journal handoff changed")?;
+    state
+        .operator_admission_barrier
+        .store(new_owner, std::sync::atomic::Ordering::Release);
+    Ok(transferred)
+}
+
 pub(crate) fn reopen_operator_admission_and_journal(
     state: &AppState,
     old_generation: u64,

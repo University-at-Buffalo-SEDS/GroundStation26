@@ -246,6 +246,7 @@ pub struct AppState {
     pub gse: Arc<Mutex<crate::gse::Runtime>>,
     /// Monotonic queued-automatic-intent epoch; never reset with GSE Runtime.
     pub(crate) automatic_generation: Arc<AtomicU64>,
+    pub(crate) operator_queue: Arc<crate::operator_queue::Control>,
     pub(crate) operator_admission_barrier: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) operator_dispatch_inflight: Arc<AtomicUsize>,
     pub(crate) manual_abort_intent: Arc<crate::manual_abort_intent::ManualAbortIntent>,
@@ -522,6 +523,30 @@ impl AppState {
     }
 
     pub fn set_launch_clock(&self, launch_clock: LaunchClockMsg) {
+        let generation = crate::gse::automatic_generation(self);
+        if crate::rrls::is_rrls() {
+            return;
+        }
+        // Reading an unchanged clock has no journal, session, or SDK effects.
+        // Some serialized state-policy callers already hold DISPATCH; do not
+        // reacquire it for a transition which cannot change the clock.
+        {
+            let current = self.launch_clock.lock().unwrap();
+            if monotonic_launch_clock_update(&current, launch_clock.clone()) == *current {
+                return;
+            }
+        }
+        let Some(claim) = crate::gse::claim_operator_dispatch(self, generation) else {
+            return;
+        };
+        self.set_launch_clock_admitted(launch_clock, &claim);
+    }
+
+    fn set_launch_clock_admitted(
+        &self,
+        launch_clock: LaunchClockMsg,
+        claim: &crate::gse::OperatorDispatchClaim,
+    ) {
         if crate::rrls::is_rrls() {
             return;
         }
@@ -550,7 +575,7 @@ impl AppState {
         }
         *current = next.clone();
         drop(current);
-        self.publish_daq_launch_clock(&next);
+        self.publish_daq_launch_clock(&next, &claim);
         let _ = self.launch_clock_tx.send(next);
     }
 
@@ -576,6 +601,10 @@ impl AppState {
             !crate::rrls::is_rrls(),
             "Only the primary GroundStation can reset T clock"
         );
+        let generation = crate::gse::automatic_generation(self);
+        let claim = crate::gse::claim_operator_dispatch(self, generation).ok_or_else(|| {
+            anyhow::anyhow!("Recovery admission is closed; T clock was not reset")
+        })?;
         let clock_now = telemetry_task::procedure_clock::now();
         let mut current = self.launch_clock.lock().unwrap();
         let next = {
@@ -592,7 +621,7 @@ impl AppState {
         self.clear_launch_sequence_command_pending();
         *current = next.clone();
         drop(current);
-        self.publish_daq_launch_clock(&next);
+        self.publish_daq_launch_clock(&next, &claim);
         let _ = self.launch_clock_tx.send(next);
         Ok(())
     }
@@ -617,6 +646,17 @@ impl AppState {
     }
 
     pub fn confirm_new_launch_cycle(&self) {
+        let generation = crate::gse::automatic_generation(self);
+        if crate::rrls::is_rrls() {
+            return;
+        }
+        let Some(claim) = crate::gse::claim_operator_dispatch(self, generation) else {
+            return;
+        };
+        self.confirm_new_launch_cycle_admitted(&claim);
+    }
+
+    fn confirm_new_launch_cycle_admitted(&self, _claim: &crate::gse::OperatorDispatchClaim) {
         if crate::rrls::is_rrls() {
             return;
         }
@@ -632,15 +672,27 @@ impl AppState {
     }
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     pub fn begin_daq_launch_log(&self) {
-        self.confirm_new_launch_cycle();
+        let generation = crate::gse::automatic_generation(self);
+        if crate::rrls::is_rrls() {
+            return;
+        }
+        let Some(claim) = crate::gse::claim_operator_dispatch(self, generation) else {
+            return;
+        };
+        self.confirm_new_launch_cycle_admitted(&claim);
         // Rotate at command acceptance, without starting the UI clock before
         // Valve confirms the sequence. Its ACK/pilot report corrects T0 later.
-        self.publish_daq_launch_clock(&launch_countdown_clock(
-            telemetry_task::procedure_clock::timestamp_ms(),
-        ));
+        self.publish_daq_launch_clock(
+            &launch_countdown_clock(telemetry_task::procedure_clock::timestamp_ms()),
+            &claim,
+        );
     }
 
-    fn publish_daq_launch_clock(&self, clock: &LaunchClockMsg) {
+    fn publish_daq_launch_clock(
+        &self,
+        clock: &LaunchClockMsg,
+        _claim: &crate::gse::OperatorDispatchClaim,
+    ) {
         // RRLS displays the primary's launch clock without creating a DAQ
         // recording session or asking its read-only router to publish one.
         if crate::rrls::is_rrls() {
@@ -767,11 +819,34 @@ impl AppState {
     }
 
     pub fn update_launch_clock_for_state(&self, next_state: FlightState, timestamp_ms: i64) {
+        let generation = crate::gse::automatic_generation(self);
+        if crate::rrls::is_rrls() {
+            return;
+        }
         let current = self.launch_clock_snapshot();
         let Some(next) = launch_clock_for_transition(&current, next_state, timestamp_ms) else {
             return;
         };
-        self.set_launch_clock(next);
+        if next == current {
+            return;
+        }
+        let Some(claim) = crate::gse::claim_operator_dispatch(self, generation) else {
+            return;
+        };
+        self.set_launch_clock_admitted(next, &claim);
+    }
+
+    fn update_launch_clock_for_state_admitted(
+        &self,
+        next_state: FlightState,
+        timestamp_ms: i64,
+        claim: &crate::gse::OperatorDispatchClaim,
+    ) {
+        let current = self.launch_clock_snapshot();
+        let Some(next) = launch_clock_for_transition(&current, next_state, timestamp_ms) else {
+            return;
+        };
+        self.set_launch_clock_admitted(next, claim);
     }
 
     fn layout_expected_boards(&self) -> std::collections::HashSet<Board> {
@@ -1454,6 +1529,25 @@ impl AppState {
 
     /// Updates local flight state, notifies subscribers, and persists the transition asynchronously.
     pub fn set_local_flight_state(&self, next_state: FlightState) {
+        self.set_local_flight_state_inner(next_state, None);
+    }
+
+    /// Fire owns DISPATCH already. Carry its real lease through clock effects
+    /// instead of acquiring the non-reentrant mutex again.
+    #[cfg(not(feature = "hitl_mode"))]
+    pub(crate) fn set_local_flight_state_with_clock_claim(
+        &self,
+        next_state: FlightState,
+        claim: &crate::gse::OperatorDispatchClaim,
+    ) {
+        self.set_local_flight_state_inner(next_state, Some(claim));
+    }
+
+    fn set_local_flight_state_inner(
+        &self,
+        next_state: FlightState,
+        clock_claim: Option<&crate::gse::OperatorDispatchClaim>,
+    ) {
         let mut slot = self.state.lock().unwrap();
         if *slot == next_state {
             return;
@@ -1473,7 +1567,11 @@ impl AppState {
                     | FlightState::Armed
             )
         {
-            self.confirm_new_launch_cycle();
+            if let Some(claim) = clock_claim {
+                self.confirm_new_launch_cycle_admitted(claim);
+            } else {
+                self.confirm_new_launch_cycle();
+            }
         }
         // Keep the simulator in lock-step with the real backend state machine.
         crate::flight_sim::sync_local_flight_state(next_state);
@@ -1482,10 +1580,13 @@ impl AppState {
         let _ = self.state_tx.send(FlightStateMsg { state: next_state });
         self.broadcast_fill_targets_snapshot();
         let ts_ms = crate::telemetry_task::get_current_timestamp_ms() as i64;
-        self.update_launch_clock_for_state(
-            next_state,
-            telemetry_task::procedure_clock::for_wall(ts_ms as u64).timestamp_ms(),
-        );
+        let clock_timestamp =
+            telemetry_task::procedure_clock::for_wall(ts_ms as u64).timestamp_ms();
+        if let Some(claim) = clock_claim {
+            self.update_launch_clock_for_state_admitted(next_state, clock_timestamp, claim);
+        } else {
+            self.update_launch_clock_for_state(next_state, clock_timestamp);
+        }
         let tx = self.db_queue_tx.clone();
         self.db_write_runtime.spawn(async move {
             let _ = tx
@@ -3892,6 +3993,7 @@ pub(crate) mod tests {
             gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
             automatic_generation: Arc::new(AtomicU64::new(1)),
             operator_admission_barrier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            operator_queue: Arc::new(crate::operator_queue::Control::default()),
             operator_dispatch_inflight: Arc::new(AtomicUsize::new(0)),
             manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
             deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),

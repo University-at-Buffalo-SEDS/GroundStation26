@@ -126,6 +126,17 @@ impl Drop for Claim {
     }
 }
 fn apply(state: &Arc<AppState>, observation: &Observation) {
+    // The lease belongs to actual blocking observation work, never its awaiter.
+    // Independent manual observations must still cancel recovery whileclosed.
+    let _automatic_claim = if observation.automatic {
+        let Some(claim) = crate::gse::claim_operator_dispatch(state, observation.generation) else {
+            return;
+        };
+        Some(claim)
+    } else {
+        None
+    };
+
     if !crate::gse::accept_observed_abort(state, observation.automatic, observation.generation) {
         log::info!(
             "ignored stale automatic abort observation packet={}",
@@ -335,5 +346,76 @@ mod tests {
         };
         apply(&state, &manual);
         assert!(state.abort_indicator_latched());
+    }
+}
+
+#[cfg(test)]
+mod recovery_observation_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    fn packet(automatic: bool) -> Packet {
+        Packet::new(
+            crate::telemetry_schema::data_type("ABORT"),
+            &[crate::telemetry_schema::endpoint("ABORT")],
+            "RF",
+            123,
+            Arc::from(if automatic {
+                b"SEDS_AUTO_ABORT_V1:observation".as_slice()
+            } else {
+                b"Manual Stop observation".as_slice()
+            }),
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn automatic_observation_uses_original_generation_and_cannot_publish_whileclosed() {
+        let state = crate::state::tests::test_app_state().await;
+        let old = crate::gse::automatic_generation(&state);
+        state
+            .operator_admission_barrier
+            .store(77, Ordering::Release);
+        let observation = Observation {
+            packet: packet(true),
+            generation: old,
+            automatic: true,
+        };
+        apply(&state, &observation);
+        let closed_latched = state.abort_indicator_latched();
+        state.automatic_generation.store(old + 1, Ordering::Release);
+        state.operator_admission_barrier.store(0, Ordering::Release);
+        apply(&state, &observation);
+        let stale_latched = state.abort_indicator_latched();
+        let fresh = Observation {
+            packet: packet(true),
+            generation: old + 1,
+            automatic: true,
+        };
+        apply(&state, &fresh);
+        assert!(
+            !closed_latched,
+            "old actual observation published Abort policy whileclosed"
+        );
+        assert!(!stale_latched);
+        assert!(state.abort_indicator_latched());
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+    }
+    #[tokio::test]
+    async fn actual_manual_observation_lane_remains_retained_and_applies_whileclosed() {
+        let state = crate::state::tests::test_app_state().await;
+        state
+            .operator_admission_barrier
+            .store(77, Ordering::Release);
+        state
+            .deferred_abort
+            .observe(&packet(false), crate::gse::automatic_generation(&state));
+        assert_eq!(state.deferred_abort.manual_epoch(), 1);
+        let mut claim = state.deferred_abort.claim().unwrap();
+        apply(&state, claim.observation.as_ref().unwrap());
+        claim.accepted = true;
+        drop(claim);
+        assert!(state.abort_indicator_latched());
+        assert!(!state.deferred_abort.manual_pending());
+        assert_eq!(state.deferred_abort.manual_epoch(), 1);
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
     }
 }

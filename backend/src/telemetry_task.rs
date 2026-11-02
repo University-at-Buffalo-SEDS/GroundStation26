@@ -487,6 +487,7 @@ pub async fn telemetry_task(
     mut db_rx: mpsc::Receiver<DbQueueItem>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
+    let mut operator_queue_rx = state.operator_queue.take_receiver().expect("operator queue receiver already owned");
     let mut handle_interval = interval(Duration::from_millis(1));
     let heartbeat_period_ms = std::env::var("GS_HEARTBEAT_INTERVAL_MS")
         .ok()
@@ -777,6 +778,9 @@ pub async fn telemetry_task(
         tokio::select! {
             biased;
 
+                Some(request) = operator_queue_rx.recv() => {
+                    crate::operator_queue::serve(&state, &mut rx, request);
+                }
                 Some(cmd) = rx.recv() => {
                     let (cmd, _operator_claim, plumbing_origin) = match cmd {
                         TelemetryCommand::QueuedOperator { generation, command, plumbing_origin } => {
@@ -789,13 +793,13 @@ pub async fn telemetry_task(
                     let automatic_generation = cmd.automatic_generation();
                     let automatic_supply_close = matches!(cmd, TelemetryCommand::AutomaticNitrogenClose { .. } | TelemetryCommand::AutomaticNitrousClose { .. });
                     let automatic_abort = matches!(cmd, TelemetryCommand::AutomaticAbort { .. });
-                    let _automatic_abort_claim = if automatic_abort {
-                        let Some(claim) = crate::gse::claim_automatic_abort(&state) else { continue; };
-                        Some(claim)
-                    } else { None };
                     let Some(cmd) = command_at_dispatch(&state, cmd) else {
                         continue;
                     };
+                    let _automatic_abort_claim = if automatic_abort {
+                        let Some(claim) = crate::gse::claim_automatic_abort_for_generation(&state, automatic_generation.expect("automatic Abort retains original generation")) else { continue; };
+                        Some(claim)
+                    } else { None };
                     if matches!(cmd, TelemetryCommand::ResetSim) {
                         reset_testing_simulation(&state).await;
                         continue;
@@ -1341,7 +1345,7 @@ pub async fn telemetry_task(
                 _ = heartbeat_interval.tick() => {
                     if !heartbeat_cadence.due(crate::simulation_clock_ms()) { continue; }
                     // Retry only failed durable admission; stable clocks emit nothing.
-                    let _ = crate::network_variables::retry_pending_daq_log_clock(&router);
+                    let _ = crate::network_variables::retry_pending_daq_log_clock_for_state(&state, &router);
                     if heartbeat::queue_station_heartbeat(&router).is_ok() {
                         state.mark_board_seen(
                             Board::GroundStation.sender_id(),
@@ -4940,6 +4944,7 @@ mod tests {
             gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
             automatic_generation: Arc::new(AtomicU64::new(1)),
             operator_admission_barrier: Arc::new(AtomicU64::new(0)),
+            operator_queue: Arc::new(crate::operator_queue::Control::default()),
             operator_dispatch_inflight: Arc::new(AtomicUsize::new(0)),
             manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
             deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),

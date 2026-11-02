@@ -4,6 +4,7 @@ use super::*;
 
 pub(crate) struct AutomaticAbortClaim {
     runtime: Arc<std::sync::Mutex<Runtime>>,
+    _operator_claim: Option<OperatorDispatchClaim>,
 }
 impl Drop for AutomaticAbortClaim {
     fn drop(&mut self) {
@@ -33,9 +34,18 @@ pub(crate) enum LivenessAbortDecision {
     Unavailable,
 }
 
+#[cfg(any(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
 pub(crate) fn claim_automatic_abort(state: &AppState) -> Option<AutomaticAbortClaim> {
+    claim_automatic_abort_for_generation(state, automatic_generation(state))
+}
+
+pub(crate) fn claim_automatic_abort_for_generation(
+    state: &AppState,
+    generation: u64,
+) -> Option<AutomaticAbortClaim> {
     #[cfg(feature = "hitl_mode")]
     {
+        let operator_claim = claim_operator_dispatch(state, generation)?;
         let mut runtime = state.gse.lock().unwrap();
         if runtime.automatic_abort_in_flight
             || state
@@ -59,11 +69,12 @@ pub(crate) fn claim_automatic_abort(state: &AppState) -> Option<AutomaticAbortCl
         runtime.automatic_abort_in_flight = true;
         Some(AutomaticAbortClaim {
             runtime: state.gse.clone(),
+            _operator_claim: Some(operator_claim),
         })
     }
     #[cfg(not(feature = "hitl_mode"))]
     {
-        match claim_from_source(state, false) {
+        match claim_from_source(state, false, generation) {
             LivenessAbortDecision::Claimed(claim) => Some(claim),
             LivenessAbortDecision::IdleOrStartup(stage) => {
                 debug_assert!(matches!(stage, FlightState::Startup | FlightState::Idle));
@@ -76,13 +87,16 @@ pub(crate) fn claim_automatic_abort(state: &AppState) -> Option<AutomaticAbortCl
 
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 pub(crate) fn claim_liveness_abort(state: &AppState) -> LivenessAbortDecision {
-    claim_from_source(state, true)
+    claim_from_source(state, true, automatic_generation(state))
 }
 
 #[cfg(not(feature = "hitl_mode"))]
-fn claim_from_source(state: &AppState, liveness: bool) -> LivenessAbortDecision {
+fn claim_from_source(state: &AppState, liveness: bool, generation: u64) -> LivenessAbortDecision {
     #[cfg(not(feature = "hitl_mode"))]
     {
+        let Some(operator_claim) = claim_operator_dispatch(state, generation) else {
+            return LivenessAbortDecision::Unavailable;
+        };
         let mut rt = state.gse.lock().unwrap();
         // Preserve the original general-claim short circuit: a held/latched
         // claim must not acquire the flight-state mutex unnecessarily.
@@ -122,6 +136,7 @@ fn claim_from_source(state: &AppState, liveness: bool) -> LivenessAbortDecision 
         drop(rt);
         LivenessAbortDecision::Claimed(AutomaticAbortClaim {
             runtime: state.gse.clone(),
+            _operator_claim: Some(operator_claim),
         })
     }
 }
@@ -132,11 +147,13 @@ pub(super) fn reserve_abort_clear(state: &AppState, rt: &mut Runtime) -> Automat
     rt.automatic_abort_in_flight = true;
     AutomaticAbortClaim {
         runtime: state.gse.clone(),
+        // Existing explicit clear already owns its outer dispatch reservation.
+        _operator_claim: None,
     }
 }
 
 #[cfg(all(test, not(feature = "hitl_mode")))]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::sync::{
         Barrier,
@@ -148,26 +165,34 @@ mod tests {
         Arc<AtomicUsize>,
         std::path::PathBuf,
     ) {
-        let state = crate::state::tests::test_app_state().await;
+        fixture_with_state(crate::state::tests::test_app_state().await).await
+    }
+
+    pub(in crate::gse) async fn fixture_with_state(
+        state: Arc<AppState>,
+    ) -> (
+        Arc<AppState>,
+        Arc<sedsnet::router::Router>,
+        Arc<AtomicUsize>,
+        std::path::PathBuf,
+    ) {
         let weak = Arc::downgrade(&state);
         let seen = Arc::new(AtomicUsize::new(0));
         let count = seen.clone();
         let router = Arc::new(sedsnet::router::Router::new(
-            sedsnet::router::RouterConfig::new([
-                sedsnet::router::EndpointHandler::new_packet_handler(
-                    crate::telemetry_schema::endpoint("ABORT"),
-                    move |packet| {
-                        assert!(
-                            weak.upgrade().unwrap().gse.try_lock().is_ok(),
-                            "router callback must not run under GSE lock"
-                        );
-                        if packet.data_type() == crate::telemetry_schema::data_type("ABORT") {
-                            count.fetch_add(1, Ordering::SeqCst);
-                        }
-                        Ok(())
-                    },
-                ),
-            ]),
+            sedsnet::router::RouterConfig::new([sedsnet::router::EndpointHandler::new_packet_handler(
+                crate::telemetry_schema::endpoint("ABORT"),
+                move |packet| {
+                    assert!(
+                        weak.upgrade().unwrap().gse.try_lock().is_ok(),
+                        "router callback must not run under GSE lock"
+                    );
+                    if packet.data_type() == crate::telemetry_schema::data_type("ABORT") {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(())
+                },
+            )]),
         ));
         let path = armed_fixture_for_test(&state, &router);
         (state, router, seen, path)
@@ -265,7 +290,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let _ = started_tx.send(());
             let unavailable = matches!(
-                claim_from_source(&worker_state, false),
+                claim_from_source(&worker_state, false, automatic_generation(&worker_state)),
                 LivenessAbortDecision::Unavailable
             );
             let _ = result_tx.send(unavailable);

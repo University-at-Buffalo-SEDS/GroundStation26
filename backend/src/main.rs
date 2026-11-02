@@ -46,6 +46,7 @@ mod loadcell_zero;
 mod log_redaction;
 mod logger;
 mod manual_abort_intent;
+mod operator_queue;
 mod map;
 mod media;
 mod media_runtime;
@@ -1241,6 +1242,7 @@ async fn main() -> anyhow::Result<()> {
         gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
         automatic_generation: Arc::new(AtomicU64::new(1)),
         operator_admission_barrier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        operator_queue: Arc::new(crate::operator_queue::Control::default()),
         operator_dispatch_inflight: Arc::new(AtomicUsize::new(0)),
         manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
         deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
@@ -1979,6 +1981,7 @@ async fn main() -> anyhow::Result<()> {
     if let Ok(expected) = std::env::var("GS_SIM_EXPECT_DISCOVERY_NODES") {
         let validation_router = router.clone();
         let validation_state = state.clone();
+        let validation_generation = gse::capture_operator_origin(&validation_state).unwrap_or(0);
         let validation_discovery_ready = full_bay_discovery_ready.clone();
         let validation_pilot_ack_generation = pilot_open_ack_generation.clone();
         let validate_valve_roundtrip = std::env::var("GS_SIM_VALIDATE_VALVE_ROUNDTRIP")
@@ -2038,6 +2041,9 @@ async fn main() -> anyhow::Result<()> {
                         .as_deref()
                         == Some("1")
                     {
+                        let Some(_claim) = gse::claim_operator_dispatch(&validation_state, validation_generation) else {
+                            return;
+                        };
                         let command = FlightComputerCommands::EvaluationRelax as u8;
                         match queue_locally_routed_flight_command(
                             &validation_state,
@@ -2165,6 +2171,9 @@ async fn main() -> anyhow::Result<()> {
                             (data_type, count)
                         })
                         .collect::<Vec<_>>();
+                        let Some(round_claim) = gse::claim_operator_dispatch(&validation_state, validation_generation) else {
+                            return;
+                        };
                         if let Some(&state) = flight_states.get(round) {
                             if let Err(error) =
                                 qualification_requests::in_controlled_round(round + 1, || {
@@ -2205,6 +2214,7 @@ async fn main() -> anyhow::Result<()> {
                             &validation_router,
                             "full-bay managed-variable validation tx",
                         );
+                        drop(round_claim);
                         if std::env::var("GS_SIM_POLICY_CORRECT_CONTROLS").as_deref() == Ok("1") {
                             // This is only a bounded global-settling barrier, never ACK
                             // evidence (retry expiry can also remove a pending entry).
@@ -2327,10 +2337,15 @@ async fn main() -> anyhow::Result<()> {
         && let Ok(sequence) = std::env::var("GS_SIM_UNDERGLOW_SEQUENCE")
     {
         let validation_router = router.clone();
+        let validation_state = state.clone();
+        let validation_generation = gse::capture_operator_origin(&validation_state).unwrap_or(0);
         tokio::spawn(async move {
             for value in sequence.split(',') {
                 tokio::time::sleep(Duration::from_millis(750)).await;
                 let enabled = matches!(value.trim(), "1" | "true" | "on");
+                let Some(_claim) = gse::claim_operator_dispatch(&validation_state, validation_generation) else {
+                    return;
+                };
                 match network_variables::set_underglow(&validation_router, enabled) {
                     Ok(()) => log::info!("full-bay validation set AV bay underglow: {enabled}"),
                     Err(error) => {
@@ -2345,10 +2360,15 @@ async fn main() -> anyhow::Result<()> {
         && let Ok(sequence) = std::env::var("GS_SIM_FLIGHT_BUZZER_SEQUENCE")
     {
         let validation_router = router.clone();
+        let validation_state = state.clone();
+        let validation_generation = gse::capture_operator_origin(&validation_state).unwrap_or(0);
         tokio::spawn(async move {
             for value in sequence.split(',') {
                 tokio::time::sleep(Duration::from_millis(750)).await;
                 let enabled = matches!(value.trim(), "1" | "true" | "on");
+                let Some(_claim) = gse::claim_operator_dispatch(&validation_state, validation_generation) else {
+                    return;
+                };
                 match network_variables::set_flight_buzzer(&validation_router, enabled) {
                     Ok(()) => {
                         log::info!("full-bay validation set Flight buzzer: {enabled}")
@@ -2368,6 +2388,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let validation_router = router.clone();
         let validation_state = state.clone();
+        let validation_generation = gse::capture_operator_origin(&validation_state).unwrap_or(0);
         let validation_pilot_ack_generation = pilot_open_ack_generation.clone();
         let validation_discovery_ready = full_bay_discovery_ready.clone();
         let mut startup_run = valve_startup_ack
@@ -2438,6 +2459,9 @@ async fn main() -> anyhow::Result<()> {
             let command_started = ValidationInstant::now();
             let ack_latency_limit_ms =
                 validation_latency_limit_ms("GS_SIM_VALVE_ACK_MAX_LATENCY_MS", 2_500);
+            let Some(command_claim) = gse::claim_operator_dispatch(&validation_state, validation_generation) else {
+                return;
+            };
             let open_result =
                 validation_router.log_queue(command_type, &[ValveBoardCommands::PilotOpen as u8]);
             if let Err(err) = open_result {
@@ -2445,6 +2469,7 @@ async fn main() -> anyhow::Result<()> {
                 return;
             }
             flush_command_tx(&validation_router, "full-bay valve-open validation tx");
+            drop(command_claim);
             log::info!(
                 "full-bay router stats after valve command: {:?}",
                 validation_router.export_runtime_stats().sides
@@ -2503,6 +2528,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let soak_router = router.clone();
         let soak_state = state.clone();
+        let soak_generation = gse::capture_operator_origin(&soak_state).unwrap_or(0);
         let soak_status = command_status_probe.clone();
         let soak_discovery_ready = full_bay_discovery_ready.clone();
         let soak_startup_ack = valve_startup_ack.clone();
@@ -2585,6 +2611,9 @@ async fn main() -> anyhow::Result<()> {
                     // This path is simulation-only and never exercises a
                     // deployment output. Require actual round transmissions
                     // and their destination receipts throughout the soak.
+                    let Some(command_claim) = gse::claim_operator_dispatch(&soak_state, soak_generation) else {
+                        return;
+                    };
                     let command = FlightComputerCommands::EvaluationRelax as u8;
                     if let Err(error) = network_variables::set_underglow(&soak_router, open)
                         .and_then(|_| {
@@ -2604,6 +2633,7 @@ async fn main() -> anyhow::Result<()> {
                         return;
                     }
                     flush_command_tx(&soak_router, "full-bay RF soak tx");
+                    drop(command_claim);
                     if !wait_for_validation_reliable_delivery(
                         &soak_router,
                         "RF soak round",
@@ -2621,6 +2651,9 @@ async fn main() -> anyhow::Result<()> {
                 for (slot, board, ty, command) in command_probe::validation_commands(open) {
                     let generation_before = soak_status.lock().unwrap().generation(slot, open);
                     let started = ValidationInstant::now();
+                    let Some(command_claim) = gse::claim_operator_dispatch(&soak_state, soak_generation) else {
+                        return;
+                    };
                     if let Err(error) =
                         soak_router.log_queue(telemetry_schema::data_type(ty), &[command])
                     {
@@ -2631,6 +2664,7 @@ async fn main() -> anyhow::Result<()> {
                         return;
                     }
                     flush_command_tx(&soak_router, "full-bay soak valve command tx");
+                    drop(command_claim);
                     let latency_limit_ms = validation_latency_limit_ms(
                         "GS_SIM_SOAK_COMMAND_ACK_MAX_LATENCY_MS",
                         2_500,

@@ -906,6 +906,7 @@ async fn set_loadcell_calibration(
     headers: HeaderMap,
     Json(update): Json<loadcell::CalibrationUpdate>,
 ) -> axum::response::Response {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -913,6 +914,13 @@ async fn set_loadcell_calibration(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     let cfg = {
         let mut current = state.loadcell_calibration.lock().unwrap();
         let cfg = match loadcell::merge_channel_update(&current, &update) {
@@ -942,6 +950,7 @@ async fn set_kg50_input(
     headers: HeaderMap,
     Json(req): Json<Kg50InputRequest>,
 ) -> axum::response::Response {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
         Ok(p) => p,
         Err(r) => return r,
@@ -949,6 +958,13 @@ async fn set_kg50_input(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     if state.loadcell_processing.status().running {
         return (
             StatusCode::CONFLICT,
@@ -989,6 +1005,7 @@ async fn capture_loadcell_zero(
     headers: HeaderMap,
     Json(req): Json<CaptureLoadcellPointReq>,
 ) -> impl IntoResponse {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -996,6 +1013,13 @@ async fn capture_loadcell_zero(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     let updated = {
         let mut cfg = state.loadcell_calibration.lock().unwrap();
         let temperature = loadcell::recent_adc_temperature(
@@ -1032,6 +1056,7 @@ async fn capture_loadcell_span(
     headers: HeaderMap,
     Json(req): Json<CaptureLoadcellSpanReq>,
 ) -> impl IntoResponse {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -1039,6 +1064,13 @@ async fn capture_loadcell_span(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     let updated = {
         let mut cfg = state.loadcell_calibration.lock().unwrap();
         let temperature = loadcell::recent_adc_temperature(
@@ -1867,6 +1899,7 @@ async fn set_flight_setup(
     headers: HeaderMap,
     Json(cfg): Json<FlightSetupConfig>,
 ) -> impl IntoResponse {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -1874,6 +1907,13 @@ async fn set_flight_setup(
     if !principal.permissions.send_commands {
         return (StatusCode::FORBIDDEN, "permission denied").into_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     match flight_setup::save(&cfg) {
         Ok(()) => Json(flight_setup::load_or_default()).into_response(),
         Err(err) => (StatusCode::BAD_REQUEST, err).into_response(),
@@ -1895,6 +1935,7 @@ async fn set_auto_zero(
     headers: HeaderMap,
     Json(settings): Json<crate::auto_zero::Settings>,
 ) -> impl IntoResponse {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
         Ok(p) => p,
         Err(response) => return response,
@@ -1902,6 +1943,13 @@ async fn set_auto_zero(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     if crate::gse::active(&state)
         || matches!(
             state.launch_clock_snapshot().kind,
@@ -1938,6 +1986,7 @@ async fn set_fill_targets(
     headers: HeaderMap,
     Json(cfg): Json<FillTargetsConfig>,
 ) -> impl IntoResponse {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -1945,6 +1994,13 @@ async fn set_fill_targets(
     if !principal.permissions.send_commands {
         return (StatusCode::FORBIDDEN, "permission denied").into_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     let result = (|| -> Result<FillTargetsConfig, (StatusCode, String)> {
         let mut gse = state.gse.lock().unwrap();
         let zero = state.auto_zero.lock().unwrap();
@@ -1986,6 +2042,7 @@ async fn apply_flight_setup(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -1993,6 +2050,13 @@ async fn apply_flight_setup(
     if !principal.permissions.send_commands {
         return (StatusCode::FORBIDDEN, "permission denied").into_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
 
     let cfg = flight_setup::load_or_default();
     let now_ms = crate::telemetry_task::get_current_timestamp_ms();
@@ -2547,6 +2611,8 @@ fn reset_primary_clock_for_origin(
     state
         .try_reset_launch_clock()
         .map_err(|error| (StatusCode::CONFLICT, error))?;
+    #[cfg(test)]
+    clock_worker_tests::pause_worker(state, clock_worker_tests::Phase::AfterMutation);
     let waiter = state.launch_history.lock().unwrap().waiter();
     if let Some((writer, ticket)) = waiter {
         // A timeout reports failure, not writer quiescence. Recovery must still
@@ -2559,7 +2625,7 @@ fn reset_primary_clock_for_origin(
 }
 
 #[cfg(test)]
-mod command_dispatch_tests {
+pub(crate) mod command_dispatch_tests {
     use super::*;
     use crate::recording_export::tests::{TestDirectory, export_state};
 
@@ -2691,7 +2757,7 @@ mod command_dispatch_tests {
         }
     }
 
-    pub(super) async fn preauth_fixture() -> (
+    pub(crate) async fn preauth_fixture() -> (
         TestDirectory,
         Arc<AppState>,
         tokio::sync::mpsc::Receiver<TelemetryCommand>,
@@ -2726,6 +2792,53 @@ mod command_dispatch_tests {
             "Bearer preauth-test".parse().unwrap(),
         );
         (root, state, rx, headers)
+    }
+
+    #[tokio::test]
+    async fn actual_http_blocked_sender_retains_old_origin_after_receiver_drain_and_reopen() {
+        let (_directory, state, mut commands, headers) = preauth_fixture().await;
+        for _ in 0..4 {
+            state.cmd_tx.try_send(TelemetryCommand::Postinit).unwrap();
+        }
+        let generation = crate::gse::automatic_generation(&state);
+        let request = send_command(
+            State(state.clone()),
+            headers,
+            Json(TelemetryCommand::Postinit),
+        );
+        tokio::pin!(request);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), request.as_mut())
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .last_command_ms
+                .lock()
+                .unwrap()
+                .contains_key("dedup:Postinit"),
+            "actual auth/policy/dedup reached before full-channel await"
+        );
+        state
+            .operator_admission_barrier
+            .store(77, std::sync::atomic::Ordering::Release);
+        let token = crate::operator_queue::Token::capture(&state, 77);
+        let mut admin = state.operator_queue.take_receiver().unwrap();
+        let receipt = state.operator_queue.request(token).unwrap();
+        crate::operator_queue::serve(&state, &mut commands, admin.recv().await.unwrap());
+        assert_eq!(receipt.await.unwrap(), Ok(4));
+        // Model only the verified epoch/reopen boundary, never a reset API.
+        state
+            .automatic_generation
+            .store(generation + 1, std::sync::atomic::Ordering::Release);
+        state
+            .operator_admission_barrier
+            .store(0, std::sync::atomic::Ordering::Release);
+        assert_eq!(request.await.0, StatusCode::OK);
+        let late = commands.recv().await.unwrap();
+        assert_origin_rejected(&state, late, generation);
+        assert!(commands.try_recv().is_err());
     }
 
     fn assert_origin_rejected(state: &AppState, queued: TelemetryCommand, origin: u64) {
@@ -2997,6 +3110,7 @@ pub(crate) mod clock_worker_tests {
     pub(crate) enum Phase {
         BeforeClaim,
         BeforeMutation,
+        AfterMutation,
         Unpaused,
     }
     struct Pause {
@@ -3209,15 +3323,19 @@ pub(crate) mod clock_worker_tests {
         let _serial = SERIAL.lock().await;
         let (_root, state, headers, path) = fixture().await;
         let origin = crate::gse::automatic_generation(&state);
-        let worker = WorkerGuard::install(&state, Phase::Unpaused);
+        let worker = WorkerGuard::install(&state, Phase::AfterMutation);
         let writer = WriterGuard::install(path);
         let request = http(state.clone(), headers.clone());
         writer.pause.entered().await;
+        // The nested state-clock lease must have returned before asserting the
+        // outer worker's exact ownership during its separate durability wait.
+        worker.probe.pause.entered().await;
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
         let inflight = state.operator_dispatch_inflight.load(Ordering::Acquire);
         let boundary = crate::gse::reset_generation::invalidate_capture_epoch(&state, origin);
         manual_stop(&state, headers).await;
+        worker.probe.pause.release();
         writer.pause.release();
         worker.completed().await;
         flush(&state).await;
@@ -3382,12 +3500,16 @@ pub(crate) mod clock_worker_tests {
         let _serial = SERIAL.lock().await;
         let (_root, state, headers, path) = fixture().await;
         let disk_before = std::fs::read(&path).unwrap();
-        let worker = WorkerGuard::install(&state, Phase::Unpaused);
+        let worker = WorkerGuard::install(&state, Phase::AfterMutation);
         let writer = WriterGuard::install(path.clone());
         let request = http(state.clone(), headers.clone());
         writer.pause.entered().await;
+        // The nested state-clock lease must have returned before asserting the
+        // outer worker's exact ownership during its separate durability wait.
+        worker.probe.pause.entered().await;
         assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 1);
         manual_stop(&state, headers).await;
+        worker.probe.pause.release();
         // Exercise the production ten-second wait deadline unchanged. The
         // separate journal thread stays paused after this HTTP failure.
         let response = tokio::time::timeout(StdDuration::from_secs(15), request)
@@ -3538,10 +3660,190 @@ pub(crate) mod clock_worker_tests {
     }
 
     #[tokio::test]
-    async fn recovery_remote_clock_keeps_receive_origin_and_actual_worker_lease_through_save() {
+    async fn recovery_owner_transfer_preserves_pending_writer_and_revokes_every_old_ticket() {
         use crate::gse::reset_generation::{
             advance_with_clock_fence, close_operator_admission,
-            reopen_operator_admission_and_journal,
+            reopen_operator_admission_and_journal, transfer_closed_recovery_owner,
+        };
+        let _serial = SERIAL.lock().await;
+        let (_root, state, headers, path) = fixture().await;
+        let generation = crate::gse::automatic_generation(&state);
+        state
+            .launch_history
+            .lock()
+            .unwrap()
+            .inhibit_automatic_actions()
+            .unwrap();
+        let before = state.launch_history.lock().unwrap().snapshot();
+        let inflight = crate::gse::claim_operator_dispatch(&state, generation).unwrap();
+        close_operator_admission(&state, generation, 501).unwrap();
+        let first = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .close_for_recovery(501)
+            .unwrap();
+        let writer = WriterGuard::install(path.clone());
+        let staged = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .stage_recovery_revision(&first)
+            .unwrap();
+        writer.pause.entered().await;
+        let disk = std::fs::read(&path).unwrap();
+        assert!(transfer_closed_recovery_owner(&state, generation, 501, 502, &staged).is_err());
+        drop(inflight);
+        for (expected, old, new) in [
+            (generation + 1, 501, 502),
+            (generation, 500, 502),
+            (generation, 501, 0),
+            (generation, 501, u64::MAX),
+            (generation, 501, 501),
+        ] {
+            assert!(transfer_closed_recovery_owner(&state, expected, old, new, &staged).is_err());
+        }
+        let transferred =
+            transfer_closed_recovery_owner(&state, generation, 501, 502, &staged).unwrap();
+        assert!(crate::gse::capture_operator_origin(&state).is_none());
+        assert!(http(state.clone(), headers.clone()).await.unwrap().0 == StatusCode::CONFLICT);
+        assert_eq!(std::fs::read(&path).unwrap(), disk);
+        assert!(
+            !state
+                .launch_history
+                .lock()
+                .unwrap()
+                .recovery_quiescent(&transferred)
+                .unwrap()
+        );
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .recovery_quiescent(&staged)
+                .is_err()
+        );
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .retry_recovery_save(&staged)
+                .is_err()
+        );
+        assert!(transfer_closed_recovery_owner(&state, generation, 501, 503, &staged).is_err());
+        assert!(advance_with_clock_fence(&state, generation, 502, &transferred).is_err());
+        assert!(reopen_operator_admission_and_journal(&state, generation, 501, &staged).is_err());
+        writer.pause.release();
+        flush(&state).await;
+        assert_eq!(
+            advance_with_clock_fence(&state, generation, 502, &transferred).unwrap(),
+            generation + 1
+        );
+        // A later terminated supervisor may have already advanced the host
+        // generation. Its replacement must use the current generation and
+        // retain the same staged clock instead of incrementing it twice.
+        let newest =
+            transfer_closed_recovery_owner(&state, generation + 1, 502, 503, &transferred).unwrap();
+        assert!(
+            reopen_operator_admission_and_journal(&state, generation, 502, &transferred).is_err()
+        );
+        reopen_operator_admission_and_journal(&state, generation, 503, &newest).unwrap();
+        let after = state.launch_history.lock().unwrap().snapshot();
+        assert_eq!(after.revision, before.revision + 1);
+        assert_eq!(after.clock, before.clock);
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .automatic_actions_inhibited()
+        );
+        assert!(crate::gse::claim_operator_dispatch(&state, generation).is_none());
+        assert!(crate::gse::claim_operator_dispatch(&state, generation + 1).is_some());
+        assert!(transfer_closed_recovery_owner(&state, generation + 1, 503, 504, &newest).is_err());
+    }
+
+    #[tokio::test]
+    async fn recovery_owner_transfer_keeps_terminal_io_failure_closed_until_explicit_retry() {
+        use crate::gse::reset_generation::{
+            advance_with_clock_fence, close_operator_admission,
+            reopen_operator_admission_and_journal, transfer_closed_recovery_owner,
+        };
+        let _serial = SERIAL.lock().await;
+        let (_root, state, _headers, path) = fixture().await;
+        let generation = crate::gse::automatic_generation(&state);
+        close_operator_admission(&state, generation, 601).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("sentinel"), b"preserve").unwrap();
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .inhibit_automatic_actions()
+                .is_err()
+        );
+        let first = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .close_for_recovery(601)
+            .unwrap();
+        let transferred =
+            transfer_closed_recovery_owner(&state, generation, 601, 602, &first).unwrap();
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .recovery_quiescent(&transferred)
+                .is_err()
+        );
+        assert!(advance_with_clock_fence(&state, generation, 602, &transferred).is_err());
+        assert!(
+            reopen_operator_admission_and_journal(&state, generation, 602, &transferred).is_err()
+        );
+        assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"preserve");
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .retry_recovery_save(&first)
+                .is_err()
+        );
+        // External fixture repair is deliberate; the implementation never
+        // removes/rewrites an unreadable target just to make recovery succeed.
+        std::fs::remove_dir_all(&path).unwrap();
+        let retried = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .retry_recovery_save(&transferred)
+            .unwrap();
+        flush(&state).await;
+        let staged = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .stage_recovery_revision(&retried)
+            .unwrap();
+        flush(&state).await;
+        advance_with_clock_fence(&state, generation, 602, &staged).unwrap();
+        // Shutdown always defeats the supervisor, including a replacement.
+        state.launch_history.lock().unwrap().close_and_waiter();
+        assert!(transfer_closed_recovery_owner(&state, generation + 1, 602, 603, &staged).is_err());
+        assert!(reopen_operator_admission_and_journal(&state, generation, 602, &staged).is_err());
+        assert!(crate::gse::capture_operator_origin(&state).is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_remote_clock_keeps_receive_origin_and_actual_worker_lease_through_save() {
+        use crate::gse::reset_generation::{
+            advance_with_clock_fence, close_operator_admission, reopen_operator_admission_and_journal,
         };
         let _serial = SERIAL.lock().await;
         let (_root, state, _headers, path) = fixture().await;
@@ -3576,30 +3878,35 @@ pub(crate) mod clock_worker_tests {
         // new request if it was received while admission was closed.
         for rejected_origin in [closed_origin, Some(original)] {
             assert!(
-                crate::launch_clock_sync::reset_primary_for_origin(
-                    &state,
-                    rejected_origin,
-                    &expected
-                )
-                .is_err()
+                crate::launch_clock_sync::reset_primary_for_origin(&state, rejected_origin, &expected)
+                    .is_err()
             );
             assert_eq!(state.launch_history.lock().unwrap().snapshot(), expected);
             assert_eq!(std::fs::read(&path).unwrap(), disk);
         }
         let fresh = crate::gse::capture_operator_origin(&state);
+        let worker = WorkerGuard::install(&state, Phase::AfterMutation);
         let writer = WriterGuard::install(path.clone());
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let work = state.clone();
         let actual = tokio::task::spawn_blocking(move || {
-            let result =
-                crate::launch_clock_sync::reset_primary_for_origin(&work, fresh, &expected);
+            let result = crate::launch_clock_sync::reset_primary_for_origin(&work, fresh, &expected);
             let _ = done_tx.send(result);
         });
         writer.pause.entered().await;
+        // The nested state-clock lease must have returned before asserting the
+        // outer worker's exact ownership during its separate durability wait.
+        worker.probe.pause.entered().await;
         assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 1);
         actual.abort();
         assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 1);
+        let current_generation = crate::gse::automatic_generation(&state);
+        assert!(
+            crate::gse::reset_generation::invalidate_capture_epoch(&state, current_generation).is_err()
+        );
+        assert_eq!(crate::gse::automatic_generation(&state), current_generation);
         assert_eq!(std::fs::read(&path).unwrap(), disk);
+        worker.probe.pause.release();
         writer.pause.release();
         tokio::time::timeout(StdDuration::from_secs(3), done_rx)
             .await
@@ -5094,6 +5401,7 @@ async fn capture_thermal_zero(
     headers: HeaderMap,
     Json(req): Json<ThermalZeroReq>,
 ) -> axum::response::Response {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
         Ok(p) => p,
         Err(response) => return response,
@@ -5101,6 +5409,13 @@ async fn capture_thermal_zero(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     if !matches!(req.sensor_id.as_str(), "KG1000" | "KG50") {
         return (StatusCode::BAD_REQUEST, "Select KG1000 or KG50").into_response();
     }
@@ -5205,6 +5520,7 @@ async fn long_zero_apply(
     headers: HeaderMap,
     Json(req): Json<LongZeroApply>,
 ) -> axum::response::Response {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let p = match authorize_headers(&state, &headers, Permission::ViewData).await {
         Ok(p) => p,
         Err(e) => return e,
@@ -5212,6 +5528,13 @@ async fn long_zero_apply(
     if !principal_can_edit_calibration(&p) {
         return calibration_edit_forbidden_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     let updated = {
         let mut slot = state.loadcell_calibration.lock().unwrap();
         let mut cfg = slot.clone();
@@ -5234,4 +5557,498 @@ async fn long_zero_apply(
     }
     state.broadcast_fill_targets_snapshot();
     Json(updated).into_response()
+}
+
+#[cfg(test)]
+mod recovery_direct_ingress_tests {
+    use super::*;
+    use futures::FutureExt;
+    use std::sync::atomic::Ordering;
+    pub(super) async fn fixture() -> (
+        crate::recording_export::tests::TestDirectory,
+        Arc<AppState>,
+        HeaderMap,
+        Arc<sedsnet::router::Router>,
+        Arc<std::sync::Mutex<Vec<sedsnet::packet::Packet>>>,
+    ) {
+        let (root, state, _commands, headers) = command_dispatch_tests::preauth_fixture().await;
+        let auth_path = root.0.join("auth.json");
+        let mut auth: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&auth_path).unwrap()).unwrap();
+        auth["users"][0]["calibration_access"] = serde_json::json!({"view":true,"edit":true});
+        std::fs::write(auth_path, auth.to_string()).unwrap();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        let router = Arc::new(sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([
+                sedsnet::router::EndpointHandler::new_packet_handler(
+                    crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"),
+                    move |packet| {
+                        sink.lock().unwrap().push(packet.clone());
+                        Ok(())
+                    },
+                ),
+            ])
+            .with_sender("GS"),
+        ));
+        state.topology_router.set(router.clone()).unwrap();
+        (root, state, headers, router, observed)
+    }
+    fn cross_epoch(state: &AppState) {
+        state
+            .operator_admission_barrier
+            .store(77, Ordering::Release);
+        state.automatic_generation.fetch_add(1, Ordering::AcqRel);
+        state.operator_admission_barrier.store(0, Ordering::Release);
+    }
+    async fn calibration_request(
+        state: Arc<AppState>,
+        headers: HeaderMap,
+        kind: usize,
+    ) -> axum::response::Response {
+        match kind {
+            0 => {
+                let mut calibration = loadcell::LoadcellCalibrationFile::default();
+                calibration.ch1.m = Some(2.0);
+                set_loadcell_calibration(
+                    State(state),
+                    headers,
+                    Json(loadcell::CalibrationUpdate {
+                        channel: "ch1".into(),
+                        calibration,
+                    }),
+                )
+                .await
+                .into_response()
+            }
+            1 => set_kg50_input(
+                State(state),
+                headers,
+                Json(Kg50InputRequest {
+                    input: loadcell::Kg50Input::P6Differential,
+                }),
+            )
+            .await
+            .into_response(),
+            2 => capture_loadcell_zero(
+                State(state),
+                headers,
+                Json(CaptureLoadcellPointReq {
+                    sensor_id: "KG1000".into(),
+                    raw: 0.123,
+                }),
+            )
+            .await
+            .into_response(),
+            3 => capture_loadcell_span(
+                State(state),
+                headers,
+                Json(CaptureLoadcellSpanReq {
+                    sensor_id: "KG1000".into(),
+                    raw: 1.234,
+                    known_kg: 1.0,
+                }),
+            )
+            .await
+            .into_response(),
+            4 => capture_thermal_zero(
+                State(state),
+                headers,
+                Json(ThermalZeroReq {
+                    sensor_id: "KG1000".into(),
+                }),
+            )
+            .await
+            .into_response(),
+            _ => {
+                let id = state.loadcell_processing.status().session_id;
+                long_zero_apply(
+                    State(state),
+                    headers,
+                    Json(LongZeroApply {
+                        session_id: id,
+                        apply_thermal: false,
+                        tau_ms: 100.0,
+                    }),
+                )
+                .await
+                .into_response()
+            }
+        }
+    }
+    #[tokio::test]
+    async fn real_calibration_ingress_keeps_preauth_origin_before_file_ram_and_sdk_effects() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "real_calibration_ingress_keeps_preauth_origin_before_file_ram_and_sdk_effects",
+        ) {
+            return;
+        }
+        let mut observations = Vec::new();
+        for kind in 0..6 {
+            let (_root, state, headers, router, _) = fixture().await;
+            if kind >= 4 {
+                let mut cfg = state.loadcell_calibration.lock().unwrap();
+                cfg.ch1.m = Some(1.0);
+                cfg.ch1.b = Some(0.0);
+            }
+            if kind == 4 {
+                let now = crate::telemetry_task::get_current_timestamp_ms() as i64;
+                let start = (now / 10000 - 12) * 10000;
+                for at in (start..=now).step_by(1000) {
+                    for (data_type, value) in [("DAQ_ADC_TEMPERATURE", 20.0), ("KG1000", 0.123)] {
+                        state.cache_recent_telemetry(TelemetryRow {
+                            timestamp_ms: at,
+                            data_type: data_type.into(),
+                            sender_id: "DAQ".into(),
+                            values: vec![Some(value)],
+                        });
+                    }
+                }
+                assert!(
+                    crate::thermal_settling::from_rows(
+                        &state.recent_telemetry_snapshot(),
+                        &state.loadcell_calibration.lock().unwrap(),
+                        "KG1000",
+                        now
+                    )
+                    .ready
+                );
+            }
+            if kind == 5 {
+                let cfg = state.loadcell_calibration.lock().unwrap().clone();
+                let capture = state
+                    .loadcell_processing
+                    .start_calibrated("KG1000", 60, true, cfg)
+                    .unwrap();
+                for i in 0..1200 {
+                    state.loadcell_processing.observe(
+                        "DAQ",
+                        "KG1000",
+                        1000 + i * 100,
+                        0.123,
+                        Some(20.0),
+                    );
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(4), async {
+                    while state.loadcell_processing.status().report.samples < 1200 {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                state.loadcell_processing.stop(&capture.session_id).unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while state.loadcell_processing.status().running {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(state.loadcell_processing.status().report.noise_ready);
+            }
+            let cfg_before =
+                serde_json::to_value(&*state.loadcell_calibration.lock().unwrap()).unwrap();
+            let path = loadcell::calibration_file_for_test();
+            let file_before = std::fs::read(&path).ok();
+            let held = state.auth_db.acquire().await.unwrap();
+            assert_eq!((state.auth_db.size(), state.auth_db.num_idle()), (1, 0));
+            let request = calibration_request(state.clone(), headers.clone(), kind);
+            tokio::pin!(request);
+            assert!(
+                request.as_mut().now_or_never().is_none(),
+                "actual first auth query must wait on held SQLite connection"
+            );
+            cross_epoch(&state);
+            drop(held);
+            let stale = request.await.status();
+            let cfg_after_stale =
+                serde_json::to_value(&*state.loadcell_calibration.lock().unwrap()).unwrap();
+            let file_after_stale = std::fs::read(&path).ok();
+            let cache_after_stale = router
+                .get_cached_network_variable(crate::telemetry_schema::data_type(
+                    "DAQ_LOADCELL_CALIBRATION",
+                ))
+                .unwrap()
+                .is_some();
+            let fresh = calibration_request(state.clone(), headers.clone(), kind)
+                .await
+                .status();
+            let cache_after_fresh = router
+                .get_cached_network_variable(crate::telemetry_schema::data_type(
+                    "DAQ_LOADCELL_CALIBRATION",
+                ))
+                .unwrap()
+                .is_some();
+            if let Some(bytes) = &file_before {
+                std::fs::write(&path, bytes).unwrap();
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+            observations.push((
+                kind,
+                fresh,
+                stale,
+                cache_after_stale,
+                cfg_after_stale == cfg_before,
+                file_after_stale == file_before,
+                cache_after_fresh,
+            ));
+        }
+        eprintln!("actual calibration HTTP observations: {observations:?}");
+        for (kind, fresh, stale, old_cache, same_ram, same_file, fresh_cache) in observations {
+            assert_eq!(
+                fresh,
+                StatusCode::OK,
+                "current authorized calibration kind={kind}"
+            );
+            assert!(
+                !old_cache,
+                "old auth-delayed calibration must not reach actual SDK kind={kind}"
+            );
+            assert!(
+                same_ram && same_file,
+                "stale request must not change disk/RAM kind={kind}"
+            );
+            assert_eq!(stale, StatusCode::CONFLICT);
+            assert!(fresh_cache);
+        }
+    }
+    #[tokio::test]
+    async fn real_flight_setup_preserves_existing_schema_refusal_and_origin_fence() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "real_flight_setup_preserves_existing_schema_refusal_and_origin_fence",
+        ) {
+            return;
+        }
+        let (_root, state, headers, router, observed) = fixture().await;
+        let mut warnings = state.warnings_tx.subscribe();
+        let held = state.auth_db.acquire().await.unwrap();
+        let request = apply_flight_setup(State(state.clone()), headers.clone());
+        tokio::pin!(request);
+        assert!(request.as_mut().now_or_never().is_none());
+        cross_epoch(&state);
+        drop(held);
+        let stale = request.await.into_response().status();
+        router.process_all_queues().unwrap();
+        let after_stale = observed.lock().unwrap().len();
+        let fresh = apply_flight_setup(State(state.clone()), headers)
+            .await
+            .into_response()
+            .status();
+        router.process_all_queues().unwrap();
+        let mut diagnostics = Vec::new();
+        while let Ok(message) = warnings.try_recv() {
+            diagnostics.push(message.message);
+        }
+        eprintln!("actual flight-setup SDK refusal: {diagnostics:?}");
+        assert_eq!(
+            fresh,
+            StatusCode::BAD_GATEWAY,
+            "existing static one-byte schema refusal must remain honest"
+        );
+        assert_eq!(
+            after_stale, 0,
+            "old handler actually reached the flight SDK owner"
+        );
+        assert_eq!(stale, StatusCode::CONFLICT);
+        assert!(observed.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn real_sd_retry_ingress_cannot_consume_admission_before_fresh_request() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "real_sd_retry_ingress_cannot_consume_admission_before_fresh_request",
+        ) {
+            return;
+        }
+        let (_root, state, headers, router, _) = fixture().await;
+        let now = crate::telemetry_task::get_current_timestamp_ms();
+        state.network_health.lock().unwrap().observe_sd_status(
+            "DAQ",
+            &[1, u32::MAX, u32::MAX, 1, 0, 0, 0, 0],
+            std::time::Instant::now(),
+            now,
+        );
+        let held = state.auth_db.acquire().await.unwrap();
+        let request = crate::daq_sd::retry(State(state.clone()), headers.clone());
+        tokio::pin!(request);
+        assert!(request.as_mut().now_or_never().is_none());
+        cross_epoch(&state);
+        drop(held);
+        let stale = request.await.status();
+        let queued_after_stale = router.export_runtime_stats().queues.tx_len;
+        let fresh = crate::daq_sd::retry(State(state.clone()), headers)
+            .await
+            .status();
+        assert_eq!(
+            queued_after_stale, 0,
+            "old auth-delayed retry actually enqueued SDK work"
+        );
+        assert_eq!(
+            fresh,
+            StatusCode::ACCEPTED,
+            "fresh request must succeed without clearing the existing retry gate"
+        );
+        assert_eq!(stale, StatusCode::CONFLICT);
+    }
+    #[tokio::test]
+    async fn direct_ingress_keeps_current_auth_permissions_ahead_of_closed_admission() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "direct_ingress_keeps_current_auth_permissions_ahead_of_closed_admission",
+        ) {
+            return;
+        }
+        let (root, state, headers, router, _) = fixture().await;
+        state
+            .operator_admission_barrier
+            .store(77, Ordering::Release);
+        let unauth = apply_flight_setup(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response()
+            .status();
+        assert!(matches!(
+            unauth,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ));
+        let path = root.0.join("auth.json");
+        let mut auth: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        auth["users"][0]["permissions"]["send_commands"] = serde_json::json!(false);
+        auth["users"][0]["calibration_access"]["edit"] = serde_json::json!(false);
+        std::fs::write(path, auth.to_string()).unwrap();
+        assert_eq!(
+            apply_flight_setup(State(state.clone()), headers.clone())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            crate::daq_sd::retry(State(state.clone()), headers.clone())
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            calibration_request(state.clone(), headers, 0)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(router.export_runtime_stats().queues.tx_len, 0);
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod recovery_control_settings_tests {
+    use super::*;
+    use futures::FutureExt;
+    use std::sync::atomic::Ordering;
+    #[derive(Clone)]
+    enum Desired {
+        Automatic(crate::auto_zero::Settings),
+        Fill(FillTargetsConfig),
+        Flight(FlightSetupConfig),
+    }
+    async fn request(
+        state: Arc<AppState>,
+        headers: HeaderMap,
+        desired: Desired,
+    ) -> axum::response::Response {
+        match desired {
+            Desired::Automatic(value) => set_auto_zero(State(state), headers, Json(value))
+                .await
+                .into_response(),
+            Desired::Fill(value) => set_fill_targets(State(state), headers, Json(value))
+                .await
+                .into_response(),
+            Desired::Flight(value) => set_flight_setup(State(state), headers, Json(value))
+                .await
+                .into_response(),
+        }
+    }
+    fn snapshot(state: &AppState, kind: usize) -> serde_json::Value {
+        match kind {
+            0 => serde_json::to_value(state.auto_zero.lock().unwrap().settings()).unwrap(),
+            1 => serde_json::to_value(&*state.fill_targets.lock().unwrap()).unwrap(),
+            _ => serde_json::to_value(flight_setup::load_or_default()).unwrap(),
+        }
+    }
+    #[tokio::test]
+    async fn real_control_settings_keep_preauth_origin_across_new_run() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "real_control_settings_keep_preauth_origin_across_new_run",
+        ) {
+            return;
+        }
+        let mut observations = Vec::new();
+        for kind in 0..3 {
+            let (_root, state, headers, _network, _) =
+                recovery_direct_ingress_tests::fixture().await;
+            let desired = match kind {
+                0 => Desired::Automatic(crate::auto_zero::Settings {
+                    enabled: !state.auto_zero.lock().unwrap().settings().enabled,
+                }),
+                1 => {
+                    let mut value = state.fill_targets.lock().unwrap().clone();
+                    value.nitrous.target_mass_kg += 1.0;
+                    Desired::Fill(value)
+                }
+                _ => {
+                    let mut value = flight_setup::load_or_default();
+                    value.selected_profile_id = value
+                        .profiles
+                        .iter()
+                        .find(|p| p.id != value.selected_profile_id)
+                        .unwrap()
+                        .id
+                        .clone();
+                    Desired::Flight(value)
+                }
+            };
+            let path = match kind {
+                0 => std::path::PathBuf::from(std::env::var_os("GS_AUTO_ZERO_CONFIG").unwrap()),
+                1 => fill_targets::config_path(),
+                _ => flight_setup::config_path(),
+            };
+            let before = snapshot(&state, kind);
+            let file_before = std::fs::read(&path).ok();
+            let held = state.auth_db.acquire().await.unwrap();
+            let future = request(state.clone(), headers.clone(), desired.clone());
+            tokio::pin!(future);
+            assert!(future.as_mut().now_or_never().is_none());
+            state
+                .operator_admission_barrier
+                .store(77, Ordering::Release);
+            state.automatic_generation.fetch_add(1, Ordering::AcqRel);
+            state.operator_admission_barrier.store(0, Ordering::Release);
+            drop(held);
+            let stale = future.await.status();
+            let same_ram = snapshot(&state, kind) == before;
+            let same_file = std::fs::read(&path).ok() == file_before;
+            let fresh = request(state.clone(), headers, desired).await.status();
+            let changed = snapshot(&state, kind) != before;
+            if let Some(bytes) = file_before {
+                std::fs::write(&path, bytes).unwrap();
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+            observations.push((kind, stale, fresh, same_ram, same_file, changed));
+        }
+        eprintln!("actual control-settings observations: {observations:?}");
+        for (kind, stale, fresh, same_ram, same_file, changed) in observations {
+            assert!(
+                same_ram && same_file,
+                "old settings request changed new run kind={kind}"
+            );
+            assert_eq!(stale, StatusCode::CONFLICT);
+            assert_eq!(fresh, StatusCode::OK);
+            assert!(changed);
+        }
+    }
 }

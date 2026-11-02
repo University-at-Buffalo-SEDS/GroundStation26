@@ -9,7 +9,9 @@ mod rrls_http_tests;
 // Staged, tested implementation only: no verified Reset API is exposed yet.
 #[cfg(test)]
 pub(crate) mod reset_generation;
+#[cfg(any(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
 pub(crate) use automatic_abort::claim_automatic_abort;
+pub(crate) use automatic_abort::claim_automatic_abort_for_generation;
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 pub(crate) use automatic_abort::{
     AutomaticAbortClaim, LivenessAbortDecision, claim_liveness_abort,
@@ -1213,8 +1215,11 @@ fn remember_automatic_cutoff_target(runtime: &mut Runtime, mass: f32, target: f3
 }
 /// Admit a late asynchronous fill completion through the same launch gate.
 pub(crate) fn start_fill_after_automatic_zero(state: &Arc<AppState>, generation: u64) {
-    {
+    let _claim = {
         let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let Some(claim) = claim_operator_dispatch_under_gate(state, generation) else {
+            return;
+        };
         if matches!(generation, 0 | u64::MAX)
             || generation != automatic_generation(state)
             || manual_stop_pending(state)
@@ -1225,7 +1230,8 @@ pub(crate) fn start_fill_after_automatic_zero(state: &Arc<AppState>, generation:
         state.gse.lock().unwrap().observe_mass(Some(0.0));
         *state.latest_fill_mass_kg.lock().unwrap() = Some(0.0);
         handle_command_inner(state, &TelemetryCommand::StartFill, None);
-    }
+        claim
+    };
     flush_effects(state);
 }
 
@@ -1236,6 +1242,9 @@ pub(crate) fn queue_automatic_supply_close(
     generation: u64,
 ) -> sedsnet::TelemetryResult<bool> {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let Some(_claim) = claim_operator_dispatch_under_gate(state, generation) else {
+        return Ok(false);
+    };
     if generation != automatic_generation(state) || !automatic_abort_allowed(state) {
         return Ok(false);
     }
@@ -1250,9 +1259,22 @@ pub(crate) fn queue_automatic_supply_close(
 /// Recoverable/unclassified faults cancel an active fill instead of latching
 /// the entire vehicle aborted. Serialize with launch so no delayed cancel can
 /// close a supply after Fire admission.
+#[cfg(any(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
 pub(crate) fn cancel_fill_for_recoverable_fault(state: &Arc<AppState>, reason: &str) {
-    {
+    let generation = capture_operator_origin(state).unwrap_or(0);
+    cancel_fill_for_recoverable_fault_for_generation(state, reason, generation);
+}
+
+pub(crate) fn cancel_fill_for_recoverable_fault_for_generation(
+    state: &Arc<AppState>,
+    reason: &str,
+    generation: u64,
+) {
+    let _claim = {
         let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let Some(claim) = claim_operator_dispatch_under_gate(state, generation) else {
+            return;
+        };
         if !automatic_abort_allowed(state) {
             return;
         }
@@ -1264,15 +1286,21 @@ pub(crate) fn cancel_fill_for_recoverable_fault(state: &Arc<AppState>, reason: &
             handle_command_inner(state, &TelemetryCommand::CancelFill, None);
             state.add_temporary_notification(format!("Fill cancelled: {reason}"));
         }
-    }
+        claim
+    };
     flush_effects(state);
 }
 
 pub fn tick(state: &Arc<AppState>, interlock: bool) {
-    {
+    let _claim = {
         let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let Some(claim) = claim_operator_dispatch_under_gate(state, automatic_generation(state))
+        else {
+            return;
+        };
         tick_inner(state, interlock);
-    }
+        claim
+    };
     flush_effects(state);
 }
 fn tick_inner(state: &Arc<AppState>, interlock: bool) {
@@ -1441,6 +1469,7 @@ async fn self_test_confirmation(
     headers: HeaderMap,
     Json(request): Json<SelfTestConfirmation>,
 ) -> Response {
+    let admission_generation = capture_operator_origin(&state).unwrap_or(0);
     let principal =
         match crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await {
             Ok(p) => p,
@@ -1452,6 +1481,13 @@ async fn self_test_confirmation(
     if !principal.allows_command_name("ValveSelfTest") {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let Some(_claim) = claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     {
         let mut rt = state.gse.lock().unwrap();
         if rt.engine.active() || (request.confirmed && rt.engine.status.self_test_locked) {
@@ -1558,10 +1594,18 @@ async fn save_config(
     headers: HeaderMap,
     Json(config): Json<Config>,
 ) -> Response {
+    let admission_generation = capture_operator_origin(&state).unwrap_or(0);
     if let Err(e) = crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await
     {
         return e;
     }
+    let Some(_claim) = claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     if let Err(err) = config.validate_settings() {
         return (StatusCode::BAD_REQUEST, err).into_response();
     }
@@ -2383,10 +2427,16 @@ mod tests {
 pub fn report_safety(state: &Arc<AppState>) {
     #[cfg(not(feature = "hitl_mode"))]
     {
-        {
+        let _claim = {
             let _dispatch = DISPATCH_GATE.lock().unwrap();
+            let Some(claim) =
+                claim_operator_dispatch_under_gate(state, automatic_generation(state))
+            else {
+                return;
+            };
             check_report_safety(state);
-        }
+            claim
+        };
         flush_effects(state);
     }
     #[cfg(feature = "hitl_mode")]
@@ -2549,6 +2599,7 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
 }
 
 async fn clear_abort(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let admission_generation = capture_operator_origin(&state).unwrap_or(0);
     let principal =
         match crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await {
             Ok(p) => p,
@@ -2557,6 +2608,13 @@ async fn clear_abort(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
     if !principal.allows_command_name("ValveSelfTest") {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let Some(_claim) = claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     match clear_ground_abort(&state) {
         Ok(()) => Json(serde_json::json!({"cleared": true})).into_response(),
         Err(error) => error.into_response(),
@@ -2564,6 +2622,7 @@ async fn clear_abort(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
 }
 
 async fn reset_qualification(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let admission_generation = capture_operator_origin(&state).unwrap_or(0);
     let principal =
         match crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await {
             Ok(p) => p,
@@ -2575,6 +2634,13 @@ async fn reset_qualification(State(state): State<Arc<AppState>>, headers: Header
     if !principal.allows_command_name("ValveSelfTest") {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let Some(_claim) = claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     #[cfg(feature = "hitl_mode")]
     {
         return (
@@ -2695,6 +2761,7 @@ async fn override_cold_flow(
     headers: HeaderMap,
     Json(request): Json<ColdFlowOverrideRequest>,
 ) -> Response {
+    let admission_generation = capture_operator_origin(&state).unwrap_or(0);
     let principal =
         match crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await {
             Ok(principal) => principal,
@@ -2706,6 +2773,13 @@ async fn override_cold_flow(
     if principal.anonymous || !principal.allows_command_name("NitrogenTest") {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let Some(_claim) = claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     #[cfg(feature = "hitl_mode")]
     {
         let _ = request.reason;
@@ -3043,6 +3117,8 @@ pub(crate) fn inhibit_automatic_actions_for_launch(
 pub(crate) fn commit_fire_intent(state: &Arc<AppState>) -> Result<LaunchAdmission, String> {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
     let ticket = LaunchAdmission::capture(state);
+    let clock_claim = claim_operator_dispatch_under_gate(state, ticket.generation)
+        .ok_or_else(|| "Recovery admission is closed; Fire was not admitted".to_string())?;
     if !ticket.trackable() {
         return Err("Stop epoch exhausted; launch was not admitted".into());
     }
@@ -3079,7 +3155,7 @@ pub(crate) fn commit_fire_intent(state: &Arc<AppState>) -> Result<LaunchAdmissio
     // From this point even a checklist-storage failure must not re-arm the operation.
     let checklist_result = rt.operational.flush_checklists();
     drop(rt);
-    state.set_local_flight_state(FlightState::Launch);
+    state.set_local_flight_state_with_clock_claim(FlightState::Launch, &clock_claim);
     checklist_result.map(|()| ticket).map_err(|error| {
         format!("Fire intent saved, but checklist update failed; manual recovery required: {error}")
     })
@@ -3239,6 +3315,9 @@ pub(crate) fn sync_calibration_after_automatic_zero(
     calibration: &crate::loadcell::LoadcellCalibrationFile,
 ) -> Result<(), String> {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let Some(_claim) = claim_operator_dispatch_under_gate(state, generation) else {
+        return Err("Automatic zero cancelled by closed admission".into());
+    };
     if matches!(generation, 0 | u64::MAX)
         || generation != automatic_generation(state)
         || manual_stop_pending(state)
@@ -3259,6 +3338,9 @@ pub(crate) fn queue_automatic_abort_for_generation(
     reason: &str,
 ) -> sedsnet::TelemetryResult<bool> {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let Some(_claim) = claim_operator_dispatch_under_gate(state, generation) else {
+        return Ok(false);
+    };
     if generation != automatic_generation(state) || !automatic_abort_allowed(state) {
         return Ok(false);
     }
@@ -4014,3 +4096,353 @@ mod pre_target_tests;
 #[cfg(test)]
 #[path = "gse/packed_owner_diagnostic.rs"]
 mod packed_owner_diagnostic;
+
+/// Receiver-owned administrative drain only: no SDK, IO, await or callback
+/// outside this bounded queue operation. This does not reopen admission.
+pub(crate) fn with_closed_operator_queue<T>(
+    state: &AppState,
+    token: crate::operator_queue::Token,
+    drain: impl FnOnce() -> T,
+) -> Option<T> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if token.owner == 0
+        || state
+            .operator_admission_barrier
+            .load(std::sync::atomic::Ordering::Acquire)
+            != token.owner
+        || automatic_generation(state) != token.generation
+        || state
+            .operator_dispatch_inflight
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    {
+        return None;
+    }
+    state
+        .manual_abort_intent
+        .admit_if_unchanged(token.manual_epoch, || {
+            state
+                .deferred_abort
+                .admit_if_no_manual_since(token.observed_manual_epoch, drain)
+        })
+        .flatten()
+}
+
+#[cfg(test)]
+mod recovery_quiescence_tests {
+    use super::*;
+    #[cfg(feature = "hitl_mode")]
+    #[tokio::test]
+    async fn direct_hitl_tick_cannot_change_active_engine_while_admission_closed() {
+        let state = crate::state::tests::test_app_state().await;
+        state.gse.lock().unwrap().engine.status.phase = Phase::Filling;
+        state
+            .operator_admission_barrier
+            .store(77, std::sync::atomic::Ordering::Release);
+        tick(&state, false); // actual engine would fault on lost interlock
+        let closed = state.gse.lock().unwrap().engine.status.phase;
+        state
+            .operator_admission_barrier
+            .store(0, std::sync::atomic::Ordering::Release);
+        tick(&state, false);
+        assert_ne!(
+            state.gse.lock().unwrap().engine.status.phase,
+            Phase::Filling
+        );
+        assert_eq!(closed, Phase::Filling);
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    #[tokio::test]
+    async fn actual_report_safety_does_not_publish_old_effects_while_admission_closed() {
+        let state = crate::state::tests::test_app_state().await;
+        {
+            let mut runtime = state.gse.lock().unwrap();
+            runtime.engine.status.phase = Phase::Filling;
+            runtime.observe_valve(ActuatorBoardCommands::NitrogenOpen as u8, true);
+        }
+        state
+            .operator_admission_barrier
+            .store(77, std::sync::atomic::Ordering::Release);
+        report_safety(&state);
+        let closed = state.gse.lock().unwrap().engine.status.phase;
+        state
+            .operator_admission_barrier
+            .store(0, std::sync::atomic::Ordering::Release);
+        report_safety(&state);
+        assert_ne!(
+            state.gse.lock().unwrap().engine.status.phase,
+            Phase::Filling
+        );
+        assert_eq!(closed, Phase::Filling);
+    }
+    #[tokio::test]
+    async fn automatic_abort_shared_owner_is_fenced_and_lease_covers_latch_lifetime() {
+        let state = crate::state::tests::test_app_state().await;
+        state
+            .operator_admission_barrier
+            .store(77, std::sync::atomic::Ordering::Release);
+        let closed_claim = claim_automatic_abort(&state);
+        let closed_admitted = closed_claim.is_some();
+        drop(closed_claim);
+        // Restore only the fixture's automatic owner latch for the independent
+        // fresh-positive control, not to make a stale command pass.
+        *state.gse.lock().unwrap() = Runtime::default();
+        state
+            .operator_admission_barrier
+            .store(0, std::sync::atomic::Ordering::Release);
+        let fresh = claim_automatic_abort(&state).unwrap();
+        let during = state
+            .operator_dispatch_inflight
+            .load(std::sync::atomic::Ordering::Acquire);
+        drop(fresh);
+        assert!(!closed_admitted);
+        assert_eq!(during, 1);
+        assert_eq!(
+            state
+                .operator_dispatch_inflight
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        state.manual_abort_intent.request();
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    #[tokio::test]
+    async fn actual_worker_old_automatic_abort_cannot_latch_or_persist_new_run() {
+        let mut state = crate::state::tests::test_app_state().await;
+        let (commands, receiver) = tokio::sync::mpsc::channel(4);
+        Arc::get_mut(&mut state).unwrap().cmd_tx = commands.clone();
+        let old = automatic_generation(&state);
+        state
+            .automatic_generation
+            .store(old + 1, std::sync::atomic::Ordering::Release);
+        let dir = std::env::temp_dir().join(format!("old-auto-owner-{}", rand::random::<u128>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qualification.json");
+        state.gse.lock().unwrap().operational.path = Some(path.clone());
+        commands
+            .try_send(TelemetryCommand::AutomaticAbort { generation: old })
+            .unwrap();
+        commands
+            .try_send(TelemetryCommand::QueuedOperator {
+                generation: old + 1,
+                command: Box::new(TelemetryCommand::Postinit),
+                plumbing_origin: None,
+            })
+            .unwrap();
+        let (_db_tx, db_rx) = tokio::sync::mpsc::channel(8);
+        let router = Arc::new(sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([]),
+        ));
+        let worker = tokio::spawn(crate::telemetry_task::telemetry_task(
+            state.clone(),
+            router,
+            vec![],
+            receiver,
+            db_rx,
+            state.shutdown_subscribe(),
+        ));
+        let progress = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !state
+                .last_command_ms
+                .lock()
+                .unwrap()
+                .contains_key("Postinit")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        state.request_shutdown();
+        worker.await.unwrap();
+        let persisted = std::fs::read(&path).ok();
+        let latched = state
+            .gse
+            .lock()
+            .unwrap()
+            .operational
+            .saved
+            .automatic_abort_claimed;
+        let phase = state.gse.lock().unwrap().engine.status.phase;
+        let _ = std::fs::remove_dir_all(&dir);
+        progress.unwrap();
+        assert!(
+            !latched,
+            "stale queued Abort must not mutate a current owner before its epoch check"
+        );
+        assert_ne!(phase, Phase::Fault);
+        assert!(
+            persisted.is_none(),
+            "stale queued Abort must not write the new run journal"
+        );
+    }
+}
+
+#[cfg(all(test, not(feature = "hitl_mode")))]
+mod recovery_http_quiescence_tests {
+    use super::*;
+    use futures::FutureExt;
+    use std::sync::atomic::Ordering;
+    fn cross_epoch(state: &AppState) {
+        state
+            .operator_admission_barrier
+            .store(77, Ordering::Release);
+        state.automatic_generation.fetch_add(1, Ordering::AcqRel);
+        state.operator_admission_barrier.store(0, Ordering::Release);
+    }
+    #[tokio::test]
+    async fn real_auth_delayed_clear_cannot_clear_new_run_owner_or_managed_state() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "real_auth_delayed_clear_cannot_clear_new_run_owner_or_managed_state",
+        ) {
+            return;
+        }
+        let (_root, state, _commands, headers) =
+            crate::web::command_dispatch_tests::preauth_fixture().await;
+        let (state, router, _seen, path) = automatic_abort::tests::fixture_with_state(state).await;
+        drop(claim_automatic_abort(&state).unwrap());
+        let before = std::fs::read(&path).unwrap();
+        let held = state.auth_db.acquire().await.unwrap();
+        let request = clear_abort(State(state.clone()), headers.clone());
+        tokio::pin!(request);
+        assert!(request.as_mut().now_or_never().is_none());
+        cross_epoch(&state);
+        drop(held);
+        let stale = request.await.status();
+        let latched_after_stale = state
+            .gse
+            .lock()
+            .unwrap()
+            .operational
+            .saved
+            .automatic_abort_claimed;
+        let file_after_stale = std::fs::read(&path).unwrap();
+        let fresh = clear_abort(State(state.clone()), headers).await.status();
+        let fresh_latched = state
+            .gse
+            .lock()
+            .unwrap()
+            .operational
+            .saved
+            .automatic_abort_claimed;
+        let cached = router
+            .get_cached_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"))
+            .unwrap();
+        let _ = std::fs::remove_file(path);
+        assert!(
+            latched_after_stale,
+            "old handler actually cleared the new run's owner before status check"
+        );
+        assert_eq!(file_after_stale, before);
+        assert_eq!(stale, StatusCode::CONFLICT);
+        assert_eq!(fresh, StatusCode::OK);
+        assert!(!fresh_latched);
+        assert_eq!(cached.unwrap().payload(), &[FlightState::Idle as u8]);
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+    }
+    #[tokio::test]
+    async fn real_auth_delayed_qualification_reset_cannot_revoke_new_run_confirmation() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "real_auth_delayed_qualification_reset_cannot_revoke_new_run_confirmation",
+        ) {
+            return;
+        }
+        let (root, state, _commands, headers) =
+            crate::web::command_dispatch_tests::preauth_fixture().await;
+        state.set_local_flight_state(FlightState::Idle);
+        let path = root.0.join("qualification.json");
+        {
+            let mut runtime = state.gse.lock().unwrap();
+            runtime.operational.path = Some(path.clone());
+            runtime.engine.config.dry_self_test_confirmed = true;
+        }
+        let held = state.auth_db.acquire().await.unwrap();
+        let request = reset_qualification(State(state.clone()), headers.clone());
+        tokio::pin!(request);
+        assert!(request.as_mut().now_or_never().is_none());
+        cross_epoch(&state);
+        drop(held);
+        let stale = request.await.status();
+        let confirmation_after_stale = state
+            .gse
+            .lock()
+            .unwrap()
+            .engine
+            .config
+            .dry_self_test_confirmed;
+        let file_after_stale = std::fs::read(&path).ok();
+        let fresh = reset_qualification(State(state.clone()), headers)
+            .await
+            .status();
+        assert!(
+            confirmation_after_stale,
+            "old reset actually changed current RAM before status assertion"
+        );
+        assert!(file_after_stale.is_none());
+        assert_eq!(stale, StatusCode::CONFLICT);
+        assert_eq!(fresh, StatusCode::OK);
+        assert!(
+            !state
+                .gse
+                .lock()
+                .unwrap()
+                .engine
+                .config
+                .dry_self_test_confirmed
+        );
+        assert!(path.is_file());
+    }
+    #[tokio::test]
+    async fn real_auth_delayed_confirmation_cannot_grant_new_run_consent() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "real_auth_delayed_confirmation_cannot_grant_new_run_consent",
+        ) {
+            return;
+        }
+        let (_root, state, _commands, headers) =
+            crate::web::command_dispatch_tests::preauth_fixture().await;
+        let held = state.auth_db.acquire().await.unwrap();
+        let request = self_test_confirmation(
+            State(state.clone()),
+            headers.clone(),
+            Json(SelfTestConfirmation { confirmed: true }),
+        );
+        tokio::pin!(request);
+        assert!(request.as_mut().now_or_never().is_none());
+        cross_epoch(&state);
+        drop(held);
+        let stale = request.await.status();
+        let confirmation_after_stale = state
+            .gse
+            .lock()
+            .unwrap()
+            .engine
+            .config
+            .dry_self_test_confirmed;
+        let fresh = self_test_confirmation(
+            State(state.clone()),
+            headers,
+            Json(SelfTestConfirmation { confirmed: true }),
+        )
+        .await
+        .status();
+        assert!(
+            !confirmation_after_stale,
+            "old consent actually reached current runtime"
+        );
+        assert_eq!(stale, StatusCode::CONFLICT);
+        assert_eq!(fresh, StatusCode::OK);
+        assert!(
+            state
+                .gse
+                .lock()
+                .unwrap()
+                .engine
+                .config
+                .dry_self_test_confirmed
+        );
+    }
+}

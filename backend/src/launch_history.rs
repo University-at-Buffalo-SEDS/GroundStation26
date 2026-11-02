@@ -408,6 +408,42 @@ impl Store {
         );
         fence.writer.quiescent_through(fence.ticket)
     }
+    /// Replace a terminated supervisor's ticket without reopening the journal.
+    /// An already queued writer retains the exact same snapshot and prefix;
+    /// its eventual completion is still required before publication.
+    #[cfg(test)]
+    pub(crate) fn transfer_recovery_owner(
+        &mut self,
+        fence: &RecoveryFence,
+        old_owner: u64,
+        new_owner: u64,
+    ) -> Result<RecoveryFence> {
+        ensure!(
+            new_owner != 0 && new_owner != u64::MAX && new_owner != fence.owner,
+            "Replacement recovery owner is unavailable"
+        );
+        ensure!(
+            old_owner == fence.owner && self.closed && self.recovery_owner == fence.owner,
+            "Journal recovery owner changed"
+        );
+        ensure!(
+            self.last_write == fence.ticket
+                && self.data.current == fence.clock
+                && self.recovery_revision_staged == fence.revision_staged,
+            "Journal capture changed"
+        );
+        ensure!(
+            self.writer
+                .as_ref()
+                .is_some_and(|writer| Arc::ptr_eq(writer, &fence.writer)),
+            "Journal writer changed"
+        );
+        self.recovery_owner = new_owner;
+        Ok(RecoveryFence {
+            owner: new_owner,
+            ..fence.clone()
+        })
+    }
     #[cfg(test)]
     pub(crate) fn recovery_publication_ready(
         &self,

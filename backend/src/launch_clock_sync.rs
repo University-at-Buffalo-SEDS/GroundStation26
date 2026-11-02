@@ -24,6 +24,11 @@ pub(crate) fn reset_primary_for_origin(
     let _claim = crate::gse::claim_operator_dispatch(state, origin)
         .context("Remote T clock reset cancelled by recovery")?;
     state.try_reset_expected_launch_clock(expected)?;
+    #[cfg(test)]
+    crate::web::clock_worker_tests::pause_worker(
+        state,
+        crate::web::clock_worker_tests::Phase::AfterMutation,
+    );
     let waiter = state.launch_history.lock().unwrap().waiter();
     if let Some((writer, ticket)) = waiter {
         writer.wait(ticket)?;
