@@ -106,7 +106,7 @@ struct Readback {
 }
 impl Readback {
     fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != 40 || bytes[0] != 1 || bytes[1] > 7 || bytes[3] & !31 != 0 {
+        if bytes.len() != 40 || bytes[0] != 1 || bytes[1] > 7 || bytes[3] & !0x3f != 0 {
             return None;
         }
         let flags = bytes[3];
@@ -408,7 +408,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
             "boot":known.map(|row|format!("{:016x}",row.boot)),"epoch":known.map(|row|row.epoch),"nonce":known.map(|row|format!("{:016x}",row.nonce)),"age_ms":age,
             "receipt_age_ms":observation.map(|row|now.duration_since(row.received).as_millis().min(u64::MAX as u128)as u64),"uptime_ms":readback.map(|row|row.uptime),"abort_latched":readback.filter(|_|matches!(board,Board::ActuatorBoard|Board::ValveBoard|Board::FlightComputer)).map(|row|row.flags&1!=0),"safe_outputs":readback.filter(|row|row.flags&OUTPUTS_VALID!=0).map(|row|row.flags&2!=0),"commanded_outputs":readback.filter(|row|row.flags&OUTPUTS_VALID!=0).map(|row|row.outputs),
             "output_readback":if readback.is_some_and(|row|row.flags&OUTPUTS_VALID!=0){"gpio_servo_command_registers"}else{"unknown"},"physical_position_verified":false,
-            "capabilities":{"query":primary&&verified,"endpoint_verified":verified,"recover":false,"resync":false,"reset_startup":false},"operation":operation,
+            "capabilities":{"query":primary&&verified,"endpoint_verified":verified,"hardened_transport":verified&&fresh&&readback.is_some_and(|row|row.flags&0x20!=0),"recover":false,"resync":false,"reset_startup":false},"operation":operation,
             "message":if !primary{"Recovery authority belongs to the current primary."}else if !verified{"Dedicated query endpoint not verified; no legacy endpoint probe is permitted."}else if !fresh{"Explicit Query is required for fresh actual board state."}else if readback.is_some_and(|row|row.result==7){"Board reports IO; actual readback retained. Recovery repair is not enabled yet."}else{"Actual board readback; verified recovery/reset coordinator not enabled yet."}})
     }).collect::<Vec<_>>();
     let mode = crate::station_mode::snapshot();
@@ -923,6 +923,117 @@ mod tests {
         .unwrap()
     }
     #[tokio::test]
+    async fn hardened_transport_bit_is_readonly_and_unknown_flags_remain_rejected() {
+        let fixture = http_fixture().await;
+        let state = fixture.state.clone();
+        let host = Arc::new(sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([]).with_sender("GS"),
+        ));
+        let side = host.add_side_packed("wire", |_| Ok(()));
+        let dedicated = crate::telemetry_schema::endpoint("BOARD_RECOVERY_AB");
+        host.rx_from_side(
+            &sedsnet::discovery::build_discovery_announce("AB", 1, &[dedicated]).unwrap(),
+            side,
+        )
+        .unwrap();
+        state.topology_router.set(host).unwrap();
+        let at = index(Board::ActuatorBoard).unwrap();
+        state.board_recovery.inner.lock().unwrap().queries[at] = Some(Query {
+            nonce: 7,
+            sent: Stamp::now(),
+            received: false,
+        });
+        let mut wire = status_wire(&state, 7);
+        wire[3] |= 0x20;
+        assert!(Readback::decode(&wire).is_some());
+        let mut unknown = wire;
+        unknown[3] |= 0x40;
+        assert!(Readback::decode(&unknown).is_none());
+        observe(&state, &status_packet("AB", wire)).unwrap();
+        let response = http(
+            state.clone(),
+            "GET",
+            "/api/board-recovery/status",
+            Some("viewer"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let board = body["boards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "AB")
+            .unwrap();
+        assert_eq!(board["capabilities"]["hardened_transport"], true);
+        for capability in ["recover", "resync", "reset_startup"] {
+            assert_eq!(board["capabilities"][capability], false);
+        }
+        state.board_recovery.inner.lock().unwrap().values[at]
+            .as_mut()
+            .unwrap()
+            .observed_after = Stamp::now() - Duration::from_secs(3);
+        let response = http(
+            state.clone(),
+            "GET",
+            "/api/board-recovery/status",
+            Some("viewer"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let stale: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let board = stale["boards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "AB")
+            .unwrap();
+        assert_eq!(board["capabilities"]["hardened_transport"], false);
+        // Old transports stay readable and never gain the new implementation
+        // capability merely because a fresh dedicated endpoint exists.
+        state.board_recovery.inner.lock().unwrap().queries[at] = Some(Query {
+            nonce: 8,
+            sent: Stamp::now(),
+            received: false,
+        });
+        observe(&state, &status_packet("AB", status_wire(&state, 8))).unwrap();
+        let response = http(
+            state.clone(),
+            "GET",
+            "/api/board-recovery/status",
+            Some("viewer"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let legacy: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let board = legacy["boards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "AB")
+            .unwrap();
+        assert!(board["age_ms"].as_u64().unwrap() <= 2000);
+        assert_eq!(board["capabilities"]["hardened_transport"], false);
+    }
+    #[tokio::test]
     async fn strict_status_shape_flags_and_identity_never_invent_zero_context() {
         let state = crate::state::tests::test_app_state().await;
         let wire = status_wire(&state, 1);
@@ -934,7 +1045,7 @@ mod tests {
         for length in 0..40 {
             assert!(Readback::decode(&wire[..length]).is_none());
         }
-        for (at, bad) in [(0, 2), (1, 8), (2, 254), (3, 32), (3, 2)] {
+        for (at, bad) in [(0, 2), (1, 8), (2, 254), (3, 64), (3, 2)] {
             let mut badwire = wire;
             badwire[at] = bad;
             assert!(Readback::decode(&badwire).is_none());
