@@ -337,8 +337,103 @@ def _frontend_public_attempt(checkout: Path, reuse: bool, lifecycle: dict, desti
                 shutil.rmtree(backup)
 
 
+class FrontendBuildInterrupted(RuntimeError):
+    """An ownership marker is evidence of uncertainty, never a PID kill ticket."""
+    def __init__(self, message: str, kind: str):
+        super().__init__(message)
+        self.kind = kind
+
+
+def _frontend_recovery_target(shared: Path) -> Path:
+    target = shared.with_name(shared.name + "-recovery")
+    if target.is_symlink() or (target.exists() and not target.is_dir()):
+        raise RuntimeError("Fixed frontend recovery target must be an independent local directory")
+    owner = target.parent / ("." + target.name + ".gs-frontend-recovery-owner.json")
+    expected = {"version": 1, "normal_target": str(shared), "recovery_target": str(target)}
+    with _frontend_cache_lock(target.parent / ("." + target.name + ".gs-frontend-selection.lock")):
+        interrupted = target.parent / ("." + target.name + ".gs-frontend-in-progress.json")
+        if interrupted.exists() or interrupted.is_symlink():
+            raise RuntimeError("The fixed frontend recovery source/target is also interrupted or active. "
+                               "All writers and markers were preserved; no further caches were allocated. "
+                               "Wait for the active build or use an explicit separate source and target.")
+        if owner.is_symlink():
+            raise RuntimeError("Frontend recovery target ownership is uncertain")
+        if owner.exists():
+            if owner.stat().st_size > 4096 or json.loads(owner.read_text(encoding="utf-8")) != expected:
+                raise RuntimeError("Frontend recovery target ownership differs")
+        else:
+            if target.exists():
+                raise RuntimeError("Fixed frontend recovery target already exists without owned provenance; preserve it and use a separate cache")
+            with owner.open("x", encoding="utf-8") as output:
+                json.dump(expected, output)
+                output.flush()
+                os.fsync(output.fileno())
+    return target
+
+
+def _frontend_recovery_checkout(checkout: Path) -> Path:
+    """Fresh committed source only; never copy uncertain generated output."""
+    checkout = checkout.resolve()
+    if _frontend_shared_target(checkout) is None:
+        raise RuntimeError("Automatic frontend isolation requires a managed immutable snapshot")
+    revision = checkout.name
+    actual = run_capture(["git", "-C", str(checkout), "rev-parse", "HEAD"], cwd=checkout).strip()
+    top = run_capture(["git", "-C", str(checkout), "rev-parse", "--show-toplevel"], cwd=checkout).strip()
+    if actual != revision or Path(top).resolve() != checkout:
+        raise RuntimeError("Interrupted frontend is not its claimed immutable Git revision")
+    root = checkout.parent / ".gs-frontend-recovery-sources"
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        raise RuntimeError("Frontend recovery source cache is not a local directory")
+    with _frontend_cache_lock(checkout.parent / ".gs-frontend-recovery-sources.lock"):
+        root.mkdir(exist_ok=True)
+        source = root / revision
+        expected = {"version": 1, "original": str(checkout), "revision": revision}
+        if source.exists() or source.is_symlink():
+            metadata = source / ".git/gs-frontend-recovery.json"
+            if source.is_symlink() or metadata.is_symlink() or not metadata.is_file() or metadata.stat().st_size > 4096:
+                raise RuntimeError("Frontend recovery snapshot is not a verified owned snapshot")
+            if json.loads(metadata.read_text(encoding="utf-8")) != expected:
+                raise RuntimeError("Frontend recovery snapshot ownership differs")
+        else:
+            # Count only this bounded recovery cache, not normal revision history.
+            # Interrupted staging directories remain evidence and consume a slot.
+            if sum(1 for path in root.iterdir() if path.is_dir() or path.is_symlink()) >= 8:
+                raise RuntimeError("Frontend recovery source cache reached its 8-slot limit; preserve uncertain writers and use a separate cache")
+            sizes = run_capture(["git", "-C", str(checkout), "ls-tree", "-r", "-l", revision], cwd=checkout)
+            total = sum(int(parts[3]) for line in sizes.splitlines() if len(parts := line.split(None, 4)) >= 4 and parts[3].isdigit())
+            if total > 256 * 1024 * 1024:
+                raise RuntimeError("Frontend recovery source exceeds the 256 MiB committed-source limit")
+            staging = Path(tempfile.mkdtemp(prefix=".snapshot-", dir=root))
+            clone = staging / "source"
+            # file:// plus depth1 avoids copying history, targets, ignored locks,
+            # output/quarantines, hardlinks, or Git object alternates.
+            # Failure leaves bounded staging evidence; do not delete under an
+            # uncertain clone subprocess after interruption.
+            run(["git", "clone", "--no-hardlinks", "--no-checkout", "--depth", "1",
+                 "--no-tags", "--single-branch", checkout.as_uri(), str(clone)], cwd=root)
+            run(["git", "-C", str(clone), "checkout", "--detach", revision], cwd=root)
+            with (clone / ".git/gs-frontend-recovery.json").open("x", encoding="utf-8") as output:
+                json.dump(expected, output)
+                output.flush()
+                os.fsync(output.fileno())
+            clone.rename(source)
+            staging.rmdir()
+        if (source / ".git").is_symlink() or (source / ".git/objects/info/alternates").exists():
+            raise RuntimeError("Frontend recovery Git metadata is not independent")
+        actual = run_capture(["git", "-C", str(source), "rev-parse", "HEAD"], cwd=source).strip()
+        top = run_capture(["git", "-C", str(source), "rev-parse", "--show-toplevel"], cwd=source).strip()
+        if Path(top).resolve() != source.resolve():
+            raise RuntimeError("Frontend recovery Git root differs")
+        dirty = run_capture(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=no"], cwd=source)
+        if actual != revision or dirty:
+            raise RuntimeError("Frontend recovery snapshot changed; no automatic overwrite is safe")
+        _browser_asset_digest(source)
+        return source
+
+
 def _run_frontend_script_with_wasm_opt_fallback(
-        script: Path, checkout_dir: Path, args: list[str], finish=None, publication_destination=None) -> None:
+        script: Path, checkout_dir: Path, args: list[str], finish=None, publication_destination=None,
+        target_override: Optional[Path] = None) -> None:
     checkout = checkout_dir.resolve()
     # Generated checkout output is shared even when callers choose different
     # targets and publish to different destinations. Global order is always
@@ -346,22 +441,23 @@ def _run_frontend_script_with_wasm_opt_fallback(
     lease = checkout.parent / ("." + checkout.name + ".gs-frontend-output.lock")
     with _frontend_cache_lock(lease):
         source_marker = checkout.parent / ("." + checkout.name + ".gs-frontend-output-in-progress.json")
-        if source_marker.exists():
-            raise RuntimeError(f"interrupted/uncertain frontend checkout output: {source_marker}. "
+        if source_marker.exists() or source_marker.is_symlink():
+            raise FrontendBuildInterrupted(f"interrupted/uncertain frontend checkout output: {source_marker}. "
                                "Use a separate checkout and CARGO_TARGET_DIR, or confirm all prior writers "
-                               "have stopped before removing its source/target markers and restoring quarantines.")
+                               "have stopped before removing its source/target markers and restoring quarantines.", "source")
         _run_frontend_script_with_source_lease(script, checkout, args, finish,
-                                               publication_destination, source_marker)
+                                               publication_destination, source_marker, target_override)
 
 
 def _run_frontend_script_with_source_lease(
-        script: Path, checkout: Path, args: list[str], finish, publication_destination, source_marker: Path) -> None:
+        script: Path, checkout: Path, args: list[str], finish, publication_destination, source_marker: Path,
+        target_override: Optional[Path] = None) -> None:
     manifest = script.resolve().parent / "Cargo.toml"
     if not manifest.resolve().is_relative_to(checkout):
         raise RuntimeError("Frontend application manifest must be inside its checkout")
     application = _frontend_package(manifest)
     explicit = os.environ.get("CARGO_TARGET_DIR")
-    target = Path(explicit).expanduser() if explicit else (_frontend_shared_target(checkout) or manifest.parent / "target")
+    target = target_override if target_override is not None else (Path(explicit).expanduser() if explicit else (_frontend_shared_target(checkout) or manifest.parent / "target"))
     if not target.is_absolute():
         target = manifest.parent / target
     target = target.resolve()
@@ -371,10 +467,10 @@ def _run_frontend_script_with_source_lease(
     # provenance. Direct callers and the normal wrapper use this same lock once.
     with _frontend_cache_lock(target.parent / ("." + target.name + ".gs-frontend-build.lock")):
         marker = target.parent / ("." + target.name + ".gs-frontend-in-progress.json")
-        if marker.exists():
-            raise RuntimeError(f"Frontend target has an interrupted/uncertain build: {marker}. "
+        if marker.exists() or marker.is_symlink():
+            raise FrontendBuildInterrupted(f"Frontend target has an interrupted/uncertain build: {marker}. "
                                "Use a separate checkout and CARGO_TARGET_DIR, or confirm all prior build descendants "
-                               "have stopped before manually removing this marker. No stale PID is killed.")
+                               "have stopped before manually removing this marker. No stale PID is killed.", "target")
         files = _frontend_source_files(checkout)
         digest = hashlib.sha256()
         for path in files:
@@ -859,15 +955,40 @@ def _run_frontend_build(
             log_path = repo_root / log_path
         args.append(f"log={log_path}")
 
-    def finish() -> None:
-        _sync_frontend_public_assets(repo_root, checkout_dir)
-        _record_browser_asset_source(repo_root, checkout_dir)
+    def selected_build(source: Path, selected_script: Path, target_override=None) -> None:
+        def finish() -> None:
+            _sync_frontend_public_assets(repo_root, source)
+            _record_browser_asset_source(repo_root, source)
+        kwargs = {"publication_destination": _frontend_sync_public_dir(repo_root)}
+        if target_override is not None:
+            kwargs["target_override"] = target_override
+        _run_frontend_script_with_wasm_opt_fallback(selected_script, source, args, finish, **kwargs)
 
     # Global order: destination, checkout output, then target lease. The callback takes
     # neither lock. Different targets cannot race while publishing one WebUI.
     with _frontend_cache_lock(repo_root / "frontend" / ".web-build.lock"):
-        _run_frontend_script_with_wasm_opt_fallback(script, checkout_dir, args, finish,
-                                                     publication_destination=_frontend_sync_public_dir(repo_root))
+        try:
+            selected_build(checkout_dir, script)
+        except FrontendBuildInterrupted as error:
+            shared = _frontend_shared_target(checkout_dir.resolve())
+            # Preserve explicit target/source intent and reuse-only requests.
+            # Neither marker contents nor a stale PID can establish safe cleanup.
+            if shared is None or os.environ.get("CARGO_TARGET_DIR") or use_existing:
+                raise
+            recovery_target = _frontend_recovery_target(shared)
+            source = _frontend_recovery_checkout(checkout_dir)
+            message = f"Preserving interrupted frontend output/cache. One isolated retry: source={source}, target={recovery_target}"
+            print(message)
+            _append_log(message + "\n")
+            try:
+                selected_build(source, _resolve_external_frontend_script(source), recovery_target)
+            except FrontendBuildInterrupted as isolated:
+                raise RuntimeError("The fixed frontend recovery source/target is also interrupted. "
+                                   "All markers, writers and quarantines were preserved; no further caches were allocated. "
+                                   "Confirm prior writers stopped before manual cleanup, or use an explicit separate source and target.") from isolated
+            # Keep backend asset preparation and the published source receipt on
+            # the effective successful source, not the uncertain original output.
+            os.environ[BROWSER_ASSET_SOURCE_ENV] = str(source.resolve())
 
 
 def _backend_script(repo_root: Path) -> Path:

@@ -851,11 +851,14 @@ impl FlightSimState {
             | TelemetryCommand::AbortAfter250
             | TelemetryCommand::ReinitAfter15
             | TelemetryCommand::ReinitAfter30
-            | TelemetryCommand::ReinitAfter50
-            | TelemetryCommand::AdvanceFlightState
-            | TelemetryCommand::RewindFlightState => {
+            | TelemetryCommand::ReinitAfter50 => {
                 // Let telemetry_task forward HITL controls. Consuming a no-op
                 // here silently swallowed them when testing was also enabled.
+                return false;
+            }
+            #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+            TelemetryCommand::AdvanceFlightState | TelemetryCommand::RewindFlightState => {
+                // The existing operator-mode dispatcher owns these transitions.
                 return false;
             }
         }
@@ -1970,5 +1973,45 @@ mod tests {
                 .iter()
                 .any(|spec| spec.dtype == crate::telemetry_schema::data_type("IMU_DATA"))
         );
+    }
+
+    #[cfg(all(
+        feature = "testing",
+        any(feature = "hitl_mode", feature = "test_fire_mode")
+    ))]
+    #[test]
+    fn operator_mode_state_controls_are_forwarded_without_model_effects() {
+        let mut sim = super::FlightSimState::new();
+        sim.flight_state = crate::types::FlightState::Armed;
+        sim.launch_sequence_started_ms = Some(10);
+        sim.actuator_igniter_sequence_started_ms = Some(20);
+        sim.launch_time_ms = Some(30);
+        let valves = sim.valves.clone();
+        let timers = (
+            sim.launch_sequence_started_ms,
+            sim.actuator_igniter_sequence_started_ms,
+            sim.launch_time_ms,
+        );
+        let queued = sim.queued.len();
+        for command in [
+            crate::types::TelemetryCommand::AdvanceFlightState,
+            crate::types::TelemetryCommand::RewindFlightState,
+        ] {
+            assert!(
+                !sim.apply_command(&command, 60_000),
+                "model consumed {command:?}"
+            );
+            assert_eq!(sim.flight_state, crate::types::FlightState::Armed);
+            assert_eq!(sim.valves, valves);
+            assert_eq!(
+                (
+                    sim.launch_sequence_started_ms,
+                    sim.actuator_igniter_sequence_started_ms,
+                    sim.launch_time_ms
+                ),
+                timers
+            );
+            assert_eq!(sim.queued.len(), queued);
+        }
     }
 }

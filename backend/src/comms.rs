@@ -1137,10 +1137,8 @@ impl UartComms {
                             normal_ready,
                             allow_background_ordinary,
                         )
-                    } else if normal_ready {
-                        mesh.begin_transmission_at_priority(now, minimum_priority)
                     } else {
-                        mesh.begin_critical_transmission(now, minimum_priority)
+                        mesh.begin_bounded_transmission(now, minimum_priority, !normal_ready, 1)
                     }
                 }
             };

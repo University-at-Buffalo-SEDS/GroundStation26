@@ -69,6 +69,10 @@ fn reserve_bytes() -> u64 {
     )
 }
 #[cfg(unix)]
+fn available_disk_bytes(blocks: impl Into<u64>, fragment_bytes: impl Into<u64>) -> u64 {
+    blocks.into().saturating_mul(fragment_bytes.into())
+}
+#[cfg(unix)]
 fn free_disk(path: &std::path::Path) -> std::io::Result<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
@@ -78,7 +82,7 @@ fn free_disk(path: &std::path::Path) -> std::io::Result<u64> {
         return Err(std::io::Error::last_os_error());
     }
     let info = unsafe { info.assume_init() };
-    Ok(info.f_bavail.saturating_mul(info.f_frsize))
+    Ok(available_disk_bytes(info.f_bavail, info.f_frsize))
 }
 #[cfg(not(unix))]
 fn free_disk(_: &std::path::Path) -> std::io::Result<u64> {
@@ -1077,5 +1081,19 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod portable_disk_budget_tests {
+    #[test]
+    fn available_disk_bytes_widens_both_fields_before_saturating() {
+        assert_eq!(
+            super::available_disk_bytes(u32::MAX, 4096_u64),
+            u64::from(u32::MAX) * 4096
+        );
+        assert_eq!(super::available_disk_bytes(7_u64, 4096_u64), 28_672);
+        assert_eq!(super::available_disk_bytes(u64::MAX, 2_u32), u64::MAX);
+        assert_eq!(super::available_disk_bytes(0_u32, u64::MAX), 0);
     }
 }
