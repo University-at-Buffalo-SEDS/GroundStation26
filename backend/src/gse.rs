@@ -1,5 +1,6 @@
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
 mod turbocharge;
+pub(crate) mod progress;
 #[cfg(all(test, feature = "firmware_sim"))]
 pub(crate) use turbocharge::mass_ingress_snapshot;
 pub(crate) use turbocharge::{mass_calibration_signature, observe_valve_pressure_ingress};
@@ -143,6 +144,9 @@ impl ValveCaptureHistory {
 
 pub struct Runtime {
     pub engine: Engine,
+    progress: crate::sequence_progress_stage::Stage,
+    progress_admission: Option<LaunchAdmission>,
+    progress_fill_target_kg:Option<f32>,
     #[cfg(not(feature = "hitl_mode"))]
     operational: operational::Operational,
     clock: Instant,
@@ -178,6 +182,9 @@ impl Default for Runtime {
         crate::checklists::paired::preflight();
         Self {
             engine: Engine::default(),
+            progress: Default::default(),
+            progress_admission: None,
+            progress_fill_target_kg:None,
             #[cfg(not(feature = "hitl_mode"))]
             operational: Default::default(),
             clock: Instant::now(),
@@ -274,6 +281,7 @@ fn sequence_clock_ms(elapsed_ms: u64, simulated_ms: Option<u64>) -> u64 {
 
 impl Runtime {
     fn cancel_automation_for_manual(&mut self) {
+        self.progress.complete(crate::sequence_progress_projection::TerminalProof::Interrupted,crate::sequence_progress_service::now_ms());
         self.turbocharge = None;
         self.turbo_evidence = None;
         self.manual_control = true;
@@ -536,8 +544,12 @@ impl Runtime {
         }
     }
     fn input(&self, prelaunch: bool, interlock: bool) -> Inputs {
+        self.input_at(self.now(),prelaunch,interlock)
+    }
+    /// Pure copy shared with presentation; the caller supplies the already sampled clock.
+    fn input_at(&self,now_ms:u64,prelaunch:bool,interlock:bool)->Inputs {
         Inputs {
-            now_ms: self.now(),
+            now_ms,
             pressure: if self.turbo_inventory_pending
                 && matches!(
                     self.engine.status.phase,
@@ -1039,6 +1051,7 @@ pub(crate) fn handle_command_with_origins(
         handle_command_inner(state, cmd, plumbing_origin, launch_revision)
     };
     flush_effects(state);
+    progress::flush(state);
     handled
 }
 fn flush_effects(state: &Arc<AppState>) {
@@ -1114,9 +1127,11 @@ fn handle_command_inner(
         return true;
     }
     if let Some(action) = action(cmd) {
+        let reserved = progress::reserve(state);
         let is_prelaunch = prelaunch(state);
         let policy = state.action_policy_snapshot();
         let nitrous_target = state.fill_targets_snapshot().nitrous.target_pressure_psi;
+        let progress_mass_target=state.fill_targets_snapshot().nitrous.target_mass_kg;
         let result = {
             let mut rt = state.gse.lock().unwrap();
             #[cfg(not(feature = "hitl_mode"))]
@@ -1153,9 +1168,16 @@ fn handle_command_inner(
             {
                 Err("Automatic fill requires fresh calibrated fill weight before starting".into())
             } else {
+                let previous_phase=rt.engine.status.phase;
+                let resuming_fill=previous_phase==Phase::Paused && rt.progress.current().is_some_and(|s|s.kind==crate::sequence_progress::Kind::Fill && !s.outcome.terminal());
                 let result = rt.engine.request(action, input);
                 if result.is_ok() {
+                    if action==Action::StartFill {rt.progress_fill_target_kg=Some(progress_mass_target);}
                     rt.manual_control = false;
+                    use crate::{sequence_progress::Kind,sequence_progress_projection::Cause};
+                    let kind=match action {Action::SelfTest=>Some(Kind::ValveSelfTest),Action::NitrogenTest=>Some(Kind::NitrogenTest),Action::StartFill if !resuming_fill=>Some(Kind::Fill),_=>None};
+                    if let Some(kind)=kind {rt.progress_start(reserved,kind,input);}
+                    else {rt.progress_observe(input,match action {Action::PauseFill=>Cause::PauseAccepted,Action::CancelFill=>Cause::CancelAccepted,_=>Cause::ResumeAccepted});}
                 }
                 #[cfg(not(feature = "hitl_mode"))]
                 if result.is_ok() {
@@ -1244,6 +1266,7 @@ pub(crate) fn start_fill_after_automatic_zero(state: &Arc<AppState>, generation:
         claim
     };
     flush_effects(state);
+    progress::flush(state);
 }
 
 pub(crate) fn queue_automatic_supply_close(
@@ -1300,6 +1323,7 @@ pub(crate) fn cancel_fill_for_recoverable_fault_for_generation(
         claim
     };
     flush_effects(state);
+    progress::flush(state);
 }
 
 pub fn tick(state: &Arc<AppState>, interlock: bool) {
@@ -1313,6 +1337,7 @@ pub fn tick(state: &Arc<AppState>, interlock: bool) {
         claim
     };
     flush_effects(state);
+    progress::flush(state);
 }
 fn tick_inner(state: &Arc<AppState>, interlock: bool) {
     if state
@@ -1338,11 +1363,15 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
     let effects = {
         let mut rt = state.gse.lock().unwrap();
         let input = rt.input(is_prelaunch, interlock);
+        if rt.progress.current().is_some_and(|s|s.kind==crate::sequence_progress::Kind::Fill){rt.progress_fill_target_kg=Some(target);}
         #[cfg(not(feature = "hitl_mode"))]
         let previous_phase = rt.engine.status.phase;
         if let Some(mut controller) = rt.fill_trim.take() {
             let mass = rt.fresh_mass(input.now_ms);
             let update = controller.tick(input, mass);
+            let reporting_trim=controller.progress_observation();
+            let reporting_view=rt.engine.progress_observation(input);
+            rt.progress.observe_trim(reporting_trim,reporting_view,mass,input.now_ms,update.fault.as_deref(),crate::sequence_progress_service::now_ms());
             if let Some(message) = update.fault {
                 #[cfg(not(feature = "hitl_mode"))]
                 {
@@ -1357,10 +1386,12 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                 // close both supplies and open vent/dump without ACK gating.
                 rt.engine.fault(input.now_ms, &message)
             } else if update.completed {
-                if let Err(error) = turbocharge::liquid_inventory_requalified(&mut rt) {
+                let inventory_retired=turbocharge::liquid_inventory_requalified(&mut rt);
+                if let Err(error) = inventory_retired {
                     rt.engine.status.message = format!(
                         "Fill closed; old Turbocharge inventory record could not be retired: {error}"
                     );
+                    rt.progress_failed_current();
                 }
                 rt.engine.status.phase = Phase::Paused;
                 rt.engine.status.message =
@@ -1370,8 +1401,10 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                     if let Some(mass) = mass {
                         remember_automatic_cutoff_target(&mut rt, mass.value, target);
                     }
-                    complete_operational_milestones(&mut rt, Phase::PauseSetup);
+                    complete_operational_milestones(&mut rt, Phase::PauseSetup, input);
                 }
+                #[cfg(feature="hitl_mode")]
+                rt.progress.complete(crate::sequence_progress_projection::TerminalProof::VerifiedFillTrim{trim:reporting_trim,input},crate::sequence_progress_service::now_ms());
                 let mut effects = update.effects;
                 effects.notification = Some("Fill complete: settled mass is within tolerance and all valves are confirmed closed".into());
                 effects
@@ -1382,10 +1415,22 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                 update.effects
             }
         } else {
+            #[cfg(feature = "hitl_mode")]
+            let progress_before=rt.engine.progress_observation(input);
             let effects = turbocharge::pressure_cutoff(&mut rt, input)
                 .unwrap_or_else(|| rt.engine.tick(input));
+            #[cfg(feature = "hitl_mode")]
+            {
+                let after=rt.engine.progress_observation(input);
+                rt.progress_observe(input,crate::sequence_progress_projection::Cause::Tick);
+                let kind=match (progress_before.phase,after.phase) {
+                    (Phase::SelfFinish,Phase::Idle)=>Some(crate::sequence_progress::Kind::ValveSelfTest),
+                    (Phase::Dumping,Phase::Passed)=>Some(crate::sequence_progress::Kind::NitrogenTest),_=>None,
+                };
+                if let Some(kind)=kind {rt.progress.complete(crate::sequence_progress_projection::TerminalProof::EngineCompleted{kind,before:progress_before,after},crate::sequence_progress_service::now_ms());}
+            }
             #[cfg(not(feature = "hitl_mode"))]
-            complete_operational_milestones(&mut rt, previous_phase);
+            complete_operational_milestones(&mut rt, previous_phase, input);
             if rt.engine.status.phase != Phase::Filling || !rt.ground_station_control {
                 rt.fill_cutoff.reset();
                 effects
@@ -1409,6 +1454,9 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                             rt.engine.claimed = true;
                             rt.engine.status.message =
                                 "Closing supplies and vent before settled mass verification".into();
+                            let reporting_trim=controller.progress_observation();
+                            let reporting_view=rt.engine.progress_observation(input);
+                            rt.progress.observe_trim(reporting_trim,reporting_view,Some(mass),input.now_ms,None,crate::sequence_progress_service::now_ms());
                             rt.fill_trim = Some(controller);
                             effects.notification = Some("Automatic fill cutoff: closing valves, then settling and verifying final mass".into());
                             effects
@@ -1452,6 +1500,7 @@ pub fn panel_command(state: &AppState, cmd: TelemetryCommand) -> TelemetryComman
 }
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .merge(progress::routes())
         .route(
             "/api/gse/config",
             get(get_config).put(save_config).post(save_config),
@@ -1705,6 +1754,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         response["qd"] = serde_json::json!(format!("{:?}", rt.operational.qd.status(rt.now())));
     }
     turbocharge::decorate_status(&state, &mut response);
+    response["sequence_progress"]=progress::envelope(&state);
     Json(response).into_response()
 }
 
@@ -2449,6 +2499,7 @@ pub fn report_safety(state: &Arc<AppState>) {
             claim
         };
         flush_effects(state);
+    progress::flush(state);
     }
     #[cfg(feature = "hitl_mode")]
     let _ = state;
@@ -2651,6 +2702,8 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
         .clear_automatic_abort_claim()
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let config = rt.engine.config.clone();
+    rt.progress.complete(crate::sequence_progress_projection::TerminalProof::Interrupted,crate::sequence_progress_service::now_ms());
+    rt.progress_admission=None;
     rt.engine = Engine::default();
     rt.manual_control = false;
     rt.fill_trim = None;
@@ -2660,6 +2713,7 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
     state.set_local_flight_state(FlightState::Idle);
     crate::sequences::refresh_action_policy_now(state);
     state.broadcast_action_policy_snapshot();
+    progress::flush(state);
     Ok(())
 }
 
@@ -2742,6 +2796,8 @@ async fn reset_qualification(State(state): State<Arc<AppState>>, headers: Header
         rt.operational.qd = QdWait::default();
         rt.operational.qd_launch_admission = None;
         let config = rt.engine.config.clone();
+        rt.progress.complete(crate::sequence_progress_projection::TerminalProof::Interrupted,crate::sequence_progress_service::now_ms());
+        rt.progress_admission=None;
         rt.engine = Engine::default();
         rt.engine.config = config;
         rt.engine.config.dry_self_test_confirmed = false;
@@ -2757,6 +2813,7 @@ async fn reset_qualification(State(state): State<Arc<AppState>>, headers: Header
         }
         drop(rt);
         crate::sequences::refresh_action_policy_now(&state);
+        progress::flush(&state);
         Json(serde_json::json!({"reset":true})).into_response()
     }
 }

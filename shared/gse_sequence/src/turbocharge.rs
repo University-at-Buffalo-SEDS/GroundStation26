@@ -93,6 +93,19 @@ pub enum Phase {
     Complete,
     Cancelled,
 }
+/// Copy-only controller state for presentation; outputs remain plans, not motion proof.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProgressObservation {
+    pub phase: Phase,
+    pub desired: [bool; 5],
+    pub pressure_target_psi: f32,
+    pub liquid_target_mass_kg: f32,
+    pub pending_mask: u8,
+    pub waiting: Option<usize>,
+    pub command_since_ms: u64,
+    pub phase_since_ms: u64,
+    pub settle_sample_count: u32,
+}
 #[derive(Default, Debug)]
 pub struct Update {
     pub effects: Effects,
@@ -233,6 +246,19 @@ impl Controller {
     }
     pub fn phase(&self) -> Phase {
         self.phase
+    }
+    pub fn progress_observation(&self) -> ProgressObservation {
+        ProgressObservation {
+            phase: self.phase,
+            desired: self.desired,
+            pressure_target_psi: self.pressure_target,
+            liquid_target_mass_kg: self.target_mass,
+            pending_mask: self.pending,
+            waiting: self.waiting,
+            command_since_ms: self.command_since,
+            phase_since_ms: self.since,
+            settle_sample_count: self.count,
+        }
     }
     fn next(&mut self, now: u64) -> Effects {
         let order = [3, 4, 0, 1, 2];
@@ -490,6 +516,46 @@ mod tests {
             qualification_generation: 2,
             configuration: [3; 32],
         }
+    }
+    #[test]
+    fn progress_getter_reads_actual_targets_without_advancing_controller() {
+        let rig = Rig::new(1.0);
+        let before = (
+            rig.c.phase,
+            rig.c.desired,
+            rig.c.pending,
+            rig.c.waiting,
+            rig.c.command_since,
+            rig.c.since,
+            rig.c.count,
+            rig.c.sum.to_bits(),
+        );
+        for _ in 0..5 {
+            let view = rig.c.progress_observation();
+            assert_eq!(view.phase, rig.c.phase);
+            assert_eq!(view.desired, rig.c.desired);
+            assert_eq!(
+                view.pressure_target_psi.to_bits(),
+                rig.c.pressure_target.to_bits()
+            );
+            assert_eq!(
+                view.liquid_target_mass_kg.to_bits(),
+                rig.c.target_mass.to_bits()
+            );
+        }
+        assert_eq!(
+            before,
+            (
+                rig.c.phase,
+                rig.c.desired,
+                rig.c.pending,
+                rig.c.waiting,
+                rig.c.command_since,
+                rig.c.since,
+                rig.c.count,
+                rig.c.sum.to_bits()
+            )
+        );
     }
     #[test]
     fn outstanding_command_requires_strictly_newer_observation() {

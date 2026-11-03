@@ -14,6 +14,19 @@ pub enum Phase {
     Fault,
     Cancelled,
 }
+/// Copy-only presentation state; desired outputs are not physical valve positions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProgressObservation {
+    pub phase: Phase,
+    pub target_mass_kg: f32,
+    pub desired: [bool; 5],
+    pub pending_mask: u8,
+    pub waiting: Option<usize>,
+    pub command_since_ms: u64,
+    pub phase_since_ms: u64,
+    pub pulses: u8,
+    pub max_pulses: u8,
+}
 #[derive(Debug, Default)]
 pub struct Update {
     pub effects: Effects,
@@ -72,6 +85,19 @@ impl Controller {
     }
     pub fn phase(&self) -> Phase {
         self.phase
+    }
+    pub fn progress_observation(&self) -> ProgressObservation {
+        ProgressObservation {
+            phase: self.phase,
+            target_mass_kg: self.target,
+            desired: self.desired,
+            pending_mask: self.pending,
+            waiting: self.waiting,
+            command_since_ms: self.command_since,
+            phase_since_ms: self.since,
+            pulses: self.pulses,
+            max_pulses: MAX_PULSES,
+        }
     }
     pub fn stop_mass_kg(&self) -> f32 {
         self.target + self.direction * self.overfill
@@ -266,6 +292,41 @@ impl Controller {
 mod tests {
     use super::*;
     use crate::ValveState;
+    #[test]
+    fn progress_getter_is_a_copy_of_controller_state_with_no_side_effects() {
+        let rig = Rig::new(1., 1.2);
+        let before = (
+            rig.controller.phase,
+            rig.controller.desired,
+            rig.controller.pending,
+            rig.controller.waiting,
+            rig.controller.since,
+            rig.controller.samples.len(),
+            rig.controller.pulses,
+        );
+        for _ in 0..5 {
+            let view = rig.controller.progress_observation();
+            assert_eq!(view.phase, rig.controller.phase);
+            assert_eq!(view.desired, rig.controller.desired);
+            assert_eq!(
+                view.target_mass_kg.to_bits(),
+                rig.controller.target.to_bits()
+            );
+            assert_eq!(view.max_pulses, MAX_PULSES);
+        }
+        assert_eq!(
+            before,
+            (
+                rig.controller.phase,
+                rig.controller.desired,
+                rig.controller.pending,
+                rig.controller.waiting,
+                rig.controller.since,
+                rig.controller.samples.len(),
+                rig.controller.pulses
+            )
+        );
+    }
     #[test]
     fn outstanding_command_requires_strictly_newer_observation() {
         let mut rig = Rig::new(1.0, 1.0);

@@ -242,6 +242,8 @@ pub(crate) fn finalize_verified_recovery(
     proofs: &crate::board_recovery::coordinator::FinalProofs,
     reset_all: bool,
 ) -> Result<(), &'static str> {
+    // Copy only, before the final owner/Stop chain. No reporting lock or IO.
+    let reporting_owner=super::progress::verified_reset_marker(state);
     let _dispatch = DISPATCH_GATE.lock().unwrap();
     if state
         .operator_admission_barrier
@@ -290,6 +292,7 @@ pub(crate) fn finalize_verified_recovery(
                         .reopen_after_recovery(fence)
                         .map_err(|_| "Journal cannot reopen")?;
                     if reset_all {
+                        super::progress::capture_verified_reset_under_gate(state,reporting_owner);
                         state.publish_verified_startup_under_gate();
                     }
                     state

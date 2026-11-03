@@ -577,14 +577,30 @@ pub(crate) async fn publish_service(
         let snapshot = snapshot_for_state(&state);
         let _ = state.board_abort_tx.send(snapshot);
         state.broadcast_action_policy_snapshot();
-        for (board, _) in state.board_abort.take_error_events() {
-            crate::web::emit_error(
-                &state,
-                format!(
-                    "{} reports Abort; new launch is disabled until a fresh actual exit report.",
-                    board.as_str()
-                ),
-            );
+        for (board, first_abort_ms) in state.board_abort.take_error_events() {
+            let message = format!("{} reports Abort; new launch is disabled until a fresh actual exit report.", board.as_str());
+            if let (Some(key), Ok(at)) = (crate::alert_conditions::BoardKey::from_sender(board.sender_id()), i64::try_from(first_abort_ms)) {
+                crate::alert_condition_runtime::observe_error(&state,
+                    crate::alert_conditions::Key::BoardAbort(key), format!("{} reports Abort",board.as_str()),
+                    at, crate::telemetry_task::get_current_timestamp_ms() as i64, message);
+            } else {
+                // Preserve the existing visible event fallback for malformed
+                // source metadata; never invent an occurrence identity.
+                crate::web::emit_error(&state, message);
+            }
+        }
+        // Read the existing atomic actual-Abort/strong-proof masks. Neither an
+        // absent board nor an expired proof is evidence of recovery.
+        let (aborted,proven)=state.board_abort.masks();
+        for (index,board) in BOARDS.iter().enumerate() {
+            if let Some(key)=crate::alert_conditions::BoardKey::from_sender(board.sender_id()) {
+                let condition=if aborted&(1<<index)!=0 {Some(crate::alert_conditions::ConditionState::Active)}
+                    else if proven&(1<<index)!=0 {Some(crate::alert_conditions::ConditionState::Resolved)}else{None};
+                if let Some(condition)=condition {crate::alert_condition_runtime::observe(&state,
+                    crate::alert_conditions::Key::BoardAbort(key),condition,
+                    if condition==crate::alert_conditions::ConditionState::Resolved {format!("{} confirmed outside Abort",board.as_str())}else{format!("{} reports Abort",board.as_str())},
+                    crate::telemetry_task::get_current_timestamp_ms() as i64);}
+            }
         }
     }
 }

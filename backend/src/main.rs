@@ -17,6 +17,10 @@ mod actuator_plumbing;
 mod antenna;
 mod auth;
 mod auto_zero;
+mod alert_conditions;
+mod alert_condition_journal;
+mod alert_condition_runtime;
+mod alert_condition_producers;
 mod board_abort;
 mod control_ingress;
 mod board_abort_history;
@@ -42,6 +46,12 @@ mod testing_board_lifecycle;
 mod gpio;
 mod gpio_panel;
 mod gse;
+mod sequence_progress;
+mod sequence_progress_projection;
+mod sequence_progress_producer;
+mod sequence_progress_service;
+mod sequence_progress_stage;
+mod sequence_stream;
 mod host_temperature;
 mod i18n;
 mod launch_analytics;
@@ -1270,6 +1280,7 @@ async fn main() -> anyhow::Result<()> {
         warnings_tx: broadcast::channel(alerts_capacity).0,
         errors_tx: broadcast::channel(alerts_capacity).0,
         alert_ack_state: Arc::new(Mutex::new(AlertAckStateMsg::default())),
+            alert_conditions: Arc::new(crate::alert_condition_runtime::Runtime::new()),
         alert_ack_tx: broadcast::channel(16).0,
         dashboard_reset_tx,
         db: Arc::new(Mutex::new(db)),
@@ -1292,6 +1303,7 @@ async fn main() -> anyhow::Result<()> {
         pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
         latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
         gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
+        sequence_progress: Arc::new(crate::sequence_progress_service::Shared::new(rand::random::<u128>())),
         automatic_generation: Arc::new(AtomicU64::new(restored_generation)),
         operator_admission_barrier: Arc::new(std::sync::atomic::AtomicU64::new(
             restored_recovery_owner,

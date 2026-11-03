@@ -191,6 +191,8 @@ pub struct AppState {
     /// Shared alert-ack state broadcast to connected frontends.
     pub alert_ack_state: Arc<Mutex<AlertAckStateMsg>>,
 
+    pub alert_conditions: Arc<crate::alert_condition_runtime::Runtime>,
+
     /// Broadcast whenever shared alert-ack state changes.
     pub alert_ack_tx: broadcast::Sender<AlertAckStateMsg>,
 
@@ -245,6 +247,7 @@ pub struct AppState {
     /// Latest fuel tank pressure (psi)
     pub latest_fuel_tank_pressure: Arc<Mutex<Option<f32>>>,
     pub gse: Arc<Mutex<crate::gse::Runtime>>,
+    pub sequence_progress: Arc<crate::sequence_progress_service::Shared>,
     /// Monotonic queued-automatic-intent epoch; never reset with GSE Runtime.
     pub(crate) automatic_generation: Arc<AtomicU64>,
     pub(crate) operator_queue: Arc<crate::operator_queue::Control>,
@@ -1546,6 +1549,37 @@ impl AppState {
             .is_some_and(|sample| sample.received_at > barrier)
     }
 
+    /// One bounded same-frame copy of fresh board output evidence. Never a
+    /// requested target, SDK ACK, valve-position or fluid-flow measurement.
+    pub(crate) fn umbilical_stream_outputs(&self)->[Option<crate::sequence_stream::CapturedOutput>;6] {
+        let now=std::time::Instant::now();
+        let simulation=crate::simulation_clock_ms();
+        let map=self.umbilical_valve_states.lock().unwrap();
+        [0,1,2,9,10,crate::rocket_commands::ActuatorBoardCommands::IgniterOn as u8].map(|key| {
+            let observed=map.get(&key)?;
+            if !observed.fresh_at(now,simulation){return None;}
+            let age=match (observed.simulation_ms,simulation) {
+                (Some(at),Some(now))=>now.checked_sub(at)?,
+                (None,None)=>now.checked_duration_since(observed.received_at)?.as_millis().min(u64::MAX as u128) as u64,
+                _=>return None,
+            };
+            Some(crate::sequence_stream::CapturedOutput{value:observed.on,age_ms:age})
+        })
+    }
+
+    /// Pending targets are inserted only after the existing station/model
+    /// queue accepts the command. They are never board ACK or motion evidence.
+    pub(crate) fn umbilical_stream_commands(&self)->[Option<crate::sequence_stream::CapturedOutput>;6] {
+        let now=std::time::Instant::now();let simulation=crate::simulation_clock_ms();
+        let pending=self.pending_umbilical_valve_states.lock().unwrap();
+        [0,1,2,9,10,crate::rocket_commands::ActuatorBoardCommands::IgniterOn as u8].map(|key| {
+            let target=pending.get(&key)?;
+            let age=match (target.simulation_ms,simulation){(Some(at),Some(now))=>now.checked_sub(at)?,(None,None)=>now.checked_duration_since(target.set_at)?.as_millis().min(u64::MAX as u128) as u64,_=>return None};
+            if age>2000{return None;}
+            Some(crate::sequence_stream::CapturedOutput{value:target.target,age_ms:age})
+        })
+    }
+
     /// Looks up the cached state for a specific umbilical valve command id.
     pub fn get_umbilical_valve_state(&self, cmd_id: u8) -> Option<bool> {
         let map = self.umbilical_valve_states.lock().unwrap();
@@ -1694,6 +1728,8 @@ impl AppState {
         });
     }
     pub(crate) fn publish_verified_startup_observation(self: &Arc<Self>) {
+        // Existing coordinator calls this only after final owner/Stop guards.
+        crate::gse::progress::publish_verified_reset_after_guards(self);
         crate::flight_sim::sync_local_flight_state(self.local_flight_state_snapshot());
         self.broadcast_fill_targets_snapshot();
         crate::sequences::refresh_action_policy_now(self);
@@ -2364,7 +2400,7 @@ impl AppState {
             status.warned = false;
         }
         *self.latest_fuel_tank_pressure.lock().unwrap() = None;
-        *self.gse.lock().unwrap() = crate::gse::Runtime::default();
+        crate::gse::progress::replace_runtime_for_sim_reset(self);
         *self.latest_fill_mass_kg.lock().unwrap() = None;
         self.last_command_ms.lock().unwrap().clear();
         self.fill_sequence_continue_requests
@@ -4089,6 +4125,7 @@ pub(crate) mod tests {
             );
         }
 
+        let condition_runtime=Arc::new(crate::alert_condition_runtime::Runtime::for_test());
         Arc::new(AppState {
             control_ingress: Arc::new(Default::default()),
             ring_buffer: Arc::new(Mutex::new(RingBuffer::new(128))),
@@ -4097,11 +4134,12 @@ pub(crate) mod tests {
             warnings_tx: broadcast::channel(4).0,
             errors_tx: broadcast::channel(4).0,
             alert_ack_state: Arc::new(Mutex::new(AlertAckStateMsg::default())),
+            alert_conditions: condition_runtime.clone(),
             alert_ack_tx: broadcast::channel(4).0,
             dashboard_reset_tx: broadcast::channel(4).0,
             db: Arc::new(Mutex::new(db)),
             db_path: Arc::new(Mutex::new("sqlite::memory:".to_string())),
-            placeholder_db_path: "sqlite::memory:".to_string(),
+            placeholder_db_path: condition_runtime.test_placeholder_path(),
             db_queue_tx,
             db_write_runtime: tokio::runtime::Handle::current(),
             auth_db,
@@ -4116,6 +4154,7 @@ pub(crate) mod tests {
             pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
             latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
             gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
+            sequence_progress: Arc::new(crate::sequence_progress_service::Shared::new(rand::random::<u128>())),
             automatic_generation: Arc::new(AtomicU64::new(1)),
             operator_admission_barrier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             operator_queue: Arc::new(crate::operator_queue::Control::default()),

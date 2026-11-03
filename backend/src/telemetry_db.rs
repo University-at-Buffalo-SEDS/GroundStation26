@@ -42,6 +42,7 @@ pub enum DbWrite {
         timestamp_ms: i64,
         severity: String,
         message: String,
+        condition: Option<crate::alert_conditions::ConditionLink>,
     },
 }
 
@@ -75,6 +76,7 @@ pub enum RecordingCommand {
 
 #[derive(Debug, Clone)]
 pub enum DbQueueItem {
+    Condition(crate::alert_condition_runtime::Work),
     Write(DbWrite),
     Control(RecordingCommand),
 }
@@ -270,6 +272,11 @@ pub async fn ensure_telemetry_schema(db: &SqlitePool) -> Result<()> {
     )
     .execute(db)
     .await?;
+
+    let alert_cols=sqlx::query("PRAGMA table_info(alerts)").fetch_all(db).await?;
+    if !alert_cols.iter().any(|row|row.get::<String,_>("name")=="condition_json") {
+        sqlx::query("ALTER TABLE alerts ADD COLUMN condition_json TEXT").execute(db).await?;
+    }
 
     sqlx::query(
         r#"

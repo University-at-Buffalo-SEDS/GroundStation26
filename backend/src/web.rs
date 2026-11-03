@@ -364,6 +364,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/rrls/control", get(crate::command_proxy::get_status))
         .route("/api/auto_zero", get(get_auto_zero).post(set_auto_zero))
         .route("/api/alerts", get(get_alerts))
+        .route("/api/alert_conditions", get(get_alert_conditions))
         .route("/api/boards", get(get_boards))
         .merge(crate::board_recovery::routes())
         .merge(crate::actuator_plumbing::routes())
@@ -589,6 +590,7 @@ pub enum WsOutMsg {
     LaunchClock(LaunchClockMsg),
     Error(ErrorMsg),
     AlertAckState(AlertAckStateMsg),
+    AlertConditions(crate::alert_conditions::Snapshot),
     BoardAbort(crate::board_abort::Snapshot),
     BoardStatus(BoardStatusMsg),
     NetworkTopology(NetworkTopologyMsg),
@@ -624,6 +626,8 @@ pub struct ValveStateMsg {
 pub struct WarningMsg {
     pub timestamp_ms: i64,
     pub message: String,
+    #[serde(flatten)]
+    pub condition:Option<crate::alert_conditions::ConditionLink>,
 }
 
 /// Error row sent to frontend (and stored in AppState channel)
@@ -631,6 +635,8 @@ pub struct WarningMsg {
 pub struct ErrorMsg {
     pub timestamp_ms: i64,
     pub message: String,
+    #[serde(flatten)]
+    pub condition:Option<crate::alert_conditions::ConditionLink>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -647,6 +653,8 @@ pub struct AlertDto {
     pub timestamp_ms: i64,
     pub severity: String,
     pub message: String,
+    #[serde(flatten)]
+    pub condition:Option<crate::alert_conditions::ConditionLink>,
 }
 
 #[derive(Serialize)]
@@ -4677,6 +4685,7 @@ async fn handle_ws(
     let mut recording_status_rx = state.recording_status_tx.subscribe();
     let mut dashboard_reset_rx = state.dashboard_reset_tx.subscribe();
     let mut alert_ack_rx = state.alert_ack_tx.subscribe();
+    let mut alert_conditions_rx=state.alert_conditions.tx.subscribe();
 
     let cmd_tx = state.cmd_tx.clone();
     let state_for_send = state.clone();
@@ -4779,6 +4788,7 @@ async fn handle_ws(
         if ws_out_tx.send(initial_board_abort).await.is_err() {
             return;
         }
+        if ws_out_tx.send(serde_json::to_string(&WsOutMsg::AlertConditions(state_for_send.alert_conditions.snapshot())).unwrap()).await.is_err(){return;}
         let initial_alert_ack_state = serde_json::to_string(&WsOutMsg::AlertAckState(
             state_for_send.alert_ack_state_snapshot(),
         ))
@@ -4886,6 +4896,10 @@ async fn handle_ws(
                     }
                 }
 
+                recv=alert_conditions_rx.recv()=>{
+                    let snapshot=match recv {Ok(snapshot)=>snapshot,Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>state_for_send.alert_conditions.snapshot(),Err(tokio::sync::broadcast::error::RecvError::Closed)=>break};
+                    if ws_out_tx.send(serde_json::to_string(&WsOutMsg::AlertConditions(snapshot)).unwrap()).await.is_err(){break;}
+                }
                 recv = alert_ack_rx.recv() => {
                     match recv {
                         Ok(ack) => {
@@ -5502,6 +5516,11 @@ struct HistoryParams {
 
 /// NEW: /api/alerts – returns warnings + errors from `alerts` table
 /// Query param: `minutes` (optional, defaults to 20)
+async fn get_alert_conditions(State(state):State<Arc<AppState>>,headers:HeaderMap)->axum::response::Response {
+    if let Err(response)=authorize_headers(&state,&headers,Permission::ViewData).await {return response;}
+    Json(state.alert_conditions.snapshot()).into_response()
+}
+
 async fn get_alerts(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -5528,14 +5547,13 @@ async fn get_alerts(
     };
     let cutoff = now_ms - (minutes as i64) * 60_000;
 
-    let alerts_db = sqlx::query(
-        r#"
-        SELECT timestamp_ms, severity, message
-        FROM alerts
-        WHERE timestamp_ms BETWEEN ? AND ?
-        ORDER BY timestamp_ms DESC
-        "#,
-    )
+    let cols=sqlx::query("PRAGMA table_info(alerts)").fetch_all(&db).await.unwrap_or_default();
+    let query=if cols.iter().any(|row|row.get::<String,_>("name")=="condition_json") {
+        "SELECT timestamp_ms,severity,message,condition_json FROM alerts WHERE timestamp_ms BETWEEN ? AND ? ORDER BY timestamp_ms DESC"
+    }else{
+        "SELECT timestamp_ms,severity,message,NULL AS condition_json FROM alerts WHERE timestamp_ms BETWEEN ? AND ? ORDER BY timestamp_ms DESC"
+    };
+    let alerts_db = sqlx::query(query)
     .bind(cutoff)
     .bind(now_ms)
     .fetch_all(&db)
@@ -5548,6 +5566,7 @@ async fn get_alerts(
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
             severity: row.get::<String, _>("severity"),
             message: row.get::<String, _>("message"),
+            condition:row.get::<Option<String>,_>("condition_json").and_then(|json|serde_json::from_str(&json).ok()),
         })
         .collect();
 
@@ -5560,7 +5579,7 @@ async fn get_alerts(
 
     alerts.sort_by_key(|alert| std::cmp::Reverse(alert.timestamp_ms));
     alerts.dedup_by(|a, b| {
-        a.timestamp_ms == b.timestamp_ms && a.severity == b.severity && a.message == b.message
+        a.timestamp_ms == b.timestamp_ms && a.severity == b.severity && a.message == b.message && a.condition==b.condition
     });
 
     Json(alerts).into_response()
@@ -5597,11 +5616,13 @@ fn spawn_alert_insert(
     timestamp_ms: i64,
     severity: &'static str,
     message: String,
+    condition:Option<crate::alert_conditions::ConditionLink>,
 ) {
     state.cache_recent_alert(AlertDto {
         timestamp_ms,
         severity: severity.to_string(),
         message: message.clone(),
+        condition:condition.clone(),
     });
     if let Err(err) = state
         .db_queue_tx
@@ -5609,6 +5630,7 @@ fn spawn_alert_insert(
             timestamp_ms,
             severity: severity.to_string(),
             message,
+            condition,
         }))
     {
         log::warn!("failed to queue {severity} alert DB write: {err}");
@@ -5622,7 +5644,8 @@ fn spawn_alert_insert(
 ///     emit_error(&app_state, "Main valve stuck closed");
 ///
 /// If you only have Arc<AppState>, just pass `&*arc` or `arc.as_ref()`.
-pub fn emit_warning<S: Into<String>>(state: &AppState, message: S) {
+pub fn emit_warning<S: Into<String>>(state: &AppState, message: S) {emit_warning_linked(state,message,None);}
+pub fn emit_warning_linked<S: Into<String>>(state:&AppState,message:S,condition:Option<crate::alert_conditions::ConditionLink>) {
     let msg_string = message.into();
     let timestamp = now_ms_i64();
 
@@ -5630,11 +5653,12 @@ pub fn emit_warning<S: Into<String>>(state: &AppState, message: S) {
     let ws_msg = WarningMsg {
         timestamp_ms: timestamp,
         message: msg_string.clone(),
+        condition:condition.clone(),
     };
     let _ = state.warnings_tx.send(ws_msg);
 
     // 2) Insert into DB asynchronously (tracked for graceful shutdown)
-    spawn_alert_insert(state, timestamp, "warning", msg_string);
+    spawn_alert_insert(state, timestamp, "warning", msg_string, condition);
 }
 
 /// Log a warning to the DB without sending it to the frontend.
@@ -5644,7 +5668,7 @@ pub fn emit_warning_db_only<S: Into<String>>(state: &AppState, message: S) {
     let timestamp = now_ms_i64();
 
     // Insert into DB asynchronously (tracked for graceful shutdown)
-    spawn_alert_insert(state, timestamp, "warning", msg_string);
+    spawn_alert_insert(state, timestamp, "warning", msg_string, None);
 }
 
 fn persist_message_db_only(state: &AppState, message: String) {
@@ -5671,19 +5695,24 @@ pub fn emit_notification_warning<S: Into<String>>(state: &AppState, message: S) 
     persist_message_db_only(state, msg_string);
 }
 
-pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
+pub fn emit_error<S: Into<String>>(state:&AppState,message:S) {emit_error_linked(state,message,None);}
+pub fn emit_error_linked<S: Into<String>>(state:&AppState,message:S,condition:Option<crate::alert_conditions::ConditionLink>) {
+    emit_error_linked_at(state, now_ms_i64(), message, condition);
+}
+/// A deferred typed receipt keeps its original event time when restore finishes.
+pub fn emit_error_linked_at<S: Into<String>>(state:&AppState,timestamp:i64,message:S,condition:Option<crate::alert_conditions::ConditionLink>) {
     let msg_string = message.into();
-    let timestamp = now_ms_i64();
 
     // 1) Broadcast to frontend immediately
     let ws_msg = ErrorMsg {
         timestamp_ms: timestamp,
         message: msg_string.clone(),
+        condition:condition.clone(),
     };
     let _ = state.errors_tx.send(ws_msg);
 
     // 2) Insert into DB asynchronously (tracked for graceful shutdown)
-    spawn_alert_insert(state, timestamp, "error", msg_string);
+    spawn_alert_insert(state, timestamp, "error", msg_string, condition);
 }
 
 #[derive(Deserialize)]
@@ -6369,4 +6398,9 @@ mod recovery_control_settings_tests {
             assert!(changed);
         }
     }
+}
+
+#[cfg(test)]
+mod alert_condition_readonly_tests {
+    include!("alert_condition_readonly_tests.rs");
 }

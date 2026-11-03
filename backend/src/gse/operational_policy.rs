@@ -131,11 +131,14 @@ fn fault(rt: &mut Runtime, reason: Fault, message: &str) -> Effects {
     rt.turbo_evidence = None;
     rt.engine.fault(rt.now(), message)
 }
-pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase) {
+pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase, progress_input:Inputs) {
     let phase = rt.engine.status.phase;
     if previous == phase || !rt.operational.running {
         return;
     }
+    // Copy the actual completed engine transition before qualification restoration
+    // can replace Cancelled with a previously retained Passed display state.
+    rt.progress_observe(progress_input,crate::sequence_progress_projection::Cause::Tick);
     if phase == Phase::CancelSetup
         && matches!(
             previous,
@@ -193,9 +196,15 @@ pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase)
         if let Err(error) = rt.operational.complete(milestone) {
             rt.engine.status.message =
                 format!("Qualification could not be saved: {error}. Manual reset required.");
+            rt.progress_failed_current();
         } else if let Err(error) = rt.operational.flush_checklists() {
             rt.engine.status.message =
                 format!("Test passed, but checklist progress could not be saved: {error}");
+            rt.progress_failed_current();
+        } else {
+            let kind=match milestone {Milestone::SelfTest=>crate::sequence_progress::Kind::ValveSelfTest,Milestone::NitrogenTest=>crate::sequence_progress::Kind::NitrogenTest,Milestone::FillTarget=>crate::sequence_progress::Kind::Fill};
+            let event=format!("qualification:{}:{milestone:?}",rt.operational.run_generation);
+            rt.progress_pass(kind,event);
         }
         rt.operational.running = false;
     }
@@ -673,7 +682,8 @@ mod tests {
             rt.engine.status.phase = Phase::Holding;
             let now = rt.now();
             let _ = rt.engine.cancel_failed_test(now, "small hold leak");
-            complete_operational_milestones(&mut rt, Phase::Holding);
+            let reporting_input=rt.input(true,true);
+            complete_operational_milestones(&mut rt, Phase::Holding, reporting_input);
             assert!(rt.operational.saved.qualification.generation() > generation);
             assert!(rt.operational.saved.qualification.fault().is_none());
             assert!(
@@ -698,7 +708,8 @@ mod tests {
                 "a delayed completion from the cancelled test cannot restore its pass"
             );
             rt.engine.status.phase = Phase::Cancelled;
-            complete_operational_milestones(&mut rt, Phase::CancelSetup);
+            let reporting_input=rt.input(true,true);
+            complete_operational_milestones(&mut rt, Phase::CancelSetup, reporting_input);
             assert_eq!(
                 rt.engine.status.phase,
                 Phase::Cancelled,
@@ -1023,7 +1034,8 @@ mod tests {
             let mut rt = state.gse.lock().unwrap();
             rt.operational.running = true;
             rt.engine.status.phase = Phase::Idle;
-            complete_operational_milestones(&mut rt, Phase::SelfFinish);
+            let reporting_input=rt.input(true,true);
+            complete_operational_milestones(&mut rt, Phase::SelfFinish, reporting_input);
             let saved = operational::Saved::load(rt.operational.path.as_ref().unwrap()).unwrap();
             assert!(saved.qualification.completed(Milestone::SelfTest));
         }
@@ -1589,7 +1601,8 @@ mod tests {
             .unwrap();
         rt.operational.running = true;
         rt.engine.status.phase = Phase::Paused;
-        complete_operational_milestones(&mut rt, Phase::PauseSetup);
+        let reporting_input=rt.input(true,true);
+        complete_operational_milestones(&mut rt, Phase::PauseSetup, reporting_input);
         assert!(!rt.operational.saved.qualification.launch_qualified());
         drop(rt);
         cleanup(&state);
@@ -1789,7 +1802,8 @@ mod tests {
         rt.operational.target_reached = Some(target);
         rt.engine.status.phase = Phase::Paused;
         rt.observe_mass(Some(target * 0.996));
-        complete_operational_milestones(&mut rt, Phase::PauseSetup);
+        let reporting_input=rt.input(true,true);
+        complete_operational_milestones(&mut rt, Phase::PauseSetup, reporting_input);
         assert_eq!(
             rt.operational.saved.qualification.stage(),
             gse_sequence::qualification::MissionStage::Armed

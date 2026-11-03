@@ -213,6 +213,7 @@ pub(super) fn allowed(state: &AppState, rt: &Runtime, original: Inputs) -> bool 
     .is_ok()
 }
 pub(super) fn request(state: &Arc<AppState>) {
+    let progress_reserved=super::progress::reserve(state);
     let policy = state.action_policy_snapshot();
     let result = (|| -> Result<Effects, String> {
         let mut rt = state.gse.lock().unwrap();
@@ -225,12 +226,14 @@ pub(super) fn request(state: &Arc<AppState>) {
             return Err("Fresh mass must use the captured current calibration".into());
         }
         let target = targets.nitrous;
+        let reporting_input=input(&rt,original);
+        let reporting_mass=rt.fresh_mass(original.now_ms);
         let (controller, effects) = Controller::start_with_inventory(
             &rt.engine.config,
             target.target_mass_kg,
             target.target_pressure_psi,
-            input(&rt, original),
-            rt.fresh_mass(original.now_ms),
+            reporting_input,
+            reporting_mass,
             context_from_binding(state, &rt, &binding),
             rt.turbo_evidence.as_ref(),
         )?;
@@ -247,12 +250,16 @@ pub(super) fn request(state: &Arc<AppState>) {
                 .map_err(str::to_string)?;
             rt.operational.persist()?;
         }
+        let reporting_controller=controller.progress_observation();
         rt.turbocharge = Some(controller);
         rt.engine.manual_override();
         rt.engine.claimed = true;
         rt.engine.status.phase = Phase::Turbocharge;
         rt.engine.status.current_step_psi = target.target_pressure_psi;
         rt.engine.status.message = "Turbocharge: confirming all five valves closed".into();
+        rt.progress_start(progress_reserved,crate::sequence_progress::Kind::Turbocharge,original);
+        let reporting_view=rt.engine.progress_observation(reporting_input);
+        rt.progress.observe_turbo(reporting_controller,reporting_view,reporting_mass,reporting_input.now_ms,None,crate::sequence_progress_service::now_ms());
         Ok(effects)
     })();
     match result {
@@ -354,7 +361,9 @@ pub(super) fn pressure_cutoff(rt: &mut Runtime, input: Inputs) -> Option<Effects
     {
         rt.operational.target_reached = None;
     }
-    rt.engine.request(Action::PauseFill, input).ok()
+    let effects=rt.engine.request(Action::PauseFill,input).ok();
+    if effects.is_some(){rt.progress_observe(input,crate::sequence_progress_projection::Cause::PauseAccepted);}
+    effects
 }
 fn invalidate_for_manual_stop(rt: &mut Runtime) -> bool {
     let changed = rt.turbocharge.take().is_some()
@@ -362,6 +371,7 @@ fn invalidate_for_manual_stop(rt: &mut Runtime) -> bool {
         | rt.turbo_binding.is_some();
     let owned =
         changed || rt.turbo_inventory_pending || rt.engine.status.phase == Phase::Turbocharge;
+    if owned {rt.progress.complete(crate::sequence_progress_projection::TerminalProof::Interrupted,crate::sequence_progress_service::now_ms());}
     if changed {
         // Manual Stop owns all resulting physical effects. Keep the durable
         // inventory barrier; cancellation cannot certify prior mass movement.
@@ -400,6 +410,7 @@ pub(super) fn tick(state: &Arc<AppState>, interlock: bool) -> bool {
         let blocked = false;
         if blocked || rt.engine.status.phase == Phase::Fault {
             let active = rt.turbocharge.take().is_some();
+            if active {rt.progress.complete(crate::sequence_progress_projection::TerminalProof::Failed{message:"Turbocharge stopped by the current qualification or fault gate; verify actual output reports.".into()},crate::sequence_progress_service::now_ms());}
             rt.turbo_evidence = None;
             return active;
         }
@@ -414,12 +425,11 @@ pub(super) fn tick(state: &Arc<AppState>, interlock: bool) -> bool {
                 && rt.valve_pressure_epoch != u64::MAX
                 && rt.mass_source_epoch != u64::MAX,
         );
-        let update = controller.tick(
-            input(&rt, original),
-            rt.fresh_mass(original.now_ms)
-                .filter(|_| mass_binding_current(state, &rt)),
-            context(state, &rt),
-        );
+        let reporting_input=input(&rt,original);
+        let reporting_mass=rt.fresh_mass(original.now_ms).filter(|_|mass_binding_current(state,&rt));
+        let update = controller.tick(reporting_input,reporting_mass,context(state,&rt));
+        let reporting_view=rt.engine.progress_observation(reporting_input);
+        rt.progress.observe_turbo(controller.progress_observation(),reporting_view,reporting_mass,reporting_input.now_ms,update.cancelled.as_deref(),crate::sequence_progress_service::now_ms());
         if update.severe_pressure {
             rt.turbo_evidence = None;
             #[cfg(not(feature = "hitl_mode"))]
@@ -448,6 +458,7 @@ pub(super) fn tick(state: &Arc<AppState>, interlock: bool) -> bool {
                 rt.engine.status.phase = Phase::Paused;
                 rt.engine.status.message =
                     format!("Turbocharge closed; audit storage failed: {error}");
+                rt.progress_failed_current();
                 return true;
             }
             #[cfg(not(feature = "hitl_mode"))]
@@ -463,6 +474,7 @@ pub(super) fn tick(state: &Arc<AppState>, interlock: bool) -> bool {
                     rt.engine.status.phase = Phase::Paused;
                     rt.engine.status.message =
                         format!("Turbocharge closed; qualification changed: {error}");
+                rt.progress_failed_current();
                     return true;
                 }
                 rt.operational.saved.turbocharge = Some(evidence.clone());
@@ -476,10 +488,12 @@ pub(super) fn tick(state: &Arc<AppState>, interlock: bool) -> bool {
                     rt.engine.status.phase = Phase::Paused;
                     rt.engine.status.message =
                         format!("Turbocharge closed; evidence storage failed: {error}");
+                rt.progress_failed_current();
                     return true;
                 }
             }
             rt.turbo_evidence = Some(evidence);
+            rt.progress_pass(crate::sequence_progress::Kind::Turbocharge,format!("turbocharge-audit:{}",original.now_ms));
             rt.engine.status.phase = Phase::Paused;
             rt.engine.status.message =
                 "Turbocharge complete: nitrogen closed, fresh mass settled".into();
@@ -1066,12 +1080,24 @@ mod tests {
                 assert!(progressed);
             }
             flush_effects(&state);
+            super::super::progress::flush(&state);
             if (missing_pressure
                 && opened
                 && state.gse.lock().unwrap().engine.status.phase == Phase::Paused)
                 || stopped_at.is_some()
                 || state.gse.lock().unwrap().turbo_evidence.is_some()
             {
+                if state.gse.lock().unwrap().turbo_evidence.is_some() {
+                    let rt=state.gse.lock().unwrap();
+                    let progress=rt.progress.current().expect("actual accepted turbo run");
+                    assert_eq!(progress.outcome,crate::sequence_progress::Outcome::Passed);
+                    let key=progress.key.clone();
+                    drop(rt);
+                    let result=state.sequence_progress.lock().unwrap().result(&key).unwrap();
+                    assert!(result.steps.iter().all(|step|matches!(step.state,crate::sequence_progress::StepState::Passed|crate::sequence_progress::StepState::Skipped)));
+                    let rt=state.gse.lock().unwrap();
+                    assert!(rt.progress.error.is_none());
+                }
                 break;
             }
         }

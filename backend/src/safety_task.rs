@@ -316,11 +316,18 @@ pub async fn safety_task(
         let model_now_ms = crate::simulation_clock_ms();
         let sim_mode = crate::flight_sim::sim_mode_enabled();
         let mut board_warnings = Vec::new();
+        let mut condition_evidence=Vec::new();
         let mut board_log_only = Vec::new();
         let all_boards_seen = {
             let mut board_status = state.board_status.lock().unwrap();
             for (board, status) in board_status.iter_mut() {
                 if !state.board_required_for_progression(*board) {
+                    // Disabling a requirement never clears a condition. A real
+                    // fresh observation from this same optional board can.
+                    if !sim_mode && status.last_seen_ms.is_some() && safety_liveness_age_ms(now_ms,status.last_seen_ms,model_now_ms,status.last_seen_model_ms).is_some_and(|age|age<=BOARD_TIMEOUT_MS)
+                        && let Some(key)=crate::alert_conditions::BoardKey::from_sender(board.sender_id())
+                        && let Some(evidence)=crate::alert_condition_producers::board_liveness(key,true,false)
+                    {condition_evidence.push(evidence);}
                     status.warned = false;
                     continue;
                 }
@@ -337,6 +344,10 @@ pub async fn safety_task(
                     status.last_seen_model_ms,
                 );
                 let offline = liveness_age_ms.is_none_or(|age| age > BOARD_TIMEOUT_MS);
+                if let Some(key)=crate::alert_conditions::BoardKey::from_sender(board.sender_id()) {
+                    let eligible=offline && !is_av_bay_board(*board) && !suppress_disconnect_warnings && current_state!=FlightState::Startup && on_ground;
+                    if let Some(evidence)=crate::alert_condition_producers::board_liveness(key,!offline && status.last_seen_ms.is_some(),eligible) {condition_evidence.push(evidence);}
+                }
                 let is_ground_board = matches!(
                     board,
                     Board::ValveBoard
@@ -359,7 +370,7 @@ pub async fn safety_task(
                         );
                         if current_state != FlightState::Startup {
                             if on_ground {
-                                board_warnings.push(msg);
+                                if let Some(key)=crate::alert_conditions::BoardKey::from_sender(board.sender_id()) {board_warnings.push((msg,crate::alert_conditions::Key::BoardOffline(key)));}
                             } else {
                                 board_log_only.push(msg);
                             }
@@ -414,8 +425,11 @@ pub async fn safety_task(
             })
         };
 
-        for warning in board_warnings {
-            emit_warning(&state, warning);
+        for evidence in condition_evidence {
+            crate::alert_condition_runtime::observe(&state,evidence.key,evidence.state,evidence.message,now_ms as i64);
+        }
+        for (warning,key) in board_warnings {
+            crate::web::emit_warning_linked(&state,warning,state.alert_conditions.current_link(key));
         }
         for warning in board_log_only {
             emit_warning_db_only(&state, warning);

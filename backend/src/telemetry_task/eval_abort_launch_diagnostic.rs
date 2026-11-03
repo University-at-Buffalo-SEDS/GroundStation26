@@ -100,9 +100,18 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
 
     let now = Arc::new(AtomicU64::new(1000));
     let clock = now.clone();
+    // Keep the explicit fault steps below, while SDK retry/deferred service
+    // continues to see real monotonic progress between those steps. A frozen
+    // clock can leave a +1ms queue refusal permanently ineligible after the
+    // first retained owner is observed but its IO callback has not finished.
+    let clock_origin = std::time::Instant::now();
     let host = Arc::new(Router::new_with_clock(
         RouterConfig::new([]).with_sender("GS"),
-        Box::new(move || clock.load(Ordering::SeqCst)),
+        Box::new(move || {
+            clock.load(Ordering::SeqCst).saturating_add(
+                u64::try_from(clock_origin.elapsed().as_millis()).unwrap_or(u64::MAX),
+            )
+        }),
     ));
     state.topology_router.set(host.clone()).unwrap();
     let fc_type = crate::telemetry_schema::data_type("FLIGHT_COMMAND");

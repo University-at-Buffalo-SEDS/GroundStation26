@@ -571,6 +571,8 @@ pub async fn telemetry_task(
             let mut last_recording_end_ms: Option<i64> = None;
 
             let mut pending: Vec<DbWrite> = Vec::with_capacity(db_batch_max);
+            let mut condition_store = crate::alert_condition_runtime::initialize(&state).await;
+            let mut pending_conditions=Vec::with_capacity(64);
             let mut deferred_control_carry: Option<RecordingCommand> = None;
             let mut shutting_down = false;
             loop {
@@ -606,6 +608,7 @@ pub async fn telemetry_task(
                             pending.push(write);
                         }
                     }
+                    DbQueueItem::Condition(work) => crate::alert_condition_runtime::stage(&state,&mut condition_store,&mut pending_conditions,work).await,
                     DbQueueItem::Control(cmd) => deferred_control = Some(cmd),
                 }
 
@@ -621,6 +624,7 @@ pub async fn telemetry_task(
                                 pending.push(write);
                             }
                         }
+                        Ok(DbQueueItem::Condition(work)) => crate::alert_condition_runtime::stage(&state,&mut condition_store,&mut pending_conditions,work).await,
                         Ok(DbQueueItem::Control(cmd)) => {
                             deferred_control = Some(cmd);
                         }
@@ -640,6 +644,7 @@ pub async fn telemetry_task(
                                         pending.push(write);
                                     }
                                 }
+                                Ok(Some(DbQueueItem::Condition(work))) => crate::alert_condition_runtime::stage(&state,&mut condition_store,&mut pending_conditions,work).await,
                                 Ok(Some(DbQueueItem::Control(cmd))) => {
                                     deferred_control = Some(cmd);
                                 }
@@ -650,6 +655,7 @@ pub async fn telemetry_task(
                     }
                 }
 
+                crate::alert_condition_runtime::flush(&state,&mut condition_store,&mut pending_conditions).await;
                 let flush_ok =
                     flush_recording_batch(active_recording.as_ref().map(|a| &a.pool), &mut pending)
                         .await;
@@ -757,6 +763,7 @@ pub async fn telemetry_task(
                     export_test_fire_csv_if_enabled(&state, &active.path).await;
                 }
             }
+            if let Some(store)=condition_store {store.close().await;}
             log::info!("telemetry db worker stopped");
         })
     };
@@ -1408,16 +1415,21 @@ pub async fn telemetry_task(
                     if !heartbeat_cadence.due(crate::simulation_clock_ms()) { continue; }
                     // Retry only failed durable admission; stable clocks emit nothing.
                     let _ = crate::network_variables::retry_pending_daq_log_clock_for_state(&state, &router);
-                    if heartbeat::queue_station_heartbeat(&router).is_ok() {
+                    let heartbeat_accepted=heartbeat::queue_station_heartbeat(&router).is_ok();
+                    let evidence=crate::alert_condition_producers::heartbeat_enqueue(heartbeat_accepted);
+                    let heartbeat_condition=crate::alert_condition_runtime::observe(&state,evidence.key,evidence.state,evidence.message,get_current_timestamp_ms() as i64);
+                    crate::alert_condition_runtime::request_repair(&state);
+                    if heartbeat_accepted {
                         state.mark_board_seen(
                             Board::GroundStation.sender_id(),
                             get_current_timestamp_ms(),
                         );
                         heartbeat_failed = false;
                     } else if !heartbeat_failed {
-                            emit_warning(
+                            crate::web::emit_warning_linked(
                                 &state,
                                 "Warning: Ground Station heartbeat send failed",
+                                heartbeat_condition,
                             );
                             heartbeat_failed = true;
 
@@ -1775,13 +1787,15 @@ async fn insert_db_batch_once(
                 timestamp_ms,
                 severity,
                 message,
+                condition,
             } => {
                 sqlx::query(
-                    "INSERT INTO alerts (timestamp_ms, severity, message) VALUES (?, ?, ?)",
+                    "INSERT INTO alerts (timestamp_ms, severity, message, condition_json) VALUES (?, ?, ?, ?)",
                 )
                 .bind(*timestamp_ms)
                 .bind(severity.as_str())
                 .bind(message.as_str())
+                .bind(condition.as_ref().map(|link|serde_json::to_string(link).expect("finite condition link")))
                 .execute(&mut *tx)
                 .await?;
             }
@@ -1910,7 +1924,7 @@ async fn queue_db_write(
                 emit_warning(state, "Warning: telemetry DB worker stopped unexpectedly");
             }
         }
-        Err(TrySendError::Full(DbQueueItem::Control(_))) => {
+        Err(TrySendError::Full(DbQueueItem::Control(_) | DbQueueItem::Condition(_))) => {
             emit_warning(
                 state,
                 "Warning: telemetry DB worker control queue backpressured",
@@ -2486,6 +2500,12 @@ async fn handle_packet_inner(
                 source >= 0
             }
         });
+        let gateway_condition=if pkt.data_type()==crate::telemetry_schema::data_type("BATTERY_VOLTAGE") && is_fill_system_battery_sender(&sender_id) {
+            crate::alert_condition_producers::gateway_voltage(
+                &pkt,live_receipt.network_ms,state.alert_conditions.current_state(crate::alert_conditions::Key::GatewayLowVoltage),
+                FILL_SYSTEM_LOW_VOLTAGE_WARN_THRESHOLD,FILL_SYSTEM_LOW_VOLTAGE_RELATCH_THRESHOLD,
+            ).and_then(|evidence|crate::alert_condition_runtime::observe(state,evidence.key,evidence.state,evidence.message,ts_ms))
+        }else{None};
         // Tare capture is live input, not a recording side effect. A full disk
         // queue must not delay its receipt clock or hide a valid sample.
         {
@@ -2561,7 +2581,7 @@ async fn handle_packet_inner(
                     && is_fill_system_battery_sender(&sender_id)
                     && update_fill_system_low_voltage_latch(first_value)
                 {
-                    emit_warning(state, FILL_SYSTEM_LOW_VOLTAGE_WARNING);
+                    crate::web::emit_warning_linked(state, FILL_SYSTEM_LOW_VOLTAGE_WARNING,gateway_condition.clone());
                 }
 
                 emit_derived_battery_rows(
@@ -5255,6 +5275,7 @@ mod tests {
             );
         }
 
+        let condition_runtime=Arc::new(crate::alert_condition_runtime::Runtime::for_test());
         let state = Arc::new(AppState {
             control_ingress: Arc::new(Default::default()),
             ring_buffer: Arc::new(Mutex::new(RingBuffer::new(128))),
@@ -5263,11 +5284,12 @@ mod tests {
             warnings_tx: broadcast::channel(4).0,
             errors_tx: broadcast::channel(4).0,
             alert_ack_state: Arc::new(Mutex::new(crate::web::AlertAckStateMsg::default())),
+            alert_conditions: condition_runtime.clone(),
             alert_ack_tx: broadcast::channel(4).0,
             dashboard_reset_tx: broadcast::channel(4).0,
             db: Arc::new(Mutex::new(db)),
             db_path: Arc::new(Mutex::new("sqlite::memory:".to_string())),
-            placeholder_db_path: "sqlite::memory:".to_string(),
+            placeholder_db_path: condition_runtime.test_placeholder_path(),
             db_queue_tx: db_tx,
             db_write_runtime: tokio::runtime::Handle::current(),
             auth_db,
@@ -5282,6 +5304,7 @@ mod tests {
             pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
             latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
             gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
+            sequence_progress: Arc::new(crate::sequence_progress_service::Shared::new(rand::random::<u128>())),
             automatic_generation: Arc::new(AtomicU64::new(1)),
             operator_admission_barrier: Arc::new(AtomicU64::new(0)),
             operator_queue: Arc::new(crate::operator_queue::Control::default()),

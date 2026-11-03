@@ -211,6 +211,44 @@ pub struct Inputs {
     pub prelaunch: bool,
 }
 
+/// Copy-only reporting values. Targets are plans; these do not prove physical valve motion.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ValveProgressObservation {
+    pub target_open: bool,
+    pub raw_readback_open: Option<bool>,
+    pub fresh_readback_open: Option<bool>,
+    pub readback_age_ms: Option<u64>,
+    pub causal_since_ms: u64,
+    pub awaiting_dispatch: bool,
+    pub awaiting_self_readback: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PressureStepProgressObservation {
+    pub target_psi: f32,
+    pub settle_ms: u64,
+    pub hold_ms: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProgressObservation {
+    pub phase: Phase,
+    pub phase_since_ms: u64,
+    pub phase_elapsed_ms: Option<u64>,
+    pub command_since_ms: u64,
+    pub self_index: usize,
+    pub self_pending_mask: u8,
+    pub self_waiting: Option<usize>,
+    pub nitrogen_step_index: usize,
+    pub nitrogen_step_count: usize,
+    pub nitrogen_step: Option<PressureStepProgressObservation>,
+    pub valves: [ValveProgressObservation; 5],
+    pub fresh_pressure_psi: Option<f32>,
+    pub nitrogen_absolute_target_psi: Option<f32>,
+    pub pressure_age_ms: Option<u64>,
+    pub all_valves_confirmed_by_engine: bool,
+    pub hold_samples: usize,
+    pub hold_reference_psi: Option<f32>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Action {
     StartFill,
@@ -619,6 +657,47 @@ impl Engine {
                 hold_ms: 5000,
             })
     }
+    /// Reads existing engine evidence without advancing its clocks, predicates or outputs.
+    pub fn progress_observation(&self, input: Inputs) -> ProgressObservation {
+        let self_confirmation=self.self_confirmation_phase();
+        ProgressObservation {
+            phase:self.status.phase,
+            phase_since_ms:self.phase_since,
+            phase_elapsed_ms:input.now_ms.checked_sub(self.phase_since),
+            command_since_ms:self.command_since,
+            self_index:self.self_index,
+            self_pending_mask:self.self_pending,
+            self_waiting:self.self_waiting,
+            nitrogen_step_index:self.nitrogen_step_index,
+            nitrogen_step_count:self.nitrogen_plan.len(),
+            nitrogen_step:self.nitrogen_plan.get(self.nitrogen_step_index).map(|step|PressureStepProgressObservation{
+                target_psi:step.target_psi,settle_ms:step.settle_ms,hold_ms:step.hold_ms,
+            }),
+            valves:std::array::from_fn(|i| {
+                let readback=input.valves[i];
+                let age=readback.and_then(|v|input.now_ms.checked_sub(v.at_ms));
+                ValveProgressObservation {
+                    target_open:self.target[i],raw_readback_open:readback.map(|v|v.open),
+                    fresh_readback_open:readback.filter(|_|age.is_some_and(|age|age<=2000)).map(|v|v.open),
+                    readback_age_ms:age,
+                    causal_since_ms:if self_confirmation {self.self_ack_since[i]}else{self.command_since},
+                    awaiting_dispatch:self_confirmation && self.self_pending&(1<<i)!=0,
+                    awaiting_self_readback:self_confirmation && self.self_waiting==Some(i),
+                }
+            }),
+            fresh_pressure_psi:Self::fresh_pressure(input),
+            nitrogen_absolute_target_psi:if matches!(self.status.phase,Phase::Raising|Phase::Settling|Phase::Holding) {
+                self.status.baseline.as_ref().map(|b|b.average_psi+self.status.current_step_psi).filter(|v|v.is_finite())
+            }else{None},
+            pressure_age_ms:input.pressure.and_then(|v|input.now_ms.checked_sub(v.at_ms)),
+            all_valves_confirmed_by_engine:self.confirmed(input),
+            hold_samples:self.hold_samples,
+            hold_reference_psi:self.hold_reference.filter(|value|value.is_finite()),
+        }
+    }
+    /// The actual already validated plan, bounded by MAX_NITROGEN_STEPS.
+    pub fn progress_nitrogen_plan(&self)->&[NitrogenStep] {&self.nitrogen_plan}
+
     fn confirmed(&self, input: Inputs) -> bool {
         input
             .valves
@@ -1569,7 +1648,7 @@ mod tests {
             input.now_ms += 100;
             input.pressure.as_mut().unwrap().at_ms = input.now_ms;
             // Boards publish full physical snapshots every second, even if no valve changed.
-            if input.now_ms % 1000 == 0 {
+            if input.now_ms.is_multiple_of(1000) {
                 for state in input.valves.iter_mut().flatten() {
                     state.at_ms = input.now_ms;
                 }
@@ -1885,4 +1964,55 @@ mod tests {
         assert_eq!(rig.engine.status.phase, Phase::Fault);
         assert!(effects.notification.unwrap().contains("no fresh report"));
     }
+    #[test]
+    fn progress_getter_preserves_actual_sequence_outputs_and_transitions() {
+        for action in [Action::SelfTest,Action::NitrogenTest] {
+            let mut control=Rig::new();let mut observed=Rig::new();
+            control.request(action);observed.request(action);
+            let mut finished=false;
+            for _ in 0..1000 {
+                let pressure=match control.engine.status.phase {
+                    Phase::Raising|Phase::Settling|Phase::Holding=>control.engine.status.baseline.as_ref().map_or(5.,|b|b.average_psi)+control.engine.status.current_step_psi,
+                    _=>5.,
+                };
+                control.pressure=pressure;observed.pressure=pressure;
+                for _ in 0..3 {
+                    let view=observed.engine.progress_observation(observed.input());
+                    assert_eq!(view.phase,observed.engine.status.phase);
+                    assert_eq!(view.all_valves_confirmed_by_engine,observed.engine.confirmed(observed.input()));
+                    assert_eq!(view.fresh_pressure_psi,Engine::fresh_pressure(observed.input()));
+                }
+                control.now+=100;observed.now+=100;
+                let expected=control.engine.tick(control.input());
+                let actual=observed.engine.tick(observed.input());
+                assert_eq!(expected.valves,actual.valves);assert_eq!(expected.notification,actual.notification);
+                control.effects(expected);observed.effects(actual);
+                assert_eq!(serde_json::to_value(&control.engine.status).unwrap(),serde_json::to_value(&observed.engine.status).unwrap());
+                assert_eq!(control.engine.phase_since,observed.engine.phase_since);
+                assert_eq!(control.engine.command_since,observed.engine.command_since);
+                assert_eq!(control.engine.samples.len(),observed.engine.samples.len());
+                assert_eq!(control.engine.self_index,observed.engine.self_index);
+                assert_eq!(control.engine.nitrogen_step_index,observed.engine.nitrogen_step_index);
+                if matches!(action,Action::SelfTest)&&control.engine.status.phase==Phase::Idle
+                    || matches!(action,Action::NitrogenTest)&&control.engine.status.phase==Phase::Passed {
+                    finished=true;break;
+                }
+                assert_ne!(control.engine.status.phase,Phase::Fault);
+            }
+            assert!(finished,"Actual {action:?} sequence did not reach its actual engine terminal phase: {:?}",control.engine.status);
+        }
+    }
+    #[test]
+    fn progress_getter_keeps_missing_stale_future_and_nonfinite_inputs_unknown() {
+        let engine=Engine::default();
+        let mut input=Inputs{now_ms:3000,pressure:None,valves:[None;5],interlock:true,prelaunch:true};
+        let view=engine.progress_observation(input);assert!(view.fresh_pressure_psi.is_none());assert!(view.valves.iter().all(|v|v.fresh_readback_open.is_none()));
+        input.pressure=Some(Sample{value:f32::NAN,at_ms:3000});input.valves[0]=Some(ValveState{open:true,at_ms:999});
+        let view=engine.progress_observation(input);assert!(view.fresh_pressure_psi.is_none());assert_eq!(view.valves[0].raw_readback_open,Some(true));assert_eq!(view.valves[0].fresh_readback_open,None);
+        input.pressure=Some(Sample{value:0.,at_ms:3001});input.valves[0]=Some(ValveState{open:true,at_ms:3001});
+        let view=engine.progress_observation(input);assert!(view.fresh_pressure_psi.is_none());assert_eq!(view.valves[0].readback_age_ms,None);assert_eq!(view.valves[0].fresh_readback_open,None);
+        input.pressure=Some(Sample{value:0.,at_ms:1000});input.valves[0]=Some(ValveState{open:false,at_ms:1000});
+        let view=engine.progress_observation(input);assert_eq!(view.fresh_pressure_psi,Some(0.));assert_eq!(view.valves[0].fresh_readback_open,Some(false));
+    }
+
 }

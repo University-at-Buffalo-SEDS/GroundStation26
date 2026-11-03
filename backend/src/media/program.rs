@@ -43,6 +43,10 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
                 )
             }),
         )
+        .route(
+            "/assets/stream-sequence-visuals.js",
+            get(|| async { ([(header::CONTENT_TYPE, "text/javascript")], gs_browser_assets::STREAM_SEQUENCE_VISUALS_JS) }),
+        )
         .route("/api/media-assets/program/state", get(program_state))
         .route("/api/media-assets/program/audio", get(program_audio))
         .route(
@@ -126,7 +130,7 @@ const MAX_PROGRAM_SNAPSHOTS: usize = 364;
 fn retain_program_snapshot(
     history: &mut std::collections::VecDeque<(u64, serde_json::Value)>,
     now: u64,
-    snapshot: serde_json::Value,
+    mut snapshot: serde_json::Value,
 ) {
     // A UTC correction cannot leave future frames or unbounded retained data.
     if history.back().is_some_and(|(time, _)| *time > now) {
@@ -136,6 +140,8 @@ fn retain_program_snapshot(
         .back()
         .is_none_or(|(time, _)| now.saturating_sub(*time) >= PROGRAM_SAMPLE_MS)
     {
+        let previous=history.back().filter(|(at,_)|now.saturating_sub(*at)<=2000).map(|(_,value)|value);
+        crate::sequence_stream::observe_clock_progress(previous,&mut snapshot);
         history.push_back((now, snapshot));
     }
     while history.len() > MAX_PROGRAM_SNAPSHOTS
@@ -319,7 +325,23 @@ pub(super) fn telemetry_snapshot(
             serde_json::json!({"label":stat.label,"value":value,"unit":stat.unit,"precision":stat.precision,"format":stat.format,"binding":binding})
         }).collect()
     };
-    serde_json::json!({"phase":format!("{phase:?}"),"test_fire_mode":cfg!(feature="test_fire_mode"),"stats":stats,"profile":profile_id,"cycle_seconds":profile.cycle_seconds,"stats_per_page":profile.stats_per_page,"scene":profile.scene,"positions":crate::antenna::snapshot(),"t_clock":program_t_clock(&app.launch_clock_snapshot(),crate::telemetry_task::procedure_clock::for_wall(now).timestamp_ms())})
+    let procedure=crate::telemetry_task::procedure_clock::for_wall(now);
+    let clock=app.launch_clock_snapshot();
+    let sampled=procedure.timestamp_ms();
+    let remaining=if clock.kind==crate::telemetry_db::LaunchClockKind::TMinus {
+        match (clock.anchor_timestamp_ms,clock.duration_ms) {
+            (Some(anchor),Some(duration))=>Some(duration.saturating_sub(sampled.saturating_sub(anchor))),
+            (Some(target),None)=>Some(target.saturating_sub(sampled)),
+            (None,Some(duration))=>Some(duration),_=>None,
+        }
+    }else{None};
+    let stream_clock=crate::sequence_stream::Clock {
+        kind:match clock.kind {crate::telemetry_db::LaunchClockKind::Idle=>"idle",crate::telemetry_db::LaunchClockKind::TMinus=>"t_minus",crate::telemetry_db::LaunchClockKind::TPlus=>"t_plus"}.into(),
+        source_kind:if procedure.model_monotonic_ms().is_some(){"model_procedure"}else{"host_wall"}.into(),
+        sampled_timestamp_ms:sampled,anchor_timestamp_ms:clock.anchor_timestamp_ms,duration_ms:clock.duration_ms,remaining_ms:remaining,advancing:false,
+    };
+    let sequence_visuals=crate::sequence_stream::project(stream_clock,Some(crate::gse::progress::stream_observation(app)),app.umbilical_stream_outputs(),app.umbilical_stream_commands());
+    serde_json::json!({"phase":format!("{phase:?}"),"test_fire_mode":cfg!(feature="test_fire_mode"),"stats":stats,"profile":profile_id,"cycle_seconds":profile.cycle_seconds,"stats_per_page":profile.stats_per_page,"scene":profile.scene,"positions":crate::antenna::snapshot(),"t_clock":program_t_clock(&clock,sampled),"sequence_visuals":sequence_visuals})
 }
 
 fn valid_hls_file(name: &str) -> bool {
