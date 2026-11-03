@@ -361,11 +361,10 @@ async fn hitl_ingress_owner_red_wrong_board_status_cannot_mint_valve_or_qd_confi
                 packet.data_type().as_str().to_string(),
                 ingress_state.canonical_network_sender_id(packet.sender()),
             ));
-            if packet.data_type() == crate::telemetry_schema::data_type("UMBILICAL_STATUS") {
-                if let Some(row) = apply_umbilical_status_at_ingress(&ingress_state, packet) {
+            if packet.data_type() == crate::telemetry_schema::data_type("UMBILICAL_STATUS")
+                && let Some(row) = apply_umbilical_status_at_ingress(&ingress_state, packet) {
                     ingress_state.cache_recent_telemetry(row);
                 }
-            }
             Ok(())
         },
     );
@@ -704,7 +703,11 @@ async fn umbilical_owner_ordering_pre_target_capture_cannot_clear_new_pending() 
     );
     let before = ingress.state.gse.lock().unwrap().mirror_valves();
     apply_captured_umbilical_status(&ingress.state, capture).unwrap();
-    assert_eq!(ingress.state.gse.lock().unwrap().mirror_valves(), before, "rejected pre-target capture must not change GSE live evidence");
+    assert_eq!(
+        ingress.state.gse.lock().unwrap().mirror_valves(),
+        before,
+        "rejected pre-target capture must not change GSE live evidence"
+    );
     eprintln!(
         "ACTUAL_PRE_TARGET_CAPTURE: pending={:?}, confirmed={:?}",
         ingress.state.get_pending_umbilical_valve_state(0),

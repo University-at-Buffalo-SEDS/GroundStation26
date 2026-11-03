@@ -791,6 +791,7 @@ mod generation_lifecycle_tests {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(Default)]
 struct ValveSnapshot {
     normally_open: Option<bool>,
     pending_normally_open: Option<bool>,
@@ -808,26 +809,6 @@ struct ValveSnapshot {
     pending_retract: Option<bool>,
 }
 
-impl Default for ValveSnapshot {
-    fn default() -> Self {
-        Self {
-            normally_open: None,
-            pending_normally_open: None,
-            dump_open: None,
-            pending_dump_open: None,
-            nitrogen_open: None,
-            pending_nitrogen_open: None,
-            nitrous_open: None,
-            pending_nitrous_open: None,
-            pilot_open: None,
-            pending_pilot_open: None,
-            igniter_on: None,
-            pending_igniter_on: None,
-            retract: None,
-            pending_retract: None,
-        }
-    }
-}
 
 impl ValveSnapshot {
     fn read(state: &AppState) -> Self {
@@ -922,6 +903,15 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::ToggleGroundStationControl => "ToggleGroundStationControl",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ToggleLaunchInterlock => "ToggleLaunchInterlock",
+        #[cfg(feature = "hitl_mode")]
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::TogglePlumbingDelayInterlock => "TogglePlumbingDelayInterlock",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ToggleChecklistInterlock => "ToggleChecklistInterlock",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ToggleSupplyInterlock => "ToggleSupplyInterlock",
+        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::ToggleBoardStateProofInterlock => "ToggleBoardStateProofInterlock",
         #[cfg(feature = "hitl_mode")]
         TelemetryCommand::TogglePhysicalLaunchMode => "TogglePhysicalLaunchMode",
         TelemetryCommand::ToggleAvBayUnderglow => "ToggleAvBayUnderglow",
@@ -1035,6 +1025,10 @@ pub fn all_command_names() -> Vec<&'static str> {
         "ToggleButtonInterlock",
         "ToggleGroundStationControl",
         "ToggleLaunchInterlock",
+        "TogglePlumbingDelayInterlock",
+        "ToggleChecklistInterlock",
+        "ToggleSupplyInterlock",
+        "ToggleBoardStateProofInterlock",
         "TogglePhysicalLaunchMode",
         "ToggleAvBayUnderglow",
         "ToggleFlightBuzzer",
@@ -1099,7 +1093,7 @@ pub fn all_command_names() -> Vec<&'static str> {
 pub fn default_action_policy() -> ActionPolicyMsg {
     #[cfg(feature = "hitl_mode")]
     {
-        return hitl_action_policy(ValveSnapshot {
+        hitl_action_policy(ValveSnapshot {
             normally_open: None,
             dump_open: None,
             nitrogen_open: None,
@@ -1108,7 +1102,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
             igniter_on: None,
             retract: None,
             ..ValveSnapshot::default()
-        });
+        })
     }
     #[cfg(not(feature = "hitl_mode"))]
     {
@@ -1117,7 +1111,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
             .map(|cmd| {
                 let enabled = is_station_utility_command(cmd)
                     || default_recording_command_enabled(cmd)
-                        .unwrap_or_else(|| matches!(cmd, "Abort" | "Postinit" | "ResetSim"));
+                        .unwrap_or(matches!(cmd, "Abort" | "Postinit" | "ResetSim"));
                 ActionControl {
                     cmd: cmd.to_string(),
                     enabled,
@@ -1401,12 +1395,14 @@ fn mass_target_reached(current_mass_kg: f32, target_mass_kg: f32, epsilon_kg: f3
 
 /// The one-button GSE fill uses the same thresholds and signed mass target as
 /// the main fill: immediate target cutoff, or a pressure/weight plateau.
+#[cfg_attr(not(test), derive(Default))]
 pub(crate) struct FillCutoff {
     #[cfg(test)]
     cfg: SequenceConfig,
     previous: Option<(f32, f32)>,
     level_since: Option<Instant>,
 }
+#[cfg(test)]
 impl Default for FillCutoff {
     fn default() -> Self {
         Self {
@@ -2309,8 +2305,8 @@ fn build_policy(
 
     match runtime.step {
         SequenceStep::SetupValves => {
-            if !cfg!(feature = "test_fire_mode") {
-                if let Some(blink) = command_prompt_blink(
+            if !cfg!(feature = "test_fire_mode")
+                && let Some(blink) = command_prompt_blink(
                     state,
                     cfg,
                     inputs.valves,
@@ -2320,7 +2316,6 @@ fn build_policy(
                 ) {
                     recommended.insert("NormallyOpen", blink);
                 }
-            }
             if let Some(blink) =
                 command_prompt_blink(state, cfg, inputs.valves, "Dump", false, inputs.now_ms)
             {

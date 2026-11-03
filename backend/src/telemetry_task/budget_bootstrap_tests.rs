@@ -230,7 +230,7 @@ async fn cold_routing_cannot_hide_paid_bootstrap_before_catalog_owner_starts() {
                 first_revoke.get_or_insert(now);
             }
             let inner = if body.starts_with(b"RR\x01")
-                && matches!(body.get(3), Some(1 | 2 | 3 | 4 | 5 | 6))
+                && matches!(body.get(3), Some(1..=6))
             {
                 &body[4..body.len() - 4]
             } else {
@@ -881,11 +881,10 @@ async fn queued_revoke_follows_completed_health_before_startup_controls() {
                 } else {
                     body.as_slice()
                 };
-                if let Ok(id) = serialize::packet_id_from_wire(inner) {
-                    if command_ids.contains(&id) {
+                if let Ok(id) = serialize::packet_id_from_wire(inner)
+                    && command_ids.contains(&id) {
                         command_writes.push((id, now));
                     }
-                }
                 toward_relay.push_back((now + 64, command, body));
             }
         }

@@ -125,6 +125,7 @@ fn setup_callbacks(
     let debounce = Duration::from_millis(50);
 
     let abort_intent = state.manual_abort_intent.clone();
+    let abort_ingress=state.control_ingress.clone();
     gpio.setup_callback_input_pin(ABORT_PIN, Trigger::RisingEdge, debounce, move |is_high| {
         log::info!("GPIO abort button interrupt on BCM GPIO {ABORT_PIN}: is_high={is_high}");
         if !is_high {
@@ -132,7 +133,7 @@ fn setup_callbacks(
             return;
         }
 
-        dispatch_gpio_abort(&abort_intent, "interrupt");
+        let _=abort_ingress.run_sync(|| dispatch_gpio_abort(&abort_intent,"interrupt"));
     })?;
     spawn_abort_poll_thread(state.clone());
 
@@ -147,6 +148,8 @@ fn setup_callbacks(
         // Capture before any policy/GSE wait so reset cannot mint a fresh token
         // for an earlier physical button press.
         let generation = crate::gse::capture_operator_origin(&state_launch).unwrap_or(0);
+        let launch_revision =
+            crate::board_abort::capture_launch_revision(&state_launch, &TelemetryCommand::Launch);
         if !allowed_launch.lock().unwrap().launch {
             return;
         }
@@ -186,7 +189,15 @@ fn setup_callbacks(
         #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
         let launch_command = TelemetryCommand::Launch;
 
-        if queue_gpio_command(&tx_launch, generation, None, launch_command).is_err() {
+        if queue_gpio_command(
+            &tx_launch,
+            generation,
+            None,
+            launch_revision,
+            launch_command,
+        )
+        .is_err()
+        {
             eprintln!("GPIO launch button: failed to send command");
         }
     })?;
@@ -302,7 +313,7 @@ fn spawn_abort_poll_thread(state: Arc<AppState>) {
                                 "GPIO abort poll level changed on BCM GPIO {ABORT_PIN}: is_high={is_high}"
                             );
                             if is_high {
-                                dispatch_gpio_abort(&state.manual_abort_intent, "polling fallback");
+                                let _=state.control_ingress.run_sync(|| dispatch_gpio_abort(&state.manual_abort_intent,"polling fallback"));
                             }
                             last_level = Some(is_high);
                         }
@@ -354,9 +365,11 @@ fn queue_gpio_command(
     tx: &mpsc::Sender<TelemetryCommand>,
     generation: u64,
     plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+    launch_revision: Option<u64>,
     command: TelemetryCommand,
 ) -> Result<(), mpsc::error::TrySendError<TelemetryCommand>> {
     tx.try_send(TelemetryCommand::QueuedOperator {
+        launch_revision,
         plumbing_origin,
         generation,
         command: Box::new(command),
@@ -382,10 +395,16 @@ where
     let _gpio_for_callback = gpio.clone();
 
     gpio.setup_callback_input_pin(pin, Trigger::RisingEdge, debounce, move |is_high| {
+        let _=state.control_ingress.run_sync(|| {
         if !is_high {
             return;
         }
-        let generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
+        let generation = if matches!(cmd, TelemetryCommand::Abort) {
+            0
+        } else {
+            crate::gse::capture_operator_origin(&state).unwrap_or(0)
+        };
+        let launch_revision = crate::board_abort::capture_launch_revision(&state, &cmd);
         let plumbing_origin = crate::actuator_plumbing::capture_motion_origin(&state, &cmd);
         #[cfg(feature = "hitl_mode")]
         if state.hitl_button_interlock_enabled()
@@ -431,12 +450,15 @@ where
             &tx,
             generation,
             plumbing_origin,
+            launch_revision,
             crate::gse::panel_command(&state, cmd.clone()),
         )
         .is_err()
         {
             eprintln!("GPIO button pin {pin}: failed to send command");
         }
+
+        });
     })?;
     Ok(())
 }
@@ -734,7 +756,7 @@ fn error_blink_pulse(phase_ms: u64, offset_ms: u64) -> Option<f64> {
 fn is_input_enabled(gpio: &crate::gpio::GpioPins, pin: u8) -> bool {
     #[cfg(feature = "raspberry_pi")]
     {
-        return gpio.read_input_pin(pin).unwrap_or(false);
+        gpio.read_input_pin(pin).unwrap_or(false)
     }
 
     #[cfg(not(feature = "raspberry_pi"))]
@@ -838,8 +860,8 @@ mod tests {
         let state = crate::state::tests::test_app_state().await;
         let (tx, mut rx) = mpsc::channel(4);
         let generation = crate::gse::automatic_generation(&state);
-        queue_gpio_command(&tx, generation, None, TelemetryCommand::Launch).unwrap();
-        queue_gpio_command(&tx, generation, None, TelemetryCommand::Nitrogen).unwrap();
+        queue_gpio_command(&tx, generation, None, Some(0), TelemetryCommand::Launch).unwrap();
+        queue_gpio_command(&tx, generation, None, None, TelemetryCommand::Nitrogen).unwrap();
         // The actual command-worker lease checks the token after reset; this
         // test isolates physical admission, without issuing a board reset.
         state
@@ -863,6 +885,7 @@ mod tests {
         queue_gpio_command(
             &tx,
             crate::gse::automatic_generation(&state),
+            None,
             None,
             TelemetryCommand::Postinit,
         )

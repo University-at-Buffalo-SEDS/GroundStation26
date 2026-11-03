@@ -610,7 +610,7 @@ pub(crate) fn save_at(cfg: &LoadcellCalibrationFile, path: &std::path::Path) -> 
     std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all({parent:?}): {e}"))?;
     let raw =
         serde_json::to_string_pretty(cfg).map_err(|e| format!("serialize calibration: {e}"))?;
-    if let Ok(previous) = std::fs::read(&path) {
+    if let Ok(previous) = std::fs::read(path) {
         if previous == raw.as_bytes() {
             return Ok(());
         }
@@ -1537,13 +1537,15 @@ mod tests {
 
     #[test]
     fn reversed_load_readings_are_not_clipped_at_132_kg() {
-        let mut cfg = LoadcellCalibrationFile::default();
-        // Coefficients reconstructed from the recording; mass must remain
+                // Coefficients reconstructed from the recording; mass must remain
         // linear outside its observed -132.95 kg minimum. Only fill percentage
         // is intentionally restricted to 0..100, never the measured mass.
-        cfg.ch1 = ChannelLinear {
+        let cfg = LoadcellCalibrationFile {
+            ch1: ChannelLinear {
             m: Some(9977.795),
             b: Some(-147.32314),
+        },
+            ..LoadcellCalibrationFile::default()
         };
         let floor = calibrated_weight_kg(&cfg, "KG1000", 0.0014401439).unwrap();
         assert!((floor + 132.95367).abs() < 0.001);
@@ -1768,7 +1770,7 @@ mod thermal_tests {
     }
     #[test]
     fn freshness_and_sender_are_required() {
-        let rows = vec![crate::types::TelemetryRow {
+        let rows = [crate::types::TelemetryRow {
             timestamp_ms: 1000,
             data_type: "DAQ_ADC_TEMPERATURE".into(),
             sender_id: "SD_CARD".into(),
@@ -2157,10 +2159,12 @@ mod history_calibration_tests {
     use crate::types::TelemetryRow;
     #[test]
     fn history_calibration_uses_current_thermal_fit_and_expires_stale_temperature() {
-        let mut cfg = LoadcellCalibrationFile::default();
-        cfg.ch1 = ChannelLinear {
+                let mut cfg = LoadcellCalibrationFile {
+            ch1: ChannelLinear {
             m: Some(2.),
             b: Some(1.),
+        },
+            ..LoadcellCalibrationFile::default()
         };
         cfg.thermal.insert(
             "KG1000".into(),
@@ -2194,10 +2198,12 @@ mod history_calibration_tests {
     }
     #[test]
     fn history_calibration_replaces_old_weights_from_raw_without_touching_raw() {
-        let mut cfg = LoadcellCalibrationFile::default();
-        cfg.ch1 = ChannelLinear {
+                let cfg = LoadcellCalibrationFile {
+            ch1: ChannelLinear {
             m: Some(2.),
             b: Some(1.),
+        },
+            ..LoadcellCalibrationFile::default()
         };
         let mut replay =
             HistoryCalibration::new(cfg, &FillTargetsConfig::default(), FlightState::Startup);

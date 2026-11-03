@@ -175,8 +175,7 @@ fn delayed_or_regressed_processing_clock_never_commits_capture_or_history() {
         assert_eq!(runtime.last_valve_captures, before);
         assert!(runtime.valves[0].is_none());
     }
-    let mut runtime = Runtime::default();
-    runtime.clock = Instant::now() - std::time::Duration::from_secs(5);
+    let mut runtime = Runtime { clock: Instant::now() - std::time::Duration::from_secs(5), ..Runtime::default() };
     let before = runtime.last_valve_captures;
     let receipt = ValveReceipt {
         network_ms: 1_798_000_000_000,

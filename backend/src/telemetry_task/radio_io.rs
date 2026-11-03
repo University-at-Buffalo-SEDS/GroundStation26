@@ -388,7 +388,6 @@ impl TransportTxActivity {
         }
         Ok(())
     }
-    #[cfg(any(not(feature = "hitl_mode"), test))]
     pub fn has_pending(&self) -> bool {
         self.pending.load(Ordering::Acquire) != 0
     }
@@ -2557,11 +2556,10 @@ pub(super) fn spawn_comms_worker_threads(
                     match result {
                         Ok(completed_charge) => {
                             // None already sent through the generic path; never send twice.
-                            if selected_ordinary {
-                                if let (Some(charge), Some(state)) = (completed_charge, mesh_ordinary_state) {
+                            if selected_ordinary
+                                && let (Some(charge), Some(state)) = (completed_charge, mesh_ordinary_state) {
                                     ordinary_balance.sdk_complete(charge, state);
                                 }
-                            }
                             #[cfg(all(test, target_os="linux", any(feature="firmware_sim",feature="hitl_mode")))]
                             root_ordinary_turn_tests::record_service("sdk_completed_service",serde_json::json!({"priority":priority,"ordinary":selected_ordinary,"actual_charge":completed_charge,"mesh_state":format!("{mesh_ordinary_state:?}"),"balance":ordinary_balance.bytes,"prefix":&payload[..payload.len().min(4)],"payload_bytes":payload.len()}));
                             if let Some(budget) = &comms_handle.tx_budget {
@@ -3765,6 +3763,7 @@ fn drain_radio_tx_queue(
     }
 }
 
+#[expect(clippy::too_many_arguments, reason = "Independent mutable transport, queue and radio window accounting must retain ownership")]
 fn send_while_uplink_window_open(
     comms: &mut dyn CommsDevice,
     worker_name: &str,

@@ -180,19 +180,21 @@ pub(super) mod tests {
         let seen = Arc::new(AtomicUsize::new(0));
         let count = seen.clone();
         let router = Arc::new(sedsnet::router::Router::new(
-            sedsnet::router::RouterConfig::new([sedsnet::router::EndpointHandler::new_packet_handler(
-                crate::telemetry_schema::endpoint("ABORT"),
-                move |packet| {
-                    assert!(
-                        weak.upgrade().unwrap().gse.try_lock().is_ok(),
-                        "router callback must not run under GSE lock"
-                    );
-                    if packet.data_type() == crate::telemetry_schema::data_type("ABORT") {
-                        count.fetch_add(1, Ordering::SeqCst);
-                    }
-                    Ok(())
-                },
-            )]),
+            sedsnet::router::RouterConfig::new([
+                sedsnet::router::EndpointHandler::new_packet_handler(
+                    crate::telemetry_schema::endpoint("ABORT"),
+                    move |packet| {
+                        assert!(
+                            weak.upgrade().unwrap().gse.try_lock().is_ok(),
+                            "router callback must not run under GSE lock"
+                        );
+                        if packet.data_type() == crate::telemetry_schema::data_type("ABORT") {
+                            count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(())
+                    },
+                ),
+            ]),
         ));
         let path = armed_fixture_for_test(&state, &router);
         (state, router, seen, path)
@@ -517,7 +519,10 @@ pub(super) mod tests {
                 sedsnet::router::RouterConfig::new([]),
             )))
             .unwrap();
-        crate::telemetry_task::refresh_host_network_time(restored.topology_router.get().unwrap(), crate::telemetry_task::get_current_timestamp_ms());
+        crate::telemetry_task::refresh_host_network_time(
+            restored.topology_router.get().unwrap(),
+            crate::telemetry_task::get_current_timestamp_ms(),
+        );
         clear_ground_abort(&restored).unwrap();
         assert!(
             !operational::Saved::load(&path)
@@ -651,6 +656,7 @@ mod launch_inhibition_tests {
     #[tokio::test]
     async fn launch_inhibits_automatic_abort_despite_delayed_state_and_clock_reset() {
         let state = crate::state::tests::test_app_state().await;
+        crate::gse::qualified_launch_proofs_for_test(&state);
         state.set_local_flight_state(FlightState::Armed);
         super::super::inhibit_automatic_actions_for_launch(&state).unwrap();
         for stage in [
@@ -662,7 +668,7 @@ mod launch_inhibition_tests {
             // A still-active fill with missing pressure would otherwise fault and
             // automatically close/open valves on the next real controller tick.
             state.gse.lock().unwrap().engine.status.phase = Phase::Filling;
-            state.set_local_flight_state(stage);
+            state.set_preexisting_flight_state_for_test(stage);
             state.reset_launch_clock();
             assert!(!super::super::automatic_abort_allowed(&state));
             assert!(claim_automatic_abort(&state).is_none());

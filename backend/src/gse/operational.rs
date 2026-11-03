@@ -75,18 +75,17 @@ impl Saved {
         if self.turbocharge.as_ref().is_some_and(|e| !e.valid()) {
             return Err("Invalid saved Turbocharge evidence".into());
         }
-        if let Some(b) = &self.baseline {
-            if b.samples < 3
+        if let Some(b) = &self.baseline
+            && (b.samples < 3
                 || ![b.average_psi, b.min_psi, b.max_psi, b.noise_psi]
                     .into_iter()
                     .all(f32::is_finite)
                 || b.min_psi > b.average_psi
                 || b.average_psi > b.max_psi
-                || b.noise_psi < 0.0
+                || b.noise_psi < 0.0)
             {
                 return Err("Invalid saved pressure baseline".into());
             }
-        }
         if self.qualification.nitrogen_satisfied() && self.baseline.is_none() {
             return Err("Saved nitrogen test has no pressure baseline".into());
         }
@@ -155,6 +154,7 @@ pub struct Operational {
     pub startup_configured: bool,
     pub qd: QdWait,
     pub qd_dispatch_utc_ms: Option<u64>,
+    pub(super) qd_launch_admission: Option<super::LaunchAdmission>,
     pub persist_error: Option<String>,
 }
 impl Operational {
@@ -190,7 +190,9 @@ impl Operational {
         }
         let mut next = self.saved.clone();
         next.automatic_abort_claimed = false;
-        let result = self.path.as_ref()
+        let result = self
+            .path
+            .as_ref()
             .ok_or_else(|| "Qualification storage is not initialized".to_string())
             .and_then(|path| next.save(path));
         if let Err(error) = result {
@@ -504,8 +506,7 @@ mod checklist_outbox_tests {
     }
     #[test]
     fn unfinished_or_stale_runs_cannot_enqueue_a_success() {
-        let mut op = Operational::default();
-        op.run_generation = 1;
+        let mut op = Operational { run_generation: 1, ..Operational::default() };
         assert!(op.complete(Milestone::SelfTest).is_err());
         assert!(op.saved.pending_checklists.is_empty());
         assert!(!op.saved.qualification.completed(Milestone::SelfTest));

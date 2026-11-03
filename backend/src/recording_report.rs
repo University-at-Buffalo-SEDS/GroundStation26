@@ -16,8 +16,8 @@ pub struct ReportQuery {
 
 fn valve_labels(layout: &serde_json::Value) -> serde_json::Value {
     fn walk(value: &serde_json::Value, labels: &mut std::collections::BTreeMap<u64, serde_json::Value>) {
-        if value["data_type"] == "VALVE_STATE" {
-            if let Some(items)=value["valves"].as_array().or_else(||value["items"].as_array()) {
+        if value["data_type"] == "VALVE_STATE"
+            && let Some(items)=value["valves"].as_array().or_else(||value["items"].as_array()) {
                 for (ordinal,item) in items.iter().enumerate() {
                     if let Some(index)=item["index"].as_u64().filter(|i|*i<7) {
                         let mut mapping=serde_json::json!({"index":index});
@@ -28,7 +28,6 @@ fn valve_labels(layout: &serde_json::Value) -> serde_json::Value {
                     }
                 }
             }
-        }
         match value {serde_json::Value::Object(map)=>{for child in map.values(){walk(child,labels);}},serde_json::Value::Array(list)=>{for child in list{walk(child,labels);}},_=>{}}
     }
     let mut labels=std::collections::BTreeMap::new();walk(layout,&mut labels);
@@ -37,8 +36,8 @@ fn valve_labels(layout: &serde_json::Value) -> serde_json::Value {
 
 fn channel_metadata(layout:&serde_json::Value)->serde_json::Value {
     fn walk(value:&serde_json::Value,out:&mut Vec<serde_json::Value>) {
-        if let Some(kind)=value["data_type"].as_str().or_else(||value["id"].as_str()) {
-            if let Some(formatters)=value["channel_formatters"].as_array() {
+        if let Some(kind)=value["data_type"].as_str().or_else(||value["id"].as_str())
+            && let Some(formatters)=value["channel_formatters"].as_array() {
                 for (index,formatter) in formatters.iter().enumerate() {
                     if let Some(unit)=formatter["suffix"].as_str().map(str::trim).filter(|s|!s.is_empty() && s.len()<=64) {
                         let mut item=serde_json::json!({"data_type":kind,"index":index,"unit":unit});
@@ -47,7 +46,6 @@ fn channel_metadata(layout:&serde_json::Value)->serde_json::Value {
                     }
                 }
             }
-        }
         match value {serde_json::Value::Object(map)=>{for child in map.values(){walk(child,out);}},serde_json::Value::Array(list)=>{for child in list{walk(child,out);}},_=>{}}
     }
     let mut out=Vec::new();walk(layout,&mut out);serde_json::Value::Array(out)

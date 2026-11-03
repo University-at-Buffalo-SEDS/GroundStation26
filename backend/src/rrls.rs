@@ -7,8 +7,7 @@ use std::{
 };
 
 #[cfg(test)]
-#[path = "comms/virtual_uart.rs"]
-mod receipt_test_wire;
+use crate::comms::virtual_uart as receipt_test_wire;
 
 #[path = "rrls/continuous_clock.rs"]
 mod continuous_clock;
@@ -624,8 +623,7 @@ impl Mesh {
         if self
             .last_position_sent
             .is_none_or(|last| now.saturating_sub(last) >= 5_000)
-        {
-            if let Some(fix) = crate::antenna::local_fix()
+            && let Some(fix) = crate::antenna::local_fix()
                 && let Some(encoded) = crate::antenna::encode_position(&fix)
             {
                 let mut payload = Vec::with_capacity(39);
@@ -641,7 +639,6 @@ impl Mesh {
                 );
                 self.last_position_sent = Some(now);
             }
-        }
         self.poll_budget(now);
     }
     fn secure_budget_nonce() -> Option<budget_negotiation::Nonce> {
@@ -845,18 +842,15 @@ impl Mesh {
                 .is_some_and(|state| state.owns(settings_framing::OwnerId::of(&queued.frame.bytes)))
     }
     fn retire_settings_parent(&mut self, queued: &Queued) {
-        if queued.settings_origin == SettingsOrigin::FramingOffer {
-            if let Some((_, body)) = decode(&queued.frame.bytes) {
-                if let Some(state) = self.settings_framing.as_mut() {
+        if queued.settings_origin == SettingsOrigin::FramingOffer
+            && let Some((_, body)) = decode(&queued.frame.bytes)
+                && let Some(state) = self.settings_framing.as_mut() {
                     state.offer_pending(body, false);
                 }
-            }
-        }
-        if queued.frame.bytes.get(3) == Some(&SETTINGS) {
-            if let Some(state) = self.settings_framing.as_mut() {
+        if queued.frame.bytes.get(3) == Some(&SETTINGS)
+            && let Some(state) = self.settings_framing.as_mut() {
                 state.retire(settings_framing::OwnerId::of(&queued.frame.bytes));
             }
-        }
     }
     fn prepare_settings_physical(&mut self, tx: &mut Transmission, now: u64) -> bool {
         if !self.settings_parent(&tx.queued) {
@@ -887,17 +881,15 @@ impl Mesh {
         true
     }
     pub(crate) fn note_settings_physical_prefix(&mut self, tx: &Transmission, accepted: usize) {
-        if tx.settings_action.is_some() {
-            if let Some(action) = tx.settings_action {
-                if let Some(state) = self.settings_framing.as_mut() {
+        if tx.settings_action.is_some()
+            && let Some(action) = tx.settings_action
+                && let Some(state) = self.settings_framing.as_mut() {
                     state.note_accepted_prefix(
                         settings_framing::OwnerId::of(&tx.queued.frame.bytes),
                         accepted,
                         action,
                     );
                 }
-            }
-        }
     }
     pub(crate) fn note_settings_counted_drain(
         &mut self,
@@ -947,13 +939,11 @@ impl Mesh {
             );
             if !keep {
                 removed_bytes += q.frame.bytes.len();
-                if q.settings_origin == SettingsOrigin::FramingOffer {
-                    if let Some((_, body)) = decode(&q.frame.bytes) {
-                        if let Some(state) = framing.as_mut() {
+                if q.settings_origin == SettingsOrigin::FramingOffer
+                    && let Some((_, body)) = decode(&q.frame.bytes)
+                        && let Some(state) = framing.as_mut() {
                             state.offer_pending(body, false);
                         }
-                    }
-                }
             }
             keep
         });
@@ -994,7 +984,7 @@ impl Mesh {
         if crc(&bytes[..end]) != u32::from_le_bytes(bytes[end..].try_into().unwrap()) {
             return (2, 0);
         }
-        let mut offset = match bytes[3] {
+        let offset = match bytes[3] {
             1 => 4,
             2 | 4 | 5 => 5,
             // A chunk's template cannot be known without reassembly. It is a
@@ -1002,11 +992,10 @@ impl Mesh {
             _ => return (2, 0),
         };
         let mut template = 0u32;
-        for shift in (0..=28).step_by(7) {
+        for (offset, shift) in (offset..).zip((0..=28).step_by(7)) {
             let Some(&byte) = bytes.get(offset).filter(|_| offset < end) else {
                 return (2, 0);
             };
-            offset += 1;
             if shift == 28 && byte > 15 {
                 return (2, 0);
             }
@@ -1160,8 +1149,7 @@ impl Mesh {
                     .bytes
                     .get(4..)
                     .is_some_and(|body| body.starts_with(b"SDT")))
-        {
-            if let Some(i) = self
+            && let Some(i) = self
                 .queue
                 .iter()
                 .position(|q| q.priority == 255 && q.frame.bytes.get(3) == frame.bytes.get(3))
@@ -1170,7 +1158,6 @@ impl Mesh {
                 self.bytes -= old.frame.bytes.len();
                 self.dropped += 1;
             }
-        }
         while self.queue.len() + usize::from(self.active_frame_count) >= MAX_FRAMES
             || self.bytes + frame.bytes.len() + self.settings_reserved_bytes() > MAX_BYTES
         {
@@ -1514,11 +1501,10 @@ impl Mesh {
             if critical_only && protected.is_none() {
                 return None;
             }
-            if !critical_only && protected.is_none() {
-                if let Some(offer) = self.begin_framing_offer_transmission(now, minimum_priority) {
+            if !critical_only && protected.is_none()
+                && let Some(offer) = self.begin_framing_offer_transmission(now, minimum_priority) {
                     return Some(offer);
                 }
-            }
             let discovery = if critical_only {
                 None
             } else {
@@ -1712,13 +1698,11 @@ impl Mesh {
                 return None;
             }
         }
-        if transmission.queued.settings_origin == SettingsOrigin::FramingOffer {
-            if let Some((_, body)) = decode(&transmission.queued.frame.bytes) {
-                if let Some(state) = self.settings_framing.as_mut() {
+        if transmission.queued.settings_origin == SettingsOrigin::FramingOffer
+            && let Some((_, body)) = decode(&transmission.queued.frame.bytes)
+                && let Some(state) = self.settings_framing.as_mut() {
                     state.offer_completed(body);
                 }
-            }
-        }
         self.retire_settings_parent(&transmission.queued);
         self.discovery_balance_bytes = self.discovery_balance_bytes.saturating_add(fair_delta);
         if transmission.queued.independent_discovery() {
@@ -2126,11 +2110,9 @@ impl Mesh {
                                     now,
                                     SettingsOrigin::FramingOffer,
                                 )
-                            {
-                                if let Some(state) = self.settings_framing.as_mut() {
+                                && let Some(state) = self.settings_framing.as_mut() {
                                     state.offer_pending(&reply, true);
                                 }
-                            }
                         }
                         if let Some(original) = result.complete {
                             if self.settings_inbox.len() < MAX_SETTINGS_INBOX {
@@ -2935,7 +2917,7 @@ mod tests {
         assert_eq!(decode(&mesh.pop(0).unwrap().bytes).unwrap().0, UP_COMMAND);
         assert!(mesh.pop(181).is_none(), "expired voice is never replayed");
         assert!(mesh.queue.is_empty());
-        mesh.queue_voice(&vec![0; crate::radio_voice::MAX_PACKET + 1], 181);
+        mesh.queue_voice(&[0; crate::radio_voice::MAX_PACKET + 1], 181);
         assert!(
             mesh.pop(181).is_none(),
             "video-sized payloads cannot enter voice"
@@ -4210,7 +4192,6 @@ mod tests {
 }
 
 /// RRLS has no fill-system hardware.
-
 pub fn settings_transport() -> Option<Shared> {
     RADIO.get().map(|(_, shared)| shared.clone())
 }

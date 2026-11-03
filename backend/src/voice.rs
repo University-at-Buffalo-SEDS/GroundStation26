@@ -164,7 +164,7 @@ pub fn routes(app: Arc<AppState>, hub: Arc<VoiceHub>) -> Router<Arc<AppState>> {
                 let Some(state) = weak.upgrade() else {
                     break;
                 };
-                for pcm in frame.pcm.chunks_exact(320) {
+                for pcm in frame.pcm.as_chunks::<320>().0.iter() {
                     let mut packet = Vec::with_capacity(4 + FRAME_BYTES);
                     packet.extend_from_slice(&0xffff_fffeu32.to_le_bytes());
                     for sample in pcm {

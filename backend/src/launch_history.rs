@@ -75,10 +75,167 @@ pub struct RecoveryEvent {
     pub primary_verified: bool,
 }
 
+/// Durable fail-closed host recovery intent. Never contains an auth token.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryPending {
+    pub owner: u64,
+    pub backend: String,
+    pub generation: u64,
+    pub manual_epoch: u64,
+    pub observed_manual_epoch: u64,
+    pub origin_utc_ms: u64,
+    pub prior_automatic_actions_inhibited: bool,
+    pub targets: Vec<RecoveryTarget>,
+    pub verified: bool,
+    pub published: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryIntent {
+    pub body: [u8; 32],
+    pub source_utc_ms: u64,
+    pub backend: String,
+    pub principal_context: String,
+}
+impl RecoveryIntent {
+    pub(crate) fn boot(&self) -> u64 {
+        u64::from_le_bytes(self.body[12..20].try_into().unwrap())
+    }
+    pub(crate) fn nonce(&self) -> u64 {
+        u64::from_le_bytes(self.body[4..12].try_into().unwrap())
+    }
+    fn validate(&self, board: &str) -> Result<()> {
+        let epoch = u32::from_le_bytes(self.body[20..24].try_into().unwrap());
+        ensure!(
+            self.backend.len() == 32
+                && self.principal_context.len() == 32
+                && self.backend.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && self
+                    .principal_context
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+            "Invalid sealed intent actor/backend identity"
+        );
+        let mut issuer_bytes = [0u8; 8];
+        for (at, byte) in issuer_bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&self.backend[at * 2..at * 2 + 2], 16)?;
+        }
+        ensure!(
+            self.body[24..32] == issuer_bytes,
+            "Sealed intent issuer differs from original backend identity"
+        );
+        ensure!(
+            self.body[0] == 1
+                && self.body[1] == 1
+                && self.body[3] == 0
+                && (self.body[2] == 0 || self.body[2] == 1 && matches!(board, "AB" | "VB"))
+                && self.source_utc_ms != 0
+                && self.nonce() != 0
+                && self.boot() != 0
+                && epoch != 0
+                && epoch < u32::MAX - 1
+                && u64::from_le_bytes(self.body[24..32].try_into().unwrap()) != 0,
+            "Invalid sealed recovery request"
+        );
+        Ok(())
+    }
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryIntentKind {
+    Normal,
+    First,
+    ReconcileFirst,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryTarget {
+    pub board: String,
+    pub desired: u8,
+    pub boot: u64,
+    pub epoch: u32,
+    pub intent: RecoveryIntent,
+    pub kind: RecoveryIntentKind,
+    pub original_first: Option<RecoveryIntent>,
+    pub uncertain_first: Option<RecoveryIntent>,
+}
+impl RecoveryPending {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !matches!(self.owner, 0 | u64::MAX)
+                && !matches!(self.generation, 0 | u64::MAX)
+                && self.manual_epoch != u64::MAX
+                && self.observed_manual_epoch != u64::MAX
+                && self.origin_utc_ms != 0
+                && self.backend.len() == 32
+                && self.backend.bytes().all(|c| c.is_ascii_hexdigit())
+                && (!self.published || self.verified)
+                && (1..=7).contains(&self.targets.len()),
+            "Invalid pending recovery identity"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for target in &self.targets {
+            ensure!(
+                matches!(
+                    target.board.as_str(),
+                    "RF" | "FC" | "PB" | "AB" | "VB" | "GB" | "DAQ"
+                ) && seen.insert(&target.board)
+                    && target.boot != 0
+                    && target.epoch != 0
+                    && target.epoch < u32::MAX - 1
+                    && (target.desired == 0
+                        || (target.desired == 1 && matches!(target.board.as_str(), "AB" | "VB"))),
+                "Invalid pending recovery target"
+            );
+            target.intent.validate(&target.board)?;
+            ensure!(
+                target.intent.boot() == target.boot
+                    && target.intent.body[2] == target.desired
+                    && u32::from_le_bytes(target.intent.body[20..24].try_into().unwrap())
+                        == target.epoch
+                    && target.intent.source_utc_ms == self.origin_utc_ms
+                    && target.intent.backend == self.backend,
+                "Pending intent differs from frozen target/boundary"
+            );
+            for first in [&target.original_first, &target.uncertain_first]
+                .into_iter()
+                .flatten()
+            {
+                first.validate(&target.board)?;
+                ensure!(
+                    first.boot() == u64::MAX && first.source_utc_ms <= self.origin_utc_ms,
+                    "Invalid retained FIRST lineage"
+                );
+            }
+            ensure!(
+                match target.kind {
+                    RecoveryIntentKind::Normal => target.boot != u64::MAX,
+                    RecoveryIntentKind::First =>
+                        target.boot == u64::MAX && target.original_first.is_some(),
+                    RecoveryIntentKind::ReconcileFirst =>
+                        target.boot == u64::MAX
+                            && target.original_first.is_some()
+                            && target
+                                .uncertain_first
+                                .as_ref()
+                                .is_some_and(|first| first.source_utc_ms < self.origin_utc_ms
+                                    && first.nonce() != target.intent.nonce()),
+                },
+                "Invalid recovery lineage kind"
+            );
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Disk {
     version: u8,
+    #[serde(default, skip_serializing_if = "is_zero_manual_ceiling")]
+    manual_abort_utc_ceiling: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_pending: Option<RecoveryPending>,
     /// Sticky across clock resets; only explicit board/startup recovery may clear it.
     #[serde(default)]
     automatic_actions_inhibited: bool,
@@ -96,16 +253,59 @@ struct Disk {
     new_cycle_confirmed: bool,
 }
 
+fn is_zero_manual_ceiling(value: &u64) -> bool {
+    *value == 0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ManualUtcKey {
+    pub owner: u64,
+    pub generation: u64,
+    pub boundary: u64,
+    pub boots: [u64; 3], // AB, VB, FC
+    pub epochs: [u32; 3],
+    pub ceiling: u64,
+    pub ticket: u64,
+}
+pub(crate) struct ManualUtcReceipt {
+    key: ManualUtcKey,
+    path: PathBuf,
+    marker: RecoveryPending,
+    writer: Arc<Writer>,
+}
+impl ManualUtcReceipt {
+    pub(crate) fn wait_and_verify(&self) -> Result<()> {
+        self.writer.wait(self.key.ticket)?;
+        let mut bytes = Vec::new();
+        fs::File::open(&self.path)?
+            .take(4 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= 4 * 1024 * 1024, "Journal exceeds limit");
+        let disk: Disk = serde_json::from_slice(&bytes)?;
+        ensure!(
+            disk.version == 1
+                && disk.manual_abort_utc_ceiling >= self.key.ceiling
+                && disk.manual_abort_utc_ceiling != u64::MAX
+                && disk.recovery_pending.as_ref() == Some(&self.marker),
+            "Manual UTC reservation readback changed"
+        );
+        disk.current.validate()?;
+        self.marker.validate()
+    }
+    pub(crate) fn key(&self) -> ManualUtcKey {
+        self.key
+    }
+}
+
 pub struct Store {
     analytics: crate::launch_analytics::Journal,
     path: Option<PathBuf>,
     writer: Option<Arc<Writer>>,
     last_write: u64,
     closed: bool,
-    #[cfg(test)]
     recovery_owner: u64,
-    #[cfg(test)]
     recovery_revision_staged: bool,
+    recovery_activation_pending: bool,
     last_reset: Option<(ClockRecord, ClockRecord)>,
     data: Disk,
     observer: bool,
@@ -115,9 +315,8 @@ pub struct Store {
     baseline_mono_ms: u64,
     baseline_elapsed_ms: Option<i64>,
 }
-/// Test-gated until the complete verified board coordinator consumes it.
-/// This is a journal fence only, never permission to reset physical boards.
-#[cfg(test)]
+/// Captures the actual durable primary journal prefix and RAM close owner.
+/// This fence alone is never permission to reset physical boards.
 #[derive(Clone)]
 pub(crate) struct RecoveryFence {
     owner: u64,
@@ -183,6 +382,8 @@ impl Store {
         } else {
             Disk {
                 version: 1,
+                manual_abort_utc_ceiling: 0,
+                recovery_pending: None,
                 automatic_actions_inhibited: false,
                 current: ClockRecord::fresh(),
                 past_sessions: Vec::new(),
@@ -196,16 +397,29 @@ impl Store {
         };
         ensure!(
             data.version == 1
+                && data.manual_abort_utc_ceiling != u64::MAX
                 && data.events.len() <= MAX_EVENTS
                 && data.past_sessions.len() <= MAX_SESSIONS,
             "Invalid launch history version or size"
         );
         data.current.validate()?;
+        if let Some(pending) = &data.recovery_pending {
+            pending.validate()?;
+            ensure!(
+                pending.published || data.automatic_actions_inhibited,
+                "Pending recovery without inhibition"
+            );
+        }
         if let Some((cached, stamp)) = cached_daq {
             data.daq_clock = cached;
             data.daq_stamp = stamp;
         }
         let baseline_elapsed_ms = data.current.t0_utc_ms.map(|t0| now.saturating_sub(t0));
+        let restored_owner = data
+            .recovery_pending
+            .as_ref()
+            .filter(|p| !p.published)
+            .map_or(0, |p| p.owner);
         let writer = Writer::start(path.clone(), false)?;
         Ok(Self {
             analytics: crate::launch_analytics::Journal::open(
@@ -214,11 +428,10 @@ impl Store {
             path: Some(path),
             writer: Some(writer),
             last_write: 0,
-            closed: false,
-            #[cfg(test)]
-            recovery_owner: 0,
-            #[cfg(test)]
+            closed: restored_owner != 0,
+            recovery_owner: restored_owner,
             recovery_revision_staged: false,
+            recovery_activation_pending: false,
             last_reset: None,
             data,
             observer,
@@ -236,13 +449,14 @@ impl Store {
             writer: None,
             last_write: 0,
             closed: false,
-            #[cfg(test)]
             recovery_owner: 0,
-            #[cfg(test)]
             recovery_revision_staged: false,
+            recovery_activation_pending: false,
             last_reset: None,
             data: Disk {
                 version: 1,
+                manual_abort_utc_ceiling: 0,
+                recovery_pending: None,
                 automatic_actions_inhibited: false,
                 current: ClockRecord::fresh(),
                 past_sessions: Vec::new(),
@@ -308,6 +522,11 @@ impl Store {
                 // Unreadable launch history cannot safely re-arm automatic actions.
                 store.data.automatic_actions_inhibited = true;
                 store.error = Some(error.to_string());
+                // An unreadable critical journal may contain a recovery that
+                // partially reached boards. Keep UI and manual Stop live, but
+                // never open ordinary admission or overwrite it with defaults.
+                store.closed = true;
+                store.recovery_owner = u64::MAX;
                 Ok(store)
             }
         }
@@ -325,7 +544,7 @@ impl Store {
         !self.data.legacy_anchor_unknown && self.error.is_none()
     }
     pub fn automatic_actions_inhibited(&self) -> bool {
-        self.data.automatic_actions_inhibited
+        self.recovery_activation_pending || self.data.automatic_actions_inhibited
     }
     /// Save before admitting any irreversible launch command. A failed save
     /// still inhibits automation in RAM and prevents launch dispatch.
@@ -347,14 +566,12 @@ impl Store {
     /// Shutdown linearization: no later clock/recovery commit can escape this ticket.
     pub fn close_and_waiter(&mut self) -> Option<(Arc<Writer>, u64)> {
         self.closed = true;
-        #[cfg(test)]
         {
             self.recovery_owner = 0;
             self.recovery_revision_staged = false;
         } // Shutdown supersedes recovery.
         self.waiter()
     }
-    #[cfg(test)]
     pub(crate) fn close_for_recovery(&mut self, owner: u64) -> Result<RecoveryFence> {
         ensure!(
             owner != 0 && owner != u64::MAX,
@@ -390,7 +607,6 @@ impl Store {
         self.recovery_owner = owner;
         Ok(fence)
     }
-    #[cfg(test)]
     pub(crate) fn recovery_quiescent(&self, fence: &RecoveryFence) -> Result<bool> {
         ensure!(
             self.closed && self.recovery_owner == fence.owner,
@@ -411,7 +627,6 @@ impl Store {
     /// Replace a terminated supervisor's ticket without reopening the journal.
     /// An already queued writer retains the exact same snapshot and prefix;
     /// its eventual completion is still required before publication.
-    #[cfg(test)]
     pub(crate) fn transfer_recovery_owner(
         &mut self,
         fence: &RecoveryFence,
@@ -444,7 +659,6 @@ impl Store {
             ..fence.clone()
         })
     }
-    #[cfg(test)]
     pub(crate) fn recovery_publication_ready(
         &self,
         fence: &RecoveryFence,
@@ -496,7 +710,6 @@ impl Store {
     }
     /// Explicit retry of the same known in-memory snapshot, after terminal IO
     /// failure. Does not format, change time, or clear automatic inhibition.
-    #[cfg(test)]
     pub(crate) fn retry_recovery_save(&mut self, fence: &RecoveryFence) -> Result<RecoveryFence> {
         ensure!(
             self.closed && self.recovery_owner == fence.owner,
@@ -520,7 +733,6 @@ impl Store {
             ..fence.clone()
         })
     }
-    #[cfg(test)]
     pub(crate) fn reopen_after_recovery(&mut self, fence: &RecoveryFence) -> Result<()> {
         ensure!(
             self.recovery_quiescent(fence)?,
@@ -535,6 +747,300 @@ impl Store {
         self.closed = false;
         // The separate board coordinator must authorize any later rearm.
         // Reopening the journal never clears the durable inhibition flag.
+        Ok(())
+    }
+    /// Bounded RAM inspection only. The caller uses try_lock; no writer lock or I/O here.
+    pub(crate) fn manual_utc_key(&self) -> Option<ManualUtcKey> {
+        if self.closed
+            || self.recovery_activation_pending
+            || self.observer
+            || self.error.is_some()
+            || self.path.is_none()
+            || self.writer.is_none()
+        {
+            return None;
+        }
+        let marker = self.data.recovery_pending.as_ref()?;
+        if !marker.published || !marker.verified || marker.targets.len() != 7 {
+            return None;
+        }
+        let mut seen = 0u8;
+        let mut boots = [0; 3];
+        let mut epochs = [0; 3];
+        for target in &marker.targets {
+            let (bit, physical) = match target.board.as_str() {
+                "RF" => (0, None),
+                "FC" => (1, Some(2)),
+                "PB" => (2, None),
+                "AB" => (3, Some(0)),
+                "VB" => (4, Some(1)),
+                "GB" => (5, None),
+                "DAQ" => (6, None),
+                _ => return None,
+            };
+            if seen & (1 << bit) != 0
+                || target.desired != 0
+                || matches!(target.boot, 0 | u64::MAX)
+                || target.kind != RecoveryIntentKind::Normal
+                || target.epoch >= u32::MAX - 1
+            {
+                return None;
+            }
+            seen |= 1 << bit;
+            if let Some(index) = physical {
+                boots[index] = target.boot;
+                epochs[index] = target.epoch + 1;
+            }
+        }
+        (seen == 0x7f).then_some(ManualUtcKey {
+            owner: marker.owner,
+            generation: marker.generation,
+            boundary: marker.origin_utc_ms,
+            boots,
+            epochs,
+            ceiling: self.data.manual_abort_utc_ceiling,
+            ticket: self.last_write,
+        })
+    }
+    /// Only an acknowledged, verified full-cohort recovery proves that an
+    /// earlier application Abort can be retired. Pending/attempted timestamps
+    /// and UTC reservations are not recovery boundaries.
+    pub(crate) fn completed_abort_boundary(&self) -> Option<u64> {
+        let boundary = self.manual_utc_key()?.boundary;
+        (boundary != 0 && boundary != u64::MAX && self.writer.as_ref()?.try_healthy())
+            .then_some(boundary)
+    }
+    pub(crate) fn manual_writer_settled(&self) -> Result<bool> {
+        let writer = self.writer.as_ref().context("Writer unavailable")?;
+        match writer.quiescent_through(self.last_write) {
+            Ok(settled) => Ok(settled),
+            Err(_) => {
+                writer.failed_terminal_prefix(self.last_write)?;
+                Ok(true)
+            }
+        }
+    }
+    pub(crate) fn retained_manual_utc_ceiling(&self) -> Result<u64> {
+        ensure!(
+            self.error.is_none()
+                && self.path.is_some()
+                && self.writer.is_some()
+                && self.data.manual_abort_utc_ceiling != u64::MAX,
+            "Durable manual UTC history unavailable"
+        );
+        Ok(self.data.manual_abort_utc_ceiling)
+    }
+    /// Serial Store owner max-merges every reservation; ordinary cloned snapshots retain it.
+    pub(crate) fn reserve_manual_utc_ceiling(
+        &mut self,
+        expected: ManualUtcKey,
+        ceiling: u64,
+    ) -> Result<ManualUtcReceipt> {
+        ensure!(
+            self.manual_utc_key() == Some(expected),
+            "Completed recovery cohort changed"
+        );
+        ensure!(
+            ceiling != 0 && ceiling != u64::MAX && ceiling > expected.boundary,
+            "Invalid manual UTC ceiling"
+        );
+        let writer = self.writer.clone().context("Writer unavailable")?;
+        ensure!(writer.error().is_none(), "Journal writer failed");
+        if ceiling > self.data.manual_abort_utc_ceiling {
+            let mut next = self.data.clone();
+            next.manual_abort_utc_ceiling = ceiling;
+            let ticket = writer.enqueue(next.clone())?;
+            self.data = next;
+            self.last_write = ticket;
+        }
+        Ok(ManualUtcReceipt {
+            key: self.manual_utc_key().context("Cohort lost")?,
+            path: self.path.clone().context("Path missing")?,
+            marker: self.data.recovery_pending.clone().unwrap(),
+            writer,
+        })
+    }
+    pub(crate) fn recovery_available(&self) -> bool {
+        !self.observer
+            && self.path.is_some()
+            && self.writer.is_some()
+            && self.error.is_none()
+            && self.recovery_owner != u64::MAX
+    }
+    pub(crate) fn recovery_pending(&self) -> Option<RecoveryPending> {
+        self.data.recovery_pending.clone()
+    }
+    pub(crate) fn restored_recovery_barrier(&self) -> (u64, u64) {
+        if self.error.is_some() {
+            return (u64::MAX, 1);
+        }
+        self.data.recovery_pending.as_ref().map_or((0, 1), |p| {
+            (if p.published { 0 } else { p.owner }, p.generation)
+        })
+    }
+    /// Enqueue only; the owning coordinator waits without holding this mutex.
+    pub(crate) fn inhibit_for_recovery(&mut self) -> Result<()> {
+        ensure!(
+            self.recovery_available(),
+            "Healthy durable primary journal required"
+        );
+        self.data.automatic_actions_inhibited = true;
+        if !self.closed {
+            self.last_write = self.writer.as_ref().unwrap().enqueue(self.data.clone())?;
+        }
+        Ok(())
+    }
+    pub(crate) fn stage_recovery_pending(
+        &mut self,
+        fence: &RecoveryFence,
+        pending: RecoveryPending,
+    ) -> Result<RecoveryFence> {
+        pending.validate()?;
+        ensure!(
+            pending.owner == fence.owner && !pending.verified && self.recovery_quiescent(fence)?,
+            "Recovery prefix is not quiescent"
+        );
+        let mut next = self.data.clone();
+        next.current.revision = next
+            .current
+            .revision
+            .checked_add(1)
+            .context("Clock revision exhausted")?;
+        next.current.validate()?;
+        next.recovery_pending = Some(pending);
+        let ticket = fence.writer.enqueue(next.clone())?;
+        self.last_write = ticket;
+        self.data = next;
+        self.recovery_revision_staged = true;
+        Ok(RecoveryFence {
+            owner: fence.owner,
+            ticket,
+            clock: self.snapshot(),
+            writer: fence.writer.clone(),
+            revision_staged: true,
+        })
+    }
+    /// Retain the marker even after successful RAM publication. A process
+    /// restart always requires a fresh explicit reconciliation, never replay.
+    pub(crate) fn stage_recovery_verified(
+        &mut self,
+        fence: &RecoveryFence,
+    ) -> Result<RecoveryFence> {
+        ensure!(
+            self.recovery_publication_ready(fence, fence.owner)?,
+            "Recovery prefix pending"
+        );
+        let mut next = self.data.clone();
+        let pending = next
+            .recovery_pending
+            .as_mut()
+            .context("Pending recovery missing")?;
+        ensure!(
+            pending.owner == fence.owner && !pending.verified,
+            "Recovery intent changed"
+        );
+        pending.verified = true;
+        let ticket = fence.writer.enqueue(next.clone())?;
+        self.data = next;
+        self.last_write = ticket;
+        Ok(RecoveryFence {
+            ticket,
+            ..fence.clone()
+        })
+    }
+    pub(crate) fn recovery_durable_snapshot(
+        &self,
+        fence: &RecoveryFence,
+    ) -> Result<(PathBuf, RecoveryPending)> {
+        ensure!(
+            self.recovery_publication_ready(fence, fence.owner)?,
+            "Recovery prefix pending"
+        );
+        Ok((
+            self.path.clone().context("Durable path missing")?,
+            self.data
+                .recovery_pending
+                .clone()
+                .context("Pending recovery missing")?,
+        ))
+    }
+    pub(crate) fn verify_recovery_file(path: &Path, expected: &RecoveryPending) -> Result<()> {
+        let mut bytes = Vec::new();
+        fs::File::open(path)?
+            .take(4 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() <= 4 * 1024 * 1024,
+            "Recovery journal exceeds limit"
+        );
+        let disk: Disk = serde_json::from_slice(&bytes)?;
+        let expected_inhibited = !expected.published
+            || !(expected.targets.len() == 7
+                && expected.targets.iter().all(|target| target.desired == 0))
+                && expected.prior_automatic_actions_inhibited;
+        ensure!(
+            disk.version == 1
+                && (!expected_inhibited || disk.automatic_actions_inhibited)
+                && disk.recovery_pending.as_ref() == Some(expected),
+            "Durable recovery marker mismatch"
+        );
+        disk.current.validate()?;
+        expected.validate()
+    }
+    /// Called ONLY after original-Stop-linearized RAM publication. Later
+    /// journal snapshots retain this acknowledgement; no T0/session reset.
+    pub(crate) fn acknowledge_recovery_publication(
+        &mut self,
+        owner: u64,
+    ) -> Result<(PathBuf, RecoveryPending, Arc<Writer>, u64)> {
+        ensure!(
+            !self.closed && self.recovery_owner == 0,
+            "RAM publication has not reopened"
+        );
+        let mut next = self.data.clone();
+        let marker = next
+            .recovery_pending
+            .as_mut()
+            .context("Recovery marker missing")?;
+        ensure!(
+            marker.owner == owner && marker.verified && !marker.published,
+            "Publication owner changed"
+        );
+        marker.published = true;
+        let expected = marker.clone();
+        next.automatic_actions_inhibited = if expected.targets.len() == 7
+            && expected.targets.iter().all(|target| target.desired == 0)
+        {
+            false
+        } else {
+            expected.prior_automatic_actions_inhibited
+        };
+        let writer = self.writer.clone().context("Writer missing")?;
+        let ticket = writer.enqueue(next.clone())?;
+        self.data = next;
+        self.last_write = ticket;
+        self.recovery_activation_pending = true;
+        Ok((
+            self.path.clone().context("Path missing")?,
+            expected,
+            writer,
+            ticket,
+        ))
+    }
+    pub(crate) fn activate_acknowledged_recovery(&mut self, owner: u64) -> Result<()> {
+        ensure!(
+            !self.closed
+                && self.recovery_activation_pending
+                && self
+                    .data
+                    .recovery_pending
+                    .as_ref()
+                    .is_some_and(|marker| marker.owner == owner
+                        && marker.verified
+                        && marker.published),
+            "Publication activation owner changed"
+        );
+        self.recovery_activation_pending = false;
         Ok(())
     }
     pub fn waiter(&self) -> Option<(Arc<Writer>, u64)> {

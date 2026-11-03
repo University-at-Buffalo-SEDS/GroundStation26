@@ -12,7 +12,6 @@ pub(crate) struct Token {
     pub(crate) observed_manual_epoch: u64,
 }
 impl Token {
-    #[cfg(test)]
     pub(crate) fn capture(state: &AppState, owner: u64) -> Self {
         Self {
             owner,
@@ -27,16 +26,15 @@ pub(crate) struct Request {
     reply: oneshot::Sender<Result<usize, &'static str>>,
 }
 pub(crate) struct Control {
-    // Retain the sending endpoint while the disabled coordinator has no
-    // request producer. The receiver therefore remains live at startup.
-    _keepalive: mpsc::Sender<Request>,
+    // Capacity-one administration is independent of ordinary serde commands.
+    sender: mpsc::Sender<Request>,
     receiver: Mutex<Option<mpsc::Receiver<Request>>>,
 }
 impl Default for Control {
     fn default() -> Self {
         let (sender, receiver) = mpsc::channel(1);
         Self {
-            _keepalive: sender,
+            sender,
             receiver: Mutex::new(Some(receiver)),
         }
     }
@@ -45,15 +43,13 @@ impl Control {
     pub(crate) fn take_receiver(&self) -> Option<mpsc::Receiver<Request>> {
         self.receiver.lock().unwrap().take()
     }
-    // The coordinator is not enabled. Only actual receiver regressions issue
-    // requests until its separately reviewed owner transition is composed.
-    #[cfg(test)]
+    // The owned coordinator requests service from the actual telemetry receiver.
     pub(crate) fn request(
         &self,
         token: Token,
     ) -> Result<oneshot::Receiver<Result<usize, &'static str>>, ()> {
         let (reply, receipt) = oneshot::channel();
-        self._keepalive
+        self.sender
             .try_send(Request { token, reply })
             .map_err(|_| ())?;
         Ok(receipt)
@@ -101,7 +97,117 @@ pub(crate) fn serve(
     // successful receipt requires the same fence at coordinator finalization;
     // an older tagged producer may enqueue after this bounded snapshot.
     let _ = request.reply.send(result);
+}/// File-mutating regressions always own their process configuration. They must
+/// be safe under plain `cargo test`, without editing operator files or changing
+/// process-global environment while unrelated tests run.
+#[cfg(test)]
+pub(crate) fn isolated_case(module: &str, name: &str) -> bool {
+    let module = module.split_once("::").map_or(module, |(_, path)| path);
+    let case = format!("{module}::{name}");
+    if std::env::var("GS_RECOVERY_ISOLATED_CASE").as_deref() == Ok(case.as_str()) {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("GS_RECOVERY_ISOLATED_ROOT").expect("private test root required"),
+        );
+        let canonical = root.canonicalize().unwrap();
+        assert!(canonical.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("gs-recovery-test-")
+        );
+        for key in [
+            "GS_LOADCELL_CALIBRATION_PATH",
+            "GS_CHECKLISTS_FILE",
+            "GS_NETWORK_VARIABLE_CACHE",
+            "GS_LAUNCH_CLOCK_STATE",
+            "GS_FLIGHT_SETUP_CONFIG",
+            "GS_FILL_TARGETS_CONFIG",
+            "GS_GSE_CONFIG",
+            "GS_AUTO_ZERO_CONFIG",
+            "GS_CALIBRATION_CONFIG_PATH",
+            "GS_STATION_POSITIONS_PATH",
+            "GS_GSE_QUALIFICATION",
+            "GS_ZERO_CAPTURE_DIR",
+        ] {
+            let path = std::path::PathBuf::from(
+                std::env::var_os(key).expect("isolated configuration path required"),
+            );
+            assert!(
+                path.starts_with(&root),
+                "test must never write operator configuration: {key}"
+            );
+        }
+        return false;
+    }
+    let directory =
+        std::env::temp_dir().join(format!("gs-recovery-test-{}", rand::random::<u128>()));
+    let config = directory.join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    for name in [
+        "flight_setup.json",
+        "fill_targets.json",
+        "gse_sequence.json",
+        "calibration_config.json",
+        "station_positions.json",
+    ] {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("config")
+            .join(name);
+        if source.is_file() {
+            std::fs::copy(source, config.join(name)).unwrap();
+        }
+    }
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", &case, "--nocapture", "--test-threads=1"])
+        .env("GS_RECOVERY_ISOLATED_CASE", &case)
+        .env("GS_RECOVERY_ISOLATED_ROOT", &directory)
+        .env("GS_RRLS_ROLE", "primary")
+        .env("GS_STATION_ROLE", "groundstation")
+        .env_remove("GS_RRLS")
+        .env(
+            "GS_STATION_PAIRING_FILE",
+            directory.join("absent-pairing.json"),
+        );
+    for (key, path) in [
+        ("GS_LOADCELL_CALIBRATION_PATH", "loadcell.json"),
+        ("GS_NETWORK_VARIABLE_CACHE", "variables.json"),
+        ("GS_LAUNCH_CLOCK_STATE", "launch.json"),
+        ("GS_CHECKLISTS_FILE", "checklists.json"),
+        ("GS_FLIGHT_SETUP_CONFIG", "config/flight_setup.json"),
+        ("GS_FILL_TARGETS_CONFIG", "config/fill_targets.json"),
+        ("GS_GSE_CONFIG", "config/gse_sequence.json"),
+        ("GS_AUTO_ZERO_CONFIG", "config/auto_zero.json"),
+        (
+            "GS_CALIBRATION_CONFIG_PATH",
+            "config/calibration_config.json",
+        ),
+        ("GS_STATION_POSITIONS_PATH", "config/station_positions.json"),
+        ("GS_GSE_QUALIFICATION", "config/qualification.json"),
+        ("GS_ZERO_CAPTURE_DIR", "zero-captures"),
+    ] {
+        command.env(key, directory.join(path));
+    }
+    let output = command.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let exact_one = stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;");
+    if output.status.success() && exact_one {
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+    assert!(
+        output.status.success() && exact_one,
+        "isolated actual regression {case} failed or did not execute once (files retained at {directory:?}):\n{stdout}\n{stderr}"
+    );
+    eprintln!("isolated actual regression {case}: 1 passed, private configuration");
+    if !stderr.is_empty() {
+        eprintln!("{stderr}");
+    }
+    true
 }
+
+
 
 #[cfg(test)]
 mod tests {
@@ -219,6 +325,7 @@ mod tests {
         let (db_tx, db_rx) = mpsc::channel(8);
         let token = close(&state);
         tx.try_send(TelemetryCommand::QueuedOperator {
+            launch_revision: None,
             generation: token.generation,
             command: Box::new(TelemetryCommand::Launch),
             plumbing_origin: None,
@@ -248,6 +355,7 @@ mod tests {
             .store(token.generation + 1, Ordering::Release);
         state.operator_admission_barrier.store(0, Ordering::Release);
         tx.send(TelemetryCommand::QueuedOperator {
+            launch_revision: None,
             generation: token.generation,
             command: Box::new(TelemetryCommand::Launch),
             plumbing_origin: None,
@@ -255,6 +363,7 @@ mod tests {
         .await
         .unwrap();
         tx.send(TelemetryCommand::QueuedOperator {
+            launch_revision: None,
             generation: token.generation + 1,
             command: Box::new(TelemetryCommand::Postinit),
             plumbing_origin: None,
@@ -363,114 +472,4 @@ mod tests {
         );
         assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
     }
-}
-
-/// File-mutating regressions always own their process configuration. They must
-/// be safe under plain `cargo test`, without editing operator files or changing
-/// process-global environment while unrelated tests run.
-#[cfg(test)]
-pub(crate) fn isolated_case(module: &str, name: &str) -> bool {
-    let module = module.split_once("::").map_or(module, |(_, path)| path);
-    let case = format!("{module}::{name}");
-    if std::env::var("GS_RECOVERY_ISOLATED_CASE").as_deref() == Ok(case.as_str()) {
-        let root = std::path::PathBuf::from(
-            std::env::var_os("GS_RECOVERY_ISOLATED_ROOT").expect("private test root required"),
-        );
-        let canonical = root.canonicalize().unwrap();
-        assert!(canonical.starts_with(std::env::temp_dir().canonicalize().unwrap()));
-        assert!(
-            root.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("gs-recovery-test-")
-        );
-        for key in [
-            "GS_LOADCELL_CALIBRATION_PATH",
-            "GS_CHECKLISTS_FILE",
-            "GS_NETWORK_VARIABLE_CACHE",
-            "GS_LAUNCH_CLOCK_STATE",
-            "GS_FLIGHT_SETUP_CONFIG",
-            "GS_FILL_TARGETS_CONFIG",
-            "GS_GSE_CONFIG",
-            "GS_AUTO_ZERO_CONFIG",
-            "GS_CALIBRATION_CONFIG_PATH",
-            "GS_STATION_POSITIONS_PATH",
-            "GS_GSE_QUALIFICATION",
-            "GS_ZERO_CAPTURE_DIR",
-        ] {
-            let path = std::path::PathBuf::from(
-                std::env::var_os(key).expect("isolated configuration path required"),
-            );
-            assert!(
-                path.starts_with(&root),
-                "test must never write operator configuration: {key}"
-            );
-        }
-        return false;
-    }
-    let directory =
-        std::env::temp_dir().join(format!("gs-recovery-test-{}", rand::random::<u128>()));
-    let config = directory.join("config");
-    std::fs::create_dir_all(&config).unwrap();
-    for name in [
-        "flight_setup.json",
-        "fill_targets.json",
-        "gse_sequence.json",
-        "calibration_config.json",
-        "station_positions.json",
-    ] {
-        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("config")
-            .join(name);
-        if source.is_file() {
-            std::fs::copy(source, config.join(name)).unwrap();
-        }
-    }
-    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    command
-        .args(["--exact", &case, "--nocapture", "--test-threads=1"])
-        .env("GS_RECOVERY_ISOLATED_CASE", &case)
-        .env("GS_RECOVERY_ISOLATED_ROOT", &directory)
-        .env("GS_RRLS_ROLE", "primary")
-        .env("GS_STATION_ROLE", "groundstation")
-        .env_remove("GS_RRLS")
-        .env(
-            "GS_STATION_PAIRING_FILE",
-            directory.join("absent-pairing.json"),
-        );
-    for (key, path) in [
-        ("GS_LOADCELL_CALIBRATION_PATH", "loadcell.json"),
-        ("GS_NETWORK_VARIABLE_CACHE", "variables.json"),
-        ("GS_LAUNCH_CLOCK_STATE", "launch.json"),
-        ("GS_CHECKLISTS_FILE", "checklists.json"),
-        ("GS_FLIGHT_SETUP_CONFIG", "config/flight_setup.json"),
-        ("GS_FILL_TARGETS_CONFIG", "config/fill_targets.json"),
-        ("GS_GSE_CONFIG", "config/gse_sequence.json"),
-        ("GS_AUTO_ZERO_CONFIG", "config/auto_zero.json"),
-        (
-            "GS_CALIBRATION_CONFIG_PATH",
-            "config/calibration_config.json",
-        ),
-        ("GS_STATION_POSITIONS_PATH", "config/station_positions.json"),
-        ("GS_GSE_QUALIFICATION", "config/qualification.json"),
-        ("GS_ZERO_CAPTURE_DIR", "zero-captures"),
-    ] {
-        command.env(key, directory.join(path));
-    }
-    let output = command.output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let exact_one = stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;");
-    if output.status.success() && exact_one {
-        let _ = std::fs::remove_dir_all(&directory);
-    }
-    assert!(
-        output.status.success() && exact_one,
-        "isolated actual regression {case} failed or did not execute once (files retained at {directory:?}):\n{stdout}\n{stderr}"
-    );
-    eprintln!("isolated actual regression {case}: 1 passed, private configuration");
-    if !stderr.is_empty() {
-        eprintln!("{stderr}");
-    }
-    true
 }

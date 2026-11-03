@@ -114,9 +114,7 @@ impl History {
         true
     }
     pub(crate) fn has(&self, seq: u32, direct: bool) -> bool {
-        self.entries
-            .iter()
-            .any(|v| *v == Some(Health { seq, direct }))
+        self.entries.contains(&Some(Health { seq, direct }))
     }
     pub(crate) fn belongs(&self, seq: u32, direct: bool) -> bool {
         self.current(direct)

@@ -62,7 +62,8 @@ async fn proof() {
     let root = PathBuf::from(std::env::var_os("GS_DAQ_CLOCK_PROOF_ROOT").unwrap());
     let ty = crate::telemetry_schema::data_type("DAQ_LOG_CLOCK");
     let sd = crate::telemetry_schema::endpoint("SD_CARD");
-    let accepted: Arc<Mutex<Vec<([u64; 2], u64)>>> = Default::default();
+    type AcceptedClockRows = Arc<Mutex<Vec<([u64; 2], u64)>>>;
+    let accepted: AcceptedClockRows = Default::default();
     let observed = accepted.clone();
     let daq = Arc::new(Router::new(
         RouterConfig::new([EndpointHandler::new_packet_handler(sd, |_| Ok(()))]).with_sender("DAQ"),

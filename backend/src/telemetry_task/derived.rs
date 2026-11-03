@@ -634,13 +634,15 @@ pub(super) fn prepare_derived_loadcell_rows(
         sample.sender_id,
         sample.ts_ms,
     );
-    state.loadcell_processing.observe(
-        sample.sender_id,
-        calibration_sensor_id,
-        sample.ts_ms,
-        sample.raw_value,
+    state.loadcell_processing.observe_source(crate::loadcell_zero::SourceSample {
+        sender: sample.sender_id,
+        sensor: calibration_sensor_id,
+        timestamp_ms: sample.ts_ms,
+        source_timestamp_ms: sample.source_timestamp_ms,
+        received_network_ms: sample.receipt.network_ms,
+        raw: sample.raw_value,
         temperature,
-    );
+    });
     let Some(calibrated_value) = loadcell::temperature_corrected_raw(
         &cfg,
         calibration_sensor_id,
@@ -825,7 +827,7 @@ pub(super) async fn emit_derived_loadcell_rows(
             DbWrite::Calibration {
                 timestamp_ms: sample.ts_ms,
                 sender_id: sample.sender_id.into(),
-                sensor_id: calibration_sensor_id.into(),
+                sensor_id: calibration_sensor_id,
                 config_json,
             },
         )
@@ -903,7 +905,7 @@ pub(super) fn f32_values_from_payload_bytes(bytes: &[u8]) -> Option<Vec<Option<f
 
     Some(
         bytes
-            .chunks_exact(size_of::<f32>())
+            .as_chunks::<{ size_of::<f32>() }>().0.iter()
             .map(|chunk| {
                 let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 value.is_finite().then_some(value)

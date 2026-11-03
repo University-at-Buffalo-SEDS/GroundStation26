@@ -126,7 +126,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
                     ty: packet.data_type().as_u32(),
                     payload: packet.payload().to_vec(),
                     owners: sedsnet::wire_format::peek_envelope(
-                        &sedsnet::wire_format::pack_packet(&packet),
+                        &sedsnet::wire_format::pack_packet(packet),
                     )
                     .unwrap()
                     .target_senders

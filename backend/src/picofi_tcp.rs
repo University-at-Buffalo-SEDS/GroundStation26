@@ -26,9 +26,10 @@ struct Shared {
     generation: AtomicU64,
     tx: SyncSender<(u64, Vec<u8>)>,
 }
+type SessionReceiver = Arc<Mutex<Receiver<(u64, Vec<u8>)>>>;
 pub struct PicoFiTcp {
     shared: Arc<Shared>,
-    rx: Arc<Mutex<Receiver<(u64, Vec<u8>)>>>,
+    rx: SessionReceiver,
     side: Option<RouterSideId>,
     exhausted: bool,
 }
@@ -350,8 +351,8 @@ fn worker(
             // A power-cycled or readdressed bridge need not send FIN/RST on
             // its old socket. Keep accepting while it is half-open. Only a
             // compatible new handshake replaces it; failed probes preserve it.
-            if let Some(l) = &listener {
-                if let Ok(mut candidate) = accept_peer(l, &config, discovery.as_ref()) {
+            if let Some(l) = &listener
+                && let Ok(mut candidate) = accept_peer(l, &config, discovery.as_ref()) {
                     let mut accepted = false;
                     let result = handshake_before_reply(&mut candidate, false, || {
                         accepted = true;
@@ -369,7 +370,6 @@ fn worker(
                         break 'session;
                     }
                 }
-            }
             // Bounded work per direction prevents a busy reader starving writes.
             for _ in 0..8 {
                 if let Some(frame) = inbound.take() {

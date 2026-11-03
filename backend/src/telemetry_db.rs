@@ -343,7 +343,7 @@ fn human_readable_session_stamp(started_at_ms: i64) -> String {
 
     let timestamp_ns = started_at_ms
         .checked_mul(1_000_000)
-        .and_then(|value| value.try_into().ok());
+        .map(i128::from);
     let Some(timestamp_ns) = timestamp_ns else {
         return started_at_ms.to_string();
     };

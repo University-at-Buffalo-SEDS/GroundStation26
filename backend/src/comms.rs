@@ -12,7 +12,9 @@ pub(crate) mod rfd_capacity;
 pub(crate) mod rfd_profile;
 #[cfg(any(target_os = "linux", test))]
 #[path = "comms/virtual_uart.rs"]
-mod virtual_uart;
+pub(crate) mod virtual_uart;
+#[cfg(target_os = "linux")]
+type MailboxReceiveResult = Result<Option<(u8, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>>;
 use crate::comms_config::{
     CanLinkConfig, CommsLinkConfig, I2cLinkConfig, SerialLinkConfig, SerialProtocol, SpiLinkConfig,
 };
@@ -205,6 +207,7 @@ pub(crate) fn is_radio_batch_command(priority: u8, payload: &[u8]) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+#[expect(clippy::too_many_arguments, reason = "Independent wire, capacity clocks and byte admission accounting remain explicit")]
 fn trace_virtual_uart_admission(
     path: &str,
     side: Option<RouterSideId>,
@@ -254,6 +257,10 @@ pub(crate) const MAX_ORDINARY_SERVICE_CHARGE: usize =
     STREAM_PACKET_MAX_SIZE + RAW_UART_FRAME_HEADER_SIZE + 256;
 
 pub trait CommsDevice: Send {
+    /// True only for the selected pureTesting SDK-backed dummy device.
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    fn testing_model_link(&self)->bool{false}
+
     fn bind_retry_tracker(
         &mut self,
         _tracker: sedsnet::router::RetryTracker,
@@ -1509,9 +1516,9 @@ fn queue_uart_router_payload(
     protocol: &SerialProtocol,
     packet_tap: &mut dyn FnMut(&Packet),
 ) -> TelemetryResult<()> {
-    if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some() {
-        if let Ok(packet) = serialize::unpack_packet(payload) {
-            if packet.data_type() == sedsnet::config::DataType::ReliableAck {
+    if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some()
+        && let Ok(packet) = serialize::unpack_packet(payload)
+            && packet.data_type() == sedsnet::config::DataType::ReliableAck {
                 log::info!(
                     "full-bay ACK transport RX side={side_id} sim={:?} source_ms={} owners={:?} receipt={:02x?}",
                     crate::simulation_clock_ms(),
@@ -1520,8 +1527,6 @@ fn queue_uart_router_payload(
                     packet.payload()
                 );
             }
-        }
-    }
     maybe_log_raw_uart_decoded(payload, protocol);
     maybe_log_raw_uart_router_queue_before(payload, protocol);
     tap_non_groundstation_gps_payload(payload, packet_tap);
@@ -1801,7 +1806,7 @@ fn drain_fd_with_timeout(fd: RawFd, timeout: Duration) -> std::io::Result<()> {
 #[cfg(target_os = "linux")]
 fn uart_wire_timeout(len: usize, baud_rate: u32) -> Duration {
     let baud = u64::from(baud_rate.max(1));
-    let wire_ms = ((len as u64 * 10 * 1_000) + baud - 1) / baud;
+    let wire_ms = (len as u64 * 10 * 1_000).div_ceil(baud);
     Duration::from_millis(wire_ms.saturating_add(50).max(100))
 }
 
@@ -2418,8 +2423,8 @@ fn take_raw_uart_framed_payload_recovering(
         return Ok(None);
     };
     let body = &rx_buf[RAW_UART_FRAME_HEADER_SIZE..total_len];
-    if raw_uart_requires_inner_crc(frame_kind, body) {
-        if !raw_uart_inner_crc_valid(body) {
+    if raw_uart_requires_inner_crc(frame_kind, body)
+        && !raw_uart_inner_crc_valid(body) {
             // A damaged length may include the next frame's sync. Reject the
             // checksum before consuming that frame, preserving bytes for resync.
             let error = if body.starts_with(b"SDT") {
@@ -2433,7 +2438,6 @@ fn take_raw_uart_framed_payload_recovering(
             *failed_prefix = total_len - 1;
             return Err(TelemetryError::Unpack(error));
         }
-    }
     let payload = body.to_vec();
     discard_raw_uart_prefix(rx_buf, total_len, failed_prefix);
     *failed_prefix = 0;
@@ -3861,7 +3865,7 @@ impl I2cComms {
     fn ingest_rx_slot(
         &mut self,
         slot: I2cMailboxSlot,
-    ) -> Result<Option<(u8, Vec<u8>)>, Box<dyn Error + Send + Sync>> {
+    ) -> MailboxReceiveResult {
         if slot.kind == I2C_KIND_IDLE {
             return Ok(None);
         }
@@ -3904,10 +3908,10 @@ impl I2cComms {
     fn transfer_write(&mut self, data: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         if let Some(simulated) = self.simulated.as_mut() {
             if self.protocol_version == 2 {
-                simulated.write_all(&[b'w'])?;
+                simulated.write_all(b"w")?;
                 simulated.write_all(&(data.len() as u16).to_le_bytes())?;
             } else {
-                simulated.write_all(&[b'W'])?;
+                simulated.write_all(b"W")?;
             }
             simulated.write_all(data)?;
             simulated.flush()?;
@@ -3931,10 +3935,10 @@ impl I2cComms {
     fn transfer_read(&mut self, data: &mut [u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         if let Some(simulated) = self.simulated.as_mut() {
             if self.protocol_version == 2 {
-                simulated.write_all(&[b'r'])?;
+                simulated.write_all(b"r")?;
                 simulated.write_all(&(data.len() as u16).to_le_bytes())?;
             } else {
-                simulated.write_all(&[b'R'])?;
+                simulated.write_all(b"R")?;
             }
             simulated.flush()?;
             simulated.read_exact(data)?;
@@ -4184,7 +4188,7 @@ impl CommsDevice for SpiComms {
                 return Ok(());
             }
             tap_non_groundstation_gps_payload(payload, packet_tap);
-            return router.rx_packed_queue_from_side(payload, side_id);
+            router.rx_packed_queue_from_side(payload, side_id)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -4345,7 +4349,7 @@ impl CommsDevice for CanComms {
                 return Ok(());
             }
             tap_non_groundstation_gps_payload(&packet, packet_tap);
-            return router.rx_packed_queue_from_side(&packet, side_id);
+            router.rx_packed_queue_from_side(&packet, side_id)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -4372,9 +4376,11 @@ impl CommsDevice for CanComms {
             self.tx_seq = self.tx_seq.wrapping_add(1);
 
             for (chunk_idx, chunk) in payload.chunks(4).enumerate() {
-                let mut frame = CanFrame::default();
-                frame.can_id = self.tx_id;
-                frame.can_dlc = (4 + chunk.len()) as u8;
+                let mut frame = CanFrame {
+                    can_id: self.tx_id,
+                    can_dlc: (4 + chunk.len()) as u8,
+                    ..CanFrame::default()
+                };
                 frame.data[0] = seq;
                 frame.data[1] = chunk_idx as u8;
                 frame.data[2] = total_chunks;
@@ -4403,6 +4409,8 @@ impl CommsDevice for CanComms {
 #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 #[derive(Debug)]
 pub struct DummyComms {
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    modeled: Option<crate::testing_board_lifecycle::Link>,
     name: &'static str,
     side_id: Option<RouterSideId>,
     #[cfg(feature = "testing")]
@@ -4417,6 +4425,8 @@ pub struct DummyComms {
 impl DummyComms {
     pub fn new(name: &'static str) -> Self {
         DummyComms {
+            #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+            modeled: crate::testing_board_lifecycle::Link::new(name),
             name,
             side_id: None,
             #[cfg(feature = "testing")]
@@ -4530,6 +4540,14 @@ impl DummyComms {
 
 #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 impl CommsDevice for DummyComms {
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    fn testing_model_link(&self)->bool {
+        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+        {self.modeled.is_some()}
+        #[cfg(not(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode")))))]
+        {false}
+    }
+
     fn recv_packet(
         &mut self,
         _router: &Router,
@@ -4540,6 +4558,15 @@ impl CommsDevice for DummyComms {
             let side_id = self
                 .side_id
                 .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
+            #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+            if let Some(model) = &mut self.modeled
+                && let Some(wire) = model.poll(_router.network_time_ms())?
+            {
+                return _router.rx_packed_queue_from_side(&wire, side_id);
+            }
+            #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+            if self.modeled.is_none(){self.maybe_queue_discovery()?;}
+            #[cfg(not(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode")))))]
             self.maybe_queue_discovery()?;
             self.maybe_queue_timesync()?;
             if let Some(pkt) = self.pending_rx.pop_front() {
@@ -4579,6 +4606,11 @@ impl CommsDevice for DummyComms {
     }
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+        if let Some(model)=&mut self.modeled {
+            model.send(payload)?;
+            return Ok(());
+        }
         #[cfg(feature = "testing")]
         use sedsnet::wire_format::peek_envelope;
 
@@ -7444,8 +7476,7 @@ mod raw_uart_tests {
 
     #[test]
     fn raw_uart_crc_recovery_caps_oversized_input_before_scanning() {
-        let mut wait = RawUartFrameWait::default();
-        wait.failed_prefix = STREAM_PACKET_MAX_SIZE;
+        let mut wait = RawUartFrameWait { failed_prefix: STREAM_PACKET_MAX_SIZE, ..RawUartFrameWait::default() };
         let body = crc_recovery_valid_body(b"bounded");
         let mut bytes = vec![0_u8; RAW_UART_MAX_FRAME_BYTES * 2];
         bytes.extend_from_slice(&build_raw_uart_frame(&body).unwrap());
@@ -7946,3 +7977,7 @@ mod captured_prefix_tests;
 ))]
 #[path = "comms/budget_writer_tests.rs"]
 mod budget_writer_tests;
+
+#[cfg(all(test, feature = "testing", not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
+#[path = "comms/testing_recovery_tests.rs"]
+mod testing_recovery_tests;

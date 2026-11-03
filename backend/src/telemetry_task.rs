@@ -5,13 +5,15 @@ use prelude::*;
 
 mod commands;
 use commands::log_command_dispatch;
-#[cfg(test)]
-pub(crate) use commands::queue_controller_command;
+#[cfg(feature = "hitl_mode")]
+use commands::queue_locally_routed_flight_command_with_launch_revision;
 pub(crate) use commands::{
     controller_packet, flush_command_tx, queue_abort_packet, queue_automatic_abort_packet,
     queue_automatic_controller_command, queue_locally_routed_flight_command,
-    queue_priority_manual_abort_packet,
+    queue_manual_abort_wire,
 };
+#[cfg(test)]
+pub(crate) use commands::{queue_controller_command, queue_priority_manual_abort_packet};
 mod heartbeat;
 mod periodic;
 pub(crate) mod procedure_clock;
@@ -130,8 +132,16 @@ fn operator_mode_adjacent_flight_state(current: FlightState, delta: i32) -> Flig
 }
 
 #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-async fn set_local_flight_state_for_operator_mode(state: &Arc<AppState>, next_state: FlightState) {
-    state.set_local_flight_state(next_state);
+async fn set_local_flight_state_for_operator_mode(
+    state: &Arc<AppState>,
+    next_state: FlightState,
+    launch_revision: Option<u64>,
+) {
+    if next_state == FlightState::Launch {
+        state.request_local_launch_state(launch_revision);
+    } else {
+        state.set_local_flight_state(next_state);
+    }
 }
 
 mod derived;
@@ -267,8 +277,14 @@ fn transition_launch_clock_to_t_plus_from_pilot_open(state: &Arc<AppState>) {
 }
 
 #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router: Arc<Router>) {
-    if let Some(reason) = crate::checklists::launch_block() {
+async fn handle_local_ground_station_launch_command(
+    state: Arc<AppState>,
+    router: Arc<Router>,
+    launch_revision: Option<u64>,
+) {
+    if let Some(reason) =
+        crate::checklists::launch_block().filter(|_| state.checklist_enforcement_enabled())
+    {
         emit_notification_warning(&state, reason);
         return;
     }
@@ -304,16 +320,17 @@ async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router
         gs_debug_println!("Ground-station launch auto-started DB recording");
     }
     #[cfg(feature = "hitl_mode")]
-    let ticket = match crate::gse::inhibit_automatic_actions_for_launch(&state) {
-        Ok(ticket) => ticket,
-        Err(error) => {
-            state.clear_launch_sequence_command_pending();
-            emit_notification_warning(&state, error);
-            return;
-        }
-    };
+    let ticket =
+        match crate::gse::inhibit_automatic_actions_for_launch_revision(&state, launch_revision) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                state.clear_launch_sequence_command_pending();
+                emit_notification_warning(&state, error);
+                return;
+            }
+        };
     #[cfg(not(feature = "hitl_mode"))]
-    let ticket = match crate::gse::commit_fire_intent(&state) {
+    let ticket = match crate::gse::commit_fire_intent_revision(&state, launch_revision) {
         Ok(ticket) => ticket,
         Err(error) => {
             state.clear_launch_sequence_command_pending();
@@ -351,8 +368,6 @@ async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router
         &[ValveBoardCommands::Sequence as u8],
     );
     flush_command_tx(&router, "Valve launch sequence command tx");
-    #[cfg(not(feature = "hitl_mode"))]
-    state.set_local_flight_state(FlightState::Launch);
     state.begin_daq_launch_log();
     crate::auto_zero::launch(&state);
     state.set_launch_indicator_latched(true);
@@ -364,8 +379,14 @@ async fn handle_local_ground_station_launch_command(state: Arc<AppState>, router
 }
 
 #[cfg(any(test, not(all(feature = "test_fire_mode", not(feature = "hitl_mode")))))]
-async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc<Router>) {
-    if let Some(reason) = crate::checklists::launch_block() {
+async fn handle_flight_computer_launch_command(
+    state: Arc<AppState>,
+    router: Arc<Router>,
+    launch_revision: Option<u64>,
+) {
+    if let Some(reason) =
+        crate::checklists::launch_block().filter(|_| state.checklist_enforcement_enabled())
+    {
         emit_notification_warning(&state, reason);
         return;
     }
@@ -391,16 +412,17 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
         gs_debug_println!("Launch auto-started DB recording");
     }
     #[cfg(feature = "hitl_mode")]
-    let ticket = match crate::gse::inhibit_automatic_actions_for_launch(&state) {
-        Ok(ticket) => ticket,
-        Err(error) => {
-            state.clear_launch_sequence_command_pending();
-            emit_notification_warning(&state, error);
-            return;
-        }
-    };
+    let ticket =
+        match crate::gse::inhibit_automatic_actions_for_launch_revision(&state, launch_revision) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                state.clear_launch_sequence_command_pending();
+                emit_notification_warning(&state, error);
+                return;
+            }
+        };
     #[cfg(not(feature = "hitl_mode"))]
-    let ticket = match crate::gse::commit_fire_intent(&state) {
+    let ticket = match crate::gse::commit_fire_intent_revision(&state, launch_revision) {
         Ok(ticket) => ticket,
         Err(error) => {
             state.clear_launch_sequence_command_pending();
@@ -445,9 +467,6 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
         );
         return;
     }
-    let now_ms = procedure_clock::timestamp_ms();
-    state.confirm_new_launch_cycle();
-    state.set_launch_clock(launch_countdown_clock(now_ms));
     log_command_dispatch(
         "Launch command",
         "broadcast",
@@ -464,8 +483,6 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
     let flight_command_sent = true;
     let valve_command_sent = true;
     if flight_command_sent || valve_command_sent {
-        #[cfg(not(feature = "hitl_mode"))]
-        state.set_local_flight_state(FlightState::Launch);
         #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
         crate::auto_zero::launch(&state);
         state.set_launch_indicator_latched(true);
@@ -479,6 +496,13 @@ async fn handle_flight_computer_launch_command(state: Arc<AppState>, router: Arc
     );
 }
 
+/// Explicit inner-worker outcome. An outer Tokio join success is insufficient:
+/// blocking worker joins can time out while the original producer remains alive.
+#[derive(Clone, Copy, Debug)]
+pub struct TelemetryShutdownOutcome {
+    pub(crate) ingress_quiesced: bool,
+}
+
 pub async fn telemetry_task(
     state: Arc<AppState>,
     router: Arc<Router>,
@@ -486,8 +510,11 @@ pub async fn telemetry_task(
     mut rx: mpsc::Receiver<TelemetryCommand>,
     mut db_rx: mpsc::Receiver<DbQueueItem>,
     mut shutdown_rx: broadcast::Receiver<()>,
-) {
-    let mut operator_queue_rx = state.operator_queue.take_receiver().expect("operator queue receiver already owned");
+) -> TelemetryShutdownOutcome {
+    let mut operator_queue_rx = state
+        .operator_queue
+        .take_receiver()
+        .expect("operator queue receiver already owned");
     let mut handle_interval = interval(Duration::from_millis(1));
     let heartbeat_period_ms = std::env::var("GS_HEARTBEAT_INTERVAL_MS")
         .ok()
@@ -754,9 +781,11 @@ pub async fn telemetry_task(
         })
     };
 
+    let mut worker_startup_failed = false;
     let router_worker = match spawn_router_worker_thread(router.clone(), state.clone()) {
         Ok(worker) => Some(worker),
         Err(err) => {
+            worker_startup_failed = true;
             eprintln!("Failed to spawn router worker thread: {err}");
             None
         }
@@ -768,6 +797,7 @@ pub async fn telemetry_task(
             let router = router.clone();
             let state = state.clone();
             spawn_comms_worker_threads(router, state, comms_handle).unwrap_or_else(|err| {
+                worker_startup_failed = true;
                 eprintln!("Failed to spawn comms worker thread: {err}");
                 Vec::new()
             })
@@ -782,13 +812,13 @@ pub async fn telemetry_task(
                     crate::operator_queue::serve(&state, &mut rx, request);
                 }
                 Some(cmd) = rx.recv() => {
-                    let (cmd, _operator_claim, plumbing_origin) = match cmd {
-                        TelemetryCommand::QueuedOperator { generation, command, plumbing_origin } => {
+                    let (cmd, _operator_claim, plumbing_origin, launch_revision) = match cmd {
+                        TelemetryCommand::QueuedOperator { launch_revision, generation, command, plumbing_origin } => {
                             if command.automatic_generation().is_some() || matches!(*command, TelemetryCommand::QueuedOperator { .. }) { continue; }
                             let Some(claim) = crate::gse::claim_operator_dispatch(&state, generation) else { continue; };
-                            (*command, Some(claim), plumbing_origin)
+                            (*command, Some(claim), plumbing_origin, launch_revision)
                         }
-                        command => (command, None, None),
+                        command => (command, None, None, None),
                     };
                     let automatic_generation = cmd.automatic_generation();
                     let automatic_supply_close = matches!(cmd, TelemetryCommand::AutomaticNitrogenClose { .. } | TelemetryCommand::AutomaticNitrousClose { .. });
@@ -804,6 +834,10 @@ pub async fn telemetry_task(
                         reset_testing_simulation(&state).await;
                         continue;
                     }
+                    if crate::board_abort::launch_command(crate::sequences::command_name(&cmd))
+                        && let Err(error)=crate::board_abort::validate_launch_revision(&state,launch_revision) {
+                            emit_notification_warning(&state,error);continue;
+                        }
                     if !state.is_command_allowed(&cmd) {
                         emit_notification_warning(
                             &state,
@@ -834,16 +868,37 @@ pub async fn telemetry_task(
                         emit_notification_warning(&state, "Manual Stop is pending; new control action was not dispatched");
                         continue;
                     }
-                    if matches!(cmd, TelemetryCommand::RetractPlumbing) {
-                        if let Err(message) = crate::actuator_plumbing::validate_motion_origin(&state, plumbing_origin) {
+                    if matches!(cmd, TelemetryCommand::RetractPlumbing)
+                        && let Err(message) = crate::actuator_plumbing::validate_motion_origin(&state, plumbing_origin) {
                             emit_notification_warning(&state, &message);
                             continue;
                         }
-                    }
                     state.record_command_accepted(&cmd, get_current_timestamp_ms());
+                    #[cfg(feature="hitl_mode")]
+                    if let Some(index)=match &cmd {
+                        TelemetryCommand::TogglePlumbingDelayInterlock=>Some(0),
+                        TelemetryCommand::ToggleChecklistInterlock=>Some(1),
+                        TelemetryCommand::ToggleSupplyInterlock=>Some(2),
+                        TelemetryCommand::ToggleBoardStateProofInterlock=>Some(3),
+                        _=>None,
+                    } {
+                        // Policy-only: keep an existing capture/fill untouched.
+                        // The actual flag mutation advances Launch authority.
+                        state.toggle_hitl_safety_interlock(index);
+                        sequences::refresh_action_policy_now(&state);
+                        state.broadcast_action_policy_snapshot();
+                        continue;
+                    }
                     state.auto_zero.lock().unwrap().cancel_for_command(&cmd);
                     if crate::auto_zero::before_fill(&state, &cmd) { continue; }
-                    let gse_handled = if matches!(cmd, TelemetryCommand::RetractPlumbing) { crate::gse::handle_command_with_motion_origin(&state, &cmd, plumbing_origin) } else { crate::gse::handle_command(&state, &cmd) };
+                    #[cfg(feature="testing")]
+                    if matches!(cmd,TelemetryCommand::RetractPlumbing)&&flight_sim::sim_mode_enabled() {
+                        if let Err(error)=crate::gse::admit_simulated_retraction_stamped(&state,plumbing_origin,|source,observed|flight_sim::handle_command_stamped(&cmd,source,observed)) {
+                            emit_notification_warning(&state,error);
+                        }
+                        continue;
+                    }
+                    let gse_handled = crate::gse::handle_command_with_origins(&state, &cmd, plumbing_origin, launch_revision);
                     if gse_handled {
                         continue;
                     }
@@ -854,11 +909,13 @@ pub async fn telemetry_task(
                     }
                     #[cfg(feature = "testing")]
                     if matches!(crate::sequences::command_name(&cmd), "Launch" | "GroundStationLaunch") && flight_sim::sim_mode_enabled() {
-                        let ticket = match crate::gse::inhibit_automatic_actions_for_launch(&state) {
+                        let original_utc=match crate::system_clock::required_control_network_utc_ms(&router){Ok(value)=>value,Err(error)=>{emit_notification_warning(&state,error.to_string());continue;}};
+                        let ticket = match crate::gse::inhibit_automatic_actions_for_launch_revision(&state,launch_revision) {
                             Ok(ticket) => ticket,
                             Err(error) => { emit_notification_warning(&state, error); continue; }
                         };
-                        if let Err(error) = crate::gse::admit_simulated_launch(&state, ticket, || flight_sim::handle_command(&cmd)) {
+                        let observed_utc=match crate::system_clock::required_control_network_utc_ms(&router){Ok(value)=>value,Err(error)=>{emit_notification_warning(&state,error.to_string());continue;}};
+                        if let Err(error) = crate::gse::admit_simulated_launch(&state, ticket, || flight_sim::handle_command_stamped(&cmd,original_utc,observed_utc)) {
                             emit_notification_warning(&state, error);
                         }
                         // Even a declined model command cannot fall through
@@ -1091,13 +1148,13 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::Launch => {
                                 #[cfg(all(feature = "test_fire_mode", not(feature = "hitl_mode")))]
-                                handle_local_ground_station_launch_command(state.clone(), router.clone()).await;
+                                handle_local_ground_station_launch_command(state.clone(), router.clone(),launch_revision).await;
                                 #[cfg(not(all(feature = "test_fire_mode", not(feature = "hitl_mode"))))]
-                                handle_flight_computer_launch_command(state.clone(), router.clone()).await;
+                                handle_flight_computer_launch_command(state.clone(), router.clone(),launch_revision).await;
                             }
                         #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
                         TelemetryCommand::GroundStationLaunch => {
-                                handle_local_ground_station_launch_command(state.clone(), router.clone()).await;
+                                handle_local_ground_station_launch_command(state.clone(), router.clone(),launch_revision).await;
                             }
                         TelemetryCommand::MonitorAltitude => {
                                 if let Err(e) = queue_locally_routed_flight_command(
@@ -1205,6 +1262,11 @@ pub async fn telemetry_task(
                                 state.broadcast_action_policy_snapshot();
                                 gs_debug_println!("HITL launch interlock toggled: {enabled}");
                         }
+                        #[cfg(feature="hitl_mode")]
+                        TelemetryCommand::TogglePlumbingDelayInterlock
+                        |TelemetryCommand::ToggleChecklistInterlock
+                        |TelemetryCommand::ToggleSupplyInterlock
+                        |TelemetryCommand::ToggleBoardStateProofInterlock=>unreachable!("pure policy handled before capture/GSE handoff"),
                         #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::TogglePhysicalLaunchMode => {
                                 let uses_gs = state.toggle_hitl_physical_launch_mode();
@@ -1261,11 +1323,11 @@ pub async fn telemetry_task(
                             let current = *state.state.lock().unwrap();
                             let next = operator_mode_adjacent_flight_state(current, 1);
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
-                                if let Err(e) = queue_locally_routed_flight_command(
+                                if let Err(e) = queue_locally_routed_flight_command_with_launch_revision(
                                     &state,
                                     &router,
                                     "AdvanceFlightState command",
-                                    &[cmd_id],
+                                    &[cmd_id],launch_revision,
                                 ) {
                                     log_telemetry_error("failed to log AdvanceFlightState command", e);
                                 } else {
@@ -1273,7 +1335,7 @@ pub async fn telemetry_task(
                                 }
                                 gs_debug_println!("AdvanceFlightState command sent to flight computer ({cmd_id})");
                             }
-                            set_local_flight_state_for_operator_mode(&state, next).await;
+                            set_local_flight_state_for_operator_mode(&state, next,launch_revision).await;
                             gs_debug_println!("Operator-mode flight state advanced: {:?} -> {:?}", current, next);
                         }
                         #[cfg(feature = "hitl_mode")]
@@ -1281,11 +1343,11 @@ pub async fn telemetry_task(
                             let current = *state.state.lock().unwrap();
                             let next = operator_mode_adjacent_flight_state(current, -1);
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
-                                if let Err(e) = queue_locally_routed_flight_command(
+                                if let Err(e) = queue_locally_routed_flight_command_with_launch_revision(
                                     &state,
                                     &router,
                                     "RewindFlightState command",
-                                    &[cmd_id],
+                                    &[cmd_id],launch_revision,
                                 ) {
                                     log_telemetry_error("failed to log RewindFlightState command", e);
                                 } else {
@@ -1293,21 +1355,21 @@ pub async fn telemetry_task(
                                 }
                                 gs_debug_println!("RewindFlightState command sent to flight computer ({cmd_id})");
                             }
-                            set_local_flight_state_for_operator_mode(&state, next).await;
+                            set_local_flight_state_for_operator_mode(&state, next,launch_revision).await;
                             gs_debug_println!("Operator-mode flight state rewound: {:?} -> {:?}", current, next);
                         }
                         #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
                         TelemetryCommand::AdvanceFlightState => {
                                 let current = *state.state.lock().unwrap();
                                 let next = operator_mode_adjacent_flight_state(current, 1);
-                                set_local_flight_state_for_operator_mode(&state, next).await;
+                                set_local_flight_state_for_operator_mode(&state, next,launch_revision).await;
                                 gs_debug_println!("Operator-mode flight state advanced: {:?} -> {:?}", current, next);
                         }
                         #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
                         TelemetryCommand::RewindFlightState => {
                                 let current = *state.state.lock().unwrap();
                                 let next = operator_mode_adjacent_flight_state(current, -1);
-                                set_local_flight_state_for_operator_mode(&state, next).await;
+                                set_local_flight_state_for_operator_mode(&state, next,launch_revision).await;
                                 gs_debug_println!("Operator-mode flight state rewound: {:?} -> {:?}", current, next);
                         }
                         #[cfg(feature = "hitl_mode")]
@@ -1410,6 +1472,9 @@ pub async fn telemetry_task(
     }
 
     let worker_shutdown_timeout = Duration::from_secs(10);
+    let mut shutdown_outcome = TelemetryShutdownOutcome {
+        ingress_quiesced: !worker_startup_failed,
+    };
 
     for worker in comms_workers {
         match tokio::time::timeout(
@@ -1419,12 +1484,21 @@ pub async fn telemetry_task(
         .await
         {
             Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(_))) => eprintln!("Comms worker panicked during shutdown"),
-            Ok(Err(e)) => eprintln!("Comms worker join task failed: {e}"),
-            Err(_) => eprintln!(
-                "Comms worker did not shut down within {:?}",
-                worker_shutdown_timeout
-            ),
+            Ok(Ok(Err(_))) => {
+                shutdown_outcome.ingress_quiesced = false;
+                eprintln!("Comms worker panicked during shutdown");
+            }
+            Ok(Err(e)) => {
+                shutdown_outcome.ingress_quiesced = false;
+                eprintln!("Comms worker join task failed: {e}");
+            }
+            Err(_) => {
+                shutdown_outcome.ingress_quiesced = false;
+                eprintln!(
+                    "Comms worker did not shut down within {:?}",
+                    worker_shutdown_timeout
+                );
+            }
         }
     }
 
@@ -1436,12 +1510,21 @@ pub async fn telemetry_task(
         .await
         {
             Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(_))) => eprintln!("Router worker panicked during shutdown"),
-            Ok(Err(e)) => eprintln!("Router worker join task failed: {e}"),
-            Err(_) => eprintln!(
-                "Router worker did not shut down within {:?}",
-                worker_shutdown_timeout
-            ),
+            Ok(Ok(Err(_))) => {
+                shutdown_outcome.ingress_quiesced = false;
+                eprintln!("Router worker panicked during shutdown");
+            }
+            Ok(Err(e)) => {
+                shutdown_outcome.ingress_quiesced = false;
+                eprintln!("Router worker join task failed: {e}");
+            }
+            Err(_) => {
+                shutdown_outcome.ingress_quiesced = false;
+                eprintln!(
+                    "Router worker did not shut down within {:?}",
+                    worker_shutdown_timeout
+                );
+            }
         }
     }
 
@@ -1449,21 +1532,34 @@ pub async fn telemetry_task(
     drop(packet_tx);
     match tokio::time::timeout(worker_shutdown_timeout, packet_worker).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("Packet worker ended with error: {e}"),
-        Err(_) => eprintln!(
-            "Packet worker did not shut down within {:?}",
-            worker_shutdown_timeout
-        ),
+        Ok(Err(e)) => {
+            shutdown_outcome.ingress_quiesced = false;
+            eprintln!("Packet worker ended with error: {e}");
+        }
+        Err(_) => {
+            shutdown_outcome.ingress_quiesced = false;
+            eprintln!(
+                "Packet worker did not shut down within {:?}",
+                worker_shutdown_timeout
+            );
+        }
     }
 
     match tokio::time::timeout(worker_shutdown_timeout, db_worker).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("DB worker ended with error: {e}"),
-        Err(_) => eprintln!(
-            "DB worker did not shut down within {:?}",
-            worker_shutdown_timeout
-        ),
+        Ok(Err(e)) => {
+            shutdown_outcome.ingress_quiesced = false;
+            eprintln!("DB worker ended with error: {e}");
+        }
+        Err(_) => {
+            shutdown_outcome.ingress_quiesced = false;
+            eprintln!(
+                "DB worker did not shut down within {:?}",
+                worker_shutdown_timeout
+            );
+        }
     }
+    shutdown_outcome
 }
 
 fn umbilical_state_key(cmd_id: u8, on: bool) -> Option<(u8, bool)> {
@@ -1723,12 +1819,11 @@ async fn flush_recording_batch(
     if batch.is_empty() {
         return true;
     }
-    if let Some(active) = active {
-        if let Err(e) = insert_db_batch_with_retry(active, batch).await {
+    if let Some(active) = active
+        && let Err(e) = insert_db_batch_with_retry(active, batch).await {
             eprintln!("DB insert failed after retry; preserving batch for retry: {e}");
             return false;
         }
-    }
     batch.clear();
     true
 }
@@ -2247,6 +2342,38 @@ async fn handle_packet_inner(
                 return Vec::new();
             }
         };
+        // FC is the flight-state authority; local GS publications carry the host
+        // state. Other boards retain their own state telemetry, but their Abort
+        // must never rewrite the aggregate or T-clock, and their delayed phases
+        // must not roll an active flight back to prelaunch.
+        let authority = state.board_from_network_sender(&sender_id);
+        let gs = authority == Some(Board::GroundStation);
+        let fc = authority == Some(Board::FlightComputer);
+        let current = state.local_flight_state_snapshot();
+        let prelaunch = |value| {
+            matches!(
+                value,
+                FlightState::Startup
+                    | FlightState::Idle
+                    | FlightState::PreFill
+                    | FlightState::FillTest
+                    | FlightState::NitrogenFill
+                    | FlightState::NitrousFill
+                    | FlightState::Armed
+            )
+        };
+        if !gs
+            && (new_flight_state == FlightState::Aborted
+                || (!prelaunch(current) && (prelaunch(new_flight_state) || !fc))
+                || current == FlightState::Aborted)
+        {
+            return vec![TelemetryRow {
+                timestamp_ms: get_current_timestamp_ms() as i64,
+                data_type: "FLIGHT_STATE".into(),
+                sender_id,
+                values: vec![Some(pkt_data as f32)],
+            }];
+        }
         {
             let mut fs = state.state.lock().unwrap();
             *fs = new_flight_state;
@@ -2430,7 +2557,7 @@ async fn handle_packet_inner(
             }
 
             if let Some(first_value) = row_values.first().copied().flatten() {
-                if row_data_type == &*crate::telemetry_schema::data_type("BATTERY_VOLTAGE").as_str()
+                if row_data_type == *crate::telemetry_schema::data_type("BATTERY_VOLTAGE").as_str()
                     && is_fill_system_battery_sender(&sender_id)
                     && update_fill_system_low_voltage_latch(first_value)
                 {
@@ -2609,6 +2736,8 @@ async fn reset_testing_simulation(state: &Arc<AppState>) {
         return;
     }
 
+    #[cfg(feature = "testing")]
+    crate::actuator_plumbing::invalidate_modeled_retraction(state);
     flight_sim::reset_simulation();
     state.clear_runtime_data_for_sim_reset();
     {
@@ -2680,6 +2809,174 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
     use std::sync::{Mutex, OnceLock};
     use tokio::sync::{Notify, broadcast, mpsc};
+
+    #[tokio::test]
+    async fn shutdown_receipt_normal_drain_is_clean_with_retained_db_senders() {
+        let (db_tx, db_rx) = mpsc::channel(8);
+        let retained_sender = db_tx.clone();
+        let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let worker = tokio::spawn(telemetry_task(
+            state.clone(),
+            router,
+            Vec::new(),
+            cmd_rx,
+            db_rx,
+            state.shutdown_subscribe(),
+        ));
+        tokio::task::yield_now().await;
+        state.request_shutdown();
+        let result = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("healthy shutdown was blocked by retained sender")
+            .expect("outer telemetry task failed");
+        assert!(
+            result.ingress_quiesced,
+            "actual inner worker drain was not clean"
+        );
+        drop(retained_sender);
+    }
+
+    #[tokio::test]
+    async fn shutdown_receipt_propagates_actual_router_worker_panic() {
+        let (db_tx, db_rx) = mpsc::channel(8);
+        let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let entered = Arc::new(AtomicBool::new(false));
+        let observed = entered.clone();
+        router.add_side_packed("shutdown_panic_fixture", move |_bytes| {
+            observed.store(true, Ordering::Release);
+            panic!("injected actual router worker panic");
+        });
+        router.poll_discovery().unwrap();
+        let worker = tokio::spawn(telemetry_task(
+            state.clone(),
+            router,
+            Vec::new(),
+            cmd_rx,
+            db_rx,
+            state.shutdown_subscribe(),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("actual router worker did not enter injected side");
+        state.request_shutdown();
+        let result = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("panicked router worker did not join")
+            .expect("outer telemetry worker must preserve inner failure outcome");
+        assert!(
+            !result.ingress_quiesced,
+            "outer task Ok hid actual inner panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_receipt_timeout_keeps_late_abort_observation_live() {
+        struct Release(Arc<(Mutex<bool>, std::sync::Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        let (db_tx, db_rx) = mpsc::channel(8);
+        let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let entered = Arc::new(AtomicBool::new(false));
+        let observed = entered.clone();
+        let release = Release(Arc::new((Mutex::new(false), std::sync::Condvar::new())));
+        let parked = release.0.clone();
+        let source = state.clone();
+        router.add_side_packed("shutdown_timeout_fixture", move |_bytes| {
+            observed.store(true, Ordering::Release);
+            let (lock, wake) = &*parked;
+            let mut ready = lock.lock().unwrap();
+            while !*ready {
+                ready = wake.wait(ready).unwrap();
+            }
+            drop(ready);
+            source
+                .board_abort
+                .observe_abort(Board::DaqBoard, std::time::Instant::now(), 123456);
+            Ok(())
+        });
+        router.poll_discovery().unwrap();
+        let worker = tokio::spawn(telemetry_task(
+            state.clone(),
+            router,
+            Vec::new(),
+            cmd_rx,
+            db_rx,
+            state.shutdown_subscribe(),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("actual router worker did not enter blocked side");
+        state.request_shutdown();
+        let result = tokio::time::timeout(Duration::from_secs(12), worker)
+            .await
+            .expect("actual worker timeout did not propagate")
+            .expect("outer telemetry worker must return its inner timeout outcome");
+        assert!(
+            !result.ingress_quiesced,
+            "actual inner timeout became a clean receipt"
+        );
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.board_abort.masks().0 & (1 << 6) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("late Abort was discarded after ambiguous producer shutdown");
+    }
+
+
+    #[tokio::test]
+    async fn shutdown_receipt_real_receiver_and_owned_writer_clean_restart() {
+        let path=std::env::temp_dir().join(format!("gs-actual-clean-{:032x}",rand::random::<u128>()));
+        std::fs::create_dir(&path).unwrap();
+        let directory=path.join("history");
+        // Start from an explicitly checked Clean fixture, not an unprovable
+        // missing directory. Production first-install absence remains Unknown7.
+        let mut checked=crate::board_abort_history::Store::provision(&directory,[43;16],0x7f).unwrap();
+        checked.begin_session(0x7f).unwrap();
+        checked.seal_clean(crate::board_abort_history::QuiescenceReceipt::checked(0,true,true,true).unwrap()).unwrap();
+        drop(checked);
+        let changed=Arc::new(Notify::new());
+        let (restored,publisher,owner)=crate::board_abort_history_writer::Owner::open(&directory,[43;16],changed.clone()).unwrap();
+        let (db_tx,db_rx)=mpsc::channel(8);
+        let (mut state,cmd_rx)=test_app_state_with_cmd_rx(db_tx).await;
+        Arc::get_mut(&mut state).expect("fixture unexpectedly shared before producers").board_abort=
+            Arc::new(crate::board_abort::Runtime::restored(restored,publisher,changed));
+        state.board_abort.publish_initial_history();
+        let router=Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let worker=tokio::spawn(telemetry_task(state.clone(),router,Vec::new(),cmd_rx,db_rx,state.shutdown_subscribe()));
+        tokio::task::yield_now().await;
+        state.request_shutdown();
+        assert!(crate::board_recovery::seal_shutdown_and_take_owner(&state).is_none());
+        assert!(crate::board_recovery::shutdown_clean_eligible(&state));
+        let outcome=tokio::time::timeout(Duration::from_secs(2),worker).await.unwrap().unwrap();
+        assert!(outcome.ingress_quiesced);
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire),0);
+        let snapshot=state.board_abort.freeze_history_after_quiescence();
+        tokio::task::spawn_blocking(move || owner.finish(snapshot,true)).await.unwrap().unwrap();
+        let changed=Arc::new(Notify::new());
+        let (restored,_,owner)=crate::board_abort_history_writer::Owner::open(&directory,[43;16],changed).unwrap();
+        assert!(!restored.previous_session_unclean);
+        assert_eq!(restored.snapshot.unknown,0,"clean normal restart made optional boards mandatory");
+        owner.finish(restored.snapshot,false).unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     fn timesync_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2851,7 +3148,9 @@ mod tests {
         sent.lock().unwrap().clear();
 
         let qualification = crate::gse::armed_fixture_for_test(&state, &router);
-        handle_local_ground_station_launch_command(state.clone(), router.clone()).await;
+        let launch_revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        handle_local_ground_station_launch_command(state.clone(), router.clone(), launch_revision)
+            .await;
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&qualification).unwrap()).unwrap();
         assert_eq!(saved["qualification"]["fire_started"], true);
@@ -2874,7 +3173,7 @@ mod tests {
             .collect();
         assert!(packets.iter().any(|packet| packet.data_type()
             == crate::telemetry_schema::data_type("VALVE_COMMAND")
-            && packet.payload() == &[ValveBoardCommands::Sequence as u8]));
+            && packet.payload() == [ValveBoardCommands::Sequence as u8]));
         assert!(
             packets
                 .iter()
@@ -3009,6 +3308,9 @@ mod tests {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
         crate::telemetry_schema::initialize().unwrap();
+        // Packet compatibility fixture: satisfy the independently tested new
+        // required-board proof before exercising the exposed Launch byte.
+        crate::gse::qualified_launch_proofs_for_test(&state);
         // Match FC's existing compatibility protocol, including every visible
         // threshold control. These are isolated packet captures, not outputs.
         for command in [
@@ -3185,7 +3487,8 @@ mod tests {
 
         #[cfg(not(feature = "hitl_mode"))]
         let qualification = crate::gse::armed_fixture_for_test(&state, &router);
-        handle_flight_computer_launch_command(state, router.clone()).await;
+        let launch_revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        handle_flight_computer_launch_command(state, router.clone(), launch_revision).await;
         #[cfg(not(feature = "hitl_mode"))]
         {
             let saved: serde_json::Value =
@@ -3203,7 +3506,7 @@ mod tests {
             .filter_map(|wire| serialize::unpack_packet(wire).ok())
             .any(|pkt| {
                 pkt.data_type() == crate::telemetry_schema::data_type("VALVE_COMMAND")
-                    && pkt.payload() == &[ValveBoardCommands::Sequence as u8]
+                    && pkt.payload() == [ValveBoardCommands::Sequence as u8]
                     && pkt
                         .endpoints()
                         .contains(&crate::telemetry_schema::endpoint("VALVE_BOARD"))
@@ -3214,11 +3517,13 @@ mod tests {
         );
     }
 
+    type SchedulerObservations = Arc<Mutex<Vec<(u8, bool)>>>;
+    type InjectedRadioTx = (mpsc::UnboundedSender<(u8, Vec<u8>)>, Vec<u8>);
     struct TestRadioComms {
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
-        scheduler_status: Option<Arc<Mutex<Vec<(u8, bool)>>>>,
+        scheduler_status: Option<SchedulerObservations>,
         windows: VecDeque<crate::comms::RadioWindowUpdate>,
-        inject_tx_on_recv: Option<(mpsc::UnboundedSender<(u8, Vec<u8>)>, Vec<u8>)>,
+        inject_tx_on_recv: Option<InjectedRadioTx>,
         fail_sends: usize,
     }
 
@@ -3382,12 +3687,11 @@ mod tests {
                         + RFBOARD_SCHED_GRANT_REANNOUNCE_MS;
                     self.next_idle_uplink_poll_ms = self.now_ms + RFBOARD_SCHED_IDLE_UPLINK_POLL_MS;
                     self.gs_seen = false;
-                } else if self.radio_turn_grant_sent && max_packets > 0 {
-                    if let Some(payload) = rf_tx_queue.pop_front() {
+                } else if self.radio_turn_grant_sent && max_packets > 0
+                    && let Some(payload) = rf_tx_queue.pop_front() {
                         packet_sink(payload);
                         self.radio_turn_sent += 1;
                     }
-                }
             } else {
                 let gs_done = self.gs_seen
                     && self.gs_seq == self.radio_turn_seq
@@ -3659,7 +3963,7 @@ mod tests {
             loop {
                 let row = ws_rx.recv().await.expect("telemetry websocket closed");
                 if row.sender_id == Board::RFBoard.sender_id()
-                    && row.data_type == &*crate::telemetry_schema::data_type("GPS_DATA").as_str()
+                    && row.data_type == *crate::telemetry_schema::data_type("GPS_DATA").as_str()
                 {
                     assert_eq!(row.values, gps_values.map(Some).to_vec());
                     break;
@@ -3671,6 +3975,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
+                {
                 let sent = sent_from_ground
                     .lock()
                     .expect("failed to lock ground tx packets");
@@ -3679,7 +3984,7 @@ mod tests {
                     .filter_map(|payload| serialize::unpack_packet(payload).ok())
                     .any(|pkt| {
                         pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND")
-                            && pkt.payload() == &[FlightComputerCommands::MonitorAltitude as u8]
+                            && pkt.payload() == [FlightComputerCommands::MonitorAltitude as u8]
                             && pkt
                                 .endpoints()
                                 .contains(&crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"))
@@ -3688,6 +3993,7 @@ mod tests {
                     break;
                 }
                 drop(sent);
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -3777,11 +4083,13 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
+                {
                 let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
                 if sent_guard.iter().any(|payload| payload == &wire) {
                     break;
                 }
                 drop(sent_guard);
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -3871,17 +4179,19 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
+                {
                 let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
                 let statuses = scheduler_status
                     .lock()
                     .expect("failed to lock scheduler statuses");
                 if sent_guard.iter().any(|payload| payload == &wire)
-                    && statuses.iter().any(|status| *status == (9, false))
+                    && statuses.contains(&(9, false))
                 {
                     break;
                 }
                 drop(statuses);
                 drop(sent_guard);
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -3900,7 +4210,7 @@ mod tests {
         let statuses = scheduler_status
             .lock()
             .expect("failed to lock scheduler statuses");
-        assert!(statuses.iter().any(|status| *status == (9, false)));
+        assert!(statuses.contains(&(9, false)));
     }
 
     #[tokio::test]
@@ -4110,11 +4420,13 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
+                {
                 let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
                 if !sent_guard.is_empty() {
                     break;
                 }
                 drop(sent_guard);
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -4201,11 +4513,13 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
+                {
                 let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
                 if sent_guard.iter().any(|payload| payload == &wire) {
                     break;
                 }
                 drop(sent_guard);
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -4361,17 +4675,19 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
+                {
                 let sent_guard = sent.lock().expect("failed to lock sent radio payloads");
                 let statuses = scheduler_status
                     .lock()
                     .expect("failed to lock scheduler statuses");
                 if sent_guard.len() >= expected_window_sends
-                    && statuses.iter().any(|status| *status == (7, true))
+                    && statuses.contains(&(7, true))
                 {
                     break;
                 }
                 drop(statuses);
                 drop(sent_guard);
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -4391,7 +4707,7 @@ mod tests {
         let statuses = scheduler_status
             .lock()
             .expect("failed to lock scheduler statuses");
-        assert!(statuses.iter().any(|status| *status == (7, true)));
+        assert!(statuses.contains(&(7, true)));
     }
 
     #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
@@ -4527,19 +4843,33 @@ mod tests {
         }
 
         for cmd in commands {
+            // Match authenticated ingress: relative state commands retain the
+            // original guard revision and dispatch generation in the queue.
+            let queued = TelemetryCommand::QueuedOperator {
+                generation: crate::gse::automatic_generation(&state),
+                launch_revision: crate::board_abort::capture_launch_revision_named(
+                    &state, crate::sequences::command_name(&cmd)),
+                plumbing_origin: None,
+                command: Box::new(cmd),
+            };
             cmd_tx
-                .send(cmd)
+                .send(queued)
                 .await
                 .expect("failed to send flight state command");
         }
 
         let remote_result = tokio::time::timeout(Duration::from_millis(1500), async {
             loop {
-                let states = remote_states.lock().expect("failed to lock remote states");
-                if states.len() >= expected_states.len() {
-                    break;
+                // The GS has its real router worker above. Service the peer's
+                // deferred ingress too, as a running remote board would.
+                remote_router.process_all_queues_with_timeout(0)
+                    .expect("failed to service remote flight-state ingress");
+                {
+                    let states = remote_states.lock().expect("failed to lock remote states");
+                    if states.len() >= expected_states.len() {
+                        break;
+                    }
                 }
-                drop(states);
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -4552,7 +4882,7 @@ mod tests {
             state.local_flight_state_snapshot() as u8,
             *expected_states.last().expect("expected states missing")
         );
-        remote_result.expect("timed out waiting for remote flight state");
+        assert!(remote_result.is_ok(), "timed out waiting for remote flight state: expected={expected_states:?}, actual={:?}", remote_states.lock().expect("failed to lock remote states"));
         let states = remote_states.lock().expect("failed to lock remote states");
         assert_eq!(states.as_slice(), expected_states.as_slice());
     }
@@ -4562,6 +4892,7 @@ mod tests {
     async fn advance_flight_state_command_reaches_flight_computer_command_path() {
         let (db_tx, db_rx) = mpsc::channel(8);
         let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
+        crate::gse::qualified_launch_proofs_for_test(&state);
         let mut state_rx = state.state_tx.subscribe();
         let mut policy = state.action_policy_snapshot();
         for control in policy.controls.iter_mut() {
@@ -4591,7 +4922,12 @@ mod tests {
 
         state
             .cmd_tx
-            .send(TelemetryCommand::AdvanceFlightState)
+            .send(TelemetryCommand::QueuedOperator {
+                generation:crate::gse::automatic_generation(&state),
+                launch_revision:crate::board_abort::capture_launch_revision_named(&state,"AdvanceFlightState"),
+                plumbing_origin:None,
+                command:Box::new(TelemetryCommand::AdvanceFlightState),
+            })
             .await
             .expect("failed to send advance flight state command");
 
@@ -4789,6 +5125,7 @@ mod tests {
             state
                 .cmd_tx
                 .send(TelemetryCommand::QueuedOperator {
+                    launch_revision: None,
                     plumbing_origin: None,
                     generation: old,
                     command: Box::new(command),
@@ -4799,6 +5136,7 @@ mod tests {
         state
             .cmd_tx
             .send(TelemetryCommand::QueuedOperator {
+                launch_revision: None,
                 plumbing_origin: None,
                 generation: old + 1,
                 command: Box::new(TelemetryCommand::Postinit),
@@ -4862,6 +5200,7 @@ mod tests {
         state
             .cmd_tx
             .send(TelemetryCommand::QueuedOperator {
+                launch_revision: None,
                 plumbing_origin: None,
                 generation: crate::gse::automatic_generation(&state),
                 command: Box::new(TelemetryCommand::EvaluationAbort),
@@ -4917,6 +5256,7 @@ mod tests {
         }
 
         let state = Arc::new(AppState {
+            control_ingress: Arc::new(Default::default()),
             ring_buffer: Arc::new(Mutex::new(RingBuffer::new(128))),
             cmd_tx,
             ws_tx,
@@ -4949,6 +5289,9 @@ mod tests {
             manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
             deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
             board_recovery: Arc::new(crate::board_recovery::Runtime::default()),
+            board_abort: Arc::new(crate::board_abort::Runtime::default()),
+            launch_dedup_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            board_abort_tx: broadcast::channel(16).0,
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
             loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
             network_traffic: Arc::new(Mutex::new(crate::network_traffic::Sampler::default())),
@@ -4985,6 +5328,10 @@ mod tests {
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "hitl_mode")]
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "hitl_mode")]
+            hitl_safety_interlocks: Arc::new(std::array::from_fn(|index| {
+                std::sync::atomic::AtomicBool::new(matches!(index, 1 | 2))
+            })),
             #[cfg(feature = "hitl_mode")]
             hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
             recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
@@ -6323,6 +6670,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn board_abort_non_authoritative_postlaunch_keeps_global_state_clock_and_stop_epochs() {
+        let (db_tx, _db_rx) = mpsc::channel(64);
+        let state = test_app_state(db_tx.clone()).await;
+        let overflow = test_db_overflow();
+        for board in Board::ALL {
+            state.mark_board_seen(board.sender_id(), get_current_timestamp_ms());
+        }
+        *state.state.lock().unwrap() = FlightState::Launch;
+        let clock = state.launch_clock_snapshot();
+        let manual = state.manual_abort_intent.epoch();
+        let observed = state.deferred_abort.manual_epoch();
+        for board in [
+            Board::ActuatorBoard,
+            Board::ValveBoard,
+            Board::DaqBoard,
+            Board::PowerBoard,
+            Board::GatewayBoard,
+            Board::RFBoard,
+            Board::FlightComputer,
+        ] {
+            let packet = Packet::new(
+                crate::telemetry_schema::data_type("FLIGHT_STATE"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                board.sender_id(),
+                1234,
+                Arc::from([FlightState::Aborted as u8]),
+            )
+            .unwrap();
+            crate::board_abort::observe_raw(&state, &packet);
+            let rows = handle_packet(&state, &db_tx, &overflow, packet).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(state.local_flight_state_snapshot(), FlightState::Launch);
+            assert_eq!(state.launch_clock_snapshot(), clock);
+            assert_eq!(state.manual_abort_intent.epoch(), manual);
+            assert_eq!(state.deferred_abort.manual_epoch(), observed);
+        }
+        assert_eq!(state.board_abort.snapshot(0).active_errors.len(), 7);
+        for reboot_phase in [FlightState::Startup, FlightState::Idle, FlightState::Armed] {
+            let packet = Packet::new(
+                crate::telemetry_schema::data_type("FLIGHT_STATE"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                Board::FlightComputer.sender_id(),
+                1235,
+                Arc::from([reboot_phase as u8]),
+            )
+            .unwrap();
+            handle_packet(&state, &db_tx, &overflow, packet).await;
+            assert_eq!(state.local_flight_state_snapshot(), FlightState::Launch);
+            assert_eq!(
+                state.launch_clock_snapshot(),
+                clock,
+                "FC reboot phase is not reset authority"
+            );
+        }
+        // Preserve the actual normalized FC authority rather than evaluator enums.
+        let packet = Packet::new(
+            crate::telemetry_schema::data_type("FLIGHT_STATE"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            Board::FlightComputer.sender_id(),
+            1235,
+            Arc::from([FlightState::Ascent as u8]),
+        )
+        .unwrap();
+        handle_packet(&state, &db_tx, &overflow, packet).await;
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Ascent);
+    }
+
+    #[tokio::test]
     async fn unknown_flight_state_code_emits_backend_message() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx.clone()).await;
@@ -6354,6 +6769,10 @@ mod tests {
             messages[0].message
         );
     }
+    mod long_capture_owner_tests {
+        include!("telemetry_task/loadcell_owner_capture_tests.rs");
+    }
+
     #[cfg(feature = "firmware_sim")]
     mod zero_ingress {
         include!("telemetry_task/loadcell_zero_ingress_tests.rs");

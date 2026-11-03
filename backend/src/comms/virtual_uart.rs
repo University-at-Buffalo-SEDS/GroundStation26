@@ -4,7 +4,7 @@
 //! completion immediately, before Renode has serialized those bytes. Retain
 //! subsequent frames in the priority queue until that virtual wire has room.
 #[derive(Default)]
-pub(super) struct WireDrain {
+pub(crate) struct WireDrain {
     ready_us: u64,
 }
 
@@ -14,7 +14,7 @@ impl WireDrain {
     // rounding each small frame up to that interval. Idle time earns no credit.
     const CLOCK_QUANTUM_US: u64 = 10_000;
 
-    pub(super) fn ready(&self, now_ms: u64) -> bool {
+    pub(crate) fn ready(&self, now_ms: u64) -> bool {
         self.ready_us
             <= now_ms
                 .saturating_mul(1_000)
@@ -22,11 +22,11 @@ impl WireDrain {
     }
 
     /// Accumulated modeled stop bit, including previously accepted UART work.
-    pub(super) fn stop_us(&self) -> u64 {
+    pub(crate) fn stop_us(&self) -> u64 {
         self.ready_us
     }
 
-    pub(super) fn committed(&mut self, now_ms: u64, bytes: usize, baud: u32) {
+    pub(crate) fn committed(&mut self, now_ms: u64, bytes: usize, baud: u32) {
         let wire_us = (bytes as u64)
             .saturating_mul(10_000_000) // start +8data +stop bits, in microseconds
             .div_ceil(u64::from(baud.max(1)));

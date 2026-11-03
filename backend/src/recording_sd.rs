@@ -78,7 +78,7 @@ fn free_disk(path: &std::path::Path) -> std::io::Result<u64> {
         return Err(std::io::Error::last_os_error());
     }
     let info = unsafe { info.assume_init() };
-    Ok((info.f_bavail as u64).saturating_mul(info.f_frsize as u64))
+    Ok(info.f_bavail.saturating_mul(info.f_frsize))
 }
 #[cfg(not(unix))]
 fn free_disk(_: &std::path::Path) -> std::io::Result<u64> {
@@ -86,6 +86,7 @@ fn free_disk(_: &std::path::Path) -> std::io::Result<u64> {
         "SD recovery disk preflight is unavailable on this backend platform",
     ))
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 fn effective_limit(root: &std::path::Path, source: &std::path::Path) -> Result<u64, Response> {
     let free = free_disk(root).map_err(|_| {
         (
@@ -112,6 +113,7 @@ fn effective_limit(root: &std::path::Path, source: &std::path::Path) -> Result<u
     }
     Ok(limit)
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn admin(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), Response> {
     let p = crate::web::authorize_headers(state, headers, Permission::ViewData).await?;
     if p.anonymous || !p.roles.contains(&StreamRole::Admin) {
@@ -123,6 +125,7 @@ async fn admin(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), Respons
     }
     Ok(())
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 fn stage(root: &std::path::Path, token: &str) -> Result<std::path::PathBuf, Response> {
     if token.is_empty() || token.len() > 40 || !token.bytes().all(|b| b.is_ascii_digit()) {
         return Err(StatusCode::BAD_REQUEST.into_response());
@@ -194,8 +197,7 @@ pub async fn init(
                 .file_name()
                 .to_string_lossy()
                 .starts_with(".sd-import-")
-            {
-                if let Ok(meta) = entry.metadata() {
+                && let Ok(meta) = entry.metadata() {
                     if meta.is_dir()
                         && !entry.file_type().map_or(true, |t| t.is_symlink())
                         && meta
@@ -209,7 +211,6 @@ pub async fn init(
                         pending += 1;
                     }
                 }
-            }
         }
     }
     if pending >= 8 {
@@ -236,6 +237,7 @@ pub async fn init(
     guard.0 = std::path::PathBuf::new();
     Json(serde_json::json!({"upload_id":token,"max_bytes":maximum,"max_database_bytes":disk_limit()})).into_response()
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn stage_metadata(
     directory: &std::path::Path,
     id: &str,
@@ -272,11 +274,10 @@ pub async fn cancel(
     if let Err(e) = stage_metadata(&directory, &id).await {
         return e;
     }
-    if let Ok(mut active) = cancellations().lock() {
-        if let Some(signal) = active.remove(&token) {
+    if let Ok(mut active) = cancellations().lock()
+        && let Some(signal) = active.remove(&token) {
             let _ = signal.send(());
         }
-    }
     match tokio::fs::remove_dir_all(directory).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -285,6 +286,7 @@ pub async fn cancel(
         Err(_) => StatusCode::CONFLICT.into_response(),
     }
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn copy_stream<W: tokio::io::AsyncWrite + Unpin>(
     body: axum::body::Body,
     file: &mut W,
@@ -312,19 +314,16 @@ async fn copy_stream<W: tokio::io::AsyncWrite + Unpin>(
             )
                 .into_response());
         }
-        if let Some(path) = disk_path {
-            if count < chunk.len() as u64 + 1
-                || count / (4 * 1024 * 1024) != (count - chunk.len() as u64) / (4 * 1024 * 1024)
-            {
-                if free_disk(path).map_or(true, |free| free < reserve_bytes()) {
+        if let Some(path) = disk_path
+            && (count < chunk.len() as u64 + 1
+                || count / (4 * 1024 * 1024) != (count - chunk.len() as u64) / (4 * 1024 * 1024))
+            && free_disk(path).map_or(true, |free| free < reserve_bytes()) {
                     return Err((
                         StatusCode::INSUFFICIENT_STORAGE,
                         "Disk reserve reached; staging data removed",
                     )
                         .into_response());
-                }
             }
-        }
         file.write_all(&chunk).await.map_err(|_| {
             (
                 StatusCode::INSUFFICIENT_STORAGE,

@@ -124,6 +124,7 @@ fn fault(rt: &mut Runtime, reason: Fault, message: &str) -> Effects {
     rt.operational.saved.qualification.latch(reason);
     rt.operational.running = false;
     rt.operational.qd = QdWait::default();
+    rt.operational.qd_launch_admission = None;
     let _ = rt.operational.persist();
     rt.fill_trim = None;
     rt.turbocharge = None;
@@ -206,6 +207,7 @@ pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase)
         let _ = rt.operational.persist();
         rt.operational.running = false;
         rt.operational.qd = QdWait::default();
+        rt.operational.qd_launch_admission = None;
     }
 }
 /// Publish the durable mission stage through the existing real FC state path.
@@ -256,9 +258,7 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
     }
     let (healthy, key) = topology(state);
     let mut effects = Effects::default();
-    let mut launch = false;
-    // operational_tick executes under DISPATCH_GATE; never mint a later token.
-    let launch_generation = crate::gse::automatic_generation(state);
+    let mut launch = None;
     let mut rt = state.gse.lock().unwrap();
     let now = rt.now();
     rt.operational.topology(now, healthy, key);
@@ -313,14 +313,28 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
     if rt.operational.qd.queued() && matches!(rt.operational.qd.status(now), QdStatus::AckTimedOut)
     {
         rt.operational.qd = QdWait::default();
+        rt.operational.qd_launch_admission = None;
         state.add_temporary_notification("QD acknowledgement timed out; queued launch cancelled");
     }
+    if rt.operational.qd.queued()
+        && rt
+            .operational
+            .qd_launch_admission
+            .is_none_or(|ticket| !ticket.remains_current(state))
+    {
+        rt.operational.qd.cancel_launch();
+        rt.operational.qd_launch_admission = None;
+        state.add_temporary_notification("Queued launch cancelled: its original admission was superseded. Check readiness and make a new explicit request.");
+    }
     if rt.operational.qd.queued() && matches!(rt.operational.qd.status(now), QdStatus::Ready) {
-        // Timer is never authority to launch: every prerequisite is rechecked.
+        // Timer never creates a new intent or replaces original ownership.
         if interlock && operational_launch_allowed(state, &rt) {
-            launch = rt.operational.qd.take_ready_launch(now);
+            if rt.operational.qd.take_ready_launch(now) {
+                launch = rt.operational.qd_launch_admission.take();
+            }
         } else {
             rt.operational.qd = QdWait::default();
+            rt.operational.qd_launch_admission = None;
             state.add_temporary_notification(
                 "Queued launch cancelled: live launch prerequisites changed",
             );
@@ -329,18 +343,19 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
     let skip = !rt.operational.running || !effects.valves.is_empty();
     drop(rt);
     apply(state, effects);
-    if launch
+    if let Some(ticket) = launch
         && state
             .cmd_tx
             .try_send(TelemetryCommand::QueuedOperator {
+                launch_revision: Some(ticket.board_abort_revision),
                 plumbing_origin: None,
-                generation: launch_generation,
+                generation: ticket.generation,
                 command: Box::new(TelemetryCommand::Launch),
             })
             .is_err()
-    {
-        state.add_notification("Queued launch was not dispatched: command queue unavailable");
-    }
+        {
+            state.add_notification("Queued launch was not dispatched: command queue unavailable");
+        }
     skip
 }
 fn qd_dispatch_timestamp_ms() -> u64 {
@@ -350,6 +365,7 @@ pub(super) fn handle_operational_command(
     state: &Arc<AppState>,
     cmd: &TelemetryCommand,
     plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+    launch_revision: Option<u64>,
 ) -> bool {
     let name = crate::sequences::command_name(cmd);
     if name == "RetractPlumbing" && !cfg!(feature = "test_fire_mode") {
@@ -379,6 +395,7 @@ pub(super) fn handle_operational_command(
             Ok(()) => {
                 rt.effects_queued = true;
                 let now = rt.now();
+                rt.operational.qd_launch_admission = None;
                 rt.operational.qd.dispatched_with_timeout(
                     now,
                     crate::actuator_plumbing::completion_timeout_ms(state),
@@ -401,8 +418,27 @@ pub(super) fn handle_operational_command(
         let mut rt = state.gse.lock().unwrap();
         let now = rt.now();
         if !matches!(rt.operational.qd.status(now), QdStatus::Ready) {
+            let ticket = match super::LaunchAdmission::capture_for_launch(state, launch_revision) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    drop(rt);
+                    state.add_temporary_notification(error);
+                    return true;
+                }
+            };
+            if rt.operational.qd.queued()
+                && rt
+                    .operational
+                    .qd_launch_admission
+                    .is_none_or(|old| !old.remains_current(state))
+            {
+                rt.operational.qd.cancel_launch();
+                rt.operational.qd_launch_admission = None;
+            }
             match rt.operational.qd.queue_launch(now) {
                 Ok(()) => {
+                    // Repeated requests do not renew an already accepted intent.
+                    rt.operational.qd_launch_admission.get_or_insert(ticket);
                     let message=match rt.operational.qd.status(now) {
                         QdStatus::Settling{remaining_ms}=>format!("Launch queued: QD settling, {:.1} seconds remaining",remaining_ms as f64/1000.0),
                         _=>"Launch queued: waiting for QD acknowledgement, then five seconds settling".into(),
@@ -550,7 +586,6 @@ pub(super) fn check_report_safety(state: &Arc<AppState>) {
                 Effects {
                     valves,
                     notification: Some("Restoring sequence valve configuration".into()),
-                    ..Effects::default()
                 },
             );
         }
@@ -883,7 +918,14 @@ mod tests {
             policy.key_enabled = true;
             policy.software_buttons_enabled = true;
             state.set_action_policy(policy);
-            assert_eq!(command_allowed(&state, &cmd), Some(true), "{command}");
+            assert_eq!(command_allowed(&state, &cmd), Some(true), "{command}: {}", {
+                let rt = state.gse.lock().unwrap();
+                format!("phase={:?} pressure={:?} baseline={:?} nitrogen_passed={} prelaunch={} operational={} engine={}",
+                    rt.engine.status.phase, rt.pressure, rt.engine.status.baseline,
+                    rt.engine.status.nitrogen_passed, prelaunch(&state),
+                    operational_action_allowed(&rt, action(&cmd).unwrap()),
+                    rt.engine.allows(action(&cmd).unwrap(), rt.input(prelaunch(&state), true)))
+            });
             assert!(handle_command(&state, &cmd));
             for _ in 0..1200 {
                 pump_test_link(&state, &peer);
@@ -1015,7 +1057,7 @@ mod tests {
             );
         }
         assert_eq!(state.get_pending_umbilical_valve_state(9), Some(false));
-        state.set_local_flight_state(FlightState::Launch);
+        state.set_preexisting_flight_state_for_test(FlightState::Launch);
         {
             let mut rt = state.gse.lock().unwrap();
             rt.operational.saved = Default::default();
@@ -1053,7 +1095,7 @@ mod tests {
         assert_eq!(state.get_pending_umbilical_valve_state(1), Some(false));
         assert_eq!(state.get_pending_umbilical_valve_state(9), None);
         assert_eq!(state.get_pending_umbilical_valve_state(10), None);
-        state.set_local_flight_state(FlightState::Launch);
+        state.set_preexisting_flight_state_for_test(FlightState::Launch);
         state.set_pending_umbilical_valve_state(1, true);
         check_report_safety(&state);
         assert_eq!(state.get_pending_umbilical_valve_state(1), Some(true));
@@ -1235,6 +1277,8 @@ mod tests {
             "five-second-valves",
             "ten-second-valves",
             "one-second-valves",
+            "board-abort-clear",
+            "host-stop-clear",
         ] {
             queued_flight_launch_scenario(revoke).await;
         }
@@ -1290,15 +1334,24 @@ mod tests {
             &state,
             &state.gse.lock().unwrap()
         ));
-        assert!(handle_operational_command(
-            &state,
-            &TelemetryCommand::RetractPlumbing,
-            None
-        ));
+        crate::gse::qualified_launch_proofs_for_test(&state);
+        // Isolate the inherited ACK+five-second settle policy with a modeled
+        // already-accepted legacy dispatch. Actual public/GSE retraction now
+        // owns durable MotionV2 provenance and the independent45s gate; its
+        // real SDK path is exercised by actuator_plumbing::http_tests.
+        {
+            let mut rt=state.gse.lock().unwrap();
+            let now=rt.now();
+            rt.operational.qd.dispatched(now);
+            rt.operational.qd_dispatch_utc_ms=Some(qd_dispatch_timestamp_ms());
+            rt.operational.qd_launch_admission=None;
+            assert_eq!(rt.operational.qd.status(now),QdStatus::AwaitingAck);
+        }
         assert!(handle_operational_command(
             &state,
             &TelemetryCommand::Launch,
-            None
+            None,
+            crate::board_abort::capture_launch_revision_named(&state, "Launch"),
         ));
         assert!(
             received.try_recv().is_err(),
@@ -1330,7 +1383,8 @@ mod tests {
         assert!(handle_operational_command(
             &state,
             &TelemetryCommand::Launch,
-            None
+            None,
+            crate::board_abort::capture_launch_revision_named(&state, "Launch"),
         ));
         let mut seen = Vec::new();
         while let Ok(messages) = notices.try_recv() {
@@ -1341,6 +1395,13 @@ mod tests {
                 .any(|notice| notice.message.contains("QD settling")
                     && notice.message.contains("seconds remaining"))
         );
+        let original = state
+            .gse
+            .lock()
+            .unwrap()
+            .operational
+            .qd_launch_admission
+            .unwrap();
         let exact_model = crate::simulation_clock_ms().is_some();
         let before = if exact_model { 4999 } else { 4900 };
         let ready = if exact_model { 5000 } else { 5100 };
@@ -1372,6 +1433,33 @@ mod tests {
                     "gps" => crate::antenna::clear_rocket_fix_for_test(),
                     "fc-route" => {
                         router.remove_side(radio).unwrap();
+                    }
+                    "board-abort-clear" => {
+                        let board = Board::ActuatorBoard;
+                        state
+                            .board_abort
+                            .observe_abort(board, Instant::now(), 10_000);
+                        let at = Instant::now();
+                        state.board_abort.observe_status(
+                            board,
+                            42,
+                            8,
+                            1,
+                            Some(1),
+                            false,
+                            true,
+                            at,
+                            state.board_abort.query_revision(board),
+                            at,
+                            10_001,
+                        );
+                        assert_eq!(state.board_abort.masks().0, 0);
+                    }
+                    "host-stop-clear" => {
+                        state.manual_abort_intent.request_untimed();
+                        state.manual_abort_intent.try_claim().unwrap().accepted();
+                        crate::board_abort::synchronize_stop_revision(&state);
+                        assert_eq!(state.board_abort.masks().0, 0);
                     }
                     _ => (),
                 }
@@ -1433,6 +1521,49 @@ mod tests {
             received.try_recv().is_err(),
             "the queued launch is dispatched once"
         );
+        if matches!(revoke, "board-abort-clear" | "host-stop-clear") {
+            assert!(!original.remains_current(&state));
+            // Independent final-admission proof: every real SDK launch queue
+            // call rejects the original revision even though Abort is cleared.
+            assert!(
+                !crate::gse::queue_controller_with_launch_revision(
+                    &state,
+                    router,
+                    crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+                    &[1],
+                    Some(original.board_abort_revision)
+                )
+                .unwrap()
+            );
+            for board in crate::board_abort::BOARDS {
+                let at = Instant::now();
+                state.board_abort.observe_status(
+                    board,
+                    42,
+                    8,
+                    2,
+                    Some(1),
+                    false,
+                    true,
+                    at,
+                    state.board_abort.query_revision(board),
+                    at,
+                    10_002,
+                );
+            }
+            let fresh = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+            assert!(
+                crate::gse::queue_controller_with_launch_revision(
+                    &state,
+                    router,
+                    crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+                    &[1],
+                    fresh
+                )
+                .unwrap(),
+                "a distinct explicit intent still reaches the actual SDK owner"
+            );
+        }
         cleanup(&state);
     }
     #[tokio::test]

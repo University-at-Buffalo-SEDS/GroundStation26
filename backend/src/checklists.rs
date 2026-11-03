@@ -774,6 +774,7 @@ async fn export_signoffs(State(state): State<Arc<AppState>>, headers: HeaderMap)
         Err(error) => (StatusCode::CONFLICT, error).into_response(),
     }
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn principal(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -993,8 +994,7 @@ mod tests {
     }
     #[test]
     fn launch_requirements_are_modular_and_recovery_does_not_block() {
-        let mut d = Document::default();
-        d.enforce_before_launch = true;
+        let mut d = Document { enforce_before_launch: true, ..Document::default() };
         assert!(d.launch_block().is_some());
         for l in &mut d.checklists {
             if l.required_before_launch {

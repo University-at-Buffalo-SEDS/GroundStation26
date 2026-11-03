@@ -3,7 +3,7 @@
 pub(super) fn now(_virtual_now: u64) -> Option<u64> {
     #[cfg(any(test, feature = "firmware_sim"))]
     {
-        return Some(_virtual_now);
+        Some(_virtual_now)
     }
     #[cfg(all(not(any(test, feature = "firmware_sim")), target_os = "linux"))]
     {
@@ -17,9 +17,9 @@ pub(super) fn now(_virtual_now: u64) -> Option<u64> {
         {
             return None;
         }
-        return (stamp.tv_sec as u64)
+        (stamp.tv_sec as u64)
             .checked_mul(1000)?
-            .checked_add(stamp.tv_nsec as u64 / 1_000_000);
+            .checked_add(stamp.tv_nsec as u64 / 1_000_000)
     }
     #[cfg(all(not(any(test, feature = "firmware_sim")), target_os = "macos"))]
     {

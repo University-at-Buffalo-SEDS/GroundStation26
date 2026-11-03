@@ -70,6 +70,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
             post(output).layer(DefaultBodyLimit::disable()),
         )
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn manager(state: &MediaState, headers: &HeaderMap) -> ApiResult<String> {
     let p = crate::web::authorize_headers(&state.app, headers, Permission::ViewData).await?;
     if !p.can_manage_stream() {
@@ -93,6 +94,7 @@ fn qualification(encoding_ms: u64, up: u64, down: u64) -> usize {
         .min(down / 12_000_000)
         .clamp(1, 8) as usize
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn hosts(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -103,6 +105,7 @@ async fn hosts(
         serde_json::json!({"selected":registry.selected,"hosts":registry.hosts.iter().map(|h|serde_json::json!({"id":h.id,"name":h.name,"passed":h.passed,"online":eligible(h),"capacity":h.capacity,"encoding_ms":h.encoding_ms,"upload_bps":h.upload_bps,"download_bps":h.download_bps})).collect::<Vec<_>>()}),
     ))
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn begin(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -140,6 +143,7 @@ async fn begin(
     });
     Ok(Json(serde_json::json!({"id":id,"test_bytes":TEST_BYTES})))
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn download(
     State(state): State<Arc<MediaState>>,
     Path(id): Path<String>,
@@ -165,6 +169,7 @@ async fn download(
     )
         .into_response())
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn upload(
     State(state): State<Arc<MediaState>>,
     Path(id): Path<String>,
@@ -215,6 +220,7 @@ async fn upload(
     host.upload_bps = (bytes as f64 * 8.0 / start.elapsed().as_secs_f64().max(0.001)) as u64;
     Ok(StatusCode::NO_CONTENT)
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn complete(
     State(state): State<Arc<MediaState>>,
     Path(id): Path<String>,
@@ -241,6 +247,7 @@ async fn complete(
         serde_json::json!({"passed":host.passed,"capacity":host.capacity,"encoding_ms":host.encoding_ms,"upload_bps":host.upload_bps,"download_bps":host.download_bps}),
     ))
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn select(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -259,6 +266,7 @@ async fn select(
     registry.selected = selection.host_id;
     Ok(Json(serde_json::json!({"selected":registry.selected})))
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn heartbeat(
     State(state): State<Arc<MediaState>>,
     Path(id): Path<String>,
@@ -318,6 +326,7 @@ pub(super) async fn choose(state: &MediaState, streams: Vec<StreamInfo>) -> Vec<
         })
         .collect()
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn output(
     State(state): State<Arc<MediaState>>,
     Path((host_id, id)): Path<(String, String)>,

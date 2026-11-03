@@ -308,11 +308,10 @@ fn default_for_role(rrls: bool) -> CommsLinksConfig {
                 protocol: SerialProtocol::RawUart,
             },
         };
-        if cfg!(target_os = "macos") {
-            if let CommsLinkConfig::Serial { serial } = &mut config.av_bay {
+        if cfg!(target_os = "macos")
+            && let CommsLinkConfig::Serial { serial } = &mut config.av_bay {
                 serial.port = "/dev/cu.RRLS-radio".into();
             }
-        }
     }
     config
 }
@@ -352,16 +351,14 @@ pub fn load_or_default() -> CommsLinksConfig {
             default_for_role(crate::rrls::is_rrls())
         }
     };
-    if crate::rrls::is_rrls() {
-        if let Ok(port) = std::env::var("GS_RRLS_RADIO_PORT") {
-            if !port.trim().is_empty() {
+    if crate::rrls::is_rrls()
+        && let Ok(port) = std::env::var("GS_RRLS_RADIO_PORT")
+            && !port.trim().is_empty() {
                 apply_simulator_serial_override(&mut config.av_bay, port, 115200);
                 if let Err(error) = save(&config) {
                     eprintln!("WARNING: cannot save RRLS radio settings: {error}");
                 }
             }
-        }
-    }
     apply_simulator_serial_overrides(&mut config);
     log::info!(
         "{} communications config: {}; radio: {}",
@@ -377,8 +374,8 @@ pub fn load_or_default() -> CommsLinksConfig {
 }
 
 fn apply_simulator_serial_overrides(config: &mut CommsLinksConfig) {
-    if std::env::var("GS_SIMULATED_SERIAL_PTY").as_deref() == Ok("1") {
-        if let Ok(address) = std::env::var("GS_FILL_PICO_TCP_ADDRESS") {
+    if std::env::var("GS_SIMULATED_SERIAL_PTY").as_deref() == Ok("1")
+        && let Ok(address) = std::env::var("GS_FILL_PICO_TCP_ADDRESS") {
             config.fill_box = CommsLinkConfig::PicoFiTcp {
                 tcp: PicoFiTcpConfig {
                     discovery: false,
@@ -390,7 +387,6 @@ fn apply_simulator_serial_overrides(config: &mut CommsLinksConfig) {
                 },
             };
         }
-    }
     if std::env::var("GS_SIMULATED_SERIAL_PTY").as_deref() == Ok("1")
         && let Ok(port) = std::env::var("GS_FILL_PICO_DISCOVERY_PORT")
         && let Ok(port) = port.parse::<u16>()

@@ -13,11 +13,16 @@ macro_rules! gs_debug_println {
     };
 }
 
+mod actuator_plumbing;
 mod antenna;
 mod auth;
 mod auto_zero;
+mod board_abort;
+mod control_ingress;
+mod board_abort_history;
+mod board_abort_history_writer;
+mod history_policy;
 mod board_recovery;
-mod actuator_plumbing;
 mod checklists;
 mod command_probe;
 mod command_proxy;
@@ -32,21 +37,23 @@ mod fill_targets;
 mod firmware_update;
 mod flight_setup;
 mod flight_sim;
+#[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+mod testing_board_lifecycle;
 mod gpio;
 mod gpio_panel;
 mod gse;
 mod host_temperature;
 mod i18n;
+mod launch_analytics;
 mod launch_clock_sync;
 mod launch_history;
-mod launch_analytics;
 mod layout;
 mod loadcell;
 mod loadcell_zero;
 mod log_redaction;
 mod logger;
 mod manual_abort_intent;
-mod operator_queue;
+mod manual_abort_utc;
 mod map;
 mod media;
 mod media_runtime;
@@ -54,6 +61,7 @@ mod mission_sync;
 mod network_health;
 mod network_traffic;
 mod network_variables;
+mod operator_queue;
 mod primary_mirror;
 mod qualification_requests;
 mod recording_export;
@@ -75,8 +83,8 @@ mod station_mode;
 mod station_pairing;
 mod system_clock;
 mod telemetry_db;
-mod telemetry_schema;
 mod telemetry_provenance;
+mod telemetry_schema;
 mod telemetry_task;
 #[cfg(feature = "test_fire_mode")]
 mod test_fire_csv;
@@ -172,10 +180,25 @@ fn network_router_time_divisor() -> u64 {
         .unwrap_or(1)
 }
 
+static SIMULATION_CLOCK_PATH: std::sync::OnceLock<Option<std::path::PathBuf>> =
+    std::sync::OnceLock::new();
+static SIMULATION_CLOCK_LAST: AtomicU64 = AtomicU64::new(0);
+static SIMULATION_CLOCK_VALID: AtomicBool = AtomicBool::new(false);
+static SIMULATION_CLOCK_SAMPLE: AtomicU64 = AtomicU64::new(0);
+
+/// No filesystem access: used only after the existing SDK clock sampled its source.
+fn cached_simulation_clock_sample() -> Option<(Option<u64>, u64)> {
+    match SIMULATION_CLOCK_PATH.get()? {
+        None => Some((None, 0)),
+        Some(_) if SIMULATION_CLOCK_VALID.load(Ordering::Acquire) => Some((
+            Some(SIMULATION_CLOCK_LAST.load(Ordering::Acquire)),
+            SIMULATION_CLOCK_SAMPLE.load(Ordering::Acquire),
+        )),
+        Some(_) => None,
+    }
+}
 fn simulation_clock_ms() -> Option<u64> {
-    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
-    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let path = PATH
+    let path = SIMULATION_CLOCK_PATH
         .get_or_init(|| {
             if cfg!(any(feature = "hitl_mode", feature = "firmware_sim")) {
                 std::env::var_os("GS_SIM_CLOCK_FILE").map(std::path::PathBuf::from)
@@ -184,18 +207,30 @@ fn simulation_clock_ms() -> Option<u64> {
             }
         })
         .as_ref()?;
-    Some(read_simulation_clock(path, &LAST))
+    let (value, valid) = read_simulation_clock_observed(path, &SIMULATION_CLOCK_LAST);
+    SIMULATION_CLOCK_VALID.store(valid, Ordering::Release);
+    let _ = SIMULATION_CLOCK_SAMPLE.try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        value.checked_add(1)
+    });
+    Some(value)
 }
 
+#[cfg(test)]
 fn read_simulation_clock(path: &std::path::Path, last: &std::sync::atomic::AtomicU64) -> u64 {
+    read_simulation_clock_observed(path, last).0
+}
+fn read_simulation_clock_observed(
+    path: &std::path::Path,
+    last: &std::sync::atomic::AtomicU64,
+) -> (u64, bool) {
     // A read can overlap the writer's truncate/write. Keep the last valid
     // monotonic tick rather than falling back to wall time during that race.
-    if let Ok(text) = std::fs::read_to_string(path) {
-        if let Ok(value) = text.trim().parse::<u64>() {
+    if let Ok(text) = std::fs::read_to_string(path)
+        && let Ok(value) = text.trim().parse::<u64>() {
             last.fetch_max(value, Ordering::Relaxed);
+            return (last.load(Ordering::Relaxed), true);
         }
-    }
-    last.load(Ordering::Relaxed)
+    (last.load(Ordering::Relaxed), false)
 }
 
 #[derive(Clone, Copy)]
@@ -286,12 +321,11 @@ async fn wait_for_validation_reliable_delivery(
             .filter(|entry| tx_before.iter().any(|(ty, _)| *ty == entry.data_type))
             .map(|entry| entry.pending_destinations.len())
             .sum();
-        if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some() {
-            if details != last_pending {
+        if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some()
+            && details != last_pending {
                 log::info!("full-bay reliable pending for {label}: {details:?}");
                 last_pending.clone_from(&details);
             }
-        }
         let transmission_counts = tx_before
             .iter()
             .map(|(expected, before)| {
@@ -329,8 +363,8 @@ async fn wait_for_validation_reliable_delivery(
         // Completion is an event: once all transmissions and their ACKs have
         // finished, later heartbeats/schema work cannot undo that event or
         // turn its latency into the length of an unrelated quiet interval.
-        if elapsed_ms >= minimum_observation_ms && delivery_ms.is_some() {
-            let delivery_ms = delivery_ms.expect("delivered timestamp recorded");
+        if elapsed_ms >= minimum_observation_ms
+            && let Some(delivery_ms) = delivery_ms {
             if delivery_ms > latency_limit_ms {
                 log::error!(
                     "full-bay reliable delivery exceeded latency bound for {label}: {delivery_ms} ms > {latency_limit_ms} ms"
@@ -1206,12 +1240,30 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let launch_history = Arc::new(Mutex::new(launch_history::Store::environment()?));
+    let history_directory = std::env::var_os("GS_BOARD_ABORT_HISTORY_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("backend/data/board_abort_history"));
+    let history_identity: [u8;16] = if let Some(pairing) = station_pairing::Pairing::load()? {
+        let digest = ring::digest::digest(&ring::digest::SHA256, pairing.public.installation_id.as_bytes());
+        digest.as_ref()[..16].try_into().unwrap()
+    } else if history_directory.exists() {
+        board_abort_history::Store::anchor_identity(&history_directory)?
+    } else { rand::random() };
+    let history_changed = Arc::new(tokio::sync::Notify::new());
+    let (history_restored, history_publisher, abort_history_writer) =
+        board_abort_history_writer::Owner::open(&history_directory, history_identity, history_changed.clone())?;
+    let board_abort = Arc::new(board_abort::Runtime::restored(history_restored, history_publisher, history_changed));
+
+    // Restore closed admission before constructing or starting any producer.
+    let (restored_recovery_owner, restored_generation) =
+        launch_history.lock().unwrap().restored_recovery_barrier();
     let restored_clock = launch_history.lock().unwrap().snapshot().clock;
     let (restored_daq, restored_stamp) = launch_history.lock().unwrap().daq_snapshot();
     if network_variables::persisted_daq_log_clock_with_revision().is_none() && restored_stamp != 0 {
         network_variables::restore_persisted_daq_log_clock_snapshot(restored_daq, restored_stamp)?;
     }
     let state = Arc::new(AppState {
+        control_ingress: Arc::new(Default::default()),
         ring_buffer: Arc::new(Mutex::new(RingBuffer::new(ring_buffer_capacity))),
         cmd_tx,
         ws_tx,
@@ -1240,13 +1292,18 @@ async fn main() -> anyhow::Result<()> {
         pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
         latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
         gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
-        automatic_generation: Arc::new(AtomicU64::new(1)),
-        operator_admission_barrier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        automatic_generation: Arc::new(AtomicU64::new(restored_generation)),
+        operator_admission_barrier: Arc::new(std::sync::atomic::AtomicU64::new(
+            restored_recovery_owner,
+        )),
         operator_queue: Arc::new(crate::operator_queue::Control::default()),
         operator_dispatch_inflight: Arc::new(AtomicUsize::new(0)),
         manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
         deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
         board_recovery: Arc::new(crate::board_recovery::Runtime::default()),
+        board_abort,
+        launch_dedup_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        board_abort_tx: broadcast::channel(16).0,
         plumbing_drive: Arc::new(crate::actuator_plumbing::Runtime::default()),
         latest_fill_mass_kg: Arc::new(Mutex::new(None)),
         loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
@@ -1284,6 +1341,10 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "hitl_mode")]
         hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
         #[cfg(feature = "hitl_mode")]
+        hitl_safety_interlocks: Arc::new(std::array::from_fn(|index| {
+            std::sync::atomic::AtomicBool::new(matches!(index, 1 | 2))
+        })),
+        #[cfg(feature = "hitl_mode")]
         hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
         recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
             mode: RecordingModeWire::Idle,
@@ -1302,6 +1363,9 @@ async fn main() -> anyhow::Result<()> {
         auth,
     });
 
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    flight_sim::initialize_model_owners(&state, history_restored.snapshot.actual_abort, history_restored.snapshot.unknown);
+    state.board_abort.publish_initial_history();
     state.set_messages_snapshot(Vec::new());
 
     if !rrls::is_rrls() {
@@ -1387,16 +1451,24 @@ async fn main() -> anyhow::Result<()> {
     let ground_station_handler = EndpointHandler::new_packet_handler(
         telemetry_schema::endpoint("GROUND_STATION"),
         move |pkt: &Packet| {
-            let umbilical_capture = if pkt.data_type() == telemetry_schema::data_type("UMBILICAL_STATUS") {
-                match telemetry_task::capture_umbilical_status_at_ingress(&ground_station_handler_state_clone, pkt) {
-                    Some(capture) => Some(capture),
-                    None => return Ok(()),
-                }
-            } else { None };
+            crate::board_abort::observe_raw(&ground_station_handler_state_clone, pkt);
+            let umbilical_capture =
+                if pkt.data_type() == telemetry_schema::data_type("UMBILICAL_STATUS") {
+                    match telemetry_task::capture_umbilical_status_at_ingress(
+                        &ground_station_handler_state_clone,
+                        pkt,
+                    ) {
+                        Some(capture) => Some(capture),
+                        None => return Ok(()),
+                    }
+                } else {
+                    None
+                };
             let captured_owner = umbilical_capture.as_ref().map(|capture| capture.owner());
             if let Some(probe) = &fill_delivery {
-                let board =
-                    captured_owner.or_else(|| ground_station_handler_state_clone.board_from_network_sender(pkt.sender()));
+                let board = captured_owner.or_else(|| {
+                    ground_station_handler_state_clone.board_from_network_sender(pkt.sender())
+                });
                 let ty = pkt.data_type();
                 let channel = if board == Some(Board::DaqBoard) {
                     if ty == telemetry_schema::data_type("KG1000")
@@ -1434,8 +1506,8 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     None
                 };
-                if let Some(channel) = channel {
-                    if pkt
+                if let Some(channel) = channel
+                    && pkt
                         .data_as_f32()
                         .is_ok_and(|v| !v.is_empty() && v.iter().all(|x| x.is_finite()))
                     {
@@ -1445,11 +1517,11 @@ async fn main() -> anyhow::Result<()> {
                             validation_elapsed_ms(fill_delivery_clock),
                         );
                     }
-                }
             }
             if std::env::var_os("GS_SIM_VALIDATE_TELEMETRY_RETURN").is_some() {
-                let board =
-                    captured_owner.or_else(|| ground_station_handler_state_clone.board_from_network_sender(pkt.sender()));
+                let board = captured_owner.or_else(|| {
+                    ground_station_handler_state_clone.board_from_network_sender(pkt.sender())
+                });
                 if pkt.data_type() == telemetry_schema::data_type("GPS_SATELLITE_NUMBER")
                     || pkt.data_type() == telemetry_schema::data_type("IMU_DATA")
                     || pkt.data_type() == telemetry_schema::data_type("BAROMETER_DATA")
@@ -1510,8 +1582,8 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         None
                     };
-                    if let Some(index) = index {
-                        if pkt
+                    if let Some(index) = index
+                        && pkt
                             .data_as_f32()
                             .is_ok_and(|values| values.len() == 1 && values[0].is_finite())
                         {
@@ -1536,7 +1608,6 @@ async fn main() -> anyhow::Result<()> {
                                 );
                             }
                         }
-                    }
                 }
                 if board == Some(Board::PowerBoard)
                     && pkt.data_type() == telemetry_schema::data_type("BATTERY_VOLTAGE")
@@ -1593,6 +1664,13 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            if pkt.data_type() == telemetry_schema::data_type("AB_FILL_MOTION_STATUS_V2") {
+                crate::actuator_plumbing::receive_motion_status(
+                    &ground_station_handler_state_clone,
+                    pkt,
+                );
+                return Ok(());
+            }
             if pkt.data_type() == telemetry_schema::data_type("AB_FILL_DRIVE_STATUS") {
                 crate::actuator_plumbing::receive_status(&ground_station_handler_state_clone, pkt);
                 return Ok(());
@@ -1609,8 +1687,9 @@ async fn main() -> anyhow::Result<()> {
                     pkt.endpoints(),
                     pkt.payload()
                 );
-                let source =
-                    captured_owner.or_else(|| ground_station_handler_state_clone.board_from_network_sender(pkt.sender()));
+                let source = captured_owner.or_else(|| {
+                    ground_station_handler_state_clone.board_from_network_sender(pkt.sender())
+                });
                 if let Some(source) = source {
                     command_status_probe_handler
                         .lock()
@@ -1655,6 +1734,7 @@ async fn main() -> anyhow::Result<()> {
     let flight_state_handler = EndpointHandler::new_packet_handler(
         telemetry_schema::endpoint("FLIGHT_STATE"),
         move |pkt: &Packet| {
+            crate::board_abort::observe_raw(&flight_state_handler_state_clone, pkt);
             flight_state_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
             let mut rb = flight_state_handler_state_clone.ring_buffer.lock().unwrap();
             rb.push(pkt.clone());
@@ -1665,7 +1745,8 @@ async fn main() -> anyhow::Result<()> {
     let abort_handler = EndpointHandler::new_packet_handler(
         telemetry_schema::endpoint("ABORT"),
         move |pkt: &Packet| {
-            abort_handler_state_clone.deferred_abort.observe(
+            crate::deferred_abort::observe(
+                &abort_handler_state_clone,
                 pkt,
                 crate::gse::automatic_generation(&abort_handler_state_clone),
             );
@@ -1762,6 +1843,11 @@ async fn main() -> anyhow::Result<()> {
             open_umbilical_comms(&comms_links.fill_box);
         (Some(comms), connected)
     };
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    crate::testing_board_lifecycle::bind_selected(
+        rocket_comms.lock().unwrap().testing_model_link(),
+        umbilical_comms.as_ref().is_some_and(|link|link.lock().unwrap().testing_model_link()));
+
     state
         .av_bay_comms_connected
         .store(av_bay_comms_connected, Ordering::Relaxed);
@@ -1793,10 +1879,10 @@ async fn main() -> anyhow::Result<()> {
     if telemetry_task::timesync_enabled() {
         telemetry_task::refresh_host_network_time(&router, get_current_timestamp_ms());
     }
-    network_variables::initialize(&router)?;
+    network_variables::initialize_for_state(&state, &router)?;
     set_network_time_router(router.clone());
     let _ = state.topology_router.set(router.clone());
-    let _abort_observations = crate::deferred_abort::spawn(state.clone());
+    let (mut abort_observations, abort_observations_stop) = crate::deferred_abort::spawn(state.clone());
 
     let (rocket_tx, rocket_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
     let (umbilical_tx, umbilical_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
@@ -1864,7 +1950,7 @@ async fn main() -> anyhow::Result<()> {
 
     if !rrls::is_rrls() {
         qualification_requests::prime_initial_cache(&router, || {
-            network_variables::publish_current(&router)
+            network_variables::publish_bootstrap_for_state(&state, &router).map(|_| ())
         })?;
     }
     // The full-system simulator uses the production toggle path while each
@@ -1952,14 +2038,29 @@ async fn main() -> anyhow::Result<()> {
     // channel. Local SDK callbacks retain observations and never wait on GSE.
     let stop_state = state.clone();
     let stop_router = router.clone();
-    let _manual_stop_publisher = tokio::spawn(crate::manual_abort_intent::service(
+    let _board_abort_publications = tokio::spawn(crate::board_abort::publish_service(
+        state.clone(),
+        state.shutdown_subscribe(),
+    ));
+    let _board_abort_queries = tokio::spawn(crate::board_abort::query_service(
+        state.clone(),
+        state.shutdown_subscribe(),
+    ));
+    let _manual_utc_reservations = tokio::spawn(crate::manual_abort_utc::service(
+        state.clone(),
+        router.clone(),
+        state.shutdown_subscribe(),
+    ));
+    let _manual_stop_publisher = tokio::spawn(crate::manual_abort_intent::service_with_claim(
         state.manual_abort_intent.clone(),
         state.shutdown_subscribe(),
-        move |epoch| match crate::telemetry_task::queue_priority_manual_abort_packet(&stop_router) {
-            Ok(()) => {
+        move |claim| match crate::manual_abort_utc::publish_claim(&stop_state, &stop_router, claim)
+        {
+            Ok(true) => {
                 crate::telemetry_task::flush_command_tx(&stop_router, "Manual Abort priority tx");
                 log::info!(
-                    "manual Abort accepted by SDK epoch={epoch} current={} pending={:?}",
+                    "manual Abort accepted by SDK epoch={} current={} pending={:?}",
+                    claim.epoch(),
                     stop_state.manual_abort_intent.epoch(),
                     stop_state.manual_abort_intent.pending_epoch()
                 );
@@ -1967,7 +2068,7 @@ async fn main() -> anyhow::Result<()> {
             }
             // Logger WriteMode::Direct can wait on disk. A refused admission
             // keeps the bounded RAM intent and retries without synchronous I/O.
-            Err(_) => false,
+            Ok(false) | Err(_) => false,
         },
     ));
     let full_bay_discovery_ready = Arc::new(AtomicBool::new(false));
@@ -2041,7 +2142,9 @@ async fn main() -> anyhow::Result<()> {
                         .as_deref()
                         == Some("1")
                     {
-                        let Some(_claim) = gse::claim_operator_dispatch(&validation_state, validation_generation) else {
+                        let Some(_claim) =
+                            gse::claim_operator_dispatch(&validation_state, validation_generation)
+                        else {
                             return;
                         };
                         let command = FlightComputerCommands::EvaluationRelax as u8;
@@ -2171,7 +2274,9 @@ async fn main() -> anyhow::Result<()> {
                             (data_type, count)
                         })
                         .collect::<Vec<_>>();
-                        let Some(round_claim) = gse::claim_operator_dispatch(&validation_state, validation_generation) else {
+                        let Some(round_claim) =
+                            gse::claim_operator_dispatch(&validation_state, validation_generation)
+                        else {
                             return;
                         };
                         if let Some(&state) = flight_states.get(round) {
@@ -2343,7 +2448,9 @@ async fn main() -> anyhow::Result<()> {
             for value in sequence.split(',') {
                 tokio::time::sleep(Duration::from_millis(750)).await;
                 let enabled = matches!(value.trim(), "1" | "true" | "on");
-                let Some(_claim) = gse::claim_operator_dispatch(&validation_state, validation_generation) else {
+                let Some(_claim) =
+                    gse::claim_operator_dispatch(&validation_state, validation_generation)
+                else {
                     return;
                 };
                 match network_variables::set_underglow(&validation_router, enabled) {
@@ -2366,7 +2473,9 @@ async fn main() -> anyhow::Result<()> {
             for value in sequence.split(',') {
                 tokio::time::sleep(Duration::from_millis(750)).await;
                 let enabled = matches!(value.trim(), "1" | "true" | "on");
-                let Some(_claim) = gse::claim_operator_dispatch(&validation_state, validation_generation) else {
+                let Some(_claim) =
+                    gse::claim_operator_dispatch(&validation_state, validation_generation)
+                else {
                     return;
                 };
                 match network_variables::set_flight_buzzer(&validation_router, enabled) {
@@ -2459,7 +2568,9 @@ async fn main() -> anyhow::Result<()> {
             let command_started = ValidationInstant::now();
             let ack_latency_limit_ms =
                 validation_latency_limit_ms("GS_SIM_VALVE_ACK_MAX_LATENCY_MS", 2_500);
-            let Some(command_claim) = gse::claim_operator_dispatch(&validation_state, validation_generation) else {
+            let Some(command_claim) =
+                gse::claim_operator_dispatch(&validation_state, validation_generation)
+            else {
                 return;
             };
             let open_result =
@@ -2611,7 +2722,9 @@ async fn main() -> anyhow::Result<()> {
                     // This path is simulation-only and never exercises a
                     // deployment output. Require actual round transmissions
                     // and their destination receipts throughout the soak.
-                    let Some(command_claim) = gse::claim_operator_dispatch(&soak_state, soak_generation) else {
+                    let Some(command_claim) =
+                        gse::claim_operator_dispatch(&soak_state, soak_generation)
+                    else {
                         return;
                     };
                     let command = FlightComputerCommands::EvaluationRelax as u8;
@@ -2651,7 +2764,9 @@ async fn main() -> anyhow::Result<()> {
                 for (slot, board, ty, command) in command_probe::validation_commands(open) {
                     let generation_before = soak_status.lock().unwrap().generation(slot, open);
                     let started = ValidationInstant::now();
-                    let Some(command_claim) = gse::claim_operator_dispatch(&soak_state, soak_generation) else {
+                    let Some(command_claim) =
+                        gse::claim_operator_dispatch(&soak_state, soak_generation)
+                    else {
                         return;
                     };
                     if let Err(error) =
@@ -2754,25 +2869,67 @@ async fn main() -> anyhow::Result<()> {
 
     let telemetry_shutdown_timeout = Duration::from_secs(20);
     let task_shutdown_timeout = Duration::from_secs(5);
-    match tokio::time::timeout(telemetry_shutdown_timeout, &mut tt).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => log::error!("telemetry task ended with error: {e}"),
-        Err(_) => log::error!(
-            "telemetry task did not shut down within {:?}",
-            telemetry_shutdown_timeout
-        ),
+    state.control_ingress.seal();
+    let control_ingress_terminal=state.control_ingress.wait_terminal(task_shutdown_timeout).await;
+    let firmware_terminal=firmware_update::seal_shutdown_and_is_quiescent();
+    let mut shutdown_producers_quiesced = control_ingress_terminal && firmware_terminal;
+    let mut receiver_producers_quiesced = false;
+    // Prevent late authenticated HTTP from replacing the retained owner after
+    // extraction. The admitted operation keeps its original actor/journal/UTC.
+    let coordinator_owner = board_recovery::seal_shutdown_and_take_owner(&state);
+    if let Some(mut owner) = coordinator_owner {
+        match tokio::time::timeout(telemetry_shutdown_timeout, &mut owner).await {
+            Ok(Ok(())) => {},
+            Ok(Err(error)) => { shutdown_producers_quiesced=false; log::error!("Recovery owner shutdown failed: {error}"); },
+            Err(_) => { shutdown_producers_quiesced=false; log::error!("Recovery owner still running; leave abort history Active"); },
+        }
+        // A timed-out admitted owner remains alive; never cancel its durable
+        // application protocol merely to fabricate a clean shutdown receipt.
     }
-    if !tt.is_finished() {
-        tt.abort();
-        let _ = tt.await;
+    shutdown_producers_quiesced &= board_recovery::shutdown_clean_eligible(&state);
+    // These owners include RRLS authenticated mirror ingress and control
+    // context changes. Retain their handles; an underscore binding is not a
+    // shutdown receipt. No application mutex is held while awaiting a join.
+    for (name, owner) in [
+        ("command_proxy", _command_proxy),
+        ("mission_sync", _mission_sync),
+        ("station_mode", _station_mode),
+        ("launch_clock_sync", _launch_clock_sync),
+        ("board_abort_queries", Some(_board_abort_queries)),
+        ("board_abort_publications", Some(_board_abort_publications)),
+        ("manual_utc_reservations", Some(_manual_utc_reservations)),
+        ("manual_stop_publisher", Some(_manual_stop_publisher)),
+    ] {
+        let Some(mut owner) = owner else { continue };
+        match tokio::time::timeout(task_shutdown_timeout, &mut owner).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                shutdown_producers_quiesced = false;
+                log::error!("{name} shutdown join failed: {error}");
+            }
+            Err(_) => {
+                shutdown_producers_quiesced = false;
+                log::error!("{name} did not stop before its shutdown deadline");
+            }
+        }
+        if !owner.is_finished() {
+            owner.abort();
+            let _ = owner.await;
+        }
     }
     match tokio::time::timeout(task_shutdown_timeout, &mut st).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => log::error!("safety task ended with error: {e}"),
-        Err(_) => log::error!(
-            "safety task did not shut down within {:?}",
-            task_shutdown_timeout
-        ),
+        Ok(Err(e)) => {
+            shutdown_producers_quiesced = false;
+            log::error!("safety task ended with error: {e}");
+        }
+        Err(_) => {
+            shutdown_producers_quiesced = false;
+            log::error!(
+                "safety task did not shut down within {:?}",
+                task_shutdown_timeout
+            );
+        }
     }
     if !st.is_finished() {
         st.abort();
@@ -2780,15 +2937,74 @@ async fn main() -> anyhow::Result<()> {
     }
     match tokio::time::timeout(task_shutdown_timeout, &mut sequence_task).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => log::error!("sequence task ended with error: {e}"),
-        Err(_) => log::error!(
-            "sequence task did not shut down within {:?}",
-            task_shutdown_timeout
-        ),
+        Ok(Err(e)) => {
+            shutdown_producers_quiesced = false;
+            log::error!("sequence task ended with error: {e}");
+        }
+        Err(_) => {
+            shutdown_producers_quiesced = false;
+            log::error!(
+                "sequence task did not shut down within {:?}",
+                task_shutdown_timeout
+            );
+        }
     }
     if !sequence_task.is_finished() {
         sequence_task.abort();
         let _ = sequence_task.await;
+    }
+
+    match tokio::time::timeout(telemetry_shutdown_timeout, &mut tt).await {
+        Ok(Ok(outcome)) => { receiver_producers_quiesced = outcome.ingress_quiesced; shutdown_producers_quiesced &= outcome.ingress_quiesced; },
+        Ok(Err(e)) => {
+            shutdown_producers_quiesced = false;
+            log::error!("telemetry task ended with error: {e}");
+        }
+        Err(_) => {
+            shutdown_producers_quiesced = false;
+            log::error!(
+                "telemetry task did not shut down within {:?}",
+                telemetry_shutdown_timeout
+            );
+        }
+    }
+    if !tt.is_finished() {
+        tt.abort();
+        let _ = tt.await;
+    }
+    // Keep manual observation apply alive until receiver intake is actually
+    // stopped. An ambiguous receiver never earns a stop/clean receipt.
+    let mut abort_observations_stop=Some(abort_observations_stop);
+    if receiver_producers_quiesced { let _=abort_observations_stop.take().unwrap().send(()); }
+    match tokio::time::timeout(task_shutdown_timeout,&mut abort_observations).await {
+        Ok(Ok(outcome))=>shutdown_producers_quiesced &= receiver_producers_quiesced && outcome.quiesced,
+        Ok(Err(error))=>{ shutdown_producers_quiesced=false; log::error!("Abort observation apply owner failed: {error}"); },
+        Err(_)=>{ shutdown_producers_quiesced=false; log::error!("Abort observation owner still active; leave history Active"); },
+    }
+    // No abort/cancel of an admitted blocking manual apply to obtain Clean.
+    // History composition point: ONLY if this is true may the adapter freeze
+    // the register, take its final snapshot, drain the owned writer, and attempt
+    // checked Clean sealing. Any failure must leave the durable session Active.
+    if !shutdown_producers_quiesced {
+        log::error!(
+            "Abort history cannot be clean-sealed: producer quiescence was not established"
+        );
+    }
+
+    // Late HTTP claims must be gone, not merely hidden by server completion.
+    shutdown_producers_quiesced &= state.operator_dispatch_inflight.load(Ordering::Acquire) == 0;
+    // Active/Unknown protects a later Launch; it is not a promise of physical
+    // Stop delivery across process death. No replay/cancel/restamp for Clean.
+    if shutdown_producers_quiesced {
+        shutdown_producers_quiesced = board_abort::shutdown_stop_quiesced(&state);
+    }
+    let final_history = if shutdown_producers_quiesced {
+        state.board_abort.freeze_history_after_quiescence()
+    } else { state.board_abort.history_snapshot() };
+    match tokio::task::spawn_blocking(move || abort_history_writer.finish(final_history, shutdown_producers_quiesced)).await {
+        Ok(Ok(())) => {},
+        Ok(Err(error)) => log::error!("Abort history shutdown failed; no clean receipt: {error}"),
+        Err(error) => log::error!("Abort history writer join failed; no clean receipt: {error}"),
     }
 
     let clock_flush = state.launch_history.lock().unwrap().close_and_waiter();

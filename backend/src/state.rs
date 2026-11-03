@@ -172,6 +172,7 @@ impl BoardStatus {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub(crate) control_ingress: Arc<crate::control_ingress::Registry>,
     /// Optional ring buffer for full telemetry packets (not JSON)
     pub ring_buffer: Arc<Mutex<RingBuffer<crate::ring_buffer::ReceivedPacket>>>,
 
@@ -252,6 +253,9 @@ pub struct AppState {
     pub(crate) manual_abort_intent: Arc<crate::manual_abort_intent::ManualAbortIntent>,
     pub(crate) deferred_abort: Arc<crate::deferred_abort::Inbox>,
     pub(crate) board_recovery: Arc<crate::board_recovery::Runtime>,
+    pub(crate) board_abort: Arc<crate::board_abort::Runtime>,
+    pub(crate) launch_dedup_revision: Arc<AtomicU64>,
+    pub(crate) board_abort_tx: broadcast::Sender<crate::board_abort::Snapshot>,
     pub(crate) plumbing_drive: Arc<crate::actuator_plumbing::Runtime>,
 
     /// Latest calibrated fill-mass estimate from 1000kg loadcell.
@@ -335,6 +339,8 @@ pub struct AppState {
 
     #[cfg(feature = "hitl_mode")]
     pub hitl_launch_interlock_enabled: Arc<AtomicBool>,
+    #[cfg(feature = "hitl_mode")]
+    pub(crate) hitl_safety_interlocks: Arc<[AtomicBool; 4]>,
 
     #[cfg(feature = "hitl_mode")]
     pub hitl_physical_launch_uses_ground_station: Arc<AtomicBool>,
@@ -377,7 +383,6 @@ pub struct AppState {
 }
 
 impl AppState {
-    #[cfg(any(not(feature = "hitl_mode"), test))]
     pub(crate) fn has_pending_transport_tx(&self) -> bool {
         self.transport_tx_activity.has_pending() || crate::rrls::status().queued_frames != 0
     }
@@ -575,7 +580,7 @@ impl AppState {
         }
         *current = next.clone();
         drop(current);
-        self.publish_daq_launch_clock(&next, &claim);
+        self.publish_daq_launch_clock(&next, claim);
         let _ = self.launch_clock_tx.send(next);
     }
 
@@ -706,14 +711,13 @@ impl AppState {
                 clock.anchor_timestamp_ms.unwrap_or(1),
             );
         }
-        if let Some(router) = self.topology_router.get() {
-            if let Err(error) = crate::network_variables::set_daq_log_clock(router, *session, clock)
+        if let Some(router) = self.topology_router.get()
+            && let Err(error) = crate::network_variables::set_daq_log_clock(router, *session, clock)
             {
                 self.add_notification(format!(
                     "DAQ launch log clock could not be published: {error}"
                 ));
             }
-        }
         if let Some((snapshot, stamp)) =
             crate::network_variables::persisted_daq_log_clock_with_revision()
         {
@@ -765,9 +769,13 @@ impl AppState {
 
     #[cfg(feature = "hitl_mode")]
     pub fn toggle_hitl_button_interlock(&self) -> bool {
-        let next = !self.hitl_button_interlock_enabled();
-        self.hitl_button_interlock_enabled
-            .store(next, Ordering::SeqCst);
+        let mut next = false;
+        self.board_abort.change_launch_context_if(|| {
+            next = !self
+                .hitl_button_interlock_enabled
+                .fetch_xor(true, Ordering::AcqRel);
+            true
+        });
         next
     }
 
@@ -778,12 +786,55 @@ impl AppState {
 
     #[cfg(feature = "hitl_mode")]
     pub fn toggle_hitl_launch_interlock(&self) -> bool {
-        let next = !self.hitl_launch_interlock_enabled();
-        self.hitl_launch_interlock_enabled
-            .store(next, Ordering::SeqCst);
+        let mut next = false;
+        self.board_abort.change_launch_context_if(|| {
+            next = !self
+                .hitl_launch_interlock_enabled
+                .fetch_xor(true, Ordering::AcqRel);
+            true
+        });
         next
     }
 
+    #[cfg(feature = "hitl_mode")]
+    pub(crate) fn hitl_safety_interlock_enabled(&self, index: usize) -> bool {
+        self.hitl_safety_interlocks[index].load(Ordering::Acquire)
+    }
+    #[cfg(feature = "hitl_mode")]
+    pub(crate) fn toggle_hitl_safety_interlock(&self, index: usize) -> bool {
+        let mut enabled = false;
+        self.board_abort.change_launch_context_if(|| {
+            enabled = !self.hitl_safety_interlocks[index].fetch_xor(true, Ordering::AcqRel);
+            true
+        });
+        enabled
+    }
+    pub(crate) fn board_state_proof_enforced(&self)->bool {
+        #[cfg(feature="hitl_mode")]
+        { self.hitl_safety_interlock_enabled(3) }
+        #[cfg(not(feature="hitl_mode"))]
+        { true }
+    }
+    pub(crate) fn checklist_enforcement_enabled(&self) -> bool {
+        #[cfg(feature = "hitl_mode")]
+        {
+            self.hitl_safety_interlock_enabled(1)
+        }
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            true
+        }
+    }
+    pub(crate) fn supply_enforcement_enabled(&self) -> bool {
+        #[cfg(feature = "hitl_mode")]
+        {
+            self.hitl_safety_interlock_enabled(2)
+        }
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            true
+        }
+    }
     #[cfg(feature = "hitl_mode")]
     pub fn hitl_physical_launch_uses_ground_station(&self) -> bool {
         self.hitl_physical_launch_uses_ground_station
@@ -792,9 +843,13 @@ impl AppState {
 
     #[cfg(feature = "hitl_mode")]
     pub fn toggle_hitl_physical_launch_mode(&self) -> bool {
-        let next = !self.hitl_physical_launch_uses_ground_station();
-        self.hitl_physical_launch_uses_ground_station
-            .store(next, Ordering::SeqCst);
+        let mut next = false;
+        self.board_abort.change_launch_context_if(|| {
+            next = !self
+                .hitl_physical_launch_uses_ground_station
+                .fetch_xor(true, Ordering::AcqRel);
+            true
+        });
         next
     }
 
@@ -1036,7 +1091,8 @@ impl AppState {
             return matches!(
                 board,
                 Board::ValveBoard | Board::GatewayBoard | Board::ActuatorBoard
-            ) || (!cfg!(feature = "hitl_mode") && board == Board::DaqBoard);
+            ) || (board == Board::DaqBoard
+                && (!cfg!(feature = "hitl_mode") || self.board_state_proof_enforced()));
         }
 
         if !self.layout_expected_boards().contains(&board) {
@@ -1097,7 +1153,7 @@ impl AppState {
                 Board::DaqBoard,
             ]
         } else {
-            Board::ALL.iter().copied().collect()
+            Board::ALL.to_vec()
         };
         let mut boards = Vec::with_capacity(visible_boards.len());
 
@@ -1522,6 +1578,7 @@ impl AppState {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok();
         if first {
+            self.control_ingress.seal();
             let _ = self.shutdown_tx.send(());
         }
         first
@@ -1529,24 +1586,47 @@ impl AppState {
 
     /// Updates local flight state, notifies subscribers, and persists the transition asynchronously.
     pub fn set_local_flight_state(&self, next_state: FlightState) {
-        self.set_local_flight_state_inner(next_state, None);
+        if next_state == FlightState::Launch {
+            self.request_local_launch_state(None);
+            return;
+        }
+        self.set_local_flight_state_inner(next_state, None, true);
+    }
+    pub(crate) fn request_local_launch_state(&self, launch_revision: Option<u64>) {
+        if self.local_flight_state_snapshot() == FlightState::Launch {
+            return;
+        }
+        let result = self
+            .topology_router
+            .get()
+            .ok_or_else(|| "Router unavailable; Launch was not admitted".to_string())
+            .and_then(|router| crate::gse::queue_state_launch(self, router, launch_revision));
+        if let Err(error) = result {
+            crate::web::emit_notification_warning(self, error);
+        }
+    }
+
+    /// Unit-fixture phase setup, not a production Launch authority shortcut.
+    #[cfg(test)]
+    pub(crate) fn set_preexisting_flight_state_for_test(&self,next:FlightState) {
+        self.set_local_flight_state_inner(next,None,false);
     }
 
     /// Fire owns DISPATCH already. Carry its real lease through clock effects
     /// instead of acquiring the non-reentrant mutex again.
-    #[cfg(not(feature = "hitl_mode"))]
     pub(crate) fn set_local_flight_state_with_clock_claim(
         &self,
         next_state: FlightState,
         claim: &crate::gse::OperatorDispatchClaim,
     ) {
-        self.set_local_flight_state_inner(next_state, Some(claim));
+        self.set_local_flight_state_inner(next_state, Some(claim), false);
     }
 
     fn set_local_flight_state_inner(
         &self,
         next_state: FlightState,
         clock_claim: Option<&crate::gse::OperatorDispatchClaim>,
+        publish_managed: bool,
     ) {
         let mut slot = self.state.lock().unwrap();
         if *slot == next_state {
@@ -1575,7 +1655,9 @@ impl AppState {
         }
         // Keep the simulator in lock-step with the real backend state machine.
         crate::flight_sim::sync_local_flight_state(next_state);
-        self.queue_router_flight_state_update(next_state);
+        if publish_managed {
+            self.queue_router_flight_state_update(next_state);
+        }
 
         let _ = self.state_tx.send(FlightStateMsg { state: next_state });
         self.broadcast_fill_targets_snapshot();
@@ -1600,6 +1682,23 @@ impl AppState {
         });
     }
 
+    /// Pure RAM/broadcast publication under the verified original Stop gate.
+    /// The coordinator already persisted/queued the original managed packet;
+    /// do not call the generic setter or mutate T0/session here.
+    pub(crate) fn publish_verified_startup_under_gate(&self) {
+        *self.state.lock().unwrap() = FlightState::Startup;
+        self.abort_indicator_latched.store(false, Ordering::SeqCst);
+        self.launch_indicator_latched.store(false, Ordering::SeqCst);
+        let _ = self.state_tx.send(FlightStateMsg {
+            state: FlightState::Startup,
+        });
+    }
+    pub(crate) fn publish_verified_startup_observation(self: &Arc<Self>) {
+        crate::flight_sim::sync_local_flight_state(self.local_flight_state_snapshot());
+        self.broadcast_fill_targets_snapshot();
+        crate::sequences::refresh_action_policy_now(self);
+        self.broadcast_action_policy_snapshot();
+    }
     /// Returns the current locally tracked flight state.
     pub fn local_flight_state_snapshot(&self) -> FlightState {
         *self.state.lock().unwrap()
@@ -1750,8 +1849,9 @@ impl AppState {
 
     /// Returns the latest action-policy snapshot used by the dashboard and command gate.
     pub fn action_policy_snapshot(&self) -> ActionPolicyMsg {
-        let local = self.action_policy.lock().unwrap().clone();
+        let mut local = self.action_policy.lock().unwrap().clone();
         if !crate::rrls::is_rrls() {
+            crate::board_abort::block_policy(self, &mut local);
             return local;
         }
         let mut mirrored =
@@ -1773,6 +1873,7 @@ impl AppState {
                         | "ResetTClock"
                 )
             }));
+        crate::board_abort::block_policy(self, &mut mirrored);
         mirrored
     }
 
@@ -1827,6 +1928,10 @@ impl AppState {
                         | "Postinit"
                         | "ToggleButtonInterlock"
                         | "ToggleLaunchInterlock"
+                        | "TogglePlumbingDelayInterlock"
+                        | "ToggleChecklistInterlock"
+                        | "ToggleSupplyInterlock"
+                        | "ToggleBoardStateProofInterlock"
                         | "TogglePhysicalLaunchMode"
                         | "ResetLaunchLatch"
                 );
@@ -1855,15 +1960,26 @@ impl AppState {
                 "ToggleLaunchInterlock" => {
                     control.actuated = Some(self.hitl_launch_interlock_enabled())
                 }
+                "TogglePlumbingDelayInterlock" => {
+                    control.actuated = Some(self.hitl_safety_interlock_enabled(0));
+                }
+                "ToggleChecklistInterlock" => {
+                    control.actuated = Some(self.hitl_safety_interlock_enabled(1));
+                }
+                "ToggleBoardStateProofInterlock" => {
+                    control.actuated = Some(self.hitl_safety_interlock_enabled(3));
+                }
+                "ToggleSupplyInterlock" => {
+                    control.actuated = Some(self.hitl_safety_interlock_enabled(2));
+                }
                 "TogglePhysicalLaunchMode" => {
                     control.actuated = Some(self.hitl_physical_launch_uses_ground_station())
                 }
                 "ResetLaunchLatch" => control.actuated = Some(self.launch_indicator_latched()),
-                "Launch" | "GroundStationLaunch" => {
-                    if self.launch_indicator_latched() {
+                "Launch" | "GroundStationLaunch"
+                    if self.launch_indicator_latched() => {
                         control.actuated = Some(true);
                     }
-                }
                 _ => {}
             }
         }
@@ -1923,15 +2039,14 @@ impl AppState {
                 "Nitrous" => Some(crate::rocket_commands::ActuatorBoardCommands::NitrousOpen as u8),
                 _ => None,
             };
-            if let Some(key) = key {
-                if self.get_pending_umbilical_valve_state(key).is_none()
+            if let Some(key) = key
+                && self.get_pending_umbilical_valve_state(key).is_none()
                     && self.get_umbilical_valve_state(key).is_none()
                 {
                     control.enabled = false;
                     control.actuated = None;
                     control.blink = crate::sequences::BlinkMode::None;
                 }
-            }
         }
         for control in &mut policy.controls {
             if crate::sequences::is_station_utility_command(&control.cmd) {
@@ -1939,7 +2054,7 @@ impl AppState {
                 control.blink = crate::sequences::BlinkMode::None;
             }
         }
-        if crate::checklists::launch_block().is_some() {
+        if self.checklist_enforcement_enabled() && crate::checklists::launch_block().is_some() {
             for control in &mut policy.controls {
                 if matches!(control.cmd.as_str(), "Launch" | "GroundStationLaunch") {
                     control.enabled = false;
@@ -1955,11 +2070,7 @@ impl AppState {
         drop(slot);
         // RRLS-local sequence policy is not the paired primary's policy. Keep
         // WebSocket and HTTP presentation on the same authoritative projection.
-        let published = if crate::rrls::is_rrls() {
-            self.action_policy_snapshot()
-        } else {
-            policy
-        };
+        let published = self.action_policy_snapshot();
         let _ = self.action_policy_tx.send(published);
     }
 
@@ -1986,6 +2097,12 @@ impl AppState {
 
     /// Applies the current software-action policy to decide whether a command can run.
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
+        if crate::board_abort::launch_command(command_name(cmd))
+            && (self.board_abort.masks().0 != 0
+                || !crate::actuator_plumbing::retraction_gate(self).allowed)
+        {
+            return false;
+        }
         if crate::rrls::is_rrls() {
             return matches!(
                 cmd,
@@ -2017,6 +2134,10 @@ impl AppState {
                     | TelemetryCommand::ToggleButtonInterlock
                     | TelemetryCommand::ToggleGroundStationControl
                     | TelemetryCommand::ToggleLaunchInterlock
+                    | TelemetryCommand::TogglePlumbingDelayInterlock
+                    | TelemetryCommand::ToggleChecklistInterlock
+                    | TelemetryCommand::ToggleSupplyInterlock
+                    | TelemetryCommand::ToggleBoardStateProofInterlock
                     | TelemetryCommand::TogglePhysicalLaunchMode
                     | TelemetryCommand::ToggleAvBayUnderglow
                     | TelemetryCommand::ToggleFlightBuzzer
@@ -2411,8 +2532,11 @@ pub(crate) mod tests {
         let weak = Arc::downgrade(&state);
         router
             .on_network_variable_update(ty, move |packet| {
-                weak.upgrade().unwrap().set_local_flight_state(
-                    crate::types::u8_to_flight_state(packet.payload()[0]).unwrap(),
+                assert_eq!(packet.sender(),"GS");
+                // This is an observer callback for a received authoritative
+                // primary value, not a request to originate a new Launch.
+                weak.upgrade().unwrap().set_local_flight_state_inner(
+                    crate::types::u8_to_flight_state(packet.payload()[0]).unwrap(),None,false,
                 );
                 Ok(())
             })
@@ -3966,6 +4090,7 @@ pub(crate) mod tests {
         }
 
         Arc::new(AppState {
+            control_ingress: Arc::new(Default::default()),
             ring_buffer: Arc::new(Mutex::new(RingBuffer::new(128))),
             cmd_tx,
             ws_tx,
@@ -3998,6 +4123,9 @@ pub(crate) mod tests {
             manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
             deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
             board_recovery: Arc::new(crate::board_recovery::Runtime::default()),
+            board_abort: Arc::new(crate::board_abort::Runtime::default()),
+            launch_dedup_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            board_abort_tx: broadcast::channel(16).0,
             plumbing_drive: Arc::new(crate::actuator_plumbing::Runtime::default()),
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
             loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
@@ -4034,6 +4162,10 @@ pub(crate) mod tests {
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "hitl_mode")]
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "hitl_mode")]
+            hitl_safety_interlocks: Arc::new(std::array::from_fn(|index| {
+                std::sync::atomic::AtomicBool::new(matches!(index,1|2))
+            })),
             #[cfg(feature = "hitl_mode")]
             hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
             recording_status: Arc::new(Mutex::new(RecordingStatusMsg {

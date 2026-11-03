@@ -95,7 +95,6 @@ impl Runtime {
         self.generation = self.generation.wrapping_add(1);
         self.pending = false;
     }
-    #[cfg(test)]
     pub(crate) fn invalidate_captures_for_verified_reset(&mut self) {
         self.cancel();
         self.kg50.clear();
@@ -440,7 +439,27 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
 #[cfg(test)]
 pub(crate) fn acquisition_budget_for_test() -> Duration {
     WINDOW
+}#[cfg(all(test, any(feature = "hitl_mode", feature = "firmware_sim")))]
+pub(crate) async fn verify_paused_capture_cancellation_and_shutdown(state: &Arc<AppState>) {
+    assert!(
+        crate::simulation_clock_ms().is_some(),
+        "This contract requires an explicit paused model"
+    );
+    *state.auto_zero.lock().unwrap() = Runtime::testing(true);
+    launch(state);
+    assert!(state.auto_zero.lock().unwrap().pending());
+    state.auto_zero.lock().unwrap().cancel();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(!state.auto_zero.lock().unwrap().pending());
+    launch(state);
+    assert!(state.auto_zero.lock().unwrap().pending());
+    state.request_shutdown();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(!state.auto_zero.lock().unwrap().pending());
+
 }
+
+
 
 #[cfg(test)]
 mod tests {
@@ -797,24 +816,4 @@ mod tests {
         assert_ne!(after_fresh, gse_sequence::Phase::Filling);
         assert_eq!(after_old, gse_sequence::Phase::Filling);
     }
-}
-
-#[cfg(all(test, any(feature = "hitl_mode", feature = "firmware_sim")))]
-pub(crate) async fn verify_paused_capture_cancellation_and_shutdown(state: &Arc<AppState>) {
-    assert!(
-        crate::simulation_clock_ms().is_some(),
-        "This contract requires an explicit paused model"
-    );
-    *state.auto_zero.lock().unwrap() = Runtime::testing(true);
-    launch(state);
-    assert!(state.auto_zero.lock().unwrap().pending());
-    state.auto_zero.lock().unwrap().cancel();
-    tokio::time::sleep(Duration::from_millis(25)).await;
-    assert!(!state.auto_zero.lock().unwrap().pending());
-    launch(state);
-    assert!(state.auto_zero.lock().unwrap().pending());
-    state.request_shutdown();
-    tokio::time::sleep(Duration::from_millis(25)).await;
-    assert!(!state.auto_zero.lock().unwrap().pending());
-
 }

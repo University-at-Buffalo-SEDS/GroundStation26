@@ -21,7 +21,7 @@ fn child(name: &str, role: &str) -> bool {
     );
     false
 }
-fn configure() -> crate::rrls::Shared {
+pub(super) fn configure() -> crate::rrls::Shared {
     crate::rrls::configure(&crate::comms_config::CommsLinkConfig::Serial {
         serial: crate::comms_config::SerialLinkConfig {
             port: "fixture-no-serial-open".into(),
@@ -40,7 +40,7 @@ fn configure() -> crate::rrls::Shared {
     }
     mesh
 }
-fn user(auth: &AuthManager, send: bool, time: bool, disabled: bool, commands: &[&str]) {
+pub(super) fn user(auth: &AuthManager, send: bool, time: bool, disabled: bool, commands: &[&str]) {
     std::fs::write(auth.path(),serde_json::to_vec(&serde_json::json!({"version":1,"users":[{"username":"operator","password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true,"send_commands":send,"set_system_time":time},"command_access":{"allowed_commands":commands},"disabled":disabled}]})).unwrap()).unwrap();
 }
 fn clients(p: &Pairing, r: &Pairing, view: Transport) -> (Runtime, Runtime, Transport) {
@@ -62,6 +62,7 @@ fn clients(p: &Pairing, r: &Pairing, view: Transport) -> (Runtime, Runtime, Tran
     rr.receive(r, rv, Mode::Normal, &reply).unwrap();
     (primary, rr, rv)
 }
+#[expect(clippy::too_many_arguments, reason = "Fixture independently controls primary and recovery identities, sessions and operation")]
 fn request(
     p: &Pairing,
     r: &Pairing,
@@ -313,7 +314,8 @@ async fn recovery_cannot_execute_proxied_hardware_locally_even_with_granted_acto
         crate::web::dispatch_proxied_command(
             state.clone(),
             principal,
-            TelemetryCommand::ToggleAvBayUnderglow
+            TelemetryCommand::ToggleAvBayUnderglow,
+            None
         )
         .await
         .0,
@@ -515,7 +517,7 @@ async fn recovery_websocket_policy_uses_primary_projection_and_new_signed_observ
         .position(|c| *c == "ToggleAvBayUnderglow")
         .unwrap();
     observation[2..10].copy_from_slice(&(1u64 << bit).to_le_bytes());
-    assert!(accept_presentation(&state, &observation, 0));
+    assert!(accept_presentation(&state, &observation, 0, [1; 16], 7));
     let current = published.try_recv().unwrap();
     assert!(current.key_enabled && current.software_buttons_enabled);
     assert!(
@@ -524,7 +526,7 @@ async fn recovery_websocket_policy_uses_primary_projection_and_new_signed_observ
             .iter()
             .any(|c| c.cmd == "ToggleAvBayUnderglow" && c.enabled && c.actuated.is_none())
     );
-    assert!(!accept_presentation(&state, &[255], 0));
+    assert!(!accept_presentation(&state, &[255], 0, [1; 16], 7));
     assert!(published.try_recv().is_err());
     invalidate_presentation(&state);
     let expired = published.try_recv().unwrap();
@@ -860,6 +862,7 @@ async fn signed_plumbing_origin_preserves_actor_policy_and_rejects_old_peer_or_m
         Outcome::Queued
     );
     let TelemetryCommand::QueuedOperator {
+        launch_revision: None,
         plumbing_origin: Some(origin),
         generation,
         command,

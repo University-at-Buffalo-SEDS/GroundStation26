@@ -205,7 +205,22 @@ pub fn initialize(router: &Router) -> Result<()> {
     initialize_for_role(router, crate::rrls::is_rrls())
 }
 
+/// Production bootstrap respects restored durable recovery closure. Register
+/// services without synthesizing any cache/default write while CLOSED. An
+/// ordinary open bootstrap owns the same actual producer lease through IO/SDK.
+pub fn initialize_for_state(state: &crate::state::AppState, router: &Router) -> Result<()> {
+    let claim = crate::gse::capture_operator_origin(state)
+        .and_then(|generation| crate::gse::claim_operator_dispatch(state, generation));
+    if claim.is_some() {
+        initialize(router)
+    } else {
+        initialize_for_role_seed(router, crate::rrls::is_rrls(), false)
+    }
+}
 fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
+    initialize_for_role_seed(router, observer, true)
+}
+fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Result<()> {
     for data_type in [
         UNDERGLOW_TYPE,
         FLIGHT_BUZZER_TYPE,
@@ -229,6 +244,15 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
     router.on_network_variable_update(
         crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE),
         |packet| {
+            // A per-board state report is not a write of the host's aggregate
+            // desired state. SDK cache refreshes retain its original provenance;
+            // only the authority's source can reach our durable GS seed.
+            if !matches!(
+                crate::types::canonical_sender_id(packet.sender()),
+                "GS" | "FC"
+            ) {
+                return Ok(());
+            }
             let state =
                 packet
                     .payload()
@@ -242,9 +266,19 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
                     "out-of-range flight-state network variable",
                 ));
             }
+            if crate::types::canonical_sender_id(packet.sender()) == "FC" && state == 15 {
+                return Ok(());
+            }
             let mut guard = store()
                 .lock()
                 .expect("network-variable store lock poisoned");
+            if crate::types::canonical_sender_id(packet.sender()) == "FC"
+                && (state == 15
+                    || guard.values.flight_state == 15
+                    || (matches!(guard.values.flight_state, 7..=14) && state <= 6))
+            {
+                return Ok(());
+            }
             let mut next = guard.values;
             if next.flight_state != state || next.flight_state_stamp == 0 {
                 next.flight_state_stamp = packet.timestamp();
@@ -261,7 +295,7 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
     // RRLS receives the primary's values. Seeding its local disk defaults as
     // GS-owned packets creates competing managed-variable refresh traffic,
     // even though the recovery transport ultimately discards those packets.
-    if observer {
+    if observer || !seed {
         return Ok(());
     }
     {
@@ -286,7 +320,11 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
         "FLIGHT_CONTROLLER",
         u8::from(flight_buzzer_enabled()),
     )?)?;
-    router.seed_managed_variable(cached_flight_state_packet()?)?;
+    // Retained Launch is history, never a fresh launch intent on restart.
+    // Unknown board proofs and partial admission must not execute it again.
+    if let Some(packet) = retained_non_launch_packet()? {
+        router.seed_managed_variable(packet)?;
+    }
     let selected = crate::loadcell::load_or_default();
     router.seed_managed_variable(packet(
         "DAQ_KG50_INPUT",
@@ -300,6 +338,20 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
     router.seed_managed_variable(thermal_packet(&calibration)?)?;
     router.seed_managed_variable(filter_packet(&calibration)?)?;
     Ok(())
+}
+
+pub fn publish_bootstrap_for_state(
+    state: &crate::state::AppState,
+    router: &Router,
+) -> Result<bool> {
+    let Some(generation) = crate::gse::capture_operator_origin(state) else {
+        return Ok(false);
+    };
+    let Some(_claim) = crate::gse::claim_operator_dispatch(state, generation) else {
+        return Ok(false);
+    };
+    publish_current(router)?;
+    Ok(true)
 }
 
 pub fn publish_current(router: &Router) -> Result<()> {
@@ -320,7 +372,9 @@ pub fn publish_current(router: &Router) -> Result<()> {
             u8::from(flight_buzzer_enabled()),
         )?,
     )?;
-    request.submit(router, cached_flight_state_packet()?)?;
+    if let Some(packet) = retained_non_launch_packet()? {
+        request.submit(router, packet)?;
+    }
     set_daq_calibration(router, &crate::loadcell::load_or_default())?;
     request.submit(router, cached_daq_log_clock_packet()?)?;
     Ok(())
@@ -396,11 +450,81 @@ pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
     Ok(())
 }
 
-fn cached_flight_state_packet() -> Result<Packet> {
+/// Pure launch preparation. No desired state, file, managed cache or SDK owner
+/// is changed until the caller wins its original Stop/board admission boundary.
+pub(crate) struct PreparedLaunchState {
+    pub(crate) packet: Packet,
+    expected: (u8, u64),
+}
+pub(crate) fn prepare_launch_state(router: &Router) -> Result<PreparedLaunchState> {
+    let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
+    let packet = packet_bytes_at(
+        FLIGHT_STATE_TYPE,
+        "FLIGHT_STATE",
+        Arc::from([7u8]),
+        timestamp,
+    )?;
     let guard = store()
         .lock()
         .expect("network-variable store lock poisoned");
-    flight_state_packet(guard.values)
+    Ok(PreparedLaunchState {
+        packet,
+        expected: (guard.values.flight_state, guard.values.flight_state_stamp),
+    })
+}
+/// Post-admission CAS. Never overwrite a later reset/Abort desired revision.
+/// No packet is submitted here: its EXACT original packet already owns SDK work.
+pub(crate) fn commit_admitted_launch(prepared: &PreparedLaunchState) -> Result<()> {
+    let mut guard = store()
+        .lock()
+        .expect("network-variable store lock poisoned");
+    if guard.durable
+        && guard.values.flight_state == 7
+        && guard.values.flight_state_stamp == prepared.packet.timestamp()
+    {
+        // The real SDK managed callback may have durably consumed this exact
+        // admitted packet first. Do not rewrite, enqueue, or freshen its stamp.
+        return Ok(());
+    }
+    anyhow::ensure!(
+        (guard.values.flight_state, guard.values.flight_state_stamp) == prepared.expected,
+        "Desired flight state changed after launch preparation; admitted launch is uncertain, explicit recovery required"
+    );
+    let mut next = guard.values;
+    next.flight_state = 7;
+    next.flight_state_stamp = prepared.packet.timestamp();
+    guard.commit(next)
+}
+
+/// Coordinator-only staging: disk IO is outside DISPATCH/Stop/SDK locks.
+/// The owner must subsequently admit this EXACT packet under its original
+/// Stop fence and require fresh actual board readbacks before reopening.
+pub(crate) fn prepare_verified_recovery_startup(router: &Router) -> Result<Packet> {
+    let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
+    let packet = packet_bytes_at(
+        FLIGHT_STATE_TYPE,
+        "FLIGHT_STATE",
+        Arc::from([0u8]),
+        timestamp,
+    )?;
+    let mut guard = store()
+        .lock()
+        .expect("network-variable store lock poisoned");
+    let mut next = guard.values;
+    next.flight_state = 0;
+    next.flight_state_stamp = timestamp;
+    guard.commit(next)?;
+    Ok(packet)
+}
+
+fn retained_non_launch_packet() -> Result<Option<Packet>> {
+    let guard = store()
+        .lock()
+        .expect("network-variable store lock poisoned");
+    if guard.values.flight_state == 7 {
+        return Ok(None);
+    }
+    Ok(Some(flight_state_packet(guard.values)?))
 }
 
 fn flight_state_packet(values: PersistentVariables) -> Result<Packet> {
@@ -1363,8 +1487,8 @@ mod tests {
         );
         let decoded: Vec<f32> = packet
             .payload()
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>().0.iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         assert_eq!(decoded, vec![1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 7.0]);
         assert_eq!(calibration_packet(&cfg).unwrap().payload().len(), 16);
@@ -1381,8 +1505,8 @@ mod tests {
         let packet = calibration_packet(&cfg).unwrap();
         let decoded: Vec<f32> = packet
             .payload()
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>().0.iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect();
         assert_eq!(decoded, vec![2.0, -3.0, 4.5, 6.0]);
     }
@@ -1477,8 +1601,8 @@ mod thermal_wire_tests {
         );
         let values: Vec<f32> = p
             .payload()
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>().0.iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         assert_eq!(values, vec![20., 0.25, 0., 0.]);
     }
@@ -1926,6 +2050,127 @@ mod persistence_callback_tests {
             String::from_utf8_lossy(&output.stderr)
         );
         false
+    }
+
+    #[test]
+    fn admitted_launch_managed_callback_before_cas_is_idempotent_and_never_overwrites_newer_state()
+    {
+        const NAME: &str = "network_variables::persistence_callback_tests::admitted_launch_managed_callback_before_cas_is_idempotent_and_never_overwrites_newer_state";
+        if !isolated(NAME) {
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let router = Router::new(
+            sedsnet::router::RouterConfig::new([
+                sedsnet::router::EndpointHandler::new_packet_handler(
+                    crate::telemetry_schema::endpoint("FLIGHT_STATE"),
+                    |_| Ok(()),
+                ),
+            ])
+            .with_sender("GS"),
+        );
+        crate::telemetry_task::refresh_host_network_time(&router, get_current_timestamp_ms());
+        initialize_for_role(&router, false).unwrap();
+        router.process_all_queues_with_timeout(0).unwrap();
+        let prepared = prepare_launch_state(&router).unwrap();
+        let before = router.queue_counters()[2];
+        router.tx_queue(prepared.packet.clone()).unwrap();
+        assert_eq!(
+            router.queue_counters()[2],
+            before + 1,
+            "original packet acquired an actual queue owner"
+        );
+        router.process_all_queues_with_timeout(0).unwrap();
+        // Prove the production managed callback actually ran before testing CAS.
+        let observed = store().lock().unwrap().values;
+        assert_eq!(
+            (observed.flight_state, observed.flight_state_stamp),
+            (7, prepared.packet.timestamp()),
+            "actual managed callback must persist the admitted original packet"
+        );
+        // queue_counters[2] is current depth, not a cumulative accepted count.
+        let admitted = router.queue_counters()[2];
+        commit_admitted_launch(&prepared)
+            .expect("identical already-persisted admitted packet is idempotent");
+        assert_eq!(
+            router.queue_counters()[2],
+            admitted,
+            "post-admission publication must never enqueue again"
+        );
+        {
+            let mut store = store().lock().unwrap();
+            let mut next = store.values;
+            next.flight_state = 15;
+            next.flight_state_stamp = prepared.packet.timestamp() + 1;
+            store.commit(next).unwrap();
+        }
+        assert!(commit_admitted_launch(&prepared).is_err());
+        assert_eq!(flight_state(), 15);
+    }
+    #[test]
+    fn board_abort_retained_sdk_refresh_never_becomes_a_gs_owned_abort() {
+        const NAME: &str = "network_variables::persistence_callback_tests::board_abort_retained_sdk_refresh_never_becomes_a_gs_owned_abort";
+        if !isolated(NAME) {
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let source = Arc::new(Router::new(
+            sedsnet::router::RouterConfig::new([]).with_sender("GS"),
+        ));
+        initialize_for_role(&source, false).unwrap();
+        let desired = flight_state();
+        let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
+        let packet = Packet::new(
+            ty,
+            &[crate::telemetry_schema::endpoint("FLIGHT_STATE")],
+            "AB",
+            9000,
+            Arc::from([15u8]),
+        )
+        .unwrap();
+        let original_id = packet.packet_id();
+        source.rx(&packet).unwrap();
+        assert_eq!(flight_state(), desired);
+        let peer = Arc::new(Router::new(
+            sedsnet::router::RouterConfig::new([]).with_sender("RF"),
+        ));
+        peer.enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+            .unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let capture = received.clone();
+        peer.on_network_variable_update(ty, move |p| {
+            capture.lock().unwrap().push(p.clone());
+            Ok(())
+        })
+        .unwrap();
+        let received_peer = peer.clone();
+        source.add_side_packet("to-rf", move |p| received_peer.rx_from_side(p, 0));
+        let received_source = source.clone();
+        peer.add_side_packet("to-gs", move |p| received_source.rx_from_side(p, 0));
+        for _ in 0..4 {
+            source.process_all_queues_with_timeout(0).unwrap();
+            peer.process_all_queues_with_timeout(0).unwrap();
+        }
+        peer.invalidate_network_variable_cache(ty);
+        received.lock().unwrap().clear();
+        assert!(peer.get_network_variable(ty, None).unwrap().is_none());
+        for _ in 0..4 {
+            peer.process_all_queues_with_timeout(0).unwrap();
+            source.process_all_queues_with_timeout(0).unwrap();
+        }
+        let refreshed = peer
+            .get_cached_network_variable(ty)
+            .unwrap()
+            .expect("actual managed request/reply must return the retained source packet");
+        assert_eq!(refreshed.sender(), "AB");
+        assert_eq!(refreshed.timestamp(), 9000);
+        assert_eq!(refreshed.packet_id(), original_id);
+        assert_eq!(refreshed.payload(), &[15]);
+        assert_eq!(flight_state(), desired);
+        let own = flight_state_packet(store().lock().unwrap().values).unwrap();
+        assert_eq!(own.sender(), "GS");
+        assert_eq!(own.payload(), &[desired]);
+        assert_ne!(own.payload(), &[15]);
     }
 
     #[test]

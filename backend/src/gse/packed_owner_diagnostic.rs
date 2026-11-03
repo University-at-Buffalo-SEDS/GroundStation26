@@ -10,8 +10,8 @@ fn retained_bulk(
 ) -> (Arc<Router>, u64, sedsnet::config::DataType) {
     let router = Arc::new(Router::new(RouterConfig::new([]).with_sender("GS")));
     state.topology_router.set(router.clone()).unwrap();
-    assert!(!manual_stop_pending(&state));
-    assert!(!controller_delivery_pending(&state));
+    assert!(!manual_stop_pending(state));
+    assert!(!controller_delivery_pending(state));
     let kind = crate::telemetry_schema::data_type("GENERIC_ERROR");
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let capture = seen.clone();
@@ -39,7 +39,7 @@ fn retained_bulk(
         )
         .unwrap();
     router.process_all_queues_with_timeout(0).unwrap();
-    assert!(!manual_stop_pending(&state));
+    assert!(!manual_stop_pending(state));
     let bulk = Packet::new_with_nonce(
         kind,
         &[crate::telemetry_schema::endpoint("SD_CARD")],
@@ -52,7 +52,7 @@ fn retained_bulk(
     let id = bulk.packet_id();
     if packed {
         router
-            .tx_packed_queue(wire_format::pack_packet(&bulk).into())
+            .tx_packed_queue(wire_format::pack_packet(&bulk))
             .unwrap();
     } else {
         router.tx_queue(bulk).unwrap();

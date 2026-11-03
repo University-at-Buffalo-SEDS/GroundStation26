@@ -72,7 +72,7 @@ impl RecoveryRadio {
                 }
                 Err(error) => {
                     state.failures += 1;
-                    if state.failures == 1 || state.failures % 30 == 0 {
+                    if state.failures == 1 || state.failures.is_multiple_of(30) {
                         log::warn!(
                             "RRLS radio {} unavailable; retrying once per second: {error:#}",
                             crate::comms::link_description(&state.config)
@@ -480,7 +480,8 @@ mod tests {
     }
     #[test]
     fn reconnecting_writer_preserves_trusted_priority_metadata() {
-        struct PrioritySpy(Arc<Mutex<Vec<(u8, Vec<u8>)>>>);
+        type PriorityPackets = Arc<Mutex<Vec<(u8, Vec<u8>)>>>;
+        struct PrioritySpy(PriorityPackets);
         impl CommsDevice for PrioritySpy {
             fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
                 Ok(Some(Box::new(Self(self.0.clone()))))

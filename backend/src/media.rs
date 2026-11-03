@@ -145,6 +145,7 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 fn check_id(id: &str) -> ApiResult<()> {
     if valid_id(id) {
         Ok(())
@@ -156,6 +157,7 @@ fn check_id(id: &str) -> ApiResult<()> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn authorize(
     state: &MediaState,
     headers: &HeaderMap,
@@ -182,6 +184,7 @@ struct StreamInfo {
     live: bool,
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn list_streams(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -197,11 +200,13 @@ async fn list_streams(
     }
     Ok(axum::Json(streams))
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn fetch_streams(state: &MediaState) -> ApiResult<axum::Json<Vec<StreamInfo>>> {
     Ok(axum::Json(
         transcoding::choose(state, fetch_streams_raw(state).await?.0).await,
     ))
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn fetch_streams_raw(state: &MediaState) -> ApiResult<axum::Json<Vec<StreamInfo>>> {
     let response = state
         .client
@@ -244,6 +249,7 @@ fn session_id(location: &str) -> Option<&str> {
     valid_id(id).then_some(id)
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn whep_offer(
     State(state): State<Arc<MediaState>>,
     Path(id): Path<String>,
@@ -324,6 +330,7 @@ async fn whep_offer(
         .into_response())
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn whep_delete(
     State(state): State<Arc<MediaState>>,
     Path((id, session)): Path<(String, String)>,
@@ -382,6 +389,7 @@ fn valid_glb(bytes: &[u8]) -> bool {
     offset == bytes.len()
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 fn model_path(state: &MediaState, stage: &str, name: &str) -> ApiResult<PathBuf> {
     check_id(stage)?;
     check_id(name)?;
@@ -400,6 +408,7 @@ fn io_error(err: std::io::Error) -> Response {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn upload_model(
     State(state): State<Arc<MediaState>>,
     Path((stage, name)): Path<(String, String)>,
@@ -428,6 +437,7 @@ async fn upload_model(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn download_model(
     State(state): State<Arc<MediaState>>,
     Path((stage, name)): Path<(String, String)>,
@@ -453,6 +463,7 @@ struct ModelInfo {
     size_bytes: u64,
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn list_models(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,

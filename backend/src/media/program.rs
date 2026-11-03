@@ -67,6 +67,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
             }),
         )
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn page(
     State(state): State<Arc<MediaState>>,
     Query(query): Query<MediaQuery>,
@@ -176,6 +177,7 @@ pub(super) async fn capture_history(state: Arc<MediaState>) {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn program_state(
     State(state): State<Arc<MediaState>>,
     Query(query): Query<MediaQuery>,
@@ -259,6 +261,7 @@ struct AudioCursor {
     after: u64,
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn program_audio(
     State(state): State<Arc<MediaState>>,
     Query(query): Query<MediaQuery>,
@@ -281,6 +284,7 @@ async fn program_audio(
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(batch)).into_response())
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn dashboard_status(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -480,12 +484,15 @@ pub(super) fn delayed_playlist(
     }
     Ok((result.join("\n") + "\n", segments))
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn hls(State(state):State<Arc<MediaState>>,Path((id,file)):Path<(String,String)>,Query(query):Query<MediaQuery>,headers:HeaderMap)->ApiResult<Response>{
     hls_impl(state,id,file,query,headers,false).await
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(crate) async fn raw_hls(State(state):State<Arc<MediaState>>,Path((id,file)):Path<(String,String)>,Query(query):Query<MediaQuery>,headers:HeaderMap)->ApiResult<Response>{
     hls_impl(state,id,file,query,headers,true).await
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn hls_impl(state:Arc<MediaState>,id:String,file:String,query:MediaQuery,headers:HeaderMap,raw:bool)->ApiResult<Response>{
     check_id(&id)?;
     if !valid_hls_file(&file) {
@@ -588,6 +595,7 @@ async fn hls_impl(state:Arc<MediaState>,id:String,file:String,query:MediaQuery,h
         .into_response())
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn roles(State(state): State<Arc<MediaState>>, headers: HeaderMap) -> ApiResult<Response> {
     let p = crate::web::authorize_headers(&state.app, &headers, Permission::ViewData).await?;
     if p.anonymous
@@ -613,6 +621,7 @@ struct RoleChange {
     username: String,
     stream_master: bool,
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn set_role(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,

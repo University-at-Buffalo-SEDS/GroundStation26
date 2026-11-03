@@ -1,6 +1,6 @@
 //! Primary-owned control from an authenticated recovery station.
 //! Local RRLS hardware execution remains denied, including when offline.
-mod recovery;
+pub(crate) mod recovery;
 mod wire;
 // Staged coordinator seam; this module does not authorize reset completion.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -54,6 +54,7 @@ struct VerifiedRequest {
     pub actor: String,
     pub operation: Operation,
     plumbing_origin_utc_ms: Option<u64>,
+    launch_revision: Option<u64>,
 }
 enum Received {
     Reply(Vec<u8>),
@@ -64,6 +65,7 @@ enum Received {
         observation: Vec<u8>,
     },
     Result {
+        boot: [u8; 16],
         request: [u8; 16],
         digest: [u8; 16],
         outcome: Outcome,
@@ -80,6 +82,10 @@ struct Runtime {
     capability: Option<([u8; 16], Mode, u64)>,
     results: VecDeque<Cached>,
     observation: Vec<u8>,
+    extended_observation: bool,
+    readiness_demand: bool,
+    readiness_seen: VecDeque<(u32, [u8; 16])>,
+    readiness_last: Option<std::time::Instant>,
 }
 fn nonce() -> [u8; 16] {
     loop {
@@ -101,6 +107,10 @@ impl Runtime {
             capability: None,
             results: VecDeque::new(),
             observation: Vec::new(),
+            extended_observation: false,
+            readiness_demand: false,
+            readiness_seen: VecDeque::new(),
+            readiness_last: None,
         }
     }
     fn synchronize_recovery(&mut self) -> bool {
@@ -112,6 +122,10 @@ impl Runtime {
         self.query = None;
         self.capability = None;
         self.results.clear();
+        self.extended_observation = false;
+        self.readiness_demand = false;
+        self.readiness_seen.clear();
+        self.readiness_last = None;
         true
     }
     pub(crate) fn connect(&mut self, transport: Option<Transport>) {
@@ -125,6 +139,10 @@ impl Runtime {
             self.query = None;
             self.capability = None;
             self.results.clear();
+            self.extended_observation = false;
+            self.readiness_demand = false;
+            self.readiness_seen.clear();
+            self.readiness_last = None;
         }
     }
     fn peer<'a>(&self, pairing: &'a Pairing) -> Result<&'a str> {
@@ -146,6 +164,14 @@ impl Runtime {
         Ok(&peers[0].id)
     }
     pub(crate) fn query(&mut self, pairing: &Pairing, transport: Transport) -> Result<Vec<u8>> {
+        self.query_for_readiness(pairing, transport, false)
+    }
+    fn query_for_readiness(
+        &mut self,
+        pairing: &Pairing,
+        transport: Transport,
+        readiness: bool,
+    ) -> Result<Vec<u8>> {
         ensure!(
             self.role == Role::Rrls && self.session == Some(transport.session),
             "Only connected recovery queries primary control"
@@ -160,9 +186,35 @@ impl Runtime {
                 sequence: transport.sequence,
                 request,
                 boot: [0; 16],
-                message: Message::Query,
+                message: if readiness {
+                    Message::QueryReadiness
+                } else {
+                    Message::Query
+                },
             },
         )
+    }
+    fn query_observe(&mut self, pairing: &Pairing, transport: Transport) -> Result<Vec<u8>> {
+        ensure!(
+            self.role == Role::Rrls && self.session == Some(transport.session),
+            "Only connected recovery queries primary control"
+        );
+        let request = *self.query.get_or_insert_with(nonce);
+        wire::seal(
+            pairing,
+            self.peer(pairing)?,
+            &Envelope {
+                issuer: pairing.public.station_id.clone(),
+                session: transport.session,
+                sequence: transport.sequence,
+                request,
+                boot: [0; 16],
+                message: Message::QueryObserve,
+            },
+        )
+    }
+    fn take_readiness_demand(&mut self) -> bool {
+        std::mem::take(&mut self.readiness_demand)
     }
     pub(crate) fn request(
         &self,
@@ -175,6 +227,7 @@ impl Runtime {
     ) -> Result<Vec<u8>> {
         self.request_with_plumbing_origin(pairing, transport, mode, request, actor, operation, None)
     }
+    #[expect(clippy::too_many_arguments, reason = "Session, actor, operation and original plumbing evidence remain independent")]
     pub(crate) fn request_with_plumbing_origin(
         &self,
         pairing: &Pairing,
@@ -185,6 +238,29 @@ impl Runtime {
         operation: Operation,
         plumbing_origin_utc_ms: Option<u64>,
     ) -> Result<Vec<u8>> {
+        self.request_with_origins(
+            pairing,
+            transport,
+            mode,
+            request,
+            actor,
+            operation,
+            plumbing_origin_utc_ms,
+            None,
+        )
+    }
+    #[expect(clippy::too_many_arguments, reason = "Session, actor, operation and original plumbing and launch evidence remain independent")]
+    pub(crate) fn request_with_origins(
+        &self,
+        pairing: &Pairing,
+        transport: Transport,
+        mode: Mode,
+        request: [u8; 16],
+        actor: String,
+        operation: Operation,
+        plumbing_origin_utc_ms: Option<u64>,
+        launch_origin: Option<crate::primary_mirror::LaunchOrigin>,
+    ) -> Result<Vec<u8>> {
         ensure!(
             self.role == Role::Rrls && self.session == Some(transport.session),
             "Only connected recovery requests primary control"
@@ -193,6 +269,15 @@ impl Runtime {
             .capability
             .ok_or_else(|| anyhow::anyhow!("Primary capability is not verified"))?;
         ensure!(primary_mode == mode, "Primary mode changed");
+        if matches!(&operation,Operation::Command(name) if wire::launch_command(name)) {
+            let origin=launch_origin.ok_or_else(||anyhow::anyhow!("Original primary launch proof is missing; check readiness and make a new explicit request"))?;
+            ensure!(
+                origin.boot == boot && origin.session == transport.session,
+                "Primary boot/session changed after launch ingress"
+            );
+        } else {
+            ensure!(launch_origin.is_none(), "Unexpected launch origin");
+        }
         wire::seal(
             pairing,
             self.peer(pairing)?,
@@ -203,6 +288,7 @@ impl Runtime {
                 request,
                 boot,
                 message: Message::Request {
+                    launch_revision: launch_origin.map(|origin| origin.revision),
                     mode,
                     actor,
                     operation,
@@ -230,18 +316,42 @@ impl Runtime {
             "Stale primary connection contract"
         );
         match envelope.message.clone() {
-            Message::Query => {
+            Message::Query | Message::QueryObserve | Message::QueryReadiness => {
                 ensure!(
                     primary && envelope.boot == [0; 16],
                     "Unexpected control query"
                 );
+                // A legacy query explicitly selects legacy replies too, even
+                // after a peer restart that retained the same transport session.
+                self.extended_observation = !matches!(envelope.message, Message::Query);
+                if matches!(envelope.message, Message::QueryReadiness) {
+                    let identity = (envelope.session, envelope.request);
+                    let unseen = !self.readiness_seen.contains(&identity);
+                    if unseen {
+                        if self.readiness_seen.len() >= 16 {
+                            self.readiness_seen.pop_front();
+                        }
+                        self.readiness_seen.push_back(identity);
+                        if self
+                            .readiness_last
+                            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(5))
+                        {
+                            self.readiness_last = Some(std::time::Instant::now());
+                            self.readiness_demand = true;
+                        }
+                    }
+                }
                 let reply = Envelope {
                     issuer: pairing.public.station_id.clone(),
                     boot: self.boot,
                     message: Message::Capability {
                         mode: local_mode,
-                        commands: supported_commands_mask(),
-                        observation: self.observation.clone(),
+                        commands: supported_commands_mask_for_peer(self.extended_observation),
+                        observation: if matches!(envelope.message, Message::Query) {
+                            crate::primary_mirror::legacy_observation(&self.observation)
+                        } else {
+                            self.observation.clone()
+                        },
                     },
                     ..envelope.clone()
                 };
@@ -269,6 +379,7 @@ impl Runtime {
                 })
             }
             Message::Request {
+                launch_revision,
                 mode,
                 actor,
                 operation,
@@ -318,6 +429,7 @@ impl Runtime {
                     actor,
                     operation,
                     plumbing_origin_utc_ms,
+                    launch_revision,
                 }))
             }
             Message::Reply {
@@ -333,6 +445,7 @@ impl Runtime {
                     "Wrong primary result boot"
                 );
                 Ok(Received::Result {
+                    boot: envelope.boot,
                     request: envelope.request,
                     digest,
                     outcome,
@@ -361,7 +474,11 @@ impl Runtime {
             message: Message::Reply {
                 digest: request.digest,
                 outcome,
-                observation: self.observation.clone(),
+                observation: if self.extended_observation {
+                    self.observation.clone()
+                } else {
+                    crate::primary_mirror::legacy_observation(&self.observation)
+                },
             },
             ..request.envelope.clone()
         };
@@ -691,7 +808,13 @@ async fn pause_before_proxy_admission() {
         pause.resume.notified().await;
     }
 }
-async fn execute_primary(
+async fn execute_primary(state: Arc<crate::state::AppState>, request: &VerifiedRequest) -> Outcome {
+    let Some(lease) = state.control_ingress.handler() else {
+        return Outcome::Unavailable;
+    };
+    lease.run(execute_primary_inner(state, request)).await
+}
+async fn execute_primary_inner(
     state: std::sync::Arc<crate::state::AppState>,
     request: &VerifiedRequest,
 ) -> Outcome {
@@ -757,13 +880,19 @@ async fn execute_primary(
                     principal,
                     command,
                     plumbing_origin,
+                    request.launch_revision,
                 )
                 .await
                 .0
             } else {
-                crate::web::dispatch_proxied_command(state, principal, command)
-                    .await
-                    .0
+                crate::web::dispatch_proxied_command(
+                    state,
+                    principal,
+                    command,
+                    request.launch_revision,
+                )
+                .await
+                .0
             }
         }
         Operation::NetworkUtc(utc) => {
@@ -816,6 +945,11 @@ impl Default for Status {
 }
 // This includes the original local credential only in process memory. It is
 // never serialized, signed into radio bytes, debug-formatted, or logged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteLaunchOrigin {
+    primary: crate::primary_mirror::LaunchOrigin,
+    local_revision: u64,
+}
 #[derive(Clone)]
 struct Pending {
     id: [u8; 16],
@@ -823,6 +957,7 @@ struct Pending {
     token: String,
     operation: Operation,
     plumbing_origin_utc_ms: Option<u64>,
+    launch_origin: Option<RemoteLaunchOrigin>,
     session: u32,
     sequence: u32,
     wire: Option<Vec<u8>>,
@@ -834,10 +969,35 @@ struct Pending {
 struct Broker {
     status: Status,
     pending: Option<Pending>,
+    readiness_request: Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>,
+    readiness_last: Option<std::time::Instant>,
 }
 static BROKER: OnceLock<Mutex<Broker>> = OnceLock::new();
 fn broker() -> &'static Mutex<Broker> {
     BROKER.get_or_init(Default::default)
+}
+pub(crate) async fn request_readiness_check() -> std::result::Result<(), String> {
+    let (send, receive) = tokio::sync::oneshot::channel();
+    {
+        let mut broker = broker().lock().unwrap();
+        if !broker.status.paired || !broker.status.connected {
+            return Err("Connect the paired primary before checking launch readiness.".into());
+        }
+        if broker.readiness_request.is_some()
+            || broker
+                .readiness_last
+                .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(5))
+        {
+            return Err(
+                "A readiness check is pending or cooling down. Retry after five seconds.".into(),
+            );
+        }
+        broker.readiness_last = Some(std::time::Instant::now());
+        broker.readiness_request = Some(send);
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5),receive).await
+        .map_err(|_|"Primary readiness check timed out. Update both stations if the primary does not support this check; no Launch was sent.".to_string())?
+        .map_err(|_|"Primary readiness service stopped; no Launch was sent.".to_string())?
 }
 pub(crate) fn status() -> Status {
     broker().lock().unwrap().status.clone()
@@ -903,6 +1063,64 @@ pub(crate) async fn submit_with_plumbing_origin(
     operation: Operation,
     plumbing_origin_utc_ms: Option<u64>,
 ) -> Response {
+    let launch_origin = match &operation {
+        Operation::Command(name) => capture_rrls_launch_origin(state, name),
+        _ => None,
+    };
+    submit_with_origins(
+        state,
+        principal,
+        token,
+        operation,
+        plumbing_origin_utc_ms,
+        launch_origin,
+    )
+    .await
+}
+pub(crate) fn capture_rrls_launch_origin(
+    state: &crate::state::AppState,
+    name: &str,
+) -> Option<RemoteLaunchOrigin> {
+    if !crate::rrls::is_rrls() || !wire::launch_command(name) {
+        return None;
+    }
+    let local_revision = crate::board_abort::capture_launch_revision_named(state, name)?;
+    let primary = crate::primary_mirror::capture_launch_origin(state)?;
+    Some(RemoteLaunchOrigin {
+        primary,
+        local_revision,
+    })
+}
+pub(crate) async fn submit_with_origins(
+    state: &Arc<crate::state::AppState>,
+    principal: &crate::auth::AuthPrincipal,
+    token: Option<&str>,
+    operation: Operation,
+    plumbing_origin_utc_ms: Option<u64>,
+    launch_origin: Option<RemoteLaunchOrigin>,
+) -> Response {
+    let Some(lease) = state.control_ingress.handler() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Control ingress is closed").into_response();
+    };
+    lease
+        .run(submit_with_origins_inner(
+            state,
+            principal,
+            token,
+            operation,
+            plumbing_origin_utc_ms,
+            launch_origin,
+        ))
+        .await
+}
+async fn submit_with_origins_inner(
+    state: &Arc<crate::state::AppState>,
+    principal: &crate::auth::AuthPrincipal,
+    token: Option<&str>,
+    operation: Operation,
+    plumbing_origin_utc_ms: Option<u64>,
+    launch_origin: Option<RemoteLaunchOrigin>,
+) -> Response {
     use crate::auth::Permission;
     if plumbing_origin_utc_ms.is_some()
         && !matches!(&operation,Operation::Command(name) if name=="RetractPlumbing")
@@ -924,10 +1142,10 @@ pub(crate) async fn submit_with_plumbing_origin(
         )
             .into_response();
     }
-    if let Operation::Command(name) = &operation {
-        if !wire::valid_command(name)
+    if let Operation::Command(name) = &operation
+        && (!wire::valid_command(name)
             || local_operation(name)
-            || !principal.allows_command_name(name)
+            || !principal.allows_command_name(name))
         {
             return (
                 StatusCode::FORBIDDEN,
@@ -935,7 +1153,6 @@ pub(crate) async fn submit_with_plumbing_origin(
             )
                 .into_response();
         }
-    }
     let Some(token) = token.filter(|value| !value.is_empty() && value.len() <= 8192) else {
         return (StatusCode::UNAUTHORIZED, "Authenticated session required.").into_response();
     };
@@ -961,11 +1178,10 @@ pub(crate) async fn submit_with_plumbing_origin(
     else {
         return (StatusCode::FORBIDDEN, "A named operator is required.").into_response();
     };
-    if let Operation::Command(name) = &operation {
-        if !fresh.allows_command_name(name) {
+    if let Operation::Command(name) = &operation
+        && !fresh.allows_command_name(name) {
             return (StatusCode::FORBIDDEN, "Command permission was revoked.").into_response();
         }
-    }
     if matches!(&operation, Operation::Command(name) if name == "Abort") {
         state.manual_abort_intent.request();
         let mut broker = broker().lock().unwrap();
@@ -978,6 +1194,26 @@ pub(crate) async fn submit_with_plumbing_origin(
             error: Some("Primary observation and actual board readback are pending.".into()),
         });
         return (StatusCode::ACCEPTED, Json(broker.status.clone())).into_response();
+    }
+    if matches!(&operation, Operation::Command(name) if crate::board_abort::launch_command(name)) {
+        if let Some(message) = crate::board_abort::blocked_message(state) {
+            return (StatusCode::CONFLICT, message).into_response();
+        }
+        if launch_origin.is_none()
+            || capture_rrls_launch_origin(
+                state,
+                match &operation {
+                    Operation::Command(name) => name,
+                    _ => "",
+                },
+            ) != launch_origin
+        {
+            return (
+                StatusCode::CONFLICT,
+                "Fresh authenticated primary board-state proof is required before Launch.",
+            )
+                .into_response();
+        }
     }
     let Some(mesh) = crate::rrls::settings_transport() else {
         return (
@@ -998,6 +1234,13 @@ pub(crate) async fn submit_with_plumbing_origin(
         )
             .into_response();
     };
+    if launch_origin.is_some_and(|origin| origin.primary.session != view.session) {
+        return (
+            StatusCode::CONFLICT,
+            "Primary connection changed; check readiness and make a new explicit Launch request.",
+        )
+            .into_response();
+    }
     let mut broker = broker().lock().unwrap();
     if !broker.status.available {
         return (
@@ -1006,8 +1249,8 @@ pub(crate) async fn submit_with_plumbing_origin(
         )
             .into_response();
     }
-    if let Operation::Command(name) = &operation {
-        if !broker
+    if let Operation::Command(name) = &operation
+        && !broker
             .status
             .supported_commands
             .iter()
@@ -1019,7 +1262,6 @@ pub(crate) async fn submit_with_plumbing_origin(
             )
                 .into_response();
         }
-    }
     if let Some(pending) = &broker.pending {
         if pending.actor.eq_ignore_ascii_case(actor) && pending.operation == operation {
             return (StatusCode::ACCEPTED, Json(broker.status.clone())).into_response();
@@ -1037,6 +1279,7 @@ pub(crate) async fn submit_with_plumbing_origin(
         token: token.into(),
         operation: operation.clone(),
         plumbing_origin_utc_ms,
+        launch_origin,
         session: view.session,
         sequence: view.sequence,
         wire: None,
@@ -1069,8 +1312,16 @@ pub(crate) async fn get_status(
 }
 // Call only after a current signed nonce or exact pending request matched.
 // The cache lock is released before the local WebSocket snapshot is built.
-fn accept_presentation(state: &crate::state::AppState, bytes: &[u8], age_ms: u64) -> bool {
-    let accepted = crate::primary_mirror::accept_control_observation(state, bytes, age_ms);
+fn accept_presentation(
+    state: &crate::state::AppState,
+    bytes: &[u8],
+    age_ms: u64,
+    boot: [u8; 16],
+    session: u32,
+) -> bool {
+    let accepted = crate::primary_mirror::accept_control_observation_with_context(
+        state, bytes, age_ms, boot, session,
+    );
     if accepted {
         state.broadcast_action_policy_snapshot();
     }
@@ -1108,6 +1359,15 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
         log::error!("A primary proxy is already active; duplicate task was not started");
         return None;
     }
+    if role == Role::Primary
+        && state
+            .operator_admission_barrier
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        && let Err(error) = runtime.admission.begin() {
+            log::error!("Restored recovery proxy closure failed: {error}");
+            return None;
+        }
     if runtime.peer(&pairing).is_err() {
         let mut broker = broker().lock().unwrap();
         broker.status.paired = true;
@@ -1123,6 +1383,13 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
         let mut last_query = None;
         let mut query_created_at = None;
         let mut previous_session = None;
+        let mut readiness_reply: Option<
+            tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+        > = None;
+        let mut readiness_started = None::<std::time::Instant>;
+        let mut readiness_phase = 0u8;
+        let mut readiness_poll_at = None::<std::time::Instant>;
+
         loop {
             tokio::select! {_=shutdown.recv()=>break,_=tick.tick()=>{}}
             let (now, view, frames) = {
@@ -1138,6 +1405,17 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
             };
             if previous_session != view.map(|view| view.session) {
                 previous_session = view.map(|view| view.session);
+                if let Some(reply) = readiness_reply.take() {
+                    let _ = reply.send(Err(
+                        "Primary connection changed; request a new readiness check.".into(),
+                    ));
+                }
+                if let Some(reply) = broker().lock().unwrap().readiness_request.take() {
+                    let _ = reply.send(Err(
+                        "Primary connection changed; request a new readiness check.".into(),
+                    ));
+                }
+                readiness_phase = 0;
                 query_attempts = 0;
                 last_query = None;
                 query_created_at = None;
@@ -1182,6 +1460,14 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                 }
                 match runtime.receive(&pairing, view, crate::station_mode::local_mode(), &bytes) {
                     Ok(Received::Reply(bytes)) => {
+                        if runtime.take_readiness_demand()
+                            && let Err(error) =
+                                crate::board_abort::request_paired_readiness_queries(&state)
+                            {
+                                log::debug!(
+                                    "Read-only readiness demand could not be queued: {error}"
+                                );
+                            }
                         if outbox.len() < 4 {
                             outbox.push_back((runtime.boot, bytes));
                         }
@@ -1198,11 +1484,10 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                             operation_name(&request.operation),
                             outcome
                         );
-                        if let Ok(reply) = runtime.finish(&pairing, request, outcome) {
-                            if outbox.len() < 4 {
+                        if let Ok(reply) = runtime.finish(&pairing, request, outcome)
+                            && outbox.len() < 4 {
                                 outbox.push_back((runtime.boot, reply));
                             }
-                        }
                     }
                     Ok(Received::Capability {
                         boot,
@@ -1214,12 +1499,37 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                                 &state,
                                 &observation,
                                 elapsed_upper_bound(now, created),
+                                boot,
+                                view.session,
                             );
                         }
                         debug_assert_ne!(boot, [0; 16]);
                         broker().lock().unwrap().status.primary_mode = Some(mode);
+                        if readiness_phase == 4 {
+                            readiness_phase = 0;
+                        }
+                        if readiness_reply.is_some() {
+                            if !crate::primary_mirror::observation_has_board_guard(&observation) {
+                                if let Some(reply) = readiness_reply.take() {
+                                    let _=reply.send(Err("Primary software does not support verified board readiness. Update both stations; no Launch was sent.".into()));
+                                }
+                                readiness_phase = 0;
+                            } else if readiness_phase == 1 {
+                                readiness_phase = 2;
+                                readiness_poll_at = Some(
+                                    std::time::Instant::now()
+                                        + std::time::Duration::from_millis(800),
+                                );
+                            } else if readiness_phase == 3 {
+                                if let Some(reply) = readiness_reply.take() {
+                                    let _ = reply.send(Ok(()));
+                                }
+                                readiness_phase = 0;
+                            }
+                        }
                     }
                     Ok(Received::Result {
+                        boot,
                         request,
                         digest,
                         outcome,
@@ -1243,6 +1553,8 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                                 &state,
                                 &observation,
                                 elapsed_upper_bound(now, created),
+                                boot,
+                                view.session,
                             );
                             match outcome {
                                 Outcome::Queued => {
@@ -1262,6 +1574,38 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                 }
             }
             if role == Role::Rrls {
+                if readiness_reply.is_none()
+                    && let Some(request) = broker().lock().unwrap().readiness_request.take() {
+                        readiness_reply = Some(request);
+                        readiness_started = Some(std::time::Instant::now());
+                        readiness_phase = 1;
+                        runtime.query = None;
+                        query_attempts = 0;
+                        last_query = None;
+                        query_created_at = None;
+                    }
+                if readiness_reply.is_some()
+                    && readiness_started
+                        .is_some_and(|at| at.elapsed() >= std::time::Duration::from_secs(4))
+                {
+                    if let Some(reply) = readiness_reply.take() {
+                        let _=reply.send(Err("Primary readiness check was unsupported or timed out. Update both stations if needed; no Launch was sent.".into()));
+                    }
+                    readiness_phase = 4;
+                    runtime.query = None;
+                    query_attempts = 0;
+                    last_query = None;
+                    query_created_at = None;
+                }
+                if readiness_phase == 2
+                    && readiness_poll_at.is_some_and(|at| std::time::Instant::now() >= at)
+                {
+                    readiness_phase = 3;
+                    runtime.query = None;
+                    query_attempts = 0;
+                    last_query = None;
+                    query_created_at = None;
+                }
                 if runtime.capability.is_none()
                     && discovery_retry_due(now, last_query, query_attempts)
                 {
@@ -1293,20 +1637,30 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                         });
                     broker.status.reason=if available {"Requests are checked by the primary; device confirmation still requires actual telemetry."} else if runtime.capability.is_none() && query_attempts >= 3 && last_query.is_some_and(|last| now.saturating_sub(last) >= 500) {"The primary did not provide a signed control capability; bounded discovery will retry after its cooldown."} else {"Waiting for signed primary control capability and matching current mode."}.into();
                 }
-                if runtime.capability.is_none()
+                if (runtime.capability.is_none() || matches!(readiness_phase, 1 | 3 | 4))
+                    && readiness_phase != 2
                     && query_attempts < 3
                     && last_query.is_none_or(|last| now >= last && now - last >= 500)
-                {
-                    if let Ok(query) = runtime.query(&pairing, view) {
-                        if mesh.lock().unwrap().queue_command_proxy(&query, now) {
+                    && let Ok(query) = if readiness_phase == 1 {
+                        runtime.query_for_readiness(&pairing, view, true)
+                    } else if readiness_phase == 3 {
+                        runtime.query_observe(&pairing, view)
+                    } else {
+                        runtime.query(&pairing, view)
+                    }
+                        && mesh.lock().unwrap().queue_command_proxy(&query, now) {
                             query_created_at.get_or_insert(now);
                             query_attempts += 1;
                             last_query = Some(now);
                         }
-                    }
-                }
                 let pending = broker().lock().unwrap().pending.clone();
                 if let Some(mut pending) = pending {
+                    if pending.launch_origin.is_some_and(|origin| {
+                        origin.local_revision != state.board_abort.abort_revision()
+                    }) {
+                        finish_pending(pending.id,"unknown",false,Some("A locally observed board Abort superseded the queued Launch. Check readiness and make a new explicit request.".into()));
+                        continue;
+                    }
                     let sequence_age = view.sequence.wrapping_sub(pending.sequence);
                     if !available
                         || pending.session != view.session
@@ -1359,7 +1713,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                                 continue;
                             };
                             let encoded = if pending.plumbing_origin_utc_ms.is_some() {
-                                runtime.request_with_plumbing_origin(
+                                runtime.request_with_origins(
                                     &pairing,
                                     Transport {
                                         session: pending.session,
@@ -1370,6 +1724,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                                     pending.actor.clone(),
                                     pending.operation.clone(),
                                     pending.plumbing_origin_utc_ms,
+                                    pending.launch_origin.map(|origin| origin.primary),
                                 )
                             } else {
                                 runtime.request(
@@ -1420,11 +1775,10 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                 let boot = runtime.admission.boot();
                 outbox.retain(|(created_boot, _)| *created_boot == boot);
             }
-            if let Some((_, bytes)) = outbox.front() {
-                if mesh.lock().unwrap().queue_command_proxy(bytes, now) {
+            if let Some((_, bytes)) = outbox.front()
+                && mesh.lock().unwrap().queue_command_proxy(bytes, now) {
                     outbox.pop_front();
                 }
-            }
         }
         invalidate_presentation(&state);
         let id = broker()
@@ -1503,6 +1857,10 @@ pub(crate) fn command_catalog() -> &'static [&'static str] {
         "ValveSelfTest",
         "NitrogenTest",
         "Turbocharge",
+        "TogglePlumbingDelayInterlock",
+        "ToggleChecklistInterlock",
+        "ToggleSupplyInterlock",
+        "ToggleBoardStateProofInterlock",
     ]
 }
 fn supported_commands_mask() -> u64 {
@@ -1517,6 +1875,21 @@ fn supported_commands_mask() -> u64 {
         })
         .fold(0, |mask, (index, _)| mask | (1u64 << index))
 }
+fn supported_commands_mask_for_peer(launch_origin_supported: bool) -> u64 {
+    let mut mask = supported_commands_mask();
+    if !launch_origin_supported {
+        for (index, name) in command_catalog().iter().enumerate() {
+            if matches!(
+                *name,
+                "Launch" | "GroundStationLaunch" | "AdvanceFlightState" | "RewindFlightState"
+            ) {
+                mask &= !(1u64 << index);
+            }
+        }
+    }
+    mask
+}
+
 #[cfg(test)]
 mod handler_tests;
 
@@ -1527,13 +1900,19 @@ mod recovery_wire_tests {
     fn delayed_signed_request_and_cached_completion_are_revoked_by_barrier() {
         let (_root, p, r, mut primary, mut rr, pv, rv) = tests::connected();
         let bytes = rr
-            .request(
+            .request_with_origins(
                 &r,
                 rv,
                 Mode::Hitl,
                 [71; 16],
                 "operator".into(),
                 Operation::Command("Launch".into()),
+                None,
+                Some(crate::primary_mirror::LaunchOrigin {
+                    revision: 0,
+                    boot: rr.capability.unwrap().0,
+                    session: rv.session,
+                }),
             )
             .unwrap();
         let Received::Execute(work) = primary.receive(&p, pv, Mode::Hitl, &bytes).unwrap() else {
@@ -1552,13 +1931,19 @@ mod recovery_wire_tests {
         };
         rr.receive(&r, rv, Mode::Normal, &cap_during).unwrap();
         let during = rr
-            .request(
+            .request_with_origins(
                 &r,
                 rv,
                 Mode::Hitl,
                 [73; 16],
                 "operator".into(),
                 Operation::Command("Launch".into()),
+                None,
+                Some(crate::primary_mirror::LaunchOrigin {
+                    revision: 0,
+                    boot: rr.capability.unwrap().0,
+                    session: rv.session,
+                }),
             )
             .unwrap();
         assert!(primary.receive(&p, pv, Mode::Hitl, &during).is_err());
@@ -1571,13 +1956,19 @@ mod recovery_wire_tests {
         };
         rr.receive(&r, rv, Mode::Normal, &cap).unwrap();
         let fresh = rr
-            .request(
+            .request_with_origins(
                 &r,
                 rv,
                 Mode::Hitl,
                 [72; 16],
                 "operator".into(),
                 Operation::Command("Launch".into()),
+                None,
+                Some(crate::primary_mirror::LaunchOrigin {
+                    revision: 0,
+                    boot: rr.capability.unwrap().0,
+                    session: rv.session,
+                }),
             )
             .unwrap();
         assert!(matches!(
@@ -1586,3 +1977,147 @@ mod recovery_wire_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod board_abort_readiness_tests {
+    use super::*;
+    #[tokio::test]
+    async fn board_abort_signed_observe_never_demands_and_refresh_is_deduped_rate_limited_and_session_bound()
+     {
+        let (_root, p, r, mut primary, mut rr, pv, rv) = super::tests::connected();
+        let state = crate::state::tests::test_app_state().await;
+        primary.observation = crate::primary_mirror::encode_control_observation(&state, 96);
+        assert_eq!(primary.observation.len(), 88);
+        let legacy = rr.query(&r, rv).unwrap();
+        let Received::Reply(reply) = primary.receive(&p, pv, Mode::Normal, &legacy).unwrap() else {
+            panic!("legacy reply")
+        };
+        let Received::Capability { observation, .. } =
+            rr.receive(&r, rv, Mode::Normal, &reply).unwrap()
+        else {
+            panic!("legacy cap")
+        };
+        assert_eq!(observation.len(), 57);
+        assert!(!primary.extended_observation);
+        assert!(!primary.take_readiness_demand());
+        let observe = rr.query_observe(&r, rv).unwrap();
+        let Received::Reply(reply) = primary.receive(&p, pv, Mode::Normal, &observe).unwrap()
+        else {
+            panic!("observe reply")
+        };
+        let Received::Capability { observation, .. } =
+            rr.receive(&r, rv, Mode::Normal, &reply).unwrap()
+        else {
+            panic!("observe cap")
+        };
+        assert_eq!(observation.len(), 88);
+        assert!(primary.extended_observation);
+        assert!(!primary.take_readiness_demand());
+        let refresh = rr.query_for_readiness(&r, rv, true).unwrap();
+        let mut unsigned = refresh.clone();
+        *unsigned.last_mut().unwrap() ^= 1;
+        assert!(primary.receive(&p, pv, Mode::Normal, &unsigned).is_err());
+        assert!(!primary.take_readiness_demand());
+        assert!(
+            primary
+                .receive(
+                    &p,
+                    Transport {
+                        session: pv.session + 1,
+                        ..pv
+                    },
+                    Mode::Normal,
+                    &refresh
+                )
+                .is_err()
+        );
+        assert!(!primary.take_readiness_demand());
+        let Received::Reply(reply) = primary.receive(&p, pv, Mode::Normal, &refresh).unwrap()
+        else {
+            panic!("refresh reply")
+        };
+        assert!(primary.take_readiness_demand());
+        assert!(!primary.take_readiness_demand());
+        assert!(primary.receive(&p, pv, Mode::Normal, &refresh).is_ok());
+        assert!(
+            !primary.take_readiness_demand(),
+            "exact signed replay cannot schedule another batch"
+        );
+        rr.receive(&r, rv, Mode::Normal, &reply).unwrap();
+        let another = rr.query_for_readiness(&r, rv, true).unwrap();
+        primary.receive(&p, pv, Mode::Normal, &another).unwrap();
+        assert!(
+            !primary.take_readiness_demand(),
+            "new nonce does not bypass five-second request budget"
+        );
+        let mode = rr.capability.unwrap().1;
+        let view = rr.session;
+        // An unsupported extension does not mutate the transport lease/capability.
+        assert!(rr.receive(&r, rv, Mode::Normal, &unsigned).is_err());
+        assert_eq!(rr.session, view);
+        assert_eq!(rr.capability.unwrap().1, mode);
+        primary.connect(Some(Transport {
+            session: pv.session + 1,
+            ..pv
+        }));
+        assert!(!primary.extended_observation);
+        assert!(!primary.take_readiness_demand());
+    }
+    #[test]
+    fn board_abort_legacy_peer_loses_only_origin_bound_launch_capabilities() {
+        let full = supported_commands_mask();
+        let legacy = supported_commands_mask_for_peer(false);
+        assert_eq!(supported_commands_mask_for_peer(true), full);
+        for (index, name) in command_catalog().iter().enumerate() {
+            let bit = 1u64 << index;
+            if matches!(
+                *name,
+                "Launch" | "GroundStationLaunch" | "AdvanceFlightState" | "RewindFlightState"
+            ) {
+                assert_eq!(legacy & bit, 0, "{name}");
+            } else {
+                assert_eq!(legacy & bit, full & bit, "{name}");
+            }
+        }
+    }
+    #[tokio::test]
+    async fn board_abort_legacy_query_restores_same_session_legacy_reply_after_peer_restart() {
+        let (_root, p, r, mut primary, mut rr, pv, rv) = super::tests::connected();
+        let state = crate::state::tests::test_app_state().await;
+        primary.observation = crate::primary_mirror::encode_control_observation(&state, 96);
+        let observe = rr.query_observe(&r, rv).unwrap();
+        let Received::Reply(reply) = primary.receive(&p, pv, Mode::Normal, &observe).unwrap()
+        else {
+            panic!("reply")
+        };
+        rr.receive(&r, rv, Mode::Normal, &reply).unwrap();
+        assert!(primary.extended_observation);
+        let old = rr.query(&r, rv).unwrap();
+        let Received::Reply(reply) = primary.receive(&p, pv, Mode::Normal, &old).unwrap() else {
+            panic!("reply")
+        };
+        let Received::Capability { observation, .. } =
+            rr.receive(&r, rv, Mode::Normal, &reply).unwrap()
+        else {
+            panic!("cap")
+        };
+        assert_eq!(observation.len(), 57);
+        assert!(!primary.extended_observation);
+        assert!(!primary.take_readiness_demand());
+        assert!(!crate::primary_mirror::observation_has_board_guard(
+            &observation
+        ));
+        assert!(crate::primary_mirror::accept_control_observation(
+            &state,
+            &observation,
+            0
+        ));
+        assert!(!crate::primary_mirror::launch_provenance_current(&state));
+    }
+}
+
+#[cfg(test)]
+mod cross_build_tests;
+
+#[cfg(all(test, any(not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "testing")), all(feature = "hitl_mode", feature = "test_fire_mode"))))]
+mod rrls_required_proof_tests;

@@ -933,14 +933,13 @@ mod tests {
                     continue;
                 }
                 for widget in state.sections.iter().flat_map(|s| &s.widgets) {
-                    if let Some(actions) = &widget.actions {
-                        if actions.iter().any(|s| s == "Nitrous") {
+                    if let Some(actions) = &widget.actions
+                        && actions.iter().any(|s| s == "Nitrous") {
                             checked += 1;
                             for (cmd, _) in GSE_SEQUENCE_ACTIONS {
                                 assert!(actions.iter().any(|s| s == cmd));
                             }
                         }
-                    }
                 }
             }
             assert!(checked > 0);

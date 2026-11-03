@@ -962,5 +962,14 @@
       "reliable": "Ordered",
       "priority": 200
     }
+    ,{
+      "name": "AB_FILL_MOTION_STATUS_V2",
+      "doc": "Actual accepted motion identity, lifecycle and monotonic minimum45 delay; separate exact56LE application status. Read-only QUERYv2 only; no mechanical position claim.",
+      "class": "Data",
+      "element": { "kind": "Static", "data_type": "UInt8", "count": 56 },
+      "endpoints": ["GROUND_STATION"],
+      "reliable": "Ordered",
+      "priority": 200
+    }
   ]
 }

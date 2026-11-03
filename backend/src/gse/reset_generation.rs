@@ -1,11 +1,9 @@
-//! Staged reset-epoch/tare barrier, not a Reset HTTP endpoint or authorization.
-//!
-//! Kept test-gated until the verified-reset API is implemented. That consumer
-//! must ungate this SAME helper only after admission is closed, all inflight
-//! work is quiescent and fresh board proofs are checked. No journal/config or
-//! calibration deletion occurs here.
+//! Verified coordinator owner/epoch fences. Admission, actual producer and
+//! journal ownership must quiesce before transitions. These helpers never
+//! delete calibration/history or reset the launch clock/session.
 use super::*;
 
+#[cfg(test)]
 pub(crate) fn invalidate_capture_epoch(
     state: &AppState,
     expected_generation: u64,
@@ -78,6 +76,7 @@ pub(crate) fn close_operator_admission(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn advance_with_clock_fence(
     state: &AppState,
     expected_generation: u64,
@@ -149,6 +148,7 @@ pub(crate) fn transfer_closed_recovery_owner(
     Ok(transferred)
 }
 
+#[cfg(test)]
 pub(crate) fn reopen_operator_admission_and_journal(
     state: &AppState,
     old_generation: u64,
@@ -186,6 +186,120 @@ pub(crate) fn reopen_operator_admission_and_journal(
         .operator_admission_barrier
         .store(0, std::sync::atomic::Ordering::Release);
     Ok(())
+}
+
+/// Every board send and final publication retains the ORIGINAL finite Stop
+/// epochs. Never capture a replacement Stop baseline after closure.
+pub(crate) fn advance_verified_recovery(
+    state: &AppState,
+    token: crate::operator_queue::Token,
+    fence: &crate::launch_history::RecoveryFence,
+) -> Result<u64, &'static str> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if state
+        .operator_admission_barrier
+        .load(std::sync::atomic::Ordering::Acquire)
+        != token.owner
+        || automatic_generation(state) != token.generation
+        || state
+            .operator_dispatch_inflight
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    {
+        return Err("Recovery owner/generation is stale or inflight");
+    }
+    state
+        .manual_abort_intent
+        .admit_if_unchanged(token.manual_epoch, || {
+            state
+                .deferred_abort
+                .admit_if_no_manual_since(token.observed_manual_epoch, || {
+                    let history = state
+                        .launch_history
+                        .try_lock()
+                        .map_err(|_| "Clock journal busy")?;
+                    if !history
+                        .recovery_publication_ready(fence, token.owner)
+                        .map_err(|_| "Clock fence changed")?
+                    {
+                        return Err("Clock prefix pending");
+                    }
+                    let generation =
+                        invalidate_capture_epoch_under_dispatch(state, token.generation)?;
+                    state.last_command_ms.lock().unwrap().clear();
+                    Ok(generation)
+                })
+        })
+        .flatten()
+        .ok_or("Manual Stop superseded recovery")?
+}
+
+pub(crate) fn finalize_verified_recovery(
+    state: &AppState,
+    token: crate::operator_queue::Token,
+    fence: &crate::launch_history::RecoveryFence,
+    proxy: Option<crate::command_proxy::recovery::Barrier>,
+    proofs: &crate::board_recovery::coordinator::FinalProofs,
+    reset_all: bool,
+) -> Result<(), &'static str> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if state
+        .operator_admission_barrier
+        .load(std::sync::atomic::Ordering::Acquire)
+        != token.owner
+        || automatic_generation(state) != token.generation
+        || state
+            .operator_dispatch_inflight
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    {
+        return Err("Recovery final owner/generation is stale or inflight");
+    }
+    state
+        .manual_abort_intent
+        .admit_if_unchanged(token.manual_epoch, || {
+            state
+                .deferred_abort
+                .admit_if_no_manual_since(token.observed_manual_epoch, || {
+                    let mut history = state
+                        .launch_history
+                        .try_lock()
+                        .map_err(|_| "Clock journal busy")?;
+                    if !history
+                        .recovery_publication_ready(fence, token.owner)
+                        .map_err(|_| "Clock fence changed")?
+                        || !history.recovery_pending().is_some_and(|pending| {
+                            pending.owner == token.owner
+                                && pending.verified
+                                && proofs.valid(&pending, token.generation)
+                                && (!reset_all
+                                    || pending.targets.len() == 7
+                                        && pending.targets.iter().all(|t| t.desired == 0))
+                        })
+                    {
+                        return Err("Durable verified marker unavailable");
+                    }
+                    // No IO/SDK callback occurs under these locks. Both proxy boot and
+                    // host barrier rotate at this same final Stop linearization point.
+                    if let Some(proxy) = proxy {
+                        proxy
+                            .reopen_after_verified_recovery()
+                            .map_err(|_| "Proxy fence changed")?;
+                    }
+                    history
+                        .reopen_after_recovery(fence)
+                        .map_err(|_| "Journal cannot reopen")?;
+                    if reset_all {
+                        state.publish_verified_startup_under_gate();
+                    }
+                    state
+                        .operator_admission_barrier
+                        .store(0, std::sync::atomic::Ordering::Release);
+                    Ok(())
+                })
+        })
+        .flatten()
+        .ok_or("Manual Stop superseded recovery")?
 }
 
 #[cfg(test)]

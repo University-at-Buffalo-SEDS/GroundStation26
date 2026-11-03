@@ -102,6 +102,7 @@ pub(super) struct Binding {
     #[serde(default)]
     pub(super) offset: f32,
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 fn require_current_phase_version(version: u8) -> ApiResult<()> {
     match version {
         crate::types::FLIGHT_PHASE_VERSION => Ok(()),
@@ -313,6 +314,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
         .route("/api/media-assets/models/{stage}/{name}", get(model_asset))
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(super) async fn read_presentation(state: &MediaState) -> ApiResult<Presentation> {
     let mut presentation: Presentation =
         match tokio::fs::read(state.models.join("_presentation.json")).await {
@@ -335,11 +337,10 @@ pub(super) async fn read_presentation(state: &MediaState) -> ApiResult<Presentat
         .rundown
         .validate()
         .map_err(|message| error(StatusCode::INTERNAL_SERVER_ERROR, message))?;
-    if let Some(plan) = &presentation.broadcast.replay {
-        if !replay::available(state, plan).await {
+    if let Some(plan) = &presentation.broadcast.replay
+        && !replay::available(state, plan).await {
             presentation.broadcast.replay = None;
         }
-    }
     if presentation.stats.is_empty() {
         presentation.stats = default_stats();
     }
@@ -362,6 +363,7 @@ pub(super) async fn read_presentation(state: &MediaState) -> ApiResult<Presentat
 
 /// Normalize the same saved model contract as the operator replay without
 /// putting a login token into an audience scene or uploaded-model URL.
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(super) async fn recorded_vehicle_config(
     state: &Arc<MediaState>,
     headers: &HeaderMap,
@@ -394,6 +396,7 @@ pub(super) async fn initialize_voice_broadcast(state: &MediaState) {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(super) async fn write_presentation(state: &MediaState, value: &Presentation) -> ApiResult<()> {
     tokio::fs::create_dir_all(&state.models)
         .await
@@ -423,6 +426,7 @@ pub(super) struct MediaQuery {
     playback_ms: Option<u64>,
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(super) async fn ticket(
     state: &MediaState,
     headers: &HeaderMap,
@@ -465,6 +469,7 @@ pub(super) async fn ticket(
     Ok(id)
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(super) async fn authorize_media(
     state: &MediaState,
     headers: &HeaderMap,
@@ -475,6 +480,7 @@ pub(super) async fn authorize_media(
     authorize(state, &headers, Permission::ViewData).await
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn ticket_headers(
     state: &MediaState,
     headers: &HeaderMap,
@@ -501,18 +507,20 @@ async fn ticket_headers(
         }
     }
     authorize(state,&headers,Permission::ViewData).await?;
-    if let Some(id)=&query.ticket {if let Some(ticket)=state.tickets.lock().await.iter_mut().find(|t|&t.id==id&&t.resource==resource){ticket.expires=Instant::now()+Duration::from_secs(3600);}}
+    if let Some(id)=&query.ticket&& let Some(ticket)=state.tickets.lock().await.iter_mut().find(|t|&t.id==id&&t.resource==resource){ticket.expires=Instant::now()+Duration::from_secs(3600);}
     Ok(headers)
 }
 
 #[derive(Deserialize)]
 pub(super) struct CameraName {name:String}
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(super) async fn rename_camera(State(state):State<Arc<MediaState>>,Path(id):Path<String>,headers:HeaderMap,axum::Json(body):axum::Json<CameraName>)->ApiResult<axum::Json<serde_json::Value>>{
  let principal=crate::web::authorize_headers(&state.app,&headers,Permission::ViewData).await?;if !principal.can_manage_stream(){return Err(error(StatusCode::FORBIDDEN,"Stream-manager access required"));}
  check_id(&id)?;let id=id.strip_prefix("transcoded-").unwrap_or(&id).to_owned();let name=body.name.trim();if name.is_empty()||name.len()>256||name.chars().count()>80||name.chars().any(char::is_control){return Err(error(StatusCode::BAD_REQUEST,"Choose a camera name of 1–80 characters"));}
  let _guard=state.presentation_write.lock().await;let mut presentation=read_presentation(&state).await?;presentation.stream_labels.insert(id.clone(),name.to_owned());write_presentation(&state,&presentation).await?;Ok(axum::Json(serde_json::json!({"id":id,"name":name})))
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(super) async fn authorize_preview(state: &MediaState, headers: &HeaderMap) -> ApiResult<()> {
     let p = crate::web::authorize_headers(&state.app, headers, Permission::ViewData).await?;
     if p.can_manage_stream() {
@@ -524,6 +532,7 @@ pub(super) async fn authorize_preview(state: &MediaState, headers: &HeaderMap) -
         ))
     }
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(super) async fn authorize_preview_media(
     state: &MediaState,
     headers: &HeaderMap,
@@ -537,6 +546,7 @@ pub(super) async fn authorize_preview_media(
     .await
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(super) async fn preview_owner(
     state: &MediaState,
     headers: &HeaderMap,
@@ -549,6 +559,7 @@ pub(super) async fn preview_owner(
     Ok(p.username.unwrap_or_default())
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn live_streams(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -597,6 +608,7 @@ async fn live_streams(
         .into_response())
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(super) async fn control_broadcast(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -605,6 +617,7 @@ pub(super) async fn control_broadcast(
     control_broadcast_inner(state, headers, broadcast, false).await
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(super) async fn control_recorded_broadcast(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -613,6 +626,7 @@ pub(super) async fn control_recorded_broadcast(
     control_broadcast_inner(state, headers, broadcast, true).await
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn control_broadcast_inner(
     state: Arc<MediaState>,
     headers: HeaderMap,
@@ -656,23 +670,21 @@ async fn control_broadcast_inner(
             "Invalid broadcast label, layout or camera list",
         ));
     }
-    if broadcast.layout == "interview"
+    if (broadcast.layout == "interview"
         || broadcast
             .rundown
             .profiles
             .values()
-            .any(|p| p.scene == "interview")
-    {
-        if broadcast.interview.main_stream_id.is_empty()
+            .any(|p| p.scene == "interview"))
+        && (broadcast.interview.main_stream_id.is_empty()
             || broadcast.interview.pip_stream_id.is_empty()
-            || broadcast.interview.main_stream_id == broadcast.interview.pip_stream_id
+            || broadcast.interview.main_stream_id == broadcast.interview.pip_stream_id)
         {
             return Err(error(
                 StatusCode::BAD_REQUEST,
                 "Choose different interview and picture-in-picture camera/participant feeds",
             ));
         }
-    }
     for id in [
         &broadcast.interview.main_stream_id,
         &broadcast.interview.pip_stream_id,
@@ -681,11 +693,10 @@ async fn control_broadcast_inner(
             check_id(id)?;
         }
     }
-    if edit_recorded_replay {
-        if let Some(plan) = broadcast.recorded_replay.as_mut() {
+    if edit_recorded_replay
+        && let Some(plan) = broadcast.recorded_replay.as_mut() {
             super::recorded_vehicle::validate_plan(&state, plan).await?;
         }
-    }
     if !broadcast.featured_stream_id.is_empty() {
         check_id(&broadcast.featured_stream_id)?;
     }
@@ -735,11 +746,13 @@ async fn control_broadcast_inner(
     Ok(axum::Json(broadcast))
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn vehicle(State(state): State<Arc<MediaState>>, headers: HeaderMap) -> ApiResult<Response> {
     let vehicle = load_vehicle(state, headers).await?;
     Ok(([(header::CACHE_CONTROL, "no-store")], axum::Json(vehicle)).into_response())
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn load_vehicle(state: Arc<MediaState>, headers: HeaderMap) -> ApiResult<Vehicle> {
     authorize(&state, &headers, Permission::ViewData).await?;
     let mut vehicle = read_presentation(&state).await?.vehicle;
@@ -833,6 +846,7 @@ async fn load_vehicle(state: Arc<MediaState>, headers: HeaderMap) -> ApiResult<V
     Ok(vehicle)
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn save_vehicle(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -900,6 +914,7 @@ async fn save_vehicle(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn save_vehicle_post(
     state: State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -909,6 +924,7 @@ async fn save_vehicle_post(
     Ok(axum::Json(serde_json::json!({"saved":true})))
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn three_asset(Path(file): Path<String>) -> ApiResult<Response> {
     let bytes: &'static [u8] = match file.as_str() {
         "vehicle-renderer.js" => gs_browser_assets::VEHICLE_RENDERER_JS,
@@ -937,6 +953,7 @@ async fn three_asset(Path(file): Path<String>) -> ApiResult<Response> {
         .into_response())
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn player(
     State(state): State<Arc<MediaState>>,
     Path(id): Path<String>,
@@ -955,6 +972,7 @@ async fn player(
         .into_response())
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn model_asset(
     State(state): State<Arc<MediaState>>,
     Path((stage, name)): Path<(String, String)>,

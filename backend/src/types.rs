@@ -40,6 +40,14 @@ pub enum TelemetryCommand {
     #[cfg(feature = "hitl_mode")]
     ToggleLaunchInterlock,
     #[cfg(feature = "hitl_mode")]
+    TogglePlumbingDelayInterlock,
+    #[cfg(feature = "hitl_mode")]
+    ToggleChecklistInterlock,
+    #[cfg(feature = "hitl_mode")]
+    ToggleSupplyInterlock,
+    #[cfg(feature = "hitl_mode")]
+    ToggleBoardStateProofInterlock,
+    #[cfg(feature = "hitl_mode")]
     TogglePhysicalLaunchMode,
     ToggleAvBayUnderglow,
     ToggleFlightBuzzer,
@@ -100,6 +108,7 @@ pub enum TelemetryCommand {
     #[serde(skip)]
     QueuedOperator {
         generation: u64,
+        launch_revision: Option<u64>,
         command: Box<TelemetryCommand>,
         plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
     },

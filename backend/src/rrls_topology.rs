@@ -22,13 +22,12 @@ pub(crate) fn project(
         .find(|n| n.sender_id.as_deref() == Some("RF"))
         .map(|n| n.id.clone());
     // A logical SDK connection is not evidence of a working direct radio path.
-    if observed.relaying || !observed.direct_age_ms.is_some_and(|age| age < 3_000) {
-        if let Some(rf) = &rf {
+    if (observed.relaying || !observed.direct_age_ms.is_some_and(|age| age < 3_000))
+        && let Some(rf) = &rf {
             links.retain(|l| {
                 !((l.source == gs && l.target == *rf) || (l.target == gs && l.source == *rf))
             });
         }
-    }
     let Some(age) = observed.peer_age_ms else {
         return;
     };
@@ -73,8 +72,8 @@ pub(crate) fn project(
         label: Some(mode.to_lowercase()),
         status,
     });
-    if online && observed.relaying {
-        if let Some(rf) = rf {
+    if online && observed.relaying
+        && let Some(rf) = rf {
             links.push(NetworkTopologyLink {
                 source: id,
                 target: rf,
@@ -82,7 +81,6 @@ pub(crate) fn project(
                 status,
             });
         }
-    }
 }
 
 #[cfg(test)]

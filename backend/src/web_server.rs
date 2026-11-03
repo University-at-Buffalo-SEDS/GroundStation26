@@ -129,8 +129,8 @@ fn identity(config: &Config) -> Result<(PathBuf, PathBuf)> {
     let saved = std::fs::read(&manifest)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Identity>(&bytes).ok());
-    if let (Some(saved), Ok(bytes)) = (saved, std::fs::read(&cert)) {
-        if key.is_file()
+    if let (Some(saved), Ok(bytes)) = (saved, std::fs::read(&cert))
+        && key.is_file()
             && saved.names == config.names
             && saved.renew_at > now.unix_timestamp()
             && saved.certificate_hash == hash(&bytes)
@@ -143,7 +143,6 @@ fn identity(config: &Config) -> Result<(PathBuf, PathBuf)> {
             }
             return Ok((cert, key));
         }
-    }
     let mut params = rcgen::CertificateParams::new(config.names.clone())?;
     params.not_before = now - time::Duration::days(1);
     params.not_after = now + time::Duration::days(397);

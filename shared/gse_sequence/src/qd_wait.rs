@@ -80,6 +80,11 @@ impl QdWait {
             }
         }
     }
+    /// Cancel only the pending operator intent; do not fabricate or discard
+    /// actuator acknowledgement/settling evidence.
+    pub fn cancel_launch(&mut self) {
+        self.queued = false;
+    }
     pub fn queued(&self) -> bool {
         self.queued
     }
@@ -120,6 +125,20 @@ mod tests {
         assert_eq!(q.status(50_100), QdStatus::AckTimedOut);
         assert!(!q.take_ready_launch(50_100));
         assert!(!q.queued());
+    }
+    #[test]
+    fn cancelling_pending_intent_preserves_real_ack_and_never_replays_launch() {
+        let mut q = QdWait::default();
+        q.dispatched(100);
+        q.queue_launch(101).unwrap();
+        q.confirm(1100);
+        q.cancel_launch();
+        assert!(!q.queued());
+        assert_eq!(q.status(6100), QdStatus::Ready);
+        assert!(!q.take_ready_launch(6100));
+        q.queue_launch(6101).unwrap();
+        assert!(q.take_ready_launch(6101));
+        assert!(!q.take_ready_launch(6102));
     }
     #[test]
     fn five_seconds_begin_at_ack_and_duplicate_reports_do_not_restart_time() {

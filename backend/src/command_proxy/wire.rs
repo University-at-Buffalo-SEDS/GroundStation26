@@ -29,12 +29,15 @@ pub(super) enum Outcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Message {
     Query,
+    QueryObserve,
+    QueryReadiness,
     Capability {
         mode: Mode,
         commands: u64,
         observation: Vec<u8>,
     },
     Request {
+        launch_revision: Option<u64>,
         mode: Mode,
         actor: String,
         operation: Operation,
@@ -102,7 +105,7 @@ pub(super) fn seal(pairing: &Pairing, recipient: &str, envelope: &Envelope) -> R
     );
     let mut wire = MAGIC.to_vec();
     wire.push(match envelope.message {
-        Message::Query => 0,
+        Message::Query | Message::QueryObserve | Message::QueryReadiness => 0,
         Message::Capability { .. } => 1,
         Message::Request { .. } => 2,
         Message::Reply { .. } => 3,
@@ -120,6 +123,8 @@ pub(super) fn seal(pairing: &Pairing, recipient: &str, envelope: &Envelope) -> R
     wire.extend(envelope.boot);
     match &envelope.message {
         Message::Query => {}
+        Message::QueryObserve => wire.push(0),
+        Message::QueryReadiness => wire.push(1),
         Message::Capability {
             mode,
             commands,
@@ -130,6 +135,7 @@ pub(super) fn seal(pairing: &Pairing, recipient: &str, envelope: &Envelope) -> R
             append_observation(&mut wire, observation)?;
         }
         Message::Request {
+            launch_revision,
             mode,
             actor,
             operation,
@@ -156,6 +162,15 @@ pub(super) fn seal(pairing: &Pairing, recipient: &str, envelope: &Envelope) -> R
                     wire.extend(utc.to_le_bytes());
                 }
             }
+            ensure!(
+                launch_revision.is_none()
+                    || matches!(operation,Operation::Command(name) if launch_command(name)),
+                "Launch origin extension is only valid for a potentially launching command"
+            );
+            ensure!(
+                launch_revision.is_none() || plumbing_origin_utc_ms.is_none(),
+                "Conflicting command origins"
+            );
             if let Some(stamp) = plumbing_origin_utc_ms {
                 ensure!(
                     matches!(operation, Operation::Command(name) if name=="RetractPlumbing")
@@ -163,6 +178,10 @@ pub(super) fn seal(pairing: &Pairing, recipient: &str, envelope: &Envelope) -> R
                     "Invalid plumbing origin extension"
                 );
                 wire.extend(stamp.to_le_bytes());
+            }
+            if let Some(revision) = launch_revision {
+                ensure!(*revision != u64::MAX, "Exhausted launch revision");
+                wire.extend(revision.to_le_bytes());
             }
         }
         Message::Reply {
@@ -194,6 +213,12 @@ fn append_observation(wire: &mut Vec<u8>, observation: &[u8]) -> Result<()> {
     wire.push(observation.len() as u8);
     wire.extend(observation);
     Ok(())
+}
+pub(super) fn launch_command(name: &str) -> bool {
+    matches!(
+        name,
+        "Launch" | "GroundStationLaunch" | "AdvanceFlightState" | "RewindFlightState"
+    )
 }
 pub(super) fn valid_command(command: &str) -> bool {
     !command.is_empty()
@@ -270,7 +295,15 @@ pub(super) fn open(pairing: &Pairing, wire: &[u8], issuer_role: &str) -> Result<
     let request = cursor.array()?;
     let boot = cursor.array()?;
     let message = match kind {
-        0 => Message::Query,
+        0 => match end.saturating_sub(cursor.at) {
+            0 => Message::Query,
+            1 => match cursor.byte()? {
+                0 => Message::QueryObserve,
+                1 => Message::QueryReadiness,
+                _ => bail!("Unknown readiness query flag"),
+            },
+            _ => bail!("Invalid readiness query length"),
+        },
         1 => Message::Capability {
             mode: mode(cursor.byte()?)?,
             commands: u64::from_le_bytes(cursor.array()?),
@@ -293,19 +326,25 @@ pub(super) fn open(pairing: &Pairing, wire: &[u8], issuer_role: &str) -> Result<
                 1 => Operation::NetworkUtc(i64::from_le_bytes(cursor.array()?)),
                 _ => bail!("Unknown control operation"),
             };
-            let plumbing_origin_utc_ms = match end - cursor.at {
-                0 => None,
-                8 if matches!(&operation, Operation::Command(name) if name=="RetractPlumbing") => {
+            let (plumbing_origin_utc_ms, launch_revision) = match end - cursor.at {
+                0 => (None, None),
+                8 if matches!(&operation,Operation::Command(name) if name=="RetractPlumbing") => {
                     let stamp = u64::from_le_bytes(cursor.array()?);
                     ensure!(
                         !matches!(stamp, 0 | u64::MAX),
                         "Invalid plumbing origin timestamp"
                     );
-                    Some(stamp)
+                    (Some(stamp), None)
+                }
+                8 if matches!(&operation,Operation::Command(name) if launch_command(name)) => {
+                    let revision = u64::from_le_bytes(cursor.array()?);
+                    ensure!(revision != u64::MAX, "Exhausted launch revision");
+                    (None, Some(revision))
                 }
                 _ => bail!("Unexpected control request extension"),
             };
             Message::Request {
+                launch_revision,
                 mode,
                 actor,
                 operation,
@@ -383,6 +422,7 @@ mod plumbing_compatibility_tests {
             ),
             (
                 Message::Request {
+                    launch_revision: None,
                     mode: Mode::Hitl,
                     actor: "operator".into(),
                     operation: Operation::Command("RetractPlumbing".into()),
@@ -396,6 +436,7 @@ mod plumbing_compatibility_tests {
             ),
             (
                 Message::Request {
+                    launch_revision: None,
                     mode: Mode::Hitl,
                     actor: "operator".into(),
                     operation: Operation::NetworkUtc(1000),
@@ -433,6 +474,7 @@ mod plumbing_compatibility_tests {
     fn marked_retract_binds_original_utc_and_old_decoder_rejects_it() {
         let (_root, primary, recovery) = crate::command_proxy::tests::fixtures();
         let request = envelope(Message::Request {
+            launch_revision: None,
             mode: Mode::Hitl,
             actor: "operator".into(),
             operation: Operation::Command("RetractPlumbing".into()),
@@ -454,6 +496,7 @@ mod plumbing_compatibility_tests {
             &recovery,
             "primary",
             &envelope(Message::Request {
+                launch_revision: None,
                 mode: Mode::Hitl,
                 actor: "operator".into(),
                 operation: Operation::Command("RetractPlumbing".into()),
@@ -463,6 +506,43 @@ mod plumbing_compatibility_tests {
         .unwrap();
         assert_eq!(bytes.len(), unmarked.len() + 8);
     }
+    #[test]
+    fn board_abort_readiness_query_extensions_are_signed_optional_and_legacy_safe() {
+        let (_root, primary, recovery) = crate::command_proxy::tests::fixtures();
+        let original = seal(&recovery, "primary", &envelope(Message::Query)).unwrap();
+        let old =
+            legacy::seal(&recovery, "primary", &old_envelope(legacy::Message::Query)).unwrap();
+        assert_eq!(original, old);
+        for message in [Message::QueryObserve, Message::QueryReadiness] {
+            let frame = seal(&recovery, "primary", &envelope(message.clone())).unwrap();
+            assert_eq!(frame.len(), original.len() + 1);
+            assert_eq!(open(&primary, &frame, "rrls").unwrap().message, message);
+            assert!(
+                legacy::open(&primary, &frame, "rrls").is_err(),
+                "old decoder must refuse extension safely"
+            );
+            let mut tampered = frame.clone();
+            let at = tampered.len() - 65;
+            tampered[at] ^= 1;
+            assert!(
+                open(&primary, &tampered, "rrls").is_err(),
+                "flag is covered by actual Ed25519 signature"
+            );
+        }
+        for extra in [&[2u8][..], &[255][..], &[0, 0][..], &[1, 0][..]] {
+            let mut frame = original[..original.len() - 64].to_vec();
+            frame.extend(extra);
+            let signature = recovery
+                .mission_signing_key()
+                .sign(&signed_bytes(&recovery, "rrls", "primary", &frame));
+            frame.extend(signature.as_ref());
+            assert!(
+                open(&primary, &frame, "rrls").is_err(),
+                "malformed signed flag/length cannot request queries"
+            );
+        }
+    }
+
     #[test]
     fn extensions_on_other_operations_or_wrong_sizes_are_rejected_even_when_signed() {
         let (_root, primary, recovery) = crate::command_proxy::tests::fixtures();
@@ -485,6 +565,7 @@ mod plumbing_compatibility_tests {
                     &recovery,
                     "primary",
                     &envelope(Message::Request {
+                        launch_revision: None,
                         mode: Mode::Hitl,
                         actor: "operator".into(),
                         operation: operation.clone(),
@@ -495,6 +576,7 @@ mod plumbing_compatibility_tests {
             );
             let wire = signed_extra(
                 Message::Request {
+                    launch_revision: None,
                     mode: Mode::Hitl,
                     actor: "operator".into(),
                     operation,
@@ -507,6 +589,7 @@ mod plumbing_compatibility_tests {
         for extra in [vec![1; 7], vec![1; 9], vec![0; 8], vec![255; 8]] {
             let wire = signed_extra(
                 Message::Request {
+                    launch_revision: None,
                     mode: Mode::Hitl,
                     actor: "operator".into(),
                     operation: Operation::Command("RetractPlumbing".into()),

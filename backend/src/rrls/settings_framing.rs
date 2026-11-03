@@ -276,12 +276,11 @@ impl State {
         let own = length
             .checked_add(fragments(length).checked_mul(OUTER + FRAGMENT_HEADER + 16)?)?
             .checked_add(PROBE_CHARGE)?;
-        Some(
-            (own as u64 * 1000)
+        (own as u64 * 1000)
                 .div_ceil(own_bytes_s)
-                .checked_add((OFFER_CHARGE as u64 * 1000).div_ceil(peer_bytes_s))?,
-        )
+                .checked_add((OFFER_CHARGE as u64 * 1000).div_ceil(peer_bytes_s))
     }
+    #[expect(clippy::too_many_arguments, reason = "Original parent owner, mesh lifetime and independent own and peer capacities remain explicit")]
     pub fn admit(
         &mut self,
         inner: &[u8],
@@ -572,14 +571,13 @@ impl State {
         }
     }
     pub fn note_accepted_prefix(&mut self, owner: OwnerId, accepted: usize, action: Action) {
-        if accepted > 0 {
-            if let Some(tx) = self.tx.as_mut().filter(|t| t.owner == owner) {
+        if accepted > 0
+            && let Some(tx) = self.tx.as_mut().filter(|t| t.owner == owner) {
                 tx.started = true;
                 if action == Action::Probe {
                     tx.probe_frozen = true;
                 }
             }
-        }
     }
     pub fn retire(&mut self, owner: OwnerId) {
         if self.owns(owner) {
@@ -662,7 +660,8 @@ impl State {
         if !self.observe(c) {
             return Incoming::default();
         }
-        let result = match body.first().copied() {
+
+        match body.first().copied() {
             Some(PROBE) => self.probe(body, c, inbox_slots, free_bytes),
             Some(OFFER) => {
                 self.offer(body, c);
@@ -673,8 +672,7 @@ impl State {
                 self.counters.rejected += 1;
                 Incoming::default()
             }
-        };
-        result
+        }
     }
     fn probe(&mut self, b: &[u8], c: Context, inbox_slots: usize, free_bytes: usize) -> Incoming {
         let expected_origin = SETTINGS_KIND | if self.local_primary { 0x80 } else { 0 };

@@ -22,6 +22,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
         )
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn owner(state: &MediaState, headers: &HeaderMap) -> ApiResult<String> {
     let p = crate::web::authorize_headers(&state.app, headers, Permission::ViewData).await?;
     if !p.can_publish_camera() {
@@ -78,6 +79,7 @@ pub(super) async fn reap(state: Arc<MediaState>) {
 struct PublishOptions {
     name: Option<String>,
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 fn camera_label(value: &str) -> ApiResult<String> {
     let value = value.trim();
     if value.is_empty()
@@ -93,6 +95,7 @@ fn camera_label(value: &str) -> ApiResult<String> {
     Ok(value.to_owned())
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn offer(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -205,6 +208,7 @@ async fn offer(
 struct CameraName {
     name: String,
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn rename(
     State(state): State<Arc<MediaState>>,
     Path((id, session)): Path<(String, String)>,
@@ -224,6 +228,7 @@ async fn rename(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn renew(
     State(state): State<Arc<MediaState>>,
     Path((id, session)): Path<(String, String)>,
@@ -241,6 +246,7 @@ async fn renew(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn stop(
     State(state): State<Arc<MediaState>>,
     Path((id, session)): Path<(String, String)>,

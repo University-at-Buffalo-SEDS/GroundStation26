@@ -375,8 +375,7 @@ pub async fn safety_task(
                         && !in_flight_ignored_board
                         && let Some(last_seen_ms) = status.last_seen_ms
                         && let Some(offline_ms) = liveness_age_ms
-                    {
-                        if offline_ms >= BOARD_OFFLINE_ABORT_TRIGGER_MS && pending_abort.is_none() {
+                        && offline_ms >= BOARD_OFFLINE_ABORT_TRIGGER_MS && pending_abort.is_none() {
                             let reason = SafetyAbortReason::BoardOffline {
                                 board: board.sender_id(),
                                 selected_state: current_state,
@@ -400,7 +399,6 @@ pub async fn safety_task(
                             record_first_abort_reason(&mut first_abort_reason, reason.clone());
                             pending_abort = Some(reason);
                         }
-                    }
                 } else {
                     status.warned = false;
                 }
@@ -431,11 +429,9 @@ pub async fn safety_task(
             && all_boards_seen
             && !cfg!(feature = "hitl_mode")
             && !cfg!(feature = "test_fire_mode")
-        {
-            if *state.state.lock().unwrap() == FlightState::Startup {
+            && *state.state.lock().unwrap() == FlightState::Startup {
                 state.set_local_flight_state(FlightState::Idle);
             }
-        }
 
         let last_packet_ms = state.last_packet_received_ms();
         if current_state == FlightState::Startup {

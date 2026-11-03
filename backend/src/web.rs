@@ -98,7 +98,7 @@ fn values_from_row(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
         && !bytes.is_empty()
     {
         let mut out = Vec::with_capacity(bytes.len() / 4);
-        for chunk in bytes.chunks_exact(4) {
+        for chunk in bytes.as_chunks::<4>().0.iter() {
             let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
             out.push(Some(f32::from_le_bytes(arr)));
         }
@@ -191,15 +191,14 @@ fn bounded_display_history(rows: Vec<TelemetryRow>, max_rows: usize) -> Vec<Tele
                 {
                     selected.insert(start + index);
                 }
-                if selected.len() < per_stream {
-                    if let Some((index, _)) = stream[start..end]
+                if selected.len() < per_stream
+                    && let Some((index, _)) = stream[start..end]
                         .iter()
                         .enumerate()
                         .max_by(|(_, a), (_, b)| value(a).total_cmp(&value(b)))
                     {
                         selected.insert(start + index);
                     }
-                }
             }
         }
         output.extend(
@@ -440,6 +439,11 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         )
         .route("/api/alerts/ack", post(post_alert_ack))
         .route("/api/action_policy", get(get_action_policy))
+        .route("/api/board_abort", get(crate::board_abort::get_status))
+        .route(
+            "/api/board_abort/refresh",
+            post(crate::board_abort::refresh_status),
+        )
         .route(
             "/api/flight_setup",
             get(get_flight_setup).post(set_flight_setup),
@@ -498,6 +502,7 @@ fn auth_failure_response(err: AuthFailure) -> axum::response::Response {
 }
 
 /// Authorizes an HTTP request against the required permission set.
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(crate) async fn authorize_headers(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -584,6 +589,7 @@ pub enum WsOutMsg {
     LaunchClock(LaunchClockMsg),
     Error(ErrorMsg),
     AlertAckState(AlertAckStateMsg),
+    BoardAbort(crate::board_abort::Snapshot),
     BoardStatus(BoardStatusMsg),
     NetworkTopology(NetworkTopologyMsg),
     Notifications(Vec<PersistentNotification>),
@@ -2248,6 +2254,9 @@ async fn start_firmware_update(
         Ok(principal) => principal,
         Err(response) => return response,
     };
+    if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
+        return (StatusCode::SERVICE_UNAVAILABLE,"ground station is shutting down").into_response();
+    }
     if !principal.permissions.send_commands {
         return (StatusCode::FORBIDDEN, "permission denied").into_response();
     }
@@ -2281,6 +2290,9 @@ async fn start_firmware_update(
                 .into_response();
         }
     };
+    if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
+        return (StatusCode::SERVICE_UNAVAILABLE,"ground station is shutting down").into_response();
+    }
     let Some(router) = state.topology_router.get() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "router unavailable").into_response();
     };
@@ -2334,17 +2346,19 @@ async fn send_command_entry(
     } else {
         None
     };
+    let remote_launch_origin = crate::command_proxy::capture_rrls_launch_origin(&state, name);
     if crate::rrls::is_rrls() && !crate::command_proxy::local_operation(name) {
         let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
             Ok(principal) => principal,
             Err(error) => return error,
         };
-        return crate::command_proxy::submit_with_plumbing_origin(
+        return crate::command_proxy::submit_with_origins(
             &state,
             &principal,
             bearer_token_from_headers(&headers),
             crate::command_proxy::Operation::Command(name.into()),
             plumbing_source_ms,
+            remote_launch_origin,
         )
         .await;
     }
@@ -2368,22 +2382,51 @@ async fn send_command(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(cmd): Json<TelemetryCommand>,
-) -> (StatusCode, &'static str) {
+) -> (StatusCode, String) {
+    let Some(lease) = state.control_ingress.handler() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Control ingress is closed".into(),
+        );
+    };
+    lease
+        .run(send_command_inner(State(state), headers, Json(cmd)))
+        .await
+}
+
+async fn send_command_inner(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(cmd): Json<TelemetryCommand>,
+) -> (StatusCode, String) {
     // Request origin must precede authentication/database waits across recovery.
-    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
+    let admission_generation = if matches!(cmd, TelemetryCommand::Abort) {
+        0
+    } else {
+        crate::gse::capture_operator_origin(&state).unwrap_or(0)
+    };
     let plumbing_origin = crate::actuator_plumbing::capture_motion_origin(&state, &cmd);
+    let launch_revision = crate::board_abort::capture_launch_revision(&state, &cmd);
     let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
         Ok(principal) => principal,
         Err(response) => {
             let status = response.status();
             return if status == StatusCode::FORBIDDEN {
-                (StatusCode::FORBIDDEN, "permission denied")
+                (StatusCode::FORBIDDEN, "permission denied".into())
             } else {
-                (StatusCode::UNAUTHORIZED, "authentication required")
+                (StatusCode::UNAUTHORIZED, "authentication required".into())
             };
         }
     };
-    dispatch_authorized_command(state, principal, cmd, admission_generation, plumbing_origin).await
+    dispatch_authorized_command(
+        state,
+        principal,
+        cmd,
+        admission_generation,
+        plumbing_origin,
+        launch_revision,
+    )
+    .await
 }
 
 /// Shared primary/local authorization and dispatch. A proxy must supply a
@@ -2394,7 +2437,8 @@ pub(crate) async fn dispatch_authorized_command(
     cmd: TelemetryCommand,
     admission_generation: u64,
     plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
-) -> (StatusCode, &'static str) {
+    launch_revision: Option<u64>,
+) -> (StatusCode, String) {
     dispatch_command(
         state,
         principal,
@@ -2402,6 +2446,7 @@ pub(crate) async fn dispatch_authorized_command(
         false,
         admission_generation,
         plumbing_origin,
+        launch_revision,
     )
     .await
 }
@@ -2409,17 +2454,36 @@ pub(crate) async fn dispatch_proxied_command(
     state: Arc<AppState>,
     principal: crate::auth::AuthPrincipal,
     cmd: TelemetryCommand,
-) -> (StatusCode, &'static str) {
-    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
-    dispatch_command(state, principal, cmd, true, admission_generation, None).await
+    launch_revision: Option<u64>,
+) -> (StatusCode, String) {
+    let admission_generation = if matches!(cmd, TelemetryCommand::Abort) {
+        0
+    } else {
+        crate::gse::capture_operator_origin(&state).unwrap_or(0)
+    };
+    dispatch_command(
+        state,
+        principal,
+        cmd,
+        true,
+        admission_generation,
+        None,
+        launch_revision,
+    )
+    .await
 }
 pub(crate) async fn dispatch_proxied_command_with_origin(
     state: Arc<AppState>,
     principal: crate::auth::AuthPrincipal,
     cmd: TelemetryCommand,
     plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
-) -> (StatusCode, &'static str) {
-    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
+    launch_revision: Option<u64>,
+) -> (StatusCode, String) {
+    let admission_generation = if matches!(cmd, TelemetryCommand::Abort) {
+        0
+    } else {
+        crate::gse::capture_operator_origin(&state).unwrap_or(0)
+    };
     dispatch_command(
         state,
         principal,
@@ -2427,6 +2491,7 @@ pub(crate) async fn dispatch_proxied_command_with_origin(
         true,
         admission_generation,
         plumbing_origin,
+        launch_revision,
     )
     .await
 }
@@ -2438,42 +2503,85 @@ async fn dispatch_command(
     immediate_admission: bool,
     admission_generation: u64,
     plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
-) -> (StatusCode, &'static str) {
+    launch_revision: Option<u64>,
+) -> (StatusCode, String) {
+    let Some(lease) = state.control_ingress.handler() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Control ingress is closed".into(),
+        );
+    };
+    lease
+        .run(dispatch_command_inner(
+            state,
+            principal,
+            cmd,
+            immediate_admission,
+            admission_generation,
+            plumbing_origin,
+            launch_revision,
+        ))
+        .await
+}
+
+async fn dispatch_command_inner(
+    state: Arc<AppState>,
+    principal: crate::auth::AuthPrincipal,
+    cmd: TelemetryCommand,
+    immediate_admission: bool,
+    admission_generation: u64,
+    plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+    launch_revision: Option<u64>,
+) -> (StatusCode, String) {
     let cmd_name = command_name(&cmd);
     if !principal.allows_command_name(cmd_name) {
         emit_warning(
             &state,
             format!("Rejected software command {cmd:?}: session is not allowed to send {cmd_name}"),
         );
-        return (StatusCode::FORBIDDEN, "command not allowed");
+        return (StatusCode::FORBIDDEN, "command not allowed".into());
     }
     // Permission is resolved, but no ordinary-queue/GSE/disk wait may precede
     // retention of a new manual emergency stop. The primary owns execution.
     if matches!(cmd, TelemetryCommand::Abort) && !crate::rrls::is_rrls() {
-        state.manual_abort_intent.request();
+        // Only the existing proxy wrappers select immediate_admission. Their
+        // secondary Stop has no proven original UTC and must never be restamped.
+        if immediate_admission {
+            state.manual_abort_intent.request_untimed();
+        } else {
+            state.manual_abort_intent.request();
+        }
         return (
             StatusCode::ACCEPTED,
-            "manual Abort intent retained; board readback required",
+            "manual Abort intent retained; board readback required".into(),
         );
+    }
+    if crate::board_abort::launch_command(command_name(&cmd)) {
+        if let Err(error) = crate::board_abort::validate_launch_revision(&state, launch_revision) {
+            return (StatusCode::CONFLICT, error);
+        }
+        if let Some(message) = crate::board_abort::blocked_message(&state) {
+            emit_notification_warning(&state, &message);
+            return (StatusCode::CONFLICT, message);
+        }
     }
     if !state.is_command_allowed(&cmd) {
         emit_notification_warning(
             &state,
             format!("Ignored software command {cmd:?}: command is currently disabled"),
         );
-        return (StatusCode::FORBIDDEN, "command disabled");
+        return (StatusCode::FORBIDDEN, "command disabled".into());
     }
-    if matches!(cmd, TelemetryCommand::RetractPlumbing) {
-        if let Err(message) =
+    if matches!(cmd, TelemetryCommand::RetractPlumbing)
+        && let Err(message) =
             crate::actuator_plumbing::validate_motion_origin(&state, plumbing_origin)
         {
             emit_notification_warning(&state, message);
             return (
                 StatusCode::CONFLICT,
-                "plumbing motion context is stale or unavailable",
+                "plumbing motion context is stale or unavailable".into(),
             );
         }
-    }
     // A bounded proxy must not wait behind a full command channel after its
     // signed contract expires, or record an unadmitted intent as a duplicate.
     let permit = if immediate_admission && !matches!(cmd, TelemetryCommand::ResetTClock) {
@@ -2482,7 +2590,7 @@ async fn dispatch_command(
             Err(_) => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "primary command queue is busy",
+                    "primary command queue is busy".into(),
                 );
             }
         }
@@ -2490,56 +2598,64 @@ async fn dispatch_command(
         None
     };
     let now_ms = software_command_clock_ms();
-    let duplicate = match crate::gse::record_operator_command(
+    let duplicate = match crate::gse::record_operator_command_with_launch_origin(
         &state,
         admission_generation,
         &cmd,
         now_ms,
         software_command_dedup_ms(),
+        launch_revision,
     ) {
-        crate::gse::OperatorCommandAdmission::Stale => {
-            return (StatusCode::CONFLICT, "command cancelled by recovery");
+        Err(message) => return (StatusCode::CONFLICT, message),
+        Ok(crate::gse::OperatorCommandAdmission::Stale) => {
+            return (StatusCode::CONFLICT, "command cancelled by recovery".into());
         }
-        crate::gse::OperatorCommandAdmission::Duplicate => true,
-        crate::gse::OperatorCommandAdmission::Fresh => false,
+        Ok(crate::gse::OperatorCommandAdmission::Duplicate) => true,
+        Ok(crate::gse::OperatorCommandAdmission::Fresh) => false,
     };
     if duplicate {
         gs_debug_println!("Ignored duplicate software command {cmd:?}");
         if matches!(cmd, TelemetryCommand::ResetTClock) {
             if crate::rrls::is_rrls() {
                 return match crate::launch_clock_sync::await_existing_reset().await {
-                    Ok(true) => (StatusCode::OK, "primary T clock reset saved"),
+                    Ok(true) => (StatusCode::OK, "primary T clock reset saved".into()),
                     Ok(false) => (
                         StatusCode::ACCEPTED,
-                        "primary reset pending; retained clock unchanged",
+                        "primary reset pending; retained clock unchanged".into(),
                     ),
-                    Err(_) => (StatusCode::CONFLICT, "primary reset was not confirmed"),
+                    Err(_) => (
+                        StatusCode::CONFLICT,
+                        "primary reset was not confirmed".into(),
+                    ),
                 };
             }
             let waiter = state.launch_history.lock().unwrap().waiter();
             if crate::launch_history::flush(waiter).await.is_err() {
                 return (
                     StatusCode::INSUFFICIENT_STORAGE,
-                    "T clock reset was not saved",
+                    "T clock reset was not saved".into(),
                 );
             }
         }
-        return (StatusCode::OK, "duplicate ignored");
+        return (StatusCode::OK, "duplicate ignored".into());
     }
     if matches!(cmd, TelemetryCommand::ResetTClock) {
         if crate::rrls::is_rrls() {
             return match crate::launch_clock_sync::request_reset(&state).await {
-                Ok(true) => (StatusCode::OK, "primary T clock reset saved"),
+                Ok(true) => (StatusCode::OK, "primary T clock reset saved".into()),
                 Ok(false) => (
                     StatusCode::ACCEPTED,
-                    "primary reset pending; retained clock unchanged",
+                    "primary reset pending; retained clock unchanged".into(),
                 ),
                 Err(error) => {
                     emit_notification_warning(
                         &state,
                         format!("Primary T clock reset not confirmed: {error}"),
                     );
-                    (StatusCode::CONFLICT, "primary reset was not confirmed")
+                    (
+                        StatusCode::CONFLICT,
+                        "primary reset was not confirmed".into(),
+                    )
                 }
             };
         }
@@ -2554,25 +2670,27 @@ async fn dispatch_command(
                 emit_notification_warning(&state, format!("T clock reset is not durable: {error}"));
                 return (
                     StatusCode::INSUFFICIENT_STORAGE,
-                    "T clock reset was not saved",
+                    "T clock reset was not saved".into(),
                 );
             }
             emit_notification_warning(&state, format!("T clock reset failed: {error}"));
-            return (StatusCode::CONFLICT, "T clock reset failed");
+            return (StatusCode::CONFLICT, "T clock reset failed".into());
         }
-        return (StatusCode::OK, "ok");
+        return (StatusCode::OK, "ok".into());
     }
     if let Some(permit) = permit {
         permit.send(TelemetryCommand::QueuedOperator {
+            launch_revision,
             plumbing_origin,
             generation: admission_generation,
             command: Box::new(cmd),
         });
-        return (StatusCode::OK, "ok");
+        return (StatusCode::OK, "ok".into());
     }
     if state
         .cmd_tx
         .send(TelemetryCommand::QueuedOperator {
+            launch_revision,
             plumbing_origin,
             generation: admission_generation,
             command: Box::new(cmd),
@@ -2583,10 +2701,10 @@ async fn dispatch_command(
         emit_notification_warning(&state, "Command worker unavailable; command was not queued");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "command worker unavailable",
+            "command worker unavailable".into(),
         );
     }
-    (StatusCode::OK, "ok")
+    (StatusCode::OK, "ok".into())
 }
 
 /// Called inside the actual blocking worker, never around its async caller.
@@ -2718,6 +2836,7 @@ pub(crate) mod command_dispatch_tests {
             TelemetryCommand::Abort,
             crate::gse::automatic_generation(&state),
             None,
+            None,
         )
         .now_or_never()
         .expect("manual intent retention must not await ordinary capacity");
@@ -2741,9 +2860,8 @@ pub(crate) mod command_dispatch_tests {
         assert!(state.manual_abort_intent.pending_epoch().is_some());
     }
     // Receipt notification is test-only and scoped to one real socket state.
-    static WS_COMMAND_RECEIVED: std::sync::OnceLock<
-        std::sync::Mutex<Option<(usize, Arc<tokio::sync::Notify>)>>,
-    > = std::sync::OnceLock::new();
+    type ScopedCommandReceipt = std::sync::Mutex<Option<(usize, Arc<tokio::sync::Notify>)>>;
+    static WS_COMMAND_RECEIVED: std::sync::OnceLock<ScopedCommandReceipt> = std::sync::OnceLock::new();
 
     pub(super) fn notify_ws_command_received(state: &Arc<AppState>) {
         let guard = WS_COMMAND_RECEIVED
@@ -2755,6 +2873,37 @@ pub(crate) mod command_dispatch_tests {
         {
             notify.notify_one();
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_late_firmware_body_cannot_start_background_transfer() {
+        use futures::FutureExt;
+        let (_directory,state,_commands,mut headers)=preauth_fixture().await;
+        headers.insert("x-firmware-filename","mock.seds".parse().unwrap());
+        let (sender,mut receiver)=tokio::sync::mpsc::channel::<Result<axum::body::Bytes,std::io::Error>>(1);
+        let entered=Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed=entered.clone();
+        let body=Body::from_stream(futures::stream::poll_fn(move |context| {
+            observed.store(true,std::sync::atomic::Ordering::Release);
+            receiver.poll_recv(context)
+        }));
+        let request=start_firmware_update(State(state.clone()),headers,Path(crate::types::Board::DaqBoard.sender_id().into()),body);
+        tokio::pin!(request);
+        tokio::time::timeout(std::time::Duration::from_secs(2),async {
+            while !entered.load(std::sync::atomic::Ordering::Acquire) {
+                assert!(request.as_mut().now_or_never().is_none(),"upload returned before held body was polled");
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        state.request_shutdown();
+        sender.send(Ok(axum::body::Bytes::from_static(b"mock-not-a-firmware-image"))).await.unwrap();
+        drop(sender);
+        let response=request.await.into_response();
+        assert_eq!(response.status(),StatusCode::SERVICE_UNAVAILABLE);
+        let reason=to_bytes(response.into_body(),512).await.unwrap();
+        assert_eq!(&reason[..],b"ground station is shutting down","router absence must not hide a missing post-body shutdown guard");
+        // Rejection precedes artifact decoding/router access; no board command
+        // or real firmware transfer is used by this regression.
     }
 
     pub(crate) async fn preauth_fixture() -> (
@@ -2969,6 +3118,62 @@ pub(crate) mod command_dispatch_tests {
     }
 
     #[tokio::test]
+    async fn shutdown_ingress_idle_ws_closes_clean_and_late_frames_cannot_retain_stop() {
+        let (_root,state,_commands,_headers)=preauth_fixture().await;
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+        let app=axum::Router::new().route("/ws",axum::routing::get(ws_handler)).with_state(state.clone());
+        let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap();});
+        let (mut socket,_)=tokio_tungstenite::connect_async(format!("ws://{address}/ws?token=preauth-test")).await.unwrap();
+        state.request_shutdown();
+        assert!(state.control_ingress.wait_terminal(StdDuration::from_secs(2)).await,"healthy idle UI connection prevented a proven terminal receipt");
+        let _=socket.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"cmd":"Abort"}"#.into())).await;
+        tokio::task::yield_now().await;
+        assert_eq!(state.manual_abort_intent.epoch(),0);
+        let response=send_command(State(state.clone()),HeaderMap::new(),Json(TelemetryCommand::Abort)).await;
+        assert_eq!(response.0,StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.manual_abort_intent.epoch(),0);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn shutdown_ingress_held_ws_auth_finishes_existing_manual_stop_but_drops_late_frame() {
+        let (_root,state,mut commands,_headers)=preauth_fixture().await;
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+        let app=axum::Router::new().route("/ws",axum::routing::get(ws_handler)).with_state(state.clone());
+        let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap();});
+        let (mut socket,_)=tokio_tungstenite::connect_async(format!("ws://{address}/ws?token=preauth-test")).await.unwrap();
+        let received=Arc::new(tokio::sync::Notify::new());
+        *WS_COMMAND_RECEIVED.get_or_init(Default::default).lock().unwrap()=Some((Arc::as_ptr(&state) as usize,received.clone()));
+        let held=state.auth_db.acquire().await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"cmd":"Abort"}"#.into())).await.unwrap();
+        tokio::time::timeout(StdDuration::from_secs(2),received.notified()).await.unwrap();
+        state.request_shutdown();
+        assert!(!state.control_ingress.wait_terminal(StdDuration::from_millis(5)).await);
+        assert_eq!(state.manual_abort_intent.epoch(),0,"authentication wait was bypassed");
+        let _=socket.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"cmd":"Abort"}"#.into())).await;
+        drop(held);
+        assert!(!state.control_ingress.wait_terminal(StdDuration::from_secs(2)).await,"in-flight-at-seal control was falsely labeled safe before SDK drain");
+        assert_eq!(state.manual_abort_intent.epoch(),1,"existing authorized Stop was cancelled or a post-seal frame was accepted");
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+        assert!(commands.try_recv().is_err(),"manual Stop entered the ordinary queue");
+        server.abort();
+    }
+    #[tokio::test]
+    async fn shutdown_ingress_held_http_stop_finishes_without_reopening_new_requests() {
+        use futures::FutureExt;
+        let (_root,state,mut commands,headers)=preauth_fixture().await;
+        let held=state.auth_db.acquire().await.unwrap();
+        let request=send_command(State(state.clone()),headers.clone(),Json(TelemetryCommand::Abort));tokio::pin!(request);
+        assert!(request.as_mut().now_or_never().is_none());
+        state.request_shutdown();drop(held);
+        assert_eq!(request.await.0,StatusCode::ACCEPTED);
+        assert_eq!(state.manual_abort_intent.epoch(),1);
+        assert!(!state.control_ingress.wait_terminal(StdDuration::from_millis(5)).await);
+        assert_eq!(send_command(State(state.clone()),headers,Json(TelemetryCommand::Abort)).await.0,StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.manual_abort_intent.epoch(),1);
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn preauth_websocket_frame_retains_origin_and_stop_is_independent() {
         use futures::SinkExt;
         let (_root, state, mut rx, _headers) = preauth_fixture().await;
@@ -3148,8 +3353,10 @@ pub(crate) mod clock_worker_tests {
         pause: Pause,
         completed: tokio::sync::Notify,
     }
-    static WORKER: OnceLock<Mutex<Option<(usize, Arc<Probe>)>>> = OnceLock::new();
-    static WRITER: OnceLock<Mutex<Option<(PathBuf, Arc<Pause>)>>> = OnceLock::new();
+    type WorkerProbe = Mutex<Option<(usize, Arc<Probe>)>>;
+    type WriterPause = Mutex<Option<(PathBuf, Arc<Pause>)>>;
+    static WORKER: OnceLock<WorkerProbe> = OnceLock::new();
+    static WRITER: OnceLock<WriterPause> = OnceLock::new();
     static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     pub(crate) struct Completion(Arc<Probe>);
     impl Drop for Completion {
@@ -3218,16 +3425,24 @@ pub(crate) mod clock_worker_tests {
             }
         }
     }
-    struct WriterGuard {
+    pub(crate) struct WriterGuard {
         path: PathBuf,
         pause: Arc<Pause>,
     }
     impl WriterGuard {
-        fn install(path: PathBuf) -> Self {
+        pub(crate) fn install(path: PathBuf) -> Self {
             let pause = Arc::new(Pause::new());
             *WRITER.get_or_init(Default::default).lock().unwrap() =
                 Some((path.clone(), pause.clone()));
             Self { path, pause }
+        }
+    }
+    impl WriterGuard {
+        pub(crate) async fn entered(&self) {
+            self.pause.entered().await;
+        }
+        pub(crate) fn release(&self) {
+            self.pause.release();
         }
     }
     impl Drop for WriterGuard {
@@ -3265,7 +3480,7 @@ pub(crate) mod clock_worker_tests {
     fn http(
         state: Arc<AppState>,
         headers: HeaderMap,
-    ) -> tokio::task::JoinHandle<(StatusCode, &'static str)> {
+    ) -> tokio::task::JoinHandle<(StatusCode, String)> {
         tokio::spawn(async move {
             send_command(State(state), headers, Json(TelemetryCommand::ResetTClock)).await
         })
@@ -3521,7 +3736,7 @@ pub(crate) mod clock_worker_tests {
             response,
             (
                 StatusCode::INSUFFICIENT_STORAGE,
-                "T clock reset was not saved"
+                "T clock reset was not saved".to_string()
             )
         );
         assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
@@ -3843,7 +4058,8 @@ pub(crate) mod clock_worker_tests {
     #[tokio::test]
     async fn recovery_remote_clock_keeps_receive_origin_and_actual_worker_lease_through_save() {
         use crate::gse::reset_generation::{
-            advance_with_clock_fence, close_operator_admission, reopen_operator_admission_and_journal,
+            advance_with_clock_fence, close_operator_admission,
+            reopen_operator_admission_and_journal,
         };
         let _serial = SERIAL.lock().await;
         let (_root, state, _headers, path) = fixture().await;
@@ -3878,8 +4094,12 @@ pub(crate) mod clock_worker_tests {
         // new request if it was received while admission was closed.
         for rejected_origin in [closed_origin, Some(original)] {
             assert!(
-                crate::launch_clock_sync::reset_primary_for_origin(&state, rejected_origin, &expected)
-                    .is_err()
+                crate::launch_clock_sync::reset_primary_for_origin(
+                    &state,
+                    rejected_origin,
+                    &expected
+                )
+                .is_err()
             );
             assert_eq!(state.launch_history.lock().unwrap().snapshot(), expected);
             assert_eq!(std::fs::read(&path).unwrap(), disk);
@@ -3890,7 +4110,8 @@ pub(crate) mod clock_worker_tests {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let work = state.clone();
         let actual = tokio::task::spawn_blocking(move || {
-            let result = crate::launch_clock_sync::reset_primary_for_origin(&work, fresh, &expected);
+            let result =
+                crate::launch_clock_sync::reset_primary_for_origin(&work, fresh, &expected);
             let _ = done_tx.send(result);
         });
         writer.pause.entered().await;
@@ -3902,7 +4123,8 @@ pub(crate) mod clock_worker_tests {
         assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 1);
         let current_generation = crate::gse::automatic_generation(&state);
         assert!(
-            crate::gse::reset_generation::invalidate_capture_epoch(&state, current_generation).is_err()
+            crate::gse::reset_generation::invalidate_capture_epoch(&state, current_generation)
+                .is_err()
         );
         assert_eq!(crate::gse::automatic_generation(&state), current_generation);
         assert_eq!(std::fs::read(&path).unwrap(), disk);
@@ -4045,7 +4267,8 @@ pub(crate) mod clock_worker_tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("sentinel"), b"keep this directory").unwrap();
-        let mut history = state.launch_history.lock().unwrap();
+        let fence = {
+            let mut history = state.launch_history.lock().unwrap();
         assert!(history.inhibit_automatic_actions().is_err());
         let fence = history.close_for_recovery(7).unwrap();
         assert!(history.recovery_quiescent(&fence).is_err());
@@ -4057,7 +4280,8 @@ pub(crate) mod clock_worker_tests {
             b"keep this directory"
         );
         assert_eq!(std::fs::read(sibling).unwrap(), saved);
-        drop(history);
+            fence
+        };
         // Only this explicit repair+retry of the known snapshot resumes IO.
         std::fs::remove_dir_all(&path).unwrap();
         let retried = state
@@ -4188,15 +4412,25 @@ async fn ws_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WsAuthQuery>,
 ) -> impl IntoResponse {
+    let Some(lease) = state.control_ingress.connection() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Control ingress is closed").into_response();
+    };
     let _principal = match state
         .auth
         .authorize_token(&state.auth_db, query.token.as_deref(), Permission::ViewData)
         .await
     {
         Ok(principal) => principal,
-        Err(err) => return auth_failure_response(err),
+        Err(err) => {
+            lease.finish();
+            return auth_failure_response(err);
+        }
     };
-    ws.on_upgrade(move |socket| handle_ws(socket, state, query.token))
+    if state.control_ingress.is_closed() {
+        lease.finish();
+        return (StatusCode::SERVICE_UNAVAILABLE, "Control ingress is closed").into_response();
+    }
+    ws.on_upgrade(move |socket| handle_ws(socket, state, query.token, lease))
 }
 
 /// Shape of commands sent from the frontend over WebSocket:
@@ -4422,11 +4656,17 @@ mod ws_freshness_tests {
     }
 }
 
-async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String>) {
+async fn handle_ws(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    token: Option<String>,
+    connection: crate::control_ingress::Lease,
+) {
     // Subscribe to all three broadcast channels
     let mut telemetry_rx = state.ws_tx.subscribe();
     let mut warnings_rx = state.warnings_tx.subscribe();
     let mut errors_rx = state.errors_tx.subscribe();
+    let mut board_abort_rx = state.board_abort_tx.subscribe();
     let mut state_rx = state.state_tx.subscribe();
     let mut launch_clock_rx = state.launch_clock_tx.subscribe();
     let mut board_status_rx = state.board_status_tx.subscribe();
@@ -4532,6 +4772,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
         if ws_out_tx.send(initial_recording_status).await.is_err() {
             return;
         }
+        let initial_board_abort = serde_json::to_string(&WsOutMsg::BoardAbort(
+            crate::board_abort::snapshot_for_state(&state_for_send),
+        ))
+        .unwrap();
+        if ws_out_tx.send(initial_board_abort).await.is_err() {
+            return;
+        }
         let initial_alert_ack_state = serde_json::to_string(&WsOutMsg::AlertAckState(
             state_for_send.alert_ack_state_snapshot(),
         ))
@@ -4606,6 +4853,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
                     }
                 }
 
+                recv = board_abort_rx.recv() => {
+                    if let Ok(snapshot)=recv
+                        && let Ok(msg)=serde_json::to_string(&WsOutMsg::BoardAbort(snapshot))
+                            && ws_out_tx.send(msg).await.is_err(){break;}
+                }
                 recv = errors_rx.recv() => {
                     match recv {
                         Ok(err) => {
@@ -4974,206 +5226,272 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, token: Option<String
         }
     };
 
-    // Task: client -> server (commands)
-    let recv_task = async move {
-        while let Some(Ok(msg)) = receiver.next().await {
-            if let Message::Text(text) = msg {
-                // Each frame retains its origin across authentication/database waits.
-                let admission_generation =
-                    crate::gse::capture_operator_origin(&state_for_recv).unwrap_or(0);
-                let plumbing_source_ms = state_for_recv.topology_router.get().and_then(|router| {
-                    crate::system_clock::required_control_network_utc_ms(router).ok()
-                });
-                let plumbing_origin =
-                    serde_json::from_str::<WsCommand>(&text)
-                        .ok()
-                        .and_then(|command| {
-                            crate::actuator_plumbing::capture_motion_origin(
-                                &state_for_recv,
-                                &command.cmd,
-                            )
-                        });
-                #[cfg(test)]
-                command_dispatch_tests::notify_ws_command_received(&state_for_recv);
-                let principal = match state_for_recv
-                    .auth
-                    .authorize_token(
-                        &state_for_recv.auth_db,
-                        token.as_deref(),
-                        Permission::SendCommands,
-                    )
-                    .await
-                {
-                    Ok(principal) => principal,
-                    Err(_) => {
-                        emit_notification_warning(
-                            &state_for_recv,
-                            "Command session expired or no longer has permission.",
-                        );
-                        continue;
-                    }
+    // Session close is observed only between frames. An authenticated/manual
+    // frame already running is allowed to finish and retains its own receipt.
+    let mut registry_closing = state.control_ingress.subscribe();
+    let (session_close, mut session_closing) = tokio::sync::watch::channel(false);
+    let receive_registry = state.control_ingress.clone();
+    let mut recv_task = tokio::spawn(async move {
+        loop {
+            if *registry_closing.borrow() || *session_closing.borrow() {
+                break;
+            }
+            let message = tokio::select! {biased;
+                _=registry_closing.changed()=>break,
+                _=session_closing.changed()=>break,
+                message=receiver.next()=>message,
+            };
+            let Some(Ok(message)) = message else {
+                break;
+            };
+            if let Message::Text(text) = message {
+                let Some(frame) = receive_registry.handler() else {
+                    break;
                 };
-                if crate::rrls::is_rrls() {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Some(name) = value.get("cmd").and_then(|value| value.as_str()) {
-                            if !crate::command_proxy::local_operation(name) {
-                                let response = crate::command_proxy::submit_with_plumbing_origin(
-                                    &state_for_recv,
-                                    &principal,
-                                    token.as_deref(),
-                                    crate::command_proxy::Operation::Command(name.into()),
-                                    if name == "RetractPlumbing" {
-                                        plumbing_source_ms
-                                    } else {
-                                        None
-                                    },
-                                )
-                                .await;
-                                if !response.status().is_success() {
-                                    emit_notification_warning(
-                                        &state_for_recv,
-                                        "Primary command request was not admitted; inspect RRLS control status.",
-                                    );
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                }
-                match serde_json::from_str::<WsCommand>(&text) {
-                    Ok(cmd) => {
-                        if !principal.permissions.send_commands {
-                            emit_warning(
-                                &state_for_recv,
-                                format!(
-                                    "Rejected websocket command {:?}: authenticated session lacks send-command permission",
-                                    cmd.cmd
-                                ),
-                            );
-                            continue;
-                        }
-                        let cmd_name = command_name(&cmd.cmd);
-                        if !principal.allows_command_name(cmd_name) {
-                            emit_warning(
-                                &state_for_recv,
-                                format!(
-                                    "Rejected websocket command {:?}: session is not allowed to send {}",
-                                    cmd.cmd, cmd_name
-                                ),
-                            );
-                            continue;
-                        }
-                        if matches!(cmd.cmd, TelemetryCommand::Abort) && !crate::rrls::is_rrls() {
-                            state_for_recv.manual_abort_intent.request();
-                            continue;
-                        }
-                        if !state_for_recv.is_command_allowed(&cmd.cmd) {
-                            emit_notification_warning(
-                                &state_for_recv,
-                                format!(
-                                    "Ignored software command {:?}: command is currently disabled",
-                                    cmd.cmd
-                                ),
-                            );
-                            continue;
-                        }
-                        let now_ms = software_command_clock_ms();
-                        match crate::gse::record_operator_command(
-                            &state_for_recv,
-                            admission_generation,
-                            &cmd.cmd,
-                            now_ms,
-                            software_command_dedup_ms(),
-                        ) {
-                            crate::gse::OperatorCommandAdmission::Stale => {
-                                emit_notification_warning(
-                                    &state_for_recv,
-                                    "Command cancelled by recovery.",
-                                );
-                                continue;
-                            }
-                            crate::gse::OperatorCommandAdmission::Duplicate => {
-                                gs_debug_println!(
-                                    "Ignored duplicate websocket command {:?}",
-                                    cmd.cmd
-                                );
-                                continue;
-                            }
-                            crate::gse::OperatorCommandAdmission::Fresh => {}
-                        }
-                        if matches!(cmd.cmd, TelemetryCommand::ResetTClock) {
-                            let reset_state = state_for_recv.clone();
-                            // Do not stall this WebSocket's Abort/command receiver on disk or radio.
-                            tokio::spawn(async move {
-                                let result = if crate::rrls::is_rrls() {
-                                    crate::launch_clock_sync::request_reset(&reset_state).await
-                                } else {
-                                    let work = reset_state.clone();
-                                    match tokio::task::spawn_blocking(move || {
-                                        reset_primary_clock_for_origin(&work, admission_generation)
-                                    })
-                                    .await
-                                    {
-                                        Ok(Ok(())) => Ok(true),
-                                        Ok(Err((_, error))) => Err(error),
-                                        Err(error) => Err(error.into()),
-                                    }
-                                };
-                                match result {
-                                    Ok(true) => {
-                                        reset_state.add_notification("Primary T clock reset saved");
-                                    }
-                                    Ok(false) => {
-                                        reset_state.add_notification("Primary T clock reset pending; retained clock unchanged");
-                                    }
-                                    Err(error) => {
-                                        reset_state.add_notification(format!(
-                                            "T clock reset not confirmed: {error}"
-                                        ));
-                                    }
-                                }
-                            });
-                            continue;
-                        }
-                        let received_cmd = cmd.cmd;
-                        eprintln!("Accepted websocket command: {:?}", received_cmd);
-                        gs_debug_println!(
-                            "\x1b[32mWebsocket command received: {:?}\x1b[0m",
-                            received_cmd
-                        );
-                        if let Err(e) = cmd_tx
-                            .send(TelemetryCommand::QueuedOperator {
-                                plumbing_origin,
-                                generation: admission_generation,
-                                command: Box::new(received_cmd),
-                            })
-                            .await
-                        {
-                            emit_notification_warning(
-                                &state_for_recv,
-                                "Command worker unavailable; command was not queued",
-                            );
-                            eprintln!("Failed to forward WS command to cmd_tx: {e}");
-                            gs_debug_println!("Failed to forward WS command to cmd_tx: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Invalid WS command JSON {text:?}: {e}");
-                        gs_debug_println!("Invalid WS command JSON {text:?}: {e}");
-                    }
-                }
+                frame
+                    .run(handle_ws_control_text(
+                        state_for_recv.clone(),
+                        token.clone(),
+                        cmd_tx.clone(),
+                        text.to_string(),
+                    ))
+                    .await;
             }
         }
+    });
+    let received = tokio::select! {
+        _=send_task=>false,
+        result=&mut recv_task=>{if result.is_err(){write_task.abort();let _=write_task.await;return;}true},
+        _=&mut write_task=>false,
     };
-
-    // Dropping the other futures closes this session when either direction
-    // or the bounded writer fails. The client reconnects and reseeds history.
-    tokio::select! {
-        _ = send_task => {},
-        _ = recv_task => {},
-        _ = &mut write_task => {},
-    }
+    session_close.send_replace(true);
+    let healthy = received || recv_task.await.is_ok();
     write_task.abort();
+    // The writer emits no controls but must not outlive the terminal session.
+    // Join only if it was not already consumed by select.
+    if !write_task.is_finished() {
+        let _ = write_task.await;
+    }
+    if healthy {
+        connection.finish();
+    }
+}
+
+async fn handle_ws_control_text(
+    state_for_recv: Arc<AppState>,
+    token: Option<String>,
+    cmd_tx: mpsc::Sender<TelemetryCommand>,
+    text: String,
+) {
+    // Each frame retains its origin across authentication/database waits.
+    let frame_name = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("cmd").and_then(|v| v.as_str()).map(str::to_owned));
+    let admission_generation = if frame_name.as_deref() == Some("Abort") {
+        0
+    } else {
+        crate::gse::capture_operator_origin(&state_for_recv).unwrap_or(0)
+    };
+    let launch_revision = frame_name
+        .as_deref()
+        .and_then(|name| crate::board_abort::capture_launch_revision_named(&state_for_recv, name));
+    let remote_launch_origin = frame_name
+        .as_deref()
+        .and_then(|name| crate::command_proxy::capture_rrls_launch_origin(&state_for_recv, name));
+    let plumbing_source_ms =
+        if crate::rrls::is_rrls() && frame_name.as_deref() == Some("RetractPlumbing") {
+            state_for_recv.topology_router.get().and_then(|router| {
+                crate::system_clock::required_control_network_utc_ms(router).ok()
+            })
+        } else {
+            None
+        };
+    let plumbing_origin = serde_json::from_str::<WsCommand>(&text)
+        .ok()
+        .and_then(|command| {
+            crate::actuator_plumbing::capture_motion_origin(&state_for_recv, &command.cmd)
+        });
+    #[cfg(test)]
+    command_dispatch_tests::notify_ws_command_received(&state_for_recv);
+    let principal = match state_for_recv
+        .auth
+        .authorize_token(
+            &state_for_recv.auth_db,
+            token.as_deref(),
+            Permission::SendCommands,
+        )
+        .await
+    {
+        Ok(principal) => principal,
+        Err(_) => {
+            emit_notification_warning(
+                &state_for_recv,
+                "Command session expired or no longer has permission.",
+            );
+            return;
+        }
+    };
+    if crate::rrls::is_rrls()
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Some(name) = value.get("cmd").and_then(|value| value.as_str())
+        && !crate::command_proxy::local_operation(name)
+    {
+        let response = crate::command_proxy::submit_with_origins(
+            &state_for_recv,
+            &principal,
+            token.as_deref(),
+            crate::command_proxy::Operation::Command(name.into()),
+            if name == "RetractPlumbing" {
+                plumbing_source_ms
+            } else {
+                None
+            },
+            remote_launch_origin,
+        )
+        .await;
+        if !response.status().is_success() {
+            emit_notification_warning(
+                &state_for_recv,
+                "Primary command request was not admitted; inspect RRLS control status.",
+            );
+        }
+        return;
+    }
+    match serde_json::from_str::<WsCommand>(&text) {
+        Ok(cmd) => {
+            if !principal.permissions.send_commands {
+                emit_warning(
+                    &state_for_recv,
+                    format!(
+                        "Rejected websocket command {:?}: authenticated session lacks send-command permission",
+                        cmd.cmd
+                    ),
+                );
+                return;
+            }
+            let cmd_name = command_name(&cmd.cmd);
+            if !principal.allows_command_name(cmd_name) {
+                emit_warning(
+                    &state_for_recv,
+                    format!(
+                        "Rejected websocket command {:?}: session is not allowed to send {}",
+                        cmd.cmd, cmd_name
+                    ),
+                );
+                return;
+            }
+            if matches!(cmd.cmd, TelemetryCommand::Abort) && !crate::rrls::is_rrls() {
+                state_for_recv.manual_abort_intent.request();
+                return;
+            }
+            if crate::board_abort::launch_command(command_name(&cmd.cmd)) {
+                if let Err(error) =
+                    crate::board_abort::validate_launch_revision(&state_for_recv, launch_revision)
+                {
+                    emit_notification_warning(&state_for_recv, error);
+                    return;
+                }
+                if let Some(message) = crate::board_abort::blocked_message(&state_for_recv) {
+                    emit_notification_warning(&state_for_recv, message);
+                    return;
+                }
+            }
+            if !state_for_recv.is_command_allowed(&cmd.cmd) {
+                emit_notification_warning(
+                    &state_for_recv,
+                    format!(
+                        "Ignored software command {:?}: command is currently disabled",
+                        cmd.cmd
+                    ),
+                );
+                return;
+            }
+            let now_ms = software_command_clock_ms();
+            match crate::gse::record_operator_command_with_launch_origin(
+                &state_for_recv,
+                admission_generation,
+                &cmd.cmd,
+                now_ms,
+                software_command_dedup_ms(),
+                launch_revision,
+            ) {
+                Err(message) => {
+                    emit_notification_warning(&state_for_recv, message);
+                    return;
+                }
+                Ok(crate::gse::OperatorCommandAdmission::Stale) => {
+                    emit_notification_warning(&state_for_recv, "Command cancelled by recovery.");
+                    return;
+                }
+                Ok(crate::gse::OperatorCommandAdmission::Duplicate) => {
+                    gs_debug_println!("Ignored duplicate websocket command {:?}", cmd.cmd);
+                    return;
+                }
+                Ok(crate::gse::OperatorCommandAdmission::Fresh) => {}
+            }
+            if matches!(cmd.cmd, TelemetryCommand::ResetTClock) {
+                let reset_state = state_for_recv.clone();
+                // Do not stall this WebSocket's Abort/command receiver on disk or radio.
+                tokio::spawn(async move {
+                    let result = if crate::rrls::is_rrls() {
+                        crate::launch_clock_sync::request_reset(&reset_state).await
+                    } else {
+                        let work = reset_state.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            reset_primary_clock_for_origin(&work, admission_generation)
+                        })
+                        .await
+                        {
+                            Ok(Ok(())) => Ok(true),
+                            Ok(Err((_, error))) => Err(error),
+                            Err(error) => Err(error.into()),
+                        }
+                    };
+                    match result {
+                        Ok(true) => {
+                            reset_state.add_notification("Primary T clock reset saved");
+                        }
+                        Ok(false) => {
+                            reset_state.add_notification(
+                                "Primary T clock reset pending; retained clock unchanged",
+                            );
+                        }
+                        Err(error) => {
+                            reset_state
+                                .add_notification(format!("T clock reset not confirmed: {error}"));
+                        }
+                    }
+                });
+                return;
+            }
+            let received_cmd = cmd.cmd;
+            eprintln!("Accepted websocket command: {:?}", received_cmd);
+            gs_debug_println!(
+                "\x1b[32mWebsocket command received: {:?}\x1b[0m",
+                received_cmd
+            );
+            if let Err(e) = cmd_tx
+                .send(TelemetryCommand::QueuedOperator {
+                    launch_revision,
+                    plumbing_origin,
+                    generation: admission_generation,
+                    command: Box::new(received_cmd),
+                })
+                .await
+            {
+                emit_notification_warning(
+                    &state_for_recv,
+                    "Command worker unavailable; command was not queued",
+                );
+                eprintln!("Failed to forward WS command to cmd_tx: {e}");
+                gs_debug_println!("Failed to forward WS command to cmd_tx: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!("Invalid WS command JSON {text:?}: {e}");
+            gs_debug_println!("Invalid WS command JSON {text:?}: {e}");
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -5240,7 +5558,7 @@ async fn get_alerts(
         alerts.push(alert);
     }
 
-    alerts.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
+    alerts.sort_by_key(|alert| std::cmp::Reverse(alert.timestamp_ms));
     alerts.dedup_by(|a, b| {
         a.timestamp_ms == b.timestamp_ms && a.severity == b.severity && a.message == b.message
     });

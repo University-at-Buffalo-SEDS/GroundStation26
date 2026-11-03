@@ -153,7 +153,7 @@ impl Tracker {
         if sender.is_empty() || sender == "GS" || sender.starts_with('@') {
             return false;
         }
-        self.record(&sender, now, wall_ms).diagnostics = Some((report, now));
+        self.record(sender, now, wall_ms).diagnostics = Some((report, now));
         true
     }
     pub fn observe_sd_status(

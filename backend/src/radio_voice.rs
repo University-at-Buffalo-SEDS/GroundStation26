@@ -54,7 +54,7 @@ impl Tx {
             return Err("Radio voice accepts only 20 ms mono PCM16 frames".into());
         }
         self.last = Instant::now();
-        for pair in pcm.chunks_exact(2) {
+        for pair in pcm.as_chunks::<2>().0.iter() {
             self.pcm[self.used] = i16::from_le_bytes([pair[0], pair[1]]);
             self.used += 1;
         }

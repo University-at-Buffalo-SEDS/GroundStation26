@@ -425,6 +425,7 @@ where
     ))
 }
 
+#[cfg_attr(all(target_os = "linux", target_pointer_width = "64"), expect(clippy::useless_conversion, reason = "Keep fallible time_t conversion for 32-bit Linux timestamp range rejection"))]
 async fn set_os_time(utc_ms: i64) -> Result<(), String> {
     time_argument(utc_ms).map_err(str::to_string)?;
     if let Some(reason) = os_clock_unavailable_reason() {

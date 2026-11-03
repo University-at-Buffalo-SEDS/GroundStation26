@@ -250,8 +250,8 @@ fn observe_at(row: &TelemetryRow, source_ms: Option<u64>, network_utc_ms: Option
     } else if matches!(
         row.data_type.as_str(),
         "RSSI_DBM" | "RFD_RSSI_DBM" | "RSSI" | "RFD_RSSI"
-    ) {
-        if let Some(value) = row
+    )
+        && let Some(value) = row
             .values
             .first()
             .copied()
@@ -274,7 +274,6 @@ fn observe_at(row: &TelemetryRow, source_ms: Option<u64>, network_utc_ms: Option
                 Instant::now(),
             ));
         }
-    }
 }
 pub fn local_fix() -> Option<Fix> {
     cache()
@@ -501,7 +500,26 @@ pub fn decode_position(data: &[u8]) -> Option<Fix> {
         manual: false,
     };
     (fix.valid() && fix.age_ms <= FIX_FRESH_MS).then_some(fix)
+}/// RF only emits GPS_DATA when gps_has_fix() is true. FC's GPS_DATA contains
+/// filtered/relative coordinates and cannot prove a current receiver lock.
+#[cfg(not(feature = "hitl_mode"))]
+pub fn rocket_launch_fix_locked() -> bool {
+    cache().lock().unwrap().rocket[0]
+        .as_ref()
+        .is_some_and(|value| {
+            let fix = value.snapshot();
+            fix.valid() && !fix.stale && fix.altitude_m.is_some()
+        })
 }
+
+#[cfg(test)]
+pub(crate) fn clear_rocket_fix_for_test() {
+    let mut cache = cache().lock().unwrap();
+    cache.rocket[0] = None;
+    cache.rf_no_fix = None;
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,23 +792,4 @@ mod tests {
         bad[34..38].copy_from_slice(&15_001u32.to_le_bytes());
         assert!(decode_position(&bad).is_none());
     }
-}
-
-/// RF only emits GPS_DATA when gps_has_fix() is true. FC's GPS_DATA contains
-/// filtered/relative coordinates and cannot prove a current receiver lock.
-#[cfg(not(feature = "hitl_mode"))]
-pub fn rocket_launch_fix_locked() -> bool {
-    cache().lock().unwrap().rocket[0]
-        .as_ref()
-        .is_some_and(|value| {
-            let fix = value.snapshot();
-            fix.valid() && !fix.stale && fix.altitude_m.is_some()
-        })
-}
-
-#[cfg(test)]
-pub(crate) fn clear_rocket_fix_for_test() {
-    let mut cache = cache().lock().unwrap();
-    cache.rocket[0] = None;
-    cache.rf_no_fix = None;
 }

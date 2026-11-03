@@ -6,8 +6,7 @@ pub(crate) use turbocharge::{mass_calibration_signature, observe_valve_pressure_
 mod automatic_abort;
 #[cfg(test)]
 mod rrls_http_tests;
-// Staged, tested implementation only: no verified Reset API is exposed yet.
-#[cfg(test)]
+// Verified recovery coordinator uses the same bounded owner primitives.
 pub(crate) mod reset_generation;
 #[cfg(any(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
 pub(crate) use automatic_abort::claim_automatic_abort;
@@ -294,6 +293,7 @@ impl Runtime {
             self.operational.target_reached = None;
             self.operational.last_correction_ms = None;
             self.operational.qd = QdWait::default();
+            self.operational.qd_launch_admission = None;
         }
     }
     /// Actual valve reports and their source ages; command intent is never evidence.
@@ -769,13 +769,15 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
     let closed = |index: usize| {
         rt.valves[index].is_some_and(|v| !v.open && v.at_ms <= now && now - v.at_ms <= 2_000)
     };
-    if matches!(cmd, TelemetryCommand::Nitrogen)
+    if state.supply_enforcement_enabled()
+        && matches!(cmd, TelemetryCommand::Nitrogen)
         && !rt.valves[3].is_some_and(|v| v.open)
         && (rt.engine.nitrous_session() || !closed(4))
     {
         return Some(false);
     }
-    if matches!(cmd, TelemetryCommand::Nitrous)
+    if state.supply_enforcement_enabled()
+        && matches!(cmd, TelemetryCommand::Nitrous)
         && !rt.valves[4].is_some_and(|v| v.open)
         && !closed(3)
     {
@@ -956,6 +958,7 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
                                 .latch(Fault::MissingTelemetry);
                             rt.operational.running = false;
                             rt.operational.qd = QdWait::default();
+                            rt.operational.qd_launch_admission = None;
                             let _ = rt.operational.persist();
                         }
                         rt.fill_trim = None;
@@ -1023,9 +1026,17 @@ pub(crate) fn handle_command_with_motion_origin(
     cmd: &TelemetryCommand,
     plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
 ) -> bool {
+    handle_command_with_origins(state, cmd, plumbing_origin, None)
+}
+pub(crate) fn handle_command_with_origins(
+    state: &Arc<AppState>,
+    cmd: &TelemetryCommand,
+    plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+    launch_revision: Option<u64>,
+) -> bool {
     let handled = {
         let _dispatch = DISPATCH_GATE.lock().unwrap();
-        handle_command_inner(state, cmd, plumbing_origin)
+        handle_command_inner(state, cmd, plumbing_origin, launch_revision)
     };
     flush_effects(state);
     handled
@@ -1042,9 +1053,10 @@ fn handle_command_inner(
     state: &Arc<AppState>,
     cmd: &TelemetryCommand,
     plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+    launch_revision: Option<u64>,
 ) -> bool {
     #[cfg(feature = "hitl_mode")]
-    let _ = plumbing_origin;
+    let _ = (plumbing_origin, launch_revision);
     if matches!(cmd, TelemetryCommand::Turbocharge) {
         turbocharge::request(state);
         return true;
@@ -1076,7 +1088,7 @@ fn handle_command_inner(
         return true;
     }
     #[cfg(not(feature = "hitl_mode"))]
-    if handle_operational_command(state, cmd, plumbing_origin) {
+    if handle_operational_command(state, cmd, plumbing_origin, launch_revision) {
         return true;
     }
     #[cfg(feature = "hitl_mode")]
@@ -1150,8 +1162,8 @@ fn handle_command_inner(
                     rt.operational.running = true;
                     rt.operational.run_generation = rt.operational.saved.qualification.generation();
                     rt.operational.target_reached = None;
-                    if action == Action::StartFill {
-                        if let Err(error) = rt.operational.begin_fill() {
+                    if action == Action::StartFill
+                        && let Err(error) = rt.operational.begin_fill() {
                             rt.operational.running = false;
                             let now = rt.now();
                             return {
@@ -1163,7 +1175,6 @@ fn handle_command_inner(
                                 true
                             };
                         }
-                    }
                 }
                 result
             }
@@ -1229,7 +1240,7 @@ pub(crate) fn start_fill_after_automatic_zero(state: &Arc<AppState>, generation:
         }
         state.gse.lock().unwrap().observe_mass(Some(0.0));
         *state.latest_fill_mass_kg.lock().unwrap() = Some(0.0);
-        handle_command_inner(state, &TelemetryCommand::StartFill, None);
+        handle_command_inner(state, &TelemetryCommand::StartFill, None, None);
         claim
     };
     flush_effects(state);
@@ -1283,7 +1294,7 @@ pub(crate) fn cancel_fill_for_recoverable_fault_for_generation(
             rt.engine.active() || rt.fill_trim.is_some()
         };
         if active && prelaunch(state) {
-            handle_command_inner(state, &TelemetryCommand::CancelFill, None);
+            handle_command_inner(state, &TelemetryCommand::CancelFill, None, None);
             state.add_temporary_notification(format!("Fill cancelled: {reason}"));
         }
         claim
@@ -2472,6 +2483,59 @@ fn require_primary_operational_station() -> Result<(), (StatusCode, String)> {
         Ok(())
     }
 }
+pub(crate) fn verified_recovery_host_idle(state: &AppState) -> bool {
+    let rt = state.gse.lock().unwrap();
+    if rt.engine.active() {
+        return false;
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    if rt.operational.running || rt.automatic_abort_in_flight {
+        return false;
+    }
+    true
+}
+/// Called only by the closed verified Reset ALL owner after all seven boards
+/// applied Startup. This does not publish state, reopen, or dispatch outputs.
+pub(crate) fn prepare_verified_startup(state: &Arc<AppState>) -> Result<(), &'static str> {
+    let mut rt = state.gse.lock().unwrap();
+    if rt.engine.active() {
+        return Err("Sequence still active");
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    {
+        if rt.operational.running || rt.automatic_abort_in_flight {
+            return Err("GSE owner still active");
+        }
+        rt.operational
+            .saved
+            .qualification
+            .reset()
+            .map_err(|_| "Qualification reset refused")?;
+        rt.operational.saved.baseline = None;
+        rt.operational.saved.fill_target_kg = None;
+        rt.operational.saved.turbocharge = None;
+        rt.operational.saved.turbocharge_binding = None;
+        rt.operational.saved.pending_checklists.clear();
+        rt.operational.saved.checklist_digest = None;
+        rt.operational.saved.automatic_abort_claimed = false;
+        rt.operational
+            .persist()
+            .map_err(|_| "Qualification persistence failed")?;
+        crate::checklists::reset_sequence_completions()
+            .map_err(|_| "Checklist reset persistence failed")?;
+        rt.operational.qd = QdWait::default();
+        rt.operational.qd_launch_admission = None;
+        rt.operational.qd_dispatch_utc_ms = None;
+        rt.operational.startup_configured = true;
+    }
+    let config = rt.engine.config.clone();
+    rt.engine = Engine::default();
+    rt.engine.config = config;
+    rt.engine.config.dry_self_test_confirmed = false;
+    rt.manual_control = false;
+    rt.fill_trim = None;
+    Ok(())
+}
 /// Operator recovery only: never dispatch a valve, ignition or launch command.
 fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)> {
     require_primary_operational_station()?;
@@ -2570,6 +2634,7 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
         rt.operational.persist_error = None;
         rt.operational.qd = QdWait::default();
+        rt.operational.qd_launch_admission = None;
         rt.operational.qd_dispatch_utc_ms = None;
         // Do not restart automatic boot valve setup during abort recovery.
         // The next explicit self-test establishes and checks its own baseline.
@@ -2643,11 +2708,11 @@ async fn reset_qualification(State(state): State<Arc<AppState>>, headers: Header
     };
     #[cfg(feature = "hitl_mode")]
     {
-        return (
+        (
             StatusCode::CONFLICT,
             "Operational qualification is not used in HITL",
         )
-            .into_response();
+            .into_response()
     }
     #[cfg(not(feature = "hitl_mode"))]
     {
@@ -2675,6 +2740,7 @@ async fn reset_qualification(State(state): State<Arc<AppState>>, headers: Header
         rt.operational.saved.fill_target_kg = None;
         rt.operational.persist_error = None;
         rt.operational.qd = QdWait::default();
+        rt.operational.qd_launch_admission = None;
         let config = rt.engine.config.clone();
         rt.engine = Engine::default();
         rt.engine.config = config;
@@ -2885,6 +2951,7 @@ fn controller_delivery_pending(state: &AppState) -> bool {
 /// held across durable I/O; a changed Stop epoch invalidates final admission.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LaunchAdmission {
+    board_abort_revision: u64,
     generation: u64,
     manual_epoch: u64,
     observed_manual_epoch: u64,
@@ -2893,8 +2960,34 @@ impl LaunchAdmission {
     fn trackable(&self) -> bool {
         self.manual_epoch != u64::MAX && self.observed_manual_epoch != u64::MAX
     }
-    fn capture(state: &AppState) -> Self {
+    fn capture_for_launch(state: &AppState, revision: Option<u64>) -> Result<Self, String> {
+        // Capture Stop first: a concurrent Stop cannot become a fresh epoch
+        // between validating an older launch revision and taking its ticket.
+        let mut ticket = Self::capture(state);
+        if !ticket.trackable() {return Err("Stop epoch exhausted; unsafe launch admission refused".into());}
+        let revision = crate::board_abort::validate_launch_revision(state, revision)?;
+        ticket.board_abort_revision = revision;
+        Ok(ticket)
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    fn remains_current(self, state: &AppState) -> bool {
+        self.trackable()
+            && self.generation == automatic_generation(state)
+            && self.board_abort_revision == state.board_abort.abort_revision()
+            && self.manual_epoch == state.manual_abort_intent.epoch()
+            && self.observed_manual_epoch == state.deferred_abort.manual_epoch()
+            && !manual_stop_pending(state)
+    }
+    pub(crate) fn original_ownership(self) -> (u64, u64, u64) {
+        (
+            self.generation,
+            self.manual_epoch,
+            self.observed_manual_epoch,
+        )
+    }
+    pub(crate) fn capture(state: &AppState) -> Self {
         Self {
+            board_abort_revision: state.board_abort.abort_revision(),
             generation: automatic_generation(state),
             manual_epoch: state.manual_abort_intent.epoch(),
             observed_manual_epoch: state.deferred_abort.manual_epoch(),
@@ -2948,14 +3041,33 @@ pub(crate) fn with_plumbing_admission<T>(
     ticket: LaunchAdmission,
     admit: impl FnOnce() -> T,
 ) -> Result<T, &'static str> {
+    with_plumbing_admission_inner(state, ticket, admit, false)
+}
+fn with_plumbing_admission_inner<T>(
+    state: &AppState,
+    ticket: LaunchAdmission,
+    admit: impl FnOnce() -> T,
+    prepared: bool,
+) -> Result<T, &'static str> {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
     if manual_stop_pending(state) {
         return Err("Manual Stop is pending; plumbing admission refused");
     }
+    if prepared {
+        #[cfg(test)]
+        nonwaiting_admission_tests::after_prepared(state);
+    }
     with_stop_admission(state, ticket, admit)
 }
-pub(crate) fn queue_plumbing_under_dispatch_with_stop_fence(
+pub(crate) fn with_prepared_motion_admission<T>(
     state: &AppState,
+    ticket: LaunchAdmission,
+    admit: impl FnOnce() -> T,
+) -> Result<T, &'static str> {
+    with_plumbing_admission_inner(state, ticket, admit, true)
+}
+pub(crate) fn queue_plumbing_under_dispatch_with_stop_fence(
+    state: &Arc<AppState>,
     router: &sedsnet::router::Router,
     origin: Option<crate::actuator_plumbing::MotionOrigin>,
     logged: bool,
@@ -2964,13 +3076,10 @@ pub(crate) fn queue_plumbing_under_dispatch_with_stop_fence(
         return Err("Manual Stop is pending; plumbing motion was not queued".into());
     }
     let ticket = LaunchAdmission::capture(state);
-    with_stop_admission(state, ticket, || {
-        crate::actuator_plumbing::queue_motion_under_dispatch(state, router, origin, logged)
-    })
-    .map_err(str::to_string)?
+    crate::actuator_plumbing::schedule_motion_under_dispatch(state, router, origin, logged, ticket)
 }
 pub(crate) fn queue_plumbing_with_stop_fence(
-    state: &AppState,
+    state: &Arc<AppState>,
     router: &sedsnet::router::Router,
     origin: Option<crate::actuator_plumbing::MotionOrigin>,
 ) -> Result<(), String> {
@@ -2978,13 +3087,50 @@ pub(crate) fn queue_plumbing_with_stop_fence(
     queue_plumbing_under_dispatch_with_stop_fence(state, router, origin, false)
 }
 
+/// Caller already owns DISPATCH; reserve a RAM-only owned worker with the
+/// same board→Stop order as final Launch admission. No IO/SDK in reserve.
+pub(crate) fn reserve_plumbing_worker(
+    state: &AppState,
+    ticket: LaunchAdmission,
+    reserve: impl FnOnce() -> bool,
+) -> bool {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    reserve_plumbing_worker_under_dispatch(state, ticket, reserve)
+}
+pub(crate) fn reserve_plumbing_worker_under_dispatch(
+    state: &AppState,
+    ticket: LaunchAdmission,
+    reserve: impl FnOnce() -> bool,
+) -> bool {
+    state
+        .board_abort
+        .change_launch_context_if(|| with_stop_admission(state, ticket, reserve).unwrap_or(false))
+}
 pub(crate) fn queue_controller_with_stop_fence(
     state: &AppState,
     router: &sedsnet::router::Router,
     kind: sedsnet::config::DataType,
     payload: &[u8],
 ) -> sedsnet::TelemetryResult<bool> {
-    let ticket = LaunchAdmission::capture(state);
+    let revision = crate::board_abort::controller_can_launch(kind, payload)
+        .then(|| state.board_abort.abort_revision());
+    queue_controller_with_launch_revision(state, router, kind, payload, revision)
+}
+pub(crate) fn queue_controller_with_launch_revision(
+    state: &AppState,
+    router: &sedsnet::router::Router,
+    kind: sedsnet::config::DataType,
+    payload: &[u8],
+    launch_revision: Option<u64>,
+) -> sedsnet::TelemetryResult<bool> {
+    let ticket = if crate::board_abort::controller_can_launch(kind, payload) {
+        let Ok(ticket) = LaunchAdmission::capture_for_launch(state, launch_revision) else {
+            return Ok(false);
+        };
+        ticket
+    } else {
+        LaunchAdmission::capture(state)
+    };
     let packet = crate::telemetry_task::controller_packet(router, kind, payload)?;
     // Only the explicit hardware abort-safe directions bypass the fence.
     if abort_safe_control(kind, payload) {
@@ -2994,9 +3140,38 @@ pub(crate) fn queue_controller_with_stop_fence(
     if manual_stop_pending(state) {
         return Ok(false);
     }
-    match with_stop_admission(state, ticket, || router.tx_queue(packet)) {
-        Ok(result) => result.map(|()| true),
-        Err(_) => Ok(false),
+    #[cfg(test)]
+    nonwaiting_admission_tests::after_prepared_packet(state,&packet);
+    let started=Instant::now();
+    loop {
+        if state.abort_indicator_latched() {return Ok(false);}
+    let attempt_packet=packet.clone();
+    let result = if crate::board_abort::controller_can_launch(kind, payload) {
+        state
+            .board_abort
+            .admit_launch(
+                state,
+                crate::board_abort::required_mask(state),
+                ticket.board_abort_revision,
+                || with_stop_admission(state, ticket, || router.try_tx_queue(attempt_packet)),
+            )
+            .and_then(|v| v.map_err(|error| error.to_string()))
+    } else {
+        with_stop_admission(state, ticket, || router.try_tx_queue(attempt_packet))
+            .map_err(|error| error.to_string())
+    };
+    match result {
+        Ok(Err(sedsnet::TelemetryError::Io("router core busy")))
+            if started.elapsed()<std::time::Duration::from_millis(100)=>{
+                #[cfg(test)]
+                nonwaiting_admission_tests::core_busy_refused(state);
+                // No SDK owner exists. Sleep outside board/Stop locks and
+                // retry this exact original packet/ticket, never a new intent.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        Ok(result)=>return result.map(|()|true),
+        Err(_)=>return Ok(false),
+    }
     }
 }
 
@@ -3007,6 +3182,7 @@ fn with_stop_admission<T>(
     ticket: LaunchAdmission,
     admit: impl FnOnce() -> T,
 ) -> Result<T, &'static str> {
+    if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) { return Err("Ground station is shutting down"); }
     if !ticket.trackable() {
         return Err("Stop epoch exhausted; unsafe control/launch admission refused");
     }
@@ -3018,7 +3194,9 @@ fn with_stop_admission<T>(
         .admit_if_unchanged(ticket.manual_epoch, || {
             state
                 .deferred_abort
-                .admit_if_no_manual_since(ticket.observed_manual_epoch, admit)
+                .admit_if_no_manual_since(ticket.observed_manual_epoch, || {
+                    if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) { None } else { Some(admit()) }
+                }).flatten()
         })
         .flatten()
         .ok_or("Manual Abort invalidated launch admission; no launch effect was admitted")
@@ -3028,13 +3206,22 @@ fn with_launch_admission<T>(
     state: &AppState,
     ticket: LaunchAdmission,
     admit: impl FnOnce() -> T,
-) -> Result<T, &'static str> {
+) -> Result<T, String> {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
-    with_stop_admission(state, ticket, admit)
+    with_stop_admission(state, ticket, || ()).map_err(str::to_string)?;
+    let required = crate::board_abort::required_mask(state);
+    state
+        .board_abort
+        .admit_launch(state, required, ticket.board_abort_revision, || {
+            with_stop_admission(state, ticket, admit)
+        })
+        .and_then(|v| v.map_err(|error| error.to_string()))
 }
 
-/// Public SDK435 tx_queue cannot invoke local/side callbacks. Packets are
-/// built before entering the short intent locks. A second admission can fail
+/// Registry SDK438 try_tx_queue does not wait for the router-core mutex or
+/// invoke local/side callbacks. Schema/configuration and allocation may still
+/// contend; no universal wait-free bound is promised. Packets are prepared
+/// before entering the short intent locks. A second admission can fail
 /// after the first succeeds; that is not an atomic batch or an automatic retry.
 pub(crate) fn queue_admitted_launch_packets(
     state: &AppState,
@@ -3042,20 +3229,102 @@ pub(crate) fn queue_admitted_launch_packets(
     ticket: LaunchAdmission,
     packets: Vec<sedsnet::packet::Packet>,
 ) -> Result<usize, String> {
+    with_stop_admission(state, ticket, || ()).map_err(str::to_string)?;
+    let prepared = if cfg!(feature = "hitl_mode") {
+        None
+    } else {
+        Some(
+            crate::network_variables::prepare_launch_state(router).map_err(|e| {
+                format!("Launch preparation failed with no SDK launch admitted: {e}")
+            })?,
+        )
+    };
+    queue_prepared_launch_packets(state, router, ticket, packets, prepared)
+}
+
+pub(crate) fn queue_state_launch(
+    state: &AppState,
+    router: &sedsnet::router::Router,
+    launch_revision: Option<u64>,
+) -> Result<usize, String> {
+    let ticket = LaunchAdmission::capture_for_launch(state, launch_revision)?;
+    let prepared =
+        crate::network_variables::prepare_launch_state(router).map_err(|e| e.to_string())?;
+    queue_prepared_launch_packets(state, router, ticket, Vec::new(), Some(prepared))
+}
+
+pub(crate) fn queue_prepared_launch_packets(
+    state: &AppState,
+    router: &sedsnet::router::Router,
+    ticket: LaunchAdmission,
+    mut packets: Vec<sedsnet::packet::Packet>,
+    prepared: Option<crate::network_variables::PreparedLaunchState>,
+) -> Result<usize, String> {
+    if let Some(prepared) = &prepared {
+        packets.insert(0, prepared.packet.clone());
+    }
     let total = packets.len();
+    #[cfg(test)]
+    nonwaiting_admission_tests::after_prepared(state);
     let result = with_launch_admission(state, ticket, || {
         let mut accepted = 0;
         for packet in packets {
-            if let Err(error) = router.tx_queue(packet) {
+            if let Err(error) = router.try_tx_queue(packet) {
                 return Err((accepted, error));
             }
             accepted += 1;
         }
         Ok(accepted)
-    })
-    .map_err(str::to_string)?;
-    result.map_err(|(accepted, error)| format!(
-        "Launch SDK admission accepted {accepted}/{total} packets: {error}; launch remains inhibited, manual recovery required"))
+    })?;
+    let accepted = match &result {
+        Ok(n) => *n,
+        Err((n, _)) => *n,
+    };
+    // Even a partial batch has real SDK owners. Persist/describe that admitted
+    // Launch truthfully; no implicit retry and no automatic Abort are allowed.
+    if let Some(prepared) = prepared.filter(|_| accepted > 0) {
+        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        with_stop_admission(state,ticket,||()) .map_err(|e|format!("SDK admitted {accepted}/{total} Launch packets, but {e}; explicit recovery required"))?;
+        let claim=claim_operator_dispatch_under_gate(state,ticket.generation).ok_or_else(||format!("SDK admitted {accepted}/{total} Launch packets, recovery closed before publication"))?;
+        crate::network_variables::commit_admitted_launch(&prepared).map_err(|e| {
+            format!(
+                "SDK admitted {accepted}/{total} Launch packets, desired publication failed: {e}"
+            )
+        })?;
+        with_stop_admission(state,ticket,||()).map_err(|e|format!("SDK admitted {accepted}/{total} Launch packets, newer Stop prevents local Launch publication: {e}"))?;
+        state.set_local_flight_state_with_clock_claim(FlightState::Launch, &claim);
+    }
+    result.map_err(|(accepted,error)|format!("Launch SDK admission accepted {accepted}/{total} packets: {error}; launch remains inhibited, explicit manual recovery required"))
+}
+
+#[cfg(feature = "testing")]
+pub(crate) fn admit_simulated_retraction_stamped(
+    state: &AppState,
+    origin: Option<crate::actuator_plumbing::MotionOrigin>,
+    effect: impl FnOnce(u64,u64) -> bool,
+) -> Result<(), String> {
+    let ticket = LaunchAdmission::capture(state);
+    let router = state
+        .topology_router
+        .get()
+        .ok_or("Testing telemetry router unavailable")?;
+    // Sampling/validation is outside the shared admission boundary.
+    let source = crate::actuator_plumbing::validated_motion_stamp(state, router, origin)?;
+    let observed_utc=crate::system_clock::required_control_network_utc_ms(router).map_err(|_|"Testing canonical UTC unavailable")?;
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let mut accepted = false;
+    state.board_abort.change_launch_context_if(|| {
+        with_stop_admission(state, ticket, || {
+            accepted = effect(source,observed_utc);
+            accepted && crate::actuator_plumbing::record_modeled_retraction(state, source, ticket)
+        })
+        .unwrap_or(false)
+    });
+    if accepted {
+        Ok(())
+    } else {
+        Err("The model did not accept the original retraction intent".into())
+    }
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -3064,7 +3333,8 @@ pub(crate) fn admit_simulated_launch(
     ticket: LaunchAdmission,
     launch: impl FnOnce() -> bool,
 ) -> Result<(), String> {
-    let accepted = with_launch_admission(state, ticket, launch).map_err(str::to_string)?;
+    let accepted =
+        with_launch_admission(state, ticket, launch).map_err(|error| error.to_string())?;
     if accepted {
         Ok(())
     } else {
@@ -3078,17 +3348,27 @@ pub(crate) fn admit_simulated_launch(
 /// Serialize launch admission against automatic valve-effect preparation in every mode.
 /// T-clock reset and delayed flight-state packets cannot re-enable automation.
 #[cfg(any(test, feature = "hitl_mode", feature = "testing"))]
-pub(crate) fn inhibit_automatic_actions_for_launch(
+pub(crate) fn inhibit_automatic_actions_for_launch_revision(
     state: &Arc<AppState>,
+    launch_revision: Option<u64>,
 ) -> Result<LaunchAdmission, String> {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
-    let ticket = LaunchAdmission::capture(state);
+    let ticket = LaunchAdmission::capture_for_launch(state, launch_revision)?;
     if !ticket.trackable() {
         return Err("Stop epoch exhausted; launch was not admitted".into());
     }
     if controller_delivery_pending(state) {
         return Err("Controller command delivery is pending; launch was not dispatched".into());
     }
+    state
+        .board_abort
+        .admit_launch(
+            state,
+            crate::board_abort::required_mask(state),
+            ticket.board_abort_revision,
+            || (),
+        )
+        .map_err(|error| error.to_string())?;
     let runtime = state.gse.lock().unwrap();
     if state
         .launch_history
@@ -3096,7 +3376,7 @@ pub(crate) fn inhibit_automatic_actions_for_launch(
         .unwrap()
         .automatic_actions_inhibited()
     {
-        return Err("Launch already admitted; explicit verified Startup reset is required".into());
+        return Err("Launch preparation or admission is retained; explicit verified Startup reset is required".into());
     }
     if runtime.automatic_abort_in_flight {
         return Err("Automatic abort is pending; launch was not dispatched".into());
@@ -3112,19 +3392,41 @@ pub(crate) fn inhibit_automatic_actions_for_launch(
         })
 }
 
+#[cfg(test)]
+pub(crate) fn inhibit_automatic_actions_for_launch(
+    state: &Arc<AppState>,
+) -> Result<LaunchAdmission, String> {
+    inhibit_automatic_actions_for_launch_revision(
+        state,
+        crate::board_abort::capture_launch_revision_named(state, "Launch"),
+    )
+}
+
 /// Commit once before dispatch, so service restart never repeats an irreversible Fire intent.
 #[cfg(not(feature = "hitl_mode"))]
-pub(crate) fn commit_fire_intent(state: &Arc<AppState>) -> Result<LaunchAdmission, String> {
+pub(crate) fn commit_fire_intent_revision(
+    state: &Arc<AppState>,
+    launch_revision: Option<u64>,
+) -> Result<LaunchAdmission, String> {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
-    let ticket = LaunchAdmission::capture(state);
-    let clock_claim = claim_operator_dispatch_under_gate(state, ticket.generation)
-        .ok_or_else(|| "Recovery admission is closed; Fire was not admitted".to_string())?;
+    let ticket = LaunchAdmission::capture_for_launch(state, launch_revision)?;
     if !ticket.trackable() {
         return Err("Stop epoch exhausted; launch was not admitted".into());
     }
     if controller_delivery_pending(state) {
         return Err("Controller command delivery is pending; launch was not dispatched".into());
     }
+    state
+        .board_abort
+        .admit_launch(
+            state,
+            crate::board_abort::required_mask(state),
+            ticket.board_abort_revision,
+            || (),
+        )
+        .map_err(|error| error.to_string())?;
+    let _clock_claim = claim_operator_dispatch_under_gate(state, ticket.generation)
+        .ok_or_else(|| "Recovery admission is closed; Fire was not admitted".to_string())?;
     let mut rt = state.gse.lock().unwrap();
     if state
         .launch_history
@@ -3132,7 +3434,7 @@ pub(crate) fn commit_fire_intent(state: &Arc<AppState>) -> Result<LaunchAdmissio
         .unwrap()
         .automatic_actions_inhibited()
     {
-        return Err("Launch already admitted; explicit verified Startup reset is required".into());
+        return Err("Launch preparation or admission is retained; explicit verified Startup reset is required".into());
     }
     if rt.operational.saved.automatic_abort_claimed || rt.automatic_abort_in_flight {
         return Err("Automatic abort is pending; clear GSE abort before Fire".into());
@@ -3155,18 +3457,36 @@ pub(crate) fn commit_fire_intent(state: &Arc<AppState>) -> Result<LaunchAdmissio
     // From this point even a checklist-storage failure must not re-arm the operation.
     let checklist_result = rt.operational.flush_checklists();
     drop(rt);
-    state.set_local_flight_state_with_clock_claim(FlightState::Launch, &clock_claim);
+    // Actual Launch publication follows final SDK admission, never preparation.
     checklist_result.map(|()| ticket).map_err(|error| {
         format!("Fire intent saved, but checklist update failed; manual recovery required: {error}")
     })
 }
 
 #[cfg(all(test, not(feature = "hitl_mode")))]
+pub(crate) fn commit_fire_intent(state: &Arc<AppState>) -> Result<LaunchAdmission, String> {
+    commit_fire_intent_revision(
+        state,
+        crate::board_abort::capture_launch_revision_named(state, "Launch"),
+    )
+}
+
+/// Modeled prerequisite for older unit fixtures. Actual nonce-correlated SDK
+/// readback and restart/missing-proof refusal are covered by coordinator tests.
+#[cfg(test)]
+pub(crate) fn qualified_launch_proofs_for_test(state:&AppState) {
+    for board in crate::board_abort::BOARDS {
+        let at=Instant::now();
+        state.board_abort.observe_status(board,42,8,1,Some(1),false,true,at,0,at,1);
+    }
+}
+#[cfg(all(test, not(feature = "hitl_mode")))]
 pub(crate) fn armed_fixture_for_test(
     state: &Arc<AppState>,
     router: &Arc<sedsnet::router::Router>,
 ) -> std::path::PathBuf {
     use crate::types::Board;
+    qualified_launch_proofs_for_test(state);
     crate::telemetry_task::refresh_host_network_time(
         router,
         crate::telemetry_task::get_current_timestamp_ms(),
@@ -3360,6 +3680,7 @@ pub(crate) enum OperatorCommandAdmission {
     Fresh,
 }
 
+#[cfg(test)]
 pub(crate) fn record_operator_command(
     state: &AppState,
     generation: u64,
@@ -3367,20 +3688,73 @@ pub(crate) fn record_operator_command(
     now_ms: u64,
     duplicate_window_ms: u64,
 ) -> OperatorCommandAdmission {
+    record_operator_command_with_launch_origin(
+        state,
+        generation,
+        command,
+        now_ms,
+        duplicate_window_ms,
+        None,
+    )
+    .unwrap_or(OperatorCommandAdmission::Stale)
+}
+
+/// A new validated launch revision retires only launch dedup keys. Keep the
+/// board gate through this RAM-only update so Abort cannot race bookkeeping.
+pub(crate) fn record_operator_command_with_launch_origin(
+    state: &AppState,
+    generation: u64,
+    command: &TelemetryCommand,
+    now_ms: u64,
+    duplicate_window_ms: u64,
+    launch_revision: Option<u64>,
+) -> Result<OperatorCommandAdmission, String> {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
-    if generation != automatic_generation(state)
+    if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) || generation != automatic_generation(state)
         || state
             .operator_admission_barrier
             .load(std::sync::atomic::Ordering::Acquire)
             != 0
     {
-        return OperatorCommandAdmission::Stale;
+        return Ok(OperatorCommandAdmission::Stale);
     }
-    if state.record_software_command_if_fresh(command, now_ms, duplicate_window_ms) {
-        OperatorCommandAdmission::Fresh
-    } else {
-        OperatorCommandAdmission::Duplicate
+    let record = || {
+        if state.record_software_command_if_fresh(command, now_ms, duplicate_window_ms) {
+            OperatorCommandAdmission::Fresh
+        } else {
+            OperatorCommandAdmission::Duplicate
+        }
+    };
+    if !crate::board_abort::launch_command(crate::sequences::command_name(command)) {
+        return Ok(record());
     }
+    let revision = crate::board_abort::validate_launch_revision(state, launch_revision)?;
+    state.board_abort.admit_launch(
+        state,
+        crate::board_abort::required_mask(state),
+        revision,
+        || {
+            if state
+                .launch_dedup_revision
+                .load(std::sync::atomic::Ordering::Acquire)
+                != revision
+            {
+                let mut history = state.last_command_ms.lock().unwrap();
+                for name in [
+                    "Launch",
+                    "GroundStationLaunch",
+                    "AdvanceFlightState",
+                    "RewindFlightState",
+                ] {
+                    history.remove(&format!("dedup:{name}"));
+                }
+                state
+                    .launch_dedup_revision
+                    .store(revision, std::sync::atomic::Ordering::Release);
+            }
+            record()
+        },
+    )
 }
 
 #[cfg(test)]
@@ -3420,6 +3794,129 @@ mod operator_admission_tests {
         );
     }
 
+    #[cfg(feature = "hitl_mode")]
+    #[tokio::test]
+    async fn hitl_board_proof_optional_actual_sdk_launch_absent_boards_and_known_abort_always_blocks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = crate::state::tests::test_app_state().await;
+        state.av_bay_comms_connected.store(true, Ordering::Relaxed);
+        state.fill_comms_connected.store(true, Ordering::Relaxed);
+        let owners = Arc::new(AtomicUsize::new(0));
+        let received = owners.clone();
+        let router = sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([
+            sedsnet::router::EndpointHandler::new_packet_handler(
+                crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"), move |packet| {
+                    assert_eq!(packet.payload(), &[crate::rocket_commands::FlightComputerCommands::Launch as u8]);
+                    received.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })]).with_sender("GS"));
+        crate::telemetry_task::refresh_host_network_time(&router, crate::telemetry_task::get_current_timestamp_ms());
+        let kind = crate::telemetry_schema::data_type("FLIGHT_COMMAND");
+        let payload = [crate::rocket_commands::FlightComputerCommands::Launch as u8];
+        assert!(!state.board_state_proof_enforced());
+        assert_eq!(crate::board_abort::required_mask(&state), 0);
+        let old = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        assert!(queue_controller_with_launch_revision(&state, &router, kind, &payload, old).unwrap());
+        router.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(owners.load(Ordering::SeqCst), 1);
+        state.toggle_hitl_safety_interlock(3);
+        assert!(state.board_state_proof_enforced());
+        assert!(!queue_controller_with_launch_revision(&state, &router, kind, &payload,
+            crate::board_abort::capture_launch_revision_named(&state, "Launch")).unwrap());
+        state.toggle_hitl_safety_interlock(3);
+        assert!(!queue_controller_with_launch_revision(&state, &router, kind, &payload, old).unwrap(),
+            "old intent does not gain authority after off/on policy transitions");
+        state.board_abort.observe_abort(crate::types::Board::FlightComputer, Instant::now(), crate::telemetry_task::get_current_timestamp_ms());
+        assert!(!queue_controller_with_launch_revision(&state, &router, kind, &payload,
+            crate::board_abort::capture_launch_revision_named(&state, "Launch")).unwrap());
+        router.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(owners.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn board_abort_launch_dedup_uses_original_revision_and_preserves_unrelated_history() {
+        let state = crate::state::tests::test_app_state().await;
+        let generation = automatic_generation(&state);
+        let prove = || {
+            for board in crate::board_abort::BOARDS {
+                let at = Instant::now();
+                state.board_abort.observe_status(
+                    board,
+                    42,
+                    8,
+                    1,
+                    Some(1),
+                    false,
+                    true,
+                    at,
+                    state.board_abort.query_revision(board),
+                    at,
+                    1,
+                );
+            }
+        };
+        // Model only fresh correlated readbacks here; the actual SDK matrix
+        // independently exercises query nonce/issuer validation.
+        prove();
+        let original = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        assert_eq!(
+            record_operator_command_with_launch_origin(
+                &state,
+                generation,
+                &TelemetryCommand::Launch,
+                10_000,
+                500,
+                original
+            )
+            .unwrap(),
+            OperatorCommandAdmission::Fresh
+        );
+        state
+            .last_command_ms
+            .lock()
+            .unwrap()
+            .insert("dedup:Postinit".into(), 9999);
+        state
+            .last_command_ms
+            .lock()
+            .unwrap()
+            .insert("Launch".into(), 9998);
+        state
+            .board_abort
+            .observe_abort(crate::types::Board::ActuatorBoard, Instant::now(), 10_001);
+        prove();
+        let before = state.last_command_ms.lock().unwrap().clone();
+        assert!(
+            record_operator_command_with_launch_origin(
+                &state,
+                generation,
+                &TelemetryCommand::Launch,
+                10_001,
+                500,
+                original
+            )
+            .is_err()
+        );
+        assert_eq!(*state.last_command_ms.lock().unwrap(), before);
+        let fresh = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        assert_ne!(fresh, original);
+        assert_eq!(
+            record_operator_command_with_launch_origin(
+                &state,
+                generation,
+                &TelemetryCommand::Launch,
+                10_002,
+                500,
+                fresh
+            )
+            .unwrap(),
+            OperatorCommandAdmission::Fresh
+        );
+        let history = state.last_command_ms.lock().unwrap();
+        assert_eq!(history.get("dedup:Postinit"), Some(&9999));
+        assert_eq!(history.get("Launch"), Some(&9998));
+        assert_eq!(history.get("dedup:Launch"), Some(&10_002));
+    }
+
     #[tokio::test]
     async fn stale_epoch_does_not_refresh_existing_duplicate_entry() {
         let state = crate::state::tests::test_app_state().await;
@@ -3454,7 +3951,7 @@ impl Drop for OperatorDispatchClaim {
 /// Capture before authentication/IO awaits; closed admission has no origin.
 pub(crate) fn capture_operator_origin(state: &AppState) -> Option<u64> {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
-    (state
+    (!state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) && state
         .operator_admission_barrier
         .load(std::sync::atomic::Ordering::Acquire)
         == 0)
@@ -3475,7 +3972,13 @@ pub(crate) fn claim_plumbing_settings_dispatch(
 ) -> Option<OperatorDispatchClaim> {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
     let claim = claim_operator_dispatch_under_gate(state, generation)?;
-    state.plumbing_drive.begin_settings();
+    if state.plumbing_drive.motion_worker_pending() {
+        return None;
+    }
+    state.board_abort.change_launch_context_if(|| {
+        state.plumbing_drive.begin_settings();
+        true
+    });
     Some(claim)
 }
 fn claim_operator_dispatch_under_gate(
@@ -3500,7 +4003,11 @@ fn claim_operator_dispatch_under_gate(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
         ) {
-            Ok(_) => return Some(OperatorDispatchClaim(count.clone())),
+            Ok(_) => {
+                let claim = OperatorDispatchClaim(count.clone());
+                if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) { drop(claim); return None; }
+                return Some(claim);
+            },
             Err(observed) => current = observed,
         }
     }
@@ -3551,6 +4058,7 @@ mod recovery_generation_tests {
                 crate::telemetry_task::command_at_dispatch(
                     &state,
                     crate::types::TelemetryCommand::QueuedOperator {
+                        launch_revision: None,
                         plumbing_origin: None,
                         generation: first,
                         command: Box::new(command)
@@ -3566,6 +4074,7 @@ mod recovery_generation_tests {
         use sedsnet::router::{EndpointHandler, Router, RouterConfig};
         for name in ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND"] {
             let state = crate::state::tests::test_app_state().await;
+            qualified_launch_proofs_for_test(&state);
             let endpoint = crate::telemetry_schema::endpoint("ACTUATOR_BOARD");
             let router = Arc::new(Router::new(RouterConfig::new([
                 EndpointHandler::new_packet_handler(endpoint, |_| Ok(())),
@@ -3623,6 +4132,36 @@ mod final_launch_admission_tests {
     use super::*;
     use sedsnet::packet::Packet;
     use sedsnet::router::{EndpointHandler, Router, RouterConfig};
+    fn fixture_state_proofs(state: &AppState) {
+        // Modeled authoritative readbacks isolate these pre-existing Stop/SDK
+        // ownership tests. The board_abort actual-SDK matrix tests the real
+        // nonce/issuer transport path separately, without this fixture.
+        for board in crate::board_abort::BOARDS {
+            let at = Instant::now();
+            let revision = state.board_abort.query_revision(board);
+            state.board_abort.observe_status(
+                board,
+                42,
+                8,
+                1,
+                Some(1),
+                false,
+                true,
+                at,
+                revision,
+                at,
+                1,
+            );
+        }
+    }
+    fn clocked_router(config: RouterConfig) -> Router {
+        let router = Router::new(config);
+        crate::telemetry_task::refresh_host_network_time(
+            &router,
+            crate::telemetry_task::get_current_timestamp_ms(),
+        );
+        router
+    }
     fn launch_packet() -> Packet {
         Packet::new(
             crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
@@ -3647,9 +4186,114 @@ mod final_launch_admission_tests {
         .unwrap()
     }
     #[tokio::test]
+    async fn board_abort_queued_launch_origin_cannot_refresh_after_abort_and_fresh_clear() {
+        let state = crate::state::tests::test_app_state().await;
+        fixture_state_proofs(&state);
+        let revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        let generation = automatic_generation(&state);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(TelemetryCommand::QueuedOperator {
+            generation,
+            command: Box::new(TelemetryCommand::Launch),
+            plumbing_origin: None,
+            launch_revision: revision,
+        })
+        .await
+        .unwrap();
+        state
+            .board_abort
+            .observe_abort(crate::types::Board::ActuatorBoard, Instant::now(), 10_000);
+        fixture_state_proofs(&state);
+        let TelemetryCommand::QueuedOperator {
+            launch_revision, ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("real application queue must retain its original envelope")
+        };
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let capture = received.clone();
+        let router = clocked_router(RouterConfig::new([EndpointHandler::new_packet_handler(
+            crate::telemetry_schema::endpoint("GROUND_STATION"),
+            move |_| {
+                capture.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )]));
+        let kind = crate::telemetry_schema::data_type("FLIGHT_COMMAND");
+        let old_accepted =
+            queue_controller_with_launch_revision(&state, &router, kind, &[1], launch_revision)
+                .unwrap();
+        router.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(
+            received.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "old queued intent acquired actual SDK owner delivery"
+        );
+        assert!(!old_accepted);
+        let fresh = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        assert_ne!(fresh, launch_revision);
+        assert!(queue_controller_with_launch_revision(&state, &router, kind, &[1], fresh).unwrap());
+        router.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn board_abort_queued_launch_origin_cannot_refresh_after_stop_without_board_abort() {
+        let state = crate::state::tests::test_app_state().await;
+        fixture_state_proofs(&state);
+        let revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        let generation = automatic_generation(&state);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(TelemetryCommand::QueuedOperator {
+            generation,
+            command: Box::new(TelemetryCommand::Launch),
+            plumbing_origin: None,
+            launch_revision: revision,
+        })
+        .await
+        .unwrap();
+        state.manual_abort_intent.request_untimed();
+        // Model SDK ownership retirement, not physical recovery. No board
+        // Abort report is introduced: the retained Stop epoch alone fences it.
+        state.manual_abort_intent.try_claim().unwrap().accepted();
+        assert_eq!(state.board_abort.masks().0, 0);
+        crate::board_abort::synchronize_stop_revision(&state);
+        let TelemetryCommand::QueuedOperator {
+            launch_revision, ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("real application queue must retain its original envelope")
+        };
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let capture = received.clone();
+        let router = clocked_router(RouterConfig::new([EndpointHandler::new_packet_handler(
+            crate::telemetry_schema::endpoint("GROUND_STATION"),
+            move |_| {
+                capture.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )]));
+        let kind = crate::telemetry_schema::data_type("FLIGHT_COMMAND");
+        let old_accepted =
+            queue_controller_with_launch_revision(&state, &router, kind, &[1], launch_revision)
+                .unwrap();
+        router.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(
+            received.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "old queued intent acquired actual SDK owner delivery"
+        );
+        assert!(!old_accepted);
+        let fresh = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        assert_ne!(fresh, launch_revision);
+        assert!(queue_controller_with_launch_revision(&state, &router, kind, &[1], fresh).unwrap());
+        router.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
     async fn exhausted_stop_epochs_never_certify_unchanged_launch_admission() {
         for deferred in [false, true] {
             let state = crate::state::tests::test_app_state().await;
+            fixture_state_proofs(&state);
             if deferred {
                 state.deferred_abort.exhaust_manual_epoch_for_test();
             } else {
@@ -3673,7 +4317,7 @@ mod final_launch_admission_tests {
                     .unwrap()
                     .automatic_actions_inhibited()
             );
-            let router = Router::new(RouterConfig::new([]));
+            let router = clocked_router(RouterConfig::new([]));
             assert!(
                 queue_admitted_launch_packets(
                     &state,
@@ -3699,6 +4343,7 @@ mod final_launch_admission_tests {
     async fn retained_or_deferred_manual_abort_blocks_launch_before_sdk_admission() {
         for deferred in [false, true] {
             let state = crate::state::tests::test_app_state().await;
+            fixture_state_proofs(&state);
             if deferred {
                 state
                     .deferred_abort
@@ -3730,7 +4375,8 @@ mod final_launch_admission_tests {
     async fn abort_between_durable_admission_and_final_sdk_queue_cannot_be_lost() {
         for deferred in [false, true] {
             let state = crate::state::tests::test_app_state().await;
-            let router = Router::new(RouterConfig::new([]));
+            fixture_state_proofs(&state);
+            let router = clocked_router(RouterConfig::new([]));
             let ticket = inhibit_automatic_actions_for_launch(&state).unwrap();
             if deferred {
                 state
@@ -3760,7 +4406,8 @@ mod final_launch_admission_tests {
         // A request accepted and fully handed off between the two checks must
         // still invalidate the old epoch even when its pending bit is clear.
         let state = crate::state::tests::test_app_state().await;
-        let router = Router::new(RouterConfig::new([]));
+        fixture_state_proofs(&state);
+        let router = clocked_router(RouterConfig::new([]));
         let ticket = inhibit_automatic_actions_for_launch(&state).unwrap();
         state.manual_abort_intent.request();
         state.manual_abort_intent.try_claim().unwrap().accepted();
@@ -3772,6 +4419,7 @@ mod final_launch_admission_tests {
     #[tokio::test]
     async fn journal_wait_does_not_block_new_manual_intent_and_final_queue_rechecks_it() {
         let state = crate::state::tests::test_app_state().await;
+        fixture_state_proofs(&state);
         let journal = state.launch_history.lock().unwrap();
         let worker_state = state.clone();
         let worker =
@@ -3792,7 +4440,7 @@ mod final_launch_admission_tests {
         assert_eq!(state.manual_abort_intent.request(), 1);
         drop(journal);
         let ticket = worker.join().unwrap().unwrap();
-        let router = Router::new(RouterConfig::new([]));
+        let router = clocked_router(RouterConfig::new([]));
         assert!(
             queue_admitted_launch_packets(&state, &router, ticket, vec![launch_packet()]).is_err()
         );
@@ -3806,9 +4454,10 @@ mod final_launch_admission_tests {
     async fn final_sdk_queue_never_executes_local_callbacks_or_flushes_under_intent_lock() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let state = crate::state::tests::test_app_state().await;
+        fixture_state_proofs(&state);
         let local = Arc::new(AtomicUsize::new(0));
         let seen = local.clone();
-        let router = Router::new(RouterConfig::new([EndpointHandler::new_packet_handler(
+        let router = clocked_router(RouterConfig::new([EndpointHandler::new_packet_handler(
             crate::telemetry_schema::endpoint("GROUND_STATION"),
             move |_| {
                 seen.fetch_add(1, Ordering::SeqCst);
@@ -3818,7 +4467,7 @@ mod final_launch_admission_tests {
         let ticket = inhibit_automatic_actions_for_launch(&state).unwrap();
         assert_eq!(
             queue_admitted_launch_packets(&state, &router, ticket, vec![launch_packet()]).unwrap(),
-            1
+            if cfg!(feature = "hitl_mode") { 1 } else { 2 }
         );
         assert_eq!(
             local.load(Ordering::SeqCst),
@@ -3826,7 +4475,11 @@ mod final_launch_admission_tests {
             "tx_queue must remain queue-only"
         );
         router.process_all_queues_with_timeout(0).unwrap();
-        assert_eq!(local.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            local.load(Ordering::SeqCst),
+            1,
+            "only the controller packet targets GROUND_STATION; Launch7 targets FLIGHT_STATE"
+        );
         assert_eq!(
             state.manual_abort_intent.request(),
             1,
@@ -3851,12 +4504,13 @@ mod final_launch_admission_tests {
             return;
         }
         let state = crate::state::tests::test_app_state().await;
+        fixture_state_proofs(&state);
         let _ticket = inhibit_automatic_actions_for_launch(&state).unwrap();
         let make_router = |budget: usize| {
             let memory =
                 sedsnet::config::RuntimeMemoryConfig::new(budget, 1, budget.min(128), 1.25)
                     .unwrap();
-            Router::new(RouterConfig::new([]).with_memory_config(memory).unwrap())
+            clocked_router(RouterConfig::new([]).with_memory_config(memory).unwrap())
         };
         // Find the real fixture's admission boundary rather than assuming its
         // retained schema/discovery metadata cost. Production limits are untouched.
@@ -3890,13 +4544,14 @@ mod final_launch_admission_tests {
                 Arc::from(&[crate::rocket_commands::ValveBoardCommands::Sequence as u8][..]),
             )
             .unwrap();
-            if let Err(message) = queue_admitted_launch_packets(
+            if let Err(message) = queue_prepared_launch_packets(
                 &state,
                 &router,
                 LaunchAdmission::capture(&state),
                 vec![launch_packet(), valve],
-            ) {
-                if message.contains("accepted 1/2") {
+                None,
+            )
+                && message.contains("accepted 1/2") {
                     assert!(message.contains("manual recovery required"));
                     assert!(router.has_pending_reliable_tx_type(
                         crate::telemetry_schema::data_type("FLIGHT_COMMAND")
@@ -3907,17 +4562,17 @@ mod final_launch_admission_tests {
                     partial_seen = true;
                     break;
                 }
-            }
         }
         assert!(
             partial_seen,
             "actual SDK must retain the first admitted owner when second admission fails"
         );
-        let refused = queue_admitted_launch_packets(
+        let refused = queue_prepared_launch_packets(
             &state,
             &make_router(16),
             LaunchAdmission::capture(&state),
             vec![launch_packet()],
+            None,
         )
         .unwrap_err();
         assert!(refused.contains("accepted 0/1"));
@@ -4022,6 +4677,7 @@ mod retained_stop_fence_tests {
     #[tokio::test]
     async fn declined_testing_model_never_falls_through_and_sticky_inhibit_survives_visual_idle() {
         let state = crate::state::tests::test_app_state().await;
+            qualified_launch_proofs_for_test(&state);
         let ticket = inhibit_automatic_actions_for_launch(&state).unwrap();
         assert!(
             admit_simulated_launch(&state, ticket, || false)
@@ -4225,6 +4881,7 @@ mod recovery_quiescence_tests {
             .unwrap();
         commands
             .try_send(TelemetryCommand::QueuedOperator {
+                launch_revision: None,
                 generation: old + 1,
                 command: Box::new(TelemetryCommand::Postinit),
                 plumbing_origin: None,
@@ -4446,3 +5103,9 @@ mod recovery_http_quiescence_tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) mod nonwaiting_admission_tests;
+
+#[cfg(all(test,feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+pub(crate) fn apply_model_effects_for_test(state:&Arc<AppState>,valves:Vec<(usize,bool)>){apply(state,Effects{valves,notification:None});}

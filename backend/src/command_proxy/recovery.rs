@@ -74,12 +74,10 @@ pub(crate) struct Barrier {
     boot: [u8; 16],
 }
 impl Barrier {
-    #[cfg_attr(not(test), allow(dead_code))] // Staged coordinator hook; no reset API consumer yet.
     pub(crate) fn is_quiescent(&self) -> bool {
         let s = self.admission.0.lock().unwrap();
         s.closed && s.boot == self.boot && s.active == 0
     }
-    #[cfg_attr(not(test), allow(dead_code))] // Root supplies verified owner/reset consumer separately.
     pub(crate) fn reopen_after_verified_recovery(self) -> Result<()> {
         let next = super::nonce();
         let mut s = self.admission.0.lock().unwrap();
@@ -112,7 +110,6 @@ pub(super) fn register(admission: &Arc<Admission>) -> Result<()> {
 }
 /// None means no active paired primary proxy exists; it says nothing about
 /// unrelated GS/RRLS command queues. Caller must hold its own recovery fence.
-#[cfg_attr(not(test), allow(dead_code))] // Explicit private integration seam, not API enablement.
 pub(crate) fn begin_primary_recovery() -> Result<Option<Barrier>> {
     ACTIVE
         .get_or_init(|| Mutex::new(Weak::new()))
@@ -121,7 +118,35 @@ pub(crate) fn begin_primary_recovery() -> Result<Option<Barrier>> {
         .upgrade()
         .map(|a| a.begin())
         .transpose()
+}/// Fixture access to the exact production admission/lease, never a replacement
+/// capability or success result. The coordinator must actually rotate and wait.
+#[cfg(test)]
+pub(crate) struct TestPrimaryAdmission(Arc<Admission>);
+#[cfg(test)]
+pub(crate) struct TestPrimaryLease {
+    _lease: Lease,
 }
+#[cfg(test)]
+impl TestPrimaryAdmission {
+    pub(crate) fn register() -> Self {
+        let admission = Admission::new();
+        register(&admission).unwrap();
+        Self(admission)
+    }
+    pub(crate) fn boot(&self) -> [u8; 16] {
+        self.0.boot()
+    }
+    pub(crate) fn closed(&self) -> bool {
+        self.0.0.lock().unwrap().closed
+    }
+    pub(crate) fn admit(&self, boot: [u8; 16]) -> Result<TestPrimaryLease> {
+        self.0
+            .admit(boot, false)
+            .map(|lease| TestPrimaryLease { _lease: lease })
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

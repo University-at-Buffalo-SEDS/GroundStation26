@@ -14,7 +14,6 @@ struct Pending {
     error: Option<(u64, String)>,
     stopped: bool,
 }
-#[cfg(test)]
 enum PrefixState {
     Pending,
     Durable,
@@ -145,7 +144,6 @@ impl Writer {
         }
     }
     /// Inspect the actual queued/writing/durable prefix. No IO or callback.
-    #[cfg(test)]
     fn prefix_state(&self, ticket: u64) -> Result<PrefixState> {
         let state = self.inner.state.lock().unwrap();
         if state.next != ticket {
@@ -164,7 +162,6 @@ impl Writer {
         }
         Err(anyhow!("Launch journal prefix is not durably complete"))
     }
-    #[cfg(test)]
     pub(super) fn quiescent_through(&self, ticket: u64) -> Result<bool> {
         match self.prefix_state(ticket)? {
             PrefixState::Pending => Ok(false),
@@ -172,7 +169,6 @@ impl Writer {
             PrefixState::Failed(message) => Err(anyhow!(message)),
         }
     }
-    #[cfg(test)]
     pub(super) fn failed_terminal_prefix(&self, ticket: u64) -> Result<()> {
         match self.prefix_state(ticket)? {
             PrefixState::Failed(_) => Ok(()),
@@ -189,6 +185,13 @@ impl Writer {
             .error
             .as_ref()
             .map(|(_, text)| text.clone())
+    }
+    /// A callback may inspect health, but must never wait for this writer.
+    pub(super) fn try_healthy(&self) -> bool {
+        self.inner
+            .state
+            .try_lock()
+            .is_ok_and(|state| !state.stopped && state.error.is_none())
     }
     pub fn set_reporter(&self, reporter: Arc<dyn Fn(String) + Send + Sync>) {
         *self.inner.reporter.lock().unwrap() = Some(reporter);

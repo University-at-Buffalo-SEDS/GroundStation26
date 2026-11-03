@@ -251,8 +251,7 @@ async fn zero_case(case: &str) {
                 payload_json,
                 ..
             }) = item
-            {
-                if data_type == raw_kind {
+                && data_type == raw_kind {
                     assert_eq!(sender_id, "DAQ");
                     recorded_sources.push(source_timestamp_ms.unwrap());
                     assert_eq!(payload_json, expected_payload);
@@ -262,7 +261,6 @@ async fn zero_case(case: &str) {
                     );
                     recorded_raw += 1;
                 }
-            }
         }
     }
     if case == "replay" {
@@ -279,8 +277,7 @@ async fn zero_case(case: &str) {
                 payload_json,
                 ..
             }) = item
-            {
-                if data_type == raw_kind {
+                && data_type == raw_kind {
                     assert_eq!(sender_id, "DAQ");
                     recorded_sources.push(source_timestamp_ms.unwrap());
                     assert_eq!(payload_json, expected_payload);
@@ -290,7 +287,6 @@ async fn zero_case(case: &str) {
                     );
                     recorded_raw += 1;
                 }
-            }
         }
     }
     tokio::time::sleep(Duration::from_millis(25)).await;
@@ -379,8 +375,7 @@ async fn zero_case(case: &str) {
             values_json,
             ..
         }) = item
-        {
-            if data_type == raw_kind {
+            && data_type == raw_kind {
                 assert_eq!(sender_id, "DAQ");
                 recorded_sources.push(source_timestamp_ms.unwrap());
                 assert_eq!(payload_json, expected_payload);
@@ -390,7 +385,6 @@ async fn zero_case(case: &str) {
                 );
                 recorded_raw += 1;
             }
-        }
     }
     assert_eq!(
         recorded_raw,
@@ -669,11 +663,10 @@ async fn rejected_source_case(case: &str) {
         .unwrap();
         handle_packet(&state, &db_tx, &overflow, packet).await;
         while let Ok(item) = db_rx.try_recv() {
-            if let DbQueueItem::Write(DbWrite::Telemetry { data_type, .. }) = item {
-                if data_type == "KG1000" {
+            if let DbQueueItem::Write(DbWrite::Telemetry { data_type, .. }) = item
+                && data_type == "KG1000" {
                     raw_rows += 1;
                 }
-            }
         }
     }
     assert_eq!(

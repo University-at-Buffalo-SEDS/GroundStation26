@@ -276,11 +276,10 @@ pub async fn discover(
 pub async fn discovery_preflight(headers: axum::http::HeaderMap) -> axum::response::Response {
     use axum::response::IntoResponse;
     let mut response = axum::http::StatusCode::NO_CONTENT.into_response();
-    if let Ok(Some(pairing)) = Pairing::load() {
-        if add_discovery_cors(&pairing, &headers, &mut response) {
+    if let Ok(Some(pairing)) = Pairing::load()
+        && add_discovery_cors(&pairing, &headers, &mut response) {
             return response;
         }
-    }
     axum::http::StatusCode::FORBIDDEN.into_response()
 }
 /// Public address hints never establish trust or authorize credential handover.

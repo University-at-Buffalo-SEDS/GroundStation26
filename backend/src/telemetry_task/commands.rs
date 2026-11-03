@@ -79,6 +79,23 @@ pub(crate) fn queue_locally_routed_flight_command(
     context: &str,
     payload: &[u8],
 ) -> sedsnet::TelemetryResult<()> {
+    let revision = crate::board_abort::controller_can_launch(
+        crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+        payload,
+    )
+    .then(|| crate::board_abort::capture_launch_revision_named(state, "Launch"))
+    .flatten();
+    queue_locally_routed_flight_command_with_launch_revision(
+        state, router, context, payload, revision,
+    )
+}
+pub(crate) fn queue_locally_routed_flight_command_with_launch_revision(
+    state: &AppState,
+    router: &Router,
+    context: &str,
+    payload: &[u8],
+    launch_revision: Option<u64>,
+) -> sedsnet::TelemetryResult<()> {
     let topology = router.export_topology();
     let rocket_has_fc = topology.routes.iter().any(|route| {
         route.side_name == "rocket_comms"
@@ -93,11 +110,12 @@ pub(crate) fn queue_locally_routed_flight_command(
                 .contains(&crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"))
     });
 
-    if !crate::gse::queue_controller_with_stop_fence(
+    if !crate::gse::queue_controller_with_launch_revision(
         state,
         router,
         crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
         payload,
+        launch_revision,
     )? {
         return Err(sedsnet::TelemetryError::Io(
             "Manual Stop is pending; flight command was not queued",
@@ -125,11 +143,26 @@ pub(crate) const MANUAL_ABORT_PREFIX: &str = "SEDS_MANUAL_ABORT_V1:";
 
 /// SDK owns the marked manual Abort before local bookkeeping runs.
 /// The actual logical router sender also owns its fallback ACK return path.
+#[cfg(test)]
 pub(crate) fn queue_priority_manual_abort_packet(router: &Router) -> sedsnet::TelemetryResult<()> {
-    router.tx_queue(abort_packet_from(
+    queue_manual_abort_wire(router, crate::manual_abort_intent::WirePolicy::Untimed)
+}
+
+pub(crate) fn queue_manual_abort_wire(
+    router: &Router,
+    wire: crate::manual_abort_intent::WirePolicy,
+) -> sedsnet::TelemetryResult<()> {
+    let (body, original) = match wire {
+        crate::manual_abort_intent::WirePolicy::Untimed => (MANUAL_ABORT_PREFIX, 0),
+        crate::manual_abort_intent::WirePolicy::KnownUtc(original) => {
+            ("SEDS_MANUAL_ABORT_V1:K", original)
+        }
+    };
+    router.tx_queue(abort_packet_from_at(
         router,
-        MANUAL_ABORT_PREFIX,
+        body,
         &router.sender(),
+        original,
     )?)
 }
 
@@ -155,6 +188,20 @@ fn abort_packet_from(
     reason: &str,
     sender: &str,
 ) -> sedsnet::TelemetryResult<Packet> {
+    abort_packet_from_at(
+        router,
+        reason,
+        sender,
+        crate::system_clock::control_packet_timestamp_ms(router),
+    )
+}
+
+fn abort_packet_from_at(
+    _router: &Router,
+    reason: &str,
+    sender: &str,
+    original: u64,
+) -> sedsnet::TelemetryResult<Packet> {
     Packet::new(
         crate::telemetry_schema::data_type("ABORT"),
         &[
@@ -167,7 +214,7 @@ fn abort_packet_from(
             crate::telemetry_schema::endpoint("SD_CARD"),
         ],
         sender,
-        crate::system_clock::control_packet_timestamp_ms(router),
+        original,
         Arc::from(reason.as_bytes()),
     )
 }
@@ -390,9 +437,74 @@ mod manual_stop_owner_tests {
     use sedsnet::router::{EndpointHandler, RouterConfig, RouterSideOptions};
 
     #[test]
+    fn manual_abort_actual_sdk_full_queue_refusal_retains_exact_known_timestamp_and_payload() {
+        use crate::manual_abort_intent::{ManualAbortIntent, WirePolicy};
+        crate::telemetry_schema::initialize().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let output = captured.clone();
+        let router = Router::new_with_clock(
+            RouterConfig::new([EndpointHandler::new_packet_handler(
+                crate::telemetry_schema::endpoint("GROUND_STATION"),
+                move |packet| {
+                    output
+                        .lock()
+                        .unwrap()
+                        .push((packet.timestamp(), packet.payload().to_vec()));
+                    Ok(())
+                },
+            )])
+            .with_sender("GS")
+            .with_memory_config(
+                sedsnet::config::RuntimeMemoryConfig::new(65536, 8, 2048, 2.0).unwrap(),
+            )
+            .unwrap(),
+            Box::new(|| 0),
+        );
+        let mut filled = 0;
+        while queue_manual_abort_wire(&router, WirePolicy::Untimed).is_ok() {
+            filled += 1;
+            assert!(filled < 1024, "bounded real queue must refuse");
+        }
+        assert!(filled > 0);
+        let intent = Arc::new(ManualAbortIntent::default());
+        intent.request();
+        let mut claim = intent.try_claim().unwrap();
+        let original = 1_793_000_000_123;
+        let wire = claim.freeze_wire(WirePolicy::KnownUtc(original)).unwrap();
+        assert!(queue_manual_abort_wire(&router, wire).is_err());
+        assert_eq!(intent.try_known_highwater(), Some(original));
+        drop(claim);
+        router.clear_tx_queue();
+        router
+            .try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(
+                original + 10_000,
+            ))
+            .unwrap();
+        let mut retry = intent.try_claim().unwrap();
+        let wire = retry
+            .freeze_wire(WirePolicy::KnownUtc(original + 10_000))
+            .unwrap();
+        assert_eq!(wire, WirePolicy::KnownUtc(original));
+        queue_manual_abort_wire(&router, wire).unwrap();
+        retry.accepted();
+        router.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(
+            &*captured.lock().unwrap(),
+            &[(original, b"SEDS_MANUAL_ABORT_V1:K".to_vec())]
+        );
+        assert_eq!(intent.pending_epoch(), None);
+        queue_manual_abort_wire(&router, WirePolicy::Untimed).unwrap();
+        router.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(
+            captured.lock().unwrap().last().unwrap(),
+            &(0, b"SEDS_MANUAL_ABORT_V1:".to_vec())
+        );
+    }
+
+    #[test]
     fn marked_manual_stop_retires_distinct_owners_for_primary_and_rrls_senders() {
         crate::telemetry_schema::initialize().unwrap();
-        assert_eq!(MANUAL_ABORT_PREFIX.as_bytes().len(), 21);
+        assert_eq!(MANUAL_ABORT_PREFIX.len(), 21);
         let abort = crate::telemetry_schema::data_type("ABORT");
         let endpoints = [
             "GROUND_STATION",
@@ -420,6 +532,11 @@ mod manual_stop_owner_tests {
                         EndpointHandler::new_packet_handler(endpoint, move |packet| {
                             if packet.data_type() == abort {
                                 assert_eq!(packet.payload(), MANUAL_ABORT_PREFIX.as_bytes());
+                                assert_eq!(
+                                    packet.timestamp(),
+                                    0,
+                                    "legacy remains untimed at the actual peer Abort owner"
+                                );
                                 let mut rows = received.lock().unwrap();
                                 let ids = rows.entry(name.clone()).or_default();
                                 if !ids.contains(&packet.packet_id()) {
@@ -431,10 +548,16 @@ mod manual_stop_owner_tests {
                     })
                     .collect::<Vec<_>>();
                 let clock = now.clone();
-                Router::new_with_clock(
+                let router = Router::new_with_clock(
                     RouterConfig::new(handlers).with_sender(name),
                     Box::new(move || clock.load(Ordering::Relaxed)),
-                )
+                );
+                router
+                    .try_set_local_network_time(
+                        sedsnet::timesync::PartialNetworkTime::from_unix_ms(1_800_000_000_123),
+                    )
+                    .unwrap();
+                router
             };
             let station = make(station_name, &[endpoints[0], endpoints[4], endpoints[5]]);
             let rf = make("RF", &[]);
@@ -510,65 +633,76 @@ mod manual_stop_owner_tests {
             )
             .unwrap();
             let intent = Arc::new(crate::manual_abort_intent::ManualAbortIntent::default());
-            intent.request();
-            let claim = intent.try_claim().unwrap();
-            queue_priority_manual_abort_packet(&station).unwrap();
-            claim.accepted();
-            assert!(station.has_pending_reliable_tx_type(abort));
-            let mut transmitted = Vec::new();
-            for at in (0..=1000).step_by(10) {
-                now.store(at, Ordering::Relaxed);
-                for _ in 0..8 {
-                    station.process_all_queues_with_timeout(0).unwrap();
-                    for wire in std::mem::take(&mut *station_out.lock().unwrap()) {
-                        if let Ok(packet) = serialize::unpack_packet(&wire) {
-                            if packet.data_type() == abort {
-                                transmitted.push(packet);
+            let mut epochs_received = Vec::new();
+            for epoch in 1..=2 {
+                assert_eq!(intent.request(), epoch);
+                now.store((epoch - 1) * 1000, Ordering::Relaxed);
+                assert!(station.network_time_ms().unwrap() >= 1_800_000_000_123);
+                let claim = intent.try_claim().unwrap();
+                queue_priority_manual_abort_packet(&station).unwrap();
+                claim.accepted();
+                assert!(station.has_pending_reliable_tx_type(abort));
+                let mut transmitted = Vec::new();
+                for at in (((epoch - 1) * 1000)..=(epoch * 1000)).step_by(10) {
+                    now.store(at, Ordering::Relaxed);
+                    for _ in 0..8 {
+                        station.process_all_queues_with_timeout(0).unwrap();
+                        for wire in std::mem::take(&mut *station_out.lock().unwrap()) {
+                            if let Ok(packet) = serialize::unpack_packet(&wire)
+                                && packet.data_type() == abort {
+                                    transmitted.push(packet);
+                                }
+                            rf.rx_packed_from_side(&wire, rf_radio).unwrap();
+                        }
+                        rf.process_all_queues_with_timeout(0).unwrap();
+                        for wire in std::mem::take(&mut *to_can.lock().unwrap()) {
+                            for (node, side) in &nodes {
+                                node.rx_packed_from_side(&wire, *side).unwrap();
                             }
                         }
-                        rf.rx_packed_from_side(&wire, rf_radio).unwrap();
-                    }
-                    rf.process_all_queues_with_timeout(0).unwrap();
-                    for wire in std::mem::take(&mut *to_can.lock().unwrap()) {
-                        for (node, side) in &nodes {
-                            node.rx_packed_from_side(&wire, *side).unwrap();
+                        for (node, _) in &nodes {
+                            node.process_all_queues_with_timeout(0).unwrap();
+                        }
+                        for wire in std::mem::take(&mut *from_can.lock().unwrap()) {
+                            rf.rx_packed_from_side(&wire, rf_can).unwrap();
+                        }
+                        rf.process_all_queues_with_timeout(0).unwrap();
+                        for wire in std::mem::take(&mut *to_station.lock().unwrap()) {
+                            station.rx_packed_from_side(&wire, station_side).unwrap();
                         }
                     }
-                    for (node, _) in &nodes {
-                        node.process_all_queues_with_timeout(0).unwrap();
-                    }
-                    for wire in std::mem::take(&mut *from_can.lock().unwrap()) {
-                        rf.rx_packed_from_side(&wire, rf_can).unwrap();
-                    }
-                    rf.process_all_queues_with_timeout(0).unwrap();
-                    for wire in std::mem::take(&mut *to_station.lock().unwrap()) {
-                        station.rx_packed_from_side(&wire, station_side).unwrap();
-                    }
                 }
-            }
-            assert!(!transmitted.is_empty());
-            let packet_id = transmitted[0].packet_id();
-            for packet in &transmitted {
-                assert_eq!(packet.sender(), station_name);
-                assert_eq!(packet.packet_id(), packet_id);
-                assert_eq!(packet.payload(), MANUAL_ABORT_PREFIX.as_bytes());
-                assert_eq!(packet.endpoints().len(), endpoints.len());
-                for endpoint in endpoints {
-                    assert!(packet.endpoints().contains(&endpoint));
-                }
-            }
-            let rows = received.lock().unwrap();
-            for owner in [station_name, "FC", "AB", "VB", "DAQ"] {
-                assert_eq!(
-                    rows.get(owner),
-                    Some(&vec![packet_id]),
-                    "{station_name}: {owner}"
+                assert!(!transmitted.is_empty());
+                let packet_id = transmitted[0].packet_id();
+                assert!(
+                    !epochs_received.contains(&packet_id),
+                    "a new manual epoch must get a distinct SDK envelope"
                 );
+                epochs_received.push(packet_id);
+                for packet in &transmitted {
+                    assert_eq!(packet.sender(), station_name);
+                    assert_eq!(packet.packet_id(), packet_id);
+                    assert_eq!(packet.payload(), MANUAL_ABORT_PREFIX.as_bytes());
+                    assert_eq!(packet.timestamp(), 0);
+                    assert_eq!(packet.endpoints().len(), endpoints.len());
+                    for endpoint in endpoints {
+                        assert!(packet.endpoints().contains(&endpoint));
+                    }
+                }
+                let rows = received.lock().unwrap();
+                for owner in [station_name, "FC", "AB", "VB", "DAQ"] {
+                    assert_eq!(
+                        rows.get(owner),
+                        Some(&epochs_received),
+                        "{station_name}: {owner}"
+                    );
+                }
+                assert!(
+                    !station.has_pending_reliable_tx_type(abort),
+                    "ACKs must retire the {station_name} sender's SDK owner"
+                );
+                assert_eq!(intent.pending_epoch(), None);
             }
-            assert!(
-                !station.has_pending_reliable_tx_type(abort),
-                "ACKs must retire the {station_name} sender's SDK owner"
-            );
         }
     }
 }

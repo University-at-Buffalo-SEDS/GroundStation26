@@ -2,7 +2,7 @@ use crate::types::Board;
 use sedsnet::router::{P2pStreamEventKind, P2pStreamId, Router};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -83,7 +83,27 @@ struct JobEntry {
     cancel: Arc<AtomicBool>,
 }
 
+#[derive(Default)]
+struct TransferLifecycle {
+    in_flight: AtomicUsize,
+    poisoned: AtomicBool,
+}
+struct TransferLease {
+    lifecycle: Arc<TransferLifecycle>,
+    completed: bool,
+}
+impl TransferLease {
+    fn complete(&mut self) { self.completed=true; }
+}
+impl Drop for TransferLease {
+    fn drop(&mut self) {
+        if !self.completed { self.lifecycle.poisoned.store(true, Ordering::Release); }
+        self.lifecycle.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 struct FirmwareUpdateManager {
+    shutdown_closed: AtomicBool,
+    lifecycle: Arc<TransferLifecycle>,
     jobs: Mutex<HashMap<u64, JobEntry>>,
     next_id: AtomicU64,
     next_source_port: AtomicU16,
@@ -108,12 +128,19 @@ struct OtaResponse {
 impl FirmwareUpdateManager {
     fn new() -> Self {
         Self {
+            shutdown_closed: AtomicBool::new(false),
+            lifecycle: Arc::new(TransferLifecycle::default()),
             jobs: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             next_source_port: AtomicU16::new(SOURCE_PORT_FIRST),
         }
     }
 
+    fn seal_shutdown_and_is_quiescent(&self) -> bool {
+        let _jobs=self.jobs.lock().expect("firmware update jobs poisoned");
+        self.shutdown_closed.store(true,Ordering::Release);
+        self.lifecycle.in_flight.load(Ordering::Acquire)==0 && !self.lifecycle.poisoned.load(Ordering::Acquire)
+    }
     fn next_source_port(&self) -> u16 {
         self.next_source_port
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |port| {
@@ -131,14 +158,19 @@ impl FirmwareUpdateManager {
         board: Board,
         filename: String,
         total_bytes: usize,
-    ) -> Result<(u64, Arc<AtomicBool>), String> {
+    ) -> Result<(u64, Arc<AtomicBool>, TransferLease), String> {
         let mut jobs = self.jobs.lock().expect("firmware update jobs poisoned");
+        if self.shutdown_closed.load(Ordering::Acquire) { return Err("ground station is shutting down".into()); }
+
         if let Some(active) = jobs.values().find(|job| job.status.phase.is_active()) {
             return Err(format!(
                 "firmware update {} for {} is already active",
                 active.status.id, active.status.board
             ));
         }
+        self.lifecycle.in_flight.try_update(Ordering::AcqRel,Ordering::Acquire,|count| count.checked_add(1))
+            .map_err(|_| "firmware producer ownership exhausted")?;
+        let lease=TransferLease { lifecycle:self.lifecycle.clone(), completed:false };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let now_ms = now_ms();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -163,7 +195,7 @@ impl FirmwareUpdateManager {
                 cancel: cancel.clone(),
             },
         );
-        Ok((id, cancel))
+        Ok((id, cancel, lease))
     }
 
     fn update(
@@ -265,10 +297,16 @@ pub fn start_update(
         ));
     }
 
-    let (id, cancel) = MANAGER.create_job(board, filename, firmware.len())?;
+    let (id, cancel, lease) = MANAGER.create_job(board, filename, firmware.len())?;
     let status = MANAGER.get(id).expect("new firmware update must exist");
-    tokio::spawn(run_update(id, router, board, firmware, cancel));
+    tokio::spawn(run_owned_transfer(lease,run_update(id,router,board,firmware,cancel)));
+
     Ok(status)
+}
+
+async fn run_owned_transfer(mut lease: TransferLease, work: impl std::future::Future<Output=()>) {
+    work.await;
+    lease.complete();
 }
 
 pub fn update_status(id: u64) -> Option<FirmwareUpdateStatus> {
@@ -753,7 +791,7 @@ mod tests {
     fn ota_chunks_fit_receivers_and_flash_programming_units() {
         assert_eq!(OTA_MAX_CHUNK, 112);
         assert_eq!(OTA_MAX_CHUNK % 16, 0);
-        assert!(OTA_MAX_CHUNK + 5 <= 128);
+        const { assert!(OTA_MAX_CHUNK + 5 <= 128); }
         let image = vec![0u8; 1001];
         for (index, chunk) in image.chunks(OTA_MAX_CHUNK).enumerate() {
             assert_eq!((index * OTA_MAX_CHUNK) % 16, 0);
@@ -937,5 +975,59 @@ mod tests {
         let received = received.lock().expect("mock OTA result");
         assert_eq!(received.bytes, firmware);
         assert!(received.finished);
+    }
+}
+
+/// Never cancels an admitted firmware transfer merely to create a Clean seal.
+pub(crate) fn seal_shutdown_and_is_quiescent() -> bool {
+    MANAGER.seal_shutdown_and_is_quiescent()
+}
+
+#[cfg(test)]
+mod shutdown_owner_tests {
+    use super::*;
+    #[tokio::test]
+    async fn actual_async_wrapper_success_panic_and_cancellation_have_distinct_receipts() {
+        let manager=FirmwareUpdateManager::new();
+        let (_,_,lease)=manager.create_job(Board::DaqBoard,"mock.seds".into(),1).unwrap();
+        tokio::spawn(run_owned_transfer(lease,async {})).await.unwrap();
+        assert!(manager.seal_shutdown_and_is_quiescent());
+        let manager=FirmwareUpdateManager::new();
+        let (_,_,lease)=manager.create_job(Board::DaqBoard,"mock.seds".into(),1).unwrap();
+        assert!(tokio::spawn(run_owned_transfer(lease,async {panic!("mock async producer panic")})).await.is_err());
+        assert_eq!(manager.lifecycle.in_flight.load(Ordering::Acquire),0);
+        assert!(!manager.seal_shutdown_and_is_quiescent());
+        let manager=FirmwareUpdateManager::new();
+        let (_,_,lease)=manager.create_job(Board::DaqBoard,"mock.seds".into(),1).unwrap();
+        let task=tokio::spawn(run_owned_transfer(lease,std::future::pending()));
+        tokio::task::yield_now().await;
+        assert!(!manager.seal_shutdown_and_is_quiescent());
+        task.abort();
+        assert!(task.await.is_err());
+        assert_eq!(manager.lifecycle.in_flight.load(Ordering::Acquire),0);
+        assert!(!manager.seal_shutdown_and_is_quiescent());
+    }
+
+    #[test]
+    fn held_job_and_late_admission_cannot_claim_quiescence() {
+        let manager=FirmwareUpdateManager::new();
+        let (_,_,mut lease)=manager.create_job(Board::DaqBoard,"mock.seds".into(),1).unwrap();
+        assert!(!manager.seal_shutdown_and_is_quiescent());
+        assert!(manager.create_job(Board::DaqBoard,"late.seds".into(),1).err().unwrap().contains("shutting down"));
+        lease.completed=true;
+        drop(lease);
+        assert!(manager.seal_shutdown_and_is_quiescent());
+    }
+    #[test]
+    fn panicked_or_dropped_wrapper_is_poisoned_after_count_returns_zero() {
+        let manager=FirmwareUpdateManager::new();
+        let (_,_,lease)=manager.create_job(Board::DaqBoard,"mock.seds".into(),1).unwrap();
+        assert!(std::thread::spawn(move || { let _lease=lease; panic!("mock OTA owner panic"); }).join().is_err());
+        assert_eq!(manager.lifecycle.in_flight.load(Ordering::Acquire),0);
+        assert!(!manager.seal_shutdown_and_is_quiescent());
+        let manager=FirmwareUpdateManager::new();
+        let (_,_,lease)=manager.create_job(Board::DaqBoard,"mock.seds".into(),1).unwrap();
+        drop(lease);
+        assert!(!manager.seal_shutdown_and_is_quiescent());
     }
 }

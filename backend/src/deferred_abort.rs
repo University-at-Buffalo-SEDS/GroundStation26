@@ -6,6 +6,43 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 const AUTOMATIC_PREFIX: &[u8] = b"SEDS_AUTO_ABORT_V1:";
+const KNOWN_MANUAL: &[u8] = b"SEDS_MANUAL_ABORT_V1:K";
+
+/// Inspect bounded application state only. In particular, do not query the
+/// SDK clock/address resolver or wait for journal I/O from an SDK callback.
+/// Uncertain provenance or a busy/unhealthy journal retains Stop authority.
+fn retired(state: &AppState, packet: &Packet) -> bool {
+    if crate::rrls::is_rrls()
+        || matches!(packet.timestamp(), 0 | u64::MAX)
+        || packet.data_type() != crate::telemetry_schema::data_type("ABORT")
+    {
+        return false;
+    }
+    let known_source = if packet.payload() == KNOWN_MANUAL {
+        matches!(packet.sender(), "GS" | "RRLS")
+    } else if packet.payload().starts_with(AUTOMATIC_PREFIX) {
+        crate::types::Board::from_sender_id(packet.sender()).is_some()
+    } else {
+        false
+    };
+    if !known_source {
+        return false;
+    }
+    state
+        .launch_history
+        .try_lock()
+        .ok()
+        .and_then(|history| history.completed_abort_boundary())
+        .is_some_and(|boundary| packet.timestamp() < boundary)
+}
+
+pub(crate) fn observe(state: &AppState, packet: &Packet, generation: u64) {
+    // Retirement precedes manual_epoch/pending bookkeeping: an old packet
+    // cannot cancel a new recovery merely by arriving after its generation.
+    if !retired(state, packet) {
+        state.deferred_abort.observe(packet, generation);
+    }
+}
 struct Observation {
     packet: Packet,
     generation: u64,
@@ -126,6 +163,11 @@ impl Drop for Claim {
     }
 }
 fn apply(state: &Arc<AppState>, observation: &Observation) {
+    // Completion may have occurred while this observation waited for its
+    // blocking worker. Never relatch a retired Abort in the new host state.
+    if retired(state, &observation.packet) {
+        return;
+    }
     // The lease belongs to actual blocking observation work, never its awaiter.
     // Independent manual observations must still cancel recovery whileclosed.
     let _automatic_claim = if observation.automatic {
@@ -174,35 +216,171 @@ fn apply(state: &Arc<AppState>, observation: &Observation) {
     );
     crate::web::emit_error(state, reason);
 }
-pub(crate) fn spawn(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut shutdown = state.shutdown_subscribe();
+pub(crate) struct ShutdownOutcome { pub(crate) quiesced: bool }
+/// Main signals this owner only after actual SDK receiver/packet drain. Global
+/// shutdown alone is not proof that no more Abort observations can arrive.
+pub(crate) fn spawn(state: Arc<AppState>) -> (tokio::task::JoinHandle<ShutdownOutcome>, tokio::sync::oneshot::Sender<()>) {
+    spawn_with_apply(state,apply)
+}
+fn spawn_with_apply(
+    state:Arc<AppState>, apply:impl Fn(&Arc<AppState>,&Observation)+Send+Sync+'static,
+) -> (tokio::task::JoinHandle<ShutdownOutcome>, tokio::sync::oneshot::Sender<()>) {
+    let apply=Arc::new(apply);
+    let (stop,mut stopping)=tokio::sync::oneshot::channel();
+    let task=tokio::spawn(async move {
+        let mut healthy=true;
         loop {
-            if let Some(mut claim) = state.deferred_abort.claim() {
-                let current = state.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    apply(
-                        &current,
-                        claim.observation.as_ref().expect("claimed observation"),
-                    );
-                    claim.accepted = true;
+            if let Some(mut claim)=state.deferred_abort.claim() {
+                let current=state.clone();
+                let apply=apply.clone();
+                let applied=tokio::task::spawn_blocking(move || {
+                    apply(&current,claim.observation.as_ref().expect("claimed observation"));
+                    claim.accepted=true;
                     drop(claim);
-                })
-                .await;
+                }).await;
+                if applied.is_err() {
+                    healthy=false;
+                    // Keep the original unaccepted observation/epoch. A failed
+                    // apply cannot be relabeled completed just to seal Clean.
+                    tokio::select! {
+                        _=&mut stopping=>break,
+                        _=tokio::time::sleep(std::time::Duration::from_millis(5))=>{},
+                    }
+                }
                 continue;
             }
             tokio::select! {
-                _ = shutdown.recv() => break,
-                _ = state.deferred_abort.wake.notified() => {},
+                _=&mut stopping=>break,
+                _=state.deferred_abort.wake.notified()=>{},
             }
         }
-    })
+        let pending=state.deferred_abort.state.lock().unwrap();
+        ShutdownOutcome { quiesced:healthy && pending.manual.is_none() && pending.automatic.is_none() && !pending.active_manual }
+    });
+    (task,stop)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::types::FlightState;
+    pub(crate) fn assert_completed_cohort_retires_original_aborts(state: Arc<AppState>) {
+        use sedsnet::router::{EndpointHandler, Router, RouterConfig};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let boundary = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .completed_abort_boundary()
+            .expect("actual completed healthy cohort");
+        let packet_at = |sender: &str, payload: &[u8], timestamp| {
+            Packet::new(
+                crate::telemetry_schema::data_type("ABORT"),
+                &[crate::telemetry_schema::endpoint("ABORT")],
+                sender,
+                timestamp,
+                Arc::from(payload),
+            )
+            .unwrap()
+        };
+        let generation = crate::gse::automatic_generation(&state);
+        let epoch = state.deferred_abort.manual_epoch();
+        assert!(!state.deferred_abort.manual_pending());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let called = calls.clone();
+        let observed_state = state.clone();
+        let router = Router::new(
+            RouterConfig::new([EndpointHandler::new_packet_handler(
+                crate::telemetry_schema::endpoint("ABORT"),
+                move |packet| {
+                    called.fetch_add(1, Ordering::Relaxed);
+                    observe(&observed_state, packet, generation);
+                    Ok(())
+                },
+            )])
+            .with_sender("GS"),
+        );
+        // Distinct packet IDs pass actual SDK deduplication. Application
+        // retirement, rather than recent-ID suppression, must reject both.
+        let first = packet_at("GS", KNOWN_MANUAL, boundary - 1);
+        let second = packet_at("GS", KNOWN_MANUAL, boundary - 1);
+        assert_ne!(first.packet_id(), second.packet_id());
+        for packet in [first, second] {
+            router.tx_queue(packet).unwrap();
+            router.drain_queues_with_timeout(0).unwrap();
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(state.deferred_abort.manual_epoch(), epoch);
+        assert!(!state.deferred_abort.manual_pending());
+
+        for sender in ["GS", "RRLS"] {
+            assert!(retired(
+                &state,
+                &packet_at(sender, KNOWN_MANUAL, boundary - 1)
+            ));
+        }
+        for sender in ["AB", "VB", "FC", "RF", "PB", "GB", "DAQ"] {
+            let packet = packet_at(sender, b"SEDS_AUTO_ABORT_V1:old cause", boundary - 1);
+            assert!(retired(&state, &packet));
+            observe(&state, &packet, generation);
+            assert!(state.deferred_abort.claim().is_none());
+            apply(
+                &state,
+                &Observation {
+                    packet,
+                    generation,
+                    automatic: true,
+                },
+            );
+            assert!(!state.abort_indicator_latched());
+        }
+        // An already retained old manual observation must also be harmless
+        // when its worker runs after the completed recovery.
+        apply(
+            &state,
+            &Observation {
+                packet: packet_at("GS", KNOWN_MANUAL, boundary - 1),
+                generation,
+                automatic: false,
+            },
+        );
+        assert!(!state.abort_indicator_latched());
+        assert_eq!(crate::gse::automatic_generation(&state), generation);
+
+        for timestamp in [0, boundary, boundary + 1, u64::MAX] {
+            for payload in [KNOWN_MANUAL, b"SEDS_AUTO_ABORT_V1:unknown".as_slice()] {
+                assert!(!retired(&state, &packet_at("GS", payload, timestamp)));
+            }
+        }
+        for (sender, payload) in [
+            ("unknown", KNOWN_MANUAL),
+            ("@addr:123", KNOWN_MANUAL),
+            ("AB", KNOWN_MANUAL),
+            ("GS", b"SEDS_MANUAL_ABORT_V1:".as_slice()),
+            ("GS", b"SEDS_MANUAL_ABORT_V1:Kextra".as_slice()),
+            ("GS", b"Manual Abort".as_slice()),
+            ("unknown", b"SEDS_AUTO_ABORT_V1:old".as_slice()),
+        ] {
+            assert!(!retired(&state, &packet_at(sender, payload, boundary - 1)));
+        }
+        let old = packet_at("GS", KNOWN_MANUAL, boundary - 1);
+        {
+            let mut history = state.launch_history.lock().unwrap();
+            // Busy inspection cannot block an SDK callback or fabricate proof.
+            assert!(!retired(&state, &old));
+            history.error = Some("injected unavailable journal".into());
+        }
+        assert!(!retired(&state, &old));
+        state.launch_history.lock().unwrap().error = None;
+        assert!(retired(&state, &old));
+        let fresh = packet_at("GS", KNOWN_MANUAL, boundary);
+        router.tx_queue(fresh).unwrap();
+        router.drain_queues_with_timeout(0).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(state.deferred_abort.manual_epoch(), epoch + 1);
+        assert!(state.deferred_abort.manual_pending());
+    }
     fn packet(message: &str) -> Packet {
         Packet::new(
             crate::telemetry_schema::data_type("ABORT"),
@@ -417,5 +595,59 @@ mod recovery_observation_tests {
         assert!(!state.deferred_abort.manual_pending());
         assert_eq!(state.deferred_abort.manual_epoch(), 1);
         assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod shutdown_receipt_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool,Ordering};
+    use std::time::Duration;
+    fn manual() -> Packet {
+        Packet::new(crate::telemetry_schema::data_type("ABORT"),&[crate::telemetry_schema::endpoint("ABORT")],"GS",123456,Arc::from(KNOWN_MANUAL)).unwrap()
+    }
+    #[tokio::test]
+    async fn global_shutdown_does_not_discard_late_manual_observation_or_pending_apply() {
+        struct Release(Arc<(Mutex<bool>,std::sync::Condvar)>);
+        impl Drop for Release { fn drop(&mut self) { *self.0.0.lock().unwrap()=true; self.0.1.notify_all(); } }
+        let state=crate::state::tests::test_app_state().await;
+        let release=Release(Arc::new((Mutex::new(false),std::sync::Condvar::new())));
+        let work=release.0.clone();
+        let entered=Arc::new(AtomicBool::new(false)); let signaled=entered.clone();
+        let (mut task,stop)=spawn_with_apply(state.clone(),move |_,_| {
+            signaled.store(true,Ordering::Release);
+            let (lock,wake)=&*work; let mut ready=lock.lock().unwrap();
+            while !*ready { ready=wake.wait(ready).unwrap(); }
+        });
+        tokio::task::yield_now().await;
+        state.request_shutdown(); // SDK receivers have NOT yet joined.
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(),"global shutdown retired observer before receiver quiescence");
+        state.deferred_abort.observe(&manual(),0);
+        tokio::time::timeout(Duration::from_secs(2),async {while !entered.load(Ordering::Acquire) {tokio::task::yield_now().await;}}).await.unwrap();
+        assert!(state.deferred_abort.manual_pending());
+        assert!(state.deferred_abort.state.try_lock().is_ok(),"apply retained inbox mutex");
+        let epoch=state.deferred_abort.manual_epoch();
+        stop.send(()).unwrap(); // Test has now stopped its synthetic receiver.
+        assert!(tokio::time::timeout(Duration::from_millis(5),&mut task).await.is_err(),"outer owner claimed completion while inner apply was live");
+        let before=state.manual_abort_intent.epoch(); state.manual_abort_intent.request();
+        assert!(state.manual_abort_intent.epoch()>before);
+        drop(release);
+        assert!(task.await.unwrap().quiesced);
+        assert!(!state.deferred_abort.manual_pending());
+        assert_eq!(state.deferred_abort.manual_epoch(),epoch,"join silently renewed manual authority");
+    }
+    #[tokio::test]
+    async fn inner_blocking_panic_cannot_be_hidden_by_outer_ok_or_clear_manual_authority() {
+        let state=crate::state::tests::test_app_state().await;
+        let entered=Arc::new(AtomicBool::new(false));let signaled=entered.clone();
+        let (task,stop)=spawn_with_apply(state.clone(),move |_,_| {signaled.store(true,Ordering::Release);panic!("mock blocking manual apply panic");});
+        state.deferred_abort.observe(&manual(),0);
+        tokio::time::timeout(Duration::from_secs(2),async{while !entered.load(Ordering::Acquire){tokio::task::yield_now().await;}}).await.unwrap();
+        let epoch=state.deferred_abort.manual_epoch();
+        stop.send(()).unwrap();
+        assert!(!task.await.unwrap().quiesced);
+        assert!(state.deferred_abort.manual_pending(),"failed apply erased retained manual observation");
+        assert_eq!(state.deferred_abort.manual_epoch(),epoch);
     }
 }

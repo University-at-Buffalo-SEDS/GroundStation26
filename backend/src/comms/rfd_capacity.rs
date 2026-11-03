@@ -1173,7 +1173,7 @@ mod tests {
         );
         assert!(!cap.ready(wall, Some(9146)));
         assert!(cap.ready(wall, Some(9147)));
-        assert!(9147_000 - wire.stop_us() >= 55_000);
+        assert!(9_147_000 - wire.stop_us() >= 55_000);
     }
 
     #[test]

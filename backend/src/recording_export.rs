@@ -143,15 +143,14 @@ async fn list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respons
         if !valid_id(&id) {
             continue;
         }
-        if let Ok(meta) = tokio::fs::symlink_metadata(entry.path()).await {
-            if meta.is_file() && !meta.file_type().is_symlink() {
+        if let Ok(meta) = tokio::fs::symlink_metadata(entry.path()).await
+            && meta.is_file() && !meta.file_type().is_symlink() {
                 recordings.push(Recording {
                     active: active.as_deref() == Some(&id),
                     id,
                     bytes: meta.len(),
                 });
             }
-        }
     }
     recordings.sort_by(|a, b| b.id.cmp(&a.id));
     recording_list_response(recordings)

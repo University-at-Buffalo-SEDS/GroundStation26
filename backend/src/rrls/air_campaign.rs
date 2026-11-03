@@ -15,8 +15,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-#[path = "../comms/virtual_uart.rs"]
-mod virtual_uart;
+use crate::comms::virtual_uart;
+type PairAdmission = Option<([usize; 2], [(u64, bool); 2])>;
 struct Driver {
     wire: virtual_uart::WireDrain,
     capacity: crate::comms::rfd_capacity::Capacity,
@@ -24,6 +24,7 @@ struct Driver {
 type Drivers = Arc<Mutex<[Driver; 3]>>;
 static FIFO_REJECT_LOGGED: AtomicU64 = AtomicU64::new(0);
 
+#[expect(clippy::too_many_arguments, reason = "Fixture independently controls node, wire time, metadata owner and mesh admission")]
 fn driver_send(
     air: &Arc<Mutex<SharedAir>>,
     drivers: &Drivers,
@@ -46,6 +47,7 @@ fn driver_send(
         None,
     )
 }
+#[expect(clippy::too_many_arguments, reason = "Fixture preserves independently controlled node, time and peer-pair ownership evidence")]
 fn driver_send_with_pair(
     air: &Arc<Mutex<SharedAir>>,
     drivers: &Drivers,
@@ -55,7 +57,7 @@ fn driver_send_with_pair(
     close_batch: bool,
     contract: Option<(u64, bool)>,
     mesh: Option<&Shared>,
-    pair: Option<([usize; 2], [(u64, bool); 2])>,
+    pair: PairAdmission,
 ) -> sedsnet::TelemetryResult<()> {
     let mut driver = drivers.lock().unwrap();
     if !driver[node].wire.ready(now)
@@ -68,8 +70,8 @@ fn driver_send_with_pair(
     let length = bytes.len();
     // RTS/CTS is disabled in the captured profile. The modem can drop a frame
     // after the UART accepted it; the SDK must recover using its actual ACKs.
-    if let Err(bytes) = air.lock().unwrap().submit(node, bytes) {
-        if FIFO_REJECT_LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
+    if let Err(bytes) = air.lock().unwrap().submit(node, bytes)
+        && FIFO_REJECT_LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
             let kind = sedsnet::wire_format::peek_frame_info(&bytes[4..])
                 .ok()
                 .map(|frame| frame.envelope.ty.as_u32());
@@ -78,7 +80,6 @@ fn driver_send_with_pair(
                 bytes.len()
             );
         }
-    }
     driver[node].wire.committed(now, length, 115_200);
     if let Some((lengths, _)) = pair {
         driver[node].capacity.committed_command_batch(
@@ -352,7 +353,7 @@ fn run_case(mode: ReliableMode, fifo: usize, overhead_bits: u32, duration: u64) 
                 a.set_link(node, 2, rrls_connected);
             }
         }
-        for node in 0..3 {
+        for (node, decoder) in stream_decoders.iter_mut().enumerate() {
             let mut ready = Vec::new();
             while let Some(bytes) = air.lock().unwrap().receive(node) {
                 ready.extend(bytes);
@@ -363,9 +364,9 @@ fn run_case(mode: ReliableMode, fifo: usize, overhead_bits: u32, duration: u64) 
             let width = 1 + (now as usize / 10 + node) % 31;
             let mut frames = Vec::new();
             for part in ready.chunks(width) {
-                frames.extend(stream_decoders[node].push(part, now));
+                frames.extend(decoder.push(part, now));
             }
-            frames.extend(stream_decoders[node].push(&[], now));
+            frames.extend(decoder.push(&[], now));
             for (command, data) in frames {
                 let data = data.as_slice();
                 if node == 0 {
@@ -373,20 +374,18 @@ fn run_case(mode: ReliableMode, fifo: usize, overhead_bits: u32, duration: u64) 
                         let mut mesh = primary.lock().unwrap();
                         mesh.incoming(command, data, now)
                     };
-                    if let Some(frame) = delivered {
-                        if !frame.command {
+                    if let Some(frame) = delivered
+                        && !frame.command {
                             gs.rx_packed_from_side(&frame.bytes, gs_side).unwrap();
                         }
-                    }
                 } else if node == 2 {
                     recovery.lock().unwrap().incoming(command, data, now);
                 } else if command {
                     // The actual RF firmware unwraps these before SEDSnet RX.
-                    if let Some((kind, data)) = decode(data) {
-                        if kind == AV_BAY_DATA {
+                    if let Some((kind, data)) = decode(data)
+                        && kind == AV_BAY_DATA {
                             rf.rx_packed_from_side(data, rf_side).unwrap();
                         }
-                    }
                 }
             }
         }

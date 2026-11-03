@@ -1,5 +1,8 @@
-//! Application-only board readback and explicit operator query transport.
+//! Verified application-state recovery with explicit authenticated intent.
 //! SDK ACKs certify delivery ownership, never board state or physical outputs.
+pub(crate) mod coordinator;
+mod exchange;
+
 use crate::{auth::Permission, state::AppState, types::Board};
 use axum::{
     Json,
@@ -106,7 +109,7 @@ struct Readback {
 }
 impl Readback {
     fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != 40 || bytes[0] != 1 || bytes[1] > 7 || bytes[3] & !0x3f != 0 {
+        if bytes.len() != 40 || bytes[0] != 1 || bytes[1] > 7 || bytes[3] & !0x7f != 0 {
             return None;
         }
         let flags = bytes[3];
@@ -160,6 +163,7 @@ impl Observation {
 }
 #[derive(Clone)]
 struct Query {
+    abort_revision: u64,
     nonce: u64,
     sent: Stamp,
     received: bool,
@@ -172,7 +176,9 @@ struct Inner {
 }
 pub(crate) struct Runtime {
     identity: Option<[u8; 16]>,
+    coordinator: coordinator::Runtime,
     inner: Mutex<Inner>,
+    pub(crate) manual_utc: crate::manual_abort_utc::Runtime,
 }
 impl Default for Runtime {
     fn default() -> Self {
@@ -184,6 +190,8 @@ impl Default for Runtime {
             .map(|_| bytes);
         Self {
             identity,
+            manual_utc: Default::default(),
+            coordinator: Default::default(),
             inner: Mutex::new(Inner {
                 values: array::from_fn(|_| None),
                 queries: array::from_fn(|_| None),
@@ -206,6 +214,22 @@ fn endpoint(board: Board) -> &'static str {
         Board::GatewayBoard => "BOARD_RECOVERY_GB",
         Board::DaqBoard => "BOARD_RECOVERY_DAQ",
         Board::GroundStation => unreachable!(),
+    }
+}
+/// Commanded-register safe domains from the actual board owners. VB's safe
+/// state opens both servos (bits1/2) and switches its pilot solenoid off.
+/// These are commanded registers, never mechanical position verification.
+fn safe_output_mask(board: Board) -> Option<u32> {
+    match board {
+        Board::ActuatorBoard | Board::FlightComputer => Some(0),
+        Board::ValveBoard => Some(6),
+        _ => None,
+    }
+}
+fn query_domain_consistent(board: Board, row: &Readback) -> bool {
+    match safe_output_mask(board) {
+        Some(mask) => row.flags & 2 == 0 || row.flags & OUTPUTS_VALID != 0 && row.outputs == mask,
+        None => row.flags & (2 | OUTPUTS_VALID) == 0,
     }
 }
 fn hex(bytes: &[u8]) -> String {
@@ -252,6 +276,15 @@ pub(crate) fn observe(state: &AppState, packet: &Packet) -> Result<(), &'static 
         return Err("Wrong recovery status destination");
     }
     let value = Readback::decode(packet.payload()).ok_or("Malformed recovery status")?;
+    if value.flags & 0x40 != 0
+        && !matches!(
+            board,
+            Board::ActuatorBoard | Board::ValveBoard | Board::FlightComputer
+        )
+    {
+        return Err("Metadata node advertised physical manual Stop capability");
+    }
+
     let id = state
         .board_recovery
         .identity
@@ -276,22 +309,93 @@ pub(crate) fn observe(state: &AppState, packet: &Packet) -> Result<(), &'static 
     } // Duplicate replies do not slide freshness.
     query.received = true;
     let observed_after = query.sent;
+    let abort_revision = query.abort_revision;
+    let accepted = value.clone();
     inner.values[at] = Some(Observation {
         value,
         received: now,
         observed_after,
     });
+    drop(inner);
+    state.board_abort.observe_status(
+        board,
+        accepted.boot,
+        accepted.epoch,
+        accepted.nonce,
+        accepted.state,
+        accepted.flags & 1 != 0,
+        accepted.result == 0
+            && accepted.flags & 0x0c == 0x0c
+            && query_domain_consistent(board, &accepted),
+        observed_after.wall,
+        abort_revision,
+        now.wall,
+        crate::telemetry_task::get_current_timestamp_ms(),
+    );
     Ok(())
 }
 /// A semantic rejection is not application confirmation. ACK/drop data status
 /// instead of trapping later valid ordered replies behind an obsolete context.
 pub(crate) fn receive_status(state: &AppState, packet: &Packet) {
+    coordinator::retain_status(state, packet);
     if let Err(reason) = observe(state, packet) {
         let mut inner = state.board_recovery.inner.lock().unwrap();
         inner.rejected_statuses = inner.rejected_statuses.saturating_add(1);
         inner.last_rejection = Some(reason);
+    } else {
+        state.board_recovery.manual_utc.wake.notify_one();
     }
 }
+pub(crate) fn manual_utc_proof(
+    state: &AppState,
+    key: crate::launch_history::ManualUtcKey,
+) -> Option<[u64; 3]> {
+    let (model_ms, _) = crate::cached_simulation_clock_sample()?;
+    let now = Stamp {
+        wall: WallInstant::now(),
+        model_ms,
+    };
+    let inner = state.board_recovery.inner.try_lock().ok()?;
+    let identity = state.board_recovery.identity?;
+    let mut nonces = [0; 3];
+    for (i, board) in [
+        Board::ActuatorBoard,
+        Board::ValveBoard,
+        Board::FlightComputer,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = index(board)?;
+        let row = inner.values[at].as_ref()?;
+        let query = inner.queries[at].as_ref()?;
+        if !query.received
+            || query.nonce != row.value.nonce
+            || !row.fresh(now)
+            || row.value.issuer != issuer(&identity)
+            || row.value.result != 0
+            || row.value.flags & 0x64 != 0x64
+            || row.value.boot != key.boots[i]
+            || row.value.epoch < key.epochs[i]
+            || !query_domain_consistent(board, &row.value)
+        {
+            return None;
+        }
+        nonces[i] = query.nonce;
+    }
+    Some(nonces)
+}
+pub(crate) fn manual_utc_endpoints(state: &AppState, router: &sedsnet::router::Router) -> bool {
+    let topology = router.export_topology();
+    [
+        Board::ActuatorBoard,
+        Board::ValveBoard,
+        Board::FlightComputer,
+    ]
+    .into_iter()
+    .all(|board| endpoint_verified(state, board, &topology))
+}
+
 fn error(status: StatusCode, code: &str, message: &str) -> Response {
     (status, Json(json!({"error":code,"message":message}))).into_response()
 }
@@ -301,9 +405,10 @@ pub(crate) fn routes() -> axum::Router<Arc<AppState>> {
     axum::Router::new()
         .route("/api/board-recovery/status", get(get_status))
         .route("/api/board-recovery/query", post(query))
-        .route("/api/board-recovery/prepare", post(write_unavailable))
-        .route("/api/board-recovery/confirm", post(write_unavailable))
+        .route("/api/board-recovery/prepare", post(coordinator::prepare))
+        .route("/api/board-recovery/confirm", post(coordinator::confirm))
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 fn primary_only() -> Result<(), Response> {
     if crate::rrls::is_rrls() {
         Err(error(
@@ -333,6 +438,28 @@ pub(crate) struct ActuatorIdleProof {
     pub(crate) boot: u64,
     pub(crate) epoch: u32,
     pub(crate) outputs: u32,
+}
+/// RAM-only fresh correlated proof for the final motion/launch gate. It
+/// does not query SDK topology or storage while that gate is held.
+pub(crate) fn actuator_cached_motion_safe_proof(state: &AppState) -> Option<ActuatorIdleProof> {
+    let inner = state.board_recovery.inner.lock().unwrap();
+    let row = inner.values[index(Board::ActuatorBoard)?].as_ref()?;
+    let value = &row.value;
+    if row.observed_after.wall.elapsed() > READBACK_TTL
+        || value.result != 0
+        || !value.state.is_some_and(|state| state <= 6)
+        || value.flags & (STATE_VALID | OUTPUTS_VALID) != (STATE_VALID | OUTPUTS_VALID)
+        || value.flags & 1 != 0
+        || matches!(value.boot, 0 | u64::MAX)
+        || matches!(value.epoch, 0 | u32::MAX)
+    {
+        return None;
+    }
+    Some(ActuatorIdleProof {
+        boot: value.boot,
+        epoch: value.epoch,
+        outputs: value.outputs,
+    })
 }
 pub(crate) fn actuator_idle_proof(state: &AppState) -> Option<ActuatorIdleProof> {
     let router = state.topology_router.get()?;
@@ -389,6 +516,17 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
     let topology = router.map(|router| router.export_topology());
     let primary =
         !crate::rrls::is_rrls() && router.is_some_and(|router| router.sender().as_ref() == "GS");
+    let can_recover = primary
+        && !principal.anonymous
+        && principal.permissions.send_commands
+        && coordinator::host_safe(&state)
+        && state.launch_history.lock().unwrap().recovery_available();
+    let principal_identity = principal_context(&identity, &headers, &principal);
+    let confirmation = state
+        .board_recovery
+        .coordinator
+        .confirmation(&state, &principal_identity);
+    let host_pending = state.launch_history.lock().unwrap().recovery_pending();
     let boards=BOARDS.iter().enumerate().map(|(at,&board)| {
         let health=network.iter().find(|entry|entry.sender_id==board.sender_id());
         let verified=topology.as_ref().is_some_and(|topology|endpoint_verified(&state,board,topology));
@@ -396,7 +534,9 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         let readback=observation.map(|row|&row.value);
         let age=observation.map(|row|row.age(now).as_millis().min(u64::MAX as u128)as u64);
         let fresh=observation.is_some_and(|row|row.fresh(now));
-        let known=readback.filter(|row|row.boot!=0&&row.epoch!=0);
+        let reconcilable=verified&&fresh&&readback.is_some_and(|row|coordinator::first_uncertainty(host_pending.as_ref(),board,row));
+        let known=readback.filter(|row|(row.boot!=0||reconcilable)&&row.epoch!=0);
+        let supported=can_recover&&verified&&fresh&&readback.is_some_and(|row|query_domain_consistent(board,row)&&row.flags&0x24==0x24&&matches!(row.result,0|7)&&(row.boot!=0||reconcilable)&&row.epoch!=0&&row.epoch<u32::MAX-1);
         let operation=queries[at].as_ref().map(|query| {
             let mut operation_id=digest::Context::new(&digest::SHA256);operation_id.update(&identity);operation_id.update(&query.nonce.to_le_bytes());operation_id.update(board.sender_id().as_bytes());
             let pending=!query.received&&now.checked_duration_since(query.sent).is_some_and(|age|age<=QUERY_TTL);
@@ -406,10 +546,11 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
             "network":{"healthy":health.is_some_and(|h|h.healthy),"age_ms":health.map_or(u64::MAX,|h|h.age_ms),"disconnects":health.map_or(0,|h|h.disconnects),"reconnects":health.map_or(0,|h|h.reconnects)},
             "state":readback.and_then(|row|row.state),"state_label":readback.and_then(|row|row.state).and_then(crate::types::u8_to_flight_state).map_or("Unknown".to_string(),|value|format!("{value:?}")),
             "boot":known.map(|row|format!("{:016x}",row.boot)),"epoch":known.map(|row|row.epoch),"nonce":known.map(|row|format!("{:016x}",row.nonce)),"age_ms":age,
-            "receipt_age_ms":observation.map(|row|now.duration_since(row.received).as_millis().min(u64::MAX as u128)as u64),"uptime_ms":readback.map(|row|row.uptime),"abort_latched":readback.filter(|_|matches!(board,Board::ActuatorBoard|Board::ValveBoard|Board::FlightComputer)).map(|row|row.flags&1!=0),"safe_outputs":readback.filter(|row|row.flags&OUTPUTS_VALID!=0).map(|row|row.flags&2!=0),"commanded_outputs":readback.filter(|row|row.flags&OUTPUTS_VALID!=0).map(|row|row.outputs),
+            "receipt_age_ms":observation.map(|row|now.duration_since(row.received).as_millis().min(u64::MAX as u128)as u64),"uptime_ms":readback.map(|row|row.uptime),"abort_latched":readback.filter(|_|matches!(board,Board::ActuatorBoard|Board::ValveBoard|Board::FlightComputer)).map(|row|row.flags&1!=0),"safe_outputs":readback.filter(|row|row.flags&OUTPUTS_VALID!=0).map(|row|row.flags&2!=0&&query_domain_consistent(board,row)),"commanded_outputs":readback.filter(|row|row.flags&OUTPUTS_VALID!=0).map(|row|row.outputs),
             "output_readback":if readback.is_some_and(|row|row.flags&OUTPUTS_VALID!=0){"gpio_servo_command_registers"}else{"unknown"},"physical_position_verified":false,
-            "capabilities":{"query":primary&&verified,"endpoint_verified":verified,"hardened_transport":verified&&fresh&&readback.is_some_and(|row|row.flags&0x20!=0),"recover":false,"resync":false,"reset_startup":false},"operation":operation,
-            "message":if !primary{"Recovery authority belongs to the current primary."}else if !verified{"Dedicated query endpoint not verified; no legacy endpoint probe is permitted."}else if !fresh{"Explicit Query is required for fresh actual board state."}else if readback.is_some_and(|row|row.result==7){"Board reports IO; actual readback retained. Recovery repair is not enabled yet."}else{"Actual board readback; verified recovery/reset coordinator not enabled yet."}})
+            "capabilities":{"query":primary&&verified,"endpoint_verified":verified,"hardened_transport":verified&&fresh&&readback.is_some_and(|row|row.flags&0x20!=0),"known_utc_manual_stop":verified&&fresh&&matches!(board,Board::ActuatorBoard|Board::ValveBoard|Board::FlightComputer)&&readback.is_some_and(|row|row.flags&0x40!=0),"recover":supported&&matches!(board,Board::ActuatorBoard|Board::ValveBoard),"resync":false,"reset_startup":supported},"operation":operation,
+            "result":readback.filter(|_|fresh).map(|row|row.result),"commissioning_required":fresh&&readback.is_some_and(|row|row.boot==u64::MAX||row.result==7),"first_uncertainty_reconcilable":reconcilable,"identity_kind":if reconcilable{"retained_first_uncertainty"}else if readback.is_some_and(|row|row.boot==u64::MAX){"commissioning_sentinel"}else if known.is_some(){"retained_generation"}else{"unknown"},
+            "message":if !primary{"Recovery authority belongs to the current primary."}else if !verified{"Dedicated query endpoint not verified; no legacy endpoint probe is permitted."}else if !fresh{"Explicit Query is required for fresh actual board state."}else if readback.is_some_and(|row|row.result==7){"Board reports IO/commissioning; only a new explicit typed intent may attempt the supported recovery leg."}else{"Actual board readback. Recovery requires explicit typed confirmation and fresh server readbacks; no physical position or power reset is certified."}})
     }).collect::<Vec<_>>();
     let mode = crate::station_mode::snapshot();
     let current = mode
@@ -418,9 +559,10 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         .unwrap_or_else(|| Value::String("unknown".into()));
     let build = serde_json::to_value(mode.local_build_mode).unwrap();
     Json(json!({"version":1,"backend_instance":hex(&identity),"principal":{"username":principal.username,"context":principal_context(&identity,&headers,&principal)},"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state)),"flight_state":state.local_flight_state_snapshot()as u8,"automatic_actions_inhibited":state.launch_history.lock().unwrap().automatic_actions_inhibited(),
-        "permissions":{"query":primary,"recover":false,"reset_startup":false,"change_mode":false},
+        "permissions":{"query":primary,"recover":can_recover,"reset_startup":can_recover,"change_mode":false},
+        "confirmation":confirmation,"host_recovery":host_pending.map(|pending|json!({"pending":!pending.published,"verified":pending.verified,"publication_acknowledged":pending.published,"targets":pending.targets.iter().map(|target|target.board.as_str()).collect::<Vec<_>>()})),
         "rejected_statuses":rejected_statuses,"last_rejection":last_rejection,
-        "mode_capability":{"current":current,"build_mode":build,"supported_modes":[build],"runtime_switch_supported":false,"requires_restart":["normal","hitl","test_fire","testing"],"message":"Only the compiled runtime is supported; changing labels does not switch hardware policy."},"boards":boards,"operation":null})).into_response()
+        "mode_capability":{"current":current,"build_mode":build,"supported_modes":[build],"runtime_switch_supported":false,"requires_restart":["normal","hitl","test_fire","testing"],"message":"Only the compiled runtime is supported; changing labels does not switch hardware policy."},"boards":boards,"operation":state.board_recovery.coordinator.operation()})).into_response()
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -448,6 +590,21 @@ pub(crate) async fn query(
             "Select one known board.",
         );
     };
+    request_board_query(&state, board)
+}
+/// Internal read-only collection shares EXACT HTTP nonce/correlation/budget rules.
+/// It cannot emit RECOVER, change board state or bypass primary identity checks.
+pub(crate) fn request_board_query(state: &Arc<AppState>, board: Board) -> Response {
+    if let Err(response) = primary_only() {
+        return response;
+    }
+    if index(board).is_none() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_target",
+            "Select one known board",
+        );
+    }
     let Some(identity) = state.board_recovery.identity else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -469,7 +626,7 @@ pub(crate) async fn query(
             "Recovery router identity is not the primary GS.",
         );
     }
-    if !endpoint_verified(&state, board, &router.export_topology()) {
+    if !endpoint_verified(state, board, &router.export_topology()) {
         return error(
             StatusCode::CONFLICT,
             "endpoint_unverified",
@@ -485,6 +642,7 @@ pub(crate) async fn query(
         );
     }
     let nonce = u64::from_le_bytes(bytes);
+    let abort_revision = state.board_abort.query_revision(board);
     let at = index(board).unwrap();
     let now = Stamp::now();
     let mut inner = state.board_recovery.inner.lock().unwrap();
@@ -538,6 +696,7 @@ pub(crate) async fn query(
     // Install correlation before SDK queue admission. tx_queue never invokes callbacks.
     let previous = inner.queries[at].take();
     inner.queries[at] = Some(Query {
+        abort_revision,
         nonce,
         sent: now,
         received: false,
@@ -552,40 +711,34 @@ pub(crate) async fn query(
     }
     drop(inner);
     Json(json!({"accepted":true,"operation":null,"message":"Query admitted to SDK; fresh board readback is still required."})).into_response()
+}/// Seal new recovery proposals/confirmation atomically before extracting its
+/// cancellation-independent owner. Main must await outside coordinator locks.
+pub(crate) fn seal_shutdown_and_take_owner(state: &AppState) -> Option<tokio::task::JoinHandle<()>> {
+    state.board_recovery.coordinator.seal_shutdown_and_take_owner()
 }
-/// Explicitly unavailable until all owner/producer quiescence proofs are complete.
-pub(crate) async fn write_unavailable(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(response) =
-        crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await
-    {
-        return response;
-    }
-    if let Err(response) = primary_only() {
-        return response;
-    }
-    error(
-        StatusCode::CONFLICT,
-        "recovery_not_ready",
-        "Verified board recovery/reset is not enabled. No state or output was changed.",
-    )
+pub(crate) fn shutdown_clean_eligible(state: &AppState) -> bool {
+    state.board_recovery.coordinator.shutdown_clean_eligible()
 }
+
+
+
+#[cfg(all(test, feature = "testing", not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
+#[path = "board_recovery/testing_model_tests.rs"]
+mod testing_model_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct HttpFixture {
-        state: Arc<AppState>,
-        directory: std::path::PathBuf,
+    pub(super) struct HttpFixture {
+        pub(super) state: Arc<AppState>,
+        pub(super) directory: std::path::PathBuf,
     }
     impl Drop for HttpFixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.directory);
         }
     }
-    async fn http_fixture() -> HttpFixture {
+    pub(super) async fn http_fixture() -> HttpFixture {
         let directory = std::env::temp_dir().join(format!(
             "board-query-http-{}-{}",
             std::process::id(),
@@ -602,6 +755,11 @@ mod tests {
         ]}).to_string()).unwrap();
         let mut state = crate::state::tests::test_app_state().await;
         Arc::get_mut(&mut state).unwrap().auth = Arc::new(crate::auth::AuthManager::new(path));
+        Arc::get_mut(&mut state).unwrap().auth_db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
         crate::ensure_auth_sessions_table(&state.auth_db)
             .await
             .unwrap();
@@ -611,7 +769,7 @@ mod tests {
         }
         HttpFixture { state, directory }
     }
-    async fn http(
+    pub(super) async fn http(
         state: Arc<AppState>,
         method: &str,
         path: &str,
@@ -627,6 +785,14 @@ mod tests {
             request = request.header("authorization", format!("Bearer {token}"));
         }
         routes()
+            .route(
+                "/api/board_abort",
+                axum::routing::get(crate::board_abort::get_status),
+            )
+            .route(
+                "/api/board_abort/refresh",
+                axum::routing::post(crate::board_abort::refresh_status),
+            )
             .with_state(state)
             .oneshot(
                 request
@@ -637,7 +803,7 @@ mod tests {
             .unwrap()
     }
     #[tokio::test]
-    async fn actual_http_routes_require_auth_and_keep_reset_writes_disabled() {
+    async fn actual_http_routes_require_auth_and_healthy_durable_context() {
         let fixture = http_fixture().await;
         let state = fixture.state.clone();
         assert_eq!(
@@ -939,6 +1105,7 @@ mod tests {
         state.topology_router.set(host).unwrap();
         let at = index(Board::ActuatorBoard).unwrap();
         state.board_recovery.inner.lock().unwrap().queries[at] = Some(Query {
+            abort_revision: 0,
             nonce: 7,
             sent: Stamp::now(),
             received: false,
@@ -947,8 +1114,16 @@ mod tests {
         wire[3] |= 0x20;
         assert!(Readback::decode(&wire).is_some());
         let mut unknown = wire;
-        unknown[3] |= 0x40;
+        unknown[3] |= 0x80;
         assert!(Readback::decode(&unknown).is_none());
+        wire[3] |= 0x40;
+        let mut metadata = wire;
+        metadata[2] = 255;
+        metadata[3] = 0x64;
+        assert_eq!(
+            observe(&state, &status_packet("DAQ", metadata)),
+            Err("Metadata node advertised physical manual Stop capability")
+        );
         observe(&state, &status_packet("AB", wire)).unwrap();
         let response = http(
             state.clone(),
@@ -972,6 +1147,7 @@ mod tests {
             .find(|row| row["id"] == "AB")
             .unwrap();
         assert_eq!(board["capabilities"]["hardened_transport"], true);
+        assert_eq!(board["capabilities"]["known_utc_manual_stop"], true);
         for capability in ["recover", "resync", "reset_startup"] {
             assert_eq!(board["capabilities"][capability], false);
         }
@@ -1004,6 +1180,7 @@ mod tests {
         // Old transports stay readable and never gain the new implementation
         // capability merely because a fresh dedicated endpoint exists.
         state.board_recovery.inner.lock().unwrap().queries[at] = Some(Query {
+            abort_revision: 0,
             nonce: 8,
             sent: Stamp::now(),
             received: false,
@@ -1069,6 +1246,7 @@ mod tests {
         let packet = status_packet("AB", status_wire(&state, 7));
         assert!(observe(&state, &packet).is_err());
         state.board_recovery.inner.lock().unwrap().queries[at] = Some(Query {
+            abort_revision: 0,
             nonce: 7,
             sent: Stamp::now(),
             received: false,
@@ -1094,6 +1272,7 @@ mod tests {
             "Duplicate status must not slide freshness"
         );
         state.board_recovery.inner.lock().unwrap().queries[at] = Some(Query {
+            abort_revision: 0,
             nonce: 9,
             sent: Stamp::now() - QUERY_TTL - Duration::from_millis(1),
             received: false,
@@ -1105,6 +1284,7 @@ mod tests {
         let state = crate::state::tests::test_app_state().await;
         let at = index(Board::ActuatorBoard).unwrap();
         state.board_recovery.inner.lock().unwrap().queries[at] = Some(Query {
+            abort_revision: 0,
             nonce: 1,
             sent: Stamp::now(),
             received: false,
@@ -1192,6 +1372,7 @@ mod tests {
             if round == 1 {
                 state.board_recovery.inner.lock().unwrap().queries
                     [index(Board::ActuatorBoard).unwrap()] = Some(Query {
+                    abort_revision: 0,
                     nonce,
                     sent: Stamp::now(),
                     received: false,
@@ -1233,6 +1414,7 @@ mod tests {
         let at = index(Board::ActuatorBoard).unwrap();
         let sent = Stamp::now() - READBACK_TTL - Duration::from_millis(10);
         state.board_recovery.inner.lock().unwrap().queries[at] = Some(Query {
+            abort_revision: 0,
             nonce: 44,
             sent,
             received: false,
@@ -1249,6 +1431,7 @@ mod tests {
         let state = crate::state::tests::test_app_state().await;
         let at = index(Board::ActuatorBoard).unwrap();
         state.board_recovery.inner.lock().unwrap().queries[at] = Some(Query {
+            abort_revision: 0,
             nonce: 45,
             sent: Stamp::now() + Duration::from_secs(1),
             received: false,

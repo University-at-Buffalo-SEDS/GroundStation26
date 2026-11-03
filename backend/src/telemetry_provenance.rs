@@ -21,8 +21,7 @@ pub(crate) fn canonical_source(source: i64, canonical_now: i64) -> Option<i64> {
     // also agree with the actual purpose clock (including explicit model UTC).
     const YEAR_2020: i64 = 1_577_836_800_000;
     const YEAR_2100: i64 = 4_102_444_800_000;
-    (source >= YEAR_2020
-        && source < YEAR_2100
+    ((YEAR_2020..YEAR_2100).contains(&source)
         && canonical_now.saturating_sub(source) >= -5_000
         && canonical_now.saturating_sub(source) <= 3_600_000)
         .then_some(source)
