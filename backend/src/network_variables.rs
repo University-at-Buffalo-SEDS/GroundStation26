@@ -521,7 +521,10 @@ fn retained_non_launch_packet() -> Result<Option<Packet>> {
     let guard = store()
         .lock()
         .expect("network-variable store lock poisoned");
-    if guard.values.flight_state == 7 {
+    // Unknown-origin defaults and legacy records are history, not a newly
+    // observed authority state. Keep them on disk without publishing UTC zero
+    // or minting a fresh operator intent during bootstrap/route refresh.
+    if guard.values.flight_state == 7 || guard.values.flight_state_stamp == 0 {
         return Ok(None);
     }
     Ok(Some(flight_state_packet(guard.values)?))
@@ -1704,15 +1707,19 @@ mod persistence_callback_tests {
             None,
             "phase must seal before any operational setter"
         );
-        let bootstrap = names.map(|name| {
+        let bootstrap: Vec<_> = names.iter().filter_map(|name| {
             source
                 .get_cached_network_variable(crate::telemetry_schema::data_type(name))
                 .unwrap()
-                .unwrap()
-        });
+                .map(|packet| (*name, packet))
+        }).collect();
+        assert_eq!(bootstrap.len(), 8);
+        assert!(source.get_cached_network_variable(
+            crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE)).unwrap().is_none(),
+            "unknown-origin default must not create a managed state owner");
         assert!(source.export_reliable_pending_stats().is_empty());
         println!(
-            "LIFECYCLE_BOOT cached9, packedSides2, knownAnnouncers0, API success, pendingOwners0; no end-to-end ACK implied"
+            "LIFECYCLE_BOOT cached8, unknown-origin state absent, packedSides2, knownAnnouncers0, API success, pendingOwners0; no end-to-end ACK implied"
         );
         phase.store(1, Ordering::Relaxed);
         now.store(1000, Ordering::Relaxed);
@@ -1722,7 +1729,7 @@ mod persistence_callback_tests {
             source.process_all_queues().unwrap();
             peer.process_all_queues().unwrap();
         }
-        for (name, original) in names.iter().zip(&bootstrap) {
+        for (name, original) in &bootstrap {
             let ty = crate::telemetry_schema::data_type(name);
             peer.request_managed_variable(ty).unwrap();
             for _ in 0..8 {
@@ -1749,8 +1756,13 @@ mod persistence_callback_tests {
                 .any(|route| !route.announcers.is_empty())
         );
         println!(
-            "LIFECYCLE_DISCOVERY all9 real peer caches converge to original boot PacketIDs via discovery/managed refresh; separate from operational500ms"
+            "LIFECYCLE_DISCOVERY all8 known-origin/config peer caches converge to original boot PacketIDs via discovery/managed refresh; separate from operational500ms"
         );
+        peer.request_managed_variable(crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE)).unwrap();
+        for _ in 0..8 { source.process_all_queues().unwrap(); peer.process_all_queues().unwrap(); }
+        assert!(peer.get_cached_network_variable(
+            crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE)).unwrap().is_none(),
+            "GET cannot manufacture authority for unknown retained state");
         phase.store(2, Ordering::Relaxed);
         now.store(1100, Ordering::Relaxed);
         crate::telemetry_task::refresh_host_network_time(&source, get_current_timestamp_ms());
@@ -2392,3 +2404,7 @@ pub(crate) fn retry_pending_daq_log_clock_for_state(
 }
 #[cfg(test)]
 mod clock_admission_tests;
+
+#[cfg(test)]
+#[path = "network_variables/unknown_origin_tests.rs"]
+mod unknown_origin_tests;
