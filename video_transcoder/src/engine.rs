@@ -1045,3 +1045,7 @@ mod tests {
         assert!(!local_host(&Url::parse("https://example.com").unwrap()));
     }
 }
+
+#[cfg(test)]
+#[path = "qualification_tests.rs"]
+mod qualification_tests;
