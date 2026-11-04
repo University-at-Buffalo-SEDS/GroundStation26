@@ -319,7 +319,10 @@ pub(super) fn telemetry_snapshot(
         profile.stats.iter().map(|stat| {
             let (binding, absolute) = stat.binding_for_fill(fill_source);
             let value = rows.iter().rev().find(|r|r.data_type==binding.data_type && binding.sender_id.as_ref().is_none_or(|s|s==&r.sender_id))
-                .filter(|r|r.timestamp_ms>=0 && now.saturating_sub(r.timestamp_ms as u64)<5000)
+                // Keep the existing programme row/now timestamp domain. A future
+                // row must be unknown, never saturating-subtracted to age zero.
+                .filter(|r| u64::try_from(r.timestamp_ms).ok()
+                    .and_then(|at| now.checked_sub(at)).is_some_and(|age| age < 5000))
                 .and_then(|r|r.values.get(binding.index).copied().flatten())
                 .map(|v|if absolute {v.abs()}else{v}).map(|v|v*binding.scale+binding.offset).filter(|v|v.is_finite());
             serde_json::json!({"label":stat.label,"value":value,"unit":stat.unit,"precision":stat.precision,"format":stat.format,"binding":binding})
@@ -783,6 +786,45 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn programme_row_timestamp_boundaries_preserve_unknown_instead_of_future_age_zero() {
+        let app = crate::state::tests::test_app_state().await;
+        let mut presentation = Presentation::default();
+        for page in presentation.broadcast.rundown.profiles.values_mut() {
+            page.stats = default_stats().into_iter().map(Into::into).collect();
+        }
+        for (at, now, expected) in [
+            (10_000, 10_000, Some(125.0)),
+            (5_001, 10_000, Some(125.0)),
+            (5_000, 10_000, None),
+            (10_001, 10_000, None),
+            (-1, 0, None),
+            (i64::MAX, i64::MAX as u64, Some(125.0)),
+            (i64::MAX, u64::MAX, None),
+        ] {
+            let mut rows = app.recent_telemetry_cache.lock().unwrap();
+            rows.clear();
+            rows.push_back(crate::types::TelemetryRow {
+                timestamp_ms: at, data_type: "GPS_DATA".into(), sender_id: "RF".into(),
+                values: vec![Some(42.0), Some(-78.0), Some(125.0)],
+            });
+            drop(rows);
+            assert_eq!(telemetry_snapshot(&app, &presentation, now)["stats"][0]["value"].as_f64(), expected, "row={at}, now={now}");
+        }
+        // A newer invalid matching row stays unknown; do not silently revive
+        // an older matching row behind it or mint a replacement timestamp.
+        let mut rows = app.recent_telemetry_cache.lock().unwrap();
+        rows.clear();
+        for at in [9_999, 10_001] {
+            rows.push_back(crate::types::TelemetryRow {
+                timestamp_ms: at, data_type: "GPS_DATA".into(), sender_id: "RF".into(),
+                values: vec![Some(42.0), Some(-78.0), Some(125.0)],
+            });
+        }
+        drop(rows);
+        assert!(telemetry_snapshot(&app, &presentation, 10_000)["stats"][0]["value"].is_null());
+    }
+
     #[test]
     fn delayed_clock_is_available_to_the_first_viewer_without_live_time_fallback() {
         use crate::telemetry_db::{LaunchClockKind, LaunchClockMsg};
