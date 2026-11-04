@@ -383,84 +383,98 @@ async fn exec_pragma_with_retry(
     Ok(())
 }
 
+// A successful SQL execution is not proof that SQLite checkpointed its WAL.
+fn checkpoint_complete(row: Option<sqlx::sqlite::SqliteRow>) -> bool {
+    let Some(row) = row else { return false; };
+    match (row.try_get::<i64, _>(0), row.try_get::<i64, _>(1), row.try_get::<i64, _>(2)) {
+        (Ok(0), Ok(-1), Ok(-1)) => true, // SQLite reports no WAL.
+        (Ok(0), Ok(log), Ok(done)) => log >= 0 && log == done,
+        _ => false,
+    }
+}
+
+async fn checkpoint_pool_with_retry(
+    db: &SqlitePool,
+    retries: usize,
+    delay_ms: u64,
+) -> Result<bool, sqlx::Error> {
+    for attempt in 0..retries {
+        match sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);").fetch_optional(db).await {
+            Ok(row) => return Ok(checkpoint_complete(row)),
+            Err(error) => {
+                if attempt + 1 >= retries { return Err(error); }
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub async fn flush_sqlite_journals(db: &SqlitePool) {
     let retries = env_usize("GS_SQLITE_SHUTDOWN_PRAGMA_RETRIES", 8, 1, 60);
     let delay_ms = env_i64("GS_SQLITE_SHUTDOWN_PRAGMA_RETRY_DELAY_MS", 120, 10, 5_000) as u64;
 
-    if let Err(err) =
-        exec_pragma_with_retry(db, "PRAGMA wal_checkpoint(TRUNCATE);", retries, delay_ms).await
-    {
-        log::error!("sqlite wal_checkpoint(TRUNCATE) failed after {retries} attempts: {err}");
+    match checkpoint_pool_with_retry(db, retries, delay_ms).await {
+        Ok(true) => {}
+        Ok(false) => log::warn!("sqlite WAL checkpoint is busy or unverified; journals retained"),
+        Err(err) => log::error!("sqlite wal_checkpoint(TRUNCATE) failed after {retries} attempts: {err}"),
     }
     if let Err(err) = exec_pragma_with_retry(db, "PRAGMA optimize;", retries, delay_ms).await {
         log::error!("sqlite PRAGMA optimize failed after {retries} attempts: {err}");
     }
 }
 
-pub async fn finalize_sqlite_after_pool_close(db_path: &str) {
-    let url = format!("sqlite://{db_path}");
-    let mut conn = match SqliteConnection::connect(&url).await {
+/// SQLite owns journal cleanup. False means finalization was not verified;
+/// it never authorizes a filesystem unlink or claims physical media durability.
+pub async fn finalize_sqlite_after_pool_close(db_path: &str) -> bool {
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(db_path)
+        .create_if_missing(false);
+    let mut conn = match SqliteConnection::connect_with(&options).await {
         Ok(conn) => conn,
-        Err(err) => {
-            log::error!("failed to reopen sqlite db for finalization ({db_path}): {err}");
-            return;
+        Err(error) => {
+            log::error!("failed to reopen sqlite db for finalization ({db_path}); journals retained: {error}");
+            return false;
         }
     };
-
-    for stmt in [
-        "PRAGMA busy_timeout=5000;",
-        "PRAGMA wal_checkpoint(TRUNCATE);",
-        "PRAGMA optimize;",
-    ] {
-        if let Err(err) = sqlx::query(stmt).execute(&mut conn).await {
-            log::error!("sqlite finalization pragma failed ({stmt}): {err}");
-        }
+    let busy_timeout_ok = match sqlx::query("PRAGMA busy_timeout=5000;").execute(&mut conn).await {
+        Ok(_) => true,
+        Err(error) => { log::error!("SQLite finalization busy_timeout failed: {error}"); false }
+    };
+    let checkpoint_ok = match sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);").fetch_optional(&mut conn).await {
+        Ok(row) => checkpoint_complete(row),
+        Err(error) => { log::error!("SQLite finalization checkpoint failed: {error}"); false }
+    };
+    if !checkpoint_ok {
+        log::warn!("SQLite finalization checkpoint busy or unverified ({db_path}); leaving journals to SQLite");
+        if let Err(error) = conn.close().await { log::error!("failed closing SQLite finalization connection: {error}"); }
+        return false;
     }
-
+    let optimize_ok = match sqlx::query("PRAGMA optimize;").execute(&mut conn).await {
+        Ok(_) => true,
+        Err(error) => { log::error!("SQLite finalization optimize failed: {error}"); false }
+    };
     let retries = env_usize("GS_SQLITE_SHUTDOWN_PRAGMA_RETRIES", 8, 1, 60);
-    let retry_delay_ms = env_i64("GS_SQLITE_SHUTDOWN_PRAGMA_RETRY_DELAY_MS", 120, 10, 5_000) as u64;
+    let delay_ms = env_i64("GS_SQLITE_SHUTDOWN_PRAGMA_RETRY_DELAY_MS", 120, 10, 5_000) as u64;
+    let mut delete_mode_verified = false;
     for attempt in 0..retries {
-        match sqlx::query("PRAGMA journal_mode=DELETE;")
-            .execute(&mut conn)
-            .await
-        {
-            Ok(_) => break,
-            Err(err) => {
-                if attempt + 1 >= retries {
-                    log::error!(
-                        "SQLite finalization pragma failed (PRAGMA journal_mode=DELETE;): {err}"
-                    );
-                } else {
-                    tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
-                }
+        match sqlx::query("PRAGMA journal_mode=DELETE;").fetch_optional(&mut conn).await {
+            Ok(row) => {
+                delete_mode_verified = row.and_then(|row| row.try_get::<String, _>(0).ok())
+                    .is_some_and(|mode| mode.eq_ignore_ascii_case("delete"));
+                break;
+            }
+            Err(error) => {
+                if attempt + 1 >= retries { log::error!("SQLite finalization journal_mode failed: {error}"); }
+                else { tokio::time::sleep(Duration::from_millis(delay_ms)).await; }
             }
         }
     }
-
-    if let Err(err) = conn.close().await {
-        log::error!("failed closing sqlite finalization connection: {err}");
-    }
-}
-
-pub async fn remove_sqlite_sidecars(db_path: &str) {
-    let retries = env_usize("GS_SQLITE_SIDECAR_DELETE_RETRIES", 12, 1, 120);
-    let retry_delay_ms = env_i64("GS_SQLITE_SIDECAR_DELETE_DELAY_MS", 100, 10, 2_000) as u64;
-    for suffix in [".wal", ".shm", "-wal", "-shm", "-journal", ".journal"] {
-        let sidecar = format!("{db_path}{suffix}");
-        for attempt in 0..retries {
-            match fs::remove_file(&sidecar) {
-                Ok(()) => break,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
-                Err(err) => {
-                    if attempt + 1 >= retries {
-                        log::error!("failed removing sqlite sidecar {sidecar}: {err}");
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
-                }
-            }
-        }
-    }
+    let close_ok = match conn.close().await {
+        Ok(()) => true,
+        Err(error) => { log::error!("failed closing SQLite finalization connection: {error}"); false }
+    };
+    busy_timeout_ok && checkpoint_ok && optimize_ok && delete_mode_verified && close_ok
 }
 
 pub fn sqlite_sidecars_present(db_path: &str) -> Vec<String> {
@@ -476,8 +490,9 @@ pub async fn close_and_finalize_sqlite(db: SqlitePool, db_path: &str) {
         flush_sqlite_journals(&db).await;
         db.close().await;
     }
-    finalize_sqlite_after_pool_close(db_path).await;
-    remove_sqlite_sidecars(db_path).await;
+    if !finalize_sqlite_after_pool_close(db_path).await {
+        log::warn!("SQLite finalization incomplete; recording and journals preserved: {db_path}");
+    }
     let lingering = sqlite_sidecars_present(db_path);
     if !lingering.is_empty() {
         log::error!(
@@ -487,34 +502,11 @@ pub async fn close_and_finalize_sqlite(db: SqlitePool, db_path: &str) {
     }
 }
 
-pub async fn sqlite_db_has_user_rows(db_path: &str) -> Result<bool> {
-    let url = format!("sqlite://{db_path}");
-    let db = open_sqlite_pool(&url).await?;
-    let total: i64 = sqlx::query_scalar(
-        r#"
-        SELECT
-            COALESCE((SELECT COUNT(*) FROM telemetry), 0) +
-            COALESCE((SELECT COUNT(*) FROM alerts), 0) +
-            COALESCE((SELECT COUNT(*) FROM flight_state), 0) +
-            COALESCE((SELECT COUNT(*) FROM messages), 0)
-        "#,
-    )
-    .fetch_one(&db)
-    .await?;
-    db.close().await;
-    Ok(total > 0)
-}
-
-pub async fn delete_sqlite_if_empty(db_path: &str) -> Result<bool> {
-    if !Path::new(db_path).exists() {
-        return Ok(false);
-    }
-    if sqlite_db_has_user_rows(db_path).await? {
-        return Ok(false);
-    }
-    fs::remove_file(db_path)?;
-    remove_sqlite_sidecars(db_path).await;
-    Ok(true)
+/// A path and an empty snapshot do not establish exclusive file ownership.
+/// Keep even empty recordings until a separately owned deletion protocol exists.
+/// Callers retain their existing async interface and treat false as not deleted.
+pub async fn delete_sqlite_if_empty(_db_path: &str) -> Result<bool> {
+    Ok(false)
 }
 
 pub async fn recover_sqlite_sidecars_in_dir(dir: &Path) -> Result<()> {
@@ -534,8 +526,9 @@ pub async fn recover_sqlite_sidecars_in_dir(dir: &Path) -> Result<()> {
             continue;
         }
         log::info!("recovering sqlite sidecars for {}", path.display());
-        finalize_sqlite_after_pool_close(&db_path).await;
-        remove_sqlite_sidecars(&db_path).await;
+        if !finalize_sqlite_after_pool_close(&db_path).await {
+            log::warn!("SQLite recovery incomplete; original journals preserved: {db_path}");
+        }
     }
     Ok(())
 }
@@ -550,3 +543,7 @@ pub fn prune_recent_writes(buffer: &mut VecDeque<DbWrite>, newest_ts_ms: i64) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "telemetry_db/durability_tests.rs"]
+mod durability_tests;
