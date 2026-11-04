@@ -1023,6 +1023,22 @@ def _backend_args(
     return args
 
 
+def build_video_transcoder(repo_root: Path, debug_mode: bool) -> None:
+    """Build the standalone native helper without fetching/building the station."""
+    manifest = repo_root / "video_transcoder" / "Cargo.toml"
+    lock = manifest.with_name("Cargo.lock")
+    if not lock.is_file():
+        raise FileNotFoundError(
+            errno.ENOENT,
+            "Restore the tracked video_transcoder/Cargo.lock before building the helper",
+            str(lock),
+        )
+    command = ["cargo", "build", "--locked", "--manifest-path", str(manifest)]
+    if not debug_mode:
+        command.append("--release")
+    run(command, cwd=repo_root)
+
+
 def print_usage(exit_code: int = 1) -> None:
     print("Usage:")
     print("  ./build.py                         # local: build frontend+backend (parallel)")
@@ -1039,6 +1055,7 @@ def print_usage(exit_code: int = 1) -> None:
     print("  ./build.py docker [pi_build|no_pi] [testing]")
     print("  ./build.py rrls                   # headless recovery backend + web UI, no local launch GPIO")
     print("  ./build.py --backend-only          # local: build backend only (backend_only also accepted)")
+    print("  ./build.py video_transcoder [debug] # separate native video helper only (Linux/macOS/Windows)")
     print("  ./build.py frontend_web            # local: build frontend web only")
     print("  ./build.py web                     # alias for frontend_web")
     print("  ./backend/build.py ...             # backend-only entry point")
@@ -1065,6 +1082,7 @@ def main() -> None:
     frontend_dev = False
     backend_only = False
     rrls_mode = False
+    video_transcoder = False
     log_file_arg: Optional[str] = None
     frontend_only_platform: Optional[str] = None
 
@@ -1076,7 +1094,9 @@ def main() -> None:
 
     for raw_arg in raw_args:
         arg = raw_arg.lower()
-        if arg == "rrls":
+        if arg == "video_transcoder":
+            video_transcoder = True
+        elif arg == "rrls":
             rrls_mode = True
             force_no_pi = True
         elif arg == "pi_build":
@@ -1118,6 +1138,14 @@ def main() -> None:
             print(f"Error: Invalid argument '{arg}'.", file=sys.stderr)
             print_usage()
 
+    if video_transcoder and any((
+        force_pi, force_no_pi, docker_mode, testing_mode, hitl_mode,
+        test_fire_mode, max_size_mode, plain_mode, use_existing, frontend_dev,
+        backend_only, rrls_mode, frontend_only_platform is not None,
+    )):
+        print("Error: video_transcoder accepts only debug and log=; station/frontend modes are separate.", file=sys.stderr)
+        print_usage()
+
     if rrls_mode:
         print("RRLS build: no local launch GPIO. Run with GS_RRLS_ROLE=rrls or run_groundstation.py --rrls.")
     if force_pi and force_no_pi:
@@ -1130,6 +1158,10 @@ def main() -> None:
 
     repo_root = Path(__file__).resolve().parent
     _configure_log_file(repo_root, log_file_arg)
+    if video_transcoder:
+        build_video_transcoder(repo_root, debug_mode)
+        return
+
 
     if frontend_only_platform is not None:
         if docker_mode or force_pi or force_no_pi or testing_mode or hitl_mode or test_fire_mode:

@@ -5,8 +5,16 @@ A separate native Rust desktop application for Linux, macOS and Windows. It conn
 Install Rust and FFmpeg with libx264/AAC support on the helper computer. FFmpeg must also be available on the station for copy remuxing. Linux desktop builds require the GTK/WebKit development libraries used by Dioxus Desktop. Build from the GroundStation repository:
 
 ```sh
-cargo build --release --manifest-path video_transcoder/Cargo.toml
+python3 build.py video_transcoder
+# Optional development build or command log:
+python3 build.py video_transcoder debug
+python3 build.py video_transcoder log=video-helper-build.log
+
+# Equivalent direct Cargo command:
+cargo build --locked --release --manifest-path video_transcoder/Cargo.toml
 ```
+
+The helper selector builds only this separate workspace on the current host. It does not fetch/build the station frontend, compile the backend, install FFmpeg or GTK/WebKit, or produce a cross-platform installer. Station modes such as `testing`, `rrls`, `docker` and `frontend_web` are rejected with this selector. The tracked helper `Cargo.lock` is required; `CARGO_TARGET_DIR`, if set, still controls Cargo output.
 
 Run `video_transcoder/target/release/gs-video-transcoder` (`.exe` on Windows). This is a separate Cargo workspace so station/Pi builds do not acquire desktop GUI dependencies. The executable needs FFmpeg on PATH. `gs-video-transcoder --benchmark` runs the synthetic encoding check without opening the GUI.
 
