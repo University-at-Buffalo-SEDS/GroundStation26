@@ -508,7 +508,6 @@ async fn startup_drive_change_preserves_motion_interlocks_and_rejects_active_pha
     f.state.set_local_flight_state(FlightState::Startup);
     f.board_state = FlightState::Startup;
     f.prime().await;
-    assert!(crate::board_recovery::actuator_idle_proof(&f.state).is_none());
     let snapshot = view(&f.state, true);
     assert_eq!(snapshot["can_configure"], true);
     assert!(snapshot["blocked_reason"].is_null());

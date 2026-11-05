@@ -50,10 +50,6 @@ impl Stamp {
         self.checked_duration_since(earlier)
             .unwrap_or(Duration::MAX)
     }
-    #[cfg(test)]
-    fn elapsed(self) -> Duration {
-        Self::now().duration_since(self)
-    }
 }
 #[cfg(test)]
 impl std::ops::Sub<Duration> for Stamp {
@@ -89,7 +85,7 @@ const BOARDS: [Board; 7] = [
     Board::GatewayBoard,
     Board::DaqBoard,
 ];
-const READBACK_TTL: Duration = Duration::from_secs(2);
+const READBACK_TTL: Duration = Duration::from_secs(5);
 const QUERY_TTL: Duration = Duration::from_secs(5);
 const QUERY_TYPE: &str = "BOARD_RECOVERY_REQUEST";
 const STATUS_TYPE: &str = "BOARD_STATE_STATUS";
@@ -299,7 +295,7 @@ fn recovery_diagnostic(
         } else {
             (
                 "readback_expired",
-                "The board readback is older than two seconds. Status refreshes automatically; preparing Recover requests a fresh readback.",
+                "The board readback is older than five seconds. Status refreshes automatically; preparing Recover requests a fresh readback.",
             )
         };
     }
@@ -563,32 +559,9 @@ pub(crate) fn actuator_cached_motion_safe_proof(state: &AppState) -> Option<Actu
         outputs: value.outputs,
     })
 }
-pub(crate) fn actuator_idle_proof(state: &AppState) -> Option<ActuatorIdleProof> {
-    let router = state.topology_router.get()?;
-    if !endpoint_verified(state, Board::ActuatorBoard, &router.export_topology()) {
-        return None;
-    }
-    let inner = state.board_recovery.inner.lock().unwrap();
-    let row = inner.values[index(Board::ActuatorBoard)?].as_ref()?;
-    let value = &row.value;
-    if !row.fresh(Stamp::now())
-        || value.result != 0
-        || value.state != Some(crate::types::FlightState::Idle as u8)
-        || value.flags & OUTPUTS_VALID == 0
-        || matches!(value.boot, 0 | u64::MAX)
-        || matches!(value.epoch, 0 | u32::MAX)
-    {
-        return None;
-    }
-    Some(ActuatorIdleProof {
-        boot: value.boot,
-        epoch: value.epoch,
-        outputs: value.outputs,
-    })
-}
 /// Drive selection is configuration, not motion admission. A freshly observed
 /// Startup board can be configured before flight-state synchronization reaches
-/// Idle; launch and motion callers retain their separate, stricter proofs.
+/// Idle; launch and motion retain their independent admission checks.
 pub(crate) fn actuator_configuration_proof(state: &AppState) -> Option<ActuatorIdleProof> {
     let router = state.topology_router.get()?;
     if !endpoint_verified(state, Board::ActuatorBoard, &router.export_topology()) {
@@ -691,7 +664,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         json!({"id":board.sender_id(),"label":board.as_str(),
             "network":{"healthy":health.is_some_and(|h|h.healthy),"age_ms":health.map_or(u64::MAX,|h|h.age_ms),"disconnects":health.map_or(0,|h|h.disconnects),"reconnects":health.map_or(0,|h|h.reconnects)},
             "state":readback.and_then(|row|row.state),"state_label":readback.and_then(|row|row.state).and_then(crate::types::u8_to_flight_state).map_or("Unknown".to_string(),|value|format!("{value:?}")),
-            "boot":known.map(|row|format!("{:016x}",row.boot)),"epoch":known.map(|row|row.epoch),"nonce":known.map(|row|format!("{:016x}",row.nonce)),"age_ms":age,
+            "boot":known.map(|row|format!("{:016x}",row.boot)),"epoch":known.map(|row|row.epoch),"nonce":known.map(|row|format!("{:016x}",row.nonce)),"age_ms":age,"readback_valid_for_ms":observation.map(|row|READBACK_TTL.saturating_sub(row.age(now)).as_millis().min(u64::MAX as u128)as u64),
             "receipt_age_ms":observation.map(|row|now.duration_since(row.received).as_millis().min(u64::MAX as u128)as u64),"uptime_ms":readback.map(|row|row.uptime),"abort_latched":readback.filter(|_|matches!(board,Board::ActuatorBoard|Board::ValveBoard|Board::FlightComputer)).map(|row|row.flags&1!=0),"safe_outputs":readback.filter(|row|row.flags&OUTPUTS_VALID!=0).map(|row|row.flags&2!=0&&query_domain_consistent(board,row)),"commanded_outputs":readback.filter(|row|row.flags&OUTPUTS_VALID!=0).map(|row|row.outputs),
             "output_readback":if readback.is_some_and(|row|row.flags&OUTPUTS_VALID!=0){"gpio_servo_command_registers"}else{"unknown"},"physical_position_verified":false,
             "capabilities":{"query":primary&&verified,"endpoint_verified":verified,"hardened_transport":verified&&fresh&&readback.is_some_and(|row|row.flags&0x20!=0),"known_utc_manual_stop":verified&&fresh&&matches!(board,Board::ActuatorBoard|Board::ValveBoard|Board::FlightComputer)&&readback.is_some_and(|row|row.flags&0x40!=0),"recover":supported&&targeted_recovery_state(board).is_some(),"prepare_recover":prepare_recover,"resync":false,"reset_startup":supported},"operation":operation,
@@ -712,7 +685,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         "rejected_statuses":rejected_statuses,"last_rejection":last_rejection,
         "mode_capability":{"current":current,"build_mode":build,"supported_modes":[build],"runtime_switch_supported":false,"requires_restart":["normal","hitl","test_fire","testing"],"message":"Only the compiled runtime is supported; changing labels does not switch hardware policy."},"boards":boards,"operation":state.board_recovery.coordinator.operation()})).into_response()
 }
-/// Background reads share one five-second budget with demand-triggered reads.
+/// Background reads share a two-second budget with demand-triggered reads.
 /// No method here prepares, confirms, stops or recovers a board.
 pub(crate) struct ReadonlyQueryRefresh {
     last: [Option<WallInstant>; 7],
@@ -781,7 +754,7 @@ impl ReadonlyQueryRefresh {
 fn readonly_query_due(last: Option<WallInstant>, now: WallInstant) -> bool {
     last.is_none_or(|last| {
         now.checked_duration_since(last)
-            .is_some_and(|age| age >= QUERY_TTL)
+            .is_some_and(|age| age >= Duration::from_secs(2))
     })
 }
 fn readonly_query_candidate(
@@ -793,9 +766,9 @@ fn readonly_query_candidate(
 ) -> bool {
     healthy
         && verified
-        && row.is_none_or(|row| !row.fresh(now))
+        && row.is_none_or(|row| row.age(now) >= Duration::from_secs(2))
         && !query.is_some_and(|query| {
-            now.checked_duration_since(query.sent)
+            !query.received && now.checked_duration_since(query.sent)
                 .is_none_or(|age| age <= QUERY_TTL)
         })
 }
@@ -1400,7 +1373,7 @@ mod tests {
         state.board_recovery.inner.lock().unwrap().queries[at] = Some(Query {
             abort_revision: 0,
             nonce: 7,
-            sent: Stamp::now(),
+            sent: Stamp::now() - Duration::from_millis(100),
             received: false,
         });
         let mut wire = status_wire(&state, 7);
@@ -1439,6 +1412,10 @@ mod tests {
             .iter()
             .find(|row| row["id"] == "AB")
             .unwrap();
+        let remaining = board["readback_valid_for_ms"].as_u64().unwrap();
+        assert!(remaining > 0 && remaining <= 4_900, "query age, not fresh receipt, spends the server lease");
+        assert!(body["boards"].as_array().unwrap().iter()
+            .find(|row| row["id"] == "RF").unwrap()["readback_valid_for_ms"].is_null());
         assert_eq!(board["capabilities"]["hardened_transport"], true);
         assert_eq!(board["capabilities"]["known_utc_manual_stop"], true);
         for capability in ["recover", "resync", "reset_startup"] {
@@ -1447,7 +1424,7 @@ mod tests {
         state.board_recovery.inner.lock().unwrap().values[at]
             .as_mut()
             .unwrap()
-            .observed_after = Stamp::now() - Duration::from_secs(3);
+            .observed_after = Stamp::now() - Duration::from_secs(6);
         let response = http(
             state.clone(),
             "GET",
@@ -1469,6 +1446,7 @@ mod tests {
             .iter()
             .find(|row| row["id"] == "AB")
             .unwrap();
+        assert_eq!(board["readback_valid_for_ms"], 0);
         assert_eq!(board["capabilities"]["hardened_transport"], false);
         // Old transports stay readable and never gain the new implementation
         // capability merely because a fresh dedicated endpoint exists.
@@ -1702,6 +1680,31 @@ mod tests {
         assert!(inner.last_rejection.is_some());
     }
     #[tokio::test]
+    async fn proactive_readonly_refresh_preserves_five_second_proof_and_pending_nonce() {
+        let state = crate::state::tests::test_app_state().await;
+        let start = Stamp::now();
+        let row = Observation {
+            value: Readback::decode(&status_wire(&state, 44)).unwrap(),
+            received: start,
+            observed_after: start,
+        };
+        let answered = Query { abort_revision: 0, nonce: 44, sent: start, received: true };
+        let pending = Query { received: false, ..answered.clone() };
+        let at = start + Duration::from_secs(2);
+        assert!(row.fresh(at));
+        assert!(readonly_query_candidate(true, true, Some(&row), Some(&answered), at));
+        assert!(!readonly_query_candidate(true, true, Some(&row), Some(&pending), at));
+        assert!(!readonly_query_candidate(false, true, Some(&row), Some(&answered), at));
+        assert!(!readonly_query_candidate(true, false, Some(&row), Some(&answered), at));
+        assert!(!readonly_query_candidate(true, true, Some(&row), Some(&answered), start + Duration::from_millis(1_999)));
+        assert!(!readonly_query_due(Some(start.wall), start.wall + Duration::from_millis(1_999)));
+        assert!(readonly_query_due(Some(start.wall), at.wall));
+        assert!(row.fresh(start + Duration::from_secs(5)));
+        assert!(!row.fresh(start + Duration::from_millis(5_001)));
+        assert_eq!(row.observed_after, start);
+    }
+
+    #[tokio::test]
     async fn delayed_reply_cannot_become_fresh_merely_by_arriving_now() {
         let state = crate::state::tests::test_app_state().await;
         let at = index(Board::ActuatorBoard).unwrap();
@@ -1712,12 +1715,9 @@ mod tests {
             sent,
             received: false,
         });
-        observe(&state, &status_packet("AB", status_wire(&state, 44))).unwrap();
+        assert!(observe(&state, &status_packet("AB", status_wire(&state, 44))).is_err());
         let inner = state.board_recovery.inner.lock().unwrap();
-        let row = inner.values[at].as_ref().unwrap();
-        assert_eq!(row.observed_after, sent);
-        assert!(!row.fresh(Stamp::now()));
-        assert!(row.received.elapsed() < Duration::from_secs(1));
+        assert!(inner.values[at].is_none());
     }
     #[tokio::test]
     async fn regressed_monotonic_context_cannot_admit_a_fresh_status() {
@@ -1790,16 +1790,16 @@ mod final_clock_freshness_tests {
         } }
     }
     #[test]
-    fn unchanged_two_second_freshness_preserves_paused_model_and_rejects_domain_loss() {
+    fn five_second_freshness_preserves_paused_model_and_rejects_domain_loss() {
         let wall=WallInstant::now();
         let at=Stamp {wall:wall-Duration::from_secs(60),model_ms:Some(1000)};
         let row=observation(at);
         assert!(row.fresh(Stamp {wall,model_ms:Some(1000)}));
-        assert!(row.fresh(Stamp {wall,model_ms:Some(3000)}));
-        assert!(!row.fresh(Stamp {wall,model_ms:Some(3001)}));
+        assert!(row.fresh(Stamp {wall,model_ms:Some(6000)}));
+        assert!(!row.fresh(Stamp {wall,model_ms:Some(6001)}));
         assert!(!row.fresh(Stamp {wall,model_ms:Some(999)}));
         assert!(!row.fresh(Stamp {wall,model_ms:None}));
-        let wall_row=observation(Stamp {wall:wall-Duration::from_secs(3),model_ms:None});
+        let wall_row=observation(Stamp {wall:wall-Duration::from_secs(6),model_ms:None});
         assert!(!wall_row.fresh(Stamp {wall,model_ms:None}));
     }
 }

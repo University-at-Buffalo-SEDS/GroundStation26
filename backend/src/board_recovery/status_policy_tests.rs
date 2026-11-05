@@ -348,11 +348,11 @@ fn readonly_refresh_budget_and_pending_context_are_bounded() {
     assert!(readonly_query_due(None, now.wall));
     assert!(!readonly_query_due(Some(now.wall), now.wall));
     assert!(!readonly_query_due(
-        Some(now.wall - Duration::from_millis(4999)),
+        Some(now.wall - Duration::from_millis(1999)),
         now.wall
     ));
     assert!(readonly_query_due(
-        Some(now.wall - Duration::from_secs(5)),
+        Some(now.wall - Duration::from_secs(2)),
         now.wall
     ));
     assert!(readonly_query_candidate(true, true, None, None, now));
@@ -372,7 +372,7 @@ fn readonly_refresh_budget_and_pending_context_are_bounded() {
         now
     ));
     query.received = true;
-    assert!(!readonly_query_candidate(
+    assert!(readonly_query_candidate(
         true,
         true,
         None,

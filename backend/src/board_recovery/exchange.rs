@@ -574,7 +574,7 @@ mod tests {
                 &query,
                 2,
                 0,
-                now + Duration::from_millis(2001),
+                now + Duration::from_millis(5001),
                 router.clone()
             )
             .is_err()

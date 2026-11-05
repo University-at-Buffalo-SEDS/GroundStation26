@@ -21,7 +21,7 @@ pub(crate) const BOARDS: [Board; 7] = [
     Board::GatewayBoard,
     Board::DaqBoard,
 ];
-const PROOF_TTL: Duration = Duration::from_secs(2);
+const PROOF_TTL: Duration = Duration::from_secs(5);
 pub(crate) fn board_names(mask: u8) -> String {
     BOARDS
         .into_iter()
@@ -744,14 +744,50 @@ pub(crate) async fn publish_service(
 
     }
 }
+/// Dedicated bounded drive/state observations keep control readiness independent
+/// of an open Settings page. Every frame still traverses the existing nonce
+/// correlation and original-source freshness checks. This emits QUERY only.
+#[derive(Default)]
+pub(crate) struct ActuatorReadbackRefresh {
+    last: Option<Instant>,
+}
+impl ActuatorReadbackRefresh {
+    pub(crate) fn poll(&mut self, state: &std::sync::Arc<AppState>) -> bool {
+        let now = Instant::now();
+        if self.last.is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+            || crate::rrls::is_rrls()
+            || !crate::board_recovery::coordinator::readonly_query_idle(state)
+            || state.topology_router.get().is_none_or(|router| router.sender().as_ref() != "GS")
+        {
+            return false;
+        }
+        let healthy = state.network_health.lock().unwrap()
+            .snapshot(now, cfg!(feature = "test_fire_mode"))
+            .iter().any(|row| row.sender_id == "AB" && row.healthy);
+        if !healthy { return false; }
+        self.last = Some(now);
+        // The board query verifies the dedicated discovered endpoint and keeps
+        // any outstanding nonce alive. Do not probe legacy command endpoints.
+        if crate::board_recovery::request_board_query(state, Board::ActuatorBoard).status()
+            != axum::http::StatusCode::OK
+        {
+            return false;
+        }
+        let _ = crate::actuator_plumbing::request_drive_query(state);
+        true
+    }
+}
+
 /// Read-only health refresh plus finite explicit-demand batches. All requests
-/// share a five-second per-board cooldown; recovery still needs human intent.
+/// share a two-second background cooldown; actuator control readbacks have a
+/// separate one-second budget. Recovery still needs human intent.
 pub(crate) async fn query_service(
     state: std::sync::Arc<AppState>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     let mut refresh = crate::board_recovery::ReadonlyQueryRefresh::default();
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut actuator = ActuatorReadbackRefresh::default();
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {biased;_=shutdown.recv()=>return,_=state.board_abort.query_needed.notified()=>{},_=tick.tick()=>{}}
@@ -759,6 +795,7 @@ pub(crate) async fn query_service(
         if crate::rrls::is_rrls() || !crate::board_recovery::coordinator::readonly_query_idle(&state) {
             continue;
         }
+        let _ = actuator.poll(&state);
         for (i, board) in BOARDS.into_iter().enumerate() {
             if demand & (1 << i) == 0 {
                 continue;
@@ -829,6 +866,27 @@ pub(crate) async fn refresh_status(
 #[cfg(test)]
 mod reset_scope_context_tests {
     use super::*;
+    #[test]
+    fn ignition_pair_lease_survives_healthy_two_second_refresh_but_expires_at_five() {
+        let runtime = Runtime::default();
+        let start = Instant::now();
+        for board in [Board::ActuatorBoard, Board::ValveBoard] {
+            runtime.observe_status(board, 7, 1, 22, Some(1), false, true,
+                start, runtime.query_revision(board), start, 100);
+        }
+        {
+            let register = runtime.register.lock().unwrap();
+            assert_eq!(Runtime::masks_at(&register, start + Duration::from_secs(3)).1
+                & crate::ignition_pair::REQUIRED_MASK, crate::ignition_pair::REQUIRED_MASK);
+            assert_eq!(Runtime::masks_at(&register, start + Duration::from_secs(5)).1
+                & crate::ignition_pair::REQUIRED_MASK, crate::ignition_pair::REQUIRED_MASK);
+            assert_eq!(Runtime::masks_at(&register, start + Duration::from_millis(5_001)).1
+                & crate::ignition_pair::REQUIRED_MASK, 0);
+        }
+        runtime.observe_abort(Board::ActuatorBoard, start + Duration::from_millis(1), 101);
+        assert!(!runtime.ignition_pair_current());
+    }
+
     #[test]
     fn same_abort_episode_and_accepted_exit_preserve_original_selection_but_new_episode_does_not() {
         let runtime = Runtime::default();

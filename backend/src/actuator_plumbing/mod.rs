@@ -2,6 +2,8 @@
 //! Delivery ACKs and timed electrical cycles never certify mechanical position.
 #[cfg(test)]
 pub(crate) mod http_tests;
+#[cfg(test)]
+mod refresh_tests;
 mod motion_journal;
 mod motion_wire;
 mod wire;
@@ -33,7 +35,7 @@ use wire::{Mode, Request, Status};
 
 const REQUEST_TYPE: &str = "AB_FILL_DRIVE_SETTINGS";
 const STATUS_TYPE: &str = "AB_FILL_DRIVE_STATUS";
-const FRESH_MS: u64 = 3_000;
+const FRESH_MS: u64 = 5_000;
 const REQUEST_TTL: u64 = 5_000;
 
 #[derive(Clone, Copy)]
@@ -645,6 +647,34 @@ fn view(state: &AppState, commands: bool) -> Value {
         "settings_inflight":inner.settings_busy,"message":inner.storage_error.as_ref().unwrap_or(&inner.message)})
 }
 
+/// Shared UI/background read-only drive query. Preserve the original nonce
+/// and receipt clock; an unanswered request is never re-dated or replaced.
+pub(crate) fn request_drive_query(state: &AppState) -> Result<(), String> {
+    if !primary(state) {
+        return Err("Drive queries require the current primary GS.".into());
+    }
+    {
+        let inner = state.plumbing_drive.inner.lock().unwrap();
+        if inner.settings_busy
+            || inner.requests.back().is_some_and(|context| {
+                context.sent.age().is_some_and(|age| {
+                    age < 1_000 || (!context.complete && age <= REQUEST_TTL)
+                })
+            })
+        {
+            return Ok(());
+        }
+    }
+    let router = state.topology_router.get().ok_or("Telemetry router unavailable")?;
+    queue(state, Request {
+        mode: None,
+        nonce: rand::random::<u64>().max(1),
+        generation: 0,
+        epoch: 0,
+        issuer: state.plumbing_drive.issuer,
+    }, crate::system_clock::control_packet_timestamp_ms(router))
+}
+
 /// Explicit read-only demand only. A failed/legacy peer never becomes ready.
 pub(crate) fn request_motion_query(state: &AppState) -> Result<(), String> {
     if !primary(state) {
@@ -1213,6 +1243,14 @@ fn queue_prepared_request(
         .ok_or("Telemetry router unavailable")?;
     {
         let mut inner = state.plumbing_drive.inner.lock().unwrap();
+        // Serialize the shared UI/background read-only budget with insertion.
+        // SET admission is unchanged; only an answered query permits the next
+        // one-second refresh before its original five-second timeout.
+        if request.mode.is_none() && (inner.settings_busy || inner.requests.back().is_some_and(|context| {
+            context.sent.age().is_some_and(|age| age < 1_000 || (!context.complete && age <= REQUEST_TTL))
+        })) {
+            return Ok(());
+        }
         if inner
             .requests
             .iter()
@@ -1293,35 +1331,7 @@ async fn query(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
             "Drive queries require the current primary GS.",
         );
     }
-    {
-        let inner = state.plumbing_drive.inner.lock().unwrap();
-        if inner
-            .requests
-            .back()
-            .is_some_and(|c| c.sent.age().is_some_and(|age| age < 1000))
-        {
-            drop(inner);
-            return Json(view(
-                &state,
-                principal.permissions.send_commands
-                    && principal.allows_command_name("RetractPlumbing"),
-            ))
-            .into_response();
-        }
-    }
-    let router = state.topology_router.get().unwrap();
-    let request = Request {
-        mode: None,
-        nonce: rand::random::<u64>().max(1),
-        generation: 0,
-        epoch: 0,
-        issuer: state.plumbing_drive.issuer,
-    };
-    if let Err(message) = queue(
-        &state,
-        request,
-        crate::system_clock::control_packet_timestamp_ms(router),
-    ) {
+    if let Err(message) = request_drive_query(&state) {
         return error(StatusCode::SERVICE_UNAVAILABLE, message);
     }
     Json(view(
@@ -1751,9 +1761,9 @@ mod tests {
         {
             let mut inner = state.plumbing_drive.inner.lock().unwrap();
             let observed = inner.observed.as_mut().unwrap();
-            observed.after.wall -= std::time::Duration::from_millis(4_000);
+            observed.after.wall -= std::time::Duration::from_millis(6_000);
             if let Some(model) = observed.after.model.as_mut() {
-                *model = model.checked_sub(4_000).unwrap_or(u64::MAX);
+                *model = model.checked_sub(6_000).unwrap_or(u64::MAX);
             }
         }
         deliver(&state, "AB", &frame(&state, 9, 2, 0));

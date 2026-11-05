@@ -3858,107 +3858,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn board_abort_healthy_session_does_not_poll_until_a_new_explicit_launch_demand() {
-        if crate::operator_queue::isolated_native_case(module_path!(),"board_abort_healthy_session_does_not_poll_until_a_new_explicit_launch_demand")
-        {
-            return;
-        }
+    async fn board_abort_healthy_session_refreshes_only_queries_without_settings_or_launch_demand() {
+        if crate::operator_queue::isolated_native_case(module_path!(),"board_abort_healthy_session_refreshes_only_queries_without_settings_or_launch_demand") { return; }
         let fixture = Fixture::from_saved_with_services_profile(None,None,None,false,false,true).await;
         completed_manual_cohort(&fixture).await;
         let state = fixture.state();
-        let count = || {
-            fixture
-                .models
-                .iter()
-                .map(|(_, m)| {
-                    m.lock()
-                        .unwrap()
-                        .requests
-                        .iter()
-                        .filter(|p| p.payload()[1] == 0)
-                        .count()
-                })
-                .sum::<usize>()
-        };
-        let baseline = count();
+        let baseline = fixture.models.iter().map(|(_,m)|m.lock().unwrap().requests.len()).collect::<Vec<_>>();
         assert_eq!(state.board_abort.take_queries(), 0);
-        let worker = tokio::spawn(crate::board_abort::query_service(
-            state.clone(),
-            state.shutdown_tx.subscribe(),
-        ));
-        tokio::time::sleep(Duration::from_millis(2100)).await;
-        for _ in 0..100 {
-            state.action_policy_snapshot();
-            state.broadcast_action_policy_snapshot();
-            crate::primary_mirror::encode_control_observation(&state, 96);
-            state
-                .board_abort
-                .snapshot(crate::board_abort::required_mask(&state));
-        }
-        assert_eq!(
-            count(),
-            baseline,
-            "healthy proof expiration and periodic presentation never poll boards"
-        );
-        assert_eq!(state.board_abort.take_queries(), 0);
-        assert!(
-            state.board_abort.snapshot(0).active_errors.is_empty(),
-            "proof TTL cannot recreate a cleared condition"
-        );
-        let router = state.topology_router.get().unwrap();
-        let required = crate::board_abort::required_mask(&state);
-        let wanted = (required | crate::ignition_pair::REQUIRED_MASK).count_ones() as usize;
-        // HITL intentionally makes disconnected layout domains optional. Do
-        // not manufacture seven required boards merely to match normal mode.
-        if required != 0 {
-            assert!(
-                !crate::gse::queue_controller_with_stop_fence(
-                    &state,
-                    router,
-                    crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
-                    &[1]
-                )
-                .unwrap()
-            );
-        } else {
-            let denied = super::super::tests::http(
-                state.clone(),
-                "POST",
-                "/api/board_abort/refresh",
-                None,
-                json!({}),
-            )
-            .await;
-            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
-            assert_eq!(state.board_abort.take_queries(), 0);
-            let response = super::super::tests::http(
-                state.clone(),
-                "POST",
-                "/api/board_abort/refresh",
-                Some("viewer"),
-                json!({}),
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::ACCEPTED);
-        }
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while count() < baseline + wanted {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        let worker = tokio::spawn(crate::board_abort::query_service(state.clone(), state.shutdown_tx.subscribe()));
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(10) {
+            for (board,_) in &fixture.models {
+                state.network_health.lock().unwrap().observe(board.sender_id(), std::time::Instant::now(),100);
             }
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            count(),
-            baseline + wanted,
-            "one coalesced batch, no mode synchronization/recovery writes"
-        );
-        assert!(
-            !router
-                .has_pending_reliable_tx_type(crate::telemetry_schema::data_type("FLIGHT_COMMAND")),
-            "check never retries Fire"
-        );
+            // Presentation does not itself create requests, grant proof, or
+            // publish a mode. The dedicated backend worker owns refresh.
+            state.action_policy_snapshot();
+            let now = Stamp::now();
+            let inner = state.board_recovery.inner.lock().unwrap();
+            for row in inner.values.iter().flatten() {
+                assert!(row.fresh(now), "healthy state expired despite proactive read-only refresh");
+            }
+            drop(inner);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         worker.abort();
+        let mut total = 0;
+        for ((_,model),before) in fixture.models.iter().zip(baseline) {
+            let model=model.lock().unwrap();
+            let added=&model.requests[before..];
+            assert!(!added.is_empty(), "healthy board was never refreshed");
+            assert!(added.iter().all(|packet|packet.payload()[..4]==[1,0,0,0]), "background must emit QUERY only");
+            total+=added.len();
+        }
+        assert!(total<=60, "background requests exceeded the bounded fair refresh budget");
+        assert!(state.board_abort.snapshot(0).active_errors.is_empty());
+        assert!(!state.topology_router.get().unwrap().has_pending_reliable_tx_type(crate::telemetry_schema::data_type("FLIGHT_COMMAND")));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
