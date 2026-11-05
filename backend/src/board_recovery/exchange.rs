@@ -262,9 +262,11 @@ impl Exchange {
         }
         let outcome = match row.result {
             1 if row.epoch == self.epoch => Outcome::Pending,
-            0 => {
+            // A separately selected progress result can carry a fresh snapshot
+            // taken after the owner advanced the epoch. It is still NOT terminal.
+            0 | 1 => {
                 if self.boot == u64::MAX
-                    || row.epoch != self.epoch + 1
+                    || self.epoch.checked_add(1) != Some(row.epoch)
                     || row.state != Some(self.desired)
                     || row.flags & ABORT != 0
                 {
@@ -283,9 +285,8 @@ impl Exchange {
                 } else if row.flags & STATE_VALID == 0 || row.flags & (OUTPUTS_VALID | SAFE) != 0 {
                     return Err("Metadata node supplied unsupported physical proof");
                 }
-                Outcome::Applied
+                if row.result == 0 { Outcome::Applied } else { Outcome::Pending }
             }
-            1 => return Err("Stop epoch changed while recovery was pending"),
             result => Outcome::Rejected(result),
         };
         if outcome != Outcome::Pending {
@@ -813,4 +814,6 @@ mod tests {
             assert_eq!(exchange.observe(&valid, now).unwrap(), Outcome::Applied);
         }
     }
+    include!("pending_next_epoch_tests.rs");
+
 }

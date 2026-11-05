@@ -744,9 +744,24 @@ pub(crate) fn shutdown_clean_eligible(state: &AppState) -> bool {
 
 
 
+/// Read-only test observation of the actual production nonce/correlation owner.
+#[cfg(test)]
+pub(crate) fn query_nonce_for_test(state:&AppState,board:Board)->Option<u64>{
+    state.board_recovery.inner.lock().unwrap().queries[index(board)?].as_ref().map(|query|query.nonce)
+}
+#[cfg(test)]
+pub(crate) fn query_reply_current_for_test(state:&AppState,board:Board,nonce:u64)->bool{
+    let Some(at)=index(board)else{return false;};
+    let inner=state.board_recovery.inner.lock().unwrap();
+    let(Some(query),Some(row))=(&inner.queries[at],&inner.values[at])else{return false;};
+    query.nonce==nonce&&query.received&&row.value.nonce==nonce&&row.value.result==0&&row.fresh(Stamp::now())
+}
+
 #[cfg(all(test, feature = "testing", not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
 #[path = "board_recovery/testing_model_tests.rs"]
 mod testing_model_tests;
+#[cfg(all(test, feature="testing", not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+pub(crate) use testing_model_tests::{ReadyIgnitionFixture,ready_ignition_fixture_for_test};
 
 #[cfg(test)]
 mod tests {

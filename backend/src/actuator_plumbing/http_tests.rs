@@ -187,8 +187,8 @@ impl Fixture {
         let weak = Arc::downgrade(&state);
         let owner = Arc::as_ptr(&state) as usize;
         let host = Arc::new(Router::new_with_clock(
-            RouterConfig::new([EndpointHandler::new_packet_handler(
-                crate::telemetry_schema::endpoint("GROUND_STATION"),
+            RouterConfig::new([crate::ignition_pair::fixture::handler(
+                &state,
                 move |packet| {
                     let state = weak.upgrade().unwrap();
                     receive_status(&state, packet);
@@ -1827,18 +1827,18 @@ async fn motion_history_cancelled_http_keeps_owned_writer_and_stop_prevents_stal
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public438_actual_prepared_control_retract_and_launch_refuse_held_core_without_delaying_stop()
  {
+    if crate::operator_queue::isolated_native_case(module_path!(),"public438_actual_prepared_control_retract_and_launch_refuse_held_core_without_delaying_stop"){return;}
     let _serial = SERIAL.lock().await;
     for case in ["control", "retract", "launch"] {
         let mut f = Fixture::new().await;
         if case == "retract" {
             f.prime_motion_identity().await;
         }
-        for board in crate::board_abort::BOARDS {
-            let at = Instant::now();
-            f.state
-                .board_abort
-                .observe_status(board, 42, 8, 1, Some(1), false, true, at, 0, at, 1);
-        }
+        let mut actual_peers=crate::ignition_pair::fixture::Peers::attach(&f.state,f.host.clone(),&[crate::types::Board::ActuatorBoard]);
+        tokio::time::timeout(std::time::Duration::from_secs(2),async {loop {f.pump();actual_peers.pump();if crate::ignition_pair::require_routes(&f.state).is_ok(){break;}tokio::task::yield_now().await;}}).await.expect("real AB and added VB command discovery must be observed");
+        let state=f.state.clone();
+        actual_peers.refresh_with(&state,||f.pump()).await;
+        f.pump();actual_peers.pump();
         let original = crate::gse::plumbing_admission_ticket(&f.state);
         let revision =
             crate::board_abort::capture_launch_revision_named(&f.state, "Launch").unwrap();

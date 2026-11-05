@@ -3675,6 +3675,8 @@ pub(crate) fn queue_controller_with_launch_revision(
     } else {
         LaunchAdmission::capture(state)
     };
+    let pair_required = crate::ignition_pair::packet_requires_pair(kind, payload);
+    if pair_required && !crate::ignition_pair::same_router(state,router) { return Ok(false); }
     let packet = crate::telemetry_task::controller_packet(router, kind, payload)?;
     // Only the explicit hardware abort-safe directions bypass the fence.
     if abort_safe_control(kind, payload) {
@@ -3689,19 +3691,39 @@ pub(crate) fn queue_controller_with_launch_revision(
     let started=Instant::now();
     loop {
         if state.abort_indicator_latched() {return Ok(false);}
+        let route_token = if pair_required {
+            if !state.board_abort.ignition_pair_current() {
+                state.board_abort.request_queries(crate::board_abort::required_mask(state)
+                    | crate::ignition_pair::REQUIRED_MASK);
+                return Ok(false);
+            }
+            Some(crate::ignition_pair::capture_route_token(state).map_err(sedsnet::TelemetryError::Io)?)
+        } else { None };
     let attempt_packet=packet.clone();
+    let offer = || {
+        if let Some(token)=route_token {
+            crate::ignition_pair::validate_route_token(state,token).map_err(sedsnet::TelemetryError::Io)?;
+        }
+        router.try_tx_queue(attempt_packet)
+    };
     let result = if crate::board_abort::controller_can_launch(kind, payload) {
         state
             .board_abort
             .admit_launch(
                 state,
-                crate::board_abort::required_mask(state),
+                crate::board_abort::required_mask(state)
+                    | if pair_required { crate::ignition_pair::REQUIRED_MASK } else { 0 },
                 ticket.board_abort_revision,
-                || with_stop_admission(state, ticket, || router.try_tx_queue(attempt_packet)),
+                || with_stop_admission(state, ticket, offer),
             )
             .and_then(|v| v.map_err(|error| error.to_string()))
+    } else if pair_required {
+        with_stop_admission(state, ticket, || {
+            state.board_abort.admit_ignition_pair(ticket.board_abort_revision,
+                offer)
+        }).and_then(|result| result).map_err(str::to_string)
     } else {
-        with_stop_admission(state, ticket, || router.try_tx_queue(attempt_packet))
+        with_stop_admission(state, ticket, offer)
             .map_err(|error| error.to_string())
     };
     match result {
@@ -3709,6 +3731,8 @@ pub(crate) fn queue_controller_with_launch_revision(
             if started.elapsed()<std::time::Duration::from_millis(100)=>{
                 #[cfg(test)]
                 nonwaiting_admission_tests::core_busy_refused(state);
+                #[cfg(test)]
+                nonwaiting_admission_tests::launch_retry_boundary(state);
                 // No SDK owner exists. Sleep outside board/Stop locks and
                 // retry this exact original packet/ticket, never a new intent.
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3749,15 +3773,30 @@ fn with_stop_admission<T>(
 fn with_launch_admission<T>(
     state: &AppState,
     ticket: LaunchAdmission,
+    ignition_pair_required: bool,
     admit: impl FnOnce() -> T,
 ) -> Result<T, String> {
+    // Observe routes before taking any application owner. Metadata-only state
+    // publication retains its original mode policy; it is not an igniter command.
+    let route_token = if ignition_pair_required {
+        if !state.board_abort.ignition_pair_current() {
+            state.board_abort.request_queries(crate::board_abort::required_mask(state)
+                | crate::ignition_pair::REQUIRED_MASK);
+            return Err("Ignition requires fresh non-Abort Actuator and Valve Board readbacks".into());
+        }
+        Some(crate::ignition_pair::capture_route_token(state).map_err(str::to_string)?)
+    } else { None };
     let _dispatch = DISPATCH_GATE.lock().unwrap();
     if cold_flow::active(state){return Err("Rocket Launch is inhibited while cold flow owns the valves".into());}
     with_stop_admission(state, ticket, || ()).map_err(str::to_string)?;
-    let required = crate::board_abort::required_mask(state);
+    let required = crate::board_abort::required_mask(state)
+        | if ignition_pair_required { crate::ignition_pair::REQUIRED_MASK } else { 0 };
     state
         .board_abort
         .admit_launch(state, required, ticket.board_abort_revision, || {
+            if let Some(token)=route_token {
+                crate::ignition_pair::validate_route_token(state,token)?;
+            }
             with_stop_admission(state, ticket, admit)
         })
         .and_then(|v| v.map_err(|error| error.to_string()))
@@ -3807,6 +3846,11 @@ pub(crate) fn queue_prepared_launch_packets(
 ) -> Result<usize, String> {
     if let Some(prepared) = &prepared {
         packets.insert(0, prepared.packet.clone());
+    }
+    let ignition_pair_required = packets.iter().any(|packet|
+        crate::ignition_pair::packet_requires_pair(packet.data_type(), packet.payload()));
+    if ignition_pair_required && !crate::ignition_pair::same_router(state,router) {
+        return Err("Ignition route observation belongs to a different SDK router".into());
     }
     let total = packets.len();
     #[cfg(test)] nonwaiting_admission_tests::record_launch_packets(state,&packets);
@@ -3858,7 +3902,7 @@ pub(crate) fn queue_prepared_launch_packets(
             }
         }
         let mut attempt_packets = packets.iter().cloned().map(Some).collect::<Vec<_>>();
-        let guarded = with_launch_admission(state, ticket, || {
+        let guarded = with_launch_admission(state, ticket, ignition_pair_required, || {
             let mut accepted = 0;
             for slot in &mut attempt_packets {
                 // A guard may have waited. No retry call starts after this
@@ -3961,7 +4005,7 @@ pub(crate) fn admit_simulated_launch(
     launch: impl FnOnce() -> bool,
 ) -> Result<(), String> {
     let accepted =
-        with_launch_admission(state, ticket, launch).map_err(|error| error.to_string())?;
+        with_launch_admission(state, ticket, true, launch).map_err(|error| error.to_string())?;
     if accepted {
         Ok(())
     } else {
@@ -4112,12 +4156,21 @@ pub(crate) fn armed_fixture_for_test(
     state: &Arc<AppState>,
     router: &Arc<sedsnet::router::Router>,
 ) -> std::path::PathBuf {
+    armed_fixture_network_for_test(state,router,true)
+}
+#[cfg(all(test, not(feature="hitl_mode"),feature="test_fire_mode"))]
+pub(crate) fn armed_fixture_with_real_pair_for_test(state:&Arc<AppState>,router:&Arc<sedsnet::router::Router>)->std::path::PathBuf {
+    armed_fixture_network_for_test(state,router,false)
+}
+#[cfg(all(test, not(feature="hitl_mode")))]
+fn armed_fixture_network_for_test(state:&Arc<AppState>,router:&Arc<sedsnet::router::Router>,modeled_network:bool)->std::path::PathBuf {
     use crate::types::Board;
     crate::telemetry_task::refresh_host_network_time(
         router,
         crate::telemetry_task::get_current_timestamp_ms(),
     );
     state.set_local_flight_state(FlightState::Armed);
+    if modeled_network {
     let side = router.add_side_packed("test_fixture_other_boards", |_| Ok(()));
     let mut endpoints = vec![crate::telemetry_schema::endpoint("ACTUATOR_BOARD")];
     if !cfg!(feature = "test_fire_mode") {
@@ -4128,6 +4181,7 @@ pub(crate) fn armed_fixture_for_test(
         .rx_packed_from_side(&sedsnet::wire_format::pack_packet(&announce), side)
         .unwrap();
     router.process_all_queues_with_timeout(0).unwrap();
+    }
     if state.topology_router.get().is_none() {
         state.topology_router.set(router.clone()).unwrap();
     }
@@ -4137,6 +4191,7 @@ pub(crate) fn armed_fixture_for_test(
         Board::ActuatorBoard,
         Board::DaqBoard,
     ] {
+        if !modeled_network&&matches!(board,Board::ActuatorBoard|Board::ValveBoard){continue;}
         state.mark_board_seen(
             board.sender_id(),
             crate::telemetry_task::get_current_timestamp_ms(),
@@ -4194,7 +4249,14 @@ pub(crate) fn armed_fixture_for_test(
     state.set_action_policy(policy);
     // Return a fresh MODELED prerequisite after unrelated setup completes.
     // This is the fixture's one original seed, never a post-intent refresh.
-    qualified_launch_proofs_for_test(state);
+    if modeled_network {qualified_launch_proofs_for_test(state);} else {
+        // Explicit MODELED GB/DAQ operational prerequisites only. AB/VB are
+        // proved by genuine same-Router QUERY replies in the caller. There is
+        // no FC/AV-bay presence, fake ACTUATOR announcement or AB/VB proof seed.
+        for board in [Board::GatewayBoard,Board::DaqBoard]{
+            let at=Instant::now();state.board_abort.observe_status(board,42,8,1,Some(1),false,true,at,0,at,1);
+        }
+    }
     path
 }
 
@@ -4427,14 +4489,16 @@ mod operator_admission_tests {
     #[tokio::test]
     async fn hitl_board_proof_optional_actual_sdk_launch_absent_boards_and_known_abort_always_blocks()
      {
+        if crate::operator_queue::isolated_native_case(module_path!(),"hitl_board_proof_optional_actual_sdk_launch_absent_boards_and_known_abort_always_blocks"){return;}
         use std::sync::atomic::{AtomicUsize, Ordering};
         let state = crate::state::tests::test_app_state().await;
         state.av_bay_comms_connected.store(true, Ordering::Relaxed);
         state.fill_comms_connected.store(true, Ordering::Relaxed);
         let owners = Arc::new(AtomicUsize::new(0));
         let received = owners.clone();
-        let router = sedsnet::router::Router::new(
+        let router = Arc::new(sedsnet::router::Router::new(
             sedsnet::router::RouterConfig::new([
+                crate::ignition_pair::fixture::handler(&state, |_|Ok(())),
                 sedsnet::router::EndpointHandler::new_packet_handler(
                     crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"),
                     move |packet| {
@@ -4448,7 +4512,8 @@ mod operator_admission_tests {
                 ),
             ])
             .with_sender("GS"),
-        );
+        ));
+        state.topology_router.set(router.clone()).unwrap();
         crate::telemetry_task::refresh_host_network_time(
             &router,
             crate::telemetry_task::get_current_timestamp_ms(),
@@ -4457,6 +4522,18 @@ mod operator_admission_tests {
         let payload = [crate::rocket_commands::FlightComputerCommands::Launch as u8];
         assert!(!state.board_state_proof_enforced());
         assert_eq!(crate::board_abort::required_mask(&state), 0);
+        // HITL may make the other boards optional; the ignition pair remains
+        // mandatory, so an absent pair never gains a Launch owner.
+        let missing = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        assert!(!queue_controller_with_launch_revision(&state,&router,kind,&payload,missing).unwrap());
+        assert!(!router.has_pending_reliable_tx_type(kind));
+        assert_eq!(owners.load(Ordering::SeqCst),0);
+        // Genuine queried AB/VB peers on this exact Arc Router; all other five
+        // boards stay absent. No synthetic proof mask or board-status seed.
+        let _actual_pair=crate::ignition_pair::fixture::Peers::warm_pair_only(&state,router.clone()).await;
+        let(aborted,proven)=state.board_abort.masks();
+        assert_eq!(aborted,0);assert_eq!(proven,crate::ignition_pair::REQUIRED_MASK);
+        assert_eq!(crate::board_abort::required_mask(&state),0);
         let old = crate::board_abort::capture_launch_revision_named(&state, "Launch");
         assert!(
             queue_controller_with_launch_revision(&state, &router, kind, &payload, old).unwrap()
@@ -4827,7 +4904,7 @@ mod recovery_generation_tests {
 mod final_launch_admission_tests {
     use super::*;
     use sedsnet::packet::Packet;
-    use sedsnet::router::{EndpointHandler, Router, RouterConfig};
+    use sedsnet::router::{Router, RouterConfig};
     fn fixture_state_proofs(state: &AppState) {
         // Modeled authoritative readbacks isolate these pre-existing Stop/SDK
         // ownership tests. The board_abort actual-SDK matrix tests the real
@@ -4883,8 +4960,18 @@ mod final_launch_admission_tests {
     }
     #[tokio::test]
     async fn board_abort_queued_launch_origin_cannot_refresh_after_abort_and_fresh_clear() {
+        if crate::operator_queue::isolated_native_case(module_path!(),"board_abort_queued_launch_origin_cannot_refresh_after_abort_and_fresh_clear"){return;}
         let state = crate::state::tests::test_app_state().await;
-        fixture_state_proofs(&state);
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let capture = received.clone();
+        let router = Arc::new(clocked_router(RouterConfig::new([crate::ignition_pair::fixture::handler(
+            &state,
+            move |_| {
+                capture.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )])));
+        let mut actual_peers = crate::ignition_pair::fixture::Peers::warm(&state, router.clone()).await;
         let revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
         let generation = automatic_generation(&state);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -4899,22 +4986,13 @@ mod final_launch_admission_tests {
         state
             .board_abort
             .observe_abort(crate::types::Board::ActuatorBoard, Instant::now(), 10_000);
-        fixture_state_proofs(&state);
+        actual_peers.refresh(&state).await;
         let TelemetryCommand::QueuedOperator {
             launch_revision, ..
         } = rx.recv().await.unwrap()
         else {
             panic!("real application queue must retain its original envelope")
         };
-        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let capture = received.clone();
-        let router = clocked_router(RouterConfig::new([EndpointHandler::new_packet_handler(
-            crate::telemetry_schema::endpoint("GROUND_STATION"),
-            move |_| {
-                capture.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(())
-            },
-        )]));
         let kind = crate::telemetry_schema::data_type("FLIGHT_COMMAND");
         let old_accepted =
             queue_controller_with_launch_revision(&state, &router, kind, &[1], launch_revision)
@@ -4934,8 +5012,18 @@ mod final_launch_admission_tests {
     }
     #[tokio::test]
     async fn board_abort_queued_launch_origin_cannot_refresh_after_stop_without_board_abort() {
+        if crate::operator_queue::isolated_native_case(module_path!(),"board_abort_queued_launch_origin_cannot_refresh_after_stop_without_board_abort"){return;}
         let state = crate::state::tests::test_app_state().await;
-        fixture_state_proofs(&state);
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let capture = received.clone();
+        let router = Arc::new(clocked_router(RouterConfig::new([crate::ignition_pair::fixture::handler(
+            &state,
+            move |_| {
+                capture.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )])));
+        let _actual_peers = crate::ignition_pair::fixture::Peers::warm(&state, router.clone()).await;
         let revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
         let generation = automatic_generation(&state);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -4959,15 +5047,6 @@ mod final_launch_admission_tests {
         else {
             panic!("real application queue must retain its original envelope")
         };
-        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let capture = received.clone();
-        let router = clocked_router(RouterConfig::new([EndpointHandler::new_packet_handler(
-            crate::telemetry_schema::endpoint("GROUND_STATION"),
-            move |_| {
-                capture.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(())
-            },
-        )]));
         let kind = crate::telemetry_schema::data_type("FLIGHT_COMMAND");
         let old_accepted =
             queue_controller_with_launch_revision(&state, &router, kind, &[1], launch_revision)
@@ -5148,18 +5227,19 @@ mod final_launch_admission_tests {
     }
     #[tokio::test]
     async fn final_sdk_queue_never_executes_local_callbacks_or_flushes_under_intent_lock() {
+        if crate::operator_queue::isolated_native_case(module_path!(),"final_sdk_queue_never_executes_local_callbacks_or_flushes_under_intent_lock"){return;}
         use std::sync::atomic::{AtomicUsize, Ordering};
         let state = crate::state::tests::test_app_state().await;
-        fixture_state_proofs(&state);
         let local = Arc::new(AtomicUsize::new(0));
         let seen = local.clone();
-        let router = clocked_router(RouterConfig::new([EndpointHandler::new_packet_handler(
-            crate::telemetry_schema::endpoint("GROUND_STATION"),
+        let router = Arc::new(clocked_router(RouterConfig::new([crate::ignition_pair::fixture::handler(
+            &state,
             move |_| {
                 seen.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             },
-        )]));
+        )])));
+        let _actual_peers = crate::ignition_pair::fixture::Peers::warm(&state, router.clone()).await;
         let ticket = inhibit_automatic_actions_for_launch(&state).unwrap();
         assert_eq!(
             queue_admitted_launch_packets(&state, &router, ticket, vec![launch_packet()]).unwrap(),
@@ -5189,6 +5269,7 @@ mod final_launch_admission_tests {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
                 .env("GS_FINAL_LAUNCH_BUDGET_CHILD", "1")
+                .env("GS_SIM_MODE", "0")
                 .output()
                 .unwrap();
             assert!(
@@ -5199,86 +5280,60 @@ mod final_launch_admission_tests {
             );
             return;
         }
-        let state = crate::state::tests::test_app_state().await;
-        fixture_state_proofs(&state);
-        let _ticket = inhibit_automatic_actions_for_launch(&state).unwrap();
+        crate::telemetry_schema::initialize().unwrap();
+        // Keep the original empty-router SDK capacity boundary separately from
+        // the admission integration, which now requires genuine same-router
+        // discovery and queried board proof before any original offer.
         let make_router = |budget: usize| {
-            let memory =
-                sedsnet::config::RuntimeMemoryConfig::new(budget, 1, budget.min(128), 1.25)
-                    .unwrap();
+            let memory = sedsnet::config::RuntimeMemoryConfig::new(budget,1,budget.min(128),1.25).unwrap();
             clocked_router(RouterConfig::new([]).with_memory_config(memory).unwrap())
         };
-        // Find the real fixture's admission boundary rather than assuming its
-        // retained schema/discovery metadata cost. Production limits are untouched.
-        let fits = |budget| make_router(budget).tx_queue(launch_packet()).is_ok();
-        let mut lower = 16usize;
-        let mut upper = 16usize;
-        while !fits(upper) {
-            lower = upper;
-            upper *= 2;
-            assert!(upper <= 1_048_576, "bounded fixture must admit one owner");
-        }
-        while upper - lower > 1 {
-            let middle = lower + (upper - lower) / 2;
-            if fits(middle) {
-                upper = middle
-            } else {
-                lower = middle
-            }
-        }
-        let mut partial_seen = false;
-        for budget in upper..upper + 256 {
-            let router = make_router(budget);
-            let valve = Packet::new(
-                crate::telemetry_schema::data_type("VALVE_COMMAND"),
-                &[
-                    crate::telemetry_schema::endpoint("GROUND_STATION"),
-                    crate::telemetry_schema::endpoint("VALVE_BOARD"),
-                ],
-                "GS",
-                100,
-                Arc::from(&[crate::rocket_commands::ValveBoardCommands::Sequence as u8][..]),
-            )
-            .unwrap();
-            if let Err(message) = queue_prepared_launch_packets(
-                &state,
-                &router,
-                LaunchAdmission::capture(&state),
-                vec![launch_packet(), valve],
-                None,
-            )
+        let fits=|budget|make_router(budget).tx_queue(launch_packet()).is_ok();
+        let(mut lower,mut upper)=(16usize,16usize);
+        while !fits(upper){lower=upper;upper*=2;assert!(upper<=1_048_576,"bounded fixture must admit one owner");}
+        while upper-lower>1{let middle=lower+(upper-lower)/2;if fits(middle){upper=middle}else{lower=middle}}
+        let valve=||Packet::new(crate::telemetry_schema::data_type("VALVE_COMMAND"),&[crate::telemetry_schema::endpoint("GROUND_STATION"),crate::telemetry_schema::endpoint("VALVE_BOARD")],"GS",100,Arc::from(&[crate::rocket_commands::ValveBoardCommands::Sequence as u8][..])).unwrap();
+        let mut bare_partial=false;
+        for budget in upper..upper+256 {let router=make_router(budget);if router.try_tx_queue(launch_packet()).is_ok()&&router.try_tx_queue(valve()).is_err(){
+            assert!(router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("FLIGHT_COMMAND")));
+            assert!(!router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("VALVE_COMMAND")));bare_partial=true;break;
+        }}
+        assert!(bare_partial,"the original bare SDK partial boundary remains exercised independently");
+        let bare_zero=make_router(16);assert!(bare_zero.try_tx_queue(launch_packet()).is_err());assert!(!bare_zero.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("FLIGHT_COMMAND")));
+        let mut partial_seen=false;
+        for budget in [18905usize,18957,19009] {
+            let mut scene=crate::ignition_pair::constrained_fixture::Scene::new(budget).await;
+            scene.warm().await.unwrap();scene.preload_readonly_gps_pressure();
+            assert!(scene.scope_current(),"pair and required scope must remain current at original offer");
+            let state=&scene.state;let router=&scene.host;
+            let ticket=inhibit_automatic_actions_for_launch(state).unwrap();
+            if let Err(message)=queue_prepared_launch_packets(state,router,ticket,vec![launch_packet(),valve()],None)
                 && message.contains("accepted 1/2") {
-                    assert!(message.contains("manual recovery required"));
-                    assert!(router.has_pending_reliable_tx_type(
-                        crate::telemetry_schema::data_type("FLIGHT_COMMAND")
-                    ));
-                    assert!(!router.has_pending_reliable_tx_type(
-                        crate::telemetry_schema::data_type("VALVE_COMMAND")
-                    ));
-                    partial_seen = true;
-                    break;
-                }
+                assert!(message.contains("manual recovery required"));
+                assert!(router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("FLIGHT_COMMAND")));
+                assert!(!router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("VALVE_COMMAND")));
+                assert!(state.launch_history.lock().unwrap().automatic_actions_inhibited());
+                assert_eq!(state.manual_abort_intent.epoch(),0,"queue refusal never automatically Aborts");
+                partial_seen=true;
+            }
+            scene.state.request_shutdown();scene.state.telemetry_db_pool().close().await;scene.state.auth_db.close().await;
+            if partial_seen{break;}
         }
-        assert!(
-            partial_seen,
-            "actual SDK must retain the first admitted owner when second admission fails"
-        );
-        let refused = queue_prepared_launch_packets(
-            &state,
-            &make_router(16),
-            LaunchAdmission::capture(&state),
-            vec![launch_packet()],
-            None,
-        )
-        .unwrap_err();
-        assert!(refused.contains("accepted 0/1"));
-        assert!(
-            state
-                .launch_history
-                .lock()
-                .unwrap()
-                .automatic_actions_inhibited()
-        );
+        assert!(partial_seen,"actual SDK must retain the first admitted owner when second admission fails");
+        // Additional readonly Ordered QUERY pressure is an actual retained
+        // SDK owner; fresh proof remains valid and no queue is processed.
+        let mut scene=crate::ignition_pair::constrained_fixture::Scene::new(18957).await;
+        scene.warm().await.unwrap();scene.preload_readonly_gps_pressure();
+        assert!(scene.preload_readonly_query(crate::types::Board::RFBoard));
+        let state=&scene.state;let ticket=inhibit_automatic_actions_for_launch(state).unwrap();
+        let refused=queue_prepared_launch_packets(state,&scene.host,ticket,vec![launch_packet()],None).unwrap_err();
+        assert!(refused.contains("accepted 0/1"));assert!(refused.contains("queue saturated"));
+        assert!(!scene.host.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("FLIGHT_COMMAND")));
+        assert!(!scene.host.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("VALVE_COMMAND")));
+        assert!(state.launch_history.lock().unwrap().automatic_actions_inhibited());
+        assert_eq!(state.manual_abort_intent.epoch(),0,"queue refusal never automatically Aborts");
+        scene.state.request_shutdown();scene.state.telemetry_db_pool().close().await;scene.state.auth_db.close().await;
+
     }
 }
 
@@ -5372,8 +5427,10 @@ mod retained_stop_fence_tests {
     }
     #[tokio::test]
     async fn declined_testing_model_never_falls_through_and_sticky_inhibit_survives_visual_idle() {
+        if crate::operator_queue::isolated_native_case(module_path!(),"declined_testing_model_never_falls_through_and_sticky_inhibit_survives_visual_idle"){return;}
         let state = crate::state::tests::test_app_state().await;
-            qualified_launch_proofs_for_test(&state);
+        let router=Arc::new(Router::new(RouterConfig::new([crate::ignition_pair::fixture::handler(&state,|_|Ok(()))]).with_sender("GS")));
+        let _actual_peers=crate::ignition_pair::fixture::Peers::warm(&state,router).await;
         let ticket = inhibit_automatic_actions_for_launch(&state).unwrap();
         assert!(
             admit_simulated_launch(&state, ticket, || false)

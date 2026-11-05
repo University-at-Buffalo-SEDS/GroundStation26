@@ -1519,6 +1519,8 @@ mod tests {
     use super::*;
     include!("postmission_stop_reset_native.rs");
     include!("queued_fc_preentry_native.rs");
+    include!("ignition_pair_causal_tests.rs");
+    include!("ignition_pair_controls.rs");
     #[cfg(feature="test_fire_mode")]
     mod pending_native { include!("pending_recovery_native_tests.rs"); }
     use futures::FutureExt;
@@ -1653,6 +1655,7 @@ mod tests {
         incoming_startup: Arc<Mutex<Vec<(Board, Packet)>>>,
         managed_state_receipts: Arc<Mutex<Vec<(Board, Packet)>>>,
         controller_receipts: Arc<Mutex<Vec<Packet>>>,
+        ignition_wire_hold: Arc<std::sync::atomic::AtomicU8>,
         _db: mpsc::Sender<crate::telemetry_db::DbQueueItem>,
         #[cfg(feature="test_fire_mode")]
         native_peers: Vec<(Board,Arc<Router>)>,
@@ -1718,11 +1721,11 @@ mod tests {
             clock: Option<Box<dyn sedsnet::router::Clock + Send + Sync>>,
             managed_peers: bool,
         ) -> Self {
-            Self::from_saved_with_services_profile(journal, retained, clock, managed_peers, false).await
+            Self::from_saved_with_services_profile(journal, retained, clock, managed_peers, false, false).await
         }
         #[cfg(not(feature="hitl_mode"))]
         async fn new_with_active_startup_peer_services() -> Self {
-            Self::from_saved_with_services_profile(None,None,None,true,true).await
+            Self::from_saved_with_services_profile(None,None,None,true,true,false).await
         }
         async fn from_saved_with_services_profile(
             journal: Option<Vec<u8>>,
@@ -1730,6 +1733,7 @@ mod tests {
             clock: Option<Box<dyn sedsnet::router::Clock + Send + Sync>>,
             managed_peers: bool,
             active_startup_services: bool,
+            ignition_peer_services: bool,
         ) -> Self {
             let mut http = super::super::tests::http_fixture().await;
             let restarting = journal.is_some();
@@ -1811,6 +1815,8 @@ mod tests {
                             );
                         }
                         receive_status(&state, packet);
+                        #[cfg(feature = "test_fire_mode")]
+                        pending_epoch_note_ingress(&state, packet);
                         #[cfg(feature="test_fire_mode")]
                         if native_enabled && packet.data_type()==crate::telemetry_schema::data_type("HEARTBEAT") {
                             state.ring_buffer.lock().unwrap().push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: packet.clone(), ingress_generation });
@@ -1879,6 +1885,20 @@ mod tests {
                     // the real startup owner must wait, not invent completion.
                     peer_handlers.push(EndpointHandler::new_packet_handler(crate::telemetry_schema::endpoint("VALVE_BOARD"), |_| Ok(())));
                     peer_handlers.push(EndpointHandler::new_packet_handler(crate::telemetry_schema::endpoint("ACTUATOR_BOARD"), |_| Ok(())));
+                }
+                if ignition_peer_services {
+                    let name = match board {
+                        Board::ActuatorBoard => Some("ACTUATOR_BOARD"),
+                        Board::ValveBoard => Some("VALVE_BOARD"),
+                        Board::FlightComputer => Some("FLIGHT_CONTROLLER"),
+                        _ => None,
+                    };
+                    if let Some(name) = name {
+                        // Actual peer-owned command endpoint: discover via SDK,
+                        // not an injected host route or a synthetic proof mask.
+                        peer_handlers.push(EndpointHandler::new_packet_handler(
+                            crate::telemetry_schema::endpoint(name), |_| Ok(())));
+                    }
                 }
                 let peer_config = RouterConfig::new(peer_handlers).with_sender(board.sender_id());
                 #[cfg(not(feature="test_fire_mode"))]
@@ -2012,9 +2032,16 @@ mod tests {
                     pending_rx: VecDeque::new(),
                 });
             }
+            let ignition_wire_hold = Arc::new(std::sync::atomic::AtomicU8::new(0));
+            let pump_hold = ignition_wire_hold.clone();
             let pump_host = host.clone();
             let pump = tokio::spawn(async move {
                 loop {
+                    if pump_hold.load(Ordering::Acquire) != 0 {
+                        pump_hold.store(2, Ordering::Release);
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                        continue;
+                    }
                     // The actual telemetry task is the sole host queue owner.
                     for link in &mut links {
                         #[cfg(feature="test_fire_mode")]
@@ -2187,6 +2214,7 @@ mod tests {
                 incoming_startup,
                 managed_state_receipts,
                 controller_receipts,
+                ignition_wire_hold,
                 _db: db,
                 #[cfg(feature="test_fire_mode")]
                 native_peers,
@@ -2205,6 +2233,14 @@ mod tests {
                         tokio::time::sleep(Duration::from_millis(2)).await;
                     }
                 }).await.expect("actual READ_ONLY peer services must be discovered before reset intent");
+            }
+            if ignition_peer_services {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if crate::ignition_pair::require_routes(&fixture.state()).is_ok() { break; }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                }).await.expect("actual command peer endpoints must be SDK-discovered");
             }
             fixture
         }
@@ -2284,7 +2320,7 @@ mod tests {
             super::super::tests::http(self.state(), "POST", "/api/board-recovery/confirm", Some("operator"), json!({"ticket":ticket["ticket"],"backend_instance":ticket["backend_instance"],"principal_context":ticket["principal_context"],"reset_epoch":ticket["reset_epoch"],"confirmation":ticket["confirmation"]})).await
         }
         async fn terminal(&self) -> Value {
-            tokio::time::timeout(Duration::from_secs(8), async {
+            let terminal = tokio::time::timeout(Duration::from_secs(8), async {
                 loop {
                     assert!(
                         !self.pump.is_finished() && !self.receiver.is_finished(),
@@ -2297,8 +2333,47 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
-            .await
-            .unwrap()
+            .await;
+            if terminal.is_err() {
+                // Failure-only RAM observation after the ORIGINAL deadline.
+                // No SDK, clock provider, QUERY, retry or authority mutation.
+                let control = match self.http.state.board_recovery.coordinator.0.try_lock() {
+                    Ok(control) => json!({
+                        "operation":control.operation.as_ref().map(|operation|json!({
+                            "phase":operation.get("phase"),
+                            "completed":operation.get("completed"),
+                            "success":operation.get("success"),
+                            "selected_proof_count":operation.get("selected_proof_count"),
+                            "reset_applied_state":operation.get("reset_applied_state"),
+                        })),
+                        "expected":control.expected.map(|(board,nonce)|json!({"board":board.sender_id(),"nonce":nonce})),
+                        "task_finished":control.task.as_ref().map(JoinHandle::is_finished),
+                        "inbox_len":control.inbox.len(),
+                        "shutdown_closed":control.shutdown_closed,
+                        "shutdown_failure":control.shutdown_failure,
+                    }),
+                    Err(_) => json!({"snapshot_unavailable":"owner busy or poisoned"}),
+                };
+                let readbacks = match self.http.state.board_recovery.inner.try_lock() {
+                    Ok(inner) => json!({
+                        "rejected_statuses":inner.rejected_statuses,
+                        "last_rejection":inner.last_rejection,
+                        "boards":BOARDS.iter().enumerate().map(|(i,board)|json!({
+                            "board":board.sender_id(),
+                            "readback":inner.values[i].as_ref().map(|v|format!("{:?}",v.value)),
+                            "query_nonce":inner.queries[i].as_ref().map(|q|q.nonce),
+                            "query_received":inner.queries[i].as_ref().map(|q|q.received),
+                        })).collect::<Vec<_>>(),
+                    }),
+                    Err(_) => json!({"snapshot_unavailable":"owner busy or poisoned"}),
+                };
+                eprintln!("ORIGINAL_TERMINAL_DEADLINE_FAILURE {}",json!({
+                    "control":control,"readbacks":readbacks,
+                    "pump_finished":self.pump.is_finished(),
+                    "receiver_finished":self.receiver.is_finished(),
+                }));
+            }
+            terminal.unwrap()
         }
     }
     #[cfg(feature="test_fire_mode")]
@@ -3602,15 +3677,12 @@ mod tests {
     #[tokio::test]
     async fn board_abort_actual_sdk_refusal_at_each_prepared_batch_position_keeps_ownership_truthful()
      {
-        if isolated(
+        if crate::operator_queue::isolated_native_case(module_path!(),
             "board_abort_actual_sdk_refusal_at_each_prepared_batch_position_keeps_ownership_truthful",
         ) {
             return;
         }
-        let fixture = Fixture::new().await;
-        completed_manual_cohort(&fixture).await;
-        let state = fixture.state();
-        let _inhibited = crate::gse::inhibit_automatic_actions_for_launch(&state).unwrap();
+        crate::telemetry_schema::initialize().unwrap();
         let make_router = |budget| {
             let memory =
                 sedsnet::config::RuntimeMemoryConfig::new(budget, 1, budget.min(128), 1.25)
@@ -3681,63 +3753,67 @@ mod tests {
                 admitted,
                 "actual prefix must exist at every batch position"
             );
-            for board in BOARDS {
-                fixture.query(board).await;
-            }
-            let router = make_router(lower);
-            let prepared = crate::network_variables::prepare_launch_state(&router).unwrap();
-            let original_clock = state.launch_clock_snapshot();
-            let original_state = state.local_flight_state_snapshot();
-            let original_desired = crate::network_variables::flight_state();
-            let before = router.queue_counters()[2];
-            let error = crate::gse::queue_prepared_launch_packets(
-                &state,
-                &router,
-                crate::gse::LaunchAdmission::capture(&state),
-                physical(&router),
-                Some(prepared),
-            )
-            .unwrap_err();
-            assert!(error.contains(&format!("{admitted}/3")), "{error}");
-            assert_eq!(
-                router.queue_counters()[2] - before,
-                admitted as u32,
-                "exact real SDK admitted prefix"
-            );
-            if admitted == 0 {
-                assert_eq!(state.local_flight_state_snapshot(), original_state);
-                assert_eq!(state.launch_clock_snapshot(), original_clock);
-                assert_eq!(crate::network_variables::flight_state(), original_desired);
-            } else {
-                assert_eq!(
-                    state.local_flight_state_snapshot(),
-                    crate::types::FlightState::Launch
-                );
-                assert_eq!(crate::network_variables::flight_state(), 7);
-                assert!(error.contains("explicit manual recovery required"));
-            }
-            assert!(
-                state
-                    .launch_history
-                    .lock()
-                    .unwrap()
-                    .automatic_actions_inhibited()
-            );
-            assert_eq!(
-                state.manual_abort_intent.epoch(),
-                0,
-                "queue refusal never automatically Aborts"
-            );
+            let router=make_router(lower);let prepared=crate::network_variables::prepare_launch_state(&router).unwrap();let before=router.queue_counters()[2];
+            let mut packets=vec![prepared.packet];packets.extend(physical(&router));
+            let actual=packets.into_iter().take_while(|p|router.try_tx_queue(p.clone()).is_ok()).count();
+            assert_eq!(actual,admitted);assert_eq!(router.queue_counters()[2]-before,admitted as u32,"exact real SDK admitted prefix on original bare-router control");
         }
+        // Genuine same-Router admission under existing readonly queue pressure.
+        // Plain and GPS+QUERY cases have actual observed2/3 and0/3 respectively.
+        // Middle positions remain an explicit assertion across bounded readonly
+        // profiles below, never
+        // inferred from net occupancy: priority16 metadata can be evicted by
+        // priority200 commands after its original admission.
+        for admitted in 0..3usize {
+            let mut seen=false;
+            'search: for budget in [18905usize,18957,19009] {for pressure in 0..7 {
+                let mut scene=crate::ignition_pair::constrained_fixture::Scene::new(budget).await;
+                scene.warm().await.unwrap();
+                // Fresh queried SAME Router scope; this does not claim the old
+                // completed-recovery premise from a different Fixture Router.
+                // APP HEARTBEAT and QUERY-alone are bounded readonly alternatives
+                // for the middle prefix; no policy or memory parameter changes.
+                let pressure_ready=match pressure {
+                    0=>true,
+                    1=>{scene.preload_readonly_gps_pressure();true},
+                    2..=4=>{scene.preload_readonly_gps_pressure();scene.preload_readonly_query([Board::RFBoard,Board::PowerBoard,Board::FlightComputer][pressure-2])},
+                    5=>scene.preload_readonly_heartbeat(),
+                    6=>scene.preload_readonly_query(Board::RFBoard),
+                    _=>unreachable!(),
+                };
+                if !pressure_ready{scene.state.request_shutdown();scene.state.telemetry_db_pool().close().await;scene.state.auth_db.close().await;continue;}
+                assert!(scene.scope_current(),"pair and required board scope must remain current at offer");
+                let state=&scene.state;let router=&scene.host;
+                let ticket=crate::gse::inhibit_automatic_actions_for_launch(state).unwrap();
+                let prepared=crate::network_variables::prepare_launch_state(router).unwrap();
+                let original_clock=state.launch_clock_snapshot();let original_state=state.local_flight_state_snapshot();let original_desired=crate::network_variables::flight_state();
+                let result=crate::gse::queue_prepared_launch_packets(state,router,ticket,physical(router),Some(prepared));
+                // Never process, flush, clear or cancel after any pressure offer.
+                if let Err(error)=result && error.contains(&format!("accepted {admitted}/3 packets:"))&&error.contains("queue saturated"){
+                    assert!(error.contains(&format!("{admitted}/3")),"{error}");
+                    assert_eq!(router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("FLIGHT_COMMAND")),admitted>=2);
+                    assert!(!router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("VALVE_COMMAND")));
+                    if admitted==0{assert_eq!(state.local_flight_state_snapshot(),original_state);assert_eq!(state.launch_clock_snapshot(),original_clock);assert_eq!(crate::network_variables::flight_state(),original_desired);}else{
+                        assert_eq!(state.local_flight_state_snapshot(),crate::types::FlightState::Launch);assert_eq!(crate::network_variables::flight_state(),7);assert!(error.contains("explicit manual recovery required"));
+                    }
+                    assert!(state.launch_history.lock().unwrap().automatic_actions_inhibited());assert_eq!(state.manual_abort_intent.epoch(),0,"queue refusal never automatically Aborts");
+                    seen=true;
+                }
+                scene.state.request_shutdown();scene.state.telemetry_db_pool().close().await;scene.state.auth_db.close().await;
+                if seen{break 'search;}
+            }}
+            assert!(seen,"genuine qualified same-Router actual SDK prefix {admitted}/3 must be exercised; a precondition refusal is not ownership evidence");
+        }
+
     }
 
     #[tokio::test]
     async fn board_abort_healthy_session_does_not_poll_until_a_new_explicit_launch_demand() {
-        if isolated("board_abort_healthy_session_does_not_poll_until_a_new_explicit_launch_demand")
+        if crate::operator_queue::isolated_native_case(module_path!(),"board_abort_healthy_session_does_not_poll_until_a_new_explicit_launch_demand")
         {
             return;
         }
-        let fixture = Fixture::new().await;
+        let fixture = Fixture::from_saved_with_services_profile(None,None,None,false,false,true).await;
         completed_manual_cohort(&fixture).await;
         let state = fixture.state();
         let count = || {
@@ -3780,10 +3856,11 @@ mod tests {
             "proof TTL cannot recreate a cleared condition"
         );
         let router = state.topology_router.get().unwrap();
-        let wanted = crate::board_abort::required_mask(&state).count_ones() as usize;
+        let required = crate::board_abort::required_mask(&state);
+        let wanted = (required | crate::ignition_pair::REQUIRED_MASK).count_ones() as usize;
         // HITL intentionally makes disconnected layout domains optional. Do
         // not manufacture seven required boards merely to match normal mode.
-        if wanted != 0 {
+        if required != 0 {
             assert!(
                 !crate::gse::queue_controller_with_stop_fence(
                     &state,
@@ -3967,12 +4044,10 @@ mod tests {
 
     #[tokio::test]
     async fn board_abort_actual_status_must_refuse_sdk_launch_without_changing_manual_owner() {
-        if isolated(
-            "board_abort_actual_status_must_refuse_sdk_launch_without_changing_manual_owner",
-        ) {
+        if crate::operator_queue::isolated_native_case(module_path!(),"board_abort_actual_status_must_refuse_sdk_launch_without_changing_manual_owner") {
             return;
         }
-        let fixture = Fixture::new().await;
+        let fixture = Fixture::from_saved_with_services_profile(None,None,None,false,false,true).await;
         completed_manual_cohort(&fixture).await;
         let state = fixture.state();
         let router = state.topology_router.get().unwrap();
@@ -5338,4 +5413,7 @@ mod tests {
         assert_eq!(model.boot, 1);
         assert_eq!(model.applied, 0);
     }
+    #[cfg(feature = "test_fire_mode")]
+    include!("pending_next_epoch_coordinator_tests.rs");
+
 }

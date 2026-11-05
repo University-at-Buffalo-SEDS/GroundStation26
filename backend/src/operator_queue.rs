@@ -102,14 +102,22 @@ pub(crate) fn serve(
 /// process-global environment while unrelated tests run.
 #[cfg(test)]
 pub(crate) fn isolated_case(module: &str, name: &str) -> bool {
-    isolated_case_inner(module, name, false)
+    isolated_case_inner(module, name, false, None)
 }
 #[cfg(all(test, any(feature = "hitl_mode", feature = "firmware_sim")))]
 pub(crate) fn isolated_case_with_capture_clock(module: &str, name: &str) -> bool {
-    isolated_case_inner(module, name, true)
+    isolated_case_inner(module, name, true, None)
+}
+#[cfg(all(test,feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+pub(crate) fn isolated_simulated_case(module:&str,name:&str)->bool {
+    isolated_case_inner(module,name,false,Some(true))
 }
 #[cfg(test)]
-fn isolated_case_inner(module: &str, name: &str, capture_clock: bool) -> bool {
+pub(crate) fn isolated_native_case(module: &str, name: &str) -> bool {
+    isolated_case_inner(module,name,false,Some(false))
+}
+#[cfg(test)]
+fn isolated_case_inner(module: &str, name: &str, capture_clock: bool, simulated:Option<bool>) -> bool {
     let module = module.split_once("::").map_or(module, |(_, path)| path);
     let case = format!("{module}::{name}");
     if std::env::var("GS_RECOVERY_ISOLATED_CASE").as_deref() == Ok(case.as_str()) {
@@ -178,6 +186,7 @@ fn isolated_case_inner(module: &str, name: &str, capture_clock: bool) -> bool {
             "GS_STATION_PAIRING_FILE",
             directory.join("absent-pairing.json"),
         );
+    if let Some(simulated)=simulated { command.env("GS_SIM_MODE", if simulated {"1"} else {"0"}); }
     for (key, path) in [
         ("GS_LOADCELL_CALIBRATION_PATH", "loadcell.json"),
         ("GS_NETWORK_VARIABLE_CACHE", "variables.json"),

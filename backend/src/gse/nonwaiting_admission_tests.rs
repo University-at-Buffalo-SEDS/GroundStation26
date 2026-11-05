@@ -233,6 +233,7 @@ pub(crate) fn record_launch_packets(state:&AppState,packets:&[sedsnet::packet::P
     if let Some(h)=hook(state as *const AppState as usize){*h.launch_packets.lock().unwrap()=packets.to_vec();}
 }
 pub(crate) fn record_launch_sdk_call(state:&AppState, first_sdk_attempt: Option<Instant>){
+    state.ignition_observer.launch_sdk_offers.fetch_add(1, Ordering::Relaxed);
     if let Some(h)=hook(state as *const AppState as usize){
         let ordinal = h.launch_calls.fetch_add(1, Ordering::Relaxed) + 1;
         if ordinal == 1 && let Some(at) = first_sdk_attempt {

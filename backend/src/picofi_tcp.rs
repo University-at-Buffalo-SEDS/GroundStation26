@@ -22,7 +22,7 @@ const STALL: Duration = Duration::from_millis(500);
 struct Shared {
     // One published epoch is the readiness snapshot; zero means disconnected.
     // Separate ready/epoch loads can accidentally tag a new-session send old.
-    ready_generation: AtomicU64,
+    ready_generation: Arc<AtomicU64>,
     generation: AtomicU64,
     tx: SyncSender<(u64, Vec<u8>)>,
 }
@@ -84,7 +84,7 @@ impl PicoFiTcp {
         let (tx, outgoing) = mpsc::sync_channel(DEPTH);
         let (incoming, rx) = mpsc::sync_channel(DEPTH);
         let shared = Arc::new(Shared {
-            ready_generation: AtomicU64::new(0),
+            ready_generation: Arc::new(AtomicU64::new(0)),
             generation: AtomicU64::new(0),
             tx,
         });
@@ -102,6 +102,10 @@ impl PicoFiTcp {
     }
 }
 impl CommsDevice for PicoFiTcp {
+    fn connection_generation(&self) -> Option<Arc<AtomicU64>> {
+        Some(self.shared.ready_generation.clone())
+    }
+
     fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
         Ok(Some(Box::new(Self {
             shared: self.shared.clone(),
@@ -307,7 +311,8 @@ fn worker(
         }
         let Some(shared) = weak.upgrade() else { return };
         shared.ready_generation.store(0, Ordering::Release);
-        let generation = shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let Ok(previous)=shared.generation.try_update(Ordering::AcqRel,Ordering::Acquire,|n|n.checked_add(1)) else { return; };
+        let generation=previous+1;
         while tx.try_recv().is_ok() {}
         drop(shared);
         let socket = if let Some(socket) = replacement.take() {
@@ -443,7 +448,7 @@ mod tests {
         let (tx, outgoing) = mpsc::sync_channel(4);
         let (incoming, rx) = mpsc::sync_channel(8);
         let shared = Arc::new(Shared {
-            ready_generation: AtomicU64::new(2),
+            ready_generation: Arc::new(AtomicU64::new(2)),
             generation: AtomicU64::new(99),
             tx,
         });
@@ -682,7 +687,7 @@ mod tests {
         let (tx, outgoing) = mpsc::sync_channel(DEPTH);
         let (incoming, rx) = mpsc::sync_channel(DEPTH);
         let shared = Arc::new(Shared {
-            ready_generation: AtomicU64::new(0),
+            ready_generation: Arc::new(AtomicU64::new(0)),
             generation: AtomicU64::new(0),
             tx,
         });
@@ -782,7 +787,7 @@ mod tests {
         let (tx, _outgoing) = mpsc::sync_channel(1);
         let (_incoming, rx) = mpsc::sync_channel(1);
         let shared = Arc::new(Shared {
-            ready_generation: AtomicU64::new(0),
+            ready_generation: Arc::new(AtomicU64::new(0)),
             generation: AtomicU64::new(1),
             tx,
         });
@@ -867,6 +872,11 @@ mod tests {
             allowed_peer: None,
         };
         let mut device = PicoFiTcp::open(&cfg).unwrap();
+        let fence=device.connection_generation().unwrap();
+        let writer=device.try_clone_tx().unwrap().unwrap();
+        assert!(Arc::ptr_eq(&fence,&writer.connection_generation().unwrap()));
+        drop(writer);
+        assert_eq!(fence.load(Ordering::Acquire),0,"no ready generation before PICOFI1 handshake");
         let (mut peer, _) = listener.accept().unwrap();
         handshake(&mut peer, false).unwrap();
         peer.set_nonblocking(false).unwrap();
@@ -878,8 +888,11 @@ mod tests {
         let mut got = [0; 6];
         peer.read_exact(&mut got).unwrap();
         assert_eq!(got, [0xb5, 0x4e, 2, 0, 7, 8]);
+        let first_generation=fence.load(Ordering::Acquire);
+        assert!(first_generation>0);
         drop(peer);
         let (mut peer, _) = listener.accept().unwrap();
+        assert_eq!(fence.load(Ordering::Acquire),0,"new socket cannot reuse old ready ownership before handshake");
         handshake(&mut peer, false).unwrap();
         peer.set_nonblocking(false).unwrap();
         peer.write_all(&[0xb5, 0x4e, 2, 0, 4, 5]).unwrap();
@@ -892,6 +905,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(frames, vec![vec![4, 5]]);
+        assert!(fence.load(Ordering::Acquire)>first_generation,"a real new handshake publishes a new generation");
         let weak = Arc::downgrade(&device.shared);
         drop(device);
         while weak.strong_count() != 0 {

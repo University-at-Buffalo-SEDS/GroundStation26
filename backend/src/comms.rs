@@ -257,6 +257,10 @@ pub(crate) const MAX_ORDINARY_SERVICE_CHARGE: usize =
     STREAM_PACKET_MAX_SIZE + RAW_UART_FRAME_HEADER_SIZE + 256;
 
 pub trait CommsDevice: Send {
+    /// Shared local connection ownership; zero means disconnected. Reading this
+    /// atomic never opens, configures, schedules or probes a transport.
+    fn connection_generation(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> { None }
+
     /// True only for the selected pureTesting SDK-backed dummy device.
     #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
     fn testing_model_link(&self)->bool{false}

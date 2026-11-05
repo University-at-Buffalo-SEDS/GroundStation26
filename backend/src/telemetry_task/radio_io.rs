@@ -2323,6 +2323,8 @@ pub(super) fn spawn_comms_worker_threads(
     state: Arc<AppState>,
     mut comms_handle: CommsWorkerHandle,
 ) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
+    state.ignition_observer.register_connection(comms_handle.side_id,
+        comms_handle.comms.lock().unwrap().connection_generation());
     if comms_handle.dedicated_radio_io {
         return spawn_dedicated_radio_io_threads(router, state, comms_handle);
     }
@@ -2334,6 +2336,7 @@ pub(super) fn spawn_comms_worker_threads(
     }
 
     let worker_name = comms_handle.name;
+    let side_id = comms_handle.side_id;
     let comms = comms_handle.comms;
     let tx_worker_state = state.clone();
     // UART reads can wait for incoming bytes while a write drains a long
@@ -2356,6 +2359,7 @@ pub(super) fn spawn_comms_worker_threads(
                 tx_worker_comms.lock().unwrap().enable_radio_capacity_control();
             }
             let mut comms_shutdown_rx = tx_worker_state.shutdown_subscribe();
+            let transport_observation = crate::ignition_pair::observer::SideWatcher::new(&tx_worker_state,side_id);
             let mut last_send_error_log_ms = 0;
             let mut suppressed_send_errors = 0;
             let mut next_tx_allowed_at = TxDeadline::now();
@@ -2553,6 +2557,7 @@ pub(super) fn spawn_comms_worker_threads(
                     let leases: Vec<_> = frames.iter().filter_map(|(_, bytes)|
                         comms_handle.tx_budget.as_ref().and_then(|budget| budget.write_lease(bytes))).collect();
                     let result = comms.send_tracked_counted(&frames, &leases);
+                    if let Err(error)=&result {transport_observation.send_error(error.as_ref());}
                     match result {
                         Ok(completed_charge) => {
                             // None already sent through the generic path; never send twice.
@@ -2652,6 +2657,7 @@ pub(super) fn spawn_comms_worker_threads(
         .name(format!("{}_comms_rx", worker_name))
         .spawn(move || {
             let mut comms_shutdown_rx = rx_worker_state.shutdown_subscribe();
+            let transport_observation = crate::ignition_pair::observer::SideWatcher::new(&rx_worker_state,side_id);
             let mut last_recv_error_log_ms = 0;
             let mut suppressed_recv_errors = 0;
             loop {
@@ -2672,7 +2678,9 @@ pub(super) fn spawn_comms_worker_threads(
                 };
 
                 let mut comms = comms.lock().expect("failed to get lock");
-                match comms.recv_packet(&rx_worker_router, &mut packet_tap) {
+                let received=comms.recv_packet(&rx_worker_router, &mut packet_tap);
+                if let Err(error)=&received {transport_observation.receive_error(error);}
+                match received {
                     Ok(_) => {}
                     Err(e) => {
                         if !handle_worker_recv_error(
@@ -2705,12 +2713,16 @@ fn spawn_legacy_comms_worker_thread(
     state: Arc<AppState>,
     mut comms_handle: CommsWorkerHandle,
 ) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
+    state.ignition_observer.register_connection(comms_handle.side_id,
+        comms_handle.comms.lock().unwrap().connection_generation());
     let worker_name = comms_handle.name;
+    let side_id = comms_handle.side_id;
     let comms = comms_handle.comms;
     let worker = thread::Builder::new()
         .name(format!("{}_comms_worker", worker_name))
         .spawn(move || {
             let mut comms_shutdown_rx = state.shutdown_subscribe();
+            let transport_observation = crate::ignition_pair::observer::SideWatcher::new(&state,side_id);
             let mut last_send_error_log_ms = 0;
             let mut suppressed_send_errors = 0;
             let mut last_recv_error_log_ms = 0;
@@ -2755,6 +2767,7 @@ fn spawn_legacy_comms_worker_thread(
                                     }
                                 }
                                 Err(e) => {
+                                    transport_observation.send_error(e.as_ref());
                                     pending_tx = Some((priority, payload));
                                     log_repeated_worker_error(
                                         &format!("{worker_name} comms worker send_data failed"),
@@ -2770,7 +2783,9 @@ fn spawn_legacy_comms_worker_thread(
                     }
                 }
 
-                match comms.recv_packet(&router, &mut packet_tap) {
+                let received=comms.recv_packet(&router, &mut packet_tap);
+                if let Err(error)=&received {transport_observation.receive_error(error);}
+                match received {
                     Ok(_) => {}
                     Err(e) => {
                         if !handle_worker_recv_error(
@@ -2801,6 +2816,8 @@ pub(super) fn spawn_dedicated_radio_io_threads(
     state: Arc<AppState>,
     mut comms_handle: CommsWorkerHandle,
 ) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
+    state.ignition_observer.register_connection(comms_handle.side_id,
+        comms_handle.comms.lock().unwrap().connection_generation());
     let worker_name = comms_handle.name;
     let side_id = comms_handle.side_id;
     let comms = comms_handle.comms;
@@ -2811,6 +2828,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
         .name(format!("{}_radio_io", worker_name))
         .spawn(move || {
             let mut comms_shutdown_rx = io_state.shutdown_subscribe();
+            let transport_observation = crate::ignition_pair::observer::SideWatcher::new(&io_state,side_id);
             let mut last_send_error_log_ms = 0;
             let mut suppressed_send_errors = 0;
             let mut last_recv_error_log_ms = 0;
@@ -2920,6 +2938,7 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                 ) {
                     Ok(()) => {}
                     Err(e) => {
+                        transport_observation.receive_error(&e);
                         if !handle_worker_recv_error(
                             &format!("{worker_name} radio io recv_serialized_packets failed"),
                             &format!("{e:?}"),
@@ -3188,12 +3207,16 @@ fn spawn_rx_priority_comms_worker_thread(
     state: Arc<AppState>,
     mut comms_handle: CommsWorkerHandle,
 ) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
+    state.ignition_observer.register_connection(comms_handle.side_id,
+        comms_handle.comms.lock().unwrap().connection_generation());
     let worker_name = comms_handle.name;
+    let side_id = comms_handle.side_id;
     let comms = comms_handle.comms;
     let worker = thread::Builder::new()
         .name(format!("{}_comms_worker", worker_name))
         .spawn(move || {
             let mut comms_shutdown_rx = state.shutdown_subscribe();
+            let transport_observation = crate::ignition_pair::observer::SideWatcher::new(&state,side_id);
             let mut last_send_error_log_ms = 0;
             let mut suppressed_send_errors = 0;
             let mut last_recv_error_log_ms = 0;
@@ -3220,6 +3243,7 @@ fn spawn_rx_priority_comms_worker_thread(
 
                 let mut comms = comms.lock().expect("failed to get lock");
                 let recv_result = comms.recv_packet(&router, &mut packet_tap);
+                if let Err(error)=&recv_result {transport_observation.receive_error(error);}
                 match recv_result {
                     Ok(()) => {
                         let now = std::time::Instant::now();
@@ -3243,6 +3267,7 @@ fn spawn_rx_priority_comms_worker_thread(
                                         + Duration::from_millis(COMMS_TX_GAP_MS);
                                 }
                                 Err(e) => {
+                                    transport_observation.send_error(e.as_ref());
                                     pending_tx = Some((priority, payload));
                                     log_repeated_worker_error(
                                         &format!("{worker_name} comms worker send_data failed"),

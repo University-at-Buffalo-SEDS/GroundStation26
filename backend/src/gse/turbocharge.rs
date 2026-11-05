@@ -965,6 +965,9 @@ mod tests {
     async fn actual_router_inventory_case(stop_before_completion: bool, missing_pressure: bool,
         target_mass: f32, target_pressure: f32, inventory_loss: f32) {
         let (state, sent, peer) = super::super::tests::button_test_state().await;
+        // This fixture exercises configured targets, without a simulation-only
+        // calibration full-mass override changing the original inventory goal.
+        state.loadcell_calibration.lock().unwrap().full_mass_kg = None;
         let mut targets = state.fill_targets_snapshot();
         targets.nitrous.target_mass_kg = target_mass;
         targets.nitrous.target_pressure_psi = target_pressure;

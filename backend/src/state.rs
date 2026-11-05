@@ -285,6 +285,7 @@ pub struct AppState {
 
     /// Software TX ownership from callback admission through physical write.
     pub transport_tx_activity: Arc<crate::telemetry_task::TransportTxActivity>,
+    pub ignition_observer: Arc<crate::ignition_pair::observer::Observer>,
 
     /// Notifies waiters when pending DB writes changes.
     pub db_write_notify: Arc<Notify>,
@@ -1656,6 +1657,7 @@ impl AppState {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok();
         if first {
+            self.ignition_observer.invalidate();
             self.control_ingress.seal();
             let _ = self.shutdown_tx.send(());
         }
@@ -1996,6 +1998,7 @@ impl AppState {
         let mut local = self.action_policy.lock().unwrap().clone();
         if !crate::rrls::is_rrls() {
             crate::board_abort::block_policy(self, &mut local);
+            crate::ignition_pair::project_fresh_proof(self, &mut local);
             return local;
         }
         let mut mirrored =
@@ -2206,6 +2209,7 @@ impl AppState {
                 }
             }
         }
+        crate::ignition_pair::project_policy(self, &mut policy);
         let mut slot = self.action_policy.lock().unwrap();
         if *slot == policy {
             return;
@@ -2245,6 +2249,10 @@ impl AppState {
             TelemetryCommand::FillWithRecording { .. } => &TelemetryCommand::StartFill,
             other => other,
         };
+        if !crate::rrls::is_rrls() && crate::ignition_pair::command_requires_pair(cmd)
+            && crate::ignition_pair::readiness(self).is_err() {
+            return false;
+        }
         if crate::board_abort::launch_command(command_name(cmd))
             && (self.board_abort.masks().0 != 0
                 || !crate::actuator_plumbing::retraction_gate(self).allowed)
@@ -4294,6 +4302,7 @@ pub(crate) mod tests {
             shutdown_tx,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             pending_db_writes: Arc::new(AtomicUsize::new(0)),
+            ignition_observer: Arc::new(Default::default()),
             transport_tx_activity: Arc::new(Default::default()),
             db_write_notify: Arc::new(Notify::new()),
             notifications: Arc::new(Mutex::new(Vec::new())),

@@ -578,6 +578,7 @@ pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
 
 /// Pure launch preparation. No desired state, file, managed cache or SDK owner
 /// is changed until the caller wins its original Stop/board admission boundary.
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct PreparedLaunchState {
     pub(crate) packet: Packet,
     expected: (u8, u64),

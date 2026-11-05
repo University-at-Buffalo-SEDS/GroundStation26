@@ -28,6 +28,7 @@ mod history_startup_path;
 mod board_abort_history_writer;
 mod board_recovery;
 mod igniter_sense;
+mod ignition_pair;
 mod checklists;
 mod command_probe;
 mod command_proxy;
@@ -202,6 +203,10 @@ static SIMULATION_CLOCK_PATH: std::sync::OnceLock<Option<std::path::PathBuf>> =
 static SIMULATION_CLOCK_LAST: AtomicU64 = AtomicU64::new(0);
 static SIMULATION_CLOCK_VALID: AtomicBool = AtomicBool::new(false);
 static SIMULATION_CLOCK_SAMPLE: AtomicU64 = AtomicU64::new(0);
+// A configured model source is one coherent observation, including its existing
+// SDK clamp and diagnostic publication. Physical/no-file clocks never take this.
+#[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
+static SIMULATION_CLOCK_OBSERVATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// No filesystem access: used only after the existing SDK clock sampled its source.
 fn cached_simulation_clock_sample() -> Option<(Option<u64>, u64)> {
@@ -224,10 +229,24 @@ fn simulation_clock_ms() -> Option<u64> {
             }
         })
         .as_ref()?;
-    // The diagnostic guard starts BEFORE source IO; its publication happens
-    // only after the unchanged SDK clock/clamp and weak-cache stores complete.
+    // Serialize only an explicitly configured simulator source. An older parsed
+    // value must not race a newer fetch_max and impersonate source rollback.
+    #[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
+    let (_source_guard, source_poisoned) = match SIMULATION_CLOCK_OBSERVATION.lock() {
+        Ok(guard) => (guard, false),
+        Err(error) => (error.into_inner(), true),
+    };
+    #[cfg(not(any(feature = "hitl_mode", feature = "firmware_sim")))]
+    let source_poisoned = false;
+    // The guard remains held through the complete source/clamp/cache/finish
+    // observation. Poison never clears: return the existing clamp but invalidate
+    // this observation, preserving the original fail-closed recovery fence.
     let final_observation = final_proof_clock::begin_model_observation();
-    let (value, valid, raw) = read_simulation_clock_details(path, &SIMULATION_CLOCK_LAST);
+    let (value, valid, raw) = if source_poisoned {
+        (SIMULATION_CLOCK_LAST.load(Ordering::Relaxed), false, None)
+    } else {
+        read_simulation_clock_details(path, &SIMULATION_CLOCK_LAST)
+    };
     SIMULATION_CLOCK_VALID.store(valid, Ordering::Release);
     let _ = SIMULATION_CLOCK_SAMPLE.try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
         value.checked_add(1)
@@ -1097,6 +1116,13 @@ async fn shutdown_signal(state: Arc<AppState>) {
     }
 }
 
+fn open_primary_link(link: &CommsLinkConfig) -> anyhow::Result<Box<dyn CommsDevice>> {
+    let device=open_link(link)?;
+    if matches!(link,CommsLinkConfig::Serial{..}|CommsLinkConfig::RaspberryPiGpioUart{..}|CommsLinkConfig::CustomSerial{..}) {
+        Ok(Box::new(rrls_radio::RecoveryRadio::from_open(link.clone(),device)?))
+    } else { Ok(device) }
+}
+
 fn open_rocket_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>>, bool) {
     if rrls::is_rrls() {
         return (
@@ -1106,7 +1132,7 @@ fn open_rocket_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>
             false,
         );
     }
-    match open_link(link) {
+    match open_primary_link(link) {
         Ok(r) => {
             gs_debug_println!("Rocket comms online");
             (Arc::new(Mutex::new(r)), true)
@@ -1133,7 +1159,7 @@ fn open_rocket_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>
 }
 
 fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>>, bool) {
-    match open_link(link) {
+    match open_primary_link(link) {
         Ok(r) => {
             gs_debug_println!("Umbilical comms online");
             (Arc::new(Mutex::new(r)), true)
@@ -1381,6 +1407,7 @@ async fn main() -> anyhow::Result<()> {
         shutdown_tx,
         shutdown_requested: Arc::new(AtomicBool::new(false)),
         pending_db_writes: Arc::new(AtomicUsize::new(0)),
+        ignition_observer: Arc::new(Default::default()),
         transport_tx_activity: Arc::new(Default::default()),
         db_write_notify: Arc::new(Notify::new()),
         notifications: Arc::new(Mutex::new(Vec::new())),

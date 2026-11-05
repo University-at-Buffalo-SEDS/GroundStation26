@@ -542,6 +542,31 @@ impl Runtime {
     /// admission or the pure model effect is permitted here, never a flush,
     /// callback, journal, GSE/state lookup or await. Public437 RX callbacks run
     /// after its core guard is dropped; held-core/reentrant tests protect that.
+    /// Mandatory pair proof is independent of optional HITL participation.
+    pub(crate) fn ignition_pair_current(&self) -> bool {
+        let Ok(register) = self.register.try_lock() else { return false; };
+        let (aborted, proven) = Self::masks_at(&register, Instant::now());
+        !register.history_frozen && register.abort_revision != u64::MAX
+            && aborted == 0 && proven & crate::ignition_pair::REQUIRED_MASK == crate::ignition_pair::REQUIRED_MASK
+    }
+    /// Direct sequence admission adds no Launch/retraction/history mutation.
+    /// Caller owns the original Stop/reset context; callback is SDK.try only.
+    pub(crate) fn admit_ignition_pair<T>(
+        &self, revision: u64, admit: impl FnOnce() -> T,
+    ) -> Result<T, &'static str> {
+        let register = self.register.try_lock().map_err(|_| "Ignition board proof owner busy")?;
+        if register.history_frozen || register.abort_revision == u64::MAX
+            || register.abort_revision != revision {
+            return Err("Ignition context changed; no new sequence was admitted");
+        }
+        let (aborted, proven) = Self::masks_at(&register, Instant::now());
+        if aborted != 0 || proven & crate::ignition_pair::REQUIRED_MASK != crate::ignition_pair::REQUIRED_MASK {
+            return Err("Ignition requires fresh non-Abort Actuator and Valve Board readbacks");
+        }
+        let result = admit();
+        drop(register);
+        Ok(result)
+    }
     pub(crate) fn admit_launch<T>(
         &self,
         state: &AppState,
@@ -770,7 +795,8 @@ pub(crate) fn request_paired_readiness_queries(state: &AppState) -> Result<(), S
     crate::actuator_plumbing::request_motion_query(state)
 }
 pub(crate) fn request_readiness_queries(state: &AppState) -> Result<(), String> {
-    let mut mask = required_mask(state) | state.board_abort.masks().0 | required_unknown_mask(state, state.board_abort.history_snapshot().unknown);
+    let mut mask = required_mask(state) | crate::ignition_pair::REQUIRED_MASK
+        | state.board_abort.masks().0 | required_unknown_mask(state, state.board_abort.history_snapshot().unknown);
     if crate::actuator_plumbing::retraction_gate(state).configured {
         mask |= 1 << index(Board::ActuatorBoard).unwrap();
     }

@@ -569,3 +569,22 @@ fn postlaunch_recovery_clears_launch_only_on_verified_owned_success() {
         }
     }
 }
+
+#[test]
+fn delayed_prelaunch_recovery_cannot_revoke_an_accepted_model_owner() {
+    prepare();
+    for board in [Board::ActuatorBoard,Board::ValveBoard,Board::FlightComputer] {
+        let mut o=Owner::new();o.initialize(0,0,0);query(&mut o,board,1,10000);
+        let before=&o.nodes[at(board)];let (boot,epoch,floor,attempted)=(before.boot,before.epoch,before.floor,before.attempted);
+        let delayed=request(board,1,0,2,boot,epoch,77,10001);
+        o.note_launch(board);
+        let reply=o.receive(board,&delayed,10003);
+        assert!(matches!(reply.action,Action::None));assert_eq!(reply.reply.unwrap().result,4);
+        let n=&o.nodes[at(board)];assert_eq!((n.boot,n.epoch,n.floor,n.attempted),(boot,epoch,floor,attempted));assert!(!n.blocked&&!n.aborted);assert!(n.launched&&n.accepted_launch);assert!(n.last.is_none());
+        // A real fresh ManualStop revokes the RAM owner independently; only
+        // verified recovery can clear the historical launch latch afterward.
+        o.manual_stop(board);assert!(!o.nodes[at(board)].accepted_launch);assert!(o.nodes[at(board)].launched);
+        query(&mut o,board,3,10004);let n=&o.nodes[at(board)];let fresh=request(board,1,0,4,n.boot,n.epoch,77,10005);
+        assert_eq!(o.receive(board,&fresh,10005).reply.unwrap().result,1);let intent=o.ready_jobs()[0].1.clone();assert_eq!(o.finish(board,&intent,10006).result,0);assert!(!o.nodes[at(board)].launched&&!o.nodes[at(board)].accepted_launch);
+    }
+}

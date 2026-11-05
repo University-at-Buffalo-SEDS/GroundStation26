@@ -21,6 +21,13 @@ use std::sync::OnceLock;
 #[cfg(feature = "testing")]
 use std::sync::{Arc, Mutex};
 
+#[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+#[path="flight_sim/ground_plant.rs"]
+mod ground_plant;
+#[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+#[path="flight_sim/effect_timer.rs"]
+mod effect_timer;
+
 #[cfg(feature = "testing")]
 const BASE_LAT: f32 = 31.7619;
 #[cfg(feature = "testing")]
@@ -356,6 +363,12 @@ impl QueuedPacket{
 struct FlightSimState {
     #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
     recovery: crate::testing_board_lifecycle::Owner,
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    expanded_plant: Option<ground_plant::Plant>,
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    plant_observation_valid: bool,
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    accepted_igniter_source: Option<effect_timer::Owner>,
     flight_state: FlightState,
     // Source provenance only: implicit GS readiness is not a new FC report.
     automatic_idle_volatile: bool,
@@ -422,6 +435,12 @@ impl FlightSimState {
         Self {
             #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
             recovery: crate::testing_board_lifecycle::Owner::new(),
+            #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+            expanded_plant:None,
+            #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+            plant_observation_valid:true,
+            #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+            accepted_igniter_source:None,
             flight_state: FlightState::Idle,
             automatic_idle_volatile: cfg!(feature = "test_fire_mode"),
             launch_sequence_started_ms: None,
@@ -696,6 +715,7 @@ impl FlightSimState {
                 for board in crate::testing_board_lifecycle::BOARDS {self.recovery.manual_stop(board);}
                 self.launch_sequence_started_ms = None;
                 self.actuator_igniter_sequence_started_ms = None;
+                #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))] {self.accepted_igniter_source=None;}
                 self.launch_time_ms = None;
                 self.valves
                     .insert(ActuatorBoardCommands::IgniterOn as u8, false);
@@ -886,6 +906,18 @@ impl FlightSimState {
     }
 
     fn update_actuator_igniter_sequence(&mut self, now_ms: u64) {
+        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+        if self.accepted_igniter_source.is_some() {
+            // One immutable networkUTC→local-model mapping made at admission.
+            // PacketUTC is never subtracted from host-wall/model time directly.
+            let on={let owner=self.accepted_igniter_source.as_mut().unwrap();let _original_source_utc=owner.source_utc;owner.on_at(now_ms)};
+            let key=ActuatorBoardCommands::IgniterOn as u8;
+            if self.valve_on(key)!=on {
+                self.valves.insert(key,on);
+                self.queue_umbilical_status(key,on,self.recovery.original_event_stamp());
+            }
+            return;
+        }
         let Some(sequence_start_ms) = self.actuator_igniter_sequence_started_ms else {
             return;
         };
@@ -1023,6 +1055,11 @@ impl FlightSimState {
         };
         self.last_physics_ms = now_ms;
 
+        let n2_open=self.valve_on(ActuatorBoardCommands::NitrogenOpen as u8);
+        let n2o_open=self.valve_on(ActuatorBoardCommands::NitrousOpen as u8);
+        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+        self.update_ground_plant(now_ms);
+        if cfg!(any(feature="hitl_mode",feature="test_fire_mode")) {
         let n2_open = self.valve_on(ActuatorBoardCommands::NitrogenOpen as u8);
         let n2o_open = self.valve_on(ActuatorBoardCommands::NitrousOpen as u8);
         let no_open = self.valve_on(ValveBoardCommands::NormallyOpenOpen as u8);
@@ -1086,6 +1123,9 @@ impl FlightSimState {
             );
         }
         self.fuel_tank_pressure_psi = self.fuel_tank_pressure_psi.max(0.0);
+
+
+        }
 
         if let Some(t0_ms) = self.launch_time_ms {
             let t = (now_ms.saturating_sub(t0_ms) as f32) / 1000.0;
@@ -1212,7 +1252,8 @@ impl FlightSimState {
         now_ms: u64,
     ) -> TelemetryResult<Option<Packet>> {
         self.update_physics(now_ms);
-
+        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+        if !self.plant_observation_valid && matches!(spec.dtype,ty if ty==crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE")||ty==crate::telemetry_schema::data_type("KG1000")) {return Ok(None);}
         let mut rng = rand::rng();
         if spec.sender == Board::ValveBoard && valve_board_disconnected_for_state(self.flight_state)
         {
@@ -1614,6 +1655,24 @@ pub fn _next_state_aware_packet() -> TelemetryResult<Option<Packet>> {
 
 #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
 impl FlightSimState {
+    fn update_ground_plant(&mut self,now:u64) {
+        let parameters=ground_plant::Parameters::default();
+        let mut plant=self.expanded_plant.take().unwrap_or_else(||{
+            let mut plant=ground_plant::Plant::empty();
+            plant.liquid_kg=f64::from(self.loadcell_mass_kg.max(0.0));
+            plant.vapor_partial_psi=f64::from(self.fuel_tank_pressure_psi.max(0.0));
+            plant
+        });
+        let valves=ground_plant::Valves{nitrogen:self.valve_on(9),nitrous:self.valve_on(10),vent:self.valve_on(1),dump:self.valve_on(2),pilot:self.valve_on(0)};
+        let result=plant.step(now,valves,parameters);
+        self.plant_observation_valid=result.is_ok();
+        if matches!(result,Err(ground_plant::StepError::ClockGap)) {log::warn!("SIMULATED plant clock discontinuity: missing interval not integrated; current sensor observation suppressed");}
+        if self.plant_observation_valid {
+            self.loadcell_mass_kg=plant.mass_kg(parameters) as f32;
+            self.fuel_tank_pressure_psi=plant.pressure_psi() as f32;
+        }
+        self.expanded_plant=Some(plant);
+    }
     fn modeled_outputs(&self, board: Board) -> u32 {
         match board {
             Board::ActuatorBoard => u32::from(self.valve_on(ActuatorBoardCommands::IgniterOn as u8))
@@ -1626,6 +1685,11 @@ impl FlightSimState {
         }
     }
     fn stop_modeled_outputs(&mut self, board: Board, now: u64) {
+        self.stop_modeled_outputs_at(board,now,now);
+    }
+    fn stop_modeled_outputs_at(&mut self,board:Board,now:u64,receipt_model_ms:u64) {
+        self.update_ground_plant(receipt_model_ms);
+        if board==Board::ActuatorBoard {self.accepted_igniter_source=None;}
         let values:&[(u8,bool)]=match board {
             Board::ActuatorBoard=>&[(7,false),(9,false),(10,false),(8,false)],
             Board::ValveBoard=>&[(0,false),(1,true),(2,true)],
@@ -1637,7 +1701,14 @@ impl FlightSimState {
             self.actuator_igniter_sequence_started_ms=None;
         }
     }
+    #[cfg(test)]
     fn apply_modeled_packet(&mut self,board:Board,ty:crate::testing_board_lifecycle::Kind,value:u8,now:u64) {
+        self.apply_modeled_packet_at(board,ty,value,now,now,now);
+    }
+    fn apply_modeled_packet_at(&mut self,board:Board,ty:crate::testing_board_lifecycle::Kind,value:u8,now:u64,observed_utc:u64,receipt_model_ms:u64) {
+        // Integrate the PREVIOUS actual valves to receipt, never use a delayed
+        // packet's sourceUTC to rewind physics or backfill flow before arrival.
+        self.update_ground_plant(receipt_model_ms);
         if ty==crate::testing_board_lifecycle::Kind::State {
             if let Some(state)=crate::types::u8_to_flight_state(value) {
                 self.recovery.note_state(board,value);
@@ -1646,12 +1717,21 @@ impl FlightSimState {
             }
             return;
         }
+        if board==Board::ActuatorBoard && ty==crate::testing_board_lifecycle::Kind::Actuator && value==14 {
+            if self.accepted_igniter_source.is_none()
+                && let Some(owner)=effect_timer::Owner::admitted(now,observed_utc,receipt_model_ms) {
+                self.accepted_igniter_source=Some(owner);
+                self.recovery.note_launch(board);
+            }
+            self.update_actuator_igniter_sequence(receipt_model_ms);
+            return;
+        }
         let output=if board==Board::ValveBoard&&matches!(ty,crate::testing_board_lifecycle::Kind::Valve|crate::testing_board_lifecycle::Kind::AutomaticValve) {
             match value {0..=2=>Some((value,true)),3..=5=>Some((value-3,false)),_=>None}
         } else if board==Board::ActuatorBoard&&matches!(ty,crate::testing_board_lifecycle::Kind::Actuator|crate::testing_board_lifecycle::Kind::AutomaticActuator) {
             match value {7|9|10=>Some((value,true)),11=>Some((7,false)),12|13=>Some((value-3,false)),_=>None}
         } else {None};
-        if let Some((key,on))=output {self.valves.insert(key,on);self.queue_umbilical_status(key,on,now);}
+        if let Some((key,on))=output {self.valves.insert(key,on);self.queue_umbilical_status(key,on,observed_utc);}
         if board == Board::FlightComputer
             && ty == crate::testing_board_lifecycle::Kind::Flight
             && value == 1
@@ -1706,7 +1786,7 @@ pub(crate) fn receive_model_packet(board:Board,packet:&Packet,sample:crate::test
     let mut model=sim().lock().unwrap();
     let observed_utc=sample.current();
     let decision=model.recovery.receive(board,packet,observed_utc);
-    match decision.action {Action::None=>{},Action::Stop=>model.stop_modeled_outputs(board,packet.timestamp()),Action::Ordinary(ty,value)=>model.apply_modeled_packet(board,ty,value,packet.timestamp())}
+    match decision.action {Action::None=>{},Action::Stop=>model.stop_modeled_outputs_at(board,observed_utc,get_current_timestamp_ms()),Action::Ordinary(ty,value)=>model.apply_modeled_packet_at(board,ty,value,packet.timestamp(),observed_utc,get_current_timestamp_ms())}
     let wire=decision.reply.map(|reply|model.recovery.status(board,reply,model.modeled_outputs(board),observed_utc));drop(model);
     wire.map(|wire|crate::testing_board_lifecycle::status_packet(board,wire,observed_utc)).transpose()
 }
@@ -1720,7 +1800,7 @@ pub(crate) fn service_model_recovery(sample:crate::testing_board_lifecycle::Cloc
     for (board,intent) in jobs {
         if !boards.contains(&board){continue;}
         let observed_utc=sample.current();
-        if model.recovery.ticket_current(board,&intent,observed_utc){model.stop_modeled_outputs(board,intent.source);}
+        if model.recovery.ticket_current(board,&intent,observed_utc){model.stop_modeled_outputs_at(board,observed_utc,get_current_timestamp_ms());}
         let reply=model.recovery.finish(board,&intent,sample.current());
         if reply.result==0{model.retire_completed_reports(board,intent.source);}
         replies.push((board,model.recovery.status(board,reply,model.modeled_outputs(board),observed_utc)));
@@ -1879,11 +1959,39 @@ impl AutomaticPhaseGuard<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    use crate::board_recovery::ReadyIgnitionFixture;
+    #[cfg(all(feature="testing",any(feature="hitl_mode",feature="test_fire_mode")))]
+    struct ReadyIgnitionFixture {
+        state:std::sync::Arc<crate::state::AppState>,
+        _peers:crate::ignition_pair::fixture::Peers,
+    }
+    #[cfg(all(feature="testing",any(feature="hitl_mode",feature="test_fire_mode")))]
+    impl Drop for ReadyIgnitionFixture {fn drop(&mut self){self.state.request_shutdown();}}
+    #[cfg(feature="testing")]
+    async fn ready_launch_fixture()->ReadyIgnitionFixture {
+        #[cfg(not(any(feature="hitl_mode",feature="test_fire_mode")))]
+        {crate::board_recovery::ready_ignition_fixture_for_test().await}
+        #[cfg(any(feature="hitl_mode",feature="test_fire_mode"))]
+        {
+            let state=crate::state::tests::test_app_state().await;
+            let host=std::sync::Arc::new(sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([
+                crate::ignition_pair::fixture::handler(&state, |_|Ok(())),
+            ]).with_sender("GS")));
+            let peers=crate::ignition_pair::fixture::Peers::warm(&state,host).await;
+            assert!(crate::ignition_pair::readiness(&state).is_ok());
+            ReadyIgnitionFixture{state,_peers:peers}
+        }
+    }
     #[cfg(feature = "testing")]
     #[tokio::test]
     async fn retained_stop_orders_actual_testing_model_launch_and_visual_idle_does_not_rearm() {
-        let state = crate::state::tests::test_app_state().await;
-        crate::gse::qualified_launch_proofs_for_test(&state);
+        #[cfg(not(any(feature="hitl_mode",feature="test_fire_mode")))]
+        if crate::operator_queue::isolated_simulated_case(module_path!(),"retained_stop_orders_actual_testing_model_launch_and_visual_idle_does_not_rearm"){return;}
+        #[cfg(any(feature="hitl_mode",feature="test_fire_mode"))]
+        if crate::operator_queue::isolated_native_case(module_path!(),"retained_stop_orders_actual_testing_model_launch_and_visual_idle_does_not_rearm"){return;}
+        let stopped_ready=ready_launch_fixture().await;
+        let state=stopped_ready.state.clone();
         let mut model = super::FlightSimState::new();
         model.flight_state = crate::types::FlightState::Armed;
         let ticket = crate::gse::inhibit_automatic_actions_for_launch(&state).unwrap();
@@ -1894,8 +2002,8 @@ mod tests {
             .is_err()
         );
         assert_eq!(model.flight_state, crate::types::FlightState::Armed);
-        let current = crate::state::tests::test_app_state().await;
-        crate::gse::qualified_launch_proofs_for_test(&current);
+        let current_ready=ready_launch_fixture().await;
+        let current=current_ready.state.clone();
         let ticket = crate::gse::inhibit_automatic_actions_for_launch(&current).unwrap();
         crate::gse::admit_simulated_launch(&current, ticket, || {
             model.apply_command(&crate::types::TelemetryCommand::Launch, 1000)
@@ -2274,3 +2382,11 @@ mod automatic_readiness_tests;
 
 #[cfg(all(test, feature = "testing"))]
 mod automatic_phase_tests;
+
+#[cfg(all(test,feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+#[path="flight_sim/expanded_plant_tests.rs"]
+mod expanded_plant_tests;
+
+#[cfg(all(test,feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+#[path="flight_sim/sdk_model_tests.rs"]
+mod sdk_model_tests;

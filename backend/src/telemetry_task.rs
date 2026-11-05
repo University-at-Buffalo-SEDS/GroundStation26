@@ -522,6 +522,7 @@ pub async fn telemetry_task(
     db_rx: mpsc::Receiver<DbQueueItem>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> TelemetryShutdownOutcome {
+    crate::ignition_pair::observer::start(&state);
     let mut operator_queue_rx = state
         .operator_queue
         .take_receiver()
@@ -3171,35 +3172,16 @@ mod tests {
     async fn test_fire_launch_uses_fill_system_without_av_bay_case() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
-        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
-        let capture = sent.clone();
-        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
-        let side = router.add_side_packed_with_options(
-            "umbilical_comms",
-            move |bytes| {
-                capture.lock().unwrap().push(bytes.to_vec());
-                Ok(())
-            },
-            sedsnet::router::RouterSideOptions {
-                reliable_enabled: true,
-                link_local_enabled: true,
-                ..Default::default()
-            },
-        );
-        // Only the valve board is present: test fires have no AV bay.
-        let discovery = sedsnet::discovery::build_discovery_announce(
-            Board::ValveBoard.sender_id(),
-            123,
-            &[crate::telemetry_schema::endpoint("VALVE_BOARD")],
-        )
-        .unwrap();
-        router
-            .rx_packed_from_side(&serialize::pack_packet(&discovery), side)
-            .unwrap();
-        router.process_all_queues_with_timeout(0).unwrap();
-        sent.lock().unwrap().clear();
-
-        let qualification = crate::gse::armed_fixture_for_test(&state, &router);
+        // No AV-bay command peer is present. AB/VB readiness is genuine SDK
+        // QUERY evidence; GB/DAQ operational qualification remains explicitly
+        // MODELED by the existing qualification fixture, not hardware proof.
+        let router=Arc::new(Router::new(sedsnet::router::RouterConfig::new([
+            crate::ignition_pair::fixture::handler(&state, |_|Ok(())),
+        ]).with_sender("GS")));
+        let qualification=crate::gse::armed_fixture_with_real_pair_for_test(&state,&router);
+        assert!(!state.board_abort.ignition_pair_current());
+        let actual_pair=crate::ignition_pair::fixture::Peers::warm_pair_only(&state,router.clone()).await;
+        assert!(state.board_abort.ignition_pair_current());
         let launch_revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
         handle_local_ground_station_launch_command(state.clone(), router.clone(), launch_revision)
             .await;
@@ -3218,7 +3200,7 @@ mod tests {
         assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::TMinus);
         std::fs::remove_file(qualification).unwrap();
         router.process_all_queues_with_timeout(0).unwrap();
-        let sent = sent.lock().unwrap();
+        let sent = actual_pair.pending_transport_wires();
         let packets: Vec<_> = sent
             .iter()
             .filter_map(|wire| serialize::unpack_packet(wire).ok())
@@ -3357,12 +3339,8 @@ mod tests {
 
     #[tokio::test]
     async fn exposed_flight_commands_transmit_to_the_discovered_rocket_side() {
-        let (db_tx, _db_rx) = mpsc::channel(8);
-        let state = test_app_state(db_tx).await;
+        if crate::operator_queue::isolated_native_case(module_path!(),"exposed_flight_commands_transmit_to_the_discovered_rocket_side"){return;}
         crate::telemetry_schema::initialize().unwrap();
-        // Packet compatibility fixture: satisfy the independently tested new
-        // required-board proof before exercising the exposed Launch byte.
-        crate::gse::qualified_launch_proofs_for_test(&state);
         // Match FC's existing compatibility protocol, including every visible
         // threshold control. These are isolated packet captures, not outputs.
         for command in [
@@ -3396,9 +3374,11 @@ mod tests {
             FlightComputerCommands::ReinitAfter30,
             FlightComputerCommands::ReinitAfter50,
         ] {
+            let (db_tx, _db_rx) = mpsc::channel(8);
+            let state = test_app_state(db_tx).await;
             let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
             let sent_clone = sent.clone();
-            let router = Router::new(sedsnet::router::RouterConfig::new([]));
+            let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([crate::ignition_pair::fixture::handler(&state, |_| Ok(()))])));
             let rocket_side = router.add_side_packed_with_options(
                 "rocket_comms",
                 move |bytes| {
@@ -3427,6 +3407,10 @@ mod tests {
             router
                 .process_all_queues_with_timeout(0)
                 .expect("failed to process RF discovery");
+
+            let _actual_peers = if matches!(command, FlightComputerCommands::Launch) {
+                Some(crate::ignition_pair::fixture::Peers::warm(&state, router.clone()).await)
+            } else { None };
 
             queue_locally_routed_flight_command(
                 &state,
@@ -3536,7 +3520,7 @@ mod tests {
         let errors=std::fs::OpenOptions::new().write(true).create_new(true).open(&stderr).unwrap();
         let mut child=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact",name,"--nocapture","--test-threads=1"])
-            .env(CHILD,"1")
+            .env(CHILD,"1").env("GS_SIM_MODE","0")
             .env("GS_LOADCELL_CALIBRATION_PATH",root.0.join("loadcell.json"))
             .env("GS_CHECKLISTS_FILE",root.0.join("checklists.json"))
             .env("GS_FLIGHT_SETUP_CONFIG",config.join("flight_setup.json"))
@@ -3581,14 +3565,14 @@ mod tests {
             let owner = Arc::as_ptr(&state) as usize;
             let clock = std::time::Instant::now();
             Arc::new(Router::new_with_clock(
-                sedsnet::router::RouterConfig::new([]),
+                sedsnet::router::RouterConfig::new([crate::ignition_pair::fixture::handler(&state, |_| Ok(()))]),
                 Box::new(move || {
                     crate::gse::nonwaiting_admission_tests::clock_pause(owner);
                     clock.elapsed().as_millis() as u64
                 }),
             ))
         } else {
-            Arc::new(Router::new(sedsnet::router::RouterConfig::new([])))
+            Arc::new(Router::new(sedsnet::router::RouterConfig::new([crate::ignition_pair::fixture::handler(&state, |_| Ok(()))])))
         };
         let valve_side = router.add_side_packed_with_options(
             "umbilical_comms",
@@ -3620,6 +3604,7 @@ mod tests {
 
         #[cfg(not(feature = "hitl_mode"))]
         let qualification = crate::gse::armed_fixture_for_test(&state, &router);
+        let _actual_peers=crate::ignition_pair::fixture::Peers::warm(&state,router.clone()).await;
         let launch_revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
         if force_core_busy {
             if state.topology_router.get().is_none() {
@@ -5519,7 +5504,8 @@ mod tests {
             shutdown_tx,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             pending_db_writes: Arc::new(AtomicUsize::new(0)),
-            transport_tx_activity: Arc::new(Default::default()),
+            ignition_observer: Arc::new(Default::default()),
+        transport_tx_activity: Arc::new(Default::default()),
             db_write_notify: Arc::new(Notify::new()),
             notifications: Arc::new(Mutex::new(Vec::new())),
             notifications_tx,
@@ -5757,6 +5743,10 @@ mod tests {
     async fn selected_1000kg_fill_uses_absolute_mass_without_changing_recorded_weight() {
         let (db_tx, _) = mpsc::channel(16);
         let state = test_app_state(db_tx.clone()).await;
+        // This raw==kg numeric oracle owns its calibration; do not inherit a
+        // physical installation's saved fit from the stage runtime directory.
+        *state.loadcell_calibration.lock().unwrap() = loadcell::LoadcellCalibrationFile::default();
+        state.loadcell_calibration.lock().unwrap().full_mass_kg = None;
         let mut targets = state.fill_targets_snapshot();
         targets.nitrous.target_mass_kg = 10.; // Original percentage oracle uses a 10 kg target.
         targets.fill_source = crate::fill_targets::FillSource::Kg1000Absolute;
@@ -5815,6 +5805,9 @@ mod tests {
     async fn stable_zero_and_disabled_auto_zero_do_not_delay_start_fill() {
         let (db_tx, _) = mpsc::channel(4);
         let state = test_app_state(db_tx).await;
+        // This raw==kg numeric oracle owns its calibration; do not inherit a
+        // physical installation's saved fit from the stage runtime directory.
+        *state.loadcell_calibration.lock().unwrap() = loadcell::LoadcellCalibrationFile::default();
         let mut targets = state.fill_targets_snapshot();
         targets.fill_source = crate::fill_targets::FillSource::Kg1000Absolute;
         state.set_fill_targets(targets);
@@ -6201,6 +6194,9 @@ mod tests {
     async fn kg1000_packet_emits_state_tab_loadcell_rows() {
         let (db_tx, mut db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx.clone()).await;
+        // This raw==kg numeric oracle owns its calibration; do not inherit a
+        // physical installation's saved fit from the stage runtime directory.
+        *state.loadcell_calibration.lock().unwrap() = loadcell::LoadcellCalibrationFile::default();
         let db_overflow = test_db_overflow();
         let mut ws_rx = state.ws_tx.subscribe();
 
@@ -6279,6 +6275,62 @@ mod tests {
                 loadcell::DERIVED_WEIGHT_DATA_TYPE.to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn kg1000_nonidentity_conversion_preserves_raw_row_and_calibrates_fill_mass() {
+        let (db_tx, _) = mpsc::channel(16);
+        let state = test_app_state(db_tx.clone()).await;
+        let calibration = loadcell::LoadcellCalibrationFile {
+            ch1: loadcell::ChannelLinear { m: Some(2.0), b: Some(1.0) },
+            ch1_fit: None,
+            ..Default::default()
+        };
+        *state.loadcell_calibration.lock().unwrap() = calibration;
+        let mut targets = state.fill_targets_snapshot();
+        targets.fill_source = crate::fill_targets::FillSource::Kg1000Absolute;
+        targets.nitrous.target_mass_kg = 10.0;
+        state.set_fill_targets(targets);
+        let mut ws = state.ws_tx.subscribe();
+        let packet = Packet::new(
+            crate::telemetry_schema::data_type("KG1000"),
+            &[crate::telemetry_schema::endpoints::GROUND_STATION],
+            Board::DaqBoard.sender_id(), 456_789, f32_payload(&[4.25]),
+        ).unwrap();
+        let raw = handle_packet(&state, &db_tx, &test_db_overflow(), packet).await;
+        assert_eq!(raw[0].values, vec![Some(4.25)]);
+        assert_eq!(ws.try_recv().unwrap().values, vec![Some(9.5)]);
+        assert_eq!(ws.try_recv().unwrap().values, vec![Some(95.0)]);
+        assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(9.5));
+    }
+
+    #[tokio::test]
+    async fn stable_raw_stream_with_physical_polynomial_load_does_not_bypass_auto_zero_limit() {
+        let (db_tx, _) = mpsc::channel(4);
+        let state = test_app_state(db_tx).await;
+        // Exact fit/zero from the physical seed in the retained failed run.
+        // A stable raw voltage is not a near-zero calibrated load.
+        let calibration: loadcell::LoadcellCalibrationFile = serde_json::from_str(r#"{
+            "ch1":{"m":-1568.1659,"b":-3.873501},
+            "ch1_fit":{"type":"poly2","a":4922774.0,"b":-1568.1659,"c":-3.873501},
+            "ch1_zero_raw":0.00023022853
+        }"#).unwrap();
+        assert!(loadcell::calibrated_weight_kg(&calibration, "KG1000", 0.1).unwrap() > 49_000.0);
+        let original = serde_json::to_value(&calibration).unwrap();
+        *state.loadcell_calibration.lock().unwrap() = calibration;
+        let mut targets = state.fill_targets_snapshot();
+        targets.fill_source = crate::fill_targets::FillSource::Kg1000Absolute;
+        state.set_fill_targets(targets);
+        {
+            let mut zero = state.auto_zero.lock().unwrap();
+            *zero = crate::auto_zero::Runtime::testing(true);
+            for _ in 0..200 { zero.observe("KG1000", 0.1); }
+        }
+        assert!(crate::auto_zero::before_fill(&state, &TelemetryCommand::StartFill),
+            "a stable but loaded physical calibration must intercept StartFill");
+        assert!(!state.auto_zero.lock().unwrap().pending(),
+            "without an admitted fill continuation no automatic tare may be started");
+        assert_eq!(serde_json::to_value(&*state.loadcell_calibration.lock().unwrap()).unwrap(), original);
     }
 
     #[tokio::test]

@@ -59,6 +59,7 @@ impl Mesh {
         ))
         .unwrap();
         assert!(state.topology_router.set(host.clone()).is_ok());
+        crate::ignition_pair::observer::start(&state);
         let out = Arc::new(Mutex::new(VecDeque::new()));
         let mut links = Vec::new();
         let mut sides = Vec::new();
@@ -94,6 +95,9 @@ impl Mesh {
             out,
             received,
         }
+    }
+    async fn observe_routes(&mut self) {
+        tokio::time::timeout(Duration::from_secs(2),async {loop {self.pump();if crate::ignition_pair::require_routes(&self.state).is_ok(){break;}tokio::time::sleep(Duration::from_millis(2)).await;}}).await.expect("actual selected virtual command routes must be observed");
     }
     fn pump(&mut self) {
         for _ in 0..80 {
@@ -744,4 +748,76 @@ async fn actual_http_confirm_uses_deployed_dummy_and_receiver_owned_journal() {
             .unwrap()
             .quiesced
     );
+}
+
+#[tokio::test]
+async fn actual_virtual_pair_queries_are_required_for_ignition() {
+    const CHILD: &str = "IGNITION_PAIR_MODEL_CHILD";
+    const NAME: &str = "board_recovery::testing_model_tests::actual_virtual_pair_queries_are_required_for_ignition";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1").env("GS_SIM_MODE", "1").env("GS_RRLS_ROLE", "primary")
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    let fixture = tests::http_fixture().await;
+    let mut mesh = Mesh::new(fixture.state.clone(), 0, 0);
+    assert!(!mesh.state.board_abort.ignition_pair_current());
+    mesh.recover(Board::ActuatorBoard).await;
+    assert!(!mesh.state.board_abort.ignition_pair_current(), "one actually queried virtual owner is insufficient");
+    mesh.recover(Board::ValveBoard).await;
+    mesh.query(Board::ActuatorBoard).await;
+    mesh.query(Board::ValveBoard).await;
+    mesh.observe_routes().await;
+    assert!(crate::ignition_pair::readiness(&mesh.state).is_ok(), "actual selected Dummy Owner QUERY and discovery must count");
+    crate::testing_board_lifecycle::bind_selected(true, false);
+    assert!(crate::ignition_pair::readiness(&mesh.state).is_err(), "a known deselected virtual fill link is not presence");
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn actual_virtual_selection_loss_after_capture_never_acquires_ignition_owner() {
+    const CHILD:&str="IGNITION_PAIR_SELECTION_RACE_CHILD";
+    const NAME:&str="board_recovery::testing_model_tests::actual_virtual_selection_loss_after_capture_never_acquires_ignition_owner";
+    if std::env::var_os(CHILD).is_none(){let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact",NAME,"--nocapture","--test-threads=1"]).env(CHILD,"1").env("GS_SIM_MODE","1").env("GS_RRLS_ROLE","primary").output().unwrap();assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));return;}
+    let fixture=tests::http_fixture().await;
+    let mut mesh=Mesh::new(fixture.state.clone(),0,0);
+    mesh.recover(Board::ActuatorBoard).await;mesh.recover(Board::ValveBoard).await;
+    mesh.query(Board::ActuatorBoard).await;mesh.query(Board::ValveBoard).await;mesh.observe_routes().await;
+    assert!(crate::ignition_pair::readiness(&mesh.state).is_ok());
+    let kind=crate::telemetry_schema::data_type("ACTUATOR_COMMAND");assert!(!mesh.host.has_pending_reliable_tx_type(kind));
+    let before=mesh.host.queue_counters()[2];let pause=crate::ignition_pair::route_test_pause::Pause::install(&mesh.state);
+    let state=mesh.state.clone();let router=mesh.host.clone();
+    let caller=std::thread::Builder::new().name("ignition-pair-new-control".into()).spawn(move||crate::gse::queue_controller_with_stop_fence(&state,&router,kind,&[14])).unwrap();
+    pause.observed.recv_timeout(Duration::from_secs(2)).expect("actual route token captured before selection loss");
+    crate::testing_board_lifecycle::bind_selected(false,false);pause.resume.send(()).unwrap();
+    let result=caller.join().unwrap();assert!(!matches!(result,Ok(true)),"deselected virtual transport acquired ignition owner: {result:?}");
+    assert_eq!(mesh.host.queue_counters()[2],before,"no SDK ignition owner after observed selection loss");assert!(!mesh.host.has_pending_reliable_tx_type(kind));
+}
+
+// Keep the actual HTTP runtime and selected Dummy links alive for callers that
+// exercise host-only launch admission with an otherwise scalar model effect.
+// Every required board readback here is real QUERY/Recovery SDK traffic.
+pub(crate) struct ReadyIgnitionFixture {
+    pub(crate) state: Arc<AppState>,
+    _mesh: Mesh,
+    _http: tests::HttpFixture,
+}
+impl Drop for ReadyIgnitionFixture {
+    fn drop(&mut self){self.state.request_shutdown();}
+}
+pub(crate) async fn ready_ignition_fixture_for_test()->ReadyIgnitionFixture {
+    let http=tests::http_fixture().await;
+    let mut mesh=Mesh::new(http.state.clone(),0,0);
+    for board in BOARDS {mesh.recover(board).await;}
+    for board in BOARDS {mesh.query(board).await;}
+    mesh.observe_routes().await;
+    assert!(crate::ignition_pair::readiness(&mesh.state).is_ok());
+    let(aborted,proven)=mesh.state.board_abort.masks();
+    assert_eq!(aborted,0);
+    let required=crate::board_abort::required_mask(&mesh.state)|crate::ignition_pair::REQUIRED_MASK;
+    assert_eq!(proven&required,required,"every required virtual owner has an actual fresh QUERY reply");
+    ReadyIgnitionFixture{state:http.state.clone(),_mesh:mesh,_http:http}
 }

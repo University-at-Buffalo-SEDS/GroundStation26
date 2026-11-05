@@ -600,11 +600,13 @@ async fn actual_cold_flow_routes_physical_edge_auth_cancel_and_no_launch_clock()
         assert!(crate::gse::handle_command(&f.state, &cmd));
     }
     let ticket = LaunchAdmission::capture(&f.state);
-    assert!(
-        with_launch_admission(&f.state, ticket, || panic!(
+    // Isolate the existing dispatch-layer ColdFlow exclusion; mandatory
+    // ignition-pair admission is exercised through actual SDK peers separately.
+    assert_eq!(
+        with_launch_admission(&f.state, ticket, false, || panic!(
             "rocket Launch admitted during cold flow"
-        ))
-        .is_err()
+        )).unwrap_err(),
+        "Rocket Launch is inhibited while cold flow owns the valves"
     );
     let ready = panel_edge(&f.state, automatic_generation(&f.state)).unwrap();
     assert!(ready.awaiting_at_edge);

@@ -60,7 +60,10 @@ fn main() {
             (fixture/'contract.csproj').write_text(
                 '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType>'
                 '<TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>')
+            # Docker runs outside the test runner's cgroup. Bound the daemon's
+            # container explicitly rather than relying on the host test limits.
             command = ['docker', 'run', '--rm', '--network=none',
+                '--memory=4g', '--memory-swap=4g', '--cpus=2', '--pids-limit=256',
                 '--user', f'{os.getuid()}:{os.getgid()}', '--env', 'DOTNET_CLI_HOME=/tmp',
                 '--env', 'RADIO_PACKETIZATION_SCHEDULE=/fixture/schedule.json',
                 '--env', 'RADIO_INTERACTIVE_PACKETIZATION=1',

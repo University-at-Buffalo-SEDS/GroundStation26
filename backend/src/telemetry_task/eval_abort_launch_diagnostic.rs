@@ -54,6 +54,57 @@ async fn public_command(state: Arc<AppState>, command: &str) -> StatusCode {
     status
 }
 
+
+// Real recovery endpoints supplement the existing instrumented command peers.
+// Replies are queued outside endpoint callbacks, exactly as on the SDK wire.
+struct ReadinessPeer {
+    board: crate::types::Board,
+    router: Arc<Router>,
+    requests: Arc<Mutex<Vec<sedsnet::packet::Packet>>>,
+}
+fn pump_eval_readiness(host: &Router, peers: &[Arc<Router>], readbacks: &[ReadinessPeer]) {
+    for _ in 0..12 {
+        host.process_all_queues_with_timeout(0).unwrap();
+        for peer in peers {
+            peer.process_all_queues_with_timeout(0).unwrap();
+        }
+        for peer in readbacks {
+            let requests = std::mem::take(&mut *peer.requests.lock().unwrap());
+            for request in requests {
+                peer.router.tx_queue(crate::ignition_pair::fixture::query_reply(peer.board, &request).unwrap()).unwrap();
+            }
+            peer.router.process_all_queues_with_timeout(0).unwrap();
+        }
+        host.process_all_queues_with_timeout(0).unwrap();
+    }
+}
+async fn warm_eval_ignition_pair(state: &Arc<AppState>, host: &Arc<Router>, peers: &[Arc<Router>], readbacks: &[ReadinessPeer]) {
+    host.announce_discovery().unwrap();
+    for peer in peers {
+        peer.announce_discovery().unwrap();
+    }
+    crate::ignition_pair::observer::start(state);
+    for board in [crate::types::Board::ActuatorBoard, crate::types::Board::ValveBoard] {
+        pump_eval_readiness(host, peers, readbacks);
+        assert_eq!(crate::board_recovery::request_board_query(state, board).status(), StatusCode::OK, "actual instrumented peer must admit one fresh QUERY");
+        let nonce = crate::board_recovery::query_nonce_for_test(state, board).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                pump_eval_readiness(host, peers, readbacks);
+                if crate::board_recovery::query_reply_current_for_test(state, board, nonce) { break; }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }).await.expect("actual same-Router peer must return this fresh nonce");
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            pump_eval_readiness(host, peers, readbacks);
+            if state.board_abort.ignition_pair_current() && crate::ignition_pair::require_routes(state).is_ok() { break; }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }).await.expect("actual queried AB/VB and observed command routes must be current");
+}
+
 async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
     crate::telemetry_schema::initialize().unwrap();
     let root = crate::recording_export::tests::TestDirectory::new();
@@ -106,7 +157,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
     // first retained owner is observed but its IO callback has not finished.
     let clock_origin = std::time::Instant::now();
     let host = Arc::new(Router::new_with_clock(
-        RouterConfig::new([]).with_sender("GS"),
+        RouterConfig::new([crate::ignition_pair::fixture::handler(&state, |_| Ok(()))]).with_sender("GS"),
         Box::new(move || {
             clock.load(Ordering::SeqCst).saturating_add(
                 u64::try_from(clock_origin.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -118,6 +169,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
     let valve_type = crate::telemetry_schema::data_type("VALVE_COMMAND");
     let fc_ep = crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER");
     let valve_ep = crate::telemetry_schema::endpoint("VALVE_BOARD");
+    let actuator_ep = crate::telemetry_schema::endpoint("ACTUATOR_BOARD");
     let wire_controls = Arc::new(Mutex::new(Vec::<ObservedControl>::new()));
     let delivered = Arc::new(Mutex::new(Vec::<ObservedControl>::new()));
     //0=refuse EvalAbort,1=hold EvalAbort retry,2=deliver normally.
@@ -126,10 +178,10 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
     let _release_on_failure = ReleaseHeldCallback(gate.clone());
     let mut peers = Vec::new();
-    for (name, ep) in [("FC", fc_ep), ("VB", valve_ep)] {
+    let mut readiness_peers = Vec::new();
+    for (name, ep) in [("FC", fc_ep), ("VB", valve_ep), ("AB", actuator_ep)] {
         let output = delivered.clone();
-        let peer = Arc::new(Router::new(
-            RouterConfig::new([EndpointHandler::new_packet_handler(ep, move |packet| {
+        let mut handlers = vec![EndpointHandler::new_packet_handler(ep, move |packet| {
                 output.lock().unwrap().push(ObservedControl {
                     id: packet.packet_id(),
                     ty: packet.data_type().as_u32(),
@@ -142,9 +194,25 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
                     .to_vec(),
                 });
                 Ok(())
-            })])
-            .with_sender(name),
-        ));
+            })];
+        let board = match name {
+            "AB" => Some(crate::types::Board::ActuatorBoard),
+            "VB" => Some(crate::types::Board::ValveBoard),
+            _ => None,
+        };
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        if let Some(board) = board {
+            let capture = requests.clone();
+            let recovery = crate::telemetry_schema::endpoint(if board == crate::types::Board::ActuatorBoard { "BOARD_RECOVERY_AB" } else { "BOARD_RECOVERY_VB" });
+            handlers.push(EndpointHandler::new_packet_handler(recovery, move |packet| {
+                capture.lock().unwrap().push(packet.clone());
+                Ok(())
+            }));
+        }
+        let peer = Arc::new(Router::new(RouterConfig::new(handlers).with_sender(name)));
+        if let Some(board) = board {
+            readiness_peers.push(ReadinessPeer { board, router: peer.clone(), requests });
+        }
         let host_side = Arc::new(OnceLock::new());
         let to_host = host_side.clone();
         let ground = Arc::downgrade(&host);
@@ -213,6 +281,10 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
         }
         host.process_all_queues_with_timeout(0).unwrap();
     }
+    // Test-only readiness premise: genuine AB plus the SAME instrumented VB.
+    crate::telemetry_task::refresh_host_network_time(&host, get_current_timestamp_ms());
+    assert!(!state.board_abort.ignition_pair_current());
+    warm_eval_ignition_pair(&state, &host, &peers, &readiness_peers).await;
     //Use the current supported HITL state/interlocks. This is not FC ready evidence.
     *state.state.lock().unwrap() = FlightState::Armed;
     state.set_action_policy(default_action_policy());
@@ -459,6 +531,9 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
             host.has_pending_reliable_tx_type(fc_type),
             host.queue_counters()
         );
+        // Explicit new operator retry follows a fresh real readiness check;
+        // no queries run inside the held-FC16 admission decision above.
+        warm_eval_ignition_pair(&state, &host, &peers, &readiness_peers).await;
         let retry_start = std::time::Instant::now();
         let mut public_duplicates = 0usize;
         let retry_body = loop {

@@ -673,6 +673,69 @@ mod tests {
         state.set_action_policy(policy);
         state
     }
+    // Scenario-only factory: retain every modeled QD/operational prerequisite,
+    // but install the real status ingress before the final independent SDK proof.
+    #[cfg(not(feature="test_fire_mode"))]
+    async fn fixture_with_status_sender(commands:tokio::sync::mpsc::Sender<TelemetryCommand>)->(Arc<AppState>,usize) {
+        let mut state = crate::state::tests::test_app_state().await;
+        // Must precede the status handler's Weak binding: Arc::get_mut then
+        // remains legal and the command channel is identical to the old case.
+        Arc::get_mut(&mut state).unwrap().cmd_tx=commands;
+        state.set_local_flight_state(FlightState::Idle);
+        let router = Arc::new(sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([crate::ignition_pair::fixture::handler(&state, |_|Ok(()))]).with_sender("GS"),
+        ));
+        let side = router.add_side_packed("simulated_fill", |_| Ok(()));
+        let announce = sedsnet::discovery::build_discovery_announce(
+            "GB",
+            123,
+            &[
+                crate::telemetry_schema::endpoint("VALVE_BOARD"),
+                crate::telemetry_schema::endpoint("ACTUATOR_BOARD"),
+            ],
+        )
+        .unwrap();
+        router
+            .rx_packed_from_side(&sedsnet::wire_format::pack_packet(&announce), side)
+            .unwrap();
+        router.process_all_queues_with_timeout(0).unwrap();
+        state.topology_router.set(router).unwrap();
+        for board in [
+            Board::GatewayBoard,
+            Board::ValveBoard,
+            Board::ActuatorBoard,
+            Board::DaqBoard,
+        ] {
+            state.mark_board_seen(
+                board.sender_id(),
+                crate::telemetry_task::get_current_timestamp_ms(),
+            );
+        }
+        let (_, key) = topology(&state);
+        let mut rt = state.gse.lock().unwrap();
+        rt.clock = Instant::now() - std::time::Duration::from_secs(3);
+        rt.operational.topology(0, true, key.clone());
+        rt.operational.topology(3000, true, key);
+        rt.operational.startup_configured = true;
+        rt.operational.path = Some(std::env::temp_dir().join(format!(
+            "gse-runtime-{}-{}.json",
+            std::process::id(),
+            rand::random::<u128>()
+        )));
+        rt.engine.config.maximum_zero_offset_psi = Some(5.0);
+        rt.engine.config.dry_self_test_confirmed = true;
+        rt.observe_pressure(Some(0.0));
+        rt.observe_mass(Some(0.0));
+        for (key, open) in KEYS.into_iter().zip(gse_sequence::CLOSED) {
+            rt.observe_valve(key, open);
+        }
+        drop(rt);
+        let mut policy = state.action_policy_snapshot();
+        policy.key_enabled = true;
+        policy.software_buttons_enabled = true;
+        state.set_action_policy(policy);
+        (state,side)
+    }
     #[tokio::test]
     async fn cancelled_leak_test_invalidates_old_pass_without_aborting_vehicle() {
         let state = fixture().await;
@@ -1318,7 +1381,8 @@ mod tests {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child
                 .args(["--exact", NAME, "--test-threads=1"])
-                .env("GS_QD_GATES_CHILD", "1");
+                .env("GS_QD_GATES_CHILD", "1")
+                .env("GS_SIM_MODE", "0");
             if cfg!(feature = "firmware_sim") {
                 std::fs::write(&clock, "0").unwrap();
                 child
@@ -1353,9 +1417,8 @@ mod tests {
     }
     #[cfg(not(feature = "test_fire_mode"))]
     async fn queued_flight_launch_scenario(revoke: &str) {
-        let mut state = fixture().await;
         let (commands, mut received) = tokio::sync::mpsc::channel(8);
-        Arc::get_mut(&mut state).unwrap().cmd_tx = commands;
+        let (state,modeled_fill_side) = fixture_with_status_sender(commands).await;
         let mut notices = state.notifications_tx.subscribe();
         let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
         {
@@ -1603,7 +1666,12 @@ mod tests {
                 )
                 .unwrap()
             );
+            // Only the independent fresh SDK-positive premise changes. All
+            // earlier QD/GPS/route/revision/Abort/Stop negatives above remain
+            // modeled with their original clocks and assertions.
+            router.remove_side(modeled_fill_side).unwrap();
             for board in crate::board_abort::BOARDS {
+                if matches!(board,Board::ActuatorBoard|Board::ValveBoard){continue;}
                 let at = Instant::now();
                 state.board_abort.observe_status(
                     board,
@@ -1619,6 +1687,11 @@ mod tests {
                     10_002,
                 );
             }
+            // Other five board prerequisites remain explicitly MODELED. The
+            // ignition pair alone is now genuine queried SDK evidence on the
+            // exact enqueue Router, with no competing fake GB controller route.
+            let _actual_pair=crate::ignition_pair::fixture::Peers::warm_pair_only(&state,router.clone()).await;
+            assert!(state.board_abort.ignition_pair_current());
             let fresh = crate::board_abort::capture_launch_revision_named(&state, "Launch");
             assert!(
                 crate::gse::queue_controller_with_launch_revision(

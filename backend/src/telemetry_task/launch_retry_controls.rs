@@ -39,7 +39,7 @@ fn isolated_child() -> bool {
     let err = root.0.join("stderr.log");
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
-        .env(CHILD, "1")
+        .env(CHILD, "1").env("GS_SIM_MODE","0")
         .env("TMPDIR", &root.0)
         .env("TMP", &root.0)
         .env("TEMP", &root.0)
@@ -120,6 +120,7 @@ struct Rig {
     wire: Arc<Mutex<Vec<Packet>>>,
     delivered: Arc<Mutex<Vec<Packet>>>,
     _db: mpsc::Receiver<DbQueueItem>,
+    actual_pair:crate::ignition_pair::fixture::Peers,
 }
 impl Rig {
     async fn new() -> Self {
@@ -129,7 +130,7 @@ impl Rig {
         let owner = Arc::as_ptr(&state) as usize;
         let start = std::time::Instant::now();
         let host = Arc::new(Router::new_with_clock(
-            RouterConfig::new([]).with_sender("GS"),
+            RouterConfig::new([crate::ignition_pair::fixture::handler(&state,|_|Ok(()))]).with_sender("GS"),
             Box::new(move || {
                 crate::gse::nonwaiting_admission_tests::clock_pause(owner);
                 let elapsed = start.elapsed();
@@ -154,7 +155,11 @@ impl Rig {
             ),
             ("VB", vec![crate::telemetry_schema::endpoint("VALVE_BOARD")]),
         ] {
-            let handlers = endpoints
+            let response_owner=Arc::new(OnceLock::<std::sync::Weak<Router>>::new());
+            let reply_owner=response_owner.clone();
+            let recovery=crate::telemetry_schema::endpoint(if name=="FC"{"BOARD_RECOVERY_FC"}else{"BOARD_RECOVERY_VB"});
+            let board=if name=="FC"{Board::FlightComputer}else{Board::ValveBoard};
+            let mut handlers = endpoints
                 .into_iter()
                 .map(|ep| {
                     let seen = delivered.clone();
@@ -164,7 +169,12 @@ impl Rig {
                     })
                 })
                 .collect::<Vec<_>>();
+            handlers.push(EndpointHandler::new_packet_handler(recovery,move|packet|{
+                let peer=reply_owner.get().unwrap().upgrade().unwrap();
+                peer.tx_queue(crate::ignition_pair::fixture::query_reply(board,packet)?)
+            }));
             let peer = Arc::new(Router::new(RouterConfig::new(handlers).with_sender(name)));
+            response_owner.set(Arc::downgrade(&peer)).unwrap();
             let host_side = Arc::new(OnceLock::new());
             let side_copy = host_side.clone();
             let receiver = Arc::downgrade(&host);
@@ -200,7 +210,9 @@ impl Rig {
             peer.announce_discovery().unwrap();
             peers.push(peer);
         }
+        let actual_pair=crate::ignition_pair::fixture::Peers::attach(&state,host.clone(),&[Board::FlightComputer,Board::ValveBoard]);
         let mut rig = Self {
+            actual_pair,
             state,
             host,
             peers,
@@ -208,10 +220,16 @@ impl Rig {
             delivered,
             _db: rx,
         };
+        tokio::time::timeout(Duration::from_secs(2),async {loop {rig.pump();if crate::ignition_pair::require_routes(&rig.state).is_ok(){break;}tokio::time::sleep(Duration::from_millis(2)).await;}}).await.expect("same custom-clock Router command peer observation");
+        let host=rig.host.clone();let peer_routers=rig.peers.clone();
+        rig.actual_pair.refresh_with(&rig.state,move||{
+            for _ in 0..32 {host.process_all_queues_with_timeout(0).unwrap();for peer in &peer_routers{peer.process_all_queues_with_timeout(0).unwrap();}}
+        }).await;
         rig.pump();
         rig
     }
     fn pump(&mut self) {
+        self.actual_pair.pump();
         for _ in 0..32 {
             self.host.process_all_queues_with_timeout(0).unwrap();
             for peer in &self.peers {
@@ -220,7 +238,6 @@ impl Rig {
         }
     }
     fn ticket(&self) -> crate::gse::LaunchAdmission {
-        crate::gse::qualified_launch_proofs_for_test(&self.state);
         crate::gse::inhibit_automatic_actions_for_launch(&self.state).unwrap()
     }
 }
@@ -455,14 +472,14 @@ async fn queue_policy(case: &str) {
     let state = test_app_state(tx).await;
     let memory = sedsnet::config::RuntimeMemoryConfig::new(1_048_576, 8, 1, 1.0).unwrap();
     let host = Arc::new(Router::new(
-        RouterConfig::new([])
+        RouterConfig::new([crate::ignition_pair::fixture::handler(&state,|_|Ok(()))])
             .with_sender("GS")
             .with_memory_config(memory)
             .unwrap(),
     ));
     refresh_host_network_time(&host, get_current_timestamp_ms());
     state.topology_router.set(host.clone()).unwrap();
-    crate::gse::qualified_launch_proofs_for_test(&state);
+    let _actual_pair=crate::ignition_pair::fixture::Peers::warm(&state,host.clone()).await;
     let ticket = crate::gse::inhibit_automatic_actions_for_launch(&state).unwrap();
     if case == "capacity" {
         let ep = sedsnet::config::register_endpoint_with_description(

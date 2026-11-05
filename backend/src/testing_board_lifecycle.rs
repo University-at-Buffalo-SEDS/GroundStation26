@@ -103,7 +103,11 @@ pub(crate) fn bind_selected(rocket: bool, fill: bool) {
     );
 }
 pub(crate) fn enabled() -> bool {
-    eligible() && SELECTED_DUMMY_LINKS.load(std::sync::atomic::Ordering::SeqCst) == 3
+    eligible() && selected_links_present()
+}
+/// Scalar-only final admission check; no eligibility/provider callbacks.
+pub(crate) fn selected_links_present() -> bool {
+    SELECTED_DUMMY_LINKS.load(std::sync::atomic::Ordering::SeqCst) == 3
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ClockSample {
@@ -257,6 +261,7 @@ struct Node {
     completed: bool,
     completed_epoch: u32,
     launched: bool,
+    accepted_launch: bool,
     query: Option<Query>,
     last: Option<Intent>,
     born: Instant,
@@ -315,6 +320,7 @@ impl Owner {
                 completed: false,
                 completed_epoch: 0,
                 launched: false,
+                accepted_launch:false,
                 query: None,
                 last: None,
                 born: Instant::now(),
@@ -392,6 +398,7 @@ impl Owner {
             node.completed_epoch = 0;
             node.last = None;
             node.launched = false;
+            node.accepted_launch=false;
             node.state = if node.aborted {
                 Some(15)
             } else if node.blocked {
@@ -411,6 +418,7 @@ impl Owner {
     pub(crate) fn manual_stop(&mut self, board: Board) {
         let abort_utc = self.original_event_stamp();
         let n = &mut self.nodes[at(board)];
+        n.accepted_launch=false;
         n.blocked = true;
         n.aborted = true;
         n.abort_utc = abort_utc;
@@ -448,6 +456,7 @@ impl Owner {
     }
     pub(crate) fn note_launch(&mut self, board: Board) {
         self.nodes[at(board)].launched = true;
+        self.nodes[at(board)].accepted_launch = true;
     }
     pub(crate) fn receive(&mut self, board: Board, packet: &Packet, now: u64) -> Decision {
         let request_ty = self.protocol.request;
@@ -493,6 +502,11 @@ impl Owner {
                 0
             });
         }
+        // Firmware parity: a delayed preLaunch Recover is not fresh intent to
+        // revoke an already accepted Launch/igniter owner. Query remains read-only.
+        // ManualStop independently retires this RAM owner; historical launched
+        // stays latched until a later verified Recovery completes.
+        if n.accepted_launch {return response(4);}
         if let Some(old) = &n.last
             && old.nonce == nonce
             && old.issuer == issuer
@@ -667,6 +681,7 @@ impl Owner {
             return Decision::none();
         };
         let raw = packet.payload()[0];
+        if kind==Kind::Actuator && raw==14 && n.accepted_launch {return Decision::none();}
         let mut kind = kind;
         let mut value = raw;
         if raw & 0x80 != 0 && matches!(kind, Kind::Actuator | Kind::Valve) {
@@ -729,7 +744,7 @@ impl Owner {
     }
     pub(crate) fn ticket_current(&self, board: Board, intent: &Intent, now: u64) -> bool {
         let n = &self.nodes[at(board)];
-        fresh(intent.source, now)
+        !n.accepted_launch && fresh(intent.source, now)
             && n.boot == intent.boot
             && n.epoch == intent.epoch
             && n.last.as_ref().is_some_and(|v| {
@@ -738,7 +753,7 @@ impl Owner {
     }
     pub(crate) fn finish(&mut self, board: Board, intent: &Intent, now: u64) -> Reply {
         let n = &mut self.nodes[at(board)];
-        let valid = fresh(intent.source, now)
+        let valid = !n.accepted_launch && fresh(intent.source, now)
             && n.boot == intent.boot
             && n.epoch == intent.epoch
             && n.last.as_ref().is_some_and(|v| {
@@ -759,6 +774,7 @@ impl Owner {
             // Same verified ticket/epoch/freshness and actual safe owner apply.
             // Query, Pending, failure and a raced Stop never reach this clear.
             n.launched = false;
+            n.accepted_launch=false;
             n.floor = intent.source;
             n.completed = true;
             n.completed_epoch = n.epoch;
