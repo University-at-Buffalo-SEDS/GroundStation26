@@ -586,6 +586,29 @@ pub(crate) fn actuator_idle_proof(state: &AppState) -> Option<ActuatorIdleProof>
         outputs: value.outputs,
     })
 }
+/// Drive selection is configuration, not motion admission. A freshly observed
+/// Startup board can be configured before flight-state synchronization reaches
+/// Idle; launch and motion callers retain their separate, stricter proofs.
+pub(crate) fn actuator_configuration_proof(state: &AppState) -> Option<ActuatorIdleProof> {
+    let router = state.topology_router.get()?;
+    if !endpoint_verified(state, Board::ActuatorBoard, &router.export_topology()) {
+        return None;
+    }
+    let inner = state.board_recovery.inner.lock().unwrap();
+    let row = inner.values[index(Board::ActuatorBoard)?].as_ref()?;
+    let value = &row.value;
+    if !row.fresh(Stamp::now())
+        || value.result != 0
+        || !matches!(value.state, Some(0 | 1))
+        || value.flags & (STATE_VALID | OUTPUTS_VALID) != (STATE_VALID | OUTPUTS_VALID)
+        || value.flags & 1 != 0
+        || matches!(value.boot, 0 | u64::MAX)
+        || matches!(value.epoch, 0 | u32::MAX)
+    {
+        return None;
+    }
+    Some(ActuatorIdleProof { boot: value.boot, epoch: value.epoch, outputs: value.outputs })
+}
 pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let principal =
         match crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {

@@ -125,6 +125,7 @@ pub(crate) struct Fixture {
     mode: u8,
     result: u8,
     outputs: u32,
+    board_state: FlightState,
     motion: Option<Vec<u8>>,
 }
 impl Drop for Fixture {
@@ -302,6 +303,7 @@ impl Fixture {
             mode: 0,
             result: 0,
             outputs: 16,
+            board_state: FlightState::Idle,
             motion: None,
         }
     }
@@ -397,7 +399,7 @@ impl Fixture {
                 bytes[12..20].copy_from_slice(&42u64.to_le_bytes());
                 bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
                 let name = if recovery {
-                    bytes[2] = FlightState::Idle as u8;
+                    bytes[2] = self.board_state as u8;
                     bytes[3] = 8 | 16 | 4 | if self.outputs == 0 { 2 } else { 0 };
                     bytes[28..32].copy_from_slice(&self.outputs.to_le_bytes());
                     bytes[32..40].copy_from_slice(&p[24..32]);
@@ -471,7 +473,7 @@ impl Fixture {
             )
             .unwrap();
         self.pump();
-        assert!(crate::board_recovery::actuator_idle_proof(&self.state).is_some());
+        assert!(crate::board_recovery::actuator_configuration_proof(&self.state).is_some());
         assert!(
             self.state
                 .plumbing_drive
@@ -497,6 +499,31 @@ impl Fixture {
             .cloned()
             .collect()
     }
+}
+
+#[tokio::test]
+async fn startup_drive_change_preserves_motion_interlocks_and_rejects_active_phase() {
+    let _serial = SERIAL.lock().await;
+    let mut f = Fixture::new().await;
+    f.state.set_local_flight_state(FlightState::Startup);
+    f.board_state = FlightState::Startup;
+    f.prime().await;
+    assert!(crate::board_recovery::actuator_idle_proof(&f.state).is_none());
+    let snapshot = view(&f.state, true);
+    assert_eq!(snapshot["can_configure"], true);
+    assert!(snapshot["blocked_reason"].is_null());
+    assert_eq!(f.http("POST", "/api/actuator/plumbing/settings", Some("operator"), f.body("auxiliary", false)).await.status(), StatusCode::CONFLICT);
+    assert!(f.sets().is_empty());
+    assert_eq!(f.http("POST", "/api/actuator/plumbing/settings", Some("operator"), f.body("auxiliary", true)).await.status(), StatusCode::ACCEPTED);
+    f.pump();
+    assert_eq!(f.sets().len(), 1);
+    assert_eq!(f.sets()[0].payload()[2], 2);
+    assert_eq!(view(&f.state, true)["board"]["mode"], "auxiliary");
+    f.state.set_local_flight_state(FlightState::Armed);
+    assert_eq!(view(&f.state, true)["can_configure"], false);
+    assert_eq!(f.http("POST", "/api/actuator/plumbing/settings", Some("operator"), f.body("stepper", false)).await.status(), StatusCode::CONFLICT);
+    f.pump();
+    assert_eq!(f.sets().len(), 1, "Active phase must not queue a second mode change");
 }
 
 #[tokio::test]

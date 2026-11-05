@@ -606,10 +606,13 @@ fn fresh(state: &AppState, observation: &Observation) -> bool {
         && !matches!(observation.value.generation, 0 | u64::MAX)
         && !matches!(observation.value.epoch, 0 | u32::MAX)
 }
+fn configuration_state(state: &AppState) -> bool {
+    matches!(state.local_flight_state_snapshot(), FlightState::Startup | FlightState::Idle)
+}
 fn view(state: &AppState, commands: bool) -> Value {
     let is_primary = primary(state);
-    let idle = state.local_flight_state_snapshot() == FlightState::Idle;
-    let proof = crate::board_recovery::actuator_idle_proof(state);
+    let idle = configuration_state(state);
+    let proof = crate::board_recovery::actuator_configuration_proof(state);
     let retraction = retraction_gate(state);
     let history_fault = state.plumbing_drive.motion_journal.fault_context();
     let inner = state.plumbing_drive.inner.lock().unwrap();
@@ -621,7 +624,18 @@ fn view(state: &AppState, commands: bool) -> Value {
         "active_action":(["none","retract","extend"][s.active_action as usize]),"remaining_ms":s.remaining_ms,
         "capabilities":{"stepper":s.capabilities&1!=0,"h_bridge":false,"auxiliary":s.capabilities&4!=0,"extend":false}
     })});
-    json!({"primary":is_primary,"can_configure":is_primary&&commands&&idle&&valid&&proof.is_some_and(|p|observed.is_some_and(|r|p.boot==r.value.generation&&p.epoch==r.value.epoch)&&p.outputs&!16==0)&&!inner.settings_busy&&inner.storage_error.is_none()&&observed.is_some_and(|row|!row.value.busy&&matches!(row.value.result,0|6)),
+    let blocked_reason = if !is_primary { Some("Change drives from the primary GroundStation.") }
+        else if !commands { Some("Fill-line control permission is required.") }
+        else if !idle { Some("Drive selection is available in Startup or Idle.") }
+        else if inner.storage_error.is_some() { Some("Saved drive settings require repair.") }
+        else if !valid { Some("Waiting for fresh actuator drive readback.") }
+        else if proof.is_none_or(|p| observed.is_none_or(|r| p.boot != r.value.generation || p.epoch != r.value.epoch)) {
+            Some("Waiting for matching actuator state and output readback.")
+        } else if proof.is_some_and(|p| p.outputs & !16 != 0) { Some("Switch off actuator outputs before changing drives.") }
+        else if inner.settings_busy || observed.is_some_and(|row| row.value.busy) { Some("Wait for the drive to stop before changing modes.") }
+        else if observed.is_none_or(|row| !matches!(row.value.result, 0 | 6)) { Some("Actuator drive settings are unavailable.") }
+        else { None };
+    json!({"primary":is_primary,"can_configure":blocked_reason.is_none(),"blocked_reason":blocked_reason,
         "backend_instance":format!("{:016x}",state.plumbing_drive.issuer),"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(state)),
         "desired":{"mode":Mode::decode(inner.desired.mode).map(Mode::name),"revision":inner.desired.revision,"durable":inner.durable},
         "board":board,"pending":inner.pending_setting.is_some()||!valid||observed.is_none_or(|row|!row.value.ready()||row.value.mode.map(|m|m as u8)!=Some(inner.desired.mode)),
@@ -1399,8 +1413,8 @@ fn apply_settings(
     let _busy = SettingsBusy(&state.plumbing_drive);
     crate::gse::with_plumbing_admission(state, admission, || ())
         .map_err(fail)?;
-    if !primary(state) || state.local_flight_state_snapshot() != FlightState::Idle {
-        return Err(fail("Drive changes require idle primary GS."));
+    if !primary(state) || !configuration_state(state) {
+        return Err(fail("Drive changes require primary GS in Startup or Idle."));
     }
     let current_time = state
         .topology_router
@@ -1415,7 +1429,7 @@ fn apply_settings(
     if body.backend_instance != format!("{:016x}", state.plumbing_drive.issuer) {
         return Err(fail("Backend changed; query again."));
     }
-    let board_proof = crate::board_recovery::actuator_idle_proof(state).ok_or_else(||fail("Fresh actual actuator Idle/output readback is required. Query both board and drive state."))?;
+    let board_proof = crate::board_recovery::actuator_configuration_proof(state).ok_or_else(||fail("Fresh actuator Startup/Idle and output readback is required."))?;
     let desired = {
         let mut inner = state.plumbing_drive.inner.lock().unwrap();
         if inner.storage_error.is_some() {
@@ -1553,8 +1567,8 @@ fn apply_settings(
             ));
         }
     }
-    let final_proof = crate::board_recovery::actuator_idle_proof(state);
-    if state.local_flight_state_snapshot() != FlightState::Idle
+    let final_proof = crate::board_recovery::actuator_configuration_proof(state);
+    if !configuration_state(state)
         || final_proof.is_none_or(|p| {
             p.boot != expected
                 || p.epoch != body.expected_epoch
@@ -1563,7 +1577,7 @@ fn apply_settings(
         })
     {
         return Err(fail(
-            "Desired drive saved, but actual actuator Idle/output proof changed; no SET was queued. Query again.",
+            "Desired drive saved, but actuator configuration proof changed; no SET was queued. Query again.",
         ));
     }
     let now = state
