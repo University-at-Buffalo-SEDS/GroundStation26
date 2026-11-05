@@ -80,6 +80,7 @@ pub async fn report(
     let export_layout=crate::layout::load_layout().ok().and_then(|layout|serde_json::to_value(layout).ok());
     request["valve_mappings"]=export_layout.as_ref().map(valve_labels).unwrap_or_else(||serde_json::json!([]));
     request["channel_metadata"]=export_layout.as_ref().map(channel_metadata).unwrap_or_else(||serde_json::json!([]));
+    request["recording_diagnostic_streams"] = crate::telemetry_task::recording_diagnostics::descriptors();
     // The root is always server-controlled, regardless of request JSON.
     request["root"] = crate::recording_export::directory(&state)
         .to_string_lossy()

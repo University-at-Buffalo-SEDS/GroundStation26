@@ -38,8 +38,7 @@ pub enum FirmwareUpdatePhase {
     Beginning,
     Transferring,
     Finishing,
-    Rebooting,
-    Completed,
+    PreparedRebootUnverified,
     Cancelling,
     Cancelled,
     Failed,
@@ -54,7 +53,6 @@ impl FirmwareUpdatePhase {
                 | Self::Beginning
                 | Self::Transferring
                 | Self::Finishing
-                | Self::Rebooting
                 | Self::Cancelling
         )
     }
@@ -487,20 +485,15 @@ async fn run_update_inner(
             wait_for_response(&mut event_rx, stream_id, board.sender_id(), OTA_OP_FINISH).await?;
         ensure_ota_ok(finish)?;
         update_started = false;
-        MANAGER.update(
-            id,
-            FirmwareUpdatePhase::Rebooting,
-            firmware.len(),
-            Some(finish.max_patch_size),
-            "firmware accepted; board is rebooting",
-        );
         let _ = router.close_p2p_stream(stream_id);
+        // FINISH OK certifies preparation only. No transaction-correlated
+        // boot/image identity is observed here; Launch can suppress the reset.
         MANAGER.update(
             id,
-            FirmwareUpdatePhase::Completed,
+            FirmwareUpdatePhase::PreparedRebootUnverified,
             firmware.len(),
             Some(finish.max_patch_size),
-            "firmware accepted and reboot requested",
+            "Patch prepared; reset requested, but reboot and running image are not verified. Launch may prevent reset. Verify the board before another explicit update.",
         );
         Ok(())
     }
@@ -760,6 +753,19 @@ mod tests {
     use sedsnet::router::{P2pStreamEvent, RouterConfig};
 
     #[test]
+    fn prepared_transfer_is_terminal_without_reboot_or_running_image_claim() {
+        let manager = FirmwareUpdateManager::new();
+        let (id, _, mut lease) = manager.create_job(Board::ActuatorBoard, "mock.seds".into(), 250).unwrap();
+        manager.update(id, FirmwareUpdatePhase::PreparedRebootUnverified, 250, Some(4096), "Reboot unverified");
+        let status = manager.get(id).unwrap();
+        assert_eq!(serde_json::to_value(&status).unwrap()["phase"], "prepared_reboot_unverified");
+        assert_eq!(status.progress_percent, 100.0); // Transfer progress, not boot proof.
+        assert!(!status.phase.is_active());
+        assert!(manager.cancel(id).is_err()); // Never send a late retry/reset.
+        lease.complete();
+    }
+
+    #[test]
     fn parses_ota_response() {
         let mut bytes = [0_u8; 13];
         bytes[0] = OTA_OP_CHUNK | OTA_RESPONSE_FLAG;
@@ -960,12 +966,13 @@ mod tests {
         });
 
         let firmware = (0..250_u16).map(|value| value as u8).collect::<Vec<_>>();
+        let (job, cancel, mut lease) = MANAGER.create_job(Board::ActuatorBoard, "mock.seds".into(), firmware.len()).unwrap();
         run_update_inner(
-            u64::MAX,
+            job,
             &client,
             Board::ActuatorBoard,
             &firmware,
-            &Arc::new(AtomicBool::new(false)),
+            &cancel,
         )
         .await
         .expect("OTA transfer should complete");
@@ -975,6 +982,12 @@ mod tests {
         let received = received.lock().expect("mock OTA result");
         assert_eq!(received.bytes, firmware);
         assert!(received.finished);
+        // This receiver only accepts FINISH; it does not reboot or publish any
+        // image/boot identity. An accepted stream cannot prove a new image runs.
+        lease.complete();
+        let status = update_status(job).unwrap();
+        assert_eq!(serde_json::to_value(&status).unwrap()["phase"], "prepared_reboot_unverified");
+        assert!(!status.phase.is_active());
     }
 }
 

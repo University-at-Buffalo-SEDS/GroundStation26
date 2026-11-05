@@ -20,6 +20,7 @@ pub fn initialize() -> anyhow::Result<()> {
         .get_or_init(|| {
             register_firmware_compatible_schema()?;
             for (name, expected) in [
+                ("ABORT", types::ABORT),
                 ("GPS_DATA", types::GPS_DATA),
                 ("BAROMETER_DATA", types::BAROMETER_DATA),
                 ("FUEL_FLOW", types::FUEL_FLOW),

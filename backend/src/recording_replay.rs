@@ -64,6 +64,9 @@ pub struct Sample {
     pub data_type: String,
     pub values: Vec<Option<f32>>,
     pub phase: Option<String>,
+    /// Bounded recording-local metadata; exact counters remain decimal strings.
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub diagnostic: Option<serde_json::Value>,
     #[serde(default,skip_serializing_if="Option::is_none")]
     pub valid_until_ms: Option<i64>,
 }
@@ -74,6 +77,8 @@ pub struct Page {
     pub has_more: bool,
     pub rows: Vec<Sample>,
     pub seeds: Vec<Sample>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub diagnostic_streams: Option<serde_json::Value>,
 }
 async fn open(state: &AppState, id: &str) -> Result<SqlitePool, StatusCode> {
     let path = recording_export::recording_path(&recording_export::directory(state), id).await?;
@@ -98,9 +103,15 @@ async fn snapshot_from(db: &SqlitePool) -> anyhow::Result<Snapshot> {
         end_ms: row.try_get("end_ms")?,
     })
 }
+async fn diagnostic_payload_expression(db: &SqlitePool) -> anyhow::Result<bool> {
+    let columns = sqlx::query("PRAGMA table_info(telemetry)").fetch_all(db).await?;
+    let present = columns.iter().any(|r| r.try_get::<String,_>("name").ok().as_deref()==Some("payload_json"));
+    Ok(present)
+}
 async fn page_from(db: &SqlitePool, window: &Window) -> anyhow::Result<Page> {
     let types = window.types()?;
-    let rows=sqlx::query("SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json FROM telemetry WHERE id > ? AND id <= ? AND timestamp_ms >= ? AND timestamp_ms <= ? AND data_type IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT ?")
+    let diagnostic_payload = diagnostic_payload_expression(db).await?;
+    let rows=sqlx::query(if diagnostic_payload { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, CASE WHEN substr(data_type,1,4)='REC_' OR data_type IN ('BOARD_HEALTH','DAQ_SD_HEALTH','DAQ_LAUNCH_LOG_STATUS') THEN substr(payload_json,1,16385) ELSE NULL END AS recorded_diagnostic_payload FROM telemetry WHERE id > ? AND id <= ? AND timestamp_ms >= ? AND timestamp_ms <= ? AND data_type IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT ?" } else { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, NULL AS recorded_diagnostic_payload FROM telemetry WHERE id > ? AND id <= ? AND timestamp_ms >= ? AND timestamp_ms <= ? AND data_type IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT ?" })
         .bind(window.after_id).bind(window.upper_id).bind(window.start_ms).bind(window.end_ms).bind(serde_json::to_string(&types)?).bind(PAGE+1).fetch_all(db).await?;
     let has_more = rows.len() > PAGE as usize;
     let mut samples = Vec::new();
@@ -112,7 +123,7 @@ async fn page_from(db: &SqlitePool, window: &Window) -> anyhow::Result<Page> {
     }
     let mut seeds = Vec::new();
     if window.after_id == 0 {
-        let rows = sqlx::query("SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY data_type,sender_id ORDER BY timestamp_ms DESC,id DESC) AS rank FROM telemetry WHERE id <= ? AND timestamp_ms < ? AND data_type IN (SELECT value FROM json_each(?))) WHERE rank=1 LIMIT 257")
+        let rows = sqlx::query(if diagnostic_payload { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, CASE WHEN substr(data_type,1,4)='REC_' OR data_type IN ('BOARD_HEALTH','DAQ_SD_HEALTH','DAQ_LAUNCH_LOG_STATUS') THEN substr(payload_json,1,16385) ELSE NULL END AS recorded_diagnostic_payload FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY data_type,sender_id ORDER BY timestamp_ms DESC,id DESC) AS rank FROM telemetry WHERE id <= ? AND timestamp_ms < ? AND data_type IN (SELECT value FROM json_each(?))) WHERE rank=1 LIMIT 257" } else { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, NULL AS recorded_diagnostic_payload FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY data_type,sender_id ORDER BY timestamp_ms DESC,id DESC) AS rank FROM telemetry WHERE id <= ? AND timestamp_ms < ? AND data_type IN (SELECT value FROM json_each(?))) WHERE rank=1 LIMIT 257" })
             .bind(window.upper_id).bind(window.start_ms).bind(serde_json::to_string(&types)?).fetch_all(db).await?;
         anyhow::ensure!(rows.len() <= 256, "too many replay source series");
         for row in rows {
@@ -126,6 +137,8 @@ async fn page_from(db: &SqlitePool, window: &Window) -> anyhow::Result<Page> {
         upper_id: window.upper_id,
         next_id,
         has_more,
+        diagnostic_streams: samples.iter().chain(seeds.iter()).any(|s|s.diagnostic.is_some())
+            .then(crate::telemetry_task::recording_diagnostics::descriptors),
         rows: samples,
         seeds,
     })
@@ -147,6 +160,11 @@ fn decode(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Sample> {
         values.len() <= 1024 && values.iter().flatten().all(|v| v.is_finite()),
         "invalid recorded replay values"
     );
+    let diagnostic_raw: Option<String> = row.try_get("recorded_diagnostic_payload").unwrap_or(None);
+    let diagnostic = diagnostic_raw.map(|raw| -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(raw.len() <= 16384, "oversized recorded diagnostic payload; no truncation accepted");
+        Ok(serde_json::from_str(&raw)?)
+    }).transpose()?;
     let phase = if data_type == "FLIGHT_STATE" && crate::types::canonical_sender_id(&sender) == "FC"
     {
         values
@@ -167,6 +185,7 @@ fn decode(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Sample> {
         data_type,
         values,
         phase,
+        diagnostic,
         valid_until_ms:None,
     })
 }
@@ -197,11 +216,12 @@ pub(crate) async fn test_export_from(db: &SqlitePool) -> anyhow::Result<serde_js
 
 async fn export_from(db: &SqlitePool) -> anyhow::Result<serde_json::Value> {
     let snapshot = snapshot_from(db).await?;
+    let diagnostic_payload = diagnostic_payload_expression(db).await?;
     let mut samples = Vec::new();
     let mut bytes = 0usize;
     let mut after = 0i64;
     loop {
-        let rows = sqlx::query("SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json FROM telemetry WHERE id>? AND id<=? ORDER BY id LIMIT 512")
+        let rows = sqlx::query(if diagnostic_payload { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, CASE WHEN substr(data_type,1,4)='REC_' OR data_type IN ('BOARD_HEALTH','DAQ_SD_HEALTH','DAQ_LAUNCH_LOG_STATUS') THEN substr(payload_json,1,16385) ELSE NULL END AS recorded_diagnostic_payload FROM telemetry WHERE id>? AND id<=? ORDER BY id LIMIT 512" } else { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, NULL AS recorded_diagnostic_payload FROM telemetry WHERE id>? AND id<=? ORDER BY id LIMIT 512" })
             .bind(after).bind(snapshot.upper_id).fetch_all(db).await?;
         if rows.is_empty() { break; }
         for row in rows {
@@ -216,7 +236,7 @@ async fn export_from(db: &SqlitePool) -> anyhow::Result<serde_json::Value> {
     apply_sd_validity(db,&mut samples).await?;
     let sd_provenance=crate::recording_sd::bundle_provenance(db,(64*1024*1024usize).saturating_sub(bytes)).await?;
     let mut value=serde_json::json!({"sd_provenance":sd_provenance,"format":"seds-replay","version":1,"snapshot":snapshot,
-        "samples":samples,"schema":serde_json::from_str::<serde_json::Value>(include_str!("../config/telemetry_config.json"))?});
+        "samples":samples,"recording_diagnostics_schema":crate::telemetry_task::recording_diagnostics::descriptors(),"schema":serde_json::from_str::<serde_json::Value>(include_str!("../config/telemetry_config.json"))?});
     if let Some(config)=value["sd_provenance"]["imports"][0]["manifest"]["config"].as_object().cloned(){
         for field in ["schema","view_config","layout","valve_mappings"]{if let Some(saved)=config.get(field){value[field]=saved.clone();}}
         value["configuration_provenance"]="Imported capture configuration; all source-specific snapshots retained in sd_provenance.imports".into();
@@ -1038,4 +1058,10 @@ mod tests {
         }
         db.close().await;
     }
+}
+
+#[cfg(test)]
+mod diagnostic_payload_tests {
+    use super::*;
+    include!("recording_diagnostics_replay_tests.rs");
 }

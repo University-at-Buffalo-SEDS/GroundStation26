@@ -14,44 +14,41 @@ macro_rules! gs_debug_println {
 }
 
 mod actuator_plumbing;
+mod alert_condition_journal;
+mod alert_condition_producers;
+mod alert_condition_runtime;
+mod alert_conditions;
 mod antenna;
 mod auth;
 mod auto_zero;
-mod alert_conditions;
-mod alert_condition_journal;
-mod alert_condition_runtime;
-mod alert_condition_producers;
 mod board_abort;
-mod control_ingress;
 mod board_abort_history;
+mod final_proof_clock;
+mod history_startup_path;
 mod board_abort_history_writer;
-mod history_policy;
 mod board_recovery;
+mod igniter_sense;
 mod checklists;
 mod command_probe;
 mod command_proxy;
 mod comms;
 mod comms_config;
+mod control_ingress;
 mod deferred_abort;
 #[cfg(feature = "testing")]
 mod dummy_packets;
 mod ethernet_autoconfig;
 mod fill_delivery_probe;
+mod fill_recording;
 mod fill_targets;
 mod firmware_update;
 mod flight_setup;
 mod flight_sim;
-#[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
-mod testing_board_lifecycle;
+mod flight_sim_runtime;
 mod gpio;
 mod gpio_panel;
 mod gse;
-mod sequence_progress;
-mod sequence_progress_projection;
-mod sequence_progress_producer;
-mod sequence_progress_service;
-mod sequence_progress_stage;
-mod sequence_stream;
+mod history_policy;
 mod host_temperature;
 mod i18n;
 mod launch_analytics;
@@ -85,8 +82,13 @@ mod rrls_radio;
 mod rrls_topology;
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 mod safety_task;
+mod sequence_progress;
+mod sequence_progress_producer;
+mod sequence_progress_projection;
+mod sequence_progress_service;
+mod sequence_progress_stage;
+mod sequence_stream;
 mod sequences;
-#[cfg(feature = "firmware_sim")]
 mod sim_daq_cadence;
 mod state;
 mod station_mode;
@@ -98,6 +100,11 @@ mod telemetry_schema;
 mod telemetry_task;
 #[cfg(feature = "test_fire_mode")]
 mod test_fire_csv;
+#[cfg(all(
+    feature = "testing",
+    not(any(feature = "hitl_mode", feature = "test_fire_mode"))
+))]
+mod testing_board_lifecycle;
 mod thermal_fit;
 mod thermal_settling;
 mod types;
@@ -217,11 +224,15 @@ fn simulation_clock_ms() -> Option<u64> {
             }
         })
         .as_ref()?;
-    let (value, valid) = read_simulation_clock_observed(path, &SIMULATION_CLOCK_LAST);
+    // The diagnostic guard starts BEFORE source IO; its publication happens
+    // only after the unchanged SDK clock/clamp and weak-cache stores complete.
+    let final_observation = final_proof_clock::begin_model_observation();
+    let (value, valid, raw) = read_simulation_clock_details(path, &SIMULATION_CLOCK_LAST);
     SIMULATION_CLOCK_VALID.store(valid, Ordering::Release);
     let _ = SIMULATION_CLOCK_SAMPLE.try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
         value.checked_add(1)
     });
+    final_observation.finish(value, raw);
     Some(value)
 }
 
@@ -229,18 +240,28 @@ fn simulation_clock_ms() -> Option<u64> {
 fn read_simulation_clock(path: &std::path::Path, last: &std::sync::atomic::AtomicU64) -> u64 {
     read_simulation_clock_observed(path, last).0
 }
+#[cfg(test)]
 fn read_simulation_clock_observed(
     path: &std::path::Path,
     last: &std::sync::atomic::AtomicU64,
 ) -> (u64, bool) {
-    // A read can overlap the writer's truncate/write. Keep the last valid
-    // monotonic tick rather than falling back to wall time during that race.
+    let (value, valid, _) = read_simulation_clock_details(path, last);
+    (value, valid)
+}
+fn read_simulation_clock_details(
+    path: &std::path::Path,
+    last: &std::sync::atomic::AtomicU64,
+) -> (u64, bool, Option<u64>) {
+    #[cfg(all(test, any(feature="hitl_mode",feature="firmware_sim")))]
+    final_proof_clock::tests::before_source_read(path);
+    // Preserve the SDK clock's existing read/parse/monotonic clamp exactly.
+    // Raw input is retained ONLY for final recovery-proof eligibility.
     if let Ok(text) = std::fs::read_to_string(path)
         && let Ok(value) = text.trim().parse::<u64>() {
             last.fetch_max(value, Ordering::Relaxed);
-            return (last.load(Ordering::Relaxed), true);
+            return (last.load(Ordering::Relaxed), true, Some(value));
         }
-    (last.load(Ordering::Relaxed), false)
+    (last.load(Ordering::Relaxed), false, None)
 }
 
 #[derive(Clone, Copy)]
@@ -596,6 +617,16 @@ impl DaqLoadcellCadence {
         };
         Self::parse(raw.as_deref())
     }
+}
+
+// Both DAQ wire formats are observed only inside the explicit
+// GS_SIM_VALIDATE_TELEMETRY_RETURN block. Packet source time stays original.
+fn validation_loadcell_source_timestamp(
+    board: Option<Board>,
+    pkt: &sedsnet::packet::Packet,
+) -> Option<u64> {
+    sim_daq_cadence::captured_loadcell(board, pkt)
+        .map(|(_, source_timestamp)| source_timestamp)
 }
 
 fn request_startup_topology(router: &sedsnet::router::Router) -> sedsnet::TelemetryResult<()> {
@@ -1130,6 +1161,7 @@ fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevic
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    flight_sim_runtime::validate_startup()?;
     let daq_loadcell_cadence = DaqLoadcellCadence::from_env()?;
     telemetry_schema::initialize()?;
     sedsnet::config::set_runtime_tuning_config(network_delivery_tuning())?;
@@ -1142,6 +1174,10 @@ async fn main() -> anyhow::Result<()> {
         cfg!(feature = "hitl_mode"),
         cfg!(feature = "test_fire_mode")
     );
+
+    if flight_sim_runtime::enabled() {
+        log::info!("FlightSim execution_mode=flight_sim output_domain=simulated; physical transports/proxy disabled");
+    }
 
     // Initialize GPIO
     let gpio = gpio::GpioPins::new();
@@ -1208,14 +1244,20 @@ async fn main() -> anyhow::Result<()> {
 
     let ring_buffer_capacity = env_usize("GS_RING_BUFFER_CAPACITY", 65_536, 1024, 1_000_000);
     let loadcell_calibration = loadcell::load_or_default();
-    let comms_links = comms_config::load_or_default();
-    comms::rfd_profile::initialize(&comms_links.av_bay)?;
-    if let comms_config::CommsLinkConfig::PicoFiTcp { tcp } = &comms_links.fill_box {
-        ethernet_autoconfig::prepare(tcp.discovery_interface.clone()).await;
-    } else if rrls::is_rrls() {
-        ethernet_autoconfig::prepare(None).await;
+    let comms_links = if flight_sim_runtime::enabled() {
+        comms_config::CommsLinksConfig::default()
+    } else {
+        comms_config::load_or_default()
+    };
+    if !flight_sim_runtime::enabled() {
+        comms::rfd_profile::initialize(&comms_links.av_bay)?;
+        if let comms_config::CommsLinkConfig::PicoFiTcp { tcp } = &comms_links.fill_box {
+            ethernet_autoconfig::prepare(tcp.discovery_interface.clone()).await;
+        } else if rrls::is_rrls() {
+            ethernet_autoconfig::prepare(None).await;
+        }
+        rrls::configure(&comms_links.av_bay)?;
     }
-    rrls::configure(&comms_links.av_bay)?;
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let users_path = std::env::var_os("GS_USERS_FILE")
         .map(PathBuf::from)
@@ -1249,20 +1291,28 @@ async fn main() -> anyhow::Result<()> {
             network_variables::verify_normal_qualification_boot()?;
         }
     }
+    let history_directory = history_startup_path::environment()?;
     let launch_history = Arc::new(Mutex::new(launch_history::Store::environment()?));
-    let history_directory = std::env::var_os("GS_BOARD_ABORT_HISTORY_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("backend/data/board_abort_history"));
     let history_identity: [u8;16] = if let Some(pairing) = station_pairing::Pairing::load()? {
         let digest = ring::digest::digest(&ring::digest::SHA256, pairing.public.installation_id.as_bytes());
         digest.as_ref()[..16].try_into().unwrap()
     } else if history_directory.exists() {
         board_abort_history::Store::anchor_identity(&history_directory)?
-    } else { rand::random() };
+    } else {
+        rand::random()
+    };
     let history_changed = Arc::new(tokio::sync::Notify::new());
     let (history_restored, history_publisher, abort_history_writer) =
-        board_abort_history_writer::Owner::open(&history_directory, history_identity, history_changed.clone())?;
-    let board_abort = Arc::new(board_abort::Runtime::restored(history_restored, history_publisher, history_changed));
+        board_abort_history_writer::Owner::open(
+            &history_directory,
+            history_identity,
+            history_changed.clone(),
+        )?;
+    let board_abort = Arc::new(board_abort::Runtime::restored(
+        history_restored,
+        history_publisher,
+        history_changed,
+    ));
 
     // Restore closed admission before constructing or starting any producer.
     let (restored_recovery_owner, restored_generation) =
@@ -1273,6 +1323,7 @@ async fn main() -> anyhow::Result<()> {
         network_variables::restore_persisted_daq_log_clock_snapshot(restored_daq, restored_stamp)?;
     }
     let state = Arc::new(AppState {
+        fill_recording: Default::default(),
         control_ingress: Arc::new(Default::default()),
         ring_buffer: Arc::new(Mutex::new(RingBuffer::new(ring_buffer_capacity))),
         cmd_tx,
@@ -1303,7 +1354,9 @@ async fn main() -> anyhow::Result<()> {
         pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
         latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
         gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
-        sequence_progress: Arc::new(crate::sequence_progress_service::Shared::new(rand::random::<u128>())),
+        sequence_progress: Arc::new(crate::sequence_progress_service::Shared::new(
+            rand::random::<u128>(),
+        )),
         automatic_generation: Arc::new(AtomicU64::new(restored_generation)),
         operator_admission_barrier: Arc::new(std::sync::atomic::AtomicU64::new(
             restored_recovery_owner,
@@ -1312,6 +1365,7 @@ async fn main() -> anyhow::Result<()> {
         operator_dispatch_inflight: Arc::new(AtomicUsize::new(0)),
         manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
         deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
+        igniter_sense: Arc::new(std::sync::Mutex::new(igniter_sense::Tracker::default())),
         board_recovery: Arc::new(crate::board_recovery::Runtime::default()),
         board_abort,
         launch_dedup_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1375,8 +1429,15 @@ async fn main() -> anyhow::Result<()> {
         auth,
     });
 
-    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
-    flight_sim::initialize_model_owners(&state, history_restored.snapshot.actual_abort, history_restored.snapshot.unknown);
+    #[cfg(all(
+        feature = "testing",
+        not(any(feature = "hitl_mode", feature = "test_fire_mode"))
+    ))]
+    flight_sim::initialize_model_owners(
+        &state,
+        history_restored.snapshot.actual_abort,
+        history_restored.snapshot.unknown,
+    );
     state.board_abort.publish_initial_history();
     state.set_messages_snapshot(Vec::new());
 
@@ -1639,13 +1700,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 // The simulator observes incoming source packets, never the
                 // derived KG1000 row created from the combined pressure format.
-                #[cfg(feature = "firmware_sim")]
-                let daq_loadcell_timestamp = sim_daq_cadence::captured_loadcell(board, pkt)
-                    .map(|(_, source_timestamp)| source_timestamp);
-                #[cfg(not(feature = "firmware_sim"))]
-                let daq_loadcell_timestamp = (board == Some(Board::DaqBoard)
-                    && pkt.data_type() == telemetry_schema::data_type("KG1000"))
-                .then(|| pkt.timestamp());
+                let daq_loadcell_timestamp = validation_loadcell_source_timestamp(board, pkt);
                 if let Some(source_timestamp) = daq_loadcell_timestamp {
                     let valid = daq_loadcell_rate_handler.lock().unwrap().observe(
                         source_timestamp,
@@ -1855,10 +1910,16 @@ async fn main() -> anyhow::Result<()> {
             open_umbilical_comms(&comms_links.fill_box);
         (Some(comms), connected)
     };
-    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    #[cfg(all(
+        feature = "testing",
+        not(any(feature = "hitl_mode", feature = "test_fire_mode"))
+    ))]
     crate::testing_board_lifecycle::bind_selected(
         rocket_comms.lock().unwrap().testing_model_link(),
-        umbilical_comms.as_ref().is_some_and(|link|link.lock().unwrap().testing_model_link()));
+        umbilical_comms
+            .as_ref()
+            .is_some_and(|link| link.lock().unwrap().testing_model_link()),
+    );
 
     state
         .av_bay_comms_connected
@@ -2891,9 +2952,15 @@ async fn main() -> anyhow::Result<()> {
     let coordinator_owner = board_recovery::seal_shutdown_and_take_owner(&state);
     if let Some(mut owner) = coordinator_owner {
         match tokio::time::timeout(telemetry_shutdown_timeout, &mut owner).await {
-            Ok(Ok(())) => {},
-            Ok(Err(error)) => { shutdown_producers_quiesced=false; log::error!("Recovery owner shutdown failed: {error}"); },
-            Err(_) => { shutdown_producers_quiesced=false; log::error!("Recovery owner still running; leave abort history Active"); },
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                shutdown_producers_quiesced = false;
+                log::error!("Recovery owner shutdown failed: {error}");
+            }
+            Err(_) => {
+                shutdown_producers_quiesced = false;
+                log::error!("Recovery owner still running; leave abort history Active");
+            }
         }
         // A timed-out admitted owner remains alive; never cancel its durable
         // application protocol merely to fabricate a clean shutdown receipt.
@@ -2967,7 +3034,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     match tokio::time::timeout(telemetry_shutdown_timeout, &mut tt).await {
-        Ok(Ok(outcome)) => { receiver_producers_quiesced = outcome.ingress_quiesced; shutdown_producers_quiesced &= outcome.ingress_quiesced; },
+        Ok(Ok(outcome)) => {
+            receiver_producers_quiesced = outcome.ingress_quiesced;
+            shutdown_producers_quiesced &= outcome.ingress_quiesced;
+        }
         Ok(Err(e)) => {
             shutdown_producers_quiesced = false;
             log::error!("telemetry task ended with error: {e}");
@@ -2986,12 +3056,22 @@ async fn main() -> anyhow::Result<()> {
     }
     // Keep manual observation apply alive until receiver intake is actually
     // stopped. An ambiguous receiver never earns a stop/clean receipt.
-    let mut abort_observations_stop=Some(abort_observations_stop);
-    if receiver_producers_quiesced { let _=abort_observations_stop.take().unwrap().send(()); }
-    match tokio::time::timeout(task_shutdown_timeout,&mut abort_observations).await {
-        Ok(Ok(outcome))=>shutdown_producers_quiesced &= receiver_producers_quiesced && outcome.quiesced,
-        Ok(Err(error))=>{ shutdown_producers_quiesced=false; log::error!("Abort observation apply owner failed: {error}"); },
-        Err(_)=>{ shutdown_producers_quiesced=false; log::error!("Abort observation owner still active; leave history Active"); },
+    let mut abort_observations_stop = Some(abort_observations_stop);
+    if receiver_producers_quiesced {
+        let _ = abort_observations_stop.take().unwrap().send(());
+    }
+    match tokio::time::timeout(task_shutdown_timeout, &mut abort_observations).await {
+        Ok(Ok(outcome)) => {
+            shutdown_producers_quiesced &= receiver_producers_quiesced && outcome.quiesced
+        }
+        Ok(Err(error)) => {
+            shutdown_producers_quiesced = false;
+            log::error!("Abort observation apply owner failed: {error}");
+        }
+        Err(_) => {
+            shutdown_producers_quiesced = false;
+            log::error!("Abort observation owner still active; leave history Active");
+        }
     }
     // No abort/cancel of an admitted blocking manual apply to obtain Clean.
     // History composition point: ONLY if this is true may the adapter freeze
@@ -3012,9 +3092,15 @@ async fn main() -> anyhow::Result<()> {
     }
     let final_history = if shutdown_producers_quiesced {
         state.board_abort.freeze_history_after_quiescence()
-    } else { state.board_abort.history_snapshot() };
-    match tokio::task::spawn_blocking(move || abort_history_writer.finish(final_history, shutdown_producers_quiesced)).await {
-        Ok(Ok(())) => {},
+    } else {
+        state.board_abort.history_snapshot()
+    };
+    match tokio::task::spawn_blocking(move || {
+        abort_history_writer.finish(final_history, shutdown_producers_quiesced)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
         Ok(Err(error)) => log::error!("Abort history shutdown failed; no clean receipt: {error}"),
         Err(error) => log::error!("Abort history writer join failed; no clean receipt: {error}"),
     }
@@ -3069,3 +3155,67 @@ mod valve_power_freshness_tests {
         assert_eq!(probe.check(0, 99999), None);
     }
 }
+
+#[cfg(test)]
+mod validation_loadcell_observer_tests {
+    use super::*;
+    use sedsnet::packet::Packet;
+    use std::sync::Arc;
+
+    fn packet(name: &str, values: &[f32], source_timestamp: u64) -> Packet {
+        let payload: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        Packet::new(
+            telemetry_schema::data_type(name),
+            &[telemetry_schema::endpoint("GROUND_STATION")],
+            "DAQ",
+            source_timestamp,
+            Arc::from(payload),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn actual_captured_combined_type_is_seen_by_validation_with_original_source_identity() {
+        // Actual received three-component example. This source timestamp is
+        // SYNTHETIC test input, never inferred from the API's receipt clock.
+        let values = [
+            f32::from_bits(0x3c8d798b),
+            f32::from_bits(0x4590606e),
+            f32::from_bits(0x41b8cd5a),
+        ];
+        let p = packet("DAQ_LOADCELL_CHAMBER", &values, 987_654);
+        let id = p.packet_id();
+        let bytes = p.payload().to_vec();
+        assert_eq!(
+            validation_loadcell_source_timestamp(Some(Board::DaqBoard), &p),
+            Some(987_654)
+        );
+        assert_eq!(p.packet_id(), id);
+        assert_eq!(p.payload(), bytes);
+        assert_eq!(
+            validation_loadcell_source_timestamp(Some(Board::ValveBoard), &p),
+            None
+        );
+        assert_eq!(validation_loadcell_source_timestamp(None, &p), None);
+    }
+    #[test]
+    fn original_scalar_and_wrong_owner_controls_still_hold() {
+        let p = packet("KG1000", &[1.25], 987_654);
+        assert_eq!(
+            validation_loadcell_source_timestamp(Some(Board::DaqBoard), &p),
+            Some(987_654)
+        );
+        assert_eq!(
+            validation_loadcell_source_timestamp(Some(Board::ValveBoard), &p),
+            None
+        );
+        assert_eq!(validation_loadcell_source_timestamp(None, &p), None);
+    }
+}
+
+#[cfg(all(test, feature="test_fire_mode"))]
+mod recovery_pending_probe;
+
+mod automatic_flight_state;
+#[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
+mod normal_publication_probe;
+mod automatic_startup_idle;

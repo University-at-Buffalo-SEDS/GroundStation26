@@ -428,7 +428,7 @@ pub(crate) fn schedule_motion_under_dispatch(
         let result = (|| -> Result<(),String> {
             let _claim = crate::gse::claim_operator_dispatch(&state,generation)
                 .ok_or("Recovery closed admission before the retraction worker started")?;
-            crate::gse::with_plumbing_admission(&state,ticket,||()).map_err(str::to_owned)?;
+            crate::gse::with_motion_context(&state,ticket,||()).map_err(str::to_owned)?;
             state.plumbing_drive.motion_journal.write_pending(&record)?;
             let router=state.topology_router.get().ok_or("Telemetry router unavailable")?;
             // Sender, clock/schema lookup, endpoints, allocation and Packet ID
@@ -437,19 +437,56 @@ pub(crate) fn schedule_motion_under_dispatch(
             if prepared.packet.timestamp()!=record.original_utc_ms {
                 return Err("Original retraction timestamp changed; no motion sent".into());
             }
-            crate::gse::with_prepared_motion_admission(&state,ticket,|| {
-                if state.local_flight_state_snapshot() as u8 >= 7 {
-                    return Err("Launch superseded the retraction worker; no motion sent".into());
+            let deadline = prepared.deadline;
+            #[cfg(test)]
+            crate::gse::nonwaiting_admission_tests::record_prepared_packet(&state, &prepared.packet);
+            let mut queued = router.prepare_tx_queue(prepared.packet)
+                .map_err(|failure| format!("Motion preparation refused: {}", failure.error))?;
+            let retry_started = Instant::now();
+            let retry_budget = std::time::Duration::from_millis(100);
+            let blocked = crate::telemetry_schema::types::ABORT;
+            let mut first_attempt = true;
+            loop {
+                if Instant::now() > deadline {
+                    return Err("Original retraction deadline expired; no motion sent".into());
                 }
-                {
-                    let inner=state.plumbing_drive.inner.lock().unwrap();
-                    if inner.desired.revision!=record.mode_revision || inner.desired.mode!=record.mode
-                        ||inner.settings_busy||inner.pending_setting.is_some()||inner.storage_error.is_some()
-                        ||Instant::now()>prepared.deadline
-                    {return Err("Original drive context expired before SDK admission; no motion sent".into());}
+                let attempt: Result<Result<(), sedsnet::router::TryQueuedPacketError>, String> = crate::gse::with_prepared_motion_admission(&state,ticket,first_attempt,|| {
+                    if state.local_flight_state_snapshot() as u8 >= 7 {
+                        return Err("Launch superseded the retraction worker; no motion sent".into());
+                    }
+                    {
+                        let inner=state.plumbing_drive.inner.lock().unwrap();
+                        if inner.desired.revision!=record.mode_revision || inner.desired.mode!=record.mode
+                            ||inner.settings_busy||inner.pending_setting.is_some()||inner.storage_error.is_some()
+                            ||Instant::now()>deadline
+                        {return Err("Original drive context expired before SDK admission; no motion sent".into());}
+                    }
+                    #[cfg(test)]
+                    if let Some(error) = http_tests::injected_motion_admission_refusal(&state) {
+                        return Ok(Err(error));
+                    }
+                    Ok(router.try_tx_queue_unless_pending_reliable_type(&mut queued, blocked))
+                }).map_err(str::to_owned)?;
+                first_attempt = false;
+                match attempt? {
+                    Ok(()) => break,
+                    Err(contention @ (sedsnet::router::TryQueuedPacketError::CoreBusy
+                        | sedsnet::router::TryQueuedPacketError::SchemaBusy)) => {
+                        #[cfg(test)]
+                        if contention == sedsnet::router::TryQueuedPacketError::CoreBusy {
+                            crate::gse::motion_core_busy_refused_for_test(&state);
+                        }
+                        let remaining = retry_budget.checked_sub(retry_started.elapsed())
+                            .and_then(|budget| deadline.checked_duration_since(Instant::now()).map(|life| budget.min(life)))
+                            .filter(|left| !left.is_zero())
+                            .ok_or_else(|| format!("Motion SDK admission remained {contention:?} through the original contention budget; no SDK owner was created"))?;
+                        // All dispatch/board/Stop guards were dropped above.
+                        // Retain THIS exact prepared Packet, identity and ticket.
+                        std::thread::sleep(remaining.min(std::time::Duration::from_millis(5)));
+                    }
+                    Err(error) => return Err(format!("Motion SDK admission refused: {error:?}; no SDK owner was created")),
                 }
-                router.try_tx_queue(prepared.packet).map_err(|error|error.to_string())
-            }).map_err(str::to_owned)??;
+            }
             {
                 let mut inner=state.plumbing_drive.inner.lock().unwrap();
                 inner.last_motion_stamp=inner.last_motion_stamp.max(record.original_utc_ms);

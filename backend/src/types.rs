@@ -91,11 +91,23 @@ pub enum TelemetryCommand {
     #[cfg(feature = "hitl_mode")]
     ReinitAfter50,
     StartFill,
+    /// Retained pre-auth Fill admission; never accepted from a client.
+    #[serde(skip)]
+    FillWithRecording {
+        origin: std::sync::Arc<crate::fill_recording::Origin>,
+    },
     PauseFill,
     CancelFill,
     ValveSelfTest,
     NitrogenTest,
     Turbocharge,
+    /// Original physical EDGE identity only; never deserialized from a client.
+    #[serde(skip)]
+    ColdFlowPanelRelease {
+        key: crate::sequence_progress::RunKey,
+        generation: u64,
+        awaiting_at_edge: bool,
+    },
     /// Internal producer intent; never accepted as a client command.
     #[serde(skip)]
     // Production SafetyTask uses direct claimed TX; retain this queued-intent

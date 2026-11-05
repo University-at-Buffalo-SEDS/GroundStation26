@@ -234,16 +234,64 @@ pub(crate) fn advance_verified_recovery(
         .ok_or("Manual Stop superseded recovery")?
 }
 
+/// Clock contention is retryable only before any finalization mutation. All
+/// original owner/Stop/proof guards must be rerun by the same operation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FinalizeError {
+    ClockBusy,
+    Refused(&'static str),
+}
+impl From<&'static str> for FinalizeError {
+    fn from(message: &'static str) -> Self {
+        Self::Refused(message)
+    }
+}
+impl From<crate::final_proof_clock::Error> for FinalizeError {
+    fn from(error: crate::final_proof_clock::Error) -> Self {
+        match error {
+            crate::final_proof_clock::Error::Busy => Self::ClockBusy,
+            other => Self::Refused(other.message()),
+        }
+    }
+}
+
+/// Explicit global publication intent is distinct from its verified MCU set.
+#[derive(Clone, Copy)]
+pub(crate) enum StartupPublication {
+    TargetedRecovery,
+    LegacyAllSeven,
+    ModeAware(crate::board_recovery::scope::Selection),
+}
+impl StartupPublication {
+    fn global(self) -> bool {
+        !matches!(self, Self::TargetedRecovery)
+    }
+    fn selection(self) -> Option<crate::board_recovery::scope::Selection> {
+        match self {
+            Self::ModeAware(selection) => Some(selection),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) fn finalize_verified_recovery(
     state: &AppState,
     token: crate::operator_queue::Token,
     fence: &crate::launch_history::RecoveryFence,
-    proxy: Option<crate::command_proxy::recovery::Barrier>,
+    proxy: &mut Option<crate::command_proxy::recovery::Barrier>,
     proofs: &crate::board_recovery::coordinator::FinalProofs,
-    reset_all: bool,
-) -> Result<(), &'static str> {
-    // Copy only, before the final owner/Stop chain. No reporting lock or IO.
-    let reporting_owner=super::progress::verified_reset_marker(state);
+    publication: StartupPublication,
+    clock: &crate::final_proof_clock::Admission,
+) -> Result<(), FinalizeError> {
+    let reset_all = publication.global();
+    let selection = publication.selection();
+    let reporting_owner = super::progress::verified_reset_marker(state);
+    let reporting_ms = crate::sequence_progress_service::now_ms();
+    // Randomness may initialize an entropy provider; prepare outside every
+    // final owner. The current proxy boot/active/collision checks remain below.
+    let proxy_nonce = proxy
+        .as_ref()
+        .map(|_| crate::command_proxy::recovery::Barrier::prepare_reopen_nonce());
     let _dispatch = DISPATCH_GATE.lock().unwrap();
     if state
         .operator_admission_barrier
@@ -255,54 +303,101 @@ pub(crate) fn finalize_verified_recovery(
             .load(std::sync::atomic::Ordering::Acquire)
             != 0
     {
-        return Err("Recovery final owner/generation is stale or inflight");
+        return Err("Recovery final owner/generation is stale or inflight".into());
     }
-    state
+    // Existing order begins at DGate. All additional owners use try_lock and
+    // precede both Stop and board-register fences. Never wait for GSE/state
+    // while holding either of those owners. Non-reset recovery needs neither.
+    let mut runtime = if reset_all {
+        Some(state.gse.try_lock().map_err(|_| "GSE owner busy")?)
+    } else {
+        None
+    };
+    let mut host_state = if reset_all {
+        Some(
+            state
+                .state
+                .try_lock()
+                .map_err(|_| "Host state owner busy")?,
+        )
+    } else {
+        None
+    };
+    let mut history = state
+        .launch_history
+        .try_lock()
+        .map_err(|_| "Clock journal busy")?;
+    let mut proxy_owner = proxy
+        .as_ref()
+        .map(|p| p.try_prepare_reopen(proxy_nonce.expect("owned proxy nonce prepared")))
+        .transpose()
+        .map_err(|_| "Proxy owner busy or changed")?;
+    if !history
+        .recovery_publication_ready_nowait(fence, token.owner)
+        .map_err(|_| "Clock prefix busy or changed")?
+    {
+        return Err("Clock prefix pending".into());
+    }
+    let result = state
         .manual_abort_intent
         .admit_if_unchanged(token.manual_epoch, || {
-            state
-                .deferred_abort
-                .admit_if_no_manual_since(token.observed_manual_epoch, || {
-                    let mut history = state
-                        .launch_history
-                        .try_lock()
-                        .map_err(|_| "Clock journal busy")?;
-                    if !history
-                        .recovery_publication_ready(fence, token.owner)
-                        .map_err(|_| "Clock fence changed")?
-                        || !history.recovery_pending().is_some_and(|pending| {
-                            pending.owner == token.owner
-                                && pending.verified
-                                && proofs.valid(&pending, token.generation)
-                                && (!reset_all
-                                    || pending.targets.len() == 7
-                                        && pending.targets.iter().all(|t| t.desired == 0))
-                        })
-                    {
-                        return Err("Durable verified marker unavailable");
+            state.deferred_abort.admit_if_no_manual_since(
+                token.observed_manual_epoch,
+                || -> Result<(), FinalizeError> {
+                    let now = clock.current().map_err(FinalizeError::from)?;
+                    if !({
+                        let pending = history
+                            .recovery_pending_ref()
+                            .ok_or("Durable marker missing")?;
+                        pending.owner == token.owner
+                            && pending.verified
+                            && proofs.valid_at(pending, token.generation, now)
+                            && (!reset_all || pending.verified_startup_policy())
+                            && selection.is_none_or(|s| {
+                                s.valid_targets(pending)
+                                    && pending.reset_policy.as_ref() == Some(&s.policy())
+                            })
+                    }) {
+                        return Err("Durable verified marker unavailable".into());
                     }
-                    // No IO/SDK callback occurs under these locks. Both proxy boot and
-                    // host barrier rotate at this same final Stop linearization point.
-                    if let Some(proxy) = proxy {
-                        proxy
-                            .reopen_after_verified_recovery()
-                            .map_err(|_| "Proxy fence changed")?;
+                    let mut publish = || -> Result<(), &'static str> {
+                        // RAM-only and no further owner/SDK/clock/file acquisition.
+                        // The history readiness check above makes reopen deterministic.
+                        history
+                            .reopen_after_recovery_ram(fence)
+                            .map_err(|_| "Journal cannot reopen")?;
+                        if let Some(owner) = &mut proxy_owner {
+                            owner.commit();
+                        }
+                        if reset_all {
+                            super::progress::capture_verified_reset_under_gate(
+                                runtime.as_mut().unwrap(),
+                                reporting_owner,
+                                reporting_ms,
+                            );
+                            state.publish_verified_startup_under_gate(host_state.as_mut().unwrap());
+                        }
+                        state
+                            .operator_admission_barrier
+                            .store(0, std::sync::atomic::Ordering::Release);
+                        Ok(())
+                    };
+                    if let Some(selection) = selection {
+                        selection.with_current(state, publish)?;
+                    } else {
+                        publish()?;
                     }
-                    history
-                        .reopen_after_recovery(fence)
-                        .map_err(|_| "Journal cannot reopen")?;
-                    if reset_all {
-                        super::progress::capture_verified_reset_under_gate(state,reporting_owner);
-                        state.publish_verified_startup_under_gate();
-                    }
-                    state
-                        .operator_admission_barrier
-                        .store(0, std::sync::atomic::Ordering::Release);
                     Ok(())
-                })
+                },
+            )
         })
         .flatten()
-        .ok_or("Manual Stop superseded recovery")?
+        .ok_or(FinalizeError::Refused("Manual Stop superseded recovery"))?;
+    drop(proxy_owner);
+    if result.is_ok() {
+        *proxy = None;
+    }
+    result
 }
 
 #[cfg(test)]

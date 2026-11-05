@@ -62,6 +62,10 @@ async fn cross_compiled_interlock_exchange_or_local_enum_contract(){
                 assert_eq!(cached,reply);put(&shared,"duplicate-result0",&cached);
             }
         }
+        // Explicit read-only refresh after the receiver's durable-save drain.
+        let query=get(&shared,"refresh-after-save").await;
+        let Received::Reply(reply)=runtime.receive(&p,pv,crate::station_mode::local_mode(),&query).unwrap()else{panic!("fresh configuration observation")};
+        put(&shared,"refresh-after-save-result",&reply);
         super::handler_tests::user(&state.auth,false,false,false,&NAMES);
         let bytes=get(&shared,"revoked").await;
         let Received::Execute(request)=runtime.receive(&p,pv,crate::station_mode::local_mode(),&bytes).unwrap()else{panic!("revoked actor request")};
@@ -77,6 +81,13 @@ async fn cross_compiled_interlock_exchange_or_local_enum_contract(){
         let Received::Capability{boot,mode,observation}=runtime.receive(&r,rv,crate::station_mode::local_mode(),&get(&shared,"capability").await).unwrap()else{panic!("actual HITL capability")};
         assert_eq!(mode,Mode::Hitl);assert_eq!(observation.len(),88);
         assert!(accept_presentation(&state,&observation,0,boot,session));
+        let saved_path=root.0.join("retained-configuration.json");
+        let mut retained=retained_config::Worker::open_at(Arc::new(Pairing::from_file(&root.0.join("rrls.json")).unwrap()),saved_path.clone());retained.idle().await;
+        let disk=retained_config::hold_next_write();
+        retained.accepted(mode,boot,&observation,0);
+        tokio::time::timeout(std::time::Duration::from_secs(2),async{while !disk.entered(){tokio::task::yield_now().await;}}).await.unwrap();
+        assert!(retained_config::snapshot(Some(mode),true).persistence_pending);
+        assert_eq!(retained_config::snapshot(Some(mode),true).status,"unknown","no durable receipt invented while fsync held");
         assert_eq!(crate::primary_mirror::board_state_proof_policy(&state),Some(false));
         assert_eq!(crate::primary_mirror::board_history_required_scope(&state),Some(0),"normal RRLS must use signed primary optional policy rather than its own mandatory policy");
         {
@@ -99,18 +110,39 @@ async fn cross_compiled_interlock_exchange_or_local_enum_contract(){
             let Received::Result{outcome,observation,..}=runtime.receive(&r,rv,Mode::Normal,&get(&shared,&format!("result{index}")).await).unwrap()else{panic!("signed command result")};
             assert_eq!(outcome,Outcome::Queued);assert_eq!(observation.len(),88);
             assert!(accept_presentation(&state,&observation,0,boot,session));
+            retained.accepted(mode,boot,&observation,0);retained.service().await;
+            assert!(retained_config::snapshot(Some(mode),true).persistence_pending,"actual signed control replies continue while metadata writer is held");
             assert_eq!(crate::primary_mirror::board_state_proof_policy(&state),Some(index==3));
             assert_eq!(crate::primary_mirror::board_history_required_scope(&state),Some(if index==3{0x7f}else{0}));
             let policy=crate::primary_mirror::action_policy(&state).unwrap();
             assert_eq!(policy.controls.iter().find(|control|control.cmd==*name).unwrap().actuated,Some(matches!(index,0|3)));
             if index==0 {put(&shared,"duplicate0",&bytes);assert!(matches!(runtime.receive(&r,rv,Mode::Normal,&get(&shared,"duplicate-result0").await).unwrap(),Received::Result{outcome:Outcome::Queued,..}));}
         }
+        disk.release();retained.idle().await;
+        assert_eq!(retained_config::snapshot(Some(mode),true).settings,[Some(true),Some(false),Some(false),Some(true)]);
+        let before_refresh=std::fs::read(&saved_path).unwrap();
+        put(&shared,"refresh-after-save",&runtime.query_observe(&r,rv).unwrap());
+        let Received::Capability{boot,mode,observation}=runtime.receive(&r,rv,Mode::Normal,&get(&shared,"refresh-after-save-result").await).unwrap()else{panic!("fresh accepted capability")};
+        assert!(accept_presentation(&state,&observation,0,boot,session));retained.accepted(mode,boot,&observation,0);retained.service().await;
+        assert_eq!(retained_config::snapshot(Some(mode),true).status,"current");
+        assert_eq!(std::fs::read(&saved_path).unwrap(),before_refresh,"fresh unchanged observation does not fsync");
+        assert!(!String::from_utf8_lossy(&before_refresh).contains("cross-token"));
+        assert!(!String::from_utf8_lossy(&before_refresh).contains("actor"));
         put(&shared,"revoked",&runtime.request(&r,rv,mode,[99;16],"operator".into(),Operation::Command(NAMES[0].into())).unwrap());
-        assert!(matches!(runtime.receive(&r,rv,Mode::Normal,&get(&shared,"revoked-result").await).unwrap(),Received::Result{outcome:Outcome::Denied,..}));
+        let before_revoked=std::fs::read(&saved_path).unwrap();
+        let Received::Result{outcome:Outcome::Denied,boot,observation,..}=runtime.receive(&r,rv,Mode::Normal,&get(&shared,"revoked-result").await).unwrap()else{panic!("revoked actor denied")};
+        retained.accepted(mode,boot,&observation,0);retained.idle().await;
+        assert_eq!(std::fs::read(&saved_path).unwrap(),before_revoked,"denied command cannot mutate retained configuration");
         runtime.connect(Some(Transport{session:session.wrapping_add(1),sequence:1}));
         assert!(runtime.capability.is_none());
         invalidate_presentation(&state);
         assert_eq!(crate::primary_mirror::board_history_required_scope(&state),None);
+        assert_eq!(retained_config::snapshot(Some(mode),false).status,"disconnected");
+        retained.shutdown().await;
+        let mut restarted=retained_config::Worker::open_at(Arc::new(Pairing::from_file(&root.0.join("rrls.json")).unwrap()),saved_path);restarted.idle().await;
+        assert_eq!(retained_config::snapshot(Some(mode),false).settings,[Some(true),Some(false),Some(false),Some(true)]);
+        assert_eq!(retained_config::snapshot(Some(Mode::Normal),false).settings,[None;4]);
+        restarted.shutdown().await;
         assert!(runtime.request(&r,Transport{session:session.wrapping_add(1),sequence:1},mode,[100;16],"operator".into(),Operation::Command(NAMES[0].into())).is_err(),"reconnect cannot invent primary HITL authority");
         state.request_shutdown();
     }

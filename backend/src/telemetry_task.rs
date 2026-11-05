@@ -18,6 +18,8 @@ mod heartbeat;
 mod periodic;
 pub(crate) mod procedure_clock;
 mod radio_io;
+pub(crate) mod recording_owner;
+pub(crate) mod recording_diagnostics;
 pub use radio_io::{CommsWorkerHandle, TransportTxActivity, TxQueueBudget};
 #[cfg(test)]
 use radio_io::{radio_command_log_line, spawn_dedicated_radio_io_threads};
@@ -137,12 +139,19 @@ async fn set_local_flight_state_for_operator_mode(
     next_state: FlightState,
     launch_revision: Option<u64>,
 ) {
+    #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+    if let Some(router) = state.topology_router.get() {
+        flight_state_timeline::event(router, "processed", next_state as u8, None, None, None);
+    }
     if next_state == FlightState::Launch {
         state.request_local_launch_state(launch_revision);
     } else {
         state.set_local_flight_state(next_state);
     }
 }
+
+#[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+pub(crate) mod flight_state_timeline;
 
 mod derived;
 use derived::*;
@@ -246,6 +255,7 @@ fn warn_launch_blocked_by_vent_valve(state: &Arc<AppState>) {
 }
 
 fn start_launch_clock_from_valve_sequence_status(state: &Arc<AppState>) {
+    if crate::gse::cold_flow::active(state){return;}
     if matches!(
         state.launch_clock_snapshot().kind,
         LaunchClockKind::TMinus | LaunchClockKind::TPlus
@@ -264,6 +274,7 @@ fn start_launch_clock_from_valve_sequence_status(state: &Arc<AppState>) {
 }
 
 fn transition_launch_clock_to_t_plus_from_pilot_open(state: &Arc<AppState>) {
+    if crate::gse::cold_flow::active(state){return;}
     if state.launch_clock_snapshot().kind != LaunchClockKind::TMinus {
         return;
     }
@@ -508,7 +519,7 @@ pub async fn telemetry_task(
     router: Arc<Router>,
     comms: Vec<CommsWorkerHandle>,
     mut rx: mpsc::Receiver<TelemetryCommand>,
-    mut db_rx: mpsc::Receiver<DbQueueItem>,
+    db_rx: mpsc::Receiver<DbQueueItem>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> TelemetryShutdownOutcome {
     let mut operator_queue_rx = state
@@ -552,220 +563,14 @@ pub async fn telemetry_task(
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(DB_BATCH_WAIT_MS_DEFAULT)
             .clamp(1, 250);
-        tokio::spawn(async move {
-            log::info!("telemetry db worker started");
-            let mut db_shutdown_rx = state.shutdown_subscribe();
-            struct ActiveRecording {
-                pool: sqlx::SqlitePool,
-                path: String,
-            }
-
-            let placeholder_path = state.placeholder_db_path.clone();
-            let recordings_dir = std::path::Path::new(&placeholder_path)
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .to_path_buf();
-            let mut recent_writes: VecDeque<DbWrite> = VecDeque::new();
-            let mut active_recording: Option<ActiveRecording> = None;
-            let mut mode = RecordingMode::Idle;
-            let mut last_recording_end_ms: Option<i64> = None;
-
-            let mut pending: Vec<DbWrite> = Vec::with_capacity(db_batch_max);
-            let mut condition_store = crate::alert_condition_runtime::initialize(&state).await;
-            let mut pending_conditions=Vec::with_capacity(64);
-            let mut deferred_control_carry: Option<RecordingCommand> = None;
-            let mut shutting_down = false;
-            loop {
-                let first = if shutting_down {
-                    match db_rx.try_recv() {
-                        Ok(item) => item,
-                        Err(MpscTryRecvError::Empty | MpscTryRecvError::Disconnected) => break,
-                    }
-                } else {
-                    tokio::select! {
-                        recv = db_rx.recv() => {
-                            let Some(item) = recv else { break; };
-                            item
-                        }
-                        recv = db_shutdown_rx.recv() => {
-                            match recv {
-                                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {
-                                    shutting_down = true;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                };
-
-                let mut deferred_control: Option<RecordingCommand> = deferred_control_carry.take();
-                match first {
-                    DbQueueItem::Write(write) => {
-                        let newest_ts = write.timestamp_ms();
-                        recent_writes.push_back(write.clone());
-                        prune_recent_writes(&mut recent_writes, newest_ts);
-                        if matches!(mode, RecordingMode::Recording) {
-                            pending.push(write);
-                        }
-                    }
-                    DbQueueItem::Condition(work) => crate::alert_condition_runtime::stage(&state,&mut condition_store,&mut pending_conditions,work).await,
-                    DbQueueItem::Control(cmd) => deferred_control = Some(cmd),
-                }
-
-                let deadline =
-                    tokio::time::Instant::now() + Duration::from_millis(db_batch_wait_ms);
-                while pending.len() < db_batch_max && deferred_control.is_none() {
-                    match db_rx.try_recv() {
-                        Ok(DbQueueItem::Write(write)) => {
-                            let newest_ts = write.timestamp_ms();
-                            recent_writes.push_back(write.clone());
-                            prune_recent_writes(&mut recent_writes, newest_ts);
-                            if matches!(mode, RecordingMode::Recording) {
-                                pending.push(write);
-                            }
-                        }
-                        Ok(DbQueueItem::Condition(work)) => crate::alert_condition_runtime::stage(&state,&mut condition_store,&mut pending_conditions,work).await,
-                        Ok(DbQueueItem::Control(cmd)) => {
-                            deferred_control = Some(cmd);
-                        }
-                        Err(MpscTryRecvError::Disconnected) => break,
-                        Err(MpscTryRecvError::Empty) => {
-                            let now = tokio::time::Instant::now();
-                            if now >= deadline {
-                                break;
-                            }
-                            let remaining = deadline.saturating_duration_since(now);
-                            match tokio::time::timeout(remaining, db_rx.recv()).await {
-                                Ok(Some(DbQueueItem::Write(write))) => {
-                                    let newest_ts = write.timestamp_ms();
-                                    recent_writes.push_back(write.clone());
-                                    prune_recent_writes(&mut recent_writes, newest_ts);
-                                    if matches!(mode, RecordingMode::Recording) {
-                                        pending.push(write);
-                                    }
-                                }
-                                Ok(Some(DbQueueItem::Condition(work))) => crate::alert_condition_runtime::stage(&state,&mut condition_store,&mut pending_conditions,work).await,
-                                Ok(Some(DbQueueItem::Control(cmd))) => {
-                                    deferred_control = Some(cmd);
-                                }
-                                Ok(None) => break,
-                                Err(_) => break,
-                            }
-                        }
-                    }
-                }
-
-                crate::alert_condition_runtime::flush(&state,&mut condition_store,&mut pending_conditions).await;
-                let flush_ok =
-                    flush_recording_batch(active_recording.as_ref().map(|a| &a.pool), &mut pending)
-                        .await;
-                if !flush_ok {
-                    deferred_control_carry = deferred_control;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-
-                if let Some(cmd) = deferred_control {
-                    match cmd {
-                        RecordingCommand::StartNow | RecordingCommand::StartWithRecent => {
-                            let started_at_ms = get_current_timestamp_ms() as i64;
-                            let target_path = session_db_path(&recordings_dir, started_at_ms);
-                            match open_telemetry_db(&target_path).await {
-                                Ok((new_pool, new_path)) => {
-                                    if let Some(active) = active_recording.take() {
-                                        log::info!("recording session closing db={}", active.path);
-                                        close_and_finalize_sqlite(active.pool, &active.path).await;
-                                        export_test_fire_csv_if_enabled(&state, &active.path).await;
-                                        last_recording_end_ms =
-                                            Some(get_current_timestamp_ms() as i64);
-                                    }
-                                    log::info!("recording session started db={new_path}");
-                                    state.replace_telemetry_db(new_pool.clone(), new_path.clone());
-                                    state.set_recording_status(RecordingStatusMsg {
-                                        mode: RecordingModeWire::Recording,
-                                        db_path: Some(new_path.clone()),
-                                    });
-                                    active_recording = Some(ActiveRecording {
-                                        pool: new_pool,
-                                        path: new_path,
-                                    });
-                                    mode = RecordingMode::Recording;
-
-                                    if matches!(cmd, RecordingCommand::StartWithRecent)
-                                        && let Some(active) = &active_recording
-                                    {
-                                        let cutoff = started_at_ms.saturating_sub(120_000);
-                                        let min_ts = last_recording_end_ms
-                                            .map(|prev| prev.max(cutoff))
-                                            .unwrap_or(cutoff);
-                                        let backfill: Vec<DbWrite> = recent_writes
-                                            .iter()
-                                            .filter(|write| write.timestamp_ms() > min_ts)
-                                            .cloned()
-                                            .collect();
-                                        if let Err(err) =
-                                            insert_db_batch_with_retry(&active.pool, &backfill)
-                                                .await
-                                        {
-                                            eprintln!("Failed to backfill recent writes: {err}");
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    emit_warning(
-                                        &state,
-                                        format!("Failed to open recording DB session: {err}"),
-                                    );
-                                }
-                            }
-                        }
-                        RecordingCommand::Pause | RecordingCommand::Stop => {
-                            if let Some(active) = active_recording.take() {
-                                log::info!("recording session closing db={}", active.path);
-                                close_and_finalize_sqlite(active.pool, &active.path).await;
-                                let deleted = delete_empty_recording_if_needed(&active.path).await;
-                                if !deleted {
-                                    export_test_fire_csv_if_enabled(&state, &active.path).await;
-                                }
-                                last_recording_end_ms = Some(get_current_timestamp_ms() as i64);
-                            }
-                            mode = if matches!(cmd, RecordingCommand::Pause) {
-                                RecordingMode::Paused
-                            } else {
-                                RecordingMode::Idle
-                            };
-                            rotate_placeholder_db(&state, mode).await;
-                            state.set_recording_status(RecordingStatusMsg {
-                                mode: RecordingModeWire::from(mode),
-                                db_path: None,
-                            });
-                        }
-                        RecordingCommand::ResetAll => {
-                            pending.clear();
-                            recent_writes.clear();
-                            let db = active_recording
-                                .as_ref()
-                                .map(|active| active.pool.clone())
-                                .unwrap_or_else(|| state.telemetry_db_pool());
-                            if let Err(err) = clear_telemetry_tables(&db).await {
-                                log::error!("failed clearing telemetry tables during reset: {err}");
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let Some(active) = active_recording.take() {
-                log::info!("recording worker finalizing active db={}", active.path);
-                close_and_finalize_sqlite(active.pool, &active.path).await;
-                let deleted = delete_empty_recording_if_needed(&active.path).await;
-                if !deleted {
-                    export_test_fire_csv_if_enabled(&state, &active.path).await;
-                }
-            }
-            if let Some(store)=condition_store {store.close().await;}
-            log::info!("telemetry db worker stopped");
-        })
+        let db_shutdown_rx = state.shutdown_subscribe();
+        tokio::spawn(recording_owner::run(
+            state,
+            db_rx,
+            db_batch_max,
+            db_batch_wait_ms,
+            db_shutdown_rx,
+        ))
     };
 
     let packet_worker = {
@@ -788,6 +593,8 @@ pub async fn telemetry_task(
         })
     };
 
+    #[cfg(all(test, feature = "test_fire_mode"))]
+    crate::recovery_pending_probe::packet_worker_registered(&state, packet_worker.abort_handle());
     let mut worker_startup_failed = false;
     let router_worker = match spawn_router_worker_thread(router.clone(), state.clone()) {
         Ok(worker) => Some(worker),
@@ -819,6 +626,11 @@ pub async fn telemetry_task(
                     crate::operator_queue::serve(&state, &mut rx, request);
                 }
                 Some(cmd) = rx.recv() => {
+                    if crate::fill_recording::dispatch_queued(&state, &cmd) { continue; }
+                    if let TelemetryCommand::ColdFlowPanelRelease{key,generation,awaiting_at_edge}=cmd {
+                        crate::gse::cold_flow::dispatch_panel(&state,crate::gse::cold_flow::PanelIntent{key,generation,awaiting_at_edge}).await;
+                        continue;
+                    }
                     let (cmd, _operator_claim, plumbing_origin, launch_revision) = match cmd {
                         TelemetryCommand::QueuedOperator { launch_revision, generation, command, plumbing_origin } => {
                             if command.automatic_generation().is_some() || matches!(*command, TelemetryCommand::QueuedOperator { .. }) { continue; }
@@ -827,6 +639,14 @@ pub async fn telemetry_task(
                         }
                         command => (command, None, None, None),
                     };
+                    if let TelemetryCommand::FillWithRecording { origin } = cmd {
+                        crate::fill_recording::spawn(state.clone(), origin);
+                        continue;
+                    }
+                    if matches!(cmd, TelemetryCommand::StartFill) {
+                        crate::fill_recording::notify_failure(&state, &crate::fill_recording::Error::Stale);
+                        continue;
+                    }
                     let automatic_generation = cmd.automatic_generation();
                     let automatic_supply_close = matches!(cmd, TelemetryCommand::AutomaticNitrogenClose { .. } | TelemetryCommand::AutomaticNitrousClose { .. });
                     let automatic_abort = matches!(cmd, TelemetryCommand::AutomaticAbort { .. });
@@ -896,6 +716,9 @@ pub async fn telemetry_task(
                         state.broadcast_action_policy_snapshot();
                         continue;
                     }
+                    if crate::gse::consume_fill_noop(&state, &cmd) {
+                        continue;
+                    }
                     state.auto_zero.lock().unwrap().cancel_for_command(&cmd);
                     if crate::auto_zero::before_fill(&state, &cmd) { continue; }
                     #[cfg(feature="testing")]
@@ -933,7 +756,7 @@ pub async fn telemetry_task(
                         continue;
                     }
                     match cmd {
-                        TelemetryCommand::QueuedOperator { .. } | TelemetryCommand::AutomaticAbort { .. } | TelemetryCommand::AutomaticNitrogenClose { .. } | TelemetryCommand::AutomaticNitrousClose { .. } => unreachable!("automatic intent checked before dispatch"),
+                        TelemetryCommand::FillWithRecording { .. } | TelemetryCommand::ColdFlowPanelRelease { .. } | TelemetryCommand::QueuedOperator { .. } | TelemetryCommand::AutomaticAbort { .. } | TelemetryCommand::AutomaticNitrogenClose { .. } | TelemetryCommand::AutomaticNitrousClose { .. } => unreachable!("automatic intent checked before dispatch"),
                         TelemetryCommand::StartFill | TelemetryCommand::PauseFill
                         | TelemetryCommand::CancelFill | TelemetryCommand::ValveSelfTest
                         | TelemetryCommand::NitrogenTest | TelemetryCommand::Turbocharge => unreachable!("GSE commands handled before dispatch"),
@@ -1924,7 +1747,9 @@ async fn queue_db_write(
                 emit_warning(state, "Warning: telemetry DB worker stopped unexpectedly");
             }
         }
-        Err(TrySendError::Full(DbQueueItem::Control(_) | DbQueueItem::Condition(_))) => {
+        Err(TrySendError::Full(
+            DbQueueItem::Control(_) | DbQueueItem::EnsureRecording(_) | DbQueueItem::Condition(_),
+        )) => {
             emit_warning(
                 state,
                 "Warning: telemetry DB worker control queue backpressured",
@@ -2170,10 +1995,19 @@ async fn handle_packet(
     db_overflow: &DbOverflow,
     pkt: Packet,
 ) -> Vec<TelemetryRow> {
+    #[cfg(all(test, feature="test_fire_mode"))]
+    crate::recovery_pending_probe::receive_entry(state, &pkt);
+    let primary_role = !crate::rrls::is_rrls();
+    // Capture ORIGINAL Stop/generation before resolving a compact source:
+    // identity lookup can wait on SDK state and must never freshen this owner.
+    let original_entry = crate::automatic_startup_idle::Captured::capture(state, primary_role);
+    let automatic_origin = original_entry.filter(|_| {
+        matches!(state.board_from_network_sender(pkt.sender()), Some(board) if board != Board::GroundStation)
+    });
     let source = i64::try_from(pkt.timestamp()).ok().and_then(|source| {
         crate::telemetry_provenance::canonical_source(source, procedure_clock::timestamp_ms())
     });
-    let rows = handle_packet_inner(state, db_tx, db_overflow, pkt).await;
+    let rows = handle_packet_inner(state, db_tx, db_overflow, pkt, primary_role, automatic_origin).await;
     for row in &rows {
         crate::telemetry_provenance::note(row, source);
     }
@@ -2185,6 +2019,8 @@ async fn handle_packet_inner(
     db_tx: &mpsc::Sender<DbQueueItem>,
     db_overflow: &DbOverflow,
     pkt: Packet,
+    primary_role: bool,
+    automatic_origin: Option<crate::automatic_startup_idle::Captured>,
 ) -> Vec<TelemetryRow> {
     let umbilical_capture =
         if pkt.data_type() == crate::telemetry_schema::data_type("UMBILICAL_STATUS") {
@@ -2222,14 +2058,12 @@ async fn handle_packet_inner(
     } else {
         state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
     }
-    if cfg!(feature = "test_fire_mode")
-        && *state.state.lock().unwrap() == FlightState::Startup
-        && state.all_required_boards_seen()
+    #[cfg(all(test, feature="test_fire_mode"))]
+    crate::recovery_pending_probe::before_automatic(state, &pkt).await;
+    if cfg!(feature = "test_fire_mode") && state.all_required_boards_seen()
+        && let Some(original) = automatic_origin
     {
-        state.set_local_flight_state(FlightState::Idle);
-        state.set_sequence_policy_state(crate::sequences::SequencePolicyState::default());
-        sequences::refresh_action_policy_now(state);
-        state.broadcast_action_policy_snapshot();
+        crate::automatic_startup_idle::publish(state, original).await;
     }
     let sender_id = umbilical_capture
         .as_ref()
@@ -2238,7 +2072,7 @@ async fn handle_packet_inner(
 
     if pkt.data_type() == crate::telemetry_schema::data_type("DAQ_LAUNCH_LOG_STATUS") {
         if let Ok(words) = pkt.data_as_u32() {
-            state
+            let accepted = state
                 .network_health
                 .lock()
                 .unwrap()
@@ -2252,30 +2086,40 @@ async fn handle_packet_inner(
                         .and_then(|t| t.try_into().ok())
                         .unwrap_or_else(get_current_timestamp_ms),
                 );
+            if accepted {
+                recording_diagnostics::raw_health(state, db_tx, &pkt, &sender_id);
+            }
         }
         return Vec::new();
     }
 
     if pkt.data_type() == crate::telemetry_schema::data_type("DAQ_SD_HEALTH") {
         if let Ok(words) = pkt.data_as_u32() {
-            state.network_health.lock().unwrap().observe_sd_status(
+            let accepted = state.network_health.lock().unwrap().observe_sd_status(
                 &sender_id,
                 &words,
                 std::time::Instant::now(),
                 get_current_timestamp_ms(),
             );
+            if accepted {
+                recording_diagnostics::raw_health(state, db_tx, &pkt, &sender_id);
+            }
         }
         return Vec::new();
     }
 
     if pkt.data_type() == crate::telemetry_schema::data_type("BOARD_HEALTH") {
         if let Ok(words) = pkt.data_as_u32() {
-            state.network_health.lock().unwrap().observe_diagnostics(
+            let accepted = state.network_health.lock().unwrap().observe_diagnostics_with_source(
                 &sender_id,
                 &words,
                 std::time::Instant::now(),
                 get_current_timestamp_ms(),
+                Some(pkt.timestamp()),
             );
+            if accepted {
+                recording_diagnostics::raw_health(state, db_tx, &pkt, &sender_id);
+            }
         }
         return Vec::new();
     }
@@ -2363,6 +2207,11 @@ async fn handle_packet_inner(
         let authority = state.board_from_network_sender(&sender_id);
         let gs = authority == Some(Board::GroundStation);
         let fc = authority == Some(Board::FlightComputer);
+        // Attribution only, outside every final owner gate. A relay's own
+        // fallback/echo is no more phase authority than a primary's own echo.
+        let self_echo = state.topology_router.get().is_some_and(|router| {
+            router.sender_matches_hostname(pkt.sender(), router.hostname().as_ref())
+        });
         let current = state.local_flight_state_snapshot();
         let prelaunch = |value| {
             matches!(
@@ -2376,10 +2225,33 @@ async fn handle_packet_inner(
                     | FlightState::Armed
             )
         };
-        if !gs
+        // A local reflection is observational, but explicit-model recordings
+        // still retain the original packet as raw telemetry. This is not a
+        // FlightState event and cannot update the aggregate, clock or JSON.
+        if (self_echo || (gs && primary_role))
+            && procedure_clock::now().model_monotonic_ms().is_some()
+        {
+            queue_db_write(
+                state,
+                db_tx,
+                db_overflow,
+                DbWrite::Telemetry {
+                    timestamp_ms: get_current_timestamp_ms() as i64,
+                    source_timestamp_ms: Some(pkt.timestamp() as i64),
+                    data_type: "FLIGHT_STATE".into(),
+                    sender_id: sender_id.clone(),
+                    values_json: Some(
+                        serde_json::to_string(&[pkt_data as f32]).expect("finite flight state"),
+                    ),
+                    payload_json: payload_json_from_pkt(&pkt),
+                },
+            )
+            .await;
+        }
+        if self_echo || (gs && primary_role) || (!gs
             && (new_flight_state == FlightState::Aborted
                 || (!prelaunch(current) && (prelaunch(new_flight_state) || !fc))
-                || current == FlightState::Aborted)
+                || current == FlightState::Aborted))
         {
             return vec![TelemetryRow {
                 timestamp_ms: get_current_timestamp_ms() as i64,
@@ -2473,6 +2345,69 @@ async fn handle_packet_inner(
 
     let payload_json = payload_json_from_pkt(&pkt);
 
+    if pkt.data_type() == crate::telemetry_schema::data_type("AB_IGNITER_SENSE") {
+        // Keep boot/sequence words exact; f32 cannot carry their identities.
+        let source_is_actuator = state.board_from_network_sender(&sender_id) == Some(Board::ActuatorBoard)
+            && pkt.endpoints() == [crate::telemetry_schema::endpoint("GROUND_STATION")];
+        let source_now = recording_network_utc_ms().and_then(|n| n.try_into().ok()).unwrap_or_else(get_current_timestamp_ms);
+        let receipt = std::time::Instant::now();
+        let observation = pkt.data_as_u32().ok().and_then(|words| {
+            // All SDK/config/clock work precedes this short pure tracker lock.
+            state.igniter_sense.lock().unwrap().observe(source_is_actuator,
+                &words, pkt.timestamp(), source_now, receipt)
+        });
+        let mut rows = Vec::new();
+        if let Some(observed) = observation {
+            // Six16-bit limbs retain boot+sequence exactly in JSON f32 values;
+            // display can pair a status with its original ADC sample.
+            let owner = [0_u32,16,32,48].into_iter()
+                .map(|shift|Some(((observed.boot >> shift)&0xffff) as f32))
+                .chain([Some((observed.sequence&0xffff) as f32),Some((observed.sequence>>16) as f32)])
+                .collect::<Vec<_>>();
+            let mut status_values=vec![Some(observed.status as u8 as f32),
+                observed.total_sample_age_ms.map(|n| n as f32),
+                (observed.reference_age_ms != u32::MAX).then_some(observed.reference_age_ms as f32), observed.capability.map(f32::from)];
+            status_values.extend(owner.iter().copied());
+            status_values.extend([0_u32,16,32,48].into_iter()
+                .map(|shift|Some(((source_now >> shift)&0xffff) as f32)));
+            rows.push(TelemetryRow {
+                timestamp_ms: ts_ms, data_type: "IGNITER_SENSE_STATUS".into(), sender_id: sender_id.clone(),
+                // Capability1:model_supply_mismatch is information, not an Abort/error producer.
+                values: status_values,
+            });
+            if let Some(signal) = observed.signal {
+                let mut signal_values=vec![signal.raw_counts,signal.volts,None];
+                signal_values.extend(owner.iter().copied());
+                let row = TelemetryRow {
+                    timestamp_ms: signal.source_utc_ms.unwrap_or(ts_ms),
+                    data_type: "IGNITER_SENSE_SIGNAL".into(), sender_id: sender_id.clone(),
+                    values: signal_values,
+                };
+                crate::telemetry_provenance::note(&row, signal.source_utc_ms);
+                rows.push(row);
+            }
+        }
+        // Exact original wire metadata is available to recording/export/replay.
+        if should_persist_telemetry_sample(&data_type_str, &sender_id, ts_ms) {
+            queue_db_write(state, db_tx, db_overflow, DbWrite::Telemetry {
+                timestamp_ms: ts_ms, source_timestamp_ms: i64::try_from(pkt.timestamp()).ok(),
+                data_type: data_type_str, sender_id: sender_id.clone(),
+                values_json: None, payload_json: payload_json.clone(),
+            }).await;
+        }
+        for row in &rows {
+            if should_persist_telemetry_sample(&row.data_type, &sender_id, row.timestamp_ms) {
+                queue_db_write(state, db_tx, db_overflow, DbWrite::Telemetry {
+                    timestamp_ms: row.timestamp_ms,
+                    source_timestamp_ms: if row.data_type == "IGNITER_SENSE_SIGNAL" { crate::telemetry_provenance::source(row) } else { i64::try_from(pkt.timestamp()).ok() },
+                    data_type: row.data_type.clone(), sender_id: sender_id.clone(),
+                    values_json: telemetry_values_json(&row.values), payload_json: payload_json.clone(),
+                }).await;
+            }
+        }
+        return rows;
+    }
+
     if pkt.data_type() == crate::telemetry_schema::data_type("GPS_SATELLITE_NUMBER") {
         return handle_gps_satellite_count_packet(state, db_tx, db_overflow, &pkt, &payload_json)
             .await
@@ -2500,12 +2435,31 @@ async fn handle_packet_inner(
                 source >= 0
             }
         });
-        let gateway_condition=if pkt.data_type()==crate::telemetry_schema::data_type("BATTERY_VOLTAGE") && is_fill_system_battery_sender(&sender_id) {
+        let gateway_condition = if pkt.data_type()
+            == crate::telemetry_schema::data_type("BATTERY_VOLTAGE")
+            && is_fill_system_battery_sender(&sender_id)
+        {
             crate::alert_condition_producers::gateway_voltage(
-                &pkt,live_receipt.network_ms,state.alert_conditions.current_state(crate::alert_conditions::Key::GatewayLowVoltage),
-                FILL_SYSTEM_LOW_VOLTAGE_WARN_THRESHOLD,FILL_SYSTEM_LOW_VOLTAGE_RELATCH_THRESHOLD,
-            ).and_then(|evidence|crate::alert_condition_runtime::observe(state,evidence.key,evidence.state,evidence.message,ts_ms))
-        }else{None};
+                &pkt,
+                live_receipt.network_ms,
+                state
+                    .alert_conditions
+                    .current_state(crate::alert_conditions::Key::GatewayLowVoltage),
+                FILL_SYSTEM_LOW_VOLTAGE_WARN_THRESHOLD,
+                FILL_SYSTEM_LOW_VOLTAGE_RELATCH_THRESHOLD,
+            )
+            .and_then(|evidence| {
+                crate::alert_condition_runtime::observe(
+                    state,
+                    evidence.key,
+                    evidence.state,
+                    evidence.message,
+                    ts_ms,
+                )
+            })
+        } else {
+            None
+        };
         // Tare capture is live input, not a recording side effect. A full disk
         // queue must not delay its receipt clock or hide a valid sample.
         {
@@ -2581,7 +2535,11 @@ async fn handle_packet_inner(
                     && is_fill_system_battery_sender(&sender_id)
                     && update_fill_system_low_voltage_latch(first_value)
                 {
-                    crate::web::emit_warning_linked(state, FILL_SYSTEM_LOW_VOLTAGE_WARNING,gateway_condition.clone());
+                    crate::web::emit_warning_linked(
+                        state,
+                        FILL_SYSTEM_LOW_VOLTAGE_WARNING,
+                        gateway_condition.clone(),
+                    );
                 }
 
                 emit_derived_battery_rows(
@@ -2960,41 +2918,69 @@ mod tests {
         .expect("late Abort was discarded after ambiguous producer shutdown");
     }
 
-
     #[tokio::test]
     async fn shutdown_receipt_real_receiver_and_owned_writer_clean_restart() {
-        let path=std::env::temp_dir().join(format!("gs-actual-clean-{:032x}",rand::random::<u128>()));
+        let path =
+            std::env::temp_dir().join(format!("gs-actual-clean-{:032x}", rand::random::<u128>()));
         std::fs::create_dir(&path).unwrap();
-        let directory=path.join("history");
+        let directory = path.join("history");
         // Start from an explicitly checked Clean fixture, not an unprovable
         // missing directory. Production first-install absence remains Unknown7.
-        let mut checked=crate::board_abort_history::Store::provision(&directory,[43;16],0x7f).unwrap();
+        let mut checked =
+            crate::board_abort_history::Store::provision(&directory, [43; 16], 0x7f).unwrap();
         checked.begin_session(0x7f).unwrap();
-        checked.seal_clean(crate::board_abort_history::QuiescenceReceipt::checked(0,true,true,true).unwrap()).unwrap();
+        checked
+            .seal_clean(
+                crate::board_abort_history::QuiescenceReceipt::checked(0, true, true, true)
+                    .unwrap(),
+            )
+            .unwrap();
         drop(checked);
-        let changed=Arc::new(Notify::new());
-        let (restored,publisher,owner)=crate::board_abort_history_writer::Owner::open(&directory,[43;16],changed.clone()).unwrap();
-        let (db_tx,db_rx)=mpsc::channel(8);
-        let (mut state,cmd_rx)=test_app_state_with_cmd_rx(db_tx).await;
-        Arc::get_mut(&mut state).expect("fixture unexpectedly shared before producers").board_abort=
-            Arc::new(crate::board_abort::Runtime::restored(restored,publisher,changed));
+        let changed = Arc::new(Notify::new());
+        let (restored, publisher, owner) =
+            crate::board_abort_history_writer::Owner::open(&directory, [43; 16], changed.clone())
+                .unwrap();
+        let (db_tx, db_rx) = mpsc::channel(8);
+        let (mut state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
+        Arc::get_mut(&mut state)
+            .expect("fixture unexpectedly shared before producers")
+            .board_abort = Arc::new(crate::board_abort::Runtime::restored(
+            restored, publisher, changed,
+        ));
         state.board_abort.publish_initial_history();
-        let router=Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
-        let worker=tokio::spawn(telemetry_task(state.clone(),router,Vec::new(),cmd_rx,db_rx,state.shutdown_subscribe()));
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let worker = tokio::spawn(telemetry_task(
+            state.clone(),
+            router,
+            Vec::new(),
+            cmd_rx,
+            db_rx,
+            state.shutdown_subscribe(),
+        ));
         tokio::task::yield_now().await;
         state.request_shutdown();
         assert!(crate::board_recovery::seal_shutdown_and_take_owner(&state).is_none());
         assert!(crate::board_recovery::shutdown_clean_eligible(&state));
-        let outcome=tokio::time::timeout(Duration::from_secs(2),worker).await.unwrap().unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(outcome.ingress_quiesced);
-        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire),0);
-        let snapshot=state.board_abort.freeze_history_after_quiescence();
-        tokio::task::spawn_blocking(move || owner.finish(snapshot,true)).await.unwrap().unwrap();
-        let changed=Arc::new(Notify::new());
-        let (restored,_,owner)=crate::board_abort_history_writer::Owner::open(&directory,[43;16],changed).unwrap();
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+        let snapshot = state.board_abort.freeze_history_after_quiescence();
+        tokio::task::spawn_blocking(move || owner.finish(snapshot, true))
+            .await
+            .unwrap()
+            .unwrap();
+        let changed = Arc::new(Notify::new());
+        let (restored, _, owner) =
+            crate::board_abort_history_writer::Owner::open(&directory, [43; 16], changed).unwrap();
         assert!(!restored.previous_session_unclean);
-        assert_eq!(restored.snapshot.unknown,0,"clean normal restart made optional boards mandatory");
-        owner.finish(restored.snapshot,false).unwrap();
+        assert_eq!(
+            restored.snapshot.unknown, 0,
+            "clean normal restart made optional boards mandatory"
+        );
+        owner.finish(restored.snapshot, false).unwrap();
         std::fs::remove_dir_all(path).unwrap();
     }
 
@@ -3137,6 +3123,12 @@ mod tests {
     #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
     #[tokio::test]
     async fn test_fire_launch_uses_fill_system_without_av_bay() {
+        if launch_core_fixture_in_fresh_process("telemetry_task::tests::test_fire_launch_uses_fill_system_without_av_bay") { return; }
+        test_fire_launch_uses_fill_system_without_av_bay_case().await;
+    }
+
+    #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+    async fn test_fire_launch_uses_fill_system_without_av_bay_case() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
         let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -3472,11 +3464,92 @@ mod tests {
 
     #[tokio::test]
     async fn launch_command_also_queues_valve_board_sequence() {
+        if launch_core_fixture_in_fresh_process("telemetry_task::tests::launch_command_also_queues_valve_board_sequence") { return; }
+        launch_queue_case(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn launch_actual_sdk_core_busy_keeps_inhibition_and_reports_zero_owners() {
+        if launch_core_fixture_in_fresh_process("telemetry_task::tests::launch_actual_sdk_core_busy_keeps_inhibition_and_reports_zero_owners") { return; }
+        launch_queue_case(true).await;
+    }
+
+    // These three legacy cases own fresh processes, so process-wide checklist
+    // STORE initialization and prior background tasks are independent. Their
+    // original case bodies and all deadlines stay unchanged.
+    fn launch_core_fixture_in_fresh_process(name: &str) -> bool {
+        const CHILD: &str = "GS_LAUNCH_CORE_FIXTURE_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok("1") { return false; }
+        struct OwnedRoot(std::path::PathBuf);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let root=OwnedRoot(std::env::temp_dir().join(format!("gs-launch-core-child-{:032x}",rand::random::<u128>())));
+        std::fs::create_dir(&root.0).unwrap();
+        let config=root.0.join("config");std::fs::create_dir(&config).unwrap();
+        for name in ["flight_setup.json","fill_targets.json","gse_sequence.json","calibration_config.json","station_positions.json"] {
+            let source=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config").join(name);
+            if source.exists() {std::fs::copy(source,config.join(name)).unwrap();}
+        }
+        let stdout=root.0.join("stdout.log");let stderr=root.0.join("stderr.log");
+        let output=std::fs::OpenOptions::new().write(true).create_new(true).open(&stdout).unwrap();
+        let errors=std::fs::OpenOptions::new().write(true).create_new(true).open(&stderr).unwrap();
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact",name,"--nocapture","--test-threads=1"])
+            .env(CHILD,"1")
+            .env("GS_LOADCELL_CALIBRATION_PATH",root.0.join("loadcell.json"))
+            .env("GS_CHECKLISTS_FILE",root.0.join("checklists.json"))
+            .env("GS_FLIGHT_SETUP_CONFIG",config.join("flight_setup.json"))
+            .env("GS_FILL_TARGETS_CONFIG",config.join("fill_targets.json"))
+            .env("GS_GSE_CONFIG",config.join("gse_sequence.json"))
+            .env("GS_AUTO_ZERO_CONFIG",config.join("auto_zero.json"))
+            .env("GS_CALIBRATION_CONFIG_PATH",config.join("calibration_config.json"))
+            .env("GS_STATION_POSITIONS_PATH",config.join("station_positions.json"))
+            .env("GS_GSE_QUALIFICATION",config.join("qualification.json"))
+            .env("GS_ZERO_CAPTURE_DIR",root.0.join("zero-captures"))
+            .stdout(std::process::Stdio::from(output))
+            .stderr(std::process::Stdio::from(errors))
+            .spawn().unwrap();
+        // This is only a process-leak guard, not the original prepared/SDK budget.
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(30);
+        let mut exceeded=false;
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now()>deadline || [&stdout,&stderr].into_iter().any(|p|std::fs::metadata(p).unwrap().len()>1_048_576) {
+                exceeded=true;let _=child.kill();break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let status=child.wait().unwrap();
+        let read=|path:&std::path::Path|{
+            use std::io::Read;
+            let mut bytes=Vec::new();std::fs::File::open(path).unwrap().take(1_048_577).read_to_end(&mut bytes).unwrap();
+            assert!(bytes.len()<=1_048_576,"owned child output exceeded bound");String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let text=format!("{}{}",read(&stdout),read(&stderr));
+        assert!(!exceeded,"owned Launch fixture exceeded30s/output guard: {text}");
+        assert!(status.success(),"fresh-process actual Launch fixture failed: {text}");
+        assert!(text.contains("1 passed"),"child did not execute original case: {text}");
+        println!("{text}");true
+    }
+
+    async fn launch_queue_case(force_core_busy: bool) {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
         let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let sent_clone = sent.clone();
-        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let router = if force_core_busy {
+            let owner = Arc::as_ptr(&state) as usize;
+            let clock = std::time::Instant::now();
+            Arc::new(Router::new_with_clock(
+                sedsnet::router::RouterConfig::new([]),
+                Box::new(move || {
+                    crate::gse::nonwaiting_admission_tests::clock_pause(owner);
+                    clock.elapsed().as_millis() as u64
+                }),
+            ))
+        } else {
+            Arc::new(Router::new(sedsnet::router::RouterConfig::new([])))
+        };
         let valve_side = router.add_side_packed_with_options(
             "umbilical_comms",
             move |bytes| {
@@ -3508,7 +3581,47 @@ mod tests {
         #[cfg(not(feature = "hitl_mode"))]
         let qualification = crate::gse::armed_fixture_for_test(&state, &router);
         let launch_revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
-        handle_flight_computer_launch_command(state, router.clone(), launch_revision).await;
+        if force_core_busy {
+            if state.topology_router.get().is_none() {
+                state.topology_router.set(router.clone()).unwrap();
+            }
+            let pause = crate::gse::nonwaiting_admission_tests::Pause::install(&state);
+            let owned_state = state.clone();
+            let owned_router = router.clone();
+            let worker = tokio::spawn(async move {
+                handle_flight_computer_launch_command(owned_state, owned_router, launch_revision).await;
+            });
+            pause.prepared.recv_timeout(Duration::from_secs(2)).unwrap();
+            let seed = Packet::new(
+                crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "GS", 100, Arc::from([0u8]),
+            ).unwrap();
+            let held = router.clone();
+            let holder = std::thread::Builder::new().name("production-sdk-core-holder".into())
+                .spawn(move || held.seed_managed_variable(seed)).unwrap();
+            pause.core_entered.recv_timeout(Duration::from_secs(2)).unwrap();
+            pause.proceed.send(()).unwrap();
+            let refused = tokio::time::timeout(Duration::from_secs(2), async {
+                while !state.notifications_snapshot().iter().any(|n|
+                    n.message.contains("Launch SDK admission accepted 0/") &&
+                    n.message.contains("router core busy")) {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }).await;
+            pause.release();
+            holder.join().unwrap().unwrap();
+            worker.await.unwrap();
+            assert!(refused.is_ok(), "actual nonwaiting core refusal was not reported: {:?}", state.notifications_snapshot());
+            assert!(state.launch_history.lock().unwrap().automatic_actions_inhibited());
+            assert!(router.export_reliable_pending_stats().iter().all(|entry|
+                entry.data_type != crate::telemetry_schema::data_type("FLIGHT_COMMAND") &&
+                entry.data_type != crate::telemetry_schema::data_type("VALVE_COMMAND")));
+            eprintln!("LAUNCH_CORE_BUSY_ZERO_OWNERS: notifications={:?} SDK={:?}",
+                state.notifications_snapshot(), router.export_runtime_stats());
+        } else {
+            handle_flight_computer_launch_command(state.clone(), router.clone(), launch_revision).await;
+        }
         #[cfg(not(feature = "hitl_mode"))]
         {
             let saved: serde_json::Value =
@@ -3520,6 +3633,8 @@ mod tests {
             .process_all_queues_with_timeout(0)
             .expect("failed to process launch command queues");
 
+        let diagnostic_notifications = state.notifications_snapshot();
+        let diagnostic_sdk = router.export_runtime_stats();
         let sent = sent.lock().expect("failed to lock sent packets");
         let valve_sequence_seen = sent
             .iter()
@@ -3531,10 +3646,15 @@ mod tests {
                         .endpoints()
                         .contains(&crate::telemetry_schema::endpoint("VALVE_BOARD"))
             });
-        assert!(
-            valve_sequence_seen,
-            "normal launch should also queue the valve-board sequence command"
-        );
+        if force_core_busy {
+            assert!(!valve_sequence_seen, "zero SDK admission cannot fabricate a sequence wire");
+            assert!(!sent.iter().filter_map(|wire| serialize::unpack_packet(wire).ok()).any(|packet|
+                packet.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND") && packet.payload() == [1]));
+        } else {
+            assert!(valve_sequence_seen,
+                "normal launch should also queue valve sequence; notifications={:?} SDK={:?}",
+                diagnostic_notifications, diagnostic_sdk);
+        }
     }
 
     type SchedulerObservations = Arc<Mutex<Vec<(u8, bool)>>>;
@@ -3996,23 +4116,23 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 {
-                let sent = sent_from_ground
-                    .lock()
-                    .expect("failed to lock ground tx packets");
-                let flight_command_seen = sent
-                    .iter()
-                    .filter_map(|payload| serialize::unpack_packet(payload).ok())
-                    .any(|pkt| {
-                        pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND")
-                            && pkt.payload() == [FlightComputerCommands::MonitorAltitude as u8]
-                            && pkt
-                                .endpoints()
-                                .contains(&crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"))
-                    });
-                if flight_command_seen {
-                    break;
-                }
-                drop(sent);
+                    let sent = sent_from_ground
+                        .lock()
+                        .expect("failed to lock ground tx packets");
+                    let flight_command_seen = sent
+                        .iter()
+                        .filter_map(|payload| serialize::unpack_packet(payload).ok())
+                        .any(|pkt| {
+                            pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND")
+                                && pkt.payload() == [FlightComputerCommands::MonitorAltitude as u8]
+                                && pkt.endpoints().contains(&crate::telemetry_schema::endpoint(
+                                    "FLIGHT_CONTROLLER",
+                                ))
+                        });
+                    if flight_command_seen {
+                        break;
+                    }
+                    drop(sent);
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -4749,11 +4869,15 @@ mod tests {
         }
         state.set_action_policy(policy);
 
+        let gs_router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
+        let timeline = flight_state_timeline::Trace::start(&gs_router);
+        let peer_timeline = timeline.clone();
         let remote_router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([
             sedsnet::router::EndpointHandler::new_packet_handler(
                 crate::telemetry_schema::endpoint("FLIGHT_STATE"),
                 move |pkt: &Packet| {
                     if let Some(state_code) = pkt.payload().first().copied() {
+                        peer_timeline.packet(pkt, state_code);
                         remote_states_handler
                             .lock()
                             .expect("failed to lock remote states")
@@ -4763,7 +4887,6 @@ mod tests {
                 },
             ),
         ])));
-        let gs_router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
         // Production main establishes UTC before admitting state changes.
         refresh_host_network_time(&gs_router, get_current_timestamp_ms());
         assert!(crate::system_clock::required_control_network_utc_ms(&gs_router).is_ok());
@@ -4773,6 +4896,7 @@ mod tests {
 
         let gs_side = {
             let gs_peer = gs_peer.clone();
+            let wire_trace = timeline.clone();
             gs_router.add_side_packed_with_options(
                 "umbilical_comms",
                 move |bytes| {
@@ -4781,7 +4905,10 @@ mod tests {
                         .expect("failed to lock gs peer")
                         .clone()
                         .expect("gs peer not initialized");
-                    peer.rx_packed_from_side(bytes, ingress)
+                    let token = wire_trace.wire_begin("GS_to_peer", bytes);
+                    let result = peer.rx_packed_from_side(bytes, ingress);
+                    wire_trace.wire_end(token, &result);
+                    result
                 },
                 sedsnet::router::RouterSideOptions {
                     reliable_enabled: true,
@@ -4792,6 +4919,7 @@ mod tests {
         };
         let remote_side = {
             let remote_peer = remote_peer.clone();
+            let wire_trace = timeline.clone();
             remote_router.add_side_packed_with_options(
                 "gs_link",
                 move |bytes| {
@@ -4800,7 +4928,10 @@ mod tests {
                         .expect("failed to lock remote peer")
                         .clone()
                         .expect("remote peer not initialized");
-                    peer.rx_packed_from_side(bytes, ingress)
+                    let token = wire_trace.wire_begin("peer_to_GS", bytes);
+                    let result = peer.rx_packed_from_side(bytes, ingress);
+                    wire_trace.wire_end(token, &result);
+                    result
                 },
                 sedsnet::router::RouterSideOptions {
                     reliable_enabled: true,
@@ -4862,13 +4993,16 @@ mod tests {
             expected_states.push(current as u8);
         }
 
-        for cmd in commands {
+        for (cmd, expected) in commands.into_iter().zip(expected_states.iter()) {
+            timeline.event("enqueue_begin", *expected, None, None, None);
             // Match authenticated ingress: relative state commands retain the
             // original guard revision and dispatch generation in the queue.
             let queued = TelemetryCommand::QueuedOperator {
                 generation: crate::gse::automatic_generation(&state),
                 launch_revision: crate::board_abort::capture_launch_revision_named(
-                    &state, crate::sequences::command_name(&cmd)),
+                    &state,
+                    crate::sequences::command_name(&cmd),
+                ),
                 plumbing_origin: None,
                 command: Box::new(cmd),
             };
@@ -4876,8 +5010,10 @@ mod tests {
                 .send(queued)
                 .await
                 .expect("failed to send flight state command");
+            timeline.event("enqueue_end", *expected, None, None, None);
         }
 
+        timeline.event("wait_1500ms_begin", 255, None, None, None);
         let remote_result = tokio::time::timeout(Duration::from_millis(1500), async {
             loop {
                 // The GS has its real router worker above. Service the peer's
@@ -4895,8 +5031,16 @@ mod tests {
         })
         .await;
 
+        timeline.event("wait_1500ms_return", 255, None, None, Some(remote_result.is_ok()));
         state.request_shutdown();
         telemetry.await.expect("telemetry task join failed");
+        timeline.event("post_shutdown_join", state.local_flight_state_snapshot() as u8, None, None, None);
+        // Captured by the test harness on success, available for ANY unchanged
+        // ordering/local-state/deadline assertion failure below.
+        let report = timeline.report();
+        flight_state_timeline::write_artifact_if_requested(&report)
+            .expect("failed to write requested owned flight-state trace artifact");
+        eprintln!("TF_STATE_ORIGINAL_DEADLINE_TIMELINE={}", report);
 
         assert_eq!(
             state.local_flight_state_snapshot() as u8,
@@ -4943,10 +5087,13 @@ mod tests {
         state
             .cmd_tx
             .send(TelemetryCommand::QueuedOperator {
-                generation:crate::gse::automatic_generation(&state),
-                launch_revision:crate::board_abort::capture_launch_revision_named(&state,"AdvanceFlightState"),
-                plumbing_origin:None,
-                command:Box::new(TelemetryCommand::AdvanceFlightState),
+                generation: crate::gse::automatic_generation(&state),
+                launch_revision: crate::board_abort::capture_launch_revision_named(
+                    &state,
+                    "AdvanceFlightState",
+                ),
+                plumbing_origin: None,
+                command: Box::new(TelemetryCommand::AdvanceFlightState),
             })
             .await
             .expect("failed to send advance flight state command");
@@ -5234,6 +5381,8 @@ mod tests {
         assert!(state.manual_abort_intent.pending_epoch().is_some());
     }
 
+    include!("igniter_sense_ingress_tests.rs");
+
     async fn test_app_state(db_tx: mpsc::Sender<DbQueueItem>) -> Arc<AppState> {
         test_app_state_with_cmd_rx(db_tx).await.0
     }
@@ -5275,8 +5424,9 @@ mod tests {
             );
         }
 
-        let condition_runtime=Arc::new(crate::alert_condition_runtime::Runtime::for_test());
+        let condition_runtime = Arc::new(crate::alert_condition_runtime::Runtime::for_test());
         let state = Arc::new(AppState {
+            fill_recording: Default::default(),
             control_ingress: Arc::new(Default::default()),
             ring_buffer: Arc::new(Mutex::new(RingBuffer::new(128))),
             cmd_tx,
@@ -5304,13 +5454,16 @@ mod tests {
             pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
             latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
             gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
-            sequence_progress: Arc::new(crate::sequence_progress_service::Shared::new(rand::random::<u128>())),
+            sequence_progress: Arc::new(crate::sequence_progress_service::Shared::new(
+                rand::random::<u128>(),
+            )),
             automatic_generation: Arc::new(AtomicU64::new(1)),
             operator_admission_barrier: Arc::new(AtomicU64::new(0)),
             operator_queue: Arc::new(crate::operator_queue::Control::default()),
             operator_dispatch_inflight: Arc::new(AtomicUsize::new(0)),
             manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
             deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
+            igniter_sense: Arc::new(std::sync::Mutex::new(crate::igniter_sense::Tracker::default())),
             board_recovery: Arc::new(crate::board_recovery::Runtime::default()),
             board_abort: Arc::new(crate::board_abort::Runtime::default()),
             launch_dedup_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -5564,6 +5717,7 @@ mod tests {
         let (db_tx, _) = mpsc::channel(16);
         let state = test_app_state(db_tx.clone()).await;
         let mut targets = state.fill_targets_snapshot();
+        targets.nitrous.target_mass_kg = 10.; // Original percentage oracle uses a 10 kg target.
         targets.fill_source = crate::fill_targets::FillSource::Kg1000Absolute;
         state.set_fill_targets(targets);
         let overflow = test_db_overflow();
@@ -5580,6 +5734,25 @@ mod tests {
         assert_eq!(raw[0].values, vec![Some(-4.25)]);
         assert_eq!(ws.try_recv().unwrap().values, vec![Some(-4.25)]);
         assert_eq!(ws.try_recv().unwrap().values, vec![Some(42.5)]);
+        assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(4.25));
+        // A changed target changes only the derived percentage, never the
+        // recorded signed sensor value or the selected absolute mass.
+        let mut targets = state.fill_targets_snapshot();
+        targets.nitrous.target_mass_kg = 8.;
+        state.set_fill_targets(targets);
+        assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(4.25));
+        let pkt = Packet::new(
+            crate::telemetry_schema::data_type("KG1000"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            Board::DaqBoard.sender_id(),
+            123_450,
+            f32_payload(&[-4.25]),
+        )
+        .unwrap();
+        let raw = handle_packet(&state, &db_tx, &overflow, pkt).await;
+        assert_eq!(raw[0].values, vec![Some(-4.25)]);
+        assert_eq!(ws.try_recv().unwrap().values, vec![Some(-4.25)]);
+        assert_eq!(ws.try_recv().unwrap().values, vec![Some(53.125)]);
         assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(4.25));
         let pkt = Packet::new(
             crate::telemetry_schema::data_type("KG50"),
@@ -6195,6 +6368,29 @@ mod tests {
         let state = test_app_state(db_tx.clone()).await;
         let db_overflow = test_db_overflow();
         let mut ws_rx = state.ws_tx.subscribe();
+        // Presentation mode precedence is Testing, HITL, TestFire, Normal.
+        // A TestFire feature alone does not select that layout in mixed builds.
+        let expected_mode = if cfg!(feature = "testing") {
+            crate::station_mode::Mode::Testing
+        } else if cfg!(feature = "hitl_mode") {
+            crate::station_mode::Mode::Hitl
+        } else if cfg!(feature = "test_fire_mode") {
+            crate::station_mode::Mode::TestFire
+        } else {
+            crate::station_mode::Mode::Normal
+        };
+        assert_eq!(crate::station_mode::local_mode(), expected_mode);
+        let selected_layout = crate::layout::load_layout().unwrap();
+        assert_eq!(selected_layout.test_fire_mode, expected_mode == crate::station_mode::Mode::TestFire);
+        let power_sources: Vec<_> = selected_layout.battery.sources.iter().filter(|source| {
+            source.sender_id == "PB" && source.input_data_type == "BATTERY_VOLTAGE"
+        }).collect();
+        if expected_mode == crate::station_mode::Mode::TestFire {
+            assert!(power_sources.is_empty(), "standalone TestFire omits the AV-bay battery source");
+        } else {
+            assert_eq!(power_sources.len(), 1, "full layouts configure one PB battery source");
+            assert_eq!(power_sources[0].percent_data_type, "AV_BAY_BATTERY_PERCENT");
+        }
 
         let ground_router = Arc::new(Router::new(
             sedsnet::router::RouterConfig::new([]).with_sender("GS"),
@@ -6247,14 +6443,14 @@ mod tests {
             .expect("battery packet should produce a raw row");
         assert_eq!(row.sender_id, "PB");
 
-        // handle_packet has finished emitting rows. Do not wait for AV-bay
-        // derived rows in Test Fire, whose layout intentionally omits them.
+        // handle_packet has finished emitting rows. The selected standalone
+        // TestFire layout omits AV-bay rows; mixed Testing/HITL layouts retain them.
         let mut derived_rows = Vec::new();
         while let Ok(derived) = ws_rx.try_recv() {
             assert_eq!(derived.sender_id, "PB");
             derived_rows.push(derived);
         }
-        if cfg!(feature = "test_fire_mode") {
+        if expected_mode == crate::station_mode::Mode::TestFire {
             assert!(derived_rows.is_empty());
         } else {
             assert_eq!(derived_rows.len(), 6);
@@ -6761,6 +6957,255 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn primary_and_rrls_self_echo_cannot_reauthorize_phase_or_clock() {
+        if crate::operator_queue::isolated_case(module_path!(), "primary_and_rrls_self_echo_cannot_reauthorize_phase_or_clock") { return; }
+        for (hostname, primary) in [("GS", true), ("RRLS", false)] {
+            let (db_tx, _db_rx) = mpsc::channel(32);
+            let state = test_app_state(db_tx.clone()).await;
+            let overflow = test_db_overflow();
+            let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([]).with_sender(hostname)));
+            state.topology_router.set(router.clone()).unwrap();
+            for board in Board::ALL { if *board != Board::GroundStation {
+                // Explicit native handler fixture, not MCU qualification.
+                state.mark_board_seen(board.sender_id(), get_current_timestamp_ms());
+            }}
+            assert!(state.all_required_boards_seen());
+            *state.state.lock().unwrap() = FlightState::Aborted;
+            let clock = state.launch_clock_snapshot();
+            for sender in [hostname.to_string(), format!("@addr:{}", router.current_address())] {
+                assert!(router.sender_matches_hostname(&sender, hostname));
+                let packet = Packet::new(crate::telemetry_schema::data_type("FLIGHT_STATE"),
+                    &[crate::telemetry_schema::endpoint("GROUND_STATION")], &sender, 1234, Arc::from([1u8])).unwrap();
+                let rows = handle_packet_inner(&state, &db_tx, &overflow, packet, primary, None).await;
+                assert_eq!(rows.len(), 1);
+                assert_eq!(state.local_flight_state_snapshot(), FlightState::Aborted);
+                assert_eq!(state.launch_clock_snapshot(), clock);
+            }
+        }
+    }
+
+    #[cfg(feature = "test_fire_mode")]
+    #[tokio::test]
+    async fn reflected_and_unknown_dequeues_cannot_qualify_cached_startup() {
+        if crate::operator_queue::isolated_case(module_path!(), "reflected_and_unknown_dequeues_cannot_qualify_cached_startup") { return; }
+        let _ = crate::network_variables::flight_state();
+        let baseline = crate::network_variables::automatic_idle_test_snapshot();
+        let (db_tx, mut db_rx) = mpsc::channel(32);
+        let state = test_app_state(db_tx.clone()).await;
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS")));
+        router.try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(1_793_000_000_000)).unwrap();
+        router.enable_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).unwrap();
+        state.topology_router.set(router.clone()).unwrap();
+        crate::gse::initialize(&state);
+        *state.state.lock().unwrap() = FlightState::Startup;
+        for board in Board::ALL { if *board != Board::GroundStation {
+            state.mark_board_seen(board.sender_id(), get_current_timestamp_ms());
+        }}
+        assert!(state.all_required_boards_seen());
+        let clock = state.launch_clock_snapshot();
+        let cached = router.get_cached_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).unwrap();
+        for sender in ["GS".to_string(), "RRLS".to_string(), format!("@addr:{}",router.current_address()), "unknown-native-peer".to_string()] {
+            let packet = Packet::new(crate::telemetry_schema::data_type("HEARTBEAT"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")], &sender, 1234, Arc::<[u8]>::from([])).unwrap();
+            handle_packet(&state, &db_tx, &test_db_overflow(), packet).await;
+            // Also exercise the actual reflected FSTATE path, not only heartbeat.
+            if sender == "GS" || sender.starts_with("@addr:") {
+                let packet = Packet::new(crate::telemetry_schema::data_type("FLIGHT_STATE"),
+                    &[crate::telemetry_schema::endpoint("GROUND_STATION")], &sender, 1235, Arc::from([1u8])).unwrap();
+                handle_packet(&state, &db_tx, &test_db_overflow(), packet).await;
+            }
+            assert_eq!(state.local_flight_state_snapshot(), FlightState::Startup);
+            assert_eq!(state.launch_clock_snapshot(), clock);
+            assert_eq!(crate::network_variables::automatic_idle_test_snapshot(), baseline);
+            let after = router.get_cached_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).unwrap();
+            assert_eq!(after.as_ref().map(|p|(p.packet_id(),p.timestamp())), cached.as_ref().map(|p|(p.packet_id(),p.timestamp())));
+            assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire),0);
+        }
+        while let Ok(item) = db_rx.try_recv() {
+            assert!(!matches!(item, DbQueueItem::Write(DbWrite::FlightState { .. })), "no phase recording from passive reflections");
+        }
+    }
+
+    #[cfg(feature = "test_fire_mode")]
+    async fn recognized_dequeue_qualifies_once(compact: bool) {
+        let _ = crate::network_variables::flight_state();
+        let baseline = crate::network_variables::automatic_idle_test_snapshot();
+        let (db_tx, _db_rx) = mpsc::channel(32);
+        let state = test_app_state(db_tx.clone()).await;
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS")));
+        router.try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(1_793_000_000_000)).unwrap();
+        router.enable_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).unwrap();
+        state.topology_router.set(router.clone()).unwrap();
+        crate::gse::initialize(&state);
+        *state.state.lock().unwrap() = FlightState::Startup;
+        for board in Board::ALL { if *board != Board::GroundStation {
+            state.mark_board_seen(board.sender_id(), get_current_timestamp_ms());
+        }}
+        assert!(state.all_required_boards_seen());
+        // Public discovery through a real decoded-packet side, never a fabricated
+        // topology record. This fixture tests attribution, not physical transport.
+        let peer = Router::new(sedsnet::router::RouterConfig::new([]).with_sender("DAQ").with_static_address(123));
+        // Discovery must arrive through a registered remote side: local rx()
+        // consumes built-ins without learning a peer route. The return sink
+        // models packet transport acceptance only, never a generated ACK or
+        // evidence that a remote application applied this host's publication.
+        let host_side = router.add_side_packet("native-peer-return", |_| Ok(()));
+        let incoming = router.clone();
+        peer.add_side_packet("native-discovery", move |packet| incoming.rx_from_side(packet, host_side));
+        peer.announce_discovery().unwrap();
+        peer.process_all_queues().unwrap();
+        // Assigned discovery address and compact packet source are distinct.
+        // Derive the latter from the actual public encoder/header parser;
+        // never assume that the peer's requested static address is on wire.
+        let source_packet = Packet::new(crate::telemetry_schema::data_type("HEARTBEAT"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "DAQ", 1234, Arc::<[u8]>::from([])).unwrap();
+        let wire = sedsnet::wire_format::pack_packet(&source_packet);
+        let envelope = sedsnet::wire_format::peek_envelope(&wire).unwrap();
+        assert_eq!(envelope.timestamp_ms, source_packet.timestamp());
+        assert_eq!(envelope.ty, source_packet.data_type());
+        let sender = if compact { format!("@addr:{}", envelope.source_address) } else { "DAQ".to_string() };
+        eprintln!("NATIVE_COMPACT_IDENTITY requested_static=123 actual_packet_source={} sender={sender}", envelope.source_address);
+        assert_eq!(state.board_from_network_sender(&sender), Some(Board::DaqBoard));
+        let packet = Packet::new(crate::telemetry_schema::data_type("HEARTBEAT"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")], &sender, 1234, Arc::<[u8]>::from([])).unwrap();
+        handle_packet(&state, &db_tx, &test_db_overflow(), packet).await;
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
+        assert_eq!(crate::network_variables::flight_state(), 0);
+        assert!(crate::network_variables::automatic_idle_test_snapshot().durable_unchanged(&baseline));
+        let cached = router.get_cached_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).unwrap().unwrap();
+        assert_eq!(cached.payload(), &[1]);
+        assert!(cached.timestamp() > 0);
+        let original = (cached.packet_id(),cached.timestamp());
+        let next = Packet::new(crate::telemetry_schema::data_type("HEARTBEAT"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")], &sender, 1235, Arc::<[u8]>::from([])).unwrap();
+        handle_packet(&state, &db_tx, &test_db_overflow(), next).await;
+        let cached = router.get_cached_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).unwrap().unwrap();
+        assert_eq!((cached.packet_id(),cached.timestamp()),original);
+    }
+
+    #[cfg(feature = "test_fire_mode")]
+    #[tokio::test]
+    async fn recognized_mcu_dequeue_keeps_original_automatic_admission() {
+        if crate::operator_queue::isolated_case(module_path!(), "recognized_mcu_dequeue_keeps_original_automatic_admission") { return; }
+        recognized_dequeue_qualifies_once(false).await;
+    }
+
+    #[cfg(feature = "test_fire_mode")]
+    #[tokio::test]
+    async fn recognized_compact_mcu_dequeue_keeps_original_automatic_admission() {
+        if crate::operator_queue::isolated_case(module_path!(), "recognized_compact_mcu_dequeue_keeps_original_automatic_admission") { return; }
+        recognized_dequeue_qualifies_once(true).await;
+    }
+
+    #[tokio::test]
+    async fn reflected_state_preserves_raw_model_recording_without_phase_authority() {
+        const NAME: &str = "reflected_state_preserves_raw_model_recording_without_phase_authority";
+        if crate::operator_queue::isolated_case(module_path!(), NAME) { return; }
+        // The parent owns isolated config paths. A second fresh process binds
+        // the existing explicit-file clock before its first clock observation.
+        if std::env::var_os("GS_RAW_ECHO_MODEL_CHILD").is_none() {
+            let root = std::path::PathBuf::from(std::env::var_os("GS_RECOVERY_ISOLATED_ROOT").unwrap());
+            let clock = root.join("raw-echo-model-clock");
+            std::fs::write(&clock, "100000").unwrap();
+            let case = format!("{}::{NAME}", module_path!().split_once("::").unwrap().1);
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &case, "--nocapture", "--test-threads=1"])
+                .env("GS_RAW_ECHO_MODEL_CHILD", "1")
+                .env("GS_SIM_CLOCK_FILE", clock)
+                .env("GS_SIM_NETWORK_EPOCH_MS", "1767225600000")
+                .output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success() && stdout.contains("1 passed; 0 failed; 0 ignored;"), "{stdout}\n{stderr}");
+            assert!(!stdout.contains("panicked at") && !stderr.contains("panicked at"));
+            return;
+        }
+        let explicit_model = cfg!(any(feature = "hitl_mode", feature = "firmware_sim"));
+        assert_eq!(procedure_clock::now().model_monotonic_ms(), explicit_model.then_some(100000));
+        let _ = crate::network_variables::flight_state();
+        let original_store = crate::network_variables::automatic_idle_test_snapshot();
+        for (hostname, primary) in [("GS", true), ("RRLS", false)] {
+            let (db_tx, mut db_rx) = mpsc::channel(32);
+            let state = test_app_state(db_tx.clone()).await;
+            let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([]).with_sender(hostname)));
+            state.topology_router.set(router.clone()).unwrap();
+            // Match the preexisting native self-echo control's contact-only
+            // prerequisite. This supplies neither board floor/readiness proof
+            // nor SDK ACKs; it lets the real FSTATE parser reach observation.
+            for board in Board::ALL { if *board != Board::GroundStation {
+                state.mark_board_seen(board.sender_id(), get_current_timestamp_ms());
+            }}
+            assert!(state.all_required_boards_seen());
+            *state.state.lock().unwrap() = FlightState::Aborted;
+            let clock = state.launch_clock_snapshot();
+            let db = state.telemetry_db_pool();
+            crate::telemetry_db::ensure_telemetry_schema(&db).await.unwrap();
+            for (index, sender) in [hostname.to_string(), format!("@addr:{}", router.current_address())].into_iter().enumerate() {
+                let source_utc = 1_767_225_699_123 + index as u64;
+                let canonical_sender = state.canonical_network_sender_id(&sender);
+                let packet = Packet::new(crate::telemetry_schema::data_type("FLIGHT_STATE"),
+                    &[crate::telemetry_schema::endpoint("GROUND_STATION")], &sender,
+                    source_utc, Arc::from([FlightState::Idle as u8])).unwrap();
+                let expected_payload = payload_json_from_pkt(&packet);
+                let before = get_current_timestamp_ms() as i64;
+                let rows = handle_packet_inner(&state, &db_tx, &test_db_overflow(), packet, primary, None).await;
+                let after = get_current_timestamp_ms() as i64;
+                assert_eq!(rows.len(), 1);
+                let mut writes = Vec::new();
+                while let Ok(item) = db_rx.try_recv() {
+                    match item {
+                        DbQueueItem::Write(write) => writes.push(write),
+                        other => panic!("unexpected recording control: {other:?}"),
+                    }
+                }
+                assert_eq!(writes.len(), usize::from(explicit_model),
+                    "raw rows only under the real explicit-model condition, never a phase event");
+                if explicit_model {
+                    assert!(matches!(&writes[0], DbWrite::Telemetry { data_type, .. } if data_type == "FLIGHT_STATE"));
+                }
+                insert_db_batch_once(&db, &writes).await.unwrap();
+                if explicit_model {
+                    let recorded: (i64, i64, String, String) = sqlx::query_as(
+                        "SELECT timestamp_ms,source_timestamp_ms,values_json,payload_json FROM telemetry WHERE data_type='FLIGHT_STATE' AND sender_id=? AND source_timestamp_ms=?")
+                        .bind(&canonical_sender).bind(source_utc as i64).fetch_one(&db).await.unwrap();
+                    assert!((before..=after).contains(&recorded.0));
+                    assert_eq!(recorded.1, source_utc as i64);
+                    assert_eq!(serde_json::from_str::<Vec<f32>>(&recorded.2).unwrap(), vec![FlightState::Idle as u8 as f32]);
+                    assert_eq!(recorded.3, expected_payload);
+                    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM telemetry WHERE data_type='FLIGHT_STATE' AND sender_id=? AND source_timestamp_ms=?")
+                        .bind(&canonical_sender).bind(source_utc as i64).fetch_one(&db).await.unwrap();
+                    assert_eq!(count, 1);
+                } else {
+                    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM telemetry WHERE data_type='FLIGHT_STATE'")
+                        .fetch_one(&db).await.unwrap();
+                    assert_eq!(count, 0, "ordinary TF has no file-model clock and must not invent raw model rows");
+                }
+                assert_eq!(state.local_flight_state_snapshot(), FlightState::Aborted);
+                assert_eq!(state.launch_clock_snapshot(), clock);
+                assert_eq!(crate::network_variables::automatic_idle_test_snapshot(), original_store);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rrls_still_projects_real_primary_gs_phase() {
+        if crate::operator_queue::isolated_case(module_path!(), "rrls_still_projects_real_primary_gs_phase") { return; }
+        let (db_tx, _db_rx) = mpsc::channel(32);
+        let state = test_app_state(db_tx.clone()).await;
+        let overflow = test_db_overflow();
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([]).with_sender("RRLS")));
+        state.topology_router.set(router).unwrap();
+        for board in Board::ALL { if *board != Board::GroundStation {
+            state.mark_board_seen(board.sender_id(), get_current_timestamp_ms());
+        }}
+        *state.state.lock().unwrap() = FlightState::Startup;
+        let packet = Packet::new(crate::telemetry_schema::data_type("FLIGHT_STATE"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "GS", 1234, Arc::from([1u8])).unwrap();
+        handle_packet_inner(&state, &db_tx, &overflow, packet, false, None).await;
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
+    }
+
+    #[tokio::test]
     async fn unknown_flight_state_code_emits_backend_message() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx.clone()).await;
@@ -6805,5 +7250,13 @@ mod tests {
     mod eval_abort_launch_ingress {
         use super::*;
         include!("telemetry_task/eval_abort_launch_diagnostic.rs");
+    }
+    mod launch_retry_controls {
+        use super::*;
+        include!("telemetry_task/launch_retry_controls.rs");
+    }
+    mod recording_diagnostic_capture {
+        use super::*;
+        include!("telemetry_task/recording_diagnostic_tests.rs");
     }
 }

@@ -126,22 +126,75 @@ struct Record {
     last_abort: Option<Instant>,
     last_local_abort: Option<Instant>,
     first_abort_ms: u64,
-    pending_error: bool,
+    alert_episode: Option<AlertEpisode>,
+    accepted_non_abort: bool,
     proof_after: Option<Instant>,
     proof_boot: u64,
     proof_epoch: u32,
     proof_nonce: u64,
+}
+/// Process-local diagnostic chronology only. These tokens never cross the wire
+/// or restore current proof from disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AlertEpisode {
+    pub(crate) ordinal: u64,
+    pub(crate) first_abort_ms: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AlertEdgeKind { Raised, AcceptedExit }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AlertEdge {
+    pub(crate) ordinal: u64,
+    pub(crate) board: crate::alert_conditions::BoardKey,
+    pub(crate) episode: Option<AlertEpisode>,
+    pub(crate) kind: AlertEdgeKind,
+    pub(crate) at_ms: u64,
+}
+const ALERT_EDGE_CAPACITY: usize = 64;
+struct AlertEdges {
+    next: u64,
+    entries: [Option<AlertEdge>; ALERT_EDGE_CAPACITY],
+    len: usize,
+    incomplete: bool,
+}
+impl Default for AlertEdges {
+    fn default() -> Self { Self { next: 0, entries: [None; ALERT_EDGE_CAPACITY], len: 0, incomplete: false } }
+}
+impl AlertEdges {
+    fn push(&mut self, board: Board, kind: AlertEdgeKind, episode: Option<AlertEpisode>, at_ms: u64, original_first_ms: Option<u64>) -> Option<AlertEpisode> {
+        let Some(next) = self.next.checked_add(1).filter(|value| *value != u64::MAX) else { self.incomplete = true; return None; };
+        self.next = next;
+        let episode = if kind == AlertEdgeKind::Raised { Some(AlertEpisode { ordinal: next, first_abort_ms: original_first_ms.unwrap_or(at_ms) }) } else { episode };
+        if let Some(key) = crate::alert_conditions::BoardKey::from_sender(board.sender_id()) {
+            if self.len < ALERT_EDGE_CAPACITY {
+                self.entries[self.len] = Some(AlertEdge { ordinal: next, board: key, episode, kind, at_ms });
+                self.len += 1;
+            } else { self.incomplete = true; }
+        } else { self.incomplete = true; }
+        episode
+    }
 }
 #[derive(Default)]
 struct Register {
     version: u64,
     abort_revision: u64,
     stop_epochs: (u64, u64),
+    reset_policy_revision: u64,
     rows: [Record; 7],
     history_unknown: u8,
     history_enrolled: u8,
     history_frozen: bool,
+    alert_edges: AlertEdges,
 }
+/// Process-local scoped-reset selection context, never restored board proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResetContext {
+    policy_revision: u64,
+    episodes: [Option<AlertEpisode>; 7],
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutomaticAdmissionError { Busy, Changed, ActiveAbort, Unavailable }
+
 #[derive(Default)]
 pub(crate) struct Runtime {
     register: Mutex<Register>,
@@ -182,16 +235,22 @@ impl Runtime {
         let rows = std::array::from_fn(|i| Record {
             aborted: value.snapshot.actual_abort & (1 << i) != 0,
             first_abort_ms: value.snapshot.first_abort_ms[i],
-            pending_error: value.snapshot.actual_abort & (1 << i) != 0,
             last_abort: Some(at), last_local_abort: Some(at), abort_revision: 1,
             ..Default::default()
         });
+        let mut register = Register {
+            version: value.snapshot.revision.saturating_add(1), abort_revision: 1,
+            history_unknown: value.snapshot.unknown, history_enrolled: value.snapshot.enrolled,
+            rows, ..Default::default()
+        };
+        for (i, board) in BOARDS.into_iter().enumerate() {
+            if register.rows[i].aborted {
+                let first = register.rows[i].first_abort_ms;
+                register.rows[i].alert_episode = register.alert_edges.push(board, AlertEdgeKind::Raised, None, crate::telemetry_task::get_current_timestamp_ms(), Some(first));
+            }
+        }
         Self {
-            register: Mutex::new(Register {
-                version: value.snapshot.revision.saturating_add(1), abort_revision: 1,
-                history_unknown: value.snapshot.unknown, history_enrolled: value.snapshot.enrolled,
-                rows, ..Default::default()
-            }),
+            register: Mutex::new(register),
             abort_counter: AtomicU64::new(1), changed,
             history: Some(publisher), ..Default::default()
         }
@@ -226,6 +285,7 @@ impl Runtime {
         if !change() {
             return false;
         }
+        register.reset_policy_revision = register.reset_policy_revision.saturating_add(1);
         register.abort_revision = register.abort_revision.saturating_add(1);
         self.abort_counter
             .store(register.abort_revision, Ordering::Release);
@@ -234,9 +294,72 @@ impl Runtime {
         self.notify_changed();
         true
     }
+    pub(crate) fn capture_reset_context(
+        &self, policy: impl FnOnce() -> u8,
+    ) -> Result<(ResetContext, u8, u8), &'static str> {
+        let register = self.register.lock().unwrap();
+        if register.history_frozen || register.reset_policy_revision == u64::MAX {
+            return Err("Scoped reset policy is closed or exhausted");
+        }
+        if register.rows.iter().any(|row| row.aborted && row.alert_episode.is_none()) {
+            return Err("Scoped reset cannot identify an active Abort episode");
+        }
+        let context = ResetContext {
+            policy_revision: register.reset_policy_revision,
+            episodes: std::array::from_fn(|i| register.rows[i].alert_episode),
+        };
+        let actual = register.rows.iter().enumerate().fold(0, |mask,(i,row)|
+            mask | if row.aborted {1 << i} else {0});
+        Ok((context, policy(), actual))
+    }
+    /// Final RAM-only publication fence. No lock acquisition, SDK, filesystem, await or GSE work
+    /// may be introduced by this callback. Final lock order: DGate→preacquired RAM owners→Stop→board.try.
+    pub(crate) fn with_reset_context<T>(
+        &self, expected: ResetContext, apply: impl FnOnce() -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        let register = self.register.try_lock().map_err(|_| "Reset policy owner busy")?;
+        if register.history_frozen || register.reset_policy_revision == u64::MAX
+            || expected.policy_revision != register.reset_policy_revision
+            || expected.episodes != std::array::from_fn(|i| register.rows[i].alert_episode)
+            || register.rows.iter().any(|row| row.aborted && row.alert_episode.is_none()) {
+            return Err("Scoped reset policy or Abort episode changed; prepare a new intent");
+        }
+        apply()
+    }
     pub(crate) fn abort_revision(&self) -> u64 {
         self.abort_counter.load(Ordering::Acquire)
     }
+    /// Same authoritative register as Launch admission and actual ingress.
+    /// This is NOT the Launch readiness/retraction policy: only known Abort,
+    /// original revision and shutdown/frozen lifetime gate automatic metadata.
+    /// Unknown history/freshness still belongs to the separate Launch interlock.
+    pub(crate) fn automatic_revision_current(&self, revision: u64) -> bool {
+        self.try_admit_automatic_prelaunch(revision, || ()).is_ok()
+    }
+    /// Final lock order: Dispatch -> preacquired RAM owners -> original Stop
+    /// scopes -> this register.try -> SDK.try. Never wait on the register.
+    /// The caller prebuilds all work; callback is SDK admission + infallible
+    /// scalar assignments only, no provider/FS/user callback/retirement.
+    pub(crate) fn try_admit_automatic_prelaunch<T>(
+        &self, revision: u64, admit: impl FnOnce() -> T,
+    ) -> Result<T, AutomaticAdmissionError> {
+        let register = self.register.try_lock().map_err(|_| AutomaticAdmissionError::Busy)?;
+        if register.history_frozen || register.abort_revision == u64::MAX {
+            return Err(AutomaticAdmissionError::Unavailable);
+        }
+        if register.abort_revision != revision {
+            return Err(AutomaticAdmissionError::Changed);
+        }
+        if register.rows.iter().any(|row| row.aborted) {
+            return Err(AutomaticAdmissionError::ActiveAbort);
+        }
+        let result = admit();
+        // Explicitly retain the exact ingress/revision owner through BOTH SDK
+        // transfer and host/model scalar commit. No unlocked-counter shortcut.
+        drop(register);
+        Ok(result)
+    }
+
     pub(crate) fn query_revision(&self, board: Board) -> u64 {
         index(board).map_or(u64::MAX, |i| {
             self.register.lock().unwrap().rows[i].abort_revision
@@ -256,11 +379,14 @@ impl Runtime {
         row.last_abort = Some(received);
         row.last_local_abort = Some(received);
         row.proof_after = None;
-        if !row.aborted {
-            row.first_abort_ms = timestamp_ms;
-            row.pending_error = true;
-        }
+        let raised = !row.aborted;
+        if raised { row.first_abort_ms = timestamp_ms; }
         row.aborted = true;
+        row.accepted_non_abort = false;
+        if raised {
+            let episode = register.alert_edges.push(board, AlertEdgeKind::Raised, None, timestamp_ms, None);
+            register.rows[i].alert_episode = episode;
+        }
         drop(register);
         self.notify_changed();
     }
@@ -298,11 +424,15 @@ impl Runtime {
             && row.abort_revision != u64::MAX
             && row.last_abort.is_none_or(|at| query_after > at)
         {
+            let publish_exit = !row.accepted_non_abort;
+            let episode = row.alert_episode;
+            row.accepted_non_abort = true;
             row.aborted = false;
             row.proof_after = Some(query_after);
             row.proof_boot = boot;
             row.proof_epoch = epoch;
             row.proof_nonce = nonce;
+            if publish_exit { register.alert_edges.push(board, AlertEdgeKind::AcceptedExit, episode, timestamp_ms, None); }
             register.history_unknown &= !(1 << i);
         }
         register.version = register.version.saturating_add(1);
@@ -337,6 +467,8 @@ impl Runtime {
         let mut changed = false;
         for (i, age) in ages.iter().enumerate() {
             let mut clear_unknown = false;
+            let mut raised = None;
+            let mut exited = None;
             if active & (1 << i) != 0 { register.history_enrolled |= 1 << i; }
             let row = &mut register.rows[i];
             if active & (1 << i) != 0 {
@@ -345,8 +477,9 @@ impl Runtime {
                     row.last_abort = Some(now);
                     row.abort_revision = row.abort_revision.saturating_add(1);
                     row.first_abort_ms = crate::telemetry_task::get_current_timestamp_ms();
-                    row.pending_error = true;
+                    raised = Some(row.first_abort_ms);
                     row.proof_after = None;
+                    row.accepted_non_abort = false;
                     changed = true;
                 }
             } else if proven & (1 << i) != 0 && *age != u16::MAX {
@@ -355,11 +488,18 @@ impl Runtime {
                     && let Some(after) = now.checked_sub(Duration::from_millis(age))
                         && row.last_local_abort.is_none_or(|abort| after > abort) {
                             changed |= row.aborted;
+                            if !row.accepted_non_abort { exited = Some(row.alert_episode); }
+                            row.accepted_non_abort = true;
                             row.aborted = false;
                             row.proof_after = Some(after);
                             clear_unknown = true;
                         }
             }
+            if let Some(first) = raised {
+                let episode = register.alert_edges.push(BOARDS[i], AlertEdgeKind::Raised, None, first, None);
+                register.rows[i].alert_episode = episode;
+            }
+            if let Some(episode) = exited { register.alert_edges.push(BOARDS[i], AlertEdgeKind::AcceptedExit, episode, crate::telemetry_task::get_current_timestamp_ms(), None); }
             if clear_unknown { changed |= register.history_unknown & (1 << i) != 0; register.history_unknown &= !(1 << i); }
         }
         if changed {
@@ -466,17 +606,13 @@ impl Runtime {
         }
         out
     }
-    pub(crate) fn take_error_events(&self) -> Vec<(Board, u64)> {
+    pub(crate) fn take_alert_edges(&self) -> ([Option<AlertEdge>; ALERT_EDGE_CAPACITY], bool) {
         let mut register = self.register.lock().unwrap();
-        let mut result = Vec::new();
-        for (i, row) in register.rows.iter_mut().enumerate() {
-            if row.pending_error {
-                row.pending_error = false;
-                result.push((BOARDS[i], row.first_abort_ms));
-            }
-        }
-        result
+        let entries = std::mem::replace(&mut register.alert_edges.entries, [None; ALERT_EDGE_CAPACITY]);
+        register.alert_edges.len = 0;
+        (entries, register.alert_edges.incomplete)
     }
+
 }
 pub(crate) fn required_unknown_mask(state: &AppState, unknown: u8) -> u8 {
     if crate::rrls::is_rrls() {
@@ -577,31 +713,10 @@ pub(crate) async fn publish_service(
         let snapshot = snapshot_for_state(&state);
         let _ = state.board_abort_tx.send(snapshot);
         state.broadcast_action_policy_snapshot();
-        for (board, first_abort_ms) in state.board_abort.take_error_events() {
-            let message = format!("{} reports Abort; new launch is disabled until a fresh actual exit report.", board.as_str());
-            if let (Some(key), Ok(at)) = (crate::alert_conditions::BoardKey::from_sender(board.sender_id()), i64::try_from(first_abort_ms)) {
-                crate::alert_condition_runtime::observe_error(&state,
-                    crate::alert_conditions::Key::BoardAbort(key), format!("{} reports Abort",board.as_str()),
-                    at, crate::telemetry_task::get_current_timestamp_ms() as i64, message);
-            } else {
-                // Preserve the existing visible event fallback for malformed
-                // source metadata; never invent an occurrence identity.
-                crate::web::emit_error(&state, message);
-            }
-        }
-        // Read the existing atomic actual-Abort/strong-proof masks. Neither an
-        // absent board nor an expired proof is evidence of recovery.
-        let (aborted,proven)=state.board_abort.masks();
-        for (index,board) in BOARDS.iter().enumerate() {
-            if let Some(key)=crate::alert_conditions::BoardKey::from_sender(board.sender_id()) {
-                let condition=if aborted&(1<<index)!=0 {Some(crate::alert_conditions::ConditionState::Active)}
-                    else if proven&(1<<index)!=0 {Some(crate::alert_conditions::ConditionState::Resolved)}else{None};
-                if let Some(condition)=condition {crate::alert_condition_runtime::observe(&state,
-                    crate::alert_conditions::Key::BoardAbort(key),condition,
-                    if condition==crate::alert_conditions::ConditionState::Resolved {format!("{} confirmed outside Abort",board.as_str())}else{format!("{} reports Abort",board.as_str())},
-                    crate::telemetry_task::get_current_timestamp_ms() as i64);}
-            }
-        }
+        let authority = state.alert_conditions.authority();
+        let (edges, incomplete) = state.board_abort.take_alert_edges();
+        crate::alert_condition_runtime::observe_board_abort_edges(&state, &authority, &edges, incomplete);
+
     }
 }
 /// One finite request batch per demand. No periodic seven-board polling or
@@ -684,3 +799,51 @@ pub(crate) async fn refresh_status(
     }
     (axum::http::StatusCode::ACCEPTED,axum::Json(serde_json::json!({"message":"Readiness check requested. Inspect fresh board states, then make a separate explicit Launch request. No Launch was sent.","snapshot":snapshot_for_state(&state)}))).into_response()
 }
+
+#[cfg(test)]
+mod reset_scope_context_tests {
+    use super::*;
+    #[test]
+    fn same_abort_episode_and_accepted_exit_preserve_original_selection_but_new_episode_does_not() {
+        let runtime = Runtime::default();
+        let (before, _, _) = runtime.capture_reset_context(|| 0x78).unwrap();
+        let at = Instant::now();
+        runtime.observe_abort(Board::RFBoard, at, 100);
+        assert!(runtime.with_reset_context(before, || Ok(())).is_err());
+        let (episode, required, actual) = runtime.capture_reset_context(|| 0x78).unwrap();
+        assert_eq!((required, actual), (0x78, 1));
+        runtime.observe_abort(Board::RFBoard, at + Duration::from_millis(1), 100);
+        assert!(runtime.with_reset_context(episode, || Ok(())).is_ok());
+        let query_at = at + Duration::from_millis(2);
+        runtime.observe_status(Board::RFBoard, 12, 2, 34, Some(0), false, true,
+            query_at, runtime.query_revision(Board::RFBoard), query_at, 101);
+        assert!(runtime.with_reset_context(episode, || Ok(())).is_ok());
+        // Same UTC is a distinct episode after actual accepted exit (ABA).
+        runtime.observe_abort(Board::RFBoard, at + Duration::from_millis(3), 100);
+        assert!(runtime.with_reset_context(episode, || Ok(())).is_err());
+    }
+    #[test]
+    fn policy_aba_exhaustion_and_unidentified_abort_cannot_authorize_scoped_reset() {
+        let runtime = Runtime::default();
+        let (context, _, _) = runtime.capture_reset_context(|| 0).unwrap();
+        assert!(runtime.change_launch_context_if(|| true));
+        assert!(runtime.change_launch_context_if(|| true));
+        assert!(runtime.with_reset_context(context, || Ok(())).is_err());
+        runtime.register.lock().unwrap().reset_policy_revision = u64::MAX;
+        assert!(runtime.capture_reset_context(|| panic!("exhausted policy callback ran")).is_err());
+        let runtime = Runtime::default();
+        runtime.register.lock().unwrap().rows[0].aborted = true;
+        assert!(runtime.capture_reset_context(|| 0).is_err());
+    }
+    #[test]
+    fn unknown_history_is_preserved_and_never_becomes_actual_abort_selection() {
+        let runtime = Runtime::default();
+        runtime.register.lock().unwrap().history_unknown = 0x7f;
+        let (_, required, actual) = runtime.capture_reset_context(|| 0x78).unwrap();
+        assert_eq!((required, actual), (0x78, 0));
+        assert_eq!(runtime.history_snapshot().unknown, 0x7f);
+    }
+}
+
+#[cfg(test)]
+mod automatic_admission_tests;

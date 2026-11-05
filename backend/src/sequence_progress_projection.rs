@@ -17,7 +17,10 @@ pub enum Cause {
     Reset,
 }
 #[derive(Clone, Debug)]
-#[expect(clippy::large_enum_variant, reason = "Bounded terminal evidence is captured into the fixed Copy stage; boxing would add heap allocation to owner-held capture paths") ]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Bounded terminal evidence is captured into the fixed Copy stage; boxing would add heap allocation to owner-held capture paths"
+)]
 pub enum TerminalProof {
     /// The caller supplies the actual successful persisted completion event ID.
     DurablePass {
@@ -59,6 +62,7 @@ fn title(kind: Kind) -> &'static str {
         Kind::NitrogenTest => "Nitrogen test",
         Kind::Fill => "Automatic fill",
         Kind::Turbocharge => "Turbocharge",
+        Kind::ColdFlow => "Auto Cold Flow",
         Kind::ContinueFillSequence => "Fill sequence",
         Kind::IgniterSequence => "Igniter sequence",
     }
@@ -159,6 +163,24 @@ fn plan(kind: Kind, nitrogen: &[NitrogenStep]) -> Result<Vec<Step>, Error> {
                 ("turbo-closing-nitrogen", "Confirm nitrogen output off"),
                 ("turbo-settling", "Verify settled mass and closed outputs"),
                 ("turbo-record", "Record verified inventory evidence"),
+            ] {
+                values.push(step(id.into(), label.into()));
+            }
+        }
+        Kind::ColdFlow => {
+            for (id, label) in [
+                ("cold-isolate", "Confirm all valves isolated"),
+                ("cold-pressure", "Pressurize with nitrogen"),
+                ("cold-hold", "Confirm nitrogen closed"),
+                ("cold-await", "Await operator Cold Flow release"),
+                ("cold-release", "Confirm PILOT/main output open"),
+                ("cold-flow", "Cold flow: awaiting operator cancel"),
+                (
+                    "cold-cancel-close",
+                    "Confirm supplies and PILOT/main closed",
+                ),
+                ("cold-relieve", "Confirm dump and vent relief outputs"),
+                ("cold-park", "Parking: owner barrier unverified"),
             ] {
                 values.push(step(id.into(), label.into()));
             }
@@ -315,6 +337,7 @@ impl Cursor {
             observed_age_ms: 0,
             valid_for_ms: 2000,
             cancel_allowed: kind.has_gse_safe_cancel(),
+            cold_flow_release_allowed: false,
             notification_id: None,
             notification_timestamp_ms: None,
             reporting_error: None,
@@ -530,40 +553,44 @@ impl Cursor {
         if self.turbo_phase != Some(turbo.phase)
             && let Some(before) = self.turbo_phase
         {
-                let normal = matches!(
-                    (before, turbo.phase),
-                    (
-                        TurboPhase::Closing,
-                        TurboPhase::OpeningNitrogen | TurboPhase::Settling
-                    ) | (
-                        TurboPhase::OpeningNitrogen,
-                        TurboPhase::Raising | TurboPhase::ClosingNitrogen
-                    ) | (TurboPhase::Raising, TurboPhase::ClosingNitrogen)
-                        | (TurboPhase::ClosingNitrogen, TurboPhase::Settling)
-                        | (TurboPhase::Settling, TurboPhase::Complete)
-                );
-                if normal
-                    && let Some(id) = turbo_step(before)
-                    && let Some(step) = self.snapshot.steps.iter_mut().find(|s| s.id == id)
-                {
-                    step.state = StepState::Passed;
-                }
-                if before == TurboPhase::Closing && turbo.phase == TurboPhase::Settling {
-                    for step in &mut self.snapshot.steps {
-                        if matches!(
-                            step.id.as_str(),
-                            "turbo-opening" | "turbo-raising" | "turbo-closing-nitrogen"
-                        ) {
-                            step.state = StepState::Skipped;
-                        }
+            let normal = matches!(
+                (before, turbo.phase),
+                (
+                    TurboPhase::Closing,
+                    TurboPhase::OpeningNitrogen | TurboPhase::Settling
+                ) | (
+                    TurboPhase::OpeningNitrogen,
+                    TurboPhase::Raising | TurboPhase::ClosingNitrogen
+                ) | (TurboPhase::Raising, TurboPhase::ClosingNitrogen)
+                    | (TurboPhase::ClosingNitrogen, TurboPhase::Settling)
+                    | (TurboPhase::Settling, TurboPhase::Complete)
+            );
+            if normal
+                && let Some(id) = turbo_step(before)
+                && let Some(step) = self.snapshot.steps.iter_mut().find(|s| s.id == id)
+            {
+                step.state = StepState::Passed;
+            }
+            if before == TurboPhase::Closing && turbo.phase == TurboPhase::Settling {
+                for step in &mut self.snapshot.steps {
+                    if matches!(
+                        step.id.as_str(),
+                        "turbo-opening" | "turbo-raising" | "turbo-closing-nitrogen"
+                    ) {
+                        step.state = StepState::Skipped;
                     }
                 }
-                if before == TurboPhase::OpeningNitrogen
-                    && turbo.phase == TurboPhase::ClosingNitrogen
-                    && let Some(step) = self.snapshot.steps.iter_mut().find(|s| s.id == "turbo-raising")
-                {
-                    step.state = StepState::Passed;
-                }
+            }
+            if before == TurboPhase::OpeningNitrogen
+                && turbo.phase == TurboPhase::ClosingNitrogen
+                && let Some(step) = self
+                    .snapshot
+                    .steps
+                    .iter_mut()
+                    .find(|s| s.id == "turbo-raising")
+            {
+                step.state = StepState::Passed;
+            }
         }
         self.turbo_phase = Some(turbo.phase);
         view.nitrogen_absolute_target_psi = Some(turbo.pressure_target_psi);
@@ -656,27 +683,28 @@ impl Cursor {
                 .into(),
             ));
             self.control_step = Some(id);
-        } else if cause == Cause::Tick && self.previous.phase != view.phase
+        } else if cause == Cause::Tick
+            && self.previous.phase != view.phase
             && let Some(id) = &self.snapshot.current_step
             && let Some(step) = self.snapshot.steps.iter_mut().find(|s| &s.id == id)
         {
-                if view.phase == Phase::Fault {
-                    step.state = StepState::Failed;
-                } else if completed_edge(self.previous, view)
-                    && !matches!(step.id.as_str(), "fill-record" | "turbo-record")
-                {
-                    step.state = StepState::Passed;
-                }
+            if view.phase == Phase::Fault {
+                step.state = StepState::Failed;
+            } else if completed_edge(self.previous, view)
+                && !matches!(step.id.as_str(), "fill-record" | "turbo-record")
+            {
+                step.state = StepState::Passed;
+            }
         }
         if matches!(cause, Cause::Fault | Cause::Reset)
             && let Some(id) = &self.snapshot.current_step
             && let Some(step) = self.snapshot.steps.iter_mut().find(|s| &s.id == id)
         {
-                step.state = if cause == Cause::Fault {
-                    StepState::Failed
-                } else {
-                    StepState::Unknown
-                };
+            step.state = if cause == Cause::Fault {
+                StepState::Failed
+            } else {
+                StepState::Unknown
+            };
         }
         self.previous = view;
         if cause == Cause::Reset {
@@ -702,6 +730,119 @@ impl Cursor {
             self.finish_steps();
         }
         self.present(view)?;
+        self.snapshot.validate()?;
+        Ok(&self.snapshot)
+    }
+    pub fn observe_cold_flow(
+        &mut self,
+        cold: gse_sequence::cold_flow::Observation,
+        view: ProgressObservation,
+    ) -> Result<&Snapshot, Error> {
+        use gse_sequence::cold_flow::Phase as C;
+        if self.snapshot.kind != Kind::ColdFlow || self.snapshot.outcome.terminal() {
+            return Err(Error::Invalid);
+        }
+        let index = match cold.phase {
+            C::Isolating => 0,
+            C::Pressurizing => 1,
+            C::ConfirmingHold => 2,
+            C::AwaitingRelease => 3,
+            C::Releasing => 4,
+            C::Flowing => 5,
+            C::CancelClosing => 6,
+            C::CancelRelieving | C::Cancelled => 7,
+            C::PauseClosing | C::ParkedUnverified => 8,
+        };
+        let previous = self.snapshot.current_step.clone();
+        let id = self.snapshot.steps[index].id.clone();
+        if previous.as_ref() != Some(&id)
+            && let Some(old) = previous
+                .as_ref()
+                .and_then(|id| self.snapshot.steps.iter_mut().find(|s| &s.id == id))
+        {
+            old.state = if index == 8 {
+                StepState::Unknown
+            } else if index >= 6 {
+                StepState::Skipped
+            } else {
+                StepState::Passed
+            };
+        }
+        self.snapshot.current_step = Some(id);
+        self.snapshot.next_step = self.snapshot.steps.get(index + 1).map(|s| s.id.clone());
+        self.snapshot.steps[index].state = StepState::Watching;
+        let fresh_pressure = view.fresh_pressure_psi.filter(|v| v.is_finite());
+        let mut watches = vec![Watch {
+            id: "cold-pressure".into(),
+            label: "Tank pressure".into(),
+            target: Some(Value::Number(f64::from(cold.target_psi))),
+            observed: fresh_pressure.map(|v| Value::Number(f64::from(v))),
+            unit: Some("psi".into()),
+            age_ms: view.pressure_age_ms,
+            valid_for_ms: 2000,
+            evidence: if fresh_pressure.is_some() {
+                Evidence::Measured
+            } else {
+                Evidence::Unknown
+            },
+        }];
+        for (i, label) in ["PILOT/main", "Vent", "Dump", "Nitrogen", "Nitrous"]
+            .into_iter()
+            .enumerate()
+        {
+            let v = view.valves[i];
+            watches.push(Watch {
+                id: format!("cold-valve-{i}"),
+                label: label.into(),
+                target: Some(Value::Boolean(cold.desired[i])),
+                observed: v.fresh_readback_open.map(Value::Boolean),
+                unit: None,
+                age_ms: v.readback_age_ms,
+                valid_for_ms: 2000,
+                evidence: if v.fresh_readback_open.is_some() {
+                    Evidence::BoardReported
+                } else {
+                    Evidence::Unknown
+                },
+            });
+        }
+        self.snapshot.steps[index].watch = watches;
+        self.snapshot.outcome = if cold.phase == C::Cancelled {
+            Outcome::Cancelled
+        } else if matches!(cold.phase, C::CancelClosing | C::CancelRelieving) {
+            Outcome::Cancelling
+        } else {
+            Outcome::Running
+        };
+        self.snapshot.cancel_allowed = !matches!(
+            cold.phase,
+            C::CancelClosing | C::CancelRelieving | C::Cancelled
+        );
+        self.snapshot.cold_flow_release_allowed = cold.phase == C::AwaitingRelease
+            && view
+                .fresh_pressure_psi
+                .is_some_and(|p| p.is_finite() && p < cold.ceiling_psi)
+            && view
+                .valves
+                .iter()
+                .all(|v| v.fresh_readback_open == Some(false));
+        self.snapshot.message=match cold.phase{C::AwaitingRelease=>"Isolated hold. Explicit Cold Flow release required; no ignition or countdown.",C::Flowing=>"PILOT/main output reported open. Flow is not measured; cancel to close and relieve through dump/vent.",C::PauseClosing|C::ParkedUnverified=>"Parking requested. Shared owner barrier unavailable: hardware pause and resume are unverified.",C::Cancelled=>"Supplies and PILOT/main reported closed; dump and vent reported open.",C::CancelClosing=>"Closing nitrogen, nitrous and PILOT/main before relief.",C::CancelRelieving=>"Supply and PILOT/main closure verified; confirming dump and vent.",_=>"Cold-flow sequence awaiting current pressure and valve readbacks."}.into();
+        if cold.issue.is_some() && !self.snapshot.outcome.terminal() {
+            self.snapshot.message.push_str(" A safety/readback condition requires attention; requested outputs are not completion proof.");
+        }
+        if self.snapshot.outcome.terminal() {
+            if cold.pending_mask != 0
+                || cold.waiting.is_some()
+                || (0..5).any(|i| view.valves[i].fresh_readback_open != Some(cold.desired[i]))
+            {
+                return Err(Error::Invalid);
+            }
+            self.snapshot.steps[index].state = StepState::Passed;
+            self.snapshot.current_step = None;
+            self.snapshot.next_step = None;
+            self.finish_steps();
+        }
+        self.snapshot.revision = self.snapshot.revision.checked_add(1).ok_or(Error::Bounds)?;
         self.snapshot.validate()?;
         Ok(&self.snapshot)
     }
@@ -754,6 +895,7 @@ impl Cursor {
                 Phase::FillSetup | Phase::Filling | Phase::Paused
             ),
             Kind::Turbocharge => matches!(view.phase, Phase::Turbocharge | Phase::Paused),
+            Kind::ColdFlow => false,
             _ => false,
         } && !self.snapshot.outcome.terminal();
     }
@@ -931,6 +1073,7 @@ mod tests {
         let mut engine = Engine::default();
         engine.config = Config {
             dry_self_test_confirmed: true,
+            nitrogen_target_psi: 120.0, // Preserve this low-pressure test fixture.
             pressure_ceiling_psi: Some(200.),
             maximum_zero_offset_psi: Some(8.),
             ..Config::default()
@@ -1313,6 +1456,7 @@ mod tests {
         use gse_sequence::{Baseline, fill_trim::Controller};
         let mut engine = Engine::default();
         engine.config = Config {
+            nitrogen_target_psi: 120.0, // Preserve this low-pressure test fixture.
             pressure_ceiling_psi: Some(200.),
             maximum_zero_offset_psi: Some(8.),
             fill_settle_ms: 1000,
@@ -1510,6 +1654,7 @@ mod tests {
     #[test]
     fn real_pause_resume_keeps_run_identity_and_requires_new_configuration_evidence() {
         let mut engine = Engine::default();
+        engine.config.nitrogen_target_psi = 120.0; // Preserve this low-pressure test fixture.
         engine.config.pressure_ceiling_psi = Some(200.);
         engine.config.maximum_zero_offset_psi = Some(8.);
         engine.nitrous_target_psi = 100.;

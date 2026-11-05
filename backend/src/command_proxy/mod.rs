@@ -1,6 +1,7 @@
 //! Primary-owned control from an authenticated recovery station.
 //! Local RRLS hardware execution remains denied, including when offline.
 pub(crate) mod recovery;
+pub(crate) mod retained_config;
 mod wire;
 // Staged coordinator seam; this module does not authorize reset completion.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -827,6 +828,9 @@ async fn execute_primary_inner(
             .is_some_and(|view| view.accepts(&request.envelope, true))
             && matches!(request.envelope.message,Message::Request{mode,..} if mode==crate::station_mode::local_mode())
     }
+    let fill_captured =
+        matches!(&request.operation, Operation::Command(name) if name == "StartFill")
+            .then(|| crate::fill_recording::Captured::capture(&state));
     // Preserve the signed remote source time and snapshot the local mode revision
     // before actor/config authentication can wait across a drive change.
     let plumbing_origin = request
@@ -873,6 +877,39 @@ async fn execute_primary_inner(
                 serde_json::Value::String(name.clone()),
             ) else {
                 return Outcome::Invalid;
+            };
+            let command = if let Some(captured) = fill_captured {
+                let initial = request.clone();
+                let accepted = request.clone();
+                let authority = crate::fill_recording::Authority::Proxy {
+                    actor: request.actor.clone(),
+                    admission_current: Arc::new(move || {
+                        live(&initial)
+                            && initial
+                                .admission
+                                .request_allowed(initial.envelope.boot, false)
+                    }),
+                    session_current: Arc::new(move || {
+                        if !accepted
+                            .admission
+                            .request_allowed(accepted.envelope.boot, false)
+                        {
+                            return false;
+                        }
+                        let Some(mesh) = crate::rrls::settings_transport() else {
+                            return false;
+                        };
+                        let mesh = mesh.lock().unwrap();
+                        mesh.command_proxy_transport(mesh.now())
+                            .is_some_and(|view| view.session == accepted.envelope.session)
+                            && matches!(accepted.envelope.message, Message::Request { mode, .. } if mode == crate::station_mode::local_mode())
+                    }),
+                };
+                crate::types::TelemetryCommand::FillWithRecording {
+                    origin: captured.bind(authority, Some(&principal)),
+                }
+            } else {
+                command
             };
             if name == "RetractPlumbing" {
                 crate::web::dispatch_proxied_command_with_origin(
@@ -1328,6 +1365,7 @@ fn accept_presentation(
     accepted
 }
 fn invalidate_presentation(state: &crate::state::AppState) {
+    retained_config::disconnected();
     crate::primary_mirror::invalidate_control_observation();
     if crate::rrls::is_rrls() {
         state.broadcast_action_policy_snapshot();
@@ -1346,6 +1384,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
             return None;
         }
     };
+    let pairing = Arc::new(pairing);
     let Some(mesh) = crate::rrls::settings_transport() else {
         let mut broker = broker().lock().unwrap();
         broker.status.paired = true;
@@ -1376,6 +1415,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
     }
     let mut shutdown = state.shutdown_subscribe();
     Some(tokio::spawn(async move {
+        let mut retained = if role == Role::Rrls { Some(retained_config::Worker::open(pairing.clone())) } else { None };
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(20));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut outbox = VecDeque::<([u8; 16], Vec<u8>)>::new();
@@ -1392,6 +1432,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
 
         loop {
             tokio::select! {_=shutdown.recv()=>break,_=tick.tick()=>{}}
+            if let Some(retained) = &mut retained {retained.service().await;}
             let (now, view, frames) = {
                 let mut mesh = mesh.lock().unwrap();
                 let now = mesh.now();
@@ -1453,6 +1494,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                     "Primary disconnected; standalone hardware authority is unavailable.".into();
                 continue;
             };
+            let received_at = std::time::Instant::now();
             for bytes in frames {
                 if role == Role::Primary {
                     runtime.observation =
@@ -1501,6 +1543,17 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                                 elapsed_upper_bound(now, created),
                                 boot,
                                 view.session,
+                            );
+                        }
+                        if let Some(created) = query_created_at
+                            && let Some(retained) = &mut retained
+                        {
+                            retained.accepted_at(
+                                mode,
+                                boot,
+                                &observation,
+                                elapsed_upper_bound(now, created),
+                                received_at,
                             );
                         }
                         debug_assert_ne!(boot, [0; 16]);
@@ -1556,6 +1609,21 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                                 boot,
                                 view.session,
                             );
+                            // Live observation is stamped BEFORE any persistence await:
+                            // slow disk must never freshen proof/source authority.
+                            // Mode comes only from this exact accepted capability boot.
+                            if let Some((capability_boot, mode, _)) = runtime.capability
+                                && capability_boot == boot
+                                && let Some(retained) = &mut retained
+                            {
+                                retained.accepted_at(
+                                    mode,
+                                    boot,
+                                    &observation,
+                                    elapsed_upper_bound(now, created),
+                                    received_at,
+                                );
+                            }
                             match outcome {
                                 Outcome::Queued => {
                                     finish_pending(request, "accepted_by_primary", true, None)
@@ -1795,6 +1863,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                 Some("Station shut down before primary confirmation.".into()),
             );
         }
+        if let Some(retained) = retained {retained.shutdown().await;}
     }))
 }
 

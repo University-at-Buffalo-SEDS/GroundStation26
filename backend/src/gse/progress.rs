@@ -53,6 +53,7 @@ impl Runtime {
             return;
         }
 
+        if super::cold_flow::runtime_active(self){return;}
         let view = self.engine.progress_observation(input);
         if view.phase == Phase::Fault {
             self.progress_failed_current();
@@ -89,7 +90,7 @@ impl Runtime {
         );
     }
 
-    fn presentation_now(&self, simulation: Option<u64>) -> u64 {
+    pub(super) fn presentation_now(&self, simulation: Option<u64>) -> u64 {
         #[cfg(test)]
         if let Some(now) = self.test_now_ms {
             return now;
@@ -312,6 +313,8 @@ async fn cancel(
     if let Err(error) = require_primary_operational_station() {
         return error.into_response();
     }
+    if super::cold_flow::owns_run(&state,&key){return super::cold_flow::cancel_authenticated(&state,key,requested);}
+
     let Some(_claim) = claim_operator_dispatch(&state, requested.generation) else {
         return StatusCode::CONFLICT.into_response();
     };
@@ -405,6 +408,7 @@ pub(crate) fn stream_observation(state: &AppState) -> gse_sequence::ProgressObse
             value.target_open = target;
         }
     }
+    if let Some(desired)=super::cold_flow::desired(&rt) {for(i,v)in view.valves.iter_mut().enumerate(){v.target_open=desired[i];}}
     view
 }
 
@@ -423,14 +427,11 @@ pub(crate) fn verified_reset_marker(
 /// Reporting-only staging at the existing final Reset linearization point.
 /// A changed owner/revision is NEVER attributed to the captured old run.
 pub(crate) fn capture_verified_reset_under_gate(
-    state: &AppState,
+    rt: &mut Runtime,
     marker: Option<crate::sequence_progress_stage::Marker>,
+    at_ms: u64,
 ) {
-    if let Ok(mut rt) = state.gse.lock()
-        && rt.progress.interrupt_if_current(marker, crate::sequence_progress_service::now_ms())
-    {
-        rt.progress_admission = None;
-    }
+    if rt.progress.interrupt_if_current(marker, at_ms) { rt.progress_admission = None; }
 }
 pub(crate) fn publish_verified_reset_after_guards(state: &AppState) {
     flush(state);

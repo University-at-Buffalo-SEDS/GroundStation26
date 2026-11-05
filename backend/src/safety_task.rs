@@ -289,6 +289,12 @@ pub async fn safety_task(
             }
         }
 
+        // This original finite owner precedes every status/layout/provider wait.
+        // Losing eligibility affects only automatic publication, never health
+        // observation or independent manual/automatic emergency supervision.
+        let automatic_observation = crate::automatic_flight_state::Observation::begin(&state);
+        #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
+        crate::normal_publication_probe::n6_record(&state, match automatic_observation.as_ref() { None => 0, Some(o) if o.captured().is_none() => 1, Some(_) => 2 });
         let current_state = { *state.state.lock().unwrap() };
         let on_ground = matches!(
             current_state,
@@ -444,7 +450,13 @@ pub async fn safety_task(
             && !cfg!(feature = "hitl_mode")
             && !cfg!(feature = "test_fire_mode")
             && *state.state.lock().unwrap() == FlightState::Startup {
-                state.set_local_flight_state(FlightState::Idle);
+                #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
+                crate::normal_publication_probe::point(&state, crate::normal_publication_probe::Site::SafetyReady, current_state as u8).await;
+                if let Some(original) = automatic_observation.as_ref().and_then(|o| o.captured())
+                    && original.expected == current_state
+                    && let Some(proposal) = original.proposal(FlightState::Idle, crate::automatic_flight_state::Cause::Readiness) {
+                    crate::automatic_flight_state::publish(&state, proposal);
+                }
             }
 
         let last_packet_ms = state.last_packet_received_ms();

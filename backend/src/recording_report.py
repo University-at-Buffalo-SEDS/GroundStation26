@@ -302,6 +302,25 @@ def data_kind(key):
     return "recorded_unclassified"
 
 
+def recorded_diagnostic_info(key, request, samples):
+    sender, kind, index = json.loads(key)
+    if not kind.startswith("REC_") or not samples:
+        return None
+    versions = request.get("_recorded_diagnostic_versions", {})
+    if not all(versions.get(json.dumps([rec, row_id])) == 1 for _, _, _, rec, row_id in samples):
+        return None
+    schema = request.get("recording_diagnostic_streams", {})
+    if schema.get("version") != 1:
+        return None
+    stream = next((s for s in schema.get("streams", []) if s.get("data_type") == kind), None)
+    if not stream or not 0 <= index < len(stream.get("channels", [])):
+        return None
+    units = stream.get("units", [])
+    unit = units[index] if index < len(units) else stream.get("unit")
+    return {"channel_label": stream["channels"][index], "unit": unit,
+            "unit_source": "recorded_diagnostic_schema_v1", "precision": "counter CSV integers exact; graph projections approximate"}
+
+
 def channel_info(key, request, provenance=None, samples=None):
     sender, kind, index = json.loads(key)
     entries = [entry for entry in request.get("channel_metadata", [])
@@ -315,10 +334,11 @@ def channel_info(key, request, provenance=None, samples=None):
         if origin.get("origin")=="sd" and isinstance(origin.get("mapping",{}).get("units"),str):
             recorded_units.add(origin["mapping"]["units"])
     chosen_units=recorded_units or units
+    diagnostic = recorded_diagnostic_info(key, request, samples)
     return {"sender": sender, "data_type": kind, "index": index,
             "unit": next(iter(chosen_units)) if len(chosen_units) == 1 else None,
             "unit_source": ("recorded_sd_manifest" if recorded_units else "export_station_layout") if len(chosen_units) == 1 else "unknown",
-            "value_kind": data_kind(key)}
+            "value_kind": data_kind(key), **(diagnostic or {})}
 
 
 def export_daq(streams, metadata, request, delimiter=",", provenance=None, all_streams=None):
@@ -473,11 +493,23 @@ def export_pdf(streams, regressions, provenance=None):
 
 def run(request):
     rows, history, provenance = read_rows(request)
+    request = dict(request)
+    versions = {}
+    for rec, row_id, received, source, sender, kind, values, payload in rows:
+        if kind.startswith("REC_"):
+            try:
+                decoded = json.loads(payload or "null")
+                context = decoded.get("context", decoded)
+                versions[json.dumps([rec, row_id])] = context.get("version")
+            except (TypeError, ValueError, AttributeError):
+                pass
+    request["_recorded_diagnostic_versions"] = versions
     all_streams = channels(rows)
     streams = selected_streams(request, all_streams)
     metadata = {key: regression(key, samples, all_streams, history) for key, samples in streams.items()}
     for key, info in metadata.items():
         _,kind,index=json.loads(key)
+        info.update(recorded_diagnostic_info(key, request, streams[key]) or {})
         if kind=="VALVE_STATE":
             mapping=next((m for m in request.get("valve_mappings",[]) if isinstance(m,dict) and m.get("index")==index),{})
             info["channel_label"]=mapping.get("label") or channel_label(key)

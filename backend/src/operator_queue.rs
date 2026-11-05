@@ -102,6 +102,14 @@ pub(crate) fn serve(
 /// process-global environment while unrelated tests run.
 #[cfg(test)]
 pub(crate) fn isolated_case(module: &str, name: &str) -> bool {
+    isolated_case_inner(module, name, false)
+}
+#[cfg(all(test, any(feature = "hitl_mode", feature = "firmware_sim")))]
+pub(crate) fn isolated_case_with_capture_clock(module: &str, name: &str) -> bool {
+    isolated_case_inner(module, name, true)
+}
+#[cfg(test)]
+fn isolated_case_inner(module: &str, name: &str, capture_clock: bool) -> bool {
     let module = module.split_once("::").map_or(module, |(_, path)| path);
     let case = format!("{module}::{name}");
     if std::env::var("GS_RECOVERY_ISOLATED_CASE").as_deref() == Ok(case.as_str()) {
@@ -188,6 +196,11 @@ pub(crate) fn isolated_case(module: &str, name: &str) -> bool {
         ("GS_ZERO_CAPTURE_DIR", "zero-captures"),
     ] {
         command.env(key, directory.join(path));
+    }
+    if capture_clock {
+        let clock = directory.join("capture-clock");
+        std::fs::write(&clock, "100000").unwrap();
+        command.env("GS_SIM_CLOCK_FILE", clock).env("GS_SIM_NETWORK_EPOCH_MS", "1767225600000");
     }
     let output = command.output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -434,12 +447,16 @@ mod tests {
         assert!(result.is_err());
     }
     #[tokio::test]
-    async fn fresh_open_callbacks_keep_existing_success_and_claims_retire() {
+    async fn fresh_open_callbacks_keep_success_but_unowned_zero_is_inert() {
         let state = crate::state::tests::test_app_state().await;
         let generation = crate::gse::automatic_generation(&state);
         *state.latest_fill_mass_kg.lock().unwrap() = Some(12.0);
+        assert!(state.fill_recording.continuation.lock().unwrap().is_none());
         crate::gse::start_fill_after_automatic_zero(&state, generation);
-        assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(0.0));
+        // A generation alone cannot create the accepted recording/zero owner.
+        // Actual owned >=5s/<7s completion is exercised in fill_recording tests.
+        assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(12.0));
+        assert!(state.fill_recording.continuation.lock().unwrap().is_none());
         assert!(
             crate::gse::queue_automatic_supply_close(&state, &router(), 12, generation).unwrap()
         );

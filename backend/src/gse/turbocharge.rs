@@ -86,6 +86,41 @@ fn route_binding(state: &AppState) -> Vec<(String, Vec<String>)> {
     routes.sort();
     routes
 }
+/// Preserve every original serialized field/order. Only the newly added inert
+/// Cold Flow preference is outside the existing Turbocharge evidence context.
+pub(super) fn config_for_binding(config: &Config) -> serde_json::Value {
+    let value = serde_json::json!(config);
+    let object = value.as_object().unwrap();
+    let mut filtered = serde_json::Map::new();
+    for (key, value) in object {
+        if key != "cold_flow_target_psi" {
+            filtered.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::Value::Object(filtered)
+}
+pub(super) fn only_cold_target_changed(a: &Config, b: &Config) -> bool {
+    a.cold_flow_target_psi != b.cold_flow_target_psi
+        && a.nitrogen_target_psi == b.nitrogen_target_psi
+        && a.nitrogen_steps == b.nitrogen_steps
+        && a.fill_overfill_kg == b.fill_overfill_kg
+        && a.fill_tolerance_kg == b.fill_tolerance_kg
+        && a.fill_settle_ms == b.fill_settle_ms
+        && a.turbocharge_max_added_mass_kg == b.turbocharge_max_added_mass_kg
+        && a.pressure_step_psi == b.pressure_step_psi
+        && a.pressure_ceiling_psi == b.pressure_ceiling_psi
+        && a.maximum_zero_offset_psi == b.maximum_zero_offset_psi
+        && a.dry_self_test_confirmed == b.dry_self_test_confirmed
+        && a.grouped_panel == b.grouped_panel
+}
+/// Existing context comparison, used only by inactive configuration saving.
+/// Calibration/targets/routes/capture epochs and qualification generation all
+/// remain bound; an inert preference cannot preserve an already-invalid context.
+pub(super) fn evidence_context_current(state: &AppState, rt: &Runtime) -> bool {
+    rt.turbo_evidence
+        .as_ref()
+        .is_none_or(|e| e.valid() && e.context == context(state, rt))
+}
 fn capture_binding(
     state: &AppState,
     rt: &Runtime,
@@ -102,9 +137,13 @@ fn capture_binding(
         *state.state.lock().unwrap(),
     );
     let signature = mass_calibration_signature(&calibration);
-    let binding = serde_json::json!({"config":rt.engine.config,"targets":targets,"calibration":calibration,
+    let binding = serde_json::json!({"config":config_for_binding(&rt.engine.config),"targets":targets,"calibration":calibration,
         "pressure_source":"VB/FUEL_TANK_PRESSURE/firmware_psi","pressure_capture_epoch":rt.valve_pressure_epoch,"mass_capture_epoch":rt.mass_source_epoch,"routes":route_binding(state)});
     (binding, signature, targets)
+}
+#[cfg(test)]
+pub(super) fn fixture_context(state: &AppState, rt: &Runtime) -> Context {
+    context(state, rt)
 }
 fn context(state: &AppState, rt: &Runtime) -> Context {
     context_from_binding(state, rt, &capture_binding(state, rt).0)
@@ -213,7 +252,7 @@ pub(super) fn allowed(state: &AppState, rt: &Runtime, original: Inputs) -> bool 
     .is_ok()
 }
 pub(super) fn request(state: &Arc<AppState>) {
-    let progress_reserved=super::progress::reserve(state);
+    let progress_reserved = super::progress::reserve(state);
     let policy = state.action_policy_snapshot();
     let result = (|| -> Result<Effects, String> {
         let mut rt = state.gse.lock().unwrap();
@@ -226,8 +265,8 @@ pub(super) fn request(state: &Arc<AppState>) {
             return Err("Fresh mass must use the captured current calibration".into());
         }
         let target = targets.nitrous;
-        let reporting_input=input(&rt,original);
-        let reporting_mass=rt.fresh_mass(original.now_ms);
+        let reporting_input = input(&rt, original);
+        let reporting_mass = rt.fresh_mass(original.now_ms);
         let (controller, effects) = Controller::start_with_inventory(
             &rt.engine.config,
             target.target_mass_kg,
@@ -250,16 +289,27 @@ pub(super) fn request(state: &Arc<AppState>) {
                 .map_err(str::to_string)?;
             rt.operational.persist()?;
         }
-        let reporting_controller=controller.progress_observation();
+        let reporting_controller = controller.progress_observation();
         rt.turbocharge = Some(controller);
         rt.engine.manual_override();
         rt.engine.claimed = true;
         rt.engine.status.phase = Phase::Turbocharge;
         rt.engine.status.current_step_psi = target.target_pressure_psi;
         rt.engine.status.message = "Turbocharge: confirming all five valves closed".into();
-        rt.progress_start(progress_reserved,crate::sequence_progress::Kind::Turbocharge,original);
-        let reporting_view=rt.engine.progress_observation(reporting_input);
-        rt.progress.observe_turbo(reporting_controller,reporting_view,reporting_mass,reporting_input.now_ms,None,crate::sequence_progress_service::now_ms());
+        rt.progress_start(
+            progress_reserved,
+            crate::sequence_progress::Kind::Turbocharge,
+            original,
+        );
+        let reporting_view = rt.engine.progress_observation(reporting_input);
+        rt.progress.observe_turbo(
+            reporting_controller,
+            reporting_view,
+            reporting_mass,
+            reporting_input.now_ms,
+            None,
+            crate::sequence_progress_service::now_ms(),
+        );
         Ok(effects)
     })();
     match result {
@@ -361,8 +411,13 @@ pub(super) fn pressure_cutoff(rt: &mut Runtime, input: Inputs) -> Option<Effects
     {
         rt.operational.target_reached = None;
     }
-    let effects=rt.engine.request(Action::PauseFill,input).ok();
-    if effects.is_some(){rt.progress_observe(input,crate::sequence_progress_projection::Cause::PauseAccepted);}
+    let effects = rt.engine.request(Action::PauseFill, input).ok();
+    if effects.is_some() {
+        rt.progress_observe(
+            input,
+            crate::sequence_progress_projection::Cause::PauseAccepted,
+        );
+    }
     effects
 }
 fn invalidate_for_manual_stop(rt: &mut Runtime) -> bool {
@@ -371,7 +426,12 @@ fn invalidate_for_manual_stop(rt: &mut Runtime) -> bool {
         | rt.turbo_binding.is_some();
     let owned =
         changed || rt.turbo_inventory_pending || rt.engine.status.phase == Phase::Turbocharge;
-    if owned {rt.progress.complete(crate::sequence_progress_projection::TerminalProof::Interrupted,crate::sequence_progress_service::now_ms());}
+    if owned {
+        rt.progress.complete(
+            crate::sequence_progress_projection::TerminalProof::Interrupted,
+            crate::sequence_progress_service::now_ms(),
+        );
+    }
     if changed {
         // Manual Stop owns all resulting physical effects. Keep the durable
         // inventory barrier; cancellation cannot certify prior mass movement.
@@ -410,7 +470,9 @@ pub(super) fn tick(state: &Arc<AppState>, interlock: bool) -> bool {
         let blocked = false;
         if blocked || rt.engine.status.phase == Phase::Fault {
             let active = rt.turbocharge.take().is_some();
-            if active {rt.progress.complete(crate::sequence_progress_projection::TerminalProof::Failed{message:"Turbocharge stopped by the current qualification or fault gate; verify actual output reports.".into()},crate::sequence_progress_service::now_ms());}
+            if active {
+                rt.progress.complete(crate::sequence_progress_projection::TerminalProof::Failed{message:"Turbocharge stopped by the current qualification or fault gate; verify actual output reports.".into()},crate::sequence_progress_service::now_ms());
+            }
             rt.turbo_evidence = None;
             return active;
         }
@@ -425,11 +487,20 @@ pub(super) fn tick(state: &Arc<AppState>, interlock: bool) -> bool {
                 && rt.valve_pressure_epoch != u64::MAX
                 && rt.mass_source_epoch != u64::MAX,
         );
-        let reporting_input=input(&rt,original);
-        let reporting_mass=rt.fresh_mass(original.now_ms).filter(|_|mass_binding_current(state,&rt));
-        let update = controller.tick(reporting_input,reporting_mass,context(state,&rt));
-        let reporting_view=rt.engine.progress_observation(reporting_input);
-        rt.progress.observe_turbo(controller.progress_observation(),reporting_view,reporting_mass,reporting_input.now_ms,update.cancelled.as_deref(),crate::sequence_progress_service::now_ms());
+        let reporting_input = input(&rt, original);
+        let reporting_mass = rt
+            .fresh_mass(original.now_ms)
+            .filter(|_| mass_binding_current(state, &rt));
+        let update = controller.tick(reporting_input, reporting_mass, context(state, &rt));
+        let reporting_view = rt.engine.progress_observation(reporting_input);
+        rt.progress.observe_turbo(
+            controller.progress_observation(),
+            reporting_view,
+            reporting_mass,
+            reporting_input.now_ms,
+            update.cancelled.as_deref(),
+            crate::sequence_progress_service::now_ms(),
+        );
         if update.severe_pressure {
             rt.turbo_evidence = None;
             #[cfg(not(feature = "hitl_mode"))]
@@ -474,7 +545,7 @@ pub(super) fn tick(state: &Arc<AppState>, interlock: bool) -> bool {
                     rt.engine.status.phase = Phase::Paused;
                     rt.engine.status.message =
                         format!("Turbocharge closed; qualification changed: {error}");
-                rt.progress_failed_current();
+                    rt.progress_failed_current();
                     return true;
                 }
                 rt.operational.saved.turbocharge = Some(evidence.clone());
@@ -488,12 +559,15 @@ pub(super) fn tick(state: &Arc<AppState>, interlock: bool) -> bool {
                     rt.engine.status.phase = Phase::Paused;
                     rt.engine.status.message =
                         format!("Turbocharge closed; evidence storage failed: {error}");
-                rt.progress_failed_current();
+                    rt.progress_failed_current();
                     return true;
                 }
             }
             rt.turbo_evidence = Some(evidence);
-            rt.progress_pass(crate::sequence_progress::Kind::Turbocharge,format!("turbocharge-audit:{}",original.now_ms));
+            rt.progress_pass(
+                crate::sequence_progress::Kind::Turbocharge,
+                format!("turbocharge-audit:{}", original.now_ms),
+            );
             rt.engine.status.phase = Phase::Paused;
             rt.engine.status.message =
                 "Turbocharge complete: nitrogen closed, fresh mass settled".into();
@@ -1088,14 +1162,23 @@ mod tests {
                 || state.gse.lock().unwrap().turbo_evidence.is_some()
             {
                 if state.gse.lock().unwrap().turbo_evidence.is_some() {
-                    let rt=state.gse.lock().unwrap();
-                    let progress=rt.progress.current().expect("actual accepted turbo run");
-                    assert_eq!(progress.outcome,crate::sequence_progress::Outcome::Passed);
-                    let key=progress.key.clone();
+                    let rt = state.gse.lock().unwrap();
+                    let progress = rt.progress.current().expect("actual accepted turbo run");
+                    assert_eq!(progress.outcome, crate::sequence_progress::Outcome::Passed);
+                    let key = progress.key.clone();
                     drop(rt);
-                    let result=state.sequence_progress.lock().unwrap().result(&key).unwrap();
-                    assert!(result.steps.iter().all(|step|matches!(step.state,crate::sequence_progress::StepState::Passed|crate::sequence_progress::StepState::Skipped)));
-                    let rt=state.gse.lock().unwrap();
+                    let result = state
+                        .sequence_progress
+                        .lock()
+                        .unwrap()
+                        .result(&key)
+                        .unwrap();
+                    assert!(result.steps.iter().all(|step| matches!(
+                        step.state,
+                        crate::sequence_progress::StepState::Passed
+                            | crate::sequence_progress::StepState::Skipped
+                    )));
+                    let rt = state.gse.lock().unwrap();
                     assert!(rt.progress.error.is_none());
                 }
                 break;
@@ -1476,5 +1559,60 @@ mod tests {
                 .all(|(_, bytes)| !matches!(bytes[0] & 0x7f, 9 | 10)),
             "severe relief may never open either supply"
         );
+    }
+    #[tokio::test]
+    async fn cold_flow_target_only_edit_does_not_change_actual_turbo_binding_bytes() {
+        let state = crate::state::tests::test_app_state().await;
+        let mut rt = state.gse.lock().unwrap();
+        rt.engine.config.cold_flow_target_psi = None;
+        let binding = capture_binding(&state, &rt).0;
+        let c = &rt.engine.config;
+        // Exact original Config field order/values from the frozen predecessor.
+        let legacy = serde_json::json!({"nitrogen_target_psi":c.nitrogen_target_psi,"nitrogen_steps":c.nitrogen_steps,"fill_overfill_kg":c.fill_overfill_kg,"fill_tolerance_kg":c.fill_tolerance_kg,"fill_settle_ms":c.fill_settle_ms,"turbocharge_max_added_mass_kg":c.turbocharge_max_added_mass_kg,"pressure_step_psi":c.pressure_step_psi,"pressure_ceiling_psi":c.pressure_ceiling_psi,"maximum_zero_offset_psi":c.maximum_zero_offset_psi,"dry_self_test_confirmed":c.dry_self_test_confirmed,"grouped_panel":c.grouped_panel});
+        let mut expected = binding.clone();
+        expected["config"] = legacy;
+        let expected = serde_json::to_vec(&expected).unwrap();
+        let before = serde_json::to_vec(&binding).unwrap();
+        assert_eq!(before, expected);
+        rt.engine.config.cold_flow_target_psi = Some(95.);
+        let after = serde_json::to_vec(&capture_binding(&state, &rt).0).unwrap();
+        assert_eq!(before, after);
+        assert_eq!(
+            ring::digest::digest(&ring::digest::SHA256, &before).as_ref(),
+            ring::digest::digest(&ring::digest::SHA256, &after).as_ref()
+        );
+        println!(
+            "COLD_FLOW_CONTROL legacy_turbo_binding_bytes_and_hash=IDENTICAL cold_target_only=INERT"
+        );
+        let original = rt.engine.config.clone();
+        let mutations: [fn(&mut Config); 11] = [
+            |c| c.nitrogen_target_psi += 1.,
+            |c| {
+                c.nitrogen_steps = vec![gse_sequence::NitrogenStep {
+                    target_psi: 35.,
+                    settle_ms: 4000,
+                    hold_ms: 5000,
+                }]
+            },
+            |c| c.fill_overfill_kg = 0.06,
+            |c| c.fill_tolerance_kg = 0.06,
+            |c| c.fill_settle_ms = 4000,
+            |c| c.turbocharge_max_added_mass_kg = Some(0.3),
+            |c| c.pressure_step_psi += 1.,
+            |c| c.pressure_ceiling_psi = Some(500.),
+            |c| c.maximum_zero_offset_psi = Some(9.),
+            |c| c.dry_self_test_confirmed = !c.dry_self_test_confirmed,
+            |c| c.grouped_panel = !c.grouped_panel,
+        ];
+        for mutate in mutations {
+            let mut changed = original.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                config_for_binding(&original),
+                config_for_binding(&changed),
+                "Every preexisting config field must remain bound"
+            );
+            assert!(!only_cold_target_changed(&original, &changed));
+        }
     }
 }

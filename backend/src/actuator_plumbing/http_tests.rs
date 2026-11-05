@@ -2049,7 +2049,7 @@ async fn modeled_retraction_actual_acceptance_uses_monotonic45_and_original_stop
         assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
     }
     let _serial = SERIAL.lock().await;
-    let f = Fixture::new().await;
+    let mut f = Fixture::new().await;
     #[cfg(not(any(feature="hitl_mode",feature="test_fire_mode")))]
     {
         crate::flight_sim::initialize_model_owners(&f.state,0,0);
@@ -2060,10 +2060,24 @@ async fn modeled_retraction_actual_acceptance_uses_monotonic45_and_original_stop
     let origin =
         capture_motion_origin(&f.state, &crate::types::TelemetryCommand::RetractPlumbing).unwrap();
     let command = crate::types::TelemetryCommand::RetractPlumbing;
-    crate::gse::admit_simulated_retraction_stamped(&f.state, Some(origin), |source,now| {
+    let before_gate = retraction_gate(&f.state);
+    let before_journal = f.state.plumbing_drive.motion_journal.snapshot();
+    let result = crate::gse::admit_simulated_retraction_stamped(&f.state, Some(origin), |source,now| {
         crate::flight_sim::handle_command_stamped(&command,source,now)
-    })
-    .unwrap();
+    });
+    if cfg!(any(feature = "hitl_mode", feature = "test_fire_mode")) {
+        // Stamped application owners exist only in pure Testing. Mixed builds
+        // must exercise their real refusal, never invent a model acceptance.
+        assert_eq!(result.unwrap_err(), "The model did not accept the original retraction intent");
+        assert!(f.state.plumbing_drive.inner.lock().unwrap().modeled_retraction.is_none());
+        assert!(before_journal.0.is_none(), "no accepted motion journal before this request");
+        assert_eq!(f.state.plumbing_drive.motion_journal.snapshot(), before_journal);
+        assert_eq!(retraction_gate(&f.state), before_gate, "refusal cannot fabricate readiness");
+        f.pump();
+        assert!(f.retractions().is_empty(), "refused model request cannot reach an SDK retract owner");
+        return;
+    }
+    result.unwrap();
     let start = f
         .state
         .plumbing_drive
@@ -2144,11 +2158,25 @@ async fn hitl_safety_interlocks_actual_http_receiver_changes_require_permission_
     let _serial = SERIAL.lock().await;
     let mut f = Fixture::new().await;
     *f.state.auto_zero.lock().unwrap() = crate::auto_zero::Runtime::testing(true);
-    assert!(crate::auto_zero::before_fill(&f.state, &crate::types::TelemetryCommand::StartFill));
-    assert!(f.state.auto_zero.lock().unwrap().pending());
-    f.state.gse.lock().unwrap().engine.status.phase = gse_sequence::Phase::Paused;
-    let capture = f.state.loadcell_processing.start("KG1000", 60, true).unwrap();
-    let original_generation = crate::gse::automatic_generation(&f.state);
+    let mut targets = f.state.fill_targets_snapshot();
+    targets.fill_source = crate::fill_targets::FillSource::Kg1000Absolute;
+    targets.nitrous.target_mass_kg = 21.;
+    f.state.set_fill_targets(targets);
+    {
+        let mut runtime = f.state.gse.lock().unwrap();
+        // The original direct before_fill fixture never validated engine limits.
+        // Match the established genuine Fill fixtures' explicit zero allowance.
+        runtime.engine.config.maximum_zero_offset_psi = Some(8.);
+        runtime.engine.config.validate().unwrap();
+        runtime.engine.nitrous_target_psi = f.state.fill_targets_snapshot().nitrous.target_pressure_psi;
+        runtime.engine.status.phase = gse_sequence::Phase::Passed;
+        runtime.engine.status.nitrogen_passed = true;
+        runtime.engine.status.baseline = Some(gse_sequence::Baseline {
+            average_psi: 0., min_psi: 0., max_psi: 0., noise_psi: 0.1, samples: 50,
+        });
+        runtime.observe_pressure(Some(0.));
+        runtime.observe_mass(Some(0.));
+    }
     f.set_host_worker_running(true);
     let worker = tokio::spawn(crate::telemetry_task::telemetry_task(
         f.state.clone(),
@@ -2158,6 +2186,22 @@ async fn hitl_safety_interlocks_actual_http_receiver_changes_require_permission_
         f.db_rx.take().unwrap(),
         f.state.shutdown_subscribe(),
     ));
+    // This authorized positive owns a real recording through the existing
+    // production telemetry/SQLite actor before it arms the bounded zero capture.
+    let fill_response = f.http("POST", "/api/command", Some("operator"), json!("StartFill")).await;
+    let fill_status = fill_response.status();
+    let fill_body = axum::body::to_bytes(fill_response.into_body(), 4096).await.unwrap();
+    assert_eq!(fill_status, StatusCode::OK, "{}", String::from_utf8_lossy(&fill_body));
+    assert_eq!(
+        f.state.recording_status_snapshot().mode,
+        crate::telemetry_db::RecordingModeWire::Recording
+    );
+    assert_ne!(f.state.fill_recording.ready_instance(), 0);
+    assert!(f.state.fill_recording.continuation.lock().unwrap().is_some());
+    assert!(f.state.auto_zero.lock().unwrap().pending());
+    f.state.gse.lock().unwrap().engine.status.phase = gse_sequence::Phase::Paused;
+    let capture = f.state.loadcell_processing.start("KG1000", 60, true).unwrap();
+    let original_generation = crate::gse::automatic_generation(&f.state);
     for (index, name, initial) in [
         (0, "TogglePlumbingDelayInterlock", false),
         (1, "ToggleChecklistInterlock", true),
@@ -2289,4 +2333,142 @@ async fn explicitly_expired_motion_during_owned_journal_never_gets_new_timestamp
     assert!(f.retractions().is_empty());
     assert_eq!(motion_journal::load(&path).unwrap().unwrap().original_utc_ms, origin.source_ms.unwrap());
     assert_eq!(f.state.plumbing_drive.inner.lock().unwrap().last_motion_stamp, 0);
+}
+
+
+// Host boundary fault injection ONLY. This does not claim an actual schema
+// mutex hold; the published SDK439 unit suite supplies that separate evidence.
+struct MotionAdmissionFault {
+    owner: usize,
+    error: sedsnet::router::TryQueuedPacketError,
+    seen: Arc<std::sync::atomic::AtomicUsize>,
+}
+static MOTION_ADMISSION_FAULT: Mutex<Option<MotionAdmissionFault>> = Mutex::new(None);
+pub(super) fn injected_motion_admission_refusal(state: &AppState) -> Option<sedsnet::router::TryQueuedPacketError> {
+    let fault = MOTION_ADMISSION_FAULT.lock().unwrap();
+    let fault = fault.as_ref().filter(|fault| fault.owner == state as *const AppState as usize)?;
+    fault.seen.fetch_add(1, Ordering::SeqCst);
+    Some(fault.error)
+}
+struct MotionAdmissionInjection;
+impl MotionAdmissionInjection {
+    fn new(state: &AppState, error: sedsnet::router::TryQueuedPacketError) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        *MOTION_ADMISSION_FAULT.lock().unwrap() = Some(MotionAdmissionFault { owner: state as *const AppState as usize, error, seen: seen.clone() });
+        (Self, seen)
+    }
+    fn release(&self) { *MOTION_ADMISSION_FAULT.lock().unwrap() = None; }
+}
+impl Drop for MotionAdmissionInjection { fn drop(&mut self) { self.release(); } }
+async fn wait_motion_terminal(f: &Fixture) {
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        while f.state.plumbing_drive.motion_journal.pending() { tokio::task::yield_now().await; }
+    }).await.expect("original owned motion has a bounded terminal result");
+}
+fn matching_motion(f: &Fixture, original: &Packet) -> Vec<Packet> {
+    f.requests.lock().unwrap().iter().filter(|packet| packet.data_type() == original.data_type() && packet.payload() == original.payload()).cloned().collect()
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public439_actual_core_contention_preserves_original_motion_and_new_stop_refuses_it() {
+    let _serial = SERIAL.lock().await;
+    for stop in [false, true] {
+        let mut f = Fixture::new().await;
+        f.prime_motion_identity().await;
+        let pause = crate::gse::nonwaiting_admission_tests::Pause::install(&f.state);
+        let origin = capture_motion_origin(&f.state, &crate::types::TelemetryCommand::RetractPlumbing).unwrap();
+        crate::gse::queue_plumbing_with_stop_fence(&f.state, &f.host, Some(origin)).unwrap();
+        pause.prepared.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let original = pause.packet.lock().unwrap().clone().unwrap();
+        let seed = Packet::new(crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"), &[crate::telemetry_schema::endpoint("GROUND_STATION")], "GS", 100, Arc::from([0u8])).unwrap();
+        let router = f.host.clone();
+        let holder = std::thread::Builder::new().name("production-sdk-core-holder".into()).spawn(move || router.seed_managed_variable(seed)).unwrap();
+        pause.core_entered.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(f.host.try_has_pending_reliable_tx_type(crate::telemetry_schema::types::ABORT), Err(sedsnet::router::TryPendingTypeError::CoreBusy));
+        pause.proceed.send(()).unwrap();
+        pause.busy.recv_timeout(std::time::Duration::from_millis(100)).expect("actual first core refusal has no SDK owner");
+        assert!(f.state.plumbing_drive.motion_journal.pending(), "Stop test must interrupt the live original retry");
+        if stop {
+            assert_eq!(tokio::time::timeout(std::time::Duration::from_millis(100), f.http("POST", "/api/command", Some("operator"), json!("Abort"))).await.unwrap().status(), StatusCode::ACCEPTED);
+        }
+        pause.release(); holder.join().unwrap().unwrap();
+        wait_motion_terminal(&f).await;
+        f.pump();
+        let actual = matching_motion(&f, &original);
+        if stop { assert!(actual.is_empty(), "new manual Stop invalidates the SAME original before SDK ownership"); }
+        else { assert_eq!(actual.len(), 1); assert_eq!(actual[0].packet_id(), original.packet_id()); assert_eq!(actual[0].timestamp(), original.timestamp()); }
+        drop(pause);
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_typed_schema_busy_injection_retries_same_motion_but_never_after_its_original_budget() {
+    let _serial = SERIAL.lock().await;
+    for release in [true, false] {
+        let mut f = Fixture::new().await;
+        f.prime_motion_identity().await;
+        let pause = crate::gse::nonwaiting_admission_tests::Pause::install(&f.state);
+        let origin = capture_motion_origin(&f.state, &crate::types::TelemetryCommand::RetractPlumbing).unwrap();
+        crate::gse::queue_plumbing_with_stop_fence(&f.state, &f.host, Some(origin)).unwrap();
+        pause.prepared.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let original = pause.packet.lock().unwrap().clone().unwrap();
+        let (fault, seen) = MotionAdmissionInjection::new(&f.state, sedsnet::router::TryQueuedPacketError::SchemaBusy);
+        pause.proceed.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(100), async { while seen.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; } }).await.unwrap();
+        if release { fault.release(); }
+        wait_motion_terminal(&f).await;
+        if !release { assert!(seen.load(Ordering::SeqCst) > 1); fault.release(); }
+        f.pump();
+        let actual = matching_motion(&f, &original);
+        if release { assert_eq!(actual.len(), 1); assert_eq!(actual[0].packet_id(), original.packet_id()); assert_eq!(actual[0].timestamp(), original.timestamp()); }
+        else { assert!(actual.is_empty(), "releasing an injected busy result after terminal budget must not resurrect motion"); }
+        assert!(!f.state.abort_indicator_latched(), "contention itself never fabricates Stop/Abort");
+        drop(pause);
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public439_real_metadata_change_refuses_prepared_motion_without_reprepare_or_fresh_timestamp() {
+    if crate::operator_queue::isolated_case(module_path!(), "public439_real_metadata_change_refuses_prepared_motion_without_reprepare_or_fresh_timestamp") { return; }
+    let _serial = SERIAL.lock().await;
+    let mut f = Fixture::new().await;
+    f.prime_motion_identity().await;
+    let pause = crate::gse::nonwaiting_admission_tests::Pause::install(&f.state);
+    let origin = capture_motion_origin(&f.state, &crate::types::TelemetryCommand::RetractPlumbing).unwrap();
+    crate::gse::queue_plumbing_with_stop_fence(&f.state, &f.host, Some(origin)).unwrap();
+    pause.prepared.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    let original = pause.packet.lock().unwrap().clone().unwrap();
+    let kind = original.data_type();
+    let previous = sedsnet::config::data_type_definition(kind).unwrap().e2e_encryption;
+    let changed = if previous == sedsnet::E2eEncryptionPolicy::PreferOff { sedsnet::E2eEncryptionPolicy::PreferOn } else { sedsnet::E2eEncryptionPolicy::PreferOff };
+    sedsnet::config::set_data_type_e2e_encryption_policy(kind, changed).unwrap();
+    pause.proceed.send(()).unwrap();
+    wait_motion_terminal(&f).await;
+    sedsnet::config::set_data_type_e2e_encryption_policy(kind, previous).unwrap();
+    f.pump();
+    assert!(matching_motion(&f, &original).is_empty(), "real stale preparation never refreshes metadata or queues the original");
+    let notifications = f.state.notifications_snapshot();
+    assert!(notifications.iter().any(|row| row.message.contains("StalePreparation")));
+    assert!(!f.state.abort_indicator_latched());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public439_atomic_motion_admission_sees_actual_sdk_abort_owner_created_after_preparation() {
+    let _serial = SERIAL.lock().await;
+    let mut f = Fixture::new().await;
+    f.prime_motion_identity().await;
+    let pause = crate::gse::nonwaiting_admission_tests::Pause::install(&f.state);
+    let origin = capture_motion_origin(&f.state, &crate::types::TelemetryCommand::RetractPlumbing).unwrap();
+    crate::gse::queue_plumbing_with_stop_fence(&f.state, &f.host, Some(origin)).unwrap();
+    pause.prepared.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    let original = pause.packet.lock().unwrap().clone().unwrap();
+    assert!(f.state.manual_abort_intent.pending_epoch().is_none());
+    assert!(!f.state.abort_indicator_latched());
+    let abort = Packet::new(crate::telemetry_schema::types::ABORT,
+        &[crate::telemetry_schema::endpoint("ABORT")], "GS", original.timestamp(), Arc::from(&b"SDK owner fence"[..])).unwrap();
+    f.host.tx_queue(abort).unwrap();
+    assert_eq!(f.host.try_has_pending_reliable_tx_type(crate::telemetry_schema::types::ABORT), Ok(true));
+    pause.proceed.send(()).unwrap();
+    wait_motion_terminal(&f).await;
+    f.pump();
+    assert!(matching_motion(&f, &original).is_empty());
+    assert!(f.state.notifications_snapshot().iter().any(|row| row.message.contains("BlockedPendingReliableType")));
+    assert!(f.state.manual_abort_intent.pending_epoch().is_none(), "no new host Abort epoch is fabricated to implement the SDK fence");
 }

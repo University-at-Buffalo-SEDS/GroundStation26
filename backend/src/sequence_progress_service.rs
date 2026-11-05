@@ -272,6 +272,7 @@ mod tests {
             observed_age_ms: 0,
             valid_for_ms: 2000,
             cancel_allowed: true,
+            cold_flow_release_allowed: false,
             notification_id: None,
             notification_timestamp_ms: None,
             reporting_error: None,

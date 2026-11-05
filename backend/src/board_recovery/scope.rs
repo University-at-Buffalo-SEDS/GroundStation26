@@ -1,0 +1,162 @@
+//! Immutable participation for the explicit mode-scoped Startup reset only.
+//! Prospective/Unknown history is deliberately NOT admitted recovery ownership.
+use super::*;
+
+#[derive(Clone, Copy)]
+pub(crate) struct Selection {
+    context: crate::board_abort::ResetContext,
+    required: u8,
+    targets: u8,
+}
+pub(crate) const fn base_mask(mode: crate::station_mode::Mode) -> u8 {
+    match mode {
+        crate::station_mode::Mode::Hitl => 0,
+        crate::station_mode::Mode::TestFire => 0x78,
+        _ => 0x7f,
+    }
+}
+fn selected_mask(required: u8, actual_abort: u8, pending: u8, explicit: u8) -> u8 {
+    required | actual_abort | pending | explicit
+}
+impl Selection {
+    pub(super) fn capture(state: &AppState, optional: &[String]) -> Result<Self, &'static str> {
+        let mut explicit = 0;
+        for sender in optional {
+            let board = Board::from_sender_id(sender).ok_or("Unsupported optional reset board")?;
+            let i = index(board).ok_or("Unsupported optional reset board")?;
+            if explicit & (1 << i) != 0 {
+                return Err("Duplicate optional reset board");
+            }
+            explicit |= 1 << i;
+        }
+        // Only actual retained admitted target ownership is mandatory here.
+        // The prospective0x7f roster and unrelated Unknown rows are not targets.
+        let pending = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .recovery_pending()
+            .filter(|pending| !pending.published)
+            .map(|pending| {
+                pending.targets.iter().try_fold(0u8, |mask, target| {
+                    let board = Board::from_sender_id(&target.board)
+                        .ok_or("Unknown retained recovery target")?;
+                    let i = index(board).ok_or("Unsupported retained recovery target")?;
+                    Ok::<_, &'static str>(mask | (1 << i))
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let (context, required, actual) = state
+            .board_abort
+            .capture_reset_context(|| base_mask(crate::station_mode::local_mode()))?;
+        let targets = selected_mask(required, actual, pending, explicit);
+        Ok(Self {
+            context,
+            required,
+            targets,
+        })
+    }
+    pub(crate) fn current(&self, state: &AppState) -> Result<(), &'static str> {
+        self.with_current(state, || Ok(()))
+    }
+    pub(crate) fn with_current<T>(
+        &self,
+        state: &AppState,
+        apply: impl FnOnce() -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        state.board_abort.with_reset_context(self.context, apply)
+    }
+    pub(super) fn boards(&self) -> Vec<Board> {
+        BOARDS
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, board)| (self.targets & (1 << i) != 0).then_some(board))
+            .collect()
+    }
+    pub(super) fn required_boards(&self) -> Vec<&'static str> {
+        BOARDS
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, board)| (self.required & (1 << i) != 0).then_some(board.sender_id()))
+            .collect()
+    }
+    pub(crate) fn policy(&self) -> crate::launch_history::ResetProofPolicy {
+        crate::launch_history::ResetProofPolicy {
+            mode: crate::station_mode::local_mode(),
+            required_mask: self.required,
+            verified_mask: self.targets,
+        }
+    }
+    pub(crate) fn valid_targets(&self, pending: &crate::launch_history::RecoveryPending) -> bool {
+        pending.targets.len() == self.targets.count_ones() as usize
+            && BOARDS.iter().enumerate().all(|(i, board)| {
+                let count = pending
+                    .targets
+                    .iter()
+                    .filter(|target| target.board == board.sender_id() && target.desired == 0)
+                    .count();
+                count == usize::from(self.targets & (1 << i) != 0)
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn scope_never_implicitly_enrolls_prospective_or_unknown_roster() {
+        for optional_truth in 0..=0x7f {
+            assert_eq!(selected_mask(0x78, 0, 0, 0), 0x78);
+            assert_eq!(selected_mask(0, 0, 0, 0), 0);
+            assert_eq!(
+                selected_mask(0x78, optional_truth, 0, 0),
+                0x78 | optional_truth
+            );
+            assert_eq!(selected_mask(0, 0, optional_truth, 0), optional_truth);
+        }
+    }
+    #[test]
+    fn explicit_optional_targets_cannot_remove_required_abort_or_admitted_targets() {
+        assert_eq!(selected_mask(0x78, 1, 2, 4), 0x7f);
+        assert_eq!(selected_mask(0, 1, 2, 0), 3);
+    }
+}
+
+#[cfg(test)]
+mod actual_policy_tests {
+    use super::*;
+    #[test]
+    fn base_policy_is_mode_fixed_not_link_or_layout_derived() {
+        use crate::station_mode::Mode::*;
+        assert_eq!(base_mask(Normal), 0x7f);
+        assert_eq!(base_mask(TestFire), 0x78);
+        assert_eq!(base_mask(Hitl), 0);
+        assert_eq!(base_mask(Testing), 0x7f);
+    }
+    #[tokio::test]
+    async fn actual_abort_and_explicit_optional_are_mandatory_without_unknown_roster() {
+        let state = crate::state::tests::test_app_state().await;
+        let expected = base_mask(crate::station_mode::local_mode());
+        let selection = Selection::capture(&state, &[]).unwrap();
+        assert_eq!(selection.targets, expected);
+        state
+            .board_abort
+            .observe_abort(Board::RFBoard, std::time::Instant::now(), 100);
+        assert!(selection.current(&state).is_err());
+        let selection = Selection::capture(&state, &["FC".into()]).unwrap();
+        assert_eq!(selection.targets, expected | 3);
+        assert!(Selection::capture(&state, &["FC".into(), "FC".into()]).is_err());
+    }
+    #[cfg(feature = "hitl_mode")]
+    #[tokio::test]
+    async fn empty_hitl_is_explicit_host_only_and_policy_aba_retires_original_intent() {
+        let state = crate::state::tests::test_app_state().await;
+        let selection = Selection::capture(&state, &[]).unwrap();
+        assert!(selection.boards().is_empty());
+        assert_eq!(selection.policy().verified_mask, 0);
+        state.toggle_hitl_safety_interlock(3);
+        state.toggle_hitl_safety_interlock(3);
+        assert!(selection.current(&state).is_err());
+    }
+}

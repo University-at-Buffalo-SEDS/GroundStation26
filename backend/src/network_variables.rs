@@ -68,6 +68,8 @@ struct VariableStore {
     path: PathBuf,
     values: PersistentVariables,
     durable: bool,
+    revision: u64,
+    automatic_idle: Option<AutomaticLiveIdentity>,
 }
 
 impl VariableStore {
@@ -77,10 +79,15 @@ impl VariableStore {
             path,
             values: persisted.unwrap_or_else(default_values),
             durable: persisted.is_some(),
+            revision: 1,
+            automatic_idle: None,
         }
     }
 
     fn commit(&mut self, values: PersistentVariables) -> Result<()> {
+        // Mutation identity is cancellation only. Exhaustion retires ordinary
+        // automatic publication, never existing critical durable writers.
+        self.revision = self.revision.saturating_add(1);
         if self.durable && self.values == values {
             return Ok(());
         }
@@ -88,6 +95,106 @@ impl VariableStore {
         self.values = values;
         self.durable = true;
         Ok(())
+    }
+    fn commit_flight_state(&mut self, values: PersistentVariables) -> Result<()> {
+        self.commit(values)?;
+        self.automatic_idle = None;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AutomaticIdleSnapshot {
+    revision: u64,
+    state: u8,
+    stamp: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AutomaticIdleIdentity {
+    pub(crate) packet_id: u64,
+    pub(crate) timestamp: u64,
+    pub(crate) generation: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutomaticLiveIdentity {
+    Idle(AutomaticIdleIdentity),
+    Phase(AutomaticPhaseIdentity),
+}
+impl AutomaticLiveIdentity {
+    fn original(self) -> AutomaticIdleIdentity {
+        match self { Self::Idle(identity) => identity, Self::Phase(identity) => identity.original }
+    }
+    fn phase(self) -> u8 { match self { Self::Idle(_) => 1, Self::Phase(identity) => identity.phase } }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AutomaticPhaseIdentity {
+    pub(crate) original: AutomaticIdleIdentity,
+    pub(crate) phase: u8,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct AutomaticPhaseSnapshot {
+    revision: u64,
+    state: u8,
+    stamp: u64,
+    live: Option<AutomaticLiveIdentity>,
+}
+pub(crate) fn capture_automatic_phase_store(expected: u8, generation: u64) -> Option<AutomaticPhaseSnapshot> {
+    let guard = STORE.get()?.try_lock().ok()?;
+    if guard.revision >= u64::MAX - 1 || expected > 6 || guard.values.flight_state > 6
+        || guard.automatic_idle.is_some_and(|live| live.phase() != expected || live.original().generation != generation) {
+        return None;
+    }
+    Some(AutomaticPhaseSnapshot { revision: guard.revision, state: guard.values.flight_state,
+        stamp: guard.values.flight_state_stamp, live: guard.automatic_idle })
+}
+pub(crate) fn automatic_phase_packet(router: &Router, phase: u8) -> Result<Packet> {
+    anyhow::ensure!((1..=6).contains(&phase), "invalid automatic prelaunch phase");
+    let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
+    packet_bytes_at(FLIGHT_STATE_TYPE, "FLIGHT_STATE", Arc::from([phase]), timestamp)
+}
+pub(crate) struct AutomaticIdleStoreGuard<'a>(std::sync::MutexGuard<'a, VariableStore>);
+impl AutomaticIdleStoreGuard<'_> {
+    pub(crate) fn matches_phase(&self, expected: AutomaticPhaseSnapshot) -> bool {
+        expected.revision < u64::MAX - 1 && self.0.revision == expected.revision
+            && (self.0.values.flight_state, self.0.values.flight_state_stamp) == (expected.state, expected.stamp)
+            && self.0.automatic_idle == expected.live
+    }
+    pub(crate) fn admitted_phase(&mut self, identity: AutomaticPhaseIdentity) {
+        self.0.revision += 1; // prevalidated by matches_phase; never wrap/allocate
+        self.0.automatic_idle = Some(AutomaticLiveIdentity::Phase(identity));
+    }
+
+    pub(crate) fn matches(&self, expected: AutomaticIdleSnapshot) -> bool {
+        expected.revision != u64::MAX && self.0.revision == expected.revision
+            && (self.0.values.flight_state, self.0.values.flight_state_stamp) == (expected.state, expected.stamp)
+            && expected.state == 0 && self.0.automatic_idle.is_none()
+    }
+    pub(crate) fn admitted(&mut self, identity: AutomaticIdleIdentity) {
+        self.0.revision = self.0.revision.saturating_add(1);
+        self.0.automatic_idle = Some(AutomaticLiveIdentity::Idle(identity));
+    }
+}
+pub(crate) fn capture_automatic_idle_store() -> Option<AutomaticIdleSnapshot> {
+    // Main initializes STORE before constructing AppState/workers. Missing
+    // initialization is not permission to perform file IO in event capture.
+    let guard = STORE.get()?.lock().ok()?;
+    (guard.revision != u64::MAX && guard.values.flight_state == 0 && guard.automatic_idle.is_none()).then_some(AutomaticIdleSnapshot {
+        revision: guard.revision, state: guard.values.flight_state, stamp: guard.values.flight_state_stamp,
+    })
+}
+pub(crate) fn try_automatic_idle_store() -> Option<AutomaticIdleStoreGuard<'static>> {
+    STORE.get()?.try_lock().ok().map(AutomaticIdleStoreGuard)
+}
+pub(crate) fn automatic_idle_packet(router: &Router) -> Result<Packet> {
+    let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
+    packet_bytes_at(FLIGHT_STATE_TYPE, "FLIGHT_STATE", Arc::from([1u8]), timestamp)
+}
+pub(crate) fn automatic_idle_batch_limits() -> sedsnet::router::ManagedBatchPreparationLimits {
+    // Nine actual registered variables, one original, and a complete registry
+    // headroom. No runtime growth/reservation or fallback admission.
+    sedsnet::router::ManagedBatchPreparationLimits {
+        max_batch_packets: 1, max_snapshot_types: 19, max_snapshot_entries: 19,
+        max_original_payload_bytes: 1, max_snapshot_logical_bytes: 1024 * 1024,
     }
 }
 
@@ -243,7 +350,7 @@ fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Resu
     }
     router.on_network_variable_update(
         crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE),
-        |packet| {
+        move |packet| {
             // A per-board state report is not a write of the host's aggregate
             // desired state. SDK cache refreshes retain its original provenance;
             // only the authority's source can reach our durable GS seed.
@@ -266,6 +373,11 @@ fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Resu
                     "out-of-range flight-state network variable",
                 ));
             }
+            if !observer && crate::types::canonical_sender_id(packet.sender()) == "GS" {
+                // Explicit local publishers own their local/durable transition.
+                // A reflected original packet is telemetry, never fresh intent.
+                return Ok(());
+            }
             if crate::types::canonical_sender_id(packet.sender()) == "FC" && state == 15 {
                 return Ok(());
             }
@@ -284,7 +396,7 @@ fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Resu
                 next.flight_state_stamp = packet.timestamp();
             }
             next.flight_state = state;
-            guard.commit(next).map_err(|err| {
+            guard.commit_flight_state(next).map_err(|err| {
                 log::warn!("failed to persist inbound flight-state network variable: {err}");
                 sedsnet::TelemetryError::HandlerError(
                     "persist inbound flight-state network variable",
@@ -444,9 +556,23 @@ pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
         let mut next = guard.values;
         next.flight_state = state;
         next.flight_state_stamp = timestamp;
-        guard.commit(next)?;
+        #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+        crate::telemetry_task::flight_state_timeline::event(router, "durable_commit_start", state, Some(packet.packet_id()), Some(timestamp), None);
+        #[cfg(all(test, feature="test_fire_mode"))]
+        crate::recovery_pending_probe::before_state_commit(state);
+        let committed = guard.commit_flight_state(next);
+        #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+        crate::telemetry_task::flight_state_timeline::event(router, "durable_commit_end", state, Some(packet.packet_id()), Some(timestamp), Some(committed.is_ok()));
+        committed?;
     }
-    request.submit(router, packet)?;
+    #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+    crate::telemetry_task::flight_state_timeline::event(router, "sdk_submit_start", state, Some(packet.packet_id()), Some(timestamp), None);
+    #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+    let submitted_packet_id = packet.packet_id();
+    let submitted = request.submit(router, packet);
+    #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+    crate::telemetry_task::flight_state_timeline::detail(router, "sdk_submit_end", state, Some(submitted_packet_id), Some(timestamp), Some(submitted.is_ok()), Some(format!("{submitted:?}")));
+    submitted?;
     Ok(())
 }
 
@@ -493,7 +619,7 @@ pub(crate) fn commit_admitted_launch(prepared: &PreparedLaunchState) -> Result<(
     let mut next = guard.values;
     next.flight_state = 7;
     next.flight_state_stamp = prepared.packet.timestamp();
-    guard.commit(next)
+    guard.commit_flight_state(next)
 }
 
 /// Coordinator-only staging: disk IO is outside DISPATCH/Stop/SDK locks.
@@ -513,7 +639,7 @@ pub(crate) fn prepare_verified_recovery_startup(router: &Router) -> Result<Packe
     let mut next = guard.values;
     next.flight_state = 0;
     next.flight_state_stamp = timestamp;
-    guard.commit(next)?;
+    guard.commit_flight_state(next)?;
     Ok(packet)
 }
 
@@ -524,6 +650,13 @@ fn retained_non_launch_packet() -> Result<Option<Packet>> {
     // Unknown-origin defaults and legacy records are history, not a newly
     // observed authority state. Keep them on disk without publishing UTC zero
     // or minting a fresh operator intent during bootstrap/route refresh.
+    if let Some(identity) = guard.automatic_idle {
+        // Only the SDK owns this live exact original. Never replace it by the
+        // older durable Startup seed, or manufacture a retained auto revision.
+        let identity = identity.original();
+        let _ = (identity.packet_id, identity.timestamp, identity.generation);
+        return Ok(None);
+    }
     if guard.values.flight_state == 7 || guard.values.flight_state_stamp == 0 {
         return Ok(None);
     }
@@ -2085,6 +2218,7 @@ mod persistence_callback_tests {
         initialize_for_role(&router, false).unwrap();
         router.process_all_queues_with_timeout(0).unwrap();
         let prepared = prepare_launch_state(&router).unwrap();
+        let baseline = automatic_idle_test_snapshot();
         let before = router.queue_counters()[2];
         router.tx_queue(prepared.packet.clone()).unwrap();
         assert_eq!(
@@ -2093,17 +2227,20 @@ mod persistence_callback_tests {
             "original packet acquired an actual queue owner"
         );
         router.process_all_queues_with_timeout(0).unwrap();
-        // Prove the production managed callback actually ran before testing CAS.
-        let observed = store().lock().unwrap().values;
-        assert_eq!(
-            (observed.flight_state, observed.flight_state_stamp),
-            (7, prepared.packet.timestamp()),
-            "actual managed callback must persist the admitted original packet"
-        );
+        // Processing really consumed/cached the SAME original, but a primary
+        // own-GS reflection is observational, never a second durable writer.
+        let cached = router.get_cached_network_variable(crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE)).unwrap().unwrap();
+        assert_eq!(cached.packet_id(), prepared.packet.packet_id());
+        assert_eq!(cached.timestamp(), prepared.packet.timestamp());
+        assert_eq!(automatic_idle_test_snapshot(), baseline, "own-source callback leaves exact Store and bytes unchanged");
         // queue_counters[2] is current depth, not a cumulative accepted count.
         let admitted = router.queue_counters()[2];
-        commit_admitted_launch(&prepared)
-            .expect("identical already-persisted admitted packet is idempotent");
+        commit_admitted_launch(&prepared).expect("explicit admitted local publisher owns durable Launch CAS");
+        let committed = automatic_idle_test_snapshot();
+        let observed = store().lock().unwrap().values;
+        assert_eq!((observed.flight_state, observed.flight_state_stamp), (7, prepared.packet.timestamp()));
+        commit_admitted_launch(&prepared).expect("SECOND identical admitted commit is idempotent");
+        assert_eq!(automatic_idle_test_snapshot(), committed, "duplicate local CAS never rewrites or changes revision");
         assert_eq!(
             router.queue_counters()[2],
             admitted,
@@ -2408,3 +2545,33 @@ mod clock_admission_tests;
 #[cfg(test)]
 #[path = "network_variables/unknown_origin_tests.rs"]
 mod unknown_origin_tests;
+
+#[cfg(test)]
+mod automatic_idle_tests;
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AutomaticIdleTestSnapshot {
+    values: PersistentVariables,
+    revision: u64,
+    volatile: Option<AutomaticLiveIdentity>,
+    bytes: Option<Vec<u8>>,
+}
+#[cfg(test)]
+pub(crate) fn automatic_idle_test_snapshot() -> AutomaticIdleTestSnapshot {
+    let guard = store().lock().unwrap();
+    AutomaticIdleTestSnapshot { values: guard.values, revision: guard.revision,
+        volatile: guard.automatic_idle, bytes: fs::read(&guard.path).ok() }
+}
+
+#[cfg(test)]
+impl AutomaticIdleTestSnapshot {
+    #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim")))]
+    pub(crate) fn live_phase_identity(&self) -> Option<AutomaticPhaseIdentity> {
+        self.volatile.map(|live| AutomaticPhaseIdentity { original: live.original(), phase: live.phase() })
+    }
+    #[cfg(any(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+    pub(crate) fn durable_unchanged(&self, previous: &Self) -> bool {
+        self.values == previous.values && self.bytes == previous.bytes
+    }
+}

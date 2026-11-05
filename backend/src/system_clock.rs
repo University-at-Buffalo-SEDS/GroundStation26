@@ -97,6 +97,9 @@ fn capability_from_linux_status(status: &str) -> bool {
 }
 
 fn os_clock_unavailable_reason() -> Option<String> {
+    if crate::flight_sim_runtime::enabled() {
+        return Some("OS clock changes are unavailable in isolated FlightSim; simulated network UTC remains separate.".into());
+    }
     if !cfg!(target_os = "linux") {
         return Some("OS clock updates require a Linux GroundStation or RRLS host.".into());
     }
@@ -707,4 +710,17 @@ mod tests {
         );
         assert_eq!((os_calls.get(), network_calls.get()), (2, 1));
     }
+    #[tokio::test]
+    async fn flight_sim_refuses_actual_os_setter_before_platform_or_privilege_checks() {
+        if crate::flight_sim_runtime::enabled() {
+            let error=super::set_os_time(1_800_000_000_000).await.expect_err("FlightSim must never call clock_settime");
+            assert!(error.contains("isolated FlightSim"),"{error}");
+            return;
+        }
+        let output=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","system_clock::tests::flight_sim_refuses_actual_os_setter_before_platform_or_privilege_checks","--nocapture"])
+            .env("GS_EXECUTION_MODE","flight_sim").output().unwrap();
+        assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    }
+
 }

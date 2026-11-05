@@ -1,6 +1,8 @@
 //! Deterministic ground-fill sequencing. This crate performs no hardware I/O.
 use serde::{Deserialize, Serialize};
+pub mod cold_flow;
 pub mod fill_trim;
+pub mod fill_resume;
 pub mod qd_wait;
 pub mod qualification;
 pub mod turbocharge;
@@ -24,6 +26,8 @@ pub struct NitrogenStep {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    /// Independent cold-flow target. Unset disables automatic cold flow.
+    pub cold_flow_target_psi: Option<f32>,
     pub nitrogen_target_psi: f32,
     pub nitrogen_steps: Vec<NitrogenStep>,
     pub fill_overfill_kg: f32,
@@ -41,7 +45,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            nitrogen_target_psi: 120.0,
+            cold_flow_target_psi: None,
+            nitrogen_target_psi: 500.0,
             nitrogen_steps: Vec::new(),
             fill_overfill_kg: 0.05,
             fill_tolerance_kg: 0.07,
@@ -139,6 +144,10 @@ impl Config {
     }
     /// Incomplete limits may be saved, but cannot enable automatic operations.
     pub fn validate_settings(&self) -> Result<(), String> {
+        if self.cold_flow_target_psi.is_some_and(|target| !target.is_finite() || target <= 0.0
+            || self.pressure_ceiling_psi.is_some_and(|ceiling| !ceiling.is_finite() || target >= ceiling)) {
+            return Err("Cold-flow target must be finite, positive and below the configured hardware ceiling, or unset".into());
+        }
         self.nitrogen_plan()?;
         self.validate_fill_trim()?;
         if self
@@ -341,7 +350,7 @@ impl Default for Engine {
     fn default() -> Self {
         Self {
             config: Config::default(),
-            nitrous_target_psi: 745.0,
+            nitrous_target_psi: 750.0,
             nitrous_session: false,
             status: Status {
                 phase: Phase::Idle,
@@ -524,7 +533,7 @@ impl Engine {
             Effects::default()
         }
     }
-    pub fn request(&mut self, action: Action, input: Inputs) -> Result<Effects, String> {
+    fn validate_request(&self, action: Action, input: Inputs) -> Result<(), String> {
         if !self.allows(action, input) {
             if !input.prelaunch {
                 return Err("GSE action blocked: vehicle is not in a prelaunch state".into());
@@ -550,6 +559,37 @@ impl Engine {
                 "GSE action blocked: check limits, fresh PT, sequence state and interlocks".into(),
             );
         }
+        Ok(())
+    }
+
+    /// Side-effect-free admission preview, including all existing engine safety gates.
+    pub fn fill_resume_required(
+        &self,
+        input: Inputs,
+        mass: Option<Sample>,
+        target_mass_kg: f32,
+    ) -> Result<bool, String> {
+        self.validate_request(Action::StartFill, input)?;
+        fill_resume::resume_required(input.now_ms, mass, target_mass_kg)
+    }
+
+    /// Explicit fill admission with the selected calibrated kg sample and configured target.
+    /// A no-op never claims the engine, changes phase, or produces valve effects.
+    pub fn request_fill(
+        &mut self,
+        input: Inputs,
+        mass: Option<Sample>,
+        target_mass_kg: f32,
+    ) -> Result<fill_resume::FillStart, String> {
+        if !self.fill_resume_required(input, mass, target_mass_kg)? {
+            return Ok(fill_resume::FillStart::Noop);
+        }
+        self.request(Action::StartFill, input)
+            .map(fill_resume::FillStart::Started)
+    }
+
+    pub fn request(&mut self, action: Action, input: Inputs) -> Result<Effects, String> {
+        self.validate_request(action, input)?;
         self.claimed = true;
         Ok(match action {
             Action::Turbocharge => {
@@ -1175,6 +1215,39 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fresh_defaults_use_requested_targets_without_inventing_hardware_limits() {
+        let config = Config::default();
+        let plan = config.nitrogen_plan().unwrap();
+        assert_eq!(config.nitrogen_target_psi, 500.0);
+        assert_eq!(plan.len(), 10);
+        assert_eq!(plan.first().unwrap().target_psi, 50.0);
+        assert_eq!(plan.last().unwrap().target_psi, 500.0);
+        assert_eq!(Engine::default().nitrous_target_psi, 750.0);
+        assert!(config.pressure_ceiling_psi.is_none());
+        assert!(config.turbocharge_max_added_mass_kg.is_none());
+        assert!(config.cold_flow_target_psi.is_none());
+    }
+    #[test]
+    fn saved_low_pressure_limits_are_preserved_and_missing_target_requires_review() {
+        let complete: Config = serde_json::from_str(
+            r#"{"nitrogen_target_psi":120,"pressure_ceiling_psi":200,"maximum_zero_offset_psi":8}"#,
+        )
+        .unwrap();
+        assert_eq!(complete.nitrogen_target_psi, 120.0);
+        assert_eq!(complete.pressure_ceiling_psi, Some(200.0));
+        assert!(complete.validate_settings().is_ok());
+        let partial: Config =
+            serde_json::from_str(r#"{"pressure_ceiling_psi":200,"maximum_zero_offset_psi":8}"#)
+                .unwrap();
+        assert_eq!(partial.nitrogen_target_psi, 500.0);
+        assert_eq!(partial.pressure_ceiling_psi, Some(200.0));
+        assert_eq!(partial.maximum_zero_offset_psi, Some(8.0));
+        assert!(
+            partial.validate_settings().is_err(),
+            "missing legacy target must not raise the saved hardware ceiling"
+        );
+    }
     struct Rig {
         engine: Engine,
         now: u64,
@@ -1185,6 +1258,7 @@ mod tests {
         fn new() -> Self {
             let engine = Engine {
                 config: Config {
+                    cold_flow_target_psi: None,
                     nitrogen_target_psi: 120.0,
                     nitrogen_steps: Vec::new(),
                     fill_overfill_kg: 0.05,

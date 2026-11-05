@@ -3,6 +3,7 @@
 pub(crate) mod coordinator;
 mod exchange;
 
+pub(crate) mod scope;
 use crate::{auth::Permission, state::AppState, types::Board};
 use axum::{
     Json,
@@ -216,6 +217,16 @@ fn endpoint(board: Board) -> &'static str {
         Board::GroundStation => unreachable!(),
     }
 }
+/// Application target only; this never requests a reboot or a new flight.
+fn targeted_recovery_state(board: Board) -> Option<u8> {
+    match board {
+        Board::ActuatorBoard | Board::ValveBoard => Some(1),
+        Board::FlightComputer | Board::RFBoard | Board::PowerBoard
+        | Board::GatewayBoard | Board::DaqBoard => Some(0),
+        Board::GroundStation => None,
+    }
+}
+
 /// Commanded-register safe domains from the actual board owners. VB's safe
 /// state opens both servos (bits1/2) and switches its pilot solenoid off.
 /// These are commanded registers, never mechanical position verification.
@@ -516,6 +527,16 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
     let topology = router.map(|router| router.export_topology());
     let primary =
         !crate::rrls::is_rrls() && router.is_some_and(|router| router.sender().as_ref() == "GS");
+    // Descriptive compiled policy only, never a grant or a board proof.
+    // PREPARE captures actual Abort/retained/optional union independently.
+    let reset_startup_policy = primary.then(|| {
+        let mode=crate::station_mode::local_mode();
+        let mask=scope::base_mask(mode);
+        let base=BOARDS.iter().enumerate().filter_map(|(i,board)|
+            (mask & (1 << i) != 0).then_some(board.sender_id())).collect::<Vec<_>>();
+        json!({"version":1,"global_startup_best_effort":true,"mode":mode,
+            "base_required_boards":base,"optional_proofs":true})
+    });
     let can_recover = primary
         && !principal.anonymous
         && principal.permissions.send_commands
@@ -548,7 +569,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
             "boot":known.map(|row|format!("{:016x}",row.boot)),"epoch":known.map(|row|row.epoch),"nonce":known.map(|row|format!("{:016x}",row.nonce)),"age_ms":age,
             "receipt_age_ms":observation.map(|row|now.duration_since(row.received).as_millis().min(u64::MAX as u128)as u64),"uptime_ms":readback.map(|row|row.uptime),"abort_latched":readback.filter(|_|matches!(board,Board::ActuatorBoard|Board::ValveBoard|Board::FlightComputer)).map(|row|row.flags&1!=0),"safe_outputs":readback.filter(|row|row.flags&OUTPUTS_VALID!=0).map(|row|row.flags&2!=0&&query_domain_consistent(board,row)),"commanded_outputs":readback.filter(|row|row.flags&OUTPUTS_VALID!=0).map(|row|row.outputs),
             "output_readback":if readback.is_some_and(|row|row.flags&OUTPUTS_VALID!=0){"gpio_servo_command_registers"}else{"unknown"},"physical_position_verified":false,
-            "capabilities":{"query":primary&&verified,"endpoint_verified":verified,"hardened_transport":verified&&fresh&&readback.is_some_and(|row|row.flags&0x20!=0),"known_utc_manual_stop":verified&&fresh&&matches!(board,Board::ActuatorBoard|Board::ValveBoard|Board::FlightComputer)&&readback.is_some_and(|row|row.flags&0x40!=0),"recover":supported&&matches!(board,Board::ActuatorBoard|Board::ValveBoard),"resync":false,"reset_startup":supported},"operation":operation,
+            "capabilities":{"query":primary&&verified,"endpoint_verified":verified,"hardened_transport":verified&&fresh&&readback.is_some_and(|row|row.flags&0x20!=0),"known_utc_manual_stop":verified&&fresh&&matches!(board,Board::ActuatorBoard|Board::ValveBoard|Board::FlightComputer)&&readback.is_some_and(|row|row.flags&0x40!=0),"recover":supported&&targeted_recovery_state(board).is_some(),"resync":false,"reset_startup":supported},"operation":operation,
             "result":readback.filter(|_|fresh).map(|row|row.result),"commissioning_required":fresh&&readback.is_some_and(|row|row.boot==u64::MAX||row.result==7),"first_uncertainty_reconcilable":reconcilable,"identity_kind":if reconcilable{"retained_first_uncertainty"}else if readback.is_some_and(|row|row.boot==u64::MAX){"commissioning_sentinel"}else if known.is_some(){"retained_generation"}else{"unknown"},
             "message":if !primary{"Recovery authority belongs to the current primary."}else if !verified{"Dedicated query endpoint not verified; no legacy endpoint probe is permitted."}else if !fresh{"Explicit Query is required for fresh actual board state."}else if readback.is_some_and(|row|row.result==7){"Board reports IO/commissioning; only a new explicit typed intent may attempt the supported recovery leg."}else{"Actual board readback. Recovery requires explicit typed confirmation and fresh server readbacks; no physical position or power reset is certified."}})
     }).collect::<Vec<_>>();
@@ -560,6 +581,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
     let build = serde_json::to_value(mode.local_build_mode).unwrap();
     Json(json!({"version":1,"backend_instance":hex(&identity),"principal":{"username":principal.username,"context":principal_context(&identity,&headers,&principal)},"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state)),"flight_state":state.local_flight_state_snapshot()as u8,"automatic_actions_inhibited":state.launch_history.lock().unwrap().automatic_actions_inhibited(),
         "permissions":{"query":primary,"recover":can_recover,"reset_startup":can_recover,"change_mode":false},
+        "reset_startup_policy":reset_startup_policy,
         "confirmation":confirmation,"host_recovery":host_pending.map(|pending|json!({"pending":!pending.published,"verified":pending.verified,"publication_acknowledged":pending.published,"targets":pending.targets.iter().map(|target|target.board.as_str()).collect::<Vec<_>>()})),
         "rejected_statuses":rejected_statuses,"last_rejection":last_rejection,
         "mode_capability":{"current":current,"build_mode":build,"supported_modes":[build],"runtime_switch_supported":false,"requires_restart":["normal","hitl","test_fire","testing"],"message":"Only the compiled runtime is supported; changing labels does not switch hardware policy."},"boards":boards,"operation":state.board_recovery.coordinator.operation()})).into_response()
@@ -1486,3 +1508,31 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod final_clock_freshness_tests {
+    use super::*;
+    fn observation(at: Stamp) -> Observation {
+        Observation { received: at, observed_after: at, value: Readback {
+            result:0,state:Some(0),flags:0x2c,nonce:1,boot:2,epoch:3,
+            uptime:4,outputs:0,issuer:5,
+        } }
+    }
+    #[test]
+    fn unchanged_two_second_freshness_preserves_paused_model_and_rejects_domain_loss() {
+        let wall=WallInstant::now();
+        let at=Stamp {wall:wall-Duration::from_secs(60),model_ms:Some(1000)};
+        let row=observation(at);
+        assert!(row.fresh(Stamp {wall,model_ms:Some(1000)}));
+        assert!(row.fresh(Stamp {wall,model_ms:Some(3000)}));
+        assert!(!row.fresh(Stamp {wall,model_ms:Some(3001)}));
+        assert!(!row.fresh(Stamp {wall,model_ms:Some(999)}));
+        assert!(!row.fresh(Stamp {wall,model_ms:None}));
+        let wall_row=observation(Stamp {wall:wall-Duration::from_secs(3),model_ms:None});
+        assert!(!wall_row.fresh(Stamp {wall,model_ms:None}));
+    }
+}
+
+#[cfg(test)]
+#[path = "board_recovery/status_policy_tests.rs"]
+mod status_policy_tests;

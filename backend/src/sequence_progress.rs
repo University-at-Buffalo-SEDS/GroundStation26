@@ -33,6 +33,7 @@ pub enum Kind {
     NitrogenTest,
     Fill,
     Turbocharge,
+    ColdFlow,
     ContinueFillSequence,
     IgniterSequence,
 }
@@ -40,7 +41,11 @@ impl Kind {
     pub fn has_gse_safe_cancel(self) -> bool {
         matches!(
             self,
-            Self::ValveSelfTest | Self::NitrogenTest | Self::Fill | Self::Turbocharge
+            Self::ValveSelfTest
+                | Self::NitrogenTest
+                | Self::Fill
+                | Self::Turbocharge
+                | Self::ColdFlow
         )
     }
 }
@@ -133,6 +138,8 @@ pub struct Snapshot {
     #[serde(default)]
     pub cancel_allowed: bool,
     #[serde(default)]
+    pub cold_flow_release_allowed: bool,
+    #[serde(default)]
     pub notification_id: Option<u64>,
     #[serde(default)]
     pub notification_timestamp_ms: Option<i64>,
@@ -179,6 +186,7 @@ impl Snapshot {
             observed_age_ms: self.observed_age_ms,
             valid_for_ms: self.valid_for_ms,
             cancel_allowed: false,
+            cold_flow_release_allowed: false,
             notification_id: self.notification_id,
             notification_timestamp_ms: self.notification_timestamp_ms,
             reporting_error: self.reporting_error.clone(),
@@ -283,6 +291,11 @@ impl Snapshot {
             if !ids.contains(id) {
                 return Err(Error::Invalid);
             }
+        }
+        if self.cold_flow_release_allowed
+            && (self.kind != Kind::ColdFlow || self.outcome != Outcome::Running)
+        {
+            return Err(Error::Invalid);
         }
         if self.outcome.terminal() && self.cancel_allowed {
             return Err(Error::Invalid);
@@ -533,6 +546,7 @@ mod tests {
             observed_age_ms: 0,
             valid_for_ms: 2000,
             cancel_allowed: true,
+            cold_flow_release_allowed: false,
             notification_id: None,
             notification_timestamp_ms: None,
             reporting_error: None,

@@ -41,6 +41,8 @@ pub struct Runtime {
     generation: u64,
     pending: bool,
     fill_pending: bool,
+    // Authority observation only, never a measurement freshness timestamp.
+    last_capture_clock: Option<CaptureClock>,
 }
 fn path() -> std::path::PathBuf {
     std::env::var_os("GS_AUTO_ZERO_CONFIG")
@@ -100,6 +102,16 @@ impl Runtime {
         self.kg50.clear();
         self.kg1000.clear();
     }
+    #[cfg(test)]
+    pub(crate) fn capture_identity_for_test(&self) -> (u64, bool, bool) {
+        (self.generation, self.pending, self.fill_pending)
+    }
+    pub(crate) fn fill_capture_pending(&self) -> bool {
+        self.pending && self.fill_pending
+    }
+    pub(crate) fn completed_fill_capture(&self, token: u64) -> bool {
+        self.generation == token && !self.pending && self.fill_pending
+    }
     pub fn cancel_for_command(&mut self, command: &TelemetryCommand) {
         if (self.pending && self.fill_pending && !matches!(command, TelemetryCommand::StartFill))
             || matches!(
@@ -130,10 +142,23 @@ impl Runtime {
     pub fn observe_packet(&mut self, sensor: &str, raw: f32, packet_id: u64) {
         self.observe_sample(sensor, raw, Some(packet_id));
     }
+    fn invalidate_sample_eligibility(&mut self) {
+        // Keep raw/ID/clock diagnostics, but never count these receipts again.
+        // Raw telemetry and SD/recording rows are untouched by this capture policy.
+        for sample in self.kg50.iter_mut().chain(self.kg1000.iter_mut()) { sample.at.invalidate(); }
+    }
     fn observe_sample(&mut self, sensor: &str, raw: f32, packet_id: Option<u64>) {
-        if !raw.is_finite() {
-            return;
+        if !raw.is_finite() || !matches!(sensor, "KG50" | "KG1000") { return; }
+        self.observe_captured(sensor, raw, packet_id, CaptureClock::now());
+    }
+    fn observe_captured(&mut self, sensor: &str, raw: f32, packet_id: Option<u64>, at: CaptureClock) {
+        if !raw.is_finite() || !matches!(sensor, "KG50" | "KG1000") { return; }
+        let changed = self.last_capture_clock.is_some_and(|previous| !previous.same_domain(at));
+        if !at.is_valid() || changed {
+            self.invalidate_sample_eligibility();
+            if self.pending { self.cancel(); }
         }
+        self.last_capture_clock = Some(at);
         let samples = match sensor {
             "KG50" => &mut self.kg50,
             "KG1000" => &mut self.kg1000,
@@ -145,7 +170,7 @@ impl Runtime {
             return;
         }
         samples.push_back(Sample {
-            at: CaptureClock::now(),
+            at,
             raw,
             packet_id,
         });
@@ -247,19 +272,53 @@ fn pause_commit_save_for_test(state: &AppState) {
     }
 }
 
+#[derive(Debug)]
+enum TareCommitError {
+    NotPublished(String),
+    PublishedUncertain(String),
+}
+impl From<String> for TareCommitError {
+    fn from(message: String) -> Self { Self::NotPublished(message) }
+}
+impl From<&str> for TareCommitError {
+    fn from(message: &str) -> Self { Self::NotPublished(message.into()) }
+}
+impl std::fmt::Display for TareCommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { Self::NotPublished(message) | Self::PublishedUncertain(message) => f.write_str(message) }
+    }
+}
+/// Existing direct guard fixtures admit a fresh capture at this test boundary.
+/// Production always supplies the ORIGINAL begin() clock to the captured path.
+#[cfg(test)]
 fn commit_tare(
+    state: &AppState, cfg: &loadcell::LoadcellCalibrationFile,
+    sensor: &str, token: u64, arm_generation: u64, raw: f32,
+) -> Result<(), String> {
+    commit_tare_captured(state, cfg, sensor, token, arm_generation, raw, CaptureClock::now())
+        .map_err(|error| error.to_string())
+}
+
+fn commit_tare_captured(
     state: &AppState,
     cfg: &loadcell::LoadcellCalibrationFile,
     sensor: &str,
     token: u64,
     arm_generation: u64,
     raw: f32,
-) -> Result<(), String> {
+    original_capture: CaptureClock,
+) -> Result<(), TareCommitError> {
+    if !original_capture.within(WINDOW) {
+        return Err("Original automatic-zero capture deadline expired or its clock changed".into());
+    }
     // Acquire before zero Runtime; retain the lease across save without holding DISPATCH.
     let _claim = crate::gse::claim_operator_dispatch(state, arm_generation)
         .ok_or_else(|| "Automatic zero cancelled by closed admission/reset".to_string())?;
     if crate::gse::manual_stop_pending(state) {
         return Err("Automatic zero cancelled by manual Stop".into());
+    }
+    if !original_capture.within(WINDOW) {
+        return Err("Original automatic-zero capture deadline expired while checking admission".into());
     }
     // Lock order: zero Runtime -> calibration. No DISPATCH/GSE acquisition or
     // SDK calls while these locks are held. Verified reset must cancel and
@@ -283,9 +342,23 @@ fn commit_tare(
     );
     #[cfg(test)]
     pause_commit_save_for_test(state);
-    loadcell::save(&updated)?;
+    if !original_capture.within(WINDOW) {
+        return Err("Original automatic-zero capture deadline expired before persistence".into());
+    }
+    // CaptureClock may read the explicit model clock file. These are the
+    // EXISTING zero/calibration persistence locks, never DISPATCH/Stop/GSE.
+    // The final guard executes immediately before atomic file replacement.
+    let saved = loadcell::save_guarded(&updated, |_| {
+        if original_capture.within(WINDOW) { Ok(()) }
+        else { Err("Original automatic-zero deadline expired before calibration replacement".into()) }
+    })?;
+    // A successful rename is actual publication, even if directory fsync
+    // finishes after the deadline. Mirror that truth rather than fake rollback.
     *current = updated;
-    Ok(())
+    match saved {
+        loadcell::GuardedSaveOutcome::Durable => Ok(()),
+        loadcell::GuardedSaveOutcome::PublishedUncertain(error) => Err(TareCommitError::PublishedUncertain(error)),
+    }
 }
 
 fn cancel_after_capture_failure(state: &Arc<AppState>, arm_generation: u64) {
@@ -301,7 +374,7 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
     let stop_pending = crate::gse::manual_stop_pending(state);
     let cfg = state.loadcell_calibration.lock().unwrap().clone();
     let start = CaptureClock::now();
-    let token = {
+    let (token, original_continuation) = {
         let mut rt = state.auto_zero.lock().unwrap();
         if !rt.settings().enabled {
             return false;
@@ -309,6 +382,11 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
         if matches!(arm_generation, 0 | u64::MAX) || stop_pending {
             return true;
         }
+        if !start.is_valid() || rt.last_capture_clock.is_some_and(|previous| !previous.same_domain(start)) {
+            rt.invalidate_sample_eligibility();
+            if rt.pending { rt.cancel(); }
+        }
+        rt.last_capture_clock = Some(start);
         if rt.pending {
             return true;
         }
@@ -322,15 +400,31 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
             };
             let fresh = history
                 .back()
-                .is_some_and(|v| start.duration_since(v.at) < Duration::from_millis(250));
+                .is_some_and(|v| start.at_or_after(v.at) && start.duration_since(v.at) < Duration::from_millis(250));
             if fresh && matches!(stable(&recent, &cfg, sensor), Ok((_, true))) {
                 return false;
             }
         }
         rt.cancel();
+        let original_continuation = if fill {
+            let prepared = state.fill_recording.continuation.lock().unwrap().clone();
+            let Some(prepared) = prepared else {
+                return true;
+            };
+            if prepared.origin.generation() != arm_generation
+                || prepared.origin.remaining().is_err()
+                || !state.fill_recording.current(&prepared.receipt)
+            {
+                return true;
+            }
+            prepared
+                .zero_generation
+                .store(rt.generation, std::sync::atomic::Ordering::Release);
+            Some(prepared)
+        } else { None };
         rt.pending = true;
         rt.fill_pending = fill;
-        rt.generation
+        (rt.generation, original_continuation)
     };
     state.add_notification_with_persistence(
         format!(
@@ -342,6 +436,8 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
     let state = state.clone();
     let mut shutdown = state.shutdown_subscribe();
     tokio::spawn(async move {
+        #[cfg(test)]
+        let _task_terminal = terminal_sync_tests::task_terminal(&state);
         let result = loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {},
@@ -368,7 +464,7 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
                 rt.samples(sensor, start)
             };
             // Never extend a capture by retrying or accept samples after its bounded budget.
-            if start.elapsed() >= WINDOW {
+            if !start.within(WINDOW) {
                 break Err(format!(
                     "200 stable samples were not captured within the {}-second acquisition budget",
                     WINDOW.as_secs()
@@ -378,8 +474,40 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
                 break stable(&raw, &cfg, sensor).map(|v| v.0);
             }
         };
-        let result =
-            result.and_then(|raw| commit_tare(&state, &cfg, sensor, token, arm_generation, raw));
+        // The first step was admitted before its original5s deadline. This
+        // accepted capture keeps WINDOW (7s), but never adopts new authority.
+        if fill {
+            let mut slice = std::time::Instant::now();
+            let authorization = loop {
+                if !start.within(WINDOW) { break Err(crate::fill_recording::Error::Stale); }
+                let outcome = crate::fill_recording::authorize_zero_continuation(&state, arm_generation).await;
+                if !start.within(WINDOW) { break Err(crate::fill_recording::Error::Stale); }
+                match outcome {
+                    Err(crate::fill_recording::Error::PendingBusy) => {
+                        let Some(remaining) = WINDOW.checked_sub(start.elapsed()).filter(|v| !v.is_zero()) else {
+                            break Err(crate::fill_recording::Error::Stale);
+                        };
+                        // Keep the SAME accepted continuation and its original
+                        // capture clock; Busy is neither manual Stop nor revoke.
+                        tokio::time::sleep(remaining.min(Duration::from_millis(5))).await;
+                        if slice.elapsed() >= Duration::from_millis(100) {
+                            tokio::task::yield_now().await;
+                            slice = std::time::Instant::now();
+                        }
+                    }
+                    outcome => break outcome,
+                }
+            };
+            if let Err(error) = authorization {
+                let mut rt = state.auto_zero.lock().unwrap();
+                if rt.generation == token { rt.cancel(); }
+                drop(rt);
+                crate::fill_recording::notify_failure(&state, &error);
+                return;
+            }
+        }
+        let result = result.map_err(TareCommitError::NotPublished)
+            .and_then(|raw| commit_tare_captured(&state, &cfg, sensor, token, arm_generation, raw, start));
         {
             let mut rt = state.auto_zero.lock().unwrap();
             if rt.generation != token {
@@ -389,7 +517,8 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
                 rt.cancel();
                 return;
             }
-            rt.pending = false;
+            if result.is_err() { rt.cancel(); }
+            else { rt.pending = false; }
         }
         if crate::gse::automatic_generation(&state) != arm_generation
             || crate::gse::manual_stop_pending(&state)
@@ -403,14 +532,36 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
                 if let Err(e) =
                     crate::gse::sync_calibration_after_automatic_zero(&state, arm_generation, &cfg)
                 {
-                    if crate::gse::automatic_generation(&state) != arm_generation
-                        || crate::gse::manual_stop_pending(&state)
+                    #[cfg(test)]
+                    terminal_sync_tests::after_actual_sync_error(&state).await;
+                    // The tare is already saved. Retire only this original
+                    // capture/Fill owner; a newer run must remain untouched.
                     {
-                        return;
+                        let mut rt = state.auto_zero.lock().unwrap();
+                        if rt.generation != token
+                            || crate::gse::automatic_generation(&state) != arm_generation
+                        {
+                            return;
+                        }
+                        rt.cancel();
+                    }
+                    if let Some(original) = original_continuation.as_ref() {
+                        let removed = {
+                            let mut current = state.fill_recording.continuation.lock().unwrap();
+                            if current.as_ref().is_some_and(|owner| {
+                                Arc::ptr_eq(owner, original)
+                                    && owner.origin.generation() == arm_generation
+                                    && owner.zero_generation.load(std::sync::atomic::Ordering::Acquire) == token
+                            }) {
+                                current.take()
+                            } else { None }
+                        };
+                        if let Some(removed) = removed { removed.origin.retire(); }
                     }
                     state.add_notification(format!(
-                        "Zero saved locally, but DAQ calibration sync failed: {e}"
+                        "Zero saved locally, but DAQ calibration sync failed: {e}. Fill was not started."
                     ));
+                    return;
                 }
                 state.add_notification_with_persistence(
                     format!("{sensor} automatic zero saved"),
@@ -423,10 +574,10 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
             Err(e) => {
                 state.add_notification(format!(
                     "Automatic zero failed: {e}. {}",
-                    if fill {
-                        "Fill was not started."
-                    } else {
-                        "Previous tare retained; manual zero required."
+                    match &e {
+                        TareCommitError::PublishedUncertain(_) => "The new tare was applied, but its persistence is uncertain; verify calibration before use. Fill was not started.",
+                        TareCommitError::NotPublished(_) if fill => "Fill was not started.",
+                        TareCommitError::NotPublished(_) => "Previous tare retained; manual zero required.",
                     }
                 ));
                 cancel_after_capture_failure(&state, arm_generation);
@@ -817,3 +968,11 @@ mod tests {
         assert_eq!(after_old, gse_sequence::Phase::Filling);
     }
 }
+
+#[cfg(test)]
+#[path = "auto_zero/deadline_tests.rs"]
+pub(crate) mod deadline_tests;
+
+#[cfg(test)]
+#[path = "auto_zero/terminal_sync_tests.rs"]
+mod terminal_sync_tests;

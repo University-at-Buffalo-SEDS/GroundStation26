@@ -1,6 +1,58 @@
 // Controlled-clock, actual packet-handler regression. No hardware transport is attached.
 use super::*;
 
+/// Use the same authenticated route and sole SQLite owner as production Fill.
+/// The packet-handler DB channel below stays independently blocked on purpose.
+async fn arm_owned_fill_capture(
+    state: &mut Arc<AppState>,
+    directory: &std::path::Path,
+) -> super::recording_owner::TestOwner {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    let users = directory.join("fill-users.json");
+    std::fs::write(&users, serde_json::to_vec(&serde_json::json!({
+        "version": 1, "users": [{"username": "zero-operator", "password": {"salt_b64":"", "hash_b64":""},
+        "roles": [], "permissions": {"view_data":true,"send_commands":true},
+        "command_access": {"allowed_commands":["StartFill"]}}]
+    })).unwrap()).unwrap();
+    Arc::get_mut(state).unwrap().auth = Arc::new(crate::auth::AuthManager::new(users));
+    crate::ensure_auth_sessions_table(&state.auth_db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,created_at_ms,expires_at_ms) VALUES('zero-token','zero-operator','session',1,1,0,9999999999999)")
+        .execute(&state.auth_db).await.unwrap();
+    let owner = super::recording_owner::TestOwner::start(state, &directory.join("fill-recordings"));
+    state.gse.lock().unwrap().observe_mass(Some(0.));
+    state.gse.lock().unwrap().observe_pressure(Some(0.));
+    let app = crate::web::router(state.clone(), "zero-fixture-video-password".into());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/command")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer zero-token")
+                .body(Body::from("\"StartFill\""))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        state.recording_status_snapshot().mode,
+        crate::telemetry_db::RecordingModeWire::Recording
+    );
+    assert_ne!(state.fill_recording.ready_instance(), 0);
+    assert!(state.fill_recording.continuation.lock().unwrap().is_some());
+    assert!(state.auto_zero.lock().unwrap().pending());
+    owner
+}
+
 fn isolated_zero_case(case: &str, test_name: &str) {
     let child_case = std::env::var("GS_ZERO_INGRESS_CHILD");
     assert!(
@@ -157,7 +209,13 @@ async fn zero_case(case: &str) {
 
     let dir = std::path::PathBuf::from(std::env::var_os("GS_ZERO_INGRESS_ROOT").unwrap());
     let (db_tx, mut db_rx) = mpsc::channel(16);
-    let state = test_app_state(db_tx.clone()).await;
+    let mut state = if kg50 {
+        crate::gse::fill_recording_test_state(0., gse_sequence::Phase::Passed, None)
+            .await
+            .0
+    } else {
+        test_app_state(db_tx.clone()).await
+    };
     let mut cfg = loadcell::LoadcellCalibrationFile::default();
     cfg.ch1.m = Some(1.0);
     cfg.ch1.b = Some(0.0);
@@ -169,17 +227,15 @@ async fn zero_case(case: &str) {
     }
     *state.loadcell_calibration.lock().unwrap() = cfg;
     *state.auto_zero.lock().unwrap() = crate::auto_zero::Runtime::testing(true);
-    if kg50 {
+    let _fill_owner = if kg50 {
         let mut targets = state.fill_targets_snapshot();
         targets.fill_source = crate::fill_targets::FillSource::Kg50;
         state.set_fill_targets(targets);
-        assert!(crate::auto_zero::before_fill(
-            &state,
-            &TelemetryCommand::StartFill
-        ));
+        Some(arm_owned_fill_capture(&mut state, &dir).await)
     } else {
         crate::auto_zero::launch(&state);
-    }
+        None
+    };
     assert!(state.auto_zero.lock().unwrap().pending());
     if !kg50 {
         let mut targets = state.fill_targets_snapshot();
@@ -251,16 +307,17 @@ async fn zero_case(case: &str) {
                 payload_json,
                 ..
             }) = item
-                && data_type == raw_kind {
-                    assert_eq!(sender_id, "DAQ");
-                    recorded_sources.push(source_timestamp_ms.unwrap());
-                    assert_eq!(payload_json, expected_payload);
-                    assert_eq!(
-                        serde_json::from_str::<Vec<f32>>(&values_json.unwrap()).unwrap(),
-                        vec![0.2]
-                    );
-                    recorded_raw += 1;
-                }
+                && data_type == raw_kind
+            {
+                assert_eq!(sender_id, "DAQ");
+                recorded_sources.push(source_timestamp_ms.unwrap());
+                assert_eq!(payload_json, expected_payload);
+                assert_eq!(
+                    serde_json::from_str::<Vec<f32>>(&values_json.unwrap()).unwrap(),
+                    vec![0.2]
+                );
+                recorded_raw += 1;
+            }
         }
     }
     if case == "replay" {
@@ -277,16 +334,17 @@ async fn zero_case(case: &str) {
                 payload_json,
                 ..
             }) = item
-                && data_type == raw_kind {
-                    assert_eq!(sender_id, "DAQ");
-                    recorded_sources.push(source_timestamp_ms.unwrap());
-                    assert_eq!(payload_json, expected_payload);
-                    assert_eq!(
-                        serde_json::from_str::<Vec<f32>>(&values_json.unwrap()).unwrap(),
-                        vec![0.2]
-                    );
-                    recorded_raw += 1;
-                }
+                && data_type == raw_kind
+            {
+                assert_eq!(sender_id, "DAQ");
+                recorded_sources.push(source_timestamp_ms.unwrap());
+                assert_eq!(payload_json, expected_payload);
+                assert_eq!(
+                    serde_json::from_str::<Vec<f32>>(&values_json.unwrap()).unwrap(),
+                    vec![0.2]
+                );
+                recorded_raw += 1;
+            }
         }
     }
     tokio::time::sleep(Duration::from_millis(25)).await;
@@ -375,16 +433,17 @@ async fn zero_case(case: &str) {
             values_json,
             ..
         }) = item
-            && data_type == raw_kind {
-                assert_eq!(sender_id, "DAQ");
-                recorded_sources.push(source_timestamp_ms.unwrap());
-                assert_eq!(payload_json, expected_payload);
-                assert_eq!(
-                    serde_json::from_str::<Vec<f32>>(&values_json.unwrap()).unwrap(),
-                    vec![0.2]
-                );
-                recorded_raw += 1;
-            }
+            && data_type == raw_kind
+        {
+            assert_eq!(sender_id, "DAQ");
+            recorded_sources.push(source_timestamp_ms.unwrap());
+            assert_eq!(payload_json, expected_payload);
+            assert_eq!(
+                serde_json::from_str::<Vec<f32>>(&values_json.unwrap()).unwrap(),
+                vec![0.2]
+            );
+            recorded_raw += 1;
+        }
     }
     assert_eq!(
         recorded_raw,
@@ -500,7 +559,13 @@ async fn recorded_load_case(launch: bool) {
     let calibration: loadcell::LoadcellCalibrationFile =
         serde_json::from_value(fixture["calibration"].clone()).unwrap();
     let (db_tx, mut db_rx) = mpsc::channel(16);
-    let state = test_app_state(db_tx.clone()).await;
+    let mut state = if launch {
+        test_app_state(db_tx.clone()).await
+    } else {
+        crate::gse::fill_recording_test_state(0., gse_sequence::Phase::Passed, None)
+            .await
+            .0
+    };
     *state.state.lock().unwrap() = FlightState::Idle;
     *state.loadcell_calibration.lock().unwrap() = calibration.clone();
     let targets: crate::fill_targets::FillTargetsConfig =
@@ -511,15 +576,13 @@ async fn recorded_load_case(launch: bool) {
         state.fill_targets_snapshot().fill_source,
         crate::fill_targets::FillSource::Kg50
     );
-    if launch {
-        crate::auto_zero::launch(&state);
-    } else {
-        assert!(crate::auto_zero::before_fill(
-            &state,
-            &TelemetryCommand::StartFill
-        ));
-    }
     let dir = std::path::PathBuf::from(std::env::var_os("GS_ZERO_INGRESS_ROOT").unwrap());
+    let _fill_owner = if launch {
+        crate::auto_zero::launch(&state);
+        None
+    } else {
+        Some(arm_owned_fill_capture(&mut state, &dir).await)
+    };
     let samples = fixture["samples"].as_array().unwrap();
     assert_eq!(samples.len(), 200);
     let start = samples[0]["timestamp_ms"].as_u64().unwrap();
@@ -664,9 +727,10 @@ async fn rejected_source_case(case: &str) {
         handle_packet(&state, &db_tx, &overflow, packet).await;
         while let Ok(item) = db_rx.try_recv() {
             if let DbQueueItem::Write(DbWrite::Telemetry { data_type, .. }) = item
-                && data_type == "KG1000" {
-                    raw_rows += 1;
-                }
+                && data_type == "KG1000"
+            {
+                raw_rows += 1;
+            }
         }
     }
     assert_eq!(

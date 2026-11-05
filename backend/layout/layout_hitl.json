@@ -2362,6 +2362,69 @@
         "chart": {
           "enabled": true
         }
+      },
+      {
+        "id": "IGNITER_SENSE_SIGNAL",
+        "label": "Igniter current sense",
+        "channels": [
+          "ADC counts",
+          "Signal voltage",
+          "Current (unavailable)"
+        ],
+        "show_min_max": true,
+        "channel_formatters": [
+          {
+            "kind": "integer"
+          },
+          {
+            "precision": 4,
+            "suffix": " V"
+          },
+          {
+            "suffix": " A"
+          }
+        ],
+        "chart": {
+          "enabled": true
+        },
+        "chart_groups": [
+          {
+            "title": "Measured current-sense signal",
+            "data_type": "IGNITER_SENSE_SIGNAL",
+            "sender_id": "AB",
+            "labels": [
+              "Signal voltage (V)"
+            ],
+            "channels": [
+              1
+            ]
+          },
+          {
+            "title": "ADC input",
+            "data_type": "IGNITER_SENSE_SIGNAL",
+            "sender_id": "AB",
+            "labels": [
+              "ADC counts"
+            ],
+            "channels": [
+              0
+            ]
+          }
+        ],
+        "subtabs": [
+          {
+            "id": "actuator_igniter_sense",
+            "label": "Actuator board",
+            "data_type": "IGNITER_SENSE_SIGNAL",
+            "sender_id": "AB",
+            "channels": [
+              "ADC counts",
+              "Signal voltage",
+              "Current (unavailable)"
+            ],
+            "show_min_max": true
+          }
+        ]
       }
     ],
     "default_display_filter": {

@@ -73,11 +73,41 @@ pub(crate) struct Barrier {
     admission: Arc<Admission>,
     boot: [u8; 16],
 }
+/// Preacquired RAM-only proxy owner. Nonce generation is outside DGate; owner preparation precedes
+/// board/Stop guards; commit acquires no lock and cannot invoke SDK work.
+pub(crate) struct PreparedReopen<'a> {
+    state: std::sync::MutexGuard<'a, State>,
+    next: [u8; 16],
+}
+impl PreparedReopen<'_> {
+    pub(crate) fn commit(&mut self) {
+        self.state.boot = self.next;
+        self.state.closed = false;
+    }
+}
 impl Barrier {
+    /// Invoke before acquiring DGate or any final publication owner.
+    pub(crate) fn prepare_reopen_nonce() -> [u8; 16] {
+        super::nonce()
+    }
+    pub(crate) fn try_prepare_reopen(&self, next: [u8; 16]) -> Result<PreparedReopen<'_>> {
+        let state = self
+            .admission
+            .0
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("Proxy owner busy"))?;
+        ensure!(
+            state.closed && state.boot == self.boot && state.active == 0 && next != state.boot,
+            "Proxy dispatch has not quiesced"
+        );
+        Ok(PreparedReopen { state, next })
+    }
+
     pub(crate) fn is_quiescent(&self) -> bool {
         let s = self.admission.0.lock().unwrap();
         s.closed && s.boot == self.boot && s.active == 0
     }
+    #[cfg(test)]
     pub(crate) fn reopen_after_verified_recovery(self) -> Result<()> {
         let next = super::nonce();
         let mut s = self.admission.0.lock().unwrap();
@@ -118,7 +148,8 @@ pub(crate) fn begin_primary_recovery() -> Result<Option<Barrier>> {
         .upgrade()
         .map(|a| a.begin())
         .transpose()
-}/// Fixture access to the exact production admission/lease, never a replacement
+}
+/// Fixture access to the exact production admission/lease, never a replacement
 /// capability or success result. The coordinator must actually rotate and wait.
 #[cfg(test)]
 pub(crate) struct TestPrimaryAdmission(Arc<Admission>);
@@ -146,10 +177,38 @@ impl TestPrimaryAdmission {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prebuilt_reopen_nonce_preserves_exact_boot_active_and_collision_checks() {
+        let admission = Admission::new();
+        let original = admission.boot();
+        let active = admission.admit(original, false).unwrap();
+        let barrier = admission.begin().unwrap();
+        let closed_boot = barrier.boot;
+        let nonce = Barrier::prepare_reopen_nonce();
+        assert!(barrier.try_prepare_reopen(closed_boot).is_err());
+        assert!(
+            barrier.try_prepare_reopen(nonce).is_err(),
+            "active owner must refuse"
+        );
+        assert_eq!(admission.boot(), closed_boot);
+        drop(active);
+        let mut prepared = barrier.try_prepare_reopen(nonce).unwrap();
+        assert!(prepared.state.closed);
+        assert_eq!(prepared.state.boot, closed_boot);
+        prepared.commit();
+        drop(prepared);
+        assert_eq!(admission.boot(), nonce);
+        assert!(!admission.0.lock().unwrap().closed);
+        assert!(
+            barrier
+                .try_prepare_reopen(Barrier::prepare_reopen_nonce())
+                .is_err()
+        );
+        assert!(admission.admit(closed_boot, false).is_err());
+    }
     #[test]
     fn rotation_revokes_paused_validation_and_waits_admitted_dispatch_drop() {
         let a = Admission::new();

@@ -71,6 +71,9 @@ impl Runtime {
             .display()
             .to_string()
     }
+    pub(crate) fn authority(&self) -> String {
+        self.registry.lock().unwrap().authority().to_owned()
+    }
     pub fn snapshot(&self) -> Snapshot {
         self.registry.lock().unwrap().snapshot()
     }
@@ -114,24 +117,25 @@ pub fn observe(
     publish_change(state, change);
     link
 }
-/// Preserve a typed error receipt while occurrence restoration is pending.
-/// Neither raw board proof nor network/control admission awaits this path.
-pub fn observe_error(
+/// Drain one atomically collected producer batch. Registry mutation is one
+/// memory-only critical section; all serialization/journal publication follows.
+pub(crate) fn observe_board_abort_edges(
     state: &AppState,
-    key: Key,
-    condition_message: String,
-    raised_at_ms: i64,
-    timestamp_ms: i64,
-    message: String,
+    authority: &str,
+    edges: &[Option<crate::board_abort::AlertEdge>],
+    incomplete: bool,
 ) {
-    let (change, errors) = {
+    let (changes, errors) = {
         let mut registry = state.alert_conditions.registry.lock().unwrap();
-        let change =
-            registry.observe_error(key, condition_message, raised_at_ms, timestamp_ms, message);
-        let errors = registry.take_ready_errors();
-        (change, errors)
+        if !registry.has_authority(authority) { return; }
+        let changes = if incomplete {
+            vec![registry.board_abort_reporting_gap("observer edge queue overflow or ordinal exhaustion")]
+        } else {
+            edges.iter().flatten().map(|edge| registry.observe_board_abort_edge(*edge)).collect::<Vec<_>>()
+        };
+        (changes, registry.take_ready_errors())
     };
-    publish_change(state, change);
+    for change in changes { publish_change(state, change); }
     publish_ready_errors(state, errors);
     request_repair(state);
 }
@@ -610,3 +614,11 @@ mod board_abort_bridge_tests {
 #[cfg(test)]
 #[path = "alert_startup_correlation_tests.rs"]
 mod startup_correlation_tests;
+
+#[cfg(test)]
+#[path = "alert_delayed_exit_tests.rs"]
+mod delayed_exit_tests;
+
+#[cfg(test)]
+#[path = "alert_edge_chronology_tests.rs"]
+mod edge_chronology_tests;

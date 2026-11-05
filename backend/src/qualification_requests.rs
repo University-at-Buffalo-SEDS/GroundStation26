@@ -145,6 +145,19 @@ impl Request {
             submissions: std::cell::Cell::new(0),
         }
     }
+    pub(crate) fn bind_prepared(&self, packet: &Packet) -> u64 {
+        let id = packet.packet_id();
+        if let Some(token) = self.token {
+            emit(serde_json::json!({"event":"bind","token":token,"packet_id":id,"submit_ms":crate::simulation_clock_ms(),"data_type":packet.data_type().as_u32()}));
+            self.submissions.set(self.submissions.get() + 1);
+        }
+        id
+    }
+    pub(crate) fn prepared_result(&self, id: u64, accepted: bool) {
+        if let Some(token) = self.token {
+            emit(serde_json::json!({"event":"submit_result","token":token,"packet_id":id,"ok":accepted,"at_ms":crate::simulation_clock_ms()}));
+        }
+    }
     pub(crate) fn submit(&self, router: &Router, packet: Packet) -> anyhow::Result<()> {
         if self.token.is_none() {
             return router.set_network_variable(packet).map_err(Into::into);

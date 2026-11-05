@@ -172,6 +172,7 @@ impl BoardStatus {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub(crate) fill_recording: std::sync::Arc<crate::fill_recording::Runtime>,
     pub(crate) control_ingress: Arc<crate::control_ingress::Registry>,
     /// Optional ring buffer for full telemetry packets (not JSON)
     pub ring_buffer: Arc<Mutex<RingBuffer<crate::ring_buffer::ReceivedPacket>>>,
@@ -256,6 +257,7 @@ pub struct AppState {
     pub(crate) manual_abort_intent: Arc<crate::manual_abort_intent::ManualAbortIntent>,
     pub(crate) deferred_abort: Arc<crate::deferred_abort::Inbox>,
     pub(crate) board_recovery: Arc<crate::board_recovery::Runtime>,
+    pub(crate) igniter_sense: Arc<Mutex<crate::igniter_sense::Tracker>>,
     pub(crate) board_abort: Arc<crate::board_abort::Runtime>,
     pub(crate) launch_dedup_revision: Arc<AtomicU64>,
     pub(crate) board_abort_tx: broadcast::Sender<crate::board_abort::Snapshot>,
@@ -458,6 +460,7 @@ impl AppState {
         *self.sequence_policy_state.lock().unwrap()
     }
 
+    #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
     pub fn set_sequence_policy_state(&self, snapshot: SequencePolicyState) {
         *self.sequence_policy_state.lock().unwrap() = snapshot;
     }
@@ -1551,32 +1554,73 @@ impl AppState {
 
     /// One bounded same-frame copy of fresh board output evidence. Never a
     /// requested target, SDK ACK, valve-position or fluid-flow measurement.
-    pub(crate) fn umbilical_stream_outputs(&self)->[Option<crate::sequence_stream::CapturedOutput>;6] {
-        let now=std::time::Instant::now();
-        let simulation=crate::simulation_clock_ms();
-        let map=self.umbilical_valve_states.lock().unwrap();
-        [0,1,2,9,10,crate::rocket_commands::ActuatorBoardCommands::IgniterOn as u8].map(|key| {
-            let observed=map.get(&key)?;
-            if !observed.fresh_at(now,simulation){return None;}
-            let age=match (observed.simulation_ms,simulation) {
-                (Some(at),Some(now))=>now.checked_sub(at)?,
-                (None,None)=>now.checked_duration_since(observed.received_at)?.as_millis().min(u64::MAX as u128) as u64,
-                _=>return None,
+    pub(crate) fn umbilical_stream_outputs(
+        &self,
+    ) -> [Option<crate::sequence_stream::CapturedOutput>; 6] {
+        let now = std::time::Instant::now();
+        let simulation = crate::simulation_clock_ms();
+        let map = self.umbilical_valve_states.lock().unwrap();
+        [
+            0,
+            1,
+            2,
+            9,
+            10,
+            crate::rocket_commands::ActuatorBoardCommands::IgniterOn as u8,
+        ]
+        .map(|key| {
+            let observed = map.get(&key)?;
+            if !observed.fresh_at(now, simulation) {
+                return None;
+            }
+            let age = match (observed.simulation_ms, simulation) {
+                (Some(at), Some(now)) => now.checked_sub(at)?,
+                (None, None) => now
+                    .checked_duration_since(observed.received_at)?
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+                _ => return None,
             };
-            Some(crate::sequence_stream::CapturedOutput{value:observed.on,age_ms:age})
+            Some(crate::sequence_stream::CapturedOutput {
+                value: observed.on,
+                age_ms: age,
+            })
         })
     }
 
     /// Pending targets are inserted only after the existing station/model
     /// queue accepts the command. They are never board ACK or motion evidence.
-    pub(crate) fn umbilical_stream_commands(&self)->[Option<crate::sequence_stream::CapturedOutput>;6] {
-        let now=std::time::Instant::now();let simulation=crate::simulation_clock_ms();
-        let pending=self.pending_umbilical_valve_states.lock().unwrap();
-        [0,1,2,9,10,crate::rocket_commands::ActuatorBoardCommands::IgniterOn as u8].map(|key| {
-            let target=pending.get(&key)?;
-            let age=match (target.simulation_ms,simulation){(Some(at),Some(now))=>now.checked_sub(at)?,(None,None)=>now.checked_duration_since(target.set_at)?.as_millis().min(u64::MAX as u128) as u64,_=>return None};
-            if age>2000{return None;}
-            Some(crate::sequence_stream::CapturedOutput{value:target.target,age_ms:age})
+    pub(crate) fn umbilical_stream_commands(
+        &self,
+    ) -> [Option<crate::sequence_stream::CapturedOutput>; 6] {
+        let now = std::time::Instant::now();
+        let simulation = crate::simulation_clock_ms();
+        let pending = self.pending_umbilical_valve_states.lock().unwrap();
+        [
+            0,
+            1,
+            2,
+            9,
+            10,
+            crate::rocket_commands::ActuatorBoardCommands::IgniterOn as u8,
+        ]
+        .map(|key| {
+            let target = pending.get(&key)?;
+            let age = match (target.simulation_ms, simulation) {
+                (Some(at), Some(now)) => now.checked_sub(at)?,
+                (None, None) => now
+                    .checked_duration_since(target.set_at)?
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+                _ => return None,
+            };
+            if age > 2000 {
+                return None;
+            }
+            Some(crate::sequence_stream::CapturedOutput {
+                value: target.target,
+                age_ms: age,
+            })
         })
     }
 
@@ -1716,23 +1760,70 @@ impl AppState {
         });
     }
 
+    /// Post-admission observations only. Re-read current phase so a later Stop
+    /// or reset is never overwritten by a stale Idle notification. Startup->Idle
+    /// does not change any valid Idle/T-/T+ clock (launch_clock_for_transition).
+    pub(crate) fn observe_automatic_idle_admission(
+        self: &Arc<Self>,
+        claim: crate::gse::OperatorDispatchClaim,
+    ) {
+        let actual = self.local_flight_state_snapshot();
+        let _ = self.state_tx.send(FlightStateMsg { state: actual });
+        self.broadcast_fill_targets_snapshot();
+        crate::sequences::refresh_action_policy_now(self);
+        self.broadcast_action_policy_snapshot();
+        // Historical admitted event, never a desired-state/control finalizer.
+        // Preserve the existing cancellation-independent recording enqueue;
+        // the counted owner survives until the DB queue accepts or closes.
+        // Actual actor fsync remains the existing recording contract.
+        let timestamp_ms = telemetry_task::get_current_timestamp_ms() as i64;
+        let tx = self.db_queue_tx.clone();
+        self.db_write_runtime.spawn(async move {
+            let _claim = claim;
+            let _ = tx.send(DbQueueItem::Write(
+                crate::telemetry_db::DbWrite::FlightState { timestamp_ms, state_code: FlightState::Idle as i64 }
+            )).await;
+        });
+    }
+
+    /// Historical observation of an ALREADY admitted automatic original. This
+    /// cannot run another state producer, change model/clock, or write desired JSON.
+    pub(crate) fn observe_automatic_phase_admission(
+        self: &Arc<Self>,
+        claim: crate::gse::OperatorDispatchClaim,
+        admitted: FlightState,
+        original_utc: u64,
+    ) {
+        let actual = self.local_flight_state_snapshot();
+        let _ = self.state_tx.send(FlightStateMsg { state: actual });
+        self.broadcast_fill_targets_snapshot();
+        crate::sequences::refresh_action_policy_projection(self);
+        self.broadcast_action_policy_snapshot();
+        let tx = self.db_queue_tx.clone();
+        let timestamp_ms = original_utc.min(i64::MAX as u64) as i64;
+        self.db_write_runtime.spawn(async move {
+            let _claim = claim;
+            let _ = tx.send(DbQueueItem::Write(crate::telemetry_db::DbWrite::FlightState {
+                timestamp_ms, state_code: admitted as i64,
+            })).await;
+        });
+    }
+
     /// Pure RAM/broadcast publication under the verified original Stop gate.
     /// The coordinator already persisted/queued the original managed packet;
     /// do not call the generic setter or mutate T0/session here.
-    pub(crate) fn publish_verified_startup_under_gate(&self) {
-        *self.state.lock().unwrap() = FlightState::Startup;
+    pub(crate) fn publish_verified_startup_under_gate(&self, current: &mut FlightState) {
+        *current = FlightState::Startup;
         self.abort_indicator_latched.store(false, Ordering::SeqCst);
         self.launch_indicator_latched.store(false, Ordering::SeqCst);
-        let _ = self.state_tx.send(FlightStateMsg {
-            state: FlightState::Startup,
-        });
     }
     pub(crate) fn publish_verified_startup_observation(self: &Arc<Self>) {
-        // Existing coordinator calls this only after final owner/Stop guards.
+        // Notify the actual current state only after final owner/Stop guards.
+        let _ = self.state_tx.send(FlightStateMsg { state: self.local_flight_state_snapshot() });
         crate::gse::progress::publish_verified_reset_after_guards(self);
         crate::flight_sim::sync_local_flight_state(self.local_flight_state_snapshot());
         self.broadcast_fill_targets_snapshot();
-        crate::sequences::refresh_action_policy_now(self);
+        crate::sequences::refresh_action_policy_projection(self);
         self.broadcast_action_policy_snapshot();
     }
     /// Returns the current locally tracked flight state.
@@ -2133,6 +2224,10 @@ impl AppState {
 
     /// Applies the current software-action policy to decide whether a command can run.
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
+        let cmd = match cmd {
+            TelemetryCommand::FillWithRecording { .. } => &TelemetryCommand::StartFill,
+            other => other,
+        };
         if crate::board_abort::launch_command(command_name(cmd))
             && (self.board_abort.masks().0 != 0
                 || !crate::actuator_plumbing::retraction_gate(self).allowed)
@@ -2386,6 +2481,7 @@ impl AppState {
     }
 
     pub fn clear_runtime_data_for_sim_reset(&self) {
+        self.igniter_sense.lock().unwrap().reset_reception(std::time::Instant::now());
         self.network_health.lock().unwrap().clear();
         self.ring_buffer.lock().unwrap().clear();
         self.recent_telemetry_cache.lock().unwrap().clear();
@@ -3733,6 +3829,7 @@ pub(crate) mod tests {
         *state.state.lock().unwrap() = FlightState::Idle;
         {
             let mut rt = state.gse.lock().unwrap();
+            rt.engine.config.nitrogen_target_psi = 120.0; // Preserve this low-pressure test fixture.
             rt.engine.config.pressure_ceiling_psi = Some(200.0);
             rt.engine.config.maximum_zero_offset_psi = Some(3.0);
             rt.observe_pressure(Some(0.0));
@@ -4125,8 +4222,9 @@ pub(crate) mod tests {
             );
         }
 
-        let condition_runtime=Arc::new(crate::alert_condition_runtime::Runtime::for_test());
+        let condition_runtime = Arc::new(crate::alert_condition_runtime::Runtime::for_test());
         Arc::new(AppState {
+            fill_recording: Default::default(),
             control_ingress: Arc::new(Default::default()),
             ring_buffer: Arc::new(Mutex::new(RingBuffer::new(128))),
             cmd_tx,
@@ -4154,13 +4252,16 @@ pub(crate) mod tests {
             pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
             latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
             gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
-            sequence_progress: Arc::new(crate::sequence_progress_service::Shared::new(rand::random::<u128>())),
+            sequence_progress: Arc::new(crate::sequence_progress_service::Shared::new(
+                rand::random::<u128>(),
+            )),
             automatic_generation: Arc::new(AtomicU64::new(1)),
             operator_admission_barrier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             operator_queue: Arc::new(crate::operator_queue::Control::default()),
             operator_dispatch_inflight: Arc::new(AtomicUsize::new(0)),
             manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
             deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
+            igniter_sense: Arc::new(Mutex::new(crate::igniter_sense::Tracker::default())),
             board_recovery: Arc::new(crate::board_recovery::Runtime::default()),
             board_abort: Arc::new(crate::board_abort::Runtime::default()),
             launch_dedup_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),

@@ -953,3 +953,104 @@ async fn signed_plumbing_paused_handler_cannot_rebind_local_mode_revision() {
     assert!(fixture.cmd_rx.as_mut().unwrap().try_recv().is_err());
     let _ = std::fs::remove_file(path);
 }
+
+#[tokio::test]
+async fn accepted_fill_zero_keeps_claimed_proxy_lineage_after_envelope_age_expires() {
+    if crate::operator_queue::isolated_case(
+        module_path!(),
+        "accepted_fill_zero_keeps_claimed_proxy_lineage_after_envelope_age_expires",
+    ) {
+        return;
+    }
+    use crate::fill_recording::tests::{Fixture, enable_owned_zero, feed_zero, settle_zero};
+    let (_pairing_root, p, r) = super::tests::fixtures();
+    let mesh = configure();
+    let pv = {
+        let mesh = mesh.lock().unwrap();
+        mesh.command_proxy_transport(mesh.now()).unwrap()
+    };
+    let (mut primary, rr, rv) = clients(&p, &r, pv);
+    let f = Fixture::new_phase(false, gse_sequence::Phase::Passed).await;
+    user(&f.state.auth, true, false, false, &["StartFill"]);
+    enable_owned_zero(&f);
+    let work = request(
+        &p,
+        &r,
+        &mut primary,
+        &rr,
+        pv,
+        rv,
+        41,
+        Operation::Command("StartFill".into()),
+    );
+    let original_wire = wire::seal(&r, &p.public.station_id, &work.envelope).unwrap();
+    assert_eq!(wire::contract_digest(&original_wire), work.digest);
+    assert_eq!(
+        execute_primary(f.state.clone(), &work).await,
+        Outcome::Queued
+    );
+    primary.finish(&p, work.clone(), Outcome::Queued).unwrap();
+    assert!(f.state.auto_zero.lock().unwrap().pending());
+    f.pump();
+    assert!(f.sent.lock().unwrap().is_empty());
+    let elapsed = feed_zero(&f, std::time::Duration::from_millis(25), |_| {
+        let mut mesh = mesh.lock().unwrap();
+        let now = mesh.now();
+        mesh.tick(now);
+    })
+    .await;
+    assert!(
+        elapsed >= std::time::Duration::from_secs(5) && elapsed < std::time::Duration::from_secs(7),
+        "{elapsed:?}"
+    );
+    settle_zero(&f, true).await;
+    let aged = {
+        let mesh = mesh.lock().unwrap();
+        mesh.command_proxy_transport(mesh.now()).unwrap()
+    };
+    assert!(
+        !aged.accepts(&work.envelope, true),
+        "the original admission envelope must actually have expired"
+    );
+    assert!(!f.state.auto_zero.lock().unwrap().pending());
+    assert!(!f.sent.lock().unwrap().is_empty());
+    assert_eq!(f.files().len(), 1);
+    let delivered = f.sent.lock().unwrap().len();
+    assert!(
+        primary
+            .receive(&p, aged, crate::station_mode::local_mode(), &original_wire)
+            .is_err()
+    );
+    f.pump();
+    assert_eq!(f.sent.lock().unwrap().len(), delivered);
+    assert_eq!(f.files().len(), 1);
+    // A separate valid-looking request held past its original envelope window
+    // cannot create a new recording or claim a new owner at execution time.
+    let (mut second_primary, second_rr, second_rv) = clients(&p, &r, aged);
+    let second = Fixture::new_phase(false, gse_sequence::Phase::Passed).await;
+    user(&second.state.auth, true, false, false, &["StartFill"]);
+    let expired = request(
+        &p,
+        &r,
+        &mut second_primary,
+        &second_rr,
+        aged,
+        second_rv,
+        42,
+        Operation::Command("StartFill".into()),
+    );
+    {
+        let mut mesh = mesh.lock().unwrap();
+        let now = mesh.now();
+        for step in 1..=6 {
+            mesh.tick(now + step * 500);
+        }
+    }
+    assert_eq!(
+        execute_primary(second.state.clone(), &expired).await,
+        Outcome::Stale
+    );
+    assert!(second.files().is_empty());
+    second.pump();
+    assert!(second.sent.lock().unwrap().is_empty());
+}

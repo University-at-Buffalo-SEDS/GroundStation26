@@ -9,6 +9,7 @@ pub struct Tracker {
 }
 struct Record {
     diagnostics: Option<(BoardDiagnostics, Instant)>,
+    diagnostic_header_utc: Option<u64>,
     sd_status: Option<(crate::daq_sd::SdStatus, Instant)>,
     launch_log: Option<(crate::daq_launch_log::Observation, Instant, u64)>,
     first: Instant,
@@ -120,6 +121,7 @@ impl Tracker {
                 sender.to_owned(),
                 Record {
                     diagnostics: None,
+                    diagnostic_header_utc: None,
                     sd_status: None,
                     launch_log: None,
                     first: now,
@@ -153,7 +155,28 @@ impl Tracker {
         if sender.is_empty() || sender == "GS" || sender.starts_with('@') {
             return false;
         }
-        self.record(sender, now, wall_ms).diagnostics = Some((report, now));
+        let record = self.record(sender, now, wall_ms);
+        record.diagnostics = Some((report, now));
+        record.diagnostic_header_utc = None;
+        true
+    }
+    /// Recording-only source metadata; actual acceptance stays in the unchanged
+    /// shared decoder/admission path, including old callers with unknown clocks.
+    pub(crate) fn observe_diagnostics_with_source(
+        &mut self,
+        sender: &str,
+        words: &[u32],
+        now: Instant,
+        wall_ms: u64,
+        header_utc: Option<u64>,
+    ) -> bool {
+        if !self.observe_diagnostics(sender, words, now, wall_ms) {
+            return false;
+        }
+        self.boards
+            .get_mut(canonical_sender_id(sender.trim()))
+            .unwrap()
+            .diagnostic_header_utc = header_utc;
         true
     }
     pub fn observe_sd_status(
@@ -243,6 +266,18 @@ impl Tracker {
     }
     pub fn clear(&mut self) {
         self.boards.clear();
+    }
+    /// Recording observes all actual sources without a nested journal-store lookup.
+    /// Expected launch-log matching is unknown here; raw journal reports are saved.
+    pub(crate) fn recording_source_stamps(&self) -> Vec<(String, Option<u64>)> {
+        self.boards
+            .iter()
+            .filter(|(_, r)| r.diagnostics.is_some())
+            .map(|(sender, r)| (sender.clone(), r.diagnostic_header_utc))
+            .collect()
+    }
+    pub(crate) fn recording_snapshot(&mut self, now: Instant) -> Vec<NetworkBoardHealthEntry> {
+        self.snapshot_with_launch_expected(now, false, None)
     }
     pub fn snapshot(&mut self, now: Instant, test_fire: bool) -> Vec<NetworkBoardHealthEntry> {
         let expected = self

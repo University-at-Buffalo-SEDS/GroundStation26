@@ -227,12 +227,15 @@ pub async fn serve(app: Router, config: Config, shutdown: impl Future<Output = (
     } else {
         ("http", http.local_addr()?)
     };
-    let _discovery = DiscoveryGuard(tokio::spawn(async move {
-        if let Err(error) = crate::station_pairing::serve_discovery(pairing, scheme, address).await
-        {
-            log::warn!("station LAN discovery unavailable: {error}");
-        }
-    }));
+    let _discovery = if crate::flight_sim_runtime::enabled() {
+        None
+    } else {
+        Some(DiscoveryGuard(tokio::spawn(async move {
+            if let Err(error) = crate::station_pairing::serve_discovery(pairing, scheme, address).await {
+                log::warn!("station LAN discovery unavailable: {error}");
+            }
+        })))
+    };
     let http_handle = Handle::new();
     let https_handle = Handle::new();
     let http_server = axum_server::from_tcp(http)?

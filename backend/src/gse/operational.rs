@@ -129,6 +129,8 @@ impl Saved {
         let result = (|| -> std::io::Result<()> {
             let mut file = std::fs::File::create(&temporary)?;
             file.write_all(&bytes)?;
+            #[cfg(test)]
+            persist_diagnostic::before_sync(path)?;
             file.sync_all()?;
             std::fs::rename(&temporary, path)?;
             std::fs::File::open(parent)?.sync_all()
@@ -554,5 +556,53 @@ mod fire_persistence_tests {
             Some(Fault::MissingTelemetry)
         );
         std::fs::remove_dir(path).unwrap();
+    }
+}
+
+// Private diagnostic successor only: exact-path, one-shot, bounded test gate.
+#[cfg(test)]
+pub(super) mod persist_diagnostic {
+    use std::{
+        io,
+        path::{Path, PathBuf},
+        sync::{Mutex, mpsc},
+        time::{Duration, Instant},
+    };
+    struct Gate {
+        path: PathBuf,
+        entered: mpsc::Sender<Instant>,
+        release: mpsc::Receiver<()>,
+    }
+    static GATE: Mutex<Option<Gate>> = Mutex::new(None);
+    pub fn arm(path: PathBuf) -> (mpsc::Receiver<Instant>, mpsc::Sender<()>) {
+        let (entry_tx, entry_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut gate = GATE.lock().unwrap();
+        assert!(gate.is_none(), "diagnostic already armed");
+        *gate = Some(Gate {
+            path,
+            entered: entry_tx,
+            release: release_rx,
+        });
+        (entry_rx, release_tx)
+    }
+    pub(super) fn before_sync(path: &Path) -> io::Result<()> {
+        let gate = {
+            let mut slot = GATE.lock().unwrap();
+            if slot.as_ref().is_some_and(|g| g.path == path) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.entered
+                .send(Instant::now())
+                .map_err(|_| io::Error::other("diagnostic observer disappeared"))?;
+            gate.release
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| io::Error::other("diagnostic bounded persist barrier expired"))?;
+        }
+        Ok(())
     }
 }

@@ -221,25 +221,34 @@ pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase,
 }
 /// Publish the durable mission stage through the existing real FC state path.
 /// G_Armed asks FC to perform Postinit; it never bypasses FC readiness checks.
+#[cfg(test)]
 pub(super) fn publish_qualified_flight_armed(state: &Arc<AppState>) {
-    if cfg!(feature = "test_fire_mode") || !prelaunch(state) {
-        return;
-    }
-    let qualified = {
-        let rt = state.gse.lock().unwrap();
-        rt.operational.saved.qualification.stage()
-            == gse_sequence::qualification::MissionStage::Armed
-            && rt.operational.persist_error.is_none()
-            && rt.operational.saved.pending_checklists.is_empty()
-            && matches!(
-                rt.engine.status.phase,
-                Phase::Paused | Phase::Passed | Phase::Idle
-            )
-    };
-    if qualified {
-        state.set_local_flight_state(FlightState::Armed);
+    // Existing direct test entry, outside Dispatch. Production carries the
+    // original tick's observation across its guard instead of recapturing.
+    let _ = crate::network_variables::flight_state();
+    if let Some(observation) = crate::automatic_flight_state::Observation::begin(state) {
+        publish_qualified_flight_armed_with_observation(state, &observation);
     }
 }
+pub(super) fn publish_qualified_flight_armed_with_observation(
+    state: &Arc<AppState>, observation: &crate::automatic_flight_state::Observation,
+) {
+    if cfg!(feature = "test_fire_mode") || !prelaunch(state) { return; }
+    let qualification_generation = {
+        let rt = state.gse.lock().unwrap();
+        if rt.operational.saved.qualification.stage() != gse_sequence::qualification::MissionStage::Armed
+            || rt.operational.persist_error.is_some()
+            || !rt.operational.saved.pending_checklists.is_empty()
+            || !matches!(rt.engine.status.phase, Phase::Paused | Phase::Passed | Phase::Idle) { return; }
+        rt.operational.saved.qualification.generation()
+    };
+    if let Some(original) = observation.captured()
+        && let Some(proposal) = original.proposal(FlightState::Armed,
+            crate::automatic_flight_state::Cause::QualifiedArmed { qualification_generation }) {
+        crate::automatic_flight_state::publish(state, proposal);
+    }
+}
+
 /// Returns true when automation must not advance this tick.
 pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
     let blocked = {
@@ -884,7 +893,9 @@ mod tests {
         let (_, key) = topology(&state);
         {
             let mut rt = state.gse.lock().unwrap();
-            rt.clock = Instant::now() - std::time::Duration::from_secs(3);
+            // This routed plant advances explicit modeled 100ms steps below.
+            // Persistence wall time must not advance that modeled sensor clock.
+            rt.test_now_ms = Some(3000);
             rt.operational.path = Some(path.clone());
             rt.operational.topology(0, true, key.clone());
             rt.operational.topology(3000, true, key);
@@ -963,7 +974,7 @@ mod tests {
                 elapsed += 100;
                 {
                     let mut rt = state.gse.lock().unwrap();
-                    rt.clock = Instant::now() - std::time::Duration::from_millis(elapsed);
+                    rt.test_now_ms = Some(elapsed);
                 }
                 confirm_test_valves(&state, valves);
                 {
@@ -1023,6 +1034,40 @@ mod tests {
         );
         cleanup(&state);
     }
+    #[tokio::test]
+    async fn nitrogen_admission_rejects_real_elapsed_stale_pressure_until_new_sample() {
+        let state = fixture().await;
+        let original_pressure = {
+            let mut rt = state.gse.lock().unwrap();
+            assert!(rt.test_now_ms.is_none(), "negative must use real monotonic time");
+            rt.operational.running = true;
+            rt.engine.status.phase = Phase::Idle;
+            let input = rt.input(true, true);
+            complete_operational_milestones(&mut rt, Phase::SelfFinish, input);
+            assert!(rt.operational.saved.qualification.completed(Milestone::SelfTest));
+            rt.observe_pressure(Some(0.0));
+            rt.pressure.unwrap()
+        };
+        assert_eq!(command_allowed(&state, &TelemetryCommand::NitrogenTest), Some(true));
+        tokio::time::sleep(std::time::Duration::from_millis(2001)).await;
+        {
+            let rt = state.gse.lock().unwrap();
+            assert!(rt.test_now_ms.is_none());
+            assert_eq!(rt.pressure.unwrap().at_ms, original_pressure.at_ms);
+            let input = rt.input(true, true);
+            let age_ms = input.now_ms.checked_sub(original_pressure.at_ms).unwrap();
+            assert!(age_ms >= 2001, "actual elapsed age={age_ms}");
+            assert!(rt.engine.config.validate().is_ok());
+            assert!(operational_action_allowed(&rt, Action::NitrogenTest));
+            assert!(!rt.engine.allows(Action::NitrogenTest, input));
+            assert_eq!(rt.engine.status.phase, Phase::Idle);
+        }
+        assert_eq!(command_allowed(&state, &TelemetryCommand::NitrogenTest), Some(false));
+        state.gse.lock().unwrap().observe_pressure(Some(0.0));
+        assert_eq!(command_allowed(&state, &TelemetryCommand::NitrogenTest), Some(true));
+        cleanup(&state);
+    }
+
     #[tokio::test]
     async fn runtime_requires_self_test_before_nitrogen_and_saves_completion() {
         let state = fixture().await;
@@ -1165,7 +1210,15 @@ mod tests {
     }
     #[tokio::test]
     async fn durable_armed_publication_is_mode_sensitive_and_once_only() {
+        if crate::operator_queue::isolated_case(module_path!(), "durable_armed_publication_is_mode_sensitive_and_once_only") { return; }
         let state = fixture().await;
+        // The final phase now requires actual SDK admission, not just the old
+        // RAM mutation before a failed unknown-clock submission. Match main's
+        // initialized managed registry and this fixture's known native UTC.
+        let _ = crate::network_variables::flight_state();
+        let router = state.topology_router.get().unwrap();
+        router.try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(1_793_000_000_000)).unwrap();
+        crate::network_variables::initialize_for_state(&state, router).unwrap();
         let mut updates = state.state_tx.subscribe();
         publish_qualified_flight_armed(&state);
         assert!(
@@ -1632,6 +1685,192 @@ mod tests {
         );
         cleanup(&state);
     }
+    mod inherited_freshness_diagnostic {
+        use super::*;
+        use std::time::{Duration, Instant};
+        async fn ready() -> Arc<AppState> {
+            let state = fixture().await;
+            let mut rt = state.gse.lock().unwrap();
+            assert!(
+                rt.test_now_ms.is_none(),
+                "must exercise real monotonic clock"
+            );
+            rt.operational
+                .saved
+                .qualification
+                .complete(Milestone::SelfTest, 0)
+                .unwrap();
+            rt.operational.saved.baseline = Some(gse_sequence::Baseline {
+                average_psi: 0.,
+                min_psi: 0.,
+                max_psi: 0.,
+                noise_psi: 0.1,
+                samples: 50,
+            });
+            rt.observe_pressure(Some(0.));
+            for key in KEYS {
+                rt.observe_valve(key, false);
+            }
+            drop(rt);
+            state
+        }
+        fn facts(rt: &Runtime, input: Inputs) -> serde_json::Value {
+            let fresh = input.pressure.filter(|p| {
+                p.value.is_finite() && p.at_ms <= input.now_ms && input.now_ms - p.at_ms <= 2000
+            });
+            let config_valid = rt.engine.config.validate().is_ok();
+            let limit = rt
+                .engine
+                .config
+                .pressure_limit(rt.engine.nitrous_target_psi, 50.)
+                .is_ok_and(|limit| limit > rt.engine.nitrous_target_psi);
+            let nitrogen = rt.engine.status.nitrogen_passed || rt.engine.status.nitrogen_overridden;
+            let phase = matches!(rt.engine.status.phase, Phase::Passed | Phase::Paused);
+            let zero = fresh.is_some_and(|p| {
+                rt.engine
+                    .status
+                    .baseline
+                    .as_ref()
+                    .is_some_and(|b| b.is_zero(p.value))
+            });
+            let actual = rt.engine.allows(Action::StartFill, input);
+            assert_eq!(
+                actual,
+                input.prelaunch
+                    && input.interlock
+                    && config_valid
+                    && fresh.is_some()
+                    && limit
+                    && nitrogen
+                    && phase
+                    && zero
+            );
+            serde_json::json!({"now_ms":input.now_ms,"pressure_at_ms":input.pressure.map(|p|p.at_ms),"pressure_age_ms":input.pressure.map(|p|input.now_ms.saturating_sub(p.at_ms)),"prelaunch":input.prelaunch,"interlock":input.interlock,"config_valid":config_valid,"fresh_pressure":fresh.is_some(),"pressure_limit":limit,"nitrogen_evidence":nitrogen,"phase":phase,"zero_baseline_with_fresh_pressure":zero,"allows":actual})
+        }
+        #[tokio::test]
+        async fn real_persist_hold_expires_old_input_then_new_reports_restore_current_context() {
+            let state = ready().await;
+            let (path, original) = {
+                let rt = state.gse.lock().unwrap();
+                (rt.operational.path.clone().unwrap(), rt.pressure.unwrap())
+            };
+            let (entered, release) = operational::persist_diagnostic::arm(path);
+            let helper = std::thread::spawn(move || {
+                let at = entered.recv_timeout(Duration::from_secs(10)).unwrap();
+                std::thread::sleep(Duration::from_millis(2200));
+                let held = at.elapsed();
+                release.send(()).unwrap();
+                held
+            });
+            let wall = Instant::now();
+            apply_cold_flow_override(&state, "alice", "Diagnostic real persistence hold").unwrap();
+            let held = helper.join().unwrap();
+            assert!(held >= Duration::from_millis(2200));
+            let mut rt = state.gse.lock().unwrap();
+            assert_eq!(rt.pressure.unwrap().at_ms, original.at_ms);
+            let old_input = rt.input(true, true);
+            let old = facts(&rt, old_input);
+            assert_eq!(old["allows"], false);
+            assert_eq!(old["fresh_pressure"], false);
+            for field in [
+                "prelaunch",
+                "interlock",
+                "config_valid",
+                "pressure_limit",
+                "nitrogen_evidence",
+                "phase",
+            ] {
+                assert_eq!(old[field], true, "{field}");
+            }
+            println!(
+                "PERSIST_FRESHNESS old={old} actual_barrier_ms={} total_wall_ms={}",
+                held.as_millis(),
+                wall.elapsed().as_millis()
+            );
+            // A new receipt through the actual observer, not a mutation of old Sample.at_ms.
+            rt.observe_pressure(Some(0.));
+            for key in KEYS {
+                rt.observe_valve(key, false);
+            }
+            let new_sample = rt.pressure.unwrap();
+            assert!(new_sample.at_ms > original.at_ms);
+            assert_eq!(original.at_ms, old_input.pressure.unwrap().at_ms);
+            let new_input = rt.input(true, true);
+            let new = facts(&rt, new_input);
+            assert_eq!(new["allows"], true);
+            println!(
+                "PERSIST_FRESHNESS genuine_new_reports={new} original_stamp_retained={}",
+                original.at_ms
+            );
+            drop(rt);
+            cleanup(&state);
+        }
+        #[tokio::test]
+        async fn fresh_reports_do_not_repair_changed_prelaunch_or_interlock() {
+            let state = ready().await;
+            apply_cold_flow_override(&state, "alice", "Context negative control").unwrap();
+            let mut rt = state.gse.lock().unwrap();
+            rt.observe_pressure(Some(0.));
+            for key in KEYS {
+                rt.observe_valve(key, false);
+            }
+            let input = rt.input(true, true);
+            assert_eq!(facts(&rt, input)["allows"], true);
+            drop(rt);
+            state.set_local_flight_state(FlightState::Ascent);
+            {
+                let mut rt = state.gse.lock().unwrap();
+                rt.observe_pressure(Some(0.));
+                let changed_state = rt.input(
+                    prelaunch(&state),
+                    interlock(&state, &state.action_policy_snapshot()),
+                );
+                let denied = facts(&rt, changed_state);
+                assert_eq!(denied["allows"], false);
+                assert_eq!(denied["fresh_pressure"], true);
+                assert_eq!(denied["prelaunch"], false);
+                println!("PERSIST_FRESHNESS actual_state_Ascent={denied}");
+            }
+            state.set_local_flight_state(FlightState::Idle);
+            // Production policy decoration acquires GSE; never call it while
+            // the test already holds that mutex.
+            let mut policy = state.action_policy_snapshot();
+            policy.key_enabled = false;
+            state.set_action_policy(policy);
+            {
+                let mut rt = state.gse.lock().unwrap();
+                rt.observe_pressure(Some(0.));
+                let changed_interlock = rt.input(
+                    prelaunch(&state),
+                    interlock(&state, &state.action_policy_snapshot()),
+                );
+                let denied = facts(&rt, changed_interlock);
+                assert_eq!(denied["allows"], false);
+                assert_eq!(denied["fresh_pressure"], true);
+                assert_eq!(denied["interlock"], false);
+                println!("PERSIST_FRESHNESS actual_key_interlock_disabled={denied}");
+            }
+            cleanup(&state);
+        }
+        #[tokio::test]
+        async fn fresh_reports_do_not_repair_unsafe_changed_ceiling() {
+            let state = ready().await;
+            apply_cold_flow_override(&state, "alice", "Configuration negative control").unwrap();
+            let mut rt = state.gse.lock().unwrap();
+            rt.engine.config.pressure_ceiling_psi = Some(1.);
+            rt.observe_pressure(Some(0.));
+            for key in KEYS {
+                rt.observe_valve(key, false);
+            }
+            let input = rt.input(true, true);
+            let denied = facts(&rt, input);
+            assert_eq!(denied["allows"], false);
+            assert_eq!(denied["fresh_pressure"], true);
+            println!("PERSIST_FRESHNESS changed_ceiling={denied}");
+            drop(rt);
+            cleanup(&state);
+        }
+    }
     #[tokio::test]
     async fn cold_flow_override_requires_real_self_test_and_live_safe_inputs() {
         let state = fixture().await;
@@ -1661,6 +1900,15 @@ mod tests {
         assert!(apply_cold_flow_override(&state, "alice", "External cold flow reviewed").is_err());
         state.gse.lock().unwrap().observe_pressure(Some(0.0));
         apply_cold_flow_override(&state, "alice", "External cold flow reviewed").unwrap();
+        // The positive assertion models continuing telemetry after durable I/O.
+        // Emit new observations; never renew the timestamp of the old sample.
+        {
+            let mut rt = state.gse.lock().unwrap();
+            rt.observe_pressure(Some(0.0));
+            for key in KEYS {
+                rt.observe_valve(key, false);
+            }
+        }
         let rt = state.gse.lock().unwrap();
         assert!(!rt.engine.status.nitrogen_passed);
         assert!(rt.engine.status.nitrogen_overridden);
@@ -1816,3 +2064,6 @@ mod tests {
         cleanup(&state);
     }
 }
+
+#[cfg(test)]
+mod automatic_phase_tests;

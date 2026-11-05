@@ -77,6 +77,7 @@ async fn actual_routes_require_current_permission_run_and_epoch_and_wait_for_con
     {
         let mut rt = state.gse.lock().unwrap();
         rt.engine.config.dry_self_test_confirmed = true;
+        rt.engine.config.nitrogen_target_psi = 120.0; // Preserve this low-pressure test fixture.
         rt.engine.config.pressure_ceiling_psi = Some(200.);
         let input = rt.input(true, true);
         rt.engine.request(Action::SelfTest, input).unwrap();
@@ -251,6 +252,7 @@ async fn actual_routes_require_current_permission_run_and_epoch_and_wait_for_con
     {
         let mut rt = state.gse.lock().unwrap();
         rt.engine = Engine::default();
+        rt.engine.config.nitrogen_target_psi = 120.0; // Preserve this low-pressure test fixture.
         rt.engine.config.pressure_ceiling_psi = Some(200.);
         rt.engine.config.maximum_zero_offset_psi = Some(8.);
         rt.observe_pressure(Some(0.));
@@ -302,6 +304,7 @@ async fn actual_routes_require_current_permission_run_and_epoch_and_wait_for_con
     {
         let mut rt = reset_state.gse.lock().unwrap();
         rt.engine.config.dry_self_test_confirmed = true;
+        rt.engine.config.nitrogen_target_psi = 120.0; // Preserve this low-pressure test fixture.
         rt.engine.config.pressure_ceiling_psi = Some(200.);
         rt.engine.config.maximum_zero_offset_psi = Some(8.);
         rt.observe_pressure(Some(0.));
@@ -381,6 +384,7 @@ async fn actual_routes_require_current_permission_run_and_epoch_and_wait_for_con
         let mut rt = state.gse.lock().unwrap();
         rt.test_now_ms = Some(100);
         rt.engine.config.dry_self_test_confirmed = true;
+        rt.engine.config.nitrogen_target_psi = 120.0; // Preserve this low-pressure test fixture.
         rt.engine.config.pressure_ceiling_psi = Some(200.);
         rt.engine.config.maximum_zero_offset_psi = Some(8.);
         rt.observe_pressure(Some(0.));

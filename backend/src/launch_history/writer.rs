@@ -162,6 +162,14 @@ impl Writer {
         }
         Err(anyhow!("Launch journal prefix is not durably complete"))
     }
+    /// Final reset prefix inspection: RAM only, never wait on the writer.
+    pub(super) fn try_quiescent_through(&self, ticket: u64) -> Result<bool> {
+        let state = self.inner.state.try_lock().map_err(|_| anyhow!("Launch writer busy"))?;
+        if state.next != ticket { return Err(anyhow!("Launch journal prefix changed")); }
+        if state.writing || state.snapshot.is_some() { return Ok(false); }
+        if state.written >= ticket { return Ok(true); }
+        Err(anyhow!("Launch journal prefix is not durably complete"))
+    }
     pub(super) fn quiescent_through(&self, ticket: u64) -> Result<bool> {
         match self.prefix_state(ticket)? {
             PrefixState::Pending => Ok(false),

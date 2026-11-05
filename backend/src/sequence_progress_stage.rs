@@ -115,6 +115,7 @@ impl Proof {
 }
 #[derive(Clone, Copy)]
 enum Payload {
+    Cold(gse_sequence::cold_flow::Observation, ProgressObservation),
     Start(Kind, ProgressObservation, [PlanStep; 32], usize),
     Observe(ProgressObservation, Cause),
     Fill(ProgressObservation, Option<Sample>, Option<f32>, u64, Cause),
@@ -323,6 +324,31 @@ impl Stage {
             at,
         );
     }
+    pub fn observe_cold_flow(
+        &mut self,
+        cold: gse_sequence::cold_flow::Observation,
+        view: ProgressObservation,
+        at: u64,
+    ) {
+        if self.current.as_ref().is_none_or(|s| s.outcome.terminal()) {
+            return;
+        }
+        self.event(Payload::Cold(cold, view), at);
+        if let Some(s) = &mut self.current {
+            use gse_sequence::cold_flow::Phase as C;
+            s.outcome = if cold.phase == C::Cancelled {
+                Outcome::Cancelled
+            } else if matches!(cold.phase, C::CancelClosing | C::CancelRelieving) {
+                Outcome::Cancelling
+            } else {
+                Outcome::Running
+            };
+            s.cancel_allowed = !matches!(
+                cold.phase,
+                C::CancelClosing | C::CancelRelieving | C::Cancelled
+            );
+        }
+    }
     pub fn complete_failure(&mut self, message: &str, at: u64) {
         if self.current.as_ref().is_none_or(|s| s.outcome.terminal()) {
             return;
@@ -409,6 +435,7 @@ impl Projector {
             }
             self.ordinal = event.ordinal;
             match event.payload {
+                Payload::Cold(cold, view) => self.producer.observe_cold_flow(cold, view, event.at),
                 Payload::Start(kind, view, plan, len) => {
                     let plan: Vec<_> = plan[..len]
                         .iter()

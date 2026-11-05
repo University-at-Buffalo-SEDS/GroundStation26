@@ -522,6 +522,86 @@ fn run_case(mode: ReliableMode, fifo: usize, overhead_bits: u32, duration: u64) 
     );
 }
 
+const CAMPAIGN_CAPTURE_LIMIT: usize = 1_048_576;
+
+struct CampaignCapturedStream {
+    bytes: Vec<u8>,
+    total_bytes: u64,
+    error: Option<String>,
+}
+struct CampaignCapture {
+    done: std::sync::mpsc::Receiver<CampaignCapturedStream>,
+    worker: std::thread::JoinHandle<()>,
+    total: Arc<AtomicU64>,
+}
+impl CampaignCapture {
+    fn start(
+        mut reader: impl std::io::Read + Send + 'static,
+        capture_fault: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let (send, done) = std::sync::mpsc::channel();
+        let total = Arc::new(AtomicU64::new(0));
+        let observed_total = total.clone();
+        let worker = std::thread::spawn(move || {
+            let mut captured = CampaignCapturedStream {
+                bytes: Vec::new(),
+                total_bytes: 0,
+                error: None,
+            };
+            let mut chunk = [0u8; 4096];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        captured.total_bytes += count as u64;
+                        observed_total.store(captured.total_bytes, Ordering::Relaxed);
+                        let retained = count.min(CAMPAIGN_CAPTURE_LIMIT - captured.bytes.len());
+                        captured.bytes.extend_from_slice(&chunk[..retained]);
+                        if retained != count {
+                            capture_fault.store(true, Ordering::Relaxed);
+                            captured.error = Some("stream exceeded 1 MiB capture".into());
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        capture_fault.store(true, Ordering::Relaxed);
+                        captured.error = Some(format!("stream read failed: {error}"));
+                        break;
+                    }
+                }
+            }
+            let _ = send.send(captured);
+        });
+        Self { done, worker, total }
+    }
+
+    fn finish(self) -> CampaignCapturedStream {
+        // This exact child branch never spawns another process: after reaping
+        // it, both sole pipe writers are closed. Still bound EOF/join failures
+        // instead of turning an unexpected inherited writer into a test hang.
+        let mut captured = self.done.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_else(|error| CampaignCapturedStream {
+                bytes: Vec::new(),
+                total_bytes: self.total.load(Ordering::Relaxed),
+                error: Some(format!("stream EOF/capture did not complete: {error}")),
+            });
+        let join_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !self.worker.is_finished() && std::time::Instant::now() < join_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Never call blocking join on an unfinished reader. Unexpected reader
+        // liveness is an explicit failure, not successful child cleanup.
+        if self.worker.is_finished() {
+            if self.worker.join().is_err() {
+                captured.error = Some("stream capture worker panicked".into());
+            }
+        } else {
+            captured.error = Some("stream capture worker did not terminate within join bound".into());
+        }
+        captured
+    }
+}
+
 #[test]
 fn finite_three_radio_mesh_recovers_actual_reliable_commands_and_receipts() {
     // The standalone SDK defaults differ from the deployed station's tuning.
@@ -534,26 +614,60 @@ fn finite_three_radio_mesh_recovers_actual_reliable_commands_and_receipts() {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn().unwrap();
+        // Same work deadline, anchored immediately after the original spawn.
         let started = std::time::Instant::now();
+        let capture_fault = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stdout = CampaignCapture::start(child.stdout.take().unwrap(), capture_fault.clone());
+        let stderr = CampaignCapture::start(child.stderr.take().unwrap(), capture_fault.clone());
+        let mut status = None;
+        let mut failure = None;
         loop {
-            if child.try_wait().unwrap().is_some() {
+            match child.try_wait() {
+                Ok(Some(done)) => { status = Some(done); break; }
+                Ok(None) => {}
+                Err(error) => { failure = Some(format!("child wait failed: {error}")); break; }
+            }
+            if capture_fault.load(Ordering::Relaxed) {
+                failure = Some("child output capture failed or exceeded 1 MiB per stream".into());
                 break;
             }
             if started.elapsed() > std::time::Duration::from_secs(30) {
-                child.kill().unwrap();
-                let _ = child.wait();
-                panic!("isolated shared-air campaign timed out");
+                failure = Some("isolated shared-air campaign timed out".into());
+                break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let output = child.wait_with_output().unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        println!("{stdout}");
-        eprintln!("{stderr}");
+        if status.is_none() {
+            let kill_error = child.kill().err();
+            // Cleanup has its own bound; it grants no more child work time.
+            let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < reap_deadline {
+                match child.try_wait() {
+                    Ok(Some(done)) => { status = Some(done); break; }
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                    Err(error) => { failure = Some(format!("child reap failed: {error}")); break; }
+                }
+            }
+            if status.is_none() {
+                failure = Some(format!("child was not reaped within cleanup bound; kill error: {kill_error:?}"));
+            }
+        }
+        let stdout = stdout.finish();
+        let stderr = stderr.finish();
+        let text = String::from_utf8_lossy(&stdout.bytes);
+        let errors = String::from_utf8_lossy(&stderr.bytes);
+        // Preserve actual progress/counters even on timeout, capture overflow,
+        // child failure or cleanup failure; never discard them before panic.
+        println!("{text}");
+        eprintln!("{errors}");
+        eprintln!("RFD_REFERENCE_CAPTURE wall_ms={} child_status={status:?} stdout_bytes={} stderr_bytes={} stdout_error={:?} stderr_error={:?} failure={failure:?}",
+            started.elapsed().as_millis(), stdout.total_bytes, stderr.total_bytes, stdout.error, stderr.error);
+        assert!(failure.is_none() && !capture_fault.load(Ordering::Relaxed)
+            && stdout.error.is_none() && stderr.error.is_none(),
+            "shared-air campaign capture/deadline/cleanup failed: {failure:?}; stdout={:?}; stderr={:?}", stdout.error, stderr.error);
         assert!(
-            output.status.success() && stdout.contains("RFD_REFERENCE_DONE profiles=6"),
-            "shared-air campaign failed: {stdout}\n{stderr}"
+            status.is_some_and(|status| status.success()) && text.contains("RFD_REFERENCE_DONE profiles=6"),
+            "shared-air campaign failed: {text}\n{errors}"
         );
         return;
     }

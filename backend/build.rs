@@ -31,6 +31,7 @@ fn main() {
         // The schema remains the sole authority for their numeric identities.
         let required: &[&str] = match module {
             "types" => &[
+                "ABORT",
                 "GPS_DATA",
                 "BAROMETER_DATA",
                 "FUEL_FLOW",

@@ -466,11 +466,11 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/tiles/{z}/{x}/{y}", get(get_tile_jpg))
         .route("/favicon.ico", get(get_favicon))
         .route("/valvestate", get(get_valve_state))
-        .merge(crate::media::router(
-            state.clone(),
-            video_password,
-            voice.clone(),
-        ))
+        .merge(if crate::flight_sim_runtime::enabled() {
+            crate::flight_sim_runtime::unavailable_media_routes()
+        } else {
+            crate::media::router(state.clone(), video_password, voice.clone())
+        })
         .merge(crate::voice::routes(state.clone(), voice))
         .merge(crate::gse::routes())
         .merge(crate::admin::routes())
@@ -484,7 +484,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
 }
 
 /// Pulls a bearer token out of the Authorization header.
-fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -2262,8 +2262,15 @@ async fn start_firmware_update(
         Ok(principal) => principal,
         Err(response) => return response,
     };
-    if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
-        return (StatusCode::SERVICE_UNAVAILABLE,"ground station is shutting down").into_response();
+    if state
+        .shutdown_requested
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ground station is shutting down",
+        )
+            .into_response();
     }
     if !principal.permissions.send_commands {
         return (StatusCode::FORBIDDEN, "permission denied").into_response();
@@ -2298,8 +2305,15 @@ async fn start_firmware_update(
                 .into_response();
         }
     };
-    if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
-        return (StatusCode::SERVICE_UNAVAILABLE,"ground station is shutting down").into_response();
+    if state
+        .shutdown_requested
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ground station is shutting down",
+        )
+            .into_response();
     }
     let Some(router) = state.topology_router.get() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "router unavailable").into_response();
@@ -2407,6 +2421,8 @@ async fn send_command_inner(
     headers: HeaderMap,
     Json(cmd): Json<TelemetryCommand>,
 ) -> (StatusCode, String) {
+    let fill_origin = matches!(cmd, TelemetryCommand::StartFill)
+        .then(|| crate::fill_recording::Captured::capture(&state));
     // Request origin must precede authentication/database waits across recovery.
     let admission_generation = if matches!(cmd, TelemetryCommand::Abort) {
         0
@@ -2415,6 +2431,10 @@ async fn send_command_inner(
     };
     let plumbing_origin = crate::actuator_plumbing::capture_motion_origin(&state, &cmd);
     let launch_revision = crate::board_abort::capture_launch_revision(&state, &cmd);
+    #[cfg(test)]
+    if !crate::telemetry_task::recording_owner::test_hooks::before_http_auth(&state).await {
+        return crate::fill_recording::http_result(Err(crate::fill_recording::Error::Stale));
+    }
     let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
         Ok(principal) => principal,
         Err(response) => {
@@ -2425,6 +2445,24 @@ async fn send_command_inner(
                 (StatusCode::UNAUTHORIZED, "authentication required".into())
             };
         }
+    };
+    let cmd = if let Some(captured) = fill_origin {
+        let weak = Arc::downgrade(&state);
+        let authority = crate::fill_recording::Authority::Session {
+            token: bearer_token_from_headers(&headers).map(str::to_owned),
+            actor: principal.username.clone(),
+            admission_current: Arc::new(move || {
+                if weak.upgrade()
+                    .is_some_and(|state| state.is_command_allowed(&TelemetryCommand::StartFill)) {
+                    crate::gse::CurrentState::Current
+                } else { crate::gse::CurrentState::Invalid }
+            }),
+        };
+        TelemetryCommand::FillWithRecording {
+            origin: captured.bind(authority, Some(&principal)),
+        }
+    } else {
+        cmd
     };
     dispatch_authorized_command(
         state,
@@ -2621,7 +2659,15 @@ async fn dispatch_command_inner(
         Ok(crate::gse::OperatorCommandAdmission::Duplicate) => true,
         Ok(crate::gse::OperatorCommandAdmission::Fresh) => false,
     };
-    if duplicate {
+    // A pending/failed recording preparation is not a completed Fill. Never
+    // acknowledge that duplicate as recording-ready; a fresh explicit retry
+    // may retry storage once the bounded preparation owner has finished.
+    let fill_retry = matches!(cmd, TelemetryCommand::FillWithRecording { .. })
+        && state.fill_recording.ready_instance() == 0;
+    if duplicate && fill_retry && state.fill_recording.preparation.available_permits() == 0 {
+        return crate::fill_recording::http_result(Err(crate::fill_recording::Error::Busy));
+    }
+    if duplicate && !fill_retry {
         gs_debug_println!("Ignored duplicate software command {cmd:?}");
         if matches!(cmd, TelemetryCommand::ResetTClock) {
             if crate::rrls::is_rrls() {
@@ -2685,6 +2731,17 @@ async fn dispatch_command_inner(
             return (StatusCode::CONFLICT, "T clock reset failed".into());
         }
         return (StatusCode::OK, "ok".into());
+    }
+    if let TelemetryCommand::FillWithRecording { origin } = cmd {
+        drop(permit);
+        let result = crate::fill_recording::start(state.clone(), origin).await;
+        if let Err(error) = &result {
+            crate::fill_recording::notify_failure(&state, error);
+        }
+        return crate::fill_recording::http_result(result);
+    }
+    if matches!(cmd, TelemetryCommand::StartFill) {
+        return crate::fill_recording::http_result(Err(crate::fill_recording::Error::Stale));
     }
     if let Some(permit) = permit {
         permit.send(TelemetryCommand::QueuedOperator {
@@ -2886,30 +2943,50 @@ pub(crate) mod command_dispatch_tests {
     #[tokio::test]
     async fn shutdown_late_firmware_body_cannot_start_background_transfer() {
         use futures::FutureExt;
-        let (_directory,state,_commands,mut headers)=preauth_fixture().await;
-        headers.insert("x-firmware-filename","mock.seds".parse().unwrap());
-        let (sender,mut receiver)=tokio::sync::mpsc::channel::<Result<axum::body::Bytes,std::io::Error>>(1);
-        let entered=Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let observed=entered.clone();
-        let body=Body::from_stream(futures::stream::poll_fn(move |context| {
-            observed.store(true,std::sync::atomic::Ordering::Release);
+        let (_directory, state, _commands, mut headers) = preauth_fixture().await;
+        headers.insert("x-firmware-filename", "mock.seds".parse().unwrap());
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(1);
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = entered.clone();
+        let body = Body::from_stream(futures::stream::poll_fn(move |context| {
+            observed.store(true, std::sync::atomic::Ordering::Release);
             receiver.poll_recv(context)
         }));
-        let request=start_firmware_update(State(state.clone()),headers,Path(crate::types::Board::DaqBoard.sender_id().into()),body);
+        let request = start_firmware_update(
+            State(state.clone()),
+            headers,
+            Path(crate::types::Board::DaqBoard.sender_id().into()),
+            body,
+        );
         tokio::pin!(request);
-        tokio::time::timeout(std::time::Duration::from_secs(2),async {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while !entered.load(std::sync::atomic::Ordering::Acquire) {
-                assert!(request.as_mut().now_or_never().is_none(),"upload returned before held body was polled");
+                assert!(
+                    request.as_mut().now_or_never().is_none(),
+                    "upload returned before held body was polled"
+                );
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         state.request_shutdown();
-        sender.send(Ok(axum::body::Bytes::from_static(b"mock-not-a-firmware-image"))).await.unwrap();
+        sender
+            .send(Ok(axum::body::Bytes::from_static(
+                b"mock-not-a-firmware-image",
+            )))
+            .await
+            .unwrap();
         drop(sender);
-        let response=request.await.into_response();
-        assert_eq!(response.status(),StatusCode::SERVICE_UNAVAILABLE);
-        let reason=to_bytes(response.into_body(),512).await.unwrap();
-        assert_eq!(&reason[..],b"ground station is shutting down","router absence must not hide a missing post-body shutdown guard");
+        let response = request.await.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let reason = to_bytes(response.into_body(), 512).await.unwrap();
+        assert_eq!(
+            &reason[..],
+            b"ground station is shutting down",
+            "router absence must not hide a missing post-body shutdown guard"
+        );
         // Rejection precedes artifact decoding/router access; no board command
         // or real firmware transfer is used by this regression.
     }
@@ -3127,57 +3204,140 @@ pub(crate) mod command_dispatch_tests {
 
     #[tokio::test]
     async fn shutdown_ingress_idle_ws_closes_clean_and_late_frames_cannot_retain_stop() {
-        let (_root,state,_commands,_headers)=preauth_fixture().await;
-        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
-        let app=axum::Router::new().route("/ws",axum::routing::get(ws_handler)).with_state(state.clone());
-        let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap();});
-        let (mut socket,_)=tokio_tungstenite::connect_async(format!("ws://{address}/ws?token=preauth-test")).await.unwrap();
+        let (_root, state, _commands, _headers) = preauth_fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route("/ws", axum::routing::get(ws_handler))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/ws?token=preauth-test"))
+                .await
+                .unwrap();
         state.request_shutdown();
-        assert!(state.control_ingress.wait_terminal(StdDuration::from_secs(2)).await,"healthy idle UI connection prevented a proven terminal receipt");
-        let _=socket.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"cmd":"Abort"}"#.into())).await;
+        assert!(
+            state
+                .control_ingress
+                .wait_terminal(StdDuration::from_secs(2))
+                .await,
+            "healthy idle UI connection prevented a proven terminal receipt"
+        );
+        let _ = socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"Abort"}"#.into(),
+            ))
+            .await;
         tokio::task::yield_now().await;
-        assert_eq!(state.manual_abort_intent.epoch(),0);
-        let response=send_command(State(state.clone()),HeaderMap::new(),Json(TelemetryCommand::Abort)).await;
-        assert_eq!(response.0,StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(state.manual_abort_intent.epoch(),0);
+        assert_eq!(state.manual_abort_intent.epoch(), 0);
+        let response = send_command(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(TelemetryCommand::Abort),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.manual_abort_intent.epoch(), 0);
         server.abort();
     }
     #[tokio::test]
     async fn shutdown_ingress_held_ws_auth_finishes_existing_manual_stop_but_drops_late_frame() {
-        let (_root,state,mut commands,_headers)=preauth_fixture().await;
-        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
-        let app=axum::Router::new().route("/ws",axum::routing::get(ws_handler)).with_state(state.clone());
-        let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap();});
-        let (mut socket,_)=tokio_tungstenite::connect_async(format!("ws://{address}/ws?token=preauth-test")).await.unwrap();
-        let received=Arc::new(tokio::sync::Notify::new());
-        *WS_COMMAND_RECEIVED.get_or_init(Default::default).lock().unwrap()=Some((Arc::as_ptr(&state) as usize,received.clone()));
-        let held=state.auth_db.acquire().await.unwrap();
-        socket.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"cmd":"Abort"}"#.into())).await.unwrap();
-        tokio::time::timeout(StdDuration::from_secs(2),received.notified()).await.unwrap();
+        let (_root, state, mut commands, _headers) = preauth_fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route("/ws", axum::routing::get(ws_handler))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/ws?token=preauth-test"))
+                .await
+                .unwrap();
+        let received = Arc::new(tokio::sync::Notify::new());
+        *WS_COMMAND_RECEIVED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap() = Some((Arc::as_ptr(&state) as usize, received.clone()));
+        let held = state.auth_db.acquire().await.unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"Abort"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(StdDuration::from_secs(2), received.notified())
+            .await
+            .unwrap();
         state.request_shutdown();
-        assert!(!state.control_ingress.wait_terminal(StdDuration::from_millis(5)).await);
-        assert_eq!(state.manual_abort_intent.epoch(),0,"authentication wait was bypassed");
-        let _=socket.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"cmd":"Abort"}"#.into())).await;
+        assert!(
+            !state
+                .control_ingress
+                .wait_terminal(StdDuration::from_millis(5))
+                .await
+        );
+        assert_eq!(
+            state.manual_abort_intent.epoch(),
+            0,
+            "authentication wait was bypassed"
+        );
+        let _ = socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"Abort"}"#.into(),
+            ))
+            .await;
         drop(held);
-        assert!(!state.control_ingress.wait_terminal(StdDuration::from_secs(2)).await,"in-flight-at-seal control was falsely labeled safe before SDK drain");
-        assert_eq!(state.manual_abort_intent.epoch(),1,"existing authorized Stop was cancelled or a post-seal frame was accepted");
+        assert!(
+            !state
+                .control_ingress
+                .wait_terminal(StdDuration::from_secs(2))
+                .await,
+            "in-flight-at-seal control was falsely labeled safe before SDK drain"
+        );
+        assert_eq!(
+            state.manual_abort_intent.epoch(),
+            1,
+            "existing authorized Stop was cancelled or a post-seal frame was accepted"
+        );
         assert!(state.manual_abort_intent.pending_epoch().is_some());
-        assert!(commands.try_recv().is_err(),"manual Stop entered the ordinary queue");
+        assert!(
+            commands.try_recv().is_err(),
+            "manual Stop entered the ordinary queue"
+        );
         server.abort();
     }
     #[tokio::test]
     async fn shutdown_ingress_held_http_stop_finishes_without_reopening_new_requests() {
         use futures::FutureExt;
-        let (_root,state,mut commands,headers)=preauth_fixture().await;
-        let held=state.auth_db.acquire().await.unwrap();
-        let request=send_command(State(state.clone()),headers.clone(),Json(TelemetryCommand::Abort));tokio::pin!(request);
+        let (_root, state, mut commands, headers) = preauth_fixture().await;
+        let held = state.auth_db.acquire().await.unwrap();
+        let request = send_command(
+            State(state.clone()),
+            headers.clone(),
+            Json(TelemetryCommand::Abort),
+        );
+        tokio::pin!(request);
         assert!(request.as_mut().now_or_never().is_none());
-        state.request_shutdown();drop(held);
-        assert_eq!(request.await.0,StatusCode::ACCEPTED);
-        assert_eq!(state.manual_abort_intent.epoch(),1);
-        assert!(!state.control_ingress.wait_terminal(StdDuration::from_millis(5)).await);
-        assert_eq!(send_command(State(state.clone()),headers,Json(TelemetryCommand::Abort)).await.0,StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(state.manual_abort_intent.epoch(),1);
+        state.request_shutdown();
+        drop(held);
+        assert_eq!(request.await.0, StatusCode::ACCEPTED);
+        assert_eq!(state.manual_abort_intent.epoch(), 1);
+        assert!(
+            !state
+                .control_ingress
+                .wait_terminal(StdDuration::from_millis(5))
+                .await
+        );
+        assert_eq!(
+            send_command(State(state.clone()), headers, Json(TelemetryCommand::Abort))
+                .await
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(state.manual_abort_intent.epoch(), 1);
         assert!(commands.try_recv().is_err());
     }
 
@@ -4788,7 +4948,18 @@ async fn handle_ws(
         if ws_out_tx.send(initial_board_abort).await.is_err() {
             return;
         }
-        if ws_out_tx.send(serde_json::to_string(&WsOutMsg::AlertConditions(state_for_send.alert_conditions.snapshot())).unwrap()).await.is_err(){return;}
+        if ws_out_tx
+            .send(
+                serde_json::to_string(&WsOutMsg::AlertConditions(
+                    state_for_send.alert_conditions.snapshot(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
         let initial_alert_ack_state = serde_json::to_string(&WsOutMsg::AlertAckState(
             state_for_send.alert_ack_state_snapshot(),
         ))
@@ -5263,11 +5434,15 @@ async fn handle_ws(
                     break;
                 };
                 frame
-                    .run(handle_ws_control_text(
+                    .run(handle_ws_control_text_with_source(
                         state_for_recv.clone(),
                         token.clone(),
                         cmd_tx.clone(),
                         text.to_string(),
+                        {
+                            let source = session_closing.clone();
+                            Arc::new(move || !*source.borrow())
+                        },
                     ))
                     .await;
             }
@@ -5291,16 +5466,19 @@ async fn handle_ws(
     }
 }
 
-async fn handle_ws_control_text(
+async fn handle_ws_control_text_with_source(
     state_for_recv: Arc<AppState>,
     token: Option<String>,
     cmd_tx: mpsc::Sender<TelemetryCommand>,
     text: String,
+    source_current: Arc<dyn Fn() -> bool + Send + Sync>,
 ) {
     // Each frame retains its origin across authentication/database waits.
     let frame_name = serde_json::from_str::<serde_json::Value>(&text)
         .ok()
         .and_then(|value| value.get("cmd").and_then(|v| v.as_str()).map(str::to_owned));
+    let fill_origin = (frame_name.as_deref() == Some("StartFill"))
+        .then(|| crate::fill_recording::Captured::capture(&state_for_recv));
     let admission_generation = if frame_name.as_deref() == Some("Abort") {
         0
     } else {
@@ -5438,8 +5616,24 @@ async fn handle_ws_control_text(
                     return;
                 }
                 Ok(crate::gse::OperatorCommandAdmission::Duplicate) => {
-                    gs_debug_println!("Ignored duplicate websocket command {:?}", cmd.cmd);
-                    return;
+                    let fill_retry = matches!(cmd.cmd, TelemetryCommand::StartFill)
+                        && state_for_recv.fill_recording.ready_instance() == 0;
+                    if !fill_retry {
+                        gs_debug_println!("Ignored duplicate websocket command {:?}", cmd.cmd);
+                        return;
+                    }
+                    if state_for_recv
+                        .fill_recording
+                        .preparation
+                        .available_permits()
+                        == 0
+                    {
+                        crate::fill_recording::notify_failure(
+                            &state_for_recv,
+                            &crate::fill_recording::Error::Busy,
+                        );
+                        return;
+                    }
                 }
                 Ok(crate::gse::OperatorCommandAdmission::Fresh) => {}
             }
@@ -5476,6 +5670,25 @@ async fn handle_ws_control_text(
                         }
                     }
                 });
+                return;
+            }
+            if matches!(cmd.cmd, TelemetryCommand::StartFill) {
+                let weak = Arc::downgrade(&state_for_recv);
+                let authority = crate::fill_recording::Authority::Session {
+                    token: token.clone(),
+                    actor: principal.username.clone(),
+                    admission_current: Arc::new(move || {
+                        if source_current()
+                            && weak.upgrade().is_some_and(|state| {
+                                state.is_command_allowed(&TelemetryCommand::StartFill)
+                            }) { crate::gse::CurrentState::Current } else { crate::gse::CurrentState::Invalid }
+                    }),
+                };
+                let Some(captured) = fill_origin else {
+                    return;
+                };
+                let origin = captured.bind(authority, Some(&principal));
+                crate::fill_recording::spawn(state_for_recv.clone(), origin);
                 return;
             }
             let received_cmd = cmd.cmd;
@@ -5516,8 +5729,13 @@ struct HistoryParams {
 
 /// NEW: /api/alerts – returns warnings + errors from `alerts` table
 /// Query param: `minutes` (optional, defaults to 20)
-async fn get_alert_conditions(State(state):State<Arc<AppState>>,headers:HeaderMap)->axum::response::Response {
-    if let Err(response)=authorize_headers(&state,&headers,Permission::ViewData).await {return response;}
+async fn get_alert_conditions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
     Json(state.alert_conditions.snapshot()).into_response()
 }
 
@@ -5644,8 +5862,14 @@ fn spawn_alert_insert(
 ///     emit_error(&app_state, "Main valve stuck closed");
 ///
 /// If you only have Arc<AppState>, just pass `&*arc` or `arc.as_ref()`.
-pub fn emit_warning<S: Into<String>>(state: &AppState, message: S) {emit_warning_linked(state,message,None);}
-pub fn emit_warning_linked<S: Into<String>>(state:&AppState,message:S,condition:Option<crate::alert_conditions::ConditionLink>) {
+pub fn emit_warning<S: Into<String>>(state: &AppState, message: S) {
+    emit_warning_linked(state, message, None);
+}
+pub fn emit_warning_linked<S: Into<String>>(
+    state: &AppState,
+    message: S,
+    condition: Option<crate::alert_conditions::ConditionLink>,
+) {
     let msg_string = message.into();
     let timestamp = now_ms_i64();
 
@@ -5695,19 +5919,30 @@ pub fn emit_notification_warning<S: Into<String>>(state: &AppState, message: S) 
     persist_message_db_only(state, msg_string);
 }
 
-pub fn emit_error<S: Into<String>>(state:&AppState,message:S) {emit_error_linked(state,message,None);}
-pub fn emit_error_linked<S: Into<String>>(state:&AppState,message:S,condition:Option<crate::alert_conditions::ConditionLink>) {
+pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
+    emit_error_linked(state, message, None);
+}
+pub fn emit_error_linked<S: Into<String>>(
+    state: &AppState,
+    message: S,
+    condition: Option<crate::alert_conditions::ConditionLink>,
+) {
     emit_error_linked_at(state, now_ms_i64(), message, condition);
 }
 /// A deferred typed receipt keeps its original event time when restore finishes.
-pub fn emit_error_linked_at<S: Into<String>>(state:&AppState,timestamp:i64,message:S,condition:Option<crate::alert_conditions::ConditionLink>) {
+pub fn emit_error_linked_at<S: Into<String>>(
+    state: &AppState,
+    timestamp: i64,
+    message: S,
+    condition: Option<crate::alert_conditions::ConditionLink>,
+) {
     let msg_string = message.into();
 
     // 1) Broadcast to frontend immediately
     let ws_msg = ErrorMsg {
         timestamp_ms: timestamp,
         message: msg_string.clone(),
-        condition:condition.clone(),
+        condition: condition.clone(),
     };
     let _ = state.errors_tx.send(ws_msg);
 

@@ -13,10 +13,13 @@ const SAFE: u8 = 2;
 pub(super) struct ConfirmBoundary {
     utc: u64,
     captured: Stamp,
+    clock_failure: crate::final_proof_clock::FailureFence,
 }
 impl ConfirmBoundary {
     pub(super) fn capture(router: &sedsnet::router::Router) -> Result<Self, &'static str> {
+        let clock_failure = crate::final_proof_clock::FailureFence::capture();
         Ok(Self {
+            clock_failure,
             utc: crate::system_clock::required_control_network_utc_ms(router)
                 .map_err(|_| "Network UTC unavailable")?,
             captured: Stamp::now(),
@@ -25,13 +28,17 @@ impl ConfirmBoundary {
     pub(super) fn utc(self) -> u64 {
         self.utc
     }
+    pub(super) fn clock_failure(self) -> crate::final_proof_clock::FailureFence { self.clock_failure }
+    pub(super) fn monotonic_current(self, now: Stamp) -> bool {
+        self.clock_failure.current().is_ok() && now.checked_duration_since(self.captured).is_some_and(|age| age <= QUERY_TTL)
+    }
     pub(super) fn current(self, router: &sedsnet::router::Router, now: Stamp) -> bool {
-        now.checked_duration_since(self.captured)
-            .is_some_and(|age| age <= QUERY_TTL)
+        self.monotonic_current(now)
             && crate::system_clock::required_control_network_utc_ms(router)
                 .ok()
                 .and_then(|utc| utc.checked_sub(self.utc))
                 .is_some_and(|age| age <= QUERY_TTL.as_millis() as u64)
+            && self.clock_failure.current().is_ok()
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +79,7 @@ impl Exchange {
         // Legacy primitive controls supply a deterministic monotonic snapshot.
         // Production routes instead use capture() at actual CONFIRM admission.
         let boundary = ConfirmBoundary {
+            clock_failure: crate::final_proof_clock::FailureFence::capture(),
             utc: crate::system_clock::required_control_network_utc_ms(&router)
                 .map_err(|_| "Network UTC unavailable")?,
             captured: now,
@@ -414,6 +422,29 @@ mod tests {
         )
         .unwrap();
         assert!(e.observe(&wrong_state, now).is_err());
+    }
+
+    #[test]
+    fn targeted_startup_unknown_terminal_and_missing_physical_proof_never_apply() {
+        for board in [Board::FlightComputer, Board::RFBoard, Board::PowerBoard, Board::GatewayBoard, Board::DaqBoard] {
+            let (mut exchange, now) = setup(board);
+            let flags = if board == Board::FlightComputer {0x3e} else {0x2c};
+            let valid = reply(&exchange, 0, flags, 9);
+            let mut wire = valid.payload().to_vec();
+            wire[2] = 255;
+            wire[3] &= !STATE_VALID;
+            let unknown = Packet::new(valid.data_type(), valid.endpoints(), valid.sender(), valid.timestamp(), Arc::from(wire)).unwrap();
+            assert!(exchange.observe(&unknown, now).is_err());
+            assert!(exchange.terminal.is_none());
+            let unsupported = reply(&exchange, 0, flags & !HARDENED, 9);
+            assert!(exchange.observe(&unsupported, now).is_err());
+            assert!(exchange.terminal.is_none());
+            assert_eq!(exchange.observe(&valid, now), Ok(Outcome::Applied));
+        }
+        let (mut fc, now) = setup(Board::FlightComputer);
+        let no_outputs = reply(&fc, 0, 0x2c, 9);
+        assert!(fc.observe(&no_outputs, now).is_err());
+        assert!(fc.terminal.is_none());
     }
 
     #[test]

@@ -228,6 +228,22 @@ impl Observation {
         })
     }
 }
+/// Configuration projection only; never freshness, proof or execution authority.
+pub(crate) fn configuration_policy(bytes: &[u8], mode: crate::station_mode::Mode) -> Option<crate::command_proxy::retained_config::Policy> {
+    let observation = Observation::decode(bytes)?;
+    let revision = observation.launch_revision.filter(|v| *v != u64::MAX)?;
+    let mut policies = [None; 4];
+    if mode == crate::station_mode::Mode::Hitl
+        && let Some((bits, _, _)) = observation.safety
+    {
+        for (index, value) in policies.iter_mut().take(3).enumerate() {
+            *value = (bits & (1 << (index + 3)) != 0).then_some(bits & (1 << index) != 0);
+        }
+    }
+    policies[3] = observation.board_proof_policy;
+    Some(crate::command_proxy::retained_config::Policy {settings:policies,source_revision:revision,signed_test_fire_scope:observation.board_proof_policy.map(|_|observation.board_proof_test_fire)})
+}
+
 pub fn encode_control_observation(state: &AppState, max_bytes: usize) -> Vec<u8> {
     if max_bytes < LEN || crate::rrls::is_rrls() {
         return Vec::new();

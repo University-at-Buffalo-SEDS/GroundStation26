@@ -357,6 +357,8 @@ struct FlightSimState {
     #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
     recovery: crate::testing_board_lifecycle::Owner,
     flight_state: FlightState,
+    // Source provenance only: implicit GS readiness is not a new FC report.
+    automatic_idle_volatile: bool,
     launch_sequence_started_ms: Option<u64>,
     actuator_igniter_sequence_started_ms: Option<u64>,
     launch_time_ms: Option<u64>,
@@ -421,6 +423,7 @@ impl FlightSimState {
             #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
             recovery: crate::testing_board_lifecycle::Owner::new(),
             flight_state: FlightState::Idle,
+            automatic_idle_volatile: cfg!(feature = "test_fire_mode"),
             launch_sequence_started_ms: None,
             actuator_igniter_sequence_started_ms: None,
             launch_time_ms: None,
@@ -461,6 +464,9 @@ impl FlightSimState {
         #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
         let retained={ let mut owner=std::mem::replace(&mut self.recovery,crate::testing_board_lifecycle::Owner::new());owner.reboot();owner };
         *self = Self::new();
+        // reset() is reached only from the explicit owned ResetSim command;
+        // unlike constructor/readiness it intentionally restores model authority.
+        self.automatic_idle_volatile = false;
         #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
         {self.recovery=retained;}
         self.queue_flight_state(now_ms);
@@ -472,6 +478,9 @@ impl FlightSimState {
     }
 
     fn set_flight_state(&mut self, fs: FlightState, now_ms: u64) {
+        // All callers are explicit modeled commands/owned local transitions or
+        // the actual flight algorithm. Passive readiness never calls this.
+        self.automatic_idle_volatile = false;
         if self.flight_state == fs {
             return;
         }
@@ -489,6 +498,11 @@ impl FlightSimState {
     }
 
     fn queue_flight_state(&mut self, now_ms: u64) {
+        if self.automatic_idle_volatile && (1..=6).contains(&(self.flight_state as u8)) {
+            // Includes deferred periodic reports: do not mint a fresh FC
+            // origin from a GS-only readiness observation.
+            return;
+        }
         #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
         let Some(published)=self.recovery.publication_state()else{return;};
         #[cfg(not(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode")))))]
@@ -668,6 +682,8 @@ impl FlightSimState {
             // Only telemetry_task may authorize and normalize this internal
             // intent; direct model calls must not bypass the dispatch check.
             TelemetryCommand::QueuedOperator { .. }
+            | TelemetryCommand::FillWithRecording { .. }
+            | TelemetryCommand::ColdFlowPanelRelease { .. }
             | TelemetryCommand::AutomaticAbort { .. }
             | TelemetryCommand::AutomaticNitrogenClose { .. }
             | TelemetryCommand::AutomaticNitrousClose { .. } => return false,
@@ -1491,8 +1507,12 @@ pub fn handle_command(cmd: &TelemetryCommand) -> bool {
             | TelemetryCommand::ValveSelfTest
             | TelemetryCommand::NitrogenTest
             | TelemetryCommand::Turbocharge
+            | TelemetryCommand::StartWritingNow
+            | TelemetryCommand::StartWritingLastTwoMinutes
+            | TelemetryCommand::PauseWritingDb
+            | TelemetryCommand::StopWritingDb
     ) {
-        // The shared backend sequence engine owns these controls. Never consume
+        // Shared backend sequence/recording owners handle these controls. Never consume
         // one here or manufacture completion independently of its interlocks.
         return false;
     }
@@ -1729,6 +1749,134 @@ pub(crate) fn handle_command_stamped(
     false
 }
 
+/// Prepared outside App/Stop/SDK gates; no packet or state authority is minted.
+pub(crate) struct PreparedAutomaticReadiness {
+    #[cfg(feature = "testing")]
+    model: Option<&'static Mutex<FlightSimState>>,
+}
+pub(crate) struct AutomaticReadinessGuard<'a> {
+    #[cfg(feature = "testing")]
+    model: Option<std::sync::MutexGuard<'a, FlightSimState>>,
+    #[cfg(not(feature = "testing"))]
+    _lifetime: std::marker::PhantomData<&'a ()>,
+}
+pub(crate) fn prepare_automatic_readiness() -> PreparedAutomaticReadiness {
+    PreparedAutomaticReadiness {
+        #[cfg(feature = "testing")]
+        model: sim_mode_enabled().then(sim),
+    }
+}
+impl PreparedAutomaticReadiness {
+    pub(crate) fn try_guard(&self) -> Option<AutomaticReadinessGuard<'_>> {
+        #[cfg(feature = "testing")]
+        {
+            let model = match self.model {
+                None => None,
+                Some(model) => {
+                    let model = model.try_lock().ok()?;
+                    if !matches!(model.flight_state, FlightState::Startup | FlightState::Idle)
+                        || model.launch_sequence_started_ms.is_some()
+                        || model.actuator_igniter_sequence_started_ms.is_some()
+                        || model.launch_time_ms.is_some() { return None; }
+                    Some(model)
+                }
+            };
+            Some(AutomaticReadinessGuard { model })
+        }
+        #[cfg(not(feature = "testing"))]
+        Some(AutomaticReadinessGuard { _lifetime: std::marker::PhantomData })
+    }
+}
+impl AutomaticReadinessGuard<'_> {
+    /// Scalar assignments only. No queue/schema/clock/provider or packet build.
+    pub(crate) fn admitted(&mut self) {
+        #[cfg(feature = "testing")]
+        if let Some(model) = self.model.as_mut() {
+            if model.flight_state == FlightState::Startup {
+                model.flight_state = FlightState::Idle;
+                model.saw_dump_open_after_n2 = false;
+                model.saw_dump_closed_after_n2 = false;
+                model.nitrous_fill_started_ms = None;
+            }
+            model.automatic_idle_volatile = true;
+        }
+    }
+}
+
+/// Purely visual/model projection of a GS automatic prelaunch phase. It cannot
+/// note per-board state, construct an FC Packet or change any motion/Launch owner.
+pub(crate) struct PreparedAutomaticPhase {
+    #[cfg(feature = "testing")]
+    model: Option<&'static Mutex<FlightSimState>>,
+    #[cfg(feature = "testing")]
+    expected: FlightState,
+    #[cfg(feature = "testing")]
+    target: FlightState,
+}
+pub(crate) struct AutomaticPhaseGuard<'a> {
+    #[cfg(feature = "testing")]
+    model: Option<std::sync::MutexGuard<'a, FlightSimState>>,
+    #[cfg(feature = "testing")]
+    target: FlightState,
+    #[cfg(not(feature = "testing"))]
+    _lifetime: std::marker::PhantomData<&'a ()>,
+}
+pub(crate) fn prepare_automatic_phase(_expected: crate::types::FlightState, _target: crate::types::FlightState) -> PreparedAutomaticPhase {
+    PreparedAutomaticPhase {
+        #[cfg(feature = "testing")]
+        model: {
+            #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
+            let allowed = crate::testing_board_lifecycle::enabled();
+            #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+            let allowed = true;
+            (allowed && sim_mode_enabled()).then(sim)
+        },
+        #[cfg(feature = "testing")]
+        expected: _expected,
+        #[cfg(feature = "testing")]
+        target: _target,
+    }
+}
+impl PreparedAutomaticPhase {
+    pub(crate) fn try_guard(&self) -> Option<AutomaticPhaseGuard<'_>> {
+        #[cfg(feature = "testing")]
+        {
+            let model = match self.model {
+                None => None,
+                Some(model) => {
+                    let model = model.try_lock().ok()?;
+                    let matches = model.flight_state == self.expected
+                        || (self.expected == FlightState::Startup && model.flight_state == FlightState::Idle);
+                    if !matches || model.launch_time_ms.is_some()
+                        || model.launch_sequence_started_ms.is_some()
+                        || model.actuator_igniter_sequence_started_ms.is_some() { return None; }
+                    Some(model)
+                }
+            };
+            Some(AutomaticPhaseGuard { model, target: self.target })
+        }
+        #[cfg(not(feature = "testing"))]
+        Some(AutomaticPhaseGuard { _lifetime: std::marker::PhantomData })
+    }
+}
+impl AutomaticPhaseGuard<'_> {
+    pub(crate) fn admitted(&mut self) {
+        #[cfg(feature = "testing")]
+        if let Some(model) = self.model.as_mut() {
+            model.flight_state = self.target;
+            if self.target != FlightState::FillTest {
+                model.saw_dump_open_after_n2 = false;
+                model.saw_dump_closed_after_n2 = false;
+            }
+            if !matches!(self.target, FlightState::NitrousFill | FlightState::Armed) {
+                model.nitrous_fill_started_ms = None;
+            }
+            model.automatic_idle_volatile = true;
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "testing")]
@@ -1767,6 +1915,47 @@ mod tests {
             .is_none()
         );
     }
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn private_fill_and_cold_flow_wrappers_require_the_real_dispatch_owner() {
+        let state = crate::state::tests::test_app_state().await;
+        let origin = crate::fill_recording::Captured::capture(&state).bind(
+            crate::fill_recording::Authority::Physical {
+                current: std::sync::Arc::new(|| true),
+            },
+            None,
+        );
+        let key = crate::sequence_progress::RunKey {
+            backend_instance: "1".repeat(32),
+            reset_epoch: "2".repeat(16),
+            run_id: "3".repeat(32),
+        };
+        assert!(key.valid());
+        let mut sim = super::FlightSimState::new();
+        let valves = sim.valves.clone();
+        let flight_state = sim.flight_state;
+        let pressure = sim.fuel_tank_pressure_psi;
+        let mass = sim.loadcell_mass_kg;
+        assert!(sim.queued.is_empty());
+        for command in [
+            crate::types::TelemetryCommand::FillWithRecording { origin },
+            crate::types::TelemetryCommand::ColdFlowPanelRelease {
+                key,
+                generation: crate::gse::automatic_generation(&state),
+                awaiting_at_edge: true,
+            },
+        ] {
+            assert!(!sim.apply_command(&command, 1000));
+            assert_eq!(sim.valves, valves);
+            assert_eq!(sim.flight_state, flight_state);
+            assert_eq!(sim.fuel_tank_pressure_psi, pressure);
+            assert_eq!(sim.loadcell_mass_kg, mass);
+            assert!(sim.queued.is_empty());
+            assert!(sim.launch_sequence_started_ms.is_none());
+            assert!(sim.actuator_igniter_sequence_started_ms.is_none());
+        }
+    }
+
     #[cfg(feature = "testing")]
     #[test]
     fn automatic_abort_intent_requires_the_normal_dispatch_guard() {
@@ -1830,14 +2019,46 @@ mod tests {
             assert!(!super::handle_command(&command));
         }
     }
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    #[test]
+    fn selected_actual_dummy_models_do_not_consume_backend_recording_controls() {
+        const NAME:&str="flight_sim::tests::selected_actual_dummy_models_do_not_consume_backend_recording_controls";
+        const CHILD:&str="FLIGHT_SIM_RECORDING_OWNER_CHILD";
+        if std::env::var(CHILD).as_deref()!=Ok("1") {
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact",NAME,"--nocapture"]).env(CHILD,"1")
+                .env("GS_SIM_MODE","1").env("GS_RRLS_ROLE","off").output().unwrap();
+            assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        use crate::comms::CommsDevice;
+        crate::telemetry_schema::initialize().unwrap();
+        let rocket=crate::comms::DummyComms::new("Rocket Comms");
+        let fill=crate::comms::DummyComms::new("Umbilical Comms");
+        crate::testing_board_lifecycle::bind_selected(rocket.testing_model_link(),fill.testing_model_link());
+        assert!(crate::testing_board_lifecycle::enabled(),"actual selected model links required");
+        for command in [crate::types::TelemetryCommand::StartWritingNow,crate::types::TelemetryCommand::StartWritingLastTwoMinutes,crate::types::TelemetryCommand::PauseWritingDb,crate::types::TelemetryCommand::StopWritingDb] {
+            assert!(!super::handle_command(&command),"recording command absorbed: {command:?}");
+        }
+    }
     #[cfg(feature = "testing")]
     #[test]
     fn queued_flight_state_is_prioritized_for_launch_clock_sync() {
         let mut sim = super::FlightSimState::new();
+        // The ordering oracle needs TWO reportable frames. TestFire's
+        // default volatile Idle intentionally cannot create an FC origin.
+        // Startup is reportable in every selected Testing mode; keep the
+        // provenance flag unchanged rather than bypassing that safety rule.
+        sim.flight_state = crate::types::FlightState::Startup;
         #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
         sim.recovery.initialize(0,0,0);
         sim.queue_umbilical_status(super::ActuatorBoardCommands::IgniterOn as u8, true, 1_000);
+        let status_original = sim.queued.front().unwrap().packet.clone();
         sim.queue_flight_state(1_000);
+        assert_eq!(sim.queued.len(), 2, "both real queue producers must execute before testing priority");
+        let flight_original = sim.queued.iter()
+            .find(|p| p.data_type() == crate::telemetry_schema::data_type("FLIGHT_STATE"))
+            .expect("explicit reportable Startup must produce the priority candidate").packet.clone();
 
         let pkt = sim
             .pop_next_queued()
@@ -1847,6 +2068,37 @@ mod tests {
             pkt.data_type(),
             crate::telemetry_schema::data_type("FLIGHT_STATE")
         );
+        assert_eq!(pkt.sender(), crate::types::Board::FlightComputer.sender_id());
+        assert_eq!(pkt.payload(), [crate::types::FlightState::Startup as u8]);
+        assert_eq!((pkt.packet_id(), pkt.timestamp()), (flight_original.packet_id(), flight_original.timestamp()));
+        let next = sim.pop_next_queued().expect("lower-priority status must remain owned");
+        assert_eq!(next.data_type(), crate::telemetry_schema::data_type("UMBILICAL_STATUS"));
+        assert_eq!((next.packet_id(), next.timestamp(), next.payload()),
+            (status_original.packet_id(), status_original.timestamp(), status_original.payload()));
+        assert!(sim.pop_next_queued().is_none());
+    }
+
+    #[cfg(all(feature = "testing", feature = "test_fire_mode"))]
+    #[test]
+    fn volatile_testfire_idle_does_not_mint_fc_origin_frame() {
+        let mut sim = super::FlightSimState::new();
+        assert_eq!(sim.flight_state, crate::types::FlightState::Idle);
+        assert!(sim.automatic_idle_volatile);
+        sim.queue_umbilical_status(super::ActuatorBoardCommands::IgniterOn as u8, true, 1_000);
+        let original = sim.queued.front().unwrap().packet.clone();
+        assert_eq!(sim.queued.len(), 1);
+        sim.queue_flight_state(1_000);
+        // Refusing to mint an FC report is the production provenance contract,
+        // not a priority failure. Preserve the existing status original.
+        assert_eq!(sim.queued.len(), 1);
+        assert!(sim.queued.iter().all(|p| p.data_type() != crate::telemetry_schema::data_type("FLIGHT_STATE")));
+        assert_eq!(sim.flight_state, crate::types::FlightState::Idle);
+        assert!(sim.automatic_idle_volatile);
+        let packet = sim.pop_next_queued().unwrap();
+        assert_eq!(packet.data_type(), crate::telemetry_schema::data_type("UMBILICAL_STATUS"));
+        assert_eq!((packet.packet_id(), packet.timestamp(), packet.sender(), packet.payload()),
+            (original.packet_id(), original.timestamp(), original.sender(), original.payload()));
+        assert!(sim.pop_next_queued().is_none());
     }
 
     #[cfg(feature = "testing")]
@@ -2015,3 +2267,10 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "testing", feature = "test_fire_mode"))]
+mod automatic_readiness_tests;
+
+
+#[cfg(all(test, feature = "testing"))]
+mod automatic_phase_tests;

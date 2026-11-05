@@ -158,6 +158,7 @@ struct Ticket {
     action: String,
     phrase: String,
     targets: Vec<Target>,
+    reset_selection: Option<super::scope::Selection>,
 }
 /// Constructed only from the dedicated final QUERY path, never from an SDK
 /// acknowledgement or UI-supplied values. Validation runs inside final gate.
@@ -167,7 +168,12 @@ pub(crate) struct FinalProofs {
     rows: Vec<(Board, Observation)>,
 }
 impl FinalProofs {
-    pub(crate) fn valid(&self, pending: &RecoveryPending, generation: u64) -> bool {
+    pub(crate) fn valid_at(&self, pending: &RecoveryPending, generation: u64,
+        now: crate::final_proof_clock::Now) -> bool {
+        let now = match now {
+            crate::final_proof_clock::Now::Wall(wall) => Stamp { wall, model_ms: None },
+            crate::final_proof_clock::Now::Model(model_ms) => Stamp { wall: WallInstant::now(), model_ms: Some(model_ms) },
+        };
         self.owner == pending.owner
             && self.generation == generation
             && self.rows.len() == pending.targets.len()
@@ -187,7 +193,7 @@ impl FinalProofs {
                                 board,
                                 Board::ActuatorBoard | Board::ValveBoard | Board::FlightComputer
                             );
-                            observation.fresh(Stamp::now())
+                            observation.fresh(now)
                                 && row.result == 0
                                 && row.boot == target.boot
                                 && target.boot != u64::MAX
@@ -210,6 +216,8 @@ struct Prepare {
     action: String,
     board: Option<String>,
     mode: Option<String>,
+    #[serde(default)]
+    boards: Vec<String>,
     backend_instance: String,
     reset_epoch: String,
 }
@@ -333,7 +341,8 @@ impl Runtime {
         let remaining = CONFIRM_TTL.checked_sub(ticket.created.elapsed())?;
         if ticket.principal != principal
             || !origin_current(state, ticket.token)
-            || ticket.mode != crate::station_mode::local_mode()
+            || ticket.reset_selection.is_some_and(|selection| selection.current(state).is_err())
+        || ticket.mode != crate::station_mode::local_mode()
             || !host_safe(state)
             || state.launch_history.lock().unwrap().snapshot() != ticket.clock
         {
@@ -386,6 +395,16 @@ pub(super) async fn prepare(
     // Recovery can be explicitly retried while CLOSED. Do not use the ordinary
     // ingress helper that deliberately returns no origin in that state.
     let token = Token::capture(&state, 0);
+    // Capture immutable policy before authentication can wait, but preserve
+    // authorization response precedence for malformed/unsupported requests.
+    let parsed = serde_json::from_value::<Prepare>(body);
+    let selected = match parsed.as_ref() {
+        Ok(request) if request.action == "reset_startup" =>
+            super::scope::Selection::capture(&state, &request.boards).map(Some),
+        Ok(request) if !request.boards.is_empty() =>
+            Err("Optional proof targets apply only to the explicit global Startup reset"),
+        _ => Ok(None),
+    };
     let principal =
         match crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await {
             Ok(value) => value,
@@ -394,25 +413,23 @@ pub(super) async fn prepare(
     if let Err(response) = primary_only() {
         return response;
     }
-    let request: Prepare = match serde_json::from_value(body) {
-        Ok(value) => value,
-        Err(_) => {
-            return error(
-                StatusCode::CONFLICT,
-                "invalid_intent",
-                "A complete explicit recovery intent is required.",
-            );
-        }
+    let request = match parsed {
+        Ok(request) => request,
+        Err(_) => return error(StatusCode::CONFLICT, "invalid_intent", "A complete explicit recovery intent is required."),
+    };
+    let reset_selection = match selected {
+        Ok(selection) => selection,
+        Err(message) => return error(StatusCode::CONFLICT, "reset_policy_unavailable", message),
     };
     if let Err(message) = crate::manual_abort_utc::before_prepare(&state).await {
         return error(StatusCode::CONFLICT, "manual_utc_pending", message);
     }
     // Ceiling waiting can consume the two-second observation window. Refresh
     // dedicated queries now, under the same explicit request's original origin.
-    if let Err(message) = refresh_prepare_queries(&state, &headers, &request, token).await {
+    if let Err(message) = refresh_prepare_queries(&state, &headers, &request, token, reset_selection).await {
         return error(StatusCode::CONFLICT, "fresh_query_required", message);
     }
-    let result = prepare_inner(&state, &headers, &principal, request, token);
+    let result = prepare_inner(&state, &headers, &principal, request, token, reset_selection);
     match result {
         Ok(value) => Json(value).into_response(),
         Err(message) => error(StatusCode::CONFLICT, "recovery_unavailable", message),
@@ -423,12 +440,15 @@ async fn refresh_prepare_queries(
     headers: &HeaderMap,
     request: &Prepare,
     token: Token,
+    reset_selection: Option<super::scope::Selection>,
 ) -> Result<(), &'static str> {
+    if let Some(selection) = reset_selection { selection.current(state)?; }
     let boards = match request.action.as_str() {
-        "reset_startup" if request.board.is_none() => BOARDS.to_vec(),
+        "reset_startup" if request.board.is_none() => reset_selection.ok_or("Reset policy missing")?.boards(),
+        "reset_startup_all7" if request.board.is_none() && request.boards.is_empty() => BOARDS.to_vec(),
         "recover_abort" => vec![
-            Board::from_sender_id(request.board.as_deref().ok_or("Select AB or VB")?)
-                .filter(|b| matches!(b, Board::ActuatorBoard | Board::ValveBoard))
+            Board::from_sender_id(request.board.as_deref().ok_or("Select a supported MCU board")?)
+                .filter(|board| targeted_recovery_state(*board).is_some())
                 .ok_or("Unsupported board")?,
         ],
         _ => return Err("Unsupported recovery action"),
@@ -478,7 +498,9 @@ fn prepare_inner(
     principal: &crate::auth::AuthPrincipal,
     request: Prepare,
     token: Token,
+    reset_selection: Option<super::scope::Selection>,
 ) -> Result<Value, &'static str> {
+    if let Some(selection) = reset_selection { selection.current(state)?; }
     let identity = state
         .board_recovery
         .identity
@@ -497,11 +519,12 @@ fn prepare_inner(
     crate::system_clock::required_control_network_utc_ms(router)
         .map_err(|_| "Network UTC unavailable")?;
     let boards = match request.action.as_str() {
-        "reset_startup" if request.board.is_none() => BOARDS.to_vec(),
+        "reset_startup" if request.board.is_none() => reset_selection.ok_or("Reset policy missing")?.boards(),
+        "reset_startup_all7" if request.board.is_none() && request.boards.is_empty() => BOARDS.to_vec(),
         "recover_abort" => vec![
-            Board::from_sender_id(request.board.as_deref().ok_or("Select AB or VB")?)
-                .filter(|b| matches!(b, Board::ActuatorBoard | Board::ValveBoard))
-                .ok_or("Per-board recovery is supported only for AB/VB")?,
+            Board::from_sender_id(request.board.as_deref().ok_or("Select a supported MCU board")?)
+                .filter(|board| targeted_recovery_state(*board).is_some())
+                .ok_or("Unsupported targeted application recovery board")?,
         ],
         _ => return Err("Unsupported recovery action; runtime mode switching is unavailable"),
     };
@@ -528,10 +551,8 @@ fn prepare_inner(
         {
             return Err("Board does not advertise a usable hardened recovery context");
         }
-        let desired = if request.action != "reset_startup"
-            && matches!(board, Board::ActuatorBoard | Board::ValveBoard)
-        {
-            1
+        let desired = if request.action == "recover_abort" {
+            targeted_recovery_state(board).ok_or("Unsupported targeted application recovery board")?
         } else {
             0
         };
@@ -628,16 +649,16 @@ fn prepare_inner(
         .any(|t| t.context.boot == u64::MAX || t.context.result == 7 || t.first_binding.is_some());
     let phrase = format!(
         "{} {}{}",
-        if request.action == "reset_startup" {
-            "RESET STARTUP"
+        if matches!(request.action.as_str(), "reset_startup" | "reset_startup_all7") {
+            "RESET ALL STARTUP; VERIFY"
         } else {
             "RECOVER"
         },
-        names.join(" "),
+        if names.is_empty() { "NONE".into() } else { names.join(" ") },
         if commissioning { " COMMISSION" } else { "" }
     );
     let context = principal_context(&identity, headers, principal);
-    let value = json!({"ticket":id,"backend_instance":hex(&identity),"principal_context":context,"reset_epoch":format!("{:016x}",token.generation),"expires_in_ms":30000,"action":request.action,"targets":names,"summary":if targets.iter().any(|target| target.first_binding.is_some()) {"Identity reconciliation ONLY for retained uncertain FIRST targets. Other targets will not reset/apply in this attempt. IO cannot clear state; a fresh Query and another distinct human confirmation are required."}else if commissioning{"Explicit commissioning leg; IO is not completion. A separate fresh confirmation is required after provisioning."}else{"Recover only selected application state; no power, sensor, physical position or runtime mode reset."},"confirmation":phrase});
+    let value = json!({"ticket":id,"backend_instance":hex(&identity),"principal_context":context,"reset_epoch":format!("{:016x}",token.generation),"expires_in_ms":30000,"action":request.action,"targets":names,"global_startup_best_effort":matches!(request.action.as_str(),"reset_startup"|"reset_startup_all7"),"required_proof_boards":reset_selection.map(|s|s.required_boards()),"unselected_board_verification":"unverified_best_effort","summary":if targets.iter().any(|target| target.first_binding.is_some()) {"Identity reconciliation ONLY for retained uncertain FIRST targets. Other targets will not reset/apply in this attempt. IO cannot clear state; a fresh Query and another distinct human confirmation are required."}else if commissioning{"Explicit commissioning leg; IO is not completion. A separate fresh confirmation is required after provisioning."}else if request.action=="recover_abort" {match targets.first().map(|target|target.board) {Some(Board::FlightComputer)=>"Reset/recover FC to Startup with verified evaluator and safe-output ownership. Preserve deployment history; a separate new flight is required. No MCU reboot or output replay.",Some(Board::RFBoard|Board::PowerBoard|Board::GatewayBoard|Board::DaqBoard)=>"Reset only selected cached application metadata to Startup. No physical recovery, power cycling, acquisition reset, reboot or resync.",_=>"Recover selected AB/VB application state to Idle with verified safe outputs. No physical-position or power-reset claim."}}else{"Explicit GLOBAL Startup broadcast to ALL boards (best effort). ONLY listed targets are verified; unlisted boards remain UNVERIFIED. No MCU reboot, physical position, power or runtime mode reset."},"confirmation":phrase});
     let mut control = state.board_recovery.coordinator.0.lock().unwrap();
     if control.shutdown_closed || state.shutdown_requested.load(Ordering::Acquire) { return Err("Ground station is shutting down"); }
     if control
@@ -660,6 +681,7 @@ fn prepare_inner(
         action: request.action,
         phrase,
         targets,
+        reset_selection,
     });
     Ok(value)
 }
@@ -738,6 +760,7 @@ fn admit_confirmation(
         || !origin_current(&state, ticket.token)
         || request.reset_epoch != format!("{:016x}", ticket.token.generation)
         || ticket.phrase != request.confirmation
+        || ticket.reset_selection.is_some_and(|selection| selection.current(&state).is_err())
         || ticket.mode != crate::station_mode::local_mode()
         || !host_safe(&state)
         || state.launch_history.lock().unwrap().snapshot() != ticket.clock
@@ -869,7 +892,7 @@ fn admit_confirmation(
         }
         target.intent = Some(intent);
     }
-    let operation = json!({"id":ticket.id,"action":ticket.action,"phase":"quiescing","targets":ticket.targets.iter().map(|t|t.board.sender_id()).collect::<Vec<_>>(),"completed":false,"success":null,"age_ms":0,"reset_applied_state":null,"message":"Owned coordinator admitted; actual board completion pending."});
+    let operation = json!({"id":ticket.id,"action":ticket.action,"phase":"quiescing","targets":ticket.targets.iter().map(|t|t.board.sender_id()).collect::<Vec<_>>(),"global_startup_best_effort":matches!(ticket.action.as_str(),"reset_startup"|"reset_startup_all7"),"selected_proof_count":ticket.targets.len(),"unselected_board_verification":if matches!(ticket.action.as_str(),"reset_startup"|"reset_startup_all7"){"unverified_best_effort"}else{"not_requested"},"completed":false,"success":null,"age_ms":0,"reset_applied_state":null,"message":"Owned coordinator admitted; actual board completion pending."});
     let old_task = control.task.take();
     control.operation = Some(operation.clone());
     let owned = state.clone();
@@ -891,7 +914,7 @@ fn admit_confirmation(
             operation["completed"] = json!(true);
             operation["success"] = json!(result.is_ok());
             operation["reset_applied_state"] =
-                json!(if result.is_ok() && ticket.action == "reset_startup" {
+                json!(if result.is_ok() && matches!(ticket.action.as_str(), "reset_startup" | "reset_startup_all7") {
                     Some(0u8)
                 } else {
                     None
@@ -899,8 +922,12 @@ fn admit_confirmation(
             operation["current_host_state"] = json!(owned.local_flight_state_snapshot() as u8);
             operation["age_ms"] = json!(ticket.created.elapsed().as_millis() as u64);
             operation["message"] = json!(match result {
+                Ok(()) if matches!(ticket.action.as_str(), "reset_startup" | "reset_startup_all7") && ticket.targets.is_empty() =>
+                    "Host Startup reset completed. Global Startup broadcast was best effort; no board terminal completion or fresh board proof is claimed.",
+                Ok(()) if matches!(ticket.action.as_str(), "reset_startup" | "reset_startup_all7") =>
+                    "Host Startup reset completed after terminal completion and fresh final readbacks from the listed proof targets. Global Startup broadcast was best effort; unlisted boards remain unverified. Physical position is not certified.",
                 Ok(()) =>
-                    "Actual application terminal completion and fresh final readbacks verified. Physical position is not certified.",
+                    "Selected board application terminal completion and fresh final readback verified. Unselected boards were not reset by this targeted recovery. Physical position is not certified.",
                 Err(message) => message,
             });
         }
@@ -931,6 +958,10 @@ async fn authorize(
         || !host_safe(state)
     {
         return Err("Recovery principal/mode/safe host state changed");
+    }
+    if let Some(selection) = ticket.reset_selection { selection.current(state)?; }
+    if let Some(boundary) = ticket.boundary {
+        boundary.clock_failure().current().map_err(|error| error.message())?;
     }
     Ok(())
 }
@@ -1204,7 +1235,7 @@ async fn run(
             ticket.token.owner,
         )?;
     }
-    let proxy =
+    let mut proxy =
         crate::command_proxy::begin_primary_recovery().map_err(|_| "Proxy revocation failed")?;
     let start = WallInstant::now();
     while state.operator_dispatch_inflight.load(Ordering::Acquire) != 0
@@ -1266,6 +1297,7 @@ async fn run(
     // Pending is durable BEFORE the first board mutation, and startup restores
     // it closed. The marker is not a substitute for actual board completion.
     let pending = RecoveryPending {
+        reset_policy: ticket.reset_selection.map(|s| s.policy()),
         owner: ticket.token.owner,
         backend: ticket.backend.clone(),
         generation: ticket
@@ -1361,7 +1393,7 @@ async fn run(
             "Identity reconciliation only; no target was reset/applied. Remain closed. Fresh Query and another distinct human intent are required.",
         );
     }
-    let reset_all = ticket.action == "reset_startup" && ticket.targets.len() == BOARDS.len();
+    let reset_all = matches!(ticket.action.as_str(), "reset_startup" | "reset_startup_all7");
     if reset_all {
         // Persist/prebuild outside DISPATCH/Stop/SDK locks. Queue admission is
         // bounded and Stop-fenced; SDK callbacks run later in telemetry owner.
@@ -1378,6 +1410,8 @@ async fn run(
         wait_sdk(state, &router, token).await?;
     }
     authorize(state, headers, ticket).await?;
+    #[cfg(all(test, any(feature="hitl_mode",feature="firmware_sim")))]
+    tests::pause_clock_marker(state).await;
     fence = state
         .launch_history
         .lock()
@@ -1404,9 +1438,38 @@ async fn run(
     authorize(state, headers, ticket).await?;
     #[cfg(test)]
     tests::pause_finalization(state).await;
-    crate::gse::reset_generation::finalize_verified_recovery(
-        state, token, &fence, proxy, &proofs, reset_all,
-    )?;
+    // Source IO is outside all admission/Stop/history locks. Busy never creates
+    // a new confirmation/query/owner or a new proof observation timestamp.
+    let clock = crate::final_proof_clock::Prepared::capture(
+        ticket.boundary.ok_or("Original confirmation boundary missing")?.clock_failure(),
+    ).map_err(|error| error.message())?;
+    #[cfg(all(test, any(feature="hitl_mode",feature="firmware_sim")))]
+    tests::pause_clock_ready(state).await;
+    let mut admission = None;
+    loop {
+        authorize(state, headers, ticket).await?;
+        // Start the NEW 100ms contention-only budget exactly once, immediately
+        // before the first final attempt. Prior durability/auth is not a new
+        // universal confirmation lifetime, and original proof clocks stay put.
+        let clock_admission = admission.get_or_insert_with(|| crate::final_proof_clock::Admission::new(clock));
+        let publication = match (reset_all, ticket.reset_selection) {
+            (true, Some(selection)) => crate::gse::reset_generation::StartupPublication::ModeAware(selection),
+            (true, None) => crate::gse::reset_generation::StartupPublication::LegacyAllSeven,
+            (false, _) => crate::gse::reset_generation::StartupPublication::TargetedRecovery,
+        };
+        match crate::gse::reset_generation::finalize_verified_recovery(
+            state, token, &fence, &mut proxy, &proofs, publication, clock_admission,
+        ) {
+            Ok(()) => break,
+            Err(crate::gse::reset_generation::FinalizeError::ClockBusy) => {
+                #[cfg(all(test, any(feature="hitl_mode",feature="firmware_sim")))]
+                tests::notify_final_clock_busy(state);
+                clock_admission.note_busy().map_err(|error| error.message())?;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(crate::gse::reset_generation::FinalizeError::Refused(message)) => return Err(message),
+        }
+    }
     if reset_all {
         state.publish_verified_startup_observation();
     }
@@ -1436,12 +1499,26 @@ async fn run(
         .unwrap()
         .activate_acknowledged_recovery(token.owner)
         .map_err(|_| "Durable recovery activation changed")?;
+    if reset_all {
+        // A NEW legitimate Normal policy owner starts only after the durable
+        // publication acknowledgement is verified and activation succeeds.
+        // It captures the current finite Stop/epoch before any observations;
+        // an intervening or retained Stop still vetoes automatic publication.
+        crate::sequences::refresh_action_policy_now(state);
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim")))]
+    mod normal_automatic_phase { include!("normal_automatic_phase_tests.rs"); }
+    include!("targeted_recovery_tests.rs");
+    #[cfg(any(feature="hitl_mode",feature="firmware_sim"))]
+    include!("final_clock_tests.rs");
     use super::*;
+    #[cfg(feature="test_fire_mode")]
+    mod pending_native { include!("pending_recovery_native_tests.rs"); }
     use futures::FutureExt;
     use sedsnet::router::{EndpointHandler, Router, RouterConfig, RouterSideOptions};
     use std::collections::HashMap;
@@ -1454,6 +1531,13 @@ mod tests {
     static AUTH_RECEIVED: Mutex<Option<(usize, Arc<tokio::sync::Notify>)>> = Mutex::new(None);
     static RESPONSE: Mutex<Option<(usize, Arc<Pause>)>> = Mutex::new(None);
     static FINAL: Mutex<Option<(usize, Arc<Pause>)>> = Mutex::new(None);
+    #[cfg(any(feature="hitl_mode",feature="firmware_sim"))]
+    static CLOCK_READY: Mutex<Option<(usize, Arc<Pause>)>> = Mutex::new(None);
+    #[cfg(any(feature="hitl_mode",feature="firmware_sim"))]
+    static CLOCK_MARKER: Mutex<Option<(usize, Arc<Pause>)>> = Mutex::new(None);
+    #[cfg(any(feature="hitl_mode",feature="firmware_sim"))]
+    static CLOCK_BUSY: Mutex<Option<(usize, Arc<tokio::sync::Notify>)>> = Mutex::new(None);
+
     struct PauseGuard {
         slot: &'static Mutex<Option<(usize, Arc<Pause>)>>,
         key: usize,
@@ -1514,7 +1598,21 @@ mod tests {
     pub(super) async fn pause_finalization(state: &Arc<AppState>) {
         pause(&FINAL, state).await;
     }
+    #[cfg(any(feature="hitl_mode",feature="firmware_sim"))]
+    pub(super) async fn pause_clock_ready(state: &Arc<AppState>) {
+        pause(&CLOCK_READY, state).await;
+    }
+    #[cfg(any(feature="hitl_mode",feature="firmware_sim"))]
+    pub(super) async fn pause_clock_marker(state: &Arc<AppState>) {
+        pause(&CLOCK_MARKER, state).await;
+    }
+    #[cfg(any(feature="hitl_mode",feature="firmware_sim"))]
+    pub(super) fn notify_final_clock_busy(state: &Arc<AppState>) {
+        if let Some((key, notify)) = CLOCK_BUSY.lock().unwrap().as_ref()
+            && *key == Arc::as_ptr(state) as usize { notify.notify_one(); }
+    }
     struct Model {
+        hardened: bool,
         manual_v1: bool,
         boot: u64,
         epoch: u32,
@@ -1529,9 +1627,13 @@ mod tests {
         fail_first_readback: bool,
         retained_first: Option<(Vec<u8>, u64)>,
     }
+    #[cfg(feature="test_fire_mode")]
+    type NativePeerRouter = Arc<Router>;
+    #[cfg(not(feature="test_fire_mode"))]
+    type NativePeerRouter = Router;
     struct Link {
         board: Board,
-        router: Router,
+        router: NativePeerRouter,
         host_side: usize,
         board_side: usize,
         outgoing: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -1546,12 +1648,18 @@ mod tests {
         receiver: JoinHandle<crate::telemetry_task::TelemetryShutdownOutcome>,
         models: Vec<(Board, Arc<Mutex<Model>>)>,
         raw_state_receipts: Arc<Mutex<Vec<Packet>>>,
+        incoming_startup: Arc<Mutex<Vec<(Board, Packet)>>>,
+        managed_state_receipts: Arc<Mutex<Vec<(Board, Packet)>>>,
         controller_receipts: Arc<Mutex<Vec<Packet>>>,
         _db: mpsc::Sender<crate::telemetry_db::DbQueueItem>,
+        #[cfg(feature="test_fire_mode")]
+        native_peers: Vec<(Board,Arc<Router>)>,
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
             let healthy = !self.pump.is_finished() && !self.receiver.is_finished();
+            #[cfg(feature="test_fire_mode")]
+            crate::recovery_pending_probe::clear_for_state(&self.http.state);
             self.http.state.request_shutdown();
             self.pump.abort();
             self.receiver.abort();
@@ -1586,6 +1694,9 @@ mod tests {
         async fn new() -> Self {
             Self::from_saved(None, None).await
         }
+        async fn new_with_managed_peers() -> Self {
+            Self::from_saved_with_clock_and_services(None,None,None,true).await
+        }
         async fn from_saved(
             journal: Option<Vec<u8>>,
             retained: Option<Vec<(Board, Arc<Mutex<Model>>)>>,
@@ -1597,6 +1708,14 @@ mod tests {
             retained: Option<Vec<(Board, Arc<Mutex<Model>>)>>,
             clock: Option<Box<dyn sedsnet::router::Clock + Send + Sync>>,
         ) -> Self {
+            Self::from_saved_with_clock_and_services(journal,retained,clock,false).await
+        }
+        async fn from_saved_with_clock_and_services(
+            journal: Option<Vec<u8>>,
+            retained: Option<Vec<(Board, Arc<Mutex<Model>>)>>,
+            clock: Option<Box<dyn sedsnet::router::Clock + Send + Sync>>,
+            managed_peers: bool,
+        ) -> Self {
             let mut http = super::super::tests::http_fixture().await;
             let restarting = journal.is_some();
             if let Some(bytes) = journal {
@@ -1605,6 +1724,10 @@ mod tests {
             let (tx, commands) = mpsc::channel(8);
             Arc::get_mut(&mut http.state).unwrap().cmd_tx = tx;
             let state = http.state.clone();
+            #[cfg(feature="test_fire_mode")]
+            let native_probe=crate::recovery_pending_probe::take_next();
+            #[cfg(feature="test_fire_mode")]
+            if let Some(p)=&native_probe { p.bind(&state); }
             *state.launch_history.lock().unwrap() = crate::launch_history::Store::open(
                 http.directory.join("clock.json"),
                 false,
@@ -1635,6 +1758,8 @@ mod tests {
             let received_raw = raw_state_receipts.clone();
             let controller_receipts=Arc::new(Mutex::new(Vec::<Packet>::new()));
             let received_controls=controller_receipts.clone();
+            #[cfg(feature="test_fire_mode")]
+            let native_enabled=native_probe.is_some();
             let weak = Arc::downgrade(&state);
             let config = RouterConfig::new([EndpointHandler::new_packet_handler(
                 crate::telemetry_schema::endpoint("GROUND_STATION"),
@@ -1658,6 +1783,10 @@ mod tests {
                             );
                         }
                         receive_status(&state, packet);
+                        #[cfg(feature="test_fire_mode")]
+                        if native_enabled && packet.data_type()==crate::telemetry_schema::data_type("HEARTBEAT") {
+                            state.ring_buffer.lock().unwrap().push(packet.clone());
+                        }
                         if packet.data_type() == crate::telemetry_schema::data_type("FLIGHT_STATE")
                         {
                             received_raw.lock().unwrap().push(packet.clone());
@@ -1666,11 +1795,18 @@ mod tests {
                     Ok(())
                 },
             )])
-            .with_sender("GS");
+            .with_sender("GS")
+            // Identical host resource policy to actual main, not peer policy.
+            .with_memory_config(crate::network_memory_config()).unwrap();
             let host = Arc::new(match clock {
                 Some(clock) => Router::new_with_clock(config, clock),
                 None => Router::new(config),
             });
+            let actual_memory: Value = serde_json::from_str(&host.export_memory_layout_json()).unwrap();
+            let configured_memory = crate::network_memory_config();
+            assert_eq!(actual_memory["shared_queue_bytes_allocated"], configured_memory.max_queue_budget);
+            eprintln!("actual GS fixture host memory: {actual_memory}; config starting={}, recent={}, growth={}",
+                configured_memory.starting_queue_size, configured_memory.max_recent_rx_ids, configured_memory.queue_grow_step);
             host.try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(
                 initial_utc,
             ))
@@ -1683,46 +1819,99 @@ mod tests {
             }
             let mut links = Vec::new();
             let mut models = Vec::new();
+            #[cfg(feature="test_fire_mode")]
+            let mut native_peers=Vec::new();
+            let incoming_startup = Arc::new(Mutex::new(Vec::<(Board,Packet)>::new()));
+            let managed_state_receipts = Arc::new(Mutex::new(Vec::<(Board,Packet)>::new()));
             for board in BOARDS {
                 let requests = Arc::new(Mutex::new(Vec::<Packet>::new()));
                 let capture = requests.clone();
                 let dedicated = crate::telemetry_schema::endpoint(endpoint(board));
-                let router = Router::new(
-                    RouterConfig::new([
+                let state_receipts = incoming_startup.clone();
+                let peer_config = RouterConfig::new([
                         EndpointHandler::new_packet_handler(dedicated, move |packet| {
                             capture.lock().unwrap().push(packet.clone());
                             Ok(())
                         }),
                         EndpointHandler::new_packet_handler(
                             crate::telemetry_schema::endpoint("FLIGHT_STATE"),
-                            |_| Ok(()),
+                            move |packet| {
+                                state_receipts.lock().unwrap().push((board,packet.clone()));
+                                Ok(())
+                            },
                         ),
                     ])
-                    .with_sender(board.sender_id()),
-                );
+                    .with_sender(board.sender_id());
+                #[cfg(not(feature="test_fire_mode"))]
+                let router=Router::new(peer_config);
+                #[cfg(feature="test_fire_mode")]
+                let router=Arc::new(if let Some(clock)=native_probe.as_ref().and_then(|p|p.clock.clone()) {
+                    Router::new_with_clock(peer_config,Box::new(crate::recovery_pending_probe::ClockSource(clock)))
+                } else { Router::new(peer_config) });
+                if managed_peers {
+                    // Match all seven actual flight_state_cache_init owners:
+                    // seds_router_enable_network_variable(FSTATE,true,false).
+                    let ty=crate::telemetry_schema::data_type("FLIGHT_STATE");
+                    router.enable_network_variable(ty,sedsnet::router::NetworkVariablePermissions::READ_ONLY).unwrap();
+                    let managed_receipts=managed_state_receipts.clone();
+                    #[cfg(feature="test_fire_mode")]
+                    let probe=native_probe.clone();
+                    #[cfg(feature="test_fire_mode")]
+                    let weak_peer=Arc::downgrade(&router);
+                    router.on_network_variable_update(ty,move |packet| {
+                        managed_receipts.lock().unwrap().push((board,packet.clone()));
+                        #[cfg(feature="test_fire_mode")]
+                        if let Some(p)=&probe {
+                            p.observe(board,packet);
+                            if board==Board::GatewayBoard && p.reject_gb.load(Ordering::Acquire) {
+                                weak_peer.upgrade().unwrap().invalidate_network_variable_cache(ty);
+                                return Err(sedsnet::TelemetryError::HandlerError("native GB strict-readiness refusal model"));
+                            }
+                        }
+                        Ok(())
+                    }).unwrap();
+                }
                 let outgoing = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
                 let output = outgoing.clone();
+                #[cfg(feature="test_fire_mode")]
+                let outgoing_wire_probe = native_probe.clone();
                 let hs = host.add_side_packed_with_options(
                     format!("wire-{}", board.sender_id()),
                     move |wire| {
+                        #[cfg(feature="test_fire_mode")]
+                        if let Some(p) = &outgoing_wire_probe { p.observe_wire("host_emit", board, wire); }
                         output.lock().unwrap().push(wire.to_vec());
                         Ok(())
                     },
                     RouterSideOptions {
-                        reliable_enabled: true,
+                        reliable_enabled: {
+                            #[cfg(feature="test_fire_mode")]
+                            {native_probe.is_none()}
+                            #[cfg(not(feature="test_fire_mode"))]
+                            {true}
+                        },
                         ..Default::default()
                     },
                 );
                 let incoming = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
                 let output = incoming.clone();
+                #[cfg(feature="test_fire_mode")]
+                let incoming_wire_probe = native_probe.clone();
                 let bs = router.add_side_packed_with_options(
                     "wire",
                     move |wire| {
+                        #[cfg(feature="test_fire_mode")]
+                        if let Some(p) = &incoming_wire_probe { p.observe_wire("peer_emit", board, wire); }
                         output.lock().unwrap().push(wire.to_vec());
                         Ok(())
                     },
                     RouterSideOptions {
-                        reliable_enabled: true,
+                        reliable_enabled: {
+                            #[cfg(feature="test_fire_mode")]
+                            {native_probe.is_none()}
+                            #[cfg(not(feature="test_fire_mode"))]
+                            {true}
+                        },
                         ..Default::default()
                     },
                 );
@@ -1753,6 +1942,7 @@ mod tests {
                     .map(|(_, model)| model.clone())
                     .unwrap_or_else(|| {
                         Arc::new(Mutex::new(Model {
+                            hardened: true,
                             manual_v1: false,
                             boot: 42,
                             epoch: 8,
@@ -1769,6 +1959,8 @@ mod tests {
                         }))
                     });
                 models.push((board, model.clone()));
+                #[cfg(feature="test_fire_mode")]
+                native_peers.push((board,router.clone()));
                 links.push(Link {
                     board,
                     router,
@@ -1786,12 +1978,24 @@ mod tests {
                 loop {
                     // The actual telemetry task is the sole host queue owner.
                     for link in &mut links {
-                        for wire in std::mem::take(&mut *link.outgoing.lock().unwrap()) {
-                            link.router
-                                .rx_packed_from_side(&wire, link.board_side)
-                                .unwrap();
+                        #[cfg(feature="test_fire_mode")]
+                        if link.board==Board::GatewayBoard && native_probe.as_ref().is_some_and(|p|p.get_due()) {
+                            link.router.request_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).unwrap();
                         }
-                        link.router.process_all_queues_with_timeout(0).unwrap();
+                        for wire in std::mem::take(&mut *link.outgoing.lock().unwrap()) {
+                            let result=link.router.rx_packed_from_side(&wire,link.board_side);
+                            #[cfg(feature="test_fire_mode")]
+                            if result.is_ok() && let Some(p) = &native_probe { p.observe_wire("peer_ingress_accepted", link.board, &wire); }
+                            #[cfg(feature="test_fire_mode")]
+                            crate::recovery_pending_probe::peer_result(native_probe.as_ref(),result);
+                            #[cfg(not(feature="test_fire_mode"))]
+                            result.unwrap();
+                        }
+                        let result=link.router.process_all_queues_with_timeout(0);
+                        #[cfg(feature="test_fire_mode")]
+                        crate::recovery_pending_probe::peer_result(native_probe.as_ref(),result);
+                        #[cfg(not(feature="test_fire_mode"))]
+                        result.unwrap();
                         for packet in std::mem::take(&mut *link.requests.lock().unwrap()) {
                             let wire = packet.payload();
                             assert_eq!(wire.len(), 32);
@@ -1862,7 +2066,7 @@ mod tests {
                             if !m.seen.contains_key(&nonce) || wire[1] == 0 {
                                 response[1] = result;
                                 response[2] = m.state;
-                                response[3] = 0x24
+                                response[3] = 0x04 | if m.hardened { 0x20 } else { 0 }
                                     | if physical && m.manual_v1 { 0x40 } else { 0 }
                                     | if m.state != 255 { 8 } else { 0 }
                                     | if physical { 0x12 } else { 0 }
@@ -1897,7 +2101,11 @@ mod tests {
                             .unwrap();
                             link.router.tx_queue(reply).unwrap();
                         }
-                        link.router.process_all_queues_with_timeout(0).unwrap();
+                        let result=link.router.process_all_queues_with_timeout(0);
+                        #[cfg(feature="test_fire_mode")]
+                        crate::recovery_pending_probe::peer_result(native_probe.as_ref(),result);
+                        #[cfg(not(feature="test_fire_mode"))]
+                        result.unwrap();
                         link.pending_rx
                             .extend(std::mem::take(&mut *link.incoming.lock().unwrap()));
                         assert!(
@@ -1905,8 +2113,12 @@ mod tests {
                             "bounded test wire retains backpressure"
                         );
                         while let Some(wire) = link.pending_rx.front() {
+                            #[cfg(feature="test_fire_mode")]
+                            if native_probe.as_ref().is_some_and(|p| p.should_hold_get(link.board, wire)) { break; }
                             match pump_host.rx_packed_from_side(wire, link.host_side) {
                                 Ok(()) => {
+                                    #[cfg(feature="test_fire_mode")]
+                                    if let Some(p) = &native_probe { p.observe_wire("host_ingress_accepted", link.board, wire); }
                                     link.pending_rx.pop_front();
                                 }
                                 Err(sedsnet::TelemetryError::Io("rx queue busy")) => break,
@@ -1928,15 +2140,35 @@ mod tests {
                 db_rx,
                 state.shutdown_subscribe(),
             ));
-            Self {
+            let fixture=Self {
                 http,
                 pump,
                 receiver,
                 models,
                 raw_state_receipts,
+                incoming_startup,
+                managed_state_receipts,
                 controller_receipts,
                 _db: db,
+                #[cfg(feature="test_fire_mode")]
+                native_peers,
+            };
+            if managed_peers {
+                // Observe REAL SDK service discovery, never inject owner IDs or
+                // rewrite routes to force multicast. No application request yet.
+                tokio::time::timeout(Duration::from_secs(2),async {
+                    loop {
+                        let topology=fixture.http.state.topology_router.get().unwrap().export_topology();
+                        let ty=crate::telemetry_schema::data_type("FLIGHT_STATE");
+                        let ready=BOARDS.iter().all(|board|topology.routes.iter().any(|route|
+                            route.announcers.iter().any(|announcer|
+                                announcer.sender_id==board.sender_id() && announcer.reachable_network_variables.contains(&ty))));
+                        if ready {break;}
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                }).await.expect("actual READ_ONLY peer services must be discovered before reset intent");
             }
+            fixture
         }
         fn state(&self) -> Arc<AppState> {
             self.http.state.clone()
@@ -2004,7 +2236,7 @@ mod tests {
         }
         async fn prepare(&self, action: &str, board: Option<&str>) -> Value {
             let state = self.state();
-            let response = super::super::tests::http(state.clone(), "POST", "/api/board-recovery/prepare", Some("operator"), json!({"action":action,"board":board,"mode":null,"backend_instance":hex(&state.board_recovery.identity.unwrap()),"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state))})).await;
+            let response = super::super::tests::http(state.clone(), "POST", "/api/board-recovery/prepare", Some("operator"), json!({"action":action,"boards":if action=="reset_startup" {BOARDS.iter().map(|b|b.sender_id()).collect::<Vec<_>>()}else{vec![]},"board":board,"mode":null,"backend_instance":hex(&state.board_recovery.identity.unwrap()),"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state))})).await;
             let status = response.status();
             let value = body(response).await;
             assert_eq!(status, StatusCode::OK, "{value}");
@@ -2031,8 +2263,172 @@ mod tests {
             .unwrap()
         }
     }
+    #[cfg(feature="test_fire_mode")]
+    fn tf_fresh_receipt_probe() -> Arc<crate::recovery_pending_probe::Probe> {
+        // Match the existing native fixture's explicit desired-cache load.
+        let _ = crate::network_variables::flight_state();
+        let probe = crate::recovery_pending_probe::Probe::new(None);
+        probe.reject_gb.store(false, Ordering::Release);
+        probe.install();
+        probe
+    }
+    #[cfg(feature="test_fire_mode")]
+    async fn assert_tf_idle_from_fresh_mcu_receipts(fixture: &Fixture) {
+        let state = fixture.state();
+        let before = crate::network_variables::automatic_idle_test_snapshot();
+        let cached_before = state.topology_router.get().unwrap()
+            .cached_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"))
+            .map(|packet| (packet.packet_id(), packet.timestamp(), packet.payload().to_vec()));
+        crate::sequences::refresh_action_policy_now(&state);
+        assert_eq!(state.local_flight_state_snapshot(), crate::types::FlightState::Startup,
+            "TF policy projection cannot remint readiness from cached contacts");
+        assert!(crate::network_variables::automatic_idle_test_snapshot().durable_unchanged(&before));
+        assert_eq!(state.topology_router.get().unwrap()
+            .cached_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"))
+            .map(|packet| (packet.packet_id(), packet.timestamp(), packet.payload().to_vec())), cached_before);
+        let required: Vec<_> = Board::ALL.iter().copied()
+            .filter(|board| state.board_required_for_progression(*board)).collect();
+        assert!(!required.is_empty());
+        for board in required {
+            let peer = &fixture.native_peers.iter().find(|(seen, _)| *seen == board).unwrap().1;
+            assert_eq!(peer.sender().as_ref(), board.sender_id());
+            let utc = state.topology_router.get().unwrap().network_time_ms().unwrap();
+            let packet = Packet::new(crate::telemetry_schema::data_type("HEARTBEAT"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")], board.sender_id(), utc,
+                Arc::<[u8]>::from([])).unwrap();
+            peer.tx_queue(packet).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.local_flight_state_snapshot() != crate::types::FlightState::Idle {
+                assert!(!fixture.pump.is_finished() && !fixture.receiver.is_finished());
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("fresh real MCU packet must drive TF readiness through actual telemetry worker");
+        assert_eq!(crate::network_variables::flight_state(), 0,
+            "automatic Idle remains live-only after explicit Startup");
+        assert!(crate::network_variables::automatic_idle_test_snapshot().durable_unchanged(&before));
+        let cached = state.topology_router.get().unwrap()
+            .cached_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"))
+            .expect("actual public SDK must retain the new Idle");
+        assert_eq!(cached.sender(), "GS");
+        assert_eq!(cached.payload(), &[1]);
+        assert!(cached.timestamp() > 0);
+        assert_ne!(cached_before.as_ref().map(|p|p.0), Some(cached.packet_id()));
+    }
     fn isolated(name: &str) -> bool {
         crate::operator_queue::isolated_case(module_path!(), name)
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=2)]
+    async fn actual_mode_reset_preserves_global_broadcast_but_verifies_only_frozen_policy() {
+        if isolated("actual_mode_reset_preserves_global_broadcast_but_verifies_only_frozen_policy") { return; }
+        #[cfg(feature="test_fire_mode")]
+        let _tf_probe = tf_fresh_receipt_probe();
+        let fixture=Fixture::new_with_managed_peers().await;
+        let state=fixture.state();
+        let request=json!({"action":"reset_startup","board":null,"mode":null,
+            "backend_instance":hex(&state.board_recovery.identity.unwrap()),
+            "reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state))});
+        let first=super::super::tests::http(state.clone(),"POST","/api/board-recovery/prepare",Some("operator"),request.clone()).await;
+        let first_status=first.status();
+        let first_body=body(first).await;
+        let mask=super::super::scope::base_mask(crate::station_mode::local_mode());
+        let ticket=if mask!=0 {
+            // Actual QUERY discovered seeded Abort episodes AFTER the original
+            // selection. That intent must die; never auto retry/restamp it.
+            assert_eq!(first_status,StatusCode::CONFLICT,"{first_body}");
+            assert_eq!(first_body["error"],"recovery_unavailable");
+            assert!(first_body["message"].as_str().unwrap().contains("Abort episode changed"));
+            assert!(state.launch_history.lock().unwrap().recovery_pending().is_none());
+            assert!(state.board_recovery.coordinator.0.lock().unwrap().ticket.is_none());
+            for (_,model) in &fixture.models { assert_eq!(model.lock().unwrap().applied,0); }
+            // A SECOND explicit request is a new operator intent. The runtime
+            // contains no retry loop and the retired first request is not used.
+            let second=super::super::tests::http(state.clone(),"POST","/api/board-recovery/prepare",Some("operator"),request).await;
+            let status=second.status();let value=body(second).await;
+            assert_eq!(status,StatusCode::OK,"new explicit prepare: {value}");value
+        } else {
+            assert_eq!(first_status,StatusCode::OK,"empty HITL: {first_body}");
+            assert_eq!(first_body["confirmation"],"RESET ALL STARTUP; VERIFY NONE");
+            for (_,model) in &fixture.models { assert!(model.lock().unwrap().requests.is_empty()); }
+            first_body
+        };
+        assert_eq!(ticket["targets"].as_array().unwrap().len(),mask.count_ones() as usize);
+        assert_eq!(ticket["global_startup_best_effort"],true);
+        assert_eq!(ticket["unselected_board_verification"],"unverified_best_effort");
+        assert_eq!(fixture.confirm(&ticket).await.status(),StatusCode::OK);
+        let result=fixture.terminal().await;
+        assert_eq!(result["success"],true,"{result}");
+        assert_eq!(result["global_startup_best_effort"],true);
+        assert_eq!(result["selected_proof_count"],mask.count_ones());
+        assert_eq!(result["unselected_board_verification"],"unverified_best_effort");
+        if mask==0 {
+            assert!(result["message"].as_str().unwrap().contains("no board terminal completion or fresh board proof is claimed"));
+        } else {
+            assert!(result["message"].as_str().unwrap().contains("listed proof targets"));
+        }
+        {
+        let history=state.launch_history.lock().unwrap();
+        let marker=history.recovery_pending().unwrap();
+        assert!(marker.verified && marker.published);
+        assert_eq!(marker.reset_policy.as_ref().unwrap().verified_mask,mask);
+        assert_eq!(marker.targets.len(),mask.count_ones() as usize);
+        assert!(!history.automatic_actions_inhibited());
+        if mask!=0x7f { assert!(history.manual_utc_key().is_none(),"subset reset cannot fabricate all-seven Manual UTC cohort"); }
+        }
+        for (i,board) in BOARDS.iter().enumerate() {
+            let model=fixture.models.iter().find(|(b,_)|b==board).unwrap().1.lock().unwrap();
+            assert_eq!(model.applied,usize::from(mask&(1<<i)!=0));
+        }
+        // This fixture explicitly installs each existing peer's FLIGHT_STATE
+        // discovery announcement before requests; assert that availability,
+        // then observe ACTUAL peer endpoint receipts without adding routes.
+        let router=state.topology_router.get().unwrap();
+        let topology=router.export_topology();
+        assert!(BOARDS.iter().all(|board| endpoint_verified(&state,*board,&topology)));
+        let delivered=tokio::time::timeout(Duration::from_secs(2),async {
+            loop {
+                let all={
+                    let received=fixture.managed_state_receipts.lock().unwrap();
+                    BOARDS.iter().all(|board| received.iter().any(|(seen,packet)|seen==board && packet.sender()=="GS" && packet.payload()==[0]))
+                };
+                if all {break;}
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }).await;
+        let cached = {
+            let received=fixture.managed_state_receipts.lock().unwrap();
+            let facts=received.iter().take(32).map(|(board,packet)|json!({"board":board.sender_id(),"sender":packet.sender(),"packet_id":packet.packet_id(),"source_utc":packet.timestamp(),"payload":packet.payload(),"type":packet.data_type().as_u32()})).collect::<Vec<_>>();
+            let endpoint_count=fixture.incoming_startup.lock().unwrap().len();
+            let cached=router.cached_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"))
+                .map(|packet|json!({"sender":packet.sender(),"packet_id":packet.packet_id(),"source_utc":packet.timestamp(),"payload":packet.payload()}));
+            assert!(delivered.is_ok(),"all seven available disposable peers must receive global Startup; actual managed callback count={}, endpoint_count={endpoint_count}, first32={facts:?}, host_cache={cached:?}",received.len());
+            let original=&received.iter().find(|(_,packet)|packet.sender()=="GS" && packet.payload()==[0]).unwrap().1;
+            assert!(original.timestamp()>0);
+            for (_,packet) in received.iter().filter(|(_,packet)|packet.sender()=="GS" && packet.payload()==[0]) {
+                assert_eq!(packet.sender(),"GS");
+                assert_eq!(packet.data_type(),crate::telemetry_schema::data_type("FLIGHT_STATE"));
+                assert_eq!(packet.payload(),[0]);
+                assert_eq!(packet.packet_id(),original.packet_id());
+                assert_eq!(packet.timestamp(),original.timestamp());
+            }
+            cached
+        };
+        // Normal may publish Idle after Startup. TF requires a NEW actual MCU
+        // packet; the READ_ONLY peer callbacks never grant that authority.
+        if !cfg!(feature="hitl_mode") {
+            assert_eq!(cached.as_ref().unwrap()["sender"],"GS");
+            if cfg!(feature="test_fire_mode") {
+                assert_eq!(state.local_flight_state_snapshot(),crate::types::FlightState::Startup);
+                assert_eq!(cached.as_ref().unwrap()["payload"],json!([0]));
+                #[cfg(feature="test_fire_mode")]
+                assert_tf_idle_from_fresh_mcu_receipts(&fixture).await;
+            } else {
+                assert_eq!(state.local_flight_state_snapshot(),crate::types::FlightState::Idle);
+                assert_eq!(cached.as_ref().unwrap()["payload"],json!([1]));
+            }
+        }
+        // Wire receipts do NOT certify unselected MCU application/physical state.
     }
 
     async fn completed_manual_cohort(fixture: &Fixture) {
@@ -2210,7 +2606,7 @@ mod tests {
         assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 1);
         let prepare_state = state.clone();
         let prepare = tokio::spawn(async move {
-            super::super::tests::http(prepare_state.clone(),"POST","/api/board-recovery/prepare",Some("operator"),json!({"action":"reset_startup","board":null,"mode":null,"backend_instance":hex(&prepare_state.board_recovery.identity.unwrap()),"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&prepare_state))})).await
+            super::super::tests::http(prepare_state.clone(),"POST","/api/board-recovery/prepare",Some("operator"),json!({"action":"reset_startup","boards":["RF","FC","PB","AB","VB","GB","DAQ"],"board":null,"mode":null,"backend_instance":hex(&prepare_state.board_recovery.identity.unwrap()),"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&prepare_state))})).await
         });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !state.board_recovery.manual_utc.is_revoked() {
@@ -2436,6 +2832,45 @@ mod tests {
         claim.accepted();
     }
 
+    #[tokio::test]
+    async fn frozen_sdk_clock_defers_same_accepted_original_until_next_tick() {
+        if isolated("frozen_sdk_clock_defers_same_accepted_original_until_next_tick") { return; }
+        use std::sync::atomic::AtomicU64;
+        let _http = super::super::tests::http_fixture().await;
+        let ticks = Arc::new(AtomicU64::new(2001));
+        let clock = ticks.clone();
+        let attempts = Arc::new(Mutex::new(Vec::<Packet>::new()));
+        let observed = attempts.clone();
+        let endpoint = crate::telemetry_schema::endpoint("BOARD_RECOVERY_FC");
+        let router = Router::new_with_clock(RouterConfig::new([]).with_sender("GS"),
+            Box::new(move || clock.load(Ordering::Acquire)));
+        let side=router.add_side_packet("wire", move |packet| {
+            if packet.data_type() != crate::telemetry_schema::data_type(QUERY_TYPE) { return Ok(()); }
+            let mut attempts = observed.lock().unwrap();
+            attempts.push(packet.clone());
+            if attempts.len() == 1 { Err(sedsnet::TelemetryError::Io("side tx busy")) }
+            else { Ok(()) }
+        });
+        router.rx_from_side(&sedsnet::discovery::build_discovery_announce(
+            "FC",1,&[endpoint]).unwrap(),side).unwrap();
+        let packet = Packet::new(crate::telemetry_schema::data_type(QUERY_TYPE),
+            &[endpoint], "GS", 1793000002001, Arc::from([0u8;32])).unwrap();
+        router.tx_queue(packet.clone()).unwrap();
+        router.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(attempts.lock().unwrap().len(),1,"actual callback must refuse first dispatch");
+        for _ in 0..8 { router.process_all_queues_with_timeout(0).unwrap(); }
+        assert_eq!(attempts.lock().unwrap().len(),1,"wall progress cannot mature frozen SDK deadline");
+        ticks.store(2002,Ordering::Release);
+        router.process_all_queues_with_timeout(0).unwrap();
+        let attempts=attempts.lock().unwrap();
+        assert_eq!(attempts.len(),2,"next monotonic tick releases retained original");
+        for actual in attempts.iter() {
+            assert_eq!(actual.packet_id(),packet.packet_id());
+            assert_eq!(actual.timestamp(),packet.timestamp());
+            assert_eq!(actual.payload(),packet.payload());
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn manual_utc_prepare_wait_refreshes_queries_and_cold_rollback_refuses_ticket() {
         if isolated("manual_utc_prepare_wait_refreshes_queries_and_cold_rollback_refuses_ticket") {
@@ -2444,10 +2879,16 @@ mod tests {
         use std::sync::atomic::AtomicU64;
         let ticks = Arc::new(AtomicU64::new(0));
         let clock_ticks = ticks.clone();
+        let thaw = Arc::new(std::sync::OnceLock::<std::time::Instant>::new());
+        let clock_thaw = thaw.clone();
         let fixture = Fixture::from_saved_with_clock(
             None,
             None,
-            Some(Box::new(move || clock_ticks.load(Ordering::Acquire))),
+            Some(Box::new(move || {
+                clock_ticks.load(Ordering::Acquire).saturating_add(
+                    clock_thaw.get().map_or(0, |start| start.elapsed().as_millis() as u64),
+                )
+            })),
         )
         .await;
         completed_manual_cohort(&fixture).await;
@@ -2475,7 +2916,7 @@ mod tests {
             .collect::<Vec<_>>();
         let prepare_state = state.clone();
         let prepare = tokio::spawn(async move {
-            super::super::tests::http(prepare_state.clone(),"POST","/api/board-recovery/prepare",Some("operator"),json!({"action":"reset_startup","board":null,"mode":null,"backend_instance":hex(&prepare_state.board_recovery.identity.unwrap()),"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&prepare_state))})).await
+            super::super::tests::http(prepare_state.clone(),"POST","/api/board-recovery/prepare",Some("operator"),json!({"action":"reset_startup","boards":["RF","FC","PB","AB","VB","GB","DAQ"],"board":null,"mode":null,"backend_instance":hex(&prepare_state.board_recovery.identity.unwrap()),"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&prepare_state))})).await
         });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !state.board_recovery.manual_utc.is_revoked() {
@@ -2496,9 +2937,74 @@ mod tests {
                 .is_none()
         );
         ticks.store(2001, Ordering::Release);
+        // The ceiling crossing is explicit and retains the original intent.
+        // Afterwards the SDK clock must advance like the independently live
+        // peer clocks and HTTP deadlines. Public SDK deferred accepted originals
+        // are eligible at now+1; freezing here strands a valid transient retry.
+        thaw.set(std::time::Instant::now()).unwrap();
         let response = prepare.await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
         let ticket = body(response).await;
+        // Failure-only, nonblocking RAM observations after the ORIGINAL prepare
+        // future has completed. No second QUERY, clock advance, provider read,
+        // SDK export, await or diagnostic mutex wait can repair this intent.
+        let failed_query_snapshot = if status != StatusCode::OK {
+            let wall = std::time::Instant::now();
+            let queries = match state.board_recovery.inner.try_lock() {
+                Ok(inner) => json!({
+                    "rejected_statuses":inner.rejected_statuses,
+                    "last_rejection":inner.last_rejection,
+                    "boards":BOARDS.iter().map(|board| {
+                        let at=index(*board).unwrap();
+                        json!({
+                            "board":board.sender_id(),
+                            "query":inner.queries[at].as_ref().map(|q|json!({
+                                "nonce":q.nonce,"received":q.received,
+                                "sent_model_ms":q.sent.model_ms,
+                                "sent_wall_age_ms":wall.checked_duration_since(q.sent.wall).map(|v|v.as_millis())
+                            })),
+                            "observation":inner.values[at].as_ref().map(|v|json!({
+                                "nonce":v.value.nonce,"issuer":v.value.issuer,
+                                "result":v.value.result,"state":v.value.state,
+                                "boot":v.value.boot,"epoch":v.value.epoch,
+                                "received_model_ms":v.received.model_ms,
+                                "received_wall_age_ms":wall.checked_duration_since(v.received.wall).map(|d|d.as_millis())
+                            }))
+                        })
+                    }).collect::<Vec<_>>()
+                }),
+                Err(error) => json!({"unavailable":format!("{error:?}")}),
+            };
+            let models=fixture.models.iter().map(|(board,model)|match model.try_lock() {
+                Ok(model)=>json!({
+                    "board":board.sender_id(),"request_count":model.requests.len(),
+                    "last_requests":model.requests.iter().rev().take(4).map(|packet| {
+                        let bytes=packet.payload();
+                        json!({"packet_id":packet.packet_id(),"source_utc_ms":packet.timestamp(),
+                            "command":bytes.get(1).copied(),
+                            "nonce":bytes.get(4..12).map(|v|u64::from_le_bytes(v.try_into().unwrap()))})
+                    }).collect::<Vec<_>>()
+                }),
+                Err(error)=>json!({"board":board.sender_id(),"unavailable":format!("{error:?}")}),
+            }).collect::<Vec<_>>();
+            let snapshot=json!({"sdk_clock_ticks":ticks.load(Ordering::Acquire),
+                "original_manual_boundary":key.boundary,"retained_manual_ceiling":key.ceiling,
+                "queries":queries,"models":models,
+                "scope":"post-response/non-atomic; last4requests perboard; no wire/reply/SDK-worker-progress or causality proof"});
+            eprintln!("MANUAL_UTC_FRESH_QUERY_FAILURE {snapshot}");
+            Some(snapshot)
+        } else {None};
+        let diagnostic = json!({
+            "failure_query_snapshot":failed_query_snapshot,
+            "response":ticket,
+            "state":format!("{:?}",state.local_flight_state_snapshot()),
+            "generation":crate::gse::automatic_generation(&state),
+            "barrier":state.operator_admission_barrier.load(Ordering::Acquire),
+            "recovery":state.launch_history.lock().unwrap().recovery_pending(),
+            "manual_utc_revoked":state.board_recovery.manual_utc.is_revoked(),
+            "wire_alive":!fixture.pump.is_finished(),"receiver_alive":!fixture.receiver.is_finished()
+        });
+        assert_eq!(status, StatusCode::OK, "original UTC prepare refused; no retry: {diagnostic}");
         for ((_, model), before) in fixture.models.iter().zip(before) {
             let model = model.lock().unwrap();
             assert_eq!(
@@ -2538,7 +3044,7 @@ mod tests {
         );
         let prepare_state = cold_state.clone();
         let prepare = tokio::spawn(async move {
-            super::super::tests::http(prepare_state.clone(),"POST","/api/board-recovery/prepare",Some("operator"),json!({"action":"reset_startup","board":null,"mode":null,"backend_instance":hex(&prepare_state.board_recovery.identity.unwrap()),"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&prepare_state))})).await
+            super::super::tests::http(prepare_state.clone(),"POST","/api/board-recovery/prepare",Some("operator"),json!({"action":"reset_startup","boards":["RF","FC","PB","AB","VB","GB","DAQ"],"board":null,"mode":null,"backend_instance":hex(&prepare_state.board_recovery.identity.unwrap()),"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&prepare_state))})).await
         });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !cold_state.board_recovery.manual_utc.is_revoked() {
@@ -3475,6 +3981,11 @@ mod tests {
         {
             return;
         }
+        #[cfg(feature="test_fire_mode")]
+        let _tf_probe = tf_fresh_receipt_probe();
+        #[cfg(feature="test_fire_mode")]
+        let fixture = Fixture::new_with_managed_peers().await;
+        #[cfg(not(feature="test_fire_mode"))]
         let fixture = Fixture::new().await;
         *fixture.http.state.state.lock().unwrap() = crate::types::FlightState::Aborted;
         let original = fixture.http.state.launch_history.lock().unwrap().snapshot();
@@ -3506,6 +4017,11 @@ mod tests {
                 fixture.http.state.local_flight_state_snapshot(),
                 crate::types::FlightState::Startup
             );
+        } else if cfg!(feature="test_fire_mode") {
+            assert!(!observed_idle_after_startup, "TF reset cleanup must not invent a fresh MCU readiness receipt");
+            assert_eq!(fixture.http.state.local_flight_state_snapshot(),crate::types::FlightState::Startup);
+            #[cfg(feature="test_fire_mode")]
+            assert_tf_idle_from_fresh_mcu_receipts(&fixture).await;
         } else {
             assert!(
                 observed_idle_after_startup,
@@ -4600,7 +5116,9 @@ mod tests {
         assert!(rf["commanded_outputs"].is_null());
         assert_eq!(rf["physical_position_verified"], false);
         assert_eq!(rf["first_uncertainty_reconcilable"], true);
-        assert_eq!(rf["capabilities"]["recover"], false);
+        // Supported targeted metadata Startup is explicit; it certifies no
+        // physical state or successful reconciliation of this uncertain board.
+        assert_eq!(rf["capabilities"]["recover"], true);
         assert_eq!(rf["capabilities"]["reset_startup"], true);
         let second = fixture.prepare("reset_startup", None).await;
         assert_eq!(fixture.confirm(&second).await.status(), StatusCode::OK);

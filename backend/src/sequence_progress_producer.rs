@@ -122,6 +122,22 @@ impl Producer {
             }
         }
     }
+    pub fn observe_cold_flow(
+        &mut self,
+        cold: gse_sequence::cold_flow::Observation,
+        view: ProgressObservation,
+        now: u64,
+    ) {
+        if let Some(cursor) = &mut self.cursor {
+            if cursor.snapshot().outcome.terminal() {
+                return;
+            }
+            match cursor.observe_cold_flow(cold, view) {
+                Ok(_) => self.emit(now),
+                Err(error) => self.error = Some(error),
+            }
+        }
+    }
     pub fn complete(&mut self, proof: TerminalProof, now: u64) {
         if let Some(cursor) = &mut self.cursor {
             if cursor.snapshot().outcome.terminal() {

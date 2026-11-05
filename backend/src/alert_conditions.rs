@@ -50,6 +50,11 @@ struct StagedObservation {
     message: String,
     at_ms: i64,
     error: Option<PendingError>,
+    board_edge: Option<crate::board_abort::AlertEdge>,
+}
+struct BoardAbortBinding {
+    episode: crate::board_abort::AlertEpisode,
+    occurrence_id: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -230,6 +235,9 @@ pub struct Registry {
     errors: VecDeque<Record>,
     pending: BTreeSet<u64>,
     persistence_error: Option<String>,
+    board_edge_sequence: u64,
+    board_abort_bindings: BTreeMap<BoardKey, BoardAbortBinding>,
+    restored_board_occurrences: BTreeMap<BoardKey, String>,
 }
 impl Registry {
     /// Expected keys must reflect the actually configured/running producers.
@@ -253,6 +261,9 @@ impl Registry {
             errors: VecDeque::new(),
             pending: BTreeSet::new(),
             persistence_error: invalid.then(|| "Missing condition authority".into()),
+            board_edge_sequence: 0,
+            board_abort_bindings: BTreeMap::new(),
+            restored_board_occurrences: BTreeMap::new(),
         }
     }
     fn advance(&mut self) {
@@ -316,6 +327,9 @@ impl Registry {
                 }
                 record.state = ConditionState::Unknown;
                 record.resolved_at_ms = None;
+                if let Key::BoardAbort(board) = key {
+                    self.restored_board_occurrences.insert(board, record.occurrence_id.clone());
+                }
                 self.awaiting.insert(key);
                 self.current.insert(key, record);
             }
@@ -328,6 +342,10 @@ impl Registry {
         self.staged_detail_bytes = 0;
         let mut journal = Vec::new();
         for observation in staged {
+            if let Some(edge) = observation.board_edge {
+                if let Some(entry) = self.observe_board_abort_edge(edge).journal { journal.push(entry); }
+                continue;
+            }
             let change = self.observe(
                 observation.key,
                 observation.state,
@@ -475,6 +493,83 @@ impl Registry {
         self.ready_error(key, error, link);
         change
     }
+    pub(crate) fn board_abort_reporting_gap(&mut self, reason: &str) -> Change {
+        let before = self.revision;
+        self.incomplete(format!("Board Abort reporting history incomplete: {reason}"));
+        Change { changed: self.revision != before, journal: None }
+    }
+    /// Exact process-local producer chronology, independent of current Launch
+    /// readiness. Only the accepted BoardAbort observer creates these receipts.
+    pub(crate) fn observe_board_abort_edge(&mut self, edge: crate::board_abort::AlertEdge) -> Change {
+        use crate::board_abort::AlertEdgeKind;
+        let staged_sequence = self.staged.iter().rev().find_map(|row| row.board_edge.map(|edge| edge.ordinal));
+        let seen = staged_sequence.unwrap_or(self.board_edge_sequence);
+        if edge.ordinal <= seen { return Change::default(); }
+        if edge.ordinal == u64::MAX || edge.ordinal != seen.saturating_add(1)
+            || edge.at_ms == 0 || i64::try_from(edge.at_ms).is_err()
+            || !crate::board_abort::BOARDS.iter().any(|board| board.sender_id() == edge.board.sender()) {
+            self.board_edge_sequence = self.board_edge_sequence.max(edge.ordinal);
+            return self.board_abort_reporting_gap("invalid or missing ordered observer receipt");
+        }
+        if !self.restored {
+            if self.staged.len() >= MAX_BOOTSTRAP_TRANSITIONS {
+                return self.board_abort_reporting_gap("ordered observer bootstrap budget exceeded");
+            }
+            self.staged.push_back(StagedObservation {
+                key: Key::BoardAbort(edge.board),
+                state: if edge.kind == AlertEdgeKind::Raised { ConditionState::Active } else { ConditionState::Resolved },
+                message: String::new(), at_ms: edge.at_ms as i64, error: None, board_edge: Some(edge),
+            });
+            self.advance();
+            return Change { changed: true, journal: None };
+        }
+        self.board_edge_sequence = edge.ordinal;
+        let key = Key::BoardAbort(edge.board);
+        let label = crate::types::Board::from_sender_id(edge.board.sender()).map_or(edge.board.sender(), |board| board.as_str());
+        match edge.kind {
+            AlertEdgeKind::Raised => {
+                let Some(episode) = edge.episode.filter(|episode| episode.ordinal == edge.ordinal
+                    && episode.first_abort_ms != 0 && i64::try_from(episode.first_abort_ms).is_ok()) else {
+                    return self.board_abort_reporting_gap("invalid raised episode identity");
+                };
+                if self.board_abort_bindings.contains_key(&edge.board)
+                    || self.current.get(&key).is_some_and(|record| record.raised_at_ms != episode.first_abort_ms as i64) {
+                    return self.board_abort_reporting_gap("raised episode conflicts with unresolved occurrence");
+                }
+                let change = self.observe_error(key, format!("{label} reports Abort"), episode.first_abort_ms as i64,
+                    edge.at_ms as i64, format!("{label} reports Abort; new launch is disabled until a fresh actual exit report."));
+                if let Some(record) = self.current.get(&key) {
+                    self.board_abort_bindings.insert(edge.board, BoardAbortBinding { episode, occurrence_id: record.occurrence_id.clone() });
+                    self.restored_board_occurrences.remove(&edge.board);
+                }
+                change
+            }
+            AlertEdgeKind::AcceptedExit => {
+                let expected = if let Some(episode) = edge.episode {
+                    self.board_abort_bindings.get(&edge.board)
+                        .filter(|binding| binding.episode == episode)
+                        .map(|binding| binding.occurrence_id.clone())
+                } else if !self.board_abort_bindings.contains_key(&edge.board) {
+                    self.restored_board_occurrences.get(&edge.board).cloned()
+                } else { None };
+                if let Some(expected) = expected {
+                    if !self.current.get(&key).is_some_and(|record| record.occurrence_id == expected) {
+                        return self.board_abort_reporting_gap("accepted exit no longer owns its exact occurrence");
+                    }
+                    let change = self.observe(key, ConditionState::Resolved, format!("{label} confirmed outside Abort"), edge.at_ms as i64);
+                    self.board_abort_bindings.remove(&edge.board);
+                    self.restored_board_occurrences.remove(&edge.board);
+                    change
+                } else if self.current.contains_key(&key) {
+                    self.board_abort_reporting_gap("accepted exit does not identify current occurrence")
+                } else {
+                    // Affirmative validated evidence may evaluate an otherwise
+                    // healthy key; absence/default masks never call this path.
+                    self.observe(key, ConditionState::Resolved, format!("{label} confirmed outside Abort"), edge.at_ms as i64)
+                }
+            }
+        }
+    }
     fn stage(
         &mut self,
         key: Key,
@@ -522,6 +617,7 @@ impl Registry {
             message,
             at_ms,
             error,
+            board_edge: None,
         });
         self.advance();
         Change {
@@ -552,6 +648,7 @@ impl Registry {
             condition,
         });
     }
+    pub(crate) fn authority(&self) -> &str { &self.authority }
     pub fn has_authority(&self, authority: &str) -> bool {
         self.authority == authority
     }

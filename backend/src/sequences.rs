@@ -134,7 +134,7 @@ pub(crate) enum SequenceStep {
     ArmedReady,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SequencePolicyState {
     pub generation: u64,
     pub step: SequenceStep,
@@ -491,9 +491,9 @@ fn begin_sequence_tick(
     state: &AppState,
     runtime: &mut SequenceRuntime,
     last_flight_state: &mut Option<FlightState>,
-) -> Option<crate::gse::OperatorDispatchClaim> {
-    let generation = crate::gse::automatic_generation(state);
-    let claim = crate::gse::claim_operator_dispatch(state, generation)?;
+) -> Option<crate::automatic_flight_state::Observation> {
+    let claim = crate::automatic_flight_state::Observation::begin(state)?;
+    let generation = claim.generation();
     if runtime.bind_generation(generation) {
         *last_flight_state = None;
     }
@@ -738,7 +738,10 @@ mod generation_lifecycle_tests {
     #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
     #[tokio::test]
     async fn policy_refresh_cannot_republish_pre_reset_armed_stage() {
-        let state = crate::state::tests::test_app_state().await;
+        if crate::operator_queue::isolated_case(module_path!(), "policy_refresh_cannot_republish_pre_reset_armed_stage") { return; }
+        // This positive publication uses the same initialized managed Store,
+        // public SDK and network clock as the actual host, not an empty state.
+        let (state, router) = crate::automatic_flight_state::tests::ready().await;
         let generation = crate::gse::automatic_generation(&state);
         let mut old = SequenceRuntime::for_generation(generation);
         old.step = SequenceStep::ArmedReady;
@@ -747,6 +750,8 @@ mod generation_lifecycle_tests {
             .automatic_generation
             .store(generation + 1, Ordering::Release);
         state.set_local_flight_state(FlightState::Idle);
+        assert_eq!(crate::network_variables::flight_state(), FlightState::Idle as u8);
+        let before_automatic = crate::network_variables::automatic_idle_test_snapshot();
         refresh_action_policy_now(&state);
         assert_eq!(
             state.local_flight_state_snapshot(),
@@ -762,6 +767,27 @@ mod generation_lifecycle_tests {
         state.set_sequence_policy_state(fresh.policy_state());
         refresh_action_policy_now(&state);
         assert_eq!(state.local_flight_state_snapshot(), FlightState::Armed);
+        let packet = router.get_cached_network_variable(
+            crate::telemetry_schema::data_type("FLIGHT_STATE")
+        ).unwrap().expect("fresh phase admitted by actual managed SDK");
+        assert_eq!(packet.payload(), &[FlightState::Armed as u8]);
+        assert_eq!(crate::network_variables::flight_state(), FlightState::Idle as u8);
+        assert!(crate::network_variables::automatic_idle_test_snapshot()
+            .durable_unchanged(&before_automatic));
+    }
+
+    #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
+    #[tokio::test]
+    async fn policy_refresh_without_initialized_transport_cannot_publish_armed_stage() {
+        if crate::operator_queue::isolated_case(module_path!(), "policy_refresh_without_initialized_transport_cannot_publish_armed_stage") { return; }
+        let state = crate::state::tests::test_app_state().await;
+        state.set_local_flight_state(FlightState::Idle);
+        let mut fresh = SequenceRuntime::for_generation(crate::gse::automatic_generation(&state));
+        fresh.step = SequenceStep::ArmedReady;
+        state.set_sequence_policy_state(fresh.policy_state());
+        assert!(state.topology_router.get().is_none());
+        refresh_action_policy_now(&state);
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
     }
 
     #[test]
@@ -790,8 +816,7 @@ mod generation_lifecycle_tests {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 struct ValveSnapshot {
     normally_open: Option<bool>,
     pending_normally_open: Option<bool>,
@@ -859,6 +884,7 @@ fn is_fill_state(state: FlightState) -> bool {
 
 pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
     match cmd {
+        TelemetryCommand::ColdFlowPanelRelease { .. } => "ColdFlowPanelRelease",
         TelemetryCommand::QueuedOperator { command, .. } => command_name(command),
         TelemetryCommand::Postinit => "Postinit",
         TelemetryCommand::Launch => "Launch",
@@ -881,7 +907,7 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::StopWritingDb => "StopWritingDb",
         TelemetryCommand::ResetSim => "ResetSim",
         TelemetryCommand::ContinueFillSequence => "ContinueFillSequence",
-        TelemetryCommand::StartFill => "StartFill",
+        TelemetryCommand::StartFill | TelemetryCommand::FillWithRecording { .. } => "StartFill",
         TelemetryCommand::PauseFill => "PauseFill",
         TelemetryCommand::CancelFill => "CancelFill",
         TelemetryCommand::ValveSelfTest => "ValveSelfTest",
@@ -2086,7 +2112,7 @@ fn update_sequence_runtime(
     }
 }
 
-fn maybe_drive_local_prelaunch_state(
+fn selected_prelaunch_state(
     state: &AppState,
     runtime: &SequenceRuntime,
     valves: ValveSnapshot,
@@ -2107,7 +2133,6 @@ fn maybe_drive_local_prelaunch_state(
     }
 
     if current_state == FlightState::Startup && state.all_required_boards_seen() {
-        state.set_local_flight_state(FlightState::Idle);
         return FlightState::Idle;
     }
 
@@ -2145,11 +2170,39 @@ fn maybe_drive_local_prelaunch_state(
     if let Some(next_state) = desired_state
         && current_state != next_state
     {
-        state.set_local_flight_state(next_state);
         return next_state;
     }
 
     current_state
+}
+
+fn drive_observed_prelaunch_state(
+    state: &Arc<AppState>,
+    runtime: &SequenceRuntime,
+    valves: ValveSnapshot,
+    current_state: FlightState,
+    captured: Option<crate::automatic_flight_state::Captured>,
+) -> FlightState {
+    let next = selected_prelaunch_state(state, runtime, valves, current_state);
+    if let Some(original) = captured
+        && original.expected == current_state
+        && let Some(proposal) = original.proposal(next,
+            crate::automatic_flight_state::Cause::LegacySequence { next_policy: runtime.policy_state() }) {
+        crate::automatic_flight_state::publish(state, proposal);
+    }
+    // Never report an unadmitted proposal as the current actual phase.
+    state.local_flight_state_snapshot()
+}
+#[cfg(test)]
+fn maybe_drive_local_prelaunch_state(
+    state: &Arc<AppState>, runtime: &SequenceRuntime, valves: ValveSnapshot, current_state: FlightState,
+) -> FlightState {
+    // Match main's initialized desired Store for this legacy direct-helper
+    // fixture. The actual production driver still uses the original entry owner.
+    let _ = crate::network_variables::flight_state();
+    let observation = crate::automatic_flight_state::Observation::begin(state);
+    drive_observed_prelaunch_state(state, runtime, valves, current_state,
+        observation.as_ref().and_then(|o| o.captured()))
 }
 
 fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
@@ -2524,6 +2577,8 @@ pub fn start_sequence_task(
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
+                        #[cfg(all(test, feature = "test_fire_mode"))]
+                        crate::recovery_pending_probe::sequence_tick(&state);
                         state.expire_pending_umbilical_valve_states(UMBILICAL_PENDING_VALVE_TIMEOUT);
                         #[cfg(feature = "hitl_mode")]
                         crate::gse::tick(&state, state.hitl_button_interlock_satisfied());
@@ -2580,14 +2635,18 @@ pub fn start_sequence_task(
 
             // Acquire before observations/GSE waits. Recovery cannot advance
             // the epoch while this tick can still publish managed state.
-            let Some(_sequence_claim) =
+            let Some(sequence_observation) =
                 begin_sequence_tick(&state, &mut runtime, &mut last_flight_state)
             else {
                 continue;
             };
+            #[cfg(all(test, feature = "test_fire_mode"))]
+            crate::recovery_pending_probe::sequence_tick(&state);
             let generation = runtime.generation;
             state.expire_pending_umbilical_valve_states(UMBILICAL_PENDING_VALVE_TIMEOUT);
             let mut flight_state = *state.state.lock().unwrap();
+            #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
+            crate::normal_publication_probe::point(&state, crate::normal_publication_probe::Site::CountedTick, flight_state as u8).await;
             let valves = ValveSnapshot::read(&state);
             let pressure_psi = *state.latest_fuel_tank_pressure.lock().unwrap();
             let current_mass_kg = *state.latest_fill_mass_kg.lock().unwrap();
@@ -2599,21 +2658,16 @@ pub fn start_sequence_task(
                 || !matches!(flight_state, FlightState::Startup | FlightState::Idle);
 
             if cfg!(feature = "test_fire_mode") {
-                if flight_state == FlightState::Startup && state.all_required_boards_seen() {
-                    state.set_local_flight_state(FlightState::Idle);
-                    flight_state = FlightState::Idle;
-                    runtime = SequenceRuntime::for_generation(generation);
-                    state.set_sequence_policy_state(runtime.policy_state());
-                }
-
+                // Readiness is published only by the original dequeued event
+                // owner. The live policy timer must not manufacture intent.
                 if flight_state == FlightState::Idle {
                     runtime = SequenceRuntime::for_generation(generation);
-                    state.set_sequence_policy_state(runtime.policy_state());
+                    sequence_observation.update_policy(&state, flight_state, runtime.policy_state());
                 } else if last_flight_state != Some(FlightState::PreFill)
                     && flight_state == FlightState::PreFill
                 {
                     runtime = SequenceRuntime::for_generation(generation);
-                    state.set_sequence_policy_state(runtime.policy_state());
+                    sequence_observation.update_policy(&state, flight_state, runtime.policy_state());
                     state.add_temporary_notification(
                         "Test-fire sequence started. Use the sequencing LEDs to move valves into the required starting positions.",
                     );
@@ -2634,9 +2688,9 @@ pub fn start_sequence_task(
             }
             if !crate::gse::claimed(&state) {
                 flight_state =
-                    maybe_drive_local_prelaunch_state(&state, &runtime, valves, flight_state);
+                    drive_observed_prelaunch_state(&state, &runtime, valves, flight_state, sequence_observation.captured());
             }
-            state.set_sequence_policy_state(runtime.policy_state());
+            sequence_observation.update_policy(&state, flight_state, runtime.policy_state());
             let policy = build_policy(
                 &state,
                 &cfg,
@@ -2656,21 +2710,31 @@ pub fn start_sequence_task(
 }
 
 pub fn refresh_action_policy_now(state: &Arc<AppState>) {
-    let generation = crate::gse::automatic_generation(state);
-    let Some(_policy_claim) = crate::gse::claim_operator_dispatch(state, generation) else {
-        return;
-    };
-    refresh_action_policy_at_generation(state, generation);
+    let Some(observation) = crate::automatic_flight_state::Observation::begin(state) else { return; };
+    refresh_action_policy_at_generation(state, observation.generation(), Some(&observation));
 }
 
 /// Only GSE's existing serialized command owner calls this entry point.
 /// Its dispatch gate already excludes reset epoch changes; reacquiring that
 /// non-reentrant gate here would deadlock the command owner.
-pub(crate) fn refresh_action_policy_under_dispatch(state: &Arc<AppState>) {
-    refresh_action_policy_at_generation(state, crate::gse::automatic_generation(state));
+pub(crate) fn refresh_action_policy_under_dispatch(_state: &Arc<AppState>) {
+    // The actual public command wrapper carries the original observation and
+    // refreshes after dropping Dispatch. No config/provider/publisher reentry.
+}
+pub(crate) fn refresh_action_policy_with_observation(
+    state: &Arc<AppState>, observation: &crate::automatic_flight_state::Observation,
+) {
+    refresh_action_policy_at_generation(state, observation.generation(), Some(observation));
+}
+pub(crate) fn refresh_action_policy_projection(state: &Arc<AppState>) {
+    // This is UI projection only; it cannot select/admit another phase.
+    refresh_action_policy_at_generation(state, crate::gse::automatic_generation(state), None);
 }
 
-fn refresh_action_policy_at_generation(state: &Arc<AppState>, generation: u64) {
+fn refresh_action_policy_at_generation(
+    state: &Arc<AppState>, generation: u64,
+    observation: Option<&crate::automatic_flight_state::Observation>,
+) {
     let cfg = SequenceConfig::from_env();
     if cfg!(feature = "hitl_mode") {
         let valves = ValveSnapshot::read(state);
@@ -2686,19 +2750,14 @@ fn refresh_action_policy_at_generation(state: &Arc<AppState>, generation: u64) {
     let key_enabled = read_key_enabled(state, &cfg);
     let software_buttons_enabled = read_software_buttons_enabled(state, &cfg);
 
-    if cfg!(feature = "test_fire_mode")
-        && flight_state == FlightState::Startup
-        && state.all_required_boards_seen()
-    {
-        state.set_local_flight_state(FlightState::Idle);
-        flight_state = FlightState::Idle;
-        runtime = SequenceRuntime::for_generation(runtime.generation);
-        state.set_sequence_policy_state(runtime.policy_state());
+    // TF readiness state is owned solely by a fresh dequeued packet's original
+    // generation/Stop/SDK admission. Policy refresh never mints that authority.
+    if !crate::gse::claimed(state) && let Some(observation) = observation {
+        flight_state = drive_observed_prelaunch_state(state, &runtime, valves, flight_state, observation.captured());
     }
-    if !crate::gse::claimed(state) {
-        flight_state = maybe_drive_local_prelaunch_state(state, &runtime, valves, flight_state);
+    if let Some(observation) = observation {
+        observation.update_policy(state, flight_state, runtime.policy_state());
     }
-    state.set_sequence_policy_state(runtime.policy_state());
     let policy = build_policy(
         state,
         &cfg,
@@ -2718,6 +2777,7 @@ fn refresh_action_policy_at_generation(state: &Arc<AppState>, generation: u64) {
 mod tests {
     #[tokio::test]
     async fn captured_normal_startup_reset_policy_republishes_idle_but_hitl_preserves_startup() {
+        if crate::operator_queue::isolated_case(module_path!(), "captured_normal_startup_reset_policy_republishes_idle_but_hitl_preserves_startup") { return; }
         crate::telemetry_schema::initialize().unwrap();
         let state = crate::state::tests::test_app_state().await;
         for board in crate::types::Board::ALL {
@@ -2911,3 +2971,6 @@ mod tests {
         assert_eq!(enabled("IgniterSequence"), Some(true));
     }
 }
+
+#[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
+mod automatic_phase_tests;

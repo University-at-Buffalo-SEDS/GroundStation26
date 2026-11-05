@@ -512,15 +512,44 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
                 .automatic_actions_inhibited()
         })
         .await;
-        wait_until("retry FCLaunch and VBSequence wire owners", || {
-            let rows = wire_controls.lock().unwrap();
-            rows.iter()
-                .any(|row| row.ty == fc_type.as_u32() && row.payload == [1])
-                && rows
-                    .iter()
-                    .any(|row| row.ty == valve_type.as_u32() && row.payload == [6])
-        })
-        .await;
+        let wire_wait = std::panic::AssertUnwindSafe(wait_until(
+            "retry FCLaunch and VBSequence wire owners", || {
+                let rows = wire_controls.lock().unwrap();
+                rows.iter()
+                    .any(|row| row.ty == fc_type.as_u32() && row.payload == [1])
+                    && rows
+                        .iter()
+                        .any(|row| row.ty == valve_type.as_u32() && row.payload == [6])
+            },
+        ));
+        if let Err(panic) = futures::FutureExt::catch_unwind(wire_wait).await {
+            let wire = wire_controls.lock().unwrap().clone();
+            let received = delivered.lock().unwrap().clone();
+            let journal_at_failure = std::fs::read(&journal)
+                .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+                .unwrap_or(serde_json::Value::Null);
+            eprintln!(
+                "EVAL16_WIRE_TIMEOUT: network_utc={:?} wall_utc={} explicit_monotonic_offset={} elapsed_ms={} fc_pending={} vb_pending={} queue_counters={:?} reliable={:?} wire={:?} delivered={:?} state={:?} clock={:?} allowed={} notifications={:?} journal={}",
+                host.network_time().and_then(|time| time.unix_time_ms),
+                get_current_timestamp_ms(),
+                now.load(Ordering::SeqCst),
+                clock_origin.elapsed().as_millis(),
+                host.has_pending_reliable_tx_type(fc_type),
+                host.has_pending_reliable_tx_type(valve_type),
+                host.queue_counters(),
+                host.export_reliable_pending_stats(),
+                wire, received,
+                state.local_flight_state_snapshot(),
+                state.launch_clock_snapshot(),
+                state.is_command_allowed(&TelemetryCommand::Launch),
+                state.notifications_snapshot(),
+                journal_at_failure,
+            );
+            eprintln!("EVAL16_WIRE_RUNTIME_STATS: {:?}", host.export_runtime_stats());
+            // Preserve the identical original timeout and panic. Diagnostics
+            // cannot create a retry, rebase intent or turn failure into success.
+            std::panic::resume_unwind(panic);
+        }
         let retry_journal: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
         assert_eq!(retry_journal["automatic_actions_inhibited"], true);

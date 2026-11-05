@@ -79,6 +79,8 @@ pub struct RecoveryEvent {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecoveryPending {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_policy: Option<ResetProofPolicy>,
     pub owner: u64,
     pub backend: String,
     pub generation: u64,
@@ -89,6 +91,28 @@ pub(crate) struct RecoveryPending {
     pub targets: Vec<RecoveryTarget>,
     pub verified: bool,
     pub published: bool,
+}
+/// Application journal evidence only; never restored live board readback.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResetProofPolicy {
+    pub mode: crate::station_mode::Mode,
+    pub required_mask: u8,
+    pub verified_mask: u8,
+}
+impl ResetProofPolicy {
+    fn valid_for(&self, targets: &[RecoveryTarget]) -> bool {
+        self.required_mask == crate::board_recovery::scope::base_mask(self.mode)
+            && self.verified_mask & !0x7f == 0
+            && self.verified_mask & self.required_mask == self.required_mask
+            && targets.len() == self.verified_mask.count_ones() as usize
+            && targets.iter().all(|t| t.desired == 0 && board_bit(&t.board)
+                .is_some_and(|bit| self.verified_mask & bit != 0))
+    }
+}
+fn board_bit(board: &str) -> Option<u8> {
+    ["RF", "FC", "PB", "AB", "VB", "GB", "DAQ"].iter()
+        .position(|b| *b == board).map(|i| 1 << i)
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -161,6 +185,11 @@ pub(crate) struct RecoveryTarget {
     pub uncertain_first: Option<RecoveryIntent>,
 }
 impl RecoveryPending {
+    pub(crate) fn verified_startup_policy(&self) -> bool {
+        self.verified && self.targets.iter().all(|t| t.desired == 0)
+            && self.reset_policy.as_ref().map_or(self.targets.len() == 7,
+                |p| p.mode == crate::station_mode::local_mode() && p.valid_for(&self.targets))
+    }
     fn validate(&self) -> Result<()> {
         ensure!(
             !matches!(self.owner, 0 | u64::MAX)
@@ -171,7 +200,7 @@ impl RecoveryPending {
                 && self.backend.len() == 32
                 && self.backend.bytes().all(|c| c.is_ascii_hexdigit())
                 && (!self.published || self.verified)
-                && (1..=7).contains(&self.targets.len()),
+                && (self.reset_policy.as_ref().map_or((1..=7).contains(&self.targets.len()), |p| p.valid_for(&self.targets))),
             "Invalid pending recovery identity"
         );
         let mut seen = std::collections::HashSet::new();
@@ -545,6 +574,7 @@ impl Store {
     }
     pub fn automatic_actions_inhibited(&self) -> bool {
         self.recovery_activation_pending || self.data.automatic_actions_inhibited
+            || self.data.recovery_pending.as_ref().is_some_and(|p| p.published && p.reset_policy.is_some() && !p.verified_startup_policy())
     }
     /// Save before admitting any irreversible launch command. A failed save
     /// still inhibits automation in RAM and prevents launch dispatch.
@@ -733,6 +763,27 @@ impl Store {
             ..fence.clone()
         })
     }
+    /// Called with this Store owner retained from the nonwaiting durable-prefix
+    /// check. No writer lock, file IO or callback under final board/Stop guard.
+    pub(crate) fn reopen_after_recovery_ram(&mut self, fence: &RecoveryFence) -> Result<()> {
+        ensure!(self.closed && self.recovery_owner == fence.owner
+            && self.last_write == fence.ticket && self.data.current == fence.clock
+            && self.recovery_revision_staged && fence.revision_staged,
+            "Final journal capture changed");
+        self.recovery_owner = 0;
+        self.recovery_revision_staged = false;
+        self.closed = false;
+        Ok(())
+    }
+    pub(crate) fn recovery_publication_ready_nowait(&self, fence: &RecoveryFence, owner: u64) -> Result<bool> {
+        ensure!(owner != 0 && owner == fence.owner && self.closed && self.recovery_owner == owner
+            && self.last_write == fence.ticket && self.data.current == fence.clock
+            && self.recovery_revision_staged && fence.revision_staged
+            && self.writer.as_ref().is_some_and(|writer| Arc::ptr_eq(writer, &fence.writer)),
+            "Final journal capture changed");
+        fence.writer.try_quiescent_through(fence.ticket)
+    }
+    #[cfg(test)]
     pub(crate) fn reopen_after_recovery(&mut self, fence: &RecoveryFence) -> Result<()> {
         ensure!(
             self.recovery_quiescent(fence)?,
@@ -870,6 +921,11 @@ impl Store {
     pub(crate) fn recovery_pending(&self) -> Option<RecoveryPending> {
         self.data.recovery_pending.clone()
     }
+    /// Immutable evidence view while the caller retains the Store owner.
+    /// Final publication must not clone its heap-backed board/intent data.
+    pub(crate) fn recovery_pending_ref(&self) -> Option<&RecoveryPending> {
+        self.data.recovery_pending.as_ref()
+    }
     pub(crate) fn restored_recovery_barrier(&self) -> (u64, u64) {
         if self.error.is_some() {
             return (u64::MAX, 1);
@@ -975,8 +1031,7 @@ impl Store {
         );
         let disk: Disk = serde_json::from_slice(&bytes)?;
         let expected_inhibited = !expected.published
-            || !(expected.targets.len() == 7
-                && expected.targets.iter().all(|target| target.desired == 0))
+            || !expected.verified_startup_policy()
                 && expected.prior_automatic_actions_inhibited;
         ensure!(
             disk.version == 1
@@ -1008,8 +1063,7 @@ impl Store {
         );
         marker.published = true;
         let expected = marker.clone();
-        next.automatic_actions_inhibited = if expected.targets.len() == 7
-            && expected.targets.iter().all(|target| target.desired == 0)
+        next.automatic_actions_inhibited = if expected.verified_startup_policy()
         {
             false
         } else {
@@ -1337,3 +1391,7 @@ pub async fn flush(waiter: Option<(Arc<Writer>, u64)>) -> Result<()> {
 #[cfg(test)]
 #[path = "launch_history/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "launch_history/reset_policy_tests.rs"]
+mod reset_policy_tests;

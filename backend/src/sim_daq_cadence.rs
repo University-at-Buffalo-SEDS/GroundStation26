@@ -1,4 +1,6 @@
-//! Simulator-only compatibility for the two DAQ load-cell wire formats.
+//! Optional telemetry-return validation for the two DAQ load-cell wire formats.
+//! The caller requires explicit GS_SIM_VALIDATE_TELEMETRY_RETURN; this module
+//! does not select firmware_sim or change any operational clock policy.
 //! Acquisition, publication, derived rows and cadence thresholds stay unchanged.
 use crate::{telemetry_schema, types::Board};
 use sedsnet::{config::DataType, packet::Packet};

@@ -1,6 +1,7 @@
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
-mod turbocharge;
+pub(crate) mod cold_flow;
 pub(crate) mod progress;
+mod turbocharge;
 #[cfg(all(test, feature = "firmware_sim"))]
 pub(crate) use turbocharge::mass_ingress_snapshot;
 pub(crate) use turbocharge::{mass_calibration_signature, observe_valve_pressure_ingress};
@@ -60,6 +61,16 @@ const ACTIONS: [(&str, Action); 5] = [
     ("ValveSelfTest", Action::SelfTest),
     ("NitrogenTest", Action::NitrogenTest),
 ];
+
+/// Presentation only: retain current observed open/closed values without
+/// inventing confirmation from commanded targets or expired observations.
+fn completion_valve_snapshot(input: Inputs) -> [Option<bool>; 5] {
+    input.valves.map(|value| {
+        value
+            .filter(|value| value.at_ms <= input.now_ms && input.now_ms - value.at_ms <= 2000)
+            .map(|value| value.open)
+    })
+}
 
 /// At most two semantic states can be admitted from one valve source tick.
 /// A changed packet nonce cannot turn the same capture into a new sample.
@@ -147,6 +158,7 @@ pub struct Runtime {
     progress: crate::sequence_progress_stage::Stage,
     progress_admission: Option<LaunchAdmission>,
     progress_fill_target_kg:Option<f32>,
+    cold_flow:Option<cold_flow::Session>,
     #[cfg(not(feature = "hitl_mode"))]
     operational: operational::Operational,
     clock: Instant,
@@ -185,6 +197,7 @@ impl Default for Runtime {
             progress: Default::default(),
             progress_admission: None,
             progress_fill_target_kg:None,
+            cold_flow:None,
             #[cfg(not(feature = "hitl_mode"))]
             operational: Default::default(),
             clock: Instant::now(),
@@ -281,7 +294,10 @@ fn sequence_clock_ms(elapsed_ms: u64, simulated_ms: Option<u64>) -> u64 {
 
 impl Runtime {
     fn cancel_automation_for_manual(&mut self) {
-        self.progress.complete(crate::sequence_progress_projection::TerminalProof::Interrupted,crate::sequence_progress_service::now_ms());
+        self.progress.complete(
+            crate::sequence_progress_projection::TerminalProof::Interrupted,
+            crate::sequence_progress_service::now_ms(),
+        );
         self.turbocharge = None;
         self.turbo_evidence = None;
         self.manual_control = true;
@@ -315,6 +331,7 @@ impl Runtime {
     /// procedure. Retain it as pending until the operator returns to Idle and
     /// explicitly clears qualification. Never clear evidence automatically.
     pub fn calibration_import_allowed(&self) -> bool {
+        if cold_flow::runtime_active(self) { return false; }
         #[cfg(feature = "hitl_mode")]
         {
             false
@@ -700,6 +717,7 @@ fn pilot_clock_allowed(engine_active: bool, fire_committed: bool, hitl_mode: boo
 }
 pub(crate) fn pilot_report_can_advance_launch_clock(state: &AppState) -> bool {
     let runtime = state.gse.lock().unwrap();
+    if cold_flow::runtime_active(&runtime){return false;}
     #[cfg(feature = "hitl_mode")]
     let fire_committed = false;
     #[cfg(not(feature = "hitl_mode"))]
@@ -735,6 +753,9 @@ pub fn valve_command(cmd: &TelemetryCommand) -> bool {
 }
 
 pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool> {
+    if cold_flow::active(state) {
+        return Some(matches!(cmd,TelemetryCommand::CancelFill|TelemetryCommand::PauseFill|TelemetryCommand::Abort));
+    }
     if matches!(cmd, TelemetryCommand::PauseFill) && state.gse.lock().unwrap().turbocharge.is_some()
     {
         return Some(prelaunch(state) && interlock(state, &state.action_policy_snapshot()));
@@ -1046,10 +1067,20 @@ pub(crate) fn handle_command_with_origins(
     plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
     launch_revision: Option<u64>,
 ) -> bool {
+    let automatic_observation = crate::automatic_flight_state::Observation::begin(state);
+    if cold_flow::active(state) && matches!(cmd,TelemetryCommand::CancelFill|TelemetryCommand::PauseFill) {
+        cold_flow::cancel_or_park_current(state,matches!(cmd,TelemetryCommand::PauseFill));
+        return true;
+    }
     let handled = {
         let _dispatch = DISPATCH_GATE.lock().unwrap();
         handle_command_inner(state, cmd, plumbing_origin, launch_revision)
     };
+    if let Some(observation) = automatic_observation.as_ref() {
+        crate::sequences::refresh_action_policy_with_observation(state, observation);
+    } else {
+        crate::sequences::refresh_action_policy_projection(state);
+    }
     flush_effects(state);
     progress::flush(state);
     handled
@@ -1062,6 +1093,166 @@ fn flush_effects(state: &Arc<AppState>) {
         crate::telemetry_task::flush_command_tx(router, "GSE sequence");
     }
 }
+/// Pure classification before recording I/O. No run, tare, progress or valve
+/// state is changed. The same classification is checked again after the await.
+pub(crate) fn classify_fill_for_recording(
+    state: &AppState,
+    origin: &crate::fill_recording::Origin,
+) -> Result<crate::fill_recording::Disposition, crate::fill_recording::Error> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    classify_fill_for_recording_under_gate(state, origin, true)
+}
+fn classify_fill_for_recording_under_gate(
+    state: &AppState,
+    origin: &crate::fill_recording::Origin,
+    preparation: bool,
+) -> Result<crate::fill_recording::Disposition, crate::fill_recording::Error> {
+    use crate::fill_recording::{Disposition, Error};
+    origin.live()?;
+    if preparation {
+        origin.remaining()?;
+    }
+    if state.operator_admission_barrier.load(std::sync::atomic::Ordering::Acquire) != 0
+        || with_stop_admission(state, origin.ticket(), || ()).is_err()
+    { return Err(Error::Stale); }
+    match manual_stop_state(state) {
+        CurrentState::Current => {},
+        CurrentState::PendingBusy => return Err(Error::PendingBusy),
+        CurrentState::Invalid => return Err(Error::Stale),
+    }
+    if cold_flow::active(state) {
+        return Err(Error::Busy);
+    }
+    let is_prelaunch = prelaunch(state);
+    let policy = state.action_policy_snapshot();
+    let targets = state.fill_targets_snapshot().nitrous;
+    let zero_pending = {
+        let zero = state.auto_zero.lock().unwrap();
+        zero.fill_capture_pending()
+    };
+    let rt = state.gse.lock().unwrap();
+    let input = rt.input(is_prelaunch, interlock(state, &policy));
+    if !input.prelaunch || !input.interlock {
+        return Err(Error::Stale);
+    }
+    if matches!(rt.engine.status.phase, Phase::FillSetup | Phase::Filling) || zero_pending {
+        return Ok(Disposition::AlreadyFilling);
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    if !operational_action_allowed(&rt, Action::StartFill) {
+        return Err(Error::Stale);
+    }
+    if rt.ground_station_control
+        && rt.valve_pressure.is_some_and(|p| {
+            p.value >= targets.target_pressure_psi
+                && p.at_ms <= input.now_ms
+                && input.now_ms - p.at_ms <= 2000
+        })
+    {
+        return Err(Error::Stale);
+    }
+    match rt
+        .engine
+        .fill_resume_required(input, rt.fresh_mass(input.now_ms), targets.target_mass_kg)
+    {
+        Ok(false) => Ok(Disposition::FullNoop),
+        Ok(true) => Ok(Disposition::MayStart),
+        Err(reason) => Err(Error::Validation(reason)),
+    }
+}
+/// This helper admits only the first bounded step, then the existing zero
+/// controller owns its unchanged capture deadline. No hot lock spans begin().
+pub(crate) fn apply_recorded_fill(
+    state: &Arc<AppState>,
+    prepared: std::sync::Arc<crate::fill_recording::Prepared>,
+) -> Result<(), crate::fill_recording::Error> {
+    use crate::fill_recording::{Disposition, Error};
+    {
+        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let now = classify_fill_for_recording_under_gate(state, &prepared.origin, true)?;
+        if !state.fill_recording.current(&prepared.receipt) {
+            return Err(Error::Unavailable);
+        }
+        if prepared.initial == Disposition::FullNoop && now != Disposition::FullNoop {
+            return Err(Error::Stale);
+        }
+        if prepared.initial == Disposition::AlreadyFilling || now == Disposition::AlreadyFilling {
+            return Ok(());
+        }
+        if now == Disposition::FullNoop {
+            state.gse.lock().unwrap().engine.status.message =
+                "Fill unchanged: weight is within 0.2 kg of the configured target or above it"
+                    .into();
+            return Ok(());
+        }
+        *state.fill_recording.continuation.lock().unwrap() = Some(prepared.clone());
+    }
+    if !state.fill_recording.current(&prepared.receipt) { return Err(Error::Stale); }
+    match prepared.origin.ram_current(state) {
+        CurrentState::Current => {},
+        CurrentState::PendingBusy => return Err(Error::PendingBusy),
+        CurrentState::Invalid => return Err(Error::Stale),
+    }
+    let cmd = TelemetryCommand::StartFill;
+    state.record_command_accepted(&cmd, crate::telemetry_task::get_current_timestamp_ms());
+    state.auto_zero.lock().unwrap().cancel_for_command(&cmd);
+    if crate::auto_zero::before_fill(state, &cmd) {
+        return Ok(());
+    }
+    {
+        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let now = classify_fill_for_recording_under_gate(state, &prepared.origin, true)?;
+        if !state.fill_recording.current(&prepared.receipt) {
+            return Err(Error::Unavailable);
+        }
+        if now == Disposition::FullNoop {
+            state.fill_recording.continuation.lock().unwrap().take();
+            return Ok(());
+        }
+        if now != Disposition::MayStart {
+            return Err(Error::Stale);
+        }
+        handle_command_inner(state, &cmd, None, None);
+        state.fill_recording.continuation.lock().unwrap().take();
+    }
+    flush_effects(state);
+    progress::flush(state);
+    Ok(())
+}
+
+/// Consume only an already-safe, explicit no-op before unrelated capture cancellation.
+/// The existing dispatch claim remains owned by the caller; no effects or progress start.
+pub(crate) fn consume_fill_noop(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
+    if !matches!(cmd, TelemetryCommand::StartFill) {
+        return false;
+    }
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if cold_flow::active(state) {
+        return false;
+    }
+    let is_prelaunch = prelaunch(state);
+    let policy = state.action_policy_snapshot();
+    let targets = state.fill_targets_snapshot().nitrous;
+    let mut rt = state.gse.lock().unwrap();
+    #[cfg(not(feature = "hitl_mode"))]
+    if !operational_action_allowed(&rt, Action::StartFill) {
+        return false;
+    }
+    let input = rt.input(is_prelaunch, interlock(state, &policy));
+    if rt.ground_station_control && rt.valve_pressure.is_some_and(|p| {
+        p.value >= targets.target_pressure_psi
+            && p.at_ms <= input.now_ms
+            && input.now_ms - p.at_ms <= 2000
+    }) {
+        return false;
+    }
+    if !matches!(rt.engine.fill_resume_required(input, rt.fresh_mass(input.now_ms), targets.target_mass_kg), Ok(false)) {
+        return false;
+    }
+    rt.engine.status.message = "Fill unchanged: weight is within 0.2 kg of the configured target or above it".into();
+    true
+}
+
 fn handle_command_inner(
     state: &Arc<AppState>,
     cmd: &TelemetryCommand,
@@ -1070,6 +1261,7 @@ fn handle_command_inner(
 ) -> bool {
     #[cfg(feature = "hitl_mode")]
     let _ = (plumbing_origin, launch_revision);
+    if cold_flow::handle_under_dispatch(state,cmd){return true;}
     if matches!(cmd, TelemetryCommand::Turbocharge) {
         turbocharge::request(state);
         return true;
@@ -1127,7 +1319,9 @@ fn handle_command_inner(
         return true;
     }
     if let Some(action) = action(cmd) {
-        let reserved = progress::reserve(state);
+        // Capture ownership outside GSE. Run-key reservation below is atomic only,
+        // and happens after actual non-noop engine admission.
+        let progress_admission = LaunchAdmission::capture(state);
         let is_prelaunch = prelaunch(state);
         let policy = state.action_policy_snapshot();
         let nitrous_target = state.fill_targets_snapshot().nitrous.target_pressure_psi;
@@ -1168,16 +1362,53 @@ fn handle_command_inner(
             {
                 Err("Automatic fill requires fresh calibrated fill weight before starting".into())
             } else {
-                let previous_phase=rt.engine.status.phase;
-                let resuming_fill=previous_phase==Phase::Paused && rt.progress.current().is_some_and(|s|s.kind==crate::sequence_progress::Kind::Fill && !s.outcome.terminal());
-                let result = rt.engine.request(action, input);
+                let previous_phase = rt.engine.status.phase;
+                let resuming_fill = previous_phase == Phase::Paused
+                    && rt.progress.current().is_some_and(|s| {
+                        s.kind == crate::sequence_progress::Kind::Fill && !s.outcome.terminal()
+                    });
+                let mass = rt.fresh_mass(input.now_ms);
+                let result = if action == Action::StartFill {
+                    match rt.engine.request_fill(input, mass, progress_mass_target) {
+                        Ok(gse_sequence::fill_resume::FillStart::Noop) => {
+                            rt.engine.status.message = "Fill unchanged: weight is within 0.2 kg of the configured target or above it".into();
+                            return true;
+                        }
+                        Ok(gse_sequence::fill_resume::FillStart::Started(effects)) => Ok(effects),
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    rt.engine.request(action, input)
+                };
                 if result.is_ok() {
-                    if action==Action::StartFill {rt.progress_fill_target_kg=Some(progress_mass_target);}
+                    let reserved = state
+                        .sequence_progress
+                        .reserve(progress_admission.generation)
+                        .ok()
+                        .map(|key| (key, progress_admission));
+                    if action == Action::StartFill {
+                        rt.progress_fill_target_kg = Some(progress_mass_target);
+                    }
                     rt.manual_control = false;
-                    use crate::{sequence_progress::Kind,sequence_progress_projection::Cause};
-                    let kind=match action {Action::SelfTest=>Some(Kind::ValveSelfTest),Action::NitrogenTest=>Some(Kind::NitrogenTest),Action::StartFill if !resuming_fill=>Some(Kind::Fill),_=>None};
-                    if let Some(kind)=kind {rt.progress_start(reserved,kind,input);}
-                    else {rt.progress_observe(input,match action {Action::PauseFill=>Cause::PauseAccepted,Action::CancelFill=>Cause::CancelAccepted,_=>Cause::ResumeAccepted});}
+                    use crate::{sequence_progress::Kind, sequence_progress_projection::Cause};
+                    let kind = match action {
+                        Action::SelfTest => Some(Kind::ValveSelfTest),
+                        Action::NitrogenTest => Some(Kind::NitrogenTest),
+                        Action::StartFill if !resuming_fill => Some(Kind::Fill),
+                        _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        rt.progress_start(reserved, kind, input);
+                    } else {
+                        rt.progress_observe(
+                            input,
+                            match action {
+                                Action::PauseFill => Cause::PauseAccepted,
+                                Action::CancelFill => Cause::CancelAccepted,
+                                _ => Cause::ResumeAccepted,
+                            },
+                        );
+                    }
                 }
                 #[cfg(not(feature = "hitl_mode"))]
                 if result.is_ok() {
@@ -1253,13 +1484,37 @@ pub(crate) fn start_fill_after_automatic_zero(state: &Arc<AppState>, generation:
         let Some(claim) = claim_operator_dispatch_under_gate(state, generation) else {
             return;
         };
-        if matches!(generation, 0 | u64::MAX)
-            || generation != automatic_generation(state)
+        let Some(prepared) = state.fill_recording.continuation.lock().unwrap().clone() else {
+            return;
+        };
+        if prepared.origin.generation() != generation
+            || prepared.origin.live().is_err()
+            || !state.fill_recording.current(&prepared.receipt)
             || manual_stop_pending(state)
             || !automatic_abort_allowed(state)
+            || with_stop_admission(state, prepared.origin.ticket(), || ()).is_err()
         {
             return;
         }
+        {
+            let zero = state.auto_zero.lock().unwrap();
+            let token = prepared
+                .zero_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            if token == 0 || !zero.completed_fill_capture(token) {
+                return;
+            }
+        }
+        // Consume this exact accepted continuation once, before any effects.
+        let mut continuation = state.fill_recording.continuation.lock().unwrap();
+        if !continuation
+            .as_ref()
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, &prepared))
+        {
+            return;
+        }
+        continuation.take();
+        drop(continuation);
         state.gse.lock().unwrap().observe_mass(Some(0.0));
         *state.latest_fill_mass_kg.lock().unwrap() = Some(0.0);
         handle_command_inner(state, &TelemetryCommand::StartFill, None, None);
@@ -1327,6 +1582,15 @@ pub(crate) fn cancel_fill_for_recoverable_fault_for_generation(
 }
 
 pub fn tick(state: &Arc<AppState>, interlock: bool) {
+    let automatic_observation = crate::automatic_flight_state::Observation::begin(state);
+    #[cfg(feature = "hitl_mode")]
+    let _ = &automatic_observation;
+    if cold_flow::active(state) {
+        let Some(_claim)=claim_operator_dispatch(state,automatic_generation(state))else{return;};
+        cold_flow::tick(state,interlock);
+        progress::flush(state);
+        return;
+    }
     let _claim = {
         let _dispatch = DISPATCH_GATE.lock().unwrap();
         let Some(claim) = claim_operator_dispatch_under_gate(state, automatic_generation(state))
@@ -1336,6 +1600,10 @@ pub fn tick(state: &Arc<AppState>, interlock: bool) {
         tick_inner(state, interlock);
         claim
     };
+    #[cfg(not(feature = "hitl_mode"))]
+    if let Some(observation) = automatic_observation.as_ref() {
+        publish_qualified_flight_armed_with_observation(state, observation);
+    }
     flush_effects(state);
     progress::flush(state);
 }
@@ -1363,15 +1631,28 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
     let effects = {
         let mut rt = state.gse.lock().unwrap();
         let input = rt.input(is_prelaunch, interlock);
-        if rt.progress.current().is_some_and(|s|s.kind==crate::sequence_progress::Kind::Fill){rt.progress_fill_target_kg=Some(target);}
+        if rt
+            .progress
+            .current()
+            .is_some_and(|s| s.kind == crate::sequence_progress::Kind::Fill)
+        {
+            rt.progress_fill_target_kg = Some(target);
+        }
         #[cfg(not(feature = "hitl_mode"))]
         let previous_phase = rt.engine.status.phase;
         if let Some(mut controller) = rt.fill_trim.take() {
             let mass = rt.fresh_mass(input.now_ms);
             let update = controller.tick(input, mass);
-            let reporting_trim=controller.progress_observation();
-            let reporting_view=rt.engine.progress_observation(input);
-            rt.progress.observe_trim(reporting_trim,reporting_view,mass,input.now_ms,update.fault.as_deref(),crate::sequence_progress_service::now_ms());
+            let reporting_trim = controller.progress_observation();
+            let reporting_view = rt.engine.progress_observation(input);
+            rt.progress.observe_trim(
+                reporting_trim,
+                reporting_view,
+                mass,
+                input.now_ms,
+                update.fault.as_deref(),
+                crate::sequence_progress_service::now_ms(),
+            );
             if let Some(message) = update.fault {
                 #[cfg(not(feature = "hitl_mode"))]
                 {
@@ -1394,6 +1675,7 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                     rt.progress_failed_current();
                 }
                 rt.engine.status.phase = Phase::Paused;
+                rt.engine.status.valves = completion_valve_snapshot(input);
                 rt.engine.status.message =
                     "Fill mass settled within tolerance; all valves confirmed closed".into();
                 #[cfg(not(feature = "hitl_mode"))]
@@ -1403,8 +1685,14 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                     }
                     complete_operational_milestones(&mut rt, Phase::PauseSetup, input);
                 }
-                #[cfg(feature="hitl_mode")]
-                rt.progress.complete(crate::sequence_progress_projection::TerminalProof::VerifiedFillTrim{trim:reporting_trim,input},crate::sequence_progress_service::now_ms());
+                #[cfg(feature = "hitl_mode")]
+                rt.progress.complete(
+                    crate::sequence_progress_projection::TerminalProof::VerifiedFillTrim {
+                        trim: reporting_trim,
+                        input,
+                    },
+                    crate::sequence_progress_service::now_ms(),
+                );
                 let mut effects = update.effects;
                 effects.notification = Some("Fill complete: settled mass is within tolerance and all valves are confirmed closed".into());
                 effects
@@ -1416,18 +1704,32 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
             }
         } else {
             #[cfg(feature = "hitl_mode")]
-            let progress_before=rt.engine.progress_observation(input);
+            let progress_before = rt.engine.progress_observation(input);
             let effects = turbocharge::pressure_cutoff(&mut rt, input)
                 .unwrap_or_else(|| rt.engine.tick(input));
             #[cfg(feature = "hitl_mode")]
             {
-                let after=rt.engine.progress_observation(input);
-                rt.progress_observe(input,crate::sequence_progress_projection::Cause::Tick);
-                let kind=match (progress_before.phase,after.phase) {
-                    (Phase::SelfFinish,Phase::Idle)=>Some(crate::sequence_progress::Kind::ValveSelfTest),
-                    (Phase::Dumping,Phase::Passed)=>Some(crate::sequence_progress::Kind::NitrogenTest),_=>None,
+                let after = rt.engine.progress_observation(input);
+                rt.progress_observe(input, crate::sequence_progress_projection::Cause::Tick);
+                let kind = match (progress_before.phase, after.phase) {
+                    (Phase::SelfFinish, Phase::Idle) => {
+                        Some(crate::sequence_progress::Kind::ValveSelfTest)
+                    }
+                    (Phase::Dumping, Phase::Passed) => {
+                        Some(crate::sequence_progress::Kind::NitrogenTest)
+                    }
+                    _ => None,
                 };
-                if let Some(kind)=kind {rt.progress.complete(crate::sequence_progress_projection::TerminalProof::EngineCompleted{kind,before:progress_before,after},crate::sequence_progress_service::now_ms());}
+                if let Some(kind) = kind {
+                    rt.progress.complete(
+                        crate::sequence_progress_projection::TerminalProof::EngineCompleted {
+                            kind,
+                            before: progress_before,
+                            after,
+                        },
+                        crate::sequence_progress_service::now_ms(),
+                    );
+                }
             }
             #[cfg(not(feature = "hitl_mode"))]
             complete_operational_milestones(&mut rt, previous_phase, input);
@@ -1454,9 +1756,16 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                             rt.engine.claimed = true;
                             rt.engine.status.message =
                                 "Closing supplies and vent before settled mass verification".into();
-                            let reporting_trim=controller.progress_observation();
-                            let reporting_view=rt.engine.progress_observation(input);
-                            rt.progress.observe_trim(reporting_trim,reporting_view,Some(mass),input.now_ms,None,crate::sequence_progress_service::now_ms());
+                            let reporting_trim = controller.progress_observation();
+                            let reporting_view = rt.engine.progress_observation(input);
+                            rt.progress.observe_trim(
+                                reporting_trim,
+                                reporting_view,
+                                Some(mass),
+                                input.now_ms,
+                                None,
+                                crate::sequence_progress_service::now_ms(),
+                            );
                             rt.fill_trim = Some(controller);
                             effects.notification = Some("Automatic fill cutoff: closing valves, then settling and verifying final mass".into());
                             effects
@@ -1475,8 +1784,7 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
         }
     };
     apply(state, effects);
-    #[cfg(not(feature = "hitl_mode"))]
-    publish_qualified_flight_armed(state);
+
 }
 
 /// The existing five-valve hardware cluster can be switched as one group.
@@ -1501,6 +1809,7 @@ pub fn panel_command(state: &AppState, cmd: TelemetryCommand) -> TelemetryComman
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(progress::routes())
+        .merge(cold_flow::routes())
         .route(
             "/api/gse/config",
             get(get_config).put(save_config).post(save_config),
@@ -1671,7 +1980,7 @@ async fn save_config(
     }
     let result = (|| -> Result<(), (StatusCode, String)> {
         let mut rt = state.gse.lock().unwrap();
-        if rt.engine.active() {
+        if rt.engine.active() || cold_flow::runtime_active(&rt) {
             return Err((
                 StatusCode::CONFLICT,
                 "Stop the active sequence before editing GSE configuration".into(),
@@ -1686,8 +1995,15 @@ async fn save_config(
                 "Grant dry self-test confirmation through its dedicated control".into(),
             ));
         }
-        invalidate_changed_configuration(&mut rt, &config)
-            .map_err(|error| (StatusCode::CONFLICT, error))?;
+        // Only an inert target-only edit with the COMPLETE original evidence
+        // context still current bypasses the old invalidation behavior. This is
+        // inactive settings work, never a sequence/report/control callback.
+        let inert_cold = turbocharge::only_cold_target_changed(&rt.engine.config,&config)
+            && turbocharge::evidence_context_current(&state,&rt);
+        if !inert_cold {
+            invalidate_changed_configuration(&mut rt, &config)
+                .map_err(|error| (StatusCode::CONFLICT, error))?;
+        }
         persist_settings(&config).map_err(|error| (StatusCode::CONFLICT, error))?;
         rt.engine.config = config;
         Ok(())
@@ -1755,11 +2071,30 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     }
     turbocharge::decorate_status(&state, &mut response);
     response["sequence_progress"]=progress::envelope(&state);
+    response["cold_flow"]=serde_json::to_value(cold_flow::status(&state)).expect("Cold-flow status serializable");
     Json(response).into_response()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completion_valve_snapshot_retains_only_fresh_actual_open_and_closed() {
+        use super::*;
+        let input = Inputs {
+            now_ms: 5000,
+            pressure: None,
+            valves: [
+                Some(ValveState { open: true, at_ms: 4999 }),
+                Some(ValveState { open: false, at_ms: 3000 }),
+                None,
+                Some(ValveState { open: false, at_ms: 2999 }),
+                Some(ValveState { open: false, at_ms: 5001 }),
+            ],
+            prelaunch: false,
+            interlock: false,
+        };
+        assert_eq!(completion_valve_snapshot(input), [Some(true), Some(false), None, None, None]);
+    }
     #[cfg(not(feature = "hitl_mode"))]
     #[test]
     fn template_switch_waits_for_local_reset_receipts() {
@@ -2032,6 +2367,11 @@ mod tests {
 
     pub(super) async fn button_test_state()
     -> (Arc<AppState>, TestCommands, Arc<sedsnet::router::Router>) {
+        button_test_state_observed(None).await
+    }
+    pub(super) async fn button_test_state_observed(
+        observer: Option<FillRecordingTestObserver>,
+    ) -> (Arc<AppState>, TestCommands, Arc<sedsnet::router::Router>) {
         let state = crate::state::tests::test_app_state().await;
         *state.state.lock().unwrap() = FlightState::Idle;
         let sent: TestCommands = Default::default();
@@ -2041,12 +2381,16 @@ mod tests {
         ]
         .map(|(endpoint, name)| {
             let sent = sent.clone();
+            let observer = observer.clone();
             sedsnet::router::EndpointHandler::new_packet_handler(
                 crate::telemetry_schema::endpoint(endpoint),
                 move |packet: &sedsnet::packet::Packet| {
                     sent.lock()
                         .unwrap()
                         .push((name.into(), packet.payload().to_vec()));
+                    if let Some(observer) = &observer {
+                        observer(packet);
+                    }
                     Ok(())
                 },
             )
@@ -2299,6 +2643,26 @@ mod tests {
         );
         drive_button_phase(&state, &sent, &peer, Phase::Paused, target);
         assert!(state.gse.lock().unwrap().fill_trim.is_none());
+        {
+            let rt = state.gse.lock().unwrap();
+            let now = rt.now();
+            assert!(rt.valves.iter().all(|value| value.is_some_and(|value|
+                !value.open && value.at_ms <= now && now - value.at_ms <= 2000)),
+                "trim completion requires all five fresh actual closed reports: {:?}", rt.valves);
+        }
+        let completed_status = state.gse.lock().unwrap().engine.status.clone();
+        let completed_snapshot = serde_json::to_value(completed_status).unwrap();
+        assert_eq!(completed_snapshot["valves"], serde_json::json!([false, false, false, false, false]),
+            "completion snapshot must immediately reflect actual closed reports");
+        let completed_commands = sent.lock().unwrap().clone();
+        {
+            let mut rt = state.gse.lock().unwrap();
+            rt.observe_mass(Some(target - target.signum() * 0.3));
+        }
+        tick(&state, true);
+        pump_test_link(&state, &peer);
+        assert_eq!(state.gse.lock().unwrap().engine.status.phase, Phase::Paused);
+        assert_eq!(*sent.lock().unwrap(), completed_commands, "weight loss cannot auto-resume fill");
     }
 
     #[tokio::test]
@@ -2486,6 +2850,9 @@ mod tests {
 /// Status receipt is checked before the next sequence tick; never wait five
 /// seconds to react to an incompatible supply opening during nitrous fill.
 pub fn report_safety(state: &Arc<AppState>) {
+    // Its typed controller checks fresh PT/outputs on the existing GSE tick.
+    // Paused here is a proxy, never proof of a nitrous-fill session.
+    if cold_flow::active(state){return;}
     #[cfg(not(feature = "hitl_mode"))]
     {
         let _claim = {
@@ -2702,8 +3069,11 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
         .clear_automatic_abort_claim()
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let config = rt.engine.config.clone();
-    rt.progress.complete(crate::sequence_progress_projection::TerminalProof::Interrupted,crate::sequence_progress_service::now_ms());
-    rt.progress_admission=None;
+    rt.progress.complete(
+        crate::sequence_progress_projection::TerminalProof::Interrupted,
+        crate::sequence_progress_service::now_ms(),
+    );
+    rt.progress_admission = None;
     rt.engine = Engine::default();
     rt.manual_control = false;
     rt.fill_trim = None;
@@ -2781,7 +3151,7 @@ async fn reset_qualification(State(state): State<Arc<AppState>>, headers: Header
                 .into_response();
         }
         let mut rt = state.gse.lock().unwrap();
-        if rt.operational.running {
+        if rt.operational.running || cold_flow::runtime_active(&rt) {
             return (StatusCode::CONFLICT, "Stop the active sequence first").into_response();
         }
         if let Err(error) = rt.operational.saved.qualification.reset() {
@@ -2796,8 +3166,11 @@ async fn reset_qualification(State(state): State<Arc<AppState>>, headers: Header
         rt.operational.qd = QdWait::default();
         rt.operational.qd_launch_admission = None;
         let config = rt.engine.config.clone();
-        rt.progress.complete(crate::sequence_progress_projection::TerminalProof::Interrupted,crate::sequence_progress_service::now_ms());
-        rt.progress_admission=None;
+        rt.progress.complete(
+            crate::sequence_progress_projection::TerminalProof::Interrupted,
+            crate::sequence_progress_service::now_ms(),
+        );
+        rt.progress_admission = None;
         rt.engine = Engine::default();
         rt.engine.config = config;
         rt.engine.config.dry_self_test_confirmed = false;
@@ -3035,6 +3408,9 @@ impl LaunchAdmission {
             && self.observed_manual_epoch == state.deferred_abort.manual_epoch()
             && !manual_stop_pending(state)
     }
+    pub(crate) fn automatic_board_context_current(self, state: &AppState) -> bool {
+        state.board_abort.automatic_revision_current(self.board_abort_revision)
+    }
     pub(crate) fn original_ownership(self) -> (u64, u64, u64) {
         (
             self.generation,
@@ -3054,12 +3430,38 @@ impl LaunchAdmission {
 
 /// Retention is not physical confirmation. Keep unsafe new controls fenced
 /// until the pending Stop owner and its local observation have been handled.
-pub(crate) fn manual_stop_pending(state: &AppState) -> bool {
+/// A busy SDK owner is temporary uncertainty, never an observed Stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CurrentState {
+    Current,
+    PendingBusy,
+    Invalid,
+}
+fn manual_stop_ram_pending(state: &AppState) -> bool {
     state.manual_abort_intent.epoch() == u64::MAX
         || state.deferred_abort.manual_epoch() == u64::MAX
         || state.manual_abort_intent.pending_epoch().is_some()
         || state.deferred_abort.manual_pending()
         || state.abort_indicator_latched()
+}
+/// Nonwaiting inspection for pure RAM publication. Packet admission must use
+/// the SDK's atomic pending-type queue operation, not this momentary sample.
+pub(crate) fn manual_stop_state(state: &AppState) -> CurrentState {
+    if manual_stop_ram_pending(state) {
+        return CurrentState::Invalid;
+    }
+    let Some(router) = state.topology_router.get() else {
+        return CurrentState::Current;
+    };
+    // Generated identity only: no schema lookup/init under application guards.
+    match router.try_has_pending_reliable_tx_type(crate::telemetry_schema::types::ABORT) {
+        Ok(false) => CurrentState::Current,
+        Ok(true) => CurrentState::Invalid,
+        Err(sedsnet::router::TryPendingTypeError::CoreBusy) => CurrentState::PendingBusy,
+    }
+}
+pub(crate) fn manual_stop_pending(state: &AppState) -> bool {
+    manual_stop_ram_pending(state)
         || state.topology_router.get().is_some_and(|router| {
             router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT"))
         })
@@ -3086,6 +3488,44 @@ fn abort_safe_control(kind: sedsnet::config::DataType, payload: &[u8]) -> bool {
         false
     }
 }
+/// Recording publication shares original Stop ordering. The same fixed
+/// one-shot plan survives Busy; only its RAM store runs inside the final gate.
+/// No pool/GSE/SDK/filesystem operation may run inside that plan.
+pub(crate) fn with_fill_recording_publication(
+    state: &AppState,
+    origin: &crate::fill_recording::Origin,
+    publication: &mut crate::fill_recording::Publication,
+) -> Result<(), crate::fill_recording::Error> {
+    use crate::fill_recording::Error;
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    origin.remaining()?;
+    if state.operator_admission_barrier.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return Err(Error::Stale);
+    }
+    match manual_stop_state(state) {
+        CurrentState::Current => {},
+        CurrentState::PendingBusy => return Err(Error::PendingBusy),
+        CurrentState::Invalid => return Err(Error::Stale),
+    }
+    with_stop_admission(state, origin.ticket(), || publication.apply(state))
+        .map_err(|_| Error::Stale)?
+}
+pub(crate) fn fill_origin_current(state: &AppState, ticket: LaunchAdmission) -> CurrentState {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if state.operator_admission_barrier.load(std::sync::atomic::Ordering::Acquire) != 0
+        || with_stop_admission(state, ticket, || ()).is_err() {
+        return CurrentState::Invalid;
+    }
+    manual_stop_state(state)
+}
+pub(crate) fn recording_publication_gate() -> std::sync::MutexGuard<'static, ()> {
+    DISPATCH_GATE.lock().unwrap()
+}
+pub(crate) fn revoke_fill_recording(state: &AppState) {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    state.fill_recording.revoke_under_dispatch();
+}
+
 /// Ordinary operators retain OperatorDispatchClaim through queue/flush; a
 /// verified Reset must quiesce those leases before advancing generation.
 /// Automatic apply already owns DISPATCH_GATE. Re-entering it here would
@@ -3116,12 +3556,38 @@ fn with_plumbing_admission_inner<T>(
     }
     with_stop_admission(state, ticket, admit)
 }
-pub(crate) fn with_prepared_motion_admission<T>(
+/// RAM-only original context. The motion callback MUST use atomic SDK
+/// pending-ABORT admission; no blocking SDK inspector may run under this gate.
+pub(crate) fn with_motion_context<T>(
     state: &AppState,
     ticket: LaunchAdmission,
     admit: impl FnOnce() -> T,
 ) -> Result<T, &'static str> {
-    with_plumbing_admission_inner(state, ticket, admit, true)
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if manual_stop_ram_pending(state) {
+        return Err("Manual Stop is pending; plumbing admission refused");
+    }
+    with_stop_admission(state, ticket, admit)
+}
+pub(crate) fn with_prepared_motion_admission<T>(
+    state: &AppState,
+    ticket: LaunchAdmission,
+    first_attempt: bool,
+    admit: impl FnOnce() -> T,
+) -> Result<T, &'static str> {
+    #[cfg(not(test))]
+    let _ = first_attempt;
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if manual_stop_ram_pending(state) {
+        return Err("Manual Stop is pending; plumbing admission refused");
+    }
+    #[cfg(test)]
+    if first_attempt { nonwaiting_admission_tests::after_prepared(state); }
+    with_stop_admission(state, ticket, admit)
+}
+#[cfg(test)]
+pub(crate) fn motion_core_busy_refused_for_test(state: &AppState) {
+    nonwaiting_admission_tests::core_busy_refused(state);
 }
 pub(crate) fn queue_plumbing_under_dispatch_with_stop_fence(
     state: &Arc<AppState>,
@@ -3265,6 +3731,7 @@ fn with_launch_admission<T>(
     admit: impl FnOnce() -> T,
 ) -> Result<T, String> {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if cold_flow::active(state){return Err("Rocket Launch is inhibited while cold flow owns the valves".into());}
     with_stop_admission(state, ticket, || ()).map_err(str::to_string)?;
     let required = crate::board_abort::required_mask(state);
     state
@@ -3321,18 +3788,100 @@ pub(crate) fn queue_prepared_launch_packets(
         packets.insert(0, prepared.packet.clone());
     }
     let total = packets.len();
+    #[cfg(test)] nonwaiting_admission_tests::record_launch_packets(state,&packets);
     #[cfg(test)]
     nonwaiting_admission_tests::after_prepared(state);
-    let result = with_launch_admission(state, ticket, || {
-        let mut accepted = 0;
-        for packet in packets {
-            if let Err(error) = router.try_tx_queue(packet) {
-                return Err((accepted, error));
-            }
-            accepted += 1;
+    // A NEW retry window for this one prepared Launch, not an ingress TTL.
+    // Each original remains owned here. Packet::clone may allocate, so build
+    // attempt slots before entering any dispatch/board/Stop admission guard.
+    // Legacy try_tx_queue consumes its argument even on refusal; it retains
+    // the existing schema/allocation/queue policy and is not a realtime API.
+    enum QueueAttempt {
+        WindowExpired,
+        Completed(Result<usize, (usize, sedsnet::TelemetryError)>),
+    }
+    let retry_window = std::time::Duration::from_millis(100);
+    let mut first_sdk_attempt: Option<Instant> = None;
+    let mut last_zero_busy = None;
+    let mut retry_controller_types = None;
+    let result = loop {
+        if first_sdk_attempt.is_some_and(|at| at.elapsed() >= retry_window) {
+            break Err((0, last_zero_busy.take().expect("retry follows a real zero-owner CoreBusy")));
         }
-        Ok(accepted)
-    })?;
+        if last_zero_busy.is_some() {
+            // A zero-owner refusal must not outlive a newly retained controller
+            // command. These conservative snapshots run outside ALL app guards;
+            // they are not an atomic multi-type check-and-queue operation.
+            with_stop_admission(state, ticket, || ()).map_err(str::to_string)?;
+            let mut inspection_busy = false;
+            // The generator exports only a subset of types. Resolve these
+            // existing configured names once, outside all application guards,
+            // and only when a real zero-owner Busy made a retry necessary.
+            let controller_types = retry_controller_types.get_or_insert_with(|| {
+                ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND"]
+                    .map(crate::telemetry_schema::data_type)
+            });
+            for kind in controller_types.iter().copied() {
+                match router.try_has_pending_reliable_tx_type(kind) {
+                    Ok(false) => {}
+                    Ok(true) => return Err("Controller command delivery is pending; launch was not dispatched".into()),
+                    Err(sedsnet::router::TryPendingTypeError::CoreBusy) => {
+                        inspection_busy = true;
+                        break;
+                    }
+                }
+            }
+            if inspection_busy {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+        }
+        let mut attempt_packets = packets.iter().cloned().map(Some).collect::<Vec<_>>();
+        let guarded = with_launch_admission(state, ticket, || {
+            let mut accepted = 0;
+            for slot in &mut attempt_packets {
+                // A guard may have waited. No retry call starts after this
+                // window; after ANY accepted prefix, preserve legacy behavior.
+                if accepted == 0
+                    && first_sdk_attempt.is_some_and(|at| at.elapsed() >= retry_window)
+                {
+                    return QueueAttempt::WindowExpired;
+                }
+                let packet = slot.take().expect("each attempt packet is consumed once");
+                first_sdk_attempt.get_or_insert_with(Instant::now);
+                #[cfg(test)] nonwaiting_admission_tests::record_launch_sdk_call(state, first_sdk_attempt);
+                if let Err(error) = router.try_tx_queue(packet) {
+                    #[cfg(test)] nonwaiting_admission_tests::record_launch_sdk_return(state, accepted, Some(&error));
+                    return QueueAttempt::Completed(Err((accepted, error)));
+                }
+                #[cfg(test)] nonwaiting_admission_tests::record_launch_sdk_return(state, accepted, None);
+                accepted += 1;
+            }
+            QueueAttempt::Completed(Ok(accepted))
+        });
+        // In particular, drop all unattempted clones outside application
+        // guards. SDK consumption of an attempted clone is unchanged legacy.
+        drop(attempt_packets);
+        let attempt = match guarded? {
+            QueueAttempt::WindowExpired => {
+                break Err((0, last_zero_busy.take().expect("expired retry retains its actual refusal")));
+            }
+            QueueAttempt::Completed(attempt) => attempt,
+        };
+        match attempt {
+            Err((0, error @ sedsnet::TelemetryError::Io("router core busy"))) => {
+                #[cfg(test)] nonwaiting_admission_tests::core_busy_refused(state);
+                #[cfg(test)] nonwaiting_admission_tests::launch_retry_boundary(state);
+                last_zero_busy = Some(error);
+                // All admission guards have returned. Keep the same ticket,
+                // vector, IDs, UTC and optional PreparedLaunchState; never
+                // reprepare or rerun an accepted prefix as a new intention.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            terminal => break terminal,
+        }
+    };
+    drop(packets);
     let accepted = match &result {
         Ok(n) => *n,
         Err((n, _)) => *n,
@@ -3543,7 +4092,6 @@ pub(crate) fn armed_fixture_for_test(
     router: &Arc<sedsnet::router::Router>,
 ) -> std::path::PathBuf {
     use crate::types::Board;
-    qualified_launch_proofs_for_test(state);
     crate::telemetry_task::refresh_host_network_time(
         router,
         crate::telemetry_task::get_current_timestamp_ms(),
@@ -3623,6 +4171,9 @@ pub(crate) fn armed_fixture_for_test(
     policy.key_enabled = true;
     policy.software_buttons_enabled = true;
     state.set_action_policy(policy);
+    // Return a fresh MODELED prerequisite after unrelated setup completes.
+    // This is the fixture's one original seed, never a post-intent refresh.
+    qualified_launch_proofs_for_test(state);
     path
 }
 
@@ -3853,39 +4404,76 @@ mod operator_admission_tests {
 
     #[cfg(feature = "hitl_mode")]
     #[tokio::test]
-    async fn hitl_board_proof_optional_actual_sdk_launch_absent_boards_and_known_abort_always_blocks() {
+    async fn hitl_board_proof_optional_actual_sdk_launch_absent_boards_and_known_abort_always_blocks()
+     {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let state = crate::state::tests::test_app_state().await;
         state.av_bay_comms_connected.store(true, Ordering::Relaxed);
         state.fill_comms_connected.store(true, Ordering::Relaxed);
         let owners = Arc::new(AtomicUsize::new(0));
         let received = owners.clone();
-        let router = sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([
-            sedsnet::router::EndpointHandler::new_packet_handler(
-                crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"), move |packet| {
-                    assert_eq!(packet.payload(), &[crate::rocket_commands::FlightComputerCommands::Launch as u8]);
-                    received.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                })]).with_sender("GS"));
-        crate::telemetry_task::refresh_host_network_time(&router, crate::telemetry_task::get_current_timestamp_ms());
+        let router = sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([
+                sedsnet::router::EndpointHandler::new_packet_handler(
+                    crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"),
+                    move |packet| {
+                        assert_eq!(
+                            packet.payload(),
+                            &[crate::rocket_commands::FlightComputerCommands::Launch as u8]
+                        );
+                        received.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                ),
+            ])
+            .with_sender("GS"),
+        );
+        crate::telemetry_task::refresh_host_network_time(
+            &router,
+            crate::telemetry_task::get_current_timestamp_ms(),
+        );
         let kind = crate::telemetry_schema::data_type("FLIGHT_COMMAND");
         let payload = [crate::rocket_commands::FlightComputerCommands::Launch as u8];
         assert!(!state.board_state_proof_enforced());
         assert_eq!(crate::board_abort::required_mask(&state), 0);
         let old = crate::board_abort::capture_launch_revision_named(&state, "Launch");
-        assert!(queue_controller_with_launch_revision(&state, &router, kind, &payload, old).unwrap());
+        assert!(
+            queue_controller_with_launch_revision(&state, &router, kind, &payload, old).unwrap()
+        );
         router.process_all_queues_with_timeout(0).unwrap();
         assert_eq!(owners.load(Ordering::SeqCst), 1);
         state.toggle_hitl_safety_interlock(3);
         assert!(state.board_state_proof_enforced());
-        assert!(!queue_controller_with_launch_revision(&state, &router, kind, &payload,
-            crate::board_abort::capture_launch_revision_named(&state, "Launch")).unwrap());
+        assert!(
+            !queue_controller_with_launch_revision(
+                &state,
+                &router,
+                kind,
+                &payload,
+                crate::board_abort::capture_launch_revision_named(&state, "Launch")
+            )
+            .unwrap()
+        );
         state.toggle_hitl_safety_interlock(3);
-        assert!(!queue_controller_with_launch_revision(&state, &router, kind, &payload, old).unwrap(),
-            "old intent does not gain authority after off/on policy transitions");
-        state.board_abort.observe_abort(crate::types::Board::FlightComputer, Instant::now(), crate::telemetry_task::get_current_timestamp_ms());
-        assert!(!queue_controller_with_launch_revision(&state, &router, kind, &payload,
-            crate::board_abort::capture_launch_revision_named(&state, "Launch")).unwrap());
+        assert!(
+            !queue_controller_with_launch_revision(&state, &router, kind, &payload, old).unwrap(),
+            "old intent does not gain authority after off/on policy transitions"
+        );
+        state.board_abort.observe_abort(
+            crate::types::Board::FlightComputer,
+            Instant::now(),
+            crate::telemetry_task::get_current_timestamp_ms(),
+        );
+        assert!(
+            !queue_controller_with_launch_revision(
+                &state,
+                &router,
+                kind,
+                &payload,
+                crate::board_abort::capture_launch_revision_named(&state, "Launch")
+            )
+            .unwrap()
+        );
         router.process_all_queues_with_timeout(0).unwrap();
         assert_eq!(owners.load(Ordering::SeqCst), 1);
     }
@@ -4048,6 +4636,8 @@ fn claim_operator_dispatch_under_gate(
             .load(std::sync::atomic::Ordering::Acquire)
             != 0
     {
+        #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
+        crate::normal_publication_probe::claim_refused(state, generation);
         return None;
     }
     let count = &state.operator_dispatch_inflight;
@@ -4062,9 +4652,15 @@ fn claim_operator_dispatch_under_gate(
         ) {
             Ok(_) => {
                 let claim = OperatorDispatchClaim(count.clone());
-                if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) { drop(claim); return None; }
+                if state
+                    .shutdown_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    drop(claim);
+                    return None;
+                }
                 return Some(claim);
-            },
+            }
             Err(observed) => current = observed,
         }
     }
@@ -5164,5 +5760,237 @@ mod recovery_http_quiescence_tests {
 #[cfg(test)]
 pub(crate) mod nonwaiting_admission_tests;
 
-#[cfg(all(test,feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
-pub(crate) fn apply_model_effects_for_test(state:&Arc<AppState>,valves:Vec<(usize,bool)>){apply(state,Effects{valves,notification:None});}
+#[cfg(all(
+    test,
+    feature = "testing",
+    not(any(feature = "hitl_mode", feature = "test_fire_mode"))
+))]
+pub(crate) fn apply_model_effects_for_test(state: &Arc<AppState>, valves: Vec<(usize, bool)>) {
+    apply(
+        state,
+        Effects {
+            valves,
+            notification: None,
+        },
+    );
+}
+
+#[cfg(test)]
+#[path = "gse/fill_resume_tests.rs"]
+mod fill_resume_tests;
+
+#[cfg(test)]
+pub(crate) async fn fill_recording_test_state(
+    mass: f32,
+    phase: Phase,
+    observer: Option<FillRecordingTestObserver>,
+) -> (
+    Arc<AppState>,
+    Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+    Arc<sedsnet::router::Router>,
+) {
+    let (state, sent, peer) = tests::button_test_state_observed(observer).await;
+    let mut policy = state.action_policy_snapshot();
+    policy.key_enabled = true;
+    policy.software_buttons_enabled = true;
+    state.set_action_policy(policy);
+    let target = state.fill_targets_snapshot().nitrous;
+    {
+        let mut rt = state.gse.lock().unwrap();
+        rt.engine.nitrous_target_psi = target.target_pressure_psi;
+        rt.engine.status.phase = phase;
+        rt.engine.status.nitrogen_passed = true;
+        rt.engine.status.baseline = Some(gse_sequence::Baseline {
+            average_psi: 0.,
+            min_psi: 0.,
+            max_psi: 0.,
+            noise_psi: 0.1,
+            samples: 50,
+        });
+        rt.observe_pressure(Some(0.));
+        rt.observe_mass(Some(mass));
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            rt.operational.startup_configured = true;
+            rt.operational.topology_stable = true;
+            let generation = rt.operational.saved.qualification.generation();
+            for milestone in [Milestone::SelfTest, Milestone::NitrogenTest] {
+                rt.operational
+                    .saved
+                    .qualification
+                    .complete(milestone, generation)
+                    .unwrap();
+            }
+            if phase == Phase::Paused {
+                rt.operational
+                    .saved
+                    .qualification
+                    .complete(Milestone::FillTarget, generation)
+                    .unwrap();
+            }
+        }
+    }
+    (state, sent, peer)
+}
+#[cfg(test)]
+pub(crate) fn pump_fill_recording_test_link(state: &AppState, peer: &sedsnet::router::Router) {
+    tests::pump_test_link(state, peer);
+}
+
+#[cfg(test)]
+pub(crate) fn fill_recording_progress_snapshot(state: &AppState) -> serde_json::Value {
+    let rt = state.gse.lock().unwrap();
+    let summary = rt
+        .progress
+        .current()
+        .map(|s| (&s.key, s.kind, s.outcome, s.cancel_allowed));
+    serde_json::json!({"phase":rt.engine.status.phase,"summary":summary,"marker":format!("{:?}",rt.progress.marker()),"generation":automatic_generation(state)})
+}
+
+#[cfg(test)]
+type FillRecordingTestObserver = Arc<dyn Fn(&sedsnet::packet::Packet) + Send + Sync>;
+
+/// One live automatic readiness publication, never durable seed mutation.
+/// Lock order is DISPATCH.try -> Store.try -> state.try -> policy.try -> model.try -> finite
+/// original manual/deferred owners -> board-Abort.try -> SDK Core.try/Schema.try. No provider,
+/// filesystem, allocation, callback or packet retirement occurs here.
+pub(crate) fn try_commit_automatic_idle(
+    state: &AppState,
+    original: crate::automatic_startup_idle::Captured,
+    identity: crate::network_variables::AutomaticIdleIdentity,
+    model: &crate::flight_sim::PreparedAutomaticReadiness,
+    prepared: &mut sedsnet::router::PreparedManagedBatch<'_>,
+) -> Result<(), crate::automatic_startup_idle::Error> {
+    use crate::automatic_startup_idle::Error;
+    use std::sync::atomic::Ordering;
+    let _dispatch = DISPATCH_GATE.try_lock().map_err(|_| Error::Busy)?;
+    if original.generation != automatic_generation(state)
+        || state.operator_admission_barrier.load(Ordering::Acquire) != 0
+        || state.shutdown_requested.load(Ordering::Acquire)
+        || manual_stop_ram_pending(state) { return Err(Error::Retired); }
+    // A retained/admitted Launch intent can precede the visible phase update.
+    // Ordinary lamp/Tclock resets cannot re-enable automatic readiness.
+    let history = state.launch_history.try_lock().map_err(|_| Error::Busy)?;
+    if history.automatic_actions_inhibited() || state.launch_indicator_latched()
+        || state.launch_sequence_command_pending.load(Ordering::Acquire) { return Err(Error::Retired); }
+    let mut variables = crate::network_variables::try_automatic_idle_store().ok_or(Error::Busy)?;
+    if !variables.matches(original.store) { return Err(Error::StoreChanged); }
+    let mut current = state.state.try_lock().map_err(|_| Error::Busy)?;
+    if *current != FlightState::Startup { return Err(Error::StateChanged); }
+    let mut policy = state.sequence_policy_state.try_lock().map_err(|_| Error::Busy)?;
+    let mut model = model.try_guard().ok_or(Error::Busy)?;
+    let router = state.topology_router.get().ok_or(Error::Retired)?;
+    with_stop_admission(state, original.ticket, || {
+        state.board_abort.try_admit_automatic_prelaunch(original.ticket.board_abort_revision, || {
+        router.try_commit_network_variable_batch_unless_pending_type(prepared, crate::telemetry_schema::types::ABORT)
+            .map_err(Error::Sdk)?;
+        *current = FlightState::Idle;
+        *policy = crate::sequences::SequencePolicyState::default();
+        variables.admitted(identity);
+        model.admitted();
+        Ok(())
+        }).map_err(|error| match error {
+            crate::board_abort::AutomaticAdmissionError::Busy => Error::Busy,
+            _ => Error::Retired,
+        })?
+    }).map_err(|_| Error::Retired)?
+}
+
+/// One original automatic scalar publication. Provider/codec/file work and all
+/// prepared-object retirement occur in the caller, outside these try guards.
+pub(crate) fn try_commit_automatic_phase(
+    state: &AppState,
+    proposal: crate::automatic_flight_state::Proposal,
+    identity: crate::network_variables::AutomaticPhaseIdentity,
+    model: &crate::flight_sim::PreparedAutomaticPhase,
+    prepared: &mut sedsnet::router::PreparedManagedBatch<'_>,
+) -> Result<(), crate::automatic_flight_state::Error> {
+    use crate::automatic_flight_state::{Cause, Error};
+    use std::sync::atomic::Ordering;
+    let original = proposal.original;
+    if !(1..=6).contains(&(proposal.target as u8))
+        || identity.phase != proposal.target as u8
+        || identity.original.generation != original.generation { return Err(Error::Ineligible); }
+    let _dispatch = DISPATCH_GATE.try_lock().map_err(|_| Error::Busy)?;
+    if original.generation != automatic_generation(state)
+        || state.operator_admission_barrier.load(Ordering::Acquire) != 0
+        || state.shutdown_requested.load(Ordering::Acquire)
+        || manual_stop_ram_pending(state) || crate::rrls::is_rrls()
+        || cfg!(feature = "hitl_mode") { return Err(Error::Retired); }
+    let runtime = state.gse.try_lock().map_err(|_| Error::Busy)?;
+    let eligible = match proposal.cause {
+        #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
+        Cause::Readiness => original.expected == FlightState::Startup && proposal.target == FlightState::Idle,
+        Cause::LegacySequence { .. } => !runtime.engine.claimed && !runtime.manual_control,
+        #[cfg(not(feature = "hitl_mode"))]
+        Cause::QualifiedArmed { qualification_generation } => {
+            #[cfg(not(feature = "hitl_mode"))]
+            { !cfg!(feature = "test_fire_mode")
+                && proposal.target == FlightState::Armed
+                && runtime.operational.saved.qualification.generation() == qualification_generation
+                && runtime.operational.saved.qualification.stage() == gse_sequence::qualification::MissionStage::Armed
+                && runtime.operational.persist_error.is_none()
+                && runtime.operational.saved.pending_checklists.is_empty()
+                && matches!(runtime.engine.status.phase, Phase::Paused | Phase::Passed | Phase::Idle) }
+            #[cfg(feature = "hitl_mode")]
+            { let _ = qualification_generation; false }
+        }
+    };
+    if !eligible { return Err(Error::Ineligible); }
+    let history = state.launch_history.try_lock().map_err(|_| Error::Busy)?;
+    if history.automatic_actions_inhibited() || state.launch_indicator_latched()
+        || state.launch_sequence_command_pending.load(Ordering::Acquire) { return Err(Error::Retired); }
+    let mut variables = crate::network_variables::try_automatic_idle_store().ok_or(Error::Busy)?;
+    if !variables.matches_phase(original.store) { return Err(Error::StoreChanged); }
+    let mut current = state.state.try_lock().map_err(|_| Error::Busy)?;
+    if *current != original.expected || (*current as u8) > FlightState::Armed as u8 { return Err(Error::StateChanged); }
+    let mut policy = state.sequence_policy_state.try_lock().map_err(|_| Error::Busy)?;
+    if *policy != original.policy { return Err(Error::PolicyChanged); }
+    let mut model = model.try_guard().ok_or(Error::Busy)?;
+    let router = state.topology_router.get().ok_or(Error::Retired)?;
+    with_stop_admission(state, original.ticket, || {
+        state.board_abort.try_admit_automatic_prelaunch(original.ticket.board_abort_revision, || {
+        router.try_commit_network_variable_batch_unless_pending_type(prepared, crate::telemetry_schema::types::ABORT)
+            .map_err(Error::Sdk)?;
+        // All remaining operations are infallible scalar assignments. The
+        // physical desired JSON and every clock/session remain untouched.
+        *current = proposal.target;
+        match proposal.cause {
+            Cause::LegacySequence { next_policy } => *policy = next_policy,
+            #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
+            Cause::Readiness => (),
+            #[cfg(not(feature = "hitl_mode"))]
+            Cause::QualifiedArmed { .. } => (),
+        }
+        variables.admitted_phase(identity);
+        model.admitted();
+        Ok(())
+        }).map_err(|error| match error {
+            crate::board_abort::AutomaticAdmissionError::Busy => Error::Busy,
+            _ => Error::Retired,
+        })?
+    }).map_err(|_| Error::Retired)?
+}
+
+/// Sequence metadata is not a new phase/command. Preserve its original finite
+/// Stop/epoch and expected-policy identity as well; never resurrect old policy.
+pub(crate) fn try_commit_automatic_policy(
+    state: &AppState,
+    ticket: LaunchAdmission,
+    expected_state: FlightState,
+    expected: crate::sequences::SequencePolicyState,
+    next: crate::sequences::SequencePolicyState,
+) {
+    let Ok(_dispatch) = DISPATCH_GATE.try_lock() else { return; };
+    if state.operator_admission_barrier.load(std::sync::atomic::Ordering::Acquire) != 0
+        || manual_stop_state(state) != CurrentState::Current { return; }
+    let Ok(history) = state.launch_history.try_lock() else { return; };
+    if history.automatic_actions_inhibited() { return; }
+    let Ok(current) = state.state.try_lock() else { return; };
+    if *current != expected_state { return; }
+    let Ok(mut policy) = state.sequence_policy_state.try_lock() else { return; };
+    if *policy != expected { return; }
+    let _ = with_stop_admission(state, ticket, || {
+        state.board_abort.try_admit_automatic_prelaunch(ticket.board_abort_revision, || { *policy = next; })
+    });
+}

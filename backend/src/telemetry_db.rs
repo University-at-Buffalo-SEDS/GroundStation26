@@ -79,6 +79,7 @@ pub enum DbQueueItem {
     Condition(crate::alert_condition_runtime::Work),
     Write(DbWrite),
     Control(RecordingCommand),
+    EnsureRecording(std::sync::Arc<crate::fill_recording::EnsureRequest>),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -319,6 +320,18 @@ pub async fn open_telemetry_db(path: &Path) -> Result<(SqlitePool, String)> {
     apply_sqlite_pragmas(&db).await;
     ensure_telemetry_schema(&db).await?;
     Ok((db, db_path))
+}
+
+/// The caller already owns a newly create_new-reserved file. On schema
+/// failure close the actual pool before its owner removes that exact file.
+pub(crate) async fn open_reserved_telemetry_db(path: &Path) -> Result<SqlitePool> {
+    let db = open_sqlite_pool(&format!("sqlite://{}", path.display())).await?;
+    apply_sqlite_pragmas(&db).await;
+    if let Err(error) = ensure_telemetry_schema(&db).await {
+        db.close().await;
+        return Err(error);
+    }
+    Ok(db)
 }
 
 pub async fn open_in_memory_telemetry_db() -> Result<SqlitePool> {

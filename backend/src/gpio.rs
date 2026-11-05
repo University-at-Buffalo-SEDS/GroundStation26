@@ -219,10 +219,15 @@ mod dummy {
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
 
+    #[cfg(test)]
+    type CallbackMap = Arc<Mutex<HashMap<u8, Arc<Mutex<Box<dyn Fn(bool) + Send>>>>>>;
+
     #[derive(Clone)]
     pub struct GpioPins {
         input_pins: Arc<Mutex<HashMap<u8, bool>>>,
         output_pins: Arc<Mutex<HashMap<u8, bool>>>,
+        #[cfg(test)]
+        callbacks: CallbackMap,
     }
     #[allow(dead_code)]
     impl GpioPins {
@@ -234,6 +239,8 @@ mod dummy {
                     Arc::new(GpioPins {
                         input_pins: Arc::new(Mutex::new(HashMap::new())),
                         output_pins: Arc::new(Mutex::new(HashMap::new())),
+                        #[cfg(test)]
+                        callbacks: Arc::new(Mutex::new(HashMap::new())),
                     })
                 })
                 .clone()
@@ -314,6 +321,23 @@ mod dummy {
             Ok(())
         }
 
+        #[cfg(test)]
+        pub(crate) fn trigger_input_for_test(&self, pin: u8, high: bool) {
+            self.input_pins.lock().unwrap().insert(pin, high);
+            let callback = self
+                .callbacks
+                .lock()
+                .unwrap()
+                .get(&pin)
+                .cloned()
+                .expect("actual callback installed");
+            callback.lock().unwrap()(high);
+        }
+        #[cfg(test)]
+        pub(crate) fn set_input_for_test(&self, pin: u8, high: bool) {
+            self.input_pins.lock().unwrap().insert(pin, high);
+        }
+
         pub fn setup_callback_input_pin<F>(
             &self,
             _pin_number: u8,
@@ -324,7 +348,12 @@ mod dummy {
         where
             F: Fn(bool) + Send + 'static,
         {
-            // No-op in dummy implementation
+            #[cfg(test)]
+            self.callbacks
+                .lock()
+                .unwrap()
+                .insert(_pin_number, Arc::new(Mutex::new(Box::new(_callback))));
+            // Production dummy mode continues to have no physical callbacks.
             gs_debug_println!(
                 "Setting up callback on pin {} (dummy, no actual effect)",
                 _pin_number

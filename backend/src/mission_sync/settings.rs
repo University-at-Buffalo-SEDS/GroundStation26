@@ -21,6 +21,8 @@ pub struct Settings {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Limits {
+    #[serde(default)]
+    cold_flow_target_psi: Option<f32>,
     nitrogen_target_psi: f32,
     #[serde(default)]
     nitrogen_steps: Vec<gse_sequence::NitrogenStep>,
@@ -47,6 +49,7 @@ fn default_fill_settle() -> u64 {
 impl Limits {
     fn from_config(c: &gse_sequence::Config) -> Self {
         Self {
+            cold_flow_target_psi: c.cold_flow_target_psi,
             nitrogen_target_psi: c.nitrogen_target_psi,
             nitrogen_steps: c.nitrogen_steps.clone(),
             fill_overfill_kg: c.fill_overfill_kg,
@@ -59,6 +62,7 @@ impl Limits {
         }
     }
     fn install(self, c: &mut gse_sequence::Config) {
+        c.cold_flow_target_psi = self.cold_flow_target_psi;
         c.nitrogen_target_psi = self.nitrogen_target_psi;
         c.nitrogen_steps = self.nitrogen_steps;
         c.fill_overfill_kg = self.fill_overfill_kg;
@@ -131,6 +135,7 @@ impl Settings {
         let mut expected = value.clone();
         if key == LIMITS {
             for field in [
+                "cold_flow_target_psi",
                 "nitrogen_steps",
                 "fill_overfill_kg",
                 "fill_tolerance_kg",
@@ -221,6 +226,30 @@ mod tests {
             auto_zero: Default::default(),
             positions: Default::default(),
         }
+    }
+    #[test]
+    fn cold_flow_target_roundtrips_independently_and_old_saved_settings_disable_it() {
+        let mut source = model();
+        source.limits.nitrogen_target_psi = 120.0; // Preserve this low-pressure test fixture.
+        source.limits.pressure_ceiling_psi = Some(200.);
+        source.limits.cold_flow_target_psi = Some(95.);
+        let original_nitrogen = source.limits.nitrogen_target_psi;
+        let original_fill = serde_json::to_value(&source.fill).unwrap();
+        let snapshot = source.snapshot().unwrap();
+        let mut sink = model().decode(LIMITS, &snapshot[LIMITS]).unwrap();
+        assert_eq!(sink.limits.cold_flow_target_psi, Some(95.));
+        assert_eq!(sink.limits.nitrogen_target_psi, original_nitrogen);
+        assert_eq!(serde_json::to_value(&sink.fill).unwrap(), original_fill);
+        let mut legacy = snapshot[LIMITS].clone();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("cold_flow_target_psi");
+        sink = sink.decode(LIMITS, &legacy).unwrap();
+        assert_eq!(sink.limits.cold_flow_target_psi, None);
+        let mut invalid = snapshot[LIMITS].clone();
+        invalid["cold_flow_target_psi"] = serde_json::json!(200.);
+        assert!(source.decode(LIMITS, &invalid).is_err());
     }
     fn peers() -> Vec<String> {
         vec!["gs".into(), "rrls".into()]

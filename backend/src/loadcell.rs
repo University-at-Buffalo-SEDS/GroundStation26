@@ -601,8 +601,63 @@ pub fn save(cfg: &LoadcellCalibrationFile) -> Result<(), String> {
     save_at(cfg, &calibration_path())
 }
 
+#[derive(Debug)]
+pub(crate) enum GuardedSaveOutcome {
+    Durable,
+    /// Rename completed; a failed directory sync makes crash durability unknown.
+    PublishedUncertain(String),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SaveBoundary { Prepare, Unchanged, Replace }
+
 pub(crate) fn save_at(cfg: &LoadcellCalibrationFile, path: &std::path::Path) -> Result<(), String> {
+    match save_at_checked(cfg, path, false, |_| Ok(()))? {
+        GuardedSaveOutcome::Durable => Ok(()),
+        GuardedSaveOutcome::PublishedUncertain(error) => Err(error),
+    }
+}
+/// Calibration format/backups remain identical. Only this guarded path owns
+/// a unique create_new temporary, so a refusal cannot remove another writer's
+/// historical fixed json.tmp file. No SDK/DISPATCH/Stop/GSE guard is involved.
+pub(crate) fn save_guarded(
+    cfg: &LoadcellCalibrationFile,
+    guard: impl FnMut(SaveBoundary) -> Result<(), String>,
+) -> Result<GuardedSaveOutcome, String> {
+    save_at_checked(cfg, &calibration_path(), true, guard)
+}
+#[cfg(test)]
+type GuardedReplaceTestHook = (std::path::PathBuf, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static GUARDED_REPLACE_TEST_HOOK: std::sync::Mutex<Option<GuardedReplaceTestHook>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(crate) fn set_guarded_replace_test_hook(path: std::path::PathBuf, hook: impl FnOnce() + Send + 'static) {
+    *GUARDED_REPLACE_TEST_HOOK.lock().unwrap() = Some((path, Box::new(hook)));
+}
+#[cfg(test)]
+fn guarded_replace_test_hook(path: &std::path::Path) {
+    let mut slot = GUARDED_REPLACE_TEST_HOOK.lock().unwrap();
+    let hook = if slot.as_ref().is_some_and(|(owner, _)| owner == path) { slot.take().map(|(_, hook)| hook) } else { None };
+    drop(slot);
+    if let Some(hook) = hook { hook(); }
+}
+
+struct OwnedCalibrationTemporary {
+    path: std::path::PathBuf,
+    remove_on_drop: bool,
+}
+impl Drop for OwnedCalibrationTemporary {
+    fn drop(&mut self) {
+        if self.remove_on_drop { let _ = std::fs::remove_file(&self.path); }
+    }
+}
+fn save_at_checked(
+    cfg: &LoadcellCalibrationFile,
+    path: &std::path::Path,
+    unique_temporary: bool,
+    mut guard: impl FnMut(SaveBoundary) -> Result<(), String>,
+) -> Result<GuardedSaveOutcome, String> {
     use std::io::Write;
+    guard(SaveBoundary::Prepare)?;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -612,7 +667,14 @@ pub(crate) fn save_at(cfg: &LoadcellCalibrationFile, path: &std::path::Path) -> 
         serde_json::to_string_pretty(cfg).map_err(|e| format!("serialize calibration: {e}"))?;
     if let Ok(previous) = std::fs::read(path) {
         if previous == raw.as_bytes() {
-            return Ok(());
+            guard(SaveBoundary::Unchanged)?;
+            if unique_temporary {
+                // A previous replaced-but-uncertain write is not made durable
+                // merely by reading identical bytes on this attempt.
+                confirm_existing_calibration_durability(path, parent, raw.as_bytes())?;
+                guard(SaveBoundary::Unchanged)?;
+            }
+            return Ok(GuardedSaveOutcome::Durable);
         }
         let backups = path
             .parent()
@@ -641,22 +703,67 @@ pub(crate) fn save_at(cfg: &LoadcellCalibrationFile, path: &std::path::Path) -> 
             .and_then(|dir| dir.sync_all())
             .map_err(|e| format!("sync calibration backups: {e}"))?;
     }
-    let temporary = path.with_extension("json.tmp");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temporary)
+    let temporary_path = if unique_temporary {
+        path.with_extension(format!("json.tmp.{}.{}", std::process::id(), rand::random::<u128>()))
+    } else {
+        path.with_extension("json.tmp")
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if unique_temporary { options.create_new(true); } else { options.create(true).truncate(true); }
+    let mut file = options.open(&temporary_path)
         .map_err(|e| format!("open calibration temporary file: {e}"))?;
-    file.write_all(raw.as_bytes())
+    let mut temporary = OwnedCalibrationTemporary { path: temporary_path, remove_on_drop: unique_temporary };
+    let written = file.write_all(raw.as_bytes())
         .and_then(|()| file.sync_all())
-        .map_err(|e| format!("write calibration {path:?}: {e}"))?;
-    std::fs::rename(&temporary, path).map_err(|e| format!("replace calibration {path:?}: {e}"))?;
+        .map_err(|e| format!("write calibration {path:?}: {e}"));
+    drop(file);
+    written?;
+    // The only publication boundary. An expired original guard drops only
+    // this successfully create_new-owned temporary; prior tare stays intact.
+    #[cfg(test)]
+    guarded_replace_test_hook(path);
+    guard(SaveBoundary::Replace)?;
+    std::fs::rename(&temporary.path, path).map_err(|e| format!("replace calibration {path:?}: {e}"))?;
+    temporary.remove_on_drop = false;
     #[cfg(unix)]
-    std::fs::File::open(parent)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|e| format!("sync calibration directory: {e}"))?;
-    Ok(())
+    if let Err(error) = std::fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+        return Ok(GuardedSaveOutcome::PublishedUncertain(format!("calibration file replaced but directory sync failed; persistence is uncertain: {error}")));
+    }
+    Ok(GuardedSaveOutcome::Durable)
+}
+
+fn confirm_existing_calibration_durability(
+    path: &std::path::Path,
+    parent: &std::path::Path,
+    expected: &[u8],
+) -> Result<(), String> {
+    use std::io::Read;
+    let uncertain = |error| format!("matching calibration durability remains uncertain: {error}");
+    let mut file = std::fs::File::open(path).map_err(uncertain)?;
+    let mut observed = Vec::new();
+    file.read_to_end(&mut observed).map_err(uncertain)?;
+    if observed != expected { return Err("calibration contents changed during durability verification".into()); }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let identity = file.metadata().map_err(uncertain)?;
+        let same_path = |current: &std::fs::Metadata| current.dev() == identity.dev() && current.ino() == identity.ino();
+        if !same_path(&std::fs::metadata(path).map_err(uncertain)?) {
+            return Err("calibration owner changed during durability verification".into());
+        }
+        file.sync_all().map_err(uncertain)?;
+        std::fs::File::open(parent).and_then(|directory| directory.sync_all()).map_err(uncertain)?;
+        if !same_path(&std::fs::metadata(path).map_err(uncertain)?) {
+            return Err("calibration owner changed after durability verification".into());
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Err("matching calibration durability remains uncertain: file/path identity verification is unavailable".into())
+    }
 }
 
 fn points_for_channel(
@@ -2220,5 +2327,99 @@ mod history_calibration_tests {
         old.data_type = DERIVED_WEIGHT_DATA_TYPE.into();
         old.values = vec![Some(9000.)];
         assert!(replay.project(old).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod guarded_save_tests {
+    use super::*;
+    struct Directory(std::path::PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("gs-guarded-calibration-{}", rand::random::<u128>()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+    fn owned_temporary_count(directory: &std::path::Path) -> usize {
+        std::fs::read_dir(directory).unwrap().filter(|entry| {
+            entry.as_ref().unwrap().file_name().to_string_lossy().starts_with("loadcell.json.tmp.")
+        }).count()
+    }
+    #[test]
+    fn late_replace_guard_preserves_previous_tare_and_never_removes_unowned_fixed_temporary() {
+        let directory = Directory::new();
+        let path = directory.0.join("loadcell.json");
+        let original = LoadcellCalibrationFile::default();
+        save_at(&original, &path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let fixed = path.with_extension("json.tmp");
+        std::fs::write(&fixed, b"another writer owns this").unwrap();
+        let mut changed = original.clone();
+        changed.ch1_zero_raw = Some(0.123);
+        let mut boundaries = Vec::new();
+        let result = save_at_checked(&changed, &path, true, |boundary| {
+            boundaries.push(boundary);
+            if boundary == SaveBoundary::Replace { Err("original capture expired".into()) } else { Ok(()) }
+        });
+        assert!(result.is_err());
+        assert_eq!(boundaries, [SaveBoundary::Prepare, SaveBoundary::Replace]);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&fixed).unwrap(), b"another writer owns this");
+        assert_eq!(owned_temporary_count(&directory.0), 0);
+    }
+    #[test]
+    fn identical_data_shortcut_still_requires_original_current_guard() {
+        let directory = Directory::new();
+        let path = directory.0.join("loadcell.json");
+        let original = LoadcellCalibrationFile::default();
+        save_at(&original, &path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let result = save_at_checked(&original, &path, true, |boundary| {
+            if boundary == SaveBoundary::Unchanged { Err("original capture expired".into()) } else { Ok(()) }
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(owned_temporary_count(&directory.0), 0);
+    }
+    #[test]
+    fn matching_bytes_do_not_claim_durable_when_the_owned_path_disappears_after_read() {
+        let directory = Directory::new();
+        let path = directory.0.join("loadcell.json");
+        let original = LoadcellCalibrationFile::default();
+        save_at(&original, &path).unwrap();
+        let mut removed = false;
+        let result = save_at_checked(&original, &path, true, |boundary| {
+            if boundary == SaveBoundary::Unchanged && !removed {
+                std::fs::remove_file(&path).unwrap();
+                removed = true;
+            }
+            Ok(())
+        });
+        assert!(result.is_err(), "a previous matching read is not current file/directory durability proof");
+        assert!(removed && !path.exists());
+        assert_eq!(owned_temporary_count(&directory.0), 0);
+    }
+    #[test]
+    fn guarded_success_keeps_normal_json_and_backup_format_without_consuming_fixed_temporary() {
+        let directory = Directory::new();
+        let path = directory.0.join("loadcell.json");
+        let original = LoadcellCalibrationFile::default();
+        save_at(&original, &path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let fixed = path.with_extension("json.tmp");
+        std::fs::write(&fixed, b"keep").unwrap();
+        let mut changed = original.clone();
+        changed.ch1_zero_raw = Some(0.123);
+        assert!(matches!(save_at_checked(&changed, &path, true, |_| Ok(())).unwrap(), GuardedSaveOutcome::Durable));
+        assert_eq!(std::fs::read(&path).unwrap(), serde_json::to_string_pretty(&changed).unwrap().as_bytes());
+        assert_eq!(std::fs::read(&fixed).unwrap(), b"keep");
+        let backups = std::fs::read_dir(directory.0.join("calibration_backups")).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(backups[0].path()).unwrap(), before);
+        assert_eq!(owned_temporary_count(&directory.0), 0);
     }
 }
