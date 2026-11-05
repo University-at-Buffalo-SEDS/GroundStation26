@@ -1524,6 +1524,7 @@ async fn main() -> anyhow::Result<()> {
     let ground_station_handler = EndpointHandler::new_packet_handler(
         telemetry_schema::endpoint("GROUND_STATION"),
         move |pkt: &Packet| {
+            let ingress_generation = gse::automatic_generation(&ground_station_handler_state_clone);
             crate::board_abort::observe_raw(&ground_station_handler_state_clone, pkt);
             let umbilical_capture =
                 if pkt.data_type() == telemetry_schema::data_type("UMBILICAL_STATUS") {
@@ -1793,7 +1794,7 @@ async fn main() -> anyhow::Result<()> {
                 .ring_buffer
                 .lock()
                 .unwrap();
-            rb.push(pkt.clone());
+            rb.push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: pkt.clone(), ingress_generation });
             Ok(())
         },
     );
@@ -1801,10 +1802,11 @@ async fn main() -> anyhow::Result<()> {
     let flight_state_handler = EndpointHandler::new_packet_handler(
         telemetry_schema::endpoint("FLIGHT_STATE"),
         move |pkt: &Packet| {
+            let ingress_generation = gse::automatic_generation(&flight_state_handler_state_clone);
             crate::board_abort::observe_raw(&flight_state_handler_state_clone, pkt);
             flight_state_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
             let mut rb = flight_state_handler_state_clone.ring_buffer.lock().unwrap();
-            rb.push(pkt.clone());
+            rb.push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: pkt.clone(), ingress_generation });
             Ok(())
         },
     );
@@ -1824,9 +1826,10 @@ async fn main() -> anyhow::Result<()> {
     let heartbeat_handler = EndpointHandler::new_packet_handler(
         telemetry_schema::endpoint("HEART_BEAT"),
         move |pkt: &Packet| {
+            let ingress_generation = gse::automatic_generation(&heartbeat_handler_state_clone);
             heartbeat_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
             let mut rb = heartbeat_handler_state_clone.ring_buffer.lock().unwrap();
-            rb.push(pkt.clone());
+            rb.push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: pkt.clone(), ingress_generation });
             Ok(())
         },
     );

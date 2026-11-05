@@ -580,8 +580,15 @@ pub async fn telemetry_task(
         tokio::spawn(async move {
             while let Some(pkt) = packet_rx.recv().await {
                 let rows = match pkt {
-                    crate::ring_buffer::ReceivedPacket::Telemetry(pkt) => {
-                        handle_packet(&state, &db_tx, &db_overflow, pkt).await
+                    crate::ring_buffer::ReceivedPacket::Telemetry { packet: pkt, ingress_generation } => {
+                        #[cfg(test)]
+                        queued_phase_probe::before_bulk_entry(&state, &pkt, ingress_generation).await;
+                        #[cfg(test)]
+                        let probe_packet_id = pkt.packet_id();
+                        let rows = handle_packet_at_ingress(&state, &db_tx, &db_overflow, pkt, ingress_generation).await;
+                        #[cfg(test)]
+                        queued_phase_probe::after_bulk_entry(&state, probe_packet_id);
+                        rows
                     }
                     crate::ring_buffer::ReceivedPacket::AppliedStatus { packet, row } => {
                         persist_umbilical_status(&state, &db_tx, &db_overflow, &packet, &row).await;
@@ -1991,14 +1998,23 @@ fn publish_received_telemetry_rows(state: &AppState, rows: Vec<TelemetryRow>) {
 
 #[cfg(test)]
 mod local_stop_phase_tests;
+#[cfg(test)]
+pub(crate) mod queued_phase_probe;
 
+/// Direct unit invocation has its own immediate entry; production bulk work
+/// must supply the original immutable SDK ingress generation instead.
+#[cfg(test)]
 async fn handle_packet(
-    state: &Arc<AppState>,
-    db_tx: &mpsc::Sender<DbQueueItem>,
-    db_overflow: &DbOverflow,
-    pkt: Packet,
+    state: &Arc<AppState>, db_tx: &mpsc::Sender<DbQueueItem>,
+    db_overflow: &DbOverflow, pkt: Packet,
 ) -> Vec<TelemetryRow> {
-    let receive_generation = crate::gse::automatic_generation(state);
+    let original = crate::gse::automatic_generation(state);
+    handle_packet_at_ingress(state, db_tx, db_overflow, pkt, original).await
+}
+async fn handle_packet_at_ingress(
+    state: &Arc<AppState>, db_tx: &mpsc::Sender<DbQueueItem>,
+    db_overflow: &DbOverflow, pkt: Packet, receive_generation: u64,
+) -> Vec<TelemetryRow> {
     #[cfg(all(test, feature="test_fire_mode"))]
     crate::recovery_pending_probe::receive_entry(state, &pkt);
     #[cfg(test)]
@@ -2006,7 +2022,9 @@ async fn handle_packet(
     let primary_role = !crate::rrls::is_rrls();
     // Capture ORIGINAL Stop/generation before resolving a compact source:
     // identity lookup can wait on SDK state and must never freshen this owner.
-    let original_entry = crate::automatic_startup_idle::Captured::capture(state, primary_role);
+    let original_entry = (receive_generation == crate::gse::automatic_generation(state))
+        .then(|| crate::automatic_startup_idle::Captured::capture(state, primary_role)
+            .filter(|captured| captured.generation == receive_generation)).flatten();
     let automatic_origin = original_entry.filter(|_| {
         matches!(state.board_from_network_sender(pkt.sender()), Some(board) if board != Board::GroundStation)
     });
@@ -2234,11 +2252,12 @@ async fn handle_packet_inner(
                     | FlightState::Armed
             )
         };
-        // A local reflection is observational, but explicit-model recordings
-        // still retain the original packet as raw telemetry. This is not a
-        // FlightState event and cannot update the aggregate, clock or JSON.
-        if (self_echo || (gs && primary_role))
-            && procedure_clock::now().model_monotonic_ms().is_some()
+        // Retired ingress and explicit-model local reflections remain raw
+        // historical observations. They are not authoritative FlightState
+        // events and cannot update the aggregate, clock or desired JSON.
+        let retired_ingress = receive_generation != crate::gse::automatic_generation(state);
+        if retired_ingress || ((self_echo || (gs && primary_role))
+            && procedure_clock::now().model_monotonic_ms().is_some())
         {
             queue_db_write(
                 state,
@@ -2257,7 +2276,7 @@ async fn handle_packet_inner(
             )
             .await;
         }
-        if self_echo || (gs && primary_role) || (!gs
+        if retired_ingress || self_echo || (gs && primary_role) || (!gs
             && (new_flight_state == FlightState::Aborted
                 || (!prelaunch(current) && (prelaunch(new_flight_state) || !fc))
                 || current == FlightState::Aborted))
@@ -4007,7 +4026,8 @@ mod tests {
             move |pkt: &Packet| {
                 handler_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
                 handler_state.mark_packet_received(get_current_timestamp_ms());
-                handler_state.ring_buffer.lock().unwrap().push(pkt.clone());
+                let ingress_generation = crate::gse::automatic_generation(&handler_state);
+                handler_state.ring_buffer.lock().unwrap().push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: pkt.clone(), ingress_generation });
                 Ok(())
             },
         );

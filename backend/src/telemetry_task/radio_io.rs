@@ -2664,10 +2664,11 @@ pub(super) fn spawn_comms_worker_threads(
 
                 let tap_state = rx_worker_state.clone();
                 let mut packet_tap = |pkt: &Packet| {
+                    let ingress_generation = crate::gse::automatic_generation(&tap_state);
                     tap_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
                     tap_state.mark_packet_received(get_current_timestamp_ms());
                     let mut rb = tap_state.ring_buffer.lock().unwrap();
-                    rb.push(pkt.clone());
+                    rb.push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: pkt.clone(), ingress_generation });
                 };
 
                 let mut comms = comms.lock().expect("failed to get lock");
@@ -2726,10 +2727,11 @@ fn spawn_legacy_comms_worker_thread(
                 let mut sent_any = false;
                 let tap_state = state.clone();
                 let mut packet_tap = |pkt: &Packet| {
+                    let ingress_generation = crate::gse::automatic_generation(&tap_state);
                     tap_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
                     tap_state.mark_packet_received(get_current_timestamp_ms());
                     let mut rb = tap_state.ring_buffer.lock().unwrap();
-                    rb.push(pkt.clone());
+                    rb.push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: pkt.clone(), ingress_generation });
                 };
                 let mut comms = comms.lock().expect("failed to get lock");
                 for _ in 0..COMMS_TX_BURST {
@@ -3157,12 +3159,13 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                 };
 
                 if let Ok(pkt) = serialize::unpack_packet(&payload) {
+                    let ingress_generation = crate::gse::automatic_generation(&ingress_state);
                     ingress_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
                     ingress_state.mark_packet_received(get_current_timestamp_ms());
                     if pkt.data_type() == crate::telemetry_schema::data_type("GPS_SATELLITE_NUMBER")
                     {
                         let mut rb = ingress_state.ring_buffer.lock().unwrap();
-                        rb.push(pkt);
+                        rb.push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: pkt, ingress_generation });
                     }
                 }
 
@@ -3208,10 +3211,11 @@ fn spawn_rx_priority_comms_worker_thread(
 
                 let tap_state = state.clone();
                 let mut packet_tap = |pkt: &Packet| {
+                    let ingress_generation = crate::gse::automatic_generation(&tap_state);
                     tap_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
                     tap_state.mark_packet_received(get_current_timestamp_ms());
                     let mut rb = tap_state.ring_buffer.lock().unwrap();
-                    rb.push(pkt.clone());
+                    rb.push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: pkt.clone(), ingress_generation });
                 };
 
                 let mut comms = comms.lock().expect("failed to get lock");

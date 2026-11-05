@@ -1518,6 +1518,7 @@ mod tests {
     include!("final_clock_tests.rs");
     use super::*;
     include!("postmission_stop_reset_native.rs");
+    include!("queued_fc_preentry_native.rs");
     #[cfg(feature="test_fire_mode")]
     mod pending_native { include!("pending_recovery_native_tests.rs"); }
     use futures::FutureExt;
@@ -1737,6 +1738,10 @@ mod tests {
             }
             let (tx, commands) = mpsc::channel(8);
             Arc::get_mut(&mut http.state).unwrap().cmd_tx = tx;
+            // Bind the real recording owner and the producer to the same channel,
+            // matching production main rather than the old metadata-only fixture.
+            let (db, db_rx) = mpsc::channel(64);
+            Arc::get_mut(&mut http.state).unwrap().db_queue_tx = db.clone();
             let state = http.state.clone();
             #[cfg(feature="test_fire_mode")]
             let native_probe=crate::recovery_pending_probe::take_next();
@@ -1778,11 +1783,15 @@ mod tests {
             let config = RouterConfig::new([EndpointHandler::new_packet_handler(
                 crate::telemetry_schema::endpoint("GROUND_STATION"),
                 move |packet| {
+                    let ingress = weak.upgrade().map(|state| {
+                        let generation = crate::gse::automatic_generation(&state);
+                        (state, generation)
+                    });
                     if ["FLIGHT_COMMAND","VALVE_COMMAND","ACTUATOR_COMMAND"].iter()
                         .any(|name|packet.data_type()==crate::telemetry_schema::data_type(name)) {
                         received_controls.lock().unwrap().push(packet.clone());
                     }
-                    if let Some(state) = weak.upgrade() {
+                    if let Some((state, ingress_generation)) = ingress {
                         // Private test ingress mirrors production ABORT endpoint observation.
                         if packet.data_type() == crate::telemetry_schema::data_type("ABORT")
                             && postmission_native_ingress_enabled(&state) {
@@ -1804,11 +1813,16 @@ mod tests {
                         receive_status(&state, packet);
                         #[cfg(feature="test_fire_mode")]
                         if native_enabled && packet.data_type()==crate::telemetry_schema::data_type("HEARTBEAT") {
-                            state.ring_buffer.lock().unwrap().push(packet.clone());
+                            state.ring_buffer.lock().unwrap().push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: packet.clone(), ingress_generation });
                         }
                         if packet.data_type() == crate::telemetry_schema::data_type("FLIGHT_STATE")
                         {
                             received_raw.lock().unwrap().push(packet.clone());
+                            if crate::telemetry_task::queued_phase_probe::observe_sdk_ingress(&state, packet, ingress_generation) {
+                                // Exact production main flight-state ingress behavior:
+                                // the dedicated status path above remains independent.
+                                state.ring_buffer.lock().unwrap().push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: packet.clone(), ingress_generation });
+                            }
                         }
                     }
                     Ok(())
@@ -2156,7 +2170,6 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
             });
-            let (db, db_rx) = mpsc::channel(8);
             let receiver = tokio::spawn(crate::telemetry_task::telemetry_task(
                 state.clone(),
                 host,

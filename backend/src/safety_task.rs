@@ -484,7 +484,7 @@ pub async fn safety_task(
             rb.recent(len)
                 .into_iter()
                 .map(|received| match received {
-                    crate::ring_buffer::ReceivedPacket::Telemetry(packet)
+                    crate::ring_buffer::ReceivedPacket::Telemetry { packet, .. }
                     | crate::ring_buffer::ReceivedPacket::AppliedStatus { packet, .. } => {
                         packet.clone()
                     }
@@ -845,13 +845,17 @@ mod tests {
             .ring_buffer
             .lock()
             .unwrap()
-            .push(packet("FLIGHT_STATE"));
+            .push(crate::ring_buffer::ReceivedPacket::Telemetry {
+                packet: packet("FLIGHT_STATE"), ingress_generation: crate::gse::automatic_generation(&state),
+            });
         if generic && !transition_idle {
             state
                 .ring_buffer
                 .lock()
                 .unwrap()
-                .push(packet("GENERIC_ERROR"));
+                .push(crate::ring_buffer::ReceivedPacket::Telemetry {
+                    packet: packet("GENERIC_ERROR"), ingress_generation: crate::gse::automatic_generation(&state),
+                });
         }
         let mut statuses = state.board_status_tx.subscribe();
         let blocker = if transition_idle {
@@ -860,13 +864,14 @@ mod tests {
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let worker = tokio::task::spawn_blocking(move || {
+                let ingress_generation = crate::gse::automatic_generation(&blocked_state);
                 let mut ring = blocked_state.ring_buffer.lock().unwrap();
                 let _ = ready_tx.send(());
                 if release_rx
                     .recv_timeout(Duration::from_secs(3))
                     .unwrap_or(false)
                 {
-                    ring.push(generic_packet);
+                    ring.push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: generic_packet, ingress_generation });
                 }
             });
             ready_rx.await.unwrap();
