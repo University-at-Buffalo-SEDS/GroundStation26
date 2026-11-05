@@ -744,29 +744,29 @@ pub(crate) async fn publish_service(
 
     }
 }
-/// One finite request batch per demand. No periodic seven-board polling or
-/// automatic retries; per-board five-second cooldown shares QUERY's deadline.
+/// Read-only health refresh plus finite explicit-demand batches. All requests
+/// share a five-second per-board cooldown; recovery still needs human intent.
 pub(crate) async fn query_service(
     state: std::sync::Arc<AppState>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
-    let mut last: [Option<Instant>; 7] = [None; 7];
+    let mut refresh = crate::board_recovery::ReadonlyQueryRefresh::default();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        tokio::select! {biased;_=shutdown.recv()=>return,_=state.board_abort.query_needed.notified()=>{}}
+        tokio::select! {biased;_=shutdown.recv()=>return,_=state.board_abort.query_needed.notified()=>{},_=tick.tick()=>{}}
         let demand = state.board_abort.take_queries();
-        if crate::rrls::is_rrls() || !crate::board_recovery::coordinator::manual_utc_idle(&state) {
+        if crate::rrls::is_rrls() || !crate::board_recovery::coordinator::readonly_query_idle(&state) {
             continue;
         }
         for (i, board) in BOARDS.into_iter().enumerate() {
-            if demand & (1 << i) == 0
-                || last[i].is_some_and(|at| at.elapsed() < Duration::from_secs(5))
-            {
+            if demand & (1 << i) == 0 {
                 continue;
             }
-            last[i] = Some(Instant::now());
-            let _ = crate::board_recovery::request_board_query(&state, board);
+            let _ = refresh.request(&state, board);
             tokio::select! {biased;_=shutdown.recv()=>return,_=tokio::time::sleep(Duration::from_millis(100))=>{}}
         }
+        let _ = refresh.poll(&state);
     }
 }
 pub(crate) async fn get_status(

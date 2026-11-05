@@ -73,7 +73,8 @@ async fn actual_get_primary_operator_has_exact_mode_policy_vocabulary() {
     assert_eq!(code, StatusCode::OK);
     assert_eq!(value["reset_startup_policy"], exact_policy());
     assert_eq!(value["reset_startup_policy"].as_object().unwrap().len(), 5);
-    assert_eq!(value["permissions"]["reset_startup"], true);
+    assert_eq!(value["permissions"]["reset_startup"], false);
+    assert_eq!(value["clock"]["network_utc_available"], false);
     assert_eq!(value["mode_capability"]["runtime_switch_supported"], false);
     assert_eq!(
         value["reset_startup_policy"]["mode"],
@@ -252,4 +253,217 @@ async fn actual_get_identity_epoch_and_policy_aba_remain_server_owned() {
     assert_ne!(before["reset_epoch"], after["reset_epoch"]);
     assert_eq!(after["reset_epoch"], format!("{next:016x}"));
     assert!(after["confirmation"].is_null());
+}
+
+#[tokio::test]
+async fn actual_get_network_utc_requirement_matches_confirm_boundary_without_writing() {
+    let f = fixture(Some("GS")).await;
+    let router = f.state.topology_router.get().unwrap();
+    assert!(exchange::ConfirmBoundary::capture(router).is_err());
+    let (_, before) = status(&f, Some("operator")).await;
+    assert_eq!(before["permissions"]["recover"], false);
+    router
+        .try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(
+            1_793_000_000_000,
+        ))
+        .unwrap();
+    assert!(exchange::ConfirmBoundary::capture(router).is_ok());
+    let (_, after) = status(&f, Some("operator")).await;
+    assert_eq!(after["clock"]["network_utc_available"], true);
+    assert_eq!(after["permissions"]["recover"], true);
+    assert!(f.state.board_recovery.coordinator.operation().is_none());
+    assert!(
+        f.state
+            .board_recovery
+            .inner
+            .lock()
+            .unwrap()
+            .queries
+            .iter()
+            .all(Option::is_none)
+    );
+}
+#[test]
+fn commissioning_and_expired_context_diagnostics_never_authorize_zero_identity() {
+    let now = Stamp::now();
+    let mut row = Observation {
+        received: now,
+        observed_after: now,
+        value: Readback {
+            boot: u64::MAX,
+            epoch: 1,
+            nonce: 2,
+            issuer: 3,
+            result: 7,
+            state: Some(0),
+            flags: 0x7e,
+            outputs: 0,
+            uptime: 4,
+        },
+    };
+    assert_eq!(
+        recovery_diagnostic(true, true, true, Some(&row), None, now, false).0,
+        "commissioning_required"
+    );
+    assert_eq!(
+        recovery_diagnostic(true, true, false, Some(&row), None, now, false).0,
+        "network_utc_unavailable"
+    );
+    row.observed_after = now - READBACK_TTL - Duration::from_millis(1);
+    assert_eq!(
+        recovery_diagnostic(true, true, true, Some(&row), None, now, false).0,
+        "commissioning_readback_expired"
+    );
+    row.value.boot = 0;
+    row.observed_after = now;
+    assert_eq!(
+        recovery_diagnostic(true, true, true, Some(&row), None, now, false).0,
+        "identity_unavailable"
+    );
+    row.value.boot = 42;
+    row.value.result = 4;
+    assert_eq!(
+        recovery_diagnostic(true, true, true, Some(&row), None, now, false).0,
+        "stale_recovery_context"
+    );
+    let query = Query {
+        abort_revision: 0,
+        nonce: 2,
+        sent: now,
+        received: false,
+    };
+    assert_eq!(
+        recovery_diagnostic(true, true, true, None, Some(&query), now, false).0,
+        "query_pending"
+    );
+    assert_eq!(
+        recovery_diagnostic(true, true, true, None, None, now, false).0,
+        "query_required"
+    );
+}
+
+#[test]
+fn readonly_refresh_budget_and_pending_context_are_bounded() {
+    let now = Stamp::now();
+    assert!(readonly_query_due(None, now.wall));
+    assert!(!readonly_query_due(Some(now.wall), now.wall));
+    assert!(!readonly_query_due(
+        Some(now.wall - Duration::from_millis(4999)),
+        now.wall
+    ));
+    assert!(readonly_query_due(
+        Some(now.wall - Duration::from_secs(5)),
+        now.wall
+    ));
+    assert!(readonly_query_candidate(true, true, None, None, now));
+    assert!(!readonly_query_candidate(false, true, None, None, now));
+    assert!(!readonly_query_candidate(true, false, None, None, now));
+    let mut query = Query {
+        abort_revision: 0,
+        nonce: 9,
+        sent: now,
+        received: false,
+    };
+    assert!(!readonly_query_candidate(
+        true,
+        true,
+        None,
+        Some(&query),
+        now
+    ));
+    query.received = true;
+    assert!(!readonly_query_candidate(
+        true,
+        true,
+        None,
+        Some(&query),
+        now
+    ));
+    query.sent = now - QUERY_TTL - Duration::from_millis(1);
+    assert!(readonly_query_candidate(
+        true,
+        true,
+        None,
+        Some(&query),
+        now
+    ));
+    let mut row = Observation {
+        received: now,
+        observed_after: now,
+        value: Readback {
+            boot: 42,
+            epoch: 1,
+            nonce: 2,
+            issuer: 3,
+            result: 0,
+            state: Some(0),
+            flags: 0x7e,
+            outputs: 0,
+            uptime: 4,
+        },
+    };
+    assert!(!readonly_query_candidate(true, true, Some(&row), None, now));
+    row.observed_after = now - READBACK_TTL - Duration::from_millis(1);
+    assert!(readonly_query_candidate(true, true, Some(&row), None, now));
+}
+
+#[tokio::test]
+async fn stale_commissioning_identity_allows_only_prepare_not_actual_recovery_proof() {
+    let f = fixture(Some("GS")).await;
+    let router = f.state.topology_router.get().unwrap();
+    router
+        .try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(
+            1_793_000_000_000,
+        ))
+        .unwrap();
+    let side = router.add_side_packed("readonly-status-test", |_| Ok(()));
+    router
+        .rx_from_side(
+            &sedsnet::discovery::build_discovery_announce(
+                "AB",
+                1,
+                &[crate::telemetry_schema::endpoint("BOARD_RECOVERY_AB")],
+            )
+            .unwrap(),
+            side,
+        )
+        .unwrap();
+    let now = Stamp::now();
+    let at = index(Board::ActuatorBoard).unwrap();
+    f.state.board_recovery.inner.lock().unwrap().values[at] = Some(Observation {
+        received: now,
+        observed_after: now - READBACK_TTL - Duration::from_millis(1),
+        value: Readback {
+            boot: u64::MAX,
+            epoch: 1,
+            nonce: 2,
+            issuer: 3,
+            result: 7,
+            state: Some(0),
+            flags: 0x7e,
+            outputs: 0,
+            uptime: 4,
+        },
+    });
+    let (_, value) = status(&f, Some("operator")).await;
+    let board = value["boards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "AB")
+        .unwrap();
+    assert_eq!(board["capabilities"]["prepare_recover"], true);
+    assert_eq!(board["capabilities"]["recover"], false);
+    assert_eq!(board["readback_status"], "commissioning_readback_expired");
+    assert!(f.state.board_recovery.coordinator.operation().is_none());
+    assert!(
+        f.state
+            .board_recovery
+            .inner
+            .lock()
+            .unwrap()
+            .queries
+            .iter()
+            .all(Option::is_none)
+    );
 }

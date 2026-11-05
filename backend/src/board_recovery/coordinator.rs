@@ -245,6 +245,27 @@ pub(crate) fn manual_utc_idle(state: &AppState) -> bool {
                     .is_some_and(|v| v["completed"] == false)
         })
 }
+/// Read-only health may resume after a confirmation expires. This does not
+/// clear its ticket or relax the separate manual UTC/recovery ownership guard.
+pub(crate) fn readonly_query_idle(state: &AppState) -> bool {
+    state
+        .board_recovery
+        .coordinator
+        .0
+        .try_lock()
+        .ok()
+        .is_some_and(|control| {
+            !control.shutdown_closed
+                && control
+                    .ticket
+                    .as_ref()
+                    .is_none_or(|ticket| ticket.created.elapsed() >= CONFIRM_TTL)
+                && !control
+                    .operation
+                    .as_ref()
+                    .is_some_and(|value| value["completed"] == false)
+        })
+}
 pub(crate) fn retained_boundary(state: &AppState) -> Result<Option<u64>, &'static str> {
     let active = state
         .board_recovery
@@ -454,8 +475,23 @@ async fn refresh_prepare_queries(
         _ => return Err("Unsupported recovery action"),
     };
     for board in boards {
-        if !origin_current(state, token) {
-            return Err("Recovery origin changed while waiting");
+        // Background status collection may already own this read-only slot.
+        // Wait for that request to finish/expire, then create a DISTINCT nonce;
+        // its old reply is never reused as the explicit preparation's proof.
+        let waiting_since = WallInstant::now();
+        loop {
+            if !origin_current(state, token) {
+                return Err("Recovery origin changed while waiting");
+            }
+            let now = Stamp::now();
+            let pending = state.board_recovery.inner.lock().unwrap().queries[index(board).unwrap()]
+                .as_ref().is_some_and(|query| !query.received && now.checked_duration_since(query.sent)
+                    .is_none_or(|age| age <= QUERY_TTL));
+            if !pending { break; }
+            if waiting_since.elapsed() >= QUERY_TTL {
+                return Err("Previous read-only query has not completed; preparation timed out");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let response = super::query(
             State(state.clone()),
@@ -2537,8 +2573,22 @@ mod tests {
                 #[cfg(feature="test_fire_mode")]
                 assert_tf_idle_from_fresh_mcu_receipts(&fixture).await;
             } else {
+                // Startup delivery and the owner's next Idle publication are
+                // asynchronous. Observe both real completion signals instead
+                // of assuming that receiving Startup already completed Idle.
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let idle = state.local_flight_state_snapshot() == crate::types::FlightState::Idle;
+                        let cached_idle = router.cached_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"))
+                            .is_some_and(|packet| packet.sender() == "GS" && packet.payload() == [1]);
+                        if idle && cached_idle { break; }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                }).await.expect("actual normal owner must advance Startup to Idle and publish its own cached Idle");
                 assert_eq!(state.local_flight_state_snapshot(),crate::types::FlightState::Idle);
-                assert_eq!(cached.as_ref().unwrap()["payload"],json!([1]));
+                let idle = router.cached_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).unwrap();
+                assert_eq!(idle.sender(),"GS");
+                assert_eq!(idle.payload(),[1]);
             }
         }
         // Wire receipts do NOT certify unselected MCU application/physical state.
@@ -5415,5 +5465,117 @@ mod tests {
     }
     #[cfg(feature = "test_fire_mode")]
     include!("pending_next_epoch_coordinator_tests.rs");
+
+    #[tokio::test]
+    async fn prepare_waits_for_background_query_then_uses_new_nonce_without_recovery() {
+        let fixture = Fixture::new().await;
+        let state = fixture.state();
+        fixture.ignition_wire_hold.store(1, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while fixture.ignition_wire_hold.load(Ordering::Acquire) != 2 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            super::super::request_board_query(&state, Board::ActuatorBoard).status(),
+            StatusCode::OK
+        );
+        let at = index(Board::ActuatorBoard).unwrap();
+        let old = state.board_recovery.inner.lock().unwrap().queries[at]
+            .as_ref()
+            .unwrap()
+            .nonce;
+        assert!(
+            !state.board_recovery.inner.lock().unwrap().queries[at]
+                .as_ref()
+                .unwrap()
+                .received
+        );
+        let release = fixture.ignition_wire_hold.clone();
+        let released = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            release.store(0, Ordering::Release);
+        });
+        let ticket = fixture.prepare("recover_abort", Some("AB")).await;
+        released.await.unwrap();
+        assert!(ticket["ticket"].is_string());
+        let inner = state.board_recovery.inner.lock().unwrap();
+        assert_ne!(inner.queries[at].as_ref().unwrap().nonce, old);
+        assert!(inner.queries[at].as_ref().unwrap().received);
+        drop(inner);
+        let model = fixture
+            .models
+            .iter()
+            .find(|(board, _)| *board == Board::ActuatorBoard)
+            .unwrap()
+            .1
+            .lock()
+            .unwrap();
+        assert_eq!(model.applied, 0);
+        assert!(model.requests.iter().all(|packet| packet.payload()[1] == 0));
+        assert!(
+            model
+                .requests
+                .iter()
+                .filter(|packet| packet.payload()[1] == 0)
+                .count()
+                >= 2
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_confirmation_resumes_readonly_queries_without_reopening_manual_utc() {
+        let fixture = Fixture::new().await;
+        let state = fixture.state();
+        let _ticket = fixture.prepare("recover_abort", Some("AB")).await;
+        assert!(!manual_utc_idle(&state));
+        assert!(!readonly_query_idle(&state));
+        {
+            let mut control = state.board_recovery.coordinator.0.lock().unwrap();
+            control.ticket.as_mut().unwrap().created =
+                WallInstant::now() - CONFIRM_TTL - Duration::from_millis(1);
+        }
+        assert!(!manual_utc_idle(&state));
+        assert!(readonly_query_idle(&state));
+        let now = Stamp::now();
+        let at = index(Board::ActuatorBoard).unwrap();
+        let old = {
+            let mut inner = state.board_recovery.inner.lock().unwrap();
+            inner.values[at].as_mut().unwrap().observed_after =
+                now - QUERY_TTL - Duration::from_millis(1);
+            let query = inner.queries[at].as_mut().unwrap();
+            query.sent = now - QUERY_TTL - Duration::from_millis(1);
+            query.nonce
+        };
+        state
+            .network_health
+            .lock()
+            .unwrap()
+            .observe("AB", now.wall, 100);
+        let mut refresh = super::super::ReadonlyQueryRefresh::default();
+        assert_eq!(refresh.poll(&state), Some(Board::ActuatorBoard));
+        assert_ne!(
+            state.board_recovery.inner.lock().unwrap().queries[at]
+                .as_ref()
+                .unwrap()
+                .nonce,
+            old
+        );
+        assert!(!manual_utc_idle(&state));
+        {
+            let mut control = state.board_recovery.coordinator.0.lock().unwrap();
+            control.operation = Some(json!({"completed":false}));
+        }
+        assert!(!readonly_query_idle(&state));
+        state.board_recovery.coordinator.0.lock().unwrap().operation = None;
+        assert!(
+            fixture
+                .models
+                .iter()
+                .all(|(_, model)| model.lock().unwrap().applied == 0)
+        );
+    }
 
 }

@@ -243,6 +243,97 @@ fn query_domain_consistent(board: Board, row: &Readback) -> bool {
         None => row.flags & (2 | OUTPUTS_VALID) == 0,
     }
 }
+/// Explanatory status only. It never grants a recovery ticket or changes the
+/// nonce/boot/epoch freshness and source-time checks at PREPARE/CONFIRM.
+fn recovery_diagnostic(
+    primary: bool,
+    verified: bool,
+    network_utc_available: bool,
+    observation: Option<&Observation>,
+    query: Option<&Query>,
+    now: Stamp,
+    reconcilable: bool,
+) -> (&'static str, &'static str) {
+    if !primary {
+        return (
+            "not_primary",
+            "Recovery authority belongs to the current primary.",
+        );
+    }
+    if !verified {
+        return (
+            "endpoint_unverified",
+            "Dedicated recovery endpoint is not verified. Query and recovery are unavailable.",
+        );
+    }
+    if !network_utc_available {
+        return (
+            "network_utc_unavailable",
+            "Network UTC is unavailable. Query remains read-only; establish network time before preparing recovery.",
+        );
+    }
+    let Some(observation) = observation else {
+        return if query.is_some_and(|q| {
+            !q.received
+                && now
+                    .checked_duration_since(q.sent)
+                    .is_some_and(|age| age <= QUERY_TTL)
+        }) {
+            (
+                "query_pending",
+                "Query is awaiting board readback. No recovery has been sent.",
+            )
+        } else {
+            (
+                "query_required",
+                "Waiting for automatic board status. Recovery needs an identified board and explicit confirmation.",
+            )
+        };
+    };
+    if !observation.fresh(now) {
+        return if observation.value.boot == u64::MAX {
+            (
+                "commissioning_readback_expired",
+                "This board needs explicit commissioning. Status refreshes automatically; Recover checks a fresh readback before confirmation.",
+            )
+        } else {
+            (
+                "readback_expired",
+                "The board readback is older than two seconds. Status refreshes automatically; preparing Recover requests a fresh readback.",
+            )
+        };
+    }
+    let row = &observation.value;
+    if row.boot == u64::MAX && row.result == 7 {
+        return (
+            "commissioning_required",
+            "Not yet commissioned. The first confirmed Recover provisions identity and keeps outputs inhibited. A fresh status check and separate second confirmation apply the requested state.",
+        );
+    }
+    if row.boot == 0 && !reconcilable {
+        return (
+            "identity_unavailable",
+            "The board has no usable recovery identity. A zero boot generation does not authorize commissioning; inspect its query result.",
+        );
+    }
+    if row.result == 4 {
+        return (
+            "stale_recovery_context",
+            "The board rejected a stale recovery context. Check network time; status refreshes automatically before another attempt.",
+        );
+    }
+    if row.result == 7 {
+        return (
+            "board_io",
+            "The board reports a storage or identity recovery error. Recovery requires a new explicit confirmation; this is not a completed reset.",
+        );
+    }
+    (
+        "readback_current",
+        "Current board readback. Recovery still requires explicit confirmation and fresh server checks.",
+    )
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -537,7 +628,10 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         json!({"version":1,"global_startup_best_effort":true,"mode":mode,
             "base_required_boards":base,"optional_proofs":true})
     });
+    let network_utc_available = router
+        .is_some_and(|router| crate::system_clock::required_control_network_utc_ms(router).is_ok());
     let can_recover = primary
+        && network_utc_available
         && !principal.anonymous
         && principal.permissions.send_commands
         && coordinator::host_safe(&state)
@@ -558,10 +652,18 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         let reconcilable=verified&&fresh&&readback.is_some_and(|row|coordinator::first_uncertainty(host_pending.as_ref(),board,row));
         let known=readback.filter(|row|(row.boot!=0||reconcilable)&&row.epoch!=0);
         let supported=can_recover&&verified&&fresh&&readback.is_some_and(|row|query_domain_consistent(board,row)&&row.flags&0x24==0x24&&matches!(row.result,0|7)&&(row.boot!=0||reconcilable)&&row.epoch!=0&&row.epoch<u32::MAX-1);
+        // Preparation grants only a fresh query/challenge, never an application
+        // proof. PREPARE re-queries before creating its ticket; CONFIRM rechecks.
+        let prepare_recover=can_recover&&verified&&targeted_recovery_state(board).is_some()
+            && readback.is_some_and(|row|query_domain_consistent(board,row)&&row.flags&0x24==0x24
+                &&matches!(row.result,0|7)&&(row.boot!=0||coordinator::first_uncertainty(host_pending.as_ref(),board,row))
+                &&row.epoch!=0&&row.epoch<u32::MAX-1);
+        let (readback_status, message) = recovery_diagnostic(primary, verified, network_utc_available,
+            observation, queries[at].as_ref(), now, reconcilable);
         let operation=queries[at].as_ref().map(|query| {
             let mut operation_id=digest::Context::new(&digest::SHA256);operation_id.update(&identity);operation_id.update(&query.nonce.to_le_bytes());operation_id.update(board.sender_id().as_bytes());
             let pending=!query.received&&now.checked_duration_since(query.sent).is_some_and(|age|age<=QUERY_TTL);
-            json!({"id":hex(&operation_id.finish().as_ref()[..16]),"action":"query","phase":if pending{"querying"}else if query.received{"completed"}else{"failed"},"targets":[board.sender_id()],"completed":!pending,"success":if pending{None}else{Some(query.received&&readback.is_some_and(|row|row.nonce==query.nonce&&row.result==0))},"age_ms":now.checked_duration_since(query.sent).unwrap_or(Duration::MAX).as_millis().min(u64::MAX as u128)as u64,"message":if pending{"Query admitted; actual board readback pending."}else if query.received{"Board answered; its result and actual-state validity are shown separately."}else{"Query readback timed out; no automatic query/recovery was issued."}})
+            json!({"id":hex(&operation_id.finish().as_ref()[..16]),"action":"query","phase":if pending{"querying"}else if query.received{"completed"}else{"failed"},"targets":[board.sender_id()],"completed":!pending,"success":if pending{None}else{Some(query.received&&readback.is_some_and(|row|row.nonce==query.nonce&&row.result==0))},"age_ms":now.checked_duration_since(query.sent).unwrap_or(Duration::MAX).as_millis().min(u64::MAX as u128)as u64,"message":if pending{"Query admitted; actual board readback pending."}else if query.received{"Board answered; its result and actual-state validity are shown separately."}else{"Query readback timed out; recovery was not issued."}})
         });
         json!({"id":board.sender_id(),"label":board.as_str(),
             "network":{"healthy":health.is_some_and(|h|h.healthy),"age_ms":health.map_or(u64::MAX,|h|h.age_ms),"disconnects":health.map_or(0,|h|h.disconnects),"reconnects":health.map_or(0,|h|h.reconnects)},
@@ -569,9 +671,9 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
             "boot":known.map(|row|format!("{:016x}",row.boot)),"epoch":known.map(|row|row.epoch),"nonce":known.map(|row|format!("{:016x}",row.nonce)),"age_ms":age,
             "receipt_age_ms":observation.map(|row|now.duration_since(row.received).as_millis().min(u64::MAX as u128)as u64),"uptime_ms":readback.map(|row|row.uptime),"abort_latched":readback.filter(|_|matches!(board,Board::ActuatorBoard|Board::ValveBoard|Board::FlightComputer)).map(|row|row.flags&1!=0),"safe_outputs":readback.filter(|row|row.flags&OUTPUTS_VALID!=0).map(|row|row.flags&2!=0&&query_domain_consistent(board,row)),"commanded_outputs":readback.filter(|row|row.flags&OUTPUTS_VALID!=0).map(|row|row.outputs),
             "output_readback":if readback.is_some_and(|row|row.flags&OUTPUTS_VALID!=0){"gpio_servo_command_registers"}else{"unknown"},"physical_position_verified":false,
-            "capabilities":{"query":primary&&verified,"endpoint_verified":verified,"hardened_transport":verified&&fresh&&readback.is_some_and(|row|row.flags&0x20!=0),"known_utc_manual_stop":verified&&fresh&&matches!(board,Board::ActuatorBoard|Board::ValveBoard|Board::FlightComputer)&&readback.is_some_and(|row|row.flags&0x40!=0),"recover":supported&&targeted_recovery_state(board).is_some(),"resync":false,"reset_startup":supported},"operation":operation,
+            "capabilities":{"query":primary&&verified,"endpoint_verified":verified,"hardened_transport":verified&&fresh&&readback.is_some_and(|row|row.flags&0x20!=0),"known_utc_manual_stop":verified&&fresh&&matches!(board,Board::ActuatorBoard|Board::ValveBoard|Board::FlightComputer)&&readback.is_some_and(|row|row.flags&0x40!=0),"recover":supported&&targeted_recovery_state(board).is_some(),"prepare_recover":prepare_recover,"resync":false,"reset_startup":supported},"operation":operation,
             "result":readback.filter(|_|fresh).map(|row|row.result),"commissioning_required":fresh&&readback.is_some_and(|row|row.boot==u64::MAX||row.result==7),"first_uncertainty_reconcilable":reconcilable,"identity_kind":if reconcilable{"retained_first_uncertainty"}else if readback.is_some_and(|row|row.boot==u64::MAX){"commissioning_sentinel"}else if known.is_some(){"retained_generation"}else{"unknown"},
-            "message":if !primary{"Recovery authority belongs to the current primary."}else if !verified{"Dedicated query endpoint not verified; no legacy endpoint probe is permitted."}else if !fresh{"Explicit Query is required for fresh actual board state."}else if readback.is_some_and(|row|row.result==7){"Board reports IO/commissioning; only a new explicit typed intent may attempt the supported recovery leg."}else{"Actual board readback. Recovery requires explicit typed confirmation and fresh server readbacks; no physical position or power reset is certified."}})
+            "readback_status":readback_status,"message":message})
     }).collect::<Vec<_>>();
     let mode = crate::station_mode::snapshot();
     let current = mode
@@ -580,12 +682,101 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         .unwrap_or_else(|| Value::String("unknown".into()));
     let build = serde_json::to_value(mode.local_build_mode).unwrap();
     Json(json!({"version":1,"backend_instance":hex(&identity),"principal":{"username":principal.username,"context":principal_context(&identity,&headers,&principal)},"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state)),"flight_state":state.local_flight_state_snapshot()as u8,"automatic_actions_inhibited":state.launch_history.lock().unwrap().automatic_actions_inhibited(),
+        "clock":{"network_utc_available":network_utc_available,"required_for_recovery":true},
         "permissions":{"query":primary,"recover":can_recover,"reset_startup":can_recover,"change_mode":false},
         "reset_startup_policy":reset_startup_policy,
         "confirmation":confirmation,"host_recovery":host_pending.map(|pending|json!({"pending":!pending.published,"verified":pending.verified,"publication_acknowledged":pending.published,"targets":pending.targets.iter().map(|target|target.board.as_str()).collect::<Vec<_>>()})),
         "rejected_statuses":rejected_statuses,"last_rejection":last_rejection,
         "mode_capability":{"current":current,"build_mode":build,"supported_modes":[build],"runtime_switch_supported":false,"requires_restart":["normal","hitl","test_fire","testing"],"message":"Only the compiled runtime is supported; changing labels does not switch hardware policy."},"boards":boards,"operation":state.board_recovery.coordinator.operation()})).into_response()
 }
+/// Background reads share one five-second budget with demand-triggered reads.
+/// No method here prepares, confirms, stops or recovers a board.
+pub(crate) struct ReadonlyQueryRefresh {
+    last: [Option<WallInstant>; 7],
+    cursor: usize,
+}
+impl Default for ReadonlyQueryRefresh {
+    fn default() -> Self {
+        Self {
+            last: [None; 7],
+            cursor: 0,
+        }
+    }
+}
+impl ReadonlyQueryRefresh {
+    pub(crate) fn request(&mut self, state: &Arc<AppState>, board: Board) -> bool {
+        let Some(at) = index(board) else {
+            return false;
+        };
+        let now = WallInstant::now();
+        if !readonly_query_due(self.last[at], now) {
+            return false;
+        }
+        // Attempt budget also bounds refusals; pending QUERY's own guard remains
+        // in request_board_query and is shared with authenticated manual requests.
+        self.last[at] = Some(now);
+        request_board_query(state, board).status() == StatusCode::OK
+    }
+    pub(crate) fn poll(&mut self, state: &Arc<AppState>) -> Option<Board> {
+        if crate::rrls::is_rrls() || !coordinator::readonly_query_idle(state) {
+            return None;
+        }
+        let router = state.topology_router.get()?;
+        if router.sender().as_ref() != "GS" {
+            return None;
+        }
+        let now = Stamp::now();
+        let topology = router.export_topology();
+        let healthy = state
+            .network_health
+            .lock()
+            .unwrap()
+            .snapshot(now.wall, cfg!(feature = "test_fire_mode"));
+        let candidate = {
+            let inner = state.board_recovery.inner.lock().unwrap();
+            (0..BOARDS.len())
+                .map(|offset| (self.cursor + offset) % BOARDS.len())
+                .find(|&at| {
+                    let board = BOARDS[at];
+                    let seen = healthy
+                        .iter()
+                        .any(|row| row.sender_id == board.sender_id() && row.healthy);
+                    readonly_query_candidate(
+                        seen,
+                        endpoint_verified(state, board, &topology),
+                        inner.values[at].as_ref(),
+                        inner.queries[at].as_ref(),
+                        now,
+                    ) && readonly_query_due(self.last[at], now.wall)
+                })
+        }?;
+        self.cursor = (candidate + 1) % BOARDS.len();
+        let board = BOARDS[candidate];
+        self.request(state, board).then_some(board)
+    }
+}
+fn readonly_query_due(last: Option<WallInstant>, now: WallInstant) -> bool {
+    last.is_none_or(|last| {
+        now.checked_duration_since(last)
+            .is_some_and(|age| age >= QUERY_TTL)
+    })
+}
+fn readonly_query_candidate(
+    healthy: bool,
+    verified: bool,
+    row: Option<&Observation>,
+    query: Option<&Query>,
+    now: Stamp,
+) -> bool {
+    healthy
+        && verified
+        && row.is_none_or(|row| !row.fresh(now))
+        && !query.is_some_and(|query| {
+            now.checked_duration_since(query.sent)
+                .is_none_or(|age| age <= QUERY_TTL)
+        })
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct QueryRequest {
@@ -963,6 +1154,13 @@ mod tests {
     }
     #[tokio::test]
     async fn actual_http_query_reaches_only_dedicated_sdk_owner_and_correlates_readback() {
+        dedicated_sdk_query(false).await;
+    }
+    #[tokio::test]
+    async fn automatic_unknown_healthy_query_reaches_only_dedicated_owner_without_recover() {
+        dedicated_sdk_query(true).await;
+    }
+    async fn dedicated_sdk_query(automatic: bool) {
         use sedsnet::router::{EndpointHandler, Router, RouterConfig, RouterSideOptions};
         use std::sync::atomic::{AtomicU64, Ordering};
         let fixture = http_fixture().await;
@@ -1044,15 +1242,34 @@ mod tests {
             Board::ActuatorBoard,
             &host.export_topology()
         ));
-        let response = http(
-            state.clone(),
-            "POST",
-            "/api/board-recovery/query",
-            Some("viewer"),
-            json!({"board":"AB"}),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
+        let mut refresh = ReadonlyQueryRefresh::default();
+        if automatic {
+            // Unseen or unverified targets are never probed.
+            assert_eq!(refresh.poll(&state), None);
+            state
+                .network_health
+                .lock()
+                .unwrap()
+                .observe("GB", WallInstant::now(), 100);
+            assert_eq!(refresh.poll(&state), None);
+            state
+                .network_health
+                .lock()
+                .unwrap()
+                .observe("AB", WallInstant::now(), 100);
+            assert_eq!(refresh.poll(&state), Some(Board::ActuatorBoard));
+            assert_eq!(refresh.poll(&state), None); // Pending request / shared cooldown.
+        } else {
+            let response = http(
+                state.clone(),
+                "POST",
+                "/api/board-recovery/query",
+                Some("viewer"),
+                json!({"board":"AB"}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
         // This SDK-only receiver fixture checks application wire/correlation;
         // firmware output/NVM behavior is qualified separately in board C tests.
         let mut responded = false;
@@ -1094,6 +1311,22 @@ mod tests {
         }
         assert!(responded);
         assert_eq!(requests.lock().unwrap().len(), 1);
+        if automatic {
+            assert_eq!(refresh.poll(&state), None);
+            assert!(state.board_recovery.coordinator.operation().is_none());
+            assert!(
+                state
+                    .launch_history
+                    .lock()
+                    .unwrap()
+                    .recovery_pending()
+                    .is_none()
+            );
+            // Closed/pending operation owners exclude the same background poll.
+            let _ = seal_shutdown_and_take_owner(&state);
+            assert_eq!(refresh.poll(&state), None);
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
         assert!(!host.has_pending_reliable_tx_type(crate::telemetry_schema::data_type(QUERY_TYPE)));
         let inner = state.board_recovery.inner.lock().unwrap();
         let at = index(Board::ActuatorBoard).unwrap();
