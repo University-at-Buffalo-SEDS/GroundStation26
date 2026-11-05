@@ -84,11 +84,63 @@ fn eligible(state: &AppState, router: &Router) -> Option<Eligible> {
 }
 /// One epoch's first attempted publication selects actual UTC once. All refused
 /// retries reuse the same wire. Renewed epochs cannot inherit an old blocked sample.
+#[cfg(test)]
 pub(crate) fn publish_claim(
     state: &AppState,
     router: &Router,
     claim: &mut Claim,
 ) -> sedsnet::TelemetryResult<bool> {
+    publish_claim_receipt(state, router, claim).map(|receipt| receipt.is_some())
+}
+
+/// Unconstructible outside this module; no receive callback can promote a packet
+/// into the locally authorized manual publisher's successful SDK admission.
+pub(crate) struct LocalStopAdmission {
+    generation: u64,
+    epoch: u64,
+    wire: WirePolicy,
+    router: usize,
+    packet_id: u64,
+    sender: String,
+    timestamp: u64,
+}
+impl LocalStopAdmission {
+    pub(crate) fn generation(&self) -> u64 { self.generation }
+    pub(crate) fn epoch(&self) -> u64 { self.epoch }
+    pub(crate) fn wire(&self) -> WirePolicy { self.wire }
+    fn is_primary_original(&self, state: &AppState, router: &Router) -> bool {
+        !crate::rrls::is_rrls()
+            && self.router == router as *const Router as usize
+            && state.topology_router.get().is_some_and(|owner| std::ptr::eq(owner.as_ref(), router))
+            && state.board_from_network_sender(&self.sender) == Some(crate::types::Board::GroundStation)
+            && self.timestamp == match self.wire { WirePolicy::Untimed => 0, WirePolicy::KnownUtc(original) => original }
+    }
+}
+/// Only the independent LOCAL publisher uses this entry. The Claim stays alive
+/// through commit/observations, so reset must wait for the real publisher owner.
+pub(crate) fn publish_local_claim(
+    state: &Arc<AppState>,
+    router: &Router,
+    claim: &mut Claim,
+) -> sedsnet::TelemetryResult<bool> {
+    let Some(receipt) = publish_claim_receipt(state, router, claim)? else { return Ok(false); };
+    // Preserve the emergency publisher's existing priority progress BEFORE any
+    // ordinary dispatch/state/provider bookkeeping can block this owner.
+    crate::telemetry_task::flush_command_tx(router, "Manual Abort priority tx");
+    if receipt.is_primary_original(state, router)
+        && crate::gse::commit_local_manual_stop(state, claim, &receipt) {
+        state.observe_local_manual_stop_admission();
+        log::debug!("local Manual Stop host admission packet={} epoch={} source_utc={}",
+            receipt.packet_id, receipt.epoch, receipt.timestamp);
+    }
+    Ok(true)
+}
+fn publish_claim_receipt(
+    state: &AppState,
+    router: &Router,
+    claim: &mut Claim,
+) -> sedsnet::TelemetryResult<Option<LocalStopAdmission>> {
+    let generation = crate::gse::automatic_generation(state);
     let wire = if let Some(wire) = claim.wire() {
         wire
     } else {
@@ -112,12 +164,13 @@ pub(crate) fn publish_claim(
             WirePolicy::Untimed
         };
         let Some(wire) = claim.freeze_wire(proposed) else {
-            return Ok(false);
+            return Ok(None);
         };
         wire
     };
-    crate::telemetry_task::queue_manual_abort_wire(router, wire)?;
-    Ok(true)
+    let (packet_id, sender, timestamp) = crate::telemetry_task::queue_manual_abort_wire_receipted(router, wire)?;
+    Ok(Some(LocalStopAdmission { generation, epoch: claim.epoch(), wire,
+        router: router as *const Router as usize, packet_id, sender, timestamp }))
 }
 struct Reservation(Arc<AppState>);
 impl Drop for Reservation {
@@ -262,3 +315,6 @@ pub(crate) fn retained_bound(state: &AppState) -> Result<u64, &'static str> {
         .ok_or("Manual Stop owner busy")?;
     Ok(ceiling.max(attempted))
 }
+
+#[cfg(test)]
+mod local_stop_sdk_tests { include!("local_stop_sdk_tests.rs"); }

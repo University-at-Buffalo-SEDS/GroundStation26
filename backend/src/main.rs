@@ -2127,10 +2127,9 @@ async fn main() -> anyhow::Result<()> {
     let _manual_stop_publisher = tokio::spawn(crate::manual_abort_intent::service_with_claim(
         state.manual_abort_intent.clone(),
         state.shutdown_subscribe(),
-        move |claim| match crate::manual_abort_utc::publish_claim(&stop_state, &stop_router, claim)
+        move |claim| match crate::manual_abort_utc::publish_local_claim(&stop_state, &stop_router, claim)
         {
             Ok(true) => {
-                crate::telemetry_task::flush_command_tx(&stop_router, "Manual Abort priority tx");
                 log::info!(
                     "manual Abort accepted by SDK epoch={} current={} pending={:?}",
                     claim.epoch(),

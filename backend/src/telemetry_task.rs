@@ -10,10 +10,10 @@ use commands::queue_locally_routed_flight_command_with_launch_revision;
 pub(crate) use commands::{
     controller_packet, flush_command_tx, queue_abort_packet, queue_automatic_abort_packet,
     queue_automatic_controller_command, queue_locally_routed_flight_command,
-    queue_manual_abort_wire,
+    queue_manual_abort_wire_receipted,
 };
 #[cfg(test)]
-pub(crate) use commands::{queue_controller_command, queue_priority_manual_abort_packet};
+pub(crate) use commands::{queue_controller_command, queue_priority_manual_abort_packet, queue_manual_abort_wire};
 mod heartbeat;
 mod periodic;
 pub(crate) mod procedure_clock;
@@ -1989,14 +1989,20 @@ fn publish_received_telemetry_rows(state: &AppState, rows: Vec<TelemetryRow>) {
     }
 }
 
+#[cfg(test)]
+mod local_stop_phase_tests;
+
 async fn handle_packet(
     state: &Arc<AppState>,
     db_tx: &mpsc::Sender<DbQueueItem>,
     db_overflow: &DbOverflow,
     pkt: Packet,
 ) -> Vec<TelemetryRow> {
+    let receive_generation = crate::gse::automatic_generation(state);
     #[cfg(all(test, feature="test_fire_mode"))]
     crate::recovery_pending_probe::receive_entry(state, &pkt);
+    #[cfg(test)]
+    local_stop_phase_tests::after_original_entry(state).await;
     let primary_role = !crate::rrls::is_rrls();
     // Capture ORIGINAL Stop/generation before resolving a compact source:
     // identity lookup can wait on SDK state and must never freshen this owner.
@@ -2007,7 +2013,7 @@ async fn handle_packet(
     let source = i64::try_from(pkt.timestamp()).ok().and_then(|source| {
         crate::telemetry_provenance::canonical_source(source, procedure_clock::timestamp_ms())
     });
-    let rows = handle_packet_inner(state, db_tx, db_overflow, pkt, primary_role, automatic_origin).await;
+    let rows = handle_packet_inner(state, db_tx, db_overflow, pkt, primary_role, automatic_origin, receive_generation).await;
     for row in &rows {
         crate::telemetry_provenance::note(row, source);
     }
@@ -2021,6 +2027,7 @@ async fn handle_packet_inner(
     pkt: Packet,
     primary_role: bool,
     automatic_origin: Option<crate::automatic_startup_idle::Captured>,
+    receive_generation: u64,
 ) -> Vec<TelemetryRow> {
     let umbilical_capture =
         if pkt.data_type() == crate::telemetry_schema::data_type("UMBILICAL_STATUS") {
@@ -2213,6 +2220,8 @@ async fn handle_packet_inner(
             router.sender_matches_hostname(pkt.sender(), router.hostname().as_ref())
         });
         let current = state.local_flight_state_snapshot();
+        #[cfg(test)]
+        local_stop_phase_tests::after_phase_snapshot(state).await;
         let prelaunch = |value| {
             matches!(
                 value,
@@ -2262,6 +2271,18 @@ async fn handle_packet_inner(
         }
         {
             let mut fs = state.state.lock().unwrap();
+            // The original snapshot is not final authority across a local Stop
+            // admission or reset. A delayed FC phase must not undo either owner.
+            if receive_generation != crate::gse::automatic_generation(state)
+                || (!gs && (new_flight_state == FlightState::Aborted
+                    || (!prelaunch(*fs) && (prelaunch(new_flight_state) || !fc))
+                    || *fs == FlightState::Aborted)) {
+                return vec![TelemetryRow {
+                    timestamp_ms: get_current_timestamp_ms() as i64,
+                    data_type: "FLIGHT_STATE".into(), sender_id,
+                    values: vec![Some(pkt_data as f32)],
+                }];
+            }
             *fs = new_flight_state;
         }
         let purpose = procedure_clock::now();
@@ -6976,7 +6997,7 @@ mod tests {
                 assert!(router.sender_matches_hostname(&sender, hostname));
                 let packet = Packet::new(crate::telemetry_schema::data_type("FLIGHT_STATE"),
                     &[crate::telemetry_schema::endpoint("GROUND_STATION")], &sender, 1234, Arc::from([1u8])).unwrap();
-                let rows = handle_packet_inner(&state, &db_tx, &overflow, packet, primary, None).await;
+                let rows = handle_packet_inner(&state, &db_tx, &overflow, packet, primary, None, crate::gse::automatic_generation(&state)).await;
                 assert_eq!(rows.len(), 1);
                 assert_eq!(state.local_flight_state_snapshot(), FlightState::Aborted);
                 assert_eq!(state.launch_clock_snapshot(), clock);
@@ -7148,7 +7169,7 @@ mod tests {
                     source_utc, Arc::from([FlightState::Idle as u8])).unwrap();
                 let expected_payload = payload_json_from_pkt(&packet);
                 let before = get_current_timestamp_ms() as i64;
-                let rows = handle_packet_inner(&state, &db_tx, &test_db_overflow(), packet, primary, None).await;
+                let rows = handle_packet_inner(&state, &db_tx, &test_db_overflow(), packet, primary, None, crate::gse::automatic_generation(&state)).await;
                 let after = get_current_timestamp_ms() as i64;
                 assert_eq!(rows.len(), 1);
                 let mut writes = Vec::new();
@@ -7198,10 +7219,10 @@ mod tests {
         for board in Board::ALL { if *board != Board::GroundStation {
             state.mark_board_seen(board.sender_id(), get_current_timestamp_ms());
         }}
-        *state.state.lock().unwrap() = FlightState::Startup;
+        *state.state.lock().unwrap() = FlightState::Aborted;
         let packet = Packet::new(crate::telemetry_schema::data_type("FLIGHT_STATE"),
             &[crate::telemetry_schema::endpoint("GROUND_STATION")], "GS", 1234, Arc::from([1u8])).unwrap();
-        handle_packet_inner(&state, &db_tx, &overflow, packet, false, None).await;
+        handle_packet_inner(&state, &db_tx, &overflow, packet, false, None, crate::gse::automatic_generation(&state)).await;
         assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
     }
 

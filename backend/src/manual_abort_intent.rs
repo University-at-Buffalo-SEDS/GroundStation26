@@ -134,6 +134,24 @@ impl Claim {
         self.wire = Some(wire);
         Some(wire)
     }
+    /// Pure RAM finalizer for the very same still-publishing local intent.
+    /// Caller owns DISPATCH first; never acquire DISPATCH inside this closure.
+    pub(crate) fn with_current_publication<T>(
+        &self,
+        expected_owner: &Arc<ManualAbortIntent>,
+        wire: WirePolicy,
+        apply: impl FnOnce() -> T,
+    ) -> Option<T> {
+        if !Arc::ptr_eq(&self.owner, expected_owner) { return None; }
+        let state = self.owner.state.lock().unwrap();
+        if self.epoch == u64::MAX || state.epoch != self.epoch
+            || state.publishing != Some(self.epoch) || !state.pending
+            || state.renewed_during_claim || state.wire != Some(wire)
+            || self.wire != Some(wire) {
+            return None;
+        }
+        Some(apply())
+    }
     /// Call only after SDK admission succeeds. A newer request remains pending.
     pub(crate) fn accepted(mut self) {
         self.accepted = true;

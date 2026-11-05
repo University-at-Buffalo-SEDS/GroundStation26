@@ -293,6 +293,20 @@ fn sequence_clock_ms(elapsed_ms: u64, simulated_ms: Option<u64>) -> u64 {
 }
 
 impl Runtime {
+    /// Retire transient automation ownership after a Stop-authoritative event.
+    /// Keep fault/evidence/history and real abort-worker leases unchanged.
+    fn retire_automation_owner_for_stop(&mut self) {
+        if let Some(mut controller) = self.fill_trim.take() { controller.cancel(); }
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            self.operational.running = false;
+            self.operational.target_reached = None;
+            self.operational.last_correction_ms = None;
+            self.operational.qd = QdWait::default();
+            self.operational.qd_launch_admission = None;
+        }
+    }
+
     fn cancel_automation_for_manual(&mut self) {
         self.progress.complete(
             crate::sequence_progress_projection::TerminalProof::Interrupted,
@@ -1261,6 +1275,12 @@ fn handle_command_inner(
 ) -> bool {
     #[cfg(feature = "hitl_mode")]
     let _ = (plumbing_origin, launch_revision);
+    if matches!(cmd, TelemetryCommand::Abort) {
+        // Engine may already be Fault/inactive while its operational owner is
+        // still retained. Retire it even on that path and before ColdFlow's
+        // early return; this emits no outputs or additional Abort packets.
+        state.gse.lock().unwrap().retire_automation_owner_for_stop();
+    }
     if cold_flow::handle_under_dispatch(state,cmd){return true;}
     if matches!(cmd, TelemetryCommand::Turbocharge) {
         turbocharge::request(state);
@@ -4669,6 +4689,28 @@ fn claim_operator_dispatch_under_gate(
 
 /// The SDK callback never takes these locks. Marked automatic observations must
 /// pass the same current launch/reset boundary as automatic command producers.
+/// Explicit local human Stop, ALREADY owned by SDK. No generic received Abort
+/// can manufacture this receipt. Only bounded RAM changes occur under guards.
+pub(crate) fn commit_local_manual_stop(
+    state: &AppState,
+    claim: &crate::manual_abort_intent::Claim,
+    receipt: &crate::manual_abort_utc::LocalStopAdmission,
+) -> bool {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if matches!(receipt.generation(), 0 | u64::MAX)
+        || receipt.generation() != automatic_generation(state)
+        || receipt.epoch() != claim.epoch()
+        || state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    claim.with_current_publication(&state.manual_abort_intent, receipt.wire(), || {
+        let mut current = state.state.lock().unwrap();
+        *current = FlightState::Aborted;
+        state.clear_launch_sequence_command_pending();
+        state.set_abort_indicator_latched(true);
+    }).is_some()
+}
+
 pub(crate) fn accept_observed_abort(state: &AppState, automatic: bool, generation: u64) -> bool {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
     if automatic && (generation != automatic_generation(state) || !automatic_abort_allowed(state)) {
@@ -5994,4 +6036,24 @@ pub(crate) fn try_commit_automatic_policy(
     let _ = with_stop_admission(state, ticket, || {
         state.board_abort.try_admit_automatic_prelaunch(ticket.board_abort_revision, || { *policy = next; })
     });
+}
+
+#[cfg(test)]
+mod local_stop_priority_tests { include!("gse/local_stop_priority_tests.rs"); }
+
+#[cfg(all(test,not(feature="hitl_mode")))]
+pub(crate) fn native_owned_startup_prime(state:&Arc<AppState>) -> serde_json::Value {
+    for now in [10000,12000] {
+        {let mut rt=state.gse.lock().unwrap();rt.test_now_ms=Some(now);
+         rt.engine.config.maximum_zero_offset_psi=Some(5.0);rt.observe_pressure(Some(0.0));}
+        tick(state,true);
+    }
+    native_owned_startup_snapshot(state)
+}
+#[cfg(all(test,not(feature="hitl_mode")))]
+pub(crate) fn native_owned_startup_snapshot(state:&AppState) -> serde_json::Value {
+    let rt=state.gse.lock().unwrap();serde_json::json!({"phase":format!("{:?}",rt.engine.status.phase),
+        "active":rt.engine.active(),"operational_running":rt.operational.running,
+        "startup_configured":rt.operational.startup_configured,"topology_healthy":rt.operational.topology_healthy,
+        "topology_stable":rt.operational.topology_stable,"fault":format!("{:?}",rt.operational.saved.qualification.fault())})
 }

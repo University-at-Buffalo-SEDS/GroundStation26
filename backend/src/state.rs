@@ -1760,6 +1760,23 @@ impl AppState {
         });
     }
 
+    /// Observations of an admitted LOCAL explicit Stop; never a state finalizer.
+    /// The live publisher Claim still prevents reset completion during this work.
+    pub(crate) fn observe_local_manual_stop_admission(&self) {
+        let actual = self.local_flight_state_snapshot();
+        crate::flight_sim::sync_local_flight_state(actual);
+        self.queue_router_flight_state_update(actual);
+        let _ = self.state_tx.send(FlightStateMsg { state: actual });
+        self.broadcast_fill_targets_snapshot();
+        let tx = self.db_queue_tx.clone();
+        let timestamp_ms = telemetry_task::get_current_timestamp_ms() as i64;
+        self.db_write_runtime.spawn(async move {
+            let _ = tx.send(DbQueueItem::Write(crate::telemetry_db::DbWrite::FlightState {
+                timestamp_ms, state_code: FlightState::Aborted as i64,
+            })).await;
+        });
+    }
+
     /// Post-admission observations only. Re-read current phase so a later Stop
     /// or reset is never overwritten by a stale Idle notification. Startup->Idle
     /// does not change any valid Idle/T-/T+ clock (launch_clock_for_transition).

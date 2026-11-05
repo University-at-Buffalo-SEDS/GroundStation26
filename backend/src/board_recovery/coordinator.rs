@@ -513,7 +513,7 @@ fn prepare_inner(
         || principal.anonymous
         || request.mode.is_some()
     {
-        return Err("Recovery origin, current primary/session or safe host state changed");
+        return Err("Recovery origin/session changed or GS is not safely Startup, Idle or Aborted. Recovery sends no Stop. An accepted Launch requires explicit Manual Abort/Stop and fresh confirmed board state before recovery.");
     }
     let router = state.topology_router.get().ok_or("Router unavailable")?;
     crate::system_clock::required_control_network_utc_ms(router)
@@ -658,7 +658,7 @@ fn prepare_inner(
         if commissioning { " COMMISSION" } else { "" }
     );
     let context = principal_context(&identity, headers, principal);
-    let value = json!({"ticket":id,"backend_instance":hex(&identity),"principal_context":context,"reset_epoch":format!("{:016x}",token.generation),"expires_in_ms":30000,"action":request.action,"targets":names,"global_startup_best_effort":matches!(request.action.as_str(),"reset_startup"|"reset_startup_all7"),"required_proof_boards":reset_selection.map(|s|s.required_boards()),"unselected_board_verification":"unverified_best_effort","summary":if targets.iter().any(|target| target.first_binding.is_some()) {"Identity reconciliation ONLY for retained uncertain FIRST targets. Other targets will not reset/apply in this attempt. IO cannot clear state; a fresh Query and another distinct human confirmation are required."}else if commissioning{"Explicit commissioning leg; IO is not completion. A separate fresh confirmation is required after provisioning."}else if request.action=="recover_abort" {match targets.first().map(|target|target.board) {Some(Board::FlightComputer)=>"Reset/recover FC to Startup with verified evaluator and safe-output ownership. Preserve deployment history; a separate new flight is required. No MCU reboot or output replay.",Some(Board::RFBoard|Board::PowerBoard|Board::GatewayBoard|Board::DaqBoard)=>"Reset only selected cached application metadata to Startup. No physical recovery, power cycling, acquisition reset, reboot or resync.",_=>"Recover selected AB/VB application state to Idle with verified safe outputs. No physical-position or power-reset claim."}}else{"Explicit GLOBAL Startup broadcast to ALL boards (best effort). ONLY listed targets are verified; unlisted boards remain UNVERIFIED. No MCU reboot, physical position, power or runtime mode reset."},"confirmation":phrase});
+    let value = json!({"ticket":id,"backend_instance":hex(&identity),"principal_context":context,"reset_epoch":format!("{:016x}",token.generation),"expires_in_ms":30000,"action":request.action,"targets":names,"global_startup_best_effort":matches!(request.action.as_str(),"reset_startup"|"reset_startup_all7"),"required_proof_boards":reset_selection.map(|s|s.required_boards()),"unselected_board_verification":"unverified_best_effort","summary":if targets.iter().any(|target| target.first_binding.is_some()) {"Identity reconciliation ONLY for retained uncertain FIRST targets. Other targets will not reset/apply in this attempt. IO cannot clear state; a fresh Query and another distinct human confirmation are required."}else if commissioning{"Explicit commissioning leg; IO is not completion. A separate fresh confirmation is required after provisioning."}else if request.action=="recover_abort" {match targets.first().map(|target|target.board) {Some(Board::FlightComputer)=>"Reset/recover FC to Startup with verified evaluator and safe-output ownership. Preserve deployment history; a separate new flight is required. No MCU reboot or output replay.",Some(Board::RFBoard|Board::PowerBoard|Board::GatewayBoard|Board::DaqBoard)=>"Reset only selected cached application metadata to Startup. No physical recovery, power cycling, acquisition reset, reboot or resync.",_=>"Recover selected AB/VB application state to Idle with verified safe outputs. This sends no Stop: after accepted Launch, explicitly use Manual Abort/Stop and confirm current board state before preparing recovery. No physical-position or power-reset claim."}}else{"Explicit GLOBAL Startup broadcast to ALL boards (best effort). This sends no Stop: after accepted Launch, explicitly use Manual Abort/Stop and confirm current board state before preparing reset. GS must be safely Startup, Idle or Aborted. ONLY listed targets are verified; unlisted boards remain UNVERIFIED. No MCU reboot, physical position, power or runtime mode reset."},"confirmation":phrase});
     let mut control = state.board_recovery.coordinator.0.lock().unwrap();
     if control.shutdown_closed || state.shutdown_requested.load(Ordering::Acquire) { return Err("Ground station is shutting down"); }
     if control
@@ -1161,7 +1161,7 @@ async fn exchange(
                         .ok_or("Malformed commissioning IO reply");
                 }
                 Outcome::Rejected(_) => {
-                    return Err("Board rejected recovery; admission remains closed");
+                    return Err("Board rejected recovery; admission remains closed. Recovery sends no Stop. If Launch was accepted, explicitly use Manual Abort/Stop, confirm fresh board state, then prepare a new recovery intent.");
                 }
             }
         }
@@ -1517,6 +1517,7 @@ mod tests {
     #[cfg(any(feature="hitl_mode",feature="firmware_sim"))]
     include!("final_clock_tests.rs");
     use super::*;
+    include!("postmission_stop_reset_native.rs");
     #[cfg(feature="test_fire_mode")]
     mod pending_native { include!("pending_recovery_native_tests.rs"); }
     use futures::FutureExt;
@@ -1716,6 +1717,19 @@ mod tests {
             clock: Option<Box<dyn sedsnet::router::Clock + Send + Sync>>,
             managed_peers: bool,
         ) -> Self {
+            Self::from_saved_with_services_profile(journal, retained, clock, managed_peers, false).await
+        }
+        #[cfg(not(feature="hitl_mode"))]
+        async fn new_with_active_startup_peer_services() -> Self {
+            Self::from_saved_with_services_profile(None,None,None,true,true).await
+        }
+        async fn from_saved_with_services_profile(
+            journal: Option<Vec<u8>>,
+            retained: Option<Vec<(Board, Arc<Mutex<Model>>)>>,
+            clock: Option<Box<dyn sedsnet::router::Clock + Send + Sync>>,
+            managed_peers: bool,
+            active_startup_services: bool,
+        ) -> Self {
             let mut http = super::super::tests::http_fixture().await;
             let restarting = journal.is_some();
             if let Some(bytes) = journal {
@@ -1769,6 +1783,11 @@ mod tests {
                         received_controls.lock().unwrap().push(packet.clone());
                     }
                     if let Some(state) = weak.upgrade() {
+                        // Private test ingress mirrors production ABORT endpoint observation.
+                        if packet.data_type() == crate::telemetry_schema::data_type("ABORT")
+                            && postmission_native_ingress_enabled(&state) {
+                            crate::deferred_abort::observe(&state, packet, crate::gse::automatic_generation(&state));
+                        }
                         crate::board_abort::observe_raw(&state, packet);
                         // Production ingress records actual board contact
                         // before applying a correlated readback. Mirror that
@@ -1828,7 +1847,7 @@ mod tests {
                 let capture = requests.clone();
                 let dedicated = crate::telemetry_schema::endpoint(endpoint(board));
                 let state_receipts = incoming_startup.clone();
-                let peer_config = RouterConfig::new([
+                let mut peer_handlers = vec![
                         EndpointHandler::new_packet_handler(dedicated, move |packet| {
                             capture.lock().unwrap().push(packet.clone());
                             Ok(())
@@ -1840,8 +1859,14 @@ mod tests {
                                 Ok(())
                             },
                         ),
-                    ])
-                    .with_sender(board.sender_id());
+                    ];
+                if active_startup_services && board == Board::GatewayBoard {
+                    // Native SDK delivery without an application valve ACK:
+                    // the real startup owner must wait, not invent completion.
+                    peer_handlers.push(EndpointHandler::new_packet_handler(crate::telemetry_schema::endpoint("VALVE_BOARD"), |_| Ok(())));
+                    peer_handlers.push(EndpointHandler::new_packet_handler(crate::telemetry_schema::endpoint("ACTUATOR_BOARD"), |_| Ok(())));
+                }
+                let peer_config = RouterConfig::new(peer_handlers).with_sender(board.sender_id());
                 #[cfg(not(feature="test_fire_mode"))]
                 let router=Router::new(peer_config);
                 #[cfg(feature="test_fire_mode")]

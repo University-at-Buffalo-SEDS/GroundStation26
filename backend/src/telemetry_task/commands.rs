@@ -148,22 +148,29 @@ pub(crate) fn queue_priority_manual_abort_packet(router: &Router) -> sedsnet::Te
     queue_manual_abort_wire(router, crate::manual_abort_intent::WirePolicy::Untimed)
 }
 
+#[cfg(test)]
 pub(crate) fn queue_manual_abort_wire(
     router: &Router,
     wire: crate::manual_abort_intent::WirePolicy,
 ) -> sedsnet::TelemetryResult<()> {
+    queue_manual_abort_wire_receipted(router, wire).map(|_| ())
+}
+
+/// Receipt metadata exists only after the actual original entered SDK ownership.
+pub(crate) fn queue_manual_abort_wire_receipted(
+    router: &Router,
+    wire: crate::manual_abort_intent::WirePolicy,
+) -> sedsnet::TelemetryResult<(u64, String, u64)> {
     let (body, original) = match wire {
         crate::manual_abort_intent::WirePolicy::Untimed => (MANUAL_ABORT_PREFIX, 0),
         crate::manual_abort_intent::WirePolicy::KnownUtc(original) => {
             ("SEDS_MANUAL_ABORT_V1:K", original)
         }
     };
-    router.tx_queue(abort_packet_from_at(
-        router,
-        body,
-        &router.sender(),
-        original,
-    )?)
+    let packet = abort_packet_from_at(router, body, &router.sender(), original)?;
+    let receipt = (packet.packet_id(), packet.sender().to_string(), packet.timestamp());
+    router.tx_queue(packet)?;
+    Ok(receipt)
 }
 
 pub(crate) fn queue_abort_packet(router: &Router, reason: &str) -> sedsnet::TelemetryResult<()> {
