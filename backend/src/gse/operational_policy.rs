@@ -49,7 +49,10 @@ pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool
         && (!rt.turbo_inventory_pending || rt.turbo_evidence.is_some())
         && rt.fresh_mass(now).is_some_and(|mass| {
             (!rt.turbo_inventory_pending
-                && fill_mass_in_band(&rt.engine.config, mass.value, target))
+                && rt.turbo_evidence.is_none()
+                && gse_sequence::fill_resume::inventory_ready(
+                    mass.value, target, rt.engine.config.fill_tolerance_kg,
+                ))
                 || turbocharge::accepts_mass(state, rt, mass)
         })
         && matches!(

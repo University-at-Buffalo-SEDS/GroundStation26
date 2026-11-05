@@ -1,4 +1,5 @@
 """Recording formatter acceptance, including the ACTUAL production DAQ C helpers."""
+from contextlib import closing
 import csv
 import importlib.util
 import io
@@ -30,7 +31,7 @@ class Formatter(unittest.TestCase):
         self.name = "groundstation_recording_2026-11-01_00-00-00.db"
         self.path = self.root / self.name
         self.utc = 1793491200000
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("CREATE TABLE telemetry(id INTEGER PRIMARY KEY,timestamp_ms INTEGER,source_timestamp_ms INTEGER,sender_id TEXT,data_type TEXT,values_json TEXT,payload_json TEXT)")
             for t, source, sender, kind, values in [
                 (self.utc, self.utc-12, "DAQ", "KG1000", [1.25]),
@@ -115,7 +116,7 @@ class Formatter(unittest.TestCase):
         fields.update(timestamp_ms=str(self.utc),monotonic_ms="345",sensor="vector",value="1 2",time_source="network",uptime_ticks="345",uptime_frequency_hz="1000",record_sequence="9")
         origin={"origin":"sd","received_timestamp_ms":None,"source_timestamp_ms":self.utc,
                 "utc_timestamp_ms":self.utc,"sd_sample_id":42,"fields":fields,"mapping":{"indices":[0,1]}}
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("CREATE TABLE sd_replay_telemetry(id INTEGER PRIMARY KEY,timestamp_ms INTEGER,source_timestamp_ms INTEGER,sender_id TEXT,data_type TEXT,values_json TEXT,payload_json TEXT,provenance_json TEXT)")
             db.execute("INSERT INTO sd_replay_telemetry VALUES(1,?,?,?,?,?,?,?)",(self.utc,self.utc,"DAQ","VECTOR","[1,2]","[]",json.dumps(origin)))
         one=json.dumps(["DAQ","VECTOR",0],separators=(",",":"))
@@ -142,7 +143,7 @@ class Formatter(unittest.TestCase):
         text="\n".join(page.extract_text() for page in pdf.pages)
         self.assertIn("canonical replay",text)
         self.assertIn("Timeline ms",text)
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM telemetry").fetchone()[0],6)
 
     def test_actual_daq_c_formatter_golden_fields_and_float_precision(self):

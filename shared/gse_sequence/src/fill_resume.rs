@@ -23,3 +23,17 @@ pub fn resume_required(now_ms: u64, mass: Option<Sample>, target_kg: f32) -> Res
         .ok_or_else(|| "Fill requires fresh calibrated fill weight before starting".to_string())?;
     Ok(mass.value * target_kg.signum() <= target_kg.abs() - RESUME_DEFICIT_KG)
 }
+
+/// Inventory already qualified by a completed fill may lose less than the
+/// explicit resume deadband. Upper tolerance remains the precise fill limit;
+/// this does not change automatic fill stopping or settling accuracy.
+pub fn inventory_ready(mass_kg: f32, target_kg: f32, upper_tolerance_kg: f32) -> bool {
+    mass_kg.is_finite()
+        && target_kg.is_finite()
+        && target_kg != 0.0
+        && upper_tolerance_kg.is_finite()
+        && upper_tolerance_kg > 0.0
+        && upper_tolerance_kg <= 0.07
+        && mass_kg * target_kg.signum() > target_kg.abs() - RESUME_DEFICIT_KG
+        && (mass_kg - target_kg) * target_kg.signum() <= upper_tolerance_kg
+}

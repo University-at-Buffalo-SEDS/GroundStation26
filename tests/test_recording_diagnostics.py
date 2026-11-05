@@ -1,3 +1,4 @@
+from contextlib import closing
 import csv
 import importlib.util
 import io
@@ -15,7 +16,7 @@ class RecordedDiagnostics(unittest.TestCase):
     def test_selected_exact_counters_named_temperature_and_unknown_are_saved_data(self):
         with tempfile.TemporaryDirectory() as directory:
             name='groundstation_recording_2026-11-03_00-00-00_000.db'
-            with sqlite3.connect(Path(directory)/name) as db:
+            with closing(sqlite3.connect(Path(directory)/name)) as db, db:
                 db.execute('CREATE TABLE telemetry(id INTEGER PRIMARY KEY,timestamp_ms INTEGER,source_timestamp_ms INTEGER,sender_id TEXT,data_type TEXT,values_json TEXT,payload_json TEXT)')
                 for kind,value,source in [('REC_SIDE_COUNTERS',2**64-1,1234),('REC_BOARD_DIE_TEMPERATURE',-1.23,1235),('REC_BOARD_DIE_TEMPERATURE',None,None)]:
                     db.execute('INSERT INTO telemetry VALUES(NULL,?,?,?,?,?,?)',(1700000000000,source,'GS/radio' if kind=='REC_SIDE_COUNTERS' else 'FC',kind,json.dumps([value]),json.dumps({'context':{'version':1},'counter':str(2**64-1)})))
@@ -32,7 +33,7 @@ class RecordedDiagnostics(unittest.TestCase):
             self.assertEqual([r['value'] for r in rows],['-1.23',''])
             self.assertEqual([r['source_timestamp_ms'] for r in rows],['1235',''])
             # Unknown diagnostic versions do not acquire guessed labels/units.
-            with sqlite3.connect(Path(directory)/name) as db:
+            with closing(sqlite3.connect(Path(directory)/name)) as db, db:
                 db.execute("UPDATE telemetry SET payload_json='{}' WHERE data_type='REC_BOARD_DIE_TEMPERATURE'")
             preview=json.loads(report.run(request))
             temp=next(v for v in preview['channels'] if 'REC_BOARD_DIE_TEMPERATURE' in v['key'])

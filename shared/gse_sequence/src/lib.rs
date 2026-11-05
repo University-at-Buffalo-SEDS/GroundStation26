@@ -36,6 +36,8 @@ pub struct Config {
     /// Explicit additional nitrogen mass allowance, in calibrated kg.
     /// None disables Turbocharge; this is not liquid overfill tolerance.
     pub turbocharge_max_added_mass_kg: Option<f32>,
+    /// Closed-tank pressure hysteresis; nitrogen still closes at the exact target.
+    pub turbocharge_pressure_deadband_psi: f32,
     pub pressure_step_psi: f32,
     pub pressure_ceiling_psi: Option<f32>,
     pub maximum_zero_offset_psi: Option<f32>,
@@ -52,6 +54,7 @@ impl Default for Config {
             fill_tolerance_kg: 0.07,
             fill_settle_ms: 3000,
             turbocharge_max_added_mass_kg: None,
+            turbocharge_pressure_deadband_psi: 12.0,
             pressure_step_psi: 50.0,
             pressure_ceiling_psi: None,
             maximum_zero_offset_psi: None,
@@ -61,6 +64,13 @@ impl Default for Config {
     }
 }
 impl Config {
+    pub fn validate_turbocharge_deadband(&self) -> Result<(), String> {
+        let band = self.turbocharge_pressure_deadband_psi;
+        if !band.is_finite() || !(8.0..=16.0).contains(&band) {
+            return Err("Turbocharge pressure deadband must be between 8 and 16 psi".into());
+        }
+        Ok(())
+    }
     pub fn nitrogen_target_psi(&self) -> f32 {
         self.nitrogen_steps
             .last()
@@ -150,6 +160,7 @@ impl Config {
         }
         self.nitrogen_plan()?;
         self.validate_fill_trim()?;
+        self.validate_turbocharge_deadband()?;
         if self
             .turbocharge_max_added_mass_kg
             .is_some_and(|v| !v.is_finite() || v <= 0.0)
@@ -330,6 +341,8 @@ pub struct Engine {
     /// Supplied from the nitrous fill target before requesting StartFill.
     pub nitrous_target_psi: f32,
     nitrous_session: bool,
+    // Captured before a new StartFill changes nitrous_session or phase.
+    resume_existing_inventory: bool,
     pub status: Status,
     pub claimed: bool,
     phase_since: u64,
@@ -352,6 +365,7 @@ impl Default for Engine {
             config: Config::default(),
             nitrous_target_psi: 750.0,
             nitrous_session: false,
+            resume_existing_inventory: false,
             status: Status {
                 phase: Phase::Idle,
                 message: "Ready for GSE checkout".into(),
@@ -385,6 +399,7 @@ impl Engine {
     /// fresh pressure and the operating interlock. A qualified filled tank is
     /// held closed; an empty checkout opens dump and vent.
     pub fn prepare_startup(&mut self, now_ms: u64, hold_filled: bool) -> Effects {
+        self.resume_existing_inventory = false;
         self.claimed = true;
         self.testing_valves = false;
         self.nitrous_session = hold_filled;
@@ -412,6 +427,18 @@ impl Engine {
                 p.value.is_finite() && p.at_ms <= input.now_ms && input.now_ms - p.at_ms <= 2000
             })
             .map(|p| p.value)
+    }
+    fn fill_entry_pressure_ready(&self, pressure: f32, continuing_inventory: bool) -> bool {
+        self.status.baseline.as_ref().is_some_and(|baseline| {
+            if continuing_inventory {
+                pressure.is_finite()
+                    && pressure >= 0.0
+                    && self.config.pressure_limit(self.nitrous_target_psi, 50.0)
+                        .is_ok_and(|limit| limit > self.nitrous_target_psi && pressure < limit)
+            } else {
+                baseline.is_zero(pressure)
+            }
+        })
     }
     pub fn allows(&self, action: Action, input: Inputs) -> bool {
         if action == Action::CancelFill {
@@ -442,16 +469,18 @@ impl Engine {
                     .is_ok_and(|limit| limit > self.nitrous_target_psi)
                     && (self.status.nitrogen_passed || self.status.nitrogen_overridden)
                     && matches!(self.status.phase, Phase::Passed | Phase::Paused)
-                    && self
-                        .status
-                        .baseline
-                        .as_ref()
-                        .is_some_and(|b| b.is_zero(Self::fresh_pressure(input).unwrap()))
+                    && self.fill_entry_pressure_ready(
+                        Self::fresh_pressure(input).unwrap(),
+                        self.nitrous_session && self.status.phase == Phase::Paused,
+                    )
             }
             _ => false,
         }
     }
     fn transition(&mut self, phase: Phase, now: u64, message: &str) {
+        if phase != Phase::FillSetup {
+            self.resume_existing_inventory = false;
+        }
         self.status.phase = phase;
         self.phase_since = now;
         self.status.message = message.into();
@@ -590,6 +619,9 @@ impl Engine {
 
     pub fn request(&mut self, action: Action, input: Inputs) -> Result<Effects, String> {
         self.validate_request(action, input)?;
+        self.resume_existing_inventory = action == Action::StartFill
+            && self.status.phase == Phase::Paused
+            && self.nitrous_session;
         self.claimed = true;
         Ok(match action {
             Action::Turbocharge => {
@@ -672,6 +704,7 @@ impl Engine {
         effects
     }
     pub fn manual_override(&mut self) {
+        self.resume_existing_inventory = false;
         self.claimed = false;
         self.testing_valves = false;
         self.self_pending = 0;
@@ -1191,7 +1224,7 @@ impl Engine {
                 }
             }
             Phase::FillSetup if self.confirmed(input) => {
-                if !self.status.baseline.as_ref().unwrap().is_zero(pressure) {
+                if !self.fill_entry_pressure_ready(pressure, self.resume_existing_inventory) {
                     return self.fault(
                         input.now_ms,
                         "Tank is not within the calibrated zero-pressure band",
@@ -1265,6 +1298,7 @@ mod tests {
                     fill_tolerance_kg: 0.07,
                     fill_settle_ms: 3000,
                     turbocharge_max_added_mass_kg: None,
+                    turbocharge_pressure_deadband_psi: 12.,
                     pressure_step_psi: 50.0,
                     pressure_ceiling_psi: Some(200.0),
                     maximum_zero_offset_psi: Some(8.0),
@@ -2090,3 +2124,6 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]
+mod operator_coherence_tests;

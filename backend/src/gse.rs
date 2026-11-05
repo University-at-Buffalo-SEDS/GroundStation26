@@ -1886,7 +1886,8 @@ fn nitrogen_configuration_changed(before: &Config, after: &Config) -> bool {
         || before.maximum_zero_offset_psi != after.maximum_zero_offset_psi
 }
 fn fill_configuration_changed(before: &Config, after: &Config) -> bool {
-    before.turbocharge_max_added_mass_kg != after.turbocharge_max_added_mass_kg
+    before.turbocharge_pressure_deadband_psi != after.turbocharge_pressure_deadband_psi
+        || before.turbocharge_max_added_mass_kg != after.turbocharge_max_added_mass_kg
         || before.fill_overfill_kg != after.fill_overfill_kg
         || before.fill_tolerance_kg != after.fill_tolerance_kg
         || before.fill_settle_ms != after.fill_settle_ms

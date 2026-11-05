@@ -165,3 +165,73 @@ async fn current_deficit_at_and_beyond_deadband_starts_actual_engine_and_sdk_com
         );
     }
 }
+
+#[tokio::test]
+async fn verified_paused_pressurized_inventory_resumes_through_actual_sdk_nitrous_open() {
+    let (state,sent,peer)=paused(7.7).await;
+    let mut targets=state.fill_targets_snapshot();targets.nitrous.target_mass_kg=8.;targets.nitrous.target_pressure_psi=750.;state.set_fill_targets(targets);
+    #[cfg(not(feature="hitl_mode"))]
+    let directory=crate::recording_export::tests::TestDirectory::new();
+    {
+        let mut rt=state.gse.lock().unwrap();rt.test_now_ms=Some(10_000);
+        rt.engine.nitrous_target_psi=750.;rt.observe_pressure(Some(0.));
+        let seed=rt.input(true,true);rt.engine.request(Action::StartFill,seed).unwrap();
+        rt.engine.manual_override();rt.engine.status.phase=Phase::Paused;
+        assert!(rt.engine.nitrous_session());rt.observe_mass(Some(7.7));rt.observe_pressure(Some(500.));
+        rt.valve_pressure=Some(Sample{value:500.,at_ms:rt.now()});
+        #[cfg(not(feature="hitl_mode"))]
+        {rt.operational.path=Some(directory.0.join("qualification.json"));rt.operational.saved.baseline=rt.engine.status.baseline.clone();rt.operational.saved.fill_target_kg=Some(8.);}
+    }
+    // The small command fixture has real routes but deliberately no board
+    // heartbeat observations. Supply them explicitly, and establish the real
+    // two-second topology continuity before admitting this active fill.
+    for board in [crate::types::Board::GatewayBoard,crate::types::Board::ValveBoard,crate::types::Board::ActuatorBoard,crate::types::Board::DaqBoard] {
+        state.mark_board_seen(board.sender_id(),crate::telemetry_task::get_current_timestamp_ms());
+    }
+    #[cfg(not(feature="hitl_mode"))]
+    {
+        assert!(operational_tick(&state,true));
+        {
+            let mut rt=state.gse.lock().unwrap();rt.test_now_ms=Some(12_000);
+            rt.observe_pressure(Some(500.));rt.observe_mass(Some(7.7));rt.valve_pressure=Some(Sample{value:500.,at_ms:rt.now()});
+        }
+        assert!(operational_tick(&state,true));
+        let rt=state.gse.lock().unwrap();assert!(rt.operational.topology_healthy&&rt.operational.topology_stable);
+    }
+    #[cfg(feature="hitl_mode")]
+    {let mut rt=state.gse.lock().unwrap();rt.test_now_ms=Some(12_000);rt.observe_pressure(Some(500.));rt.observe_mass(Some(7.7));}
+    assert!(!consume_fill_noop(&state,&TelemetryCommand::StartFill));
+    assert!(handle_command(&state,&TelemetryCommand::StartFill));
+    assert_eq!(state.gse.lock().unwrap().engine.status.phase,Phase::FillSetup);
+    let mut actual=[false;5];let mut consumed=0;let mut nitrous_seen=false;
+    for step in 1..=20 {
+        tests::pump_test_link(&state,&peer);
+        {
+            let commands=sent.lock().unwrap();
+            for(kind,bytes)in &commands[consumed..] {
+                assert_eq!(bytes.len(),1);assert_ne!(bytes[0]&0x80,0);let code=bytes[0]&0x7f;
+                let i=(if kind=="VALVE_COMMAND"{0..3}else{assert_eq!(kind,"ACTUATOR_COMMAND");3..5}).find(|i|code==OPEN[*i]||code==CLOSE[*i]).unwrap();
+                let open=code==OPEN[i];assert_ne!((i,open),(3,true),"fill resume must never open nitrogen");
+                actual[i]=open;if(i,open)==(4,true){nitrous_seen=true;}
+            }consumed=commands.len();
+        }
+        {
+            let mut rt=state.gse.lock().unwrap();rt.test_now_ms=Some(12_000+step*100);
+            for(key,open)in KEYS.into_iter().zip(actual){rt.observe_valve(key,open);}
+            rt.observe_pressure(Some(500.));rt.observe_mass(Some(7.7));rt.valve_pressure=Some(Sample{value:500.,at_ms:rt.now()});
+        }
+        if nitrous_seen{break;}
+        tick(&state,true);flush_effects(&state);
+    }
+    let failure_facts = {
+        let rt=state.gse.lock().unwrap();
+        #[cfg(not(feature="hitl_mode"))]
+        let operational=serde_json::json!({"healthy":rt.operational.topology_healthy,"stable":rt.operational.topology_stable,"stage":format!("{:?}",rt.operational.saved.qualification.stage()),"fault":format!("{:?}",rt.operational.saved.qualification.fault()),"message":rt.operational.persist_error});
+        #[cfg(feature="hitl_mode")]
+        let operational=serde_json::json!({"mode":"hitl"});
+        serde_json::json!({"status":rt.engine.status,"operational":operational,"sent":*sent.lock().unwrap()})
+    };
+    assert!(nitrous_seen,"actual SDK never emitted Nitrous open after safe pressure and valve confirmations: {failure_facts}");
+    assert_eq!(state.gse.lock().unwrap().engine.status.phase,Phase::Filling);
+    assert!(sent.lock().unwrap().contains(&("ACTUATOR_COMMAND".into(),vec![10|0x80])));
+}

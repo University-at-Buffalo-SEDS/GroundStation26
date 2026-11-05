@@ -1,5 +1,7 @@
 """Actual Cargo shared-target regressions; no UI tools or network required."""
 import json
+import io
+from contextlib import redirect_stdout
 import os
 from pathlib import Path
 import subprocess
@@ -91,8 +93,10 @@ if os.environ.get('FIXTURE_FALLBACK'):
                 with patch.object(build, '_sync_frontend_public_assets', side_effect=OSError('sync failed')), self.assertRaises(OSError):
                     self.invoke(root, source)
                 self.assertFalse(stamp.exists())
-                with patch.dict(os.environ, {'FIXTURE_FALLBACK': '1'}):
+                expected_output = io.StringIO()
+                with patch.dict(os.environ, {'FIXTURE_FALLBACK': '1'}), redirect_stdout(expected_output):
                     self.assertTrue(self.invoke(root, source).endswith('|a'))
+                self.assertIn('Warning: frontend build completed but wasm-opt post-processing failed.', expected_output.getvalue())
                 self.assertTrue(stamp.exists())
 
     def test_relative_target_and_removed_vendor(self):
@@ -341,8 +345,10 @@ if os.environ.get('FIXTURE_FALLBACK'):
                 self.assertEqual((source / 'dist/public/index.html').read_text().strip(), old)
                 (source / 'build.py').write_text(original_script)
                 library = source / 'vendor/src/lib.rs'; library.write_text(library.read_text().replace('"a"', '"fresh"'))
-                with patch.dict(os.environ, {'FIXTURE_FALLBACK': '1'}):
+                expected_output = io.StringIO()
+                with patch.dict(os.environ, {'FIXTURE_FALLBACK': '1'}), redirect_stdout(expected_output):
                     self.assertTrue(self.invoke(root, source).endswith('|BUILD=a|fresh'))
+                self.assertIn('Warning: frontend build completed but wasm-opt post-processing failed.', expected_output.getvalue())
                 self.assertEqual(list(source.rglob('.gs-public-prior-*')), [])
 
     def test_ignored_lockfile_explicit_provenance_changes_clean_once_then_warm(self):

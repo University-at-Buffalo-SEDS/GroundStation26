@@ -379,6 +379,7 @@ async fn actual_cold_flow_routes_physical_edge_auth_cancel_and_no_launch_clock()
         rt.turbo_evidence = Some(gse_sequence::turbocharge::Evidence {
             context: super::turbocharge::fixture_context(&f.state, &rt),
             nitrous_target_mass_kg: 1.,
+            pressure_deadband_psi: 12.,
             pressure_target_psi: 100.,
             max_added_nitrogen_mass_kg: 0.5,
             before_mass: cap,

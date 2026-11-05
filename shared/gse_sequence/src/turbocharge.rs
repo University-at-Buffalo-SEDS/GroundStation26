@@ -3,6 +3,10 @@
 use crate::{CLOSED, Config, Effects, Inputs, Sample, VALVE_ACK_TIMEOUT_MS};
 use serde::{Deserialize, Serialize};
 
+fn default_pressure_deadband() -> f32 {
+    12.0
+}
+
 const RAISE_TIMEOUT_MS: u64 = 60_000; // Same finite raising window as nitrogen testing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Context {
@@ -29,6 +33,8 @@ pub struct Evidence {
     pub context: Context,
     pub nitrous_target_mass_kg: f32,
     pub pressure_target_psi: f32,
+    #[serde(default = "default_pressure_deadband")]
+    pub pressure_deadband_psi: f32,
     pub max_added_nitrogen_mass_kg: f32,
     pub before_mass: Capture,
     pub before_pressure: Capture,
@@ -45,6 +51,7 @@ impl Evidence {
         [
             self.nitrous_target_mass_kg,
             self.pressure_target_psi,
+            self.pressure_deadband_psi,
             self.max_added_nitrogen_mass_kg,
             self.before_mass.value,
             self.after_mass.value,
@@ -56,10 +63,12 @@ impl Evidence {
         .into_iter()
         .all(f32::is_finite)
             && self.nitrous_target_mass_kg != 0.0
-            && self.pressure_target_psi > 0.0
+            && (8.0..=16.0).contains(&self.pressure_deadband_psi)
+            && self.pressure_target_psi > self.pressure_deadband_psi
             && self.max_added_nitrogen_mass_kg > 0.0
             && self.mass_samples >= 10
-            && self.reached_pressure.value >= self.pressure_target_psi
+            && self.reached_pressure.value >= self.pressure_target_psi - self.pressure_deadband_psi
+            && self.after_pressure.value >= self.pressure_target_psi - self.pressure_deadband_psi
             && self.added_mass_kg <= self.max_added_nitrogen_mass_kg
             && self.completed_at_ms >= self.after_mass.at_ms
             && self
@@ -70,7 +79,6 @@ impl Evidence {
 
     pub fn accepts_mass(&self, context: Context, mass: Sample, now: u64, tolerance: f32) -> bool {
         self.valid()
-            && self.reached_pressure.value >= self.pressure_target_psi
             && context == self.context
             && fresh(Some(mass), now).is_some()
             && tolerance.is_finite()
@@ -118,6 +126,7 @@ pub struct Controller {
     context: Context,
     target_mass: f32,
     pressure_target: f32,
+    pressure_deadband: f32,
     pressure_limit: f32,
     max_added: f32,
     tolerance: f32,
@@ -171,6 +180,7 @@ impl Controller {
         prior: Option<&Evidence>,
     ) -> Result<(Self, Effects), String> {
         config.validate_fill_trim()?;
+        config.validate_turbocharge_deadband()?;
         let max_added = config
             .turbocharge_max_added_mass_kg
             .filter(|v| v.is_finite() && *v > 0.0)
@@ -182,7 +192,7 @@ impl Controller {
         if !target_mass.is_finite()
             || target_mass == 0.0
             || !pressure_target.is_finite()
-            || pressure_target <= 0.0
+            || pressure_target <= config.turbocharge_pressure_deadband_psi
             || pressure_target >= ceiling
         {
             return Err("Turbocharge requires a valid nitrous mass target and pressure target below the hardware ceiling".into());
@@ -191,12 +201,19 @@ impl Controller {
             return Err("Turbocharge requires prelaunch state and the operating interlock".into());
         }
         let mass = fresh(mass, input.now_ms).ok_or("Fresh calibrated fill mass is required")?;
-        if prior.is_none() && (mass.value - target_mass).abs() > config.fill_tolerance_kg {
+        if prior.is_none()
+            && !crate::fill_resume::inventory_ready(
+                mass.value,
+                target_mass,
+                config.fill_tolerance_kg,
+            )
+        {
             return Err("Nitrous inventory must first be within its qualified mass band".into());
         }
         if prior.is_some_and(|e| {
             e.nitrous_target_mass_kg != target_mass
                 || e.pressure_target_psi != pressure_target
+                || e.pressure_deadband_psi != config.turbocharge_pressure_deadband_psi
                 || e.max_added_nitrogen_mass_kg != max_added
                 || !e.accepts_mass(context, mass, input.now_ms, config.fill_tolerance_kg)
         }) {
@@ -218,6 +235,7 @@ impl Controller {
             context,
             target_mass,
             pressure_target,
+            pressure_deadband: config.turbocharge_pressure_deadband_psi,
             pressure_limit,
             max_added,
             tolerance: config.fill_tolerance_kg,
@@ -392,7 +410,7 @@ impl Controller {
         }
         match self.phase {
             Phase::Closing => {
-                if pressure.value >= self.pressure_target {
+                if pressure.value >= self.pressure_target - self.pressure_deadband {
                     self.reached_pressure = Some(pressure);
                     self.phase = Phase::Settling;
                     self.since = input.now_ms;
@@ -424,9 +442,9 @@ impl Controller {
                 self.since = input.now_ms;
             }
             Phase::Settling => {
-                if pressure.value < self.pressure_target {
+                if pressure.value < self.pressure_target - self.pressure_deadband {
                     return self.cancel(
-                        "Pressure fell below the target while settling; paused for operator review",
+                        "Pressure fell below the Turbocharge deadband while settling; paused for operator review",
                         true,
                     );
                 }
@@ -469,6 +487,7 @@ impl Controller {
                             context: self.context,
                             nitrous_target_mass_kg: self.target_mass,
                             pressure_target_psi: self.pressure_target,
+                            pressure_deadband_psi: self.pressure_deadband,
                             max_added_nitrogen_mass_kg: self.max_added,
                             before_mass: self.before_mass.into(),
                             before_pressure: self.before_pressure.into(),
@@ -557,6 +576,80 @@ mod tests {
             )
         );
     }
+    #[test]
+    fn pressure_deadband_boundaries_settle_closed_and_never_restart() {
+        for band in [8.0_f32, 12.0, 16.0] {
+            for pressure in [745.0, 745.0 - band, (745.0 - band).next_up(), 745.0 - band / 2.0] {
+                let mut r = Rig::new(10.0);
+                r.c.pressure_deadband = band;
+                r.pressure = pressure;
+                for _ in 0..60 {
+                    r.step();
+                    if r.evidence.is_some() { break; }
+                }
+                let evidence = r.evidence.as_ref().expect("in-band closed tank settles");
+                assert!(evidence.valid());
+                assert_eq!(evidence.pressure_deadband_psi, band);
+                assert!(!r.events.contains(&(3, true)));
+                let count = r.events.len();
+                r.pressure = 100.0;
+                for _ in 0..10 { r.step(); }
+                assert_eq!(r.c.phase(), Phase::Complete);
+                assert_eq!(r.events.len(), count, "completed controller never restarts");
+            }
+            let mut below = Rig::new(10.0);
+            below.c.pressure_deadband = band;
+            below.pressure = (745.0 - band).next_down();
+            below.reach_raising();
+            assert!(below.events.contains(&(3, true)));
+            // Hysteresis does not move the nitrogen shutoff point below target.
+            below.pressure = 744.875;
+            assert!(below.step().effects.valves.is_empty());
+            assert_eq!(below.c.phase(), Phase::Raising);
+            below.pressure = 745.0;
+            assert_eq!(below.step().effects.valves, vec![(3, false)]);
+            while below.c.phase() != Phase::Settling { below.step(); }
+            for index in 0..40 {
+                below.pressure = if index % 2 == 0 { 745.0 - band } else { 745.0 };
+                let update = below.step();
+                assert!(update.cancelled.is_none());
+                if below.evidence.is_some() { break; }
+            }
+            assert!(below.evidence.as_ref().is_some_and(Evidence::valid));
+            let mut low = Rig::new(10.0);
+            low.c.pressure_deadband = band;
+            low.pressure = 745.0;
+            while low.c.phase() != Phase::Settling { low.step(); }
+            low.pressure = (745.0 - band).next_down();
+            assert!(low.step().cancelled.is_some());
+            assert_eq!(low.c.phase(), Phase::Cancelled);
+            assert!(low.c.desired.iter().all(|open| !open));
+        }
+    }
+
+    #[test]
+    fn deadband_defaults_validate_and_cannot_make_zero_pressure_ready() {
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.turbocharge_pressure_deadband_psi, 12.0);
+        for band in [f32::NAN, f32::INFINITY, 0.0, 7.99, 16.01] {
+            let mut cfg = config();
+            cfg.turbocharge_pressure_deadband_psi = band;
+            assert!(cfg.validate_settings().is_err());
+            let r = Rig::new(10.0);
+            assert!(Controller::start(&cfg, 10., 745., r.input(), Some(Sample {
+                value: 10., at_ms: r.now,
+            }), context()).is_err());
+        }
+        for band in [8., 12., 16.] {
+            let mut cfg = config();
+            cfg.turbocharge_pressure_deadband_psi = band;
+            let r = Rig::new(10.0);
+            assert!(Controller::start(&cfg, 10., band, r.input(), Some(Sample {
+                value: 10., at_ms: r.now,
+            }), context()).is_err());
+        }
+    }
+
     #[test]
     fn outstanding_command_requires_strictly_newer_observation() {
         let mut rig = Rig::new(1.0);
@@ -935,6 +1028,7 @@ mod cumulative_tests {
             context: ctx,
             nitrous_target_mass_kg: 10.0,
             pressure_target_psi: 745.0,
+            pressure_deadband_psi: 12.0,
             max_added_nitrogen_mass_kg: 0.3,
             before_mass: capture,
             before_pressure: Capture {

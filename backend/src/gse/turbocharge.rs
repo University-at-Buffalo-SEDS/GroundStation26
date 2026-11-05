@@ -107,6 +107,7 @@ pub(super) fn only_cold_target_changed(a: &Config, b: &Config) -> bool {
         && a.fill_tolerance_kg == b.fill_tolerance_kg
         && a.fill_settle_ms == b.fill_settle_ms
         && a.turbocharge_max_added_mass_kg == b.turbocharge_max_added_mass_kg
+        && a.turbocharge_pressure_deadband_psi == b.turbocharge_pressure_deadband_psi
         && a.pressure_step_psi == b.pressure_step_psi
         && a.pressure_ceiling_psi == b.pressure_ceiling_psi
         && a.maximum_zero_offset_psi == b.maximum_zero_offset_psi
@@ -721,6 +722,7 @@ pub(super) fn accepts_mass(state: &AppState, rt: &Runtime, mass: Sample) -> bool
             p.at_ms <= rt.now()
                 && rt.now() - p.at_ms <= 2000
                 && p.value >= state.fill_targets_snapshot().nitrous.target_pressure_psi
+                    - rt.engine.config.turbocharge_pressure_deadband_psi
         })
         && rt.valves.iter().all(|v| {
             v.is_some_and(|v| !v.open && v.at_ms <= rt.now() && rt.now() - v.at_ms <= 2000)
@@ -954,13 +956,21 @@ mod tests {
         actual_router_sequence_case(false, true).await;
     }
     async fn actual_router_sequence_case(stop_before_completion: bool, missing_pressure: bool) {
+        actual_router_inventory_case(stop_before_completion, missing_pressure, 10.0, 745.0, 0.0).await;
+    }
+    #[tokio::test]
+    async fn near_full_paused_fill_noop_then_actual_turbo_settles_and_qualifies_launch() {
+        actual_router_inventory_case(false, false, 8.0, 750.0, 0.1).await;
+    }
+    async fn actual_router_inventory_case(stop_before_completion: bool, missing_pressure: bool,
+        target_mass: f32, target_pressure: f32, inventory_loss: f32) {
         let (state, sent, peer) = super::super::tests::button_test_state().await;
         let mut targets = state.fill_targets_snapshot();
-        targets.nitrous.target_mass_kg = 10.0;
-        targets.nitrous.target_pressure_psi = 745.0;
+        targets.nitrous.target_mass_kg = target_mass;
+        targets.nitrous.target_pressure_psi = target_pressure;
         state.set_fill_targets(targets);
         let target = state.fill_targets_snapshot().nitrous;
-        let inventory = target.target_mass_kg;
+        let inventory = target.target_mass_kg - inventory_loss * target.target_mass_kg.signum();
         let mut policy = state.action_policy_snapshot();
         policy.key_enabled = true;
         policy.software_buttons_enabled = true;
@@ -1013,6 +1023,7 @@ mod tests {
                 rt.engine.nitrous_session(),
                 "exercise real retained nitrous inventory safety"
             );
+            if inventory_loss > 0.0 { rt.observe_pressure(Some(100.0)); }
             rt.observe_mass(Some(inventory));
             rt.mass_calibration = Some(calibration);
             rt.valve_pressure = Some(Sample {
@@ -1042,8 +1053,17 @@ mod tests {
                         .complete(milestone, 0)
                         .unwrap();
                 }
-                rt.operational.saved.fill_target_kg = Some(inventory);
+                rt.operational.saved.fill_target_kg = Some(target.target_mass_kg);
             }
+        }
+        if inventory_loss > 0.0 {
+            let generation = super::super::automatic_generation(&state);
+            assert!(super::super::consume_fill_noop(&state, &TelemetryCommand::StartFill));
+            assert!(handle_command(&state, &TelemetryCommand::StartFill));
+            super::super::tests::pump_test_link(&state, &peer);
+            assert!(sent.lock().unwrap().is_empty());
+            assert_eq!(super::super::automatic_generation(&state), generation);
+            assert_eq!(state.gse.lock().unwrap().engine.status.phase, Phase::Paused);
         }
         let original_calibration = state.loadcell_calibration.lock().unwrap().clone();
         state.loadcell_calibration.lock().unwrap().ch1.b = Some(12.0);
@@ -1286,6 +1306,48 @@ mod tests {
             command_allowed(&state, &TelemetryCommand::Turbocharge).unwrap(),
             "a settled bounded top-up can be repeated within its ORIGINAL inventory allowance"
         );
+        if inventory_loss > 0.0 {
+            let rt = state.gse.lock().unwrap();
+            let evidence = rt.turbo_evidence.as_ref().unwrap();
+            assert!(evidence.valid());
+            assert!((evidence.before_mass.value - inventory).abs() < 0.0001);
+            assert!((evidence.added_mass_kg - 0.2).abs() < 0.0001);
+            #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+            assert!(super::super::operational_launch_allowed(&state, &rt),
+                "actual settled inventory, closed reports and raw750psi must satisfy the TestFire launch gate");
+        }
+        if inventory_loss > 0.0 {
+            let mut rt = state.gse.lock().unwrap();
+            let original = rt.valve_pressure.unwrap();
+            let anchor = rt.turbo_evidence.as_ref().unwrap().before_mass.value;
+            let band = rt.engine.config.turbocharge_pressure_deadband_psi;
+            for pressure in [target_pressure, target_pressure - band] {
+                rt.valve_pressure = Some(Sample { value: pressure, ..original });
+                assert!(accepts_mass(&state, &rt, rt.fresh_mass(rt.now()).unwrap()));
+            }
+            rt.valve_pressure = Some(Sample { value: target_pressure - band - 0.125, ..original });
+            assert!(!accepts_mass(&state, &rt, rt.fresh_mass(rt.now()).unwrap()));
+            #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+            assert!(!super::super::operational_launch_allowed(&state, &rt));
+            assert_eq!(rt.turbo_evidence.as_ref().unwrap().before_mass.value, anchor);
+            // Even a mass still in the liquid-only ready band cannot bypass existing Turbo pressure authority.
+            let original_mass = rt.mass.unwrap();
+            rt.mass = Some(Sample { value: target_mass + 0.04, ..original_mass });
+            let pending = rt.turbo_inventory_pending;
+            rt.turbo_inventory_pending = false;
+            #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+            assert!(!super::super::operational_launch_allowed(&state, &rt));
+            rt.turbo_inventory_pending = pending;
+            rt.mass = Some(original_mass);
+            let previous = rt.turbo_evidence.as_ref().unwrap();
+            let (repeat, _) = Controller::start_with_inventory(
+                &rt.engine.config, target_mass, target_pressure,
+                Inputs { now_ms: rt.now(), pressure: rt.valve_pressure, valves: rt.valves,
+                    prelaunch: true, interlock: true }, rt.mass, context(&state, &rt), Some(previous),
+            ).unwrap();
+            assert_eq!(repeat.inventory_anchor().value, anchor);
+            rt.valve_pressure = Some(original);
+        }
         let before = sent.lock().unwrap().len();
         state
             .launch_history
@@ -1567,10 +1629,10 @@ mod tests {
         rt.engine.config.cold_flow_target_psi = None;
         let binding = capture_binding(&state, &rt).0;
         let c = &rt.engine.config;
-        // Exact original Config field order/values from the frozen predecessor.
-        let legacy = serde_json::json!({"nitrogen_target_psi":c.nitrogen_target_psi,"nitrogen_steps":c.nitrogen_steps,"fill_overfill_kg":c.fill_overfill_kg,"fill_tolerance_kg":c.fill_tolerance_kg,"fill_settle_ms":c.fill_settle_ms,"turbocharge_max_added_mass_kg":c.turbocharge_max_added_mass_kg,"pressure_step_psi":c.pressure_step_psi,"pressure_ceiling_psi":c.pressure_ceiling_psi,"maximum_zero_offset_psi":c.maximum_zero_offset_psi,"dry_self_test_confirmed":c.dry_self_test_confirmed,"grouped_panel":c.grouped_panel});
+        // Current Turbo binding projection: the pressure deadband is intentionally bound.
+        let current_projection = serde_json::json!({"nitrogen_target_psi":c.nitrogen_target_psi,"nitrogen_steps":c.nitrogen_steps,"fill_overfill_kg":c.fill_overfill_kg,"fill_tolerance_kg":c.fill_tolerance_kg,"fill_settle_ms":c.fill_settle_ms,"turbocharge_max_added_mass_kg":c.turbocharge_max_added_mass_kg,"turbocharge_pressure_deadband_psi":c.turbocharge_pressure_deadband_psi,"pressure_step_psi":c.pressure_step_psi,"pressure_ceiling_psi":c.pressure_ceiling_psi,"maximum_zero_offset_psi":c.maximum_zero_offset_psi,"dry_self_test_confirmed":c.dry_self_test_confirmed,"grouped_panel":c.grouped_panel});
         let mut expected = binding.clone();
-        expected["config"] = legacy;
+        expected["config"] = current_projection;
         let expected = serde_json::to_vec(&expected).unwrap();
         let before = serde_json::to_vec(&binding).unwrap();
         assert_eq!(before, expected);
@@ -1582,11 +1644,12 @@ mod tests {
             ring::digest::digest(&ring::digest::SHA256, &after).as_ref()
         );
         println!(
-            "COLD_FLOW_CONTROL legacy_turbo_binding_bytes_and_hash=IDENTICAL cold_target_only=INERT"
+            "COLD_FLOW_CONTROL current_turbo_binding_projection=IDENTICAL cold_target_only=INERT deadband=BOUND"
         );
         let original = rt.engine.config.clone();
-        let mutations: [fn(&mut Config); 11] = [
+        let mutations: [fn(&mut Config); 12] = [
             |c| c.nitrogen_target_psi += 1.,
+            |c| c.turbocharge_pressure_deadband_psi = 16.,
             |c| {
                 c.nitrogen_steps = vec![gse_sequence::NitrogenStep {
                     target_psi: 35.,
