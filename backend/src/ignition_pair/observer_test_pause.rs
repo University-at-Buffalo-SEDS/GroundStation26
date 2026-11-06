@@ -3,6 +3,7 @@ use super::*;
 struct Gate {
     entered: mpsc::Sender<()>,
     resume: Mutex<mpsc::Receiver<()>>,
+    expire_request: AtomicBool,
 }
 struct Installed {
     key: usize,
@@ -24,6 +25,7 @@ impl Pause {
             gate: Arc::new(Gate {
                 entered,
                 resume: Mutex::new(resumed),
+                expire_request: AtomicBool::new(false),
             }),
         });
         Self {
@@ -32,6 +34,13 @@ impl Pause {
             key,
         }
     }
+    pub(super) fn expire_original_request(&self) {
+        let slot = GATE.get().unwrap().lock().unwrap();
+        let installed = slot.as_ref().unwrap();
+        assert_eq!(installed.key, self.key);
+        installed.gate.expire_request.store(true, Ordering::Release);
+    }
+
 }
 impl Drop for Pause {
     fn drop(&mut self) {
@@ -47,7 +56,7 @@ impl Drop for Pause {
         }
     }
 }
-pub(super) fn after_topology(owner: &Arc<Observer>) {
+pub(super) fn after_topology(owner: &Arc<Observer>, requested: Instant) -> Instant {
     let gate = GATE.get().and_then(|slot| {
         slot.lock()
             .unwrap()
@@ -62,5 +71,9 @@ pub(super) fn after_topology(owner: &Arc<Observer>) {
             .unwrap()
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
+        if gate.expire_request.load(Ordering::Acquire) {
+            return Instant::now() - MAX_AGE - Duration::from_millis(10);
+        }
     }
+    requested
 }

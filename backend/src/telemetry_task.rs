@@ -379,6 +379,7 @@ async fn handle_local_ground_station_launch_command(
         emit_notification_warning(&state, error);
         return;
     }
+    state.begin_daq_launch_log();
     log_command_dispatch(
         "Valve launch sequence command",
         "umbilical_comms",
@@ -386,7 +387,6 @@ async fn handle_local_ground_station_launch_command(
         &[ValveBoardCommands::Sequence as u8],
     );
     flush_command_tx(&router, "Valve launch sequence command tx");
-    state.begin_daq_launch_log();
     crate::auto_zero::launch(&state);
     state.set_launch_indicator_latched(true);
     sequences::refresh_action_policy_now(&state);
@@ -492,6 +492,8 @@ async fn handle_flight_computer_launch_command(
         );
         return;
     }
+    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+    state.begin_daq_launch_log();
     log_command_dispatch(
         "Launch command",
         "broadcast",
@@ -5567,9 +5569,7 @@ mod tests {
             #[cfg(feature = "hitl_mode")]
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "hitl_mode")]
-            hitl_safety_interlocks: Arc::new(std::array::from_fn(|index| {
-                std::sync::atomic::AtomicBool::new(matches!(index, 1 | 2))
-            })),
+            hitl_safety_interlocks: crate::state::default_hitl_safety_interlocks(),
             #[cfg(feature = "hitl_mode")]
             hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
             recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
@@ -7433,6 +7433,11 @@ mod tests {
     mod launch_preflight {
         use super::*;
         include!("telemetry_task/launch_preflight_tests.rs");
+    }
+    #[cfg(feature = "hitl_mode")]
+    mod launch_admission_latency {
+        use super::*;
+        include!("telemetry_task/launch_admission_latency_tests.rs");
     }
     mod launch_retry_controls {
         use super::*;

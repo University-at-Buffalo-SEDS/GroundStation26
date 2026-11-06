@@ -544,7 +544,7 @@ impl Runtime {
     /// admission or the pure model effect is permitted here, never a flush,
     /// callback, journal, GSE/state lookup or await. Public437 RX callbacks run
     /// after its core guard is dropped; held-core/reentrant tests protect that.
-    /// Mandatory pair proof is independent of optional HITL participation.
+    /// Strict proof view; optional HITL admission is selected separately.
     pub(crate) fn ignition_pair_current(&self) -> bool {
         let Ok(register) = self.register.try_lock() else { return false; };
         let (aborted, proven) = Self::masks_at(&register, Instant::now());
@@ -553,8 +553,8 @@ impl Runtime {
     }
     /// Direct sequence admission adds no Launch/retraction/history mutation.
     /// Caller owns the original Stop/reset context; callback is SDK.try only.
-    pub(crate) fn admit_ignition_pair<T>(
-        &self, revision: u64, admit: impl FnOnce() -> T,
+    pub(crate) fn admit_ignition<T>(
+        &self, revision: u64, require_fresh: bool, admit: impl FnOnce() -> T,
     ) -> Result<T, &'static str> {
         let register = self.register.try_lock().map_err(|_| "Ignition board proof owner busy")?;
         if register.history_frozen || register.abort_revision == u64::MAX
@@ -562,7 +562,7 @@ impl Runtime {
             return Err("Ignition context changed; no new sequence was admitted");
         }
         let (aborted, proven) = Self::masks_at(&register, Instant::now());
-        if aborted != 0 || proven & crate::ignition_pair::REQUIRED_MASK != crate::ignition_pair::REQUIRED_MASK {
+        if aborted != 0 || require_fresh && proven & crate::ignition_pair::REQUIRED_MASK != crate::ignition_pair::REQUIRED_MASK {
             return Err("Ignition requires fresh non-Abort Actuator and Valve Board readbacks");
         }
         let result = admit();

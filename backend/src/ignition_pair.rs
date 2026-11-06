@@ -95,7 +95,24 @@ pub(crate) fn validate_route_token(
     }
 }
 
+/// HITL's board-state proof switch is opt-in; normal builds always enforce it.
+pub(crate) fn proof_enforced(state: &AppState) -> bool {
+    state.board_state_proof_enforced()
+}
+
 pub(crate) fn readiness(state: &AppState) -> Result<(), &'static str> {
+    if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
+        return Err("Ground station is shutting down");
+    }
+    if state.board_abort.masks().0 != 0 {
+        return Err("A board reports Abort; ignition is inhibited");
+    }
+    if state.topology_router.get().is_none() {
+        return Err("Ignition router unavailable");
+    }
+    if !proof_enforced(state) {
+        return Ok(());
+    }
     if !state.board_abort.ignition_pair_current() {
         state
             .board_abort
@@ -121,7 +138,9 @@ fn disable(policy: &mut ActionPolicyMsg) {
 /// fill routes: RRLS projects the primary's policy and commands return to primary.
 pub(crate) fn project_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
     if !crate::rrls::is_rrls()
-        && (!state.board_abort.ignition_pair_current() || require_routes(state).is_err())
+        && (state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire)
+            || state.board_abort.masks().0 != 0
+            || proof_enforced(state) && (!state.board_abort.ignition_pair_current() || require_routes(state).is_err()))
     {
         disable(policy);
     }
@@ -129,7 +148,10 @@ pub(crate) fn project_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
 
 /// Snapshot callers can already hold application owners: inspect RAM only here.
 pub(crate) fn project_fresh_proof(state: &AppState, policy: &mut ActionPolicyMsg) {
-    if !crate::rrls::is_rrls() && !state.board_abort.ignition_pair_current() {
+    if !crate::rrls::is_rrls()
+        && (state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire)
+            || state.board_abort.masks().0 != 0
+            || proof_enforced(state) && !state.board_abort.ignition_pair_current()) {
         disable(policy);
     }
 }
@@ -137,6 +159,50 @@ pub(crate) fn project_fresh_proof(state: &AppState, policy: &mut ActionPolicyMsg
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn hitl_proof_opt_in_preserves_actual_abort_stop_shutdown_and_router_identity() {
+        if crate::operator_queue::isolated_native_case(module_path!(), "hitl_proof_opt_in_preserves_actual_abort_stop_shutdown_and_router_identity") { return; }
+        for blocker in ["none", "proof_on", "abort", "stop", "shutdown", "other_router"] {
+            let state = crate::state::tests::test_app_state().await;
+            let router = std::sync::Arc::new(sedsnet::router::Router::new(
+                sedsnet::router::RouterConfig::new([]).with_sender("GS")));
+            state.topology_router.set(router.clone()).unwrap();
+            router.try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(1_793_563_200_000)).unwrap();
+            #[cfg(feature = "hitl_mode")]
+            if blocker == "proof_on" { state.toggle_hitl_safety_interlock(3); }
+            if blocker == "abort" {
+                state.board_abort.observe_abort(crate::types::Board::ActuatorBoard, std::time::Instant::now(), 100);
+            }
+            if blocker == "stop" { state.manual_abort_intent.request_untimed(); }
+            if blocker == "shutdown" { state.request_shutdown(); }
+            let unrelated = sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([]).with_sender("OTHER"));
+            let dispatch_router = if blocker == "other_router" { &unrelated } else { router.as_ref() };
+            let result = crate::gse::queue_controller_with_stop_fence(
+                &state, dispatch_router, crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
+                &[crate::rocket_commands::ActuatorBoardCommands::IgniterSequence as u8]);
+            let accepted = result.unwrap_or(false);
+            let expected = cfg!(feature = "hitl_mode") && blocker == "none";
+            assert_eq!(accepted, expected, "blocker={blocker}, optional proof must not bypass actual Abort/Stop/identity");
+            if blocker == "none" {
+                #[cfg(feature = "hitl_mode")]
+                {
+                    for index in 0..4 { assert!(!state.hitl_safety_interlock_enabled(index)); }
+                    state.set_action_policy(crate::sequences::default_action_policy());
+                    let policy = state.action_policy_snapshot();
+                    for name in ["TogglePlumbingDelayInterlock", "ToggleChecklistInterlock", "ToggleSupplyInterlock", "ToggleBoardStateProofInterlock"] {
+                        assert_eq!(policy.controls.iter().find(|control|control.cmd==name).unwrap().actuated, Some(false), "public policy default {name}");
+                    }
+                }
+                assert_eq!(proof_enforced(&state), !cfg!(feature = "hitl_mode"));
+                assert_eq!(readiness(&state).is_ok(), cfg!(feature = "hitl_mode"));
+            }
+            if blocker == "proof_on" || blocker == "abort" || blocker == "shutdown" {
+                assert!(readiness(&state).is_err());
+            }
+            state.request_shutdown();
+        }
+    }
+
     #[test]
     fn automatic_bit_does_not_bypass_sequence_classification_and_off_is_not_gated() {
         crate::telemetry_schema::initialize().unwrap();

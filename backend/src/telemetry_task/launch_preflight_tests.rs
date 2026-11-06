@@ -2,6 +2,7 @@
 async fn fixture() -> (Arc<AppState>, Arc<Router>) {
     let state = crate::state::tests::test_app_state().await;
     state.set_local_flight_state(FlightState::Idle);
+    state.toggle_hitl_safety_interlock(3); // This suite specifically exercises enabled ignition-proof preflight.
     let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([
         crate::ignition_pair::fixture::handler(&state, |_| Ok(())),
     ]).with_sender("GS")));

@@ -4,6 +4,8 @@ async fn ignition_pair_absent_owners_refuses_new_sdk_sequence() {
     crate::telemetry_schema::initialize().unwrap();
     let fixture = super::super::tests::http_fixture().await;
     let state = fixture.state.clone();
+    #[cfg(feature = "hitl_mode")]
+    state.toggle_hitl_safety_interlock(3); // Missing-proof refusal is an explicitly enabled policy.
     let host = Arc::new(Router::new(
         RouterConfig::new([EndpointHandler::new_packet_handler(
             crate::telemetry_schema::endpoint("GROUND_STATION"),

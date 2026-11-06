@@ -27,6 +27,10 @@ use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Duration, Instant};
 
 pub const LAUNCH_COUNTDOWN_DURATION_MS: i64 = 10_000;
+#[cfg(feature = "hitl_mode")]
+pub(crate) fn default_hitl_safety_interlocks() -> Arc<[AtomicBool; 4]> {
+    Arc::new(std::array::from_fn(|_| AtomicBool::new(false)))
+}
 pub const UMBILICAL_PENDING_VALVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const BOARD_STATUS_BROADCAST_MIN_INTERVAL_MS: u64 = 200;
 pub(crate) const BOARD_SEEN_TIMEOUT_MS: u64 = 12_000;
@@ -4072,6 +4076,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn gse_active_sequence_preserves_supply_feedback_interlocks_and_explicit_closes() {
         let state = active_gse_with_enabled_manual_policy(false).await;
+        #[cfg(feature = "hitl_mode")]
+        state.toggle_hitl_safety_interlock(2); // Explicitly qualify enabled supply-feedback enforcement.
         for cmd in [TelemetryCommand::Nitrogen, TelemetryCommand::Nitrous] {
             assert!(
                 !state.is_command_allowed(&cmd),
@@ -4361,9 +4367,7 @@ pub(crate) mod tests {
             #[cfg(feature = "hitl_mode")]
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "hitl_mode")]
-            hitl_safety_interlocks: Arc::new(std::array::from_fn(|index| {
-                std::sync::atomic::AtomicBool::new(matches!(index,1|2))
-            })),
+            hitl_safety_interlocks: default_hitl_safety_interlocks(),
             #[cfg(feature = "hitl_mode")]
             hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
             recording_status: Arc::new(Mutex::new(RecordingStatusMsg {

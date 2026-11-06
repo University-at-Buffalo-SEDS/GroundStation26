@@ -10,7 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 const REFRESH: Duration = Duration::from_millis(50);
-const MAX_AGE: Duration = Duration::from_millis(100);
+// Server-owned lease tolerates normal durable preparation and scheduler stalls.
+// Side/connection generations, Abort and reset epochs still invalidate immediately.
+const MAX_AGE: Duration = Duration::from_secs(5);
 const MAX_SIDES: usize = 64;
 static WORKER_ALIVE: AtomicBool = AtomicBool::new(false);
 #[derive(Clone)]
@@ -256,7 +258,8 @@ fn dispatcher() -> &'static Option<mpsc::SyncSender<Job>> {
                     };
                     if young(job.requested) && job.epoch == owner.epoch.load(Ordering::Acquire) {
                         let topology = job.router.export_topology();
-                        #[cfg(test)] test_pause::after_topology(&owner);
+                        #[cfg(test)]
+                        let job = Job { requested: test_pause::after_topology(&owner, job.requested), ..job };
                         let runtime = job.router.export_runtime_stats();
                         {
                             let mut sides = [None; 2];

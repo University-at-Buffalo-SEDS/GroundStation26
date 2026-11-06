@@ -3732,8 +3732,9 @@ pub(crate) fn queue_controller_with_launch_revision(
     } else {
         LaunchAdmission::capture(state)
     };
-    let pair_required = crate::ignition_pair::packet_requires_pair(kind, payload);
-    if pair_required && !crate::ignition_pair::same_router(state,router) { return Ok(false); }
+    let pair_command = crate::ignition_pair::packet_requires_pair(kind, payload);
+    let pair_required = pair_command && crate::ignition_pair::proof_enforced(state);
+    if pair_command && !crate::ignition_pair::same_router(state,router) { return Ok(false); }
     let packet = crate::telemetry_task::controller_packet(router, kind, payload)?;
     // Only the explicit hardware abort-safe directions bypass the fence.
     if abort_safe_control(kind, payload) {
@@ -3774,9 +3775,9 @@ pub(crate) fn queue_controller_with_launch_revision(
                 || with_stop_admission(state, ticket, offer),
             )
             .and_then(|v| v.map_err(|error| error.to_string()))
-    } else if pair_required {
+    } else if pair_command {
         with_stop_admission(state, ticket, || {
-            state.board_abort.admit_ignition_pair(ticket.board_abort_revision,
+            state.board_abort.admit_ignition(ticket.board_abort_revision, pair_required,
                 offer)
         }).and_then(|result| result).map_err(str::to_string)
     } else {
@@ -3835,7 +3836,8 @@ fn with_launch_admission<T>(
 ) -> Result<T, String> {
     // Observe routes before taking any application owner. Metadata-only state
     // publication retains its original mode policy; it is not an igniter command.
-    let route_token = if ignition_pair_required {
+    let require_fresh_pair = ignition_pair_required && crate::ignition_pair::proof_enforced(state);
+    let route_token = if require_fresh_pair {
         if !state.board_abort.ignition_pair_current() {
             state.board_abort.request_queries(crate::board_abort::required_mask(state)
                 | crate::ignition_pair::REQUIRED_MASK);
@@ -3847,7 +3849,7 @@ fn with_launch_admission<T>(
     if cold_flow::active(state){return Err("Rocket Launch is inhibited while cold flow owns the valves".into());}
     with_stop_admission(state, ticket, || ()).map_err(str::to_string)?;
     let required = crate::board_abort::required_mask(state)
-        | if ignition_pair_required { crate::ignition_pair::REQUIRED_MASK } else { 0 };
+        | if require_fresh_pair { crate::ignition_pair::REQUIRED_MASK } else { 0 };
     state
         .board_abort
         .admit_launch(state, required, ticket.board_abort_revision, || {

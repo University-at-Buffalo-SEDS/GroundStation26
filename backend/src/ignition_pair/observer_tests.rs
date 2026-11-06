@@ -122,7 +122,7 @@ fn late_capture_cannot_publish_as_fresh_and_reads_never_renew_capture_age() {
     let pause = super::test_pause::Pause::install(&owner);
     owner.request(router.clone(), 0);
     pause.entered.recv_timeout(Duration::from_secs(2)).unwrap();
-    std::thread::sleep(MAX_AGE + Duration::from_millis(10));
+    pause.expire_original_request();
     pause.resume.send(()).unwrap();
     completed(&owner);
     assert!(
@@ -135,11 +135,13 @@ fn late_capture_cannot_publish_as_fresh_and_reads_never_renew_capture_age() {
     let token = owner.read(&router, 0).unwrap();
     let original = token.requested;
     assert_eq!(owner.read(&router, 0).unwrap().requested, original);
-    std::thread::sleep(MAX_AGE + Duration::from_millis(10));
+    let expired = Instant::now() - MAX_AGE - Duration::from_millis(10);
+    owner.cache.lock().unwrap().as_mut().unwrap().requested = expired;
     assert!(owner.read(&router, 0).is_err());
     assert_eq!(
         owner.cache.lock().unwrap().as_ref().unwrap().requested,
-        original
+        expired,
+        "reading an expired original observation cannot renew it"
     );
 }
 #[test]

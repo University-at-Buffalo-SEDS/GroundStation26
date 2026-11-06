@@ -25,7 +25,10 @@ async fn ignition_valid_fixture() -> Fixture {
             )
         })
         .collect();
-    Fixture::from_saved_with_services_profile(None, Some(owners), None, true, false, true).await
+    let fixture = Fixture::from_saved_with_services_profile(None, Some(owners), None, true, false, true).await;
+    #[cfg(feature = "hitl_mode")]
+    fixture.state().toggle_hitl_safety_interlock(3); // These regressions qualify explicitly enabled pair proof.
+    fixture
 }
 async fn ignition_query_pair(fixture: &Fixture) {
     fixture.query(Board::ActuatorBoard).await;
@@ -142,11 +145,10 @@ async fn ignition_pair_route_loss_after_real_proof_refuses_first_owner() {
 }
 #[cfg(feature = "hitl_mode")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ignition_pair_hitl_optional_flags_and_viewer_cannot_bypass() {
-    if crate::operator_queue::isolated_native_case(module_path!(), "ignition_pair_hitl_optional_flags_and_viewer_cannot_bypass") { return; }
+async fn ignition_pair_hitl_opt_in_requires_proof_and_off_preserves_viewer_authorization() {
+    if crate::operator_queue::isolated_native_case(module_path!(), "ignition_pair_hitl_opt_in_requires_proof_and_off_preserves_viewer_authorization") { return; }
     let fixture = ignition_valid_fixture().await;
     let state = fixture.state();
-    state.hitl_safety_interlocks[3].store(false, std::sync::atomic::Ordering::Release);
     state
         .hitl_button_interlock_enabled
         .store(false, std::sync::atomic::Ordering::Release);
@@ -166,7 +168,20 @@ async fn ignition_pair_hitl_optional_flags_and_viewer_cannot_bypass() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
+    state.toggle_hitl_safety_interlock(3);
+    assert!(state.is_command_allowed(&crate::types::TelemetryCommand::IgniterSequence),
+        "explicit HITL proof OFF does not require fresh readbacks");
+    for (principal, expected) in [("viewer", StatusCode::FORBIDDEN), ("operator", StatusCode::OK)] {
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder().method("POST").uri("/api/command")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {principal}"))
+            .body(axum::body::Body::from(json!("IgniterSequence").to_string())).unwrap();
+        let response = crate::web::router(state.clone(), "fixture-only".into()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), expected, "proof override never grants viewer command permission");
+    }
     ignition_query_pair(&fixture).await;
+    state.toggle_hitl_safety_interlock(3);
     assert!(state.is_command_allowed(&crate::types::TelemetryCommand::IgniterSequence));
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -234,8 +249,6 @@ async fn ignition_pair_missing_vb_blocks_the_entire_fc_and_vb_bundle() {
     if crate::operator_queue::isolated_native_case(module_path!(), "ignition_pair_missing_vb_blocks_the_entire_fc_and_vb_bundle") { return; }
     let fixture = ignition_valid_fixture().await;
     let state = fixture.state();
-    #[cfg(feature = "hitl_mode")]
-    state.hitl_safety_interlocks[3].store(false, std::sync::atomic::Ordering::Release);
     fixture.query(Board::ActuatorBoard).await;
     let host = state.topology_router.get().unwrap();
     let ticket = crate::gse::plumbing_admission_ticket(&state);
@@ -441,6 +454,9 @@ async fn ignition_pair_actual_core_busy_then_route_loss_has_zero_sdk_owners() {
     )
     .await;
     let state = fixture.state();
+    #[cfg(feature = "hitl_mode")]
+    state.toggle_hitl_safety_interlock(3); // Explicitly qualify enabled fresh-route fencing.
+
     owner.store(Arc::as_ptr(&state) as usize, AtomicOrdering::Release);
     ignition_query_pair(&fixture).await;
     ignition_hold_transport(&fixture).await;

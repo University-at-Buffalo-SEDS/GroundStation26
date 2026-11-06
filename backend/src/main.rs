@@ -1438,9 +1438,7 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "hitl_mode")]
         hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
         #[cfg(feature = "hitl_mode")]
-        hitl_safety_interlocks: Arc::new(std::array::from_fn(|index| {
-            std::sync::atomic::AtomicBool::new(matches!(index, 1 | 2))
-        })),
+        hitl_safety_interlocks: state::default_hitl_safety_interlocks(),
         #[cfg(feature = "hitl_mode")]
         hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
         recording_status: Arc::new(Mutex::new(RecordingStatusMsg {

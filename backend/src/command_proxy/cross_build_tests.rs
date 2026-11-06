@@ -50,7 +50,7 @@ async fn cross_compiled_interlock_exchange_or_local_enum_contract(){
             assert_eq!(execute_primary(state.clone(),&request).await,Outcome::Queued);
             #[cfg(feature="hitl_mode")]
             tokio::time::timeout(std::time::Duration::from_secs(2),async {
-                let expected=matches!(index,1|2);
+                let expected=false;
                 while state.hitl_safety_interlock_enabled(index)==expected {tokio::task::yield_now().await;}
                 while state.action_policy_snapshot().controls.iter().find(|c|c.cmd==*name).is_none_or(|c|c.actuated!=Some(!expected)){tokio::task::yield_now().await;}
             }).await.unwrap();
@@ -115,11 +115,11 @@ async fn cross_compiled_interlock_exchange_or_local_enum_contract(){
             assert_eq!(crate::primary_mirror::board_state_proof_policy(&state),Some(index==3));
             assert_eq!(crate::primary_mirror::board_history_required_scope(&state),Some(if index==3{0x7f}else{0}));
             let policy=crate::primary_mirror::action_policy(&state).unwrap();
-            assert_eq!(policy.controls.iter().find(|control|control.cmd==*name).unwrap().actuated,Some(matches!(index,0|3)));
+            assert_eq!(policy.controls.iter().find(|control|control.cmd==*name).unwrap().actuated,Some(true));
             if index==0 {put(&shared,"duplicate0",&bytes);assert!(matches!(runtime.receive(&r,rv,Mode::Normal,&get(&shared,"duplicate-result0").await).unwrap(),Received::Result{outcome:Outcome::Queued,..}));}
         }
         disk.release();retained.idle().await;
-        assert_eq!(retained_config::snapshot(Some(mode),true).settings,[Some(true),Some(false),Some(false),Some(true)]);
+        assert_eq!(retained_config::snapshot(Some(mode),true).settings,[Some(true);4]);
         let before_refresh=std::fs::read(&saved_path).unwrap();
         put(&shared,"refresh-after-save",&runtime.query_observe(&r,rv).unwrap());
         let Received::Capability{boot,mode,observation}=runtime.receive(&r,rv,Mode::Normal,&get(&shared,"refresh-after-save-result").await).unwrap()else{panic!("fresh accepted capability")};
@@ -140,7 +140,7 @@ async fn cross_compiled_interlock_exchange_or_local_enum_contract(){
         assert_eq!(retained_config::snapshot(Some(mode),false).status,"disconnected");
         retained.shutdown().await;
         let mut restarted=retained_config::Worker::open_at(Arc::new(Pairing::from_file(&root.0.join("rrls.json")).unwrap()),saved_path);restarted.idle().await;
-        assert_eq!(retained_config::snapshot(Some(mode),false).settings,[Some(true),Some(false),Some(false),Some(true)]);
+        assert_eq!(retained_config::snapshot(Some(mode),false).settings,[Some(true);4]);
         assert_eq!(retained_config::snapshot(Some(Mode::Normal),false).settings,[None;4]);
         restarted.shutdown().await;
         assert!(runtime.request(&r,Transport{session:session.wrapping_add(1),sequence:1},mode,[100;16],"operator".into(),Operation::Command(NAMES[0].into())).is_err(),"reconnect cannot invent primary HITL authority");

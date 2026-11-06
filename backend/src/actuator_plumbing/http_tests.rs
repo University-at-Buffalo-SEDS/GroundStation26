@@ -2373,8 +2373,8 @@ async fn hitl_safety_interlocks_actual_http_receiver_changes_require_permission_
     let original_generation = crate::gse::automatic_generation(&f.state);
     for (index, name, initial) in [
         (0, "TogglePlumbingDelayInterlock", false),
-        (1, "ToggleChecklistInterlock", true),
-        (2, "ToggleSupplyInterlock", true),
+        (1, "ToggleChecklistInterlock", false),
+        (2, "ToggleSupplyInterlock", false),
         (3,"ToggleBoardStateProofInterlock",false),
     ] {
         assert_eq!(f.state.hitl_safety_interlock_enabled(index), initial);
