@@ -378,7 +378,7 @@ pub(crate) fn schedule_motion_under_dispatch(
             && row.mode_revision == inner.desired.revision
             && row.value.setting.ready() && !row.value.setting.busy
             && row.value.setting.mode.map(|m| m as u8) == Some(inner.desired.mode)
-        ).ok_or("Check launch readiness for fresh actuator MotionV2 identity before retracting.")?;
+        ).ok_or("Refreshing actuator retraction status; try again shortly.")?;
             (
                 inner.desired.mode,
                 inner.desired.revision,
@@ -675,7 +675,8 @@ pub(crate) fn request_drive_query(state: &AppState) -> Result<(), String> {
     }, crate::system_clock::control_packet_timestamp_ms(router))
 }
 
-/// Explicit read-only demand only. A failed/legacy peer never becomes ready.
+/// Nonce-correlated read-only observation, shared by background refresh and
+/// explicit readiness checks. A failed/legacy peer never becomes ready.
 pub(crate) fn request_motion_query(state: &AppState) -> Result<(), String> {
     if !primary(state) {
         return Err("Motion provenance checks require the primary GS".into());
@@ -701,7 +702,11 @@ pub(crate) fn request_motion_query(state: &AppState) -> Result<(), String> {
         if inner
             .motion_queries
             .back()
-            .is_some_and(|q| q.sent.age().is_some_and(|age| age < 1_000))
+            .is_some_and(|q| q.sent.age().is_some_and(|age| {
+                age < 1_000 || (!q.complete && age <= REQUEST_TTL
+                    && q.mode_revision == inner.desired.revision
+                    && q.generation == crate::gse::automatic_generation(state))
+            }))
         {
             return Ok(());
         }
@@ -1652,11 +1657,20 @@ fn motion_ready_inner(state: &AppState, inner: &Inner) -> Result<(), String> {
         .as_ref()
         .filter(|row| fresh(state, row))
         .ok_or("Fresh actuator drive readback is required.")?;
-    if !observed.value.ready()
-        || observed.value.busy
-        || observed.value.mode.map(|mode| mode as u8) != Some(inner.desired.mode)
-    {
-        return Err("Actuator is moving or drive confirmation is pending.".into());
+    if !observed.value.ready() {
+        return Err(format!("Actuator drive is not ready ({}). Check drive settings.", observed.value.result_name()));
+    }
+    if observed.value.busy {
+        let action = ["idle", "retracting", "extending"][observed.value.active_action as usize];
+        return Err(format!("Actuator is {action} ({} ms remaining). Wait for it to stop.", observed.value.remaining_ms));
+    }
+    if observed.value.mode.map(|mode| mode as u8) != Some(inner.desired.mode) {
+        let label = |mode| match mode {
+            Some(Mode::Stepper) => "Stepper", Some(Mode::Auxiliary) => "Auxiliary",
+            Some(Mode::HBridge) => "H-bridge", None => "unknown drive",
+        };
+        return Err(format!("Actuator reports {}; save the selected {} drive in Settings before retracting.",
+            label(observed.value.mode), label(Mode::decode(inner.desired.mode))));
     }
     Ok(())
 }

@@ -774,6 +774,7 @@ impl ActuatorReadbackRefresh {
             return false;
         }
         let _ = crate::actuator_plumbing::request_drive_query(state);
+        let _ = crate::actuator_plumbing::request_motion_query(state);
         true
     }
 }

@@ -870,7 +870,7 @@ async fn public_motion_queue_cannot_cross_mode_commit_and_fresh_motion_keeps_ori
     }
     let _serial = SERIAL.lock().await;
     let mut f = Fixture::new().await;
-    f.prime().await;
+    f.prime_background_motion_identity().await;
     let old_path = crate::gse::armed_fixture_for_test(&f.state, &f.host);
     for side in f
         .host
@@ -1040,7 +1040,7 @@ async fn public_motion_queue_cannot_cross_mode_commit_and_fresh_motion_keeps_ori
         && p.payload() == [8]));
     // New protocol prerequisite: actual fresh current-mode/safe-state proof,
     // not a synthetic timer or an arbitrary sleep/dedup delay.
-    f.prime_motion_identity().await;
+    f.prime_background_motion_identity().await;
     // Immediate new-mode intent must not need a dedup delay.
     let before_request_stamp = f.host.network_time_ms().unwrap();
     let started = std::time::Instant::now();
@@ -1319,6 +1319,36 @@ impl Fixture {
                 tokio::task::yield_now().await;
             }
         }).await.expect("actual current-mode nonce-correlated MotionV2 response");
+    }
+
+    /// The normal backend service owns every QUERY here. No readiness page,
+    /// explicit query endpoint or synthetic observation installs the proof.
+    async fn prime_background_motion_identity(&mut self) {
+        let mut proof = vec![0; 56];
+        proof[0] = 2;
+        proof[2] = self.mode;
+        proof[3] = 5;
+        proof[12..20].copy_from_slice(&42u64.to_le_bytes());
+        proof[20..24].copy_from_slice(&1u32.to_le_bytes());
+        proof[48..52].copy_from_slice(&45_000u32.to_le_bytes());
+        self.motion = Some(proof);
+        let mut refresh = crate::board_abort::ActuatorReadbackRefresh::default();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                self.state.network_health.lock().unwrap().observe("AB", std::time::Instant::now(),100);
+                let _ = refresh.poll(&self.state);
+                self.pump();
+                let current = {
+                    let inner=self.state.plumbing_drive.inner.lock().unwrap();
+                    inner.motion_observed.as_ref().is_some_and(|row|
+                        row.mode_revision==inner.desired.revision
+                        &&row.value.setting.mode.map(|mode|mode as u8)==Some(self.mode)
+                        &&row.after.age().is_some_and(|age|age<=FRESH_MS))
+                };
+                if current && crate::board_recovery::actuator_cached_motion_safe_proof(&self.state).is_some() { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("backend background QUERY receives current-mode MotionV2 and actual safe-state identity");
     }
 
     fn retractions(&self) -> Vec<Packet> {

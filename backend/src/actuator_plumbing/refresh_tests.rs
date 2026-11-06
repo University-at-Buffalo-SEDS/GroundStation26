@@ -79,3 +79,50 @@ async fn background_drive_query_preserves_unanswered_set_and_its_pending_nonce()
     assert_eq!(inner.requests[0].request.mode, Some(Mode::Auxiliary));
     assert!(!inner.requests[0].complete);
 }
+
+#[tokio::test]
+async fn motion_query_preserves_pending_current_context_but_refreshes_after_mode_change() {
+    let fixture = http_tests::Fixture::new().await;
+    request_motion_query(&fixture.state).unwrap();
+    let (nonce, sent) = {
+        let mut inner = fixture.state.plumbing_drive.inner.lock().unwrap();
+        let query = inner.motion_queries.back_mut().unwrap();
+        query.sent.wall -= Duration::from_millis(1_500);
+        if let Some(model) = query.sent.model.as_mut() { *model = model.checked_sub(1_500).unwrap_or(u64::MAX); }
+        (query.nonce, query.sent.wall)
+    };
+    request_motion_query(&fixture.state).unwrap();
+    {
+        let mut inner = fixture.state.plumbing_drive.inner.lock().unwrap();
+        assert_eq!(inner.motion_queries.len(), 1);
+        assert_eq!((inner.motion_queries[0].nonce, inner.motion_queries[0].sent.wall), (nonce, sent));
+        inner.desired.revision += 1;
+        inner.desired.mode = Mode::Auxiliary as u8;
+    }
+    request_motion_query(&fixture.state).unwrap();
+    let inner = fixture.state.plumbing_drive.inner.lock().unwrap();
+    assert_eq!(inner.motion_queries.len(), 2);
+    assert_ne!(inner.motion_queries[1].nonce, nonce);
+    assert_eq!(inner.motion_queries[1].mode_revision, inner.desired.revision);
+    assert_eq!(inner.motion_queries[0].sent.wall, sent);
+}
+
+#[tokio::test]
+async fn drive_mismatch_is_distinct_from_busy_or_unready_feedback() {
+    let mut fixture = http_tests::Fixture::new().await;
+    fixture.prime().await;
+    let mut inner = fixture.state.plumbing_drive.inner.lock().unwrap();
+    inner.desired.mode = Mode::Auxiliary as u8;
+    let mismatch = motion_ready_inner(&fixture.state, &inner).unwrap_err();
+    assert!(mismatch.contains("reports Stepper") && mismatch.contains("selected Auxiliary"), "{mismatch}");
+    assert!(!mismatch.contains("moving"));
+    inner.observed.as_mut().unwrap().value.busy = true;
+    inner.observed.as_mut().unwrap().value.active_action = 1;
+    inner.observed.as_mut().unwrap().value.remaining_ms = 123;
+    let busy = motion_ready_inner(&fixture.state, &inner).unwrap_err();
+    assert!(busy.contains("retracting") && busy.contains("123 ms"), "{busy}");
+    inner.observed.as_mut().unwrap().value.busy = false;
+    inner.observed.as_mut().unwrap().value.result = 7;
+    let unready = motion_ready_inner(&fixture.state, &inner).unwrap_err();
+    assert!(unready.contains("not ready"), "{unready}");
+}
