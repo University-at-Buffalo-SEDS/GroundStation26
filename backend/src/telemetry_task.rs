@@ -330,6 +330,13 @@ async fn handle_local_ground_station_launch_command(
             .await;
         gs_debug_println!("Ground-station launch auto-started DB recording");
     }
+    // Refuse known missing ignition evidence before recording a sticky Fire
+    // intent. Final nonce/epoch/Stop/route checks still run at SDK admission.
+    if let Err(reason) = crate::ignition_pair::readiness(&state) {
+        state.clear_launch_sequence_command_pending();
+        emit_notification_warning(&state, reason);
+        return;
+    }
     #[cfg(feature = "hitl_mode")]
     let ticket =
         match crate::gse::inhibit_automatic_actions_for_launch_revision(&state, launch_revision) {
@@ -421,6 +428,13 @@ async fn handle_flight_computer_launch_command(
             .send(DbQueueItem::Control(RecordingCommand::StartNow))
             .await;
         gs_debug_println!("Launch auto-started DB recording");
+    }
+    // Refuse known missing ignition evidence before recording a sticky Fire
+    // intent. Final nonce/epoch/Stop/route checks still run at SDK admission.
+    if let Err(reason) = crate::ignition_pair::readiness(&state) {
+        state.clear_launch_sequence_command_pending();
+        emit_notification_warning(&state, reason);
+        return;
     }
     #[cfg(feature = "hitl_mode")]
     let ticket =
@@ -7343,6 +7357,11 @@ mod tests {
     mod eval_abort_launch_ingress {
         use super::*;
         include!("telemetry_task/eval_abort_launch_diagnostic.rs");
+    }
+    #[cfg(feature = "hitl_mode")]
+    mod launch_preflight {
+        use super::*;
+        include!("telemetry_task/launch_preflight_tests.rs");
     }
     mod launch_retry_controls {
         use super::*;

@@ -1323,6 +1323,7 @@ impl Fixture {
 
     /// The normal backend service owns every QUERY here. No readiness page,
     /// explicit query endpoint or synthetic observation installs the proof.
+    #[cfg(not(feature = "hitl_mode"))]
     async fn prime_background_motion_identity(&mut self) {
         let mut proof = vec![0; 56];
         proof[0] = 2;
