@@ -925,8 +925,22 @@ pub(super) fn cancel_or_park_current(state: &Arc<AppState>, park: bool) {
         );
     }
 }
+pub(super) fn manual_handoff(cmd: &TelemetryCommand) -> bool {
+    super::valve_command(cmd) || matches!(cmd, TelemetryCommand::Igniter | TelemetryCommand::RetractPlumbing)
+}
 pub(super) fn handle_under_dispatch(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
     if !active(state) {
+        return false;
+    }
+    if manual_handoff(cmd) {
+        // Retire scheduled effects without changing any output. The original
+        // manual packet continues through the normal dispatch path once.
+        let mut rt = state.gse.lock().unwrap();
+        if let Some(session) = &mut rt.cold_flow {
+            session.retired = true;
+            session.pending = None;
+        }
+        rt.cancel_automation_for_manual();
         return false;
     }
     if matches!(cmd, TelemetryCommand::Abort) {
@@ -941,8 +955,12 @@ pub(super) fn handle_under_dispatch(state: &Arc<AppState>, cmd: &TelemetryComman
         );
         return false;
     }
-    // Ordinary control commands cannot steal or launch an owned cold-flow run.
-    !matches!(cmd, TelemetryCommand::ResetSim)
+    // Only competing automation belongs to this controller. Utilities, lights
+    // and other operator commands keep their normal dispatch path.
+    super::action(cmd).is_some()
+        || matches!(cmd, TelemetryCommand::Launch | TelemetryCommand::Turbocharge)
+        || crate::sequences::command_name(cmd) == "GroundStationLaunch"
+        || crate::sequences::command_name(cmd) == "IgniterSequence"
 }
 
 #[cfg(test)]

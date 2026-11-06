@@ -595,7 +595,7 @@ async fn actual_cold_flow_routes_physical_edge_auth_cancel_and_no_launch_clock()
     assert_eq!(f.phase(), ColdPhase::AwaitingRelease);
     assert_eq!(f.actual, CLOSED);
     assert!(!crate::gse::pilot_report_can_advance_launch_clock(&f.state));
-    let blocked = vec![TelemetryCommand::Launch, TelemetryCommand::Igniter];
+    let blocked = vec![TelemetryCommand::Launch];
     #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     let blocked = {
         let mut values = blocked;
@@ -1521,4 +1521,29 @@ async fn actual_cold_flow_preparation_busy_retains_origin_and_all_revocations() 
         assert_eq!(pause.keys().0, 0);
         println!("COLD_FLOW_PREPARATION original5s_timeout=refused no_renewal=true");
     }
+}
+
+#[tokio::test]
+async fn manual_handoff_retires_cold_flow_without_emitting_automatic_outputs() {
+    if crate::operator_queue::isolated_native_case(module_path!(),
+        "manual_handoff_retires_cold_flow_without_emitting_automatic_outputs") { return; }
+    let mut f = Fixture::new().await;
+    f.start().await;
+    f.hold();
+    assert!(active(&f.state));
+    // Unrelated operator controls must not be swallowed by valve automation.
+    assert!(!handle_under_dispatch(&f.state, &TelemetryCommand::ToggleAvBayUnderglow));
+    assert!(active(&f.state));
+    let before = f.sent.lock().unwrap().len();
+    let actual = f.actual;
+    assert_ne!(crate::gse::command_allowed(&f.state, &TelemetryCommand::Dump), Some(false));
+    assert!(!handle_under_dispatch(&f.state, &TelemetryCommand::Dump));
+    assert!(!active(&f.state));
+    assert_eq!(f.sent.lock().unwrap().len(), before,
+        "manual handoff must not emit cancellation/vent/park effects");
+    assert_eq!(f.actual, actual);
+    assert!(f.state.gse.lock().unwrap().cold_flow.as_ref().unwrap().pending.is_none());
+    f.step(100.);
+    assert_eq!(f.sent.lock().unwrap().len(), before,
+        "retired scheduled effects must not overwrite manual control");
 }

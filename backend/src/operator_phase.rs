@@ -45,12 +45,24 @@ impl Intent {
     pub(crate) fn context(&self) -> (FlightState, Option<FlightState>, u64, bool) {
         (self.expected, self.target, self.revision, self.local)
     }
+    /// Bind this immutable request to its own admitted manual receipt. Only
+    /// the relief fence advances; deadline, requested phase and Stop stay sealed.
+    pub(crate) fn bind_manual_claim(
+        &mut self,
+        state: &AppState,
+        origin: &crate::operator_queue::manual_origin::Origin,
+    ) -> bool {
+        let Some(successor) = origin.phase_successor(state, self.token) else { return false; };
+        self.token.relief_epoch = successor;
+        true
+    }
     pub(crate) fn validate(&self, state: &AppState) -> bool {
         self.revision != u64::MAX
             && self.captured.elapsed() <= Duration::from_secs(5)
             && self.token.generation == crate::gse::automatic_generation(state)
             && self.token.manual_epoch == state.manual_abort_intent.epoch()
             && self.token.observed_manual_epoch == state.deferred_abort.manual_epoch()
+            && self.token.relief_epoch == state.operator_queue.relief_epoch()
             && crate::gse::operator_phase_mode(state).is_some_and(|(enabled, revision)| {
                 enabled == self.local && revision == self.revision
             })
@@ -92,18 +104,9 @@ pub(crate) fn local_allowed(state: &AppState) -> bool {
         && !state
             .shutdown_requested
             .load(std::sync::atomic::Ordering::Acquire)
-        && state
-            .operator_admission_barrier
-            .load(std::sync::atomic::Ordering::Acquire)
-            == 0
         && !state.abort_indicator_latched()
         && crate::gse::manual_stop_state(state) == crate::gse::CurrentState::Current
         && state.board_abort.masks().0 == 0
-        && state
-            .launch_history
-            .try_lock()
-            .ok()
-            .is_some_and(|h| !h.automatic_actions_inhibited())
         && crate::gse::operator_phase_runtime_available(state)
 }
 pub(crate) fn enabled_for_name(state: &AppState, name: &str) -> Option<bool> {
@@ -196,11 +199,6 @@ pub(crate) fn project(state: &AppState, policy: &mut crate::sequences::ActionPol
         board_revision: state.board_abort.abort_revision(),
     };
     let stop = crate::gse::manual_stop_state(state);
-    let history = state
-        .launch_history
-        .try_lock()
-        .ok()
-        .map(|history| history.automatic_actions_inhibited());
     let runtime = crate::gse::operator_phase_public_context(state);
     let deny = !policy.key_enabled
         || !policy.software_buttons_enabled
@@ -208,17 +206,12 @@ pub(crate) fn project(state: &AppState, policy: &mut crate::sequences::ActionPol
         || state
             .shutdown_requested
             .load(std::sync::atomic::Ordering::Acquire)
-        || state
-            .operator_admission_barrier
-            .load(std::sync::atomic::Ordering::Acquire)
-            != 0
         || state.abort_indicator_latched()
         || state.board_abort.masks().0 != 0
         || binding.revision == u64::MAX
         || binding.manual == u64::MAX
         || binding.observed == u64::MAX
         || matches!(stop, crate::gse::CurrentState::Invalid)
-        || history == Some(true)
         || runtime.is_some_and(|(selected, revision, idle)| {
             !selected || revision != binding.revision || !idle
         });
@@ -226,7 +219,6 @@ pub(crate) fn project(state: &AppState, policy: &mut crate::sequences::ActionPol
     let mask = if deny {
         0
     } else if runtime == Some((true, binding.revision, true))
-        && history == Some(false)
         && matches!(stop, crate::gse::CurrentState::Current)
     {
         u8::from(adjacent(phase, false).is_some())
@@ -385,7 +377,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn boundaries_retained_launch_stop_and_control_mode_aba_refuse_old_intents() {
+    async fn boundaries_stop_and_control_mode_aba_refuse_old_intents() {
         for phase in [
             FlightState::Startup,
             FlightState::Armed,
@@ -430,7 +422,15 @@ mod tests {
             .unwrap()
             .inhibit_automatic_actions()
             .unwrap();
-        assert!(apply(&fixture.state, &value).is_err());
+        // Retained automatic-launch bookkeeping is not a manual phase veto.
+        assert!(value.validate(&fixture.state));
+        fixture.state.operator_admission_barrier.store(77, std::sync::atomic::Ordering::Release);
+        assert!(value.validate(&fixture.state));
+        let policy = fixture.state.action_policy_snapshot();
+        for name in ["AdvanceFlightState", "RewindFlightState"] {
+            assert!(policy.controls.iter().find(|row| row.cmd == name).unwrap().enabled,
+                "recovery bookkeeping must not disable fresh manual phase controls");
+        }
     }
     #[test]
     fn external_json_cannot_forge_internal_phase_and_ladder_never_contains_fire() {

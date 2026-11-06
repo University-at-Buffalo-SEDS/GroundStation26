@@ -1121,6 +1121,16 @@ pub fn all_command_names() -> Vec<&'static str> {
     ]
 }
 
+/// Controls owned by the Valve master while its actual launch scheduler runs.
+/// A retained flight phase/recovery record is not evidence of that ownership.
+pub(crate) fn is_fill_system_control(name: &str) -> bool {
+    matches!(name,
+        "Dump" | "NormallyOpen" | "Pilot" | "Igniter" | "IgniterSequence"
+        | "RetractPlumbing" | "Nitrogen" | "NitrogenClose" | "Nitrous" | "NitrousClose"
+        | "StartFill" | "ContinueFillSequence" | "NitrogenTest" | "ValveSelfTest"
+        | "Turbocharge")
+}
+
 pub fn default_action_policy() -> ActionPolicyMsg {
     #[cfg(feature = "hitl_mode")]
     {

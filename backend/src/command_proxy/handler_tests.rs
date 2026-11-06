@@ -864,6 +864,7 @@ async fn signed_plumbing_origin_preserves_actor_policy_and_rejects_old_peer_or_m
         Outcome::Queued
     );
     let TelemetryCommand::QueuedOperator {
+        recovery_origin: None,
         launch_revision: None,
         plumbing_origin: Some(origin),
         generation,

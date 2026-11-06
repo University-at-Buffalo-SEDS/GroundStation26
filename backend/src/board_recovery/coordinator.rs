@@ -15,6 +15,39 @@ const QUIESCE_TTL: Duration = Duration::from_secs(12);
 const POLL: Duration = Duration::from_millis(300);
 
 #[cfg(test)]
+mod explicit_launch_reset_tests {
+    use super::*;
+    #[tokio::test]
+    async fn launch_reset_is_explicit_hitl_only_and_pending_dispatch_stays_fenced() {
+        let state = crate::state::tests::test_app_state().await;
+        *state.state.lock().unwrap() = crate::types::FlightState::Launch;
+        assert!(!host_safe(&state));
+        assert!(!host_action_allowed(&state, "reset_startup"), "no SDK router cannot prove drained ownership");
+        let endpoint = crate::telemetry_schema::endpoint("ACTUATOR_BOARD");
+        let router = Arc::new(sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([
+            sedsnet::router::EndpointHandler::new_packet_handler(endpoint, |_| Ok(())),
+        ])));
+        state.topology_router.set(router.clone()).unwrap();
+        assert_eq!(host_action_allowed(&state, "reset_startup"), cfg!(feature="hitl_mode"));
+        router.tx_queue(Packet::new(crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
+            &[endpoint], "GS", 100, Arc::from(&b"\x00"[..])).unwrap()).unwrap();
+        assert!(!host_action_allowed(&state, "reset_startup"), "actual SDK controller owner blocks Reset");
+        router.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(host_action_allowed(&state, "reset_startup"), cfg!(feature="hitl_mode"));
+        for action in ["recover_abort", "resync", "reset_startup_all7", "unknown"] {
+            assert!(!host_action_allowed(&state, action), "{action}");
+        }
+        state.launch_sequence_command_pending.store(true, Ordering::Release);
+        assert!(!host_action_allowed(&state, "reset_startup"));
+        state.launch_sequence_command_pending.store(false, Ordering::Release);
+        *state.state.lock().unwrap() = crate::types::FlightState::Armed;
+        assert!(!host_action_allowed(&state, "reset_startup"));
+        *state.state.lock().unwrap() = crate::types::FlightState::Idle;
+        assert!(host_action_allowed(&state, "reset_startup"));
+    }
+}
+
+#[cfg(test)]
 mod shutdown_durability_tests {
     use super::*;
     #[tokio::test]
@@ -322,6 +355,7 @@ fn origin_current(state: &AppState, token: Token) -> bool {
     token.generation != 0
         && token.generation != u64::MAX
         && crate::gse::automatic_generation(state) == token.generation
+        && state.operator_queue.relief_epoch() == token.relief_epoch
         && stop_unchanged(state, token)
 }
 pub(super) fn host_safe(state: &AppState) -> bool {
@@ -331,6 +365,20 @@ pub(super) fn host_safe(state: &AppState) -> bool {
             | crate::types::FlightState::Idle
             | crate::types::FlightState::Aborted
     ) && crate::gse::verified_recovery_host_idle(state)
+}
+/// A human may prepare a scoped HITL Startup reset from Launch. This grants
+/// only a fresh board transaction, never completion inferred from host time.
+pub(super) fn host_action_allowed(state: &AppState, action: &str) -> bool {
+    if host_safe(state) { return true; }
+    #[cfg(feature = "hitl_mode")]
+    if action == "reset_startup"
+        && state.local_flight_state_snapshot() == crate::types::FlightState::Launch
+        && crate::gse::hitl_launch_reset_host_idle(state)
+    {
+        return true;
+    }
+    let _ = action;
+    false
 }
 fn context_same(a: &Readback, b: &Readback) -> bool {
     // A dedicated fresh QUERY necessarily has a different nonce and uptime.
@@ -364,7 +412,7 @@ impl Runtime {
             || !origin_current(state, ticket.token)
             || ticket.reset_selection.is_some_and(|selection| selection.current(state).is_err())
         || ticket.mode != crate::station_mode::local_mode()
-            || !host_safe(state)
+            || !host_action_allowed(state, &ticket.action)
             || state.launch_history.lock().unwrap().snapshot() != ticket.clock
         {
             return None;
@@ -544,12 +592,12 @@ fn prepare_inner(
     if request.backend_instance != hex(&identity)
         || request.reset_epoch != format!("{:016x}", token.generation)
         || !origin_current(state, token)
-        || !host_safe(state)
+        || !host_action_allowed(state, &request.action)
         || state.board_recovery.coordinator.busy()
         || principal.anonymous
         || request.mode.is_some()
     {
-        return Err("Recovery origin/session changed or GS is not safely Startup, Idle or Aborted. Recovery sends no Stop. An accepted Launch requires explicit Manual Abort/Stop and fresh confirmed board state before recovery.");
+        return Err("Recovery origin/session changed or host work is active. Recovery sends no Stop; selected boards must independently verify recovery eligibility.");
     }
     let router = state.topology_router.get().ok_or("Router unavailable")?;
     crate::system_clock::required_control_network_utc_ms(router)
@@ -798,7 +846,7 @@ fn admit_confirmation(
         || ticket.phrase != request.confirmation
         || ticket.reset_selection.is_some_and(|selection| selection.current(&state).is_err())
         || ticket.mode != crate::station_mode::local_mode()
-        || !host_safe(&state)
+        || !host_action_allowed(&state, &ticket.action)
         || state.launch_history.lock().unwrap().snapshot() != ticket.clock
         || control
             .operation
@@ -991,7 +1039,7 @@ async fn authorize(
     if principal.anonymous
         || ticket.principal != principal_context(&identity, headers, &principal)
         || ticket.mode != crate::station_mode::local_mode()
-        || !host_safe(state)
+        || !host_action_allowed(state, &ticket.action)
     {
         return Err("Recovery principal/mode/safe host state changed");
     }
@@ -1197,7 +1245,7 @@ async fn exchange(
                         .ok_or("Malformed commissioning IO reply");
                 }
                 Outcome::Rejected(_) => {
-                    return Err("Board rejected recovery; admission remains closed. Recovery sends no Stop. If Launch was accepted, explicitly use Manual Abort/Stop, confirm fresh board state, then prepare a new recovery intent.");
+                    return Err("Board rejected recovery; no reset applied. Wait for the active launch owner to complete, or explicitly stop it, then Query and confirm a new recovery intent.");
                 }
             }
         }
@@ -4816,6 +4864,7 @@ mod tests {
         state
             .cmd_tx
             .send(crate::types::TelemetryCommand::QueuedOperator {
+            recovery_origin: None,
                 launch_revision: None,
                 generation: crate::gse::automatic_generation(&state),
                 command: Box::new(crate::types::TelemetryCommand::ToggleFlightBuzzer),

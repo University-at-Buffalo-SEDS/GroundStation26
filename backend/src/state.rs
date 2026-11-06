@@ -2016,6 +2016,14 @@ impl AppState {
             crate::board_abort::block_policy(self, &mut local);
             crate::ignition_pair::project_fresh_proof(self, &mut local);
             crate::operator_phase::project(self,&mut local);
+            if self.operator_queue.fill_launch_active() {
+                for control in &mut local.controls {
+                    if crate::sequences::is_fill_system_control(&control.cmd) {
+                        control.enabled = false;
+                        control.blink = crate::sequences::BlinkMode::None;
+                    }
+                }
+            }
             return local;
         }
         let mut mirrored =
@@ -2271,6 +2279,10 @@ impl AppState {
 
     /// Applies the current software-action policy to decide whether a command can run.
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
+        if self.operator_queue.fill_launch_active()
+            && crate::sequences::is_fill_system_control(command_name(cmd)) {
+            return false;
+        }
         if let TelemetryCommand::OperatorPhase{intent}=cmd {
             if !intent.validate(self){return false;}
             if intent.local(){return crate::operator_phase::local_allowed(self)&&crate::operator_phase::button_allowed(self)

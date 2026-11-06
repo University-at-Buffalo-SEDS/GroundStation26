@@ -201,6 +201,7 @@ pub(crate) fn advance_verified_recovery(
         .load(std::sync::atomic::Ordering::Acquire)
         != token.owner
         || automatic_generation(state) != token.generation
+        || state.operator_queue.relief_epoch() != token.relief_epoch
         || state
             .operator_dispatch_inflight
             .load(std::sync::atomic::Ordering::Acquire)
@@ -298,6 +299,7 @@ pub(crate) fn finalize_verified_recovery(
         .load(std::sync::atomic::Ordering::Acquire)
         != token.owner
         || automatic_generation(state) != token.generation
+        || state.operator_queue.relief_epoch() != token.relief_epoch
         || state
             .operator_dispatch_inflight
             .load(std::sync::atomic::Ordering::Acquire)

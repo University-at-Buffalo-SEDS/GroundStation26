@@ -386,6 +386,7 @@ fn queue_gpio_command(
     command: TelemetryCommand,
 ) -> Result<(), mpsc::error::TrySendError<TelemetryCommand>> {
     tx.try_send(TelemetryCommand::QueuedOperator {
+            recovery_origin: None,
         launch_revision,
         plumbing_origin,
         generation,

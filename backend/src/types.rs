@@ -122,6 +122,7 @@ pub enum TelemetryCommand {
     /// Authenticated server admission envelope; never accepted from a client.
     #[serde(skip)]
     QueuedOperator {
+        recovery_origin: Option<crate::operator_queue::manual_origin::Origin>,
         generation: u64,
         launch_revision: Option<u64>,
         command: Box<TelemetryCommand>,

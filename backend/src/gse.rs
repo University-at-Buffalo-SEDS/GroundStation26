@@ -79,7 +79,7 @@ fn completion_valve_snapshot(input: Inputs) -> [Option<bool>; 5] {
 /// from a re-nonced replay of the already-seen A capture.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ValveCaptureHistory {
+pub(crate) struct ValveCaptureHistory {
     source_ms: i64,
     packet_ids: [u64; 2],
     seen_values: u8,
@@ -100,7 +100,7 @@ pub(crate) struct PreparedValveSource {
 }
 
 impl ValveCaptureHistory {
-    fn admit(
+    pub(crate) fn admit(
         &mut self,
         source_ms: i64,
         receipt_ms: i64,
@@ -769,8 +769,16 @@ pub fn valve_command(cmd: &TelemetryCommand) -> bool {
 }
 
 pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool> {
-    if cold_flow::active(state) {
-        return Some(matches!(cmd,TelemetryCommand::CancelFill|TelemetryCommand::PauseFill|TelemetryCommand::Abort));
+    let cold_flow_active = cold_flow::active(state);
+    if cold_flow_active && !cold_flow::manual_handoff(cmd) {
+        // An owned cold-flow run excludes competing automation, not unrelated
+        // operator controls. Physical manual controls retire that run below.
+        if action(cmd).is_some() || matches!(cmd, TelemetryCommand::Launch | TelemetryCommand::Turbocharge)
+            || crate::sequences::command_name(cmd) == "GroundStationLaunch"
+            || crate::sequences::command_name(cmd) == "IgniterSequence"
+        {
+            return Some(matches!(cmd,TelemetryCommand::CancelFill|TelemetryCommand::PauseFill|TelemetryCommand::Abort));
+        }
     }
     if matches!(cmd, TelemetryCommand::PauseFill) && state.gse.lock().unwrap().turbocharge.is_some()
     {
@@ -850,6 +858,7 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
         );
     }
     if rt.engine.active()
+        && !(cold_flow_active && cold_flow::manual_handoff(cmd))
         && (["GroundStationLaunch", "IgniterSequence"]
             .contains(&crate::sequences::command_name(cmd))
             || matches!(
@@ -2938,6 +2947,28 @@ pub(crate) fn verified_recovery_host_idle(state: &AppState) -> bool {
     }
     true
 }
+/// Explicit HITL reset may retire host Launch metadata only after host work
+/// has drained. Board completion is still verified by the recovery transaction.
+#[cfg(feature = "hitl_mode")]
+pub(crate) fn hitl_launch_reset_host_idle(state: &AppState) -> bool {
+    {
+        let rt = state.gse.lock().unwrap();
+        if rt.engine.active() || cold_flow::runtime_active(&rt) {
+            return false;
+        }
+    }
+    if state.launch_sequence_command_pending.load(std::sync::atomic::Ordering::Acquire)
+        || manual_stop_pending(state) {
+        return false;
+    }
+    // Recovery status is a read-only poll: never wait behind the SDK owner.
+    // Busy means not yet eligible for Reset, never a manual-command veto.
+    state.topology_router.get().is_some_and(|router| {
+        ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND"]
+            .iter().all(|name| matches!(router.try_has_pending_reliable_tx_type(
+                crate::telemetry_schema::data_type(name)), Ok(false)))
+    })
+}
 /// Called only by the closed verified Reset ALL owner after all seven boards
 /// applied Startup. This does not publish state, reopen, or dispatch outputs.
 pub(crate) fn prepare_verified_startup(state: &Arc<AppState>) -> Result<(), &'static str> {
@@ -3433,8 +3464,6 @@ pub(crate) fn commit_operator_phase(
     if !local || runtime.phase_control_revision != revision || !runtime.ground_station_control {
         return Err("Phase authority changed".into());
     }
-    let history = state.launch_history.try_lock().map_err(|_| "Launch journal busy")?;
-    if history.automatic_actions_inhibited() { return Err("Retained Launch requires verified reset".into()); }
     let mut current = state.state.try_lock().map_err(|_| "Phase state busy")?;
     if *current != expected { return Err("Global phase changed; request a new phase step".into()); }
     let router = state.topology_router.get().ok_or("Phase router unavailable")?;
@@ -3449,7 +3478,7 @@ pub(crate) fn commit_operator_phase(
             Ok::<(), sedsnet::router::TryManagedBatchError>(())
         })
     });
-    drop(current); drop(history); drop(runtime); drop(dispatch);
+    drop(current); drop(runtime); drop(dispatch);
     admitted.map_err(str::to_string)?
         .map_err(|_| "Stop or board context changed".to_string())?
         .map_err(|error| format!("Phase update was not admitted: {error:?}"))
@@ -4459,14 +4488,21 @@ pub(crate) fn record_operator_command_with_launch_origin(
     duplicate_window_ms: u64,
     launch_revision: Option<u64>,
 ) -> Result<OperatorCommandAdmission, String> {
+    record_operator_command_with_recovery_origin(state,generation,command,now_ms,duplicate_window_ms,launch_revision,&mut None)
+}
+pub(crate) fn record_operator_command_with_recovery_origin(
+    state:&AppState, generation:u64, command:&TelemetryCommand, now_ms:u64,
+    duplicate_window_ms:u64, launch_revision:Option<u64>, recovery_origin:&mut Option<crate::operator_queue::manual_origin::Origin>,
+)->Result<OperatorCommandAdmission,String> {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let recovery_current = recovery_origin.as_ref().is_some_and(|origin| origin.admits(state,command));
     if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) || generation != automatic_generation(state)
-        || state
-            .operator_admission_barrier
-            .load(std::sync::atomic::Ordering::Acquire)
-            != 0
+        || (state.operator_admission_barrier.load(std::sync::atomic::Ordering::Acquire) != 0 && !recovery_current)
     {
         return Ok(OperatorCommandAdmission::Stale);
+    }
+    if let Some(origin)=recovery_origin.as_mut() {
+        if !recovery_current || !origin.admit(state) {return Ok(OperatorCommandAdmission::Stale);}
     }
     let record = || {
         if state.record_software_command_if_fresh(command, now_ms, duplicate_window_ms) {
@@ -4797,6 +4833,9 @@ fn claim_operator_dispatch_under_gate(
         crate::normal_publication_probe::claim_refused(state, generation);
         return None;
     }
+    claim_operator_inflight_under_gate(state)
+}
+fn claim_operator_inflight_under_gate(state: &AppState) -> Option<OperatorDispatchClaim> {
     let count = &state.operator_dispatch_inflight;
     let mut current = count.load(std::sync::atomic::Ordering::Acquire);
     loop {
@@ -4821,6 +4860,44 @@ fn claim_operator_dispatch_under_gate(
             Err(observed) => current = observed,
         }
     }
+}
+
+/// A sealed safe direction may cross a retained recovery barrier without
+/// reopening it. Retire the coordinator's original quiescence proof first.
+pub(crate) fn admit_safe_manual<T>(
+    state: &AppState,
+    intent: &crate::operator_queue::safe_manual::Intent,
+    offer: impl FnOnce() -> T,
+) -> Option<(T, OperatorDispatchClaim)> {
+    use std::sync::atomic::Ordering;
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if !intent.current(state) || state.operator_queue.fill_launch_active() || !state.action_policy.lock().unwrap().software_buttons_enabled {
+        return None;
+    }
+    let token = intent.token();
+    state.manual_abort_intent.admit_safe_if_epoch_unchanged(token.manual_epoch, || {
+        state.deferred_abort.admit_safe_if_epoch_unchanged(token.observed_manual_epoch, || {
+            let count = &state.operator_dispatch_inflight;
+            let mut current = count.load(Ordering::Acquire);
+            loop {
+                match count.compare_exchange_weak(current, current.checked_add(1)?, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
+            let claim = OperatorDispatchClaim(count.clone());
+            if !state.operator_queue.advance_relief_epoch(token.relief_epoch) { return None; }
+            Some((offer(), claim))
+        }).flatten()
+    }).flatten()
+}
+
+pub(crate) fn claim_manual_dispatch(state:&AppState,generation:u64,origin:Option<crate::operator_queue::manual_origin::Origin>)->Option<OperatorDispatchClaim> {
+    let _dispatch=DISPATCH_GATE.lock().unwrap();
+    if let Some(origin)=origin {
+        if origin.generation()!=generation || !origin.dispatched(state) {return None;}
+        claim_operator_inflight_under_gate(state)
+    } else {claim_operator_dispatch_under_gate(state,generation)}
 }
 
 /// The SDK callback never takes these locks. Marked automatic observations must
@@ -4890,6 +4967,7 @@ mod recovery_generation_tests {
                 crate::telemetry_task::command_at_dispatch(
                     &state,
                     crate::types::TelemetryCommand::QueuedOperator {
+            recovery_origin: None,
                         launch_revision: None,
                         plumbing_origin: None,
                         generation: first,
@@ -5035,6 +5113,7 @@ mod final_launch_admission_tests {
         let generation = automatic_generation(&state);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         tx.send(TelemetryCommand::QueuedOperator {
+            recovery_origin: None,
             generation,
             command: Box::new(TelemetryCommand::Launch),
             plumbing_origin: None,
@@ -5087,6 +5166,7 @@ mod final_launch_admission_tests {
         let generation = automatic_generation(&state);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         tx.send(TelemetryCommand::QueuedOperator {
+            recovery_origin: None,
             generation,
             command: Box::new(TelemetryCommand::Launch),
             plumbing_origin: None,
@@ -5579,6 +5659,7 @@ pub(crate) fn with_closed_operator_queue<T>(
             .load(std::sync::atomic::Ordering::Acquire)
             != token.owner
         || automatic_generation(state) != token.generation
+        || state.operator_queue.relief_epoch() != token.relief_epoch
         || state
             .operator_dispatch_inflight
             .load(std::sync::atomic::Ordering::Acquire)
@@ -5693,6 +5774,7 @@ mod recovery_quiescence_tests {
             .unwrap();
         commands
             .try_send(TelemetryCommand::QueuedOperator {
+            recovery_origin: None,
                 launch_revision: None,
                 generation: old + 1,
                 command: Box::new(TelemetryCommand::Postinit),

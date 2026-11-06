@@ -42,9 +42,17 @@ pub(crate) fn command_at_dispatch(
     state: &AppState,
     command: TelemetryCommand,
 ) -> Option<TelemetryCommand> {
+    command_at_dispatch_with_manual_origin(state, command, None)
+}
+fn command_at_dispatch_with_manual_origin(
+    state: &AppState,
+    command: TelemetryCommand,
+    origin: Option<crate::operator_queue::manual_origin::Origin>,
+) -> Option<TelemetryCommand> {
     // Recovery closes ordinary dispatch independently of the manual Stop path.
     if state.operator_admission_barrier.load(Ordering::Acquire) != 0
         && !matches!(command, TelemetryCommand::Abort)
+        && !origin.is_some_and(|origin| origin.dispatched(state))
     {
         return None;
     }
@@ -655,16 +663,23 @@ pub async fn telemetry_task(
                         crate::gse::cold_flow::dispatch_panel(&state,crate::gse::cold_flow::PanelIntent{key,generation,awaiting_at_edge}).await;
                         continue;
                     }
+                    let recovery_origin = match &cmd {
+                        TelemetryCommand::QueuedOperator {recovery_origin,..}=>*recovery_origin,
+                        _=>None,
+                    };
                     let (cmd, _operator_claim, plumbing_origin, launch_revision) = match cmd {
-                        TelemetryCommand::QueuedOperator { launch_revision, generation, command, plumbing_origin } => {
+                        TelemetryCommand::QueuedOperator { recovery_origin, launch_revision, generation, command, plumbing_origin } => {
                             if command.automatic_generation().is_some() || matches!(*command, TelemetryCommand::QueuedOperator { .. }) { continue; }
-                            let Some(claim) = crate::gse::claim_operator_dispatch(&state, generation) else { continue; };
+                            let Some(claim) = crate::gse::claim_manual_dispatch(&state, generation, recovery_origin) else { continue; };
                             (*command, Some(claim), plumbing_origin, launch_revision)
                         }
                         command => (command, None, None, None),
                     };
                     let sealed_phase=matches!(cmd,TelemetryCommand::OperatorPhase{..});
-                    let cmd = if let TelemetryCommand::OperatorPhase { intent } = cmd {
+                    let cmd = if let TelemetryCommand::OperatorPhase { mut intent } = cmd {
+                        if let Some(origin)=recovery_origin {
+                            if !intent.bind_manual_claim(&state,&origin) {continue;}
+                        }
                         if !intent.validate(&state) {emit_notification_warning(&state,"Phase request changed or expired; choose a new phase action.");continue;}
                         if intent.local() {
                             if let Err(error)=crate::operator_phase::apply(&state,&intent){emit_notification_warning(&state,error);}
@@ -689,7 +704,7 @@ pub async fn telemetry_task(
                     let automatic_generation = cmd.automatic_generation();
                     let automatic_supply_close = matches!(cmd, TelemetryCommand::AutomaticNitrogenClose { .. } | TelemetryCommand::AutomaticNitrousClose { .. });
                     let automatic_abort = matches!(cmd, TelemetryCommand::AutomaticAbort { .. });
-                    let Some(cmd) = command_at_dispatch(&state, cmd) else {
+                    let Some(cmd) = command_at_dispatch_with_manual_origin(&state, cmd, recovery_origin) else {
                         continue;
                     };
                     let _automatic_abort_claim = if automatic_abort {
@@ -1943,6 +1958,9 @@ fn apply_captured_status_inner(
     let sender_id = owner.sender_id().to_string();
     {
         if cmd_id == ValveBoardCommands::Sequence as u8 {
+            // Only this already validated VB owner can publish sequence activity.
+            // Retained launch metadata and unrelated board states do not own it.
+            if !state.operator_queue.observe_fill_launch_active(on,pkt.timestamp() as i64,pkt.packet_id(),receipt) {return None;}
             if on {
                 start_launch_clock_from_valve_sequence_status(state);
             }
@@ -5057,6 +5075,7 @@ mod tests {
             // Match authenticated ingress: relative state commands retain the
             // original guard revision and dispatch generation in the queue.
             let queued = TelemetryCommand::QueuedOperator {
+            recovery_origin: None,
                 generation: crate::gse::automatic_generation(&state),
                 launch_revision: crate::board_abort::capture_launch_revision_named(
                     &state,
@@ -5147,6 +5166,7 @@ mod tests {
         state
             .cmd_tx
             .send(TelemetryCommand::QueuedOperator {
+            recovery_origin: None,
                 generation: crate::gse::automatic_generation(&state),
                 launch_revision: crate::board_abort::capture_launch_revision_named(
                     &state,
@@ -5352,6 +5372,7 @@ mod tests {
             state
                 .cmd_tx
                 .send(TelemetryCommand::QueuedOperator {
+            recovery_origin: None,
                     launch_revision: None,
                     plumbing_origin: None,
                     generation: old,
@@ -5363,6 +5384,7 @@ mod tests {
         state
             .cmd_tx
             .send(TelemetryCommand::QueuedOperator {
+            recovery_origin: None,
                 launch_revision: None,
                 plumbing_origin: None,
                 generation: old + 1,
@@ -5427,6 +5449,7 @@ mod tests {
         state
             .cmd_tx
             .send(TelemetryCommand::QueuedOperator {
+            recovery_origin: None,
                 launch_revision: None,
                 plumbing_origin: None,
                 generation: crate::gse::automatic_generation(&state),

@@ -2422,13 +2422,15 @@ async fn send_command_inner(
     Json(cmd): Json<TelemetryCommand>,
 ) -> (StatusCode, String) {
     let cmd = crate::operator_phase::seal(&state,cmd);
+    let safe_manual = crate::operator_queue::safe_manual::Intent::capture(&state, &cmd);
+    let recovery_origin = crate::operator_queue::manual_origin::Origin::capture(&state,&cmd);
     let fill_origin = matches!(cmd, TelemetryCommand::StartFill)
         .then(|| crate::fill_recording::Captured::capture(&state));
     // Request origin must precede authentication/database waits across recovery.
     let admission_generation = if matches!(cmd, TelemetryCommand::Abort) {
         0
     } else {
-        crate::gse::capture_operator_origin(&state).unwrap_or(0)
+        crate::gse::capture_operator_origin(&state).or_else(||recovery_origin.map(|origin|origin.generation())).unwrap_or(0)
     };
     let plumbing_origin = crate::actuator_plumbing::capture_motion_origin(&state, &cmd);
     let launch_revision = crate::board_abort::capture_launch_revision(&state, &cmd);
@@ -2447,6 +2449,9 @@ async fn send_command_inner(
             };
         }
     };
+    if let Some(intent) = safe_manual {
+        return crate::operator_queue::safe_manual::dispatch(state, &principal, intent, None).await;
+    }
     let cmd = if let Some(captured) = fill_origin {
         let weak = Arc::downgrade(&state);
         let authority = crate::fill_recording::Authority::Session {
@@ -2465,13 +2470,8 @@ async fn send_command_inner(
     } else {
         cmd
     };
-    dispatch_authorized_command(
-        state,
-        principal,
-        cmd,
-        admission_generation,
-        plumbing_origin,
-        launch_revision,
+    dispatch_command_inner(
+        state, principal, cmd, false, admission_generation, plumbing_origin, launch_revision, recovery_origin,
     )
     .await
 }
@@ -2567,6 +2567,7 @@ async fn dispatch_command(
             admission_generation,
             plumbing_origin,
             launch_revision,
+            None,
         ))
         .await
 }
@@ -2579,6 +2580,7 @@ async fn dispatch_command_inner(
     admission_generation: u64,
     plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
     launch_revision: Option<u64>,
+    mut recovery_origin: Option<crate::operator_queue::manual_origin::Origin>,
 ) -> (StatusCode, String) {
     let cmd_name = command_name(&cmd);
     if !principal.allows_command_name(cmd_name) {
@@ -2649,13 +2651,14 @@ async fn dispatch_command_inner(
         None
     };
     let now_ms = software_command_clock_ms();
-    let duplicate = match crate::gse::record_operator_command_with_launch_origin(
+    let duplicate = match crate::gse::record_operator_command_with_recovery_origin(
         &state,
         admission_generation,
         &cmd,
         now_ms,
         software_command_dedup_ms(),
         launch_revision,
+        &mut recovery_origin,
     ) {
         Err(message) => return (StatusCode::CONFLICT, message),
         Ok(crate::gse::OperatorCommandAdmission::Stale) => {
@@ -2750,6 +2753,7 @@ async fn dispatch_command_inner(
     }
     if let Some(permit) = permit {
         permit.send(TelemetryCommand::QueuedOperator {
+            recovery_origin,
             launch_revision,
             plumbing_origin,
             generation: admission_generation,
@@ -2760,6 +2764,7 @@ async fn dispatch_command_inner(
     if state
         .cmd_tx
         .send(TelemetryCommand::QueuedOperator {
+            recovery_origin,
             launch_revision,
             plumbing_origin,
             generation: admission_generation,
@@ -5484,12 +5489,14 @@ pub(crate) async fn handle_ws_control_text_with_source(
         .and_then(|value| value.get("cmd").and_then(|v| v.as_str()).map(str::to_owned));
     let phase_origin = serde_json::from_str::<WsCommand>(&text).ok()
         .map(|cmd|crate::operator_phase::seal(&state_for_recv,cmd.cmd));
+    let safe_manual = phase_origin.as_ref().and_then(|cmd| crate::operator_queue::safe_manual::Intent::capture(&state_for_recv, cmd));
+    let mut recovery_origin = phase_origin.as_ref().and_then(|cmd| crate::operator_queue::manual_origin::Origin::capture(&state_for_recv, cmd));
     let fill_origin = (frame_name.as_deref() == Some("StartFill"))
         .then(|| crate::fill_recording::Captured::capture(&state_for_recv));
     let admission_generation = if frame_name.as_deref() == Some("Abort") {
         0
     } else {
-        crate::gse::capture_operator_origin(&state_for_recv).unwrap_or(0)
+        crate::gse::capture_operator_origin(&state_for_recv).or_else(||recovery_origin.map(|origin|origin.generation())).unwrap_or(0)
     };
     let launch_revision = frame_name
         .as_deref()
@@ -5580,6 +5587,15 @@ pub(crate) async fn handle_ws_control_text_with_source(
                 );
                 return;
             }
+            if let Some(intent) = safe_manual {
+                if !source_current() { return; }
+                let work = state_for_recv.clone();
+                tokio::spawn(async move {
+                    let (status, message) = crate::operator_queue::safe_manual::dispatch(work.clone(), &principal, intent, Some(source_current)).await;
+                    if !status.is_success() { emit_notification_warning(&work, message); }
+                });
+                return;
+            }
             if matches!(cmd.cmd, TelemetryCommand::Abort) && !crate::rrls::is_rrls() {
                 state_for_recv.manual_abort_intent.request();
                 return;
@@ -5607,13 +5623,14 @@ pub(crate) async fn handle_ws_control_text_with_source(
                 return;
             }
             let now_ms = software_command_clock_ms();
-            match crate::gse::record_operator_command_with_launch_origin(
+            match crate::gse::record_operator_command_with_recovery_origin(
                 &state_for_recv,
                 admission_generation,
                 &cmd.cmd,
                 now_ms,
                 software_command_dedup_ms(),
                 launch_revision,
+                &mut recovery_origin,
             ) {
                 Err(message) => {
                     emit_notification_warning(&state_for_recv, message);
@@ -5707,6 +5724,7 @@ pub(crate) async fn handle_ws_control_text_with_source(
             );
             if let Err(e) = cmd_tx
                 .send(TelemetryCommand::QueuedOperator {
+            recovery_origin,
                     launch_revision,
                     plumbing_origin,
                     generation: admission_generation,
@@ -6647,3 +6665,7 @@ mod recovery_control_settings_tests {
 mod alert_condition_readonly_tests {
     include!("alert_condition_readonly_tests.rs");
 }
+
+#[cfg(test)]
+#[path = "operator_queue/safe_manual_http_tests.rs"]
+mod safe_manual_http_tests;

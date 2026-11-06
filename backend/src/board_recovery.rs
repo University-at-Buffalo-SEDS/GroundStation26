@@ -664,6 +664,12 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         && principal.permissions.send_commands
         && coordinator::host_safe(&state)
         && state.launch_history.lock().unwrap().recovery_available();
+    let can_reset_startup = primary
+        && network_utc_available
+        && !principal.anonymous
+        && principal.permissions.send_commands
+        && coordinator::host_action_allowed(&state, "reset_startup")
+        && state.launch_history.lock().unwrap().recovery_available();
     let principal_identity = principal_context(&identity, &headers, &principal);
     let confirmation = state
         .board_recovery
@@ -713,7 +719,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
     let build = serde_json::to_value(mode.local_build_mode).unwrap();
     Json(json!({"version":1,"backend_instance":hex(&identity),"principal":{"username":principal.username,"context":principal_context(&identity,&headers,&principal)},"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state)),"flight_state":state.local_flight_state_snapshot()as u8,"automatic_actions_inhibited":state.launch_history.lock().unwrap().automatic_actions_inhibited(),
         "clock":{"network_utc_available":network_utc_available,"required_for_recovery":true},
-        "permissions":{"query":primary,"recover":can_recover,"reset_startup":can_recover,"change_mode":false},
+        "permissions":{"query":primary,"recover":can_recover,"reset_startup":can_reset_startup,"change_mode":false},
         "reset_startup_policy":reset_startup_policy,
         "confirmation":confirmation,"host_recovery":host_pending.map(|pending|json!({"pending":!pending.published,"verified":pending.verified,"publication_acknowledged":pending.published,"targets":pending.targets.iter().map(|target|target.board.as_str()).collect::<Vec<_>>()})),
         "rejected_statuses":rejected_statuses,"last_rejection":last_rejection,

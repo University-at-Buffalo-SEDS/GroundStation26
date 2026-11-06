@@ -116,6 +116,13 @@ impl Inbox {
         }
         Some(admit())
     }
+    /// Static relief directions may coexist with an already retained Stop.
+    /// A newer Stop still invalidates the original request. No IO in `admit`.
+    pub(crate) fn admit_safe_if_epoch_unchanged<T>(&self, epoch: u64, admit: impl FnOnce() -> T) -> Option<T> {
+        let state = self.state.lock().unwrap();
+        if epoch == u64::MAX || state.manual_epoch != epoch { return None; }
+        Some(admit())
+    }
     #[cfg(test)]
     pub(crate) fn exhaust_manual_epoch_for_test(&self) {
         let mut state = self.state.lock().unwrap();

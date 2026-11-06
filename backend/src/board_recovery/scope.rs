@@ -18,6 +18,23 @@ pub(crate) const fn base_mask(mode: crate::station_mode::Mode) -> u8 {
 fn selected_mask(required: u8, actual_abort: u8, pending: u8, explicit: u8) -> u8 {
     required | actual_abort | pending | explicit
 }
+/// HITL host Launch reset must ask the master to retire its actual owner.
+/// AB participates when its retained readback says Launch, or the pair proof
+/// was enforced. Missing/stale selected identities still need a fresh query.
+fn launch_proof_mask(state: &AppState) -> u8 {
+    #[cfg(feature = "hitl_mode")]
+    if state.local_flight_state_snapshot() == crate::types::FlightState::Launch {
+        let inner = state.board_recovery.inner.lock().unwrap();
+        let actuator_launch = inner.values[index(Board::ActuatorBoard).unwrap()]
+            .as_ref().is_some_and(|row| row.value.state == Some(crate::types::FlightState::Launch as u8));
+        return (1 << index(Board::ValveBoard).unwrap())
+            | if actuator_launch || crate::ignition_pair::proof_enforced(state) {
+                1 << index(Board::ActuatorBoard).unwrap()
+            } else { 0 };
+    }
+    let _ = state;
+    0
+}
 impl Selection {
     pub(super) fn capture(state: &AppState, optional: &[String]) -> Result<Self, &'static str> {
         let mut explicit = 0;
@@ -50,7 +67,7 @@ impl Selection {
         let (context, required, actual) = state
             .board_abort
             .capture_reset_context(|| base_mask(crate::station_mode::local_mode()))?;
-        let targets = selected_mask(required, actual, pending, explicit);
+        let targets = selected_mask(required, actual, pending, explicit) | launch_proof_mask(state);
         Ok(Self {
             context,
             required,
@@ -65,6 +82,9 @@ impl Selection {
         state: &AppState,
         apply: impl FnOnce() -> Result<T, &'static str>,
     ) -> Result<T, &'static str> {
+        if launch_proof_mask(state) & !self.targets != 0 {
+            return Err("Launch participation changed; prepare a fresh reset scope");
+        }
         state.board_abort.with_reset_context(self.context, apply)
     }
     pub(super) fn boards(&self) -> Vec<Board> {
@@ -147,6 +167,38 @@ mod actual_policy_tests {
         let selection = Selection::capture(&state, &["FC".into()]).unwrap();
         assert_eq!(selection.targets, expected | 3);
         assert!(Selection::capture(&state, &["FC".into(), "FC".into()]).is_err());
+    }
+    #[cfg(feature = "hitl_mode")]
+    #[tokio::test]
+    async fn launch_reset_requires_master_and_cannot_shed_new_pair_participation() {
+        let state = crate::state::tests::test_app_state().await;
+        *state.state.lock().unwrap() = crate::types::FlightState::Launch;
+        let selection = Selection::capture(&state, &[]).unwrap();
+        assert_eq!(selection.boards(), vec![Board::ValveBoard]);
+        assert_eq!(selection.policy().required_mask, 0);
+        state.toggle_hitl_safety_interlock(3);
+        assert!(selection.current(&state).is_err());
+        let selection = Selection::capture(&state, &[]).unwrap();
+        assert_eq!(selection.boards(), vec![Board::ActuatorBoard, Board::ValveBoard]);
+    }
+    #[cfg(feature = "hitl_mode")]
+    #[tokio::test]
+    async fn launch_reset_keeps_observed_actuator_even_after_its_proof_expires() {
+        let state = crate::state::tests::test_app_state().await;
+        *state.state.lock().unwrap() = crate::types::FlightState::Launch;
+        let before = Selection::capture(&state, &[]).unwrap();
+        let at = Stamp::now();
+        let mut old = at;
+        old.wall -= Duration::from_secs(60);
+        state.board_recovery.inner.lock().unwrap().values[index(Board::ActuatorBoard).unwrap()] = Some(Observation {
+            received: old, observed_after: old,
+            value: Readback { result: 0, state: Some(crate::types::FlightState::Launch as u8),
+                flags: 0x3c, nonce: 1, boot: 1, epoch: 1, uptime: 1, outputs: 0, issuer: 1 },
+        });
+        assert!(before.current(&state).is_err(), "new participation cannot escape frozen scope");
+        let after = Selection::capture(&state, &[]).unwrap();
+        assert_eq!(after.boards(), vec![Board::ActuatorBoard, Board::ValveBoard]);
+        assert!(!state.board_recovery.inner.lock().unwrap().values[index(Board::ActuatorBoard).unwrap()].as_ref().unwrap().fresh(at));
     }
     #[cfg(feature = "hitl_mode")]
     #[tokio::test]

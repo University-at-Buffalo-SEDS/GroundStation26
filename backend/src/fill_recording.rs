@@ -572,6 +572,7 @@ pub(crate) fn dispatch_queued(
     let crate::types::TelemetryCommand::QueuedOperator {
         generation,
         command,
+        recovery_origin,
         ..
     } = command
     else {
@@ -580,7 +581,7 @@ pub(crate) fn dispatch_queued(
     let crate::types::TelemetryCommand::FillWithRecording { origin } = command.as_ref() else {
         return false;
     };
-    let Some(_claim) = crate::gse::claim_operator_dispatch(state, *generation) else {
+    let Some(_claim) = crate::gse::claim_manual_dispatch(state, *generation, *recovery_origin) else {
         return true;
     };
     spawn(state.clone(), origin.clone());

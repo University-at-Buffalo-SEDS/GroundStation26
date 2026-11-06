@@ -368,6 +368,7 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
         && state
             .cmd_tx
             .try_send(TelemetryCommand::QueuedOperator {
+            recovery_origin: None,
                 launch_revision: Some(ticket.board_abort_revision),
                 plumbing_origin: None,
                 generation: ticket.generation,

@@ -1,7 +1,9 @@
 //! Receiver-owned host queue drain prerequisite. It never clears SDK work,
 //! reopens admission, advances an epoch, or certifies board/proxy quiescence.
 use crate::{state::AppState, types::TelemetryCommand};
-use std::sync::Mutex;
+use std::sync::{Mutex, atomic::{AtomicU64, Ordering}};
+pub(crate) mod safe_manual;
+pub(crate) mod manual_origin;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Clone, Copy, Debug)]
@@ -10,6 +12,7 @@ pub(crate) struct Token {
     pub(crate) generation: u64,
     pub(crate) manual_epoch: u64,
     pub(crate) observed_manual_epoch: u64,
+    pub(crate) relief_epoch: u64,
 }
 impl Token {
     pub(crate) fn capture(state: &AppState, owner: u64) -> Self {
@@ -18,6 +21,7 @@ impl Token {
             generation: crate::gse::automatic_generation(state),
             manual_epoch: state.manual_abort_intent.epoch(),
             observed_manual_epoch: state.deferred_abort.manual_epoch(),
+            relief_epoch: state.operator_queue.relief_epoch(),
         }
     }
 }
@@ -26,6 +30,11 @@ pub(crate) struct Request {
     reply: oneshot::Sender<Result<usize, &'static str>>,
 }
 pub(crate) struct Control {
+    relief_epoch: AtomicU64,
+    // One atomic observation: monotonic validity deadline << 1 | reported active.
+    fill_launch_lease: AtomicU64,
+    fill_launch_history: Mutex<(crate::gse::ValveCaptureHistory, Option<u64>)>,
+    fill_launch_clock: std::time::Instant,
     // Capacity-one administration is independent of ordinary serde commands.
     sender: mpsc::Sender<Request>,
     receiver: Mutex<Option<mpsc::Receiver<Request>>>,
@@ -34,12 +43,44 @@ impl Default for Control {
     fn default() -> Self {
         let (sender, receiver) = mpsc::channel(1);
         Self {
+            relief_epoch: AtomicU64::new(0),
+            fill_launch_lease: AtomicU64::new(0),
+            fill_launch_history: Mutex::new(Default::default()),
+            fill_launch_clock: std::time::Instant::now(),
             sender,
             receiver: Mutex::new(Some(receiver)),
         }
     }
 }
 impl Control {
+    /// Expiry means unknown, never completed. Only a fresh positive board
+    /// observation owns the temporary manual fill-system exclusion.
+    pub(crate) fn fill_launch_activity(&self)->Option<bool> {
+        let lease=self.fill_launch_lease.load(Ordering::Acquire);
+        let now=u64::try_from(self.fill_launch_clock.elapsed().as_millis()).ok()?;
+        (lease!=0 && now<=lease>>1).then_some(lease&1!=0)
+    }
+    pub(crate) fn fill_launch_active(&self)->bool {self.fill_launch_activity()==Some(true)}
+    pub(crate) fn observe_fill_launch_active(&self,active:bool,source_ms:i64,packet_id:u64,receipt:crate::gse::ValveReceipt)->bool {
+        let Some(now)=receipt.monotonic_at.checked_duration_since(self.fill_launch_clock).and_then(|d|u64::try_from(d.as_millis()).ok()) else {return false;};
+        let mut history=self.fill_launch_history.lock().unwrap();
+        let mut candidate=history.0;
+        let Some(at)=candidate.admit(source_ms,receipt.network_ms,now,active,packet_id,history.1) else {return false;};
+        let processing=u64::try_from(self.fill_launch_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if !processing.checked_sub(at).is_some_and(|age|age<=2000) {return false;}
+        // Original source/receipt age counts against the lease. Re-reading,
+        // processing a duplicate, or a policy refresh cannot renew it.
+        let Some(lease)=at.checked_add(5000).and_then(|until|until.checked_mul(2)) else {return false;};
+        *history=(candidate,Some(at));
+        self.fill_launch_lease.store(lease|u64::from(active),Ordering::Release);
+        true
+    }
+
+    pub(crate) fn relief_epoch(&self) -> u64 { self.relief_epoch.load(Ordering::Acquire) }
+    // Called only under the dispatch owner. Exhaustion permanently refuses renewal.
+    pub(crate) fn advance_relief_epoch(&self, expected: u64) -> bool {
+        expected.checked_add(1).is_some_and(|next| self.relief_epoch.compare_exchange(expected, next, Ordering::AcqRel, Ordering::Acquire).is_ok())
+    }
     pub(crate) fn take_receiver(&self) -> Option<mpsc::Receiver<Request>> {
         self.receiver.lock().unwrap().take()
     }
@@ -347,6 +388,7 @@ mod tests {
         let (db_tx, db_rx) = mpsc::channel(8);
         let token = close(&state);
         tx.try_send(TelemetryCommand::QueuedOperator {
+            recovery_origin: None,
             launch_revision: None,
             generation: token.generation,
             command: Box::new(TelemetryCommand::Launch),
@@ -377,6 +419,7 @@ mod tests {
             .store(token.generation + 1, Ordering::Release);
         state.operator_admission_barrier.store(0, Ordering::Release);
         tx.send(TelemetryCommand::QueuedOperator {
+            recovery_origin: None,
             launch_revision: None,
             generation: token.generation,
             command: Box::new(TelemetryCommand::Launch),
@@ -385,6 +428,7 @@ mod tests {
         .await
         .unwrap();
         tx.send(TelemetryCommand::QueuedOperator {
+            recovery_origin: None,
             launch_revision: None,
             generation: token.generation + 1,
             command: Box::new(TelemetryCommand::Postinit),
@@ -497,5 +541,58 @@ mod tests {
                 .is_some()
         );
         assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod fill_launch_lease_tests {
+    use super::*;
+    #[tokio::test]
+    async fn expired_actual_active_status_releases_manual_policy_without_resetting_launch() {
+        let mut state=crate::state::tests::test_app_state().await;
+        state.action_policy.lock().unwrap().software_buttons_enabled=true;
+        state.launch_history.lock().unwrap().inhibit_automatic_actions().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let packet=sedsnet::packet::Packet::new(crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],"VB",
+            crate::telemetry_task::get_current_timestamp_ms(),std::sync::Arc::from(&[6,1][..])).unwrap();
+        crate::telemetry_task::apply_umbilical_status_at_ingress(&state,&packet);
+        assert_eq!(state.operator_queue.fill_launch_activity(),Some(true));
+        assert!(!state.is_command_allowed(&TelemetryCommand::NitrogenClose));
+        let clock=state.launch_history.lock().unwrap().snapshot();
+        let raw=state.operator_queue.fill_launch_lease.load(Ordering::Acquire);
+        let app=std::sync::Arc::get_mut(&mut state).expect("isolated state has no background owner");
+        std::sync::Arc::get_mut(&mut app.operator_queue).expect("isolated control has no background owner").fill_launch_clock-=std::time::Duration::from_secs(6);
+        assert_eq!(state.operator_queue.fill_launch_activity(),None);
+        assert!(state.is_command_allowed(&TelemetryCommand::NitrogenClose));
+        assert_eq!(state.operator_queue.fill_launch_lease.load(Ordering::Acquire),raw);
+        let history=state.launch_history.lock().unwrap();
+        assert_eq!(history.snapshot(),clock,"expiry cannot reset the launch clock or history");
+        assert!(history.automatic_actions_inhibited(),"retained launch protocol remains independent");
+    }
+
+    #[test]
+    fn active_fill_lease_expires_to_unknown_without_completion_or_replay_floor_reset() {
+        let mut control=Control::default();
+        let source=1_793_563_200_000_i64;
+        let receipt=crate::gse::ValveReceipt {network_ms:source,monotonic_at:std::time::Instant::now(),simulation_ms:None};
+        assert!(control.observe_fill_launch_active(true,source,41,receipt));
+        assert_eq!(control.fill_launch_activity(),Some(true));
+        let retained_lease=control.fill_launch_lease.load(Ordering::Acquire);
+        let retained_floor=*control.fill_launch_history.lock().unwrap();
+        // Advance only this isolated control's elapsed monotonic clock. Keep
+        // the reported wire value, source UTC, packet identity and floor.
+        control.fill_launch_clock-=std::time::Duration::from_secs(6);
+        assert_eq!(control.fill_launch_activity(),None);
+        assert!(!control.fill_launch_active(),"unknown activity must not indefinitely lock manual controls");
+        assert_eq!(control.fill_launch_lease.load(Ordering::Acquire),retained_lease);
+        assert_eq!(*control.fill_launch_history.lock().unwrap(),retained_floor);
+        assert_eq!(retained_lease&1,1,"expiry did not manufacture an inactive report");
+        let late=crate::gse::ValveReceipt {monotonic_at:std::time::Instant::now(),..receipt};
+        assert!(!control.observe_fill_launch_active(false,source-1,42,late));
+        assert_eq!(control.fill_launch_activity(),None);
+        assert!(!control.observe_fill_launch_active(true,source,41,late),"a retransmission cannot renew the expired lease");
+        assert!(control.observe_fill_launch_active(false,source+1,43,crate::gse::ValveReceipt{network_ms:source+1,..late}));
+        assert_eq!(control.fill_launch_activity(),Some(false));
     }
 }
