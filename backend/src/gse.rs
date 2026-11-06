@@ -3062,7 +3062,7 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
     ))?;
     #[cfg(not(feature = "hitl_mode"))]
     if router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT"))
-        || state.has_pending_transport_tx()
+        || state.has_pending_recovery_control_tx()
     {
         return Err((
             StatusCode::CONFLICT,

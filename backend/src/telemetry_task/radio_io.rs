@@ -102,6 +102,7 @@ pub struct TxQueueBudget {
     pending_commands: Mutex<Vec<(u8, Vec<u8>)>>,
     // Keys identify the accepted Vec allocation, never equal application bytes.
     write_leases: Mutex<Vec<(usize, usize, sedsnet::router::PackedWriteLease)>>,
+    recovery_classifier: RecoveryFrameClassifier,
 }
 
 impl TxQueueBudget {
@@ -115,6 +116,7 @@ impl TxQueueBudget {
             short_lookahead: false,
             pending_commands: Mutex::new(Vec::new()),
             write_leases: Mutex::new(Vec::new()),
+            recovery_classifier:Default::default(),
         }
     }
 
@@ -133,24 +135,30 @@ impl TxQueueBudget {
         priority: u8,
         payload: &[u8],
     ) -> sedsnet::TelemetryResult<()> {
-        self.try_send_inner(sender, priority, payload, None)
+        self.try_send_inner(sender, priority, payload, None, None)
     }
 
+    #[cfg(test)]
     pub fn try_send_leased(
         &self,
         sender: &mpsc::UnboundedSender<(u8, Vec<u8>)>,
         priority: u8,
         lease: sedsnet::router::PackedWriteLease,
     ) -> sedsnet::TelemetryResult<()> {
-        self.try_send_inner(sender, priority, lease.bytes(), Some(&lease))
+        self.try_send_inner(sender, priority, lease.bytes(), Some(&lease),None)
     }
 
+    pub fn try_send_leased_tracked(&self,sender:&mpsc::UnboundedSender<(u8,Vec<u8>)>,priority:u8,
+        lease:sedsnet::router::PackedWriteLease,activity:&TransportTxActivity)->sedsnet::TelemetryResult<()> {
+        self.try_send_inner(sender,priority,lease.bytes(),Some(&lease),Some(activity))
+    }
     fn try_send_inner(
         &self,
         sender: &mpsc::UnboundedSender<(u8, Vec<u8>)>,
         priority: u8,
         payload: &[u8],
         lease: Option<&sedsnet::router::PackedWriteLease>,
+        activity:Option<&TransportTxActivity>,
     ) -> sedsnet::TelemetryResult<()> {
         if payload.is_empty() {
             return Err(sedsnet::TelemetryError::HandlerError(
@@ -267,13 +275,11 @@ impl TxQueueBudget {
         // before IO. Publish admission/progress atomically with actual channel
         // acceptance; a closed channel never admits the SDK offer.
         let mut records = self.write_leases.lock().unwrap();
-        if let Err(error) = sender.send((priority, owned)) {
-            drop(records);
-            self.complete(error.0.0, &error.0.1);
-            return Err(sedsnet::TelemetryError::HandlerError(
-                "radio tx queue closed",
-            ));
-        }
+        let offer=|bytes| sender.send((priority,bytes)).map_err(|_|sedsnet::TelemetryError::HandlerError("radio tx queue closed"));
+        let accepted=if let Some(activity)=activity {
+            activity.try_enqueue_owned(self.recovery_classifier.classify(payload),owned,offer)
+        }else{offer(owned)};
+        if let Err(error)=accepted {drop(records);self.complete(priority,payload);return Err(error);}
         if let Some(lease) = lease {
             match lease.admit() {
                 Ok(()) => records.push((identity.0, identity.1, lease.clone())),
@@ -348,7 +354,7 @@ fn discard_retired_write(
     {
         budget.complete(priority, payload);
         if let Some(activity) = activity {
-            activity.complete();
+            activity.complete_frame(payload);
         }
         true
     } else {
@@ -366,36 +372,93 @@ fn send_owned_write(
     comms.send_tracked(&[(priority, payload)], lease.as_slice())
 }
 
-/// Accepted software TX ownership, including queue-pop and active-write windows.
-/// This does not assert drain/receipt inside an external modem or remote board.
+/// Side effects that must drain before verified board recovery. Routine
+/// samples, board readbacks, ACKs and discovery do not own controller outputs.
+pub(crate) const RECOVERY_CONTROL_TYPES: &[&str] = &[
+    "ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND", "FLIGHT_STATE",
+    "BOARD_RECOVERY_REQUEST", "AB_FILL_DRIVE_SETTINGS", "AV_BAY_UNDERGLOW", "FLIGHT_BUZZER",
+    "DAQ_LOADCELL_CALIBRATION", "DAQ_KG50_CALIBRATION", "DAQ_LOG_CLOCK",
+    "DAQ_THERMAL_CALIBRATION", "DAQ_FILTER_CALIBRATION", "DAQ_KG50_INPUT", "DAQ_SD_RETRY",
+    "RESERVED_135", "RESERVED_136",
+];
+pub(crate) fn is_recovery_control_frame(payload:&[u8])->bool {
+    let Ok(info)=serialize::peek_frame_info_unchecked(payload) else {return true;};
+    if info.ack_only() || sedsnet::discovery::is_discovery_type(info.envelope.ty) || matches!(info.envelope.ty,
+        sedsnet::config::DataType::ReliableAck|sedsnet::config::DataType::ReliablePartialAck|sedsnet::config::DataType::ReliablePacketRequest) {return false;}
+    if RECOVERY_CONTROL_TYPES.iter().any(|name|info.envelope.ty==crate::telemetry_schema::data_type(name)){return true;}
+    static KNOWN:OnceLock<Vec<sedsnet::config::DataType>>=OnceLock::new();
+    let known=KNOWN.get_or_init(||{
+        let schema:serde_json::Value=serde_json::from_slice(include_bytes!("../../config/telemetry_config.json")).expect("compiled schema");
+        schema["types"].as_array().expect("compiled types").iter().map(|row|crate::telemetry_schema::data_type(row["name"].as_str().expect("type name"))).collect()
+    });
+    !known.contains(&info.envelope.ty)
+}
+/// One cache per physical side; template identifiers are not global. Only a
+/// CRC-valid canonical template can teach an ordinary type; misses stay control.
+#[derive(Default)]
+pub struct RecoveryFrameClassifier {templates:Mutex<VecDeque<(u32,bool)>>}
+impl RecoveryFrameClassifier {
+    pub fn classify(&self,bytes:&[u8])->bool {
+        fn id(bytes:&[u8],off:&mut usize)->Option<u32>{let mut value=0;for shift in (0..35).step_by(7){let b=*bytes.get(*off)?;*off+=1;if shift==28&&b>15{return None;}value|=u32::from(b&127)<<shift;if b&128==0{return Some(value);}}None}
+        if !bytes.starts_with(b"SDT"){return is_recovery_control_frame(bytes);}
+        if bytes.len()<8{return true;}let end=bytes.len()-4;
+        if crc32fast::hash(&bytes[..end])!=u32::from_le_bytes(bytes[end..].try_into().unwrap()){return true;}
+        let body=&bytes[4..end];let mut templates=self.templates.lock().unwrap();
+        match bytes[3] {
+            1=>{let mut off=0;let Some(key)=id(body,&mut off)else{return true;};let Some(frame)=body.get(off..)else{return true;};
+                if serialize::peek_frame_info_unchecked(frame).is_err(){return true;}
+                let control=is_recovery_control_frame(frame);
+                if let Some(i)=templates.iter().position(|(id,_)|*id==key){templates.remove(i);}
+                if templates.len()>=256{templates.pop_front();}templates.push_back((key,control));control},
+            2|4|5=>{let mut off=1;id(body,&mut off).and_then(|id|templates.iter().find(|(key,_)|*key==id).map(|(_,control)|*control)).unwrap_or(true)},
+            _=>true,
+        }
+    }
+}
+/// Ownership lasts through queue pop and an entire partial/failed physical
+/// write. Classification is an immutable canonical header; opaque frames stay
+/// conservative, never inferred to be telemetry from their scheduling priority.
 #[derive(Default)]
 pub struct TransportTxActivity {
     pending: AtomicUsize,
+    pending_control: AtomicUsize,
+    owners:Mutex<Vec<(usize,usize,bool)>>,
 }
 impl TransportTxActivity {
-    pub fn try_enqueue(
-        &self,
-        send: impl FnOnce() -> sedsnet::TelemetryResult<()>,
-    ) -> sedsnet::TelemetryResult<()> {
-        self.pending
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                count.checked_add(1)
-            })
-            .map_err(|_| sedsnet::TelemetryError::Io("side tx busy"))?;
-        if let Err(error) = send() {
-            self.complete();
-            return Err(error);
+    #[cfg(test)]
+    pub fn try_enqueue(&self,send:impl FnOnce()->sedsnet::TelemetryResult<()>)->sedsnet::TelemetryResult<()> {
+        self.try_enqueue_classified(true,send)
+    }
+    pub fn try_enqueue_classified(&self,control:bool,send:impl FnOnce()->sedsnet::TelemetryResult<()>)->sedsnet::TelemetryResult<()> {
+        if control {self.pending_control.try_update(Ordering::AcqRel,Ordering::Acquire,|n|n.checked_add(1))
+            .map_err(|_|sedsnet::TelemetryError::Io("side control tx busy"))?;}
+        if self.pending.try_update(Ordering::AcqRel,Ordering::Acquire,|n|n.checked_add(1)).is_err(){
+            if control{self.pending_control.fetch_sub(1,Ordering::AcqRel);}return Err(sedsnet::TelemetryError::Io("side tx busy"));
         }
+        if let Err(error)=send(){self.complete_classified(control);return Err(error);}
         Ok(())
     }
-    pub fn has_pending(&self) -> bool {
-        self.pending.load(Ordering::Acquire) != 0
+    pub fn try_enqueue_owned(&self,control:bool,payload:Vec<u8>,send:impl FnOnce(Vec<u8>)->sedsnet::TelemetryResult<()>)->sedsnet::TelemetryResult<()> {
+        let mut owners=self.owners.lock().unwrap();
+        if owners.len()>=4096{return Err(sedsnet::TelemetryError::Io("side owner tracking busy"));}
+        let identity=(payload.as_ptr()as usize,payload.len(),control);
+        self.try_enqueue_classified(control,||{owners.push(identity);let result=send(payload);if result.is_err(){owners.pop();}result})
     }
-    fn complete(&self) {
-        // Underflow retains a fail-closed nonzero count even in release builds.
-        let previous = self.pending.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous != 0, "unowned software TX completion");
+    #[cfg(test)]
+    pub fn has_pending(&self)->bool {self.pending.load(Ordering::Acquire)!=0}
+    pub fn has_pending_control(&self)->bool {self.pending_control.load(Ordering::Acquire)!=0}
+    fn complete_classified(&self,control:bool){
+        if control {let old=self.pending_control.fetch_sub(1,Ordering::AcqRel);debug_assert!(old!=0,"unowned controller completion");}
+        let old=self.pending.fetch_sub(1,Ordering::AcqRel);debug_assert!(old!=0,"unowned software completion");
     }
+    pub(crate) fn complete_frame(&self,payload:&[u8]){
+        let mut owners=self.owners.lock().unwrap();
+        let control=owners.iter().position(|(ptr,len,_)|*ptr==payload.as_ptr()as usize&&*len==payload.len())
+            .map(|index|owners.swap_remove(index).2).unwrap_or(true);
+        self.complete_classified(control);
+    }
+    #[cfg(test)]
+    fn complete(&self){self.complete_classified(true);}
 }
 
 pub struct CommsWorkerHandle {
@@ -568,7 +631,7 @@ impl WireBacklog {
             if retired {
                 budget.complete(priority, bytes);
                 if let Some(activity) = activity {
-                    activity.complete();
+                    activity.complete_frame(bytes);
                 }
             }
             !retired
@@ -2571,7 +2634,7 @@ pub(super) fn spawn_comms_worker_threads(
                                 budget.complete(priority, &payload);
                             }
                             if let Some(activity) = &comms_handle.transport_activity {
-                                activity.complete();
+                                activity.complete_frame(&payload);
                             }
                             log_link_control_send(worker_name, &payload);
                             log_radio_command_event("radio TX sent", worker_name, &payload);
@@ -2580,7 +2643,7 @@ pub(super) fn spawn_comms_worker_threads(
                                     budget.complete(*next_priority, next_payload);
                                 }
                                 if let Some(activity) = &comms_handle.transport_activity {
-                                    activity.complete();
+                                    activity.complete_frame(next_payload);
                                 }
                                 log_link_control_send(worker_name, next_payload);
                                 log_radio_command_event("radio TX sent", worker_name, next_payload);
@@ -2755,7 +2818,7 @@ fn spawn_legacy_comms_worker_thread(
                             match send_owned_write(&mut **comms, comms_handle.tx_budget.as_deref(), priority, &payload) {
                                 Ok(()) => {
                                     if let Some(budget) = &comms_handle.tx_budget { budget.complete(priority, &payload); }
-                                    if let Some(activity) = &comms_handle.transport_activity { activity.complete(); }
+                                    if let Some(activity) = &comms_handle.transport_activity { activity.complete_frame(&payload); }
                                     log_link_control_send(worker_name, &payload);
                                     log_radio_command_event("radio TX sent", worker_name, &payload);
                                     if suppressed_send_errors > 0 {
@@ -3254,7 +3317,7 @@ fn spawn_rx_priority_comms_worker_thread(
                             match send_owned_write(&mut **comms, comms_handle.tx_budget.as_deref(), priority, &payload) {
                                 Ok(()) => {
                                     if let Some(budget) = &comms_handle.tx_budget { budget.complete(priority, &payload); }
-                                    if let Some(activity) = &comms_handle.transport_activity { activity.complete(); }
+                                    if let Some(activity) = &comms_handle.transport_activity { activity.complete_frame(&payload); }
                                     log_radio_command_event("radio TX sent", worker_name, &payload);
                                     if suppressed_send_errors > 0 {
                                         eprintln!(
@@ -3768,20 +3831,24 @@ fn drain_radio_tx_queue(
                     } else {
                         1
                     };
-                for _ in 0..repeats {
-                    if is_command_payload(&payload) {
-                        command_backlog.push_back((priority, payload.clone()));
-                    } else {
-                        telemetry_backlog.push_back((priority, payload.clone()));
-                    }
+                let command=is_command_payload(&payload);
+                // Preserve the accepted Vec identity through queue pop. Extra
+                // legacy flight-command copies get their own conservative owner.
+                for _ in 1..repeats {
+                    let copy=payload.clone();
+                    if let Some(activity)=transport_activity {
+                        let _=activity.try_enqueue_owned(true,copy,|owned|{command_backlog.push_back((priority,owned));Ok(())});
+                    }else{command_backlog.push_back((priority,copy));}
                 }
+                if command{command_backlog.push_back((priority,payload));}
+                else{telemetry_backlog.push_back((priority,payload));}
                 while telemetry_backlog.len() > radio_tx_backlog_limit {
                     if let Some((priority, payload)) = telemetry_backlog.pop_front() {
                         if let Some(budget) = tx_budget {
                             budget.complete(priority, &payload);
                         }
                         if let Some(activity) = transport_activity {
-                            activity.complete();
+                            activity.complete_frame(&payload);
                         }
                     }
                 }
@@ -3908,7 +3975,7 @@ fn send_while_uplink_window_open(
                     budget.complete(priority, &payload);
                 }
                 if let Some(activity) = transport_activity {
-                    activity.complete();
+                    activity.complete_frame(&payload);
                 }
                 log_radio_command_event("radio TX sent", worker_name, &payload);
                 *sent_in_current_uplink_window += 1;
@@ -4588,7 +4655,7 @@ mod transport_pending_tests {
                 })
                 .unwrap();
             assert!(
-                state.has_pending_transport_tx(),
+                state.has_pending_transport_tx() && activity.has_pending_control(),
                 "queued work must block clear"
             );
             let workers = spawn_comms_worker_threads(
@@ -4617,19 +4684,19 @@ mod transport_pending_tests {
                 if observed.recv_timeout(Duration::from_secs(2)) != Ok(0) {
                     return Err("first write not reached");
                 }
-                if !state.has_pending_transport_tx() {
+                if !state.has_pending_transport_tx() || !activity.has_pending_control() {
                     return Err("ownership disappeared during active write");
                 }
                 release.store(1, Ordering::Release);
                 if observed.recv_timeout(Duration::from_secs(2)) != Ok(1) {
                     return Err("failed write dropped instead of retried");
                 }
-                if !state.has_pending_transport_tx() {
+                if !state.has_pending_transport_tx() || !activity.has_pending_control() {
                     return Err("ownership disappeared across retry");
                 }
                 release.store(2, Ordering::Release);
                 for _ in 0..2000 {
-                    if !activity.has_pending() {
+                    if !activity.has_pending() && !activity.has_pending_control() {
                         return Ok(());
                     }
                     thread::sleep(Duration::from_millis(1));
@@ -4646,7 +4713,7 @@ mod transport_pending_tests {
                 result.is_ok(),
                 "legacy={legacy} rx_priority={prioritize_rx}: {result:?}"
             );
-            assert!(!activity.has_pending());
+            assert!(!activity.has_pending() && !activity.has_pending_control());
         }
     }
     #[test]
@@ -4768,3 +4835,50 @@ mod budget_bootstrap_tests;
 
 #[path = "retained_write_retries.rs"]
 mod retained_write_retries;
+
+#[cfg(test)]
+mod recovery_control_tests {
+ use super::*;
+ fn frame(name:&str)->Vec<u8>{let payload=vec![1u8;if name=="KG50"{4}else{1}];serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type(name),&[crate::telemetry_schema::endpoint("GROUND_STATION")],"GS",123,Arc::from(payload)).unwrap()).to_vec()}
+ fn sdt(kind:u8,body:&[u8])->Vec<u8>{let mut bytes=b"SDT".to_vec();bytes.push(kind);bytes.extend(body);bytes.extend(crc32fast::hash(&bytes).to_le_bytes());bytes}
+ #[test]
+ fn continuous_100hz_sdt_samples_and_ack_ownership_do_not_hold_recovery() {
+  let activity=TransportTxActivity::default();let classifier=RecoveryFrameClassifier::default();let mut held=Vec::new();
+  let mut template=vec![9];template.extend(frame("KG50"));assert!(!classifier.classify(&sdt(1,&template)));
+  for _ in 0..100 {let bytes=sdt(2,&[0,9,3]);activity.try_enqueue_owned(classifier.classify(&bytes),bytes,|b|{held.push(b);Ok(())}).unwrap();}
+  let ack=serialize::pack_packet(&Packet::new(sedsnet::config::DataType::ReliableAck,&[crate::telemetry_schema::endpoint("GROUND_STATION")],"GS",123,Arc::from(1u64.to_le_bytes())).unwrap()).to_vec();
+  activity.try_enqueue_owned(classifier.classify(&ack),ack,|b|{held.push(b);Ok(())}).unwrap();
+  assert!(activity.has_pending());assert!(!activity.has_pending_control());
+  for bytes in &held {activity.complete_frame(bytes);}assert!(!activity.has_pending());assert!(!activity.has_pending_control());
+ }
+ #[test]
+ fn actual_sdk_100hz_sdt_stream_retains_total_ownership_without_recovery_control(){
+  use sedsnet::router::{RouterConfig,RouterSideOptions};
+  crate::telemetry_schema::initialize().unwrap();
+  let activity=Arc::new(TransportTxActivity::default());let captured=Arc::new(Mutex::new(Vec::new()));
+  let output=captured.clone();let owner=activity.clone();let classifier=RecoveryFrameClassifier::default();
+  let router=Router::new_with_clock(RouterConfig::default(),Box::new(||0));
+  router.add_side_packed_with_options("recovery_sdt",move|wire|{
+   owner.try_enqueue_owned(classifier.classify(wire),wire.to_vec(),|bytes|{output.lock().unwrap().push(bytes);Ok(())})
+  },RouterSideOptions::default().with_small_packet_transport(128));
+  for tick in 0..100u64 {
+   router.tx(Packet::new(crate::telemetry_schema::data_type("KG50"),&[crate::telemetry_schema::endpoint("GROUND_STATION")],"DAQ",tick*10,Arc::from((tick as f32).to_le_bytes())).unwrap()).unwrap();
+  }
+  let held=captured.lock().unwrap();assert!(held.len()>=100,"actual SDK callbacks, not handwritten frames");
+  assert!(held.iter().any(|bytes|bytes.starts_with(b"SDT\x01")),"SDK emits a real template");
+  assert!(held.iter().any(|bytes|bytes.starts_with(b"SDT")&&matches!(bytes.get(3),Some(2|4|5))),"SDK emits real compact samples");
+  assert!(activity.has_pending());assert!(!activity.has_pending_control(),"100Hz source samples cannot block recovery");
+  for bytes in held.iter(){activity.complete_frame(bytes);}assert!(!activity.has_pending());assert!(!activity.has_pending_control());
+ }
+ #[test]
+ fn template_rebind_does_not_reclassify_old_accepted_frame_and_unknown_stays_control(){
+  let activity=TransportTxActivity::default();let classifier=RecoveryFrameClassifier::default();let mut held=Vec::new();
+  let mut data=vec![9];data.extend(frame("KG50"));assert!(!classifier.classify(&sdt(1,&data)));
+  let bytes=sdt(2,&[0,9,3]);activity.try_enqueue_owned(classifier.classify(&bytes),bytes.clone(),|b|{held.push(b);Ok(())}).unwrap();
+  let mut command=vec![9];command.extend(frame("VALVE_COMMAND"));assert!(classifier.classify(&sdt(1,&command)));
+  activity.try_enqueue_owned(classifier.classify(&bytes),bytes,|b|{held.push(b);Ok(())}).unwrap();
+  assert!(activity.has_pending_control());activity.complete_frame(&held[0]);assert!(activity.has_pending_control());
+  activity.complete_frame(&held[1]);assert!(!activity.has_pending_control());assert!(classifier.classify(&sdt(2,&[0,99,1])));
+  assert!(classifier.classify(&[1,2,3]));
+ }
+}

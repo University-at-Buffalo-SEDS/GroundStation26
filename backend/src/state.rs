@@ -397,6 +397,10 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn has_pending_recovery_control_tx(&self)->bool {
+        self.transport_tx_activity.has_pending_control() || crate::rrls::has_pending_recovery_control()
+    }
+    #[cfg(test)]
     pub(crate) fn has_pending_transport_tx(&self) -> bool {
         self.transport_tx_activity.has_pending() || crate::rrls::status().queued_frames != 0
     }

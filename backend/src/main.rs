@@ -2006,7 +2006,7 @@ async fn main() -> anyhow::Result<()> {
         router.add_side_packed_leased_with_priority_and_options(
             "rocket_comms",
             move |pkt, priority| {
-                activity.try_enqueue(|| budget.try_send_leased(&rocket_tx, priority, pkt))
+                budget.try_send_leased_tracked(&rocket_tx,priority,pkt,&activity)
             },
             opts,
             sedsnet::router::RetryTrackerLimits::default(),
@@ -2019,6 +2019,7 @@ async fn main() -> anyhow::Result<()> {
         Some({
             let umbilical_tx = umbilical_tx.clone();
             let activity = state.transport_tx_activity.clone();
+            let recovery_classifier=telemetry_task::RecoveryFrameClassifier::default();
             let opts = RouterSideOptions {
                 reliable_enabled: router_hop_reliable_enabled(&comms_links.fill_box),
                 ..Default::default()
@@ -2027,8 +2028,8 @@ async fn main() -> anyhow::Result<()> {
             router.add_side_packed_with_priority_and_options(
                 "umbilical_comms",
                 move |pkt, priority| {
-                    activity.try_enqueue(|| {
-                        umbilical_tx.send((priority, pkt.to_vec())).map_err(|_| {
+                    activity.try_enqueue_owned(recovery_classifier.classify(pkt),pkt.to_vec(), |owned| {
+                        umbilical_tx.send((priority, owned)).map_err(|_| {
                             TelemetryError::HandlerError("umbilical_comms tx queue closed")
                         })
                     })

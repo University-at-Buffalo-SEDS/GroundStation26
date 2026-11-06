@@ -42,6 +42,7 @@ const SETTINGS_PEER_AGE_MS: u64 = 15_000;
 #[derive(Clone, Copy)]
 struct FrameClass {
     priority: u8,
+    recovery_control: bool,
 }
 struct TemplateClass {
     id: u32,
@@ -137,6 +138,12 @@ pub fn configure(link: &crate::comms_config::CommsLinkConfig) -> anyhow::Result<
     Ok(())
 }
 
+/// Typed queued/active ownership only. A busy mesh is uncertainty, not proof
+/// that an accepted controller owner has drained. No parsing/SDK lock here.
+pub(crate) fn has_pending_recovery_control() -> bool {
+    RADIO.get().is_some_and(|(_,mesh)|mesh.try_lock().map_or(true,|mesh|mesh.pending_recovery_control()))
+}
+
 pub fn attach(port: &str) -> Option<Shared> {
     RADIO
         .get()
@@ -229,6 +236,8 @@ struct Queued {
 impl Queued {
     const INDEPENDENT_DISCOVERY: u8 = 1;
     const BUDGET_EVER_RESERVED: u8 = 2;
+    const RECOVERY_CONTROL: u8 = 4;
+    fn recovery_control(&self)->bool {self.flags&Self::RECOVERY_CONTROL!=0}
     fn independent_discovery(&self) -> bool {
         self.flags & Self::INDEPENDENT_DISCOVERY != 0
     }
@@ -277,6 +286,10 @@ pub(crate) struct Transmission {
     settings_action: Option<settings_framing::Action>,
 }
 impl Transmission {
+    fn recovery_control(&self)->bool {
+        self.queued.recovery_control() || self.follower.as_ref().is_some_and(|q|q.recovery_control())
+    }
+
     pub(crate) fn frame(&self) -> &Outgoing {
         self.physical.as_ref().unwrap_or(&self.queued.frame)
     }
@@ -425,6 +438,7 @@ pub struct Mesh {
     templates: VecDeque<TemplateClass>,
     active_transmission: Option<u64>,
     active_frame_count: u8,
+    active_recovery_control: bool,
     active_cancelled: bool,
     active_survives_clear: bool,
     next_transmission: u64,
@@ -485,6 +499,7 @@ impl Mesh {
             templates: VecDeque::new(),
             active_transmission: None,
             active_frame_count: 0,
+            active_recovery_control: false,
             active_cancelled: false,
             active_survives_clear: false,
             next_transmission: 0,
@@ -1121,6 +1136,21 @@ impl Mesh {
             })
     }
 
+    pub(crate) fn pending_recovery_control(&self)->bool {
+        self.active_recovery_control || self.queue.iter().any(|queued|queued.recovery_control())
+    }
+    fn recovery_control_for_frame(&mut self,frame:&Outgoing,origin:SettingsOrigin)->bool {
+        let Some((kind,body))=decode(&frame.bytes) else {return true;};
+        match kind {
+            DOWN_COMMAND|UP_COMMAND|AV_BAY_COMMAND|HOST_CONTROL=>true,
+            DOWN_DATA|UP_DATA|AV_BAY_DATA=>self.classify_namespace(body,kind!=DOWN_DATA)
+                .map_or(true,|class|class.recovery_control),
+            HEALTH|READY|POSITION|VOICE|BUDGET_CONTROL|RF_PROFILE_CONTROL=>false,
+            SETTINGS=>origin!=SettingsOrigin::FramingOffer,
+            _=>true,
+        }
+    }
+
     fn enqueue(&mut self, frame: Outgoing, priority: u8, now: u64) {
         self.enqueue_with_origin(frame, priority, now, SettingsOrigin::None);
     }
@@ -1197,6 +1227,7 @@ impl Mesh {
         self.bytes += frame.bytes.len();
         let independent_discovery = Self::independent_discovery(&frame);
         let (sdt_kind, sdt_template) = Self::sdt_dependency(&frame);
+        let recovery_control=self.recovery_control_for_frame(&frame,origin);
         let mut queued = Queued {
             settings_origin: origin,
             frame,
@@ -1206,6 +1237,7 @@ impl Mesh {
             sdt_kind,
             sdt_template,
         };
+        if recovery_control {queued.flags|=Queued::RECOVERY_CONTROL;}
         queued.set_independent_discovery(independent_discovery);
         self.queue.push_back(queued);
         true
@@ -1319,6 +1351,7 @@ impl Mesh {
         self.next_transmission = id;
         self.active_transmission = Some(id);
         self.active_frame_count = 1;
+        self.active_recovery_control=tx.recovery_control();
         self.active_survives_clear = true;
         self.active_fair_delta_bytes = 0;
         Some(tx)
@@ -1367,6 +1400,7 @@ impl Mesh {
             {
                 transmission.follower = self.queue.remove(index);
                 self.active_frame_count = 2;
+                self.active_recovery_control=transmission.recovery_control();
                 self.active_survives_clear = false;
             }
         }
@@ -1399,6 +1433,7 @@ impl Mesh {
             self.next_transmission = id;
             self.active_transmission = Some(id);
             self.active_frame_count = 1;
+            self.active_recovery_control=queued.recovery_control();
             self.active_fair_delta_bytes = 0;
             self.active_survives_clear = false;
             return Some(Transmission {
@@ -1433,6 +1468,7 @@ impl Mesh {
         self.next_transmission = id;
         self.active_transmission = Some(id);
         self.active_frame_count = 1;
+        self.active_recovery_control=queued.recovery_control();
         self.active_fair_delta_bytes = 0;
         self.budget_inflight = true;
         self.active_survives_clear = true;
@@ -1622,6 +1658,7 @@ impl Mesh {
             self.next_transmission = id;
             self.active_transmission = Some(id);
             self.active_frame_count = 1;
+            self.active_recovery_control=tx.recovery_control();
             self.budget_inflight = Self::budget_kind(&tx.queued.frame.bytes);
             self.active_survives_clear = matches!(
                 tx.queued.frame.bytes.get(3),
@@ -1660,6 +1697,7 @@ impl Mesh {
         assert_eq!(usize::from(self.active_frame_count), count);
         self.active_transmission = None;
         self.active_frame_count = 0;
+        self.active_recovery_control=false;
         self.budget_inflight = false;
         self.budget_committed(&transmission.queued.frame, sent);
         let fair_delta = std::mem::take(&mut self.active_fair_delta_bytes);
@@ -1990,6 +2028,7 @@ impl Mesh {
             let p = sedsnet::wire_format::peek_frame_info(bytes).ok()?;
             let gps = p.envelope.ty == crate::telemetry_schema::data_type("GPS_DATA");
             Some(FrameClass {
+                recovery_control: crate::telemetry_task::is_recovery_control_frame(bytes),
                 priority: if gps {
                     255
                 // Reliable low-priority telemetry keeps its schema priority and
@@ -2050,7 +2089,7 @@ impl Mesh {
                     .find(|entry| entry.id == template && entry.uplink == uplink)
                     .map(|entry| entry.class)
             }
-            3 => Some(FrameClass { priority: 253 }),
+            3 => Some(FrameClass { priority: 253, recovery_control: true }),
             _ => None,
         }
     }
@@ -4671,3 +4710,7 @@ mod completed_owner_certificate_tests {
 #[cfg(test)]
 #[path = "rrls/budget_mesh_tests.rs"]
 mod budget_mesh_tests;
+
+#[cfg(test)]
+#[path = "rrls/recovery_control_tests.rs"]
+mod recovery_control_tests;

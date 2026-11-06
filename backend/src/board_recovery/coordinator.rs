@@ -16,6 +16,9 @@ const POLL: Duration = Duration::from_millis(300);
 #[cfg(test)]
 #[path = "coordinator_c_board_tests.rs"]
 mod c_board_ordering_tests;
+#[cfg(test)]
+#[path = "coordinator_control_drain_tests.rs"]
+mod control_drain_tests;
 
 #[cfg(test)]
 mod explicit_launch_reset_tests {
@@ -768,7 +771,7 @@ fn prepare_inner(
         if commissioning { " COMMISSION" } else { "" }
     );
     let context = principal_context(&identity, headers, principal);
-    let value = json!({"ticket":id,"backend_instance":hex(&identity),"principal_context":context,"reset_epoch":format!("{:016x}",token.generation),"expires_in_ms":original_query_remaining(&targets,Stamp::now()).as_millis() as u64,"action":request.action,"targets":names,"global_startup_best_effort":matches!(request.action.as_str(),"reset_startup"|"reset_startup_all7"),"required_proof_boards":reset_selection.map(|s|s.required_boards()),"unselected_board_verification":"unverified_best_effort","summary":if targets.iter().any(|target| target.first_binding.is_some()) {"Identity reconciliation ONLY for retained uncertain FIRST targets. Other targets will not reset/apply in this attempt. IO cannot clear state; a fresh Query and another distinct human confirmation are required."}else if commissioning{"Explicit commissioning leg; IO is not completion. A separate fresh confirmation is required after provisioning."}else if request.action=="recover_abort" {match targets.first().map(|target|target.board) {Some(Board::FlightComputer)=>"Reset/recover FC to Startup with verified evaluator and safe-output ownership. Preserve deployment history; a separate new flight is required. No MCU reboot or output replay.",Some(Board::RFBoard|Board::PowerBoard|Board::GatewayBoard|Board::DaqBoard)=>"Reset only selected cached application metadata to Startup. No physical recovery, power cycling, acquisition reset, reboot or resync.",_=>"Recover selected AB/VB application state to Idle with verified safe outputs. This sends no Stop: after accepted Launch, explicitly use Manual Abort/Stop and confirm current board state before preparing recovery. No physical-position or power-reset claim."}}else{"Explicit GLOBAL Startup broadcast to ALL boards (best effort). This sends no Stop: after accepted Launch, explicitly use Manual Abort/Stop and confirm current board state before preparing reset. GS must be safely Startup, Idle or Aborted. ONLY listed targets are verified; unlisted boards remain UNVERIFIED. No MCU reboot, physical position, power or runtime mode reset."},"confirmation":phrase});
+    let value = json!({"ticket":id,"backend_instance":hex(&identity),"principal_context":context,"reset_epoch":format!("{:016x}",token.generation),"expires_in_ms":original_query_remaining(&targets,Stamp::now()).as_millis() as u64,"action":request.action,"targets":names,"global_startup_best_effort":matches!(request.action.as_str(),"reset_startup"|"reset_startup_all7"),"required_proof_boards":reset_selection.map(|s|s.required_boards()),"unselected_board_verification":"unverified_best_effort","summary":if targets.iter().any(|target| target.first_binding.is_some()) {"Identity reconciliation ONLY for retained uncertain FIRST targets. Other targets will not reset/apply in this attempt. IO cannot clear state; a fresh Query and another distinct human confirmation are required."}else if commissioning{"Explicit commissioning leg; IO is not completion. A separate fresh confirmation is required after provisioning."}else if request.action=="recover_abort" {match targets.first().map(|target|target.board) {Some(Board::FlightComputer)=>"Reset/recover FC to Startup with verified evaluator and safe-output ownership. Preserve deployment history; a separate new flight is required. No MCU reboot or output replay.",Some(Board::RFBoard|Board::PowerBoard|Board::GatewayBoard|Board::DaqBoard)=>"Reset only selected cached application metadata to Startup. No physical recovery, power cycling, acquisition reset, reboot or resync.",_=>"Recover selected AB/VB application state to Idle with verified safe outputs. A completed launch can recover directly; active launch work must finish or be explicitly stopped first. No MCU reboot or physical-position proof."}}else{"Explicit GLOBAL Startup broadcast to ALL boards (best effort). Selected boards are verified; active launch work must finish or be explicitly stopped first. Clock, calibration and network power are preserved. Unselected boards remain unverified."},"confirmation":phrase});
     let mut control = state.board_recovery.coordinator.0.lock().unwrap();
     if control.shutdown_closed || state.shutdown_requested.load(Ordering::Acquire) { return Err("Ground station is shutting down"); }
     if control
@@ -1293,27 +1296,10 @@ async fn exchange(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
-fn sdk_pending(state: &AppState, router: &sedsnet::router::Router) -> bool {
-    static TYPES: std::sync::OnceLock<Vec<sedsnet::config::DataType>> = std::sync::OnceLock::new();
-    let types = TYPES.get_or_init(|| {
-        let schema: Value =
-            serde_json::from_slice(include_bytes!("../../config/telemetry_config.json"))
-                .expect("compiled telemetry schema");
-        schema["types"]
-            .as_array()
-            .expect("compiled type array")
-            .iter()
-            .map(|row| {
-                crate::telemetry_schema::data_type(
-                    row["name"].as_str().expect("compiled type name"),
-                )
-            })
-            .collect()
-    });
-    state.has_pending_transport_tx()
-        || types
-            .iter()
-            .any(|ty| router.has_pending_reliable_tx_type(*ty))
+fn sdk_pending(state:&AppState,router:&sedsnet::router::Router)->bool {
+    state.has_pending_recovery_control_tx() || crate::telemetry_task::RECOVERY_CONTROL_TYPES.iter()
+        .any(|name| !matches!(router.try_has_pending_reliable_tx_type(crate::telemetry_schema::data_type(name)),Ok(false)))
+        ||state.has_pending_recovery_control_tx() // Close the SDK→physical ownership handoff window.
 }
 async fn wait_sdk(
     state: &Arc<AppState>,
@@ -1321,15 +1307,18 @@ async fn wait_sdk(
     token: Token,
 ) -> Result<(), &'static str> {
     let start = WallInstant::now();
-    while sdk_pending(state, router) {
-        if !stop_unchanged(state, token) || start.elapsed() > QUIESCE_TTL {
+    loop {
+        if !origin_current(state,token){return Err("Recovery generation, Stop or newer manual control changed");}
+        if !sdk_pending(state,router){
+            return if origin_current(state,token){Ok(())}else{Err("Recovery generation, Stop or newer manual control changed")};
+        }
+        if start.elapsed() > QUIESCE_TTL {
             return Err(
                 "SDK/local transport still owns work or new Stop; hidden modem retirement is not inferred",
             );
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    Ok(())
 }
 async fn run(
     state: &Arc<AppState>,
