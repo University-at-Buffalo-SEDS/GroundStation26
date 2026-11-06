@@ -32,6 +32,8 @@ pub enum BlinkMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActionControl {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
     pub cmd: String,
     pub enabled: bool,
     pub blink: BlinkMode,
@@ -62,6 +64,20 @@ fn backend_blink_for(cmd: &str, enabled: bool, recommended: Option<&BlinkMode>) 
     BlinkMode::None
 }
 
+/// Publish explanations from the same server policy that denied the command.
+/// Presentation metadata never changes admission or enables a control.
+pub(crate) fn explain_disabled_policy(policy: &mut ActionPolicyMsg) {
+    for control in &mut policy.controls {
+        if control.enabled { control.disabled_reason = None; continue; }
+        if control.disabled_reason.is_some() { continue; }
+        control.disabled_reason = Some(if matches!(control.cmd.as_str(), "AdvanceFlightState" | "RewindFlightState")
+            && policy.local_phase_controls_reason.is_some() {
+            policy.local_phase_controls_reason.clone().unwrap()
+        } else if !policy.key_enabled { "GroundStation key control is disabled.".into() }
+        else if !policy.software_buttons_enabled { "Software controls are disabled by GroundStation.".into() }
+        else { "This command is unavailable under the current GroundStation policy.".into() });
+    }
+}
 fn is_recording_command(cmd: &str) -> bool {
     matches!(
         cmd,
@@ -1153,7 +1169,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
                 let enabled = is_station_utility_command(cmd)
                     || default_recording_command_enabled(cmd)
                         .unwrap_or(matches!(cmd, "Abort" | "Postinit" | "ResetSim"));
-                ActionControl {
+                ActionControl { disabled_reason: None,
                     cmd: cmd.to_string(),
                     enabled,
                     blink: backend_blink_for(cmd, enabled, None),
@@ -1199,7 +1215,7 @@ fn policy_with_overrides(
             } else {
                 key_enabled
             };
-            ActionControl {
+            ActionControl { disabled_reason: None,
                 cmd: cmd.to_string(),
                 enabled,
                 blink: backend_blink_for(cmd, enabled, recommended.get(cmd)),
@@ -2229,7 +2245,7 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
         .into_iter()
         .map(|cmd| {
             let actuated = default_command_actuated(cmd).or_else(|| valves.actuated_for_cmd(cmd));
-            ActionControl {
+            ActionControl { disabled_reason: None,
                 cmd: cmd.to_string(),
                 enabled: true,
                 blink: BlinkMode::None,
@@ -2995,3 +3011,25 @@ mod tests {
 
 #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
 mod automatic_phase_tests;
+
+#[cfg(test)]
+mod disabled_reason_tests {
+    use super::*;
+    #[test]
+    fn disabled_reasons_are_presentation_only_and_preserve_precise_server_causes() {
+        let mut policy: ActionPolicyMsg = serde_json::from_value(serde_json::json!({
+            "key_enabled":true,"software_buttons_enabled":true,
+            "controls":[{"cmd":"Launch","enabled":false,"blink":"none","actuated":null,
+                "disabled_reason":"VB reports Abort; review recovery."},
+                {"cmd":"Nitrogen","enabled":true,"blink":"none","actuated":null,
+                "disabled_reason":"old blocker"},
+                {"cmd":"StartFill","enabled":false,"blink":"none","actuated":null}]
+        })).unwrap();
+        explain_disabled_policy(&mut policy);
+        assert_eq!(policy.controls[0].disabled_reason.as_deref(),Some("VB reports Abort; review recovery."));
+        assert!(policy.controls[1].enabled);
+        assert_eq!(policy.controls[1].disabled_reason,None);
+        assert!(!policy.controls[2].enabled);
+        assert!(policy.controls[2].disabled_reason.as_deref().unwrap().contains("GroundStation policy"));
+    }
+}

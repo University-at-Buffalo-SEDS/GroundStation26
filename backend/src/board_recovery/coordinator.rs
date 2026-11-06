@@ -13,6 +13,9 @@ use tokio::task::JoinHandle;
 const CONFIRM_TTL: Duration = Duration::from_secs(30);
 const QUIESCE_TTL: Duration = Duration::from_secs(12);
 const POLL: Duration = Duration::from_millis(300);
+#[cfg(test)]
+#[path = "coordinator_c_board_tests.rs"]
+mod c_board_ordering_tests;
 
 #[cfg(test)]
 mod explicit_launch_reset_tests {
@@ -100,6 +103,7 @@ struct Target {
     board: Board,
     desired: u8,
     context: Readback,
+    prepared_query: Observation,
     intent: Option<RecoveryIntent>,
     original_first: Option<RecoveryIntent>,
     uncertain_first: Option<RecoveryIntent>,
@@ -280,6 +284,15 @@ pub(crate) fn manual_utc_idle(state: &AppState) -> bool {
 }
 /// Read-only health may resume after a confirmation expires. This does not
 /// clear its ticket or relax the separate manual UTC/recovery ownership guard.
+/// Serialize external QUERY admission with sealing CONFIRM. Once an operation
+/// owns recovery, only its private query path may emit later verification queries.
+pub(super) fn admit_external_query<T>(state:&AppState,offer:impl FnOnce()->T)->Option<T> {
+    let control=state.board_recovery.coordinator.0.lock().unwrap();
+    if control.shutdown_closed || control.operation.as_ref().is_some_and(|row|row["completed"]==false) {
+        return None;
+    }
+    Some(offer())
+}
 pub(crate) fn readonly_query_idle(state: &AppState) -> bool {
     state
         .board_recovery
@@ -389,6 +402,16 @@ fn context_same(a: &Readback, b: &Readback) -> bool {
         && a.flags == b.flags
         && a.outputs == b.outputs
 }
+fn original_query_remaining(targets:&[Target],now:Stamp)->Duration {
+    targets.iter().filter(|target| target.first_binding.is_none()&&target.context.boot!=u64::MAX)
+        .map(|target| READBACK_TTL.saturating_sub(target.prepared_query.age(now)))
+        .min().unwrap_or(CONFIRM_TTL)
+}
+fn normal_pre_exchange_query(target:&Target,now:Stamp)->Result<Option<Observation>,&'static str> {
+    if target.first_binding.is_some()||target.context.boot==u64::MAX {return Ok(None);}
+    if !target.prepared_query.fresh(now) {return Err("Original preparation query expired; prepare and confirm a fresh recovery intent");}
+    Ok(Some(target.prepared_query.clone()))
+}
 impl Runtime {
     pub(super) fn seal_shutdown_and_take_owner(&self) -> Option<JoinHandle<()>> {
         let mut control = self.0.lock().unwrap();
@@ -407,7 +430,9 @@ impl Runtime {
         let control = self.0.lock().unwrap();
         if control.shutdown_closed { return None; }
         let ticket = control.ticket.as_ref()?;
-        let remaining = CONFIRM_TTL.checked_sub(ticket.created.elapsed())?;
+        let remaining = CONFIRM_TTL.checked_sub(ticket.created.elapsed())?
+            .min(original_query_remaining(&ticket.targets,Stamp::now()));
+        if remaining.is_zero(){return None;}
         if ticket.principal != principal
             || !origin_current(state, ticket.token)
             || ticket.reset_selection.is_some_and(|selection| selection.current(state).is_err())
@@ -691,6 +716,7 @@ fn prepare_inner(
             board,
             desired,
             context: row.value.clone(),
+            prepared_query: row.clone(),
             intent: None,
             original_first,
             uncertain_first,
@@ -742,7 +768,7 @@ fn prepare_inner(
         if commissioning { " COMMISSION" } else { "" }
     );
     let context = principal_context(&identity, headers, principal);
-    let value = json!({"ticket":id,"backend_instance":hex(&identity),"principal_context":context,"reset_epoch":format!("{:016x}",token.generation),"expires_in_ms":30000,"action":request.action,"targets":names,"global_startup_best_effort":matches!(request.action.as_str(),"reset_startup"|"reset_startup_all7"),"required_proof_boards":reset_selection.map(|s|s.required_boards()),"unselected_board_verification":"unverified_best_effort","summary":if targets.iter().any(|target| target.first_binding.is_some()) {"Identity reconciliation ONLY for retained uncertain FIRST targets. Other targets will not reset/apply in this attempt. IO cannot clear state; a fresh Query and another distinct human confirmation are required."}else if commissioning{"Explicit commissioning leg; IO is not completion. A separate fresh confirmation is required after provisioning."}else if request.action=="recover_abort" {match targets.first().map(|target|target.board) {Some(Board::FlightComputer)=>"Reset/recover FC to Startup with verified evaluator and safe-output ownership. Preserve deployment history; a separate new flight is required. No MCU reboot or output replay.",Some(Board::RFBoard|Board::PowerBoard|Board::GatewayBoard|Board::DaqBoard)=>"Reset only selected cached application metadata to Startup. No physical recovery, power cycling, acquisition reset, reboot or resync.",_=>"Recover selected AB/VB application state to Idle with verified safe outputs. This sends no Stop: after accepted Launch, explicitly use Manual Abort/Stop and confirm current board state before preparing recovery. No physical-position or power-reset claim."}}else{"Explicit GLOBAL Startup broadcast to ALL boards (best effort). This sends no Stop: after accepted Launch, explicitly use Manual Abort/Stop and confirm current board state before preparing reset. GS must be safely Startup, Idle or Aborted. ONLY listed targets are verified; unlisted boards remain UNVERIFIED. No MCU reboot, physical position, power or runtime mode reset."},"confirmation":phrase});
+    let value = json!({"ticket":id,"backend_instance":hex(&identity),"principal_context":context,"reset_epoch":format!("{:016x}",token.generation),"expires_in_ms":original_query_remaining(&targets,Stamp::now()).as_millis() as u64,"action":request.action,"targets":names,"global_startup_best_effort":matches!(request.action.as_str(),"reset_startup"|"reset_startup_all7"),"required_proof_boards":reset_selection.map(|s|s.required_boards()),"unselected_board_verification":"unverified_best_effort","summary":if targets.iter().any(|target| target.first_binding.is_some()) {"Identity reconciliation ONLY for retained uncertain FIRST targets. Other targets will not reset/apply in this attempt. IO cannot clear state; a fresh Query and another distinct human confirmation are required."}else if commissioning{"Explicit commissioning leg; IO is not completion. A separate fresh confirmation is required after provisioning."}else if request.action=="recover_abort" {match targets.first().map(|target|target.board) {Some(Board::FlightComputer)=>"Reset/recover FC to Startup with verified evaluator and safe-output ownership. Preserve deployment history; a separate new flight is required. No MCU reboot or output replay.",Some(Board::RFBoard|Board::PowerBoard|Board::GatewayBoard|Board::DaqBoard)=>"Reset only selected cached application metadata to Startup. No physical recovery, power cycling, acquisition reset, reboot or resync.",_=>"Recover selected AB/VB application state to Idle with verified safe outputs. This sends no Stop: after accepted Launch, explicitly use Manual Abort/Stop and confirm current board state before preparing recovery. No physical-position or power-reset claim."}}else{"Explicit GLOBAL Startup broadcast to ALL boards (best effort). This sends no Stop: after accepted Launch, explicitly use Manual Abort/Stop and confirm current board state before preparing reset. GS must be safely Startup, Idle or Aborted. ONLY listed targets are verified; unlisted boards remain UNVERIFIED. No MCU reboot, physical position, power or runtime mode reset."},"confirmation":phrase});
     let mut control = state.board_recovery.coordinator.0.lock().unwrap();
     if control.shutdown_closed || state.shutdown_requested.load(Ordering::Acquire) { return Err("Ground station is shutting down"); }
     if control
@@ -858,6 +884,11 @@ fn admit_confirmation(
             "stale_confirmation",
             "Ticket expired or immutable intent/session/Stop context changed.",
         );
+    }
+    if ticket.targets.iter().any(|target| target.first_binding.is_none()
+        && target.context.boot != u64::MAX && !target.prepared_query.fresh(Stamp::now())) {
+        return error(StatusCode::CONFLICT,"preparation_query_expired",
+            "Original preparation query expired; prepare and confirm a fresh recovery intent.");
     }
     let boundary = match boundary.filter(|boundary| {
         state
@@ -1225,7 +1256,10 @@ async fn exchange(
         .expected(target.board, exchange.nonce);
     authorize(state, headers, ticket).await?;
     send(state,headers,ticket,&router,token,exchange.packet(Stamp::now())?.clone(),
-        ||exchange.packet(Stamp::now()).map(|_|())).await?;
+        || {
+            if !row.fresh(Stamp::now()) {return Err("Original preparation query expired before SDK admission");}
+            exchange.packet(Stamp::now()).map(|_|())
+        }).await?;
     let mut next_poll = WallInstant::now() + POLL;
     loop {
         if crate::gse::with_closed_operator_queue(state, token, || ()).is_none() {
@@ -1445,7 +1479,13 @@ async fn run(
         if reconcile_only && target.first_binding.is_none() {
             continue;
         }
-        let query = fresh_query(state, headers, ticket, token, target.board, &router).await?;
+        // NORMAL completion is armed by the dedicated PREPARE query A.
+        // CONFIRM seals immutable source B>A. A new QUERY C after confirmation
+        // would overwrite that proof and make B<C permanently stale on-device.
+        // Do not renew the original observation or confirmation clock after IO.
+        let query = if let Some(original)=normal_pre_exchange_query(target,Stamp::now())? {original} else {
+            fresh_query(state, headers, ticket, token, target.board, &router).await?
+        };
         if !context_same(&target.context, &query.value) {
             return Err("Fresh query differs from immutable board confirmation context");
         }

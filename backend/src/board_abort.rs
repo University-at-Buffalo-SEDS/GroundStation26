@@ -709,12 +709,16 @@ pub(crate) fn launch_command(name: &str) -> bool {
     )
 }
 pub(crate) fn block_policy(state: &AppState, policy: &mut crate::sequences::ActionPolicyMsg) {
-    if blocked_message(state).is_some()
-        || !crate::rrls::is_rrls() && !crate::actuator_plumbing::retraction_gate(state).allowed
-    {
+    let reason = blocked_message(state).or_else(|| {
+        if crate::rrls::is_rrls() { return None; }
+        let gate = crate::actuator_plumbing::retraction_gate(state);
+        (!gate.allowed).then_some(gate.message)
+    });
+    if let Some(reason) = reason {
         for control in &mut policy.controls {
             if launch_command(&control.cmd) {
                 control.enabled = false;
+                control.disabled_reason = Some(reason.clone());
                 control.blink = crate::sequences::BlinkMode::None;
             }
         }

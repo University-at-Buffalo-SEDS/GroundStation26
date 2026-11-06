@@ -614,6 +614,11 @@ pub(crate) fn actuator_configuration_proof(state: &AppState) -> Option<ActuatorI
     }
     Some(ActuatorIdleProof { boot: value.boot, epoch: value.epoch, outputs: value.outputs })
 }
+fn recovery_requirement_reason(actual_abort: bool, unfinished_target: bool) -> Option<&'static str> {
+    if actual_abort { Some("abort_latched") }
+    else if unfinished_target { Some("unfinished_recovery") }
+    else { None }
+}
 pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let principal =
         match crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {
@@ -676,7 +681,11 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         .coordinator
         .confirmation(&state, &principal_identity);
     let host_pending = state.launch_history.lock().unwrap().recovery_pending();
+    let actual_abort_mask = state.board_abort.masks().0;
     let boards=BOARDS.iter().enumerate().map(|(at,&board)| {
+        let recovery_reason = recovery_requirement_reason(actual_abort_mask & (1 << at) != 0,
+            host_pending.as_ref().is_some_and(|pending| !pending.published
+                && pending.targets.iter().any(|target| target.board == board.sender_id())));
         let health=network.iter().find(|entry|entry.sender_id==board.sender_id());
         let verified=topology.as_ref().is_some_and(|topology|endpoint_verified(&state,board,topology));
         let observation=values[at].as_ref();
@@ -700,6 +709,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
             json!({"id":hex(&operation_id.finish().as_ref()[..16]),"action":"query","phase":if pending{"querying"}else if query.received{"completed"}else{"failed"},"targets":[board.sender_id()],"completed":!pending,"success":if pending{None}else{Some(query.received&&readback.is_some_and(|row|row.nonce==query.nonce&&row.result==0))},"age_ms":now.checked_duration_since(query.sent).unwrap_or(Duration::MAX).as_millis().min(u64::MAX as u128)as u64,"message":if pending{"Query admitted; actual board readback pending."}else if query.received{"Board answered; its result and actual-state validity are shown separately."}else{"Query readback timed out; recovery was not issued."}})
         });
         json!({"id":board.sender_id(),"label":board.as_str(),
+            "recovery_required":recovery_reason.is_some(),"recovery_reason":recovery_reason,
             "display_connected":health.is_some_and(|h|h.healthy),
             "display_known":health.is_some_and(|h|h.healthy)&&known.is_some_and(|row|row.result==0&&row.state.is_some()&&query_domain_consistent(board,row)),
             "network":{"healthy":health.is_some_and(|h|h.healthy),"age_ms":health.map_or(u64::MAX,|h|h.age_ms),"disconnects":health.map_or(0,|h|h.disconnects),"reconnects":health.map_or(0,|h|h.reconnects)},
@@ -894,6 +904,31 @@ pub(crate) fn request_board_query(state: &Arc<AppState>, board: Board) -> Respon
     let abort_revision = state.board_abort.query_revision(board);
     let at = index(board).unwrap();
     let now = Stamp::now();
+    let mut wire = [0; 32];
+    wire[0] = 1;
+    wire[4..12].copy_from_slice(&bytes);
+    wire[24..32].copy_from_slice(&issuer(&identity).to_le_bytes());
+    // QUERY remains inspectable before network UTC synchronization. RECOVER
+    // must use required_control_network_utc_ms; this fallback is read-only only.
+    let packet = match Packet::new(
+        crate::telemetry_schema::data_type(QUERY_TYPE),
+        &[crate::telemetry_schema::endpoint(endpoint(board))],
+        &router.sender(),
+        crate::system_clock::control_packet_timestamp_ms(router),
+        Arc::from(wire),
+    ) {
+        Ok(packet) => packet,
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "packet_rejected",
+                "Query packet preparation failed.",
+            );
+        }
+    };
+    // Packet/clock/topology preparation stays outside the confirmation owner.
+    // Only correlation mutation and the nonblocking SDK offer share its gate.
+    coordinator::admit_external_query(state, || {
     let mut inner = state.board_recovery.inner.lock().unwrap();
     if inner.queries[at]
         .as_ref()
@@ -920,28 +955,6 @@ pub(crate) fn request_board_query(state: &Arc<AppState>, board: Board) -> Respon
             "This board already has an outstanding query; no duplicate request was queued.",
         );
     }
-    let mut wire = [0; 32];
-    wire[0] = 1;
-    wire[4..12].copy_from_slice(&bytes);
-    wire[24..32].copy_from_slice(&issuer(&identity).to_le_bytes());
-    // QUERY remains inspectable before network UTC synchronization. RECOVER
-    // must use required_control_network_utc_ms; this fallback is read-only only.
-    let packet = match Packet::new(
-        crate::telemetry_schema::data_type(QUERY_TYPE),
-        &[crate::telemetry_schema::endpoint(endpoint(board))],
-        &router.sender(),
-        crate::system_clock::control_packet_timestamp_ms(router),
-        Arc::from(wire),
-    ) {
-        Ok(packet) => packet,
-        Err(_) => {
-            return error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "packet_rejected",
-                "Query packet preparation failed.",
-            );
-        }
-    };
     // Install correlation before SDK queue admission. tx_queue never invokes callbacks.
     let previous = inner.queries[at].take();
     inner.queries[at] = Some(Query {
@@ -950,7 +963,7 @@ pub(crate) fn request_board_query(state: &Arc<AppState>, board: Board) -> Respon
         sent: now,
         received: false,
     });
-    if router.tx_queue(packet).is_err() {
+    if router.try_tx_queue(packet).is_err() {
         inner.queries[at] = previous;
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -960,7 +973,10 @@ pub(crate) fn request_board_query(state: &Arc<AppState>, board: Board) -> Respon
     }
     drop(inner);
     Json(json!({"accepted":true,"operation":null,"message":"Query admitted to SDK; fresh board readback is still required."})).into_response()
-}/// Seal new recovery proposals/confirmation atomically before extracting its
+    }).unwrap_or_else(||error(StatusCode::CONFLICT,"query_recovery_owned",
+        "An immutable recovery operation owns this board query; wait for its terminal result."))
+}
+/// Seal new recovery proposals/confirmation atomically before extracting its
 /// cancellation-independent owner. Main must await outside coordinator locks.
 pub(crate) fn seal_shutdown_and_take_owner(state: &AppState) -> Option<tokio::task::JoinHandle<()>> {
     state.board_recovery.coordinator.seal_shutdown_and_take_owner()
@@ -1890,3 +1906,34 @@ mod final_clock_freshness_tests {
 #[cfg(test)]
 #[path = "board_recovery/status_policy_tests.rs"]
 mod status_policy_tests;
+
+#[cfg(test)]
+mod recovery_requirement_tests {
+    use super::*;
+    #[tokio::test]
+    async fn recovery_needed_http_uses_actual_board_authority_not_other_cached_rows() {
+        let fixture = super::tests::http_fixture().await;
+        let state = fixture.state.clone();
+        state.board_abort.observe_abort(Board::ValveBoard, WallInstant::now(), 100);
+        *state.state.lock().unwrap() = crate::types::FlightState::Launch;
+        let now=Stamp::now();
+        state.board_recovery.inner.lock().unwrap().values[index(Board::ActuatorBoard).unwrap()] = Some(Observation {
+            received:now, observed_after:now,
+            value:Readback {result:0,state:Some(15),flags:0x3d,nonce:1,boot:1,epoch:1,uptime:1,outputs:0,issuer:1}
+        });
+        let response = super::tests::http(state.clone(), "GET", "/api/board-recovery/status", Some("viewer"), Value::Null).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes=axum::body::to_bytes(response.into_body(),1024*1024).await.unwrap();
+        let body:Value=serde_json::from_slice(&bytes).unwrap();
+        for board in body["boards"].as_array().unwrap() {
+            if board["id"]=="VB" {
+                assert_eq!(board["recovery_required"],true);
+                assert_eq!(board["recovery_reason"],"abort_latched");
+            } else {
+                assert_eq!(board["recovery_required"],false,"unrelated cached Abort/state/health cannot mark another board");
+                assert!(board["recovery_reason"].is_null());
+            }
+        }
+        assert!(state.topology_router.get().is_none(),"read-only badge metadata never installs a transport or sends commands");
+    }
+}

@@ -24,7 +24,7 @@ impl Intent {
         let owner = state
             .operator_admission_barrier
             .load(std::sync::atomic::Ordering::Acquire);
-        if owner == 0 || owner == u64::MAX {
+        if owner == 0 {
             return None;
         }
         let (kind, byte) = match cmd {
@@ -69,7 +69,6 @@ impl Intent {
         !state.shutdown_requested.load(Ordering::Acquire)
             && self.captured_at.elapsed() <= Duration::from_secs(5)
             && self.token.owner != 0
-            && self.token.owner != u64::MAX
             && self.token.generation != 0
             && self.token.generation != u64::MAX
             && state.operator_admission_barrier.load(Ordering::Acquire) == self.token.owner

@@ -542,6 +542,7 @@ impl Store {
         ) {
             Ok(store) => Ok(store),
             Err(error) => {
+                log::error!("Launch clock journal {} could not be restored: {error:#}. Existing journal retained; automatic actions remain inhibited.", path.display());
                 let mut store = Self::ephemeral();
                 store.writer = Some(Writer::start(path.clone(), true)?);
                 store.path = Some(path);

@@ -904,7 +904,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
     let rt = state.gse.lock().unwrap();
     let input = rt.input(is_prelaunch, interlock(state, policy));
     policy.controls.retain(|c| c.cmd != "Turbocharge");
-    policy.controls.push(ActionControl {
+    policy.controls.push(ActionControl { disabled_reason: None,
         cmd: "Turbocharge".into(),
         enabled: turbocharge::allowed(state, &rt, input),
         blink: BlinkMode::None,
@@ -921,7 +921,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
         #[cfg(not(feature = "hitl_mode"))]
         let enabled = enabled && operational_action_allowed(&rt, action);
         policy.controls.retain(|c| c.cmd != cmd);
-        policy.controls.push(ActionControl {
+        policy.controls.push(ActionControl { disabled_reason: None,
             cmd: cmd.into(),
             enabled,
             blink: BlinkMode::None,
@@ -938,7 +938,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
         policy
             .controls
             .retain(|c| c.cmd != "ToggleGroundStationControl");
-        policy.controls.push(ActionControl {
+        policy.controls.push(ActionControl { disabled_reason: None,
             cmd: "ToggleGroundStationControl".into(),
             enabled: true,
             blink: BlinkMode::None,
@@ -4480,6 +4480,7 @@ pub(crate) fn record_operator_command(
 
 /// A new validated launch revision retires only launch dedup keys. Keep the
 /// board gate through this RAM-only update so Abort cannot race bookkeeping.
+#[cfg(test)]
 pub(crate) fn record_operator_command_with_launch_origin(
     state: &AppState,
     generation: u64,
@@ -4490,19 +4491,39 @@ pub(crate) fn record_operator_command_with_launch_origin(
 ) -> Result<OperatorCommandAdmission, String> {
     record_operator_command_with_recovery_origin(state,generation,command,now_ms,duplicate_window_ms,launch_revision,&mut None)
 }
+#[cfg(test)]
 pub(crate) fn record_operator_command_with_recovery_origin(
     state:&AppState, generation:u64, command:&TelemetryCommand, now_ms:u64,
     duplicate_window_ms:u64, launch_revision:Option<u64>, recovery_origin:&mut Option<crate::operator_queue::manual_origin::Origin>,
 )->Result<OperatorCommandAdmission,String> {
+    record_operator_command_with_recovery_origin_diagnostic(state,generation,command,now_ms,duplicate_window_ms,launch_revision,recovery_origin,&mut None)
+}
+pub(crate) fn record_operator_command_with_recovery_origin_diagnostic(
+    state:&AppState, generation:u64, command:&TelemetryCommand, now_ms:u64,
+    duplicate_window_ms:u64, launch_revision:Option<u64>, recovery_origin:&mut Option<crate::operator_queue::manual_origin::Origin>,
+    rejection:&mut Option<crate::operator_queue::manual_origin::Rejection>,
+)->Result<OperatorCommandAdmission,String> {
     let _dispatch = DISPATCH_GATE.lock().unwrap();
+    // A second copy must not spend a relief epoch then disappear as Duplicate:
+    // that would invalidate the only queued real command. Check duplicates
+    // under the same owner/generation/Stop/deadline context, without mutation.
+    if generation==automatic_generation(state) && recovery_origin.as_ref().is_some_and(|origin|origin.same_command_context(state,command))
+        && state.software_command_is_duplicate(command,now_ms,duplicate_window_ms) {
+        return Ok(OperatorCommandAdmission::Duplicate);
+    }
     let recovery_current = recovery_origin.as_ref().is_some_and(|origin| origin.admits(state,command));
     if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) || generation != automatic_generation(state)
         || (state.operator_admission_barrier.load(std::sync::atomic::Ordering::Acquire) != 0 && !recovery_current)
     {
+        use crate::operator_queue::manual_origin::Rejection;
+        *rejection=Some(if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {Rejection::Shutdown}
+            else if generation==0 {Rejection::MissingOrigin}
+            else if generation!=automatic_generation(state) {Rejection::ResetChanged}
+            else {recovery_origin.as_ref().map_or(Rejection::MissingOrigin,|origin|origin.rejection(state))});
         return Ok(OperatorCommandAdmission::Stale);
     }
     if let Some(origin)=recovery_origin.as_mut() {
-        if !recovery_current || !origin.admit(state) {return Ok(OperatorCommandAdmission::Stale);}
+        if !recovery_current || !origin.admit(state) {*rejection=Some(origin.rejection(state));return Ok(OperatorCommandAdmission::Stale);}
     }
     let record = || {
         if state.record_software_command_if_fresh(command, now_ms, duplicate_window_ms) {

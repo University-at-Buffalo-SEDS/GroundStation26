@@ -2020,10 +2020,12 @@ impl AppState {
                 for control in &mut local.controls {
                     if crate::sequences::is_fill_system_control(&control.cmd) {
                         control.enabled = false;
+                        control.disabled_reason = Some("Fill-system manual control is unavailable while the launch sequence is active.".into());
                         control.blink = crate::sequences::BlinkMode::None;
                     }
                 }
             }
+            crate::sequences::explain_disabled_policy(&mut local);
             return local;
         }
         let mut mirrored =
@@ -2055,6 +2057,7 @@ impl AppState {
                 )
             }));
         crate::board_abort::block_policy(self, &mut mirrored);
+        crate::sequences::explain_disabled_policy(&mut mirrored);
         mirrored
     }
 
@@ -2389,6 +2392,13 @@ impl AppState {
     pub fn record_command_accepted(&self, cmd: &TelemetryCommand, ts_ms: u64) {
         let mut map = self.last_command_ms.lock().unwrap();
         map.insert(command_name(cmd).to_string(), ts_ms);
+    }
+
+    /// Read-only duplicate classification: cannot refresh the dedup clock or
+    /// invalidate an already admitted operator request.
+    pub(crate) fn software_command_is_duplicate(&self,cmd:&TelemetryCommand,ts_ms:u64,window_ms:u64)->bool {
+        !matches!(cmd,TelemetryCommand::Abort) && self.last_command_ms.lock().unwrap()
+            .get(&command_dedup_key(cmd)).is_some_and(|last|ts_ms.saturating_sub(*last)<window_ms)
     }
 
     /// Records a software command only if it is not an immediate duplicate.

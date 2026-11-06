@@ -493,7 +493,7 @@ async fn recovery_websocket_policy_uses_primary_projection_and_new_signed_observ
         local_phase_controls_reason: None,
         key_enabled: true,
         software_buttons_enabled: true,
-        controls: vec![crate::sequences::ActionControl {
+        controls: vec![crate::sequences::ActionControl { disabled_reason: None,
             cmd: "ToggleAvBayUnderglow".into(),
             enabled: true,
             blink: crate::sequences::BlinkMode::None,

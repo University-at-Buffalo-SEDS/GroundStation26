@@ -322,6 +322,8 @@ async fn manual_origin_http_and_websocket_physical_commands_reach_actual_telemet
 #[cfg(feature = "hitl_mode")]
 #[tokio::test]
 async fn manual_origin_fresh_http_and_websocket_phase_receipt_works_without_resealing_old_intent() {
+    if crate::operator_queue::isolated_native_case(module_path!(), "manual_origin_fresh_http_and_websocket_phase_receipt_works_without_resealing_old_intent") {return;}
+
     for websocket in [false, true] {
         let (_root, state, headers, _observed, commands) = fixture().await;
         if !crate::operator_phase::local_mode(&state) {
@@ -438,4 +440,93 @@ async fn manual_origin_fill_exclusion_uses_ordered_actual_valve_sequence_not_ret
     );
     crate::telemetry_task::apply_umbilical_status_at_ingress(&state, &packet("VB", base + 2, 0));
     assert!(!state.operator_queue.fill_launch_active());
+}
+
+#[tokio::test]
+async fn manual_origin_actual_unreadable_journal_keeps_startup_manual_control_live() {
+    if crate::operator_queue::isolated_native_case(module_path!(), "manual_origin_actual_unreadable_journal_keeps_startup_manual_control_live") {return;}
+    let path=std::path::PathBuf::from(std::env::var_os("GS_LAUNCH_CLOCK_STATE").unwrap());
+    let private_fixture=std::env::var_os("GS_MANUAL_PRIVATE_JOURNAL_FIXTURE");
+    let invalid=private_fixture.as_ref().map_or_else(||b"unreadable test journal: keep original evidence".to_vec(),|path|std::fs::read(path).unwrap());
+    let mut names=vec!["NitrogenClose","Nitrogen","ToggleGroundStationControl"];
+    #[cfg(not(feature="hitl_mode"))] {names.pop();}
+    #[cfg(feature="hitl_mode")] {names.push("AdvanceFlightState");}
+    for websocket in [false,true] {
+        for name in names.iter().copied() {
+            let (_root,state,headers,observed,commands)=fixture().await;
+            state.set_umbilical_valve_state(10,false);
+            state.set_umbilical_valve_state(9,false);
+            std::fs::write(&path,&invalid).unwrap();
+            let history=crate::launch_history::Store::environment().unwrap();
+            let persistence_error=history.persistence_error();
+            let (owner,generation)=history.restored_recovery_barrier();
+            if private_fixture.is_none() {assert!(persistence_error.is_some());assert_eq!(owner,u64::MAX);}
+            else {eprintln!("PRIVATE_RESTORE healthy={} sentinel={} finite_generation={} error={:?}",persistence_error.is_none(),owner==u64::MAX,!matches!(generation,0|u64::MAX),persistence_error);}
+            assert_ne!(owner,0,"fixture must restore closed admission");
+            *state.launch_history.lock().unwrap()=history;
+            state.automatic_generation.store(generation,Ordering::Release);
+            state.operator_admission_barrier.store(owner,Ordering::Release);
+            assert_eq!(state.local_flight_state_snapshot(),FlightState::Startup);
+            assert!(crate::gse::capture_operator_origin(&state).is_none());
+            let prior_mode=crate::operator_phase::local_mode(&state);
+            let before=state.launch_history.lock().unwrap().snapshot();
+            let router=state.topology_router.get().unwrap().clone();
+            #[cfg(feature="hitl_mode")]
+            router.enable_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).unwrap();
+            let (_db_tx,db_rx)=mpsc::channel(8);
+            let worker=tokio::spawn(crate::telemetry_task::telemetry_task(state.clone(),router,Vec::new(),commands,db_rx,state.shutdown_subscribe()));
+            if websocket {
+                handle_ws_control_text_with_source(state.clone(),Some("preauth-test".into()),state.cmd_tx.clone(),serde_json::json!({"cmd":name}).to_string(),Arc::new(||true)).await;
+            } else {
+                let response=http(state.clone(),headers,name).await;
+                assert!(response.status().is_success(),"{name} rejected from unreadable-journal Startup: {}",response.status());
+                if name=="NitrogenClose" {assert_eq!(response.status(),StatusCode::ACCEPTED,"must use sealed direct safe direction");}
+            }
+            let result=tokio::time::timeout(StdDuration::from_secs(2),async {
+                loop {
+                    let changed=match name {
+                        "NitrogenClose"=>observed.lock().unwrap().iter().any(|p|p.data_type()==crate::telemetry_schema::data_type("ACTUATOR_COMMAND")&&p.payload()==[12]),
+                        "Nitrogen"=>observed.lock().unwrap().iter().any(|p|p.data_type()==crate::telemetry_schema::data_type("ACTUATOR_COMMAND")&&p.payload()==[9]),
+                        "ToggleGroundStationControl"=>crate::operator_phase::local_mode(&state)!=prior_mode,
+                        "AdvanceFlightState"=>state.local_flight_state_snapshot()==FlightState::Idle,
+                        _=>unreachable!(),
+                    };
+                    if changed {break;}
+                    tokio::time::sleep(StdDuration::from_millis(5)).await;
+                }
+            }).await;
+            state.request_shutdown();worker.await.unwrap();
+            assert!(result.is_ok(),"no actual effect name={name} websocket={websocket} notes={:?}",state.notifications_snapshot());
+            let history=state.launch_history.lock().unwrap();
+            assert_eq!(history.persistence_error(),persistence_error);
+            assert_eq!(history.snapshot(),before,"manual admission must not fabricate a durable launch reset");
+            assert!(history.automatic_actions_inhibited());
+            assert_eq!(state.operator_admission_barrier.load(Ordering::Acquire),owner);
+            assert_eq!(std::fs::read(&path).unwrap(),invalid,"unreadable journal must never be silently overwritten");
+        }
+    }
+}
+
+#[cfg(feature="hitl_mode")]
+#[tokio::test]
+async fn manual_origin_duplicate_cannot_retire_the_only_queued_mode_change() {
+    let (_root,state,headers,_observed,mut commands)=fixture().await;
+    let before=crate::operator_phase::local_mode(&state);
+    assert_eq!(http(state.clone(),headers.clone(),"ToggleGroundStationControl").await.status(),StatusCode::OK);
+    let queued=commands.recv().await.unwrap();
+    let epoch=state.operator_queue.relief_epoch();
+    assert_eq!(http(state.clone(),headers,"ToggleGroundStationControl").await.status(),StatusCode::OK);
+    assert_eq!(state.operator_queue.relief_epoch(),epoch,"duplicate must not invalidate the only real action");
+    assert!(commands.try_recv().is_err(),"duplicate cannot enqueue a second toggle");
+    let TelemetryCommand::QueuedOperator{recovery_origin,generation,..}=&queued else {panic!("server envelope required")};
+    assert!(crate::gse::claim_manual_dispatch(&state,*generation,*recovery_origin).is_some());
+    state.cmd_tx.try_send(queued).unwrap();
+    let (_db_tx,db_rx)=mpsc::channel(8);
+    let router=state.topology_router.get().unwrap().clone();
+    let worker=tokio::spawn(crate::telemetry_task::telemetry_task(state.clone(),router,Vec::new(),commands,db_rx,state.shutdown_subscribe()));
+    let changed=tokio::time::timeout(StdDuration::from_secs(2),async {
+        while crate::operator_phase::local_mode(&state)==before {tokio::time::sleep(StdDuration::from_millis(5)).await;}
+    }).await;
+    state.request_shutdown();worker.await.unwrap();
+    assert!(changed.is_ok(),"the only authenticated mode change was silently discarded");
 }

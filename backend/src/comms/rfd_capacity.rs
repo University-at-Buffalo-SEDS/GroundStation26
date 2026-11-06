@@ -516,6 +516,7 @@ impl Capacity {
     }
     /// A single physical boundary serves the already-owned commands. Record
     /// every logical ID only when a boundary was actually promoted.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn close_command_batch<const N: usize>(
         &mut self,
         wall: Instant,
@@ -798,6 +799,7 @@ impl Capacity {
 
     /// PTYs complete writes before their modeled UART drains. Preserve the
     /// same quiet interval as physical tcdrain, including accumulated lookahead.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn drained_virtual(&mut self, stop_us: u64) {
         let quiet_until = stop_us
             .div_ceil(1_000)

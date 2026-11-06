@@ -871,7 +871,7 @@ mod tests {
         state.set_umbilical_valve_state(0, false);
         let mut policy = state.action_policy_snapshot();
         policy.controls.retain(|control| control.cmd != "Pilot");
-        policy.controls.push(ActionControl {
+        policy.controls.push(ActionControl { disabled_reason: None,
             cmd: "Pilot".into(),
             enabled: true,
             blink: BlinkMode::None,

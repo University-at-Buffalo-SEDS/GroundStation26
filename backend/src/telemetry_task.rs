@@ -38,6 +38,7 @@ const ROUTER_DECODE_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
 static ROUTER_DECODE_ERROR_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static ROUTER_DECODE_ERROR_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
 pub(crate) fn command_at_dispatch(
     state: &AppState,
     command: TelemetryCommand,

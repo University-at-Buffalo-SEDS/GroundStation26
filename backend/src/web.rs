@@ -2399,6 +2399,14 @@ async fn send_command_entry(
         .into_response()
 }
 
+fn command_disabled_message(state:&AppState,command:&TelemetryCommand)->String {
+    let name=command_name(command);
+    let policy=state.action_policy_snapshot();
+    let reason=policy.controls.iter().find(|control|control.cmd==name)
+        .and_then(|control|control.disabled_reason.as_deref());
+    reason.map_or_else(||format!("{name} is unavailable under the current GroundStation policy. Check its control details."),|reason|format!("{name}: {reason}"))
+}
+
 /// Validates and forwards a frontend command into the backend command channel.
 async fn send_command(
     State(state): State<Arc<AppState>>,
@@ -2478,6 +2486,7 @@ async fn send_command_inner(
 
 /// Shared primary/local authorization and dispatch. A proxy must supply a
 /// freshly resolved local principal; this never changes RRLS execution policy.
+#[cfg(test)]
 pub(crate) async fn dispatch_authorized_command(
     state: Arc<AppState>,
     principal: crate::auth::AuthPrincipal,
@@ -2619,11 +2628,9 @@ async fn dispatch_command_inner(
         }
     }
     if !state.is_command_allowed(&cmd) {
-        emit_notification_warning(
-            &state,
-            format!("{} is currently disabled",command_name(&cmd)),
-        );
-        return (StatusCode::FORBIDDEN, "command disabled".into());
+        let message=command_disabled_message(&state,&cmd);
+        emit_notification_warning(&state,&message);
+        return (StatusCode::FORBIDDEN, message);
     }
     if matches!(cmd, TelemetryCommand::RetractPlumbing)
         && let Err(message) =
@@ -2651,7 +2658,8 @@ async fn dispatch_command_inner(
         None
     };
     let now_ms = software_command_clock_ms();
-    let duplicate = match crate::gse::record_operator_command_with_recovery_origin(
+    let mut admission_rejection=None;
+    let duplicate = match crate::gse::record_operator_command_with_recovery_origin_diagnostic(
         &state,
         admission_generation,
         &cmd,
@@ -2659,10 +2667,13 @@ async fn dispatch_command_inner(
         software_command_dedup_ms(),
         launch_revision,
         &mut recovery_origin,
+        &mut admission_rejection,
     ) {
         Err(message) => return (StatusCode::CONFLICT, message),
         Ok(crate::gse::OperatorCommandAdmission::Stale) => {
-            return (StatusCode::CONFLICT, "command cancelled by recovery".into());
+            let message=admission_rejection.unwrap_or(crate::operator_queue::manual_origin::Rejection::MissingOrigin).message();
+            log::warn!("Command {} was not admitted: {}",cmd_name,message);
+            return (StatusCode::CONFLICT, message.into());
         }
         Ok(crate::gse::OperatorCommandAdmission::Duplicate) => true,
         Ok(crate::gse::OperatorCommandAdmission::Fresh) => false,
@@ -3398,7 +3409,7 @@ pub(crate) mod command_dispatch_tests {
                 assert_origin_rejected(&state, queued.unwrap(), origin);
             }
             notices = stale_notifications.recv() => {
-                assert!(notices.unwrap().iter().any(|notice| notice.message == "Command cancelled by recovery."));
+                assert!(notices.unwrap().iter().any(|notice| notice.message == crate::operator_queue::manual_origin::Rejection::ResetChanged.message()));
             }
             _ = tokio::time::sleep(StdDuration::from_secs(3)) => panic!("stale frame did not reach ordinary admission"),
         }
@@ -5613,17 +5624,12 @@ pub(crate) async fn handle_ws_control_text_with_source(
                 }
             }
             if !state_for_recv.is_command_allowed(&cmd.cmd) {
-                emit_notification_warning(
-                    &state_for_recv,
-                    format!(
-                        "{} is currently disabled",
-                        command_name(&cmd.cmd)
-                    ),
-                );
+                emit_notification_warning(&state_for_recv,command_disabled_message(&state_for_recv,&cmd.cmd));
                 return;
             }
             let now_ms = software_command_clock_ms();
-            match crate::gse::record_operator_command_with_recovery_origin(
+            let mut admission_rejection=None;
+            match crate::gse::record_operator_command_with_recovery_origin_diagnostic(
                 &state_for_recv,
                 admission_generation,
                 &cmd.cmd,
@@ -5631,13 +5637,16 @@ pub(crate) async fn handle_ws_control_text_with_source(
                 software_command_dedup_ms(),
                 launch_revision,
                 &mut recovery_origin,
+                &mut admission_rejection,
             ) {
                 Err(message) => {
                     emit_notification_warning(&state_for_recv, message);
                     return;
                 }
                 Ok(crate::gse::OperatorCommandAdmission::Stale) => {
-                    emit_notification_warning(&state_for_recv, "Command cancelled by recovery.");
+                    let message=admission_rejection.unwrap_or(crate::operator_queue::manual_origin::Rejection::MissingOrigin).message();
+                    log::warn!("Command {} was not admitted: {}",cmd_name,message);
+                    emit_notification_warning(&state_for_recv, message);
                     return;
                 }
                 Ok(crate::gse::OperatorCommandAdmission::Duplicate) => {
