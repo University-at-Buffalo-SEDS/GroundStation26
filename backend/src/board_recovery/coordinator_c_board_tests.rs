@@ -2,9 +2,9 @@
 //! GPIO/NVM/ThreadX are inert fixtures; no hardware or physical output claim.
 use super::*;
 use std::{io::{BufRead,BufReader,Write},process::{Child,ChildStdin,ChildStdout,Command,Stdio},sync::Mutex};
-struct Bridge { child:Child,input:ChildStdin,output:BufReader<ChildStdout>,now:u64 }
+pub(super) struct Bridge { child:Child,input:ChildStdin,output:BufReader<ChildStdout>,now:u64 }
 impl Bridge {
- fn start(board:Board)->Self {
+ pub(super) fn start(board:Board)->Self {
   let dir=std::env::var("GS_RECOVERY_C_BRIDGES").expect("Build backend/tests/build_recovery_c_bridge.py and set GS_RECOVERY_C_BRIDGES");
   let mut child=Command::new(std::path::Path::new(&dir).join(if board==Board::ActuatorBoard{"ab"}else{"vb"}))
    .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
@@ -12,9 +12,11 @@ impl Bridge {
   let mut ready=String::new();output.read_line(&mut ready).unwrap();assert_eq!(ready.trim(),"READY");
   Self{child,input,output,now:0}
  }
- fn packet(&mut self,p:&Packet)->Vec<u8> {
+ pub(super) fn packet(&mut self,p:&Packet)->Vec<u8> {
   self.now=self.now.max(p.timestamp());
-  let hex=p.payload().iter().map(|b|format!("{b:02x}")).collect::<String>();
+  let mut body=p.payload().to_vec();
+  if p.data_type()!=crate::telemetry_schema::data_type(QUERY_TYPE) { body=vec![0;32];body[0]=255;body[1]=p.payload()[0]; }
+  let hex=body.iter().map(|b|format!("{b:02x}")).collect::<String>();
   writeln!(self.input,"{} {} {}",self.now,p.timestamp(),hex).unwrap();self.input.flush().unwrap();
   let mut line=String::new();self.output.read_line(&mut line).unwrap();let line=line.trim();assert_eq!(line.len(),80,"actual C bridge response");
   (0..40).map(|i|u8::from_str_radix(&line[i*2..i*2+2],16).unwrap()).collect()

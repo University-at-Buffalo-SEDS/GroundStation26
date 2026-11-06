@@ -19,6 +19,9 @@ mod c_board_ordering_tests;
 #[cfg(test)]
 #[path = "coordinator_control_drain_tests.rs"]
 mod control_drain_tests;
+#[cfg(test)]
+#[path = "coordinator_prepare_admission_tests.rs"]
+mod prepare_admission_tests;
 
 #[cfg(test)]
 mod explicit_launch_reset_tests {
@@ -569,17 +572,22 @@ async fn refresh_prepare_queries(
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let response = super::query(
-            State(state.clone()),
-            headers.clone(),
-            Json(QueryRequest {
-                board: board.sender_id().into(),
-            }),
-        )
-        .await;
-        if response.status() != StatusCode::OK {
-            return Err("Fresh dedicated QUERY could not be admitted; Query and prepare again");
-        }
+        admit_prepare_query(
+            || {
+                if !origin_current(state, token) {
+                    return Err("Recovery origin changed while admitting query");
+                }
+                if let Some(selection) = reset_selection {
+                    selection.current(state)?;
+                }
+                Ok(())
+            },
+            || super::query(
+                State(state.clone()),
+                headers.clone(),
+                Json(QueryRequest { board: board.sender_id().into() }),
+            ),
+        ).await?;
         let nonce = state.board_recovery.inner.lock().unwrap().queries[index(board).unwrap()]
             .as_ref()
             .ok_or("Query missing")?
@@ -604,6 +612,34 @@ async fn refresh_prepare_queries(
     }
     Ok(())
 }
+// Retry only a rejected, never-owned read-only offer, before Confirm seals UTC.
+// Accepted queries, RECOVER and post-confirmation queries never retry here.
+async fn admit_prepare_query<C, F, Fut>(mut current: C, mut offer: F) -> Result<(), &'static str>
+where
+    C: FnMut() -> Result<(), &'static str>,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Response>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    loop {
+        current()?;
+        let response = tokio::time::timeout_at(deadline, offer()).await
+            .map_err(|_| "Fresh dedicated QUERY admission remained busy; Query and prepare again")?;
+        if response.status() == StatusCode::OK {
+            return Ok(());
+        }
+        if response.extensions().get::<super::QueryAdmissionCoreBusy>().is_none() {
+            return Err("Fresh dedicated QUERY could not be admitted; Query and prepare again");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("Fresh dedicated QUERY admission remained busy; Query and prepare again");
+        }
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + Duration::from_millis(10)).min(deadline),
+        ).await;
+    }
+}
+
 fn prepare_inner(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -1758,6 +1794,7 @@ mod tests {
         requests: Arc<Mutex<Vec<Packet>>>,
         model: Arc<Mutex<Model>>,
         pending_rx: VecDeque<Vec<u8>>,
+        c_bridge: Option<super::c_board_ordering_tests::Bridge>,
     }
     struct Fixture {
         http: super::super::tests::HttpFixture,
@@ -1834,19 +1871,27 @@ mod tests {
             clock: Option<Box<dyn sedsnet::router::Clock + Send + Sync>>,
             managed_peers: bool,
         ) -> Self {
-            Self::from_saved_with_services_profile(journal, retained, clock, managed_peers, false, false).await
+            Self::from_saved_with_services_profile_and_c_boards(journal, retained, clock, managed_peers, false, false, false).await
         }
         #[cfg(not(feature="hitl_mode"))]
         async fn new_with_active_startup_peer_services() -> Self {
-            Self::from_saved_with_services_profile(None,None,None,true,true,false).await
+            Self::from_saved_with_services_profile_and_c_boards(None,None,None,true,true,false,false).await
         }
         async fn from_saved_with_services_profile(
+            journal: Option<Vec<u8>>, retained: Option<Vec<(Board,Arc<Mutex<Model>>)>>,
+            clock: Option<Box<dyn sedsnet::router::Clock+Send+Sync>>,
+            managed_peers: bool, active_startup_services: bool, ignition_peer_services: bool,
+        )->Self {
+            Self::from_saved_with_services_profile_and_c_boards(journal,retained,clock,managed_peers,active_startup_services,ignition_peer_services,false).await
+        }
+        async fn from_saved_with_services_profile_and_c_boards(
             journal: Option<Vec<u8>>,
             retained: Option<Vec<(Board, Arc<Mutex<Model>>)>>,
             clock: Option<Box<dyn sedsnet::router::Clock + Send + Sync>>,
             managed_peers: bool,
             active_startup_services: bool,
             ignition_peer_services: bool,
+            actual_c_boards: bool,
         ) -> Self {
             let mut http = super::super::tests::http_fixture().await;
             let restarting = journal.is_some();
@@ -1999,7 +2044,7 @@ mod tests {
                     peer_handlers.push(EndpointHandler::new_packet_handler(crate::telemetry_schema::endpoint("VALVE_BOARD"), |_| Ok(())));
                     peer_handlers.push(EndpointHandler::new_packet_handler(crate::telemetry_schema::endpoint("ACTUATOR_BOARD"), |_| Ok(())));
                 }
-                if ignition_peer_services {
+                if ignition_peer_services || actual_c_boards {
                     let name = match board {
                         Board::ActuatorBoard => Some("ACTUATOR_BOARD"),
                         Board::ValveBoard => Some("VALVE_BOARD"),
@@ -2010,7 +2055,13 @@ mod tests {
                         // Actual peer-owned command endpoint: discover via SDK,
                         // not an injected host route or a synthetic proof mask.
                         peer_handlers.push(EndpointHandler::new_packet_handler(
-                            crate::telemetry_schema::endpoint(name), |_| Ok(())));
+                            crate::telemetry_schema::endpoint(name), {
+                                let capture=requests.clone();
+                                move |packet| {
+                                    if actual_c_boards && matches!(board,Board::ActuatorBoard|Board::ValveBoard) && ["ACTUATOR_COMMAND","VALVE_COMMAND"].iter().any(|name|packet.data_type()==crate::telemetry_schema::data_type(name)) { capture.lock().unwrap().push(packet.clone()); }
+                                    Ok(())
+                                }
+                            }));
                     }
                 }
                 let peer_config = RouterConfig::new(peer_handlers).with_sender(board.sender_id());
@@ -2143,6 +2194,7 @@ mod tests {
                     requests,
                     model,
                     pending_rx: VecDeque::new(),
+                    c_bridge: (actual_c_boards && matches!(board,Board::ActuatorBoard|Board::ValveBoard)).then(||super::c_board_ordering_tests::Bridge::start(board)),
                 });
             }
             let ignition_wire_hold = Arc::new(std::sync::atomic::AtomicU8::new(0));
@@ -2176,6 +2228,18 @@ mod tests {
                         #[cfg(not(feature="test_fire_mode"))]
                         result.unwrap();
                         for packet in std::mem::take(&mut *link.requests.lock().unwrap()) {
+                            if let Some(bridge)=&mut link.c_bridge {
+                                let response=bridge.packet(&packet);
+                                link.model.lock().unwrap().requests.push(packet.clone());
+                                if packet.data_type()!=crate::telemetry_schema::data_type(QUERY_TYPE) {
+                                    assert_eq!(response[0],0,"actual C ordinary command admission");
+                                    continue;
+                                }
+                                let reply=Packet::new(crate::telemetry_schema::data_type(STATUS_TYPE),
+                                    &[crate::telemetry_schema::endpoint("GROUND_STATION")],&link.router.sender(),packet.timestamp(),Arc::from(response)).unwrap();
+                                link.router.tx_queue(reply).unwrap();
+                                continue;
+                            }
                             let wire = packet.payload();
                             assert_eq!(wire.len(), 32);
                             let nonce = u64::from_le_bytes(wire[4..12].try_into().unwrap());
@@ -2669,6 +2733,134 @@ mod tests {
             }
         }
         // Wire receipts do NOT certify unselected MCU application/physical state.
+    }
+
+    /// Entire HTTP/coordinator/SDK path; only GPIO/NVM/ThreadX are inert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires prebuilt actual AB/VB C bridge fixtures"]
+    async fn actual_http_single_prepare_confirm_recovers_completed_c_boards_then_reset() {
+        run_http_c_completed_recovery(false).await;
+    }
+    /// Separate explicit review-refresh experiment, never a single-Prepare proof.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires prebuilt actual AB/VB C bridge fixtures"]
+    async fn actual_http_c_recovery_with_explicit_review_refreshes() {
+        run_http_c_completed_recovery(true).await;
+    }
+    async fn run_http_c_completed_recovery(explicit_review_refresh:bool) {
+        let fixture=Fixture::from_saved_with_services_profile_and_c_boards(None,None,None,true,false,true,true).await;
+        let state=fixture.state();
+        // Unrelated metadata peers start normally; discovering a new Abort
+        // during review must still invalidate a frozen scope (tested separately).
+        for (board,model) in &fixture.models {
+            if !matches!(board,Board::ActuatorBoard|Board::ValveBoard) {
+                model.lock().unwrap().state=0;
+            }
+        }
+        let router=state.topology_router.get().unwrap().clone();
+        // A live 100 Hz unrelated producer continues through every drain and
+        // recovery. Keep physical telemetry owners outstanding as well.
+        let mut held=Vec::new();
+        for _ in 0..100 {
+            let p=Packet::new(crate::telemetry_schema::data_type("KG50"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],"DAQ",1,Arc::from(1f32.to_le_bytes())).unwrap();
+            let bytes=sedsnet::wire_format::pack_packet(&p).to_vec();
+            state.transport_tx_activity.try_enqueue_owned(false,bytes,|b|{held.push(b);Ok(())}).unwrap();
+        }
+        let producing=Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let producer_active=producing.clone();
+        let produced=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let producer_count=produced.clone();
+        let traffic=tokio::spawn(async move {
+            loop {
+                if !producer_active.load(Ordering::Acquire) {tokio::time::sleep(Duration::from_millis(2)).await;continue;}
+                let p=Packet::new(crate::telemetry_schema::data_type("KG50"),
+                    &[crate::telemetry_schema::endpoint("GROUND_STATION")],"DAQ",
+                    crate::system_clock::required_control_network_utc_ms(&router).unwrap(),Arc::from(1f32.to_le_bytes())).unwrap();
+                if router.try_tx_queue(p).is_ok() {producer_count.fetch_add(1,Ordering::Relaxed);} // Busy telemetry retries on the next tick.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        struct StopTraffic(JoinHandle<()>);
+        impl Drop for StopTraffic {fn drop(&mut self){self.0.abort();}}
+        let _traffic=StopTraffic(traffic);
+        let mut initial_epochs=Vec::new();
+        for board in [Board::ActuatorBoard,Board::ValveBoard] {
+            // Human review is separate from the SDK receive callback completing.
+            if explicit_review_refresh {tokio::time::sleep(Duration::from_millis(20)).await;}
+            let response=super::super::tests::http(state.clone(),"POST","/api/board-recovery/prepare",Some("operator"),json!({"action":"recover_abort","board":board.sender_id(),"mode":null,"backend_instance":hex(&state.board_recovery.identity.unwrap()),"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state))})).await;
+            let status=response.status();let ticket=body(response).await;
+            if status!=StatusCode::OK {
+                let diagnostic=super::super::tests::http(state.clone(),"POST","/api/board-recovery/query",Some("operator"),json!({"board":board.sender_id()})).await;
+                eprintln!("Prepare {board:?}={ticket}; following QUERY {} {}",diagnostic.status(),body(diagnostic).await);
+            }
+            assert_eq!(status,StatusCode::OK,"{ticket}");
+            let initial=state.board_recovery.inner.lock().unwrap().values[index(board).unwrap()].as_ref().unwrap().value.clone();
+            assert_eq!(initial.state,Some(7),"Prepare queried actual C completed Launch owner");
+            initial_epochs.push((board,initial.epoch));
+            producing.store(true,Ordering::Release);
+            let response=fixture.confirm(&ticket).await;
+            assert_eq!(response.status(),StatusCode::OK,"{}",body(response).await);
+            let result=fixture.terminal().await;
+            assert_eq!(result["success"],true,"{result}");
+            producing.store(false,Ordering::Release);
+            if explicit_review_refresh {tokio::time::sleep(Duration::from_millis(20)).await;}
+            let row=state.board_recovery.inner.lock().unwrap().values[index(board).unwrap()].as_ref().unwrap().value.clone();
+            assert_eq!(row.state,Some(1));assert_eq!(row.epoch,initial.epoch+1);
+        }
+        // Explicit separate HTTP review attempts, not a mutating retry or an
+        // overwritten sealed intent. Keep admission failures observable.
+        let mut review_attempts=0;
+        let ticket=loop {
+            review_attempts+=1;
+            let response=super::super::tests::http(state.clone(),"POST","/api/board-recovery/prepare",Some("operator"),json!({"action":"reset_startup","board":null,"boards":BOARDS.iter().map(|b|b.sender_id()).collect::<Vec<_>>(),"mode":null,"backend_instance":hex(&state.board_recovery.identity.unwrap()),"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state))})).await;
+            let status=response.status();let ticket=body(response).await;
+            if status==StatusCode::OK {break ticket;}
+            eprintln!("Explicit global review attempt {review_attempts}: {status} {ticket}");
+            assert_eq!(ticket["error"],"fresh_query_required","{ticket}");
+            assert!(explicit_review_refresh && review_attempts<20,"single Prepare must succeed; bounded explicit review experiment is separate");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        eprintln!("Global HTTP review accepted on attempt {review_attempts}; explicit refresh allowed={explicit_review_refresh}");
+        producing.store(true,Ordering::Release);
+        eprintln!("Global HTTP Confirm starting");
+        let response=fixture.confirm(&ticket).await;
+        eprintln!("Global HTTP Confirm returned");
+        assert_eq!(response.status(),StatusCode::OK,"{}",body(response).await);
+        let result=fixture.terminal().await;assert_eq!(result["success"],true,"{result}");
+        eprintln!("Global HTTP reset completed with verified C readbacks");
+        producing.store(false,Ordering::Release);
+        if explicit_review_refresh {tokio::time::sleep(Duration::from_millis(20)).await;}
+        assert_eq!(result["reset_applied_state"],0);
+        for (board,epoch) in initial_epochs {
+            let row=state.board_recovery.inner.lock().unwrap().values[index(board).unwrap()].as_ref().unwrap().value.clone();
+            assert_eq!(row.state,Some(0));assert_eq!(row.epoch,epoch+2);
+            let name=if board==Board::ActuatorBoard {"ACTUATOR_COMMAND"}else{"VALVE_COMMAND"};
+            let destination=if board==Board::ActuatorBoard {"ACTUATOR_BOARD"}else{"VALVE_BOARD"};
+            let router=state.topology_router.get().unwrap();
+            let command=Packet::new(crate::telemetry_schema::data_type(name),&[crate::telemetry_schema::endpoint(destination)],"GS",
+                crate::system_clock::required_control_network_utc_ms(router).unwrap(),Arc::from([9u8])).unwrap();
+            let id=command.packet_id();
+            eprintln!("Ordinary {board:?} command admission starting");
+            tokio::time::timeout(Duration::from_secs(2),async {
+                loop {
+                    match router.try_tx_queue(command.clone()) {
+                        Ok(())=>break,
+                        Err(sedsnet::TelemetryError::Io("router core busy"))=>tokio::time::sleep(Duration::from_millis(2)).await,
+                        Err(reason)=>panic!("ordinary fixture command rejected: {reason:?}"),
+                    }
+                }
+            }).await.expect("non-admitted ordinary fixture packet retained within deadline");
+            tokio::time::timeout(Duration::from_secs(2),async {
+                while !fixture.models.iter().find(|(b,_)|*b==board).unwrap().1.lock().unwrap().requests.iter().any(|p|p.packet_id()==id) {
+                    assert!(!fixture.pump.is_finished(),"C command admission must succeed");
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }).await.unwrap();
+        }
+        assert!(produced.load(Ordering::Acquire)>0,"actual SDK accepted telemetry during recovery drains");
+        assert!(state.has_pending_transport_tx(),"continuous unrelated ownership survived recovery");
+        for bytes in &held {state.transport_tx_activity.complete_frame(bytes);}
     }
 
     async fn completed_manual_cohort(fixture: &Fixture) {
@@ -3937,7 +4129,7 @@ mod tests {
     #[tokio::test]
     async fn board_abort_healthy_session_refreshes_only_queries_without_settings_or_launch_demand() {
         if crate::operator_queue::isolated_native_case(module_path!(),"board_abort_healthy_session_refreshes_only_queries_without_settings_or_launch_demand") { return; }
-        let fixture = Fixture::from_saved_with_services_profile(None,None,None,false,false,true).await;
+        let fixture = Fixture::from_saved_with_services_profile_and_c_boards(None,None,None,false,false,true,false).await;
         completed_manual_cohort(&fixture).await;
         let state = fixture.state();
         let baseline = fixture.models.iter().map(|(_,m)|m.lock().unwrap().requests.len()).collect::<Vec<_>>();
@@ -4109,7 +4301,7 @@ mod tests {
         if crate::operator_queue::isolated_native_case(module_path!(),"board_abort_actual_status_must_refuse_sdk_launch_without_changing_manual_owner") {
             return;
         }
-        let fixture = Fixture::from_saved_with_services_profile(None,None,None,false,false,true).await;
+        let fixture = Fixture::from_saved_with_services_profile_and_c_boards(None,None,None,false,false,true,false).await;
         completed_manual_cohort(&fixture).await;
         let state = fixture.state();
         let router = state.topology_router.get().unwrap();

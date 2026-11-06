@@ -35,6 +35,26 @@ fn launch_proof_mask(state: &AppState) -> u8 {
     let _ = state;
     0
 }
+/// Final publication already owns host state. Retain any Launch readback
+/// owner before entering Stop/Abort fences; never reacquire it inside them.
+pub(crate) struct PublicationLaunchProof<'a> {
+    host: crate::types::FlightState,
+    readbacks: Option<std::sync::MutexGuard<'a, Inner>>,
+}
+impl PublicationLaunchProof<'_> {
+    fn mask(&self, state: &AppState) -> u8 {
+        if !cfg!(feature = "hitl_mode") || self.host != crate::types::FlightState::Launch {
+            return 0;
+        }
+        let inner = self.readbacks.as_ref().expect("Launch proof owner pre-acquired");
+        let actuator_launch = inner.values[index(Board::ActuatorBoard).unwrap()]
+            .as_ref().is_some_and(|row| row.value.state == Some(crate::types::FlightState::Launch as u8));
+        (1 << index(Board::ValveBoard).unwrap())
+            | if actuator_launch || crate::ignition_pair::proof_enforced(state) {
+                1 << index(Board::ActuatorBoard).unwrap()
+            } else { 0 }
+    }
+}
 impl Selection {
     pub(super) fn capture(state: &AppState, optional: &[String]) -> Result<Self, &'static str> {
         let mut explicit = 0;
@@ -86,6 +106,31 @@ impl Selection {
             return Err("Launch participation changed; prepare a fresh reset scope");
         }
         state.board_abort.with_reset_context(self.context, apply)
+    }
+    pub(crate) fn hold_for_publication<'a>(
+        &self,
+        state: &'a AppState,
+        host: crate::types::FlightState,
+    ) -> Result<PublicationLaunchProof<'a>, &'static str> {
+        let readbacks = if cfg!(feature = "hitl_mode") && host == crate::types::FlightState::Launch {
+            Some(state.board_recovery.inner.try_lock().map_err(|_| "Launch readback owner busy")?)
+        } else {
+            None
+        };
+        Ok(PublicationLaunchProof { host, readbacks })
+    }
+    pub(crate) fn with_current_publication<T>(
+        &self,
+        state: &AppState,
+        proof: &PublicationLaunchProof<'_>,
+        apply: impl FnOnce() -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        state.board_abort.with_reset_context(self.context, || {
+            if proof.mask(state) & !self.targets != 0 {
+                return Err("Launch participation changed; prepare a fresh reset scope");
+            }
+            apply()
+        })
     }
     pub(super) fn boards(&self) -> Vec<Board> {
         BOARDS
@@ -211,4 +256,34 @@ mod actual_policy_tests {
         state.toggle_hitl_safety_interlock(3);
         assert!(selection.current(&state).is_err());
     }
+    #[cfg(feature = "hitl_mode")]
+    #[tokio::test]
+    async fn publication_uses_held_host_state_without_relocking_and_keeps_scope_fences() {
+        let state = crate::state::tests::test_app_state().await;
+        let selection = Selection::capture(&state, &[]).unwrap();
+        let host = state.state.lock().unwrap();
+        let proof = selection.hold_for_publication(&state, *host).unwrap();
+        assert!(selection.with_current_publication(&state, &proof, || Ok(())).is_ok());
+        state.toggle_hitl_safety_interlock(3);
+        assert!(selection.with_current_publication(&state, &proof, || -> Result<(), &'static str> { panic!("changed context cannot publish") }).is_err());
+    }
+    #[cfg(feature = "hitl_mode")]
+    #[tokio::test]
+    async fn publication_retains_launch_readbacks_and_refuses_new_actuator_participation() {
+        let state = crate::state::tests::test_app_state().await;
+        *state.state.lock().unwrap() = crate::types::FlightState::Launch;
+        let selection = Selection::capture(&state, &[]).unwrap();
+        assert_eq!(selection.boards(), vec![Board::ValveBoard]);
+        let at = Stamp::now();
+        state.board_recovery.inner.lock().unwrap().values[index(Board::ActuatorBoard).unwrap()] = Some(Observation {
+            received: at, observed_after: at,
+            value: Readback { result: 0, state: Some(crate::types::FlightState::Launch as u8),
+                flags: 0x3c, nonce: 1, boot: 1, epoch: 1, uptime: 1, outputs: 0, issuer: 1 },
+        });
+        let host = state.state.lock().unwrap();
+        let proof = selection.hold_for_publication(&state, *host).unwrap();
+        assert!(state.board_recovery.inner.try_lock().is_err(), "readback owner remains held through publication");
+        assert!(selection.with_current_publication(&state, &proof, || -> Result<(), &'static str> { panic!("new AB owner cannot be omitted") }).is_err());
+    }
+
 }

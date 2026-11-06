@@ -325,6 +325,12 @@ pub(crate) fn finalize_verified_recovery(
     } else {
         None
     };
+    // The host-state owner is already held. Snapshot/retain participation
+    // before Stop fences instead of recursively locking host state at publish.
+    let publication_launch = match (selection, host_state.as_deref()) {
+        (Some(selection), Some(host)) => Some(selection.hold_for_publication(state, *host)?),
+        _ => None,
+    };
     let mut history = state
         .launch_history
         .try_lock()
@@ -385,7 +391,11 @@ pub(crate) fn finalize_verified_recovery(
                         Ok(())
                     };
                     if let Some(selection) = selection {
-                        selection.with_current(state, publish)?;
+                        selection.with_current_publication(
+                            state,
+                            publication_launch.as_ref().expect("global selection proof prepared"),
+                            publish,
+                        )?;
                     } else {
                         publish()?;
                     }

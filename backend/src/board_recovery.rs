@@ -853,6 +853,21 @@ pub(crate) async fn query(
 }
 /// Internal read-only collection shares EXACT HTTP nonce/correlation/budget rules.
 /// It cannot emit RECOVER, change board state or bypass primary identity checks.
+// Private admission detail for the pre-confirmation read-only coordinator.
+// HTTP clients retain the existing error status/body.
+#[derive(Clone, Copy)]
+struct QueryAdmissionCoreBusy;
+fn rejected_query_offer(reason: sedsnet::TelemetryError) -> Response {
+    let mut response = error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "queue_rejected",
+        "SDK did not accept query ownership.",
+    );
+    if matches!(reason, sedsnet::TelemetryError::Io("router core busy")) {
+        response.extensions_mut().insert(QueryAdmissionCoreBusy);
+    }
+    response
+}
 pub(crate) fn request_board_query(state: &Arc<AppState>, board: Board) -> Response {
     if let Err(response) = primary_only() {
         return response;
@@ -963,13 +978,9 @@ pub(crate) fn request_board_query(state: &Arc<AppState>, board: Board) -> Respon
         sent: now,
         received: false,
     });
-    if router.try_tx_queue(packet).is_err() {
+    if let Err(reason) = router.try_tx_queue(packet) {
         inner.queries[at] = previous;
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "queue_rejected",
-            "SDK did not accept query ownership.",
-        );
+        return rejected_query_offer(reason);
     }
     drop(inner);
     Json(json!({"accepted":true,"operation":null,"message":"Query admitted to SDK; fresh board readback is still required."})).into_response()
