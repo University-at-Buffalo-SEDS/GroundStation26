@@ -935,6 +935,29 @@ pub(crate) fn retraction_gate(state: &AppState) -> RetractionGate {
             "A plumbing owner or setting is pending. Wait for its actual terminal outcome before Launch.",
         );
     }
+    // A busy SDK owner is not a newly observed Stop. Final packet admission
+    // still uses the atomic pending-ABORT fence; policy reads must not wait on
+    // the SDK or flicker solely because its core is temporarily busy.
+    if crate::gse::manual_stop_state(state) == crate::gse::CurrentState::Invalid {
+        return make(
+            false,
+            "needs_check",
+            None,
+            "A manual Stop is pending. Resolve it before making a new Launch request.",
+        );
+    }
+    #[cfg(feature = "hitl_mode")]
+    if !enforced {
+        // This is the effective server policy, not a claim that old intent or
+        // another boot proves retraction. The explicit HITL override removes
+        // the retraction requirement; other Launch admission gates still apply.
+        return make(
+            true,
+            "hitl_bypassed",
+            None,
+            "HITL retraction enforcement is disabled. Retraction completion is not asserted; other Launch interlocks still apply.",
+        );
+    }
     if sealed && record.is_none() {
         return make(false,"needs_check",None,"Retraction history is CLOSED. A fresh durable retraction intent and actual checks are required; optional delay settings do not bypass uncertainty.");
     }
@@ -978,21 +1001,12 @@ pub(crate) fn retraction_gate(state: &AppState) -> RetractionGate {
         };
     }
     let Some(record) = record else {
-        return if enforced {
-            make(
-                false,
-                "needs_check",
-                None,
-                "Retract the configured fill plumbing, then check actual completion before Launch.",
-            )
-        } else {
-            make(
-                true,
-                "hitl_bypassed",
-                None,
-                "HITL retraction minimum-delay interlock is disabled.",
-            )
-        };
+        return make(
+            false,
+            "needs_check",
+            None,
+            "Retract the configured fill plumbing, then check actual completion before Launch.",
+        );
     };
     if !record.valid()
         || record.mode != desired.mode
@@ -1051,16 +1065,6 @@ pub(crate) fn retraction_gate(state: &AppState) -> RetractionGate {
             },
             remaining,
             "Retraction timing is an estimate until fresh same-operation completion is checked. Launch remains locked.",
-        );
-    }
-    if !enforced {
-        // The known board-owned motion is distinct from a delayed host worker.
-        // HITL may bypass min45; uncertainty/Stop/recovery still never bypasses.
-        return make(
-            true,
-            "hitl_bypassed",
-            None,
-            "HITL minimum-delay interlock is disabled; actual retraction identity is known.",
         );
     }
     if proof.minimum_delay_remaining_ms != 0 {

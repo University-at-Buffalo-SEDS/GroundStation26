@@ -126,6 +126,7 @@ pub(crate) struct Fixture {
     result: u8,
     outputs: u32,
     board_state: FlightState,
+    board_boot: u64,
     motion: Option<Vec<u8>>,
 }
 impl Drop for Fixture {
@@ -304,6 +305,7 @@ impl Fixture {
             result: 0,
             outputs: 16,
             board_state: FlightState::Idle,
+            board_boot: 42,
             motion: None,
         }
     }
@@ -396,7 +398,7 @@ impl Fixture {
                 let mut bytes = [0u8; 40];
                 bytes[0] = 1;
                 bytes[4..12].copy_from_slice(&p[4..12]);
-                bytes[12..20].copy_from_slice(&42u64.to_le_bytes());
+                bytes[12..20].copy_from_slice(&self.board_boot.to_le_bytes());
                 bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
                 let name = if recovery {
                     bytes[2] = self.board_state as u8;
@@ -1295,7 +1297,7 @@ impl Fixture {
         proof[0] = 2;
         proof[2] = self.mode;
         proof[3] = 5;
-        proof[12..20].copy_from_slice(&42u64.to_le_bytes());
+        proof[12..20].copy_from_slice(&self.board_boot.to_le_bytes());
         proof[20..24].copy_from_slice(&1u32.to_le_bytes());
         proof[48..52].copy_from_slice(&45_000u32.to_le_bytes());
         self.motion = Some(proof);
@@ -1672,6 +1674,112 @@ async fn motion_final_gate_uses_actual_minimum_proof_and_original_operation_not_
     );
 }
 
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retraction_override_after_actuator_restart_is_hitl_only_and_preserves_other_gates() {
+    if crate::operator_queue::isolated_native_case(module_path!(), "retraction_override_after_actuator_restart_is_hitl_only_and_preserves_other_gates") { return; }
+    let _serial = SERIAL.lock().await;
+    let mut f = Fixture::new().await;
+    f.prime_motion_identity().await;
+    let origin = capture_motion_origin(&f.state, &crate::types::TelemetryCommand::RetractPlumbing).unwrap();
+    crate::gse::queue_plumbing_with_stop_fence(&f.state, &f.host, Some(origin)).unwrap();
+    f.wait_motion_worker().await;
+    let record = f.state.plumbing_drive.motion_journal.snapshot().0.unwrap();
+    assert_eq!(record.boot, 42);
+    let journal_before = fs::read(f.root.join("motion.json")).unwrap();
+    let retractions_before = f.retractions().len();
+    assert_eq!(retractions_before, 1, "the original intent was actually dispatched through the SDK");
+
+    // Restarted peer reports a new boot and an idle MotionV2 with no accepted
+    // action. Its retained host record must not be mistaken for completion.
+    f.board_boot = 43;
+    tokio::time::sleep(std::time::Duration::from_millis(1_010)).await;
+    f.prime_motion_identity().await;
+    let actual = crate::board_recovery::actuator_configuration_proof(&f.state).unwrap();
+    assert_eq!(actual.boot, 43, "new identity came through the correlated SDK board response");
+    {
+        let inner = f.state.plumbing_drive.inner.lock().unwrap();
+        let current = inner.motion_observed.as_ref().unwrap();
+        assert_eq!(current.value.setting.generation, 43);
+        assert_eq!(current.value.accepted_action, 0);
+        assert_eq!(current.value.original_utc_ms, 0);
+    }
+    async fn http_gate(f: &Fixture) -> Value {
+        let response = f.http("GET", "/api/actuator/plumbing/status", Some("viewer"), Value::Null).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 32_768).await.unwrap();
+        serde_json::from_slice::<Value>(&bytes).unwrap()["retraction_interlock"].clone()
+    }
+    #[cfg(feature = "hitl_mode")]
+    assert!(!f.state.hitl_safety_interlock_enabled(0));
+    let gate = http_gate(&f).await;
+    assert_eq!(gate["configured"], true);
+    #[cfg(feature = "hitl_mode")]
+    {
+        assert_eq!(gate["enforced"], false);
+        assert_eq!(gate["allowed"], true, "explicit HITL override covers a restarted board: {gate}");
+        assert_eq!(gate["phase"], "hitl_bypassed");
+        let revision = crate::board_abort::capture_launch_revision_named(&f.state, "Launch").unwrap();
+        assert_eq!(f.state.board_abort.admit_launch(&f.state, 0, revision, || "admitted").unwrap(), "admitted",
+            "isolated final SDK admission observes the same plumbing policy");
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    {
+        assert_eq!(gate["enforced"], true);
+        assert_eq!(gate["allowed"], false, "normal build cannot use the HITL setting");
+    }
+    #[cfg(feature = "hitl_mode")]
+    {
+        f.state.toggle_hitl_safety_interlock(0);
+        assert_eq!(http_gate(&f).await["allowed"], false, "enforcement ON requires fresh same-operation proof");
+        f.state.toggle_hitl_safety_interlock(0);
+    }
+
+    // An override is not permission to race a writer, ignore persistence
+    // failures, clear Stop, or manufacture a new accepted motion record.
+    f.state.plumbing_drive.inner.lock().unwrap().settings_busy = true;
+    assert_eq!(http_gate(&f).await["allowed"], false);
+    f.state.plumbing_drive.inner.lock().unwrap().settings_busy = false;
+    f.state.plumbing_drive.inner.lock().unwrap().pending_setting = Some(999);
+    assert_eq!(http_gate(&f).await["allowed"], false);
+    f.state.plumbing_drive.inner.lock().unwrap().pending_setting = None;
+    assert!(f.state.plumbing_drive.motion_journal.reserve());
+    assert_eq!(http_gate(&f).await["allowed"], false);
+    f.state.plumbing_drive.motion_journal.finish();
+    f.state.plumbing_drive.inner.lock().unwrap().storage_error = Some("injected configuration failure".into());
+    assert_eq!(http_gate(&f).await["allowed"], false);
+    f.state.plumbing_drive.inner.lock().unwrap().storage_error = None;
+    #[cfg(feature = "hitl_mode")]
+    assert_eq!(http_gate(&f).await["allowed"], true, "cleared independent blockers restore explicit override");
+    f.state.manual_abort_intent.request_untimed();
+    assert_eq!(http_gate(&f).await["allowed"], false, "pending manual Stop remains authoritative");
+    assert_eq!(fs::read(f.root.join("motion.json")).unwrap(), journal_before);
+    assert_eq!(f.state.plumbing_drive.motion_journal.snapshot().0.unwrap(), record);
+    assert_eq!(f.retractions().len(), retractions_before, "read-only status and override do not dispatch motion");
+}
+
+#[cfg(feature = "hitl_mode")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hitl_retraction_override_covers_closed_history_but_not_corrupt_history() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new_with_history(Some(b"preserved-corrupt-retraction-history\n")).await;
+    assert!(!f.state.hitl_safety_interlock_enabled(0));
+    let fault = retraction_gate(&f.state);
+    assert!(!fault.allowed, "an override cannot suppress a journal integrity failure");
+    assert_eq!(fault.phase, "fault");
+    let response = f.http("POST", "/api/actuator/plumbing/retraction-history/reset", Some("operator"), f.history_reset_body()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(f.state.plumbing_drive.motion_journal.sealed());
+    assert_eq!(f.state.plumbing_drive.motion_journal.snapshot(), (None, None));
+    let gate = retraction_gate(&f.state);
+    assert!(gate.configured && !gate.enforced && gate.allowed);
+    assert_eq!(gate.phase, "hitl_bypassed");
+    f.state.toggle_hitl_safety_interlock(0);
+    assert!(!retraction_gate(&f.state).allowed, "enforcement ON retains the sealed-history requirement");
+    assert!(f.retractions().is_empty());
+    assert!(f.sets().is_empty());
+}
+
 struct MotionCutGuard;
 impl MotionCutGuard {
     fn install(path: &Path, stage: u8) -> Self {
@@ -1697,6 +1805,8 @@ impl Fixture {
 async fn motion_history_actual_authorized_reset_is_evidence_preserving_one_use_and_always_closed() {
     let _serial = SERIAL.lock().await;
     let f = Fixture::new_with_history(Some(b"preserved-corrupt-retraction-history\n")).await;
+        #[cfg(feature = "hitl_mode")]
+        f.state.toggle_hitl_safety_interlock(0); // This regression qualifies enforced history, not the explicit HITL override.
     let path = f.root.join("motion.json");
     let original = fs::read(&path).unwrap();
     let body = f.history_reset_body();
@@ -1782,6 +1892,8 @@ async fn motion_history_each_durable_prefix_reloads_old_fault_or_sealed_closed_n
     let _serial = SERIAL.lock().await;
     for stage in 0..=6 {
         let f = Fixture::new_with_history(Some(b"preserved-corrupt-retraction-history\n")).await;
+        #[cfg(feature = "hitl_mode")]
+        f.state.toggle_hitl_safety_interlock(0); // This regression qualifies enforced history, not the explicit HITL override.
         let path = f.root.join("motion.json");
         let original = fs::read(&path).unwrap();
         let body = f.history_reset_body();
