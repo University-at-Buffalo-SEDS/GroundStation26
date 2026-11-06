@@ -3418,6 +3418,7 @@ fn apply_cold_flow_override(
 }
 /// Accepted controller owners must retire before an irreversible launch is saved.
 /// This inspects SDK ownership, not modem airtime or physical output feedback.
+#[cfg(test)]
 fn controller_delivery_pending(state: &AppState) -> bool {
     if manual_stop_pending(state) {
         return true;
@@ -3432,6 +3433,80 @@ fn controller_delivery_pending(state: &AppState) -> bool {
         .iter()
         .any(|name| router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type(name)))
     })
+}
+
+/// Inspect actual accepted controller ownership without waiting for SDK Core.
+/// Providers are resolved before DISPATCH; Busy never means clear ownership.
+fn launch_controller_delivery_state(
+    state: &AppState,
+    kinds: &[sedsnet::config::DataType; 4],
+) -> CurrentState {
+    if manual_stop_ram_pending(state) {
+        return CurrentState::Invalid;
+    }
+    let Some(router) = state.topology_router.get() else {
+        return CurrentState::Current;
+    };
+    for kind in kinds {
+        match router.try_has_pending_reliable_tx_type(*kind) {
+            Ok(false) => {}
+            Ok(true) => return CurrentState::Invalid,
+            Err(sedsnet::router::TryPendingTypeError::CoreBusy) => {
+                return CurrentState::PendingBusy;
+            }
+        }
+    }
+    CurrentState::Current
+}
+/// Return the real effect gate ONLY after a nonwaiting clear observation.
+/// Every Busy drops DISPATCH/Stop guards before bounded same-ticket retry.
+/// No durable Launch inhibition is written on this preparation-only retry path.
+fn launch_preparation_gate(
+    state: &AppState,
+    ticket: LaunchAdmission,
+    kinds: &[sedsnet::config::DataType; 4],
+) -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    let started = Instant::now();
+    let window = std::time::Duration::from_millis(100);
+    let mut retried = false;
+    loop {
+        if retried && started.elapsed() >= window {
+            return Err(
+                "Launch preparation timed out waiting for SDK Core; no launch intent was saved"
+                    .into(),
+            );
+        }
+        let dispatch = DISPATCH_GATE.lock().unwrap();
+        if retried && started.elapsed() >= window {
+            return Err(
+                "Launch preparation timed out waiting for SDK Core; no launch intent was saved"
+                    .into(),
+            );
+        }
+        with_stop_admission(state, ticket, || ()).map_err(str::to_string)?;
+        match launch_controller_delivery_state(state, kinds) {
+            CurrentState::Current => return Ok(dispatch),
+            CurrentState::Invalid => return Err(
+                "Controller command delivery or Manual Stop is pending; launch was not dispatched"
+                    .into(),
+            ),
+            CurrentState::PendingBusy => {
+                drop(dispatch);
+                retried = true;
+            }
+        }
+        #[cfg(test)]
+        nonwaiting_admission_tests::core_busy_refused(state);
+        if started.elapsed() >= window {
+            return Err(
+                "Launch preparation timed out waiting for SDK Core; no launch intent was saved"
+                    .into(),
+            );
+        }
+        std::thread::sleep(
+            std::time::Duration::from_millis(5).min(window.saturating_sub(started.elapsed())),
+        );
+    }
 }
 
 pub(crate) fn operator_phase_mode(state:&AppState)->Option<(bool,u64)> {
@@ -4111,14 +4186,14 @@ pub(crate) fn inhibit_automatic_actions_for_launch_revision(
     state: &Arc<AppState>,
     launch_revision: Option<u64>,
 ) -> Result<LaunchAdmission, String> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    // Freeze the original ticket once, before provider work or retry waits.
     let ticket = LaunchAdmission::capture_for_launch(state, launch_revision)?;
     if !ticket.trackable() {
         return Err("Stop epoch exhausted; launch was not admitted".into());
     }
-    if controller_delivery_pending(state) {
-        return Err("Controller command delivery is pending; launch was not dispatched".into());
-    }
+    let controller_types=["ABORT","VALVE_COMMAND","ACTUATOR_COMMAND","FLIGHT_COMMAND"]
+        .map(crate::telemetry_schema::data_type);
+    let _dispatch=launch_preparation_gate(state,ticket,&controller_types)?;
     state
         .board_abort
         .admit_launch(
@@ -4167,14 +4242,14 @@ pub(crate) fn commit_fire_intent_revision(
     state: &Arc<AppState>,
     launch_revision: Option<u64>,
 ) -> Result<LaunchAdmission, String> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    // Freeze the original ticket once, before provider work or retry waits.
     let ticket = LaunchAdmission::capture_for_launch(state, launch_revision)?;
     if !ticket.trackable() {
         return Err("Stop epoch exhausted; launch was not admitted".into());
     }
-    if controller_delivery_pending(state) {
-        return Err("Controller command delivery is pending; launch was not dispatched".into());
-    }
+    let controller_types=["ABORT","VALVE_COMMAND","ACTUATOR_COMMAND","FLIGHT_COMMAND"]
+        .map(crate::telemetry_schema::data_type);
+    let _dispatch=launch_preparation_gate(state,ticket,&controller_types)?;
     state
         .board_abort
         .admit_launch(
@@ -6276,3 +6351,6 @@ pub(crate) fn native_owned_startup_snapshot(state:&AppState) -> serde_json::Valu
         "startup_configured":rt.operational.startup_configured,"topology_healthy":rt.operational.topology_healthy,
         "topology_stable":rt.operational.topology_stable,"fault":format!("{:?}",rt.operational.saved.qualification.fault())})
 }
+
+#[cfg(test)]
+mod launch_preparation_contention_tests;
