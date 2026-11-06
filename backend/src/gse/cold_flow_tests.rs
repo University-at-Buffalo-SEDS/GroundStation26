@@ -296,6 +296,19 @@ async fn actual_cold_flow_routes_physical_edge_auth_cancel_and_no_launch_clock()
     }
     // Real SDK packet path: N2 pressurize, isolated operator hold, edge-bound PILOT.
     let mut f = Fixture::new().await;
+    let sent_before=f.sent.lock().unwrap().len();
+    let current=serde_json::to_value(status(&f.state)).unwrap();
+    assert_eq!(current["start_available"],true);
+    assert_eq!(current["valid_for_ms"],2000);
+    assert_eq!(current["backend_instance"],f.state.sequence_progress.backend_instance());
+    assert_eq!(current["reset_epoch"],format!("{:016x}",automatic_generation(&f.state)));
+    f.state.gse.lock().unwrap().test_now_ms=Some(1600);
+    assert_eq!(serde_json::to_value(status(&f.state)).unwrap()["valid_for_ms"],500,"status cannot renew the pressure producer receipt");
+    f.state.gse.lock().unwrap().test_now_ms=Some(2101);
+    let expired=serde_json::to_value(status(&f.state)).unwrap();
+    assert_eq!(expired["valid_for_ms"],0);assert_eq!(expired["start_available"],false);
+    assert_eq!(f.sent.lock().unwrap().len(),sent_before,"status/lease reads never emit valve effects");
+    f.state.gse.lock().unwrap().test_now_ms=Some(100);
     assert!(panel_edge(&f.state, automatic_generation(&f.state)).is_none());
     assert!(matches!(
         f.call("/api/gse/cold-flow/start", serde_json::json!({}), None)

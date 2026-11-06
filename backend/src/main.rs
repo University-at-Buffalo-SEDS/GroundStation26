@@ -70,6 +70,7 @@ mod network_health;
 mod network_traffic;
 mod network_variables;
 mod operator_queue;
+mod operator_phase;
 mod primary_mirror;
 mod qualification_requests;
 mod recording_export;
@@ -1380,6 +1381,9 @@ async fn main() -> anyhow::Result<()> {
         pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
         latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
         gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
+        phase_control_selected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        phase_control_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        phase_control_public: Arc::new(Mutex::new(None)),
         sequence_progress: Arc::new(crate::sequence_progress_service::Shared::new(
             rand::random::<u128>(),
         )),

@@ -626,6 +626,11 @@ pub(crate) fn commit_admitted_launch(prepared: &PreparedLaunchState) -> Result<(
 /// Coordinator-only staging: disk IO is outside DISPATCH/Stop/SDK locks.
 /// The owner must subsequently admit this EXACT packet under its original
 /// Stop fence and require fresh actual board readbacks before reopening.
+pub(crate) fn operator_phase_packet(router:&Router,phase:u8)->Result<Packet> {
+    anyhow::ensure!(matches!(crate::types::u8_to_flight_state(phase),Some(crate::types::FlightState::Startup|crate::types::FlightState::Idle|crate::types::FlightState::PreFill|crate::types::FlightState::FillTest|crate::types::FlightState::NitrogenFill|crate::types::FlightState::NitrousFill|crate::types::FlightState::Armed)),"Operator phase cannot enter Fire or flight");
+    packet_bytes_at(FLIGHT_STATE_TYPE,"FLIGHT_STATE",Arc::from([phase]),crate::system_clock::required_control_network_utc_ms(router)?)
+}
+
 pub(crate) fn prepare_verified_recovery_startup(router: &Router) -> Result<Packet> {
     let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
     let packet = packet_bytes_at(

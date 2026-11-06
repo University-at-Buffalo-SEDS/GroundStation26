@@ -17,6 +17,16 @@ pub struct ResultLink {
     pub timestamp_ms: i64,
     pub warning: bool,
 }
+/// Mutable presentation metadata, separate from immutable run/watch revisions.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BoardDisplay {
+    pub connected: bool,
+    pub known: bool,
+    pub boot: Option<String>,
+    pub epoch: Option<u32>,
+    pub outputs: Option<u32>,
+    pub outputs_age_ms: Option<u64>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Envelope {
     pub version: u16,
@@ -29,6 +39,8 @@ pub struct Envelope {
     pub reporting_error: Option<String>,
     #[serde(default)]
     pub result_links: Vec<ResultLink>,
+    #[serde(default)]
+    pub board_display: std::collections::BTreeMap<String, BoardDisplay>,
 }
 pub struct Service {
     instance: String,
@@ -176,6 +188,7 @@ impl Service {
             value
         };
         Envelope {
+            board_display: Default::default(),
             version: VERSION,
             backend_instance: self.instance.clone(),
             reset_epoch: format!("{reset_epoch:016x}"),
@@ -229,6 +242,9 @@ impl Shared {
     }
     pub fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Service>> {
         self.inner.lock()
+    }
+    pub fn backend_instance(&self) -> String {
+        format!("{:032x}", self.instance)
     }
     pub fn reserve(&self, epoch: u64) -> Result<RunKey, Error> {
         let mut current = self.serial.load(Ordering::Relaxed);

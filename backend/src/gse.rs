@@ -184,6 +184,7 @@ pub struct Runtime {
     fill_cutoff: crate::sequences::FillCutoff,
     fill_trim: Option<gse_sequence::fill_trim::Controller>,
     ground_station_control: bool,
+    phase_control_revision: u64,
     manual_control: bool,
     effects_queued: bool,
     automatic_abort_in_flight: bool,
@@ -223,6 +224,7 @@ impl Default for Runtime {
             fill_cutoff: Default::default(),
             fill_trim: None,
             ground_station_control: true,
+            phase_control_revision: 0,
             manual_control: false,
             effects_queued: false,
             automatic_abort_in_flight: false,
@@ -1321,6 +1323,9 @@ fn handle_command_inner(
         let enabled = {
             let mut rt = state.gse.lock().unwrap();
             rt.ground_station_control = !rt.ground_station_control;
+            state.phase_control_selected.store(rt.ground_station_control,std::sync::atomic::Ordering::Release);
+            rt.phase_control_revision = rt.phase_control_revision.checked_add(1).unwrap_or(u64::MAX);
+            state.phase_control_revision.store(rt.phase_control_revision,std::sync::atomic::Ordering::Release);
             if !rt.ground_station_control && rt.fill_trim.is_some() {
                 rt.cancel_automation_for_manual();
                 rt.engine.status.message =
@@ -3398,6 +3403,58 @@ fn controller_delivery_pending(state: &AppState) -> bool {
     })
 }
 
+pub(crate) fn operator_phase_mode(state:&AppState)->Option<(bool,u64)> {
+    state.gse.try_lock().ok().map(|rt|(rt.ground_station_control,rt.phase_control_revision))
+}
+pub(crate) fn operator_phase_public_context(state:&AppState)->Option<(bool,u64,bool)> {
+    state.gse.try_lock().ok().map(|runtime|(runtime.ground_station_control,runtime.phase_control_revision,runtime.cold_flow.is_none()))
+}
+pub(crate) fn operator_phase_runtime_available(state:&AppState)->bool {
+    state.gse.try_lock().ok().is_some_and(|runtime|runtime.cold_flow.is_none())
+}
+#[cfg(feature="hitl_mode")]
+pub(crate) fn operator_phase_ticket(state:&AppState,token:crate::operator_queue::Token)->LaunchAdmission {
+    LaunchAdmission {board_abort_revision:state.board_abort.abort_revision(),generation:token.generation,
+        manual_epoch:token.manual_epoch,observed_manual_epoch:token.observed_manual_epoch}
+}
+pub(crate) fn commit_operator_phase(
+    state: &AppState,
+    intent: &crate::operator_phase::Intent,
+    prepared: &mut sedsnet::router::PreparedManagedBatch<'_>,
+) -> Result<(), String> {
+    let dispatch = DISPATCH_GATE.lock().unwrap();
+    if !intent.validate(state)
+        || !crate::operator_phase::button_allowed(state)
+        || !crate::operator_phase::controls_allowed(state)
+    { return Err("Phase authority changed; request a new phase step.".into()); }
+    let (expected, target, revision, local) = intent.context();
+    let target = target.ok_or("Use the explicit Fire/Abort/reset action at this boundary.")?;
+    let runtime = state.gse.try_lock().map_err(|_| "Phase controller busy")?;
+    if !local || runtime.phase_control_revision != revision || !runtime.ground_station_control {
+        return Err("Phase authority changed".into());
+    }
+    let history = state.launch_history.try_lock().map_err(|_| "Launch journal busy")?;
+    if history.automatic_actions_inhibited() { return Err("Retained Launch requires verified reset".into()); }
+    let mut current = state.state.try_lock().map_err(|_| "Phase state busy")?;
+    if *current != expected { return Err("Global phase changed; request a new phase step".into()); }
+    let router = state.topology_router.get().ok_or("Phase router unavailable")?;
+    // Same Stop -> board-Abort -> SDK Core.try/Schema.try order as automatic
+    // phase publication. Preparation, allocation and retirement stay outside.
+    let admitted = with_stop_admission(state, intent.ticket(), || {
+        state.board_abort.try_admit_automatic_prelaunch(intent.ticket().board_abort_revision, || {
+            router.try_commit_network_variable_batch_unless_pending_type(
+                prepared, crate::telemetry_schema::types::ABORT,
+            )?;
+            *current = target;
+            Ok::<(), sedsnet::router::TryManagedBatchError>(())
+        })
+    });
+    drop(current); drop(history); drop(runtime); drop(dispatch);
+    admitted.map_err(str::to_string)?
+        .map_err(|_| "Stop or board context changed".to_string())?
+        .map_err(|error| format!("Phase update was not admitted: {error:?}"))
+}
+
 /// Ownership snapshot taken before launch journal work. No intent lock is
 /// held across durable I/O; a changed Stop epoch invalidates final admission.
 #[derive(Debug, Clone, Copy)]
@@ -4416,7 +4473,7 @@ pub(crate) fn record_operator_command_with_launch_origin(
             OperatorCommandAdmission::Duplicate
         }
     };
-    if !crate::board_abort::launch_command(crate::sequences::command_name(command)) {
+    if crate::operator_phase::is_local(command) || !crate::board_abort::launch_command(crate::sequences::command_name(command)) {
         return Ok(record());
     }
     let revision = crate::board_abort::validate_launch_revision(state, launch_revision)?;

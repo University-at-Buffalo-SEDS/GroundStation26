@@ -40,6 +40,10 @@ pub struct ActionControl {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActionPolicyMsg {
+    #[serde(default)]
+    pub local_phase_controls: bool,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub local_phase_controls_reason: Option<String>,
     pub key_enabled: bool,
     pub software_buttons_enabled: bool,
     pub controls: Vec<ActionControl>,
@@ -884,6 +888,7 @@ fn is_fill_state(state: FlightState) -> bool {
 
 pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
     match cmd {
+        TelemetryCommand::OperatorPhase{intent} => intent.name(),
         TelemetryCommand::ColdFlowPanelRelease { .. } => "ColdFlowPanelRelease",
         TelemetryCommand::QueuedOperator { command, .. } => command_name(command),
         TelemetryCommand::Postinit => "Postinit",
@@ -1147,6 +1152,8 @@ pub fn default_action_policy() -> ActionPolicyMsg {
             })
             .collect();
         ActionPolicyMsg {
+            local_phase_controls: false,
+            local_phase_controls_reason: None,
             key_enabled: true,
             software_buttons_enabled: true,
             controls,
@@ -1192,6 +1199,8 @@ fn policy_with_overrides(
         .collect();
 
     ActionPolicyMsg {
+        local_phase_controls: false,
+        local_phase_controls_reason: None,
         key_enabled,
         software_buttons_enabled,
         controls,
@@ -2220,6 +2229,8 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
         .collect();
 
     ActionPolicyMsg {
+        local_phase_controls: false,
+        local_phase_controls_reason: None,
         key_enabled: true,
         software_buttons_enabled: true,
         controls,

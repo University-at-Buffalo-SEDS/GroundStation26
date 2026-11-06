@@ -221,7 +221,10 @@ pub(crate) fn envelope(state: &AppState) -> serde_json::Value {
         .ok()
         .map(|s| s.envelope(epoch, crate::sequence_progress_service::now_ms()));
     observation
-        .and_then(|value| serde_json::to_value(value).ok())
+        .and_then(|mut value| {
+            value.board_display = crate::board_recovery::sequence_board_display(state);
+            serde_json::to_value(value).ok()
+        })
         .unwrap_or_default()
 }
 pub(super) fn routes() -> Router<Arc<AppState>> {

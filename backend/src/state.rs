@@ -248,6 +248,10 @@ pub struct AppState {
     /// Latest fuel tank pressure (psi)
     pub latest_fuel_tank_pressure: Arc<Mutex<Option<f32>>>,
     pub gse: Arc<Mutex<crate::gse::Runtime>>,
+    /// Committed operator selection for presentation; mutation still validates Runtime revision.
+    pub phase_control_selected: Arc<AtomicBool>,
+    pub phase_control_revision: Arc<AtomicU64>,
+    pub phase_control_public: Arc<Mutex<Option<crate::operator_phase::PublicSnapshot>>>,
     pub sequence_progress: Arc<crate::sequence_progress_service::Shared>,
     /// Monotonic queued-automatic-intent epoch; never reset with GSE Runtime.
     pub(crate) automatic_generation: Arc<AtomicU64>,
@@ -1845,6 +1849,14 @@ impl AppState {
         crate::sequences::refresh_action_policy_projection(self);
         self.broadcast_action_policy_snapshot();
     }
+    pub(crate) fn publish_operator_phase_observation(self:&Arc<Self>) {
+        let current=self.local_flight_state_snapshot();
+        let _=self.state_tx.send(FlightStateMsg{state:current});
+        crate::flight_sim::sync_local_flight_state(current);
+        self.broadcast_fill_targets_snapshot();
+        crate::sequences::refresh_action_policy_projection(self);
+        self.broadcast_action_policy_snapshot();
+    }
     /// Returns the current locally tracked flight state.
     pub fn local_flight_state_snapshot(&self) -> FlightState {
         *self.state.lock().unwrap()
@@ -1999,14 +2011,24 @@ impl AppState {
         if !crate::rrls::is_rrls() {
             crate::board_abort::block_policy(self, &mut local);
             crate::ignition_pair::project_fresh_proof(self, &mut local);
+            crate::operator_phase::project(self,&mut local);
             return local;
         }
         let mut mirrored =
             crate::primary_mirror::action_policy(self).unwrap_or_else(|| ActionPolicyMsg {
+                local_phase_controls: false,
+                local_phase_controls_reason: None,
                 key_enabled: false,
                 software_buttons_enabled: false,
                 controls: Vec::new(),
             });
+        if mirrored.local_phase_controls || crate::station_mode::snapshot().effective_mode==Some(crate::station_mode::Mode::Hitl) {
+            mirrored.local_phase_controls=false;
+            mirrored.local_phase_controls_reason=Some("Phase steps require the primary GroundStation connection.".into());
+            for control in &mut mirrored.controls {
+                if matches!(control.cmd.as_str(),"AdvanceFlightState"|"RewindFlightState") {control.enabled=false;control.blink=crate::sequences::BlinkMode::None;}
+            }
+        }
         // Recording and durable clock reset retain their separate local paths.
         mirrored
             .controls
@@ -2245,6 +2267,13 @@ impl AppState {
 
     /// Applies the current software-action policy to decide whether a command can run.
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
+        if let TelemetryCommand::OperatorPhase{intent}=cmd {
+            if !intent.validate(self){return false;}
+            if intent.local(){return crate::operator_phase::local_allowed(self)&&crate::operator_phase::button_allowed(self)
+                &&crate::operator_phase::controls_allowed(self);}
+        }
+
+        if let Some(enabled)=crate::operator_phase::enabled_for_name(self,command_name(cmd)){return enabled;}
         let cmd = match cmd {
             TelemetryCommand::FillWithRecording { .. } => &TelemetryCommand::StartFill,
             other => other,
@@ -4277,6 +4306,9 @@ pub(crate) mod tests {
             pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
             latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
             gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
+            phase_control_selected: Arc::new(AtomicBool::new(true)),
+            phase_control_revision: Arc::new(AtomicU64::new(0)),
+            phase_control_public: Arc::new(Mutex::new(None)),
             sequence_progress: Arc::new(crate::sequence_progress_service::Shared::new(
                 rand::random::<u128>(),
             )),

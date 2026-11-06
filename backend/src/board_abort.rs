@@ -11,6 +11,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
+mod discovery_refresh;
 
 pub(crate) const BOARDS: [Board; 7] = [
     Board::RFBoard,
@@ -35,6 +36,7 @@ pub(crate) fn capture_launch_revision(
     state: &AppState,
     command: &crate::types::TelemetryCommand,
 ) -> Option<u64> {
+    if crate::operator_phase::is_local(command) {return None;}
     capture_launch_revision_named(state, crate::sequences::command_name(command))
 }
 pub(crate) fn capture_launch_revision_named(state: &AppState, name: &str) -> Option<u64> {
@@ -788,6 +790,7 @@ pub(crate) async fn query_service(
 ) {
     let mut refresh = crate::board_recovery::ReadonlyQueryRefresh::default();
     let mut actuator = ActuatorReadbackRefresh::default();
+    let mut discovery = discovery_refresh::DiscoveryRefresh::default();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -796,6 +799,7 @@ pub(crate) async fn query_service(
         if crate::rrls::is_rrls() || !crate::board_recovery::coordinator::readonly_query_idle(&state) {
             continue;
         }
+        let _ = discovery.poll(&state);
         let _ = actuator.poll(&state);
         for (i, board) in BOARDS.into_iter().enumerate() {
             if demand & (1 << i) == 0 {

@@ -617,6 +617,8 @@ pub fn action_policy(state: &AppState) -> Option<ActionPolicyMsg> {
     with_received(state, |r, elapsed| {
         let fresh = elapsed <= SOURCE_FRESH_MS;
         ActionPolicyMsg {
+            local_phase_controls: false,
+            local_phase_controls_reason: None,
             key_enabled: fresh && r.flags & 1 != 0,
             software_buttons_enabled: fresh && r.flags & 2 != 0,
             controls: crate::command_proxy::command_catalog()

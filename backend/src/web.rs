@@ -2421,6 +2421,7 @@ async fn send_command_inner(
     headers: HeaderMap,
     Json(cmd): Json<TelemetryCommand>,
 ) -> (StatusCode, String) {
+    let cmd = crate::operator_phase::seal(&state,cmd);
     let fill_origin = matches!(cmd, TelemetryCommand::StartFill)
         .then(|| crate::fill_recording::Captured::capture(&state));
     // Request origin must precede authentication/database waits across recovery.
@@ -2602,7 +2603,11 @@ async fn dispatch_command_inner(
             "manual Abort intent retained; board readback required".into(),
         );
     }
-    if crate::board_abort::launch_command(command_name(&cmd)) {
+    #[cfg(feature="hitl_mode")]
+    if matches!(cmd,TelemetryCommand::AdvanceFlightState|TelemetryCommand::RewindFlightState) {
+        return (StatusCode::CONFLICT,"Phase steps require a fresh request on the primary GroundStation connection.".into());
+    }
+    if !crate::operator_phase::is_local(&cmd) && crate::board_abort::launch_command(command_name(&cmd)) {
         if let Err(error) = crate::board_abort::validate_launch_revision(&state, launch_revision) {
             return (StatusCode::CONFLICT, error);
         }
@@ -2614,7 +2619,7 @@ async fn dispatch_command_inner(
     if !state.is_command_allowed(&cmd) {
         emit_notification_warning(
             &state,
-            format!("Ignored software command {cmd:?}: command is currently disabled"),
+            format!("{} is currently disabled",command_name(&cmd)),
         );
         return (StatusCode::FORBIDDEN, "command disabled".into());
     }
@@ -5466,7 +5471,7 @@ async fn handle_ws(
     }
 }
 
-async fn handle_ws_control_text_with_source(
+pub(crate) async fn handle_ws_control_text_with_source(
     state_for_recv: Arc<AppState>,
     token: Option<String>,
     cmd_tx: mpsc::Sender<TelemetryCommand>,
@@ -5477,6 +5482,8 @@ async fn handle_ws_control_text_with_source(
     let frame_name = serde_json::from_str::<serde_json::Value>(&text)
         .ok()
         .and_then(|value| value.get("cmd").and_then(|v| v.as_str()).map(str::to_owned));
+    let phase_origin = serde_json::from_str::<WsCommand>(&text).ok()
+        .map(|cmd|crate::operator_phase::seal(&state_for_recv,cmd.cmd));
     let fill_origin = (frame_name.as_deref() == Some("StartFill"))
         .then(|| crate::fill_recording::Captured::capture(&state_for_recv));
     let admission_generation = if frame_name.as_deref() == Some("Abort") {
@@ -5550,7 +5557,8 @@ async fn handle_ws_control_text_with_source(
         return;
     }
     match serde_json::from_str::<WsCommand>(&text) {
-        Ok(cmd) => {
+        Ok(mut cmd) => {
+            if let Some(original)=phase_origin {cmd.cmd=original;}
             if !principal.permissions.send_commands {
                 emit_warning(
                     &state_for_recv,
@@ -5576,7 +5584,7 @@ async fn handle_ws_control_text_with_source(
                 state_for_recv.manual_abort_intent.request();
                 return;
             }
-            if crate::board_abort::launch_command(command_name(&cmd.cmd)) {
+            if !crate::operator_phase::is_local(&cmd.cmd) && crate::board_abort::launch_command(command_name(&cmd.cmd)) {
                 if let Err(error) =
                     crate::board_abort::validate_launch_revision(&state_for_recv, launch_revision)
                 {
@@ -5592,8 +5600,8 @@ async fn handle_ws_control_text_with_source(
                 emit_notification_warning(
                     &state_for_recv,
                     format!(
-                        "Ignored software command {:?}: command is currently disabled",
-                        cmd.cmd
+                        "{} is currently disabled",
+                        command_name(&cmd.cmd)
                     ),
                 );
                 return;

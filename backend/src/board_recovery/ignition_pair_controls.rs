@@ -174,6 +174,8 @@ async fn ignition_pair_policy_disables_sequence_without_disabling_manual_off_cat
     if crate::operator_queue::isolated_native_case(module_path!(), "ignition_pair_policy_disables_sequence_without_disabling_manual_off_catalog") { return; }
     let fixture = ignition_valid_fixture().await;
     let mut policy = crate::sequences::ActionPolicyMsg {
+        local_phase_controls: false,
+        local_phase_controls_reason: None,
         key_enabled: true,
         software_buttons_enabled: true,
         controls: [

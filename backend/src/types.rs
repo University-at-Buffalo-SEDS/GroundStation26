@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum TelemetryCommand {
+    #[serde(skip)]
+    #[cfg_attr(not(feature="hitl_mode"), expect(dead_code, reason="Only HITL ingress constructs this non-serializable intent"))]
+    OperatorPhase { intent: crate::operator_phase::Intent },
     Postinit,
     Launch,
     Dump,

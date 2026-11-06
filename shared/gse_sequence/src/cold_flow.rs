@@ -60,6 +60,16 @@ pub struct Controller {
     closure_confirmed: bool,
     resume_to_hold: bool,
 }
+/// Remaining validity of the actual calibrated pressure receipt used by start.
+/// This never refreshes a producer timestamp or authorizes a command.
+pub fn start_input_valid_for_ms(input: Inputs) -> u64 {
+    input
+        .pressure
+        .filter(|sample| sample.value.is_finite() && sample.at_ms <= input.now_ms)
+        .map_or(0, |sample| {
+            FRESH_MS.saturating_sub(input.now_ms - sample.at_ms)
+        })
+}
 fn pressure(input: Inputs) -> Option<f32> {
     input
         .pressure
@@ -710,5 +720,32 @@ mod tests {
         assert_eq!(e.valves.len(), 5);
         assert!(e.valves.iter().all(|(_, on)| !*on));
         assert!(!r.c.paused_ready());
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    #[test]
+    fn remaining_start_lease_uses_original_pressure_receipt() {
+        let mut input = Inputs {
+            now_ms: 10000,
+            pressure: Some(crate::Sample {
+                value: 42.,
+                at_ms: 9000,
+            }),
+            valves: [None; 5],
+            prelaunch: true,
+            interlock: true,
+        };
+        assert_eq!(start_input_valid_for_ms(input), 1000);
+        input.now_ms = 11000;
+        assert_eq!(start_input_valid_for_ms(input), 0);
+        input.now_ms = 12000;
+        assert_eq!(start_input_valid_for_ms(input), 0);
+        input.now_ms = 8000;
+        assert_eq!(start_input_valid_for_ms(input), 0);
+        input.pressure.as_mut().unwrap().value = f32::NAN;
+        assert_eq!(start_input_valid_for_ms(input), 0);
     }
 }

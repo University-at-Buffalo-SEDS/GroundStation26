@@ -661,6 +661,21 @@ pub async fn telemetry_task(
                         }
                         command => (command, None, None, None),
                     };
+                    let sealed_phase=matches!(cmd,TelemetryCommand::OperatorPhase{..});
+                    let cmd = if let TelemetryCommand::OperatorPhase { intent } = cmd {
+                        if !intent.validate(&state) {emit_notification_warning(&state,"Phase request changed or expired; choose a new phase action.");continue;}
+                        if intent.local() {
+                            if let Err(error)=crate::operator_phase::apply(&state,&intent){emit_notification_warning(&state,error);}
+                            continue;
+                        }
+                        #[cfg(feature="hitl_mode")] {intent.original_command()}
+                        #[cfg(not(feature="hitl_mode"))] {continue;}
+                    } else {cmd};
+                    #[cfg(feature="hitl_mode")]
+                    if !sealed_phase && matches!(cmd,TelemetryCommand::AdvanceFlightState|TelemetryCommand::RewindFlightState) {
+                        emit_notification_warning(&state,"Phase request has no original authority; make a new request from current primary controls.");continue;
+                    }
+                    #[cfg(not(feature="hitl_mode"))] let _=sealed_phase;
                     if let TelemetryCommand::FillWithRecording { origin } = cmd {
                         crate::fill_recording::spawn(state.clone(), origin);
                         continue;
@@ -778,7 +793,7 @@ pub async fn telemetry_task(
                         continue;
                     }
                     match cmd {
-                        TelemetryCommand::FillWithRecording { .. } | TelemetryCommand::ColdFlowPanelRelease { .. } | TelemetryCommand::QueuedOperator { .. } | TelemetryCommand::AutomaticAbort { .. } | TelemetryCommand::AutomaticNitrogenClose { .. } | TelemetryCommand::AutomaticNitrousClose { .. } => unreachable!("automatic intent checked before dispatch"),
+                        TelemetryCommand::OperatorPhase { .. } | TelemetryCommand::FillWithRecording { .. } | TelemetryCommand::ColdFlowPanelRelease { .. } | TelemetryCommand::QueuedOperator { .. } | TelemetryCommand::AutomaticAbort { .. } | TelemetryCommand::AutomaticNitrogenClose { .. } | TelemetryCommand::AutomaticNitrousClose { .. } => unreachable!("automatic intent checked before dispatch"),
                         TelemetryCommand::StartFill | TelemetryCommand::PauseFill
                         | TelemetryCommand::CancelFill | TelemetryCommand::ValveSelfTest
                         | TelemetryCommand::NitrogenTest | TelemetryCommand::Turbocharge => unreachable!("GSE commands handled before dispatch"),
@@ -2241,9 +2256,9 @@ async fn handle_packet_inner(
             }
         };
         // FC is the flight-state authority; local GS publications carry the host
-        // state. Other boards retain their own state telemetry, but their Abort
-        // must never rewrite the aggregate or T-clock, and their delayed phases
-        // must not roll an active flight back to prelaunch.
+        // state. Other boards retain their own state telemetry in every phase,
+        // including Startup/Idle: their reports never rewrite the global master,
+        // clock or an explicitly verified global reset.
         let authority = state.board_from_network_sender(&sender_id);
         let gs = authority == Some(Board::GroundStation);
         let fc = authority == Some(Board::FlightComputer);
@@ -2292,8 +2307,9 @@ async fn handle_packet_inner(
             .await;
         }
         if retired_ingress || self_echo || (gs && primary_role) || (!gs
-            && (new_flight_state == FlightState::Aborted
-                || (!prelaunch(current) && (prelaunch(new_flight_state) || !fc))
+            && (!fc || new_flight_state == FlightState::Aborted
+                || (fc && prelaunch(new_flight_state) && crate::operator_phase::fc_prelaunch_is_raw(state))
+                || (!prelaunch(current) && prelaunch(new_flight_state))
                 || current == FlightState::Aborted))
         {
             return vec![TelemetryRow {
@@ -2308,8 +2324,9 @@ async fn handle_packet_inner(
             // The original snapshot is not final authority across a local Stop
             // admission or reset. A delayed FC phase must not undo either owner.
             if receive_generation != crate::gse::automatic_generation(state)
-                || (!gs && (new_flight_state == FlightState::Aborted
-                    || (!prelaunch(*fs) && (prelaunch(new_flight_state) || !fc))
+                || (!gs && (!fc || new_flight_state == FlightState::Aborted
+                    || (fc && prelaunch(new_flight_state) && crate::operator_phase::fc_prelaunch_is_raw(state))
+                    || (!prelaunch(*fs) && prelaunch(new_flight_state))
                     || *fs == FlightState::Aborted)) {
                 return vec![TelemetryRow {
                     timestamp_ms: get_current_timestamp_ms() as i64,
@@ -5097,6 +5114,7 @@ mod tests {
         let (db_tx, db_rx) = mpsc::channel(8);
         let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
         crate::gse::qualified_launch_proofs_for_test(&state);
+        crate::gse::handle_command_with_origins(&state,&TelemetryCommand::ToggleGroundStationControl,None,None);
         let mut state_rx = state.state_tx.subscribe();
         let mut policy = state.action_policy_snapshot();
         for control in policy.controls.iter_mut() {
@@ -5133,7 +5151,7 @@ mod tests {
                     "AdvanceFlightState",
                 ),
                 plumbing_origin: None,
-                command: Box::new(TelemetryCommand::AdvanceFlightState),
+                command: Box::new(crate::operator_phase::seal(&state,TelemetryCommand::AdvanceFlightState)),
             })
             .await
             .expect("failed to send advance flight state command");
@@ -5494,6 +5512,9 @@ mod tests {
             pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
             latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
             gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
+        phase_control_selected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        phase_control_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        phase_control_public: Arc::new(Mutex::new(None)),
             sequence_progress: Arc::new(crate::sequence_progress_service::Shared::new(
                 rand::random::<u128>(),
             )),
@@ -6993,6 +7014,56 @@ mod tests {
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0].0, "GB");
         assert_eq!(writes[1].0, "PB");
+    }
+
+    #[cfg(feature="hitl_mode")]
+    #[tokio::test]
+    async fn fc_prelaunch_reports_follow_explicit_global_master_selection() {
+        let (db_tx,_db_rx)=mpsc::channel(64);
+        let state=test_app_state(db_tx.clone()).await;
+        for board in Board::ALL {state.mark_board_seen(board.sender_id(),get_current_timestamp_ms());}
+        let overflow=test_db_overflow();
+        *state.state.lock().unwrap()=FlightState::Armed;
+        let mut events=state.state_tx.subscribe();
+        let packet=||Packet::new(crate::telemetry_schema::data_type("FLIGHT_STATE"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],"FC",1234,Arc::from([FlightState::Idle as u8])).unwrap();
+        assert!(crate::operator_phase::local_mode(&state));
+        assert_eq!(handle_packet(&state,&db_tx,&overflow,packet()).await.len(),1);
+        assert_eq!(state.local_flight_state_snapshot(),FlightState::Armed);
+        assert!(events.try_recv().is_err(),"FC's per-board Idle must not replace the selected GS master");
+        crate::gse::handle_command_with_origins(&state,&TelemetryCommand::ToggleGroundStationControl,None,None);
+        assert!(!crate::operator_phase::local_mode(&state));
+        handle_packet(&state,&db_tx,&overflow,packet()).await;
+        assert_eq!(state.local_flight_state_snapshot(),FlightState::Idle,"explicit FC mode retains FC phase authority");
+        assert_eq!(events.try_recv().unwrap().state,FlightState::Idle);
+    }
+
+    #[tokio::test]
+    async fn non_authoritative_prelaunch_reports_preserve_global_state_clock_and_ws() {
+        let (db_tx, _db_rx) = mpsc::channel(256);
+        let state = test_app_state(db_tx.clone()).await;
+        let overflow = test_db_overflow();
+        for board in Board::ALL { state.mark_board_seen(board.sender_id(), get_current_timestamp_ms()); }
+        let mut global_events = state.state_tx.subscribe();
+        let clock = state.launch_clock_snapshot();
+        for master in [FlightState::Startup, FlightState::Idle, FlightState::NitrousFill, FlightState::Armed] {
+            *state.state.lock().unwrap() = master;
+            for board in [Board::ActuatorBoard, Board::ValveBoard, Board::DaqBoard,
+                Board::GatewayBoard, Board::RFBoard, Board::PowerBoard] {
+                for reported in [FlightState::Startup, FlightState::Idle, FlightState::Armed, FlightState::Launch] {
+                    let packet = Packet::new(crate::telemetry_schema::data_type("FLIGHT_STATE"),
+                        &[crate::telemetry_schema::endpoint("GROUND_STATION")],board.sender_id(),1234,
+                        Arc::from([reported as u8])).unwrap();
+                    let rows=handle_packet(&state,&db_tx,&overflow,packet).await;
+                    assert_eq!(rows.len(),1);
+                    assert_eq!(rows[0].sender_id,board.sender_id());
+                    assert_eq!(rows[0].values,vec![Some(reported as u8 as f32)]);
+                    assert_eq!(state.local_flight_state_snapshot(),master,"{board:?} {reported:?} cannot replace global {master:?}");
+                    assert_eq!(state.launch_clock_snapshot(),clock);
+                    assert!(global_events.try_recv().is_err(),"per-board telemetry is not a global WS phase event");
+                }
+            }
+        }
     }
 
     #[tokio::test]

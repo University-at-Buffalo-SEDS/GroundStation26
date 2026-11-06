@@ -341,17 +341,25 @@ fn endpoint_verified(
     board: Board,
     topology: &sedsnet::discovery::TopologySnapshot,
 ) -> bool {
+    endpoint_advertisement_age(state, board, topology).is_some_and(|age| age <= 12_000)
+}
+
+/// Age of the newest matching identity/endpoint advertisement. Discovery
+/// refresh may use this before expiry; it never grants command authority.
+pub(crate) fn endpoint_advertisement_age(
+    state: &AppState,
+    board: Board,
+    topology: &sedsnet::discovery::TopologySnapshot,
+) -> Option<u64> {
     let expected = crate::telemetry_schema::endpoint(endpoint(board));
     topology
         .routes
         .iter()
-        .filter(|route| route.age_ms <= 12_000)
-        .any(|route| {
+        .flat_map(|route| {
             route
                 .announcers
                 .iter()
-                .filter(|peer| peer.age_ms <= 12_000)
-                .any(|peer| {
+                .filter(move |peer| {
                     (state.board_from_network_sender(&peer.sender_id) == Some(board)
                         && peer.reachable_endpoints.contains(&expected))
                         || peer.routers.iter().any(|node| {
@@ -359,7 +367,9 @@ fn endpoint_verified(
                                 && node.reachable_endpoints.contains(&expected)
                         })
                 })
+                .map(move |peer| route.age_ms.max(peer.age_ms))
         })
+        .min()
 }
 /// Called directly at SDK ingress, before DB/GSE work. Normal-runtime time is
 /// RAM-only; an explicit simulation uses the router's existing model clock.
@@ -405,6 +415,15 @@ pub(crate) fn observe(state: &AppState, packet: &Packet) -> Result<(), &'static 
     if query.received {
         return Ok(());
     } // Duplicate replies do not slide freshness.
+    // PENDING is an interim wire result, not a completed correlated query.
+    // Preserve the last confirmed presentation but never renew its proof age.
+    if value.result == 1 {
+        if inner.values[at].as_ref().is_some_and(|old|
+            old.value.boot != value.boot || old.value.epoch != value.epoch) {
+            inner.values[at] = None;
+        }
+        return Ok(());
+    }
     query.received = true;
     let observed_after = query.sent;
     let abort_revision = query.abort_revision;
@@ -431,6 +450,19 @@ pub(crate) fn observe(state: &AppState, packet: &Packet) -> Result<(), &'static 
         crate::telemetry_task::get_current_timestamp_ms(),
     );
     Ok(())
+}
+/// Last board-reported output registers for presentation only. No lease or
+/// command capability is granted by connectivity or this retained readback.
+pub(crate) fn sequence_board_display(state:&AppState)->std::collections::BTreeMap<String,crate::sequence_progress_service::BoardDisplay> {
+    let health=state.network_health.lock().unwrap().snapshot(WallInstant::now(),cfg!(feature="test_fire_mode"));
+    let now=Stamp::now();
+    let inner=state.board_recovery.inner.lock().unwrap();
+    [Board::ActuatorBoard,Board::ValveBoard].into_iter().map(|board| {
+        let connected=health.iter().any(|row|row.sender_id==board.sender_id()&&row.healthy);
+        let value=inner.values[index(board).unwrap()].as_ref().map(|row|&row.value)
+            .filter(|row|connected&&row.result==0&&row.boot!=0&&row.boot!=u64::MAX&&row.epoch!=0&&row.state.is_some()&&row.flags&OUTPUTS_VALID!=0&&query_domain_consistent(board,row));
+        (board.sender_id().to_owned(),crate::sequence_progress_service::BoardDisplay {connected,known:value.is_some(),boot:value.map(|row|format!("{:016x}",row.boot)),epoch:value.map(|row|row.epoch),outputs:value.map(|row|row.outputs),outputs_age_ms:value.and_then(|_|inner.values[index(board).unwrap()].as_ref()).map(|row|row.age(now).as_millis().min(u64::MAX as u128)as u64)})
+    }).collect()
 }
 /// A semantic rejection is not application confirmation. ACK/drop data status
 /// instead of trapping later valid ordered replies behind an obsolete context.
@@ -662,6 +694,8 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
             json!({"id":hex(&operation_id.finish().as_ref()[..16]),"action":"query","phase":if pending{"querying"}else if query.received{"completed"}else{"failed"},"targets":[board.sender_id()],"completed":!pending,"success":if pending{None}else{Some(query.received&&readback.is_some_and(|row|row.nonce==query.nonce&&row.result==0))},"age_ms":now.checked_duration_since(query.sent).unwrap_or(Duration::MAX).as_millis().min(u64::MAX as u128)as u64,"message":if pending{"Query admitted; actual board readback pending."}else if query.received{"Board answered; its result and actual-state validity are shown separately."}else{"Query readback timed out; recovery was not issued."}})
         });
         json!({"id":board.sender_id(),"label":board.as_str(),
+            "display_connected":health.is_some_and(|h|h.healthy),
+            "display_known":health.is_some_and(|h|h.healthy)&&known.is_some_and(|row|row.result==0&&row.state.is_some()&&query_domain_consistent(board,row)),
             "network":{"healthy":health.is_some_and(|h|h.healthy),"age_ms":health.map_or(u64::MAX,|h|h.age_ms),"disconnects":health.map_or(0,|h|h.disconnects),"reconnects":health.map_or(0,|h|h.reconnects)},
             "state":readback.and_then(|row|row.state),"state_label":readback.and_then(|row|row.state).and_then(crate::types::u8_to_flight_state).map_or("Unknown".to_string(),|value|format!("{value:?}")),
             "boot":known.map(|row|format!("{:016x}",row.boot)),"epoch":known.map(|row|row.epoch),"nonce":known.map(|row|format!("{:016x}",row.nonce)),"age_ms":age,"readback_valid_for_ms":observation.map(|row|READBACK_TTL.saturating_sub(row.age(now)).as_millis().min(u64::MAX as u128)as u64),
@@ -1528,6 +1562,13 @@ mod tests {
         wrong[32] ^= 1;
         assert!(observe(&state, &status_packet("AB", wrong)).is_err());
         assert!(state.board_recovery.inner.lock().unwrap().values[at].is_none());
+        let mut pending = status_wire(&state,7); pending[1]=1;
+        observe(&state,&status_packet("AB",pending)).unwrap();
+        {
+            let inner=state.board_recovery.inner.lock().unwrap();
+            assert!(!inner.queries[at].as_ref().unwrap().received,"Interim PENDING cannot finish QUERY");
+            assert!(inner.values[at].is_none(),"PENDING is not a confirmed state");
+        }
         observe(&state, &packet).unwrap();
         let first = state.board_recovery.inner.lock().unwrap().values[at]
             .as_ref()
@@ -1543,12 +1584,48 @@ mod tests {
             "Duplicate status must not slide freshness"
         );
         state.board_recovery.inner.lock().unwrap().queries[at] = Some(Query {
+            abort_revision:0,nonce:8,sent:Stamp::now(),received:false,
+        });
+        let mut pending=status_wire(&state,8);pending[1]=1;
+        observe(&state,&status_packet("AB",pending)).unwrap();
+        {
+            let inner=state.board_recovery.inner.lock().unwrap();
+            assert_eq!(inner.values[at].as_ref().unwrap().received,first,"PENDING neither erases nor refreshes prior confirmed proof");
+            assert!(!inner.queries[at].as_ref().unwrap().received);
+        }
+        observe(&state,&status_packet("AB",status_wire(&state,8))).unwrap();
+        assert!(state.board_recovery.inner.lock().unwrap().queries[at].as_ref().unwrap().received);
+        state.board_recovery.inner.lock().unwrap().queries[at] = Some(Query {
             abort_revision: 0,
             nonce: 9,
             sent: Stamp::now() - QUERY_TTL - Duration::from_millis(1),
             received: false,
         });
         assert!(observe(&state, &status_packet("AB", status_wire(&state, 9))).is_err());
+    }
+    #[tokio::test]
+    async fn connected_board_display_never_renews_mutating_proof_or_accepts_pending_identity() {
+        let state=crate::state::tests::test_app_state().await;
+        let at=index(Board::ActuatorBoard).unwrap();
+        state.network_health.lock().unwrap().observe("AB",WallInstant::now(),100);
+        state.board_recovery.inner.lock().unwrap().queries[at]=Some(Query{abort_revision:0,nonce:71,sent:Stamp::now(),received:false});
+        observe(&state,&status_packet("AB",status_wire(&state,71))).unwrap();
+        {
+            let mut inner=state.board_recovery.inner.lock().unwrap();
+            let row=inner.values[at].as_mut().unwrap();row.observed_after=Stamp::now()-Duration::from_secs(30);
+            assert!(!row.fresh(Stamp::now()));
+        }
+        let display=sequence_board_display(&state);
+        assert!(display["AB"].connected&&display["AB"].known);
+        assert_eq!(display["AB"].outputs,Some(0));
+        assert!(display["AB"].outputs_age_ms.is_some_and(|age|age>=30000),"display retains the ORIGINAL QUERY stamp instead of making old registers look new");
+        assert!(!display["VB"].known);
+        let json=serde_json::to_value(display).unwrap();assert_eq!(json["AB"]["boot"],"0000000000000002");
+        state.board_recovery.inner.lock().unwrap().queries[at]=Some(Query{abort_revision:0,nonce:72,sent:Stamp::now(),received:false});
+        let mut pending=status_wire(&state,72);pending[1]=1;pending[12..20].copy_from_slice(&4u64.to_le_bytes());
+        observe(&state,&status_packet("AB",pending)).unwrap();
+        assert!(!sequence_board_display(&state)["AB"].known,"new boot invalidates retained presentation immediately");
+        assert!(state.board_recovery.inner.lock().unwrap().values[at].is_none());
     }
     #[tokio::test]
     async fn honest_io_readback_keeps_actual_identity_for_manual_repair_without_claiming_success() {
