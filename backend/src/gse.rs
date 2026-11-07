@@ -343,6 +343,20 @@ impl Runtime {
             .map(|value| value.map(|v| (v.open, now.saturating_sub(v.at_ms))))
     }
 
+    /// A response is current observed feedback, independent of whether the
+    /// sequence engine ticked (external fill trim owns its own controller).
+    /// Copy only: command targets, engine state and controller ownership stay put.
+    fn presentation_status_at(
+        &self,
+        now_ms: u64,
+        prelaunch: bool,
+        interlock: bool,
+    ) -> gse_sequence::Status {
+        let mut status = self.engine.status.clone();
+        status.valves = completion_valve_snapshot(self.input_at(now_ms, prelaunch, interlock));
+        status
+    }
+
     /// Imported calibration must not invalidate an active or already-qualified
     /// procedure. Retain it as pending until the operator returns to Idle and
     /// explicitly clears qualification. Never clear evidence automatically.
@@ -2068,8 +2082,12 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     let flight_state = *state.state.lock().unwrap();
     let prelaunch = prelaunch_flight_state(flight_state);
     let interlock = interlock(&state, &state.action_policy_snapshot());
-    let mut response = serde_json::to_value(state.gse.lock().unwrap().engine.status.clone())
-        .expect("GSE status is serializable");
+    let status = {
+        let rt = state.gse.lock().unwrap();
+        let sampled_now = rt.now();
+        rt.presentation_status_at(sampled_now, prelaunch, interlock)
+    };
+    let mut response = serde_json::to_value(status).expect("GSE status is serializable");
     let mode = crate::station_mode::snapshot();
     response["operating_mode"] = serde_json::to_value(&mode).expect("mode serializable");
     response["request_gate"] = serde_json::json!({
@@ -2109,6 +2127,10 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     response["cold_flow"]=serde_json::to_value(cold_flow::status(&state)).expect("Cold-flow status serializable");
     Json(response).into_response()
 }
+
+#[cfg(test)]
+#[path = "gse/status_presentation_tests.rs"]
+mod status_presentation_tests;
 
 #[cfg(test)]
 mod tests {
