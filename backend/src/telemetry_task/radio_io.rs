@@ -4882,3 +4882,7 @@ mod recovery_control_tests {
   assert!(classifier.classify(&[1,2,3]));
  }
 }
+
+#[cfg(test)]
+#[path = "radio_owner_ack_loss_tests.rs"]
+mod owner_ack_loss_tests;

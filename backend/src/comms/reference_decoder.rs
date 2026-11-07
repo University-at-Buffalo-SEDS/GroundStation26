@@ -1,6 +1,13 @@
 //! Test-only adapter: reference radio scenarios must use the production stream
 //! decoder rather than assume every modem burst is one application frame.
 use super::*;
+
+/// Use the maintained raw-UART builder for test-only data frames.
+#[cfg(test)]
+pub(crate) fn frame_data(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    build_raw_uart_frame(bytes)
+}
+
 #[derive(Default)]
 pub(crate) struct Decoder {
     buffer: Vec<u8>,
