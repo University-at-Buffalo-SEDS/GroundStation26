@@ -111,6 +111,9 @@ pub(crate) fn controller_can_launch(kind: sedsnet::config::DataType, payload: &[
     }
     false
 }
+fn unreset_message(mask: u8) -> String {
+    format!("Launch locked: {} missed the last reset. Use Reset all boards.", board_names(mask))
+}
 pub(crate) fn blocked_message(state: &AppState) -> Option<String> {
     let seen = present_mask(state);
     let register = state.board_abort.register.lock().unwrap();
@@ -120,6 +123,8 @@ pub(crate) fn blocked_message(state: &AppState) -> Option<String> {
     if !cfg!(feature = "hitl_mode") && let Some(error) = state.board_abort.history_failure() { return Some(format!("Abort history unavailable: {error}")); }
     let mask = Runtime::launch_abort_mask_at(&register, seen, Instant::now());
     if mask != 0 { return Some(format!("Launch disabled: {} report Abort.", board_names(mask))); }
+    let unreset = register.unreset & seen;
+    if unreset != 0 { return Some(unreset_message(unreset)); }
     let unknown = required_unknown_mask(state, register.history_unknown);
     (unknown != 0).then(|| format!("Fresh actual state required because saved history is missing or was not clean for {}.", board_names(unknown)))
 }
@@ -184,6 +189,8 @@ impl AlertEdges {
 }
 #[derive(Default)]
 struct Register {
+    /// Boards the last operator reset could not reach. RAM only.
+    unreset: u8,
     version: u64,
     abort_revision: u64,
     stop_epochs: (u64, u64),
@@ -261,6 +268,7 @@ impl Runtime {
             ..Default::default()
         });
         let mut register = Register {
+            unreset: 0,
             version: value.snapshot.revision.saturating_add(1), abort_revision: 1,
             history_unknown: value.snapshot.unknown, history_enrolled: value.snapshot.enrolled,
             rows, ..Default::default()
@@ -571,6 +579,25 @@ impl Runtime {
             if aborted & (1 << i) != 0 && (seen & (1 << i) != 0 || recent) { mask | (1 << i) } else { mask }
         })
     }
+    /// Record which boards a completed reset covered. Others in this mode's scope
+    /// keep Launch locked while present, until reset or seen rebooted to Startup.
+    pub(crate) fn note_reset_completed(&self, reset: u8) {
+        let scope = crate::board_recovery::scope::mode_scope(crate::station_mode::local_mode());
+        let mut register = self.register.lock().unwrap();
+        register.unreset = scope & !reset;
+        register.version = register.version.saturating_add(1);
+        drop(register);
+        self.changed.notify_waiters();
+    }
+    fn clear_unreset(&self, bit: u8) {
+        let mut register = self.register.lock().unwrap();
+        if register.unreset & bit != 0 {
+            register.unreset &= !bit;
+            register.version = register.version.saturating_add(1);
+            drop(register);
+            self.changed.notify_waiters();
+        }
+    }
     pub(crate) fn launch_abort_mask(&self, state: &AppState) -> u8 {
         let seen = present_mask(state);
         Self::launch_abort_mask_at(&self.register.lock().unwrap(), seen, Instant::now())
@@ -625,6 +652,10 @@ impl Runtime {
                 "Launch disabled: {} report Abort.",
                 board_names(aborted)
             ));
+        }
+        let unreset = register.unreset & seen;
+        if unreset != 0 {
+            return Err(unreset_message(unreset));
         }
         if register.abort_revision == u64::MAX || register.abort_revision != revision {
             return Err("A board Abort superseded this launch intent; prepare a new launch".into());
@@ -726,6 +757,10 @@ pub(crate) fn observe_raw(state: &AppState, packet: &sedsnet::packet::Packet) {
     };
     #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
     if crate::testing_board_lifecycle::retired_model_abort_state(board,packet) {return;}
+    // A board reporting Startup rebooted or was reset, which is what the lock asks for.
+    if value == FlightState::Startup {
+        state.board_abort.clear_unreset(1 << index(board).unwrap());
+    }
     if value == FlightState::Aborted {
         state.board_abort.observe_abort(
             board,
@@ -751,6 +786,24 @@ pub(crate) fn block_policy(state: &AppState, policy: &mut crate::sequences::Acti
         let gate = crate::actuator_plumbing::retraction_gate(state);
         (!gate.allowed).then_some(gate.message)
     });
+    if !crate::rrls::is_rrls() {
+        let fire_reason = if crate::gse::turbocharge_active_nowait(state) {
+            Some(crate::gse::TURBOCHARGE_UNFINISHED_MESSAGE)
+        } else if state.launch_history.try_lock().is_ok_and(|history| history.automatic_actions_inhibited()) {
+            Some(crate::gse::LAUNCH_LOCKED_MESSAGE)
+        } else {
+            None
+        };
+        if let Some(fire_reason) = fire_reason {
+            for control in &mut policy.controls {
+                if matches!(control.cmd.as_str(), "Launch" | "GroundStationLaunch") {
+                    control.enabled = false;
+                    control.disabled_reason = Some(fire_reason.into());
+                    control.blink = crate::sequences::BlinkMode::None;
+                }
+            }
+        }
+    }
     if let Some(reason) = reason {
         for control in &mut policy.controls {
             if launch_command(&control.cmd) {
@@ -765,7 +818,7 @@ pub(crate) fn block_policy(state: &AppState, policy: &mut crate::sequences::Acti
 /// Boards heard from within the board-seen timeout. Taken before the register
 /// lock and never waits: a busy status table counts as present, so contention
 /// keeps an Abort blocking rather than releasing it.
-fn present_mask(state: &AppState) -> u8 {
+pub(crate) fn present_mask(state: &AppState) -> u8 {
     // RRLS mirrors the primary's Abort rows and has no local board presence.
     if crate::rrls::is_rrls() { return u8::MAX; }
     let Ok(status) = state.board_status.try_lock() else { return u8::MAX; };
@@ -1027,6 +1080,24 @@ mod launch_presence_tests {
         assert!(blocked_message(&state).unwrap().contains("Abort"));
         assert!(capture_launch_revision_named(&state, "Launch").is_none());
         assert!(snapshot_for_state(&state).active_errors[0].launch_blocking);
+    }
+    /// A board the reset missed locks Launch once it returns, until it is reset
+    /// or seen rebooted to Startup. While absent it blocks nothing.
+    #[tokio::test]
+    async fn board_missed_by_reset_locks_launch_only_once_present() {
+        let state = crate::state::tests::test_app_state().await;
+        let scope = crate::board_recovery::scope::mode_scope(crate::station_mode::local_mode());
+        let bit = 1 << index(Board::ValveBoard).unwrap();
+        state.board_abort.note_reset_completed(scope & !bit);
+        assert!(blocked_message(&state).is_none());
+        state.board_status.lock().unwrap().get_mut(&Board::ValveBoard).unwrap().last_seen_instant = Some(Instant::now());
+        let message = blocked_message(&state).unwrap();
+        assert!(message.contains("missed the last reset"), "{message}");
+        assert!(capture_launch_revision_named(&state, "Launch").is_none());
+        state.board_abort.clear_unreset(bit);
+        assert!(blocked_message(&state).is_none());
+        state.board_abort.note_reset_completed(scope);
+        assert!(blocked_message(&state).is_none());
     }
     /// A fresh Abort report blocks even before any board-status bookkeeping.
     #[tokio::test]

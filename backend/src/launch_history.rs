@@ -102,7 +102,8 @@ pub(crate) struct ResetProofPolicy {
 }
 impl ResetProofPolicy {
     fn valid_for(&self, targets: &[RecoveryTarget]) -> bool {
-        self.required_mask == crate::board_recovery::scope::base_mask(self.mode)
+        // Journals from before the available-boards reset still carry a nonzero mask.
+        self.required_mask & !0x7f == 0
             && self.verified_mask & !0x7f == 0
             && self.verified_mask & self.required_mask == self.required_mask
             && targets.len() == self.verified_mask.count_ones() as usize

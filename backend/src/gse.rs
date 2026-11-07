@@ -783,6 +783,11 @@ pub fn valve_command(cmd: &TelemetryCommand) -> bool {
 }
 
 pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool> {
+    if matches!(crate::sequences::command_name(cmd), "Launch" | "GroundStationLaunch" | "IgniterSequence")
+        && turbocharge_active_nowait(state)
+    {
+        return Some(false);
+    }
     let cold_flow_active = cold_flow::active(state);
     if cold_flow_active && !cold_flow::manual_handoff(cmd) {
         // An owned cold-flow run excludes competing automation, not unrelated
@@ -2971,9 +2976,8 @@ pub(crate) fn verified_recovery_host_idle(state: &AppState) -> bool {
 }
 /// Explicit reset may retire host Launch metadata only after host work has
 /// drained. Board completion is still verified by the recovery transaction. A
-/// Launch still waiting on its Valve Board does not count as work: this reset
-/// is the way out when that sequence never starts.
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+/// Launch waiting on its Valve Board, or the latch left by an earlier Stop, is
+/// not work: this reset is the way out of both.
 pub(crate) fn operator_reset_host_idle(state: &AppState) -> bool {
     if !verified_recovery_host_idle(state) {
         return false;
@@ -2984,7 +2988,7 @@ pub(crate) fn operator_reset_host_idle(state: &AppState) -> bool {
             return false;
         }
     }
-    if manual_stop_pending(state) {
+    if state.manual_abort_intent.pending_epoch().is_some() || state.deferred_abort.manual_pending() {
         return false;
     }
     // Recovery status is a read-only poll: never wait behind the SDK owner.
@@ -3489,6 +3493,16 @@ fn launch_controller_delivery_state(
         }
     }
     CurrentState::Current
+}
+pub(crate) const LAUNCH_LOCKED_MESSAGE: &str = "Launch is locked after the last attempt. Use Reset all boards to unlock it.";
+pub(crate) const TURBOCHARGE_UNFINISHED_MESSAGE: &str = "Turbocharge must finish or be cancelled before firing.";
+/// Turbocharge is a pre-fire operation. Busy reads as unfinished so contention
+/// cannot admit a fire; presentation callers use `turbocharge_active_nowait`.
+fn turbocharge_active(rt: &Runtime) -> bool {
+    rt.turbocharge.is_some() || rt.engine.status.phase == Phase::Turbocharge
+}
+pub(crate) fn turbocharge_active_nowait(state: &AppState) -> bool {
+    state.gse.try_lock().map_or(true, |rt| turbocharge_active(&rt))
 }
 /// Return the real effect gate ONLY after a nonwaiting clear observation.
 /// Every Busy drops DISPATCH/Stop guards before bounded same-ticket retry.
@@ -4237,20 +4251,19 @@ pub(crate) fn inhibit_automatic_actions_for_launch_revision(
         )
         .map_err(|error| error.to_string())?;
     let runtime = state.gse.lock().unwrap();
-    // HITL keeps the retained inhibition for automatic actions but does not let
-    // it veto the operator: clearing it needs a verified board reset, which an
-    // absent board can never complete. The running T-clock rejects double sends.
-    if !cfg!(feature = "hitl_mode")
-        && state
-            .launch_history
-            .lock()
-            .unwrap()
-            .automatic_actions_inhibited()
+    if state
+        .launch_history
+        .lock()
+        .unwrap()
+        .automatic_actions_inhibited()
     {
-        return Err("Launch preparation or admission is retained; explicit verified Startup reset is required".into());
+        return Err(LAUNCH_LOCKED_MESSAGE.into());
     }
     if runtime.automatic_abort_in_flight {
         return Err("Automatic abort is pending; launch was not dispatched".into());
+    }
+    if turbocharge_active(&runtime) {
+        return Err(TURBOCHARGE_UNFINISHED_MESSAGE.into());
     }
     state
         .launch_history
@@ -4305,10 +4318,13 @@ pub(crate) fn commit_fire_intent_revision(
         .unwrap()
         .automatic_actions_inhibited()
     {
-        return Err("Launch preparation or admission is retained; explicit verified Startup reset is required".into());
+        return Err(LAUNCH_LOCKED_MESSAGE.into());
     }
     if rt.operational.saved.automatic_abort_claimed || rt.automatic_abort_in_flight {
         return Err("Automatic abort is pending; clear GSE abort before Fire".into());
+    }
+    if turbocharge_active(&rt) {
+        return Err(TURBOCHARGE_UNFINISHED_MESSAGE.into());
     }
     if !prelaunch(state)
         || !operational_launch_allowed(state, &rt)
@@ -5397,18 +5413,17 @@ mod final_launch_admission_tests {
     /// board on the network reports Abort.
     #[cfg(feature = "hitl_mode")]
     #[tokio::test]
-    async fn hitl_fresh_press_is_not_held_by_retained_or_undeliverable_state() {
+    async fn hitl_fresh_press_is_not_held_by_undeliverable_state() {
+        let stopped = crate::state::tests::test_app_state().await;
+        let router = Arc::new(clocked_router(RouterConfig::new([])));
+        stopped.topology_router.set(router.clone()).unwrap();
+        stopped.set_abort_indicator_latched(true);
+        let revision = crate::board_abort::capture_launch_revision_named(&stopped, "Launch");
+        assert!(inhibit_automatic_actions_for_launch_revision(&stopped, revision).is_ok(),
+            "a Stop that never reached an absent board must not hold a fresh press");
         let state = crate::state::tests::test_app_state().await;
         let router = Arc::new(clocked_router(RouterConfig::new([])));
         state.topology_router.set(router.clone()).unwrap();
-        state.launch_history.lock().unwrap().inhibit_automatic_actions().unwrap();
-        let first = crate::board_abort::capture_launch_revision_named(&state, "Launch");
-        assert!(inhibit_automatic_actions_for_launch_revision(&state, first).is_ok(),
-            "retained inhibition must not need a verified reset of absent boards");
-        state.set_abort_indicator_latched(true);
-        let after_stop = crate::board_abort::capture_launch_revision_named(&state, "Launch");
-        assert!(inhibit_automatic_actions_for_launch_revision(&state, after_stop).is_ok(),
-            "a Stop that never reached an absent board must not hold a fresh press");
         for name in ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND"] {
             let kind = crate::telemetry_schema::data_type(name);
             let payload: &[u8] = if name == "ABORT" { b"manual" } else { b"\x00" };
@@ -5418,9 +5433,36 @@ mod final_launch_admission_tests {
                 _ => crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"),
             }], "GS", 100, Arc::from(payload)).unwrap()).unwrap();
         }
-        let pending = crate::board_abort::capture_launch_revision_named(&state, "Launch");
-        assert!(inhibit_automatic_actions_for_launch_revision(&state, pending).is_ok(),
+        let revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        assert!(inhibit_automatic_actions_for_launch_revision(&state, revision).is_ok(),
             "commands retained for absent boards must not hold a fresh press");
+    }
+    /// Only the dedicated reset unlocks Launch; a T-clock reset must not.
+    #[tokio::test]
+    async fn t_clock_reset_does_not_unlock_launch() {
+        let state = crate::state::tests::test_app_state().await;
+        let router = Arc::new(clocked_router(RouterConfig::new([])));
+        state.topology_router.set(router.clone()).unwrap();
+        crate::gse::qualified_launch_proofs_for_test(&state);
+        state.launch_history.lock().unwrap().inhibit_automatic_actions().unwrap();
+        state.reset_launch_clock();
+        let revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        assert_eq!(inhibit_automatic_actions_for_launch_revision(&state, revision).unwrap_err(), LAUNCH_LOCKED_MESSAGE);
+    }
+    /// Turbocharge is pre-fire: it must be finished or cancelled before Launch.
+    #[tokio::test]
+    async fn launch_is_refused_while_turbocharge_runs() {
+        let state = crate::state::tests::test_app_state().await;
+        let router = Arc::new(clocked_router(RouterConfig::new([])));
+        state.topology_router.set(router.clone()).unwrap();
+        crate::gse::qualified_launch_proofs_for_test(&state);
+        state.gse.lock().unwrap().engine.status.phase = Phase::Turbocharge;
+        assert_eq!(command_allowed(&state, &TelemetryCommand::Launch), Some(false));
+        let revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        assert_eq!(inhibit_automatic_actions_for_launch_revision(&state, revision).unwrap_err(), TURBOCHARGE_UNFINISHED_MESSAGE);
+        state.gse.lock().unwrap().engine.status.phase = Phase::Idle;
+        let revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        assert!(inhibit_automatic_actions_for_launch_revision(&state, revision).is_ok());
     }
     /// A Stop pressed after Launch was pressed still cancels that Launch.
     #[cfg(feature = "hitl_mode")]
@@ -5774,7 +5816,6 @@ mod retained_stop_fence_tests {
             )
             .is_none()
         );
-        #[cfg(not(feature = "hitl_mode"))]
         assert!(inhibit_automatic_actions_for_launch(&state).is_err());
     }
 }

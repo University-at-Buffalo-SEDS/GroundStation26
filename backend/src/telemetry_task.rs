@@ -326,11 +326,11 @@ async fn handle_local_ground_station_launch_command(
         state.launch_clock_snapshot().kind,
         LaunchClockKind::TMinus | LaunchClockKind::TPlus
     ) {
-        emit_notification_warning(&state, "Launch not sent: the T-clock is already running. Reset the T-clock to send Launch again.");
+        emit_notification_warning(&state, "Launch not sent: the T-clock is already running. Use Reset all boards to send Launch again.");
         return;
     }
     if !state.try_begin_launch_sequence_command() {
-        emit_notification_warning(&state, "Launch not sent: the last Launch is still waiting for the Valve Board to start its sequence. Reset the T-clock to send Launch again.");
+        emit_notification_warning(&state, "Launch not sent: the last Launch is still waiting for the Valve Board to start its sequence. Use Reset all boards to send Launch again.");
         return;
     }
     if state.recording_status_snapshot().mode != RecordingModeWire::Recording {
@@ -435,7 +435,7 @@ async fn handle_flight_computer_launch_command(
         state.launch_clock_snapshot().kind,
         LaunchClockKind::TMinus | LaunchClockKind::TPlus
     ) {
-        emit_notification_warning(&state, "Launch not sent: the T-clock is already running. Reset the T-clock to send Launch again.");
+        emit_notification_warning(&state, "Launch not sent: the T-clock is already running. Use Reset all boards to send Launch again.");
         return;
     }
     if state.recording_status_snapshot().mode != RecordingModeWire::Recording {

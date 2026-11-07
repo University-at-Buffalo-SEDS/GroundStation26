@@ -8,15 +8,20 @@ pub(crate) struct Selection {
     required: u8,
     targets: u8,
 }
-pub(crate) const fn base_mask(mode: crate::station_mode::Mode) -> u8 {
+/// No board is required: a reset covers whichever are available, so an absent
+/// board can't block it. Boards it misses keep Launch locked if they come back.
+pub(crate) const fn base_mask(_mode: crate::station_mode::Mode) -> u8 {
+    0
+}
+/// Boards this mode resets and tracks. Test-fire has no AV bay requirement.
+pub(crate) const fn mode_scope(mode: crate::station_mode::Mode) -> u8 {
     match mode {
-        crate::station_mode::Mode::Hitl => 0,
         crate::station_mode::Mode::TestFire => 0x78,
         _ => 0x7f,
     }
 }
-fn selected_mask(required: u8, actual_abort: u8, pending: u8, explicit: u8) -> u8 {
-    required | actual_abort | pending | explicit
+fn selected_mask(available: u8, actual_abort: u8, pending: u8, explicit: u8) -> u8 {
+    available | actual_abort | pending | explicit
 }
 /// HITL host Launch reset must ask the master to retire its actual owner.
 /// AB participates when its retained readback says Launch, or the pair proof
@@ -27,10 +32,10 @@ fn launch_proof_mask(state: &AppState) -> u8 {
         let inner = state.board_recovery.inner.lock().unwrap();
         let actuator_launch = inner.values[index(Board::ActuatorBoard).unwrap()]
             .as_ref().is_some_and(|row| row.value.state == Some(crate::types::FlightState::Launch as u8));
-        return (1 << index(Board::ValveBoard).unwrap())
+        return crate::board_abort::present_mask(state) & ((1 << index(Board::ValveBoard).unwrap())
             | if actuator_launch || crate::ignition_pair::proof_enforced(state) {
                 1 << index(Board::ActuatorBoard).unwrap()
-            } else { 0 };
+            } else { 0 });
     }
     let _ = state;
     0
@@ -49,10 +54,10 @@ impl PublicationLaunchProof<'_> {
         let inner = self.readbacks.as_ref().expect("Launch proof owner pre-acquired");
         let actuator_launch = inner.values[index(Board::ActuatorBoard).unwrap()]
             .as_ref().is_some_and(|row| row.value.state == Some(crate::types::FlightState::Launch as u8));
-        (1 << index(Board::ValveBoard).unwrap())
+        crate::board_abort::present_mask(state) & ((1 << index(Board::ValveBoard).unwrap())
             | if actuator_launch || crate::ignition_pair::proof_enforced(state) {
                 1 << index(Board::ActuatorBoard).unwrap()
-            } else { 0 }
+            } else { 0 })
     }
 }
 impl Selection {
@@ -87,7 +92,12 @@ impl Selection {
         let (context, required, actual) = state
             .board_abort
             .capture_reset_context(|| base_mask(crate::station_mode::local_mode()))?;
-        let targets = selected_mask(required, actual, pending, explicit) | launch_proof_mask(state);
+        let present = crate::board_abort::present_mask(state);
+        let scope = mode_scope(crate::station_mode::local_mode());
+        // `actual` from a board that left the network can't be verified; a fresh
+        // report counts as present even before board status records it.
+        let targets = selected_mask(present & scope, actual & state.board_abort.launch_abort_mask(state), pending, explicit)
+            | launch_proof_mask(state);
         Ok(Self {
             context,
             required,
@@ -191,18 +201,33 @@ mod tests {
 #[cfg(test)]
 mod actual_policy_tests {
     use super::*;
+    fn seen(state: &AppState, boards: &[Board]) {
+        let mut status = state.board_status.lock().unwrap();
+        for board in boards {
+            status.get_mut(board).unwrap().last_seen_instant = Some(std::time::Instant::now());
+        }
+    }
+    /// A reset covers what is available and nothing else in this mode's scope.
+    #[tokio::test]
+    async fn reset_targets_available_boards_and_absent_ones_cannot_hold_it() {
+        let state = crate::state::tests::test_app_state().await;
+        assert!(Selection::capture(&state, &[]).unwrap().boards().is_empty());
+        seen(&state, &[Board::ValveBoard]);
+        assert_eq!(Selection::capture(&state, &[]).unwrap().boards(), vec![Board::ValveBoard]);
+    }
     #[test]
     fn base_policy_is_mode_fixed_not_link_or_layout_derived() {
         use crate::station_mode::Mode::*;
-        assert_eq!(base_mask(Normal), 0x7f);
-        assert_eq!(base_mask(TestFire), 0x78);
-        assert_eq!(base_mask(Hitl), 0);
-        assert_eq!(base_mask(Testing), 0x7f);
+        for mode in [Normal, TestFire, Hitl, Testing] { assert_eq!(base_mask(mode), 0); }
+        assert_eq!(mode_scope(Normal), 0x7f);
+        assert_eq!(mode_scope(TestFire), 0x78);
+        assert_eq!(mode_scope(Hitl), 0x7f);
+        assert_eq!(mode_scope(Testing), 0x7f);
     }
     #[tokio::test]
     async fn actual_abort_and_explicit_optional_are_mandatory_without_unknown_roster() {
         let state = crate::state::tests::test_app_state().await;
-        let expected = base_mask(crate::station_mode::local_mode());
+        let expected = 0;
         let selection = Selection::capture(&state, &[]).unwrap();
         assert_eq!(selection.targets, expected);
         state
@@ -217,10 +242,12 @@ mod actual_policy_tests {
     #[tokio::test]
     async fn launch_reset_requires_master_and_cannot_shed_new_pair_participation() {
         let state = crate::state::tests::test_app_state().await;
+        seen(&state, &[Board::ValveBoard]);
         *state.state.lock().unwrap() = crate::types::FlightState::Launch;
         let selection = Selection::capture(&state, &[]).unwrap();
         assert_eq!(selection.boards(), vec![Board::ValveBoard]);
         assert_eq!(selection.policy().required_mask, 0);
+        seen(&state, &[Board::ActuatorBoard]);
         state.toggle_hitl_safety_interlock(3);
         assert!(selection.current(&state).is_err());
         let selection = Selection::capture(&state, &[]).unwrap();
@@ -230,6 +257,7 @@ mod actual_policy_tests {
     #[tokio::test]
     async fn launch_reset_keeps_observed_actuator_even_after_its_proof_expires() {
         let state = crate::state::tests::test_app_state().await;
+        seen(&state, &[Board::ValveBoard]);
         *state.state.lock().unwrap() = crate::types::FlightState::Launch;
         let before = Selection::capture(&state, &[]).unwrap();
         let at = Stamp::now();
@@ -240,6 +268,7 @@ mod actual_policy_tests {
             value: Readback { result: 0, state: Some(crate::types::FlightState::Launch as u8),
                 flags: 0x3c, nonce: 1, boot: 1, epoch: 1, uptime: 1, outputs: 0, issuer: 1 },
         });
+        seen(&state, &[Board::ActuatorBoard]);
         assert!(before.current(&state).is_err(), "new participation cannot escape frozen scope");
         let after = Selection::capture(&state, &[]).unwrap();
         assert_eq!(after.boards(), vec![Board::ActuatorBoard, Board::ValveBoard]);
@@ -271,6 +300,7 @@ mod actual_policy_tests {
     #[tokio::test]
     async fn publication_retains_launch_readbacks_and_refuses_new_actuator_participation() {
         let state = crate::state::tests::test_app_state().await;
+        seen(&state, &[Board::ValveBoard]);
         *state.state.lock().unwrap() = crate::types::FlightState::Launch;
         let selection = Selection::capture(&state, &[]).unwrap();
         assert_eq!(selection.boards(), vec![Board::ValveBoard]);
@@ -280,6 +310,7 @@ mod actual_policy_tests {
             value: Readback { result: 0, state: Some(crate::types::FlightState::Launch as u8),
                 flags: 0x3c, nonce: 1, boot: 1, epoch: 1, uptime: 1, outputs: 0, issuer: 1 },
         });
+        seen(&state, &[Board::ActuatorBoard]);
         let host = state.state.lock().unwrap();
         let proof = selection.hold_for_publication(&state, *host).unwrap();
         assert!(state.board_recovery.inner.try_lock().is_err(), "readback owner remains held through publication");

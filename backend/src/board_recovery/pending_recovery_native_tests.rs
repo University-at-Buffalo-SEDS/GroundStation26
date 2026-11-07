@@ -273,7 +273,8 @@ async fn prepare_selected_reset(f: &Fixture) -> Value {
     let expected: Vec<_> = BOARDS.iter().filter(|board| required.contains(board) || FILL.contains(board))
         .map(|board| board.sender_id()).collect();
     assert_eq!(value["targets"], json!(expected));
-    assert_eq!(value["required_proof_boards"], json!(required.iter().map(|board| board.sender_id()).collect::<Vec<_>>()));
+    // No board is required: the reset covers whichever are available.
+    assert_eq!(value["required_proof_boards"], json!(Vec::<&str>::new()));
     value
 }
 async fn operation(f: &Fixture, limit: Duration) -> Value {

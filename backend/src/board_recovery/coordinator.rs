@@ -27,7 +27,7 @@ mod prepare_admission_tests;
 mod explicit_launch_reset_tests {
     use super::*;
     #[tokio::test]
-    async fn launch_reset_is_explicit_operator_only_and_pending_dispatch_stays_fenced() {
+    async fn launch_reset_is_explicit_and_pending_dispatch_stays_fenced() {
         let state = crate::state::tests::test_app_state().await;
         *state.state.lock().unwrap() = crate::types::FlightState::Launch;
         assert!(!host_safe(&state));
@@ -37,21 +37,21 @@ mod explicit_launch_reset_tests {
             sedsnet::router::EndpointHandler::new_packet_handler(endpoint, |_| Ok(())),
         ])));
         state.topology_router.set(router.clone()).unwrap();
-        assert_eq!(host_action_allowed(&state, "reset_startup"), cfg!(any(feature="hitl_mode",feature="test_fire_mode")));
+        assert!(host_action_allowed(&state, "reset_startup"));
         router.tx_queue(Packet::new(crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
             &[endpoint], "GS", 100, Arc::from(&b"\x00"[..])).unwrap()).unwrap();
         assert!(!host_action_allowed(&state, "reset_startup"), "actual SDK controller owner blocks Reset");
         router.process_all_queues_with_timeout(0).unwrap();
-        assert_eq!(host_action_allowed(&state, "reset_startup"), cfg!(any(feature="hitl_mode",feature="test_fire_mode")));
+        assert!(host_action_allowed(&state, "reset_startup"));
         for action in ["recover_abort", "resync", "reset_startup_all7", "unknown"] {
             assert!(!host_action_allowed(&state, action), "{action}");
         }
         // A Launch still waiting on its Valve Board must not hold the way out.
         state.launch_sequence_command_pending.store(true, Ordering::Release);
-        assert_eq!(host_action_allowed(&state, "reset_startup"), cfg!(any(feature="hitl_mode",feature="test_fire_mode")));
+        assert!(host_action_allowed(&state, "reset_startup"));
         state.launch_sequence_command_pending.store(false, Ordering::Release);
         *state.state.lock().unwrap() = crate::types::FlightState::Armed;
-        assert_eq!(host_action_allowed(&state, "reset_startup"), cfg!(any(feature="hitl_mode",feature="test_fire_mode")));
+        assert!(host_action_allowed(&state, "reset_startup"));
         *state.state.lock().unwrap() = crate::types::FlightState::Idle;
         assert!(host_action_allowed(&state, "reset_startup"));
     }
@@ -386,16 +386,17 @@ pub(super) fn host_safe(state: &AppState) -> bool {
             | crate::types::FlightState::Aborted
     ) && crate::gse::verified_recovery_host_idle(state)
 }
-/// HITL and test-fire operators may reset from any point up to and including
-/// Launch once host work has drained. Flight builds never can. This grants only
-/// a fresh board transaction, never completion inferred from host time.
+/// Operators may reset without a reboot from any point up to and including
+/// Launch, and after landing, once host work has drained. Never during powered or
+/// descending flight. This grants only a fresh board transaction, never completion
+/// inferred from host time.
 pub(super) fn host_action_allowed(state: &AppState, action: &str) -> bool {
     if host_safe(state) { return true; }
-    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     if action == "reset_startup"
         && {
+            use crate::types::FlightState as F;
             let flight_state = state.local_flight_state_snapshot();
-            flight_state == crate::types::FlightState::Launch
+            matches!(flight_state, F::Launch | F::Landed | F::Recovery)
                 || crate::gse::prelaunch_flight_state(flight_state)
         }
         && crate::gse::operator_reset_host_idle(state)
@@ -406,17 +407,18 @@ pub(super) fn host_action_allowed(state: &AppState, action: &str) -> bool {
     false
 }
 /// The reset itself already cleared retained Launch inhibition. Finish what the
-/// operator asked for: a stopped T-clock, an unlatched Launch button and, in
-/// HITL where nothing publishes it automatically, the Idle phase. Test-fire
-/// reaches Idle through its automatic Startup transition. The boards are already
-/// verified, so a clock failure is reported rather than failing the reset.
-/// Flight builds keep their T0 across a reset.
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-fn finish_operator_reset(state: &AppState) {
+/// operator asked for: a stopped T-clock, cleared Launch and Stop latches and, in
+/// HITL where nothing publishes it automatically, the Idle phase. Other builds
+/// reach Idle through their Startup transition. Boards the reset could not reach
+/// keep Launch locked if they return. The boards are already verified, so a clock
+/// failure is reported rather than failing the reset.
+fn finish_operator_reset(state: &AppState, reset: u8) {
+    state.board_abort.note_reset_completed(reset);
     if let Err(error) = state.try_reset_launch_clock() {
         state.add_notification(format!("Boards reset, but the T-clock did not reset: {error}"));
     }
     state.set_launch_indicator_latched(false);
+    state.set_abort_indicator_latched(false);
     #[cfg(feature = "hitl_mode")]
     if state.local_flight_state_snapshot() == crate::types::FlightState::Startup {
         state.set_local_flight_state(crate::types::FlightState::Idle);
@@ -1671,8 +1673,9 @@ async fn run(
         .activate_acknowledged_recovery(token.owner)
         .map_err(|_| "Durable recovery activation changed")?;
     if reset_all {
-        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-        finish_operator_reset(state);
+        finish_operator_reset(state, ticket.targets.iter().fold(0, |mask, target| {
+            mask | index(target.board).map_or(0, |i| 1 << i)
+        }));
         // A NEW legitimate Normal policy owner starts only after the durable
         // publication acknowledgement is verified and activation succeeds.
         // It captures the current finite Stop/epoch before any observations;
@@ -2651,7 +2654,7 @@ mod tests {
         let first=super::super::tests::http(state.clone(),"POST","/api/board-recovery/prepare",Some("operator"),request.clone()).await;
         let first_status=first.status();
         let first_body=body(first).await;
-        let mask=super::super::scope::base_mask(crate::station_mode::local_mode());
+        let mask=crate::board_abort::present_mask(&state)&super::super::scope::mode_scope(crate::station_mode::local_mode());
         let ticket=if mask!=0 {
             // Actual QUERY discovered seeded Abort episodes AFTER the original
             // selection. That intent must die; never auto retry/restamp it.
@@ -3658,14 +3661,7 @@ mod tests {
         let clock = state.launch_history.lock().unwrap().snapshot();
         // After an operator reset the clock waits for a new launch cycle, so an
         // explicit T-clock reset is what moves the journal revision there.
-        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
         state.try_reset_launch_clock().unwrap();
-        #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
-        state.set_launch_clock(crate::telemetry_db::LaunchClockMsg {
-            kind: crate::telemetry_db::LaunchClockKind::TMinus,
-            anchor_timestamp_ms: Some(crate::telemetry_task::get_current_timestamp_ms() as i64),
-            duration_ms: Some(60_000),
-        });
         let after = state
             .launch_history
             .lock()
@@ -4450,18 +4446,14 @@ mod tests {
         }
         let history = fixture.http.state.launch_history.lock().unwrap();
         let current = history.snapshot();
-        if cfg!(any(feature = "hitl_mode", feature = "test_fire_mode")) {
+        {
             assert_ne!(original.session, current.session, "operator reset starts a new T-clock session");
             assert_eq!(current.t0_utc_ms, None);
             assert_eq!(current.clock.kind, crate::telemetry_db::LaunchClockKind::Idle);
             assert!(!fixture.http.state.launch_indicator_latched());
-        } else {
-            assert_eq!(original.session, current.session);
-            assert_eq!(original.t0_utc_ms, current.t0_utc_ms);
         }
         // One revision for recovery, one for the operator reset's T-clock reset.
-        let revisions = if cfg!(any(feature = "hitl_mode", feature = "test_fire_mode")) { 2 } else { 1 };
-        assert_eq!(current.revision, original.revision + revisions);
+        assert_eq!(current.revision, original.revision + 2);
         let marker = history.recovery_pending().unwrap();
         assert!(marker.published);
         for (_, model) in &fixture.models {

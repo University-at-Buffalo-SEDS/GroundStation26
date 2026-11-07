@@ -43,12 +43,8 @@ async fn actual_pair_preflight_admits_original_launch_once_and_keeps_retained_hi
     assert!(state.launch_indicator_latched(), "original intent must not reject its own retained inhibition");
     assert!(router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("FLIGHT_COMMAND")));
     let revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
-    let second = crate::gse::inhibit_automatic_actions_for_launch_revision(&state, revision);
-    // HITL re-sends are allowed: the firmware ignores a Launch while its sequence
-    // is active, and retained history stays set for automatic actions.
-    assert_eq!(second.is_ok(), cfg!(feature = "hitl_mode"),
-        "only HITL may send a second intent over retained Launch history");
-    assert!(state.launch_history.lock().unwrap().automatic_actions_inhibited());
+    assert!(crate::gse::inhibit_automatic_actions_for_launch_revision(&state, revision).is_err(),
+        "a second intent cannot clear or reuse retained Launch history");
     state.request_shutdown();
 }
 

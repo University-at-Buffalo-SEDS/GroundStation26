@@ -70,8 +70,9 @@ fn mode_policy_never_infers_unverified_boards_or_weakens_required_masks() {
     for (mode, mask) in [(Normal, 0x7f), (TestFire, 0x78), (Hitl, 0)] {
         marker(mask, Some(policy(mode, mask))).validate().unwrap();
     }
-    assert!(marker(0x78, Some(policy(Normal, 0x78))).validate().is_err());
-    assert!(marker(0, Some(policy(TestFire, 0))).validate().is_err());
+    // A reset covers the available boards, so any subset is a valid proof.
+    marker(0x78, Some(policy(Normal, 0x78))).validate().unwrap();
+    marker(0, Some(policy(TestFire, 0))).validate().unwrap();
     let mut wrong = policy(TestFire, 0x78);
     wrong.verified_mask = 0x7f;
     assert!(marker(0x78, Some(wrong)).validate().is_err());
