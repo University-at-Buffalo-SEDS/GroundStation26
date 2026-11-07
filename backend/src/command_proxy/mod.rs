@@ -17,6 +17,18 @@ use wire::{Envelope, Message, Outcome};
 const MAX_RESULTS: usize = 64;
 const SEQUENCE_WINDOW: u32 = 4;
 const DISCOVERY_COOLDOWN_MS: u64 = 30_000;
+/// RRLS live view of the primary's control observation (fill boards
+/// included). One signed QueryObserve and one Capability reply per period,
+/// each at most MAX_WIRE bytes plus mesh framing: under 55 B/s worst case,
+/// about a fifth of the 256 B/s settings allowance. Replies are bound to a
+/// fresh nonce and their ages are source age plus the elapsed upper bound
+/// since this query, so a lost or late reply only lets rows go stale.
+const OBSERVE_REFRESH_MS: u64 = 10_000;
+fn observe_refresh_due(now: u64, last: Option<u64>, link_idle_direct: bool, idle: bool) -> bool {
+    link_idle_direct
+        && idle
+        && last.is_none_or(|last| now.checked_sub(last).is_none_or(|age| age >= OBSERVE_REFRESH_MS))
+}
 fn discovery_retry_due(now: u64, last: Option<u64>, attempts: u8) -> bool {
     attempts >= 3
         && last
@@ -491,6 +503,24 @@ impl Runtime {
             .ok_or_else(|| anyhow::anyhow!("Expired request owner"))?;
         entry.reply = Some(bytes.clone());
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod observe_refresh_tests {
+    use super::*;
+    #[test]
+    fn refresh_is_bounded_and_only_when_idle_on_a_direct_link() {
+        assert!(observe_refresh_due(0, None, true, true));
+        assert!(!observe_refresh_due(0, None, false, true));
+        assert!(!observe_refresh_due(0, None, true, false));
+        assert!(!observe_refresh_due(OBSERVE_REFRESH_MS - 1, Some(0), true, true));
+        assert!(observe_refresh_due(OBSERVE_REFRESH_MS, Some(0), true, true));
+        // A clock that moved backwards restarts the period instead of stalling.
+        assert!(observe_refresh_due(5, Some(10), true, true));
+        // Query plus reply, each a full frame with mesh framing, per period.
+        let worst_bytes_per_s = 2 * (MAX_WIRE as u64 + 16) * 1000 / OBSERVE_REFRESH_MS;
+        assert!(worst_bytes_per_s <= 256 / 4, "{worst_bytes_per_s} B/s");
     }
 }
 
@@ -1429,6 +1459,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
         let mut readiness_started = None::<std::time::Instant>;
         let mut readiness_phase = 0u8;
         let mut readiness_poll_at = None::<std::time::Instant>;
+        let mut last_observe_refresh = None::<u64>;
 
         loop {
             tokio::select! {_=shutdown.recv()=>break,_=tick.tick()=>{}}
@@ -1726,6 +1757,24 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                             query_attempts += 1;
                             last_query = Some(now);
                         }
+                let idle = runtime.capability.is_some()
+                    && readiness_reply.is_none()
+                    && !matches!(readiness_phase, 1..=3)
+                    && last_query != Some(now)
+                    && broker().lock().unwrap().pending.is_none();
+                let link_idle_direct = mesh.lock().unwrap().observation_refresh_allowed(now);
+                if observe_refresh_due(now, last_observe_refresh, link_idle_direct, idle) {
+                    last_observe_refresh = Some(now);
+                    // Fresh nonce: an unanswered earlier query cannot be replayed.
+                    runtime.query = None;
+                    if let Ok(query) = runtime.query_observe(&pairing, view) {
+                        if mesh.lock().unwrap().queue_command_proxy(&query, now) {
+                            query_created_at = Some(now);
+                        } else {
+                            runtime.query = None;
+                        }
+                    }
+                }
                 let pending = broker().lock().unwrap().pending.clone();
                 if let Some(mut pending) = pending {
                     if pending.launch_origin.is_some_and(|origin| {

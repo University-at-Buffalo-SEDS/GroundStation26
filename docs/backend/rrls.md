@@ -280,7 +280,12 @@ its live policy. It does not claim that an expired displayed interlock is enable
 Primary valve, fill-board, topology and host-temperature observations can accompany
 signed capability and command replies. They retain source ages, add the original
 request's whole elapsed time, and expire instead of confirming a requested target.
-These are sparse observations, not a continuous telemetry stream. Host temperature
+These are sparse observations, not a continuous telemetry stream. While the
+primary's HEALTH is fresh and reports its own direct link (RRLS not relaying)
+and no readiness check or command is pending, a paired RRLS sends one signed
+observation query every 10 s with a fresh nonce. Query plus reply stay under
+55 B/s worst case, about a fifth of the 256 B/s settings allowance. A lost reply
+is not retried; rows simply age and expire as before. Host temperature
 currently travels from primary to RRLS only. Unknown pressures,
 baselines and primary configuration are not replaced by RRLS-local values. A later
 host receipt is not proof that a board generated its report after a command.

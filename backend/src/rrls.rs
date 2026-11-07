@@ -1816,6 +1816,17 @@ impl Mesh {
             self.topology_peer_seen = Some(self.topology_peer_seen.map_or(now, |old| old.max(now)));
         }
     }
+    /// RRLS only: the primary's HEALTH is fresh and reports its own direct
+    /// link, so this station is not relaying and spare air exists for a
+    /// bounded observation refresh.
+    pub(crate) fn observation_refresh_allowed(&self, now: u64) -> bool {
+        self.role == Role::Rrls
+            && self.primary_direct
+            && !self.active(now)
+            && self
+                .health_received
+                .is_some_and(|last| now.saturating_sub(last) < LEASE_MS)
+    }
     /// Link freshness only; signed proxy capability and actor policy remain independent.
     pub(crate) fn command_proxy_transport(
         &self,
@@ -4144,6 +4155,19 @@ mod tests {
         assert_eq!(primary.recovery_air_share(5_100), None);
         relay.incoming(true, &health(1, 1, true), 5_100);
         assert_eq!(relay.recovery_air_share(5_100), None);
+    }
+
+    #[test]
+    fn observation_refresh_only_while_primary_reports_direct_link() {
+        let mut rrls = Mesh::new(Role::Rrls, 2);
+        assert!(!rrls.observation_refresh_allowed(1_000), "no primary heard");
+        rrls.incoming(true, &health(1, 1, true), 1_000);
+        assert!(rrls.observation_refresh_allowed(1_500));
+        assert!(!rrls.observation_refresh_allowed(1_000 + LEASE_MS), "stale HEALTH");
+        rrls.incoming(true, &health(1, 2, false), 2_000);
+        assert!(!rrls.observation_refresh_allowed(2_100), "relaying needs the air");
+        let primary = Mesh::new(Role::Primary, 1);
+        assert!(!primary.observation_refresh_allowed(0));
     }
 
     #[test]

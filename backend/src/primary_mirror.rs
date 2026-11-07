@@ -1,5 +1,6 @@
 //! Bounded presentation-only observations carried inside authenticated control replies.
-//! No periodic stream, route installation, desired-state confirmation or control authority.
+//! No continuous stream (RRLS asks at most once per 10 s), route installation,
+//! desired-state confirmation or control authority.
 use crate::{
     sequences::{ActionControl, ActionPolicyMsg, BlinkMode},
     state::AppState,
