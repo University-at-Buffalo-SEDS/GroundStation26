@@ -2242,10 +2242,11 @@ impl AppState {
                 control.blink = crate::sequences::BlinkMode::None;
             }
         }
-        if self.checklist_enforcement_enabled() && crate::checklists::launch_block().is_some() {
+        if let Some(reason) = crate::checklists::launch_block().filter(|_| self.checklist_enforcement_enabled()) {
             for control in &mut policy.controls {
                 if matches!(control.cmd.as_str(), "Launch" | "GroundStationLaunch") {
                     control.enabled = false;
+                    control.disabled_reason = Some(reason.clone());
                     control.blink = crate::sequences::BlinkMode::None;
                 }
             }

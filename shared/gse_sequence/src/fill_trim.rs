@@ -122,7 +122,13 @@ impl Controller {
         self.desired = desired;
         self.waiting = None;
         self.samples.clear();
-        self.next(now)
+        let mut effects = self.next(now);
+        // A late Nitrogen readback must not hold Nitrous open past cutoff. The
+        // sequenced close of Nitrous still runs and confirms its own readback.
+        if phase == Phase::Closing && self.waiting == Some(3) && !self.desired[4] {
+            effects.valves.push((4, false));
+        }
+        effects
     }
     fn next(&mut self, now: u64) -> Effects {
         let order = [3, 4, 0, 1, 2];
@@ -419,6 +425,13 @@ mod tests {
             }
             panic!("phase {:?}", self.controller.phase());
         }
+    }
+    /// Overfill regression: cutoff must not wait on Nitrogen's readback to close Nitrous.
+    #[test]
+    fn cutoff_closes_nitrous_immediately_without_waiting_for_nitrogen_readback() {
+        let (controller, effects) = Controller::start(100, 8.0, 800.0, &Config::default()).unwrap();
+        assert_eq!(effects.valves, vec![(3, false), (4, false)]);
+        assert_eq!(controller.phase(), Phase::Closing);
     }
     #[test]
     fn signed_targets_close_settle_then_complete_only_with_vent_closed() {
