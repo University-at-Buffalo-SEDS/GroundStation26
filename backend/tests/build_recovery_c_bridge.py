@@ -2,24 +2,27 @@
 """Build inert host bridges from the actual sibling AB/VB recovery C fixtures.
 
 No hardware, firmware build, downloads, or source edits. This opt-in test needs
-both board repositories and their already configured SDK/LaunchCore sources.
+both board repositories and existing SDK/LaunchCore sources. Set
+SEDSNET_TEST_SOURCE and SDK_FREE_LAUNCHCORE_SOURCE to those roots when no
+firmware configure cache is available; otherwise the maintained resolver uses
+the board configuration.
 """
-import importlib.util, os, pathlib, re, shutil, subprocess, sys
-workspace=pathlib.Path(__file__).resolve().parents[3]
-out=pathlib.Path(sys.argv[1]);out.mkdir(parents=True,exist_ok=True)
-for short,folder in [('ab','ActuatorBoard26'),('vb','ValveBoard26')]:
- root=workspace/folder
- sys.path.insert(0,str(root/'tests'))
- for name in ['native_sdk','test_no_telemetry']:sys.modules.pop(name,None)
- spec=importlib.util.spec_from_file_location('actual_'+short,root/'tests/test_recovery_launch_exclusion.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
- from native_sdk import configured_dependency_source
- cache=(root/'build/Release_Script/CMakeCache.txt').read_text()
- sdk=pathlib.Path(re.search(r'^SEDSNET_DIR:PATH=(.+)$',cache,re.M).group(1))
- os.environ.pop('SDK_FREE_LAUNCHCORE_SOURCE',None)
- lc=configured_dependency_source(root,'sedslaunchcore','SDK_FREE_LAUNCHCORE_SOURCE')
- os.environ['SEDSNET_TEST_SOURCE']=str(sdk);os.environ['SDK_FREE_LAUNCHCORE_SOURCE']=str(lc);os.environ['RECOVERY_LAUNCH_TEST_SOURCE']=str(root)
- harness=out/(short+'_bridge.c')
- harness.write_text(('#define ACTUAL_AB_BRIDGE 1\n' if short=='ab' else '')+'#define main fixture_original_main\n#include "'+str(root/'tests/fixtures/recovery_launch_exclusion/harness.c')+'"\n#undef main\n'+r'''
+import importlib.util, os, pathlib, shutil, subprocess, sys
+ENVIRONMENT_KEYS = ('SEDSNET_TEST_SOURCE', 'SDK_FREE_LAUNCHCORE_SOURCE', 'RECOVERY_LAUNCH_TEST_SOURCE')
+
+
+def restore_environment(original):
+    for key, value in original.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def compile_board(root, out, short, sdk, lc):
+    spec=importlib.util.spec_from_file_location('actual_'+short,root/'tests/test_recovery_launch_exclusion.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    harness=out/(short+'_bridge.c')
+    harness.write_text(('#define ACTUAL_AB_BRIDGE 1\n' if short=='ab' else '')+'#define main fixture_original_main\n#include "'+str(root/'tests/fixtures/recovery_launch_exclusion/harness.c')+'"\n#undef main\n'+r'''
 static uint8_t bridge_prepare_outputs(uint8_t desired){assert(state_mutex->locked&&desired<=1);return 1;}
 int main(void){
  scenario="sdk_bridge";image_path="unused";memset(image.nvm,255,NVM_SIZE);
@@ -42,21 +45,52 @@ int main(void){
 #endif
    memset(response,0,40);response[0]=(uint8_t)thread_comm_admit_network(command,timestamp);
   }else{request(r,body,(uint64_t)timestamp);main_service();assert(responses);}
-  for(unsigned i=0;i<40;i++)printf("%02x",response[i]);putchar('\n');fflush(stdout);
+  for(unsigned i=0;i<40;i++){printf("%02x",response[i]);}putchar('\n');fflush(stdout);
  }
  return 0;
 }
 ''')
- real_run=subprocess.run
- def compile_bridge(args,*a,**kw):
-  if isinstance(args,list) and args[0]=='cc':
-   args=args.copy();old=str(root/'tests/fixtures/recovery_launch_exclusion/harness.c');args[args.index(old)]=str(harness);args[1:1]=['-Wno-attributes','-Wno-unused-command-line-argument']
-  return real_run(args,*a,**kw)
- subprocess.run=compile_bridge
- cls=module.RecoveryLaunchExclusionTests
- try:
-  cls.setUpClass();shutil.copy2(cls.exe,out/short)
- finally:
-  subprocess.run=real_run
-  if hasattr(cls,'tmp'):cls.tearDownClass()
- print(short, out/short)
+    real_run=subprocess.run
+    def compile_bridge(args,*a,**kw):
+     if isinstance(args,list) and args[0]=='cc':
+      args=args.copy();old=str(root/'tests/fixtures/recovery_launch_exclusion/harness.c');args[args.index(old)]=str(harness);args[1:1]=['-Wno-attributes','-Wno-unused-command-line-argument']
+     return real_run(args,*a,**kw)
+    subprocess.run=compile_bridge
+    cls=module.RecoveryLaunchExclusionTests
+    try:
+     cls.setUpClass();shutil.copy2(cls.exe,out/short)
+    finally:
+     subprocess.run=real_run
+     if hasattr(cls,'tmp'):cls.tearDownClass()
+    print(short, out/short)
+
+
+def build_bridges(workspace, out):
+    workspace, out = pathlib.Path(workspace), pathlib.Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    original = {key: os.environ.get(key) for key in ENVIRONMENT_KEYS}
+    try:
+        for short, folder in [('ab', 'ActuatorBoard26'), ('vb', 'ValveBoard26')]:
+            # A previous board's resolved roots are never caller overrides.
+            restore_environment(original)
+            root = workspace / folder
+            sys.path.insert(0, str(root / 'tests'))
+            for name in ['native_sdk', 'test_no_telemetry']:
+                sys.modules.pop(name, None)
+            from native_sdk import configured_dependency_source
+            sdk = configured_dependency_source(root, 'sedsnet', 'SEDSNET_TEST_SOURCE')
+            lc = configured_dependency_source(root, 'sedslaunchcore', 'SDK_FREE_LAUNCHCORE_SOURCE')
+            os.environ['SEDSNET_TEST_SOURCE'] = str(sdk)
+            os.environ['SDK_FREE_LAUNCHCORE_SOURCE'] = str(lc)
+            os.environ['RECOVERY_LAUNCH_TEST_SOURCE'] = str(root)
+            compile_board(root, out, short, sdk, lc)
+    finally:
+        restore_environment(original)
+
+
+def main():
+    build_bridges(pathlib.Path(__file__).resolve().parents[3], pathlib.Path(sys.argv[1]))
+
+
+if __name__ == '__main__':
+    main()
