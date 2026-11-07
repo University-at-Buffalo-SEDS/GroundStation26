@@ -18,11 +18,12 @@ async fn background_queries_keep_drive_and_board_fresh_without_settings_polling(
         assert_eq!(snapshot["board"]["fresh"], true, "{snapshot}");
         assert_eq!(snapshot["can_configure"], true, "{snapshot}");
         assert!(crate::board_recovery::actuator_configuration_proof(&fixture.state).is_some());
-        let inner = fixture.state.plumbing_drive.inner.lock().unwrap();
-        assert!(inner.requests.iter().all(|row| row.request.mode.is_none()));
-        assert!(inner.pending_setting.is_none());
-        assert_eq!(inner.desired.revision, 0);
-        drop(inner);
+        {
+            let inner = fixture.state.plumbing_drive.inner.lock().unwrap();
+            assert!(inner.requests.iter().all(|row| row.request.mode.is_none()));
+            assert!(inner.pending_setting.is_none());
+            assert_eq!(inner.desired.revision, 0);
+        }
         observations += 1;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

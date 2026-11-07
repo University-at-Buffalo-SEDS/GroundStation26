@@ -147,7 +147,7 @@ pub(crate) fn seal(state: &AppState, command: TelemetryCommand) -> TelemetryComm
             .ok()
             .map(|value| *value)
             .unwrap_or(FlightState::Aborted);
-        return TelemetryCommand::OperatorPhase {
+        TelemetryCommand::OperatorPhase {
             intent: Intent {
                 ticket: crate::gse::operator_phase_ticket(state, token),
                 token,
@@ -158,7 +158,7 @@ pub(crate) fn seal(state: &AppState, command: TelemetryCommand) -> TelemetryComm
                 forward,
                 captured: Instant::now(),
             },
-        };
+        }
     }
     #[cfg(not(feature = "hitl_mode"))]
     {

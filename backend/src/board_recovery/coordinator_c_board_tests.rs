@@ -23,7 +23,8 @@ impl Bridge {
  }
 }
 impl Drop for Bridge {fn drop(&mut self){let _=self.child.kill();let _=self.child.wait();}}
-fn sdk(board:Board)->(Arc<sedsnet::router::Router>,Arc<Mutex<Vec<Vec<u8>>>>) {
+type CapturedBoardReplies = Arc<Mutex<Vec<Vec<u8>>>>;
+fn sdk(board:Board)->(Arc<sedsnet::router::Router>,CapturedBoardReplies) {
  let bridge=Arc::new(Mutex::new(Bridge::start(board)));let replies=Arc::new(Mutex::new(Vec::new()));let out=replies.clone();
  let router=Arc::new(sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([
   sedsnet::router::EndpointHandler::new_packet_handler(crate::telemetry_schema::endpoint(endpoint(board)),move|p|{

@@ -2479,7 +2479,8 @@ async fn send_command_inner(
         cmd
     };
     dispatch_command_inner(
-        state, principal, cmd, false, admission_generation, plumbing_origin, launch_revision, recovery_origin,
+        state, principal, cmd, false, admission_generation,
+        CommandDispatchOrigins { plumbing_origin, launch_revision, recovery_origin },
     )
     .await
 }
@@ -2574,23 +2575,27 @@ async fn dispatch_command(
             cmd,
             immediate_admission,
             admission_generation,
-            plumbing_origin,
-            launch_revision,
-            None,
+            CommandDispatchOrigins { plumbing_origin, launch_revision, recovery_origin: None },
         ))
         .await
 }
 
+/// The original command's provenance moves as one value across the handler
+/// future; this groups existing fields without recapturing any authority.
+struct CommandDispatchOrigins {
+    plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+    launch_revision: Option<u64>,
+    recovery_origin: Option<crate::operator_queue::manual_origin::Origin>,
+}
 async fn dispatch_command_inner(
     state: Arc<AppState>,
     principal: crate::auth::AuthPrincipal,
     cmd: TelemetryCommand,
     immediate_admission: bool,
     admission_generation: u64,
-    plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
-    launch_revision: Option<u64>,
-    mut recovery_origin: Option<crate::operator_queue::manual_origin::Origin>,
+    origins: CommandDispatchOrigins,
 ) -> (StatusCode, String) {
+    let CommandDispatchOrigins { plumbing_origin, launch_revision, mut recovery_origin } = origins;
     let cmd_name = command_name(&cmd);
     if !principal.allows_command_name(cmd_name) {
         emit_warning(
@@ -2666,8 +2671,10 @@ async fn dispatch_command_inner(
         now_ms,
         software_command_dedup_ms(),
         launch_revision,
-        &mut recovery_origin,
-        &mut admission_rejection,
+        crate::gse::RecoveryAdmissionDiagnostic {
+            origin: &mut recovery_origin,
+            rejection: &mut admission_rejection,
+        },
     ) {
         Err(message) => return (StatusCode::CONFLICT, message),
         Ok(crate::gse::OperatorCommandAdmission::Stale) => {
@@ -5636,8 +5643,10 @@ pub(crate) async fn handle_ws_control_text_with_source(
                 now_ms,
                 software_command_dedup_ms(),
                 launch_revision,
-                &mut recovery_origin,
-                &mut admission_rejection,
+                crate::gse::RecoveryAdmissionDiagnostic {
+                    origin: &mut recovery_origin,
+                    rejection: &mut admission_rejection,
+                },
             ) {
                 Err(message) => {
                     emit_notification_warning(&state_for_recv, message);

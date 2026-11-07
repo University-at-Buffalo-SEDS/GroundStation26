@@ -368,6 +368,7 @@ fn dispatch_gpio_abort(
 
 /// Shared by the real callback and its native command-spy fixture. No hardware
 /// operations or fallback command are performed by this edge sender.
+#[expect(clippy::result_large_err, reason = "Retain the original rejected command without allocating during control-queue backpressure")]
 pub(crate) fn queue_cold_flow_panel_edge(
     tx: &mpsc::Sender<TelemetryCommand>,
     edge: crate::gse::cold_flow::PanelIntent,
@@ -378,6 +379,7 @@ pub(crate) fn queue_cold_flow_panel_edge(
         awaiting_at_edge: edge.awaiting_at_edge,
     })
 }
+#[expect(clippy::result_large_err, reason = "Retain the original rejected command without allocating during control-queue backpressure")]
 fn queue_gpio_command(
     tx: &mpsc::Sender<TelemetryCommand>,
     generation: u64,

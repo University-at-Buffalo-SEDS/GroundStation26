@@ -737,31 +737,42 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
 }
 /// Background reads share a two-second budget with demand-triggered reads.
 /// No method here prepares, confirms, stops or recovers a board.
+#[derive(Default)]
 pub(crate) struct ReadonlyQueryRefresh {
     last: [Option<WallInstant>; 7],
     cursor: usize,
-}
-impl Default for ReadonlyQueryRefresh {
-    fn default() -> Self {
-        Self {
-            last: [None; 7],
-            cursor: 0,
-        }
-    }
+    core_busy_last: [Option<WallInstant>; 7],
 }
 impl ReadonlyQueryRefresh {
+    fn due(&self, at: usize, now: WallInstant) -> bool {
+        readonly_query_due(self.last[at], now)
+            && self.core_busy_last[at].is_none_or(|last| {
+                now.checked_duration_since(last)
+                    .is_some_and(|age| age >= Duration::from_millis(250))
+            })
+    }
+    fn record_response(&mut self, at: usize, now: WallInstant, response: &Response) -> bool {
+        if response.extensions().get::<QueryAdmissionCoreBusy>().is_some() {
+            // The SDK accepted no owner. Bound attempts without consuming the
+            // two-second network budget for an observation that was never sent.
+            self.core_busy_last[at] = Some(now);
+        } else {
+            // Accepted queries and every other refusal retain the old cooldown.
+            self.last[at] = Some(now);
+            self.core_busy_last[at] = None;
+        }
+        response.status() == StatusCode::OK
+    }
     pub(crate) fn request(&mut self, state: &Arc<AppState>, board: Board) -> bool {
         let Some(at) = index(board) else {
             return false;
         };
         let now = WallInstant::now();
-        if !readonly_query_due(self.last[at], now) {
+        if !self.due(at, now) {
             return false;
         }
-        // Attempt budget also bounds refusals; pending QUERY's own guard remains
-        // in request_board_query and is shared with authenticated manual requests.
-        self.last[at] = Some(now);
-        request_board_query(state, board).status() == StatusCode::OK
+        let response = request_board_query(state, board);
+        self.record_response(at, now, &response)
     }
     pub(crate) fn poll(&mut self, state: &Arc<AppState>) -> Option<Board> {
         if crate::rrls::is_rrls() || !coordinator::readonly_query_idle(state) {
@@ -787,7 +798,7 @@ impl ReadonlyQueryRefresh {
                     let seen = healthy
                         .iter()
                         .any(|row| row.sender_id == board.sender_id() && row.healthy);
-                    readonly_query_candidate(
+                    self.due(at, now.wall) && readonly_query_candidate(
                         seen,
                         endpoint_verified(state, board, &topology),
                         inner.values[at].as_ref(),

@@ -1333,7 +1333,7 @@ fn handle_command_inner(
             let mut rt = state.gse.lock().unwrap();
             rt.ground_station_control = !rt.ground_station_control;
             state.phase_control_selected.store(rt.ground_station_control,std::sync::atomic::Ordering::Release);
-            rt.phase_control_revision = rt.phase_control_revision.checked_add(1).unwrap_or(u64::MAX);
+            rt.phase_control_revision = rt.phase_control_revision.saturating_add(1);
             state.phase_control_revision.store(rt.phase_control_revision,std::sync::atomic::Ordering::Release);
             if !rt.ground_station_control && rt.fill_trim.is_some() {
                 rt.cancel_automation_for_manual();
@@ -4571,13 +4571,19 @@ pub(crate) fn record_operator_command_with_recovery_origin(
     state:&AppState, generation:u64, command:&TelemetryCommand, now_ms:u64,
     duplicate_window_ms:u64, launch_revision:Option<u64>, recovery_origin:&mut Option<crate::operator_queue::manual_origin::Origin>,
 )->Result<OperatorCommandAdmission,String> {
-    record_operator_command_with_recovery_origin_diagnostic(state,generation,command,now_ms,duplicate_window_ms,launch_revision,recovery_origin,&mut None)
+    record_operator_command_with_recovery_origin_diagnostic(state,generation,command,now_ms,duplicate_window_ms,launch_revision,RecoveryAdmissionDiagnostic { origin: recovery_origin, rejection: &mut None })
+}
+/// Borrow the original recovery claim and its rejection output together;
+/// neither field captures a replacement command origin.
+pub(crate) struct RecoveryAdmissionDiagnostic<'a> {
+    pub origin: &'a mut Option<crate::operator_queue::manual_origin::Origin>,
+    pub rejection: &'a mut Option<crate::operator_queue::manual_origin::Rejection>,
 }
 pub(crate) fn record_operator_command_with_recovery_origin_diagnostic(
     state:&AppState, generation:u64, command:&TelemetryCommand, now_ms:u64,
-    duplicate_window_ms:u64, launch_revision:Option<u64>, recovery_origin:&mut Option<crate::operator_queue::manual_origin::Origin>,
-    rejection:&mut Option<crate::operator_queue::manual_origin::Rejection>,
+    duplicate_window_ms:u64, launch_revision:Option<u64>, diagnostic:RecoveryAdmissionDiagnostic<'_>,
 )->Result<OperatorCommandAdmission,String> {
+    let RecoveryAdmissionDiagnostic { origin: recovery_origin, rejection } = diagnostic;
     let _dispatch = DISPATCH_GATE.lock().unwrap();
     // A second copy must not spend a relief epoch then disappear as Duplicate:
     // that would invalidate the only queued real command. Check duplicates
@@ -4597,9 +4603,8 @@ pub(crate) fn record_operator_command_with_recovery_origin_diagnostic(
             else {recovery_origin.as_ref().map_or(Rejection::MissingOrigin,|origin|origin.rejection(state))});
         return Ok(OperatorCommandAdmission::Stale);
     }
-    if let Some(origin)=recovery_origin.as_mut() {
-        if !recovery_current || !origin.admit(state) {*rejection=Some(origin.rejection(state));return Ok(OperatorCommandAdmission::Stale);}
-    }
+    if let Some(origin)=recovery_origin.as_mut()
+        && (!recovery_current || !origin.admit(state)) {*rejection=Some(origin.rejection(state));return Ok(OperatorCommandAdmission::Stale);}
     let record = || {
         if state.record_software_command_if_fresh(command, now_ms, duplicate_window_ms) {
             OperatorCommandAdmission::Fresh
@@ -4713,12 +4718,13 @@ mod operator_admission_tests {
         let payload = [crate::rocket_commands::FlightComputerCommands::Launch as u8];
         assert!(!state.board_state_proof_enforced());
         assert_eq!(crate::board_abort::required_mask(&state), 0);
-        // HITL may make the other boards optional; the ignition pair remains
-        // mandatory, so an absent pair never gains a Launch owner.
+        // With the HITL proof interlock disabled, absent board proof is optional.
+        // Verify an actual SDK owner and callback, not merely queue acceptance.
         let missing = crate::board_abort::capture_launch_revision_named(&state, "Launch");
-        assert!(!queue_controller_with_launch_revision(&state,&router,kind,&payload,missing).unwrap());
-        assert!(!router.has_pending_reliable_tx_type(kind));
-        assert_eq!(owners.load(Ordering::SeqCst),0);
+        assert!(queue_controller_with_launch_revision(&state,&router,kind,&payload,missing).unwrap());
+        assert!(router.has_pending_reliable_tx_type(kind));
+        router.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(owners.load(Ordering::SeqCst),1);
         // Genuine queried AB/VB peers on this exact Arc Router; all other five
         // boards stay absent. No synthetic proof mask or board-status seed.
         let _actual_pair=crate::ignition_pair::fixture::Peers::warm_pair_only(&state,router.clone()).await;
@@ -4730,7 +4736,7 @@ mod operator_admission_tests {
             queue_controller_with_launch_revision(&state, &router, kind, &payload, old).unwrap()
         );
         router.process_all_queues_with_timeout(0).unwrap();
-        assert_eq!(owners.load(Ordering::SeqCst), 1);
+        assert_eq!(owners.load(Ordering::SeqCst), 2);
         state.toggle_hitl_safety_interlock(3);
         assert!(state.board_state_proof_enforced());
         assert!(
@@ -4764,7 +4770,7 @@ mod operator_admission_tests {
             .unwrap()
         );
         router.process_all_queues_with_timeout(0).unwrap();
-        assert_eq!(owners.load(Ordering::SeqCst), 1);
+        assert_eq!(owners.load(Ordering::SeqCst), 2);
     }
     #[tokio::test]
     async fn board_abort_launch_dedup_uses_original_revision_and_preserves_unrelated_history() {
@@ -5354,6 +5360,8 @@ mod final_launch_admission_tests {
         for deferred in [false, true] {
             let state = crate::state::tests::test_app_state().await;
             fixture_state_proofs(&state);
+            let router = Arc::new(clocked_router(RouterConfig::new([])));
+            state.topology_router.set(router.clone()).unwrap();
             if deferred {
                 state
                     .deferred_abort
@@ -5361,17 +5369,14 @@ mod final_launch_admission_tests {
             } else {
                 state.manual_abort_intent.request();
             }
-            assert!(
-                inhibit_automatic_actions_for_launch(&state)
-                    .unwrap_err()
-                    .contains("Controller command delivery")
-            );
+            let error = inhibit_automatic_actions_for_launch(&state).unwrap_err();
+            eprintln!("STOP_PREPARATION_REFUSAL deferred={deferred} error={error}");
+            assert_eq!(error, "Manual Abort invalidated launch admission; no launch effect was admitted");
             #[cfg(not(feature = "hitl_mode"))]
-            assert!(
-                commit_fire_intent(&state)
-                    .unwrap_err()
-                    .contains("Controller command delivery")
-            );
+            assert_eq!(commit_fire_intent(&state).unwrap_err(), "Manual Abort invalidated launch admission; no launch effect was admitted");
+            for kind in ["ABORT", "FLIGHT_COMMAND", "VALVE_COMMAND", "ACTUATOR_COMMAND"] {
+                assert!(!router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type(kind)), "Stop refusal must create no SDK owner: {kind}");
+            }
             assert!(
                 !state
                     .launch_history

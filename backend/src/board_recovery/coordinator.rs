@@ -2254,25 +2254,26 @@ mod tests {
                                 Board::ActuatorBoard | Board::ValveBoard | Board::FlightComputer
                             );
                             let mut result = m.result;
+                            let mut identity_rejected = false;
                             if wire[1] == 1 {
                                 if let Some(old) = m.seen.get(&nonce) {
                                     response = old.clone();
                                 } else {
                                     let expected_boot =
                                         u64::from_le_bytes(wire[12..20].try_into().unwrap());
-                                    assert_eq!(
-                                        expected_boot,
-                                        if m.boot == 0 && m.retained_first.is_some() {
-                                            u64::MAX
-                                        } else {
-                                            m.boot
-                                        }
-                                    );
-                                    assert_eq!(
-                                        u32::from_le_bytes(wire[20..24].try_into().unwrap()),
-                                        m.epoch
-                                    );
-                                    if let Some(failure) = m.fail_result {
+                                    let live_boot = if m.boot == 0 && m.retained_first.is_some() {
+                                        u64::MAX
+                                    } else {
+                                        m.boot
+                                    };
+                                    let expected_epoch = u32::from_le_bytes(wire[20..24].try_into().unwrap());
+                                    // Actual AB/VB V1 storage admission rejects stale boot/epoch
+                                    // with result4, then transport reports CURRENT state/identity.
+                                    // This fixture must not panic or rewrite the frozen request.
+                                    if expected_boot != live_boot || expected_epoch != m.epoch {
+                                        result = 4; // BOARD_RECOVERY_RESULT_STALE
+                                        identity_rejected = true;
+                                    } else if let Some(failure) = m.fail_result {
                                         result = failure;
                                     } else if m.pending_only {
                                         result = 1;
@@ -2329,7 +2330,7 @@ mod tests {
                                         })
                                         .to_le_bytes(),
                                 );
-                                if wire[1] == 1 && result != 1 {
+                                if wire[1] == 1 && result != 1 && !identity_rejected {
                                     m.seen.insert(nonce, response.clone());
                                 }
                             }
@@ -2451,20 +2452,23 @@ mod tests {
             .expect("actual receiver-owned state callback must finish");
         }
         async fn query(&self, board: Board) {
-            let response = super::super::tests::http(
-                self.state(),
-                "POST",
-                "/api/board-recovery/query",
-                Some("operator"),
-                json!({"board":board.sender_id()}),
-            )
-            .await;
-            assert_eq!(
-                response.status(),
-                StatusCode::OK,
-                "{}",
-                body(response).await
-            );
+            let state = self.state();
+            let origin = Token::capture(&state, 0);
+            // Fixture warm-up precedes the operation under test. Like production
+            // Prepare, retry ONLY marked never-owned read-only CoreBusy offers.
+            // HTTP 200 stops immediately; generic failures and owner 409 do not retry.
+            admit_prepare_query(
+                || origin_current(&state, origin)
+                    .then_some(())
+                    .ok_or("Fixture Query origin changed during warm-up"),
+                || super::super::tests::http(
+                    state.clone(),
+                    "POST",
+                    "/api/board-recovery/query",
+                    Some("operator"),
+                    json!({"board":board.sender_id()}),
+                ),
+            ).await.expect("Fixture read-only Query warm-up must acquire actual SDK ownership before the operation under test");
             let nonce = self.http.state.board_recovery.inner.lock().unwrap().queries
                 [index(board).unwrap()]
             .as_ref()
@@ -4144,11 +4148,12 @@ mod tests {
             // publish a mode. The dedicated backend worker owns refresh.
             state.action_policy_snapshot();
             let now = Stamp::now();
-            let inner = state.board_recovery.inner.lock().unwrap();
-            for row in inner.values.iter().flatten() {
-                assert!(row.fresh(now), "healthy state expired despite proactive read-only refresh");
+            {
+                let inner = state.board_recovery.inner.lock().unwrap();
+                for row in inner.values.iter().flatten() {
+                    assert!(row.fresh(now), "healthy state expired despite proactive read-only refresh");
+                }
             }
-            drop(inner);
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         worker.abort();
@@ -4680,47 +4685,43 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn immutable_ticket_survives_readback_expiry_but_server_refreshes_before_recover() {
-        if isolated("immutable_ticket_survives_readback_expiry_but_server_refreshes_before_recover")
-        {
-            return;
-        }
+    async fn expired_preparation_query_requires_distinct_new_intent_without_auto_refresh() {
+        if isolated("expired_preparation_query_requires_distinct_new_intent_without_auto_refresh") { return; }
         let fixture = Fixture::new().await;
         fixture.query(Board::ActuatorBoard).await;
         let ticket = fixture.prepare("recover_abort", Some("AB")).await;
         tokio::time::sleep(READBACK_TTL + Duration::from_millis(20)).await;
-        assert!(
-            !fixture
-                .http
-                .state
-                .board_recovery
-                .inner
-                .lock()
-                .unwrap()
-                .values[index(Board::ActuatorBoard).unwrap()]
-            .as_ref()
-            .unwrap()
-            .fresh(Stamp::now())
-        );
-        assert_eq!(fixture.confirm(&ticket).await.status(), StatusCode::OK);
+        let state = fixture.state();
+        assert!(!state.board_recovery.inner.lock().unwrap().values[index(Board::ActuatorBoard).unwrap()].as_ref().unwrap().fresh(Stamp::now()));
+        let original_offers = || fixture.models.iter().map(|(_, model)| {
+            model.lock().unwrap().requests.iter().map(|packet|(packet.packet_id(), packet.timestamp())).collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
+        let before = original_offers();
+        let response = fixture.confirm(&ticket).await;
+        let status = response.status();
+        let rejected = body(response).await;
+        eprintln!("EXPIRED_PREPARATION_CONFIRM status={status} body={rejected}");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(rejected["error"], "preparation_query_expired");
+        assert_eq!(original_offers(), before, "an expired confirmation cannot silently query, restamp, or offer recovery");
+        assert!(state.launch_history.lock().unwrap().recovery_pending().is_none());
+        assert!(fixture.models.iter().all(|(_, model)| model.lock().unwrap().applied == 0));
+        // Fresh read-only metadata does not replace the ORIGINAL preparation
+        // observation retained inside this ticket.
+        fixture.query(Board::ActuatorBoard).await;
+        let after_readonly = original_offers();
+        let response = fixture.confirm(&ticket).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(body(response).await["error"], "preparation_query_expired");
+        assert_eq!(original_offers(), after_readonly);
+        assert!(fixture.models.iter().all(|(_, model)| model.lock().unwrap().applied == 0));
+        let fresh = fixture.prepare("recover_abort", Some("AB")).await;
+        assert_ne!(fresh["ticket"], ticket["ticket"], "only a distinct explicit intent may bind a new preparation");
+        assert_eq!(fixture.confirm(&fresh).await.status(), StatusCode::OK);
         let operation = fixture.terminal().await;
         assert_eq!(operation["success"], true, "{operation}");
-        let model = fixture
-            .models
-            .iter()
-            .find(|(b, _)| *b == Board::ActuatorBoard)
-            .unwrap()
-            .1
-            .lock()
-            .unwrap();
-        assert!(
-            model
-                .requests
-                .iter()
-                .filter(|p| p.payload()[1] == 0)
-                .count()
-                >= 3
-        );
+        assert_eq!(fixture.models.iter().find(|(board,_)|*board==Board::ActuatorBoard).unwrap().1.lock().unwrap().applied, 1);
+        assert!(fixture.models.iter().filter(|(board,_)|*board!=Board::ActuatorBoard).all(|(_,model)|model.lock().unwrap().applied==0));
     }
     #[tokio::test]
     async fn partial_board_failure_stays_closed_and_explicit_retry_joins_and_transfers_owner() {
@@ -4909,37 +4910,54 @@ mod tests {
                 .is_none()
         );
     }
-    #[tokio::test]
-    async fn fresh_query_cannot_adopt_a_boot_epoch_changed_after_confirmation_context() {
-        if isolated("fresh_query_cannot_adopt_a_boot_epoch_changed_after_confirmation_context") {
-            return;
-        }
+    async fn changed_review_identity_is_rejected_without_adopting_fresh_query(change_boot: bool) {
         let fixture = Fixture::new().await;
         fixture.query(Board::ActuatorBoard).await;
         let ticket = fixture.prepare("recover_abort", Some("AB")).await;
-        fixture
-            .models
-            .iter()
-            .find(|(b, _)| *b == Board::ActuatorBoard)
-            .unwrap()
-            .1
-            .lock()
-            .unwrap()
-            .boot = 43;
+        let model = fixture.models.iter().find(|(board, _)| *board == Board::ActuatorBoard).unwrap().1.clone();
+        let (reviewed_boot, reviewed_epoch, original_state) = {
+            let mut model = model.lock().unwrap();
+            let original = (model.boot, model.epoch, model.state);
+            if change_boot { model.boot += 1; } else { model.epoch += 1; }
+            original
+        };
         assert_eq!(fixture.confirm(&ticket).await.status(), StatusCode::OK);
         let operation = fixture.terminal().await;
         assert_eq!(operation["success"], false, "{operation}");
-        assert_ne!(
-            fixture
-                .http
-                .state
-                .operator_admission_barrier
-                .load(Ordering::Acquire),
-            0
-        );
-        for (_, model) in &fixture.models {
-            assert_eq!(model.lock().unwrap().applied, 0);
+        let state = fixture.state();
+        let retained_owner = state.operator_admission_barrier.load(Ordering::Acquire);
+        assert_ne!(retained_owner, 0);
+        {
+            let model = model.lock().unwrap();
+            let mutations = model.requests.iter().filter(|packet| packet.payload()[1] == 1).collect::<Vec<_>>();
+            assert!(!mutations.is_empty(), "actual SDK must reach the rejecting peer");
+            for packet in mutations {
+                let wire = packet.payload();
+                assert_eq!(u64::from_le_bytes(wire[12..20].try_into().unwrap()), reviewed_boot);
+                assert_eq!(u32::from_le_bytes(wire[20..24].try_into().unwrap()), reviewed_epoch);
+                let nonce = u64::from_le_bytes(wire[4..12].try_into().unwrap());
+                assert!(!model.seen.contains_key(&nonce), "rejected identity cannot seed a cached apply/replay");
+            }
+            assert_eq!(model.boot, reviewed_boot + u64::from(change_boot));
+            assert_eq!(model.epoch, reviewed_epoch + u32::from(!change_boot));
+            assert_eq!(model.state, original_state);
         }
+        // A separately accepted fresh READ-ONLY query may describe the new
+        // identity; it cannot repair or rebind the already failed frozen intent.
+        fixture.query(Board::ActuatorBoard).await;
+        assert_eq!(state.board_recovery.coordinator.operation().unwrap()["success"], false);
+        assert_eq!(state.operator_admission_barrier.load(Ordering::Acquire), retained_owner);
+        assert!(fixture.models.iter().all(|(_, model)| model.lock().unwrap().applied == 0));
+    }
+    #[tokio::test]
+    async fn fresh_query_cannot_adopt_a_boot_epoch_changed_after_confirmation_context() {
+        if isolated("fresh_query_cannot_adopt_a_boot_epoch_changed_after_confirmation_context") { return; }
+        changed_review_identity_is_rejected_without_adopting_fresh_query(true).await;
+    }
+    #[tokio::test]
+    async fn fresh_query_cannot_adopt_an_abort_epoch_changed_after_confirmation_context() {
+        if isolated("fresh_query_cannot_adopt_an_abort_epoch_changed_after_confirmation_context") { return; }
+        changed_review_identity_is_rejected_without_adopting_fresh_query(false).await;
     }
     #[tokio::test]
     async fn pending_restart_marker_is_validated_and_corrupt_identity_never_opens_fallback() {
@@ -5024,7 +5042,7 @@ mod tests {
         assert_eq!(viewer["permissions"]["recover"], false);
         tokio::time::sleep(READBACK_TTL + Duration::from_millis(20)).await;
         let stale = body(get(fixture.state(), "operator").await).await;
-        assert_eq!(stale["confirmation"]["ticket"], ticket["ticket"]);
+        assert!(stale["confirmation"].is_null(), "expired original preparation is not an actionable confirmation");
         let ab = stale["boards"]
             .as_array()
             .unwrap()
@@ -5781,6 +5799,39 @@ mod tests {
                 .iter()
                 .all(|(_, model)| model.lock().unwrap().applied == 0)
         );
+    }
+
+    #[tokio::test]
+    async fn fixture_query_warmup_never_retries_confirmed_owner_409() {
+        if crate::operator_queue::isolated_native_case(module_path!(), "fixture_query_warmup_never_retries_confirmed_owner_409") { return; }
+        let fixture = Fixture::new().await;
+        let state = fixture.state();
+        // Explicit coordinator-state scaffolding: exercise the real external
+        // HTTP owner gate, not a synthetic successful SDK/Recovery proof.
+        state.board_recovery.coordinator.0.lock().unwrap().operation = Some(json!({"completed":false}));
+        let attempts = std::cell::Cell::new(0usize);
+        let origin = Token::capture(&state, 0);
+        let result = admit_prepare_query(
+            || origin_current(&state, origin).then_some(()).ok_or("origin changed"),
+            || {
+                attempts.set(attempts.get()+1);
+                let state = state.clone();
+                async move {
+                    let response = super::super::tests::http(state, "POST", "/api/board-recovery/query", Some("operator"), json!({"board":"AB"})).await;
+                    assert_eq!(response.status(), StatusCode::CONFLICT);
+                    assert!(response.extensions().get::<super::super::QueryAdmissionCoreBusy>().is_none());
+                    response
+                }
+            },
+        ).await;
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 1, "An external owner refusal must not become a repeated query");
+        assert_eq!(state.board_recovery.coordinator.0.lock().unwrap().operation.as_ref().unwrap()["completed"], false);
+    }
+
+    mod readonly_busy {
+        use super::*;
+        include!("readonly_busy_tests.rs");
     }
 
 }

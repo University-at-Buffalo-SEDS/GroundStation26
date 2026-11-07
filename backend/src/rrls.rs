@@ -1144,7 +1144,7 @@ impl Mesh {
         match kind {
             DOWN_COMMAND|UP_COMMAND|AV_BAY_COMMAND|HOST_CONTROL=>true,
             DOWN_DATA|UP_DATA|AV_BAY_DATA=>self.classify_namespace(body,kind!=DOWN_DATA)
-                .map_or(true,|class|class.recovery_control),
+                .is_none_or(|class|class.recovery_control),
             HEALTH|READY|POSITION|VOICE|BUDGET_CONTROL|RF_PROFILE_CONTROL=>false,
             SETTINGS=>origin!=SettingsOrigin::FramingOffer,
             _=>true,

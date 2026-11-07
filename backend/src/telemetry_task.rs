@@ -679,9 +679,8 @@ pub async fn telemetry_task(
                     };
                     let sealed_phase=matches!(cmd,TelemetryCommand::OperatorPhase{..});
                     let cmd = if let TelemetryCommand::OperatorPhase { mut intent } = cmd {
-                        if let Some(origin)=recovery_origin {
-                            if !intent.bind_manual_claim(&state,&origin) {continue;}
-                        }
+                        if let Some(origin)=recovery_origin
+                            && !intent.bind_manual_claim(&state,&origin) {continue;}
                         if !intent.validate(&state) {emit_notification_warning(&state,"Phase request changed or expired; choose a new phase action.");continue;}
                         if intent.local() {
                             if let Err(error)=crate::operator_phase::apply(&state,&intent){emit_notification_warning(&state,error);}
