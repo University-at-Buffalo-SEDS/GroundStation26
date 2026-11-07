@@ -231,9 +231,14 @@ GS–RF edge. Direct reception must be observed before the direct edge is shown
 again. A delayed READY can establish radio presence without renewing command
 readiness. The detail panel distinguishes relayed telemetry from confirmed
 command readiness; stale peer observations become offline after 15 seconds.
-A previously observed RRLS remains visible in standby. A never-observed standby
-radio cannot be inferred from configuration alone because standby does not
-advertise SDK discovery. Downstream board connections still come from discovery.
+A previously observed RRLS remains visible in standby. Besides READY and
+relayed traffic, a station-mode or command-capability frame from the RRLS that
+the primary verified (pairing signature, or the mesh session for an unpaired
+mode display) also counts as observation; this adds no radio traffic and grants
+no lease. Because standby is otherwise silent, the node is labelled with the age
+of that last verified exchange ("RRLS · Standby · seen N s ago") rather than as
+live. A never-observed standby radio cannot be inferred from configuration
+alone because standby does not advertise SDK discovery. Downstream board connections still come from discovery.
 
 The status API's `forwarded_frames` is a cumulative count of all successful mesh
 transmissions, including presence and settings. It does not prove that RRLS is

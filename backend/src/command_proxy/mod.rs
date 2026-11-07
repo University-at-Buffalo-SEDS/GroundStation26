@@ -1500,7 +1500,12 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                     runtime.observation =
                         crate::primary_mirror::encode_control_observation(&state, 96);
                 }
-                match runtime.receive(&pairing, view, crate::station_mode::local_mode(), &bytes) {
+                let received =
+                    runtime.receive(&pairing, view, crate::station_mode::local_mode(), &bytes);
+                if role == Role::Primary && received.is_ok() {
+                    mesh.lock().unwrap().note_verified_peer(now);
+                }
+                match received {
                     Ok(Received::Reply(bytes)) => {
                         if runtime.take_readiness_demand()
                             && let Err(error) =

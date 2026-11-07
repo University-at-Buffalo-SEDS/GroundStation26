@@ -601,10 +601,12 @@ impl WorkerRuntime {
             None => Ok(Self::Display(DisplayRuntime::new(observer, path)?)),
         }
     }
+    /// `verified` is set when any peer frame passed verification.
     fn poll(
         &mut self,
         pairing: Option<&Pairing>,
         observation: Observation,
+        verified: &mut bool,
     ) -> anyhow::Result<Snapshot> {
         let Observation {
             now,
@@ -619,8 +621,9 @@ impl WorkerRuntime {
                 // Invalidate the old challenge before receiving any buffered reply.
                 rt.connect_mesh(connected, session);
                 for wire in frames {
-                    if let Err(error) = rt.receive(pairing, &wire, now) {
-                        rt.error = Some(error.to_string());
+                    match rt.receive(pairing, &wire, now) {
+                        Ok(_) => *verified = true,
+                        Err(error) => rt.error = Some(error.to_string()),
                     }
                 }
                 rt.step(pairing, connected, now)?;
@@ -630,8 +633,9 @@ impl WorkerRuntime {
                 anyhow::ensure!(pairing.is_none(), "Configured pairing cannot downgrade");
                 rt.connect(session);
                 for wire in frames {
-                    if let Err(error) = rt.receive(&wire, now) {
-                        rt.error = Some(error.to_string());
+                    match rt.receive(&wire, now) {
+                        Ok(_) => *verified = true,
+                        Err(error) => rt.error = Some(error.to_string()),
                     }
                 }
                 rt.step(now);
@@ -696,15 +700,18 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
             let (runtime, pairing, path) = (runtime.clone(), pairing.clone(), path.clone());
             // Exactly one bounded blocking job per tick, awaited before another.
             // Persistence and signature operations never hold the radio lock.
-            let work = tokio::task::spawn_blocking(move || -> anyhow::Result<Snapshot> {
+            let mut peer_verified = false;
+            let work = tokio::task::spawn_blocking(move || -> anyhow::Result<(Snapshot, bool)> {
                 let mut runtime = runtime.lock().unwrap();
                 if runtime.is_none() {
                     *runtime = Some(WorkerRuntime::new(pairing.as_deref(), observer, path)?);
                 }
-                runtime
+                let mut verified = false;
+                let snapshot = runtime
                     .as_mut()
                     .unwrap()
-                    .poll(pairing.as_deref(), observation)
+                    .poll(pairing.as_deref(), observation, &mut verified)?;
+                Ok((snapshot, verified))
             })
             .await;
             {
@@ -713,12 +720,18 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
                     .lock()
                     .unwrap();
                 match work {
-                    Ok(Ok(snapshot)) => *status = snapshot,
+                    Ok(Ok((snapshot, verified))) => {
+                        *status = snapshot;
+                        peer_verified = verified;
+                    }
                     other => {
                         status.synchronized = false;
                         status.error = Some(format!("Mode synchronization unavailable: {other:?}"));
                     }
                 }
+            }
+            if peer_verified && !observer {
+                mesh.lock().unwrap().note_verified_peer(now);
             }
             crate::mission_sync::wire::flush(&mesh, now);
         }

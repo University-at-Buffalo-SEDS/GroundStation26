@@ -44,10 +44,17 @@ pub(crate) fn project(
     } else {
         "Standby"
     };
+    // Standby is silent: presence is only the last verified exchange, so the
+    // label states its age instead of claiming the radio is live now.
+    let seen = format!("seen {} s ago", age / 1000);
     let id = "board_rrls".to_string();
     let node = NetworkTopologyNode {
         id: id.clone(),
-        label: format!("RRLS · {mode}"),
+        label: if observed.relaying && online {
+            format!("RRLS · {mode}")
+        } else {
+            format!("RRLS · {mode} · {seen}")
+        },
         kind: NetworkTopologyNodeKind::Board,
         status,
         group: "recovery".into(),
@@ -59,7 +66,7 @@ pub(crate) fn project(
         detail: Some(if observed.relaying && !observed.command_ready {
             "Relayed telemetry received; command readiness unconfirmed".into()
         } else {
-            format!("Recovery radio: {}", mode.to_lowercase())
+            format!("Recovery radio: {}, last verified exchange {seen}", mode.to_lowercase())
         }),
         stats: None,
     };
@@ -154,7 +161,11 @@ mod tests {
         let (nodes, links) = snapshot(o);
         assert!(edge(&links, "gs", "rf"));
         assert!(!edge(&links, "rrls", "rf"));
-        assert!(nodes.iter().any(|n| n.label == "RRLS · Standby"));
+        assert!(nodes.iter().any(|n| n.label == "RRLS · Standby · seen 0 s ago"));
+        o.peer_age_ms = Some(4_999);
+        let (nodes, _) = snapshot(o);
+        assert!(nodes.iter().any(|n| n.label == "RRLS · Standby · seen 4 s ago"
+            && n.detail.as_deref().is_some_and(|d| d.contains("last verified exchange seen 4 s ago"))));
         o.peer_age_ms = Some(15_000);
         o.direct_age_ms = None;
         let (nodes, links) = snapshot(o);

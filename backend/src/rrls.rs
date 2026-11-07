@@ -1807,6 +1807,15 @@ impl Mesh {
     pub fn authenticated_settings_peer(&mut self, now: u64) {
         self.settings_peer_seen = Some(now);
     }
+    /// Primary only: the RRLS sent a station-mode or command-capability frame
+    /// that its worker verified (pairing signature, or the mesh session for an
+    /// unpaired mode display). Topology presence only; it grants no relay,
+    /// settings or command lease and sends nothing.
+    pub(crate) fn note_verified_peer(&mut self, now: u64) {
+        if self.role == Role::Primary {
+            self.topology_peer_seen = Some(self.topology_peer_seen.map_or(now, |old| old.max(now)));
+        }
+    }
     /// Link freshness only; signed proxy capability and actor policy remain independent.
     pub(crate) fn command_proxy_transport(
         &self,
@@ -4135,6 +4144,22 @@ mod tests {
         assert_eq!(primary.recovery_air_share(5_100), None);
         relay.incoming(true, &health(1, 1, true), 5_100);
         assert_eq!(relay.recovery_air_share(5_100), None);
+    }
+
+    #[test]
+    fn verified_peer_exchange_shows_standby_rrls_without_radio_traffic() {
+        let mut primary = Mesh::new(Role::Primary, 1);
+        assert_eq!(primary.topology_observation(1_000).peer_age_ms, None);
+        let queued = primary.queue.len();
+        primary.note_verified_peer(1_000);
+        primary.note_verified_peer(900);
+        assert_eq!(primary.queue.len(), queued, "presence sends nothing");
+        let seen = primary.topology_observation(5_000);
+        assert_eq!(seen.peer_age_ms, Some(4_000), "a delayed note never moves presence back");
+        assert!(!seen.relaying && !seen.command_ready, "presence grants no lease");
+        let mut rrls = Mesh::new(Role::Rrls, 2);
+        rrls.note_verified_peer(1_000);
+        assert_eq!(rrls.topology_peer_seen, None);
     }
 
     #[test]
