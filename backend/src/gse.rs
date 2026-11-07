@@ -615,7 +615,7 @@ impl Runtime {
 fn prelaunch(state: &AppState) -> bool {
     prelaunch_flight_state(*state.state.lock().unwrap())
 }
-fn prelaunch_flight_state(state: FlightState) -> bool {
+pub(crate) fn prelaunch_flight_state(state: FlightState) -> bool {
     #[cfg(feature = "hitl_mode")]
     if matches!(state, FlightState::Startup | FlightState::Armed) {
         return true;
@@ -2969,18 +2969,22 @@ pub(crate) fn verified_recovery_host_idle(state: &AppState) -> bool {
     }
     true
 }
-/// Explicit HITL reset may retire host Launch metadata only after host work
-/// has drained. Board completion is still verified by the recovery transaction.
-#[cfg(feature = "hitl_mode")]
-pub(crate) fn hitl_launch_reset_host_idle(state: &AppState) -> bool {
+/// Explicit reset may retire host Launch metadata only after host work has
+/// drained. Board completion is still verified by the recovery transaction. A
+/// Launch still waiting on its Valve Board does not count as work: this reset
+/// is the way out when that sequence never starts.
+#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+pub(crate) fn operator_reset_host_idle(state: &AppState) -> bool {
+    if !verified_recovery_host_idle(state) {
+        return false;
+    }
     {
         let rt = state.gse.lock().unwrap();
-        if rt.engine.active() || cold_flow::runtime_active(&rt) {
+        if cold_flow::runtime_active(&rt) {
             return false;
         }
     }
-    if state.launch_sequence_command_pending.load(std::sync::atomic::Ordering::Acquire)
-        || manual_stop_pending(state) {
+    if manual_stop_pending(state) {
         return false;
     }
     // Recovery status is a read-only poll: never wait behind the SDK owner.

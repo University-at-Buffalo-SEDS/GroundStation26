@@ -57,7 +57,11 @@ async fn queued_fc_preentry_original_must_not_survive_actual_completed_reset() {
             fresh_hold.released.notify_one();
             tokio::time::timeout(Duration::from_secs(3),fresh_hold.processed.notified()).await.unwrap();
             assert_eq!(state.local_flight_state_snapshot(),FlightState::Ascent,"fresh authority must remain functional");
-            assert_eq!(state.launch_clock_snapshot().kind,crate::telemetry_db::LaunchClockKind::TPlus);
+            assert_eq!(state.launch_clock_snapshot().kind,if cfg!(any(feature="hitl_mode",feature="test_fire_mode")) {
+                crate::telemetry_db::LaunchClockKind::Idle
+            } else {
+                crate::telemetry_db::LaunchClockKind::TPlus
+            });
             fixture._db.send(DbQueueItem::Control(RecordingCommand::Pause)).await.unwrap();
             tokio::time::timeout(Duration::from_secs(3),async {
                 while state.recording_status_snapshot().mode!=RecordingModeWire::Paused {tokio::time::sleep(Duration::from_millis(2)).await;}
