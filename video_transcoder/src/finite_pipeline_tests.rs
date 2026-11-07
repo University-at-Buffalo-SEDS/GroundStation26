@@ -52,7 +52,7 @@ async fn released_media(session: &Session, address: &Url, destination: &Path, pr
     Ok((path, objects))
 }
 
-async fn audience_snapshot(session: &Session, destination: &Path) -> Result<(PathBuf, usize)> {
+pub(in crate::engine) async fn audience_snapshot(session: &Session, destination: &Path) -> Result<(PathBuf, usize)> {
     let address = endpoint(&session.base, "/api/media-assets/hls/transcoded-front/index.m3u8")?;
     let master = String::from_utf8(owned_get(session, &address).await?)?;
     std::fs::create_dir_all(destination)?;
@@ -87,7 +87,8 @@ fn run_decode(program: &str, args: &[&str], output: &Path) -> Result<()> {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command.args(args).stdin(Stdio::null()).stdout(file).stderr(Stdio::null()).spawn()?;
+    let errors = std::fs::File::create(output.with_extension("stderr.log"))?;
+    let mut child = command.args(args).stdin(Stdio::null()).stdout(file).stderr(errors).spawn()?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(status) = child.try_wait()? {
@@ -103,7 +104,7 @@ fn run_decode(program: &str, args: &[&str], output: &Path) -> Result<()> {
     }
 }
 
-fn decode_audience(path: PathBuf) -> Result<(usize, usize)> {
+pub(in crate::engine) fn decode_audience(path: PathBuf) -> Result<(usize, usize)> {
     let folder = path.parent().context("audience folder")?;
     let input = path.to_str().context("audience path UTF8")?;
     let probe = folder.join("probe.json");
@@ -114,8 +115,8 @@ fn decode_audience(path: PathBuf) -> Result<(usize, usize)> {
     anyhow::ensure!(streams.iter().any(|s| s["codec_type"] == "audio" && s["codec_name"] == "aac"), "actual AAC audio required");
     let video = folder.join("video.framemd5");
     let audio = folder.join("audio.framemd5");
-    run_decode("ffmpeg", &["-v", "quiet", "-nostdin", "-i", input, "-map", "0:v:0", "-frames:v", "5", "-f", "framemd5", "pipe:1"], &video)?;
-    run_decode("ffmpeg", &["-v", "quiet", "-nostdin", "-i", input, "-map", "0:a:0", "-frames:a", "5", "-f", "framemd5", "pipe:1"], &audio)?;
+    run_decode("ffmpeg", &["-v", "quiet", "-nostdin", "-threads", "1", "-i", input, "-threads", "1", "-map", "0:v:0", "-frames:v", "5", "-f", "framemd5", "pipe:1"], &video)?;
+    run_decode("ffmpeg", &["-v", "quiet", "-nostdin", "-threads", "1", "-i", input, "-threads", "1", "-map", "0:a:0", "-frames:a", "5", "-f", "framemd5", "pipe:1"], &audio)?;
     let count = |file: &Path| -> Result<usize> { Ok(std::fs::read_to_string(file)?.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).count()) };
     let frames = (count(&video)?, count(&audio)?);
     anyhow::ensure!(frames == (5, 5), "five actually decoded video and audio frames required");
@@ -130,7 +131,7 @@ fn frame_hashes(path: &Path) -> Vec<String> {
     assert!(frames.iter().all(|hash|hash.len()==32 && hash.bytes().all(|byte|byte.is_ascii_hexdigit())));
     frames
 }
-fn actual_media_processes() -> HashSet<u32> {
+pub(in crate::engine) fn actual_media_processes() -> HashSet<u32> {
     let source: u32 = std::env::var("GS_MEDIA_TEST_SOURCE_PID").expect("owned fixture source pid required").parse().unwrap();
     assert!(Path::new(&format!("/proc/{source}")).exists());
     std::fs::read_dir("/proc").unwrap().filter_map(|entry| {

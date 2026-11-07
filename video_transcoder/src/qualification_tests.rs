@@ -53,7 +53,7 @@ async fn actual_auth_and_local_certificate_policy() {
 #[ignore = "manual synthetic real helper controller and live permission revocation"]
 async fn actual_controller_qualification_jobs_and_revocation() {
     let admin = administrator().await;
-    let controller = Controller::start();
+    let (controller, mut worker_owner) = Controller::start_owned();
     controller.tx.send(Action::Connect {station:origin("GS_MEDIA_TEST_ORIGIN"),username:"producer".into(),password:"fixture-only-password".into(),local_certificate:false}).unwrap();
     until(async || controller.view.lock().unwrap().connected, Duration::from_secs(15)).await;
     controller.tx.send(Action::Test{name:"Current controller acceptance".into()}).unwrap();
@@ -86,11 +86,30 @@ async fn actual_controller_qualification_jobs_and_revocation() {
     user["roles"]=serde_json::json!([]);
     std::fs::write(&restore.path,serde_json::to_vec(&accounts).unwrap()).unwrap();
     let revoked=Instant::now();
-    until(async || controller.view.lock().unwrap().jobs==0,Duration::from_secs(7)).await;
+    println!("ACTUAL_REVOCATION_PHASE before-jobs-zero");
+    until(async || {
+        let value=controller.view.lock().unwrap().clone();
+        if revoked.elapsed()>=Duration::from_secs(6) {
+            println!("ACTUAL_REVOCATION_VIEW {}",serde_json::json!({"jobs":value.jobs,"connected":value.connected,"offered":value.offered,"busy":value.busy,"message":value.message}));
+        }
+        value.jobs==0
+    },Duration::from_secs(7)).await;
+    println!("ACTUAL_REVOCATION_PHASE jobs-zero-before-fallback");
     until(async || !encoded(&streams(&admin).await),Duration::from_secs(7)).await;
     controller.tx.send(Action::Disconnect).unwrap();
     until(async || !controller.view.lock().unwrap().connected,Duration::from_secs(5)).await;
     drop(restore);
+    controller.request_shutdown();
+    let joined_deadline=Instant::now()+Duration::from_secs(45);
+    loop {
+        match worker_owner.poll_shutdown() {
+            ShutdownPoll::Joined(_)=>break,
+            ShutdownPoll::Pending=>{},
+            ShutdownPoll::LocalUncertain(code)=>panic!("native cleanup unverified: {code}"),
+        }
+        assert!(Instant::now()<joined_deadline,"actual native worker must join");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     println!("CONTROLLER_REAL_QUALIFICATION {}",serde_json::json!({"encoding_ms":view.encoding_ms,"upload_bps":view.upload_bps,"download_bps":view.download_bps,"capacity":view.capacity,"actual_jobs":jobs,"revocation_fallback_ms":revoked.elapsed().as_millis(),"network_bytes_each_direction":4*1024*1024}));
 }
 #[tokio::test]
@@ -121,8 +140,9 @@ async fn actual_missing_heartbeat_falls_back_without_offer_false() {
     until(async || !encoded(&streams(&admin).await),Duration::from_secs(6)).await;
     let elapsed=last.elapsed();assert!(elapsed>=Duration::from_secs(15)&&elapsed<Duration::from_secs(18));
     for job in jobs {job.abort();let _=job.await;}
+    session.local.settle().await;
     println!("PASS actual omitted-heartbeat original15s fallback {}ms; no Offer(false) or synthetic last_seen rewrite",elapsed.as_millis());
 }
 
 #[path = "finite_pipeline_tests.rs"]
-mod finite_pipeline_tests;
+pub(in crate::engine) mod finite_pipeline_tests;
