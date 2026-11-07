@@ -1057,3 +1057,80 @@ async fn accepted_fill_zero_keeps_claimed_proxy_lineage_after_envelope_age_expir
     second.pump();
     assert!(second.sent.lock().unwrap().is_empty());
 }
+#[tokio::test]
+async fn proxied_clear_gse_abort_runs_the_local_endpoint_checks_at_the_primary() {
+    if !child(
+        "command_proxy::handler_tests::proxied_clear_gse_abort_runs_the_local_endpoint_checks_at_the_primary",
+        "primary",
+    ) {
+        return;
+    }
+    assert_eq!(permission_name("ClearGseAbort"), "ValveSelfTest");
+    assert!(supported_commands_mask() & (1 << command_catalog().iter().position(|n| *n == "ClearGseAbort").unwrap()) != 0);
+    let (root, p, r) = super::tests::fixtures();
+    let mesh = configure();
+    let pv = {
+        let m = mesh.lock().unwrap();
+        m.command_proxy_transport(m.now()).unwrap()
+    };
+    let (mut primary, rr, rv) = clients(&p, &r, pv);
+    let state = crate::recording_export::tests::export_state(&root.0, false).await;
+    let clear = Operation::Command("ClearGseAbort".into());
+    // Without the command the local endpoint checks, the primary refuses.
+    user(&state.auth, true, false, false, &["Pilot"]);
+    let denied = request(&p, &r, &mut primary, &rr, pv, rv, 1, clear.clone());
+    assert_eq!(execute_primary(state.clone(), &denied).await, Outcome::Denied);
+    // With it, the same "not aborted" refusal as the local endpoint.
+    user(&state.auth, true, false, false, &["ValveSelfTest"]);
+    let idle = request(&p, &r, &mut primary, &rr, pv, rv, 2, clear.clone());
+    assert_eq!(execute_primary(state.clone(), &idle).await, Outcome::Stale);
+    assert_eq!(
+        crate::gse::clear_abort_for_proxy(
+            &state,
+            &state.auth.paired_proxy_actor("operator", Permission::SendCommands).unwrap(),
+            crate::gse::capture_operator_origin(&state).unwrap_or(0),
+        ),
+        axum::http::StatusCode::CONFLICT
+    );
+    state.request_shutdown();
+}
+/// A Launch relayed from the RRLS meets the same primary admission as a local
+/// Launch: a board reporting Abort refuses both, and nothing is queued.
+#[tokio::test]
+async fn proxied_launch_is_refused_like_local_launch_while_a_board_reports_abort() {
+    let root = crate::recording_export::tests::TestDirectory::new();
+    let mut state = crate::recording_export::tests::export_state(&root.0, false).await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    Arc::get_mut(&mut state).unwrap().cmd_tx = tx;
+    state.action_policy.lock().unwrap().software_buttons_enabled = true;
+    user(&state.auth, true, false, false, &["Launch"]);
+    let principal = state
+        .auth
+        .paired_proxy_actor("operator", Permission::SendCommands)
+        .unwrap();
+    let revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+    state
+        .board_abort
+        .observe_abort(crate::types::Board::ValveBoard, std::time::Instant::now(), 100);
+    assert!(crate::board_abort::blocked_message(&state).is_some());
+    let proxied = crate::web::dispatch_proxied_command(
+        state.clone(),
+        principal.clone(),
+        TelemetryCommand::Launch,
+        revision,
+    )
+    .await;
+    let local = crate::web::dispatch_authorized_command(
+        state.clone(),
+        principal,
+        TelemetryCommand::Launch,
+        0,
+        None,
+        revision,
+    )
+    .await;
+    assert_eq!(proxied.0, axum::http::StatusCode::CONFLICT, "{}", proxied.1);
+    assert_eq!(proxied, local);
+    assert!(rx.try_recv().is_err(), "no Launch reaches the command queue");
+    state.request_shutdown();
+}

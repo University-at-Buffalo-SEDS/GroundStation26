@@ -330,6 +330,25 @@ currently travels from primary to RRLS only. Unknown pressures,
 baselines and primary configuration are not replaced by RRLS-local values. A later
 host receipt is not proof that a board generated its report after a command.
 
+Besides the command catalog, an RRLS operator can ask the primary to **Clear GSE
+abort** (`/api/gse/abort/clear` on RRLS). It travels as the proxy-only catalog
+entry `ClearGseAbort` and the primary runs exactly its local endpoint: the
+account needs the ValveSelfTest command, the GroundStation must be aborted with
+no sequence active and no abort delivery pending, and network time must be
+synchronized. It never clears board aborts or the launch lock. An older primary
+does not advertise it and the RRLS refuses the request.
+
+Launch, GroundStation Launch and phase steps requested from RRLS are admitted by
+the same primary code as a local Launch: a present board reporting Abort blocks
+it, the launch lock still needs Reset all boards, and Launch is refused while
+turbocharge runs. The RRLS additionally needs fresh signed primary board state.
+
+These stay at the primary on purpose: **Reset all boards** and per-board
+recovery (their frozen-ticket confirmation is bound to the primary session, and
+Reset all boards is the only way to clear the launch lock), GSE sequence start,
+pause and cancel, cold-flow override, the dry self-test confirmation,
+qualification reset and pressure-limit configuration.
+
 Standalone physical command authority is unavailable: the existing RRLS identity
 and board GS-heartbeat ownership do not provide a safe takeover/handover protocol.
 Local recording and the separate durable T-clock reset workflow retain their

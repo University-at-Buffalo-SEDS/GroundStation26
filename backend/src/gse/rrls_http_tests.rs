@@ -79,12 +79,11 @@ async fn rrls_http_cannot_clear_abort_or_mutate_operational_qualification() {
     assert!(principal.allows_command_name("NitrogenTest"));
     assert!(crate::rrls::is_rrls());
     assert!(!state.is_command_allowed(&TelemetryCommand::Abort));
-    assert_eq!(
-        clear_abort(State(state.clone()), headers.clone())
-            .await
-            .status(),
-        StatusCode::FORBIDDEN
-    );
+    // RRLS never clears locally. It may only ask a connected primary over the
+    // signed proxy; with no primary link that request is refused outright.
+    let refused = clear_abort(State(state.clone()), headers.clone()).await;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(*state.state.lock().unwrap(), FlightState::Aborted);
     assert_eq!(
         self_test_confirmation(
             State(state.clone()),

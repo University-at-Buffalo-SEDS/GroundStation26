@@ -3275,6 +3275,24 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
     Ok(())
 }
 
+/// Signed RRLS request at the primary: exactly the local endpoint's checks.
+pub(crate) fn clear_abort_for_proxy(
+    state: &Arc<AppState>,
+    principal: &crate::auth::AuthPrincipal,
+    admission_generation: u64,
+) -> StatusCode {
+    if !principal.allows_command_name("ValveSelfTest") {
+        return StatusCode::FORBIDDEN;
+    }
+    let Some(_claim) = claim_operator_dispatch(state, admission_generation) else {
+        return StatusCode::CONFLICT;
+    };
+    match clear_ground_abort(state) {
+        Ok(()) => StatusCode::OK,
+        Err((status, _)) => status,
+    }
+}
+
 async fn clear_abort(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let admission_generation = capture_operator_origin(&state).unwrap_or(0);
     let principal =
@@ -3282,6 +3300,16 @@ async fn clear_abort(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
             Ok(p) => p,
             Err(error) => return error,
         };
+    if crate::rrls::is_rrls() {
+        // RRLS has no authority of its own: ask the primary over the signed proxy.
+        return crate::command_proxy::submit(
+            &state,
+            &principal,
+            crate::web::bearer_token_from_headers(&headers),
+            crate::command_proxy::Operation::Command("ClearGseAbort".into()),
+        )
+        .await;
+    }
     if !principal.allows_command_name("ValveSelfTest") {
         return StatusCode::FORBIDDEN.into_response();
     }

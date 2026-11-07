@@ -861,6 +861,9 @@ async fn execute_primary_inner(
     let fill_captured =
         matches!(&request.operation, Operation::Command(name) if name == "StartFill")
             .then(|| crate::fill_recording::Captured::capture(&state));
+    // Same origin capture as the local clear-abort endpoint, before auth can wait.
+    let clear_abort_origin = matches!(&request.operation, Operation::Command(name) if name == "ClearGseAbort")
+        .then(|| crate::gse::capture_operator_origin(&state).unwrap_or(0));
     // Preserve the signed remote source time and snapshot the local mode revision
     // before actor/config authentication can wait across a drive change.
     let plumbing_origin = request
@@ -900,9 +903,12 @@ async fn execute_primary_inner(
     };
     let status = match &request.operation {
         Operation::Command(name) => {
-            if local_operation(name) || !principal.allows_command_name(name) {
+            if local_operation(name) || !principal.allows_command_name(permission_name(name)) {
                 return Outcome::Denied;
             }
+            if let Some(origin) = clear_abort_origin {
+                crate::gse::clear_abort_for_proxy(&state, &principal, origin)
+            } else {
             let Ok(command) = serde_json::from_value::<crate::types::TelemetryCommand>(
                 serde_json::Value::String(name.clone()),
             ) else {
@@ -960,6 +966,7 @@ async fn execute_primary_inner(
                 )
                 .await
                 .0
+            }
             }
         }
         Operation::NetworkUtc(utc) => {
@@ -1212,7 +1219,7 @@ async fn submit_with_origins_inner(
     if let Operation::Command(name) = &operation
         && (!wire::valid_command(name)
             || local_operation(name)
-            || !principal.allows_command_name(name))
+            || !principal.allows_command_name(permission_name(name)))
         {
             return (
                 StatusCode::FORBIDDEN,
@@ -1246,7 +1253,7 @@ async fn submit_with_origins_inner(
         return (StatusCode::FORBIDDEN, "A named operator is required.").into_response();
     };
     if let Operation::Command(name) = &operation
-        && !fresh.allows_command_name(name) {
+        && !fresh.allows_command_name(permission_name(name)) {
             return (StatusCode::FORBIDDEN, "Command permission was revoked.").into_response();
         }
     if matches!(&operation, Operation::Command(name) if name == "Abort") {
@@ -1405,7 +1412,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
     let pairing = match Pairing::load() {
         Ok(Some(pairing)) => pairing,
         Ok(None) => {
-            broker().lock().unwrap().status.reason="Configure existing station pairing on both stations for authenticated primary commands. Standalone hardware authority is unavailable.".into();
+            broker().lock().unwrap().status.reason="Pair this RRLS with the primary (Administration > Station pairing) for authenticated primary commands. Standalone hardware authority is unavailable.".into();
             return None;
         }
         Err(_) => {
@@ -1984,17 +1991,33 @@ pub(crate) fn command_catalog() -> &'static [&'static str] {
         "ToggleChecklistInterlock",
         "ToggleSupplyInterlock",
         "ToggleBoardStateProofInterlock",
+        "ClearGseAbort",
     ]
+}
+/// Proxy-only operations: catalog entries that are primary HTTP actions rather
+/// than telemetry commands. Each runs the same primary-side checks as its
+/// local endpoint and is authorized by the command that endpoint checks.
+pub(crate) fn proxy_only_operation(name: &str) -> Option<&'static str> {
+    match name {
+        // `/api/gse/abort/clear` is authorized by ValveSelfTest.
+        "ClearGseAbort" => Some("ValveSelfTest"),
+        _ => None,
+    }
+}
+/// The command name whose account permission authorizes `name`.
+pub(crate) fn permission_name(name: &str) -> &str {
+    proxy_only_operation(name).unwrap_or(name)
 }
 fn supported_commands_mask() -> u64 {
     command_catalog()
         .iter()
         .enumerate()
         .filter(|(_, name)| {
-            serde_json::from_value::<crate::types::TelemetryCommand>(serde_json::Value::String(
-                (**name).into(),
-            ))
-            .is_ok()
+            proxy_only_operation(name).is_some()
+                || serde_json::from_value::<crate::types::TelemetryCommand>(
+                    serde_json::Value::String((**name).into()),
+                )
+                .is_ok()
         })
         .fold(0, |mask, (index, _)| mask | (1u64 << index))
 }
