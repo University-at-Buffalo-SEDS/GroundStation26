@@ -577,9 +577,8 @@ async fn refresh_prepare_queries(
                 if !origin_current(state, token) {
                     return Err("Recovery origin changed while admitting query");
                 }
-                if let Some(selection) = reset_selection {
-                    selection.current(state)?;
-                }
+                // Read-only: finish the frozen cohort so one refusal reveals every
+                // Abort episode. prepare_inner still fences the changed selection.
                 Ok(())
             },
             || super::query(

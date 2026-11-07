@@ -322,17 +322,36 @@ fn dispatcher() -> &'static Option<mpsc::SyncSender<Job>> {
                                 && job.epoch == owner.epoch.load(Ordering::Acquire)
                                 && let Ok(mut cache) = owner.cache.try_lock()
                             {
-                                if let Ok(previous) = owner.revision.try_update(
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                    |n| n.checked_add(1),
-                                ) {
+                                // Only a changed observation retires held tokens; an
+                                // identical 50ms refresh must not void the 5s lease.
+                                let unchanged_route = cache.as_ref().is_some_and(|old| {
+                                    old.router == Arc::as_ptr(&job.router) as usize
+                                        && old.generation == job.generation
+                                        && old.epoch == job.epoch
+                                        && old.sides == sides
+                                        && old.side_versions == side_versions
+                                        && std::array::from_fn::<_, 2, _>(|i| {
+                                            old.connections[i].as_ref().map(|c| c.generation)
+                                                == connection_tokens[i].as_ref().map(|c| c.generation)
+                                        }) == [true, true]
+                                });
+                                let revision = if unchanged_route {
+                                    Ok(owner.revision.load(Ordering::Acquire))
+                                } else {
+                                    owner
+                                        .revision
+                                        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                                            n.checked_add(1)
+                                        })
+                                        .map(|previous| previous + 1)
+                                };
+                                if let Ok(revision) = revision {
                                     *cache = Some(Token {
                                         owner: Arc::as_ptr(&owner) as usize,
                                         router: Arc::as_ptr(&job.router) as usize,
                                         generation: job.generation,
                                         epoch: job.epoch,
-                                        revision: previous + 1,
+                                        revision,
                                         requested: job.requested,
                                         sides,
                                         side_versions,
