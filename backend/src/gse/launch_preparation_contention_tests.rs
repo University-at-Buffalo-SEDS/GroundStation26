@@ -220,14 +220,20 @@ async fn genuine_pending_sdk_controller_owner_refuses_without_durable_inhibition
     f.router.tx_queue(packet).unwrap();
     assert_eq!(f.router.try_has_pending_reliable_tx_type(kind), Ok(true));
     let revision = crate::board_abort::capture_launch_revision_named(&f.state, "Launch");
-    assert!(prepare(&f.state, revision).unwrap_err().contains("pending"));
-    assert!(
-        !f.state
-            .launch_history
-            .lock()
-            .unwrap()
-            .automatic_actions_inhibited()
-    );
+    // HITL: a command retained for an absent board must not hold Launch.
+    #[cfg(feature = "hitl_mode")]
+    assert!(prepare(&f.state, revision).is_ok());
+    #[cfg(not(feature = "hitl_mode"))]
+    {
+        assert!(prepare(&f.state, revision).unwrap_err().contains("pending"));
+        assert!(
+            !f.state
+                .launch_history
+                .lock()
+                .unwrap()
+                .automatic_actions_inhibited()
+        );
+    }
     assert_eq!(f.router.try_has_pending_reliable_tx_type(kind), Ok(true));
 }
 #[tokio::test]

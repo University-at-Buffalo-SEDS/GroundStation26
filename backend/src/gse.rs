@@ -3463,7 +3463,12 @@ fn launch_controller_delivery_state(
     state: &AppState,
     kinds: &[sedsnet::config::DataType; 4],
 ) -> CurrentState {
-    if manual_stop_ram_pending(state) {
+    // HITL: an undeliverable command to an absent board, or a Stop that has not
+    // been delivered, must not hold a fresh press. A Stop pressed after this
+    // press still cancels it through the ticket's epochs, and a Stop that lands
+    // makes the board report Abort, which blocks the next press.
+    let hitl = cfg!(feature = "hitl_mode");
+    if !hitl && manual_stop_ram_pending(state) {
         return CurrentState::Invalid;
     }
     let Some(router) = state.topology_router.get() else {
@@ -3472,6 +3477,7 @@ fn launch_controller_delivery_state(
     for kind in kinds {
         match router.try_has_pending_reliable_tx_type(*kind) {
             Ok(false) => {}
+            Ok(true) if hitl => {}
             Ok(true) => return CurrentState::Invalid,
             Err(sedsnet::router::TryPendingTypeError::CoreBusy) => {
                 return CurrentState::PendingBusy;
@@ -4074,6 +4080,7 @@ pub(crate) fn queue_prepared_launch_packets(
             for kind in controller_types.iter().copied() {
                 match router.try_has_pending_reliable_tx_type(kind) {
                     Ok(false) => {}
+                    Ok(true) if cfg!(feature = "hitl_mode") => {}
                     Ok(true) => return Err("Controller command delivery is pending; launch was not dispatched".into()),
                     Err(sedsnet::router::TryPendingTypeError::CoreBusy) => {
                         inspection_busy = true;
@@ -4226,11 +4233,15 @@ pub(crate) fn inhibit_automatic_actions_for_launch_revision(
         )
         .map_err(|error| error.to_string())?;
     let runtime = state.gse.lock().unwrap();
-    if state
-        .launch_history
-        .lock()
-        .unwrap()
-        .automatic_actions_inhibited()
+    // HITL keeps the retained inhibition for automatic actions but does not let
+    // it veto the operator: clearing it needs a verified board reset, which an
+    // absent board can never complete. The running T-clock rejects double sends.
+    if !cfg!(feature = "hitl_mode")
+        && state
+            .launch_history
+            .lock()
+            .unwrap()
+            .automatic_actions_inhibited()
     {
         return Err("Launch preparation or admission is retained; explicit verified Startup reset is required".into());
     }
@@ -5103,6 +5114,7 @@ mod recovery_generation_tests {
         }
     }
 
+    #[cfg(not(feature = "hitl_mode"))]
     #[tokio::test]
     async fn launch_refuses_actual_sdk_controller_owners_before_journal_commit() {
         use sedsnet::router::{EndpointHandler, Router, RouterConfig};
@@ -5377,6 +5389,48 @@ mod final_launch_admission_tests {
             }
         }
     }
+    /// HITL "no way out" paths: none of these can veto a fresh press when no
+    /// board on the network reports Abort.
+    #[cfg(feature = "hitl_mode")]
+    #[tokio::test]
+    async fn hitl_fresh_press_is_not_held_by_retained_or_undeliverable_state() {
+        let state = crate::state::tests::test_app_state().await;
+        let router = Arc::new(clocked_router(RouterConfig::new([])));
+        state.topology_router.set(router.clone()).unwrap();
+        state.launch_history.lock().unwrap().inhibit_automatic_actions().unwrap();
+        let first = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        assert!(inhibit_automatic_actions_for_launch_revision(&state, first).is_ok(),
+            "retained inhibition must not need a verified reset of absent boards");
+        state.set_abort_indicator_latched(true);
+        let after_stop = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        assert!(inhibit_automatic_actions_for_launch_revision(&state, after_stop).is_ok(),
+            "a Stop that never reached an absent board must not hold a fresh press");
+        for name in ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND"] {
+            let kind = crate::telemetry_schema::data_type(name);
+            let payload: &[u8] = if name == "ABORT" { b"manual" } else { b"\x00" };
+            router.tx_queue(Packet::new(kind, &[match name {
+                "VALVE_COMMAND" => crate::telemetry_schema::endpoint("VALVE_BOARD"),
+                "ACTUATOR_COMMAND" => crate::telemetry_schema::endpoint("ACTUATOR_BOARD"),
+                _ => crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"),
+            }], "GS", 100, Arc::from(payload)).unwrap()).unwrap();
+        }
+        let pending = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        assert!(inhibit_automatic_actions_for_launch_revision(&state, pending).is_ok(),
+            "commands retained for absent boards must not hold a fresh press");
+    }
+    /// A Stop pressed after Launch was pressed still cancels that Launch.
+    #[cfg(feature = "hitl_mode")]
+    #[tokio::test]
+    async fn hitl_stop_pressed_after_launch_press_still_cancels_it() {
+        let state = crate::state::tests::test_app_state().await;
+        let router = Arc::new(clocked_router(RouterConfig::new([])));
+        state.topology_router.set(router.clone()).unwrap();
+        let revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        let ticket = inhibit_automatic_actions_for_launch_revision(&state, revision).unwrap();
+        let _ = state.manual_abort_intent.request();
+        assert!(queue_admitted_launch_packets(&state, &router, ticket, vec![launch_packet()]).is_err());
+    }
+    #[cfg(not(feature = "hitl_mode"))]
     #[tokio::test]
     async fn retained_or_deferred_manual_abort_blocks_launch_before_sdk_admission() {
         for deferred in [false, true] {
@@ -5716,6 +5770,7 @@ mod retained_stop_fence_tests {
             )
             .is_none()
         );
+        #[cfg(not(feature = "hitl_mode"))]
         assert!(inhibit_automatic_actions_for_launch(&state).is_err());
     }
 }

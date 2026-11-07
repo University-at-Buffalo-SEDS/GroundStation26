@@ -23,6 +23,10 @@ pub(crate) const BOARDS: [Board; 7] = [
     Board::DaqBoard,
 ];
 const PROOF_TTL: Duration = Duration::from_secs(5);
+/// A retained Abort blocks Launch only while its board is on the network. The
+/// row and its alert stay until a fresh non-Abort proof; an absent board just
+/// cannot veto Launch, since it could never report the proof that clears it.
+const ABORT_PRESENCE_TTL: Duration = Duration::from_millis(crate::state::BOARD_SEEN_TIMEOUT_MS);
 pub(crate) fn board_names(mask: u8) -> String {
     BOARDS
         .into_iter()
@@ -45,8 +49,9 @@ pub(crate) fn capture_launch_revision_named(state: &AppState, name: &str) -> Opt
         return None;
     }
     synchronize_stop_revision(state);
+    let seen = present_mask(state);
     let register = state.board_abort.register.lock().unwrap();
-    let (active, _) = Runtime::masks_at(&register, Instant::now());
+    let active = Runtime::launch_abort_mask_at(&register, seen, Instant::now());
     (active == 0 && register.abort_revision != u64::MAX).then_some(register.abort_revision)
 }
 pub(crate) fn validate_launch_revision(
@@ -107,12 +112,13 @@ pub(crate) fn controller_can_launch(kind: sedsnet::config::DataType, payload: &[
     false
 }
 pub(crate) fn blocked_message(state: &AppState) -> Option<String> {
+    let seen = present_mask(state);
     let register = state.board_abort.register.lock().unwrap();
     if state.shutdown_requested.load(Ordering::Acquire) || register.history_frozen {
         return Some("Ground station is shutting down".into());
     }
-    if let Some(error) = state.board_abort.history_failure() { return Some(format!("Abort history unavailable: {error}")); }
-    let mask = Runtime::masks_at(&register, Instant::now()).0;
+    if !cfg!(feature = "hitl_mode") && let Some(error) = state.board_abort.history_failure() { return Some(format!("Abort history unavailable: {error}")); }
+    let mask = Runtime::launch_abort_mask_at(&register, seen, Instant::now());
     if mask != 0 { return Some(format!("Launch disabled: {} report Abort.", board_names(mask))); }
     let unknown = required_unknown_mask(state, register.history_unknown);
     (unknown != 0).then(|| format!("Fresh actual state required because saved history is missing or was not clean for {}.", board_names(unknown)))
@@ -213,8 +219,11 @@ pub(crate) struct ActiveError {
     pub board_label: String,
     pub timestamp_ms: u64,
     pub message: String,
+    #[serde(default = "launch_gate_default")]
+    pub launch_blocking: bool,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+fn launch_gate_default() -> bool { true }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     pub version: u64,
     pub active_errors: Vec<ActiveError>,
@@ -226,6 +235,17 @@ pub(crate) struct Snapshot {
     pub history_unknown_boards: Vec<String>,
     #[serde(default)]
     pub history_error: Option<String>,
+    #[serde(default = "launch_gate_default")]
+    pub history_blocks_launch: bool,
+}
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            version: 0, active_errors: Vec::new(), required_boards: Vec::new(),
+            missing_required_state: Vec::new(), retraction: None,
+            history_unknown_boards: Vec::new(), history_error: None, history_blocks_launch: true,
+        }
+    }
 }
 impl Runtime {
     pub(crate) fn restored(
@@ -540,6 +560,21 @@ impl Runtime {
     pub(crate) fn masks(&self) -> (u8, u8) {
         Self::masks_at(&self.register.lock().unwrap(), Instant::now())
     }
+    /// Aborted boards that are still present: seen recently, or whose Abort
+    /// report is itself recent. `seen` comes from `present_mask`.
+    fn launch_abort_mask_at(register: &Register, seen: u8, now: Instant) -> u8 {
+        let (aborted, _) = Self::masks_at(register, now);
+        register.rows.iter().enumerate().fold(0, |mask, (i, row)| {
+            let recent = row.last_abort.is_some_and(|at| {
+                now.checked_duration_since(at).is_none_or(|age| age <= ABORT_PRESENCE_TTL)
+            });
+            if aborted & (1 << i) != 0 && (seen & (1 << i) != 0 || recent) { mask | (1 << i) } else { mask }
+        })
+    }
+    pub(crate) fn launch_abort_mask(&self, state: &AppState) -> u8 {
+        let seen = present_mask(state);
+        Self::launch_abort_mask_at(&self.register.lock().unwrap(), seen, Instant::now())
+    }
     /// Shared linearization with actual ingress. Only prebuilt SDK queue
     /// admission or the pure model effect is permitted here, never a flush,
     /// callback, journal, GSE/state lookup or await. Public437 RX callbacks run
@@ -576,12 +611,14 @@ impl Runtime {
         revision: u64,
         admit: impl FnOnce() -> T,
     ) -> Result<T, String> {
+        let seen = present_mask(state);
         let register = self.register.lock().unwrap();
         if state.shutdown_requested.load(Ordering::Acquire) || register.history_frozen { return Err("Ground station is shutting down".into()); }
-        if let Some(error) = self.history_failure() { return Err(format!("Abort history unavailable: {error}")); }
+        if !cfg!(feature = "hitl_mode") && let Some(error) = self.history_failure() { return Err(format!("Abort history unavailable: {error}")); }
         let unknown = required_unknown_mask(state, register.history_unknown);
         if unknown != 0 { self.request_queries(unknown); return Err(format!("Fresh actual state required because saved history is missing or was not clean for {}.", board_names(unknown))); }
-        let (aborted, proven) = Self::masks_at(&register, Instant::now());
+        let (_, proven) = Self::masks_at(&register, Instant::now());
+        let aborted = Self::launch_abort_mask_at(&register, seen, Instant::now());
         if aborted != 0 {
             drop(register);
             return Err(format!(
@@ -628,7 +665,7 @@ impl Runtime {
             if rows[i].aborted {
                 out.active_errors.push(ActiveError{source:format!("board_abort:{}",board.sender_id()),
                 board:board.sender_id().into(),board_label:board.as_str().into(),timestamp_ms:rows[i].first_abort_ms,
-                message:format!("{} reports Abort. New launch is disabled until a fresh actual non-Abort state is confirmed.",board.as_str())});
+                message:format!("{} reports Abort. New launch is disabled until a fresh actual non-Abort state is confirmed.",board.as_str()),launch_blocking:true});
             }
         }
         out
@@ -725,9 +762,37 @@ pub(crate) fn block_policy(state: &AppState, policy: &mut crate::sequences::Acti
     }
 }
 
+/// Boards heard from within the board-seen timeout. Taken before the register
+/// lock and never waits: a busy status table counts as present, so contention
+/// keeps an Abort blocking rather than releasing it.
+fn present_mask(state: &AppState) -> u8 {
+    // RRLS mirrors the primary's Abort rows and has no local board presence.
+    if crate::rrls::is_rrls() { return u8::MAX; }
+    let Ok(status) = state.board_status.try_lock() else { return u8::MAX; };
+    let now = Instant::now();
+    BOARDS.iter().enumerate().fold(0, |mask, (i, board)| {
+        let seen = status.get(board).and_then(|row| row.last_seen_instant).is_some_and(|at| {
+            now.checked_duration_since(at).is_none_or(|age| age <= ABORT_PRESENCE_TTL)
+        });
+        if seen { mask | (1 << i) } else { mask }
+    })
+}
 pub(crate) fn snapshot_for_state(state: &AppState) -> Snapshot {
     let required = required_mask(state) | required_unknown_mask(state, state.board_abort.history_snapshot().unknown);
     let mut value = state.board_abort.snapshot(required);
+    if !crate::rrls::is_rrls() {
+        // RRLS projects the primary's verdict and has no local board presence.
+        let blocking = state.board_abort.launch_abort_mask(state);
+        for error in &mut value.active_errors {
+            if BOARDS.iter().enumerate().any(|(i, board)| {
+                board.sender_id() == error.board && blocking & (1 << i) == 0
+            }) {
+                error.launch_blocking = false;
+                error.message = format!("{} last reported Abort and is not on the network. It does not block Launch.", error.board_label);
+            }
+        }
+        value.history_blocks_launch = !cfg!(feature = "hitl_mode");
+    }
     if !crate::rrls::is_rrls() {
         value.retraction = Some(crate::actuator_plumbing::retraction_gate(state));
     } else {
@@ -938,5 +1003,39 @@ mod reset_scope_context_tests {
     }
 }
 
+#[cfg(test)]
+mod launch_presence_tests {
+    use super::*;
+    /// An Abort from a board that left the network stays visible but cannot
+    /// veto Launch; the same board coming back re-establishes the block.
+    #[tokio::test]
+    async fn absent_board_abort_stays_visible_but_does_not_block_until_it_returns() {
+        let state = crate::state::tests::test_app_state().await;
+        let long_ago = Instant::now() - ABORT_PRESENCE_TTL - Duration::from_secs(1);
+        state.board_abort.observe_abort(Board::ValveBoard, long_ago, 100);
+        let bit = 1 << index(Board::ValveBoard).unwrap();
+        assert_eq!(state.board_abort.masks().0 & bit, bit);
+        assert_eq!(state.board_abort.launch_abort_mask(&state), 0);
+        assert!(blocked_message(&state).is_none());
+        assert!(capture_launch_revision_named(&state, "Launch").is_some());
+        let snapshot = snapshot_for_state(&state);
+        assert_eq!(snapshot.active_errors.len(), 1);
+        assert!(!snapshot.active_errors[0].launch_blocking);
+
+        state.board_status.lock().unwrap().get_mut(&Board::ValveBoard).unwrap().last_seen_instant = Some(Instant::now());
+        assert_eq!(state.board_abort.launch_abort_mask(&state), bit);
+        assert!(blocked_message(&state).unwrap().contains("Abort"));
+        assert!(capture_launch_revision_named(&state, "Launch").is_none());
+        assert!(snapshot_for_state(&state).active_errors[0].launch_blocking);
+    }
+    /// A fresh Abort report blocks even before any board-status bookkeeping.
+    #[tokio::test]
+    async fn fresh_abort_blocks_without_a_board_status_entry() {
+        let state = crate::state::tests::test_app_state().await;
+        state.board_abort.observe_abort(Board::ActuatorBoard, Instant::now(), 100);
+        assert_ne!(state.board_abort.launch_abort_mask(&state), 0);
+        assert!(capture_launch_revision_named(&state, "Launch").is_none());
+    }
+}
 #[cfg(test)]
 mod automatic_admission_tests;

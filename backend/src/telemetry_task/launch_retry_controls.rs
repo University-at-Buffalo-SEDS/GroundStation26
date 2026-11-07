@@ -355,6 +355,10 @@ async fn actual_busy(kind: &str) {
             );
             pause.resume_retry();
             let result = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // HITL: an undelivered FC16 (e.g. FC absent) must not hold Launch.
+            #[cfg(feature = "hitl_mode")]
+            assert!(result.is_ok(), "{result:?}");
+            #[cfg(not(feature = "hitl_mode"))]
             assert!(
                 result
                     .as_ref()
@@ -367,8 +371,9 @@ async fn actual_busy(kind: &str) {
                 "FC16 doesnot fabricate manualStop epoch"
             );
             eprintln!(
-                "NEW_FC16_DURING_RETRY: actual_owner_id={fc16_id} original_sdk_call_count={} old_launch_refused=true",
-                pause.launch_calls.load(Ordering::Relaxed)
+                "NEW_FC16_DURING_RETRY: actual_owner_id={fc16_id} original_sdk_call_count={} old_launch_refused={}",
+                pause.launch_calls.load(Ordering::Relaxed),
+                result.is_err()
             );
             result
         }
@@ -434,6 +439,9 @@ async fn actual_busy(kind: &str) {
             assert!(!actual.is_empty());
             assert!(actual.iter().all(|p| p.timestamp() == original.timestamp()));
         }
+    } else if cfg!(feature = "hitl_mode") && kind == "new_fc16" {
+        // HITL: an undelivered FC16 (e.g. FC absent) does not hold Launch.
+        result.unwrap();
     } else {
         let error = result.unwrap_err();
         if kind == "permanent" {

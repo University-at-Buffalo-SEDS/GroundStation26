@@ -686,6 +686,7 @@ mod launch_inhibition_tests {
                 crate::telemetry_task::command_at_dispatch(&state, TelemetryCommand::Abort)
                     .is_some()
             );
+            #[cfg(not(feature = "hitl_mode"))]
             assert!(
                 super::super::inhibit_automatic_actions_for_launch(&state).is_err(),
                 "T-clock reset cannot admit launch twice"

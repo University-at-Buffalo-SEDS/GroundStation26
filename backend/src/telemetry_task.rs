@@ -310,27 +310,27 @@ async fn handle_local_ground_station_launch_command(
         return;
     }
     if vent_valve_known_open_for_launch(&state) {
-        warn_launch_blocked_by_vent_valve(&state);
-        sequences::refresh_action_policy_now(&state);
-        state.broadcast_action_policy_snapshot();
-        gs_debug_println!(
-            "Ground-station launch command ignored because vent valve is reported open"
-        );
-        return;
+        // HITL warns only: the last report may come from a Valve Board that is
+        // gone, leaving no way to close it and no way to send Launch.
+        if cfg!(feature = "hitl_mode") {
+            emit_notification_warning(&state, "Vent valve is still reported open; sending Launch anyway (HITL).");
+        } else {
+            warn_launch_blocked_by_vent_valve(&state);
+            sequences::refresh_action_policy_now(&state);
+            state.broadcast_action_policy_snapshot();
+            gs_debug_println!("Launch command ignored because vent valve is reported open");
+            return;
+        }
     }
     if matches!(
         state.launch_clock_snapshot().kind,
         LaunchClockKind::TMinus | LaunchClockKind::TPlus
     ) {
-        gs_debug_println!(
-            "Ground-station launch command ignored because launch clock is already running"
-        );
+        emit_notification_warning(&state, "Launch not sent: the T-clock is already running. Reset the T-clock to send Launch again.");
         return;
     }
     if !state.try_begin_launch_sequence_command() {
-        gs_debug_println!(
-            "Ground-station launch command ignored because valve-board launch sequence command is already pending"
-        );
+        emit_notification_warning(&state, "Launch not sent: the last Launch is still waiting for the Valve Board to start its sequence. Reset the T-clock to send Launch again.");
         return;
     }
     if state.recording_status_snapshot().mode != RecordingModeWire::Recording {
@@ -419,17 +419,23 @@ async fn handle_flight_computer_launch_command(
         return;
     }
     if vent_valve_known_open_for_launch(&state) {
-        warn_launch_blocked_by_vent_valve(&state);
-        sequences::refresh_action_policy_now(&state);
-        state.broadcast_action_policy_snapshot();
-        gs_debug_println!("Launch command ignored because vent valve is reported open");
-        return;
+        // HITL warns only: the last report may come from a Valve Board that is
+        // gone, leaving no way to close it and no way to send Launch.
+        if cfg!(feature = "hitl_mode") {
+            emit_notification_warning(&state, "Vent valve is still reported open; sending Launch anyway (HITL).");
+        } else {
+            warn_launch_blocked_by_vent_valve(&state);
+            sequences::refresh_action_policy_now(&state);
+            state.broadcast_action_policy_snapshot();
+            gs_debug_println!("Launch command ignored because vent valve is reported open");
+            return;
+        }
     }
     if matches!(
         state.launch_clock_snapshot().kind,
         LaunchClockKind::TMinus | LaunchClockKind::TPlus
     ) {
-        gs_debug_println!("Launch command ignored because launch clock is already running");
+        emit_notification_warning(&state, "Launch not sent: the T-clock is already running. Reset the T-clock to send Launch again.");
         return;
     }
     if state.recording_status_snapshot().mode != RecordingModeWire::Recording {

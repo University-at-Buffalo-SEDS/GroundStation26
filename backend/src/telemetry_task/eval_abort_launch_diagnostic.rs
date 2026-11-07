@@ -673,6 +673,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
     admitted
 }
 
+#[cfg(not(feature = "hitl_mode"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn eval_abort_retained_owner_must_block_public_fresh_launch() {
     assert!(
@@ -681,6 +682,7 @@ async fn eval_abort_retained_owner_must_block_public_fresh_launch() {
     );
 }
 
+#[cfg(not(feature = "hitl_mode"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn eval_abort_held_retry_must_block_public_fresh_launch() {
     assert!(

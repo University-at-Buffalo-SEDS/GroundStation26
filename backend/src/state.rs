@@ -2306,7 +2306,7 @@ impl AppState {
             return false;
         }
         if crate::board_abort::launch_command(command_name(cmd))
-            && (self.board_abort.masks().0 != 0
+            && (self.board_abort.launch_abort_mask(self) != 0
                 || !crate::actuator_plumbing::retraction_gate(self).allowed)
         {
             return false;

@@ -104,7 +104,7 @@ pub(crate) fn readiness(state: &AppState) -> Result<(), &'static str> {
     if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
         return Err("Ground station is shutting down");
     }
-    if state.board_abort.masks().0 != 0 {
+    if state.board_abort.launch_abort_mask(state) != 0 {
         return Err("A board reports Abort; ignition is inhibited");
     }
     if state.topology_router.get().is_none() {
@@ -139,7 +139,7 @@ fn disable(policy: &mut ActionPolicyMsg) {
 pub(crate) fn project_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
     if !crate::rrls::is_rrls()
         && (state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire)
-            || state.board_abort.masks().0 != 0
+            || state.board_abort.launch_abort_mask(state) != 0
             || proof_enforced(state) && (!state.board_abort.ignition_pair_current() || require_routes(state).is_err()))
     {
         disable(policy);
@@ -150,7 +150,7 @@ pub(crate) fn project_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
 pub(crate) fn project_fresh_proof(state: &AppState, policy: &mut ActionPolicyMsg) {
     if !crate::rrls::is_rrls()
         && (state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire)
-            || state.board_abort.masks().0 != 0
+            || state.board_abort.launch_abort_mask(state) != 0
             || proof_enforced(state) && !state.board_abort.ignition_pair_current()) {
         disable(policy);
     }
