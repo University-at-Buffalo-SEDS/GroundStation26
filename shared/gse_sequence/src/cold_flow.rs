@@ -721,6 +721,40 @@ mod tests {
         assert!(e.valves.iter().all(|(_, on)| !*on));
         assert!(!r.c.paused_ready());
     }
+    #[test]
+    fn repeated_cancel_preserves_close_floor_and_each_bad_report_blocks_relief() {
+        for missing in [0_usize, 3, 4] {
+            for bad_age in 0..3 {
+                let mut r = Rig::new();r.hold();
+                let release = r.c.release(r.input).unwrap();r.apply(release);r.until(Phase::Flowing);
+                let floor = r.input.now_ms;
+                let close = r.c.cancel(floor);r.apply(close);
+                let since = r.c.since;let command_since = r.c.command_since;
+                assert!(r.c.cancel(floor + 100).valves.is_empty());
+                assert_eq!(r.c.since, since);assert_eq!(r.c.command_since, command_since);
+                r.input.now_ms = floor + 3000;
+                r.input.pressure = None;r.input.interlock = false;
+                r.input.valves = [Some(ValveState { open: false, at_ms: r.input.now_ms }); 5];
+                r.input.valves[missing] = Some(ValveState { open: false, at_ms: match bad_age {
+                    0 => floor, // Equal command timestamp is not a new physical report.
+                    1 => r.input.now_ms + 1,
+                    _ => r.input.now_ms - 2001,
+                }});
+                let blocked = r.c.tick(r.input);
+                assert!(blocked.valves.is_empty());
+                assert_eq!(r.c.phase, Phase::CancelClosing);
+                assert!(!r.c.closure_confirmed);
+                r.input.now_ms += 1;
+                r.input.valves = [Some(ValveState { open: false, at_ms: r.input.now_ms }); 5];
+                let relief = r.c.tick(r.input);
+                assert_eq!(r.c.phase, Phase::CancelRelieving);
+                assert_eq!(relief.valves.len(), 1);
+                assert!(relief.valves.iter().all(|(i, open)| *open && [1, 2].contains(i)),
+                    "only actual newer supply/PILOT closure allows relief; no main discharge");
+            }
+        }
+    }
+
 }
 
 #[cfg(test)]
@@ -748,4 +782,5 @@ mod lease_tests {
         input.pressure.as_mut().unwrap().value = f32::NAN;
         assert_eq!(start_input_valid_for_ms(input), 0);
     }
+
 }

@@ -692,6 +692,9 @@ mod tests {
     }
     impl Rig {
         fn new(target: f32) -> Self {
+            Self::with_config(target, &config())
+        }
+        fn with_config(target: f32, config: &Config) -> Self {
             let input = Inputs {
                 now_ms: 100,
                 pressure: Some(Sample {
@@ -703,7 +706,7 @@ mod tests {
                 prelaunch: true,
             };
             let (c, e) = Controller::start(
-                &config(),
+                config,
                 target,
                 745.0,
                 input,
@@ -1003,6 +1006,37 @@ mod tests {
         }
         assert_ne!(r.c.phase(), Phase::Complete);
     }
+    #[test]
+    fn configured_custom_deadband_survives_public_start_close_and_settled_evidence() {
+        for band in [8.0_f32, 9.5, 12.0, 16.0] {
+            let mut cfg = config();
+            cfg.turbocharge_pressure_deadband_psi = band;
+            let mut r = Rig::with_config(8.0, &cfg);
+            r.reach_raising();
+            r.pressure = 745.0;
+            assert_eq!(r.step().effects.valves, vec![(3, false)], "exact pressure target closes nitrogen");
+            r.pressure = 745.0 - band;
+            for _ in 0..40 {
+                let update = r.step();
+                assert!(update.cancelled.is_none());
+                if r.evidence.is_some() { break; }
+            }
+            let evidence = r.evidence.as_ref().expect("configured boundary settles");
+            assert!(evidence.valid());
+            assert_eq!(evidence.pressure_deadband_psi.to_bits(), band.to_bits());
+            assert_eq!(evidence.after_pressure.value, 745.0 - band);
+            assert!(r.valves.iter().all(|v| v.is_some_and(|v| !v.open)));
+            assert_eq!(r.events.iter().filter(|&&(i, open)| i == 3 && open).count(), 1);
+        }
+        for band in [8.0_f32.next_down(), 16.0_f32.next_up(), f32::NEG_INFINITY] {
+            let mut cfg = config();cfg.turbocharge_pressure_deadband_psi = band;
+            assert!(cfg.validate_settings().is_err());
+            let r = Rig::new(8.0);
+            assert!(Controller::start(&cfg, 8.0, 745.0, r.input(),
+                Some(Sample { value: 8.0, at_ms: r.now }), context()).is_err());
+        }
+    }
+
 }
 
 #[cfg(test)]
@@ -1171,4 +1205,5 @@ mod cumulative_tests {
         assert!(!update.severe_pressure);
         assert!(update.effects.valves.is_empty());
     }
+
 }

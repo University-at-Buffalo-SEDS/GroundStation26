@@ -114,3 +114,47 @@ fn near_full_first_turbo_completes_then_repeat_keeps_first_anchor_and_cumulative
  assert!((again.inventory_anchor().value-7.9).abs()<0.0001);r.c=again;r.pressure=700.;r.evidence=None;apply(first,&mut r.valves,r.now,&mut r.events);r.raise();
  r.mass=8.21;let bad=r.step();assert!(bad.cancelled.is_some());assert!(bad.completed.is_none());assert!(bad.effects.valves.iter().all(|(_,open)|!*open));
 }
+
+
+#[test]
+fn explicit_paused_refill_uses_adjacent_signed_boundary_without_mutating_noop_inventory() {
+    let now = 10_000;
+    let boundary = 8.0_f32 - fill_resume::RESUME_DEFICIT_KG;
+    for sign in [1.0_f32, -1.0] {
+        for (normalized, starts) in [(8.0, false), (boundary.next_up(), false),
+                                    (boundary, true), (boundary.next_down(), true)] {
+            let mut e = engine(true);
+            let before = serde_json::to_value(&e.status).unwrap();
+            let ownership = (e.claimed, e.nitrous_session, e.resume_existing_inventory);
+            let result = e.request_fill(input(now, 500.0),
+                Some(Sample { value: normalized * sign, at_ms: now }), 8.0 * sign).unwrap();
+            if starts {
+                let FillStart::Started(first) = result else { panic!("inclusive explicit refill boundary was a no-op"); };
+                assert!(e.resume_existing_inventory);
+                let events = drive_setup(&mut e, first, 500.0);
+                assert_eq!(e.status.phase, Phase::Filling);
+                assert_eq!(events.last(), Some(&(4, true)));
+            } else {
+                assert!(matches!(result, FillStart::Noop));
+                assert_eq!(serde_json::to_value(&e.status).unwrap(), before);
+                assert_eq!((e.claimed, e.nitrous_session, e.resume_existing_inventory), ownership);
+            }
+        }
+        // Exactly fresh at 2000ms may no-op; stale/future/nonfinite/absent mass
+        // must fail before claiming a paused engine, even at the target weight.
+        let mut fresh = engine(true);
+        assert!(matches!(fresh.request_fill(input(now, 500.0),
+            Some(Sample { value: 8.0 * sign, at_ms: now - 2000 }), 8.0 * sign).unwrap(), FillStart::Noop));
+        for sample in [None, Some(Sample { value: 8.0 * sign, at_ms: now - 2001 }),
+            Some(Sample { value: 8.0 * sign, at_ms: now + 1 }),
+            Some(Sample { value: f32::NAN, at_ms: now }),
+            Some(Sample { value: f32::INFINITY * sign, at_ms: now })] {
+            let mut e = engine(true);
+            let before = serde_json::to_value(&e.status).unwrap();
+            let ownership = (e.claimed, e.nitrous_session, e.resume_existing_inventory);
+            assert!(e.request_fill(input(now, 500.0), sample, 8.0 * sign).is_err());
+            assert_eq!(serde_json::to_value(&e.status).unwrap(), before);
+            assert_eq!((e.claimed, e.nitrous_session, e.resume_existing_inventory), ownership);
+        }
+    }
+}
