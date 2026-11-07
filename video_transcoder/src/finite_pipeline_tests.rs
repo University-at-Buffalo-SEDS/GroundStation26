@@ -122,6 +122,24 @@ fn decode_audience(path: PathBuf) -> Result<(usize, usize)> {
     Ok(frames)
 }
 
+fn frame_hashes(path: &Path) -> Vec<String> {
+    let frames: Vec<_> = std::fs::read_to_string(path).unwrap().lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.rsplit(',').next().unwrap().trim().to_owned()).collect();
+    assert_eq!(frames.len(), 5);
+    assert!(frames.iter().all(|hash|hash.len()==32 && hash.bytes().all(|byte|byte.is_ascii_hexdigit())));
+    frames
+}
+fn actual_media_processes() -> HashSet<u32> {
+    let source: u32 = std::env::var("GS_MEDIA_TEST_SOURCE_PID").expect("owned fixture source pid required").parse().unwrap();
+    assert!(Path::new(&format!("/proc/{source}")).exists());
+    std::fs::read_dir("/proc").unwrap().filter_map(|entry| {
+        let entry = entry.ok()?;
+        let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+        (pid != source && std::fs::read_to_string(entry.path().join("comm")).ok()?.trim() == "ffmpeg").then_some(pid)
+    }).collect()
+}
+
 #[tokio::test]
 #[ignore = "manual actual finite loopback MediaMTX/controller/audience decode"]
 async fn actual_controller_to_audience_decoded_h264_aac_and_stop() {
@@ -160,16 +178,38 @@ async fn actual_controller_to_audience_decoded_h264_aac_and_stop() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     let decoded = tokio::task::spawn_blocking(move || decode_audience(snapshot)).await.unwrap().unwrap();
+    let first_video = frame_hashes(&owned.join("video.framemd5"));
+    let first_processes = actual_media_processes();
+    assert!(first_processes.len() >= 2, "actual local encoder and station remux must exist");
     tx.send(Action::Offer(false)).unwrap();
-    wait_view(&view, |v| !v.offered && v.message.contains("new processing work is blocked"), 15).await;
+    wait_view(&view, |v| !v.offered && !v.busy && v.jobs == 0 && v.message.contains("acknowledged remote cleanup"), 15).await;
+    assert!(first_processes.iter().all(|pid| !Path::new(&format!("/proc/{pid}")).exists()), "acknowledged Stop must have reaped old local and remote media children");
+    assert!(view.lock().unwrap().passed, "safe Stop retains qualification without a helper restart");
     tx.send(Action::Offer(true)).unwrap();
-    tokio::time::sleep(Duration::from_millis(6200)).await;
-    assert!(!view.lock().unwrap().offered, "unknown remote completion must not automatically re-offer");
+    wait_view(&view, |v| v.offered && v.jobs > 0, 10).await;
+    let second_owned = PathBuf::from(std::env::var_os("GS_MEDIA_TEST_DIR").unwrap()).join("decoded-reoffered-audience");
+    let deadline = Instant::now() + Duration::from_secs(50);
+    let (second_objects, second_decoded) = loop {
+        if let Ok((snapshot, count)) = audience_snapshot(&admin, &second_owned).await
+            && let Ok(frames) = tokio::task::spawn_blocking(move || decode_audience(snapshot)).await.unwrap()
+            && frame_hashes(&second_owned.join("video.framemd5")) != first_video {
+            break (count, frames);
+        }
+        assert!(Instant::now() < deadline, "fresh reoffered audience media must actually decode");
+        assert!(view.lock().unwrap().offered);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let second_processes = actual_media_processes();
+    assert!(second_processes.len() >= 2 && second_processes.is_disjoint(&first_processes));
+    tx.send(Action::Offer(false)).unwrap();
+    wait_view(&view, |v| !v.offered && !v.busy && v.jobs == 0 && v.message.contains("acknowledged remote cleanup"), 15).await;
+    assert!(second_processes.iter().all(|pid| !Path::new(&format!("/proc/{pid}")).exists()));
     tx.send(Action::Disconnect).unwrap();
-    wait_view(&view, |v| !v.connected, 10).await;
+    wait_view(&view, |v| !v.connected && !v.busy, 10).await;
     drop(tx);
-    assert!(tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap().is_err(), "latched remote completion uncertainty must remain explicit at shutdown");
-    println!("ACTUAL_FINITE_HELPER_PROGRAM {}", serde_json::json!({"actual_compute_ms":qualified.encoding_ms,"actual_upload_bps":qualified.upload_bps,"actual_download_bps":qualified.download_bps,"actual_audience_objects":objects,"decoded_video_frames":decoded.0,"decoded_audio_frames":decoded.1,"codecs":["h264","aac"],"actual_stop_and_disconnect":true,"uncertain_remote_completion_not_reoffered":true,"controller_task_joined":true,"scope":"owned finite source, real login/control/auth proxy/encoder/backend/MediaMTX/audience HLS; no UI thread/physical platform claim"}));
+    tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap().unwrap();
+    println!("ACTUAL_FINITE_HELPER_PROGRAM {}", serde_json::json!({"actual_compute_ms":qualified.encoding_ms,"actual_upload_bps":qualified.upload_bps,"actual_download_bps":qualified.download_bps,"actual_audience_objects":objects,"decoded_video_frames":decoded.0,"decoded_audio_frames":decoded.1,"reoffered_audience_objects":second_objects,"reoffered_decoded_video_frames":second_decoded.0,"reoffered_decoded_audio_frames":second_decoded.1,"codecs":["h264","aac"],"actual_stop_and_disconnect":true,"acknowledged_stop_and_same_controller_reoffer":true,"old_media_children_reaped_before_reoffer":true,"fresh_media_processes_disjoint":true,"fresh_video_frame_bytes":true,"controller_task_joined":true,"scope":"owned finite source, actual controller/remote generation acknowledgement, two audience decode cycles; no GUI/window-exit or physical platform claim"}));
+
 }
 
 #[tokio::test]
@@ -204,8 +244,11 @@ async fn actual_finite_valid_upload_decodes_and_returns_204_after_encoder_exit0(
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
     let output = encoder.stdout.take().unwrap();
     let captured = session.clone();
+    let generation = job.generation.clone().expect("original assigned job generation");
+    assert_eq!(Some(&generation), session.generation.as_ref());
     let upload = tokio::spawn(async move {
         captured.upload_client.post(destination).bearer_auth(&captured.token).header("Content-Type", "video/x-matroska")
+            .header("X-Station-Transcode-Generation", generation)
             .body(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(output))).send().await
     });
     let owned = PathBuf::from(std::env::var_os("GS_MEDIA_TEST_DIR").unwrap()).join("decoded-natural-audience");
@@ -230,4 +273,55 @@ async fn actual_finite_valid_upload_decodes_and_returns_204_after_encoder_exit0(
     let streams: serde_json::Value = json(admin.client.get(endpoint(&admin.base, "/api/live_streams").unwrap()).bearer_auth(&admin.token).send().await.unwrap()).await.unwrap();
     assert!(streams["streams"].as_array().unwrap().iter().any(|s| s["id"] == "front" && s["online"] == true && !s["url"].as_str().unwrap().contains("transcoded-")), "natural completion restores the live original feed");
     println!("ACTUAL_FINITE_NATURAL_COMPLETION {}", serde_json::json!({"http_status":204,"actual_encoder_exit0":true,"decoded_video_frames":5,"decoded_audio_frames":5,"actual_audience_objects":objects,"qualified_worker":true,"original_feed_restored":true,"scope":"finite valid container natural EOF/actual response+process exit and audience decode; actual input proxy/controller covered separately by19"}));
+}
+
+#[tokio::test]
+#[ignore = "manual actual authenticated loopback generation route contract"]
+async fn actual_original_generation_late_upload_and_stale_close_are_refused() {
+    let origin = std::env::var("GS_MEDIA_TEST_ORIGIN").unwrap();
+    let mut worker = connect(origin.clone(), "producer".into(), "fixture-only-password".into(), false).await.unwrap();
+    let admin = connect(origin, "administrator".into(), "fixture-only-password".into(), false).await.unwrap();
+    let report = test(&mut worker, "Generation route control".into()).await.unwrap();
+    assert_eq!(report["passed"], true);
+    let original = worker.generation.clone().expect("qualified opaque generation");
+    let _ = heartbeat(&worker, true).await.unwrap();
+    let host = worker.host.as_ref().unwrap();
+    let selection = admin.client.post(endpoint(&admin.base, "/api/video/transcode/hosts").unwrap()).bearer_auth(&admin.token)
+        .json(&serde_json::json!({"host_id":host})).send().await.unwrap();
+    assert!(selection.status().is_success());
+    let reply = heartbeat(&worker, true).await.unwrap();
+    assert!(reply.jobs.iter().all(|job|job.generation.as_ref()==Some(&original)));
+    let ack = heartbeat(&worker, false).await.unwrap();
+    assert!(stop_acknowledges(&original, &ack));
+    let next = ack.generation.clone().unwrap();
+    let output = endpoint(&worker.base, &format!("/api/video/transcode/output/{host}/front")).unwrap();
+    let late = worker.upload_client.post(output.clone()).bearer_auth(&worker.token).header("X-Station-Transcode-Generation", &original)
+        .header("Content-Type", "video/x-matroska").body(Vec::new()).send().await.unwrap();
+    assert_eq!(late.status(), reqwest::StatusCode::CONFLICT);
+    worker.generation=Some(next.clone());
+    let _ = heartbeat(&worker, true).await.unwrap();
+    // Both old and missing generation must be refused while the NEW
+    // generation is offered/selected, not merely because the host is stopped.
+    let late = worker.upload_client.post(output.clone()).bearer_auth(&worker.token)
+        .header("X-Station-Transcode-Generation", &original).header("Content-Type", "video/x-matroska")
+        .body(Vec::new()).send().await.unwrap();
+    assert_eq!(late.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(late.text().await.unwrap(), "video_processing_generation_stale");
+    let missing = worker.upload_client.post(output.clone()).bearer_auth(&worker.token)
+        .header("Content-Type", "video/x-matroska").body(Vec::new()).send().await.unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(missing.text().await.unwrap(), "video_processing_generation_stale");
+    let missing_stop = worker.client.post(endpoint(&worker.base, &format!("/api/video/transcode/host/{host}")).unwrap())
+        .bearer_auth(&worker.token).json(&serde_json::json!({"offered":false})).send().await.unwrap();
+    assert_eq!(missing_stop.status(), reqwest::StatusCode::CONFLICT);
+    let stale = worker.client.post(endpoint(&worker.base, &format!("/api/video/transcode/host/{host}")).unwrap()).bearer_auth(&worker.token)
+        .json(&serde_json::json!({"offered":false,"generation":original})).send().await.unwrap();
+    assert_eq!(stale.status(), reqwest::StatusCode::CONFLICT);
+    assert!(!stop_acknowledges(&next, &ack));
+    let after = heartbeat(&worker, true).await.unwrap();
+    assert!(after.selected && after.generation.as_ref()==Some(&next));
+    let unauthenticated = worker.client.post(output).header("X-Station-Transcode-Generation", &next).body(Vec::new()).send().await.unwrap();
+    assert!(matches!(unauthenticated.status().as_u16(),401|403));
+    let ack=heartbeat(&worker,false).await.unwrap();assert!(stop_acknowledges(&next,&ack));
+    println!("ACTUAL_GENERATION_ROUTE_CONTROL {}",serde_json::json!({"late_upload_status":409,"late_upload_after_reoffer_status":409,"missing_generation_after_reoffer_status":409,"missing_generation_close_status":409,"stale_close_status":409,"stale_ack_rejected":true,"new_offer_survived_stale_close":true,"unauthenticated_upload_rejected":true,"actual_same_origin_authenticated_http":true}));
 }

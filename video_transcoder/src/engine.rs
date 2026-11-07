@@ -72,6 +72,7 @@ struct Session {
     base: Url,
     token: String,
     host: Option<String>,
+    generation: Option<String>,
 }
 #[derive(Deserialize)]
 struct Challenge {
@@ -91,6 +92,8 @@ struct Proof<'a> {
 }
 #[derive(Clone, Deserialize)]
 struct Job {
+    #[serde(default)]
+    generation: Option<String>,
     id: String,
     input: String,
     output: String,
@@ -99,6 +102,12 @@ struct Job {
 struct Heartbeat {
     selected: bool,
     jobs: Vec<Job>,
+    #[serde(default)]
+    generation: Option<String>,
+    #[serde(default)]
+    stopped_generation: Option<String>,
+    #[serde(default)]
+    cleanup_complete: bool,
 }
 fn update(view: &Arc<Mutex<View>>, f: impl FnOnce(&mut View)) {
     if let Ok(mut v) = view.lock() {
@@ -252,6 +261,7 @@ async fn connect(
         base,
         token,
         host: None,
+        generation: None,
     };
     let response = session
         .client
@@ -321,6 +331,11 @@ async fn test(session: &mut Session, name: String) -> Result<serde_json::Value> 
     )
     .await?;
     session.host = Some(id.to_owned());
+    session.generation = match report.get("generation") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) if valid_generation(value) => Some(value.clone()),
+        _ => anyhow::bail!("Invalid station processing generation"),
+    };
     Ok(report)
 }
 pub async fn benchmark() -> Result<u64> {
@@ -380,19 +395,14 @@ pub async fn benchmark() -> Result<u64> {
 }
 async fn heartbeat(session: &Session, offered: bool) -> Result<Heartbeat> {
     let id = session.host.as_deref().context("Test this host first")?;
-    json(
-        session
-            .client
-            .post(endpoint(
-                &session.base,
-                &format!("/api/video/transcode/host/{id}"),
-            )?)
-            .bearer_auth(&session.token)
-            .json(&serde_json::json!({"offered":offered}))
-            .send()
-            .await?,
-    )
-    .await
+    let reply: Heartbeat = json(session.client.post(endpoint(&session.base, &format!("/api/video/transcode/host/{id}"))?)
+        .bearer_auth(&session.token)
+        .json(&serde_json::json!({"offered":offered,"generation":session.generation}))
+        .send().await?).await?;
+    if offered && session.generation.is_some() {
+        ensure!(reply.generation == session.generation, "Station returned a different processing generation");
+    }
+    Ok(reply)
 }
 // FFmpeg must see the complete HLS master, including alternate audio renditions.
 // Keep station credentials inside this bounded loopback proxy, never in argv.
@@ -573,11 +583,18 @@ struct StopReport {
     uncertain: Option<CleanupUncertain>,
 }
 impl StopReport {
+    fn add_uncertainty(&mut self, reason: CleanupUncertain) {
+        // Local cleanup uncertainty cannot be overwritten by an unrelated
+        // remote-only uncertainty whose acknowledgement could later clear it.
+        if self.uncertain.is_none() || matches!(self.uncertain, Some(CleanupUncertain::RemoteCompletion)) {
+            self.uncertain = Some(reason);
+        }
+    }
     fn observe(&mut self, outcome: Result<JobOutcome, tokio::task::JoinError>) {
         match outcome {
             Ok(JobOutcome::Completed | JobOutcome::Cancelled) => {},
             Ok(JobOutcome::Failed(code)) => self.failed = Some(code),
-            Ok(JobOutcome::CleanupUncertain(reason)) => self.uncertain = Some(reason),
+            Ok(JobOutcome::CleanupUncertain(reason)) => self.add_uncertainty(reason),
             Err(_) => self.uncertain = Some(CleanupUncertain::JobJoin),
         }
     }
@@ -737,7 +754,7 @@ async fn rejected_upload(response: reqwest::Response, cancelled: &CancellationTo
     };
     match (status.as_u16(), code.as_deref()) {
         (400, Some("Invalid source camera" | "IDs must be 1–64 ASCII letters, digits, hyphens or underscores" | "video_upload_interrupted"))
-        | (409, Some("Host is no longer selected" | "video_processing_assignment_revoked"))
+        | (409, Some("Host is no longer selected" | "video_processing_assignment_revoked" | "video_processing_generation_revoked" | "video_processing_generation_stale" | "video_processing_previous_upload_not_reaped"))
         | (408, Some("video_upload_cancelled"))
         | (502, Some("video_remux_failed" | "video_remux_ended_before_input" | "video_remux_input_failed" | "video_remux_pipe_missing"))
         | (503, Some("FFmpeg remuxer is unavailable" | "Invalid local video receiver" | "Invalid receiver"))
@@ -751,6 +768,9 @@ async fn transcode_until_cancelled(
     job: Job,
     cancelled: CancellationToken,
 ) -> JobOutcome {
+    if job.generation != session.generation {
+        return JobOutcome::Failed("video_processing_job_generation_mismatch");
+    }
     let destination = match endpoint(&session.base, &job.output) {
         Ok(destination) => destination,
         Err(_) => return JobOutcome::Failed("video_processing_output_address_rejected"),
@@ -860,11 +880,14 @@ async fn transcode_until_cancelled(
             };
         };
 
-        let mut upload = Box::pin(session.upload_client.post(destination)
+        let mut request = session.upload_client.post(destination)
             .bearer_auth(&session.token)
             .header("Content-Type", "video/x-matroska")
-            .body(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(output)))
-            .send());
+            .body(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(output)));
+        if let Some(generation) = &job.generation {
+            request = request.header("X-Station-Transcode-Generation", generation);
+        }
+        let mut upload = Box::pin(request.send());
         let mut encoder_status = None;
         enum Transfer {
             Cancelled,
@@ -965,8 +988,11 @@ async fn transcode_until_cancelled(
         }
     }.await;
     let proxy_closed = proxy.close().await;
+    with_proxy_completion(work, proxy_closed)
+}
+fn with_proxy_completion(work: JobOutcome, proxy_closed: Result<(), CleanupUncertain>) -> JobOutcome {
     match (work, proxy_closed) {
-        (JobOutcome::CleanupUncertain(reason), _) => JobOutcome::CleanupUncertain(reason),
+        (JobOutcome::CleanupUncertain(reason), _) if !matches!(reason, CleanupUncertain::RemoteCompletion) => JobOutcome::CleanupUncertain(reason),
         (_, Err(reason)) => JobOutcome::CleanupUncertain(reason),
         (outcome, Ok(())) => outcome,
     }
@@ -982,13 +1008,45 @@ async fn stop_jobs(jobs: &mut HashMap<String, EncodingJob>) -> StopReport {
     for (_, job) in jobs.drain() { report.observe(job.task.await); }
     report
 }
+fn valid_generation(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+fn stop_acknowledges(original: &str, reply: &Heartbeat) -> bool {
+    reply.cleanup_complete && !reply.selected && reply.jobs.is_empty()
+        && reply.stopped_generation.as_deref() == Some(original)
+        && reply.generation.as_deref().is_some_and(|next| valid_generation(next) && next != original)
+}
+async fn stop_with_fence(
+    session: Option<&mut Session>, jobs: &mut HashMap<String, EncodingJob>,
+    prior: Option<CleanupUncertain>,
+) -> StopReport {
+    let mut report = stop_jobs(jobs).await;
+    if let Some(reason) = prior { report.add_uncertainty(reason); }
+    if let Some(session) = session {
+        let original = session.generation.clone();
+        let reply = heartbeat(session, false).await;
+        let acknowledged = original.as_deref().zip(reply.as_ref().ok())
+            .is_some_and(|(original, reply)| stop_acknowledges(original, reply));
+        if acknowledged {
+            // This mutable session remains owned by the single controller
+            // throughout the await. No replacement session adopts this ack.
+            if report.uncertain.is_none() || matches!(report.uncertain, Some(CleanupUncertain::RemoteCompletion)) {
+                session.generation = reply.unwrap().generation;
+                report.uncertain = None;
+            }
+        } else if original.is_some() {
+            report.add_uncertainty(CleanupUncertain::RemoteCompletion);
+        }
+    }
+    report
+}
 async fn control(mut rx: mpsc::UnboundedReceiver<Action>, view: Arc<Mutex<View>>) -> Result<()> {
     let mut session: Option<Session> = None;
     let mut jobs = HashMap::<String, EncodingJob>::new();
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     let mut offered = false;
-    // This latch is never cleared by a tick, disconnect or new credentials.
-    // There is no API in this slice that can manufacture missing reap proof.
+    // Only an authenticated acknowledgement of the original offer generation
+    // can clear remote-only uncertainty; local cleanup failures remain latched.
     let mut uncertain: Option<CleanupUncertain> = None;
     loop {
         tokio::select! {
@@ -997,10 +1055,9 @@ async fn control(mut rx: mpsc::UnboundedReceiver<Action>, view: Arc<Mutex<View>>
                 match action {
                     Action::Connect { station, username, password, local_certificate } => {
                         if let Some(reason) = uncertain { publish_cleanup_blocked(&view,reason); continue; }
-                        let stopped = stop_jobs(&mut jobs).await;
+                        let stopped = stop_with_fence(session.as_mut(), &mut jobs, uncertain).await;
                         if let Some(reason) = stopped.uncertain {
                             uncertain = Some(reason); offered = false;
-                            if let Some(s)=&session { let _=heartbeat(s,false).await; }
                             publish_cleanup_blocked(&view,reason); continue;
                         }
                         offered = false;
@@ -1021,18 +1078,18 @@ if let Some(s)=session.as_mut(){update(&view,|v|{v.busy=true;v.message="Testing 
                         if value && let Some(reason)=uncertain { publish_cleanup_blocked(&view,reason);continue; }
                         offered=value; update(&view,|v|v.offered=value);
                         if !value {
-                            let stopped=stop_jobs(&mut jobs).await;
-                            if let Some(reason)=stopped.uncertain { uncertain=Some(reason); }
-                            if let Some(s)=&session { let _=heartbeat(s,false).await; }
+                            update(&view,|v|v.busy=true);
+                            let stopped=stop_with_fence(session.as_mut(), &mut jobs, uncertain).await;
+                            uncertain=stopped.uncertain;
                             if let Some(reason)=uncertain { publish_cleanup_blocked(&view,reason); }
-                            else { update(&view,|v|{v.jobs=0;v.message=stopped.failed.unwrap_or("Processing stopped; this host is no longer offered.").into();}); }
+                            else { update(&view,|v|{v.busy=false;v.jobs=0;v.message=stopped.failed.unwrap_or("Processing stopped after acknowledged remote cleanup; this host is no longer offered.").into();}); }
                         }
                     }
                     Action::Disconnect => {
+                        update(&view,|v|v.busy=true);
                         offered=false;
-                        let stopped=stop_jobs(&mut jobs).await;
-                        if let Some(reason)=stopped.uncertain { uncertain=Some(reason); }
-                        if let Some(s)=&session { let _=heartbeat(s,false).await; }
+                        let stopped=stop_with_fence(session.as_mut(), &mut jobs, uncertain).await;
+                        uncertain=stopped.uncertain;
                         session=None;
                         if let Some(reason)=uncertain {
                             update(&view,|v|v.connected=false);
@@ -1043,8 +1100,8 @@ if let Some(s)=session.as_mut(){update(&view,|v|{v.busy=true;v.message="Testing 
             }
             _ = tick.tick() => {
                 if uncertain.is_some() || !offered { continue; }
-                let Some(s)=&session else { continue; };
-                match heartbeat(s,true).await {
+                let Some(s)=session.clone() else { continue; };
+                match heartbeat(&s,true).await {
                     Ok(reply) => {
                         let wanted:HashSet<_>=reply.jobs.iter().map(|job|job.id.clone()).collect();
                         let remove:Vec<_>=jobs.iter().filter(|(id,job)|!wanted.contains(*id)||job.task.is_finished()).map(|(id,_)|id.clone()).collect();
@@ -1060,10 +1117,10 @@ if let Some(s)=session.as_mut(){update(&view,|v|{v.busy=true;v.message="Testing 
                         }
                         if let Some(reason)=report.uncertain {
                             uncertain=Some(reason);offered=false;
-                            let remaining=stop_jobs(&mut jobs).await;
-                            if let Some(reason)=remaining.uncertain { uncertain=Some(reason); }
-                            let _=heartbeat(s,false).await;
+                            let remaining=stop_with_fence(session.as_mut(), &mut jobs, uncertain).await;
+                            uncertain=remaining.uncertain;
                             if let Some(reason)=uncertain { publish_cleanup_blocked(&view,reason); }
+                            else { update(&view,|v|{v.offered=false;v.jobs=0;v.message="Processing stopped after acknowledged remote cleanup; offer again explicitly.".into();}); }
                             continue;
                         }
                         // Only proven-cleanup failures can retry the same
@@ -1084,7 +1141,9 @@ if let Some(s)=session.as_mut(){update(&view,|v|{v.busy=true;v.message="Testing 
                         });
                     }
                     Err(_) => {
-                        let stopped=stop_jobs(&mut jobs).await;
+                        offered=false;
+                        update(&view,|v|v.offered=false);
+                        let stopped=stop_with_fence(session.as_mut(), &mut jobs, uncertain).await;
                         if let Some(reason)=stopped.uncertain {
                             uncertain=Some(reason);offered=false;publish_cleanup_blocked(&view,reason);
                         } else {
@@ -1095,8 +1154,8 @@ if let Some(s)=session.as_mut(){update(&view,|v|{v.busy=true;v.message="Testing 
             }
         }
     }
-    let stopped=stop_jobs(&mut jobs).await;
-    if let Some(reason)=stopped.uncertain.or(uncertain) { anyhow::bail!(reason.code()); }
+    let stopped=stop_with_fence(session.as_mut(), &mut jobs, uncertain).await;
+    if let Some(reason)=stopped.uncertain { anyhow::bail!(reason.code()); }
     if let Some(code)=stopped.failed { update(&view,|v|v.message=code.into()); }
     Ok(())
 }
@@ -1104,6 +1163,31 @@ if let Some(s)=session.as_mut(){update(&view,|v|{v.busy=true;v.message="Testing 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stop_ack_requires_original_generation_and_never_clears_local_uncertainty() {
+        let original = "11111111111111111111111111111111";
+        let mut reply = Heartbeat { selected: false, jobs: Vec::new(), generation: Some("22222222222222222222222222222222".into()),
+            stopped_generation: Some(original.into()), cleanup_complete: true };
+        assert!(stop_acknowledges(original, &reply));
+        assert!(!stop_acknowledges("33333333333333333333333333333333", &reply));
+        reply.cleanup_complete = false;
+        assert!(!stop_acknowledges(original, &reply));
+        reply.cleanup_complete = true;
+        reply.generation = Some(original.into());
+        assert!(!stop_acknowledges(original, &reply));
+        let combined = with_proxy_completion(JobOutcome::CleanupUncertain(CleanupUncertain::RemoteCompletion), Err(CleanupUncertain::ProxyTimeout));
+        assert!(matches!(combined, JobOutcome::CleanupUncertain(CleanupUncertain::ProxyTimeout)));
+        let preserved = with_proxy_completion(JobOutcome::CleanupUncertain(CleanupUncertain::EncoderTimeout), Err(CleanupUncertain::ProxyTimeout));
+        assert!(matches!(preserved, JobOutcome::CleanupUncertain(CleanupUncertain::EncoderTimeout)));
+        let mut report = StopReport::default();
+        report.add_uncertainty(CleanupUncertain::ProxyTimeout);
+        report.add_uncertainty(CleanupUncertain::RemoteCompletion);
+        assert!(matches!(report.uncertain, Some(CleanupUncertain::ProxyTimeout)));
+        let mut report = StopReport::default();
+        report.add_uncertainty(CleanupUncertain::RemoteCompletion);
+        report.add_uncertainty(CleanupUncertain::EncoderTimeout);
+        assert!(matches!(report.uncertain, Some(CleanupUncertain::EncoderTimeout)));
+    }
     #[tokio::test]
     #[ignore = "manual synthetic MediaMTX/backend roundtrip; loopback fixture only"]
     async fn native_worker_roundtrip() {
@@ -1344,6 +1428,7 @@ mod tests {
                 base: Url::parse("http://127.0.0.1:19090").unwrap(),
                 token: "secret-token".into(),
                 host: None,
+        generation: None,
             },
             prefix: "/api/video/transcode/input/front/".into(),
             origin: "http://127.0.0.1:12345".into(),

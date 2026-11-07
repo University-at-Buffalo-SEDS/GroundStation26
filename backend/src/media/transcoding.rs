@@ -3,7 +3,8 @@ use super::*;
 use axum::{Json, extract::Request};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use std::{collections::HashMap, time::Instant};
+use tokio::sync::watch;
 use tokio::io::AsyncWriteExt;
 
 const TEST_BYTES: usize = 4 * 1024 * 1024;
@@ -26,11 +27,20 @@ struct Host {
     downloaded: bool,
     #[serde(skip)]
     last_seen: Instant,
+    #[serde(skip)]
+    generation: String,
+    #[serde(skip)]
+    previously_closed: Option<String>,
+    #[serde(skip)]
+    generation_closed: bool,
+    #[serde(skip)]
+    fenced: bool,
 }
 #[derive(Default)]
 pub(super) struct Registry {
     hosts: Vec<Host>,
     selected: Option<String>,
+    uploads: HashMap<String, ActiveUpload>,
 }
 #[derive(Deserialize)]
 struct Name {
@@ -44,6 +54,8 @@ struct Report {
 #[derive(Deserialize)]
 struct Offer {
     offered: bool,
+    #[serde(default)]
+    generation: Option<String>,
 }
 #[derive(Deserialize)]
 struct Selection {
@@ -140,6 +152,10 @@ async fn begin(
         upload_bytes: 0,
         downloaded: false,
         last_seen: Instant::now(),
+        generation: format!("{:032x}", rand::random::<u128>()),
+        previously_closed: None,
+        generation_closed: false,
+        fenced: false,
     });
     Ok(Json(serde_json::json!({"id":id,"test_bytes":TEST_BYTES})))
 }
@@ -244,7 +260,7 @@ async fn complete(
     host.passed = host.capacity > 0;
     host.last_seen = Instant::now();
     Ok(Json(
-        serde_json::json!({"passed":host.passed,"capacity":host.capacity,"encoding_ms":host.encoding_ms,"upload_bps":host.upload_bps,"download_bps":host.download_bps}),
+        serde_json::json!({"passed":host.passed,"capacity":host.capacity,"encoding_ms":host.encoding_ms,"upload_bps":host.upload_bps,"download_bps":host.download_bps,"generation":host.generation}),
     ))
 }
 #[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
@@ -266,7 +282,41 @@ async fn select(
     registry.selected = selection.host_id;
     Ok(Json(serde_json::json!({"selected":registry.selected})))
 }
-#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
+// The registry retains completion observers even when an HTTP handler drops.
+// Only the owned relay can publish Clean after actual child/group reap.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UploadCompletion { Pending, Clean, Unknown }
+struct ActiveUpload {
+    host: String,
+    generation: String,
+    camera: String,
+    cancelled: watch::Sender<bool>,
+    completion: watch::Receiver<UploadCompletion>,
+}
+struct CompletionGuard(watch::Sender<UploadCompletion>);
+impl CompletionGuard {
+    fn finish(&self, known: bool) {
+        self.0.send_replace(if known { UploadCompletion::Clean } else { UploadCompletion::Unknown });
+    }
+}
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        let pending = *self.0.borrow() == UploadCompletion::Pending;
+        if pending { self.0.send_replace(UploadCompletion::Unknown); }
+    }
+}
+async fn completion_known(mut observer: watch::Receiver<UploadCompletion>) -> bool {
+    loop {
+        let state = *observer.borrow_and_update();
+        match state {
+            UploadCompletion::Clean => return true,
+            UploadCompletion::Unknown => return false,
+            UploadCompletion::Pending => {},
+        }
+        if observer.changed().await.is_err() { return false; }
+    }
+}
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API")]
 async fn heartbeat(
     State(state): State<Arc<MediaState>>,
     Path(id): Path<String>,
@@ -274,31 +324,63 @@ async fn heartbeat(
     Json(offer): Json<Offer>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let owner = manager(&state, &headers).await?;
-    let (selected, capacity) = {
+    let (selected, capacity, generation, stopped) = {
         let mut registry = state.transcoding.lock().await;
         let selected = registry.selected.as_deref() == Some(&id);
-        let host = registry
-            .hosts
-            .iter_mut()
-            .find(|h| h.id == id && h.owner == owner)
+        let host = registry.hosts.iter_mut().find(|h| h.id == id && h.owner == owner)
             .ok_or_else(|| error(StatusCode::NOT_FOUND, "Test this host again"))?;
-        if offer.offered && !host.passed {
-            return Err(error(
-                StatusCode::CONFLICT,
-                "Host has not passed qualification",
-            ));
+        if let Some(original) = offer.generation.as_deref() {
+            if original != host.generation {
+                // Lost acknowledgement is retryable only before the new offer.
+                if !offer.offered && !host.offered && host.previously_closed.as_deref() == Some(original) {
+                    return Ok(Json(serde_json::json!({"selected":false,"jobs":[],"cleanup_complete":true,"stopped_generation":original,"generation":host.generation})));
+                }
+                return Err(error(StatusCode::CONFLICT, "video_processing_generation_stale"));
+            }
+            host.fenced = true;
+        } else if host.fenced {
+            return Err(error(StatusCode::CONFLICT, "video_processing_generation_required"));
+        }
+        if offer.offered && (!host.passed || host.generation_closed) {
+            return Err(error(StatusCode::CONFLICT, "Host is not qualified or its generation is closed"));
         }
         host.offered = offer.offered;
         host.last_seen = Instant::now();
-        (selected && eligible(host), host.capacity)
+        if !offer.offered && offer.generation.is_some() { host.generation_closed = true; }
+        (selected && eligible(host), host.capacity, host.generation.clone(), !offer.offered && host.fenced)
     };
-    let streams = if selected {
-        fetch_streams_raw(&state).await?.0
-    } else {
-        Vec::new()
-    };
-    let jobs:Vec<_>=streams.iter().filter(|s|s.live&&!s.id.starts_with("transcoded-")&&s.id.len()<=53).take(capacity).map(|s|serde_json::json!({"id":s.id,"input":format!("/api/video/transcode/input/{}/index.m3u8",s.id),"output":format!("/api/video/transcode/output/{}/{}",id,s.id)})).collect();
-    Ok(Json(serde_json::json!({"selected":selected,"jobs":jobs})))
+    if stopped {
+        let observers = {
+            let registry = state.transcoding.lock().await;
+            registry.uploads.values().filter(|upload| upload.host == id && upload.generation == generation)
+                .map(|upload| { upload.cancelled.send_replace(true); upload.completion.clone() }).collect::<Vec<_>>()
+        };
+        let known = tokio::time::timeout(Duration::from_secs(5), async {
+            for observer in observers {
+                if !completion_known(observer).await { return false; }
+            }
+            true
+        }).await.unwrap_or(false);
+        if !known { return Err(error(StatusCode::BAD_GATEWAY, "video_processing_remote_completion_unverified")); }
+        // Reauthenticate the same caller before acknowledging quiescence.
+        if manager(&state, &headers).await? != owner {
+            return Err(error(StatusCode::FORBIDDEN, "Host owner changed"));
+        }
+        let mut registry = state.transcoding.lock().await;
+        let host = registry.hosts.iter_mut().find(|h| h.id == id && h.owner == owner)
+            .ok_or_else(|| error(StatusCode::NOT_FOUND, "Test this host again"))?;
+        if host.generation != generation || !host.generation_closed {
+            return Err(error(StatusCode::CONFLICT, "video_processing_generation_stale"));
+        }
+        host.previously_closed = Some(generation.clone());
+        host.generation = format!("{:032x}", rand::random::<u128>());
+        host.generation_closed = false;
+        return Ok(Json(serde_json::json!({"selected":false,"jobs":[],"cleanup_complete":true,"stopped_generation":generation,"generation":host.generation})));
+    }
+    let streams = if selected { fetch_streams_raw(&state).await?.0 } else { Vec::new() };
+    let jobs: Vec<_> = streams.iter().filter(|s| s.live && !s.id.starts_with("transcoded-") && s.id.len() <= 53).take(capacity)
+        .map(|s| serde_json::json!({"id":s.id,"input":format!("/api/video/transcode/input/{}/index.m3u8",s.id),"output":format!("/api/video/transcode/output/{}/{}",id,s.id),"generation":if offer.generation.is_some(){Some(&generation)}else{None}})).collect();
+    Ok(Json(serde_json::json!({"selected":selected,"jobs":jobs,"generation":generation})))
 }
 pub(super) async fn choose(state: &MediaState, streams: Vec<StreamInfo>) -> Vec<StreamInfo> {
     let registry = state.transcoding.lock().await;
@@ -335,17 +417,6 @@ async fn output(
 ) -> ApiResult<StatusCode> {
     let owner = manager(&state, &headers).await?;
     check_id(&id)?;
-    {
-        let registry = state.transcoding.lock().await;
-        if registry.selected.as_deref() != Some(&host_id)
-            || !registry
-                .hosts
-                .iter()
-                .any(|h| h.id == host_id && h.owner == owner && eligible(h))
-        {
-            return Err(error(StatusCode::CONFLICT, "Host is no longer selected"));
-        }
-    }
     if id.starts_with("transcoded-") || id.len() > 53 {
         return Err(error(StatusCode::BAD_REQUEST, "Invalid source camera"));
     }
@@ -379,7 +450,34 @@ async fn output(
         use std::os::unix::process::CommandExt;
         command.as_std_mut().process_group(0);
     }
-    let child = command
+    // Reserve before spawn under the same registry lock used by Stop. A
+    // queued upload cannot enter after its generation has been closed.
+    let (generation, reservation, revoked) = {
+        let mut registry = state.transcoding.lock().await;
+        let host = registry.hosts.iter().find(|h| h.id == host_id && h.owner == owner && eligible(h) && !h.generation_closed)
+            .filter(|_| registry.selected.as_deref() == Some(&host_id))
+            .ok_or_else(|| error(StatusCode::CONFLICT, "Host is no longer selected"))?;
+        let supplied = headers.get("X-Station-Transcode-Generation").and_then(|v| v.to_str().ok());
+        if (host.fenced && supplied != Some(host.generation.as_str())) || supplied.is_some_and(|v| v != host.generation) {
+            return Err(error(StatusCode::CONFLICT, "video_processing_generation_stale"));
+        }
+        let generation = host.generation.clone();
+        let capacity = host.capacity;
+        registry.uploads.retain(|_, upload| *upload.completion.borrow() != UploadCompletion::Clean);
+        if registry.uploads.len() >= 256 || registry.uploads.values().filter(|upload| upload.host == host_id).count() >= capacity {
+            return Err(error(StatusCode::TOO_MANY_REQUESTS, "video_processing_upload_capacity"));
+        }
+        if registry.uploads.values().any(|upload| upload.camera == id) {
+            return Err(error(StatusCode::CONFLICT, "video_processing_previous_upload_not_reaped"));
+        }
+        let (cancelled, revoked) = watch::channel(false);
+        let (completion, observer) = watch::channel(UploadCompletion::Pending);
+        registry.uploads.insert(format!("{:032x}", rand::random::<u128>()), ActiveUpload {
+            host: host_id.clone(), generation: generation.clone(), camera: id.clone(), cancelled, completion: observer,
+        });
+        (generation, CompletionGuard(completion), revoked)
+    };
+    let spawned = command
         .args([
             "-hide_banner",
             "-loglevel",
@@ -417,19 +515,19 @@ async fn output(
             std::process::Stdio::null()
         })
         .kill_on_drop(true)
-        .spawn()
-        .map_err(|_| {
-            error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "FFmpeg remuxer is unavailable",
-            )
-        })?;
+        .spawn();
+    let child = match spawned {
+        Ok(child) => child,
+        Err(_) => {
+            reservation.finish(true);
+            return Err(error(StatusCode::SERVICE_UNAVAILABLE, "FFmpeg remuxer is unavailable"));
+        }
+    };
     // The HTTP future may be dropped at any await. Its sender then closes,
     // while this owned task retains the child until kill/wait completes.
     let (cancel_on_drop, cancelled) = tokio::sync::oneshot::channel::<()>();
-    let relay = tokio::spawn(relay_output(
-        state, host_id, headers, request, child, cancelled,
-    ));
+    let authority = UploadAuthority { host_id, generation, headers, revoked, completion: reservation };
+    let relay = tokio::spawn(relay_output(state, authority, request, child, cancelled));
     let result = relay.await.map_err(|_| {
         error(StatusCode::BAD_GATEWAY, "video_remux_task_failed")
     })?;
@@ -470,14 +568,20 @@ async fn terminate_remux(child: &mut tokio::process::Child) -> Result<(), &'stat
     }
 }
 
+async fn tracked_terminate(child: &mut tokio::process::Child, known: &mut bool) -> Result<(), &'static str> {
+    let result = terminate_remux(child).await;
+    if result.is_err() { *known = false; }
+    result
+}
+
 fn natural_remux_completion(status: std::process::ExitStatus) -> Result<StatusCode, &'static str> {
     if status.success() { Ok(StatusCode::NO_CONTENT) } else { Err("video_remux_failed") }
 }
 
-async fn original_processing_assignment(state: &MediaState, headers: &HeaderMap, host_id: &str) -> Result<(), Box<Response>> {
+async fn original_processing_assignment(state: &MediaState, headers: &HeaderMap, host_id: &str, generation: &str) -> Result<(), Box<Response>> {
     manager(state,headers).await.map_err(Box::new)?;
     let registry=state.transcoding.lock().await;
-    if registry.selected.as_deref()!=Some(host_id) || !registry.hosts.iter().any(|host|host.id==host_id&&eligible(host)) {
+    if registry.selected.as_deref()!=Some(host_id) || !registry.hosts.iter().any(|host|host.id==host_id&&eligible(host)&&!host.generation_closed&&host.generation==generation) {
         return Err(Box::new(error(StatusCode::CONFLICT,"video_processing_assignment_revoked")));
     }
     Ok(())
@@ -489,14 +593,22 @@ enum RemuxFinalization {
     TimedOut,
 }
 
+struct UploadAuthority {
+    host_id: String,
+    generation: String,
+    headers: HeaderMap,
+    revoked: watch::Receiver<bool>,
+    completion: CompletionGuard,
+}
 async fn relay_output(
     state: Arc<MediaState>,
-    host_id: String,
-    headers: HeaderMap,
+    authority: UploadAuthority,
     request: Request,
     mut child: tokio::process::Child,
     mut cancelled: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<StatusCode, Box<Response>> {
+    let UploadAuthority { host_id, generation, headers, mut revoked, completion } = authority;
+    let mut cleanup_known = true;
     let outcome: ApiResult<StatusCode> = async {
         #[cfg(unix)]
         {
@@ -506,12 +618,12 @@ async fn relay_output(
                     && pid as libc::pid_t != libc::getpgrp() }
             });
             if !valid {
-                let cleanup = terminate_remux(&mut child).await;
+                let cleanup = tracked_terminate(&mut child, &mut cleanup_known).await;
                 return Err(error(StatusCode::BAD_GATEWAY, cleanup.err().unwrap_or("video_remux_group_unverified")));
             }
         }
         let Some(mut input) = child.stdin.take() else {
-            let cleanup = terminate_remux(&mut child).await;
+            let cleanup = tracked_terminate(&mut child, &mut cleanup_known).await;
             return Err(error(StatusCode::BAD_GATEWAY, cleanup.err().unwrap_or("video_remux_pipe_missing")));
         };
         let mut stream = request.into_body().into_data_stream();
@@ -521,6 +633,7 @@ async fn relay_output(
             tokio::select! {
                 biased;
                 _ = &mut cancelled => { caller_dropped = true; break Ok(()); }
+                _ = revoked.changed() => { break Err(error(StatusCode::CONFLICT,"video_processing_generation_revoked")); }
                 status = child.wait() => {
                     break match status {
                         Ok(status) if status.success() => Err(error(StatusCode::BAD_GATEWAY, "video_remux_ended_before_input")),
@@ -532,7 +645,8 @@ async fn relay_output(
                     let authorized = tokio::select! {
                         biased;
                         _ = &mut cancelled => { caller_dropped = true; break Ok(()); }
-                        authorized = original_processing_assignment(&state,&headers,&host_id) => authorized,
+                _ = revoked.changed() => { break Err(error(StatusCode::CONFLICT,"video_processing_generation_revoked")); }
+                        authorized = original_processing_assignment(&state,&headers,&host_id,&generation) => authorized,
                     };
                     if let Err(response)=authorized { break Err(*response); }
                 }
@@ -545,6 +659,7 @@ async fn relay_output(
                             tokio::select! {
                                 biased;
                                 _ = &mut cancelled => { caller_dropped = true; break 'relay Ok(()); }
+                                _ = revoked.changed() => { break 'relay Err(error(StatusCode::CONFLICT,"video_processing_generation_revoked")); }
                                 status = child.wait() => {
                                     break 'relay match status {
                                         Ok(status) if status.success() => Err(error(StatusCode::BAD_GATEWAY, "video_remux_ended_before_input")),
@@ -556,7 +671,8 @@ async fn relay_output(
                                     let authorized = tokio::select! {
                                         biased;
                                         _ = &mut cancelled => { caller_dropped = true; break 'relay Ok(()); }
-                                        authorized = original_processing_assignment(&state,&headers,&host_id) => authorized,
+                                _ = revoked.changed() => { break 'relay Err(error(StatusCode::CONFLICT,"video_processing_generation_revoked")); }
+                                        authorized = original_processing_assignment(&state,&headers,&host_id,&generation) => authorized,
                                     };
                                     if let Err(response)=authorized { break 'relay Err(*response); }
                                 }
@@ -581,7 +697,7 @@ async fn relay_output(
         // establish that the copy-remux process succeeded.
         drop(input);
         if caller_dropped || transfer.is_err() {
-            let cleanup = terminate_remux(&mut child).await;
+            let cleanup = tracked_terminate(&mut child, &mut cleanup_known).await;
             if let Err(code) = cleanup {
                 return Err(error(StatusCode::BAD_GATEWAY, code));
             }
@@ -597,13 +713,15 @@ async fn relay_output(
                 tokio::select! {
                     biased;
                     _ = &mut cancelled => break RemuxFinalization::Cancelled,
+                    _ = revoked.changed() => break RemuxFinalization::Refused(Box::new(error(StatusCode::CONFLICT,"video_processing_generation_revoked"))),
                     _ = &mut deadline => break RemuxFinalization::TimedOut,
                     _ = lease.tick() => {
                         let authorized=tokio::select! {
                             biased;
                             _ = &mut cancelled => break RemuxFinalization::Cancelled,
+                    _ = revoked.changed() => break RemuxFinalization::Refused(Box::new(error(StatusCode::CONFLICT,"video_processing_generation_revoked"))),
                             _ = &mut deadline => break RemuxFinalization::TimedOut,
-                            authorized=original_processing_assignment(&state,&headers,&host_id)=>authorized,
+                            authorized=original_processing_assignment(&state,&headers,&host_id,&generation)=>authorized,
                         };
                         if let Err(response)=authorized { break RemuxFinalization::Refused(response); }
                     }
@@ -616,8 +734,9 @@ async fn relay_output(
                             let authorized=tokio::select! {
                                 biased;
                                 _ = &mut cancelled => break RemuxFinalization::Cancelled,
+                    _ = revoked.changed() => break RemuxFinalization::Refused(Box::new(error(StatusCode::CONFLICT,"video_processing_generation_revoked"))),
                                 _ = &mut deadline => break RemuxFinalization::TimedOut,
-                                authorized=original_processing_assignment(&state,&headers,&host_id)=>authorized,
+                                authorized=original_processing_assignment(&state,&headers,&host_id,&generation)=>authorized,
                             };
                             if let Err(response)=authorized { break RemuxFinalization::Refused(response); }
                         }
@@ -629,21 +748,21 @@ async fn relay_output(
         match completion {
             RemuxFinalization::Exited(Ok(status)) => natural_remux_completion(status).map_err(|code|error(StatusCode::BAD_GATEWAY,code)),
             RemuxFinalization::Exited(Err(_)) => {
-                let cleanup=terminate_remux(&mut child).await;
+                let cleanup=tracked_terminate(&mut child, &mut cleanup_known).await;
                 Err(error(StatusCode::BAD_GATEWAY,cleanup.err().unwrap_or("video_remux_wait_failed")))
             }
             RemuxFinalization::Refused(response) => {
-                if let Err(code)=terminate_remux(&mut child).await { return Err(error(StatusCode::BAD_GATEWAY,code)); }
+                if let Err(code)=tracked_terminate(&mut child, &mut cleanup_known).await { return Err(error(StatusCode::BAD_GATEWAY,code)); }
                 Err(*response)
             }
             RemuxFinalization::Cancelled => {
-                match terminate_remux(&mut child).await {
+                match tracked_terminate(&mut child, &mut cleanup_known).await {
                     Ok(())=>Err(error(StatusCode::REQUEST_TIMEOUT,"video_upload_cancelled")),
                     Err(code)=>Err(error(StatusCode::BAD_GATEWAY,code)),
                 }
             }
             RemuxFinalization::TimedOut => {
-                match terminate_remux(&mut child).await {
+                match tracked_terminate(&mut child, &mut cleanup_known).await {
                     Ok(())=>Err(error(StatusCode::GATEWAY_TIMEOUT,"video_remux_timeout")),
                     Err(code)=>Err(error(StatusCode::BAD_GATEWAY,code)),
                 }
@@ -651,6 +770,7 @@ async fn relay_output(
         }
 
     }.await;
+    completion.finish(cleanup_known);
     outcome.map_err(Box::new)
 }
 
@@ -807,7 +927,7 @@ mod tests {
             State(state.clone()),
             Path(id.clone()),
             headers("manager"),
-            Json(Offer { offered: true }),
+            Json(Offer { offered: true, generation: None }),
         )
         .await
         .unwrap();
@@ -820,6 +940,44 @@ mod tests {
         )
         .await
         .unwrap();
+        // This portable fixture has no MediaMTX API service. Keep host
+        // generation controls unselected through the real manager route;
+        // selected/live generation uploads are tested by the actual HTTP harness.
+        let _ = select(State(state.clone()), headers("manager"), Json(Selection { host_id: None })).await.unwrap();
+        // Actual authenticated route admission: close a fenced generation,
+        // reject a late upload before spawning, then explicitly reoffer.
+        let generation = state.transcoding.lock().await.hosts[0].generation.clone();
+        let _ = heartbeat(State(state.clone()), Path(id.clone()), headers("manager"),
+            Json(Offer { offered: true, generation: Some(generation.clone()) })).await.unwrap();
+        let stopped = heartbeat(State(state.clone()), Path(id.clone()), headers("manager"),
+            Json(Offer { offered: false, generation: Some(generation.clone()) })).await.unwrap();
+        assert_eq!(stopped.0["cleanup_complete"], true);
+        assert_eq!(stopped.0["stopped_generation"], generation);
+        let next = stopped.0["generation"].as_str().unwrap().to_owned();
+        assert_ne!(next, generation);
+        let mut stale_headers = headers("manager");
+        stale_headers.insert("X-Station-Transcode-Generation", generation.parse().unwrap());
+        assert_eq!(output(State(state.clone()), Path((id.clone(), "front".into())), stale_headers,
+            Request::new(axum::body::Body::empty())).await.unwrap_err().status(), StatusCode::CONFLICT);
+        assert!(state.transcoding.lock().await.uploads.is_empty(), "late upload was rejected before reservation/spawn");
+        let _ = heartbeat(State(state.clone()), Path(id.clone()), headers("manager"),
+            Json(Offer { offered: true, generation: Some(next.clone()) })).await.unwrap();
+        assert_eq!(heartbeat(State(state.clone()), Path(id.clone()), headers("manager"),
+            Json(Offer { offered: false, generation: Some(generation) })).await.unwrap_err().status(), StatusCode::CONFLICT,
+            "old close cannot stop the new offered generation");
+        // Retain an actual completion observer whose owner vanished without a
+        // reap acknowledgement. Unknown must never be transformed into clean.
+        let (cancelled, _revoked) = watch::channel(false);
+        let (finished, completion) = watch::channel(UploadCompletion::Pending);
+        let unknown = CompletionGuard(finished);
+        state.transcoding.lock().await.uploads.insert("unknown-owner".into(), ActiveUpload {
+            host: id.clone(), generation: next.clone(), camera: "front".into(), cancelled, completion,
+        });
+        drop(unknown);
+        assert_eq!(heartbeat(State(state.clone()), Path(id.clone()), headers("manager"),
+            Json(Offer { offered: false, generation: Some(next.clone()) })).await.unwrap_err().status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(heartbeat(State(state.clone()), Path(id.clone()), headers("manager"),
+            Json(Offer { offered: true, generation: Some(next) })).await.unwrap_err().status(), StatusCode::CONFLICT);
         state.transcoding.lock().await.hosts[0].last_seen =
             Instant::now() - LEASE - Duration::from_secs(1);
         let chosen = choose(
