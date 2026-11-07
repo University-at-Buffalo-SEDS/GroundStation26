@@ -678,6 +678,73 @@ mod generation_lifecycle_tests {
         assert_old_decision_rejected(2).await;
     }
 
+    /// RRLS role runs the same sequence task but has no fill telemetry, so the
+    /// fill-sequence calibration check must not raise its warning there.
+    #[tokio::test]
+    async fn rrls_role_never_raises_fill_sequence_calibration_warning() {
+        const CHILD: &str = "GS_RRLS_CALIBRATION_WARNING_TEST_CHILD";
+        const NAME: &str = "sequences::generation_lifecycle_tests::rrls_role_never_raises_fill_sequence_calibration_warning";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir().join(format!(
+                "rrls-calibration-warning-{}-{}",
+                std::process::id(),
+                rand::random::<u128>()
+            ));
+            for role in ["rrls", "primary"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, role)
+                    .env("GS_RRLS_ROLE", role)
+                    .env("GS_SIM_MODE", "0")
+                    .env_remove("GS_SIM_CLOCK_FILE")
+                    .env("GS_NETWORK_VARIABLE_CACHE", root.join("variables.json"))
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                    "{role}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        let rrls = std::env::var(CHILD).unwrap() == "rrls";
+        assert_eq!(crate::rrls::is_rrls(), rrls);
+        crate::telemetry_schema::initialize().unwrap();
+        let state = crate::state::tests::test_app_state().await;
+        let cfg = SequenceConfig::from_env();
+        let mut runtime = SequenceRuntime::default();
+        assert!(matches!(runtime.step, SequenceStep::SetupValves));
+        // RRLS has no fill telemetry: mass and pressure are always absent.
+        for _ in 0..3 {
+            update_sequence_runtime(
+                &state,
+                &mut runtime,
+                &cfg,
+                ValveSnapshot::default(),
+                None,
+                None,
+                Instant::now(),
+            );
+        }
+        let warned = state
+            .notifications_snapshot()
+            .iter()
+            .any(|n| n.message.contains("Check sequence sensor calibration"));
+        if rrls {
+            assert!(!warned, "RRLS raised the fill calibration warning");
+            assert!(runtime.calibration_block_message.is_none());
+            assert!(!runtime.calibration_ready, "RRLS never claims fill readiness");
+            assert!(matches!(runtime.step, SequenceStep::SetupValves));
+        } else {
+            assert!(warned, "primary keeps the calibration warning");
+            assert!(runtime.calibration_block_message.is_some());
+        }
+    }
+
     #[tokio::test]
     async fn fresh_fill_decisions_remain_dispatchable_in_all_close_branches() {
         crate::telemetry_schema::initialize().unwrap();
@@ -1637,6 +1704,15 @@ fn update_sequence_runtime(
         runtime.notified_reopen_normally_open = false;
     }
 
+    if matches!(runtime.step, SequenceStep::SetupValves) && crate::rrls::is_rrls() {
+        // RRLS has no fill telemetry, so mass is always absent there and the
+        // check could only ever warn. It also never starts the fill sequence
+        // (it previously stopped here on that same missing mass). Synced
+        // calibration settings cannot change this; skip the local evaluation.
+        runtime.calibration_ready = false;
+        runtime.calibration_block_message = None;
+        return;
+    }
     if matches!(runtime.step, SequenceStep::SetupValves) {
         if let Some(issue) =
             fill_sequence_calibration_issue(state, cfg, pressure_psi, current_mass_kg)
