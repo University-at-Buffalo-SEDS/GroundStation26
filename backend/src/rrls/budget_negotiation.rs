@@ -4,6 +4,10 @@
 const KIND: u8 = 13;
 const RF_KIND: u8 = 14;
 const LEASE_MS: u64 = 2_000;
+/// Primary without any observed RRLS: after this long on the direct path with
+/// no relay budget message, use the confirmed-direct share. Much longer than
+/// LEASE_MS, so a relay that once held the high share has already dropped it.
+pub(crate) const NO_RELAY_DIRECT_MS: u64 = 30_000;
 const OFFER_HISTORY: usize = 3;
 const RETRY_MS: u64 = 1_000;
 const MAX_RETRY_MS: u64 = 8_000;
@@ -315,6 +319,10 @@ pub(crate) struct Primary {
     grant: Option<Context>,
     grant_done: Option<Context>,
     retry: Retry,
+    /// Start of the current issued-direct phase, primary clock.
+    direct_since: Option<u64>,
+    /// Last relay-originated budget message (Offer, HighAck or BaseAck).
+    relay_seen: Option<u64>,
 }
 impl Primary {
     pub(crate) fn new(session: u32, shares: Shares, expected: Profile) -> Option<Self> {
@@ -330,11 +338,31 @@ impl Primary {
             grant: None,
             grant_done: None,
             retry: Retry::default(),
+            direct_since: None,
+            relay_seen: None,
         })
+    }
+    /// No RRLS has been heard and the direct path has held long enough that
+    /// any relay is at its base share: direct share fits without a handshake.
+    fn alone(&self, now: u64) -> bool {
+        let aged = |at: u64| now >= at && now - at >= NO_RELAY_DIRECT_MS;
+        self.history.current(true)
+            && self.grant.is_none()
+            && self.direct_since.is_some_and(aged)
+            && self.relay_seen.is_none_or(aged)
+    }
+    fn effective_share(&self, now: u64) -> u8 {
+        if self.alone(now) {
+            self.shares.primary_direct
+        } else {
+            self.share
+        }
     }
     pub(crate) fn time(&mut self, now: u64) -> bool {
         if self.clock.is_some_and(|old| now < old) {
             self.history = History::default();
+            self.direct_since = None;
+            self.relay_seen = None;
             self.share = self.shares.primary_fallback;
             self.revoke = None;
             self.completed_health = None;
@@ -354,6 +382,11 @@ impl Primary {
         let previous_direct = self.history.current(true);
         if !self.history.add(health) {
             return false;
+        }
+        if !health.direct {
+            self.direct_since = None;
+        } else if !previous_direct {
+            self.direct_since = Some(now);
         }
         if !health.direct {
             self.share = self.shares.primary_fallback;
@@ -438,6 +471,13 @@ impl Primary {
         if !self.time(now) {
             return None;
         }
+        if matches!(
+            message,
+            Message::Offer { .. } | Message::HighAck(_) | Message::BaseAck { .. }
+        ) {
+            // Any RRLS on air: back to the negotiated share and handshake.
+            self.relay_seen = Some(now);
+        }
         match message {
             Message::Offer { context, rf_reply }
                 if context.session == self.session
@@ -473,7 +513,7 @@ impl Primary {
     }
     pub(crate) fn share(&mut self, now: u64) -> u8 {
         self.time(now);
-        self.share
+        self.effective_share(now)
     }
     pub(crate) fn retry_message(&mut self, now: u64) -> Option<Message> {
         if !self.time(now) || !self.retry.ready(now) {
@@ -870,7 +910,7 @@ impl Driver {
                 if p.clock.is_some_and(|old| now < old) {
                     15
                 } else {
-                    p.share
+                    p.effective_share(now)
                 }
             }
             State::Relay(r) => {
@@ -1083,6 +1123,46 @@ mod tests {
         assert_eq!(r.share(4, n(9)), 50);
         (p, r, grant)
     }
+    #[test]
+    fn primary_without_rrls_reaches_direct_share_and_falls_back_when_one_appears() {
+        let shares = Shares::CANDIDATE;
+        // The direct share still conserves air with RF and a base-share relay.
+        assert!(shares.valid(Profile::MATCHED));
+        assert!(
+            u16::from(shares.primary_direct)
+                + u16::from(Profile::MATCHED.rf_share)
+                + u16::from(shares.relay_base)
+                <= 100
+        );
+        let mut p = Primary::new(7, shares, Profile::MATCHED).unwrap();
+        assert_eq!(p.share(0), 15);
+        p.health_issued(Health { seq: 1, direct: true }, 100);
+        // Relay absent: the revoke handshake never completes.
+        assert!(p.start_revoke(n(4), 100).is_some());
+        let mut seq = 2;
+        for at in (1_100..100 + NO_RELAY_DIRECT_MS).step_by(500) {
+            p.health_issued(Health { seq, direct: true }, at);
+            seq += 1;
+            assert_eq!(p.share(at), 15, "no handshake and not yet long enough");
+        }
+        assert_eq!(p.share(100 + NO_RELAY_DIRECT_MS - 1), 15);
+        assert_eq!(p.share(100 + NO_RELAY_DIRECT_MS), 25);
+        // A lost direct link restarts the wait.
+        assert!(p.health_issued(Health { seq, direct: false }, 50_000));
+        assert_eq!(p.share(50_001), 15);
+        assert!(p.health_issued(Health { seq: seq + 1, direct: true }, 51_000));
+        assert_eq!(p.share(51_000 + NO_RELAY_DIRECT_MS - 1), 15);
+        assert_eq!(p.share(51_000 + NO_RELAY_DIRECT_MS), 25);
+        // An RRLS appears: back to 15 until the normal handshake confirms.
+        let (_, mut r) = pair();
+        let offer = r.offer(1, n(9)).unwrap();
+        let at = 51_000 + NO_RELAY_DIRECT_MS + 1;
+        p.incoming(offer, at);
+        assert_eq!(p.share(at), 15);
+        assert_eq!(p.share(at + NO_RELAY_DIRECT_MS - 1), 15);
+        assert_eq!(p.share(at + NO_RELAY_DIRECT_MS), 25);
+    }
+
     #[test]
     fn defaults_and_conservation_reject_bad_profiles() {
         assert!(Shares::CANDIDATE.valid(Profile::MATCHED));

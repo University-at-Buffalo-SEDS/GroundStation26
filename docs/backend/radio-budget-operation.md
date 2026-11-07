@@ -14,8 +14,16 @@ GroundStation/RRLS pair negotiates the remaining allocation:
 | State | GroundStation | RF | RRLS |
 | --- | ---: | ---: | ---: |
 | Startup or unconfirmed peer | 15% | 35% | 35% |
+| Direct path, no RRLS heard for 30 s | 25% | 35% | 35% |
 | Confirmed direct path | 25% | 35% | 35% |
 | Confirmed relay path | 15% | 35% | 50% |
+
+Without an RRLS the GroundStation no longer stays at 15%: after 30 s on the
+direct path with no RRLS budget message (Offer, HighAck or BaseAck), it uses
+25%, the same share as a confirmed direct path (25 + 35 + RRLS base 35 = 95%).
+Any RRLS budget message returns it to 15% until the normal handshake confirms.
+30 s is far longer than the 2 s relay lease, so an RRLS that once held 50% has
+already dropped to its base share. With `GS_RRLS_ROLE=off` nothing changes.
 
 RRLS enters the higher allocation only after matching RF application-profile
 confirmation and a current GroundStation grant. Returning to the direct path
