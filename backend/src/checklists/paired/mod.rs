@@ -36,7 +36,9 @@ pub(crate) fn preflight() {
         return;
     }
     PREFLIGHT.get_or_init(|| {
-        if !matches!(crate::station_pairing::Pairing::load(), Ok(None)) {
+        // A broken pairing runs unpaired: it must not leave Launch blocked on
+        // shared checklists that can never start.
+        if crate::station_pairing::Pairing::load_or_unpaired("shared checklists").is_some() {
             REQUESTED.store(true, Ordering::Release);
         }
     });

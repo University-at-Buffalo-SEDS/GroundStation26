@@ -18,7 +18,7 @@ def main() -> None:
         os.environ["GS_RRLS_COMMS_LINK_CONFIG"]=str(Path(args.comms_config).resolve())
     sys.argv[1:]=remaining
     if "--help" in remaining or "-h" in remaining:
-        print("RRLS options: --radio-port DEVICE (saved in RRLS config), --comms-config FILE")
+        print("RRLS options: --radio-port DEVICE (saved in RRLS config), --comms-config FILE, --pairing FILE (station pairing.json)")
     if "--rrls" not in sys.argv[1:]:
         sys.argv.insert(1, "--rrls")
     runpy.run_path(str(Path(__file__).with_name("run_groundstation.py")), run_name="__main__")

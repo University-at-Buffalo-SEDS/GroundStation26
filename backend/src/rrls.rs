@@ -1967,9 +1967,31 @@ impl Mesh {
     }
     pub fn take_settings(&mut self) -> Option<Vec<u8>> {
         let index = self.settings_inbox.iter().position(|wire| {
-            !crate::station_mode::recognizes(wire) && !crate::launch_clock_sync::recognizes(wire)
+            !crate::station_mode::recognizes(wire)
+                && !crate::launch_clock_sync::recognizes(wire)
+                && !crate::station_pairing::exchange::recognizes(wire)
         })?;
         self.settings_inbox.remove(index)
+    }
+    pub(crate) fn take_station_pairing(&mut self) -> Option<Vec<u8>> {
+        let index = self
+            .settings_inbox
+            .iter()
+            .position(|wire| crate::station_pairing::exchange::recognizes(wire))?;
+        self.settings_inbox.remove(index)
+    }
+    /// UI pairing frames. The RRLS asks while it hears the primary; the primary
+    /// answers the same way it answers mode queries, since a standby RRLS is
+    /// otherwise silent. Grants no settings presence, lease or control.
+    pub(crate) fn queue_station_pairing(&mut self, payload: &[u8], now: u64) -> bool {
+        if !crate::station_pairing::exchange::recognizes(payload) {
+            return false;
+        }
+        if self.role == Role::Primary {
+            self.queue_operating_mode_reply(payload, now)
+        } else {
+            self.queue_settings(payload, now)
+        }
     }
     pub(crate) fn take_launch_clock(&mut self) -> Option<Vec<u8>> {
         let index = self

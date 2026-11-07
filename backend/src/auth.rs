@@ -893,9 +893,8 @@ async fn create_session_for_user(
     let permissions = user.permissions.for_roles(&user.roles);
     let (command_access, calibration_access) = configured_user_access(config, &user.username);
     let session_type = if remember_me { "remembered" } else { "session" };
-    let token = match crate::station_pairing::Pairing::load()
-        .map_err(|_| AuthFailure::Internal("station pairing configuration invalid".into()))?
-    {
+    // A broken pairing falls back to an ordinary local session; login must not fail.
+    let token = match crate::station_pairing::Pairing::load_or_unpaired("login") {
         Some(pairing) => pairing
             .token(&crate::station_pairing::Claims {
                 installation_id: pairing.public.installation_id.clone(),

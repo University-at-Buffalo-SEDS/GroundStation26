@@ -44,7 +44,7 @@ impl From<auth::UserRecord> for Account {
     }
 }
 #[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
-async fn administrator(
+pub(crate) async fn administrator(
     state: &Arc<AppState>,
     headers: &HeaderMap,
 ) -> Result<auth::AuthPrincipal, Response> {

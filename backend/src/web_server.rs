@@ -221,7 +221,7 @@ pub async fn serve(app: Router, config: Config, shutdown: impl Future<Output = (
             self.0.abort();
         }
     }
-    let pairing = crate::station_pairing::Pairing::load()?;
+    let pairing = crate::station_pairing::Pairing::load_or_unpaired("paired discovery");
     let (scheme, address) = if let Some(listener) = &https {
         ("https", listener.local_addr()?)
     } else {

@@ -6,6 +6,9 @@ use ring::signature::{self, KeyPair};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub(crate) mod exchange;
+pub(crate) mod manage;
+
 pub const PORT: u16 = 49363;
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Peer {
@@ -74,11 +77,23 @@ struct Discovery<'a> {
     scheme: &'a str,
 }
 impl Pairing {
+    /// `GS_STATION_PAIRING_FILE` first, then a pairing saved from the UI.
     pub fn load() -> anyhow::Result<Option<Self>> {
-        let Some(path) = std::env::var_os("GS_STATION_PAIRING_FILE") else {
+        let Some((path, _)) = manage::configured_path() else {
             return Ok(None);
         };
-        Self::from_file(Path::new(&path)).map(Some)
+        Self::from_file(&path).map(Some)
+    }
+    /// For login and primary operation: a broken or partial pairing is logged
+    /// and reported on the pairing page, and the station runs unpaired.
+    pub fn load_or_unpaired(purpose: &str) -> Option<Self> {
+        match Self::load() {
+            Ok(pairing) => pairing,
+            Err(error) => {
+                log::warn!("Station pairing ignored for {purpose}: {error}");
+                None
+            }
+        }
     }
     pub(crate) fn from_file(path: &Path) -> anyhow::Result<Self> {
         let c: FileConfig = serde_json::from_slice(&std::fs::read(path)?)?;

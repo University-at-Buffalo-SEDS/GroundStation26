@@ -1321,10 +1321,20 @@ async fn main() -> anyhow::Result<()> {
     }
     let history_directory = history_startup_path::environment()?;
     let launch_history = Arc::new(Mutex::new(launch_history::Store::environment()?));
-    let history_identity: [u8;16] = if let Some(pairing) = station_pairing::Pairing::load()? {
+    let paired_identity = station_pairing::Pairing::load_or_unpaired("abort history").map(|pairing| -> [u8; 16] {
         let digest = ring::digest::digest(&ring::digest::SHA256, pairing.public.installation_id.as_bytes());
         digest.as_ref()[..16].try_into().unwrap()
+    });
+    let history_identity: [u8;16] = if let Some(identity) = paired_identity
+        .filter(|identity| !history_directory.exists() || board_abort_history::Store::anchor_identity(&history_directory).ok() == Some(*identity))
+    {
+        identity
     } else if history_directory.exists() {
+        // History written before this pairing (or under another one) keeps its
+        // own anchor: pairing from the UI must not stop the station starting.
+        if paired_identity.is_some() {
+            log::warn!("Abort history predates the current station pairing; keeping its existing identity");
+        }
         board_abort_history::Store::anchor_identity(&history_directory)?
     } else {
         rand::random()
@@ -2958,6 +2968,7 @@ async fn main() -> anyhow::Result<()> {
     let _station_mode = station_mode::start(state.clone());
     let _launch_clock_sync = launch_clock_sync::start(state.clone());
     let _command_proxy = command_proxy::start(state.clone());
+    let _station_pairing = station_pairing::manage::start(state.clone());
 
     // --- Webserver ---
     let mut video_runtime = media_runtime::VideoRuntime::start();

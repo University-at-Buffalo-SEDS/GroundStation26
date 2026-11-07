@@ -119,6 +119,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rrls", action="store_true", help="Run the headless recovery receiver/relay with local web and mobile access.")
     parser.add_argument("--frontend-dev", "--frontend_dev", action="store_true", help="Build the WebUI from the frontend dev branch (also accepts frontend_dev, like build.py).")
+    parser.add_argument("--pairing", type=Path, metavar="FILE", help="Station pairing.json from pair_stations.py (sets GS_STATION_PAIRING_FILE). Without it, a pairing made in the UI is used.")
     arguments=["--frontend-dev" if argument in {"frontend_dev", "frontend-dev"} else argument for argument in sys.argv[1:]]
     args=parser.parse_args(arguments)
     return args
@@ -143,6 +144,14 @@ def main() -> None:
         raise ValueError("--flight-sim-users requires --flight-sim")
     if args.flight_sim_data_dir and not flight_sim_mode:
         raise ValueError("--flight-sim-data-dir requires --flight-sim")
+    if args.pairing:
+        if flight_sim_mode:
+            raise ValueError("FlightSim does not use station pairing")
+        pairing = args.pairing.expanduser().resolve()
+        if not pairing.is_file():
+            print(f"Error: pairing file not found: {pairing}", file=sys.stderr)
+            sys.exit(2)
+        os.environ["GS_STATION_PAIRING_FILE"] = str(pairing)
     cmd = ["cargo", "run"]
     if not debug_mode:
         cmd.append("--release")

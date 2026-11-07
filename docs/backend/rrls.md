@@ -174,8 +174,35 @@ before starting RRLS. Both builds use the same isolated frontend revision.
 
 ## Native app handover and application identity
 
-Pairing is opt-in. Provision a persistent application signing identity, independent
-of HTTP, HTTPS certificates, or a reverse proxy:
+Pairing is opt-in. It gives both stations one persistent application signing
+identity, independent of HTTP, HTTPS certificates, or a reverse proxy.
+
+**From the UI (no file copying).** Both stations need their radio roles and the
+RRLS must hear the primary. On each station an application administrator opens
+**Administration > Station pairing**, checks the station's own address (as apps
+reach it, prefilled from the current connection) and selects **Start pairing**
+within five minutes of each other. The stations exchange keys over the radio
+and each shows the same six-digit code. Compare the two screens, type the code
+on each station and confirm. Nothing is saved until both admins confirm: the
+primary saves after its admin confirmed and the RRLS proved, with the new
+identity, that its admin confirmed the same code; the RRLS saves on the
+primary's signed reply. Then restart both services so signed control, settings
+and checklist sync, mode sync and handover start with the new identity. The
+page shows paired or not paired, the peer and its address, a short identity
+fingerprint (the same on both stations), whether a restart is still needed and,
+on RRLS, whether the primary accepts signed requests. **Unpair** deletes that
+station's identity; unpair the other station too and restart both.
+
+How it works: an ephemeral X25519 agreement over the existing settings channel.
+The RRLS commits to its key before it sees the primary's, so a relay in the
+middle gets one guess in a million at matching the codes. The primary generates
+the seed and installation id and sends them encrypted under the agreed key
+(ChaCha20-Poly1305). The result is exactly the `pair_stations.py` layout,
+written to `data/station-pairing/` under the service working directory
+(`GS_STATION_PAIRING_DIR` overrides), with the seed file mode 0600. The
+exchange adds a few hundred bytes of radio traffic only while a window is open.
+
+**From the command line.** Provision both bundles on a trusted machine:
 
 ```sh
 python3 backend/tools/pair_stations.py --output /private/path/station-pair \
@@ -183,12 +210,25 @@ python3 backend/tools/pair_stations.py --output /private/path/station-pair \
 ```
 
 Install `primary/` on the primary station and `rrls/` on RRLS, outside the source
-checkout. Set `GS_STATION_PAIRING_FILE` to each station's `pairing.json` and restart
-the service. Keep `identity.seed` private; it is the installation's application
+checkout. Set `GS_STATION_PAIRING_FILE` to each station's `pairing.json` (or pass
+`--pairing FILE` to `run_groundstation.py` / `run_rrls.py`; see
+[rrls.service](rrls.service) for systemd) and restart the service.
+`GS_STATION_PAIRING_FILE` takes priority over a pairing saved from the UI, and
+the UI cannot unpair it.
+
+Keep `identity.seed` private; it is the installation's application
 identity and session-signing key. Do not regenerate it for HTTPS certificate
 renewal. The configured URLs may use HTTP or HTTPS and may point at a proxy.
 TLS trust is still governed by the app's connection settings. HTTP retains its
 normal lack of transport encryption.
+
+A broken or partial pairing never blocks login or primary operation: the
+station logs it, shows it on the pairing page and runs unpaired (local
+sessions, no shared checklist requirement, its own abort-history identity).
+Paired-only features stay off until the pairing is fixed: signed RRLS control,
+mode and clock sync, settings and checklist sync, and handover. If one station
+saved and the other did not (for example a window expired after one confirm),
+unpair the saved one and pair again.
 
 Provision the same username on both servers with the intended local permissions.
 Sign in once after enabling pairing to obtain a portable session. The destination
