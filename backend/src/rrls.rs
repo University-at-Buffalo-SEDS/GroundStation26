@@ -34,6 +34,10 @@ const AV_BAY_COMMAND: u8 = 6;
 const READY: u8 = 7;
 const POSITION: u8 = 8;
 const VOICE: u8 = 9;
+/// A voice packet carries 320 ms of speech; one waiting longer than this is stale.
+pub(crate) const VOICE_EXPIRY_MS: u64 = 400;
+/// At most this many voice packets wait for the radio.
+const VOICE_QUEUE: usize = 2;
 const SETTINGS: u8 = 10;
 // Host application control; kind12 remains reserved for legacy framing. Budget negotiation uses13.
 const HOST_CONTROL: u8 = 11;
@@ -1053,7 +1057,7 @@ impl Mesh {
             > if q.settings_origin == SettingsOrigin::Reply {
                 5_000
             } else if q.frame.bytes.get(3) == Some(&VOICE) {
-                180
+                VOICE_EXPIRY_MS
             } else if q.independent_discovery() {
                 3_000
             } else if q.priority == 255
@@ -2018,8 +2022,18 @@ impl Mesh {
                     .is_some_and(|last| now.saturating_sub(last) < LEASE_MS),
             }
     }
+    /// Voice may be sent: the link is fresh and this station's airtime share
+    /// leaves room for commands and telemetry. A primary held at 15% while
+    /// an RRLS relays still receives voice but does not send it.
+    pub fn voice_sendable(&self, now: u64) -> bool {
+        self.voice_available(now)
+            && (self.role == Role::Rrls
+                || self
+                    .recovery_air_share(now)
+                    .is_none_or(|share| share >= crate::radio_voice::MIN_SENDER_SHARE_PERCENT))
+    }
     pub fn queue_voice(&mut self, payload: &[u8], now: u64) {
-        if !self.voice_available(now) || payload.len() > crate::radio_voice::MAX_PACKET {
+        if !self.voice_sendable(now) || payload.len() > crate::radio_voice::MAX_PACKET {
             return;
         }
         while self
@@ -2027,7 +2041,7 @@ impl Mesh {
             .iter()
             .filter(|q| q.frame.bytes.get(3) == Some(&VOICE))
             .count()
-            >= 3
+            >= VOICE_QUEUE
         {
             let index = self
                 .queue
@@ -2902,7 +2916,7 @@ mod tests {
             sender.queue_voice(&crate::radio_voice::test_packet(role), 1);
             let packet = sender.pop(1).unwrap();
             assert!(receiver.incoming(true, &packet.bytes, 1).is_none());
-            assert_eq!(audio.try_recv().unwrap().pcm.len(), 960);
+            assert_eq!(audio.try_recv().unwrap().pcm.len(), 2 * 320 * crate::radio_voice::FRAMES_PER_PACKET);
             assert!(receiver.incoming(true, &packet.bytes, 2).is_none());
             assert!(audio.try_recv().is_err(), "duplicate audio cannot replay");
             assert!(receiver.pop(2).is_none(), "received voice cannot echo");
@@ -2925,7 +2939,7 @@ mod tests {
                 mesh.relay_seen = Some(now);
             }
             let before = mesh.queue.len();
-            mesh.queue_voice(&[0; 71], now);
+            mesh.queue_voice(&[0; crate::radio_voice::MAX_PACKET], now);
             if !mesh.voice_available(now) {
                 assert_eq!(mesh.queue.len(), before);
             }
@@ -2955,8 +2969,8 @@ mod tests {
             if now % 120 == 0 {
                 mesh.pop(now);
             }
-            assert!(mesh.queue.len() <= 3);
-            assert!(mesh.bytes <= 3 * (crate::radio_voice::MAX_PACKET + 8));
+            assert!(mesh.queue.len() <= VOICE_QUEUE);
+            assert!(mesh.bytes <= VOICE_QUEUE * (crate::radio_voice::MAX_PACKET + 8));
         }
         assert_eq!((controls, gps), (6000, 6000));
         assert!(
@@ -2973,11 +2987,11 @@ mod tests {
         let mut mesh = Mesh::new(Role::Primary, 1);
         mesh.voice_enabled = true;
         mesh.relay_seen = Some(0);
-        let payload = vec![0; 71];
+        let payload = vec![0; crate::radio_voice::MAX_PACKET];
         for _ in 0..100 {
             mesh.queue_voice(&payload, 0);
         }
-        assert_eq!(mesh.queue.len(), 3);
+        assert_eq!(mesh.queue.len(), VOICE_QUEUE);
         mesh.enqueue(
             Outgoing {
                 command: true,
@@ -2996,13 +3010,32 @@ mod tests {
         );
         assert_eq!(decode(&mesh.pop(0).unwrap().bytes).unwrap().0, DOWN_DATA);
         assert_eq!(decode(&mesh.pop(0).unwrap().bytes).unwrap().0, UP_COMMAND);
-        assert!(mesh.pop(181).is_none(), "expired voice is never replayed");
+        assert!(mesh.pop(VOICE_EXPIRY_MS + 1).is_none(), "expired voice is never replayed");
         assert!(mesh.queue.is_empty());
-        mesh.queue_voice(&[0; crate::radio_voice::MAX_PACKET + 1], 181);
+        mesh.queue_voice(&[0; crate::radio_voice::MAX_PACKET + 1], VOICE_EXPIRY_MS + 1);
         assert!(
-            mesh.pop(181).is_none(),
+            mesh.pop(VOICE_EXPIRY_MS + 1).is_none(),
             "video-sized payloads cannot enter voice"
         );
+    }
+    #[test]
+    fn primary_held_at_fifteen_percent_receives_but_does_not_send_voice() {
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        mesh.voice_enabled = true;
+        mesh.relay_seen = Some(0);
+        assert!(mesh.voice_sendable(0));
+        // Relay requested: the primary's share drops to 15%.
+        mesh.fallback = true;
+        assert_eq!(mesh.recovery_air_share(0), Some(15));
+        assert!(mesh.voice_available(0), "RRLS voice is still received");
+        assert!(!mesh.voice_sendable(0));
+        mesh.queue_voice(&[0; crate::radio_voice::MAX_PACKET], 0);
+        assert!(mesh.queue.is_empty());
+        // The RRLS always has at least 35%.
+        let mut rrls = Mesh::new(Role::Rrls, 2);
+        rrls.voice_enabled = true;
+        rrls.health_received = Some(0);
+        assert!(rrls.voice_sendable(0));
     }
     #[test]
     fn lean_v4_direct_frames_prevent_false_relay_fallback_and_real_loss_recovers() {
@@ -4314,7 +4347,7 @@ pub fn voice_transport() -> Option<Shared> {
 pub fn voice_status() -> (bool, bool) {
     if let Some(shared) = voice_transport() {
         let mesh = shared.lock().unwrap();
-        (true, mesh.voice_available(mesh.now()))
+        (true, mesh.voice_sendable(mesh.now()))
     } else {
         (false, false)
     }
