@@ -53,12 +53,12 @@ impl Default for FillTargetsConfig {
             fill_source: FillSource::default(),
             version: default_fill_targets_version(),
             nitrogen: FluidFillTarget {
-                target_mass_kg: 10.0,
-                target_pressure_psi: 120.0,
+                target_mass_kg: 0.5,
+                target_pressure_psi: 500.0,
             },
             nitrous: FluidFillTarget {
-                target_mass_kg: 10.0,
-                target_pressure_psi: 745.0,
+                target_mass_kg: 8.0,
+                target_pressure_psi: 750.0,
             },
         }
     }
@@ -192,7 +192,13 @@ mod tests {
         cfg.nitrous.target_pressure_psi = 650.;
         cfg.fill_source = FillSource::Kg1000Absolute;
         save_to_path(&cfg, &path).unwrap();
+        let saved = fs::read(&path).unwrap();
         assert_eq!(load_from_path(&path).unwrap(), cfg);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            saved,
+            "loading preserves configured targets without migration"
+        );
         assert!(!path.with_extension("json.tmp").exists());
         fs::remove_file(&path).unwrap();
         fs::remove_dir(&dir).unwrap();
@@ -208,6 +214,101 @@ mod tests {
                 .unwrap()
                 .fill_source,
             FillSource::Kg50
+        );
+    }
+
+    #[test]
+    fn fresh_defaults_match_shipped_seed_and_keep_hardware_limits_explicit() {
+        let defaults = FillTargetsConfig::default();
+        let seed: FillTargetsConfig =
+            serde_json::from_str(include_str!("../config/fill_targets.json")).unwrap();
+        assert_eq!(seed, defaults);
+        assert_eq!(
+            (
+                defaults.nitrogen.target_mass_kg,
+                defaults.nitrogen.target_pressure_psi
+            ),
+            (0.5, 500.0)
+        );
+        assert_eq!(
+            (
+                defaults.nitrous.target_mass_kg,
+                defaults.nitrous.target_pressure_psi
+            ),
+            (8.0, 750.0)
+        );
+        let sequence: gse_sequence::Config =
+            serde_json::from_str(include_str!("../config/gse_sequence.json")).unwrap();
+        assert_eq!(sequence.nitrogen_target_psi, 500.0);
+        assert!(sequence.nitrogen_steps.is_empty());
+        assert!(sequence.pressure_ceiling_psi.is_none());
+        assert!(sequence.turbocharge_max_added_mass_kg.is_none());
+        assert!(sequence.cold_flow_target_psi.is_none());
+        assert_eq!(
+            gse_sequence::Engine::default().nitrous_target_psi,
+            defaults.nitrous.target_pressure_psi
+        );
+    }
+
+    #[test]
+    fn fresh_targets_require_explicit_turbo_limits_without_retargeting_nitrogen() {
+        use gse_sequence::turbocharge::{Context, Controller};
+        use gse_sequence::{Inputs, Sample};
+        let targets = FillTargetsConfig::default();
+        let mut config = gse_sequence::Config::default();
+        let input = Inputs {
+            now_ms: 100,
+            pressure: Some(Sample {
+                value: 100.0,
+                at_ms: 100,
+            }),
+            valves: [None; 5],
+            prelaunch: true,
+            interlock: true,
+        };
+        let mass = Some(Sample {
+            value: targets.nitrous.target_mass_kg,
+            at_ms: 100,
+        });
+        let context = Context {
+            reset_generation: 1,
+            qualification_generation: 1,
+            configuration: [0; 32],
+        };
+        let start = |config: &gse_sequence::Config| {
+            Controller::start(
+                config,
+                targets.nitrous.target_mass_kg,
+                targets.nitrous.target_pressure_psi,
+                input,
+                mass,
+                context,
+            )
+        };
+        assert!(
+            start(&config).is_err(),
+            "fluid targets are not hardware limits"
+        );
+        config.turbocharge_max_added_mass_kg = Some(0.3); // Explicit test-only allowance.
+        assert!(
+            start(&config).is_err(),
+            "an allowance does not supply a hardware ceiling"
+        );
+        config.pressure_ceiling_psi = Some(750.0);
+        assert!(
+            start(&config).is_err(),
+            "target must remain below the explicit ceiling"
+        );
+        config.pressure_ceiling_psi = Some(1000.0); // Explicit test-only ceiling.
+        let (controller, effects) = start(&config).unwrap();
+        let observation = controller.progress_observation();
+        assert_eq!(observation.pressure_target_psi, 750.0);
+        assert_eq!(observation.liquid_target_mass_kg, 8.0);
+        assert_eq!(targets.nitrogen.target_pressure_psi, 500.0);
+        assert!(effects.valves.iter().all(|(_, open)| !open));
+        assert!(
+            !effects.valves.is_empty(),
+            "initial plan closes outputs before nitrogen admission"
         );
     }
 

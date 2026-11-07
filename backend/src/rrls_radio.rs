@@ -8,7 +8,10 @@ use sedsnet::{
 };
 use std::{
     error::Error,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 type Device = Arc<Mutex<Box<dyn CommsDevice>>>;
@@ -21,11 +24,14 @@ struct Connection {
     rx: Option<Device>,
     tx: Option<Device>,
     failures: u64,
+    retry_tracker: Option<sedsnet::router::RetryTracker>,
+    capacity_enabled: bool,
 }
 pub struct RecoveryRadio {
     shared: Arc<Mutex<Connection>>,
     tx: bool,
     side: Option<RouterSideId>,
+    ready_generation: Arc<AtomicU64>,
 }
 impl RecoveryRadio {
     pub fn new(config: CommsLinkConfig) -> Self {
@@ -38,26 +44,58 @@ impl RecoveryRadio {
                 rx: None,
                 tx: None,
                 failures: 0,
+                retry_tracker: None,
+                capacity_enabled: true,
             })),
             tx: false,
             side: None,
+            ready_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+    /// Preserve the already opened primary handle and its configuration.
+    /// Capacity control remains off until the existing worker enables it.
+    pub(crate) fn from_open(
+        config: CommsLinkConfig,
+        rx: Box<dyn CommsDevice>,
+    ) -> anyhow::Result<Self> {
+        let tx = rx
+            .try_clone_tx()?
+            .ok_or_else(|| anyhow::anyhow!("Serial recovery requires independent transmit"))?;
+        let radio = Self::new(config);
+        {
+            let mut state = radio.shared.lock().unwrap();
+            state.generation = 1;
+            state.capacity_enabled = false;
+            state.rx = Some(Arc::new(Mutex::new(rx)));
+            state.tx = Some(Arc::new(Mutex::new(tx)));
+        }
+        radio.ready_generation.store(1, Ordering::Release);
+        Ok(radio)
     }
     fn connect(&self) -> Option<(u64, Device)> {
         let mut state = self.shared.lock().unwrap();
         if state.rx.is_none() && Instant::now() >= state.retry_at {
             state.retry_at = Instant::now() + Duration::from_secs(1);
             match (state.opener)(&state.config).and_then(|mut rx| {
-                rx.enable_radio_capacity_control();
+                if state.capacity_enabled {
+                    rx.enable_radio_capacity_control();
+                }
+                if let Some(tracker) = &state.retry_tracker {
+                    // A new UART instance invalidates both old and new write evidence.
+                    tracker.invalidate_generation()?;
+                    rx.bind_retry_tracker(tracker.clone())?;
+                }
                 let tx = rx
                     .try_clone_tx()?
                     .ok_or_else(|| anyhow::anyhow!("RRLS requires independent UART transmit"))?;
                 Ok((rx, tx))
             }) {
                 Ok((rx, tx)) => {
-                    state.generation += 1;
+                    state.generation = state.generation.checked_add(1)?;
                     state.rx = Some(Arc::new(Mutex::new(rx)));
                     state.tx = Some(Arc::new(Mutex::new(tx)));
+                    self.ready_generation
+                        .store(state.generation, Ordering::Release);
                     log::info!(
                         "RRLS radio connected: {}",
                         crate::comms::link_description(&state.config)
@@ -65,7 +103,7 @@ impl RecoveryRadio {
                 }
                 Err(error) => {
                     state.failures += 1;
-                    if state.failures == 1 || state.failures % 30 == 0 {
+                    if state.failures == 1 || state.failures.is_multiple_of(30) {
                         log::warn!(
                             "RRLS radio {} unavailable; retrying once per second: {error:#}",
                             crate::comms::link_description(&state.config)
@@ -79,7 +117,13 @@ impl RecoveryRadio {
     }
     fn disconnected(&self, generation: u64) {
         let mut state = self.shared.lock().unwrap();
-        if state.generation == generation {
+        if state.generation == generation && state.rx.is_some() {
+            self.ready_generation.store(0, Ordering::Release);
+            if let Some(tracker) = &state.retry_tracker
+                && let Err(error) = tracker.invalidate_generation()
+            {
+                log::warn!("RRLS retry fence unavailable: {error}");
+            }
             // Endpoints do not retain idle clones of failed UART handles.
             state.rx = None;
             state.tx = None;
@@ -111,12 +155,151 @@ impl RecoveryRadio {
     }
 }
 fn io_failure(error: &TelemetryError) -> bool {
-    matches!(
-        error,
-        TelemetryError::Io(_) | TelemetryError::GenericError(_)
-    )
+    // SDK Io values describe logical queue/routing ownership, not OS socket
+    // health. Actual receive/read IO errors use std::io -> GenericError.
+    matches!(error, TelemetryError::GenericError(_))
+}
+pub(crate) fn boxed_io_failure(error: &(dyn Error + Send + Sync + 'static)) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::NotFound
+        ) || (error.kind() == std::io::ErrorKind::Other && error.raw_os_error().is_some())
+    })
 }
 impl CommsDevice for RecoveryRadio {
+    fn connection_generation(&self) -> Option<Arc<AtomicU64>> {
+        Some(self.ready_generation.clone())
+    }
+    fn enable_radio_capacity_control(&mut self) {
+        let mut state = self.shared.lock().unwrap();
+        state.capacity_enabled = true;
+        if let Some(device) = &state.rx {
+            device.lock().unwrap().enable_radio_capacity_control();
+        }
+    }
+
+    fn bind_retry_tracker(
+        &mut self,
+        tracker: sedsnet::router::RetryTracker,
+    ) -> TelemetryResult<()> {
+        let mut state = self.shared.lock().unwrap();
+        if state.retry_tracker.as_ref() == Some(&tracker) {
+            return Ok(());
+        }
+        if let Some(old) = &state.retry_tracker {
+            old.invalidate_generation()?;
+        }
+        tracker.invalidate_generation()?;
+        if let Some(device) = &state.rx {
+            device.lock().unwrap().bind_retry_tracker(tracker.clone())?;
+        }
+        state.retry_tracker = Some(tracker);
+        Ok(())
+    }
+    fn command_batch_frame_len(&self, priority: u8, payload: &[u8]) -> Option<usize> {
+        let state = self.shared.lock().unwrap();
+        let device = if self.tx { &state.tx } else { &state.rx };
+        device.as_ref().and_then(|device| {
+            device
+                .lock()
+                .unwrap()
+                .command_batch_frame_len(priority, payload)
+        })
+    }
+    fn send_tracked(
+        &mut self,
+        frames: &[(u8, &[u8])],
+        leases: &[sedsnet::router::PackedWriteLease],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.with_device(
+            "RRLS radio disconnected".into(),
+            |error| boxed_io_failure(error.as_ref()),
+            |device| device.send_tracked(frames, leases),
+        )
+    }
+
+    fn send_tracked_counted(
+        &mut self,
+        frames: &[(u8, &[u8])],
+        leases: &[sedsnet::router::PackedWriteLease],
+    ) -> Result<Option<usize>, Box<dyn Error + Send + Sync>> {
+        self.with_device(
+            "RRLS radio disconnected".into(),
+            |error| boxed_io_failure(error.as_ref()),
+            |device| device.send_tracked_counted(frames, leases),
+        )
+    }
+    fn send_command_batch(
+        &mut self,
+        frames: &[(u8, &[u8])],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.with_device(
+            "RRLS radio disconnected".into(),
+            |error| boxed_io_failure(error.as_ref()),
+            |device| device.send_command_batch(frames),
+        )
+    }
+    fn ordinary_background_state(&self) -> Option<crate::comms::OrdinaryLaneState> {
+        let device = {
+            let state = self.shared.lock().unwrap();
+            if self.tx {
+                state.tx.clone()
+            } else {
+                state.rx.clone()
+            }
+        };
+        device.and_then(|device| device.lock().unwrap().ordinary_background_state())
+    }
+    fn recovery_budget_configured(&self) -> bool {
+        let device = {
+            let state = self.shared.lock().unwrap();
+            if self.tx {
+                state.tx.clone()
+            } else {
+                state.rx.clone()
+            }
+        };
+        device.is_some_and(|device| device.lock().unwrap().recovery_budget_configured())
+    }
+    fn service_background_mode(&mut self) -> TelemetryResult<()> {
+        self.with_device(
+            TelemetryError::Io("RRLS radio disconnected"),
+            io_failure,
+            |device| device.service_background_mode(),
+        )
+    }
+    fn service_background_transmit(&mut self) -> TelemetryResult<()> {
+        self.with_device(
+            TelemetryError::Io("RRLS radio disconnected"),
+            io_failure,
+            |device| device.service_background_transmit(),
+        )
+    }
+    fn service_background_transmit_counted(
+        &mut self,
+        allow_ordinary: bool,
+    ) -> TelemetryResult<Option<crate::comms::BackgroundProgress>> {
+        self.with_device(
+            TelemetryError::Io("RRLS radio disconnected"),
+            io_failure,
+            |device| device.service_background_transmit_counted(allow_ordinary),
+        )
+    }
+    fn service_paid_budget_transmit_counted(
+        &mut self,
+    ) -> TelemetryResult<Option<crate::comms::BackgroundProgress>> {
+        self.with_device(
+            TelemetryError::Io("RRLS radio disconnected"),
+            io_failure,
+            |device| device.service_paid_budget_transmit_counted(),
+        )
+    }
     fn service_transmit(&mut self) -> TelemetryResult<()> {
         self.with_device(
             TelemetryError::Io("RRLS radio disconnected"),
@@ -144,6 +327,7 @@ impl CommsDevice for RecoveryRadio {
             shared: self.shared.clone(),
             tx: true,
             side: self.side,
+            ready_generation: self.ready_generation.clone(),
         })))
     }
     fn set_side_id(&mut self, side: RouterSideId) {
@@ -196,14 +380,7 @@ impl CommsDevice for RecoveryRadio {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.with_device(
             "RRLS radio disconnected".into(),
-            |error| {
-                !error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                    matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                    )
-                })
-            },
+            |error| boxed_io_failure(error.as_ref()),
             |device| device.send_data_with_priority(payload, priority),
         )
     }
@@ -241,18 +418,53 @@ impl CommsDevice for RecoveryRadio {
 }
 #[cfg(test)]
 mod tests {
+    include!("rrls_radio/connection_generation_tests.rs");
     use super::*;
     use crate::comms_config::{SerialLinkConfig, SerialProtocol};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     fn missing() -> RecoveryRadio {
         RecoveryRadio::new(CommsLinkConfig::Serial {
             serial: SerialLinkConfig {
+                hardware_flow_control: false,
+                rfd_profile: None,
                 port: "/missing-rrls-radio-for-test".into(),
                 baud_rate: 115200,
                 protocol: SerialProtocol::RawUart,
             },
         })
     }
+    #[test]
+    fn retry_reconnect_invalidates_but_idempotent_bind_and_stale_failure_do_not() {
+        use crate::comms::retry_tracker_tests::Fixture;
+        use sedsnet::router::WriteStart;
+        for disconnect in [false, true] {
+            let fixture = Fixture::new(true);
+            let mut radio = missing();
+            radio.shared.lock().unwrap().opener = Box::new(|_| {
+                Ok(Box::new(TestRadio {
+                    online: Arc::new(AtomicBool::new(true)),
+                    ready: Arc::new(AtomicBool::new(true)),
+                    sent: Arc::new(Mutex::new(Vec::new())),
+                    alive: Arc::new(AtomicUsize::new(1)),
+                }))
+            });
+            radio.bind_retry_tracker(fixture.tracker.clone()).unwrap();
+            let (generation, _) = radio.connect().unwrap();
+            let first = fixture.publish(1);
+            assert_eq!(first.try_start(), WriteStart::Ready);
+            first.report_drained().unwrap();
+            let retry = fixture.retry();
+            fixture.finish(first.bytes());
+            radio.bind_retry_tracker(fixture.tracker.clone()).unwrap();
+            radio.disconnected(if disconnect {
+                generation
+            } else {
+                generation - 1
+            });
+            assert_eq!(retry.discard_if_retired(), !disconnect);
+        }
+    }
+
     #[test]
     fn absent_radio_is_bounded_and_does_not_panic_or_fake_success() {
         let mut radio = missing();
@@ -387,7 +599,8 @@ mod tests {
     }
     #[test]
     fn reconnecting_writer_preserves_trusted_priority_metadata() {
-        struct PrioritySpy(Arc<Mutex<Vec<(u8, Vec<u8>)>>>);
+        type PriorityPackets = Arc<Mutex<Vec<(u8, Vec<u8>)>>>;
+        struct PrioritySpy(PriorityPackets);
         impl CommsDevice for PrioritySpy {
             fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
                 Ok(Some(Box::new(Self(self.0.clone()))))

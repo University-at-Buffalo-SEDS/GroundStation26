@@ -67,11 +67,19 @@ transport frames retain their order because timestamp deltas may depend on prior
 frames. A bounded 256-entry header classification cache recognizes compact GPS
 without expanding its payload. It is limited to 64
 frames / 64 KiB, drops lower-priority work first, and expires stale pending work.
-Forwarding is capped at 2,000 framed UART bytes/second, with a 4,160-byte burst,
-to leave airtime for the original rocket transmission and return traffic. This
-is an application budget; modem RF overhead is additional. Normal traffic
-expires after 250 ms; GPS after 1.5 seconds. Equal-priority work
-keeps FIFO order. Queue drops are observable rather than an allocation failure.
+Forwarding uses the shared UART capacity controller, including per-frame air
+cost, outstanding byte debt and the serial quiet interval. With the matched
+32 kbit/s application profile, RRLS starts at 35% and can negotiate 50% while
+the primary holds 15%; RF uses 35%. Returning to primary 25% requires a
+confirmed relay downshift. See [application airtime allocation](radio-budget-operation.md)
+for deployment compatibility, conservative startup and configuration faults.
+
+Sparse downlink telemetry and GPS normally expire after 1.5 seconds; other
+ordinary work and interactive control retain the default 250 ms deadline. Independent address discovery uses 3 seconds,
+operating-mode replies use 5 seconds, and context-bound budget negotiation uses
+8 seconds. Started settings transfers retain their existing ownership policy.
+Equal-priority work keeps FIFO order. Queue drops are observable rather than an
+allocation failure.
 
 RRLS local clients can view recovery telemetry, maps, and recordings and control
 local recording. Flight/GSE commands are issued at the main station and relayed;
@@ -235,3 +243,45 @@ application envelopes. These counters exclude presence/settings messages,
 failed writes, cancelled queued work, and the outer UART header. `forwarding`
 reports the current relay lease decision; inspect its freshness separately from
 cumulative counts.
+
+### Requests through the primary station
+
+With the existing pairing configured on both stations, RRLS automatically negotiates
+signed control capabilities from its paired primary. Each station must have exactly
+one paired counterparty of the expected role. No additional feature flag is needed.
+A connected RRLS sends operator requests through the primary; it does not execute
+those hardware commands locally. A normal RRLS build can request commands supported
+by a HITL primary without running local HITL behavior.
+
+Both stations check the operator's current enabled account and permissions. The
+primary also checks its current mode and interlocks before admitting a command.
+Network UTC changes use the primary's existing time-setting policy. Local bearer
+tokens are never sent over the radio. Only one request can be pending; radio retries
+retain its exact identity and cannot dispatch the same request twice.
+
+`GET /api/rrls/control` distinguishes a pending request, acceptance by the primary,
+rejection and an unknown outcome. Acceptance means the primary admitted the request,
+not that a board actuated or acknowledged it. A timeout or disconnect must be resolved
+by inspecting actual state before issuing a new request; unknown commands are not
+replayed automatically. Temporary capability-discovery loss uses bounded retry
+bursts with a cooldown and stops after negotiation succeeds.
+
+The UI polls this local status endpoint without sending radio traffic. Existing
+policy controls remain subject to fresh displayed state. The separate **Request
+execution at primary** action can actuate if the primary permits it; it uses the
+current local account allowlist and signed command catalog while the primary checks
+its live policy. It does not claim that an expired displayed interlock is enabled.
+
+Primary valve, fill-board, topology and host-temperature observations can accompany
+signed capability and command replies. They retain source ages, add the original
+request's whole elapsed time, and expire instead of confirming a requested target.
+These are sparse observations, not a continuous telemetry stream. Host temperature
+currently travels from primary to RRLS only. Unknown pressures,
+baselines and primary configuration are not replaced by RRLS-local values. A later
+host receipt is not proof that a board generated its report after a command.
+
+Standalone physical command authority is unavailable: the existing RRLS identity
+and board GS-heartbeat ownership do not provide a safe takeover/handover protocol.
+Local recording and the separate durable T-clock reset workflow retain their
+existing policies. Display-mode synchronization alone does not grant hardware
+control authority.

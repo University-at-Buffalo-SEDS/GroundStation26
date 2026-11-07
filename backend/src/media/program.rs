@@ -43,6 +43,10 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
                 )
             }),
         )
+        .route(
+            "/assets/stream-sequence-visuals.js",
+            get(|| async { ([(header::CONTENT_TYPE, "text/javascript")], gs_browser_assets::STREAM_SEQUENCE_VISUALS_JS) }),
+        )
         .route("/api/media-assets/program/state", get(program_state))
         .route("/api/media-assets/program/audio", get(program_audio))
         .route(
@@ -67,6 +71,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
             }),
         )
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn page(
     State(state): State<Arc<MediaState>>,
     Query(query): Query<MediaQuery>,
@@ -125,7 +130,7 @@ const MAX_PROGRAM_SNAPSHOTS: usize = 364;
 fn retain_program_snapshot(
     history: &mut std::collections::VecDeque<(u64, serde_json::Value)>,
     now: u64,
-    snapshot: serde_json::Value,
+    mut snapshot: serde_json::Value,
 ) {
     // A UTC correction cannot leave future frames or unbounded retained data.
     if history.back().is_some_and(|(time, _)| *time > now) {
@@ -135,6 +140,8 @@ fn retain_program_snapshot(
         .back()
         .is_none_or(|(time, _)| now.saturating_sub(*time) >= PROGRAM_SAMPLE_MS)
     {
+        let previous=history.back().filter(|(at,_)|now.saturating_sub(*at)<=2000).map(|(_,value)|value);
+        crate::sequence_stream::observe_clock_progress(previous,&mut snapshot);
         history.push_back((now, snapshot));
     }
     while history.len() > MAX_PROGRAM_SNAPSHOTS
@@ -176,6 +183,7 @@ pub(super) async fn capture_history(state: Arc<MediaState>) {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn program_state(
     State(state): State<Arc<MediaState>>,
     Query(query): Query<MediaQuery>,
@@ -259,6 +267,7 @@ struct AudioCursor {
     after: u64,
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn program_audio(
     State(state): State<Arc<MediaState>>,
     Query(query): Query<MediaQuery>,
@@ -281,6 +290,7 @@ async fn program_audio(
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(batch)).into_response())
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn dashboard_status(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -309,13 +319,32 @@ pub(super) fn telemetry_snapshot(
         profile.stats.iter().map(|stat| {
             let (binding, absolute) = stat.binding_for_fill(fill_source);
             let value = rows.iter().rev().find(|r|r.data_type==binding.data_type && binding.sender_id.as_ref().is_none_or(|s|s==&r.sender_id))
-                .filter(|r|r.timestamp_ms>=0 && now.saturating_sub(r.timestamp_ms as u64)<5000)
+                // Keep the existing programme row/now timestamp domain. A future
+                // row must be unknown, never saturating-subtracted to age zero.
+                .filter(|r| u64::try_from(r.timestamp_ms).ok()
+                    .and_then(|at| now.checked_sub(at)).is_some_and(|age| age < 5000))
                 .and_then(|r|r.values.get(binding.index).copied().flatten())
                 .map(|v|if absolute {v.abs()}else{v}).map(|v|v*binding.scale+binding.offset).filter(|v|v.is_finite());
             serde_json::json!({"label":stat.label,"value":value,"unit":stat.unit,"precision":stat.precision,"format":stat.format,"binding":binding})
         }).collect()
     };
-    serde_json::json!({"phase":format!("{phase:?}"),"test_fire_mode":cfg!(feature="test_fire_mode"),"stats":stats,"profile":profile_id,"cycle_seconds":profile.cycle_seconds,"stats_per_page":profile.stats_per_page,"scene":profile.scene,"positions":crate::antenna::snapshot(),"t_clock":program_t_clock(&app.launch_clock_snapshot(),crate::telemetry_task::procedure_clock::for_wall(now).timestamp_ms())})
+    let procedure=crate::telemetry_task::procedure_clock::for_wall(now);
+    let clock=app.launch_clock_snapshot();
+    let sampled=procedure.timestamp_ms();
+    let remaining=if clock.kind==crate::telemetry_db::LaunchClockKind::TMinus {
+        match (clock.anchor_timestamp_ms,clock.duration_ms) {
+            (Some(anchor),Some(duration))=>Some(duration.saturating_sub(sampled.saturating_sub(anchor))),
+            (Some(target),None)=>Some(target.saturating_sub(sampled)),
+            (None,Some(duration))=>Some(duration),_=>None,
+        }
+    }else{None};
+    let stream_clock=crate::sequence_stream::Clock {
+        kind:match clock.kind {crate::telemetry_db::LaunchClockKind::Idle=>"idle",crate::telemetry_db::LaunchClockKind::TMinus=>"t_minus",crate::telemetry_db::LaunchClockKind::TPlus=>"t_plus"}.into(),
+        source_kind:if procedure.model_monotonic_ms().is_some(){"model_procedure"}else{"host_wall"}.into(),
+        sampled_timestamp_ms:sampled,anchor_timestamp_ms:clock.anchor_timestamp_ms,duration_ms:clock.duration_ms,remaining_ms:remaining,advancing:false,
+    };
+    let sequence_visuals=crate::sequence_stream::project(stream_clock,Some(crate::gse::progress::stream_observation(app)),app.umbilical_stream_outputs(),app.umbilical_stream_commands());
+    serde_json::json!({"phase":format!("{phase:?}"),"test_fire_mode":cfg!(feature="test_fire_mode"),"stats":stats,"profile":profile_id,"cycle_seconds":profile.cycle_seconds,"stats_per_page":profile.stats_per_page,"scene":profile.scene,"positions":crate::antenna::snapshot(),"t_clock":program_t_clock(&clock,sampled),"sequence_visuals":sequence_visuals})
 }
 
 fn valid_hls_file(name: &str) -> bool {
@@ -480,12 +509,15 @@ pub(super) fn delayed_playlist(
     }
     Ok((result.join("\n") + "\n", segments))
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn hls(State(state):State<Arc<MediaState>>,Path((id,file)):Path<(String,String)>,Query(query):Query<MediaQuery>,headers:HeaderMap)->ApiResult<Response>{
     hls_impl(state,id,file,query,headers,false).await
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(crate) async fn raw_hls(State(state):State<Arc<MediaState>>,Path((id,file)):Path<(String,String)>,Query(query):Query<MediaQuery>,headers:HeaderMap)->ApiResult<Response>{
     hls_impl(state,id,file,query,headers,true).await
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn hls_impl(state:Arc<MediaState>,id:String,file:String,query:MediaQuery,headers:HeaderMap,raw:bool)->ApiResult<Response>{
     check_id(&id)?;
     if !valid_hls_file(&file) {
@@ -588,6 +620,7 @@ async fn hls_impl(state:Arc<MediaState>,id:String,file:String,query:MediaQuery,h
         .into_response())
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn roles(State(state): State<Arc<MediaState>>, headers: HeaderMap) -> ApiResult<Response> {
     let p = crate::web::authorize_headers(&state.app, &headers, Permission::ViewData).await?;
     if p.anonymous
@@ -613,6 +646,7 @@ struct RoleChange {
     username: String,
     stream_master: bool,
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn set_role(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -752,6 +786,45 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn programme_row_timestamp_boundaries_preserve_unknown_instead_of_future_age_zero() {
+        let app = crate::state::tests::test_app_state().await;
+        let mut presentation = Presentation::default();
+        for page in presentation.broadcast.rundown.profiles.values_mut() {
+            page.stats = default_stats().into_iter().map(Into::into).collect();
+        }
+        for (at, now, expected) in [
+            (10_000, 10_000, Some(125.0)),
+            (5_001, 10_000, Some(125.0)),
+            (5_000, 10_000, None),
+            (10_001, 10_000, None),
+            (-1, 0, None),
+            (i64::MAX, i64::MAX as u64, Some(125.0)),
+            (i64::MAX, u64::MAX, None),
+        ] {
+            let mut rows = app.recent_telemetry_cache.lock().unwrap();
+            rows.clear();
+            rows.push_back(crate::types::TelemetryRow {
+                timestamp_ms: at, data_type: "GPS_DATA".into(), sender_id: "RF".into(),
+                values: vec![Some(42.0), Some(-78.0), Some(125.0)],
+            });
+            drop(rows);
+            assert_eq!(telemetry_snapshot(&app, &presentation, now)["stats"][0]["value"].as_f64(), expected, "row={at}, now={now}");
+        }
+        // A newer invalid matching row stays unknown; do not silently revive
+        // an older matching row behind it or mint a replacement timestamp.
+        let mut rows = app.recent_telemetry_cache.lock().unwrap();
+        rows.clear();
+        for at in [9_999, 10_001] {
+            rows.push_back(crate::types::TelemetryRow {
+                timestamp_ms: at, data_type: "GPS_DATA".into(), sender_id: "RF".into(),
+                values: vec![Some(42.0), Some(-78.0), Some(125.0)],
+            });
+        }
+        drop(rows);
+        assert!(telemetry_snapshot(&app, &presentation, 10_000)["stats"][0]["value"].is_null());
+    }
+
     #[test]
     fn delayed_clock_is_available_to_the_first_viewer_without_live_time_fallback() {
         use crate::telemetry_db::{LaunchClockKind, LaunchClockMsg};

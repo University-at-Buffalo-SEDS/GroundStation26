@@ -44,7 +44,7 @@ class BrowserAssetSourceTests(unittest.TestCase):
     def test_reusing_preselected_source_never_fetches_again(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
             root=Path(tmp);source=self.source(root)
-            with patch.object(build,'_ensure_frontend_checkout') as ensure,patch.object(build,'_resolve_external_frontend_script',return_value=source/'build.py'),patch.object(build,'_run_frontend_script_with_wasm_opt_fallback'),patch.object(build,'_sync_frontend_public_assets'):
+            with patch.object(build,'_ensure_frontend_checkout') as ensure,patch.object(build,'_resolve_external_frontend_script',return_value=source/'build.py'),patch.object(build,'_run_frontend_script_with_wasm_opt_fallback',side_effect=lambda script, checkout, args, finish, **kwargs: finish()),patch.object(build,'_sync_frontend_public_assets'):
                 build._run_frontend_build(root,False,False,False,None,True,source)
             ensure.assert_not_called()
             receipt=json.loads(build._browser_source_receipt(root).read_text())

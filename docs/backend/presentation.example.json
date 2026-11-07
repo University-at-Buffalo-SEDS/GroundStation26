@@ -25,7 +25,7 @@
         "scale": 1,
         "offset": 0
       },
-      "unit": "°",
+      "unit": "\u00b0",
       "precision": 5
     },
     {
@@ -37,7 +37,7 @@
         "scale": 1,
         "offset": 0
       },
-      "unit": "°",
+      "unit": "\u00b0",
       "precision": 5
     },
     {
@@ -136,7 +136,7 @@
         "binding": null,
         "phase_values": {
           "*": 0,
-          "ParachuteDeploy": 1
+          "Descent": 1
         }
       },
       {
@@ -152,11 +152,12 @@
         "binding": null,
         "phase_values": {
           "*": 0,
-          "Descent": 1,
+          "Reefing": 1,
           "Landed": 1,
           "Recovery": 1
         }
       }
-    ]
+    ],
+    "flight_phase_version": 1
   }
 }

@@ -53,7 +53,7 @@ const LED_FRAME_MS: u64 = 16;
 const LED_DISABLED_BRIGHTNESS: f64 = 0.0;
 const ABORT_POLL_INTERVAL_MS: u64 = 10;
 const ABORT_DISPATCH_DEBOUNCE_MS: u64 = 250;
-static LAST_ABORT_DISPATCH_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_ABORT_DISPATCH: Mutex<Option<Instant>> = Mutex::new(None);
 
 //####################################################################
 
@@ -124,7 +124,8 @@ fn setup_callbacks(
     let gpio = state.gpio.clone();
     let debounce = Duration::from_millis(50);
 
-    let tx_abort = tx.clone();
+    let abort_intent = state.manual_abort_intent.clone();
+    let abort_ingress=state.control_ingress.clone();
     gpio.setup_callback_input_pin(ABORT_PIN, Trigger::RisingEdge, debounce, move |is_high| {
         log::info!("GPIO abort button interrupt on BCM GPIO {ABORT_PIN}: is_high={is_high}");
         if !is_high {
@@ -132,9 +133,9 @@ fn setup_callbacks(
             return;
         }
 
-        dispatch_gpio_abort(&tx_abort, "interrupt");
+        let _=abort_ingress.run_sync(|| dispatch_gpio_abort(&abort_intent,"interrupt"));
     })?;
-    spawn_abort_poll_thread(state.clone(), tx.clone());
+    spawn_abort_poll_thread(state.clone());
 
     let allowed_launch = allowed.clone();
     let tx_launch = tx.clone();
@@ -144,7 +145,13 @@ fn setup_callbacks(
         if !is_high {
             return;
         }
-        if !allowed_launch.lock().unwrap().launch {
+        // Capture before any policy/GSE wait so reset cannot mint a fresh token
+        // for an earlier physical button press.
+        let generation = crate::gse::capture_operator_origin(&state_launch).unwrap_or(0);
+        let launch_revision =
+            crate::board_abort::capture_launch_revision(&state_launch, &TelemetryCommand::Launch);
+        let cold_edge=crate::gse::cold_flow::panel_edge(&state_launch,generation);
+        if cold_edge.is_none() && !allowed_launch.lock().unwrap().launch {
             return;
         }
         #[cfg(feature = "hitl_mode")]
@@ -172,6 +179,10 @@ fn setup_callbacks(
             );
             return;
         }
+        if let Some(edge)=cold_edge {
+            let _=queue_cold_flow_panel_edge(&tx_launch,edge);
+            return;
+        }
         #[cfg(feature = "hitl_mode")]
         let launch_command = if state_launch.hitl_physical_launch_uses_ground_station() {
             TelemetryCommand::GroundStationLaunch
@@ -183,7 +194,15 @@ fn setup_callbacks(
         #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
         let launch_command = TelemetryCommand::Launch;
 
-        if tx_launch.try_send(launch_command).is_err() {
+        if queue_gpio_command(
+            &tx_launch,
+            generation,
+            None,
+            launch_revision,
+            launch_command,
+        )
+        .is_err()
+        {
             eprintln!("GPIO launch button: failed to send command");
         }
     })?;
@@ -275,7 +294,7 @@ fn setup_callbacks(
     Ok(())
 }
 
-fn spawn_abort_poll_thread(state: Arc<AppState>, tx: mpsc::Sender<TelemetryCommand>) {
+fn spawn_abort_poll_thread(state: Arc<AppState>) {
     let gpio = state.gpio.clone();
     let mut shutdown_rx = state.shutdown_subscribe();
     let _ = thread::Builder::new()
@@ -299,7 +318,7 @@ fn spawn_abort_poll_thread(state: Arc<AppState>, tx: mpsc::Sender<TelemetryComma
                                 "GPIO abort poll level changed on BCM GPIO {ABORT_PIN}: is_high={is_high}"
                             );
                             if is_high {
-                                dispatch_gpio_abort(&tx, "polling fallback");
+                                let _=state.control_ingress.run_sync(|| dispatch_gpio_abort(&state.manual_abort_intent,"polling fallback"));
                             }
                             last_level = Some(is_high);
                         }
@@ -315,19 +334,66 @@ fn spawn_abort_poll_thread(state: Arc<AppState>, tx: mpsc::Sender<TelemetryComma
         });
 }
 
-fn dispatch_gpio_abort(tx: &mpsc::Sender<TelemetryCommand>, source: &'static str) {
-    let now_ms = crate::telemetry_task::get_current_timestamp_ms();
-    let last_ms = LAST_ABORT_DISPATCH_MS.swap(now_ms, Ordering::Relaxed);
-    if now_ms.saturating_sub(last_ms) < ABORT_DISPATCH_DEBOUNCE_MS {
-        log::info!("GPIO abort button {source}: duplicate dispatch ignored by debounce");
+fn admit_abort_edge(last: &mut Option<Instant>, now: Instant) -> bool {
+    if last.is_some_and(|previous| {
+        now.saturating_duration_since(previous) < Duration::from_millis(ABORT_DISPATCH_DEBOUNCE_MS)
+    }) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+fn dispatch_gpio_abort(
+    intent: &crate::manual_abort_intent::ManualAbortIntent,
+    source: &'static str,
+) {
+    let admitted = {
+        let mut last = LAST_ABORT_DISPATCH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        admit_abort_edge(&mut last, Instant::now())
+    };
+    if !admitted {
+        log::info!("GPIO abort button {source}: duplicate edge ignored by monotonic debounce");
         return;
     }
+    // Physical Stop never waits for ordinary queue capacity or GSE/DB work.
+    // Retention is not a claim of radio delivery or physical safe-state proof.
+    let epoch = intent.request();
+    log::info!(
+        "GPIO abort button {source}: manual Abort retained epoch={epoch}; board readback pending"
+    );
+}
 
-    log::info!("GPIO abort button {source}: queueing abort command");
-    match tx.try_send(TelemetryCommand::Abort) {
-        Ok(()) => log::info!("GPIO abort button {source}: Abort command queued to telemetry task"),
-        Err(err) => log::error!("GPIO abort button {source}: failed to send command: {err}"),
-    }
+/// Shared by the real callback and its native command-spy fixture. No hardware
+/// operations or fallback command are performed by this edge sender.
+#[expect(clippy::result_large_err, reason = "Retain the original rejected command without allocating during control-queue backpressure")]
+pub(crate) fn queue_cold_flow_panel_edge(
+    tx: &mpsc::Sender<TelemetryCommand>,
+    edge: crate::gse::cold_flow::PanelIntent,
+) -> Result<(), mpsc::error::TrySendError<TelemetryCommand>> {
+    tx.try_send(TelemetryCommand::ColdFlowPanelRelease {
+        key: edge.key,
+        generation: edge.generation,
+        awaiting_at_edge: edge.awaiting_at_edge,
+    })
+}
+#[expect(clippy::result_large_err, reason = "Retain the original rejected command without allocating during control-queue backpressure")]
+fn queue_gpio_command(
+    tx: &mpsc::Sender<TelemetryCommand>,
+    generation: u64,
+    plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+    launch_revision: Option<u64>,
+    command: TelemetryCommand,
+) -> Result<(), mpsc::error::TrySendError<TelemetryCommand>> {
+    tx.try_send(TelemetryCommand::QueuedOperator {
+            recovery_origin: None,
+        launch_revision,
+        plumbing_origin,
+        generation,
+        command: Box::new(command),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -347,11 +413,22 @@ where
     static LAST_WARN_MS_BY_CMD: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
     static WARN_INTERVAL_MS: AtomicU64 = AtomicU64::new(3_000);
     let _gpio_for_callback = gpio.clone();
+    let can_press = Arc::new(can_press);
 
     gpio.setup_callback_input_pin(pin, Trigger::RisingEdge, debounce, move |is_high| {
+        let _=state.control_ingress.run_sync(|| {
         if !is_high {
             return;
         }
+        let fill_captured = matches!(cmd, TelemetryCommand::Nitrous | TelemetryCommand::StartFill)
+            .then(|| crate::fill_recording::Captured::capture(&state));
+        let generation = if matches!(cmd, TelemetryCommand::Abort) {
+            0
+        } else {
+            crate::gse::capture_operator_origin(&state).unwrap_or(0)
+        };
+        let launch_revision = crate::board_abort::capture_launch_revision(&state, &cmd);
+        let plumbing_origin = crate::actuator_plumbing::capture_motion_origin(&state, &cmd);
         #[cfg(feature = "hitl_mode")]
         if state.hitl_button_interlock_enabled()
             && !is_input_enabled(&_gpio_for_callback, ALL_BUTTONS_ENABLE_PIN)
@@ -392,12 +469,36 @@ where
             }
             return;
         }
-        if tx
-            .try_send(crate::gse::panel_command(&state, cmd.clone()))
-            .is_err()
+        let command = crate::gse::panel_command(&state, cmd.clone());
+        let command = if matches!(command, TelemetryCommand::StartFill) {
+            let Some(captured) = fill_captured else { return; };
+            let weak = Arc::downgrade(&state);
+            let allowed = allowed.clone(); let predicate = can_press.clone(); let gpio = _gpio_for_callback.clone();
+            let original_name = crate::sequences::command_name(&cmd);
+            let authority = crate::fill_recording::Authority::Physical { current: Arc::new(move || {
+                let Some(state) = weak.upgrade() else { return false; };
+                if state.control_ingress.is_closed() || crate::gse::panel_name(&state, original_name) != "StartFill" { return false; }
+                #[cfg(feature = "hitl_mode")]
+                if state.hitl_button_interlock_enabled() && !is_input_enabled(&gpio, ALL_BUTTONS_ENABLE_PIN) { return false; }
+                #[cfg(not(feature = "hitl_mode"))]
+                let _ = &gpio;
+                predicate(&allowed.lock().unwrap())
+            }) };
+            TelemetryCommand::FillWithRecording { origin: captured.bind(authority, None) }
+        } else { command };
+        if queue_gpio_command(
+            &tx,
+            generation,
+            plumbing_origin,
+            launch_revision,
+            command,
+        )
+        .is_err()
         {
             eprintln!("GPIO button pin {pin}: failed to send command");
         }
+
+        });
     })?;
     Ok(())
 }
@@ -695,7 +796,7 @@ fn error_blink_pulse(phase_ms: u64, offset_ms: u64) -> Option<f64> {
 fn is_input_enabled(gpio: &crate::gpio::GpioPins, pin: u8) -> bool {
     #[cfg(feature = "raspberry_pi")]
     {
-        return gpio.read_input_pin(pin).unwrap_or(false);
+        gpio.read_input_pin(pin).unwrap_or(false)
     }
 
     #[cfg(not(feature = "raspberry_pi"))]
@@ -754,6 +855,87 @@ fn set_binary_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn physical_abort_is_retained_when_ordinary_queue_is_full_or_closed() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(TelemetryCommand::Postinit).unwrap();
+        let intent = crate::manual_abort_intent::ManualAbortIntent::default();
+        // Exercise the production edge dispatcher, not a substitute channel.
+        *LAST_ABORT_DISPATCH.lock().unwrap() = None;
+        dispatch_gpio_abort(&intent, "test edge");
+        assert_eq!(intent.pending_epoch(), Some(1));
+        assert!(matches!(rx.try_recv(), Ok(TelemetryCommand::Postinit)));
+        drop(rx);
+        *LAST_ABORT_DISPATCH.lock().unwrap() = None;
+        dispatch_gpio_abort(&intent, "test closed channel");
+        assert_eq!(intent.pending_epoch(), Some(2));
+    }
+
+    #[test]
+    fn physical_abort_debounce_uses_elapsed_time_and_does_not_slide_on_bounce() {
+        let start = Instant::now();
+        let mut last = None;
+        assert!(admit_abort_edge(&mut last, start));
+        assert!(!admit_abort_edge(
+            &mut last,
+            start + Duration::from_millis(249)
+        ));
+        assert!(admit_abort_edge(
+            &mut last,
+            start + Duration::from_millis(250)
+        ));
+        // No wall-clock or network UTC value participates in this decision.
+        assert!(!admit_abort_edge(
+            &mut last,
+            start + Duration::from_millis(251)
+        ));
+        assert!(admit_abort_edge(
+            &mut last,
+            start + Duration::from_millis(500)
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_physical_launch_and_valve_intents_do_not_cross_reset_generation() {
+        let state = crate::state::tests::test_app_state().await;
+        let (tx, mut rx) = mpsc::channel(4);
+        let generation = crate::gse::automatic_generation(&state);
+        queue_gpio_command(&tx, generation, None, Some(0), TelemetryCommand::Launch).unwrap();
+        queue_gpio_command(&tx, generation, None, None, TelemetryCommand::Nitrogen).unwrap();
+        // The actual command-worker lease checks the token after reset; this
+        // test isolates physical admission, without issuing a board reset.
+        state
+            .automatic_generation
+            .store(generation + 1, Ordering::Release);
+        for expected in [TelemetryCommand::Launch, TelemetryCommand::Nitrogen] {
+            let TelemetryCommand::QueuedOperator {
+                generation: captured,
+                command,
+                ..
+            } = rx.try_recv().unwrap()
+            else {
+                panic!("physical command must retain its admission generation");
+            };
+            assert_eq!(
+                std::mem::discriminant(&*command),
+                std::mem::discriminant(&expected)
+            );
+            assert!(crate::gse::claim_operator_dispatch(&state, captured).is_none());
+        }
+        queue_gpio_command(
+            &tx,
+            crate::gse::automatic_generation(&state),
+            None,
+            None,
+            TelemetryCommand::Postinit,
+        )
+        .unwrap();
+        let TelemetryCommand::QueuedOperator { generation, .. } = rx.try_recv().unwrap() else {
+            panic!("expected operator envelope");
+        };
+        assert!(crate::gse::claim_operator_dispatch(&state, generation).is_some());
+    }
+
     #[tokio::test]
     async fn panel_mirror_tracks_grouped_and_manual_button_meanings() {
         let state = crate::state::tests::test_app_state().await;
@@ -784,5 +966,101 @@ mod tests {
             assert_eq!(controls[5]["action"], "QD retract");
             assert_eq!(controls[8]["command"], "Abort");
         }
+    }
+}
+
+#[cfg(all(test, not(feature = "raspberry_pi")))]
+mod fill_recording_tests {
+    use super::*;
+    #[tokio::test]
+    async fn actual_grouped_gpio_callback_queue_rechecks_key_and_never_logs_manual_nitrous() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "actual_grouped_gpio_callback_queue_rechecks_key_and_never_logs_manual_nitrous",
+        ) {
+            return;
+        }
+        let f = crate::fill_recording::tests::Fixture::new_phase(true, gse_sequence::Phase::Paused)
+            .await;
+        f.state.gse.lock().unwrap().engine.config.grouped_panel = true;
+        let allowed = Arc::new(Mutex::new(AllowedActions {
+            nitrous: true,
+            ..Default::default()
+        }));
+        let (tx, mut rx) = mpsc::channel(4);
+        f.state
+            .gpio
+            .setup_input_pin(NITROUS_TANK_VALVE_PIN)
+            .unwrap();
+        f.state
+            .gpio
+            .set_input_for_test(ALL_BUTTONS_ENABLE_PIN, true);
+        setup_button_callback(
+            f.state.clone(),
+            f.state.gpio.clone(),
+            allowed.clone(),
+            tx,
+            NITROUS_TANK_VALVE_PIN,
+            |a| a.nitrous,
+            TelemetryCommand::Nitrous,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        f.state
+            .gpio
+            .trigger_input_for_test(NITROUS_TANK_VALVE_PIN, true);
+        let old = rx.recv().await.unwrap();
+        let (arrived, release) =
+            crate::telemetry_task::recording_owner::test_hooks::hold_after_open(&f.state);
+        assert!(crate::fill_recording::dispatch_queued(&f.state, &old));
+        tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(2)).unwrap())
+            .await
+            .unwrap();
+        allowed.lock().unwrap().nitrous = false;
+        release.send(()).unwrap();
+        for _ in 0..100 {
+            if f.files().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(f.files().is_empty());
+        f.pump();
+        assert!(f.sent.lock().unwrap().is_empty());
+        allowed.lock().unwrap().nitrous = true;
+        // Reviving the policy cannot revive this canceled original edge.
+        assert!(crate::fill_recording::dispatch_queued(&f.state, &old));
+        tokio::time::sleep(Duration::from_millis(55)).await;
+        assert!(f.files().is_empty());
+        f.state
+            .gpio
+            .trigger_input_for_test(NITROUS_TANK_VALVE_PIN, true);
+        assert!(crate::fill_recording::dispatch_queued(
+            &f.state,
+            &rx.recv().await.unwrap()
+        ));
+        for _ in 0..100 {
+            if f.state.recording_status_snapshot().mode
+                == crate::telemetry_db::RecordingModeWire::Recording
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(f.files().len(), 1);
+        f.pump();
+        assert!(f.sent.lock().unwrap().is_empty());
+        let path = f.state.recording_status_snapshot().db_path;
+        f.state.gse.lock().unwrap().engine.config.grouped_panel = false;
+        f.state
+            .gpio
+            .trigger_input_for_test(NITROUS_TANK_VALVE_PIN, true);
+        let manual = rx.recv().await.unwrap();
+        assert!(
+            matches!(&manual, TelemetryCommand::QueuedOperator {command,..} if matches!(command.as_ref(),TelemetryCommand::Nitrous))
+        );
+        assert!(!crate::fill_recording::dispatch_queued(&f.state, &manual));
+        assert_eq!(f.state.recording_status_snapshot().db_path, path);
+        assert_eq!(f.files().len(), 1);
     }
 }

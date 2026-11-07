@@ -36,9 +36,9 @@ def warn_if_db_sidecars_present(repo_root: Path) -> None:
         )
 
 
-def run(cmd: list[str], cwd: Path) -> None:
+def run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
     print(f"Running: {' '.join(cmd)} (cwd={cwd})")
-    proc = subprocess.Popen(cmd, cwd=cwd)
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env)
     code: int
     try:
         code = proc.wait()
@@ -86,9 +86,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=["testing", "hitl-mode", "test-fire-mode", "debug"],
+        choices=["testing", "hitl-mode", "test-fire-mode", "flight-sim", "debug"],
         help="Legacy positional mode. Use 'testing', 'hitl-mode', 'test-fire-mode', or 'debug'.",
     )
+    parser.add_argument("--flight-sim", action="store_true", help="Run isolated FlightSim models; no physical transports or outputs.")
+    parser.add_argument("--flight-sim-users", type=Path, help="Explicit read-only users.json snapshot for this isolated session; sessions/proofs are never copied.")
+    parser.add_argument("--flight-sim-data-dir", type=Path, help="Parent for fresh isolated FlightSim sessions (existing sessions are never reused).")
     parser.add_argument(
         "--testing",
         action="store_true",
@@ -125,22 +128,29 @@ def main() -> None:
     args = parse_args()
     if args.rrls:
         os.environ["GS_RRLS_ROLE"] = "rrls"
+    flight_sim_mode = args.flight_sim or args.mode == "flight-sim"
     testing_mode = args.testing or args.mode == "testing"
     hitl_mode = args.hitl_mode or args.mode == "hitl-mode"
     test_fire_mode = args.test_fire_mode or args.mode == "test-fire-mode"
     debug_mode = args.debug or args.mode == "debug"
-    if sum([testing_mode, hitl_mode, test_fire_mode]) > 1:
-        print("Error: testing mode, hitl-mode, and test-fire-mode are mutually exclusive.", file=sys.stderr)
+    if sum([testing_mode, hitl_mode, test_fire_mode, flight_sim_mode]) > 1:
+        print("Error: testing, hitl-mode, test-fire-mode, and flight-sim are mutually exclusive.", file=sys.stderr)
         sys.exit(2)
 
+    if flight_sim_mode and args.rrls:
+        raise ValueError("FlightSim cannot run as RRLS or proxy physical commands")
+    if args.flight_sim_users and not flight_sim_mode:
+        raise ValueError("--flight-sim-users requires --flight-sim")
+    if args.flight_sim_data_dir and not flight_sim_mode:
+        raise ValueError("--flight-sim-data-dir requires --flight-sim")
     cmd = ["cargo", "run"]
     if not debug_mode:
         cmd.append("--release")
     cmd.extend(["-p", "groundstation_backend"])
     features: list[str] = []
-    if is_raspberry_pi() and not args.rrls:
+    if is_raspberry_pi() and not args.rrls and not flight_sim_mode:
         features.append("raspberry_pi")
-    if testing_mode:
+    if testing_mode or flight_sim_mode:
         features.append("testing")
     if hitl_mode:
         features.append("hitl_mode")
@@ -162,7 +172,16 @@ def main() -> None:
     prepare_browser_asset_source(repo_root, frontend_dev=args.frontend_dev, refresh=False)
     try:
         refresh_sedsnet_dependency(repo_root)
-        run(cmd, cwd=repo_root)
+        if flight_sim_mode:
+            from flight_sim_runtime import prepare_environment
+            root, env = prepare_environment(args.flight_sim_data_dir or Path.home() / ".groundstation26" / "flight_sim", dict(os.environ), repo_root / "frontend/dist/public", args.flight_sim_users)
+            cmd.extend(["--manifest-path", str(repo_root / "Cargo.toml")])
+            print(f"FlightSim — SIMULATED OUTPUTS; isolated session: {root}")
+            if not args.flight_sim_users:
+                print(f"Accounts are isolated. Provision with: {sys.executable} {repo_root / 'backend/tools/users_config_tui.py'} --file {root / 'users/users.json'}")
+            run(cmd, cwd=root, env=env)
+        else:
+            run(cmd, cwd=repo_root)
     except subprocess.CalledProcessError as e:
         print("Backend exited with error.", file=sys.stderr)
         sys.exit(e.returncode)

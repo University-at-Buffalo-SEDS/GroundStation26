@@ -9,6 +9,35 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+// One durable desired revision, not a periodic route/clock refresh. An older
+// in-flight submission must never clear or replace a newer T0/reset request.
+#[derive(Default)]
+struct PendingDaqClock {
+    desired: Option<([u64; 2], u64)>,
+    highest_revision: u64,
+}
+impl PendingDaqClock {
+    fn record(&mut self, pair: [u64; 2], revision: u64) {
+        if revision >= self.highest_revision {
+            self.highest_revision = revision;
+            self.desired = Some((pair, revision));
+        }
+    }
+    fn accepted(&mut self, snapshot: ([u64; 2], u64)) {
+        if self.desired == Some(snapshot) {
+            self.desired = None;
+        }
+    }
+}
+static PENDING_DAQ_CLOCK: Mutex<PendingDaqClock> = Mutex::new(PendingDaqClock {
+    desired: None,
+    highest_revision: 0,
+});
+static DAQ_CLOCK_RETRY_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static DAQ_CLOCK_RETRY_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 const DEFAULT_CACHE_PATH: &str = "backend/data/network_variables.json";
 const UNDERGLOW_TYPE: &str = "AV_BAY_UNDERGLOW";
 const FLIGHT_BUZZER_TYPE: &str = "FLIGHT_BUZZER";
@@ -24,8 +53,13 @@ struct PersistentVariables {
     flight_buzzer: bool,
     #[serde(default)]
     flight_state: u8,
+    /// Original network timestamp; zero denotes an unknown legacy origin.
+    #[serde(default)]
+    flight_state_stamp: u64,
     #[serde(default)]
     daq_log_clock: [u64; 2],
+    #[serde(default)]
+    daq_log_clock_stamp: u64,
     #[serde(default)]
     daq_log_last_session: u64,
 }
@@ -34,6 +68,8 @@ struct VariableStore {
     path: PathBuf,
     values: PersistentVariables,
     durable: bool,
+    revision: u64,
+    automatic_idle: Option<AutomaticLiveIdentity>,
 }
 
 impl VariableStore {
@@ -43,10 +79,15 @@ impl VariableStore {
             path,
             values: persisted.unwrap_or_else(default_values),
             durable: persisted.is_some(),
+            revision: 1,
+            automatic_idle: None,
         }
     }
 
     fn commit(&mut self, values: PersistentVariables) -> Result<()> {
+        // Mutation identity is cancellation only. Exhaustion retires ordinary
+        // automatic publication, never existing critical durable writers.
+        self.revision = self.revision.saturating_add(1);
         if self.durable && self.values == values {
             return Ok(());
         }
@@ -54,6 +95,106 @@ impl VariableStore {
         self.values = values;
         self.durable = true;
         Ok(())
+    }
+    fn commit_flight_state(&mut self, values: PersistentVariables) -> Result<()> {
+        self.commit(values)?;
+        self.automatic_idle = None;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AutomaticIdleSnapshot {
+    revision: u64,
+    state: u8,
+    stamp: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AutomaticIdleIdentity {
+    pub(crate) packet_id: u64,
+    pub(crate) timestamp: u64,
+    pub(crate) generation: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutomaticLiveIdentity {
+    Idle(AutomaticIdleIdentity),
+    Phase(AutomaticPhaseIdentity),
+}
+impl AutomaticLiveIdentity {
+    fn original(self) -> AutomaticIdleIdentity {
+        match self { Self::Idle(identity) => identity, Self::Phase(identity) => identity.original }
+    }
+    fn phase(self) -> u8 { match self { Self::Idle(_) => 1, Self::Phase(identity) => identity.phase } }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AutomaticPhaseIdentity {
+    pub(crate) original: AutomaticIdleIdentity,
+    pub(crate) phase: u8,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct AutomaticPhaseSnapshot {
+    revision: u64,
+    state: u8,
+    stamp: u64,
+    live: Option<AutomaticLiveIdentity>,
+}
+pub(crate) fn capture_automatic_phase_store(expected: u8, generation: u64) -> Option<AutomaticPhaseSnapshot> {
+    let guard = STORE.get()?.try_lock().ok()?;
+    if guard.revision >= u64::MAX - 1 || expected > 6 || guard.values.flight_state > 6
+        || guard.automatic_idle.is_some_and(|live| live.phase() != expected || live.original().generation != generation) {
+        return None;
+    }
+    Some(AutomaticPhaseSnapshot { revision: guard.revision, state: guard.values.flight_state,
+        stamp: guard.values.flight_state_stamp, live: guard.automatic_idle })
+}
+pub(crate) fn automatic_phase_packet(router: &Router, phase: u8) -> Result<Packet> {
+    anyhow::ensure!((1..=6).contains(&phase), "invalid automatic prelaunch phase");
+    let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
+    packet_bytes_at(FLIGHT_STATE_TYPE, "FLIGHT_STATE", Arc::from([phase]), timestamp)
+}
+pub(crate) struct AutomaticIdleStoreGuard<'a>(std::sync::MutexGuard<'a, VariableStore>);
+impl AutomaticIdleStoreGuard<'_> {
+    pub(crate) fn matches_phase(&self, expected: AutomaticPhaseSnapshot) -> bool {
+        expected.revision < u64::MAX - 1 && self.0.revision == expected.revision
+            && (self.0.values.flight_state, self.0.values.flight_state_stamp) == (expected.state, expected.stamp)
+            && self.0.automatic_idle == expected.live
+    }
+    pub(crate) fn admitted_phase(&mut self, identity: AutomaticPhaseIdentity) {
+        self.0.revision += 1; // prevalidated by matches_phase; never wrap/allocate
+        self.0.automatic_idle = Some(AutomaticLiveIdentity::Phase(identity));
+    }
+
+    pub(crate) fn matches(&self, expected: AutomaticIdleSnapshot) -> bool {
+        expected.revision != u64::MAX && self.0.revision == expected.revision
+            && (self.0.values.flight_state, self.0.values.flight_state_stamp) == (expected.state, expected.stamp)
+            && expected.state == 0 && self.0.automatic_idle.is_none()
+    }
+    pub(crate) fn admitted(&mut self, identity: AutomaticIdleIdentity) {
+        self.0.revision = self.0.revision.saturating_add(1);
+        self.0.automatic_idle = Some(AutomaticLiveIdentity::Idle(identity));
+    }
+}
+pub(crate) fn capture_automatic_idle_store() -> Option<AutomaticIdleSnapshot> {
+    // Main initializes STORE before constructing AppState/workers. Missing
+    // initialization is not permission to perform file IO in event capture.
+    let guard = STORE.get()?.lock().ok()?;
+    (guard.revision != u64::MAX && guard.values.flight_state == 0 && guard.automatic_idle.is_none()).then_some(AutomaticIdleSnapshot {
+        revision: guard.revision, state: guard.values.flight_state, stamp: guard.values.flight_state_stamp,
+    })
+}
+pub(crate) fn try_automatic_idle_store() -> Option<AutomaticIdleStoreGuard<'static>> {
+    STORE.get()?.try_lock().ok().map(AutomaticIdleStoreGuard)
+}
+pub(crate) fn automatic_idle_packet(router: &Router) -> Result<Packet> {
+    let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
+    packet_bytes_at(FLIGHT_STATE_TYPE, "FLIGHT_STATE", Arc::from([1u8]), timestamp)
+}
+pub(crate) fn automatic_idle_batch_limits() -> sedsnet::router::ManagedBatchPreparationLimits {
+    // Nine actual registered variables, one original, and a complete registry
+    // headroom. No runtime growth/reservation or fallback admission.
+    sedsnet::router::ManagedBatchPreparationLimits {
+        max_batch_packets: 1, max_snapshot_types: 19, max_snapshot_entries: 19,
+        max_original_payload_bytes: 1, max_snapshot_logical_bytes: 1024 * 1024,
     }
 }
 
@@ -116,6 +257,8 @@ fn default_values() -> PersistentVariables {
             .filter(|value| *value <= 15)
             .unwrap_or(0),
         daq_log_clock: [0, 0],
+        flight_state_stamp: 0,
+        daq_log_clock_stamp: 0,
         daq_log_last_session: 0,
     }
 }
@@ -146,11 +289,20 @@ fn packet(data_type: &str, endpoint: &str, value: u8) -> Result<Packet> {
 }
 
 fn packet_bytes(data_type: &str, endpoint: &str, payload: Arc<[u8]>) -> Result<Packet> {
+    packet_bytes_at(data_type, endpoint, payload, get_current_timestamp_ms())
+}
+
+fn packet_bytes_at(
+    data_type: &str,
+    endpoint: &str,
+    payload: Arc<[u8]>,
+    timestamp: u64,
+) -> Result<Packet> {
     Ok(Packet::new(
         crate::telemetry_schema::data_type(data_type),
         &[crate::telemetry_schema::endpoint(endpoint)],
         Board::GroundStation.sender_id(),
-        get_current_timestamp_ms(),
+        timestamp,
         payload,
     )?
     .with_nonce(NETWORK_VARIABLE_NONCE.fetch_add(1, Ordering::Relaxed)))
@@ -160,7 +312,22 @@ pub fn initialize(router: &Router) -> Result<()> {
     initialize_for_role(router, crate::rrls::is_rrls())
 }
 
+/// Production bootstrap respects restored durable recovery closure. Register
+/// services without synthesizing any cache/default write while CLOSED. An
+/// ordinary open bootstrap owns the same actual producer lease through IO/SDK.
+pub fn initialize_for_state(state: &crate::state::AppState, router: &Router) -> Result<()> {
+    let claim = crate::gse::capture_operator_origin(state)
+        .and_then(|generation| crate::gse::claim_operator_dispatch(state, generation));
+    if claim.is_some() {
+        initialize(router)
+    } else {
+        initialize_for_role_seed(router, crate::rrls::is_rrls(), false)
+    }
+}
 fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
+    initialize_for_role_seed(router, observer, true)
+}
+fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Result<()> {
     for data_type in [
         UNDERGLOW_TYPE,
         FLIGHT_BUZZER_TYPE,
@@ -183,7 +350,16 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
     }
     router.on_network_variable_update(
         crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE),
-        |packet| {
+        move |packet| {
+            // A per-board state report is not a write of the host's aggregate
+            // desired state. SDK cache refreshes retain its original provenance;
+            // only the authority's source can reach our durable GS seed.
+            if !matches!(
+                crate::types::canonical_sender_id(packet.sender()),
+                "GS" | "FC"
+            ) {
+                return Ok(());
+            }
             let state =
                 packet
                     .payload()
@@ -197,12 +373,30 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
                     "out-of-range flight-state network variable",
                 ));
             }
+            if !observer && crate::types::canonical_sender_id(packet.sender()) == "GS" {
+                // Explicit local publishers own their local/durable transition.
+                // A reflected original packet is telemetry, never fresh intent.
+                return Ok(());
+            }
+            if crate::types::canonical_sender_id(packet.sender()) == "FC" && state == 15 {
+                return Ok(());
+            }
             let mut guard = store()
                 .lock()
                 .expect("network-variable store lock poisoned");
+            if crate::types::canonical_sender_id(packet.sender()) == "FC"
+                && (state == 15
+                    || guard.values.flight_state == 15
+                    || (matches!(guard.values.flight_state, 7..=14) && state <= 6))
+            {
+                return Ok(());
+            }
             let mut next = guard.values;
+            if next.flight_state != state || next.flight_state_stamp == 0 {
+                next.flight_state_stamp = packet.timestamp();
+            }
             next.flight_state = state;
-            guard.commit(next).map_err(|err| {
+            guard.commit_flight_state(next).map_err(|err| {
                 log::warn!("failed to persist inbound flight-state network variable: {err}");
                 sedsnet::TelemetryError::HandlerError(
                     "persist inbound flight-state network variable",
@@ -213,14 +407,17 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
     // RRLS receives the primary's values. Seeding its local disk defaults as
     // GS-owned packets creates competing managed-variable refresh traffic,
     // even though the recovery transport ultimately discards those packets.
-    if observer {
+    if observer || !seed {
         return Ok(());
     }
     {
         let mut guard = store()
             .lock()
             .expect("network-variable store lock poisoned");
-        if !guard.path.exists() {
+        if guard.values.daq_log_clock_stamp == 0 {
+            let pair = guard.values.daq_log_clock;
+            commit_daq_clock_pair(&mut guard, pair, get_current_timestamp_ms())?;
+        } else if !guard.path.exists() {
             persist(&guard.path, guard.values)?;
             guard.durable = true;
         }
@@ -235,7 +432,11 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
         "FLIGHT_CONTROLLER",
         u8::from(flight_buzzer_enabled()),
     )?)?;
-    router.seed_managed_variable(packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", flight_state())?)?;
+    // Retained Launch is history, never a fresh launch intent on restart.
+    // Unknown board proofs and partial admission must not execute it again.
+    if let Some(packet) = retained_non_launch_packet()? {
+        router.seed_managed_variable(packet)?;
+    }
     let selected = crate::loadcell::load_or_default();
     router.seed_managed_variable(packet(
         "DAQ_KG50_INPUT",
@@ -249,6 +450,20 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
     router.seed_managed_variable(thermal_packet(&calibration)?)?;
     router.seed_managed_variable(filter_packet(&calibration)?)?;
     Ok(())
+}
+
+pub fn publish_bootstrap_for_state(
+    state: &crate::state::AppState,
+    router: &Router,
+) -> Result<bool> {
+    let Some(generation) = crate::gse::capture_operator_origin(state) else {
+        return Ok(false);
+    };
+    let Some(_claim) = crate::gse::claim_operator_dispatch(state, generation) else {
+        return Ok(false);
+    };
+    publish_current(router)?;
+    Ok(true)
 }
 
 pub fn publish_current(router: &Router) -> Result<()> {
@@ -269,10 +484,9 @@ pub fn publish_current(router: &Router) -> Result<()> {
             u8::from(flight_buzzer_enabled()),
         )?,
     )?;
-    request.submit(
-        router,
-        packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", flight_state())?,
-    )?;
+    if let Some(packet) = retained_non_launch_packet()? {
+        request.submit(router, packet)?;
+    }
     set_daq_calibration(router, &crate::loadcell::load_or_default())?;
     request.submit(router, cached_daq_log_clock_packet()?)?;
     Ok(())
@@ -328,16 +542,141 @@ pub fn set_flight_buzzer(router: &Router, enabled: bool) -> Result<()> {
 pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
     let request = crate::qualification_requests::Request::begin("set_flight_state");
     anyhow::ensure!(state <= 15, "invalid flight-state value {state}");
+    let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
+    let packet = packet_bytes_at(
+        FLIGHT_STATE_TYPE,
+        "FLIGHT_STATE",
+        Arc::from([state]),
+        timestamp,
+    )?;
     {
         let mut guard = store()
             .lock()
             .expect("network-variable store lock poisoned");
         let mut next = guard.values;
         next.flight_state = state;
-        guard.commit(next)?;
+        next.flight_state_stamp = timestamp;
+        #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+        crate::telemetry_task::flight_state_timeline::event(router, "durable_commit_start", state, Some(packet.packet_id()), Some(timestamp), None);
+        #[cfg(all(test, feature="test_fire_mode"))]
+        crate::recovery_pending_probe::before_state_commit(state);
+        let committed = guard.commit_flight_state(next);
+        #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+        crate::telemetry_task::flight_state_timeline::event(router, "durable_commit_end", state, Some(packet.packet_id()), Some(timestamp), Some(committed.is_ok()));
+        committed?;
     }
-    request.submit(router, packet(FLIGHT_STATE_TYPE, "FLIGHT_STATE", state)?)?;
+    #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+    crate::telemetry_task::flight_state_timeline::event(router, "sdk_submit_start", state, Some(packet.packet_id()), Some(timestamp), None);
+    #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+    let submitted_packet_id = packet.packet_id();
+    let submitted = request.submit(router, packet);
+    #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+    crate::telemetry_task::flight_state_timeline::detail(router, "sdk_submit_end", state, Some(submitted_packet_id), Some(timestamp), Some(submitted.is_ok()), Some(format!("{submitted:?}")));
+    submitted?;
     Ok(())
+}
+
+/// Pure launch preparation. No desired state, file, managed cache or SDK owner
+/// is changed until the caller wins its original Stop/board admission boundary.
+#[cfg_attr(test, derive(Clone))]
+pub(crate) struct PreparedLaunchState {
+    pub(crate) packet: Packet,
+    expected: (u8, u64),
+}
+pub(crate) fn prepare_launch_state(router: &Router) -> Result<PreparedLaunchState> {
+    let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
+    let packet = packet_bytes_at(
+        FLIGHT_STATE_TYPE,
+        "FLIGHT_STATE",
+        Arc::from([7u8]),
+        timestamp,
+    )?;
+    let guard = store()
+        .lock()
+        .expect("network-variable store lock poisoned");
+    Ok(PreparedLaunchState {
+        packet,
+        expected: (guard.values.flight_state, guard.values.flight_state_stamp),
+    })
+}
+/// Post-admission CAS. Never overwrite a later reset/Abort desired revision.
+/// No packet is submitted here: its EXACT original packet already owns SDK work.
+pub(crate) fn commit_admitted_launch(prepared: &PreparedLaunchState) -> Result<()> {
+    let mut guard = store()
+        .lock()
+        .expect("network-variable store lock poisoned");
+    if guard.durable
+        && guard.values.flight_state == 7
+        && guard.values.flight_state_stamp == prepared.packet.timestamp()
+    {
+        // The real SDK managed callback may have durably consumed this exact
+        // admitted packet first. Do not rewrite, enqueue, or freshen its stamp.
+        return Ok(());
+    }
+    anyhow::ensure!(
+        (guard.values.flight_state, guard.values.flight_state_stamp) == prepared.expected,
+        "Desired flight state changed after launch preparation; admitted launch is uncertain, explicit recovery required"
+    );
+    let mut next = guard.values;
+    next.flight_state = 7;
+    next.flight_state_stamp = prepared.packet.timestamp();
+    guard.commit_flight_state(next)
+}
+
+/// Coordinator-only staging: disk IO is outside DISPATCH/Stop/SDK locks.
+/// The owner must subsequently admit this EXACT packet under its original
+/// Stop fence and require fresh actual board readbacks before reopening.
+pub(crate) fn operator_phase_packet(router:&Router,phase:u8)->Result<Packet> {
+    anyhow::ensure!(matches!(crate::types::u8_to_flight_state(phase),Some(crate::types::FlightState::Startup|crate::types::FlightState::Idle|crate::types::FlightState::PreFill|crate::types::FlightState::FillTest|crate::types::FlightState::NitrogenFill|crate::types::FlightState::NitrousFill|crate::types::FlightState::Armed)),"Operator phase cannot enter Fire or flight");
+    packet_bytes_at(FLIGHT_STATE_TYPE,"FLIGHT_STATE",Arc::from([phase]),crate::system_clock::required_control_network_utc_ms(router)?)
+}
+
+pub(crate) fn prepare_verified_recovery_startup(router: &Router) -> Result<Packet> {
+    let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
+    let packet = packet_bytes_at(
+        FLIGHT_STATE_TYPE,
+        "FLIGHT_STATE",
+        Arc::from([0u8]),
+        timestamp,
+    )?;
+    let mut guard = store()
+        .lock()
+        .expect("network-variable store lock poisoned");
+    let mut next = guard.values;
+    next.flight_state = 0;
+    next.flight_state_stamp = timestamp;
+    guard.commit_flight_state(next)?;
+    Ok(packet)
+}
+
+fn retained_non_launch_packet() -> Result<Option<Packet>> {
+    let guard = store()
+        .lock()
+        .expect("network-variable store lock poisoned");
+    // Unknown-origin defaults and legacy records are history, not a newly
+    // observed authority state. Keep them on disk without publishing UTC zero
+    // or minting a fresh operator intent during bootstrap/route refresh.
+    if let Some(identity) = guard.automatic_idle {
+        // Only the SDK owns this live exact original. Never replace it by the
+        // older durable Startup seed, or manufacture a retained auto revision.
+        let identity = identity.original();
+        let _ = (identity.packet_id, identity.timestamp, identity.generation);
+        return Ok(None);
+    }
+    if guard.values.flight_state == 7 || guard.values.flight_state_stamp == 0 {
+        return Ok(None);
+    }
+    Ok(Some(flight_state_packet(guard.values)?))
+}
+
+fn flight_state_packet(values: PersistentVariables) -> Result<Packet> {
+    // Reconnect must not make a retained Abort newer than a recovery cutoff.
+    packet_bytes_at(
+        FLIGHT_STATE_TYPE,
+        "FLIGHT_STATE",
+        Arc::from([values.flight_state]),
+        values.flight_state_stamp,
+    )
 }
 
 fn filter_packet(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Result<Packet> {
@@ -437,7 +776,7 @@ fn daq_log_clock_payload(
         let deadline = network_now
             .saturating_add(anchor.saturating_sub(launch_now))
             .saturating_add(countdown)
-            .saturating_add(120_000);
+            .saturating_add(20_000);
         anyhow::ensure!(
             (315_532_800_000..4_354_819_200_000).contains(&deadline),
             "Set GroundStation/network UTC before timestamped DAQ launch logging"
@@ -452,16 +791,90 @@ fn daq_log_clock_payload(
     Ok([session.to_le_bytes(), deadline.to_le_bytes()].concat())
 }
 
+fn daq_log_clock_packet(pair: [u64; 2], stamp: u64) -> Result<Packet> {
+    Ok(Packet::new(
+        crate::telemetry_schema::data_type("DAQ_LOG_CLOCK"),
+        &[crate::telemetry_schema::endpoint("SD_CARD")],
+        Board::GroundStation.sender_id(),
+        stamp,
+        Arc::<[u8]>::from([pair[0].to_le_bytes(), pair[1].to_le_bytes()].concat()),
+    )?
+    .with_nonce(NETWORK_VARIABLE_NONCE.fetch_add(1, Ordering::Relaxed)))
+}
+
+/* A control revision, independent of UTC corrections. Commit it atomically
+ * with the unchanged16-byte value; replays must never create a new revision. */
+fn commit_daq_clock_pair(guard: &mut VariableStore, pair: [u64; 2], wall_ms: u64) -> Result<u64> {
+    let mut next = guard.values;
+    if next.daq_log_clock != pair || next.daq_log_clock_stamp == 0 {
+        next.daq_log_clock_stamp = next
+            .daq_log_clock_stamp
+            .checked_add(1)
+            .context("DAQ launch-clock revision exhausted")?
+            .max(wall_ms);
+    }
+    next.daq_log_clock = pair;
+    next.daq_log_last_session = next.daq_log_last_session.max(pair[0]);
+    guard.commit(next)?;
+    Ok(next.daq_log_clock_stamp)
+}
+
 fn cached_daq_log_clock_packet() -> Result<Packet> {
     let values = store()
         .lock()
         .expect("network-variable store lock poisoned")
-        .values
-        .daq_log_clock;
-    packet_bytes(
-        "DAQ_LOG_CLOCK",
-        "SD_CARD",
-        Arc::from([values[0].to_le_bytes(), values[1].to_le_bytes()].concat()),
+        .values;
+    daq_log_clock_packet(values.daq_log_clock, values.daq_log_clock_stamp)
+}
+
+/// Exact retained payload/revision for the launch-clock journal. No disk I/O.
+pub fn persisted_daq_log_clock_with_revision() -> Option<([u64; 2], u64)> {
+    let values = store()
+        .lock()
+        .expect("network-variable store lock poisoned")
+        .values;
+    (values.daq_log_clock_stamp != 0).then_some((values.daq_log_clock, values.daq_log_clock_stamp))
+}
+
+fn restore_daq_clock_snapshot(
+    guard: &mut VariableStore,
+    pair: [u64; 2],
+    stamp: u64,
+) -> Result<bool> {
+    anyhow::ensure!(
+        stamp != 0
+            && ((pair[0] == 0 && pair[1] == 0)
+                || (pair[0] != 0 && (315_532_800_000..4_354_819_200_000).contains(&pair[1]))),
+        "Invalid retained DAQ launch-clock snapshot"
+    );
+    if guard.values.daq_log_clock_stamp != 0 {
+        anyhow::ensure!(
+            guard.values.daq_log_clock == pair && guard.values.daq_log_clock_stamp == stamp,
+            "Existing DAQ launch-clock revision differs from the journal"
+        );
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        guard.values.daq_log_clock == [0, 0] || guard.values.daq_log_clock == pair,
+        "Legacy DAQ launch-clock value differs from the journal"
+    );
+    let mut next = guard.values;
+    next.daq_log_clock = pair;
+    next.daq_log_clock_stamp = stamp;
+    next.daq_log_last_session = next.daq_log_last_session.max(pair[0]);
+    guard.commit(next)?;
+    Ok(true)
+}
+
+/// Restore only a missing/unstamped matching cache. Preserve the literal stamp;
+/// never refresh it from wall time, publish, or roll back a conflicting revision.
+pub fn restore_persisted_daq_log_clock_snapshot(pair: [u64; 2], stamp: u64) -> Result<bool> {
+    restore_daq_clock_snapshot(
+        &mut store()
+            .lock()
+            .expect("network-variable store lock poisoned"),
+        pair,
+        stamp,
     )
 }
 
@@ -494,25 +907,55 @@ pub fn set_daq_log_clock(
     );
 
     let payload = daq_log_clock_payload(session, clock, launch_now, network_now)?;
-    // Preserve the absolute deadline, not a fresh countdown on service restart.
-    // Drop the disk-cache lock before entering SEDSNet (callbacks may use it).
-    {
+    // Body and revision share one durable cache commit. UTC rollback and
+    // primary restart cannot make an older launch/T0/reset appear newer.
+    let pair = [
+        u64::from_le_bytes(payload[..8].try_into().unwrap()),
+        u64::from_le_bytes(payload[8..].try_into().unwrap()),
+    ];
+    let stamp = {
         let mut guard = store()
             .lock()
             .expect("network-variable store lock poisoned");
-        let mut next = guard.values;
-        next.daq_log_clock = [
-            u64::from_le_bytes(payload[..8].try_into().unwrap()),
-            u64::from_le_bytes(payload[8..].try_into().unwrap()),
-        ];
-        next.daq_log_last_session = next.daq_log_last_session.max(session);
-        guard.commit(next)?;
-    }
-    request.submit(
-        router,
-        packet_bytes("DAQ_LOG_CLOCK", "SD_CARD", Arc::from(payload))?,
-    )?;
+        let revision = commit_daq_clock_pair(&mut guard, pair, get_current_timestamp_ms())?;
+        // Publish ordering follows the durable commit; no SDK lock is taken
+        // while holding either application lock.
+        PENDING_DAQ_CLOCK.lock().unwrap().record(pair, revision);
+        revision
+    };
+    request.submit(router, daq_log_clock_packet(pair, stamp)?)?;
+    PENDING_DAQ_CLOCK.lock().unwrap().accepted((pair, stamp));
+    DAQ_CLOCK_RETRY_WARNED.store(false, Ordering::Relaxed);
     Ok(())
+}
+
+/// Retry only an unadmitted durable revision. Keep its original deadline/stamp.
+/// Once admitted, SDK reliable delivery and managed reconnect replay own it.
+/// Returns true only when an outstanding snapshot was admitted this call.
+fn retry_pending_daq_log_clock(router: &Router) -> Result<bool> {
+    if crate::rrls::is_rrls() || router.sender().as_ref() != "GS" {
+        return Ok(false);
+    }
+    let Some((pair, stamp)) = PENDING_DAQ_CLOCK.lock().unwrap().desired else {
+        return Ok(false);
+    };
+    let request = crate::qualification_requests::Request::begin("retry_pending_daq_log_clock");
+    match request.submit(router, daq_log_clock_packet(pair, stamp)?) {
+        Ok(()) => {
+            PENDING_DAQ_CLOCK.lock().unwrap().accepted((pair, stamp));
+            DAQ_CLOCK_RETRY_WARNED.store(false, Ordering::Relaxed);
+            Ok(true)
+        }
+        Err(error) => {
+            let failures = DAQ_CLOCK_RETRY_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+            if !DAQ_CLOCK_RETRY_WARNED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "DAQ launch-clock publication remains pending after SDK admission failure ({failures} retry failures): {error}"
+                );
+            }
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -563,19 +1006,30 @@ pub(crate) fn verify_normal_qualification_boot() -> Result<()> {
         .context("normal qualification requires the engine sample marker")?;
     let completed = fs::read_to_string(marker)
         .context("read normal qualification sample marker")?
-        .trim().parse::<usize>().context("parse normal qualification sample marker")?;
+        .trim()
+        .parse::<usize>()
+        .context("parse normal qualification sample marker")?;
     verify_qualification_boot_cache(&cache_path(), completed, flight_state())
 }
 
 fn verify_qualification_boot_cache(path: &Path, completed: usize, actual: u8) -> Result<()> {
     let cached = read_persisted(path);
     if completed == 0 {
-        anyhow::ensure!(cached.is_none(), "fresh normal qualification requires an isolated empty cache");
-        anyhow::ensure!(actual == 0, "fresh normal qualification must boot actual Startup0");
+        anyhow::ensure!(
+            cached.is_none(),
+            "fresh normal qualification requires an isolated empty cache"
+        );
+        anyhow::ensure!(
+            actual == 0,
+            "fresh normal qualification must boot actual Startup0"
+        );
     } else {
-        let cached = cached.context("restarted normal qualification requires valid retained state")?;
-        anyhow::ensure!(actual == cached.flight_state,
-            "restarted normal qualification must restore the exact persisted flight state");
+        let cached =
+            cached.context("restarted normal qualification requires valid retained state")?;
+        anyhow::ensure!(
+            actual == cached.flight_state,
+            "restarted normal qualification must restore the exact persisted flight state"
+        );
     }
     Ok(())
 }
@@ -587,13 +1041,22 @@ mod tests {
 
     #[test]
     fn qualification_requires_fresh_startup_zero_and_exact_restart_restoration() {
-        let root = std::env::temp_dir().join(format!("gs-qualified-boot-{}-{}", std::process::id(), rand::random::<u64>()));
+        let root = std::env::temp_dir().join(format!(
+            "gs-qualified-boot-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
         let path = root.join("variables.json");
         assert!(verify_qualification_boot_cache(&path, 0, 0).is_ok());
         assert!(verify_qualification_boot_cache(&path, 0, 1).is_err());
         assert!(verify_qualification_boot_cache(&path, 4, 0).is_err());
         let mut first = VariableStore::new(path.clone());
-        first.commit(PersistentVariables { flight_state: 1, ..PersistentVariables::default() }).unwrap();
+        first
+            .commit(PersistentVariables {
+                flight_state: 1,
+                ..PersistentVariables::default()
+            })
+            .unwrap();
         let restored = VariableStore::new(path.clone());
         assert!(verify_qualification_boot_cache(&path, 4, restored.values.flight_state).is_ok());
         assert!(verify_qualification_boot_cache(&path, 8, 1).is_ok());
@@ -720,7 +1183,7 @@ mod tests {
                 u64::from_le_bytes(bytes[8..].try_into().unwrap()),
             )
         };
-        let expected = (17, (now + 130_000) as u64);
+        let expected = (17, (now + 30_000) as u64);
         assert_eq!(
             decode(daq_log_clock_payload(17, &clock, now, now).unwrap()),
             expected
@@ -756,7 +1219,7 @@ mod tests {
             let bytes = daq_log_clock_payload(17, clock, now, now).unwrap();
             u64::from_le_bytes(bytes[8..].try_into().unwrap())
         };
-        let expected = (start + 130_000) as u64;
+        let expected = (start + 30_000) as u64;
         assert_eq!(deadline(&clock, start), expected);
         assert_eq!(deadline(&clock, start + 833), expected);
         assert_eq!(deadline(&clock, start + 833), expected); // paused model
@@ -767,6 +1230,98 @@ mod tests {
         };
         assert_eq!(deadline(&ascent, start + 10_000), expected);
         assert_eq!(deadline(&ascent, start + 12_500), expected);
+    }
+
+    #[test]
+    fn daq_revision_survives_restart_wall_rollback_and_replay_without_restamping() {
+        crate::telemetry_schema::initialize().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "daq-revisions-{}-{}.json",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let pair = [10, 1_800_000_030_000];
+        let mut first = VariableStore::new(path.clone());
+        let initial = commit_daq_clock_pair(&mut first, pair, 1_800_000_000_000).unwrap();
+        let original = fs::read(&path).unwrap();
+        let mut restarted = VariableStore::new(path.clone());
+        assert_eq!(restarted.values.daq_log_clock_stamp, initial);
+        let blocker = path.with_extension("json.tmp");
+        fs::create_dir(&blocker).unwrap();
+        assert_eq!(
+            commit_daq_clock_pair(&mut restarted, pair, initial + 99999).unwrap(),
+            initial
+        );
+        assert_eq!(fs::read(&path).unwrap(), original); // identical replay needs no write
+        fs::remove_dir(&blocker).unwrap();
+        let later_t0 = [10, pair[1] + 5000];
+        let correction = commit_daq_clock_pair(&mut restarted, later_t0, initial - 10000).unwrap();
+        assert_eq!(correction, initial + 1); // wall clock went backwards
+        let reset = commit_daq_clock_pair(&mut restarted, [0, 0], 0).unwrap();
+        assert_eq!(reset, correction + 1);
+        let mut second_restart = VariableStore::new(path.clone());
+        assert_eq!(second_restart.values.daq_log_last_session, 10);
+        assert_eq!(second_restart.values.daq_log_clock, [0, 0]);
+        let next = commit_daq_clock_pair(&mut second_restart, [11, pair[1] + 30000], 0).unwrap();
+        assert_eq!(next, reset + 1);
+        for _ in 0..3 {
+            let replay = daq_log_clock_packet(second_restart.values.daq_log_clock, next).unwrap();
+            assert_eq!(replay.timestamp(), next);
+            assert_eq!(replay.payload().len(), 16);
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn daq_revision_upgrade_and_overflow_are_atomic() {
+        let path = std::env::temp_dir().join(format!(
+            "daq-revision-atomic-{}-{}.json",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::write(
+            &path,
+            r#"{"daq_log_clock":[7,1800000030000],"daq_log_last_session":7}"#,
+        )
+        .unwrap();
+        let mut legacy = VariableStore::new(path.clone());
+        assert_eq!(legacy.values.daq_log_clock_stamp, 0);
+        assert_eq!(
+            commit_daq_clock_pair(&mut legacy, [7, 1_800_000_030_000], 1234).unwrap(),
+            1234
+        );
+        let mut maximum = legacy.values;
+        maximum.daq_log_clock_stamp = u64::MAX;
+        legacy.commit(maximum).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(commit_daq_clock_pair(&mut legacy, [0, 0], 0).is_err());
+        assert_eq!(legacy.values, maximum);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(
+            commit_daq_clock_pair(&mut legacy, maximum.daq_log_clock, 0).unwrap(),
+            u64::MAX
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn journal_daq_snapshot_restore_preserves_literal_revision_and_refuses_conflict() {
+        let path = std::env::temp_dir().join(format!(
+            "daq-journal-restore-{}-{}.json",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut missing = VariableStore::new(path.clone());
+        let pair = [17, 1_800_000_030_000];
+        assert!(restore_daq_clock_snapshot(&mut missing, pair, 4321).unwrap());
+        assert_eq!(missing.values.daq_log_clock_stamp, 4321);
+        assert_eq!(VariableStore::new(path.clone()).values, missing.values);
+        assert!(!restore_daq_clock_snapshot(&mut missing, pair, 4321).unwrap());
+        assert!(restore_daq_clock_snapshot(&mut missing, [0, 0], 4322).is_err());
+        assert!(restore_daq_clock_snapshot(&mut missing, pair, 4320).is_err());
+        assert_eq!(missing.values.daq_log_clock, pair);
+        assert!(restore_daq_clock_snapshot(&mut missing, pair, 0).is_err());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -790,13 +1345,19 @@ mod tests {
         let ground_link: Arc<Mutex<Option<Arc<Router>>>> = Default::default();
         let daq_link: Arc<Mutex<Option<Arc<Router>>>> = Default::default();
         let observed: Arc<Mutex<Vec<Vec<u8>>>> = Default::default();
+        let revisions: Arc<Mutex<Vec<u64>>> = Default::default();
+        let saved_revision = std::sync::atomic::AtomicU64::new(1_800_000_000_000);
         let expected: Vec<u8> = [123u64.to_le_bytes(), 1_800_000_130_000u64.to_le_bytes()].concat();
         let make_ground = || {
             let r = Arc::new(Router::new(RouterConfig::new([]).with_sender("GS")));
             r.enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)
                 .unwrap();
             r.seed_managed_variable(
-                packet_bytes("DAQ_LOG_CLOCK", "SD_CARD", Arc::from(expected.clone())).unwrap(),
+                daq_log_clock_packet(
+                    [123, 1_800_000_130_000],
+                    saved_revision.load(Ordering::Relaxed),
+                )
+                .unwrap(),
             )
             .unwrap();
             let link = daq_link.clone();
@@ -811,8 +1372,10 @@ mod tests {
             r.enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
                 .unwrap();
             let observations = observed.clone();
+            let stamps = revisions.clone();
             r.on_network_variable_update(ty, move |p| {
                 observations.lock().unwrap().push(p.payload().to_vec());
+                stamps.lock().unwrap().push(p.timestamp());
                 Ok(())
             })
             .unwrap();
@@ -851,13 +1414,22 @@ mod tests {
                 Some(&expected),
                 "restart round {round}"
             );
+            assert_eq!(
+                revisions.lock().unwrap().last().copied(),
+                Some(saved_revision.load(Ordering::Relaxed)),
+                "replay must keep the saved revision"
+            );
             // Also prove the new GS instance can deliver a changed clock, not
             // merely that DAQ still remembers the value from before restart.
             let changed: Vec<u8> =
                 [124u64.to_le_bytes(), 1_800_000_140_000u64.to_le_bytes()].concat();
             ground
                 .set_network_variable(
-                    packet_bytes("DAQ_LOG_CLOCK", "SD_CARD", Arc::from(changed.clone())).unwrap(),
+                    daq_log_clock_packet(
+                        [124, 1_800_000_140_000],
+                        saved_revision.fetch_add(1, Ordering::Relaxed) + 1,
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             for _ in 0..32 {
@@ -868,7 +1440,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
             ground
                 .set_network_variable(
-                    packet_bytes("DAQ_LOG_CLOCK", "SD_CARD", Arc::from(expected.clone())).unwrap(),
+                    daq_log_clock_packet(
+                        [123, 1_800_000_130_000],
+                        saved_revision.fetch_add(1, Ordering::Relaxed) + 1,
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             for _ in 0..32 {
@@ -913,7 +1489,9 @@ mod tests {
                 av_bay_underglow: true,
                 flight_buzzer: true,
                 flight_state: 6,
+                flight_state_stamp: 0,
                 daq_log_clock: [0, 0],
+                daq_log_clock_stamp: 0,
                 daq_log_last_session: 0,
             },
         )
@@ -1051,8 +1629,8 @@ mod tests {
         );
         let decoded: Vec<f32> = packet
             .payload()
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>().0.iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         assert_eq!(decoded, vec![1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 7.0]);
         assert_eq!(calibration_packet(&cfg).unwrap().payload().len(), 16);
@@ -1069,8 +1647,8 @@ mod tests {
         let packet = calibration_packet(&cfg).unwrap();
         let decoded: Vec<f32> = packet
             .payload()
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>().0.iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect();
         assert_eq!(decoded, vec![2.0, -3.0, 4.5, 6.0]);
     }
@@ -1165,8 +1743,8 @@ mod thermal_wire_tests {
         );
         let values: Vec<f32> = p
             .payload()
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>().0.iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         assert_eq!(values, vec![20., 0.25, 0., 0.]);
     }
@@ -1268,15 +1846,19 @@ mod persistence_callback_tests {
             None,
             "phase must seal before any operational setter"
         );
-        let bootstrap = names.map(|name| {
+        let bootstrap: Vec<_> = names.iter().filter_map(|name| {
             source
                 .get_cached_network_variable(crate::telemetry_schema::data_type(name))
                 .unwrap()
-                .unwrap()
-        });
+                .map(|packet| (*name, packet))
+        }).collect();
+        assert_eq!(bootstrap.len(), 8);
+        assert!(source.get_cached_network_variable(
+            crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE)).unwrap().is_none(),
+            "unknown-origin default must not create a managed state owner");
         assert!(source.export_reliable_pending_stats().is_empty());
         println!(
-            "LIFECYCLE_BOOT cached9, packedSides2, knownAnnouncers0, API success, pendingOwners0; no end-to-end ACK implied"
+            "LIFECYCLE_BOOT cached8, unknown-origin state absent, packedSides2, knownAnnouncers0, API success, pendingOwners0; no end-to-end ACK implied"
         );
         phase.store(1, Ordering::Relaxed);
         now.store(1000, Ordering::Relaxed);
@@ -1286,7 +1868,7 @@ mod persistence_callback_tests {
             source.process_all_queues().unwrap();
             peer.process_all_queues().unwrap();
         }
-        for (name, original) in names.iter().zip(&bootstrap) {
+        for (name, original) in &bootstrap {
             let ty = crate::telemetry_schema::data_type(name);
             peer.request_managed_variable(ty).unwrap();
             for _ in 0..8 {
@@ -1313,10 +1895,16 @@ mod persistence_callback_tests {
                 .any(|route| !route.announcers.is_empty())
         );
         println!(
-            "LIFECYCLE_DISCOVERY all9 real peer caches converge to original boot PacketIDs via discovery/managed refresh; separate from operational500ms"
+            "LIFECYCLE_DISCOVERY all8 known-origin/config peer caches converge to original boot PacketIDs via discovery/managed refresh; separate from operational500ms"
         );
+        peer.request_managed_variable(crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE)).unwrap();
+        for _ in 0..8 { source.process_all_queues().unwrap(); peer.process_all_queues().unwrap(); }
+        assert!(peer.get_cached_network_variable(
+            crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE)).unwrap().is_none(),
+            "GET cannot manufacture authority for unknown retained state");
         phase.store(2, Ordering::Relaxed);
         now.store(1100, Ordering::Relaxed);
+        crate::telemetry_task::refresh_host_network_time(&source, get_current_timestamp_ms());
         set_flight_state(&source, 1).unwrap();
         let pending = source.export_reliable_pending_stats();
         assert_eq!(pending.len(), 1);
@@ -1409,6 +1997,7 @@ mod persistence_callback_tests {
         let states =
             crate::qualification_requests::policy_states(cfg!(feature = "hitl_mode"), &[1, 0, 1])
                 .unwrap();
+        crate::telemetry_task::refresh_host_network_time(&source, get_current_timestamp_ms());
         for (round, state) in states.into_iter().enumerate() {
             crate::qualification_requests::in_controlled_round(round + 1, || {
                 set_flight_state(&source, state).unwrap();
@@ -1464,6 +2053,7 @@ mod persistence_callback_tests {
         let states =
             crate::qualification_requests::policy_states(cfg!(feature = "hitl_mode"), &[1, 0, 1])
                 .unwrap();
+        crate::telemetry_task::refresh_host_network_time(&router, get_current_timestamp_ms());
         for (round, (state, enabled)) in states.iter().zip([true, false, true]).enumerate() {
             crate::qualification_requests::in_controlled_round(round + 1, || {
                 set_flight_state(&router, *state).unwrap();
@@ -1614,6 +2204,131 @@ mod persistence_callback_tests {
     }
 
     #[test]
+    fn admitted_launch_managed_callback_before_cas_is_idempotent_and_never_overwrites_newer_state()
+    {
+        const NAME: &str = "network_variables::persistence_callback_tests::admitted_launch_managed_callback_before_cas_is_idempotent_and_never_overwrites_newer_state";
+        if !isolated(NAME) {
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let router = Router::new(
+            sedsnet::router::RouterConfig::new([
+                sedsnet::router::EndpointHandler::new_packet_handler(
+                    crate::telemetry_schema::endpoint("FLIGHT_STATE"),
+                    |_| Ok(()),
+                ),
+            ])
+            .with_sender("GS"),
+        );
+        crate::telemetry_task::refresh_host_network_time(&router, get_current_timestamp_ms());
+        initialize_for_role(&router, false).unwrap();
+        router.process_all_queues_with_timeout(0).unwrap();
+        let prepared = prepare_launch_state(&router).unwrap();
+        let baseline = automatic_idle_test_snapshot();
+        let before = router.queue_counters()[2];
+        router.tx_queue(prepared.packet.clone()).unwrap();
+        assert_eq!(
+            router.queue_counters()[2],
+            before + 1,
+            "original packet acquired an actual queue owner"
+        );
+        router.process_all_queues_with_timeout(0).unwrap();
+        // Processing really consumed/cached the SAME original, but a primary
+        // own-GS reflection is observational, never a second durable writer.
+        let cached = router.get_cached_network_variable(crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE)).unwrap().unwrap();
+        assert_eq!(cached.packet_id(), prepared.packet.packet_id());
+        assert_eq!(cached.timestamp(), prepared.packet.timestamp());
+        assert_eq!(automatic_idle_test_snapshot(), baseline, "own-source callback leaves exact Store and bytes unchanged");
+        // queue_counters[2] is current depth, not a cumulative accepted count.
+        let admitted = router.queue_counters()[2];
+        commit_admitted_launch(&prepared).expect("explicit admitted local publisher owns durable Launch CAS");
+        let committed = automatic_idle_test_snapshot();
+        let observed = store().lock().unwrap().values;
+        assert_eq!((observed.flight_state, observed.flight_state_stamp), (7, prepared.packet.timestamp()));
+        commit_admitted_launch(&prepared).expect("SECOND identical admitted commit is idempotent");
+        assert_eq!(automatic_idle_test_snapshot(), committed, "duplicate local CAS never rewrites or changes revision");
+        assert_eq!(
+            router.queue_counters()[2],
+            admitted,
+            "post-admission publication must never enqueue again"
+        );
+        {
+            let mut store = store().lock().unwrap();
+            let mut next = store.values;
+            next.flight_state = 15;
+            next.flight_state_stamp = prepared.packet.timestamp() + 1;
+            store.commit(next).unwrap();
+        }
+        assert!(commit_admitted_launch(&prepared).is_err());
+        assert_eq!(flight_state(), 15);
+    }
+    #[test]
+    fn board_abort_retained_sdk_refresh_never_becomes_a_gs_owned_abort() {
+        const NAME: &str = "network_variables::persistence_callback_tests::board_abort_retained_sdk_refresh_never_becomes_a_gs_owned_abort";
+        if !isolated(NAME) {
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let source = Arc::new(Router::new(
+            sedsnet::router::RouterConfig::new([]).with_sender("GS"),
+        ));
+        initialize_for_role(&source, false).unwrap();
+        let desired = flight_state();
+        let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
+        let packet = Packet::new(
+            ty,
+            &[crate::telemetry_schema::endpoint("FLIGHT_STATE")],
+            "AB",
+            9000,
+            Arc::from([15u8]),
+        )
+        .unwrap();
+        let original_id = packet.packet_id();
+        source.rx(&packet).unwrap();
+        assert_eq!(flight_state(), desired);
+        let peer = Arc::new(Router::new(
+            sedsnet::router::RouterConfig::new([]).with_sender("RF"),
+        ));
+        peer.enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+            .unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let capture = received.clone();
+        peer.on_network_variable_update(ty, move |p| {
+            capture.lock().unwrap().push(p.clone());
+            Ok(())
+        })
+        .unwrap();
+        let received_peer = peer.clone();
+        source.add_side_packet("to-rf", move |p| received_peer.rx_from_side(p, 0));
+        let received_source = source.clone();
+        peer.add_side_packet("to-gs", move |p| received_source.rx_from_side(p, 0));
+        for _ in 0..4 {
+            source.process_all_queues_with_timeout(0).unwrap();
+            peer.process_all_queues_with_timeout(0).unwrap();
+        }
+        peer.invalidate_network_variable_cache(ty);
+        received.lock().unwrap().clear();
+        assert!(peer.get_network_variable(ty, None).unwrap().is_none());
+        for _ in 0..4 {
+            peer.process_all_queues_with_timeout(0).unwrap();
+            source.process_all_queues_with_timeout(0).unwrap();
+        }
+        let refreshed = peer
+            .get_cached_network_variable(ty)
+            .unwrap()
+            .expect("actual managed request/reply must return the retained source packet");
+        assert_eq!(refreshed.sender(), "AB");
+        assert_eq!(refreshed.timestamp(), 9000);
+        assert_eq!(refreshed.packet_id(), original_id);
+        assert_eq!(refreshed.payload(), &[15]);
+        assert_eq!(flight_state(), desired);
+        let own = flight_state_packet(store().lock().unwrap().values).unwrap();
+        assert_eq!(own.sender(), "GS");
+        assert_eq!(own.payload(), &[desired]);
+        assert_ne!(own.payload(), &[15]);
+    }
+
+    #[test]
     fn first_unchanged_sdk_state_still_creates_a_missing_durable_cache() {
         const NAME: &str = "network_variables::persistence_callback_tests::first_unchanged_sdk_state_still_creates_a_missing_durable_cache";
         if !isolated(NAME) {
@@ -1643,6 +2358,7 @@ mod persistence_callback_tests {
         }
         crate::telemetry_schema::initialize().unwrap();
         let router = Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS"));
+        crate::telemetry_task::refresh_host_network_time(&router, get_current_timestamp_ms());
         initialize_for_role(&router, false).unwrap();
         let sent = Arc::new(Mutex::new(Vec::new()));
         let output = sent.clone();
@@ -1670,6 +2386,86 @@ mod persistence_callback_tests {
     }
 
     #[test]
+    fn retained_flight_state_keeps_origin_through_disk_reload_and_sdk_seed() {
+        crate::telemetry_schema::initialize().unwrap();
+        let path =
+            std::env::temp_dir().join(format!("gs-state-origin-{}.json", rand::random::<u128>()));
+        let values = PersistentVariables {
+            flight_state: 15,
+            flight_state_stamp: 1000,
+            ..Default::default()
+        };
+        persist(&path, values).unwrap();
+        let restored = VariableStore::new(path.clone());
+        let router = Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS"));
+        crate::telemetry_task::refresh_host_network_time(&router, get_current_timestamp_ms());
+        let retained = flight_state_packet(restored.values).unwrap();
+        assert_eq!(retained.timestamp(), 1000);
+        assert_eq!(retained.payload(), &[15]);
+        router
+            .enable_network_variable(
+                crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE),
+                NetworkVariablePermissions::READ_WRITE,
+            )
+            .unwrap();
+        router.seed_managed_variable(retained).unwrap();
+        let cached = router
+            .get_cached_network_variable(crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cached.timestamp(),
+            1000,
+            "reseed must remain older than a later recovery cutoff"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_flight_state_origin_is_unknown_instead_of_freshened() {
+        crate::telemetry_schema::initialize().unwrap();
+        let values: PersistentVariables = serde_json::from_str(r#"{"flight_state":15}"#).unwrap();
+        assert_eq!(flight_state_packet(values).unwrap().timestamp(), 0);
+    }
+
+    #[test]
+    fn actual_primary_bootstrap_preserves_recorded_state_origin() {
+        const NAME: &str = "network_variables::persistence_callback_tests::actual_primary_bootstrap_preserves_recorded_state_origin";
+        if !isolated(NAME) {
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let values =
+            serde_json::from_str(r#"{"flight_state":15,"flight_state_stamp":1000}"#).unwrap();
+        persist(&cache_path(), values).unwrap();
+        let router = Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS"));
+        initialize_for_role(&router, false).unwrap();
+        let cached = router
+            .get_cached_network_variable(crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.payload(), &[15]);
+        assert_eq!(
+            cached.timestamp(),
+            1000,
+            "boot must not mint fresh time for a retained Abort"
+        );
+    }
+
+    #[test]
+    fn unsynchronized_state_change_does_not_modify_retained_state() {
+        const NAME: &str = "network_variables::persistence_callback_tests::unsynchronized_state_change_does_not_modify_retained_state";
+        if !isolated(NAME) {
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let router = Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS"));
+        let before = store().lock().unwrap().values;
+        assert!(set_flight_state(&router, 15).is_err());
+        assert_eq!(store().lock().unwrap().values, before);
+    }
+
+    #[test]
     fn failed_store_commit_is_atomic_for_every_cached_field_and_retries() {
         let path = std::env::temp_dir()
             .join(format!(
@@ -1682,7 +2478,9 @@ mod persistence_callback_tests {
             av_bay_underglow: true,
             flight_buzzer: true,
             flight_state: 4,
+            flight_state_stamp: 100,
             daq_log_clock: [7, 123456],
+            daq_log_clock_stamp: 0,
             daq_log_last_session: 7,
         };
         persist(&path, original).unwrap();
@@ -1692,7 +2490,9 @@ mod persistence_callback_tests {
             av_bay_underglow: false,
             flight_buzzer: false,
             flight_state: 5,
+            flight_state_stamp: 200,
             daq_log_clock: [8, 123789],
+            daq_log_clock_stamp: 0,
             daq_log_last_session: 8,
         };
         let temporary = path.with_extension("json.tmp");
@@ -1718,5 +2518,66 @@ mod persistence_callback_tests {
         assert_eq!(state.values, original);
         assert_eq!(load(&path), original);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+}
+
+/// Read a legacy durable pair without stamping or inferring its launch T0.
+pub fn persisted_daq_log_clock() -> Option<[u64; 2]> {
+    let guard = store()
+        .lock()
+        .expect("network-variable store lock poisoned");
+    guard.durable.then_some(guard.values.daq_log_clock)
+}
+
+#[cfg(test)]
+#[path = "network_variables/daq_clock_tests.rs"]
+mod daq_clock_tests;
+
+/// Retry the current durable metadata only with a live host admission lease.
+/// Closing admission pauses retries without changing their original revision.
+pub(crate) fn retry_pending_daq_log_clock_for_state(
+    state: &crate::state::AppState,
+    router: &Router,
+) -> Result<bool> {
+    let generation = crate::gse::automatic_generation(state);
+    let Some(_claim) = crate::gse::claim_operator_dispatch(state, generation) else {
+        return Ok(false);
+    };
+    retry_pending_daq_log_clock(router)
+}
+#[cfg(test)]
+mod clock_admission_tests;
+
+#[cfg(test)]
+#[path = "network_variables/unknown_origin_tests.rs"]
+mod unknown_origin_tests;
+
+#[cfg(test)]
+mod automatic_idle_tests;
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AutomaticIdleTestSnapshot {
+    values: PersistentVariables,
+    revision: u64,
+    volatile: Option<AutomaticLiveIdentity>,
+    bytes: Option<Vec<u8>>,
+}
+#[cfg(test)]
+pub(crate) fn automatic_idle_test_snapshot() -> AutomaticIdleTestSnapshot {
+    let guard = store().lock().unwrap();
+    AutomaticIdleTestSnapshot { values: guard.values, revision: guard.revision,
+        volatile: guard.automatic_idle, bytes: fs::read(&guard.path).ok() }
+}
+
+#[cfg(test)]
+impl AutomaticIdleTestSnapshot {
+    #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim")))]
+    pub(crate) fn live_phase_identity(&self) -> Option<AutomaticPhaseIdentity> {
+        self.volatile.map(|live| AutomaticPhaseIdentity { original: live.original(), phase: live.phase() })
+    }
+    #[cfg(any(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+    pub(crate) fn durable_unchanged(&self, previous: &Self) -> bool {
+        self.values == previous.values && self.bytes == previous.bytes
     }
 }

@@ -98,7 +98,7 @@ fn values_from_row(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
         && !bytes.is_empty()
     {
         let mut out = Vec::with_capacity(bytes.len() / 4);
-        for chunk in bytes.chunks_exact(4) {
+        for chunk in bytes.as_chunks::<4>().0.iter() {
             let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
             out.push(Some(f32::from_le_bytes(arr)));
         }
@@ -133,6 +133,186 @@ fn compact_recent_rows(rows: Vec<TelemetryRow>, cutoff: i64) -> Vec<TelemetryRow
             .then_with(|| a.data_type.cmp(&b.data_type))
     });
     rows
+}
+
+#[derive(Default, Deserialize)]
+struct RecentDisplayParams {
+    #[serde(default)]
+    display: bool,
+    max_rows: Option<usize>,
+}
+
+/// Display-only envelope: balanced history keeps every active stream's newest
+/// sample and each bucket's extrema. Recording/export rows are never changed.
+fn bounded_display_history(rows: Vec<TelemetryRow>, max_rows: usize) -> Vec<TelemetryRow> {
+    let mut streams: HashMap<(String, String), Vec<TelemetryRow>> = HashMap::new();
+    for row in rows {
+        streams
+            .entry((row.sender_id.clone(), row.data_type.clone()))
+            .or_default()
+            .push(row);
+    }
+    let mut streams: Vec<_> = streams.into_values().collect();
+    // If an adversarial runtime schema alone exceeds the entire envelope,
+    // retain its newest streams. Normal applications preserve all streams.
+    streams.sort_by_key(|rows| std::cmp::Reverse(rows.last().map(|row| row.timestamp_ms)));
+    streams.truncate(max_rows);
+    let per_stream = (max_rows / streams.len().max(1)).max(1);
+    let mut output = Vec::with_capacity(max_rows);
+    for mut stream in streams {
+        stream.sort_by_key(|row| row.timestamp_ms);
+        if stream.len() <= per_stream {
+            output.extend(stream);
+            continue;
+        }
+        if per_stream == 1 {
+            output.push(stream.pop().unwrap());
+            continue;
+        }
+        let count = stream.len();
+        let mut selected = std::collections::BTreeSet::from([0, count - 1]);
+        let buckets = (per_stream.saturating_sub(2) / 2).max(1);
+        if per_stream > 2 {
+            for bucket in 0..buckets {
+                let start = 1 + bucket * (count - 2) / buckets;
+                let end = 1 + (bucket + 1) * (count - 2) / buckets;
+                let value = |row: &TelemetryRow| {
+                    row.values
+                        .iter()
+                        .flatten()
+                        .copied()
+                        .find(|v| v.is_finite())
+                        .unwrap_or(0.0)
+                };
+                if let Some((index, _)) = stream[start..end]
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| value(a).total_cmp(&value(b)))
+                {
+                    selected.insert(start + index);
+                }
+                if selected.len() < per_stream
+                    && let Some((index, _)) = stream[start..end]
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| value(a).total_cmp(&value(b)))
+                    {
+                        selected.insert(start + index);
+                    }
+            }
+        }
+        output.extend(
+            stream
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, row)| selected.contains(&index).then_some(row)),
+        );
+    }
+    output.sort_by_key(|row| row.timestamp_ms);
+    output
+}
+
+fn recent_rows_for_request(
+    rows: Vec<TelemetryRow>,
+    cutoff: i64,
+    params: &RecentDisplayParams,
+) -> Vec<TelemetryRow> {
+    let rows = compact_recent_rows(rows, cutoff);
+    if params.display {
+        bounded_display_history(rows, params.max_rows.unwrap_or(12_000).clamp(512, 20_000))
+    } else {
+        rows
+    }
+}
+
+#[cfg(test)]
+mod display_history_tests {
+    use super::*;
+    #[test]
+    fn large_reseed_preserves_latest_sparse_pressure_and_extrema_with_a_fixed_payload_bound() {
+        let mut input = Vec::new();
+        let names = [
+            "KG1000",
+            "KG50",
+            "COMBUSTION_CHAMBER_PRESSURE",
+            "COMBUSTION_CHAMBER_VOLTAGE",
+            "LOADCELL_WEIGHT_KG",
+            "LOADCELL_50_WEIGHT_KG",
+            "DAQ_ADC_TEMPERATURE",
+            "DAQ_SAR_VOLTAGES",
+            "DAQ_CURRENT_SENSE",
+            "DAQ_POWER_MONITOR",
+            "BATTERY_VOLTAGE",
+            "BATTERY_CURRENT",
+        ];
+        for sample in 0..175_000i64 {
+            input.push(TelemetryRow {
+                timestamp_ms: sample * 5,
+                sender_id: "DAQ".into(),
+                data_type: names[(sample % 12) as usize].into(),
+                values: vec![Some(if sample == 77_772 {
+                    9999.0
+                } else {
+                    (sample % 100) as f32
+                })],
+            });
+        }
+        input.push(TelemetryRow {
+            timestamp_ms: 1,
+            sender_id: "VB".into(),
+            data_type: "FUEL_TANK_PRESSURE".into(),
+            values: vec![Some(12.0)],
+        });
+        input.push(TelemetryRow {
+            timestamp_ms: 874_998,
+            sender_id: "VB".into(),
+            data_type: "FUEL_TANK_PRESSURE".into(),
+            values: vec![Some(42.0)],
+        });
+        input.sort_by_key(|row| row.timestamp_ms);
+        let mut latest = HashMap::new();
+        for row in &input {
+            latest.insert(
+                (row.sender_id.clone(), row.data_type.clone()),
+                row.timestamp_ms,
+            );
+        }
+        let full =
+            recent_rows_for_request(input.clone(), i64::MIN, &RecentDisplayParams::default());
+        assert_eq!(
+            full.len(),
+            input.len(),
+            "analysis history remains unchanged without display mode"
+        );
+        let sampled = recent_rows_for_request(
+            input,
+            i64::MIN,
+            &RecentDisplayParams {
+                display: true,
+                max_rows: Some(12_000),
+            },
+        );
+        assert!(sampled.len() <= 12_000);
+        for ((sender, ty), timestamp) in latest {
+            assert!(
+                sampled.iter().any(|row| row.sender_id == sender
+                    && row.data_type == ty
+                    && row.timestamp_ms == timestamp),
+                "latest missing: {sender}/{ty}"
+            );
+        }
+        assert_eq!(
+            sampled
+                .iter()
+                .filter(|row| row.data_type == "FUEL_TANK_PRESSURE")
+                .count(),
+            2
+        );
+        assert!(sampled.iter().any(|row| row.values == vec![Some(9999.0)]));
+        if let Ok(path) = std::env::var("GS_DISPLAY_HISTORY_FIXTURE") {
+            std::fs::write(path, serde_json::to_vec(&sampled).unwrap()).unwrap();
+        }
+    }
 }
 
 fn wants_ndjson(headers: &HeaderMap) -> bool {
@@ -176,10 +356,18 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         )
         .route("/api/auth/logout", post(logout))
         .route("/api/recent", get(get_recent))
-        .route("/api/command", post(send_command))
+        .route("/api/command", post(send_command_entry))
+        .route(
+            "/api/network-health/daq/sd/retry",
+            post(crate::daq_sd::retry),
+        )
+        .route("/api/rrls/control", get(crate::command_proxy::get_status))
         .route("/api/auto_zero", get(get_auto_zero).post(set_auto_zero))
         .route("/api/alerts", get(get_alerts))
+        .route("/api/alert_conditions", get(get_alert_conditions))
         .route("/api/boards", get(get_boards))
+        .merge(crate::board_recovery::routes())
+        .merge(crate::actuator_plumbing::routes())
         .route("/api/layout", get(get_layout))
         .route("/api/i18n/catalog", get(get_translation_catalog))
         .route("/api/i18n/translate", post(post_translate_texts))
@@ -223,7 +411,10 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/calibration/capture_zero", post(capture_loadcell_zero))
         .route("/api/calibration/capture_span", post(capture_loadcell_span))
         .route("/api/calibration/refit", post(refit_loadcell_channel))
-        .route("/api/network_time", get(get_network_time).post(crate::system_clock::sync_network))
+        .route(
+            "/api/network_time",
+            get(get_network_time).post(crate::system_clock::sync_network),
+        )
         .route("/api/launch_clock", get(get_launch_clock))
         .route("/api/network_topology", get(get_network_topology))
         .route("/api/network_diagnostics", get(get_network_diagnostics))
@@ -249,6 +440,11 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         )
         .route("/api/alerts/ack", post(post_alert_ack))
         .route("/api/action_policy", get(get_action_policy))
+        .route("/api/board_abort", get(crate::board_abort::get_status))
+        .route(
+            "/api/board_abort/refresh",
+            post(crate::board_abort::refresh_status),
+        )
         .route(
             "/api/flight_setup",
             get(get_flight_setup).post(set_flight_setup),
@@ -270,24 +466,25 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/tiles/{z}/{x}/{y}", get(get_tile_jpg))
         .route("/favicon.ico", get(get_favicon))
         .route("/valvestate", get(get_valve_state))
-        .merge(crate::media::router(
-            state.clone(),
-            video_password,
-            voice.clone(),
-        ))
+        .merge(if crate::flight_sim_runtime::enabled() {
+            crate::flight_sim_runtime::unavailable_media_routes()
+        } else {
+            crate::media::router(state.clone(), video_password, voice.clone())
+        })
         .merge(crate::voice::routes(state.clone(), voice))
         .merge(crate::gse::routes())
         .merge(crate::admin::routes())
         .merge(crate::checklists::routes())
         .merge(crate::mission_sync::routes())
         .merge(crate::station_mode::routes())
+        .merge(crate::launch_history::api::routes())
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)
         .with_state(state)
 }
 
 /// Pulls a bearer token out of the Authorization header.
-fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -306,6 +503,7 @@ fn auth_failure_response(err: AuthFailure) -> axum::response::Response {
 }
 
 /// Authorizes an HTTP request against the required permission set.
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(crate) async fn authorize_headers(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -392,9 +590,12 @@ pub enum WsOutMsg {
     LaunchClock(LaunchClockMsg),
     Error(ErrorMsg),
     AlertAckState(AlertAckStateMsg),
+    AlertConditions(crate::alert_conditions::Snapshot),
+    BoardAbort(crate::board_abort::Snapshot),
     BoardStatus(BoardStatusMsg),
     NetworkTopology(NetworkTopologyMsg),
     Notifications(Vec<PersistentNotification>),
+    Notification(PersistentNotification),
     Messages(Vec<PersistentNotification>),
     ActionPolicy(ActionPolicyMsg),
     FillTargets(FillTargetsConfig),
@@ -425,6 +626,8 @@ pub struct ValveStateMsg {
 pub struct WarningMsg {
     pub timestamp_ms: i64,
     pub message: String,
+    #[serde(flatten)]
+    pub condition:Option<crate::alert_conditions::ConditionLink>,
 }
 
 /// Error row sent to frontend (and stored in AppState channel)
@@ -432,6 +635,8 @@ pub struct WarningMsg {
 pub struct ErrorMsg {
     pub timestamp_ms: i64,
     pub message: String,
+    #[serde(flatten)]
+    pub condition:Option<crate::alert_conditions::ConditionLink>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -448,6 +653,8 @@ pub struct AlertDto {
     pub timestamp_ms: i64,
     pub severity: String,
     pub message: String,
+    #[serde(flatten)]
+    pub condition:Option<crate::alert_conditions::ConditionLink>,
 }
 
 #[derive(Serialize)]
@@ -713,6 +920,7 @@ async fn set_loadcell_calibration(
     headers: HeaderMap,
     Json(update): Json<loadcell::CalibrationUpdate>,
 ) -> axum::response::Response {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -720,6 +928,13 @@ async fn set_loadcell_calibration(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     let cfg = {
         let mut current = state.loadcell_calibration.lock().unwrap();
         let cfg = match loadcell::merge_channel_update(&current, &update) {
@@ -749,6 +964,7 @@ async fn set_kg50_input(
     headers: HeaderMap,
     Json(req): Json<Kg50InputRequest>,
 ) -> axum::response::Response {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
         Ok(p) => p,
         Err(r) => return r,
@@ -756,6 +972,13 @@ async fn set_kg50_input(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     if state.loadcell_processing.status().running {
         return (
             StatusCode::CONFLICT,
@@ -796,6 +1019,7 @@ async fn capture_loadcell_zero(
     headers: HeaderMap,
     Json(req): Json<CaptureLoadcellPointReq>,
 ) -> impl IntoResponse {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -803,6 +1027,13 @@ async fn capture_loadcell_zero(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     let updated = {
         let mut cfg = state.loadcell_calibration.lock().unwrap();
         let temperature = loadcell::recent_adc_temperature(
@@ -839,6 +1070,7 @@ async fn capture_loadcell_span(
     headers: HeaderMap,
     Json(req): Json<CaptureLoadcellSpanReq>,
 ) -> impl IntoResponse {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -846,6 +1078,13 @@ async fn capture_loadcell_span(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     let updated = {
         let mut cfg = state.loadcell_calibration.lock().unwrap();
         let temperature = loadcell::recent_adc_temperature(
@@ -1232,11 +1471,15 @@ fn synthesize_zoom_tile_from_ancestor(
 }
 
 /// Returns the recent telemetry window, preferring the in-memory cache to cover DB write lag.
-async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+async fn get_recent(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<RecentDisplayParams>,
+) -> Response {
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
-    if wants_ndjson(&headers) {
+    if wants_ndjson(&headers) && !params.display {
         return stream_recent_rows_response(state).await;
     }
 
@@ -1250,7 +1493,7 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
             oldest_cache_ts.is_some_and(|oldest| oldest <= cutoff + RECENT_BUCKET_MS);
         if cache_covers_window {
             let rows = recalibrate_recent_rows(&state, cache_snapshot);
-            return Json(compact_recent_rows(rows, cutoff)).into_response();
+            return Json(recent_rows_for_request(rows, cutoff, &params)).into_response();
         }
 
         let db_end_ms = oldest_cache_ts.unwrap_or(now_ms).saturating_sub(1);
@@ -1266,7 +1509,7 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
                 .filter(|row| row.timestamp_ms >= cutoff && row.timestamp_ms <= now_ms),
         );
         let rows = recalibrate_recent_rows(&state, merged_rows);
-        return Json(compact_recent_rows(rows, cutoff)).into_response();
+        return Json(recent_rows_for_request(rows, cutoff, &params)).into_response();
     }
 
     let db = state.telemetry_db_pool();
@@ -1281,9 +1524,10 @@ async fn get_recent(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     };
     let cutoff = now_ms.saturating_sub(RECENT_HISTORY_MS);
     let rows = load_recent_rows_from_db(&state, cutoff, now_ms).await;
-    Json(compact_recent_rows(
+    Json(recent_rows_for_request(
         recalibrate_recent_rows(&state, rows),
         cutoff,
+        &params,
     ))
     .into_response()
 }
@@ -1350,6 +1594,7 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
                 r#"
                 SELECT
                     timestamp_ms,
+                    source_timestamp_ms,
                     data_type,
                     sender_id,
                     values_json,
@@ -1370,6 +1615,16 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
                     sender_id: row.get::<String, _>("sender_id"),
                     values: values_from_row(&row),
                 };
+                crate::telemetry_provenance::note(
+                    &telemetry_row,
+                    row.get::<Option<i64>, _>("source_timestamp_ms")
+                        .and_then(|source| {
+                            crate::telemetry_provenance::canonical_source(
+                                source,
+                                crate::telemetry_task::procedure_clock::timestamp_ms(),
+                            )
+                        }),
+                );
                 for row in replay.project(telemetry_row) {
                     if send_ndjson_row(&tx, &row).await.is_err() {
                         return;
@@ -1425,6 +1680,7 @@ async fn load_recent_rows_from_db(
         r#"
         SELECT
             timestamp_ms,
+            source_timestamp_ms,
             data_type,
             sender_id,
             values_json,
@@ -1442,12 +1698,23 @@ async fn load_recent_rows_from_db(
 
     let mut out = Vec::with_capacity(rows_db.len());
     for row in rows_db {
-        out.push(TelemetryRow {
+        let telemetry_row = TelemetryRow {
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
             data_type: row.get::<String, _>("data_type"),
             sender_id: row.get::<String, _>("sender_id"),
             values: values_from_row(&row),
-        });
+        };
+        crate::telemetry_provenance::note(
+            &telemetry_row,
+            row.get::<Option<i64>, _>("source_timestamp_ms")
+                .and_then(|source| {
+                    crate::telemetry_provenance::canonical_source(
+                        source,
+                        crate::telemetry_task::procedure_clock::timestamp_ms(),
+                    )
+                }),
+        );
+        out.push(telemetry_row);
     }
     out
 }
@@ -1526,7 +1793,7 @@ mod live_flight_state_tests {
         Arc::get_mut(&mut state).unwrap().auth =
             Arc::new(crate::auth::AuthManager::new(auth_path.clone()));
         for expected in [
-            FlightState::ParachuteDeploy,
+            FlightState::Descent,
             FlightState::Startup,
             FlightState::Armed,
         ] {
@@ -1646,6 +1913,7 @@ async fn set_flight_setup(
     headers: HeaderMap,
     Json(cfg): Json<FlightSetupConfig>,
 ) -> impl IntoResponse {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -1653,6 +1921,13 @@ async fn set_flight_setup(
     if !principal.permissions.send_commands {
         return (StatusCode::FORBIDDEN, "permission denied").into_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     match flight_setup::save(&cfg) {
         Ok(()) => Json(flight_setup::load_or_default()).into_response(),
         Err(err) => (StatusCode::BAD_REQUEST, err).into_response(),
@@ -1674,6 +1949,7 @@ async fn set_auto_zero(
     headers: HeaderMap,
     Json(settings): Json<crate::auto_zero::Settings>,
 ) -> impl IntoResponse {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
         Ok(p) => p,
         Err(response) => return response,
@@ -1681,6 +1957,13 @@ async fn set_auto_zero(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     if crate::gse::active(&state)
         || matches!(
             state.launch_clock_snapshot().kind,
@@ -1717,6 +2000,7 @@ async fn set_fill_targets(
     headers: HeaderMap,
     Json(cfg): Json<FillTargetsConfig>,
 ) -> impl IntoResponse {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -1724,6 +2008,13 @@ async fn set_fill_targets(
     if !principal.permissions.send_commands {
         return (StatusCode::FORBIDDEN, "permission denied").into_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     let result = (|| -> Result<FillTargetsConfig, (StatusCode, String)> {
         let mut gse = state.gse.lock().unwrap();
         let zero = state.auto_zero.lock().unwrap();
@@ -1765,6 +2056,7 @@ async fn apply_flight_setup(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
         Ok(principal) => principal,
         Err(response) => return response,
@@ -1772,6 +2064,13 @@ async fn apply_flight_setup(
     if !principal.permissions.send_commands {
         return (StatusCode::FORBIDDEN, "permission denied").into_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
 
     let cfg = flight_setup::load_or_default();
     let now_ms = crate::telemetry_task::get_current_timestamp_ms();
@@ -1963,6 +2262,16 @@ async fn start_firmware_update(
         Ok(principal) => principal,
         Err(response) => return response,
     };
+    if state
+        .shutdown_requested
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ground station is shutting down",
+        )
+            .into_response();
+    }
     if !principal.permissions.send_commands {
         return (StatusCode::FORBIDDEN, "permission denied").into_response();
     }
@@ -1996,6 +2305,16 @@ async fn start_firmware_update(
                 .into_response();
         }
     };
+    if state
+        .shutdown_requested
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ground station is shutting down",
+        )
+            .into_response();
+    }
     let Some(router) = state.topology_router.get() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "router unavailable").into_response();
     };
@@ -2031,55 +2350,493 @@ async fn cancel_firmware_update(
     }
 }
 
+/// RRLS forwards opaque operation names, so a normal RRLS build does not need
+/// to compile primary HITL variants or execute them locally.
+async fn send_command_entry(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(value): Json<serde_json::Value>,
+) -> Response {
+    let Some(name) = value.as_str() else {
+        return (StatusCode::BAD_REQUEST, "Expected a command name.").into_response();
+    };
+    let plumbing_source_ms = if name == "RetractPlumbing" {
+        state
+            .topology_router
+            .get()
+            .and_then(|r| crate::system_clock::required_control_network_utc_ms(r).ok())
+    } else {
+        None
+    };
+    let remote_launch_origin = crate::command_proxy::capture_rrls_launch_origin(&state, name);
+    if crate::rrls::is_rrls() && !crate::command_proxy::local_operation(name) {
+        let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
+            Ok(principal) => principal,
+            Err(error) => return error,
+        };
+        return crate::command_proxy::submit_with_origins(
+            &state,
+            &principal,
+            bearer_token_from_headers(&headers),
+            crate::command_proxy::Operation::Command(name.into()),
+            plumbing_source_ms,
+            remote_launch_origin,
+        )
+        .await;
+    }
+    let command = match serde_json::from_value(value) {
+        Ok(command) => command,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Unknown command for this station build.",
+            )
+                .into_response();
+        }
+    };
+    send_command(State(state), headers, Json(command))
+        .await
+        .into_response()
+}
+
+fn command_disabled_message(state:&AppState,command:&TelemetryCommand)->String {
+    let name=command_name(command);
+    let policy=state.action_policy_snapshot();
+    let reason=policy.controls.iter().find(|control|control.cmd==name)
+        .and_then(|control|control.disabled_reason.as_deref());
+    reason.map_or_else(||format!("{name} is unavailable under the current GroundStation policy. Check its control details."),|reason|format!("{name}: {reason}"))
+}
+
 /// Validates and forwards a frontend command into the backend command channel.
 async fn send_command(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(cmd): Json<TelemetryCommand>,
-) -> (StatusCode, &'static str) {
+) -> (StatusCode, String) {
+    let Some(lease) = state.control_ingress.handler() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Control ingress is closed".into(),
+        );
+    };
+    lease
+        .run(send_command_inner(State(state), headers, Json(cmd)))
+        .await
+}
+
+async fn send_command_inner(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(cmd): Json<TelemetryCommand>,
+) -> (StatusCode, String) {
+    let cmd = crate::operator_phase::seal(&state,cmd);
+    let safe_manual = crate::operator_queue::safe_manual::Intent::capture(&state, &cmd);
+    let recovery_origin = crate::operator_queue::manual_origin::Origin::capture(&state,&cmd);
+    let fill_origin = matches!(cmd, TelemetryCommand::StartFill)
+        .then(|| crate::fill_recording::Captured::capture(&state));
+    // Request origin must precede authentication/database waits across recovery.
+    let admission_generation = if matches!(cmd, TelemetryCommand::Abort) {
+        0
+    } else {
+        crate::gse::capture_operator_origin(&state).or_else(||recovery_origin.map(|origin|origin.generation())).unwrap_or(0)
+    };
+    let plumbing_origin = crate::actuator_plumbing::capture_motion_origin(&state, &cmd);
+    let launch_revision = crate::board_abort::capture_launch_revision(&state, &cmd);
+    #[cfg(test)]
+    if !crate::telemetry_task::recording_owner::test_hooks::before_http_auth(&state).await {
+        return crate::fill_recording::http_result(Err(crate::fill_recording::Error::Stale));
+    }
     let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
         Ok(principal) => principal,
         Err(response) => {
             let status = response.status();
             return if status == StatusCode::FORBIDDEN {
-                (StatusCode::FORBIDDEN, "permission denied")
+                (StatusCode::FORBIDDEN, "permission denied".into())
             } else {
-                (StatusCode::UNAUTHORIZED, "authentication required")
+                (StatusCode::UNAUTHORIZED, "authentication required".into())
             };
         }
     };
+    if let Some(intent) = safe_manual {
+        return crate::operator_queue::safe_manual::dispatch(state, &principal, intent, None).await;
+    }
+    let cmd = if let Some(captured) = fill_origin {
+        let weak = Arc::downgrade(&state);
+        let authority = crate::fill_recording::Authority::Session {
+            token: bearer_token_from_headers(&headers).map(str::to_owned),
+            actor: principal.username.clone(),
+            admission_current: Arc::new(move || {
+                if weak.upgrade()
+                    .is_some_and(|state| state.is_command_allowed(&TelemetryCommand::StartFill)) {
+                    crate::gse::CurrentState::Current
+                } else { crate::gse::CurrentState::Invalid }
+            }),
+        };
+        TelemetryCommand::FillWithRecording {
+            origin: captured.bind(authority, Some(&principal)),
+        }
+    } else {
+        cmd
+    };
+    dispatch_command_inner(
+        state, principal, cmd, false, admission_generation,
+        CommandDispatchOrigins { plumbing_origin, launch_revision, recovery_origin },
+    )
+    .await
+}
+
+/// Shared primary/local authorization and dispatch. A proxy must supply a
+/// freshly resolved local principal; this never changes RRLS execution policy.
+#[cfg(test)]
+pub(crate) async fn dispatch_authorized_command(
+    state: Arc<AppState>,
+    principal: crate::auth::AuthPrincipal,
+    cmd: TelemetryCommand,
+    admission_generation: u64,
+    plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+    launch_revision: Option<u64>,
+) -> (StatusCode, String) {
+    dispatch_command(
+        state,
+        principal,
+        cmd,
+        false,
+        admission_generation,
+        plumbing_origin,
+        launch_revision,
+    )
+    .await
+}
+pub(crate) async fn dispatch_proxied_command(
+    state: Arc<AppState>,
+    principal: crate::auth::AuthPrincipal,
+    cmd: TelemetryCommand,
+    launch_revision: Option<u64>,
+) -> (StatusCode, String) {
+    let admission_generation = if matches!(cmd, TelemetryCommand::Abort) {
+        0
+    } else {
+        crate::gse::capture_operator_origin(&state).unwrap_or(0)
+    };
+    dispatch_command(
+        state,
+        principal,
+        cmd,
+        true,
+        admission_generation,
+        None,
+        launch_revision,
+    )
+    .await
+}
+pub(crate) async fn dispatch_proxied_command_with_origin(
+    state: Arc<AppState>,
+    principal: crate::auth::AuthPrincipal,
+    cmd: TelemetryCommand,
+    plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+    launch_revision: Option<u64>,
+) -> (StatusCode, String) {
+    let admission_generation = if matches!(cmd, TelemetryCommand::Abort) {
+        0
+    } else {
+        crate::gse::capture_operator_origin(&state).unwrap_or(0)
+    };
+    dispatch_command(
+        state,
+        principal,
+        cmd,
+        true,
+        admission_generation,
+        plumbing_origin,
+        launch_revision,
+    )
+    .await
+}
+
+async fn dispatch_command(
+    state: Arc<AppState>,
+    principal: crate::auth::AuthPrincipal,
+    cmd: TelemetryCommand,
+    immediate_admission: bool,
+    admission_generation: u64,
+    plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+    launch_revision: Option<u64>,
+) -> (StatusCode, String) {
+    let Some(lease) = state.control_ingress.handler() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Control ingress is closed".into(),
+        );
+    };
+    lease
+        .run(dispatch_command_inner(
+            state,
+            principal,
+            cmd,
+            immediate_admission,
+            admission_generation,
+            CommandDispatchOrigins { plumbing_origin, launch_revision, recovery_origin: None },
+        ))
+        .await
+}
+
+/// The original command's provenance moves as one value across the handler
+/// future; this groups existing fields without recapturing any authority.
+struct CommandDispatchOrigins {
+    plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+    launch_revision: Option<u64>,
+    recovery_origin: Option<crate::operator_queue::manual_origin::Origin>,
+}
+async fn dispatch_command_inner(
+    state: Arc<AppState>,
+    principal: crate::auth::AuthPrincipal,
+    cmd: TelemetryCommand,
+    immediate_admission: bool,
+    admission_generation: u64,
+    origins: CommandDispatchOrigins,
+) -> (StatusCode, String) {
+    let CommandDispatchOrigins { plumbing_origin, launch_revision, mut recovery_origin } = origins;
     let cmd_name = command_name(&cmd);
     if !principal.allows_command_name(cmd_name) {
         emit_warning(
             &state,
             format!("Rejected software command {cmd:?}: session is not allowed to send {cmd_name}"),
         );
-        return (StatusCode::FORBIDDEN, "command not allowed");
+        return (StatusCode::FORBIDDEN, "command not allowed".into());
+    }
+    // Permission is resolved, but no ordinary-queue/GSE/disk wait may precede
+    // retention of a new manual emergency stop. The primary owns execution.
+    if matches!(cmd, TelemetryCommand::Abort) && !crate::rrls::is_rrls() {
+        // Only the existing proxy wrappers select immediate_admission. Their
+        // secondary Stop has no proven original UTC and must never be restamped.
+        if immediate_admission {
+            state.manual_abort_intent.request_untimed();
+        } else {
+            state.manual_abort_intent.request();
+        }
+        return (
+            StatusCode::ACCEPTED,
+            "manual Abort intent retained; board readback required".into(),
+        );
+    }
+    #[cfg(feature="hitl_mode")]
+    if matches!(cmd,TelemetryCommand::AdvanceFlightState|TelemetryCommand::RewindFlightState) {
+        return (StatusCode::CONFLICT,"Phase steps require a fresh request on the primary GroundStation connection.".into());
+    }
+    if !crate::operator_phase::is_local(&cmd) && crate::board_abort::launch_command(command_name(&cmd)) {
+        if let Err(error) = crate::board_abort::validate_launch_revision(&state, launch_revision) {
+            return (StatusCode::CONFLICT, error);
+        }
+        if let Some(message) = crate::board_abort::blocked_message(&state) {
+            emit_notification_warning(&state, &message);
+            return (StatusCode::CONFLICT, message);
+        }
     }
     if !state.is_command_allowed(&cmd) {
-        emit_notification_warning(
-            &state,
-            format!("Ignored software command {cmd:?}: command is currently disabled"),
-        );
-        return (StatusCode::FORBIDDEN, "command disabled");
+        let message=command_disabled_message(&state,&cmd);
+        emit_notification_warning(&state,&message);
+        return (StatusCode::FORBIDDEN, message);
     }
+    if matches!(cmd, TelemetryCommand::RetractPlumbing)
+        && let Err(message) =
+            crate::actuator_plumbing::validate_motion_origin(&state, plumbing_origin)
+        {
+            emit_notification_warning(&state, message);
+            return (
+                StatusCode::CONFLICT,
+                "plumbing motion context is stale or unavailable".into(),
+            );
+        }
+    // A bounded proxy must not wait behind a full command channel after its
+    // signed contract expires, or record an unadmitted intent as a duplicate.
+    let permit = if immediate_admission && !matches!(cmd, TelemetryCommand::ResetTClock) {
+        match state.cmd_tx.clone().try_reserve_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "primary command queue is busy".into(),
+                );
+            }
+        }
+    } else {
+        None
+    };
     let now_ms = software_command_clock_ms();
-    if !state.record_software_command_if_fresh(&cmd, now_ms, software_command_dedup_ms()) {
-        gs_debug_println!("Ignored duplicate software command {cmd:?}");
-        return (StatusCode::OK, "duplicate ignored");
+    let mut admission_rejection=None;
+    let duplicate = match crate::gse::record_operator_command_with_recovery_origin_diagnostic(
+        &state,
+        admission_generation,
+        &cmd,
+        now_ms,
+        software_command_dedup_ms(),
+        launch_revision,
+        crate::gse::RecoveryAdmissionDiagnostic {
+            origin: &mut recovery_origin,
+            rejection: &mut admission_rejection,
+        },
+    ) {
+        Err(message) => return (StatusCode::CONFLICT, message),
+        Ok(crate::gse::OperatorCommandAdmission::Stale) => {
+            let message=admission_rejection.unwrap_or(crate::operator_queue::manual_origin::Rejection::MissingOrigin).message();
+            log::warn!("Command {} was not admitted: {}",cmd_name,message);
+            return (StatusCode::CONFLICT, message.into());
+        }
+        Ok(crate::gse::OperatorCommandAdmission::Duplicate) => true,
+        Ok(crate::gse::OperatorCommandAdmission::Fresh) => false,
+    };
+    // A pending/failed recording preparation is not a completed Fill. Never
+    // acknowledge that duplicate as recording-ready; a fresh explicit retry
+    // may retry storage once the bounded preparation owner has finished.
+    let fill_retry = matches!(cmd, TelemetryCommand::FillWithRecording { .. })
+        && state.fill_recording.ready_instance() == 0;
+    if duplicate && fill_retry && state.fill_recording.preparation.available_permits() == 0 {
+        return crate::fill_recording::http_result(Err(crate::fill_recording::Error::Busy));
     }
-    if state.cmd_tx.send(cmd).await.is_err() {
+    if duplicate && !fill_retry {
+        gs_debug_println!("Ignored duplicate software command {cmd:?}");
+        if matches!(cmd, TelemetryCommand::ResetTClock) {
+            if crate::rrls::is_rrls() {
+                return match crate::launch_clock_sync::await_existing_reset().await {
+                    Ok(true) => (StatusCode::OK, "primary T clock reset saved".into()),
+                    Ok(false) => (
+                        StatusCode::ACCEPTED,
+                        "primary reset pending; retained clock unchanged".into(),
+                    ),
+                    Err(_) => (
+                        StatusCode::CONFLICT,
+                        "primary reset was not confirmed".into(),
+                    ),
+                };
+            }
+            let waiter = state.launch_history.lock().unwrap().waiter();
+            if crate::launch_history::flush(waiter).await.is_err() {
+                return (
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "T clock reset was not saved".into(),
+                );
+            }
+        }
+        return (StatusCode::OK, "duplicate ignored".into());
+    }
+    if matches!(cmd, TelemetryCommand::ResetTClock) {
+        if crate::rrls::is_rrls() {
+            return match crate::launch_clock_sync::request_reset(&state).await {
+                Ok(true) => (StatusCode::OK, "primary T clock reset saved".into()),
+                Ok(false) => (
+                    StatusCode::ACCEPTED,
+                    "primary reset pending; retained clock unchanged".into(),
+                ),
+                Err(error) => {
+                    emit_notification_warning(
+                        &state,
+                        format!("Primary T clock reset not confirmed: {error}"),
+                    );
+                    (
+                        StatusCode::CONFLICT,
+                        "primary reset was not confirmed".into(),
+                    )
+                }
+            };
+        }
+        let work = state.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            reset_primary_clock_for_origin(&work, admission_generation)
+        })
+        .await
+        .unwrap_or_else(|error| Err((StatusCode::CONFLICT, error.into())));
+        if let Err((status, error)) = result {
+            if status == StatusCode::INSUFFICIENT_STORAGE {
+                emit_notification_warning(&state, format!("T clock reset is not durable: {error}"));
+                return (
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "T clock reset was not saved".into(),
+                );
+            }
+            emit_notification_warning(&state, format!("T clock reset failed: {error}"));
+            return (StatusCode::CONFLICT, "T clock reset failed".into());
+        }
+        return (StatusCode::OK, "ok".into());
+    }
+    if let TelemetryCommand::FillWithRecording { origin } = cmd {
+        drop(permit);
+        let result = crate::fill_recording::start(state.clone(), origin).await;
+        if let Err(error) = &result {
+            crate::fill_recording::notify_failure(&state, error);
+        }
+        return crate::fill_recording::http_result(result);
+    }
+    if matches!(cmd, TelemetryCommand::StartFill) {
+        return crate::fill_recording::http_result(Err(crate::fill_recording::Error::Stale));
+    }
+    if let Some(permit) = permit {
+        permit.send(TelemetryCommand::QueuedOperator {
+            recovery_origin,
+            launch_revision,
+            plumbing_origin,
+            generation: admission_generation,
+            command: Box::new(cmd),
+        });
+        return (StatusCode::OK, "ok".into());
+    }
+    if state
+        .cmd_tx
+        .send(TelemetryCommand::QueuedOperator {
+            recovery_origin,
+            launch_revision,
+            plumbing_origin,
+            generation: admission_generation,
+            command: Box::new(cmd),
+        })
+        .await
+        .is_err()
+    {
         emit_notification_warning(&state, "Command worker unavailable; command was not queued");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "command worker unavailable",
+            "command worker unavailable".into(),
         );
     }
-    (StatusCode::OK, "ok")
+    (StatusCode::OK, "ok".into())
+}
+
+/// Called inside the actual blocking worker, never around its async caller.
+/// HTTP/WS cancellation must not release the worker's mutation or durability
+/// wait. The claim is a lease; no dispatch/history mutex crosses writer.wait.
+fn reset_primary_clock_for_origin(
+    state: &AppState,
+    generation: u64,
+) -> Result<(), (StatusCode, anyhow::Error)> {
+    #[cfg(test)]
+    let _completion = clock_worker_tests::completion(state);
+    #[cfg(test)]
+    clock_worker_tests::pause_worker(state, clock_worker_tests::Phase::BeforeClaim);
+    let _claim = crate::gse::claim_operator_dispatch(state, generation).ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            anyhow::anyhow!("T clock reset cancelled by recovery"),
+        )
+    })?;
+    #[cfg(test)]
+    clock_worker_tests::pause_worker(state, clock_worker_tests::Phase::BeforeMutation);
+    state
+        .try_reset_launch_clock()
+        .map_err(|error| (StatusCode::CONFLICT, error))?;
+    #[cfg(test)]
+    clock_worker_tests::pause_worker(state, clock_worker_tests::Phase::AfterMutation);
+    let waiter = state.launch_history.lock().unwrap().waiter();
+    if let Some((writer, ticket)) = waiter {
+        // A timeout reports failure, not writer quiescence. Recovery must still
+        // verify the actual journal prefix before publishing its completion.
+        writer
+            .wait(ticket)
+            .map_err(|error| (StatusCode::INSUFFICIENT_STORAGE, error))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
-mod command_dispatch_tests {
+pub(crate) mod command_dispatch_tests {
     use super::*;
     use crate::recording_export::tests::{TestDirectory, export_state};
 
@@ -2152,11 +2909,1685 @@ mod command_dispatch_tests {
         )
         .await;
         assert_eq!(result.0, StatusCode::OK);
-        assert!(matches!(rx.try_recv(), Ok(TelemetryCommand::Postinit)));
+        let queued = rx.try_recv().unwrap();
+        assert!(
+            matches!(queued, TelemetryCommand::QueuedOperator { generation, command , .. }
+            if generation == crate::gse::automatic_generation(&state)
+                && matches!(*command, TelemetryCommand::Postinit))
+        );
+        // Full ordinary capacity cannot delay authenticated emergency retention.
+        for _ in 0..4 {
+            state.cmd_tx.try_send(TelemetryCommand::Postinit).unwrap();
+        }
+        let principal = authorize_headers(&state, &headers, Permission::SendCommands)
+            .await
+            .unwrap();
+        use futures::FutureExt;
+        let retained = dispatch_authorized_command(
+            state.clone(),
+            principal,
+            TelemetryCommand::Abort,
+            crate::gse::automatic_generation(&state),
+            None,
+            None,
+        )
+        .now_or_never()
+        .expect("manual intent retention must not await ordinary capacity");
+        assert_eq!(retained.0, StatusCode::ACCEPTED);
+        let epoch = state.manual_abort_intent.epoch();
+        assert!(epoch > 0);
         drop(rx);
-        // A separate command avoids the intentional button-repeat suppression.
-        let result = send_command(State(state), headers, Json(TelemetryCommand::Abort)).await;
-        assert_eq!(result.0, StatusCode::SERVICE_UNAVAILABLE);
+        state.last_command_ms.lock().unwrap().clear();
+        let lost = send_command(
+            State(state.clone()),
+            headers.clone(),
+            Json(TelemetryCommand::Postinit),
+        )
+        .await;
+        assert_eq!(lost.0, StatusCode::SERVICE_UNAVAILABLE);
+        // Abort owns an independent retained lane even when the ordinary worker
+        // has closed. Acceptance means retained intent, not board confirmation.
+        let result =
+            send_command(State(state.clone()), headers, Json(TelemetryCommand::Abort)).await;
+        assert_eq!(result.0, StatusCode::ACCEPTED);
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+    }
+    // Receipt notification is test-only and scoped to one real socket state.
+    type ScopedCommandReceipt = std::sync::Mutex<Option<(usize, Arc<tokio::sync::Notify>)>>;
+    static WS_COMMAND_RECEIVED: std::sync::OnceLock<ScopedCommandReceipt> = std::sync::OnceLock::new();
+
+    pub(super) fn notify_ws_command_received(state: &Arc<AppState>) {
+        let guard = WS_COMMAND_RECEIVED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap();
+        if let Some((owner, notify)) = guard.as_ref()
+            && *owner == Arc::as_ptr(state) as usize
+        {
+            notify.notify_one();
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_late_firmware_body_cannot_start_background_transfer() {
+        use futures::FutureExt;
+        let (_directory, state, _commands, mut headers) = preauth_fixture().await;
+        headers.insert("x-firmware-filename", "mock.seds".parse().unwrap());
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(1);
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = entered.clone();
+        let body = Body::from_stream(futures::stream::poll_fn(move |context| {
+            observed.store(true, std::sync::atomic::Ordering::Release);
+            receiver.poll_recv(context)
+        }));
+        let request = start_firmware_update(
+            State(state.clone()),
+            headers,
+            Path(crate::types::Board::DaqBoard.sender_id().into()),
+            body,
+        );
+        tokio::pin!(request);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !entered.load(std::sync::atomic::Ordering::Acquire) {
+                assert!(
+                    request.as_mut().now_or_never().is_none(),
+                    "upload returned before held body was polled"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        state.request_shutdown();
+        sender
+            .send(Ok(axum::body::Bytes::from_static(
+                b"mock-not-a-firmware-image",
+            )))
+            .await
+            .unwrap();
+        drop(sender);
+        let response = request.await.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let reason = to_bytes(response.into_body(), 512).await.unwrap();
+        assert_eq!(
+            &reason[..],
+            b"ground station is shutting down",
+            "router absence must not hide a missing post-body shutdown guard"
+        );
+        // Rejection precedes artifact decoding/router access; no board command
+        // or real firmware transfer is used by this regression.
+    }
+
+    pub(crate) async fn preauth_fixture() -> (
+        TestDirectory,
+        Arc<AppState>,
+        tokio::sync::mpsc::Receiver<TelemetryCommand>,
+        HeaderMap,
+    ) {
+        let root = TestDirectory::new();
+        let mut state = export_state(&root.0, false).await;
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::ensure_auth_sessions_table(&db).await.unwrap();
+        sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,created_at_ms,expires_at_ms) VALUES('preauth-test','operator','session',1,1,0,9999999999999)")
+            .execute(&db).await.unwrap();
+        std::fs::write(
+            root.0.join("auth.json"),
+            serde_json::json!({"users":[{
+                "username":"operator", "roles":[], "password":{"salt_b64":"","hash_b64":""},
+                "permissions":{"view_data":true,"send_commands":true}
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.auth_db = db;
+        inner.cmd_tx = tx;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer preauth-test".parse().unwrap(),
+        );
+        (root, state, rx, headers)
+    }
+
+    #[tokio::test]
+    async fn actual_http_blocked_sender_retains_old_origin_after_receiver_drain_and_reopen() {
+        let (_directory, state, mut commands, headers) = preauth_fixture().await;
+        for _ in 0..4 {
+            state.cmd_tx.try_send(TelemetryCommand::Postinit).unwrap();
+        }
+        let generation = crate::gse::automatic_generation(&state);
+        let request = send_command(
+            State(state.clone()),
+            headers,
+            Json(TelemetryCommand::Postinit),
+        );
+        tokio::pin!(request);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), request.as_mut())
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .last_command_ms
+                .lock()
+                .unwrap()
+                .contains_key("dedup:Postinit"),
+            "actual auth/policy/dedup reached before full-channel await"
+        );
+        state
+            .operator_admission_barrier
+            .store(77, std::sync::atomic::Ordering::Release);
+        let token = crate::operator_queue::Token::capture(&state, 77);
+        let mut admin = state.operator_queue.take_receiver().unwrap();
+        let receipt = state.operator_queue.request(token).unwrap();
+        crate::operator_queue::serve(&state, &mut commands, admin.recv().await.unwrap());
+        assert_eq!(receipt.await.unwrap(), Ok(4));
+        // Model only the verified epoch/reopen boundary, never a reset API.
+        state
+            .automatic_generation
+            .store(generation + 1, std::sync::atomic::Ordering::Release);
+        state
+            .operator_admission_barrier
+            .store(0, std::sync::atomic::Ordering::Release);
+        assert_eq!(request.await.0, StatusCode::OK);
+        let late = commands.recv().await.unwrap();
+        assert_origin_rejected(&state, late, generation);
+        assert!(commands.try_recv().is_err());
+    }
+
+    fn assert_origin_rejected(state: &AppState, queued: TelemetryCommand, origin: u64) {
+        let TelemetryCommand::QueuedOperator {
+            generation,
+            command,
+            ..
+        } = queued
+        else {
+            panic!("expected existing operator envelope");
+        };
+        assert!(matches!(*command, TelemetryCommand::Postinit));
+        assert!(
+            crate::gse::claim_operator_dispatch(state, generation).is_none(),
+            "pre-reset origin must never acquire dispatch after recovery"
+        );
+        assert_eq!(
+            generation, origin,
+            "authentication must not refresh a request's generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn preauth_http_request_retains_origin_across_sqlite_wait() {
+        use futures::FutureExt;
+        let (_root, state, mut rx, headers) = preauth_fixture().await;
+        let held = state.auth_db.acquire().await.unwrap();
+        assert_eq!(state.auth_db.size(), 1);
+        assert_eq!(state.auth_db.num_idle(), 0);
+        let origin = crate::gse::automatic_generation(&state);
+        let request = send_command(
+            State(state.clone()),
+            headers.clone(),
+            Json(TelemetryCommand::Postinit),
+        );
+        tokio::pin!(request);
+        assert!(
+            request.as_mut().now_or_never().is_none(),
+            "actual SQLite authorization must block"
+        );
+        state
+            .automatic_generation
+            .store(origin + 1, std::sync::atomic::Ordering::Release);
+        drop(held);
+        let stale = request.await;
+        if let Ok(queued) = rx.try_recv() {
+            // Predecessor runtime preserves the old envelope but still records
+            // dedup: exercise its actual owner rejection before the next check.
+            assert_origin_rejected(&state, queued, origin);
+        }
+        let fresh = send_command(
+            State(state.clone()),
+            headers.clone(),
+            Json(TelemetryCommand::Postinit),
+        )
+        .await;
+        let queued = rx
+            .try_recv()
+            .expect("stale authorization must not suppress the identical fresh command");
+        let TelemetryCommand::QueuedOperator { generation, .. } = queued else {
+            panic!("missing positive envelope");
+        };
+        assert!(crate::gse::claim_operator_dispatch(&state, generation).is_some());
+        // Check stale response only after the causal owner/dedup controls.
+        assert_eq!(stale.0, StatusCode::CONFLICT);
+        assert_eq!(fresh.0, StatusCode::OK);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            send_command(
+                State(state.clone()),
+                headers,
+                Json(TelemetryCommand::Postinit)
+            )
+            .await
+            .1,
+            "duplicate ignored"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn preauth_http_revocation_and_manual_stop_keep_authentication() {
+        use futures::FutureExt;
+        let (_root, state, mut rx, headers) = preauth_fixture().await;
+        let mut held = state.auth_db.acquire().await.unwrap();
+        let origin = crate::gse::automatic_generation(&state);
+        let request = send_command(
+            State(state.clone()),
+            headers.clone(),
+            Json(TelemetryCommand::Abort),
+        );
+        tokio::pin!(request);
+        assert!(request.as_mut().now_or_never().is_none());
+        state
+            .automatic_generation
+            .store(origin + 1, std::sync::atomic::Ordering::Release);
+        sqlx::query("DELETE FROM auth_sessions")
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        drop(held);
+        assert_eq!(request.await.0, StatusCode::UNAUTHORIZED);
+        assert!(state.manual_abort_intent.pending_epoch().is_none());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            send_command(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(TelemetryCommand::Abort)
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,created_at_ms,expires_at_ms) VALUES('preauth-test','operator','session',1,1,0,9999999999999)")
+            .execute(&state.auth_db).await.unwrap();
+        let held = state.auth_db.acquire().await.unwrap();
+        let stop = send_command(State(state.clone()), headers, Json(TelemetryCommand::Abort));
+        tokio::pin!(stop);
+        assert!(stop.as_mut().now_or_never().is_none());
+        state
+            .automatic_generation
+            .store(origin + 2, std::sync::atomic::Ordering::Release);
+        drop(held);
+        assert_eq!(stop.await.0, StatusCode::ACCEPTED);
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_ingress_idle_ws_closes_clean_and_late_frames_cannot_retain_stop() {
+        let (_root, state, _commands, _headers) = preauth_fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route("/ws", axum::routing::get(ws_handler))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/ws?token=preauth-test"))
+                .await
+                .unwrap();
+        state.request_shutdown();
+        assert!(
+            state
+                .control_ingress
+                .wait_terminal(StdDuration::from_secs(2))
+                .await,
+            "healthy idle UI connection prevented a proven terminal receipt"
+        );
+        let _ = socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"Abort"}"#.into(),
+            ))
+            .await;
+        tokio::task::yield_now().await;
+        assert_eq!(state.manual_abort_intent.epoch(), 0);
+        let response = send_command(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(TelemetryCommand::Abort),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.manual_abort_intent.epoch(), 0);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn shutdown_ingress_held_ws_auth_finishes_existing_manual_stop_but_drops_late_frame() {
+        let (_root, state, mut commands, _headers) = preauth_fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route("/ws", axum::routing::get(ws_handler))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/ws?token=preauth-test"))
+                .await
+                .unwrap();
+        let received = Arc::new(tokio::sync::Notify::new());
+        *WS_COMMAND_RECEIVED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap() = Some((Arc::as_ptr(&state) as usize, received.clone()));
+        let held = state.auth_db.acquire().await.unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"Abort"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(StdDuration::from_secs(2), received.notified())
+            .await
+            .unwrap();
+        state.request_shutdown();
+        assert!(
+            !state
+                .control_ingress
+                .wait_terminal(StdDuration::from_millis(5))
+                .await
+        );
+        assert_eq!(
+            state.manual_abort_intent.epoch(),
+            0,
+            "authentication wait was bypassed"
+        );
+        let _ = socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"Abort"}"#.into(),
+            ))
+            .await;
+        drop(held);
+        assert!(
+            !state
+                .control_ingress
+                .wait_terminal(StdDuration::from_secs(2))
+                .await,
+            "in-flight-at-seal control was falsely labeled safe before SDK drain"
+        );
+        assert_eq!(
+            state.manual_abort_intent.epoch(),
+            1,
+            "existing authorized Stop was cancelled or a post-seal frame was accepted"
+        );
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+        assert!(
+            commands.try_recv().is_err(),
+            "manual Stop entered the ordinary queue"
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn shutdown_ingress_held_http_stop_finishes_without_reopening_new_requests() {
+        use futures::FutureExt;
+        let (_root, state, mut commands, headers) = preauth_fixture().await;
+        let held = state.auth_db.acquire().await.unwrap();
+        let request = send_command(
+            State(state.clone()),
+            headers.clone(),
+            Json(TelemetryCommand::Abort),
+        );
+        tokio::pin!(request);
+        assert!(request.as_mut().now_or_never().is_none());
+        state.request_shutdown();
+        drop(held);
+        assert_eq!(request.await.0, StatusCode::ACCEPTED);
+        assert_eq!(state.manual_abort_intent.epoch(), 1);
+        assert!(
+            !state
+                .control_ingress
+                .wait_terminal(StdDuration::from_millis(5))
+                .await
+        );
+        assert_eq!(
+            send_command(State(state.clone()), headers, Json(TelemetryCommand::Abort))
+                .await
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(state.manual_abort_intent.epoch(), 1);
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn preauth_websocket_frame_retains_origin_and_stop_is_independent() {
+        use futures::SinkExt;
+        let (_root, state, mut rx, _headers) = preauth_fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route("/ws", axum::routing::get(ws_handler))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/ws?token=preauth-test"))
+                .await
+                .unwrap();
+        let received = Arc::new(tokio::sync::Notify::new());
+        *WS_COMMAND_RECEIVED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap() = Some((Arc::as_ptr(&state) as usize, received.clone()));
+        let origin = crate::gse::automatic_generation(&state);
+        let mut stale_notifications = state.notifications_tx.subscribe();
+        let held = state.auth_db.acquire().await.unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"Postinit"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(StdDuration::from_secs(3), received.notified())
+            .await
+            .unwrap();
+        // Current-thread runtime: receiver runs through its notification into the
+        // actual SQLite wait before this test can resume; the sole DB owner is held.
+        state
+            .automatic_generation
+            .store(origin + 1, std::sync::atomic::Ordering::Release);
+        drop(held);
+        tokio::select! {
+            queued = rx.recv() => {
+                // Predecessor runtime still writes dedup despite this correct
+                // old-envelope owner rejection. The identical fresh frame below
+                // must be admitted without clearing that map in the test.
+                assert_origin_rejected(&state, queued.unwrap(), origin);
+            }
+            notices = stale_notifications.recv() => {
+                assert!(notices.unwrap().iter().any(|notice| notice.message == crate::operator_queue::manual_origin::Rejection::ResetChanged.message()));
+            }
+            _ = tokio::time::sleep(StdDuration::from_secs(3)) => panic!("stale frame did not reach ordinary admission"),
+        }
+        assert!(rx.try_recv().is_err());
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"Postinit"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let TelemetryCommand::QueuedOperator { generation, .. } =
+            tokio::time::timeout(StdDuration::from_secs(3), rx.recv())
+                .await
+                .expect("stale authorization must not suppress the identical fresh frame")
+                .unwrap()
+        else {
+            panic!("missing positive envelope");
+        };
+        assert!(crate::gse::claim_operator_dispatch(&state, generation).is_some());
+        received.notified().await;
+        let held = state.auth_db.acquire().await.unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"Abort"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(StdDuration::from_secs(3), received.notified())
+            .await
+            .unwrap();
+        state
+            .automatic_generation
+            .store(origin + 2, std::sync::atomic::Ordering::Release);
+        let mut notifications = state.notifications_tx.subscribe();
+        // Revoke while authentication is genuinely held: even emergency
+        // retention requires a currently authorized session.
+        let mut held = held;
+        sqlx::query("DELETE FROM auth_sessions")
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        drop(held);
+        tokio::time::timeout(StdDuration::from_secs(3), notifications.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.manual_abort_intent.pending_epoch().is_none());
+        assert!(rx.try_recv().is_err());
+        sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,created_at_ms,expires_at_ms) VALUES('preauth-test','operator','session',1,1,0,9999999999999)")
+            .execute(&state.auth_db).await.unwrap();
+        let held = state.auth_db.acquire().await.unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"Abort"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(StdDuration::from_secs(3), received.notified())
+            .await
+            .unwrap();
+        state
+            .automatic_generation
+            .store(origin + 3, std::sync::atomic::Ordering::Release);
+        drop(held);
+        // Sending a following ordinary command gives a receiver-order completion
+        // barrier after Abort retention without timing sleeps.
+        state.last_command_ms.lock().unwrap().clear();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"Postinit"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(StdDuration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+        *WS_COMMAND_RECEIVED.get().unwrap().lock().unwrap() = None;
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod clock_worker_tests {
+    use super::*;
+    use crate::telemetry_db::{LaunchClockKind, LaunchClockMsg};
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Phase {
+        BeforeClaim,
+        BeforeMutation,
+        AfterMutation,
+        Unpaused,
+    }
+    struct Pause {
+        entered: tokio::sync::Notify,
+        released: Mutex<bool>,
+        changed: Condvar,
+    }
+    impl Pause {
+        fn new() -> Self {
+            Self {
+                entered: tokio::sync::Notify::new(),
+                released: Mutex::new(false),
+                changed: Condvar::new(),
+            }
+        }
+        fn block(&self) {
+            self.entered.notify_one();
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.changed.wait(released).unwrap();
+            }
+        }
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+        async fn entered(&self) {
+            tokio::time::timeout(StdDuration::from_secs(3), self.entered.notified())
+                .await
+                .expect("actual worker must reach its pause");
+        }
+    }
+    struct Probe {
+        phase: Phase,
+        pause: Pause,
+        completed: tokio::sync::Notify,
+    }
+    type WorkerProbe = Mutex<Option<(usize, Arc<Probe>)>>;
+    type WriterPause = Mutex<Option<(PathBuf, Arc<Pause>)>>;
+    static WORKER: OnceLock<WorkerProbe> = OnceLock::new();
+    static WRITER: OnceLock<WriterPause> = OnceLock::new();
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(crate) struct Completion(Arc<Probe>);
+    impl Drop for Completion {
+        fn drop(&mut self) {
+            self.0.completed.notify_one();
+        }
+    }
+    fn probe(state: &AppState) -> Option<Arc<Probe>> {
+        WORKER
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(key, _)| *key == state as *const AppState as usize)
+            .map(|(_, p)| p.clone())
+    }
+    pub(crate) fn completion(state: &AppState) -> Option<Completion> {
+        probe(state).map(Completion)
+    }
+    pub(crate) fn pause_worker(state: &AppState, phase: Phase) {
+        if let Some(p) = probe(state)
+            && p.phase == phase
+        {
+            p.pause.block();
+        }
+    }
+    pub(crate) fn pause_journal_before_save(path: &std::path::Path) {
+        let p = WRITER
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(key, _)| key == path)
+            .map(|(_, p)| p.clone());
+        if let Some(p) = p {
+            p.block();
+        }
+    }
+    struct WorkerGuard {
+        key: usize,
+        probe: Arc<Probe>,
+    }
+    impl WorkerGuard {
+        fn install(state: &Arc<AppState>, phase: Phase) -> Self {
+            let key = Arc::as_ptr(state) as usize;
+            let probe = Arc::new(Probe {
+                phase,
+                pause: Pause::new(),
+                completed: tokio::sync::Notify::new(),
+            });
+            *WORKER.get_or_init(Default::default).lock().unwrap() = Some((key, probe.clone()));
+            Self { key, probe }
+        }
+        async fn completed(&self) {
+            tokio::time::timeout(StdDuration::from_secs(3), self.probe.completed.notified())
+                .await
+                .expect("actual blocking closure must complete");
+        }
+    }
+    impl Drop for WorkerGuard {
+        fn drop(&mut self) {
+            self.probe.pause.release();
+            let mut current = WORKER.get().unwrap().lock().unwrap();
+            if current.as_ref().is_some_and(|(key, _)| *key == self.key) {
+                *current = None;
+            }
+        }
+    }
+    pub(crate) struct WriterGuard {
+        path: PathBuf,
+        pause: Arc<Pause>,
+    }
+    impl WriterGuard {
+        pub(crate) fn install(path: PathBuf) -> Self {
+            let pause = Arc::new(Pause::new());
+            *WRITER.get_or_init(Default::default).lock().unwrap() =
+                Some((path.clone(), pause.clone()));
+            Self { path, pause }
+        }
+    }
+    impl WriterGuard {
+        pub(crate) async fn entered(&self) {
+            self.pause.entered().await;
+        }
+        pub(crate) fn release(&self) {
+            self.pause.release();
+        }
+    }
+    impl Drop for WriterGuard {
+        fn drop(&mut self) {
+            self.pause.release();
+            let mut current = WRITER.get().unwrap().lock().unwrap();
+            if current.as_ref().is_some_and(|(path, _)| *path == self.path) {
+                *current = None;
+            }
+        }
+    }
+    async fn fixture() -> (
+        crate::recording_export::tests::TestDirectory,
+        Arc<AppState>,
+        HeaderMap,
+        PathBuf,
+    ) {
+        let (root, state, _rx, headers) = command_dispatch_tests::preauth_fixture().await;
+        let path = root.0.join("actual-clock.json");
+        let now = crate::telemetry_task::get_current_timestamp_ms() as i64;
+        *state.launch_history.lock().unwrap() =
+            crate::launch_history::Store::open(path.clone(), false, None, now, 0).unwrap();
+        state.set_launch_clock(LaunchClockMsg {
+            kind: LaunchClockKind::TPlus,
+            anchor_timestamp_ms: Some(now - 1_000),
+            duration_ms: None,
+        });
+        flush(&state).await;
+        (root, state, headers, path)
+    }
+    async fn flush(state: &AppState) {
+        let waiter = state.launch_history.lock().unwrap().waiter();
+        crate::launch_history::flush(waiter).await.unwrap();
+    }
+    fn http(
+        state: Arc<AppState>,
+        headers: HeaderMap,
+    ) -> tokio::task::JoinHandle<(StatusCode, String)> {
+        tokio::spawn(async move {
+            send_command(State(state), headers, Json(TelemetryCommand::ResetTClock)).await
+        })
+    }
+    async fn manual_stop(state: &Arc<AppState>, headers: HeaderMap) {
+        let result = tokio::time::timeout(
+            StdDuration::from_secs(3),
+            send_command(State(state.clone()), headers, Json(TelemetryCommand::Abort)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.0, StatusCode::ACCEPTED);
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+    }
+    #[tokio::test]
+    async fn clock_worker_cancelled_http_keeps_actual_mutation_owned() {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, headers, path) = fixture().await;
+        let before = state.launch_history.lock().unwrap().snapshot();
+        let disk_before = std::fs::read(&path).unwrap();
+        let origin = crate::gse::automatic_generation(&state);
+        let guard = WorkerGuard::install(&state, Phase::BeforeMutation);
+        let request = http(state.clone(), headers.clone());
+        guard.probe.pause.entered().await;
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        let inflight = state.operator_dispatch_inflight.load(Ordering::Acquire);
+        let boundary = crate::gse::reset_generation::invalidate_capture_epoch(&state, origin);
+        manual_stop(&state, headers).await;
+        guard.probe.pause.release();
+        guard.completed().await;
+        flush(&state).await;
+        let after = state.launch_history.lock().unwrap().snapshot();
+        let disk_after = std::fs::read(&path).unwrap();
+        eprintln!(
+            "actual cancelled HTTP: inflight={inflight}, epoch_advanced={}, RAM_changed={}, journal_changed={}",
+            boundary.is_ok(),
+            after != before,
+            disk_after != disk_before
+        );
+        assert_eq!(after.clock, LaunchClockMsg::idle());
+        assert_ne!(
+            disk_after, disk_before,
+            "actual accepted worker must complete its journal write"
+        );
+        assert!(
+            boundary.is_err(),
+            "cancelled HTTP must not release the actual mutating worker's ownership"
+        );
+        assert_eq!(inflight, 1);
+        assert!(crate::gse::reset_generation::invalidate_capture_epoch(&state, origin).is_ok());
+    }
+    #[tokio::test]
+    async fn clock_worker_cancelled_http_keeps_actual_journal_flush_owned() {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, headers, path) = fixture().await;
+        let origin = crate::gse::automatic_generation(&state);
+        let worker = WorkerGuard::install(&state, Phase::AfterMutation);
+        let writer = WriterGuard::install(path);
+        let request = http(state.clone(), headers.clone());
+        writer.pause.entered().await;
+        // The nested state-clock lease must have returned before asserting the
+        // outer worker's exact ownership during its separate durability wait.
+        worker.probe.pause.entered().await;
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        let inflight = state.operator_dispatch_inflight.load(Ordering::Acquire);
+        let boundary = crate::gse::reset_generation::invalidate_capture_epoch(&state, origin);
+        manual_stop(&state, headers).await;
+        worker.probe.pause.release();
+        writer.pause.release();
+        worker.completed().await;
+        flush(&state).await;
+        eprintln!(
+            "actual cancelled HTTP journal flush: inflight={inflight}, epoch_advanced={}",
+            boundary.is_ok()
+        );
+        assert!(
+            boundary.is_err(),
+            "journal ticket still writing must retain the worker claim through HTTP cancellation"
+        );
+        assert_eq!(inflight, 1);
+        assert!(crate::gse::reset_generation::invalidate_capture_epoch(&state, origin).is_ok());
+    }
+    #[tokio::test]
+    async fn clock_worker_websocket_spawn_before_epoch_cannot_write_late() {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, _headers, path) = fixture().await;
+        let before = state.launch_history.lock().unwrap().snapshot();
+        let disk_before = std::fs::read(&path).unwrap();
+        let origin = crate::gse::automatic_generation(&state);
+        let guard = WorkerGuard::install(&state, Phase::BeforeClaim);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/ws?token=preauth-test"))
+                .await
+                .unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"ResetTClock"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        guard.probe.pause.entered().await;
+        assert!(crate::gse::reset_generation::invalidate_capture_epoch(&state, origin).is_ok());
+        // Actual WS task has already spawned actual blocking work. Closing the
+        // socket must not make that old origin acquire fresh authority later.
+        socket.close(None).await.unwrap();
+        guard.probe.pause.release();
+        guard.completed().await;
+        flush(&state).await;
+        let after = state.launch_history.lock().unwrap().snapshot();
+        let disk_after = std::fs::read(&path).unwrap();
+        eprintln!(
+            "actual detached WS: RAM_changed={}, journal_changed={}",
+            after != before,
+            disk_after != disk_before
+        );
+        server.abort();
+        assert!(
+            after == before && disk_after == disk_before,
+            "spawned old-origin WS reset must not mutate RAM or journal after the epoch boundary"
+        );
+    }
+    #[tokio::test]
+    async fn clock_worker_http_spawn_before_epoch_returns409_without_mutation() {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, headers, path) = fixture().await;
+        let before = state.launch_history.lock().unwrap().snapshot();
+        let disk_before = std::fs::read(&path).unwrap();
+        let origin = crate::gse::automatic_generation(&state);
+        let worker = WorkerGuard::install(&state, Phase::BeforeClaim);
+        let request = http(state.clone(), headers);
+        worker.probe.pause.entered().await;
+        assert!(crate::gse::reset_generation::invalidate_capture_epoch(&state, origin).is_ok());
+        worker.probe.pause.release();
+        worker.completed().await;
+        assert_eq!(request.await.unwrap().0, StatusCode::CONFLICT);
+        flush(&state).await;
+        assert_eq!(state.launch_history.lock().unwrap().snapshot(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+    }
+
+    #[tokio::test]
+    async fn clock_worker_current_http_and_websocket_remain_durable_and_authorized() {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, headers, path) = fixture().await;
+        let before = state.launch_history.lock().unwrap().snapshot();
+        let disk_before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            send_command(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(TelemetryCommand::ResetTClock)
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(state.launch_history.lock().unwrap().snapshot(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+        assert_eq!(
+            http(state.clone(), headers).await.unwrap().0,
+            StatusCode::OK
+        );
+        let clock = state.launch_history.lock().unwrap().snapshot();
+        assert_eq!(clock.clock, LaunchClockMsg::idle());
+        assert_eq!(clock.revision, before.revision + 1);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()["current"],
+            serde_json::to_value(&clock).unwrap()
+        );
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+
+        let (_root_ws, ws_state, _headers, ws_path) = fixture().await;
+        let before = ws_state.launch_history.lock().unwrap().snapshot();
+        let worker = WorkerGuard::install(&ws_state, Phase::Unpaused);
+        let mut notices = ws_state.notifications_tx.subscribe();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .with_state(ws_state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/ws?token=preauth-test"))
+                .await
+                .unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"cmd":"ResetTClock"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        worker.completed().await;
+        let saved = tokio::time::timeout(StdDuration::from_secs(3), notices.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            saved
+                .iter()
+                .any(|n| n.message == "Primary T clock reset saved")
+        );
+        let clock = ws_state.launch_history.lock().unwrap().snapshot();
+        assert_eq!(clock.clock, LaunchClockMsg::idle());
+        assert_eq!(clock.revision, before.revision + 1);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(ws_path).unwrap()).unwrap()
+                ["current"],
+            serde_json::to_value(&clock).unwrap()
+        );
+        assert_eq!(
+            ws_state.operator_dispatch_inflight.load(Ordering::Acquire),
+            0
+        );
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn clock_worker_writer_timeout_is507_and_not_writer_quiescence() {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, headers, path) = fixture().await;
+        let disk_before = std::fs::read(&path).unwrap();
+        let worker = WorkerGuard::install(&state, Phase::AfterMutation);
+        let writer = WriterGuard::install(path.clone());
+        let request = http(state.clone(), headers.clone());
+        writer.pause.entered().await;
+        // The nested state-clock lease must have returned before asserting the
+        // outer worker's exact ownership during its separate durability wait.
+        worker.probe.pause.entered().await;
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 1);
+        manual_stop(&state, headers).await;
+        worker.probe.pause.release();
+        // Exercise the production ten-second wait deadline unchanged. The
+        // separate journal thread stays paused after this HTTP failure.
+        let response = tokio::time::timeout(StdDuration::from_secs(15), request)
+            .await
+            .unwrap()
+            .unwrap();
+        worker.completed().await;
+        assert_eq!(
+            response,
+            (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "T clock reset was not saved".to_string()
+            )
+        );
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+        assert!(
+            !*writer.pause.released.lock().unwrap(),
+            "the actual writer is still blocked after timeout"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+        assert_eq!(
+            state.launch_history.lock().unwrap().snapshot().clock,
+            LaunchClockMsg::idle()
+        );
+        eprintln!(
+            "actual timeout: HTTP507, claim_released=true, actual_writer_still_paused=true, journal_unchanged=true; NOT quiescent"
+        );
+        // No epoch advance is attempted: the full coordinator must inspect
+        // its journal prefix rather than use a timeout/zero owner count as proof.
+        writer.pause.release();
+        flush(&state).await;
+        assert_ne!(std::fs::read(path).unwrap(), disk_before);
+    }
+
+    #[tokio::test]
+    async fn recovery_admission_journal_blocks_epoch_until_actual_prefix_and_preserves_manual_stop()
+    {
+        use crate::gse::reset_generation::{
+            advance_with_clock_fence, close_operator_admission,
+            reopen_operator_admission_and_journal,
+        };
+        let _serial = SERIAL.lock().await;
+        let (_root, state, headers, _path) = fixture().await;
+        let generation = crate::gse::automatic_generation(&state);
+        let inflight = crate::gse::claim_operator_dispatch(&state, generation).unwrap();
+        close_operator_admission(&state, generation, 71).unwrap();
+        assert!(close_operator_admission(&state, generation, 72).is_err());
+        close_operator_admission(&state, generation, 71).unwrap();
+        assert!(crate::gse::claim_operator_dispatch(&state, generation).is_none());
+        assert_eq!(
+            crate::gse::record_operator_command(
+                &state,
+                generation,
+                &TelemetryCommand::Postinit,
+                10_000,
+                500
+            ),
+            crate::gse::OperatorCommandAdmission::Stale
+        );
+        assert!(
+            crate::telemetry_task::command_at_dispatch(&state, TelemetryCommand::Nitrogen)
+                .is_none()
+        );
+        assert!(matches!(
+            crate::telemetry_task::command_at_dispatch(&state, TelemetryCommand::Abort),
+            Some(TelemetryCommand::Abort)
+        ));
+        // The real authenticated HTTP clock mutation is also refused while closed.
+        let rejected = http(state.clone(), headers.clone()).await.unwrap();
+        manual_stop(&state, headers).await;
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
+        state
+            .launch_history
+            .lock()
+            .unwrap()
+            .inhibit_automatic_actions()
+            .unwrap();
+        let fence = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .close_for_recovery(71)
+            .unwrap();
+        assert!(
+            advance_with_clock_fence(&state, generation, 71, &fence).is_err(),
+            "old unstaged prefix cannot publish"
+        );
+        let writer = WriterGuard::install(_path.clone());
+        let staged = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .stage_recovery_revision(&fence)
+            .unwrap();
+        writer.pause.entered().await;
+        assert!(
+            advance_with_clock_fence(&state, generation, 71, &staged).is_err(),
+            "pending real writer cannot publish"
+        );
+        assert!(reopen_operator_admission_and_journal(&state, generation, 71, &staged).is_err());
+        writer.pause.release();
+        flush(&state).await;
+        assert!(
+            advance_with_clock_fence(&state, generation, 71, &staged).is_err(),
+            "inflight owner still blocks publication"
+        );
+        drop(inflight);
+        assert!(advance_with_clock_fence(&state, generation, 72, &staged).is_err());
+        assert_eq!(
+            advance_with_clock_fence(&state, generation, 71, &staged).unwrap(),
+            generation + 1
+        );
+        assert!(crate::gse::claim_operator_dispatch(&state, generation + 1).is_none());
+        assert!(crate::gse::capture_operator_origin(&state).is_none());
+        assert!(advance_with_clock_fence(&state, generation, 71, &staged).is_err());
+        assert!(reopen_operator_admission_and_journal(&state, generation, 72, &staged).is_err());
+        reopen_operator_admission_and_journal(&state, generation, 71, &staged).unwrap();
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .automatic_actions_inhibited()
+        );
+        assert!(crate::gse::claim_operator_dispatch(&state, generation).is_none());
+        assert!(crate::gse::claim_operator_dispatch(&state, generation + 1).is_some());
+        assert_eq!(
+            crate::gse::record_operator_command(
+                &state,
+                generation,
+                &TelemetryCommand::Postinit,
+                10_001,
+                500
+            ),
+            crate::gse::OperatorCommandAdmission::Stale
+        );
+        assert_eq!(
+            crate::gse::record_operator_command(
+                &state,
+                generation + 1,
+                &TelemetryCommand::Postinit,
+                10_002,
+                500
+            ),
+            crate::gse::OperatorCommandAdmission::Fresh
+        );
+        assert!(reopen_operator_admission_and_journal(&state, generation, 71, &staged).is_err());
+    }
+
+    #[tokio::test]
+    async fn recovery_owner_transfer_preserves_pending_writer_and_revokes_every_old_ticket() {
+        use crate::gse::reset_generation::{
+            advance_with_clock_fence, close_operator_admission,
+            reopen_operator_admission_and_journal, transfer_closed_recovery_owner,
+        };
+        let _serial = SERIAL.lock().await;
+        let (_root, state, headers, path) = fixture().await;
+        let generation = crate::gse::automatic_generation(&state);
+        state
+            .launch_history
+            .lock()
+            .unwrap()
+            .inhibit_automatic_actions()
+            .unwrap();
+        let before = state.launch_history.lock().unwrap().snapshot();
+        let inflight = crate::gse::claim_operator_dispatch(&state, generation).unwrap();
+        close_operator_admission(&state, generation, 501).unwrap();
+        let first = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .close_for_recovery(501)
+            .unwrap();
+        let writer = WriterGuard::install(path.clone());
+        let staged = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .stage_recovery_revision(&first)
+            .unwrap();
+        writer.pause.entered().await;
+        let disk = std::fs::read(&path).unwrap();
+        assert!(transfer_closed_recovery_owner(&state, generation, 501, 502, &staged).is_err());
+        drop(inflight);
+        for (expected, old, new) in [
+            (generation + 1, 501, 502),
+            (generation, 500, 502),
+            (generation, 501, 0),
+            (generation, 501, u64::MAX),
+            (generation, 501, 501),
+        ] {
+            assert!(transfer_closed_recovery_owner(&state, expected, old, new, &staged).is_err());
+        }
+        let transferred =
+            transfer_closed_recovery_owner(&state, generation, 501, 502, &staged).unwrap();
+        assert!(crate::gse::capture_operator_origin(&state).is_none());
+        assert!(http(state.clone(), headers.clone()).await.unwrap().0 == StatusCode::CONFLICT);
+        assert_eq!(std::fs::read(&path).unwrap(), disk);
+        assert!(
+            !state
+                .launch_history
+                .lock()
+                .unwrap()
+                .recovery_quiescent(&transferred)
+                .unwrap()
+        );
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .recovery_quiescent(&staged)
+                .is_err()
+        );
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .retry_recovery_save(&staged)
+                .is_err()
+        );
+        assert!(transfer_closed_recovery_owner(&state, generation, 501, 503, &staged).is_err());
+        assert!(advance_with_clock_fence(&state, generation, 502, &transferred).is_err());
+        assert!(reopen_operator_admission_and_journal(&state, generation, 501, &staged).is_err());
+        writer.pause.release();
+        flush(&state).await;
+        assert_eq!(
+            advance_with_clock_fence(&state, generation, 502, &transferred).unwrap(),
+            generation + 1
+        );
+        // A later terminated supervisor may have already advanced the host
+        // generation. Its replacement must use the current generation and
+        // retain the same staged clock instead of incrementing it twice.
+        let newest =
+            transfer_closed_recovery_owner(&state, generation + 1, 502, 503, &transferred).unwrap();
+        assert!(
+            reopen_operator_admission_and_journal(&state, generation, 502, &transferred).is_err()
+        );
+        reopen_operator_admission_and_journal(&state, generation, 503, &newest).unwrap();
+        let after = state.launch_history.lock().unwrap().snapshot();
+        assert_eq!(after.revision, before.revision + 1);
+        assert_eq!(after.clock, before.clock);
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .automatic_actions_inhibited()
+        );
+        assert!(crate::gse::claim_operator_dispatch(&state, generation).is_none());
+        assert!(crate::gse::claim_operator_dispatch(&state, generation + 1).is_some());
+        assert!(transfer_closed_recovery_owner(&state, generation + 1, 503, 504, &newest).is_err());
+    }
+
+    #[tokio::test]
+    async fn recovery_owner_transfer_keeps_terminal_io_failure_closed_until_explicit_retry() {
+        use crate::gse::reset_generation::{
+            advance_with_clock_fence, close_operator_admission,
+            reopen_operator_admission_and_journal, transfer_closed_recovery_owner,
+        };
+        let _serial = SERIAL.lock().await;
+        let (_root, state, _headers, path) = fixture().await;
+        let generation = crate::gse::automatic_generation(&state);
+        close_operator_admission(&state, generation, 601).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("sentinel"), b"preserve").unwrap();
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .inhibit_automatic_actions()
+                .is_err()
+        );
+        let first = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .close_for_recovery(601)
+            .unwrap();
+        let transferred =
+            transfer_closed_recovery_owner(&state, generation, 601, 602, &first).unwrap();
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .recovery_quiescent(&transferred)
+                .is_err()
+        );
+        assert!(advance_with_clock_fence(&state, generation, 602, &transferred).is_err());
+        assert!(
+            reopen_operator_admission_and_journal(&state, generation, 602, &transferred).is_err()
+        );
+        assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"preserve");
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .retry_recovery_save(&first)
+                .is_err()
+        );
+        // External fixture repair is deliberate; the implementation never
+        // removes/rewrites an unreadable target just to make recovery succeed.
+        std::fs::remove_dir_all(&path).unwrap();
+        let retried = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .retry_recovery_save(&transferred)
+            .unwrap();
+        flush(&state).await;
+        let staged = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .stage_recovery_revision(&retried)
+            .unwrap();
+        flush(&state).await;
+        advance_with_clock_fence(&state, generation, 602, &staged).unwrap();
+        // Shutdown always defeats the supervisor, including a replacement.
+        state.launch_history.lock().unwrap().close_and_waiter();
+        assert!(transfer_closed_recovery_owner(&state, generation + 1, 602, 603, &staged).is_err());
+        assert!(reopen_operator_admission_and_journal(&state, generation, 602, &staged).is_err());
+        assert!(crate::gse::capture_operator_origin(&state).is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_remote_clock_keeps_receive_origin_and_actual_worker_lease_through_save() {
+        use crate::gse::reset_generation::{
+            advance_with_clock_fence, close_operator_admission,
+            reopen_operator_admission_and_journal,
+        };
+        let _serial = SERIAL.lock().await;
+        let (_root, state, _headers, path) = fixture().await;
+        let original = crate::gse::capture_operator_origin(&state).unwrap();
+        close_operator_admission(&state, original, 91).unwrap();
+        let closed_origin = crate::gse::capture_operator_origin(&state);
+        assert!(closed_origin.is_none());
+        state
+            .launch_history
+            .lock()
+            .unwrap()
+            .inhibit_automatic_actions()
+            .unwrap();
+        let fence = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .close_for_recovery(91)
+            .unwrap();
+        let staged = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .stage_recovery_revision(&fence)
+            .unwrap();
+        flush(&state).await;
+        advance_with_clock_fence(&state, original, 91, &staged).unwrap();
+        reopen_operator_admission_and_journal(&state, original, 91, &staged).unwrap();
+        let expected = state.launch_history.lock().unwrap().snapshot();
+        let disk = std::fs::read(&path).unwrap();
+        // Even a request carrying the newly visible record cannot become a
+        // new request if it was received while admission was closed.
+        for rejected_origin in [closed_origin, Some(original)] {
+            assert!(
+                crate::launch_clock_sync::reset_primary_for_origin(
+                    &state,
+                    rejected_origin,
+                    &expected
+                )
+                .is_err()
+            );
+            assert_eq!(state.launch_history.lock().unwrap().snapshot(), expected);
+            assert_eq!(std::fs::read(&path).unwrap(), disk);
+        }
+        let fresh = crate::gse::capture_operator_origin(&state);
+        let worker = WorkerGuard::install(&state, Phase::AfterMutation);
+        let writer = WriterGuard::install(path.clone());
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let work = state.clone();
+        let actual = tokio::task::spawn_blocking(move || {
+            let result =
+                crate::launch_clock_sync::reset_primary_for_origin(&work, fresh, &expected);
+            let _ = done_tx.send(result);
+        });
+        writer.pause.entered().await;
+        // The nested state-clock lease must have returned before asserting the
+        // outer worker's exact ownership during its separate durability wait.
+        worker.probe.pause.entered().await;
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 1);
+        actual.abort();
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 1);
+        let current_generation = crate::gse::automatic_generation(&state);
+        assert!(
+            crate::gse::reset_generation::invalidate_capture_epoch(&state, current_generation)
+                .is_err()
+        );
+        assert_eq!(crate::gse::automatic_generation(&state), current_generation);
+        assert_eq!(std::fs::read(&path).unwrap(), disk);
+        worker.probe.pause.release();
+        writer.pause.release();
+        tokio::time::timeout(StdDuration::from_secs(3), done_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+        assert_ne!(std::fs::read(&path).unwrap(), disk);
+    }
+
+    #[tokio::test]
+    async fn recovery_journal_timeout_never_proves_quiescence_and_closed_store_blocks_late_reset() {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, headers, path) = fixture().await;
+        state
+            .launch_history
+            .lock()
+            .unwrap()
+            .inhibit_automatic_actions()
+            .unwrap();
+        let worker = WorkerGuard::install(&state, Phase::Unpaused);
+        let writer = WriterGuard::install(path.clone());
+        let request = http(state.clone(), headers.clone());
+        writer.pause.entered().await;
+        let response = tokio::time::timeout(StdDuration::from_secs(15), request)
+            .await
+            .unwrap()
+            .unwrap();
+        worker.completed().await;
+        assert_eq!(response.0, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+        let disk = std::fs::read(&path).unwrap();
+        let fence = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .close_for_recovery(7)
+            .unwrap();
+        assert!(
+            !state
+                .launch_history
+                .lock()
+                .unwrap()
+                .recovery_quiescent(&fence)
+                .unwrap()
+        );
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .reopen_after_recovery(&fence)
+                .is_err()
+        );
+        let clock = state.launch_history.lock().unwrap().snapshot();
+        let late = tokio::time::timeout(StdDuration::from_secs(3), http(state.clone(), headers))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(late.0, StatusCode::CONFLICT);
+        assert_eq!(state.launch_history.lock().unwrap().snapshot(), clock);
+        assert_eq!(std::fs::read(&path).unwrap(), disk);
+        writer.pause.release();
+        flush(&state).await;
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .recovery_quiescent(&fence)
+                .unwrap()
+        );
+        assert_ne!(std::fs::read(&path).unwrap(), disk);
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .reopen_after_recovery(&fence)
+                .is_err()
+        );
+        let staged = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .stage_recovery_revision(&fence)
+            .unwrap();
+        flush(&state).await;
+        state
+            .launch_history
+            .lock()
+            .unwrap()
+            .reopen_after_recovery(&staged)
+            .unwrap();
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .automatic_actions_inhibited()
+        );
+        eprintln!(
+            "actual timed-out worker: claim0 whilewriterpaused => fencePending; actual lateHTTP409 noRAM/noJournal; release+realflush => exactprefixDurable; inhibitionretained"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_journal_wrong_owner_and_shutdown_cannot_reopen_a_recovery_fence() {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, _headers, _path) = fixture().await;
+        let mut history = state.launch_history.lock().unwrap();
+        assert!(
+            history.close_for_recovery(7).is_err(),
+            "inhibition is a required precondition"
+        );
+        history.inhibit_automatic_actions().unwrap();
+        let fence = history.close_for_recovery(7).unwrap();
+        assert!(history.recovery_quiescent(&fence).unwrap());
+        assert!(history.close_for_recovery(8).is_err());
+        assert!(history.reset_primary(123456, 0).is_err());
+        history.close_and_waiter();
+        assert!(history.recovery_quiescent(&fence).is_err());
+        assert!(history.reopen_after_recovery(&fence).is_err());
+        assert!(history.automatic_actions_inhibited());
+    }
+
+    #[tokio::test]
+    async fn recovery_journal_failed_atomic_write_remains_closed_and_never_formats_the_path() {
+        let _serial = SERIAL.lock().await;
+        let (root, state, _headers, path) = fixture().await;
+        // Occupy the exact target with a directory in this disposable
+        // fixture; the actual writer must fail rather than reformat it.
+        let saved = std::fs::read(&path).unwrap();
+        let sibling = root.0.join("saved-before-write-failure");
+        std::fs::write(&sibling, &saved).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("sentinel"), b"keep this directory").unwrap();
+        let fence = {
+            let mut history = state.launch_history.lock().unwrap();
+        assert!(history.inhibit_automatic_actions().is_err());
+        let fence = history.close_for_recovery(7).unwrap();
+        assert!(history.recovery_quiescent(&fence).is_err());
+        assert!(history.reopen_after_recovery(&fence).is_err());
+        assert!(history.reset_primary(123456, 0).is_err());
+        assert!(path.is_dir());
+        assert_eq!(
+            std::fs::read(path.join("sentinel")).unwrap(),
+            b"keep this directory"
+        );
+        assert_eq!(std::fs::read(sibling).unwrap(), saved);
+            fence
+        };
+        // Only this explicit repair+retry of the known snapshot resumes IO.
+        std::fs::remove_dir_all(&path).unwrap();
+        let retried = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .retry_recovery_save(&fence)
+            .unwrap();
+        flush(&state).await;
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .recovery_quiescent(&retried)
+                .unwrap()
+        );
+        let staged = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .stage_recovery_revision(&retried)
+            .unwrap();
+        flush(&state).await;
+        state
+            .launch_history
+            .lock()
+            .unwrap()
+            .reopen_after_recovery(&staged)
+            .unwrap();
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .automatic_actions_inhibited()
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_journal_revision_preserves_time_but_rejects_preboundary_remote_reset_contract()
+     {
+        let _serial = SERIAL.lock().await;
+        let (_root, state, _headers, path) = fixture().await;
+        state
+            .launch_history
+            .lock()
+            .unwrap()
+            .inhibit_automatic_actions()
+            .unwrap();
+        let original = state.launch_history.lock().unwrap().snapshot();
+        let fence = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .close_for_recovery(7)
+            .unwrap();
+        let staged = state
+            .launch_history
+            .lock()
+            .unwrap()
+            .stage_recovery_revision(&fence)
+            .unwrap();
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .recovery_quiescent(&fence)
+                .is_err()
+        );
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .stage_recovery_revision(&staged)
+                .is_err()
+        );
+        flush(&state).await;
+        state
+            .launch_history
+            .lock()
+            .unwrap()
+            .reopen_after_recovery(&staged)
+            .unwrap();
+        let current = state.launch_history.lock().unwrap().snapshot();
+        assert_eq!(current.clock, original.clock);
+        assert_eq!(current.t0_utc_ms, original.t0_utc_ms);
+        assert_eq!(current.session, original.session);
+        assert_eq!(current.authority, original.authority);
+        assert_eq!(current.revision, original.revision + 1);
+        let disk = std::fs::read(&path).unwrap();
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .reset_expected_primary(&original, 123456, 0)
+                .is_err()
+        );
+        assert_eq!(state.launch_history.lock().unwrap().snapshot(), current);
+        assert_eq!(std::fs::read(&path).unwrap(), disk);
+        assert!(
+            state
+                .launch_history
+                .lock()
+                .unwrap()
+                .automatic_actions_inhibited()
+        );
     }
 }
 
@@ -2177,15 +4608,25 @@ async fn ws_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WsAuthQuery>,
 ) -> impl IntoResponse {
-    let principal = match state
+    let Some(lease) = state.control_ingress.connection() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Control ingress is closed").into_response();
+    };
+    let _principal = match state
         .auth
         .authorize_token(&state.auth_db, query.token.as_deref(), Permission::ViewData)
         .await
     {
         Ok(principal) => principal,
-        Err(err) => return auth_failure_response(err),
+        Err(err) => {
+            lease.finish();
+            return auth_failure_response(err);
+        }
     };
-    ws.on_upgrade(move |socket| handle_ws(socket, state, principal))
+    if state.control_ingress.is_closed() {
+        lease.finish();
+        return (StatusCode::SERVICE_UNAVAILABLE, "Control ingress is closed").into_response();
+    }
+    ws.on_upgrade(move |socket| handle_ws(socket, state, query.token, lease))
 }
 
 /// Shape of commands sent from the frontend over WebSocket:
@@ -2195,11 +4636,233 @@ struct WsCommand {
     cmd: TelemetryCommand,
 }
 
-async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::auth::AuthPrincipal) {
+fn new_notification_events(
+    history: &[PersistentNotification],
+    last_id: &mut u64,
+) -> Vec<PersistentNotification> {
+    let mut events: Vec<_> = history
+        .iter()
+        .filter(|n| n.id > *last_id)
+        .cloned()
+        .collect();
+    events.sort_by_key(|n| n.id);
+    if let Some(event) = events.last() {
+        *last_id = event.id;
+    }
+    events
+}
+
+#[cfg(test)]
+mod notification_delivery_tests {
+    use super::*;
+    fn notice(id: u64) -> PersistentNotification {
+        PersistentNotification {
+            id,
+            timestamp_ms: id as i64,
+            message: "T clock reset".into(),
+            persistent: false,
+            action_label: None,
+            action_cmd: None,
+        }
+    }
+    #[test]
+    fn connection_history_and_repeated_snapshots_do_not_replay_events() {
+        let mut history = vec![notice(1), notice(2)];
+        let mut connection_cutoff = history.last().unwrap().id;
+        assert!(new_notification_events(&history, &mut connection_cutoff).is_empty());
+        history.push(notice(3));
+        let events = new_notification_events(&history, &mut connection_cutoff);
+        assert_eq!(events.iter().map(|n| n.id).collect::<Vec<_>>(), vec![3]);
+        assert!(new_notification_events(&history, &mut connection_cutoff).is_empty());
+        let mut reconnect_cutoff = history.last().unwrap().id;
+        assert!(new_notification_events(&history, &mut reconnect_cutoff).is_empty());
+        let live = serde_json::to_value(WsOutMsg::Notification(notice(4))).unwrap();
+        assert_eq!(live["ty"], "Notification");
+        assert_eq!(
+            serde_json::to_value(WsOutMsg::Notifications(history)).unwrap()["ty"],
+            "Notifications"
+        );
+    }
+}
+
+/// One bounded live display frame, retaining each stream's latest row. Raw
+/// telemetry remains in DB/recent; a slow browser cannot queue seconds of frames.
+#[derive(Default)]
+struct LatestWsTelemetry {
+    pending: std::sync::Mutex<Option<PendingWsTelemetry>>,
+    ready: tokio::sync::Notify,
+}
+struct PendingWsTelemetry {
+    updated: Instant,
+    rows: HashMap<(String, String), TelemetryRow>,
+}
+const WS_LIVE_STREAM_CAP: usize = 1024;
+const WS_LIVE_FRAME_MAX_AGE: StdDuration = StdDuration::from_millis(250);
+const WS_WRITE_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+
+impl LatestWsTelemetry {
+    fn publish(&self, rows: Vec<TelemetryRow>) -> bool {
+        let mut slot = self.pending.lock().unwrap();
+        let coalesced = slot.is_some();
+        let pending = slot.get_or_insert_with(|| PendingWsTelemetry {
+            updated: Instant::now(),
+            rows: HashMap::new(),
+        });
+        for row in rows {
+            let key = (row.sender_id.clone(), row.data_type.clone());
+            if !pending.rows.contains_key(&key) && pending.rows.len() >= WS_LIVE_STREAM_CAP {
+                // A hostile/unbounded runtime schema cannot grow the display
+                // slot forever. Retire only its oldest telemetry stream.
+                if let Some(oldest) = pending
+                    .rows
+                    .iter()
+                    .min_by_key(|(_, row)| row.timestamp_ms)
+                    .map(|(key, _)| key.clone())
+                {
+                    pending.rows.remove(&oldest);
+                }
+            }
+            match pending.rows.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if row.timestamp_ms >= entry.get().timestamp_ms {
+                        entry.insert(row);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(row);
+                }
+            }
+        }
+        pending.updated = Instant::now();
+        drop(slot);
+        self.ready.notify_one();
+        coalesced
+    }
+    async fn recv(&self) -> (Instant, Vec<TelemetryRow>) {
+        loop {
+            self.ready.notified().await;
+            let frame = self.pending.lock().unwrap().take();
+            if let Some(frame) = frame {
+                let mut rows: Vec<_> = frame.rows.into_values().collect();
+                rows.sort_by_key(|row| row.timestamp_ms);
+                return (frame.updated, rows);
+            }
+        }
+    }
+}
+
+async fn next_ws_output(
+    control: &mut mpsc::Receiver<String>,
+    telemetry: &LatestWsTelemetry,
+) -> Option<String> {
+    loop {
+        tokio::select! {
+            biased;
+            // Ordered warnings, confirmations and state changes never compete
+            // for FIFO space with high-rate chart data.
+            message = control.recv() => return message,
+            (queued, rows) = telemetry.recv() => {
+                if queued.elapsed() <= WS_LIVE_FRAME_MAX_AGE {
+                    return Some(serde_json::to_string(&WsOutMsg::TelemetryBatch(rows)).unwrap_or_default());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ws_freshness_tests {
+    use super::*;
+    fn row(ty: &str, timestamp_ms: i64) -> TelemetryRow {
+        TelemetryRow {
+            timestamp_ms,
+            data_type: ty.into(),
+            sender_id: "DAQ".into(),
+            values: vec![Some(timestamp_ms as f32)],
+        }
+    }
+    #[tokio::test]
+    async fn slow_display_coalesces_telemetry_but_preserves_ordered_controls() {
+        let latest = LatestWsTelemetry::default();
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send("warning".into()).await.unwrap();
+        tx.send("confirmation".into()).await.unwrap();
+        assert!(!latest.publish(vec![row("KG1000", 0)]));
+        for sequence in 1..1000 {
+            assert!(latest.publish(vec![row("KG1000", sequence)]));
+        }
+        assert_eq!(
+            next_ws_output(&mut rx, &latest).await.as_deref(),
+            Some("warning")
+        );
+        assert_eq!(
+            next_ws_output(&mut rx, &latest).await.as_deref(),
+            Some("confirmation")
+        );
+        let frame: serde_json::Value =
+            serde_json::from_str(&next_ws_output(&mut rx, &latest).await.unwrap()).unwrap();
+        assert_eq!(frame["ty"], "TelemetryBatch");
+        assert_eq!(frame["data"].as_array().unwrap().len(), 1);
+        assert_eq!(frame["data"][0]["timestamp_ms"], 999);
+        assert!(latest.pending.lock().unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn sparse_pressure_survives_loadcell_bursts_and_stream_count_is_bounded() {
+        let latest = LatestWsTelemetry::default();
+        latest.publish(vec![row("COMBUSTION_CHAMBER_PRESSURE", 50)]);
+        for sequence in 51..1000 {
+            latest.publish(vec![row("KG50", sequence), row("KG1000", sequence)]);
+        }
+        // Older retransmissions cannot roll a stream backward.
+        latest.publish(vec![row("KG1000", 10)]);
+        let (_, rows) = latest.recv().await;
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .any(|r| r.data_type == "COMBUSTION_CHAMBER_PRESSURE" && r.timestamp_ms == 50)
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.data_type == "KG1000" && r.timestamp_ms == 999)
+        );
+        for sequence in 0..2048 {
+            latest.publish(vec![row(&format!("stream{sequence}"), sequence)]);
+        }
+        assert_eq!(latest.recv().await.1.len(), WS_LIVE_STREAM_CAP);
+    }
+    #[tokio::test]
+    async fn expired_unsent_display_frame_is_not_replayed() {
+        let latest = LatestWsTelemetry::default();
+        let (tx, mut rx) = mpsc::channel(1);
+        latest.publish(vec![row("KG1000", 1)]);
+        latest.pending.lock().unwrap().as_mut().unwrap().updated =
+            Instant::now() - StdDuration::from_secs(30);
+        assert!(
+            tokio::time::timeout(
+                StdDuration::from_millis(10),
+                next_ws_output(&mut rx, &latest)
+            )
+            .await
+            .is_err()
+        );
+        latest.publish(vec![row("KG1000", 2)]);
+        let frame = next_ws_output(&mut rx, &latest).await.unwrap();
+        assert!(frame.contains("\"timestamp_ms\":2"));
+        drop(tx);
+    }
+}
+
+async fn handle_ws(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    token: Option<String>,
+    connection: crate::control_ingress::Lease,
+) {
     // Subscribe to all three broadcast channels
     let mut telemetry_rx = state.ws_tx.subscribe();
     let mut warnings_rx = state.warnings_tx.subscribe();
     let mut errors_rx = state.errors_tx.subscribe();
+    let mut board_abort_rx = state.board_abort_tx.subscribe();
     let mut state_rx = state.state_tx.subscribe();
     let mut launch_clock_rx = state.launch_clock_tx.subscribe();
     let mut board_status_rx = state.board_status_tx.subscribe();
@@ -2210,6 +4873,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
     let mut recording_status_rx = state.recording_status_tx.subscribe();
     let mut dashboard_reset_rx = state.dashboard_reset_tx.subscribe();
     let mut alert_ack_rx = state.alert_ack_tx.subscribe();
+    let mut alert_conditions_rx=state.alert_conditions.tx.subscribe();
 
     let cmd_tx = state.cmd_tx.clone();
     let state_for_send = state.clone();
@@ -2222,14 +4886,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         .clamp(32, 8192);
     let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<String>(ws_out_queue_cap);
 
-    // Dedicated writer: continuously drains queued outbound messages.
-    let write_task = tokio::spawn(async move {
-        while let Some(text) = ws_out_rx.recv().await {
-            if socket_sender
-                .send(Message::Text(Utf8Bytes::from(text)))
-                .await
-                .is_err()
-            {
+    let live_telemetry = Arc::new(LatestWsTelemetry::default());
+    let live_telemetry_writer = live_telemetry.clone();
+    // One live display slot plus the ordered control queue. Bound a stalled
+    // socket write so reconnect can reseed rather than replay an old backlog.
+    let mut write_task = tokio::spawn(async move {
+        while let Some(text) = next_ws_output(&mut ws_out_rx, &live_telemetry_writer).await {
+            if !matches!(
+                tokio::time::timeout(
+                    WS_WRITE_TIMEOUT,
+                    socket_sender.send(Message::Text(Utf8Bytes::from(text)))
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
@@ -2237,10 +4907,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
 
     // Task: collect, batch, and enqueue outbound messages.
     let send_task = async move {
-        let initial_notifications = serde_json::to_string(&WsOutMsg::Notifications(
-            state_for_send.notifications_snapshot(),
-        ))
-        .unwrap_or_default();
+        let notification_history = state_for_send.notifications_snapshot();
+        let mut last_notification_id = notification_history.iter().map(|n| n.id).max().unwrap_or(0);
+        let initial_notifications =
+            serde_json::to_string(&WsOutMsg::Notifications(notification_history))
+                .unwrap_or_default();
         if ws_out_tx.send(initial_notifications).await.is_err() {
             return;
         }
@@ -2296,6 +4967,25 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         ))
         .unwrap_or_default();
         if ws_out_tx.send(initial_recording_status).await.is_err() {
+            return;
+        }
+        let initial_board_abort = serde_json::to_string(&WsOutMsg::BoardAbort(
+            crate::board_abort::snapshot_for_state(&state_for_send),
+        ))
+        .unwrap();
+        if ws_out_tx.send(initial_board_abort).await.is_err() {
+            return;
+        }
+        if ws_out_tx
+            .send(
+                serde_json::to_string(&WsOutMsg::AlertConditions(
+                    state_for_send.alert_conditions.snapshot(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .is_err()
+        {
             return;
         }
         let initial_alert_ack_state = serde_json::to_string(&WsOutMsg::AlertAckState(
@@ -2372,6 +5062,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     }
                 }
 
+                recv = board_abort_rx.recv() => {
+                    if let Ok(snapshot)=recv
+                        && let Ok(msg)=serde_json::to_string(&WsOutMsg::BoardAbort(snapshot))
+                            && ws_out_tx.send(msg).await.is_err(){break;}
+                }
                 recv = errors_rx.recv() => {
                     match recv {
                         Ok(err) => {
@@ -2400,6 +5095,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     }
                 }
 
+                recv=alert_conditions_rx.recv()=>{
+                    let snapshot=match recv {Ok(snapshot)=>snapshot,Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>state_for_send.alert_conditions.snapshot(),Err(tokio::sync::broadcast::error::RecvError::Closed)=>break};
+                    if ws_out_tx.send(serde_json::to_string(&WsOutMsg::AlertConditions(snapshot)).unwrap()).await.is_err(){break;}
+                }
                 recv = alert_ack_rx.recv() => {
                     match recv {
                         Ok(ack) => {
@@ -2508,6 +5207,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                 recv = notifications_rx.recv() => {
                     match recv {
                         Ok(snapshot) => {
+                            // A snapshot is history, never a popup. Announce only
+                            // events observed live after this connection began.
+                            for event in new_notification_events(&snapshot, &mut last_notification_id) {
+                                let text = serde_json::to_string(&WsOutMsg::Notification(event)).unwrap_or_default();
+                                if ws_out_tx.send(text).await.is_err() { return; }
+                            }
                             let msg = WsOutMsg::Notifications(snapshot);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
@@ -2515,7 +5220,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            let msg = WsOutMsg::Notifications(state_for_send.notifications_snapshot());
+                            let snapshot = state_for_send.notifications_snapshot();
+                            // Events missed by a slow client belong only in its
+                            // Notification Center, not a burst of stale popups.
+                            last_notification_id = snapshot.iter().map(|n| n.id).max().unwrap_or(last_notification_id);
+                            let msg = WsOutMsg::Notifications(snapshot);
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
                                 break;
@@ -2699,8 +5408,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                     rows.sort_by_key(|r| r.timestamp_ms);
                     let row_count = rows.len();
 
-                    let msg = WsOutMsg::TelemetryBatch(rows);
-                    let text = serde_json::to_string(&msg).unwrap_or_default();
                     if ws_diagnostics && last_ws_diag_log.elapsed() >= ws_diag_interval {
                         eprintln!(
                             "ws telemetry flush: rows={} pending_before={} dynamic_max_per_flush={}",
@@ -2710,17 +5417,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
                         );
                         last_ws_diag_log = Instant::now();
                     }
-                    let send_started = Instant::now();
-                    if ws_out_tx.send(text).await.is_err() {
-                        break;
-                    }
-                    let send_wait = send_started.elapsed();
-                    let queue_was_full = send_wait >= StdDuration::from_millis(5);
+                    let queue_was_full = live_telemetry.publish(rows);
                     if ws_diagnostics && queue_was_full {
                         eprintln!(
-                            "ws telemetry backpressure: rows={} send_wait_ms={}",
-                            row_count,
-                            send_wait.as_millis()
+                            "ws telemetry coalesced unsent display batch: rows={}",
+                            row_count
                         );
                     }
 
@@ -2738,79 +5439,330 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, principal: crate::au
         }
     };
 
-    // Task: client -> server (commands)
-    let recv_task = async move {
-        while let Some(Ok(msg)) = receiver.next().await {
-            if let Message::Text(text) = msg {
-                match serde_json::from_str::<WsCommand>(&text) {
-                    Ok(cmd) => {
-                        if !principal.permissions.send_commands {
-                            emit_warning(
-                                &state_for_recv,
-                                format!(
-                                    "Rejected websocket command {:?}: authenticated session lacks send-command permission",
-                                    cmd.cmd
-                                ),
-                            );
-                            continue;
-                        }
-                        let cmd_name = command_name(&cmd.cmd);
-                        if !principal.allows_command_name(cmd_name) {
-                            emit_warning(
-                                &state_for_recv,
-                                format!(
-                                    "Rejected websocket command {:?}: session is not allowed to send {}",
-                                    cmd.cmd, cmd_name
-                                ),
-                            );
-                            continue;
-                        }
-                        if !state_for_recv.is_command_allowed(&cmd.cmd) {
-                            emit_notification_warning(
-                                &state_for_recv,
-                                format!(
-                                    "Ignored software command {:?}: command is currently disabled",
-                                    cmd.cmd
-                                ),
-                            );
-                            continue;
-                        }
-                        let now_ms = software_command_clock_ms();
-                        if !state_for_recv.record_software_command_if_fresh(
-                            &cmd.cmd,
-                            now_ms,
-                            software_command_dedup_ms(),
-                        ) {
-                            gs_debug_println!("Ignored duplicate websocket command {:?}", cmd.cmd);
-                            continue;
-                        }
-                        let received_cmd = cmd.cmd;
-                        eprintln!("Accepted websocket command: {:?}", received_cmd);
-                        gs_debug_println!(
-                            "\x1b[32mWebsocket command received: {:?}\x1b[0m",
-                            received_cmd
-                        );
-                        if let Err(e) = cmd_tx.send(received_cmd).await {
-                            emit_notification_warning(
-                                &state_for_recv,
-                                "Command worker unavailable; command was not queued",
-                            );
-                            eprintln!("Failed to forward WS command to cmd_tx: {e}");
-                            gs_debug_println!("Failed to forward WS command to cmd_tx: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Invalid WS command JSON {text:?}: {e}");
-                        gs_debug_println!("Invalid WS command JSON {text:?}: {e}");
-                    }
-                }
+    // Session close is observed only between frames. An authenticated/manual
+    // frame already running is allowed to finish and retains its own receipt.
+    let mut registry_closing = state.control_ingress.subscribe();
+    let (session_close, mut session_closing) = tokio::sync::watch::channel(false);
+    let receive_registry = state.control_ingress.clone();
+    let mut recv_task = tokio::spawn(async move {
+        loop {
+            if *registry_closing.borrow() || *session_closing.borrow() {
+                break;
+            }
+            let message = tokio::select! {biased;
+                _=registry_closing.changed()=>break,
+                _=session_closing.changed()=>break,
+                message=receiver.next()=>message,
+            };
+            let Some(Ok(message)) = message else {
+                break;
+            };
+            if let Message::Text(text) = message {
+                let Some(frame) = receive_registry.handler() else {
+                    break;
+                };
+                frame
+                    .run(handle_ws_control_text_with_source(
+                        state_for_recv.clone(),
+                        token.clone(),
+                        cmd_tx.clone(),
+                        text.to_string(),
+                        {
+                            let source = session_closing.clone();
+                            Arc::new(move || !*source.borrow())
+                        },
+                    ))
+                    .await;
             }
         }
+    });
+    let received = tokio::select! {
+        _=send_task=>false,
+        result=&mut recv_task=>{if result.is_err(){write_task.abort();let _=write_task.await;return;}true},
+        _=&mut write_task=>false,
     };
-
-    // Run both directions until one side ends
-    tokio::join!(send_task, recv_task);
+    session_close.send_replace(true);
+    let healthy = received || recv_task.await.is_ok();
     write_task.abort();
+    // The writer emits no controls but must not outlive the terminal session.
+    // Join only if it was not already consumed by select.
+    if !write_task.is_finished() {
+        let _ = write_task.await;
+    }
+    if healthy {
+        connection.finish();
+    }
+}
+
+pub(crate) async fn handle_ws_control_text_with_source(
+    state_for_recv: Arc<AppState>,
+    token: Option<String>,
+    cmd_tx: mpsc::Sender<TelemetryCommand>,
+    text: String,
+    source_current: Arc<dyn Fn() -> bool + Send + Sync>,
+) {
+    // Each frame retains its origin across authentication/database waits.
+    let frame_name = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("cmd").and_then(|v| v.as_str()).map(str::to_owned));
+    let phase_origin = serde_json::from_str::<WsCommand>(&text).ok()
+        .map(|cmd|crate::operator_phase::seal(&state_for_recv,cmd.cmd));
+    let safe_manual = phase_origin.as_ref().and_then(|cmd| crate::operator_queue::safe_manual::Intent::capture(&state_for_recv, cmd));
+    let mut recovery_origin = phase_origin.as_ref().and_then(|cmd| crate::operator_queue::manual_origin::Origin::capture(&state_for_recv, cmd));
+    let fill_origin = (frame_name.as_deref() == Some("StartFill"))
+        .then(|| crate::fill_recording::Captured::capture(&state_for_recv));
+    let admission_generation = if frame_name.as_deref() == Some("Abort") {
+        0
+    } else {
+        crate::gse::capture_operator_origin(&state_for_recv).or_else(||recovery_origin.map(|origin|origin.generation())).unwrap_or(0)
+    };
+    let launch_revision = frame_name
+        .as_deref()
+        .and_then(|name| crate::board_abort::capture_launch_revision_named(&state_for_recv, name));
+    let remote_launch_origin = frame_name
+        .as_deref()
+        .and_then(|name| crate::command_proxy::capture_rrls_launch_origin(&state_for_recv, name));
+    let plumbing_source_ms =
+        if crate::rrls::is_rrls() && frame_name.as_deref() == Some("RetractPlumbing") {
+            state_for_recv.topology_router.get().and_then(|router| {
+                crate::system_clock::required_control_network_utc_ms(router).ok()
+            })
+        } else {
+            None
+        };
+    let plumbing_origin = serde_json::from_str::<WsCommand>(&text)
+        .ok()
+        .and_then(|command| {
+            crate::actuator_plumbing::capture_motion_origin(&state_for_recv, &command.cmd)
+        });
+    #[cfg(test)]
+    command_dispatch_tests::notify_ws_command_received(&state_for_recv);
+    let principal = match state_for_recv
+        .auth
+        .authorize_token(
+            &state_for_recv.auth_db,
+            token.as_deref(),
+            Permission::SendCommands,
+        )
+        .await
+    {
+        Ok(principal) => principal,
+        Err(_) => {
+            emit_notification_warning(
+                &state_for_recv,
+                "Command session expired or no longer has permission.",
+            );
+            return;
+        }
+    };
+    if crate::rrls::is_rrls()
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Some(name) = value.get("cmd").and_then(|value| value.as_str())
+        && !crate::command_proxy::local_operation(name)
+    {
+        let response = crate::command_proxy::submit_with_origins(
+            &state_for_recv,
+            &principal,
+            token.as_deref(),
+            crate::command_proxy::Operation::Command(name.into()),
+            if name == "RetractPlumbing" {
+                plumbing_source_ms
+            } else {
+                None
+            },
+            remote_launch_origin,
+        )
+        .await;
+        if !response.status().is_success() {
+            emit_notification_warning(
+                &state_for_recv,
+                "Primary command request was not admitted; inspect RRLS control status.",
+            );
+        }
+        return;
+    }
+    match serde_json::from_str::<WsCommand>(&text) {
+        Ok(mut cmd) => {
+            if let Some(original)=phase_origin {cmd.cmd=original;}
+            if !principal.permissions.send_commands {
+                emit_warning(
+                    &state_for_recv,
+                    format!(
+                        "Rejected websocket command {:?}: authenticated session lacks send-command permission",
+                        cmd.cmd
+                    ),
+                );
+                return;
+            }
+            let cmd_name = command_name(&cmd.cmd);
+            if !principal.allows_command_name(cmd_name) {
+                emit_warning(
+                    &state_for_recv,
+                    format!(
+                        "Rejected websocket command {:?}: session is not allowed to send {}",
+                        cmd.cmd, cmd_name
+                    ),
+                );
+                return;
+            }
+            if let Some(intent) = safe_manual {
+                if !source_current() { return; }
+                let work = state_for_recv.clone();
+                tokio::spawn(async move {
+                    let (status, message) = crate::operator_queue::safe_manual::dispatch(work.clone(), &principal, intent, Some(source_current)).await;
+                    if !status.is_success() { emit_notification_warning(&work, message); }
+                });
+                return;
+            }
+            if matches!(cmd.cmd, TelemetryCommand::Abort) && !crate::rrls::is_rrls() {
+                state_for_recv.manual_abort_intent.request();
+                return;
+            }
+            if !crate::operator_phase::is_local(&cmd.cmd) && crate::board_abort::launch_command(command_name(&cmd.cmd)) {
+                if let Err(error) =
+                    crate::board_abort::validate_launch_revision(&state_for_recv, launch_revision)
+                {
+                    emit_notification_warning(&state_for_recv, error);
+                    return;
+                }
+                if let Some(message) = crate::board_abort::blocked_message(&state_for_recv) {
+                    emit_notification_warning(&state_for_recv, message);
+                    return;
+                }
+            }
+            if !state_for_recv.is_command_allowed(&cmd.cmd) {
+                emit_notification_warning(&state_for_recv,command_disabled_message(&state_for_recv,&cmd.cmd));
+                return;
+            }
+            let now_ms = software_command_clock_ms();
+            let mut admission_rejection=None;
+            match crate::gse::record_operator_command_with_recovery_origin_diagnostic(
+                &state_for_recv,
+                admission_generation,
+                &cmd.cmd,
+                now_ms,
+                software_command_dedup_ms(),
+                launch_revision,
+                crate::gse::RecoveryAdmissionDiagnostic {
+                    origin: &mut recovery_origin,
+                    rejection: &mut admission_rejection,
+                },
+            ) {
+                Err(message) => {
+                    emit_notification_warning(&state_for_recv, message);
+                    return;
+                }
+                Ok(crate::gse::OperatorCommandAdmission::Stale) => {
+                    let message=admission_rejection.unwrap_or(crate::operator_queue::manual_origin::Rejection::MissingOrigin).message();
+                    log::warn!("Command {} was not admitted: {}",cmd_name,message);
+                    emit_notification_warning(&state_for_recv, message);
+                    return;
+                }
+                Ok(crate::gse::OperatorCommandAdmission::Duplicate) => {
+                    let fill_retry = matches!(cmd.cmd, TelemetryCommand::StartFill)
+                        && state_for_recv.fill_recording.ready_instance() == 0;
+                    if !fill_retry {
+                        gs_debug_println!("Ignored duplicate websocket command {:?}", cmd.cmd);
+                        return;
+                    }
+                    if state_for_recv
+                        .fill_recording
+                        .preparation
+                        .available_permits()
+                        == 0
+                    {
+                        crate::fill_recording::notify_failure(
+                            &state_for_recv,
+                            &crate::fill_recording::Error::Busy,
+                        );
+                        return;
+                    }
+                }
+                Ok(crate::gse::OperatorCommandAdmission::Fresh) => {}
+            }
+            if matches!(cmd.cmd, TelemetryCommand::ResetTClock) {
+                let reset_state = state_for_recv.clone();
+                // Do not stall this WebSocket's Abort/command receiver on disk or radio.
+                tokio::spawn(async move {
+                    let result = if crate::rrls::is_rrls() {
+                        crate::launch_clock_sync::request_reset(&reset_state).await
+                    } else {
+                        let work = reset_state.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            reset_primary_clock_for_origin(&work, admission_generation)
+                        })
+                        .await
+                        {
+                            Ok(Ok(())) => Ok(true),
+                            Ok(Err((_, error))) => Err(error),
+                            Err(error) => Err(error.into()),
+                        }
+                    };
+                    match result {
+                        Ok(true) => {
+                            reset_state.add_notification("Primary T clock reset saved");
+                        }
+                        Ok(false) => {
+                            reset_state.add_notification(
+                                "Primary T clock reset pending; retained clock unchanged",
+                            );
+                        }
+                        Err(error) => {
+                            reset_state
+                                .add_notification(format!("T clock reset not confirmed: {error}"));
+                        }
+                    }
+                });
+                return;
+            }
+            if matches!(cmd.cmd, TelemetryCommand::StartFill) {
+                let weak = Arc::downgrade(&state_for_recv);
+                let authority = crate::fill_recording::Authority::Session {
+                    token: token.clone(),
+                    actor: principal.username.clone(),
+                    admission_current: Arc::new(move || {
+                        if source_current()
+                            && weak.upgrade().is_some_and(|state| {
+                                state.is_command_allowed(&TelemetryCommand::StartFill)
+                            }) { crate::gse::CurrentState::Current } else { crate::gse::CurrentState::Invalid }
+                    }),
+                };
+                let Some(captured) = fill_origin else {
+                    return;
+                };
+                let origin = captured.bind(authority, Some(&principal));
+                crate::fill_recording::spawn(state_for_recv.clone(), origin);
+                return;
+            }
+            let received_cmd = cmd.cmd;
+            eprintln!("Accepted websocket command: {:?}", received_cmd);
+            gs_debug_println!(
+                "\x1b[32mWebsocket command received: {:?}\x1b[0m",
+                received_cmd
+            );
+            if let Err(e) = cmd_tx
+                .send(TelemetryCommand::QueuedOperator {
+            recovery_origin,
+                    launch_revision,
+                    plumbing_origin,
+                    generation: admission_generation,
+                    command: Box::new(received_cmd),
+                })
+                .await
+            {
+                emit_notification_warning(
+                    &state_for_recv,
+                    "Command worker unavailable; command was not queued",
+                );
+                eprintln!("Failed to forward WS command to cmd_tx: {e}");
+                gs_debug_println!("Failed to forward WS command to cmd_tx: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!("Invalid WS command JSON {text:?}: {e}");
+            gs_debug_println!("Invalid WS command JSON {text:?}: {e}");
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2821,6 +5773,16 @@ struct HistoryParams {
 
 /// NEW: /api/alerts – returns warnings + errors from `alerts` table
 /// Query param: `minutes` (optional, defaults to 20)
+async fn get_alert_conditions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(state.alert_conditions.snapshot()).into_response()
+}
+
 async fn get_alerts(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2847,14 +5809,13 @@ async fn get_alerts(
     };
     let cutoff = now_ms - (minutes as i64) * 60_000;
 
-    let alerts_db = sqlx::query(
-        r#"
-        SELECT timestamp_ms, severity, message
-        FROM alerts
-        WHERE timestamp_ms BETWEEN ? AND ?
-        ORDER BY timestamp_ms DESC
-        "#,
-    )
+    let cols=sqlx::query("PRAGMA table_info(alerts)").fetch_all(&db).await.unwrap_or_default();
+    let query=if cols.iter().any(|row|row.get::<String,_>("name")=="condition_json") {
+        "SELECT timestamp_ms,severity,message,condition_json FROM alerts WHERE timestamp_ms BETWEEN ? AND ? ORDER BY timestamp_ms DESC"
+    }else{
+        "SELECT timestamp_ms,severity,message,NULL AS condition_json FROM alerts WHERE timestamp_ms BETWEEN ? AND ? ORDER BY timestamp_ms DESC"
+    };
+    let alerts_db = sqlx::query(query)
     .bind(cutoff)
     .bind(now_ms)
     .fetch_all(&db)
@@ -2867,6 +5828,7 @@ async fn get_alerts(
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
             severity: row.get::<String, _>("severity"),
             message: row.get::<String, _>("message"),
+            condition:row.get::<Option<String>,_>("condition_json").and_then(|json|serde_json::from_str(&json).ok()),
         })
         .collect();
 
@@ -2877,9 +5839,9 @@ async fn get_alerts(
         alerts.push(alert);
     }
 
-    alerts.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
+    alerts.sort_by_key(|alert| std::cmp::Reverse(alert.timestamp_ms));
     alerts.dedup_by(|a, b| {
-        a.timestamp_ms == b.timestamp_ms && a.severity == b.severity && a.message == b.message
+        a.timestamp_ms == b.timestamp_ms && a.severity == b.severity && a.message == b.message && a.condition==b.condition
     });
 
     Json(alerts).into_response()
@@ -2916,11 +5878,13 @@ fn spawn_alert_insert(
     timestamp_ms: i64,
     severity: &'static str,
     message: String,
+    condition:Option<crate::alert_conditions::ConditionLink>,
 ) {
     state.cache_recent_alert(AlertDto {
         timestamp_ms,
         severity: severity.to_string(),
         message: message.clone(),
+        condition:condition.clone(),
     });
     if let Err(err) = state
         .db_queue_tx
@@ -2928,6 +5892,7 @@ fn spawn_alert_insert(
             timestamp_ms,
             severity: severity.to_string(),
             message,
+            condition,
         }))
     {
         log::warn!("failed to queue {severity} alert DB write: {err}");
@@ -2942,6 +5907,13 @@ fn spawn_alert_insert(
 ///
 /// If you only have Arc<AppState>, just pass `&*arc` or `arc.as_ref()`.
 pub fn emit_warning<S: Into<String>>(state: &AppState, message: S) {
+    emit_warning_linked(state, message, None);
+}
+pub fn emit_warning_linked<S: Into<String>>(
+    state: &AppState,
+    message: S,
+    condition: Option<crate::alert_conditions::ConditionLink>,
+) {
     let msg_string = message.into();
     let timestamp = now_ms_i64();
 
@@ -2949,11 +5921,12 @@ pub fn emit_warning<S: Into<String>>(state: &AppState, message: S) {
     let ws_msg = WarningMsg {
         timestamp_ms: timestamp,
         message: msg_string.clone(),
+        condition:condition.clone(),
     };
     let _ = state.warnings_tx.send(ws_msg);
 
     // 2) Insert into DB asynchronously (tracked for graceful shutdown)
-    spawn_alert_insert(state, timestamp, "warning", msg_string);
+    spawn_alert_insert(state, timestamp, "warning", msg_string, condition);
 }
 
 /// Log a warning to the DB without sending it to the frontend.
@@ -2963,7 +5936,7 @@ pub fn emit_warning_db_only<S: Into<String>>(state: &AppState, message: S) {
     let timestamp = now_ms_i64();
 
     // Insert into DB asynchronously (tracked for graceful shutdown)
-    spawn_alert_insert(state, timestamp, "warning", msg_string);
+    spawn_alert_insert(state, timestamp, "warning", msg_string, None);
 }
 
 fn persist_message_db_only(state: &AppState, message: String) {
@@ -2991,18 +5964,34 @@ pub fn emit_notification_warning<S: Into<String>>(state: &AppState, message: S) 
 }
 
 pub fn emit_error<S: Into<String>>(state: &AppState, message: S) {
+    emit_error_linked(state, message, None);
+}
+pub fn emit_error_linked<S: Into<String>>(
+    state: &AppState,
+    message: S,
+    condition: Option<crate::alert_conditions::ConditionLink>,
+) {
+    emit_error_linked_at(state, now_ms_i64(), message, condition);
+}
+/// A deferred typed receipt keeps its original event time when restore finishes.
+pub fn emit_error_linked_at<S: Into<String>>(
+    state: &AppState,
+    timestamp: i64,
+    message: S,
+    condition: Option<crate::alert_conditions::ConditionLink>,
+) {
     let msg_string = message.into();
-    let timestamp = now_ms_i64();
 
     // 1) Broadcast to frontend immediately
     let ws_msg = ErrorMsg {
         timestamp_ms: timestamp,
         message: msg_string.clone(),
+        condition: condition.clone(),
     };
     let _ = state.errors_tx.send(ws_msg);
 
     // 2) Insert into DB asynchronously (tracked for graceful shutdown)
-    spawn_alert_insert(state, timestamp, "error", msg_string);
+    spawn_alert_insert(state, timestamp, "error", msg_string, condition);
 }
 
 #[derive(Deserialize)]
@@ -3038,6 +6027,7 @@ async fn capture_thermal_zero(
     headers: HeaderMap,
     Json(req): Json<ThermalZeroReq>,
 ) -> axum::response::Response {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
         Ok(p) => p,
         Err(response) => return response,
@@ -3045,6 +6035,13 @@ async fn capture_thermal_zero(
     if !principal_can_edit_calibration(&principal) {
         return calibration_edit_forbidden_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     if !matches!(req.sensor_id.as_str(), "KG1000" | "KG50") {
         return (StatusCode::BAD_REQUEST, "Select KG1000 or KG50").into_response();
     }
@@ -3149,6 +6146,7 @@ async fn long_zero_apply(
     headers: HeaderMap,
     Json(req): Json<LongZeroApply>,
 ) -> axum::response::Response {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let p = match authorize_headers(&state, &headers, Permission::ViewData).await {
         Ok(p) => p,
         Err(e) => return e,
@@ -3156,6 +6154,13 @@ async fn long_zero_apply(
     if !principal_can_edit_calibration(&p) {
         return calibration_edit_forbidden_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (
+            StatusCode::CONFLICT,
+            "Recovery admission is closed or request is stale",
+        )
+            .into_response();
+    };
     let updated = {
         let mut slot = state.loadcell_calibration.lock().unwrap();
         let mut cfg = slot.clone();
@@ -3179,3 +6184,506 @@ async fn long_zero_apply(
     state.broadcast_fill_targets_snapshot();
     Json(updated).into_response()
 }
+
+#[cfg(test)]
+mod recovery_direct_ingress_tests {
+    use super::*;
+    use futures::FutureExt;
+    use std::sync::atomic::Ordering;
+    pub(super) async fn fixture() -> (
+        crate::recording_export::tests::TestDirectory,
+        Arc<AppState>,
+        HeaderMap,
+        Arc<sedsnet::router::Router>,
+        Arc<std::sync::Mutex<Vec<sedsnet::packet::Packet>>>,
+    ) {
+        let (root, state, _commands, headers) = command_dispatch_tests::preauth_fixture().await;
+        let auth_path = root.0.join("auth.json");
+        let mut auth: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&auth_path).unwrap()).unwrap();
+        auth["users"][0]["calibration_access"] = serde_json::json!({"view":true,"edit":true});
+        std::fs::write(auth_path, auth.to_string()).unwrap();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        let router = Arc::new(sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([
+                sedsnet::router::EndpointHandler::new_packet_handler(
+                    crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"),
+                    move |packet| {
+                        sink.lock().unwrap().push(packet.clone());
+                        Ok(())
+                    },
+                ),
+            ])
+            .with_sender("GS"),
+        ));
+        state.topology_router.set(router.clone()).unwrap();
+        (root, state, headers, router, observed)
+    }
+    fn cross_epoch(state: &AppState) {
+        state
+            .operator_admission_barrier
+            .store(77, Ordering::Release);
+        state.automatic_generation.fetch_add(1, Ordering::AcqRel);
+        state.operator_admission_barrier.store(0, Ordering::Release);
+    }
+    async fn calibration_request(
+        state: Arc<AppState>,
+        headers: HeaderMap,
+        kind: usize,
+    ) -> axum::response::Response {
+        match kind {
+            0 => {
+                let mut calibration = loadcell::LoadcellCalibrationFile::default();
+                calibration.ch1.m = Some(2.0);
+                set_loadcell_calibration(
+                    State(state),
+                    headers,
+                    Json(loadcell::CalibrationUpdate {
+                        channel: "ch1".into(),
+                        calibration,
+                    }),
+                )
+                .await
+                .into_response()
+            }
+            1 => set_kg50_input(
+                State(state),
+                headers,
+                Json(Kg50InputRequest {
+                    input: loadcell::Kg50Input::P6Differential,
+                }),
+            )
+            .await
+            .into_response(),
+            2 => capture_loadcell_zero(
+                State(state),
+                headers,
+                Json(CaptureLoadcellPointReq {
+                    sensor_id: "KG1000".into(),
+                    raw: 0.123,
+                }),
+            )
+            .await
+            .into_response(),
+            3 => capture_loadcell_span(
+                State(state),
+                headers,
+                Json(CaptureLoadcellSpanReq {
+                    sensor_id: "KG1000".into(),
+                    raw: 1.234,
+                    known_kg: 1.0,
+                }),
+            )
+            .await
+            .into_response(),
+            4 => capture_thermal_zero(
+                State(state),
+                headers,
+                Json(ThermalZeroReq {
+                    sensor_id: "KG1000".into(),
+                }),
+            )
+            .await
+            .into_response(),
+            _ => {
+                let id = state.loadcell_processing.status().session_id;
+                long_zero_apply(
+                    State(state),
+                    headers,
+                    Json(LongZeroApply {
+                        session_id: id,
+                        apply_thermal: false,
+                        tau_ms: 100.0,
+                    }),
+                )
+                .await
+                .into_response()
+            }
+        }
+    }
+    #[tokio::test]
+    async fn real_calibration_ingress_keeps_preauth_origin_before_file_ram_and_sdk_effects() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "real_calibration_ingress_keeps_preauth_origin_before_file_ram_and_sdk_effects",
+        ) {
+            return;
+        }
+        let mut observations = Vec::new();
+        for kind in 0..6 {
+            let (_root, state, headers, router, _) = fixture().await;
+            if kind >= 4 {
+                let mut cfg = state.loadcell_calibration.lock().unwrap();
+                cfg.ch1.m = Some(1.0);
+                cfg.ch1.b = Some(0.0);
+            }
+            if kind == 4 {
+                let now = crate::telemetry_task::get_current_timestamp_ms() as i64;
+                let start = (now / 10000 - 12) * 10000;
+                for at in (start..=now).step_by(1000) {
+                    for (data_type, value) in [("DAQ_ADC_TEMPERATURE", 20.0), ("KG1000", 0.123)] {
+                        state.cache_recent_telemetry(TelemetryRow {
+                            timestamp_ms: at,
+                            data_type: data_type.into(),
+                            sender_id: "DAQ".into(),
+                            values: vec![Some(value)],
+                        });
+                    }
+                }
+                assert!(
+                    crate::thermal_settling::from_rows(
+                        &state.recent_telemetry_snapshot(),
+                        &state.loadcell_calibration.lock().unwrap(),
+                        "KG1000",
+                        now
+                    )
+                    .ready
+                );
+            }
+            if kind == 5 {
+                let cfg = state.loadcell_calibration.lock().unwrap().clone();
+                let capture = state
+                    .loadcell_processing
+                    .start_calibrated("KG1000", 60, true, cfg)
+                    .unwrap();
+                for i in 0..1200 {
+                    state.loadcell_processing.observe(
+                        "DAQ",
+                        "KG1000",
+                        1000 + i * 100,
+                        0.123,
+                        Some(20.0),
+                    );
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(4), async {
+                    while state.loadcell_processing.status().report.samples < 1200 {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                state.loadcell_processing.stop(&capture.session_id).unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while state.loadcell_processing.status().running {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(state.loadcell_processing.status().report.noise_ready);
+            }
+            let cfg_before =
+                serde_json::to_value(&*state.loadcell_calibration.lock().unwrap()).unwrap();
+            let path = loadcell::calibration_file_for_test();
+            let file_before = std::fs::read(&path).ok();
+            let held = state.auth_db.acquire().await.unwrap();
+            assert_eq!((state.auth_db.size(), state.auth_db.num_idle()), (1, 0));
+            let request = calibration_request(state.clone(), headers.clone(), kind);
+            tokio::pin!(request);
+            assert!(
+                request.as_mut().now_or_never().is_none(),
+                "actual first auth query must wait on held SQLite connection"
+            );
+            cross_epoch(&state);
+            drop(held);
+            let stale = request.await.status();
+            let cfg_after_stale =
+                serde_json::to_value(&*state.loadcell_calibration.lock().unwrap()).unwrap();
+            let file_after_stale = std::fs::read(&path).ok();
+            let cache_after_stale = router
+                .get_cached_network_variable(crate::telemetry_schema::data_type(
+                    "DAQ_LOADCELL_CALIBRATION",
+                ))
+                .unwrap()
+                .is_some();
+            let fresh = calibration_request(state.clone(), headers.clone(), kind)
+                .await
+                .status();
+            let cache_after_fresh = router
+                .get_cached_network_variable(crate::telemetry_schema::data_type(
+                    "DAQ_LOADCELL_CALIBRATION",
+                ))
+                .unwrap()
+                .is_some();
+            if let Some(bytes) = &file_before {
+                std::fs::write(&path, bytes).unwrap();
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+            observations.push((
+                kind,
+                fresh,
+                stale,
+                cache_after_stale,
+                cfg_after_stale == cfg_before,
+                file_after_stale == file_before,
+                cache_after_fresh,
+            ));
+        }
+        eprintln!("actual calibration HTTP observations: {observations:?}");
+        for (kind, fresh, stale, old_cache, same_ram, same_file, fresh_cache) in observations {
+            assert_eq!(
+                fresh,
+                StatusCode::OK,
+                "current authorized calibration kind={kind}"
+            );
+            assert!(
+                !old_cache,
+                "old auth-delayed calibration must not reach actual SDK kind={kind}"
+            );
+            assert!(
+                same_ram && same_file,
+                "stale request must not change disk/RAM kind={kind}"
+            );
+            assert_eq!(stale, StatusCode::CONFLICT);
+            assert!(fresh_cache);
+        }
+    }
+    #[tokio::test]
+    async fn real_flight_setup_preserves_existing_schema_refusal_and_origin_fence() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "real_flight_setup_preserves_existing_schema_refusal_and_origin_fence",
+        ) {
+            return;
+        }
+        let (_root, state, headers, router, observed) = fixture().await;
+        let mut warnings = state.warnings_tx.subscribe();
+        let held = state.auth_db.acquire().await.unwrap();
+        let request = apply_flight_setup(State(state.clone()), headers.clone());
+        tokio::pin!(request);
+        assert!(request.as_mut().now_or_never().is_none());
+        cross_epoch(&state);
+        drop(held);
+        let stale = request.await.into_response().status();
+        router.process_all_queues().unwrap();
+        let after_stale = observed.lock().unwrap().len();
+        let fresh = apply_flight_setup(State(state.clone()), headers)
+            .await
+            .into_response()
+            .status();
+        router.process_all_queues().unwrap();
+        let mut diagnostics = Vec::new();
+        while let Ok(message) = warnings.try_recv() {
+            diagnostics.push(message.message);
+        }
+        eprintln!("actual flight-setup SDK refusal: {diagnostics:?}");
+        assert_eq!(
+            fresh,
+            StatusCode::BAD_GATEWAY,
+            "existing static one-byte schema refusal must remain honest"
+        );
+        assert_eq!(
+            after_stale, 0,
+            "old handler actually reached the flight SDK owner"
+        );
+        assert_eq!(stale, StatusCode::CONFLICT);
+        assert!(observed.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn real_sd_retry_ingress_cannot_consume_admission_before_fresh_request() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "real_sd_retry_ingress_cannot_consume_admission_before_fresh_request",
+        ) {
+            return;
+        }
+        let (_root, state, headers, router, _) = fixture().await;
+        let now = crate::telemetry_task::get_current_timestamp_ms();
+        state.network_health.lock().unwrap().observe_sd_status(
+            "DAQ",
+            &[1, u32::MAX, u32::MAX, 1, 0, 0, 0, 0],
+            std::time::Instant::now(),
+            now,
+        );
+        let held = state.auth_db.acquire().await.unwrap();
+        let request = crate::daq_sd::retry(State(state.clone()), headers.clone());
+        tokio::pin!(request);
+        assert!(request.as_mut().now_or_never().is_none());
+        cross_epoch(&state);
+        drop(held);
+        let stale = request.await.status();
+        let queued_after_stale = router.export_runtime_stats().queues.tx_len;
+        let fresh = crate::daq_sd::retry(State(state.clone()), headers)
+            .await
+            .status();
+        assert_eq!(
+            queued_after_stale, 0,
+            "old auth-delayed retry actually enqueued SDK work"
+        );
+        assert_eq!(
+            fresh,
+            StatusCode::ACCEPTED,
+            "fresh request must succeed without clearing the existing retry gate"
+        );
+        assert_eq!(stale, StatusCode::CONFLICT);
+    }
+    #[tokio::test]
+    async fn direct_ingress_keeps_current_auth_permissions_ahead_of_closed_admission() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "direct_ingress_keeps_current_auth_permissions_ahead_of_closed_admission",
+        ) {
+            return;
+        }
+        let (root, state, headers, router, _) = fixture().await;
+        state
+            .operator_admission_barrier
+            .store(77, Ordering::Release);
+        let unauth = apply_flight_setup(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response()
+            .status();
+        assert!(matches!(
+            unauth,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ));
+        let path = root.0.join("auth.json");
+        let mut auth: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        auth["users"][0]["permissions"]["send_commands"] = serde_json::json!(false);
+        auth["users"][0]["calibration_access"]["edit"] = serde_json::json!(false);
+        std::fs::write(path, auth.to_string()).unwrap();
+        assert_eq!(
+            apply_flight_setup(State(state.clone()), headers.clone())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            crate::daq_sd::retry(State(state.clone()), headers.clone())
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            calibration_request(state.clone(), headers, 0)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(router.export_runtime_stats().queues.tx_len, 0);
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod recovery_control_settings_tests {
+    use super::*;
+    use futures::FutureExt;
+    use std::sync::atomic::Ordering;
+    #[derive(Clone)]
+    enum Desired {
+        Automatic(crate::auto_zero::Settings),
+        Fill(FillTargetsConfig),
+        Flight(FlightSetupConfig),
+    }
+    async fn request(
+        state: Arc<AppState>,
+        headers: HeaderMap,
+        desired: Desired,
+    ) -> axum::response::Response {
+        match desired {
+            Desired::Automatic(value) => set_auto_zero(State(state), headers, Json(value))
+                .await
+                .into_response(),
+            Desired::Fill(value) => set_fill_targets(State(state), headers, Json(value))
+                .await
+                .into_response(),
+            Desired::Flight(value) => set_flight_setup(State(state), headers, Json(value))
+                .await
+                .into_response(),
+        }
+    }
+    fn snapshot(state: &AppState, kind: usize) -> serde_json::Value {
+        match kind {
+            0 => serde_json::to_value(state.auto_zero.lock().unwrap().settings()).unwrap(),
+            1 => serde_json::to_value(&*state.fill_targets.lock().unwrap()).unwrap(),
+            _ => serde_json::to_value(flight_setup::load_or_default()).unwrap(),
+        }
+    }
+    #[tokio::test]
+    async fn real_control_settings_keep_preauth_origin_across_new_run() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "real_control_settings_keep_preauth_origin_across_new_run",
+        ) {
+            return;
+        }
+        let mut observations = Vec::new();
+        for kind in 0..3 {
+            let (_root, state, headers, _network, _) =
+                recovery_direct_ingress_tests::fixture().await;
+            let desired = match kind {
+                0 => Desired::Automatic(crate::auto_zero::Settings {
+                    enabled: !state.auto_zero.lock().unwrap().settings().enabled,
+                }),
+                1 => {
+                    let mut value = state.fill_targets.lock().unwrap().clone();
+                    value.nitrous.target_mass_kg += 1.0;
+                    Desired::Fill(value)
+                }
+                _ => {
+                    let mut value = flight_setup::load_or_default();
+                    value.selected_profile_id = value
+                        .profiles
+                        .iter()
+                        .find(|p| p.id != value.selected_profile_id)
+                        .unwrap()
+                        .id
+                        .clone();
+                    Desired::Flight(value)
+                }
+            };
+            let path = match kind {
+                0 => std::path::PathBuf::from(std::env::var_os("GS_AUTO_ZERO_CONFIG").unwrap()),
+                1 => fill_targets::config_path(),
+                _ => flight_setup::config_path(),
+            };
+            let before = snapshot(&state, kind);
+            let file_before = std::fs::read(&path).ok();
+            let held = state.auth_db.acquire().await.unwrap();
+            let future = request(state.clone(), headers.clone(), desired.clone());
+            tokio::pin!(future);
+            assert!(future.as_mut().now_or_never().is_none());
+            state
+                .operator_admission_barrier
+                .store(77, Ordering::Release);
+            state.automatic_generation.fetch_add(1, Ordering::AcqRel);
+            state.operator_admission_barrier.store(0, Ordering::Release);
+            drop(held);
+            let stale = future.await.status();
+            let same_ram = snapshot(&state, kind) == before;
+            let same_file = std::fs::read(&path).ok() == file_before;
+            let fresh = request(state.clone(), headers, desired).await.status();
+            let changed = snapshot(&state, kind) != before;
+            if let Some(bytes) = file_before {
+                std::fs::write(&path, bytes).unwrap();
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+            observations.push((kind, stale, fresh, same_ram, same_file, changed));
+        }
+        eprintln!("actual control-settings observations: {observations:?}");
+        for (kind, stale, fresh, same_ram, same_file, changed) in observations {
+            assert!(
+                same_ram && same_file,
+                "old settings request changed new run kind={kind}"
+            );
+            assert_eq!(stale, StatusCode::CONFLICT);
+            assert_eq!(fresh, StatusCode::OK);
+            assert!(changed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod alert_condition_readonly_tests {
+    include!("alert_condition_readonly_tests.rs");
+}
+
+#[cfg(test)]
+#[path = "operator_queue/safe_manual_http_tests.rs"]
+mod safe_manual_http_tests;

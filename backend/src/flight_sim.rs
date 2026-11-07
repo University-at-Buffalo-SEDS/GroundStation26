@@ -21,6 +21,13 @@ use std::sync::OnceLock;
 #[cfg(feature = "testing")]
 use std::sync::{Arc, Mutex};
 
+#[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+#[path="flight_sim/ground_plant.rs"]
+mod ground_plant;
+#[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+#[path="flight_sim/effect_timer.rs"]
+mod effect_timer;
+
 #[cfg(feature = "testing")]
 const BASE_LAT: f32 = 31.7619;
 #[cfg(feature = "testing")]
@@ -193,7 +200,7 @@ const FILL_SYSTEM_SENSOR_SEQUENCE: &[SimSensorSpec] = &[
     },
     SimSensorSpec {
         dtype: crate::telemetry_schema::types::FUEL_TANK_PRESSURE,
-        sender: Board::DaqBoard,
+        sender: Board::ValveBoard,
     },
     SimSensorSpec {
         dtype: crate::telemetry_schema::types::BATTERY_VOLTAGE,
@@ -334,10 +341,37 @@ fn vented_pressure_target_psi(_loadcell_mass_kg: f32, _nitrous_loaded: bool) -> 
     0.0
 }
 
+#[cfg(feature="testing")]
+#[derive(Debug)]
+struct QueuedPacket {
+    packet:Packet,
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    origin:Option<crate::testing_board_lifecycle::ReportOrigin>,
+}
+#[cfg(feature="testing")]
+impl std::ops::Deref for QueuedPacket{type Target=Packet;fn deref(&self)->&Packet{&self.packet}}
+#[cfg(feature="testing")]
+impl QueuedPacket{
+    fn into_packet(self)->Packet{
+        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+        if let Some(origin)=self.origin{crate::testing_board_lifecycle::register_model_report(&self.packet,origin);}
+        self.packet
+    }
+}
 #[cfg(feature = "testing")]
 #[derive(Debug)]
 struct FlightSimState {
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    recovery: crate::testing_board_lifecycle::Owner,
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    expanded_plant: Option<ground_plant::Plant>,
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    plant_observation_valid: bool,
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    accepted_igniter_source: Option<effect_timer::Owner>,
     flight_state: FlightState,
+    // Source provenance only: implicit GS readiness is not a new FC report.
+    automatic_idle_volatile: bool,
     launch_sequence_started_ms: Option<u64>,
     actuator_igniter_sequence_started_ms: Option<u64>,
     launch_time_ms: Option<u64>,
@@ -370,7 +404,7 @@ struct FlightSimState {
     saw_dump_open_after_n2: bool,
     saw_dump_closed_after_n2: bool,
     nitrous_fill_started_ms: Option<u64>,
-    queued: VecDeque<Packet>,
+    queued: VecDeque<QueuedPacket>,
 }
 
 #[cfg(feature = "testing")]
@@ -381,8 +415,8 @@ fn valve_board_disconnected_for_state(state: FlightState) -> bool {
             | FlightState::Ascent
             | FlightState::Coast
             | FlightState::Apogee
-            | FlightState::ParachuteDeploy
             | FlightState::Descent
+            | FlightState::Reefing
             | FlightState::Landed
             | FlightState::Recovery
     )
@@ -399,7 +433,16 @@ impl FlightSimState {
         valves.insert(ActuatorBoardCommands::RetractPlumbing as u8, false);
 
         Self {
+            #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+            recovery: crate::testing_board_lifecycle::Owner::new(),
+            #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+            expanded_plant:None,
+            #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+            plant_observation_valid:true,
+            #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+            accepted_igniter_source:None,
             flight_state: FlightState::Idle,
+            automatic_idle_volatile: cfg!(feature = "test_fire_mode"),
             launch_sequence_started_ms: None,
             actuator_igniter_sequence_started_ms: None,
             launch_time_ms: None,
@@ -437,7 +480,14 @@ impl FlightSimState {
     }
 
     fn reset(&mut self, now_ms: u64) {
+        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+        let retained={ let mut owner=std::mem::replace(&mut self.recovery,crate::testing_board_lifecycle::Owner::new());owner.reboot();owner };
         *self = Self::new();
+        // reset() is reached only from the explicit owned ResetSim command;
+        // unlike constructor/readiness it intentionally restores model authority.
+        self.automatic_idle_volatile = false;
+        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+        {self.recovery=retained;}
         self.queue_flight_state(now_ms);
         self.queue_housekeeping(now_ms);
     }
@@ -447,10 +497,15 @@ impl FlightSimState {
     }
 
     fn set_flight_state(&mut self, fs: FlightState, now_ms: u64) {
+        // All callers are explicit modeled commands/owned local transitions or
+        // the actual flight algorithm. Passive readiness never calls this.
+        self.automatic_idle_volatile = false;
         if self.flight_state == fs {
             return;
         }
         self.flight_state = fs;
+        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+        for board in crate::testing_board_lifecycle::BOARDS{self.recovery.note_state(board,fs as u8);}
         if !matches!(fs, FlightState::FillTest) {
             self.saw_dump_open_after_n2 = false;
             self.saw_dump_closed_after_n2 = false;
@@ -462,6 +517,19 @@ impl FlightSimState {
     }
 
     fn queue_flight_state(&mut self, now_ms: u64) {
+        if self.automatic_idle_volatile && (1..=6).contains(&(self.flight_state as u8)) {
+            // Includes deferred periodic reports: do not mint a fresh FC
+            // origin from a GS-only readiness observation.
+            return;
+        }
+        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+        let Some(published)=self.recovery.publication_state()else{return;};
+        #[cfg(not(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode")))))]
+        let published=self.flight_state as u8;
+        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+        let source=self.recovery.publication_source(now_ms);
+        #[cfg(not(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode")))))]
+        let source=now_ms;
         if let Ok(pkt) = Packet::new(
             crate::telemetry_schema::data_type("FLIGHT_STATE"),
             &[
@@ -469,14 +537,17 @@ impl FlightSimState {
                 crate::telemetry_schema::endpoint("FLIGHT_STATE"),
             ],
             Board::FlightComputer.sender_id(),
-            now_ms,
-            Arc::from([self.flight_state as u8]),
+            source,
+            Arc::from([published]),
         ) {
-            self.queued.push_back(pkt);
+            self.queued.push_back(QueuedPacket{packet:pkt,
+                #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+                origin:if published==15{self.recovery.report_origin(Board::FlightComputer)}else{None},
+            });
         }
     }
 
-    fn pop_next_queued(&mut self) -> Option<Packet> {
+    fn pop_next_queued(&mut self) -> Option<QueuedPacket> {
         let flight_state_idx = self
             .queued
             .iter()
@@ -492,9 +563,12 @@ impl FlightSimState {
             &[crate::telemetry_schema::endpoint("ABORT")],
             board.sender_id(),
             now_ms,
-            Arc::<[u8]>::from(reason.as_bytes().to_vec()),
+            Arc::<[u8]>::from(format!("SEDS_AUTO_ABORT_V1:{reason}").into_bytes()),
         ) {
-            self.queued.push_back(pkt);
+            self.queued.push_back(QueuedPacket{packet:pkt,
+                #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+                origin:None,
+            });
         }
     }
 
@@ -511,7 +585,10 @@ impl FlightSimState {
             now_ms,
             Arc::from([cmd_id, if on { 1 } else { 0 }]),
         ) {
-            self.queued.push_back(pkt);
+            self.queued.push_back(QueuedPacket{packet:pkt,
+                #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+                origin:None,
+            });
         }
     }
 
@@ -523,7 +600,10 @@ impl FlightSimState {
             now_ms,
             Arc::from(Vec::<u8>::new()),
         ) {
-            self.queued.push_back(pkt);
+            self.queued.push_back(QueuedPacket{packet:pkt,
+                #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+                origin:None,
+            });
         }
     }
 
@@ -536,7 +616,10 @@ impl FlightSimState {
             now_ms,
             Arc::from(bytes.as_slice()),
         ) {
-            self.queued.push_back(pkt);
+            self.queued.push_back(QueuedPacket{packet:pkt,
+                #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+                origin:None,
+            });
         }
     }
 
@@ -617,10 +700,22 @@ impl FlightSimState {
         match cmd {
             // Only telemetry_task may authorize and normalize this internal
             // intent; direct model calls must not bypass the dispatch check.
-            TelemetryCommand::AutomaticAbort => return false,
+            TelemetryCommand::QueuedOperator { .. }
+            | TelemetryCommand::FillWithRecording { .. }
+            | TelemetryCommand::ColdFlowPanelRelease { .. }
+            | TelemetryCommand::AutomaticAbort { .. }
+            | TelemetryCommand::AutomaticNitrogenClose { .. }
+            | TelemetryCommand::AutomaticNitrousClose { .. } => return false,
             TelemetryCommand::Abort => {
+                #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+                let report_utc=self.recovery.original_event_stamp();
+                #[cfg(not(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode")))))]
+                let report_utc=0;
+                #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+                for board in crate::testing_board_lifecycle::BOARDS {self.recovery.manual_stop(board);}
                 self.launch_sequence_started_ms = None;
                 self.actuator_igniter_sequence_started_ms = None;
+                #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))] {self.accepted_igniter_source=None;}
                 self.launch_time_ms = None;
                 self.valves
                     .insert(ActuatorBoardCommands::IgniterOn as u8, false);
@@ -628,11 +723,11 @@ impl FlightSimState {
                 self.valves
                     .insert(ValveBoardCommands::PilotOpen as u8, false);
                 self.queue_umbilical_status(ValveBoardCommands::PilotOpen as u8, false, now_ms);
-                self.queue_abort(Board::ValveBoard, "simulated valve board abort", now_ms);
+                self.queue_abort(Board::ValveBoard, "simulated valve board abort", report_utc);
                 self.queue_abort(
                     Board::ActuatorBoard,
                     "simulated actuator board abort",
-                    now_ms,
+                    report_utc,
                 );
                 self.set_flight_state(FlightState::Aborted, now_ms);
             }
@@ -738,6 +833,7 @@ impl FlightSimState {
             | TelemetryCommand::CancelFill
             | TelemetryCommand::ValveSelfTest
             | TelemetryCommand::NitrogenTest
+            | TelemetryCommand::Turbocharge
             | TelemetryCommand::StartWritingNow
             | TelemetryCommand::StartWritingLastTwoMinutes
             | TelemetryCommand::PauseWritingDb
@@ -770,6 +866,10 @@ impl FlightSimState {
             TelemetryCommand::ToggleButtonInterlock
             | TelemetryCommand::ToggleGroundStationControl
             | TelemetryCommand::ToggleLaunchInterlock
+            | TelemetryCommand::TogglePlumbingDelayInterlock
+            | TelemetryCommand::ToggleChecklistInterlock
+            | TelemetryCommand::ToggleSupplyInterlock
+            | TelemetryCommand::ToggleBoardStateProofInterlock
             | TelemetryCommand::TogglePhysicalLaunchMode
             | TelemetryCommand::ResetLaunchLatch
             | TelemetryCommand::ResetFlightState
@@ -787,11 +887,14 @@ impl FlightSimState {
             | TelemetryCommand::AbortAfter250
             | TelemetryCommand::ReinitAfter15
             | TelemetryCommand::ReinitAfter30
-            | TelemetryCommand::ReinitAfter50
-            | TelemetryCommand::AdvanceFlightState
-            | TelemetryCommand::RewindFlightState => {
+            | TelemetryCommand::ReinitAfter50 => {
                 // Let telemetry_task forward HITL controls. Consuming a no-op
                 // here silently swallowed them when testing was also enabled.
+                return false;
+            }
+            #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+            TelemetryCommand::AdvanceFlightState | TelemetryCommand::RewindFlightState => {
+                // The existing operator-mode dispatcher owns these transitions.
                 return false;
             }
         }
@@ -803,6 +906,18 @@ impl FlightSimState {
     }
 
     fn update_actuator_igniter_sequence(&mut self, now_ms: u64) {
+        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+        if self.accepted_igniter_source.is_some() {
+            // One immutable networkUTC→local-model mapping made at admission.
+            // PacketUTC is never subtracted from host-wall/model time directly.
+            let on={let owner=self.accepted_igniter_source.as_mut().unwrap();let _original_source_utc=owner.source_utc;owner.on_at(now_ms)};
+            let key=ActuatorBoardCommands::IgniterOn as u8;
+            if self.valve_on(key)!=on {
+                self.valves.insert(key,on);
+                self.queue_umbilical_status(key,on,self.recovery.original_event_stamp());
+            }
+            return;
+        }
         let Some(sequence_start_ms) = self.actuator_igniter_sequence_started_ms else {
             return;
         };
@@ -940,6 +1055,11 @@ impl FlightSimState {
         };
         self.last_physics_ms = now_ms;
 
+        let n2_open=self.valve_on(ActuatorBoardCommands::NitrogenOpen as u8);
+        let n2o_open=self.valve_on(ActuatorBoardCommands::NitrousOpen as u8);
+        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+        self.update_ground_plant(now_ms);
+        if cfg!(any(feature="hitl_mode",feature="test_fire_mode")) {
         let n2_open = self.valve_on(ActuatorBoardCommands::NitrogenOpen as u8);
         let n2o_open = self.valve_on(ActuatorBoardCommands::NitrousOpen as u8);
         let no_open = self.valve_on(ValveBoardCommands::NormallyOpenOpen as u8);
@@ -1003,6 +1123,9 @@ impl FlightSimState {
             );
         }
         self.fuel_tank_pressure_psi = self.fuel_tank_pressure_psi.max(0.0);
+
+
+        }
 
         if let Some(t0_ms) = self.launch_time_ms {
             let t = (now_ms.saturating_sub(t0_ms) as f32) / 1000.0;
@@ -1080,14 +1203,14 @@ impl FlightSimState {
         } else if t < 54.0 {
             let chute_terminal_fps = -55.0;
             (
-                FlightState::ParachuteDeploy,
+                FlightState::Descent,
                 (chute_terminal_fps - self.velocity_fps) * 1.4,
                 0.0,
             )
         } else if self.altitude_ft > 4.0 {
             let terminal_fps = -52.0;
             (
-                FlightState::Descent,
+                FlightState::Reefing,
                 (terminal_fps - self.velocity_fps) * 0.65,
                 0.0,
             )
@@ -1129,7 +1252,8 @@ impl FlightSimState {
         now_ms: u64,
     ) -> TelemetryResult<Option<Packet>> {
         self.update_physics(now_ms);
-
+        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+        if !self.plant_observation_valid && matches!(spec.dtype,ty if ty==crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE")||ty==crate::telemetry_schema::data_type("KG1000")) {return Ok(None);}
         let mut rng = rand::rng();
         if spec.sender == Board::ValveBoard && valve_board_disconnected_for_state(self.flight_state)
         {
@@ -1271,8 +1395,8 @@ fn sensor_sequence_for_state(state: FlightState, link: SimLink) -> &'static [Sim
             | FlightState::Ascent
             | FlightState::Coast
             | FlightState::Apogee => AV_BAY_ASCENT_SENSOR_SEQUENCE,
-            FlightState::ParachuteDeploy
-            | FlightState::Descent
+            FlightState::Descent
+            | FlightState::Reefing
             | FlightState::Landed
             | FlightState::Recovery => AV_BAY_DESCENT_SENSOR_SEQUENCE,
             _ => AV_BAY_GROUND_SENSOR_SEQUENCE,
@@ -1334,7 +1458,7 @@ fn next_scheduled_pressure_transducer_packet(
     state.next_sensor_packet(
         SimSensorSpec {
             dtype: crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE"),
-            sender: Board::DaqBoard,
+            sender: Board::ValveBoard,
         },
         now_ms,
     )
@@ -1410,6 +1534,8 @@ pub fn sim_mode_enabled() -> bool {
 
 #[cfg(feature = "testing")]
 pub fn handle_command(cmd: &TelemetryCommand) -> bool {
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    if !crate::testing_board_lifecycle::enabled(){return false;}
     if !sim_mode_enabled() {
         return false;
     }
@@ -1421,11 +1547,18 @@ pub fn handle_command(cmd: &TelemetryCommand) -> bool {
             | TelemetryCommand::CancelFill
             | TelemetryCommand::ValveSelfTest
             | TelemetryCommand::NitrogenTest
+            | TelemetryCommand::Turbocharge
+            | TelemetryCommand::StartWritingNow
+            | TelemetryCommand::StartWritingLastTwoMinutes
+            | TelemetryCommand::PauseWritingDb
+            | TelemetryCommand::StopWritingDb
     ) {
-        // The shared backend sequence engine owns these controls. Never consume
+        // Shared backend sequence/recording owners handle these controls. Never consume
         // one here or manufacture completion independently of its interlocks.
         return false;
     }
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    if matches!(cmd,TelemetryCommand::Dump|TelemetryCommand::NormallyOpen|TelemetryCommand::Pilot|TelemetryCommand::Igniter|TelemetryCommand::Nitrogen|TelemetryCommand::NitrogenClose|TelemetryCommand::Nitrous|TelemetryCommand::NitrousClose) {return false;}
     let now_ms = get_current_timestamp_ms();
     let mut s = sim().lock().expect("flight sim mutex poisoned");
     s.apply_command(cmd, now_ms)
@@ -1433,6 +1566,8 @@ pub fn handle_command(cmd: &TelemetryCommand) -> bool {
 
 #[cfg(feature = "testing")]
 pub fn reset_simulation() {
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    if !crate::testing_board_lifecycle::enabled(){return  ;}
     if !sim_mode_enabled() {
         return;
     }
@@ -1446,6 +1581,8 @@ pub fn reset_simulation() {}
 
 #[cfg(feature = "testing")]
 pub fn sync_local_flight_state(next_state: FlightState) {
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    if !crate::testing_board_lifecycle::enabled(){return  ;}
     if !sim_mode_enabled() {
         return;
     }
@@ -1463,14 +1600,16 @@ pub fn _next_state_aware_packet() -> TelemetryResult<Option<Packet>> {
     let mut s = sim().lock().expect("flight sim mutex poisoned");
 
     if let Some(pkt) = s.pop_next_queued() {
-        return Ok(Some(pkt));
+        drop(s);
+        return Ok(Some(pkt.into_packet()));
     }
 
     if now_ms.saturating_sub(s.last_housekeeping_emit_ms) >= HOUSEKEEPING_PERIOD_MS {
         s.last_housekeeping_emit_ms = now_ms;
         s.queue_housekeeping(now_ms);
         if let Some(pkt) = s.pop_next_queued() {
-            return Ok(Some(pkt));
+            drop(s);
+        return Ok(Some(pkt.into_packet()));
         }
     }
 
@@ -1478,7 +1617,8 @@ pub fn _next_state_aware_packet() -> TelemetryResult<Option<Packet>> {
         s.last_state_emit_ms = now_ms;
         s.queue_flight_state(now_ms);
         if let Some(pkt) = s.pop_next_queued() {
-            return Ok(Some(pkt));
+            drop(s);
+        return Ok(Some(pkt.into_packet()));
         }
     }
 
@@ -1513,15 +1653,427 @@ pub fn _next_state_aware_packet() -> TelemetryResult<Option<Packet>> {
     unreachable!("flight sim only available with testing feature")
 }
 
+#[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+impl FlightSimState {
+    fn update_ground_plant(&mut self,now:u64) {
+        let parameters=ground_plant::Parameters::default();
+        let mut plant=self.expanded_plant.take().unwrap_or_else(||{
+            let mut plant=ground_plant::Plant::empty();
+            plant.liquid_kg=f64::from(self.loadcell_mass_kg.max(0.0));
+            plant.vapor_partial_psi=f64::from(self.fuel_tank_pressure_psi.max(0.0));
+            plant
+        });
+        let valves=ground_plant::Valves{nitrogen:self.valve_on(9),nitrous:self.valve_on(10),vent:self.valve_on(1),dump:self.valve_on(2),pilot:self.valve_on(0)};
+        let result=plant.step(now,valves,parameters);
+        self.plant_observation_valid=result.is_ok();
+        if matches!(result,Err(ground_plant::StepError::ClockGap)) {log::warn!("SIMULATED plant clock discontinuity: missing interval not integrated; current sensor observation suppressed");}
+        if self.plant_observation_valid {
+            self.loadcell_mass_kg=plant.mass_kg(parameters) as f32;
+            self.fuel_tank_pressure_psi=plant.pressure_psi() as f32;
+        }
+        self.expanded_plant=Some(plant);
+    }
+    fn modeled_outputs(&self, board: Board) -> u32 {
+        match board {
+            Board::ActuatorBoard => u32::from(self.valve_on(ActuatorBoardCommands::IgniterOn as u8))
+                | (u32::from(self.valve_on(ActuatorBoardCommands::NitrogenOpen as u8))<<1)
+                | (u32::from(self.valve_on(ActuatorBoardCommands::NitrousOpen as u8))<<2),
+            Board::ValveBoard => u32::from(self.valve_on(ValveBoardCommands::PilotOpen as u8))
+                | (u32::from(self.valve_on(ValveBoardCommands::NormallyOpenOpen as u8))<<1)
+                | (u32::from(self.valve_on(ValveBoardCommands::DumpOpen as u8))<<2),
+            _=>0,
+        }
+    }
+    fn stop_modeled_outputs(&mut self, board: Board, now: u64) {
+        self.stop_modeled_outputs_at(board,now,now);
+    }
+    fn stop_modeled_outputs_at(&mut self,board:Board,now:u64,receipt_model_ms:u64) {
+        self.update_ground_plant(receipt_model_ms);
+        if board==Board::ActuatorBoard {self.accepted_igniter_source=None;}
+        let values:&[(u8,bool)]=match board {
+            Board::ActuatorBoard=>&[(7,false),(9,false),(10,false),(8,false)],
+            Board::ValveBoard=>&[(0,false),(1,true),(2,true)],
+            _=>&[],
+        };
+        for &(key,value) in values {self.valves.insert(key,value);self.queue_umbilical_status(key,value,now);}
+        if matches!(board,Board::ActuatorBoard|Board::ValveBoard|Board::FlightComputer) {
+            self.launch_sequence_started_ms=None;
+            self.actuator_igniter_sequence_started_ms=None;
+        }
+    }
+    #[cfg(test)]
+    fn apply_modeled_packet(&mut self,board:Board,ty:crate::testing_board_lifecycle::Kind,value:u8,now:u64) {
+        self.apply_modeled_packet_at(board,ty,value,now,now,now);
+    }
+    fn apply_modeled_packet_at(&mut self,board:Board,ty:crate::testing_board_lifecycle::Kind,value:u8,now:u64,observed_utc:u64,receipt_model_ms:u64) {
+        // Integrate the PREVIOUS actual valves to receipt, never use a delayed
+        // packet's sourceUTC to rewind physics or backfill flow before arrival.
+        self.update_ground_plant(receipt_model_ms);
+        if ty==crate::testing_board_lifecycle::Kind::State {
+            if let Some(state)=crate::types::u8_to_flight_state(value) {
+                self.recovery.note_state(board,value);
+                if value==FlightState::Launch as u8 {self.recovery.note_launch(board);}
+                if board==Board::FlightComputer {self.set_flight_state(state,now);}
+            }
+            return;
+        }
+        if board==Board::ActuatorBoard && ty==crate::testing_board_lifecycle::Kind::Actuator && value==14 {
+            if self.accepted_igniter_source.is_none()
+                && let Some(owner)=effect_timer::Owner::admitted(now,observed_utc,receipt_model_ms) {
+                self.accepted_igniter_source=Some(owner);
+                self.recovery.note_launch(board);
+            }
+            self.update_actuator_igniter_sequence(receipt_model_ms);
+            return;
+        }
+        let output=if board==Board::ValveBoard&&matches!(ty,crate::testing_board_lifecycle::Kind::Valve|crate::testing_board_lifecycle::Kind::AutomaticValve) {
+            match value {0..=2=>Some((value,true)),3..=5=>Some((value-3,false)),_=>None}
+        } else if board==Board::ActuatorBoard&&matches!(ty,crate::testing_board_lifecycle::Kind::Actuator|crate::testing_board_lifecycle::Kind::AutomaticActuator) {
+            match value {7|9|10=>Some((value,true)),11=>Some((7,false)),12|13=>Some((value-3,false)),_=>None}
+        } else {None};
+        if let Some((key,on))=output {self.valves.insert(key,on);self.queue_umbilical_status(key,on,observed_utc);}
+        if board == Board::FlightComputer
+            && ty == crate::testing_board_lifecycle::Kind::Flight
+            && value == 1
+            && self.apply_command(&TelemetryCommand::Launch, now)
+        {
+            self.recovery.note_launch(board);
+        }
+    }
+    fn retire_completed_reports(&mut self,board:Board,boundary:u64) {
+        if boundary==0||boundary==u64::MAX {return;}
+        self.queued.retain(|p| {
+            let own=p.sender()==board.sender_id();
+            let diagnostic=p.data_type()==crate::telemetry_schema::data_type("ABORT")&&p.payload().starts_with(b"SEDS_AUTO_ABORT_V1:");
+            let abort_state=p.data_type()==crate::telemetry_schema::data_type("FLIGHT_STATE")&&p.payload()==[15];
+            !(own&&(diagnostic||abort_state)&&p.timestamp()!=0&&p.timestamp()!=u64::MAX&&p.timestamp()<boundary)
+        });
+    }
+}
+
+#[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+pub(crate) fn model_report_is_old(origin:crate::testing_board_lifecycle::ReportOrigin,source:u64)->bool {
+    if !crate::testing_board_lifecycle::enabled(){return false;}
+    sim().try_lock().is_ok_and(|model|model.recovery.report_is_old(origin,source))
+}
+
+#[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+pub(crate) fn observe_model_clock(utc:Option<u64>){
+    if crate::testing_board_lifecycle::eligible(){sim().lock().unwrap().recovery.observe_clock(utc);}
+}
+#[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+pub(crate) fn initialize_model_owners(state:&crate::state::AppState,actual_abort:u8,unknown:u8) {
+    if !crate::testing_board_lifecycle::eligible() {return;}
+    let (closed,boundary)={let store=state.launch_history.lock().unwrap();(store.automatic_actions_inhibited()||store.recovery_pending().is_some_and(|p|!p.published),store.completed_abort_boundary().unwrap_or(0))};
+    let (live_aborted,_)=state.board_abort.masks();
+    let aborted=actual_abort|live_aborted;
+    let manual=state.manual_abort_intent.pending_epoch().is_some();
+    let mut model=sim().lock().unwrap();
+    model.recovery.initialize_boot(if closed||manual {0x7f}else{aborted},aborted,unknown,boundary);
+    for board in crate::testing_board_lifecycle::BOARDS {if model.recovery.blocked(board){model.stop_modeled_outputs(board,0);}}
+}
+#[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+pub(crate) fn receive_model_packet(board:Board,packet:&Packet,sample:crate::testing_board_lifecycle::ClockSample)->TelemetryResult<Option<Packet>> {
+    use crate::testing_board_lifecycle::Action;
+    let observed_utc=sample.current();
+    if !crate::testing_board_lifecycle::enabled(){
+        // A constructed but unselected Dummy is not application proof.
+        let p=packet.payload();
+        if packet.data_type()!=crate::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST")||p.len()!=32||p[0]!=1||p[1]!=0||packet.sender()!="GS"{return Ok(None);}
+        let mut wire=[0;40];wire[0]=1;wire[1]=7;wire[2]=255;wire[4..12].copy_from_slice(&p[4..12]);wire[32..40].copy_from_slice(&p[24..32]);
+        return crate::testing_board_lifecycle::status_packet(board,wire,observed_utc).map(Some);
+    }
+    let mut model=sim().lock().unwrap();
+    let observed_utc=sample.current();
+    let decision=model.recovery.receive(board,packet,observed_utc);
+    match decision.action {Action::None=>{},Action::Stop=>model.stop_modeled_outputs_at(board,observed_utc,get_current_timestamp_ms()),Action::Ordinary(ty,value)=>model.apply_modeled_packet_at(board,ty,value,packet.timestamp(),observed_utc,get_current_timestamp_ms())}
+    let wire=decision.reply.map(|reply|model.recovery.status(board,reply,model.modeled_outputs(board),observed_utc));drop(model);
+    wire.map(|wire|crate::testing_board_lifecycle::status_packet(board,wire,observed_utc)).transpose()
+}
+
+#[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+pub(crate) fn service_model_recovery(sample:crate::testing_board_lifecycle::ClockSample,boards:&[Board])->TelemetryResult<Vec<(Board,Packet)>> {
+    if !crate::testing_board_lifecycle::enabled(){return Ok(Vec::new());}
+    // No wait can turn an old clock observation into fresh authorization.
+    let Ok(mut model)=sim().try_lock()else{return Ok(Vec::new());};
+    let jobs=model.recovery.ready_jobs();let mut replies=Vec::new();
+    for (board,intent) in jobs {
+        if !boards.contains(&board){continue;}
+        let observed_utc=sample.current();
+        if model.recovery.ticket_current(board,&intent,observed_utc){model.stop_modeled_outputs_at(board,observed_utc,get_current_timestamp_ms());}
+        let reply=model.recovery.finish(board,&intent,sample.current());
+        if reply.result==0{model.retire_completed_reports(board,intent.source);}
+        replies.push((board,model.recovery.status(board,reply,model.modeled_outputs(board),observed_utc)));
+    }
+    drop(model);
+    replies.into_iter().map(|(board,wire)|crate::testing_board_lifecycle::status_packet(board,wire,sample.current()).map(|packet|(board,packet))).collect()
+}
+
+#[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+pub(crate) fn handle_command_stamped(cmd:&TelemetryCommand,source:u64,observed_utc:u64)->bool {
+    if !crate::testing_board_lifecycle::enabled(){return false;}
+    let mut model=sim().lock().unwrap();
+    let boards:&[Board]=if matches!(cmd,TelemetryCommand::RetractPlumbing){&[Board::ActuatorBoard]}else{&[Board::ActuatorBoard,Board::ValveBoard,Board::FlightComputer]};
+    if boards.iter().any(|b|!model.recovery.source_allowed(*b,source,observed_utc)){return false;}
+    let accepted=model.apply_command(cmd,source);
+    if accepted&&matches!(cmd,TelemetryCommand::Launch) {for &board in boards{model.recovery.note_launch(board);}}
+    accepted
+}
+
+#[cfg(all(feature = "testing", any(feature = "hitl_mode", feature = "test_fire_mode")))]
+pub(crate) fn handle_command_stamped(
+    _cmd: &TelemetryCommand,
+    _source: u64,
+    _observed: u64,
+) -> bool {
+    false
+}
+
+/// Prepared outside App/Stop/SDK gates; no packet or state authority is minted.
+pub(crate) struct PreparedAutomaticReadiness {
+    #[cfg(feature = "testing")]
+    model: Option<&'static Mutex<FlightSimState>>,
+}
+pub(crate) struct AutomaticReadinessGuard<'a> {
+    #[cfg(feature = "testing")]
+    model: Option<std::sync::MutexGuard<'a, FlightSimState>>,
+    #[cfg(not(feature = "testing"))]
+    _lifetime: std::marker::PhantomData<&'a ()>,
+}
+pub(crate) fn prepare_automatic_readiness() -> PreparedAutomaticReadiness {
+    PreparedAutomaticReadiness {
+        #[cfg(feature = "testing")]
+        model: sim_mode_enabled().then(sim),
+    }
+}
+impl PreparedAutomaticReadiness {
+    pub(crate) fn try_guard(&self) -> Option<AutomaticReadinessGuard<'_>> {
+        #[cfg(feature = "testing")]
+        {
+            let model = match self.model {
+                None => None,
+                Some(model) => {
+                    let model = model.try_lock().ok()?;
+                    if !matches!(model.flight_state, FlightState::Startup | FlightState::Idle)
+                        || model.launch_sequence_started_ms.is_some()
+                        || model.actuator_igniter_sequence_started_ms.is_some()
+                        || model.launch_time_ms.is_some() { return None; }
+                    Some(model)
+                }
+            };
+            Some(AutomaticReadinessGuard { model })
+        }
+        #[cfg(not(feature = "testing"))]
+        Some(AutomaticReadinessGuard { _lifetime: std::marker::PhantomData })
+    }
+}
+impl AutomaticReadinessGuard<'_> {
+    /// Scalar assignments only. No queue/schema/clock/provider or packet build.
+    pub(crate) fn admitted(&mut self) {
+        #[cfg(feature = "testing")]
+        if let Some(model) = self.model.as_mut() {
+            if model.flight_state == FlightState::Startup {
+                model.flight_state = FlightState::Idle;
+                model.saw_dump_open_after_n2 = false;
+                model.saw_dump_closed_after_n2 = false;
+                model.nitrous_fill_started_ms = None;
+            }
+            model.automatic_idle_volatile = true;
+        }
+    }
+}
+
+/// Purely visual/model projection of a GS automatic prelaunch phase. It cannot
+/// note per-board state, construct an FC Packet or change any motion/Launch owner.
+pub(crate) struct PreparedAutomaticPhase {
+    #[cfg(feature = "testing")]
+    model: Option<&'static Mutex<FlightSimState>>,
+    #[cfg(feature = "testing")]
+    expected: FlightState,
+    #[cfg(feature = "testing")]
+    target: FlightState,
+}
+pub(crate) struct AutomaticPhaseGuard<'a> {
+    #[cfg(feature = "testing")]
+    model: Option<std::sync::MutexGuard<'a, FlightSimState>>,
+    #[cfg(feature = "testing")]
+    target: FlightState,
+    #[cfg(not(feature = "testing"))]
+    _lifetime: std::marker::PhantomData<&'a ()>,
+}
+pub(crate) fn prepare_automatic_phase(_expected: crate::types::FlightState, _target: crate::types::FlightState) -> PreparedAutomaticPhase {
+    PreparedAutomaticPhase {
+        #[cfg(feature = "testing")]
+        model: {
+            #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
+            let allowed = crate::testing_board_lifecycle::enabled();
+            #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+            let allowed = true;
+            (allowed && sim_mode_enabled()).then(sim)
+        },
+        #[cfg(feature = "testing")]
+        expected: _expected,
+        #[cfg(feature = "testing")]
+        target: _target,
+    }
+}
+impl PreparedAutomaticPhase {
+    pub(crate) fn try_guard(&self) -> Option<AutomaticPhaseGuard<'_>> {
+        #[cfg(feature = "testing")]
+        {
+            let model = match self.model {
+                None => None,
+                Some(model) => {
+                    let model = model.try_lock().ok()?;
+                    let matches = model.flight_state == self.expected
+                        || (self.expected == FlightState::Startup && model.flight_state == FlightState::Idle);
+                    if !matches || model.launch_time_ms.is_some()
+                        || model.launch_sequence_started_ms.is_some()
+                        || model.actuator_igniter_sequence_started_ms.is_some() { return None; }
+                    Some(model)
+                }
+            };
+            Some(AutomaticPhaseGuard { model, target: self.target })
+        }
+        #[cfg(not(feature = "testing"))]
+        Some(AutomaticPhaseGuard { _lifetime: std::marker::PhantomData })
+    }
+}
+impl AutomaticPhaseGuard<'_> {
+    pub(crate) fn admitted(&mut self) {
+        #[cfg(feature = "testing")]
+        if let Some(model) = self.model.as_mut() {
+            model.flight_state = self.target;
+            if self.target != FlightState::FillTest {
+                model.saw_dump_open_after_n2 = false;
+                model.saw_dump_closed_after_n2 = false;
+            }
+            if !matches!(self.target, FlightState::NitrousFill | FlightState::Armed) {
+                model.nitrous_fill_started_ms = None;
+            }
+            model.automatic_idle_volatile = true;
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    use crate::board_recovery::ReadyIgnitionFixture;
+    #[cfg(all(feature="testing",any(feature="hitl_mode",feature="test_fire_mode")))]
+    struct ReadyIgnitionFixture {
+        state:std::sync::Arc<crate::state::AppState>,
+        _peers:crate::ignition_pair::fixture::Peers,
+    }
+    #[cfg(all(feature="testing",any(feature="hitl_mode",feature="test_fire_mode")))]
+    impl Drop for ReadyIgnitionFixture {fn drop(&mut self){self.state.request_shutdown();}}
+    #[cfg(feature="testing")]
+    async fn ready_launch_fixture()->ReadyIgnitionFixture {
+        #[cfg(not(any(feature="hitl_mode",feature="test_fire_mode")))]
+        {crate::board_recovery::ready_ignition_fixture_for_test().await}
+        #[cfg(any(feature="hitl_mode",feature="test_fire_mode"))]
+        {
+            let state=crate::state::tests::test_app_state().await;
+            let host=std::sync::Arc::new(sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([
+                crate::ignition_pair::fixture::handler(&state, |_|Ok(())),
+            ]).with_sender("GS")));
+            let peers=crate::ignition_pair::fixture::Peers::warm(&state,host).await;
+            assert!(crate::ignition_pair::readiness(&state).is_ok());
+            ReadyIgnitionFixture{state,_peers:peers}
+        }
+    }
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn retained_stop_orders_actual_testing_model_launch_and_visual_idle_does_not_rearm() {
+        #[cfg(not(any(feature="hitl_mode",feature="test_fire_mode")))]
+        if crate::operator_queue::isolated_simulated_case(module_path!(),"retained_stop_orders_actual_testing_model_launch_and_visual_idle_does_not_rearm"){return;}
+        #[cfg(any(feature="hitl_mode",feature="test_fire_mode"))]
+        if crate::operator_queue::isolated_native_case(module_path!(),"retained_stop_orders_actual_testing_model_launch_and_visual_idle_does_not_rearm"){return;}
+        let stopped_ready=ready_launch_fixture().await;
+        let state=stopped_ready.state.clone();
+        let mut model = super::FlightSimState::new();
+        model.flight_state = crate::types::FlightState::Armed;
+        let ticket = crate::gse::inhibit_automatic_actions_for_launch(&state).unwrap();
+        state.manual_abort_intent.request();
+        assert!(
+            crate::gse::admit_simulated_launch(&state, ticket, || model
+                .apply_command(&crate::types::TelemetryCommand::Launch, 1000))
+            .is_err()
+        );
+        assert_eq!(model.flight_state, crate::types::FlightState::Armed);
+        let current_ready=ready_launch_fixture().await;
+        let current=current_ready.state.clone();
+        let ticket = crate::gse::inhibit_automatic_actions_for_launch(&current).unwrap();
+        crate::gse::admit_simulated_launch(&current, ticket, || {
+            model.apply_command(&crate::types::TelemetryCommand::Launch, 1000)
+        })
+        .unwrap();
+        assert_eq!(model.flight_state, crate::types::FlightState::Launch);
+        model.flight_state = crate::types::FlightState::Idle;
+        current.set_local_flight_state(crate::types::FlightState::Idle);
+        assert!(crate::gse::inhibit_automatic_actions_for_launch(&current).is_err());
+        assert!(
+            crate::telemetry_task::command_at_dispatch(
+                &current,
+                crate::types::TelemetryCommand::AutomaticAbort {
+                    generation: crate::gse::automatic_generation(&current)
+                }
+            )
+            .is_none()
+        );
+    }
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn private_fill_and_cold_flow_wrappers_require_the_real_dispatch_owner() {
+        let state = crate::state::tests::test_app_state().await;
+        let origin = crate::fill_recording::Captured::capture(&state).bind(
+            crate::fill_recording::Authority::Physical {
+                current: std::sync::Arc::new(|| true),
+            },
+            None,
+        );
+        let key = crate::sequence_progress::RunKey {
+            backend_instance: "1".repeat(32),
+            reset_epoch: "2".repeat(16),
+            run_id: "3".repeat(32),
+        };
+        assert!(key.valid());
+        let mut sim = super::FlightSimState::new();
+        let valves = sim.valves.clone();
+        let flight_state = sim.flight_state;
+        let pressure = sim.fuel_tank_pressure_psi;
+        let mass = sim.loadcell_mass_kg;
+        assert!(sim.queued.is_empty());
+        for command in [
+            crate::types::TelemetryCommand::FillWithRecording { origin },
+            crate::types::TelemetryCommand::ColdFlowPanelRelease {
+                key,
+                generation: crate::gse::automatic_generation(&state),
+                awaiting_at_edge: true,
+            },
+        ] {
+            assert!(!sim.apply_command(&command, 1000));
+            assert_eq!(sim.valves, valves);
+            assert_eq!(sim.flight_state, flight_state);
+            assert_eq!(sim.fuel_tank_pressure_psi, pressure);
+            assert_eq!(sim.loadcell_mass_kg, mass);
+            assert!(sim.queued.is_empty());
+            assert!(sim.launch_sequence_started_ms.is_none());
+            assert!(sim.actuator_igniter_sequence_started_ms.is_none());
+        }
+    }
+
     #[cfg(feature = "testing")]
     #[test]
     fn automatic_abort_intent_requires_the_normal_dispatch_guard() {
         let mut sim = super::FlightSimState::new();
         let valves = sim.valves.clone();
         let flight_state = sim.flight_state;
-        assert!(!sim.apply_command(&crate::types::TelemetryCommand::AutomaticAbort, 1_000));
+        assert!(!sim.apply_command(
+            &crate::types::TelemetryCommand::AutomaticAbort { generation: 1 },
+            1_000
+        ));
         assert_eq!(sim.valves, valves);
         assert_eq!(sim.flight_state, flight_state);
     }
@@ -1575,12 +2127,46 @@ mod tests {
             assert!(!super::handle_command(&command));
         }
     }
+    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+    #[test]
+    fn selected_actual_dummy_models_do_not_consume_backend_recording_controls() {
+        const NAME:&str="flight_sim::tests::selected_actual_dummy_models_do_not_consume_backend_recording_controls";
+        const CHILD:&str="FLIGHT_SIM_RECORDING_OWNER_CHILD";
+        if std::env::var(CHILD).as_deref()!=Ok("1") {
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact",NAME,"--nocapture"]).env(CHILD,"1")
+                .env("GS_SIM_MODE","1").env("GS_RRLS_ROLE","off").output().unwrap();
+            assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        use crate::comms::CommsDevice;
+        crate::telemetry_schema::initialize().unwrap();
+        let rocket=crate::comms::DummyComms::new("Rocket Comms");
+        let fill=crate::comms::DummyComms::new("Umbilical Comms");
+        crate::testing_board_lifecycle::bind_selected(rocket.testing_model_link(),fill.testing_model_link());
+        assert!(crate::testing_board_lifecycle::enabled(),"actual selected model links required");
+        for command in [crate::types::TelemetryCommand::StartWritingNow,crate::types::TelemetryCommand::StartWritingLastTwoMinutes,crate::types::TelemetryCommand::PauseWritingDb,crate::types::TelemetryCommand::StopWritingDb] {
+            assert!(!super::handle_command(&command),"recording command absorbed: {command:?}");
+        }
+    }
     #[cfg(feature = "testing")]
     #[test]
     fn queued_flight_state_is_prioritized_for_launch_clock_sync() {
         let mut sim = super::FlightSimState::new();
+        // The ordering oracle needs TWO reportable frames. TestFire's
+        // default volatile Idle intentionally cannot create an FC origin.
+        // Startup is reportable in every selected Testing mode; keep the
+        // provenance flag unchanged rather than bypassing that safety rule.
+        sim.flight_state = crate::types::FlightState::Startup;
+        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+        sim.recovery.initialize(0,0,0);
         sim.queue_umbilical_status(super::ActuatorBoardCommands::IgniterOn as u8, true, 1_000);
+        let status_original = sim.queued.front().unwrap().packet.clone();
         sim.queue_flight_state(1_000);
+        assert_eq!(sim.queued.len(), 2, "both real queue producers must execute before testing priority");
+        let flight_original = sim.queued.iter()
+            .find(|p| p.data_type() == crate::telemetry_schema::data_type("FLIGHT_STATE"))
+            .expect("explicit reportable Startup must produce the priority candidate").packet.clone();
 
         let pkt = sim
             .pop_next_queued()
@@ -1590,6 +2176,37 @@ mod tests {
             pkt.data_type(),
             crate::telemetry_schema::data_type("FLIGHT_STATE")
         );
+        assert_eq!(pkt.sender(), crate::types::Board::FlightComputer.sender_id());
+        assert_eq!(pkt.payload(), [crate::types::FlightState::Startup as u8]);
+        assert_eq!((pkt.packet_id(), pkt.timestamp()), (flight_original.packet_id(), flight_original.timestamp()));
+        let next = sim.pop_next_queued().expect("lower-priority status must remain owned");
+        assert_eq!(next.data_type(), crate::telemetry_schema::data_type("UMBILICAL_STATUS"));
+        assert_eq!((next.packet_id(), next.timestamp(), next.payload()),
+            (status_original.packet_id(), status_original.timestamp(), status_original.payload()));
+        assert!(sim.pop_next_queued().is_none());
+    }
+
+    #[cfg(all(feature = "testing", feature = "test_fire_mode"))]
+    #[test]
+    fn volatile_testfire_idle_does_not_mint_fc_origin_frame() {
+        let mut sim = super::FlightSimState::new();
+        assert_eq!(sim.flight_state, crate::types::FlightState::Idle);
+        assert!(sim.automatic_idle_volatile);
+        sim.queue_umbilical_status(super::ActuatorBoardCommands::IgniterOn as u8, true, 1_000);
+        let original = sim.queued.front().unwrap().packet.clone();
+        assert_eq!(sim.queued.len(), 1);
+        sim.queue_flight_state(1_000);
+        // Refusing to mint an FC report is the production provenance contract,
+        // not a priority failure. Preserve the existing status original.
+        assert_eq!(sim.queued.len(), 1);
+        assert!(sim.queued.iter().all(|p| p.data_type() != crate::telemetry_schema::data_type("FLIGHT_STATE")));
+        assert_eq!(sim.flight_state, crate::types::FlightState::Idle);
+        assert!(sim.automatic_idle_volatile);
+        let packet = sim.pop_next_queued().unwrap();
+        assert_eq!(packet.data_type(), crate::telemetry_schema::data_type("UMBILICAL_STATUS"));
+        assert_eq!((packet.packet_id(), packet.timestamp(), packet.sender(), packet.payload()),
+            (original.packet_id(), original.timestamp(), original.sender(), original.payload()));
+        assert!(sim.pop_next_queued().is_none());
     }
 
     #[cfg(feature = "testing")]
@@ -1665,8 +2282,8 @@ mod tests {
         }
 
         for state in [
-            FlightState::ParachuteDeploy,
             FlightState::Descent,
+            FlightState::Reefing,
             FlightState::Landed,
             FlightState::Recovery,
         ] {
@@ -1708,14 +2325,68 @@ mod tests {
                     | crate::types::Board::ValveBoard
             )
         }));
-        assert!(
-            fill.iter()
-                .any(|spec| spec.dtype == crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE"))
-        );
+        assert!(fill.iter().any(|spec| spec.dtype
+            == crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE")
+            && spec.sender == crate::types::Board::ValveBoard));
         assert!(
             av_bay
                 .iter()
                 .any(|spec| spec.dtype == crate::telemetry_schema::data_type("IMU_DATA"))
         );
     }
+
+    #[cfg(all(
+        feature = "testing",
+        any(feature = "hitl_mode", feature = "test_fire_mode")
+    ))]
+    #[test]
+    fn operator_mode_state_controls_are_forwarded_without_model_effects() {
+        let mut sim = super::FlightSimState::new();
+        sim.flight_state = crate::types::FlightState::Armed;
+        sim.launch_sequence_started_ms = Some(10);
+        sim.actuator_igniter_sequence_started_ms = Some(20);
+        sim.launch_time_ms = Some(30);
+        let valves = sim.valves.clone();
+        let timers = (
+            sim.launch_sequence_started_ms,
+            sim.actuator_igniter_sequence_started_ms,
+            sim.launch_time_ms,
+        );
+        let queued = sim.queued.len();
+        for command in [
+            crate::types::TelemetryCommand::AdvanceFlightState,
+            crate::types::TelemetryCommand::RewindFlightState,
+        ] {
+            assert!(
+                !sim.apply_command(&command, 60_000),
+                "model consumed {command:?}"
+            );
+            assert_eq!(sim.flight_state, crate::types::FlightState::Armed);
+            assert_eq!(sim.valves, valves);
+            assert_eq!(
+                (
+                    sim.launch_sequence_started_ms,
+                    sim.actuator_igniter_sequence_started_ms,
+                    sim.launch_time_ms
+                ),
+                timers
+            );
+            assert_eq!(sim.queued.len(), queued);
+        }
+    }
 }
+
+#[cfg(all(test, feature = "testing", feature = "test_fire_mode"))]
+mod automatic_readiness_tests;
+
+
+#[cfg(all(test, feature = "testing"))]
+mod automatic_phase_tests;
+
+#[cfg(all(test,feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+#[path="flight_sim/expanded_plant_tests.rs"]
+mod expanded_plant_tests;
+
+#[cfg(all(test,feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+#[path="flight_sim/sdk_model_tests.rs"]
+mod sdk_model_tests;

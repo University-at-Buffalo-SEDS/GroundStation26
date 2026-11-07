@@ -19,6 +19,7 @@ pub enum FlightComputerCommands {
     EvaluationAbort = 16,
     ReinitSensors = 17,
     ReinitBarometer = 18,
+    // Historical API name: FC byte 19 reinitializes the IMU.
     EnableIMU = 19,
     DisableIMU = 20,
     #[cfg(feature = "hitl_mode")]
@@ -57,4 +58,53 @@ pub enum ActuatorBoardCommands {
     NitrousClose = 13,
     #[allow(unused)]
     IgniterSequence = 14,
+}
+
+#[cfg(test)]
+mod flight_command_wire_tests {
+    use super::FlightComputerCommands::*;
+
+    #[test]
+    fn existing_command_bytes_match_the_captured_fc_compatibility_table() {
+        let contract: serde_json::Value = serde_json::from_str(include_str!(
+            "test-fixtures/fc-global-state-contract.json"
+        )).unwrap();
+        let cases = [
+            (Postinit, "Compat_Postinit_Signal"),
+            (Launch, "Compat_Launch_Signal"),
+            (MonitorAltitude, "Compat_Vigilant_Mode"),
+            (RevokeMonitorAltitude, "Revoke_Vigilant_Mode"),
+            (ConsecutiveSamples, "Compat_Eval_Successive"),
+            (RevokeConsecutiveSamples, "Revoke_Eval_Successive"),
+            (ResetFailures, "Compat_Reset_Failures"),
+            (RevokeResetFailures, "Revoke_Reset_Failures"),
+            (ValidateMeasms, "Compat_Measm_Reports"),
+            (RevokeValidateMeasms, "Revoke_Measm_Reports"),
+            (DeployParachute, "Compat_Deploy_Parachute"),
+            (ExpandParachute, "Compat_Expand_Parachute"),
+            (EvaluationRelax, "Compat_Evaluation_Relax"),
+            (EvaluationFocus, "Compat_Evaluation_Focus"),
+            (EvaluationAbort, "Compat_Evaluation_Abort"),
+            (ReinitSensors, "Compat_Reinit_Sensors"),
+            (ReinitBarometer, "Compat_Reinit_Barometer"),
+            (EnableIMU, "Compat_Reinit_IMU"),
+            (DisableIMU, "Compat_Disable_IMU"),
+            #[cfg(feature = "hitl_mode")]
+            (AdvanceFlightState, "Compat_Advance_State"),
+            #[cfg(feature = "hitl_mode")]
+            (RewindFlightState, "Compat_Rewind_State"),
+            (AbortAfter40, "Compat_Abort_After_40"),
+            (AbortAfter100, "Compat_Abort_After_100"),
+            (AbortAfter250, "Compat_Abort_After_250"),
+            (ReinitAfter15, "Compat_Reinit_After_15"),
+            (ReinitAfter30, "Compat_Reinit_After_30"),
+            (ReinitAfter50, "Compat_Reinit_After_50"),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(contract["remote_commands_compat"][command as usize], expected);
+        }
+        // Bytes 10 and 11 are intentionally not reused by another GS command.
+        assert_eq!(contract["remote_commands_compat"][10], "Compat_Velocity_Checks");
+        assert_eq!(contract["remote_commands_compat"][11], "Revoke_Velocity_Checks");
+    }
 }

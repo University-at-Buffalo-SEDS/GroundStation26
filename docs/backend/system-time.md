@@ -15,7 +15,10 @@ Network UTC is also available in Actions and Settings in every flight state.
 `POST /api/network_time` accepts `{"source":"client","utc_ms":1793052000000}`
 with the same explicit `set_system_time` account permission. This updates the
 primary station's SEDSnet UTC source, without invoking systemd or changing the
-host wall clock. Existing network clocks converge using SEDSnet's bounded slew;
+host wall clock. The selected client source remains anchored to SEDSnet's
+monotonic clock; periodic host-clock fallback refreshes do not overwrite it.
+The API reports admission failures instead of claiming success. Existing network
+clocks converge using SEDSnet's bounded slew;
 they do not immediately jump to the requested value. Network time labels use
 the router's synchronized UTC when available. RRLS must receive its time from
 the primary; direct network-clock writes on RRLS return a conflict response.
@@ -37,36 +40,41 @@ SEDSNet UTC reading (RF supplies this after valid GPS time). These are explicit
 authorized operations, not unsolicited clock changes from telemetry.
 
 `GET /api/system/time` returns current OS UTC, available network UTC, and whether
-the current user can set time. `POST` requires that permission and accepts either
+the current user has clock permission, whether the host can perform an OS
+clock update, and an explanation when unavailable. `POST` requires that permission and accepts either
 `{"source":"client","utc_ms":1790000000000}` or `{"source":"network"}`.
 Network uptime and ordinary packet timestamps are not treated as UTC.
 
 ## Linux host setup
 
-The backend invokes `/usr/bin/timedatectl --no-ask-password set-time @SECONDS`
-without a shell. The service account needs polkit authorization for
-`org.freedesktop.timedate1.set-time`. Do not run the backend as root or grant it
-unrestricted sudo. An administrator can install a root-owned rule such as
-`/etc/polkit-1/rules.d/49-groundstation-time.rules`, replacing the example account
-with the dedicated, noninteractive GroundStation service account:
+Settings → Maintenance → Station system date/time provides an explicit
+**Set OS + network from this device** action. Date/time and network-source
+changes are also permission-gated at the backend. OS success is followed by a
+checked SDK source update; if SDK admission fails, the response explicitly says
+that the OS clock changed but the network source was not accepted. Network
+corrections still converge gradually at the SDK's configured slew rate. A
+nine-minute offset at the default 5% correction rate can take about three hours.
+This action does not reset discovery, monotonic clocks, or launch deadlines.
 
-```javascript
-polkit.addRule(function(action, subject) {
-    if (action.id === "org.freedesktop.timedate1.set-time" &&
-        subject.user === "groundstation") {
-        return polkit.Result.YES;
-    }
-});
-```
+The Linux backend uses `clock_settime(CLOCK_REALTIME)` directly. It needs
+**CAP_SYS_TIME** in its effective capability set. The native Pi service runs as
+root; if its systemd unit restricts `CapabilityBoundingSet`, include
+`CAP_SYS_TIME` in the existing list without removing its other required
+capabilities. A dedicated non-root service can receive `CAP_SYS_TIME` through
+`AmbientCapabilities`; keep it in the bounding set too. Hardened units using
+`ProtectClock=yes` or a syscall filter that rejects clock changes must permit
+this explicit function. No service or host setting is changed automatically.
 
-This OS permission covers processes running as that account; the application
-enforces the separate per-user permission. Do not use a shared interactive account.
-The rule is an example, **not installed automatically**. No host clock is changed
-by builds or tests. macOS/non-systemd hosts report unsupported status.
+`GET /api/system/time` distinguishes application permission from Linux/kernel
+capability. macOS and other unsupported hosts report the reason and do not offer
+an OS update button. Kernel rejection is returned truthfully even when capability
+inspection initially looked usable. Builds and tests never set the host clock;
+tests inject a mock setter. The backend does not invoke a shell, sudo, polkit, or
+`timedatectl` for this operation.
 
-If automatic NTP is enabled, systemd may reject manual changes. The API reports
-that error; it does not turn NTP off. The administrator must choose how to manage
-NTP on the offline Pi. See [systemd time service documentation](https://github.com/systemd/systemd/blob/main/man/org.freedesktop.timedate1.xml).
+NTP configuration remains unchanged. An active time synchronization service may
+later correct the wall clock again; choose its policy separately for an offline
+Pi. Only an explicit authenticated UI/API request changes the OS clock.
 
 Correct the clock **before active operations/recording**: wall-clock jumps can
 expire authentication sessions, alter freshness displays, and affect wall-clock

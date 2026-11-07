@@ -3,15 +3,12 @@
 use super::*;
 
 pub(crate) struct AutomaticAbortClaim {
-    #[cfg(not(feature = "hitl_mode"))]
     runtime: Arc<std::sync::Mutex<Runtime>>,
+    _operator_claim: Option<OperatorDispatchClaim>,
 }
 impl Drop for AutomaticAbortClaim {
     fn drop(&mut self) {
-        #[cfg(not(feature = "hitl_mode"))]
-        {
-            self.runtime.lock().unwrap().automatic_abort_in_flight = false;
-        }
+        self.runtime.lock().unwrap().automatic_abort_in_flight = false;
     }
 }
 
@@ -30,20 +27,97 @@ pub(super) fn stage_allows_automatic_abort(rt: &Runtime, stage: FlightState) -> 
         )
 }
 
+#[cfg(not(feature = "hitl_mode"))]
+pub(crate) enum LivenessAbortDecision {
+    Claimed(AutomaticAbortClaim),
+    IdleOrStartup(FlightState),
+    Unavailable,
+}
+
+#[cfg(any(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
 pub(crate) fn claim_automatic_abort(state: &AppState) -> Option<AutomaticAbortClaim> {
+    claim_automatic_abort_for_generation(state, automatic_generation(state))
+}
+
+pub(crate) fn claim_automatic_abort_for_generation(
+    state: &AppState,
+    generation: u64,
+) -> Option<AutomaticAbortClaim> {
     #[cfg(feature = "hitl_mode")]
     {
-        let _ = state;
-        Some(AutomaticAbortClaim {})
+        let operator_claim = claim_operator_dispatch(state, generation)?;
+        let mut runtime = state.gse.lock().unwrap();
+        if runtime.automatic_abort_in_flight
+            || state
+                .launch_history
+                .lock()
+                .unwrap()
+                .automatic_actions_inhibited()
+            || !matches!(
+                state.local_flight_state_snapshot(),
+                FlightState::Startup
+                    | FlightState::Idle
+                    | FlightState::PreFill
+                    | FlightState::FillTest
+                    | FlightState::NitrogenFill
+                    | FlightState::NitrousFill
+                    | FlightState::Armed
+            )
+        {
+            return None;
+        }
+        runtime.automatic_abort_in_flight = true;
+        Some(AutomaticAbortClaim {
+            runtime: state.gse.clone(),
+            _operator_claim: Some(operator_claim),
+        })
     }
     #[cfg(not(feature = "hitl_mode"))]
     {
+        match claim_from_source(state, false, generation) {
+            LivenessAbortDecision::Claimed(claim) => Some(claim),
+            LivenessAbortDecision::IdleOrStartup(stage) => {
+                debug_assert!(matches!(stage, FlightState::Startup | FlightState::Idle));
+                None
+            }
+            LivenessAbortDecision::Unavailable => None,
+        }
+    }
+}
+
+#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
+pub(crate) fn claim_liveness_abort(state: &AppState) -> LivenessAbortDecision {
+    claim_from_source(state, true, automatic_generation(state))
+}
+
+#[cfg(not(feature = "hitl_mode"))]
+fn claim_from_source(state: &AppState, liveness: bool, generation: u64) -> LivenessAbortDecision {
+    #[cfg(not(feature = "hitl_mode"))]
+    {
+        let Some(operator_claim) = claim_operator_dispatch(state, generation) else {
+            return LivenessAbortDecision::Unavailable;
+        };
         let mut rt = state.gse.lock().unwrap();
+        // Preserve the original general-claim short circuit: a held/latched
+        // claim must not acquire the flight-state mutex unnecessarily.
         if rt.automatic_abort_in_flight
             || rt.operational.saved.automatic_abort_claimed
-            || !stage_allows_automatic_abort(&rt, state.local_flight_state_snapshot())
+            || state
+                .launch_history
+                .lock()
+                .unwrap()
+                .automatic_actions_inhibited()
         {
-            return None;
+            return LivenessAbortDecision::Unavailable;
+        }
+        let stage = state.local_flight_state_snapshot();
+        // Source-specific eligibility is checked at the same serialized claim
+        // decision as the durable latch. Other producers retain Idle policy.
+        if liveness && matches!(stage, FlightState::Startup | FlightState::Idle) {
+            return LivenessAbortDecision::IdleOrStartup(stage);
+        }
+        if !stage_allows_automatic_abort(&rt, stage) {
+            return LivenessAbortDecision::Unavailable;
         }
         rt.automatic_abort_in_flight = true;
         rt.operational.saved.automatic_abort_claimed = true;
@@ -60,8 +134,9 @@ pub(crate) fn claim_automatic_abort(state: &AppState) -> Option<AutomaticAbortCl
             );
         }
         drop(rt);
-        Some(AutomaticAbortClaim {
+        LivenessAbortDecision::Claimed(AutomaticAbortClaim {
             runtime: state.gse.clone(),
+            _operator_claim: Some(operator_claim),
         })
     }
 }
@@ -72,11 +147,13 @@ pub(super) fn reserve_abort_clear(state: &AppState, rt: &mut Runtime) -> Automat
     rt.automatic_abort_in_flight = true;
     AutomaticAbortClaim {
         runtime: state.gse.clone(),
+        // Existing explicit clear already owns its outer dispatch reservation.
+        _operator_claim: None,
     }
 }
 
 #[cfg(all(test, not(feature = "hitl_mode")))]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::sync::{
         Barrier,
@@ -88,7 +165,17 @@ mod tests {
         Arc<AtomicUsize>,
         std::path::PathBuf,
     ) {
-        let state = crate::state::tests::test_app_state().await;
+        fixture_with_state(crate::state::tests::test_app_state().await).await
+    }
+
+    pub(in crate::gse) async fn fixture_with_state(
+        state: Arc<AppState>,
+    ) -> (
+        Arc<AppState>,
+        Arc<sedsnet::router::Router>,
+        Arc<AtomicUsize>,
+        std::path::PathBuf,
+    ) {
         let weak = Arc::downgrade(&state);
         let seen = Arc::new(AtomicUsize::new(0));
         let count = seen.clone();
@@ -157,6 +244,78 @@ mod tests {
         }
         router.process_all_queues_with_timeout(0).unwrap();
     }
+    #[cfg(not(feature = "test_fire_mode"))]
+    #[tokio::test]
+    async fn liveness_claim_rechecks_idle_without_weakening_general_fault_claims() {
+        let (state, _router, _seen, path) = fixture().await;
+        state.set_local_flight_state(FlightState::Idle);
+        assert!(matches!(
+            claim_liveness_abort(&state),
+            LivenessAbortDecision::IdleOrStartup(FlightState::Idle)
+        ));
+        assert!(
+            !state
+                .gse
+                .lock()
+                .unwrap()
+                .operational
+                .saved
+                .automatic_abort_claimed
+        );
+        // GENERIC_ERROR and automatic ADC failure use this unchanged general path.
+        let claim = claim_automatic_abort(&state).expect("general fault remains eligible in Idle");
+        assert!(
+            state
+                .gse
+                .lock()
+                .unwrap()
+                .operational
+                .saved
+                .automatic_abort_claimed
+        );
+        drop(claim);
+        assert!(
+            claim_automatic_abort(&state).is_none(),
+            "durable claim remains latched"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn latched_general_claim_returns_without_waiting_for_flight_state_mutex() {
+        let (state, _router, _seen, path) = fixture().await;
+        drop(claim_automatic_abort(&state).unwrap());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker_state = state.clone();
+        let held_state = state.state.lock().unwrap();
+        let worker = std::thread::spawn(move || {
+            let _ = started_tx.send(());
+            let unavailable = matches!(
+                claim_from_source(&worker_state, false, automatic_generation(&worker_state)),
+                LivenessAbortDecision::Unavailable
+            );
+            let _ = result_tx.send(unavailable);
+        });
+        let started = started_rx.recv_timeout(std::time::Duration::from_secs(1));
+        let outcome = if started.is_ok() {
+            result_rx.recv_timeout(std::time::Duration::from_secs(1))
+        } else {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        };
+        // Always release the lock and join before asserting, including the
+        // old-order negative path, so the regression cannot strand a worker.
+        drop(held_state);
+        let joined = worker.join();
+        let _ = std::fs::remove_file(path);
+        assert!(started.is_ok(), "claim worker started");
+        assert!(joined.is_ok(), "claim worker completed after cleanup");
+        assert!(
+            matches!(outcome, Ok(true)),
+            "latched claim returns Unavailable without reading state"
+        );
+    }
+
     #[tokio::test]
     async fn abort_claim_first_blocks_fire_and_clear_until_dispatch_finishes() {
         let (state, router, seen, path) = fixture().await;
@@ -360,6 +519,10 @@ mod tests {
                 sedsnet::router::RouterConfig::new([]),
             )))
             .unwrap();
+        crate::telemetry_task::refresh_host_network_time(
+            restored.topology_router.get().unwrap(),
+            crate::telemetry_task::get_current_timestamp_ms(),
+        );
         clear_ground_abort(&restored).unwrap();
         assert!(
             !operational::Saved::load(&path)
@@ -453,7 +616,10 @@ mod tests {
             packet.data_type(),
             crate::telemetry_schema::data_type("ABORT")
         );
-        assert_eq!(packet.payload(), b"Safety Task Abort Command Issued");
+        assert_eq!(
+            packet.payload(),
+            b"SEDS_AUTO_ABORT_V1:Safety Task Abort Command Issued"
+        );
         // Popping the software channel does not release ownership before the
         // worker completes its write; active-write retries remain pending.
         assert!(state.has_pending_transport_tx());
@@ -480,5 +646,71 @@ mod tests {
             .remove("automatic_abort_claimed");
         let restored: operational::Saved = serde_json::from_value(old).unwrap();
         assert!(!restored.automatic_abort_claimed);
+    }
+}
+
+#[cfg(test)]
+mod launch_inhibition_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn launch_inhibits_automatic_abort_despite_delayed_state_and_clock_reset() {
+        let state = crate::state::tests::test_app_state().await;
+        crate::gse::qualified_launch_proofs_for_test(&state);
+        state.set_local_flight_state(FlightState::Armed);
+        super::super::inhibit_automatic_actions_for_launch(&state).unwrap();
+        for stage in [
+            FlightState::Armed,
+            FlightState::Idle,
+            FlightState::Startup,
+            FlightState::Launch,
+        ] {
+            // A still-active fill with missing pressure would otherwise fault and
+            // automatically close/open valves on the next real controller tick.
+            state.gse.lock().unwrap().engine.status.phase = Phase::Filling;
+            state.set_preexisting_flight_state_for_test(stage);
+            state.reset_launch_clock();
+            assert!(!super::super::automatic_abort_allowed(&state));
+            assert!(claim_automatic_abort(&state).is_none());
+            for command in [
+                TelemetryCommand::AutomaticNitrogenClose {
+                    generation: crate::gse::automatic_generation(&state),
+                },
+                TelemetryCommand::AutomaticNitrousClose {
+                    generation: crate::gse::automatic_generation(&state),
+                },
+            ] {
+                assert!(crate::telemetry_task::command_at_dispatch(&state, command).is_none());
+            }
+            assert!(
+                crate::telemetry_task::command_at_dispatch(&state, TelemetryCommand::Abort)
+                    .is_some()
+            );
+            assert!(
+                super::super::inhibit_automatic_actions_for_launch(&state).is_err(),
+                "T-clock reset cannot admit launch twice"
+            );
+            super::super::tick(&state, false);
+            super::super::cancel_fill_for_recoverable_fault(&state, "late board error");
+            super::super::start_fill_after_automatic_zero(
+                &state,
+                crate::gse::automatic_generation(&state),
+            );
+            super::super::report_safety(&state);
+            assert_eq!(
+                state.gse.lock().unwrap().engine.status.phase,
+                Phase::Filling,
+                "post-launch automatic tick/cancel must not change valve sequencing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_cannot_overtake_an_admitted_automatic_abort() {
+        let state = crate::state::tests::test_app_state().await;
+        state.set_local_flight_state(FlightState::Armed);
+        let claim = claim_automatic_abort(&state).expect("prelaunch automatic abort admission");
+        assert!(super::super::inhibit_automatic_actions_for_launch(&state).is_err());
+        drop(claim);
     }
 }

@@ -28,13 +28,13 @@
       {
         "label": "Latitude",
         "value": 42,
-        "unit": "°",
+        "unit": "\u00b0",
         "precision": 5
       },
       {
         "label": "Longitude",
         "value": -78,
-        "unit": "°",
+        "unit": "\u00b0",
         "precision": 5
       },
       {
@@ -101,7 +101,8 @@
         null
       ],
       "orbit": "",
-      "clip": ""
+      "clip": "",
+      "flight_phase_version": 1
     }
   },
   "model": {
@@ -156,7 +157,7 @@
         "binding": null,
         "phase_values": {
           "*": 0,
-          "ParachuteDeploy": 1
+          "Descent": 1
         }
       },
       {
@@ -172,11 +173,12 @@
         "binding": null,
         "phase_values": {
           "*": 0,
-          "Descent": 1,
+          "Reefing": 1,
           "Landed": 1,
           "Recovery": 1
         }
       }
-    ]
+    ],
+    "flight_phase_version": 1
   }
 }

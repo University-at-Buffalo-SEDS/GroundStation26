@@ -202,6 +202,7 @@ fn clip_playlist(text: &str, start: u64, end: u64) -> Result<(String, Vec<String
     }
     Ok((out.join("\n") + "\n", files))
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn upstream(state: &MediaState, camera: &str, file: &str) -> ApiResult<reqwest::Response> {
     let response = state
         .client
@@ -223,6 +224,7 @@ async fn upstream(state: &MediaState, camera: &str, file: &str) -> ApiResult<req
     }
     Ok(response)
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn playlist(state: &MediaState, camera: &str, file: &str) -> ApiResult<String> {
     let mut response = upstream(state, camera, file).await?;
     let mut bytes = Vec::new();
@@ -234,6 +236,7 @@ async fn playlist(state: &MediaState, camera: &str, file: &str) -> ApiResult<Str
     }
     String::from_utf8(bytes).map_err(|_| error(StatusCode::BAD_GATEWAY, "Invalid HLS playlist"))
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(super) async fn prepare(
     state: &MediaState,
     broadcast: &mut Broadcast,
@@ -244,8 +247,8 @@ pub(super) async fn prepare(
     };
     plan.validate()
         .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
-    if let Some(old) = &previous.replay {
-        if !plan.id.is_empty() && plan.id == old.id {
+    if let Some(old) = &previous.replay
+        && !plan.id.is_empty() && plan.id == old.id {
             // Reframe and reorder only footage captured for this session.
             if plan.duration_seconds != old.duration_seconds
                 || plan.speed != old.speed
@@ -263,7 +266,6 @@ pub(super) async fn prepare(
             plan.source_end_ms = old.source_end_ms;
             return Ok(());
         }
-    }
     let now = program::now_ms();
     plan.source_end_ms = now.saturating_sub(broadcast.delay_seconds as u64 * 1000 + 2500);
     plan.id = format!("r{now}-{}", previous.revision);
@@ -354,6 +356,7 @@ pub(super) async fn prepare(
 pub(super) fn routes() -> Router<Arc<MediaState>> {
     Router::new().route("/api/media-assets/replay/{session}/{id}/{file}", get(asset))
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn asset(
     State(state): State<Arc<MediaState>>,
     Path((session, id, file)): Path<(String, String, String)>,
@@ -513,6 +516,7 @@ mod tests {
             hls_segments: Mutex::new(Default::default()),
             preview_sessions: Mutex::new(Vec::new()),
             publishers: Mutex::new(Vec::new()),
+            publish_offer: Mutex::new(()),
             transcoding: Mutex::default(),
             recorded_vehicle_cache: Mutex::new(Default::default()),
         });

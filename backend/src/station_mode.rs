@@ -44,24 +44,30 @@ pub fn local_mode() -> Mode {
 pub struct Snapshot {
     pub effective_mode: Option<Mode>,
     pub local_build_mode: Mode,
+    pub execution_mode: &'static str,
+    pub output_domain: &'static str,
     pub primary_station: Option<String>,
     pub synchronized: bool,
     pub persisted: bool,
     pub local_capabilities_match: bool,
     pub error: Option<String>,
     pub authority: &'static str,
+    pub(crate) retained_configuration: Option<crate::command_proxy::retained_config::Snapshot>,
 }
 impl Snapshot {
     fn unknown() -> Self {
         Self {
             effective_mode: None,
             local_build_mode: local_mode(),
+            execution_mode: if crate::flight_sim_runtime::enabled() { "flight_sim" } else { "compiled_mode" },
+            output_domain: if crate::flight_sim_runtime::enabled() { "simulated" } else { "build_defined" },
             primary_station: None,
             synchronized: false,
             persisted: false,
             local_capabilities_match: false,
             error: None,
             authority: "unknown",
+            retained_configuration: None,
         }
     }
 }
@@ -71,19 +77,24 @@ pub fn snapshot() -> Snapshot {
         return Snapshot {
             effective_mode: Some(local_mode()),
             local_build_mode: local_mode(),
+            execution_mode: if crate::flight_sim_runtime::enabled() { "flight_sim" } else { "compiled_mode" },
+            output_domain: if crate::flight_sim_runtime::enabled() { "simulated" } else { "build_defined" },
             primary_station: None,
             synchronized: true,
             persisted: false,
             local_capabilities_match: true,
             error: None,
             authority: "local_primary",
+            retained_configuration: None,
         };
     }
-    STATUS
+    let mut snapshot = STATUS
         .get_or_init(|| Mutex::new(Snapshot::unknown()))
         .lock()
         .unwrap()
-        .clone()
+        .clone();
+    snapshot.retained_configuration = Some(crate::command_proxy::retained_config::snapshot(snapshot.effective_mode, snapshot.synchronized));
+    snapshot
 }
 pub(crate) fn recognizes(wire: &[u8]) -> bool {
     wire.starts_with(MAGIC) || wire.starts_with(DISPLAY_MAGIC)
@@ -258,12 +269,15 @@ impl Runtime {
         Snapshot {
             effective_mode: self.mode,
             local_build_mode: local_mode(),
+            execution_mode: if crate::flight_sim_runtime::enabled() { "flight_sim" } else { "compiled_mode" },
+            output_domain: if crate::flight_sim_runtime::enabled() { "simulated" } else { "build_defined" },
             primary_station: self.primary.clone(),
             synchronized: self.connected && self.last_verified.is_some_and(|v| now >= v),
             persisted: self.persisted,
             local_capabilities_match: self.mode == Some(local_mode()),
             error: self.error.clone(),
             authority: "paired_signature",
+            retained_configuration: None,
         }
     }
     fn receive(&mut self, pairing: &Pairing, wire: &[u8], now: u64) -> anyhow::Result<()> {
@@ -558,12 +572,15 @@ impl DisplayRuntime {
         Snapshot {
             effective_mode: self.mode,
             local_build_mode: local_mode(),
+            execution_mode: if crate::flight_sim_runtime::enabled() { "flight_sim" } else { "compiled_mode" },
+            output_domain: if crate::flight_sim_runtime::enabled() { "simulated" } else { "build_defined" },
             primary_station: None,
             synchronized: self.session.is_some() && self.verified.is_some_and(|v| now >= v),
             persisted: self.persisted,
             local_capabilities_match: self.mode == Some(local_mode()),
             error: self.error.clone(),
             authority: "mesh_session",
+            retained_configuration: None,
         }
     }
 }

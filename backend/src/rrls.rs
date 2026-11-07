@@ -7,8 +7,16 @@ use std::{
 };
 
 #[cfg(test)]
-#[path = "comms/virtual_uart.rs"]
-mod receipt_test_wire;
+use crate::comms::virtual_uart as receipt_test_wire;
+
+#[path = "rrls/continuous_clock.rs"]
+mod continuous_clock;
+#[path = "rrls/settings_framing.rs"]
+mod settings_framing;
+
+pub(crate) mod budget_negotiation;
+const BUDGET_CONTROL: u8 = 13;
+const RF_PROFILE_CONTROL: u8 = 14;
 
 const LOSS_MS: u64 = 3_000;
 const RESTORE_MS: u64 = 2_000;
@@ -27,11 +35,14 @@ const READY: u8 = 7;
 const POSITION: u8 = 8;
 const VOICE: u8 = 9;
 const SETTINGS: u8 = 10;
+// Host application control; kind12 remains reserved for legacy framing. Budget negotiation uses13.
+const HOST_CONTROL: u8 = 11;
 const MAX_SETTINGS_INBOX: usize = 4;
 const SETTINGS_PEER_AGE_MS: u64 = 15_000;
 #[derive(Clone, Copy)]
 struct FrameClass {
     priority: u8,
+    recovery_control: bool,
 }
 struct TemplateClass {
     id: u32,
@@ -104,6 +115,17 @@ pub fn configure(link: &crate::comms_config::CommsLinkConfig) -> anyhow::Result<
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random)
         .map_err(|_| anyhow::anyhow!("cannot generate recovery session identity"))?;
     let mut mesh = Mesh::new(role, u32::from_le_bytes(random));
+    if crate::comms::rfd_profile::active().is_some_and(|p| {
+        p.transport.usable_air_bps == 32_000 && p.transport.frame_overhead_bytes == 16
+    }) && std::env::var_os("GS_RADIO_AIR_SHARE_PERCENT").is_none()
+    {
+        mesh.enable_settings_framing();
+    }
+    if let Some(expected) =
+        crate::comms::rfd_profile::active().and_then(|p| p.recovery_budget_tuple())
+    {
+        mesh.enable_budget(expected);
+    }
     mesh.voice_enabled = std::env::var("GS_RRLS_VOICE").ok().as_deref() == Some("1");
     RADIO
         .set((serial.port.clone(), Arc::new(Mutex::new(mesh))))
@@ -114,6 +136,12 @@ pub fn configure(link: &crate::comms_config::CommsLinkConfig) -> anyhow::Result<
         configured.is_none()
     );
     Ok(())
+}
+
+/// Typed queued/active ownership only. A busy mesh is uncertainty, not proof
+/// that an accepted controller owner has drained. No parsing/SDK lock here.
+pub(crate) fn has_pending_recovery_control() -> bool {
+    RADIO.get().is_some_and(|(_,mesh)|mesh.try_lock().map_or(true,|mesh|mesh.pending_recovery_control()))
 }
 
 pub fn attach(port: &str) -> Option<Shared> {
@@ -138,6 +166,10 @@ pub struct Status {
     pub relayed_frames: u64,
     /// Bytes in those RR envelopes; excludes the outer UART header.
     pub relay_envelope_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings_framing: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_budget: Option<serde_json::Value>,
 }
 pub fn status() -> Status {
     if let Some((_, shared)) = RADIO.get() {
@@ -154,6 +186,12 @@ pub fn status() -> Status {
             forwarded_frames: m.forwarded,
             relayed_frames: m.relayed_frames,
             relay_envelope_bytes: m.relay_envelope_bytes,
+            settings_framing: m.settings_framing.as_ref().map(|state| state.diagnostics()),
+            recovery_budget:m.budget_requested.then(||serde_json::json!({"requested_share_percent":m.recovery_air_share(now),"initialized":m.budget.is_some(),"effective_transport_compatible":!m.budget_transport_fault,"outbound_paused":m.budget_transport_fault,
+                "fault_reason":if m.budget_transport_fault {Some("effective application/UART tuple differs from validated profile")}else{None},
+                "tuple_scope":"application and UART configuration, not live modem AT readback",
+                "expected_tuple":m.budget_profile.map(|p|serde_json::json!({"uart_baud":p.baud,"usable_air_bps":p.usable_bps,"rf_share_percent":p.rf_share,"frame_overhead_bytes":p.overhead,"packet_burst_ms":p.burst_ms,"packet_gap_ms":p.gap_ms,"flags":p.flags})),
+                "actual_effective_tuple":m.budget_actual,"pending_queued_owner":m.queue.iter().any(|q|Mesh::budget_kind(&q.frame.bytes)),"inflight_owner":m.budget_inflight})),
         }
     } else {
         Status {
@@ -167,6 +205,8 @@ pub fn status() -> Status {
             forwarded_frames: 0,
             relayed_frames: 0,
             relay_envelope_bytes: 0,
+            settings_framing: None,
+            recovery_budget: None,
         }
     }
 }
@@ -175,24 +215,61 @@ pub struct Outgoing {
     pub command: bool,
     pub bytes: Vec<u8>,
 }
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsOrigin {
+    None,
+    Settings,
+    Reply,
+    FramingOffer,
+}
+
 struct Queued {
-    mode_reply: bool,
+    settings_origin: SettingsOrigin,
     frame: Outgoing,
     at: u64,
     priority: u8,
-    independent_discovery: bool,
+    flags: u8,
     sdt_kind: u8,
     sdt_template: u32,
 }
 impl Queued {
+    const INDEPENDENT_DISCOVERY: u8 = 1;
+    const BUDGET_EVER_RESERVED: u8 = 2;
+    const RECOVERY_CONTROL: u8 = 4;
+    fn recovery_control(&self)->bool {self.flags&Self::RECOVERY_CONTROL!=0}
+    fn independent_discovery(&self) -> bool {
+        self.flags & Self::INDEPENDENT_DISCOVERY != 0
+    }
+    fn budget_ever_reserved(&self) -> bool {
+        self.flags & Self::BUDGET_EVER_RESERVED != 0
+    }
+    fn set_independent_discovery(&mut self, value: bool) {
+        if value {
+            self.flags |= Self::INDEPENDENT_DISCOVERY;
+        } else {
+            self.flags &= !Self::INDEPENDENT_DISCOVERY;
+        }
+    }
+    // Freeze protocol bytes on the first reservation, including zero-byte refusal.
+    fn mark_budget_reserved(&mut self) {
+        self.flags |= Self::BUDGET_EVER_RESERVED;
+    }
     fn closes_packet_batch(&self) -> bool {
-        !self.independent_discovery
+        if self.frame.bytes.get(3) == Some(&HOST_CONTROL) {
+            return true;
+        }
+        !self.independent_discovery()
             && decode(&self.frame.bytes).is_some_and(|(_, body)| {
                 crate::comms::closes_radio_packet_batch(self.priority, body)
             })
     }
     fn boundary_contract(&self) -> Option<(u64, bool)> {
-        if self.independent_discovery {
+        if self.frame.bytes.get(3) == Some(&HOST_CONTROL) {
+            let (_, body) = decode(&self.frame.bytes)?;
+            return crate::command_proxy::wire_boundary(body).map(|id| (id, false));
+        }
+        if self.independent_discovery() {
             return None;
         }
         decode(&self.frame.bytes)
@@ -205,10 +282,16 @@ pub(crate) struct Transmission {
     queued: Queued,
     follower: Option<Queued>,
     id: u64,
+    physical: Option<Outgoing>,
+    settings_action: Option<settings_framing::Action>,
 }
 impl Transmission {
+    fn recovery_control(&self)->bool {
+        self.queued.recovery_control() || self.follower.as_ref().is_some_and(|q|q.recovery_control())
+    }
+
     pub(crate) fn frame(&self) -> &Outgoing {
-        &self.queued.frame
+        self.physical.as_ref().unwrap_or(&self.queued.frame)
     }
     pub(crate) fn follower_frame(&self) -> Option<&Outgoing> {
         self.follower.as_ref().map(|queued| &queued.frame)
@@ -220,22 +303,78 @@ impl Transmission {
         ])
     }
     pub(crate) fn single_control_contract(&self) -> Option<(u64, bool)> {
-        if self.follower.is_some() { return None; }
+        if self.settings_action.is_some() || self.follower.is_some() {
+            return None;
+        }
         Self::batch_contract(&self.queued)
     }
     fn batch_contract(queued: &Queued) -> Option<(u64, bool)> {
-        if queued.priority < 254 || queued.independent_discovery {
+        if queued.priority < 254 || queued.independent_discovery() {
             return None;
+        }
+        if queued.frame.bytes.get(3) == Some(&HOST_CONTROL) {
+            return queued.boundary_contract();
         }
         let (_, body) = decode(&queued.frame.bytes)?;
         crate::comms::radio_batch_control_contract(queued.priority, body)
     }
     /// Ordinary-lane wire bytes eligible for funding only after full successful IO.
     /// Dependent SDT stays in its existing lane; independent discovery/control does not.
+    pub(crate) fn ordinary_background_service_bytes(&self) -> usize {
+        if Mesh::budget_kind(&self.frame().bytes) {
+            return 0;
+        }
+        if self.queued.priority >= 254
+            || self.queued.settings_origin == SettingsOrigin::FramingOffer
+            || (self.queued.frame.bytes.get(3) == Some(&SETTINGS)
+                && self.queued.settings_origin == SettingsOrigin::None)
+            || (self.settings_action.is_none()
+                && self.queued.settings_origin == SettingsOrigin::None
+                && self.queued.closes_packet_batch())
+        {
+            return 0;
+        }
+        self.frame().bytes.len() + 4
+    }
+    /// One completed physical ordinary owner, not ordinary fairness funding.
+    /// Protocol negotiation/HostControl is never a source of this permission.
+    pub(crate) fn completed_ordinary_owner_bytes(&self) -> usize {
+        if self.queued.priority >= 254
+            || self.queued.independent_discovery()
+            || self.queued.settings_origin == SettingsOrigin::FramingOffer
+            || self.queued.closes_packet_batch()
+        {
+            return 0;
+        }
+        let kind = self.frame().bytes.get(3);
+        // A timed-out negotiation still sends the original whole legacy owner.
+        // Probe/fragment actions and their physical kind15 envelopes never fund it.
+        if self.settings_action.is_some()
+            && !(self.settings_action == Some(settings_framing::Action::Legacy)
+                && kind == Some(&SETTINGS)
+                && matches!(
+                    self.queued.settings_origin,
+                    SettingsOrigin::Settings | SettingsOrigin::Reply
+                ))
+        {
+            return 0;
+        }
+        if matches!(kind, Some(&DOWN_DATA) | Some(&UP_DATA) | Some(&AV_BAY_DATA))
+            || (kind == Some(&SETTINGS)
+                && matches!(
+                    self.queued.settings_origin,
+                    SettingsOrigin::Settings | SettingsOrigin::Reply
+                ))
+        {
+            self.frame().bytes.len() + 4
+        } else {
+            0
+        }
+    }
     pub(crate) fn successful_ordinary_service_bytes(&self) -> usize {
         if self.queued.priority < 254
             && !self.queued.closes_packet_batch()
-            && !self.queued.independent_discovery
+            && !self.queued.independent_discovery()
             && matches!(
                 self.queued.frame.bytes.get(3),
                 Some(&DOWN_DATA) | Some(&AV_BAY_DATA)
@@ -247,9 +386,12 @@ impl Transmission {
         }
     }
     pub(crate) fn closes_packet_batch(&self) -> bool {
-        self.queued.closes_packet_batch()
+        self.settings_action.is_none() && self.queued.closes_packet_batch()
     }
     pub(crate) fn boundary_contract(&self) -> Option<(u64, bool)> {
+        if self.settings_action.is_some() {
+            return None;
+        }
         self.queued.boundary_contract()
     }
     #[cfg(test)]
@@ -265,9 +407,12 @@ pub struct Mesh {
     voice_enabled: bool,
     settings_peer_seen: Option<u64>,
     settings_inbox: VecDeque<Vec<u8>>,
+    command_proxy_inbox: VecDeque<Vec<u8>>,
     started: Instant,
     // The shared simulation clock survives host process restarts.
     clock_origin_ms: u64,
+    #[cfg(test)]
+    budget_test_clock: Option<u64>,
     session: u32,
     sequence: u32,
     last_health_sent: Option<u64>,
@@ -293,6 +438,7 @@ pub struct Mesh {
     templates: VecDeque<TemplateClass>,
     active_transmission: Option<u64>,
     active_frame_count: u8,
+    active_recovery_control: bool,
     active_cancelled: bool,
     active_survives_clear: bool,
     next_transmission: u64,
@@ -300,17 +446,34 @@ pub struct Mesh {
     receipt_service_pending: bool,
     active_fair_delta_bytes: i32,
     fair_overhead_bytes: u16,
+    settings_framing: Option<Box<settings_framing::State>>,
+    budget: Option<budget_negotiation::Driver>,
+    budget_requested: bool,
+    budget_profile: Option<budget_negotiation::Profile>,
+    budget_actual: Option<crate::comms::EffectiveRadioBudget>,
+    budget_inflight: bool,
+    budget_transport_fault: bool,
 }
 
 impl Mesh {
     pub fn new(role: Role, session: u32) -> Self {
         Self {
             role,
+            settings_framing: None,
+            budget: None,
+            budget_requested: false,
+            budget_profile: None,
+            budget_actual: None,
+            budget_inflight: false,
+            budget_transport_fault: false,
             voice_enabled: false,
             settings_peer_seen: None,
             settings_inbox: VecDeque::new(),
+            command_proxy_inbox: VecDeque::new(),
             started: Instant::now(),
             clock_origin_ms: crate::simulation_clock_ms().unwrap_or(0),
+            #[cfg(test)]
+            budget_test_clock: None,
             session,
             sequence: 0,
             last_health_sent: None,
@@ -336,6 +499,7 @@ impl Mesh {
             templates: VecDeque::new(),
             active_transmission: None,
             active_frame_count: 0,
+            active_recovery_control: false,
             active_cancelled: false,
             active_survives_clear: false,
             next_transmission: 0,
@@ -350,6 +514,10 @@ impl Mesh {
         }
     }
     pub fn now(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(now) = self.budget_test_clock {
+            return now;
+        }
         // A linked emulator can run far slower than wall time. Liveness, relay
         // leases and UART drain must advance on the same explicit test clock.
         // Ordinary stations and standalone HITL retain their monotonic clock.
@@ -359,7 +527,10 @@ impl Mesh {
     fn direct(&mut self, now: u64) {
         // Use the same loss boundary as tick(): slower valid reports must
         // not restart restoration while the direct link is still live.
-        if self.last_direct.is_none_or(|v| now.saturating_sub(v) >= LOSS_MS) {
+        if self
+            .last_direct
+            .is_none_or(|v| now.saturating_sub(v) >= LOSS_MS)
+        {
             self.direct_since = Some(now);
         }
         self.last_direct = Some(now);
@@ -381,6 +552,15 @@ impl Mesh {
         }
     }
     pub(crate) fn recovery_air_share(&self, now: u64) -> Option<u8> {
+        if self.budget_requested {
+            return Some(
+                self.budget
+                    .as_ref()
+                    .map_or(if self.role == Role::Primary { 15 } else { 35 }, |budget| {
+                        budget.peek_share(now)
+                    }),
+            );
+        }
         match self.role {
             // Match the advertised relay request even before READY is received.
             Role::Primary if self.fallback => Some(15),
@@ -390,8 +570,15 @@ impl Mesh {
     }
 
     pub fn tick(&mut self, now: u64) {
+        self.observe_settings_framing(now);
         if self.role == Role::Primary {
-            if self.last_direct.map_or(now.saturating_sub(self.clock_origin_ms), |v| now.saturating_sub(v)) >= LOSS_MS {
+            if self
+                .last_direct
+                .map_or(now.saturating_sub(self.clock_origin_ms), |v| {
+                    now.saturating_sub(v)
+                })
+                >= LOSS_MS
+            {
                 self.fallback = true;
             } else if self
                 .direct_since
@@ -406,6 +593,9 @@ impl Mesh {
                 let mut payload = self.session.to_le_bytes().to_vec();
                 payload.extend_from_slice(&self.sequence.to_le_bytes());
                 payload.push(u8::from(!self.fallback));
+                if let Some(budget) = self.budget.as_mut() {
+                    budget.health(self.session, self.sequence, !self.fallback, now);
+                }
                 self.sequence = self.sequence.wrapping_add(1);
                 self.last_health_sent = Some(now);
                 self.enqueue(
@@ -448,8 +638,7 @@ impl Mesh {
         if self
             .last_position_sent
             .is_none_or(|last| now.saturating_sub(last) >= 5_000)
-        {
-            if let Some(fix) = crate::antenna::local_fix()
+            && let Some(fix) = crate::antenna::local_fix()
                 && let Some(encoded) = crate::antenna::encode_position(&fix)
             {
                 let mut payload = Vec::with_capacity(39);
@@ -465,19 +654,311 @@ impl Mesh {
                 );
                 self.last_position_sent = Some(now);
             }
+        self.poll_budget(now);
+    }
+    fn secure_budget_nonce() -> Option<budget_negotiation::Nonce> {
+        let mut bytes = [0; 16];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes).ok()?;
+        budget_negotiation::Nonce::new(bytes)
+    }
+    pub(crate) fn enable_budget(&mut self, expected: budget_negotiation::Profile) {
+        self.enable_budget_with_entropy(expected, Self::secure_budget_nonce);
+    }
+    pub(crate) fn enable_budget_with_entropy(
+        &mut self,
+        expected: budget_negotiation::Profile,
+        entropy: fn() -> Option<budget_negotiation::Nonce>,
+    ) {
+        self.budget_requested = true;
+        self.budget_profile = Some(expected);
+        self.budget = budget_negotiation::Driver::new(
+            self.role == Role::Primary,
+            self.session,
+            expected,
+            entropy,
+        );
+        if self.budget.is_none() {
+            log::warn!(
+                "Recovery budget requested but initialization failed; retaining conservative role share"
+            );
         }
     }
+    pub(crate) fn note_budget_effective(
+        &mut self,
+        actual: Option<crate::comms::EffectiveRadioBudget>,
+    ) {
+        self.budget_actual = actual;
+    }
+    pub(crate) fn budget_expected_profile(&self) -> Option<budget_negotiation::Profile> {
+        self.budget
+            .as_ref()
+            .map(|b| b.expected())
+            .or(self.budget_profile)
+    }
+    #[cfg(all(
+        test,
+        target_os = "linux",
+        any(feature = "firmware_sim", feature = "hitl_mode")
+    ))]
+    pub(crate) fn budget_transport_fault_for_test(&self) -> bool {
+        self.budget_transport_fault
+    }
+    #[cfg(all(
+        test,
+        target_os = "linux",
+        any(feature = "firmware_sim", feature = "hitl_mode")
+    ))]
+    pub(crate) fn queued_budget_for_test(&self) -> Option<(Vec<u8>, bool)> {
+        self.queue
+            .iter()
+            .find(|q| Self::budget_kind(&q.frame.bytes))
+            .map(|q| (q.frame.bytes.clone(), q.budget_ever_reserved()))
+    }
+    pub(crate) fn budget_effective_transport(&mut self, matches: bool) -> bool {
+        if !matches {
+            if !self.budget_transport_fault {
+                log::warn!(
+                    "Recovery budget negotiation blocked: effective UART/capacity tuple differs from validated profile"
+                );
+            }
+            self.budget_transport_fault = true;
+            if let Some(budget) = self.budget.as_mut() {
+                budget.fail_closed();
+            }
+            return false;
+        }
+        if self.budget_transport_fault {
+            let Some(expected) = self.budget_expected_profile() else {
+                return false;
+            };
+            let Some(budget) = budget_negotiation::Driver::new(
+                self.role == Role::Primary,
+                self.session,
+                expected,
+                Self::secure_budget_nonce,
+            ) else {
+                return false;
+            };
+            self.budget = Some(budget);
+            self.budget_transport_fault = false;
+        }
+        true
+    }
+    fn budget_kind(bytes: &[u8]) -> bool {
+        matches!(
+            bytes.get(3),
+            Some(&BUDGET_CONTROL) | Some(&RF_PROFILE_CONTROL)
+        )
+    }
+    fn poll_budget(&mut self, now: u64) {
+        let Some(mut state) = self.budget.take() else {
+            return;
+        };
+        state.share(now);
+        let mut removed = 0usize;
+        let mut expired = 0u64;
+        self.queue.retain(|q| {
+            let is_budget = Self::budget_kind(&q.frame.bytes);
+            let too_old = is_budget && (now < q.at || now.saturating_sub(q.at) > 8_000);
+            if is_budget && (too_old || !state.valid(&q.frame.bytes, now)) {
+                removed += q.frame.bytes.len();
+                expired += u64::from(too_old);
+                false
+            } else {
+                true
+            }
+        });
+        self.bytes -= removed;
+        self.dropped = self.dropped.saturating_add(expired);
+        for queued in &mut self.queue {
+            if !queued.budget_ever_reserved()
+                && let Some(frame) = state.refresh_unreserved_revoke(&queued.frame.bytes, now)
+            {
+                debug_assert_eq!(queued.frame.bytes.len(), frame.wire().len());
+                queued.frame.bytes.copy_from_slice(frame.wire());
+            }
+        }
+        if !self.budget_inflight
+            && !self.queue.iter().any(|q| Self::budget_kind(&q.frame.bytes))
+            && let Some(frame) = state.prepare(now)
+        {
+            self.enqueue(
+                Outgoing {
+                    command: true,
+                    bytes: frame.wire().to_vec(),
+                },
+                // Protected selection only: normal paid Capacity readiness still
+                // applies; these frames carry no command or fairness credit.
+                254,
+                now,
+            );
+        }
+        self.budget = Some(state);
+    }
+    fn budget_committed(&mut self, frame: &Outgoing, sent: bool) {
+        if sent
+            && let Some((HEALTH, payload)) = decode(&frame.bytes)
+            && payload.len() == 9
+            && payload[8] <= 1
+        {
+            let now = self.now();
+            if let Some(state) = self.budget.as_mut() {
+                state.full_health_written(
+                    u32::from_le_bytes(payload[..4].try_into().unwrap()),
+                    u32::from_le_bytes(payload[4..8].try_into().unwrap()),
+                    payload[8] != 0,
+                    now,
+                );
+            }
+        }
+        if Self::budget_kind(&frame.bytes) {
+            let now = self.now();
+            if let Some(state) = self.budget.as_mut() {
+                state.committed(&frame.bytes, now, sent);
+            }
+        }
+    }
+    pub(crate) fn enable_settings_framing(&mut self) {
+        self.settings_framing = Some(Box::new(settings_framing::State::new(
+            self.role == Role::Primary,
+        )));
+    }
+    fn settings_context(&self, now: u64) -> settings_framing::Context {
+        settings_framing::Context {
+            mesh_ms: now,
+            continuous_ms: continuous_clock::now(now),
+            session: self.operating_mode_session(now),
+            sequence: if self.role == Role::Primary {
+                self.sequence.wrapping_sub(1)
+            } else {
+                self.primary_sequence
+            },
+            peer_fresh: self.settings_available(now),
+        }
+    }
+    fn observe_settings_framing(&mut self, now: u64) {
+        let context = self.settings_context(now);
+        if let Some(state) = self.settings_framing.as_mut() {
+            state.observe(context);
+        }
+    }
+    fn settings_reserved_bytes(&self) -> usize {
+        if let Some(state) = self.settings_framing.as_ref() {
+            state.reserved_bytes() + self.settings_inbox.iter().map(Vec::capacity).sum::<usize>()
+        } else {
+            0
+        }
+    }
+    fn settings_parent(&self, queued: &Queued) -> bool {
+        queued.frame.bytes.get(3) == Some(&SETTINGS)
+            && self
+                .settings_framing
+                .as_ref()
+                .is_some_and(|state| state.owns(settings_framing::OwnerId::of(&queued.frame.bytes)))
+    }
+    fn retire_settings_parent(&mut self, queued: &Queued) {
+        if queued.settings_origin == SettingsOrigin::FramingOffer
+            && let Some((_, body)) = decode(&queued.frame.bytes)
+                && let Some(state) = self.settings_framing.as_mut() {
+                    state.offer_pending(body, false);
+                }
+        if queued.frame.bytes.get(3) == Some(&SETTINGS)
+            && let Some(state) = self.settings_framing.as_mut() {
+                state.retire(settings_framing::OwnerId::of(&queued.frame.bytes));
+            }
+    }
+    fn prepare_settings_physical(&mut self, tx: &mut Transmission, now: u64) -> bool {
+        if !self.settings_parent(&tx.queued) {
+            return true;
+        }
+        let context = self.settings_context(now);
+        let Some((SETTINGS, inner)) = decode(&tx.queued.frame.bytes) else {
+            return false;
+        };
+        let Some(physical) = self.settings_framing.as_mut().and_then(|state| {
+            state.physical(
+                inner,
+                settings_framing::OwnerId::of(&tx.queued.frame.bytes),
+                context,
+            )
+        }) else {
+            return false;
+        };
+        tx.settings_action = Some(physical.action);
+        if physical.action != settings_framing::Action::Legacy {
+            let bytes = settings_framing::wrap(&physical.body);
+            assert!(bytes.len() + 4 <= settings_framing::QUANTUM);
+            tx.physical = Some(Outgoing {
+                command: true,
+                bytes,
+            });
+        }
+        true
+    }
+    pub(crate) fn note_settings_physical_prefix(&mut self, tx: &Transmission, accepted: usize) {
+        if tx.settings_action.is_some()
+            && let Some(action) = tx.settings_action
+                && let Some(state) = self.settings_framing.as_mut() {
+                    state.note_accepted_prefix(
+                        settings_framing::OwnerId::of(&tx.queued.frame.bytes),
+                        accepted,
+                        action,
+                    );
+                }
+    }
+    pub(crate) fn note_settings_counted_drain(
+        &mut self,
+        tx: &Transmission,
+        model_stop_us: Option<u64>,
+    ) {
+        let Some(action) = tx.settings_action else {
+            return;
+        };
+        let context = self.settings_context(self.now());
+        let Some(now) = context.continuous_ms else {
+            if let Some(s) = self.settings_framing.as_mut() {
+                s.observe(context);
+            }
+            return;
+        };
+        // Compare model timestamps only with model timestamps; add the
+        // remaining serialization DURATION to local continuous time.
+        let remaining =
+            model_stop_us.map_or(0, |us| us.div_ceil(1000).saturating_sub(context.mesh_ms));
+        let Some(complete) = now.checked_add(remaining) else {
+            return;
+        };
+        if let Some(s) = self.settings_framing.as_mut() {
+            s.note_counted_drain(
+                settings_framing::OwnerId::of(&tx.queued.frame.bytes),
+                action,
+                complete,
+            );
+        }
+    }
+
     fn clear(&mut self) {
         self.active_cancelled |= self.active_transmission.is_some() && !self.active_survives_clear;
         let old = self.queue.len();
         let mut removed_bytes = 0;
+        let framing = &mut self.settings_framing;
         self.queue.retain(|q| {
             let keep = matches!(
                 q.frame.bytes.get(3),
-                Some(&POSITION) | Some(&VOICE) | Some(&SETTINGS)
+                Some(&POSITION)
+                    | Some(&VOICE)
+                    | Some(&SETTINGS)
+                    | Some(&HOST_CONTROL)
+                    | Some(&BUDGET_CONTROL)
+                    | Some(&RF_PROFILE_CONTROL)
             );
             if !keep {
                 removed_bytes += q.frame.bytes.len();
+                if q.settings_origin == SettingsOrigin::FramingOffer
+                    && let Some((_, body)) = decode(&q.frame.bytes)
+                        && let Some(state) = framing.as_mut() {
+                            state.offer_pending(body, false);
+                        }
             }
             keep
         });
@@ -518,7 +999,7 @@ impl Mesh {
         if crc(&bytes[..end]) != u32::from_le_bytes(bytes[end..].try_into().unwrap()) {
             return (2, 0);
         }
-        let mut offset = match bytes[3] {
+        let offset = match bytes[3] {
             1 => 4,
             2 | 4 | 5 => 5,
             // A chunk's template cannot be known without reassembly. It is a
@@ -526,11 +1007,10 @@ impl Mesh {
             _ => return (2, 0),
         };
         let mut template = 0u32;
-        for shift in (0..=28).step_by(7) {
+        for (offset, shift) in (offset..).zip((0..=28).step_by(7)) {
             let Some(&byte) = bytes.get(offset).filter(|_| offset < end) else {
                 return (2, 0);
             };
-            offset += 1;
             if shift == 28 && byte > 15 {
                 return (2, 0);
             }
@@ -542,7 +1022,109 @@ impl Mesh {
         (2, 0)
     }
 
+    fn queued_expired(&self, q: &Queued, now: u64) -> bool {
+        // New context-bound budget owner only; application/control/source TTLs below are untouched.
+        if Self::budget_kind(&q.frame.bytes) {
+            return now < q.at || now.saturating_sub(q.at) > 8_000;
+        }
+
+        if q.settings_origin == SettingsOrigin::FramingOffer {
+            return !decode(&q.frame.bytes).is_some_and(|(kind, body)| {
+                kind == settings_framing::KIND
+                    && self
+                        .settings_framing
+                        .as_ref()
+                        .is_some_and(|state| state.offer_is_live(body, self.settings_context(now)))
+            });
+        }
+        if self.settings_parent(q) {
+            let state = self.settings_framing.as_ref().unwrap();
+            if state.failed(
+                settings_framing::OwnerId::of(&q.frame.bytes),
+                continuous_clock::now(now),
+            ) {
+                return true;
+            }
+            if state.started(settings_framing::OwnerId::of(&q.frame.bytes)) {
+                return false;
+            }
+        }
+        now.saturating_sub(q.at)
+            > if q.settings_origin == SettingsOrigin::Reply {
+                5_000
+            } else if q.frame.bytes.get(3) == Some(&VOICE) {
+                180
+            } else if q.independent_discovery() {
+                3_000
+            } else if q.priority == 255
+                || (q.priority < 254 && q.frame.bytes.get(3) == Some(&DOWN_DATA))
+            {
+                // Retain sparse reports through bounded sensor bursts. Reliable
+                // interactive controls retain their 250 ms deadline at priority 254.
+                // Stateful SDT fragments remain owned and ordered; never coalesce.
+                1500
+            } else {
+                250
+            }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_settings_parent_for_test(&self) -> bool {
+        self.queue.iter().any(|queued| self.settings_parent(queued))
+    }
+
+    pub(crate) fn ordinary_background_state(&self) -> crate::comms::OrdinaryLaneState {
+        use crate::comms::OrdinaryLaneState;
+        let mut owned = false;
+        for (index, queued) in self.queue.iter().enumerate() {
+            if queued.priority >= 254 {
+                continue;
+            }
+            if queued.frame.bytes.get(3) == Some(&SETTINGS)
+                && queued.settings_origin == SettingsOrigin::None
+            {
+                owned = true;
+                continue;
+            }
+            if queued.settings_origin == SettingsOrigin::None && queued.closes_packet_batch() {
+                // Unknown opaque ownership is retained conservatively; never
+                // infer a metadata service contract from TC/CP-looking bytes.
+                owned = true;
+                continue;
+            }
+            owned = true;
+            if self.dependency_ready(index) {
+                return OrdinaryLaneState::Ready;
+            }
+        }
+        if owned || self.active_transmission.is_some() {
+            OrdinaryLaneState::Blocked
+        } else {
+            OrdinaryLaneState::Empty
+        }
+    }
+
+    fn budget_reservation_ready(&self, queued: &Queued, now: u64) -> bool {
+        queued.budget_ever_reserved()
+            || !Self::budget_kind(&queued.frame.bytes)
+            || self
+                .budget
+                .as_ref()
+                .is_some_and(|state| state.unreserved_revoke_ready(&queued.frame.bytes, now))
+    }
     fn dependency_ready(&self, index: usize) -> bool {
+        if !self.budget_reservation_ready(&self.queue[index], self.now()) {
+            return false;
+        }
+        if self.settings_parent(&self.queue[index])
+            && self.settings_framing.as_ref().is_some_and(|state| {
+                !state.selectable(settings_framing::OwnerId::of(
+                    &self.queue[index].frame.bytes,
+                ))
+            })
+        {
+            return false;
+        }
         let item = &self.queue[index];
         item.sdt_kind == 0
             || !self.queue.iter().take(index).any(|earlier| {
@@ -554,10 +1136,41 @@ impl Mesh {
             })
     }
 
+    pub(crate) fn pending_recovery_control(&self)->bool {
+        self.active_recovery_control || self.queue.iter().any(|queued|queued.recovery_control())
+    }
+    fn recovery_control_for_frame(&mut self,frame:&Outgoing,origin:SettingsOrigin)->bool {
+        let Some((kind,body))=decode(&frame.bytes) else {return true;};
+        match kind {
+            DOWN_COMMAND|UP_COMMAND|AV_BAY_COMMAND|HOST_CONTROL=>true,
+            DOWN_DATA|UP_DATA|AV_BAY_DATA=>self.classify_namespace(body,kind!=DOWN_DATA)
+                .is_none_or(|class|class.recovery_control),
+            HEALTH|READY|POSITION|VOICE|BUDGET_CONTROL|RF_PROFILE_CONTROL=>false,
+            SETTINGS=>origin!=SettingsOrigin::FramingOffer,
+            _=>true,
+        }
+    }
+
     fn enqueue(&mut self, frame: Outgoing, priority: u8, now: u64) {
+        self.enqueue_with_origin(frame, priority, now, SettingsOrigin::None);
+    }
+    fn enqueue_with_origin(
+        &mut self,
+        frame: Outgoing,
+        priority: u8,
+        now: u64,
+        origin: SettingsOrigin,
+    ) -> bool {
+        // A bounded receiver reply is protocol metadata for admission only.
+        // Its physical priority remains0 and it never receives an early loan.
+        let incoming_rank = if origin == SettingsOrigin::FramingOffer {
+            507
+        } else {
+            u16::from(priority) * 2
+        };
         if frame.bytes.len() > MAX_PAYLOAD + 8 {
             self.dropped += 1;
-            return;
+            return false;
         }
         // GPS and health are current values, not history. Keep only the newest.
         if priority == 255
@@ -566,8 +1179,7 @@ impl Mesh {
                     .bytes
                     .get(4..)
                     .is_some_and(|body| body.starts_with(b"SDT")))
-        {
-            if let Some(i) = self
+            && let Some(i) = self
                 .queue
                 .iter()
                 .position(|q| q.priority == 255 && q.frame.bytes.get(3) == frame.bytes.get(3))
@@ -576,42 +1188,59 @@ impl Mesh {
                 self.bytes -= old.frame.bytes.len();
                 self.dropped += 1;
             }
-        }
         while self.queue.len() + usize::from(self.active_frame_count) >= MAX_FRAMES
-            || self.bytes + frame.bytes.len() > MAX_BYTES
+            || self.bytes + frame.bytes.len() + self.settings_reserved_bytes() > MAX_BYTES
         {
             let Some((i, p)) = self
                 .queue
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, q)| q.priority)
-                .map(|(i, q)| (i, q.priority))
+                .filter(|(_, q)| !self.settings_parent(q))
+                .map(|(i, q)| {
+                    (
+                        i,
+                        if q.settings_origin == SettingsOrigin::FramingOffer
+                            && !self.queued_expired(q, now)
+                        {
+                            507
+                        } else {
+                            u16::from(q.priority) * 2
+                        },
+                    )
+                })
+                .min_by_key(|(_, rank)| *rank)
             else {
                 // The only reservation may belong to an active serial write;
                 // it cannot be evicted or admitted a second time.
                 self.dropped += 1;
-                return;
+                return false;
             };
-            if p > priority {
+            if p > incoming_rank {
                 self.dropped += 1;
-                return;
+                return false;
             }
             let old = self.queue.remove(i).unwrap();
             self.bytes -= old.frame.bytes.len();
+            self.retire_settings_parent(&old);
             self.dropped += 1;
         }
         self.bytes += frame.bytes.len();
         let independent_discovery = Self::independent_discovery(&frame);
         let (sdt_kind, sdt_template) = Self::sdt_dependency(&frame);
-        self.queue.push_back(Queued {
-            mode_reply: false,
+        let recovery_control=self.recovery_control_for_frame(&frame,origin);
+        let mut queued = Queued {
+            settings_origin: origin,
             frame,
             at: now,
             priority,
-            independent_discovery,
+            flags: 0,
             sdt_kind,
             sdt_template,
-        });
+        };
+        if recovery_control {queued.flags|=Queued::RECOVERY_CONTROL;}
+        queued.set_independent_discovery(independent_discovery);
+        self.queue.push_back(queued);
+        true
     }
     #[cfg(test)]
     pub(crate) fn begin_transmission(&mut self, now: u64) -> Option<Transmission> {
@@ -637,18 +1266,35 @@ impl Mesh {
     /// retries at the same priority. Fresh controls and opaque SDT/READY/GPS
     /// entries remain barriers; ownership, age and service credits are unchanged.
     pub(crate) fn prioritize_receipt_over_replays(&mut self, replayed: impl Fn(u64) -> bool) {
-        if self.active_transmission.is_some() { return; }
-        let Some(head) = self.queue.iter().enumerate()
-            .filter(|(i, item)| !item.independent_discovery && item.priority >= 254 && self.dependency_ready(*i))
-            .max_by_key(|(i, item)| (item.priority, std::cmp::Reverse(*i))).map(|(i, _)| i)
-        else { return; };
+        if self.active_transmission.is_some() {
+            return;
+        }
+        let Some(head) = self
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(i, item)| {
+                !item.independent_discovery() && item.priority >= 254 && self.dependency_ready(*i)
+            })
+            .max_by_key(|(i, item)| (item.priority, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
+        else {
+            return;
+        };
         let priority = self.queue[head].priority;
         if !Transmission::batch_contract(&self.queue[head])
-            .is_some_and(|(id, receipt)| !receipt && replayed(id)) { return; }
+            .is_some_and(|(id, receipt)| !receipt && replayed(id))
+        {
+            return;
+        }
         for index in head + 1..self.queue.len() {
             let item = &self.queue[index];
-            if item.independent_discovery || item.priority < priority { continue; }
-            if item.priority != priority || !self.dependency_ready(index) { break; }
+            if item.independent_discovery() || item.priority < priority {
+                continue;
+            }
+            if item.priority != priority || !self.dependency_ready(index) {
+                break;
+            }
             match Transmission::batch_contract(item) {
                 Some((_, true)) => {
                     let receipt = self.queue.remove(index).unwrap();
@@ -663,6 +1309,7 @@ impl Mesh {
 
     /// One independent background reply; it never takes critical capacity/loans.
     pub(crate) fn begin_mode_reply_transmission(&mut self, now: u64) -> Option<Transmission> {
+        self.observe_settings_framing(now);
         if self.role != Role::Primary
             || self.active_transmission.is_some()
             || self
@@ -673,25 +1320,41 @@ impl Mesh {
         {
             return None;
         }
-        let index = self.queue.iter().position(|q| q.mode_reply)?;
+        let index = self
+            .queue
+            .iter()
+            .enumerate()
+            .find(|(index, q)| {
+                q.settings_origin == SettingsOrigin::Reply && self.dependency_ready(*index)
+            })
+            .map(|(index, _)| index)?;
         if now < self.queue[index].at || now.saturating_sub(self.queue[index].at) > 5_000 {
             let expired = self.queue.remove(index).unwrap();
             self.bytes -= expired.frame.bytes.len();
+            self.retire_settings_parent(&expired);
             self.dropped += 1;
             return None;
         }
         let id = self.next_transmission.checked_add(1)?;
         let queued = self.queue.remove(index).unwrap();
-        self.next_transmission = id;
-        self.active_transmission = Some(id);
-        self.active_frame_count = 1;
-        self.active_survives_clear = true;
-        self.active_fair_delta_bytes = 0;
-        Some(Transmission {
+        let mut tx = Transmission {
             queued,
             follower: None,
             id,
-        })
+            physical: None,
+            settings_action: None,
+        };
+        if !self.prepare_settings_physical(&mut tx, now) {
+            self.queue.push_back(tx.queued);
+            return None;
+        }
+        self.next_transmission = id;
+        self.active_transmission = Some(id);
+        self.active_frame_count = 1;
+        self.active_recovery_control=tx.recovery_control();
+        self.active_survives_clear = true;
+        self.active_fair_delta_bytes = 0;
+        Some(tx)
     }
     /// Reserve at most two already-owned canonical controls. The second is
     /// the existing normal protected winner: never search past a higher SDT,
@@ -719,7 +1382,9 @@ impl Mesh {
             .iter()
             .enumerate()
             .filter(|(index, item)| {
-                !item.independent_discovery && item.priority >= 254 && self.dependency_ready(*index)
+                !item.independent_discovery()
+                    && item.priority >= 254
+                    && self.dependency_ready(*index)
             })
             .max_by_key(|(index, item)| (item.priority, std::cmp::Reverse(*index)))
             .map(|(index, _)| index);
@@ -735,12 +1400,110 @@ impl Mesh {
             {
                 transmission.follower = self.queue.remove(index);
                 self.active_frame_count = 2;
+                self.active_recovery_control=transmission.recovery_control();
                 self.active_survives_clear = false;
             }
         }
         Some(transmission)
     }
 
+    /// A typed receiver reservation reply remains an ordinary paid owner.
+    /// The caller must hold the UART writer and require full Capacity readiness.
+    fn begin_framing_offer_transmission(
+        &mut self,
+        now: u64,
+        minimum_priority: u8,
+    ) -> Option<Transmission> {
+        if self.active_transmission.is_some() {
+            return None;
+        }
+        loop {
+            let index = self.queue.iter().position(|q| {
+                q.settings_origin == SettingsOrigin::FramingOffer && q.priority >= minimum_priority
+            })?;
+            if self.queued_expired(&self.queue[index], now) {
+                let old = self.queue.remove(index).unwrap();
+                self.bytes -= old.frame.bytes.len();
+                self.retire_settings_parent(&old);
+                self.dropped += 1;
+                continue;
+            }
+            let id = self.next_transmission.checked_add(1)?;
+            let queued = self.queue.remove(index).unwrap();
+            self.next_transmission = id;
+            self.active_transmission = Some(id);
+            self.active_frame_count = 1;
+            self.active_recovery_control=queued.recovery_control();
+            self.active_fair_delta_bytes = 0;
+            self.active_survives_clear = false;
+            return Some(Transmission {
+                queued,
+                follower: None,
+                id,
+                physical: None,
+                settings_action: None,
+            });
+        }
+    }
+    pub(crate) fn queued_budget_owner(&mut self, now: u64) -> bool {
+        self.poll_budget(now);
+        self.queue
+            .iter()
+            .any(|q| Self::budget_kind(&q.frame.bytes) && self.budget_reservation_ready(q, now))
+    }
+    pub(crate) fn begin_paid_budget_transmission(&mut self, now: u64) -> Option<Transmission> {
+        if self.active_transmission.is_some() {
+            return None;
+        }
+        self.poll_budget(now);
+        let index = self.queue.iter().position(|q| {
+            Self::budget_kind(&q.frame.bytes) && self.budget_reservation_ready(q, now)
+        })?;
+        if self.queued_expired(&self.queue[index], now) {
+            return None;
+        }
+        let id = self.next_transmission.checked_add(1)?;
+        let mut queued = self.queue.remove(index)?;
+        queued.mark_budget_reserved();
+        self.next_transmission = id;
+        self.active_transmission = Some(id);
+        self.active_frame_count = 1;
+        self.active_recovery_control=queued.recovery_control();
+        self.active_fair_delta_bytes = 0;
+        self.budget_inflight = true;
+        self.active_survives_clear = true;
+        Some(Transmission {
+            queued,
+            follower: None,
+            id,
+            physical: None,
+            settings_action: None,
+        })
+    }
+    pub(crate) fn begin_primary_background_transmission(
+        &mut self,
+        now: u64,
+        minimum_priority: u8,
+        normal_ready: bool,
+        allow_ordinary: bool,
+    ) -> Option<Transmission> {
+        let protected =
+            self.begin_bounded_transmission(now, minimum_priority.max(254), !normal_ready, 1);
+        if protected.is_some() {
+            return protected;
+        }
+        if !normal_ready {
+            return None;
+        }
+        if let Some(offer) = self.begin_framing_offer_transmission(now, minimum_priority) {
+            return Some(offer);
+        }
+        if !allow_ordinary {
+            return None;
+        }
+        self.begin_mode_reply_transmission(now)
+            .or_else(|| self.begin_bounded_transmission(now, minimum_priority, false, 1))
+    }
     fn begin_matching_transmission(
         &mut self,
         now: u64,
@@ -750,6 +1513,7 @@ impl Mesh {
         if self.active_transmission.is_some() {
             return None;
         }
+        self.poll_budget(now);
         // Never reuse a reservation identity after wraparound.
         let id = self.next_transmission.checked_add(1)?;
         // The caller gates this reservation through its shared physical UART
@@ -760,7 +1524,7 @@ impl Mesh {
                 .iter()
                 .enumerate()
                 .filter(|(index, item)| {
-                    !item.independent_discovery
+                    !item.independent_discovery()
                         && (if critical_only {
                             item.priority >= minimum_priority && item.closes_packet_batch()
                         } else {
@@ -773,12 +1537,16 @@ impl Mesh {
             if critical_only && protected.is_none() {
                 return None;
             }
+            if !critical_only && protected.is_none()
+                && let Some(offer) = self.begin_framing_offer_transmission(now, minimum_priority) {
+                    return Some(offer);
+                }
             let discovery = if critical_only {
                 None
             } else {
                 self.queue
                     .iter()
-                    .position(|item| item.independent_discovery)
+                    .position(|item| item.independent_discovery())
             };
             // Only the ordinary head may yield into service: a later packet
             // must never leapfrog an earlier opaque SDT bootstrap or follower.
@@ -790,7 +1558,7 @@ impl Mesh {
                     .enumerate()
                     .find(|(index, item)| {
                         item.priority < 254
-                            && !item.independent_discovery
+                            && !item.independent_discovery()
                             && matches!(
                                 item.frame.bytes.get(3),
                                 Some(&DOWN_DATA) | Some(&AV_BAY_DATA)
@@ -821,7 +1589,8 @@ impl Mesh {
                 if discovery.is_none() {
                     self.receipt_service_pending = false;
                 }
-                let highest = self.queue
+                let highest = self
+                    .queue
                     .iter()
                     .enumerate()
                     .filter(|(index, _)| self.dependency_ready(*index))
@@ -831,8 +1600,10 @@ impl Mesh {
                 // then use dependency-safe FIFO inside ordinary data. A fresh
                 // routine heartbeat must not starve an accepted sensor report
                 // merely because no independent snapshot is currently queued.
-                if matches!(self.queue[highest].frame.bytes.get(3), Some(&DOWN_DATA) | Some(&AV_BAY_DATA))
-                    && !self.queue[highest].independent_discovery
+                if matches!(
+                    self.queue[highest].frame.bytes.get(3),
+                    Some(&DOWN_DATA) | Some(&AV_BAY_DATA)
+                ) && !self.queue[highest].independent_discovery()
                 {
                     ordinary.unwrap_or(highest)
                 } else {
@@ -843,36 +1614,29 @@ impl Mesh {
             if q.priority < minimum_priority {
                 return None;
             }
-            if now.saturating_sub(q.at)
-                > if q.mode_reply {
-                    5_000
-                } else if q.frame.bytes.get(3) == Some(&VOICE) {
-                    180
-                } else if q.independent_discovery {
-                    3_000
-                } else if q.priority == 255
-                    || (q.priority < 254 && q.frame.bytes.get(3) == Some(&DOWN_DATA))
-                {
-                    // Retain sparse reports through bounded sensor bursts. Reliable
-                    // interactive controls retain their 250 ms deadline at priority 254.
-                    // Stateful SDT fragments remain owned and ordered; never coalesce.
-                    1500
-                } else {
-                    250
-                }
+            if self.queued_expired(q, now)
+                || (Self::budget_kind(&q.frame.bytes)
+                    && self
+                        .budget
+                        .as_mut()
+                        .is_none_or(|b| !b.valid(&q.frame.bytes, now)))
             {
                 let old = self.queue.remove(i).unwrap();
                 self.bytes -= old.frame.bytes.len();
+                self.retire_settings_parent(&old);
                 self.dropped += 1;
                 continue;
             }
-            let queued = self.queue.remove(i).unwrap();
+            let mut queued = self.queue.remove(i).unwrap();
+            if Self::budget_kind(&queued.frame.bytes) {
+                queued.mark_budget_reserved();
+            }
             self.active_fair_delta_bytes = if contested {
                 let cost =
                     (queued.frame.bytes.len() + 4 + usize::from(self.fair_overhead_bytes)) as i32;
                 // Source-paced discovery bursts reserve four ordinary bytes per
                 // independent snapshot byte to keep accepted reports below 1.5 s with allowance for radio transit.
-                if queued.independent_discovery {
+                if queued.independent_discovery() {
                     4 * cost
                 } else {
                     -cost
@@ -880,14 +1644,32 @@ impl Mesh {
             } else {
                 0
             };
+            let mut tx = Transmission {
+                queued,
+                follower: None,
+                id,
+                physical: None,
+                settings_action: None,
+            };
+            if !self.prepare_settings_physical(&mut tx, now) {
+                self.queue.push_back(tx.queued);
+                return None;
+            }
             self.next_transmission = id;
             self.active_transmission = Some(id);
             self.active_frame_count = 1;
+            self.active_recovery_control=tx.recovery_control();
+            self.budget_inflight = Self::budget_kind(&tx.queued.frame.bytes);
             self.active_survives_clear = matches!(
-                queued.frame.bytes.get(3),
-                Some(&POSITION) | Some(&VOICE) | Some(&SETTINGS)
+                tx.queued.frame.bytes.get(3),
+                Some(&POSITION)
+                    | Some(&VOICE)
+                    | Some(&SETTINGS)
+                    | Some(&HOST_CONTROL)
+                    | Some(&BUDGET_CONTROL)
+                    | Some(&RF_PROFILE_CONTROL)
             );
-            return Some(Transmission { queued, follower: None, id });
+            return Some(tx);
         }
     }
 
@@ -915,6 +1697,9 @@ impl Mesh {
         assert_eq!(usize::from(self.active_frame_count), count);
         self.active_transmission = None;
         self.active_frame_count = 0;
+        self.active_recovery_control=false;
+        self.budget_inflight = false;
+        self.budget_committed(&transmission.queued.frame, sent);
         let fair_delta = std::mem::take(&mut self.active_fair_delta_bytes);
         let owned_bytes = transmission.queued.frame.bytes.len()
             + transmission
@@ -924,6 +1709,7 @@ impl Mesh {
         if !sent && self.active_cancelled {
             self.active_cancelled = false;
             self.bytes -= owned_bytes;
+            self.retire_settings_parent(&transmission.queued);
             self.dropped += count as u64;
             return None;
         }
@@ -935,8 +1721,29 @@ impl Mesh {
             self.queue.push_front(transmission.queued);
             return None;
         }
+        if let Some(action) = transmission.settings_action {
+            let context = self.settings_context(self.now());
+            let complete = self.settings_framing.as_mut().is_some_and(|state| {
+                state.complete_physical(
+                    settings_framing::OwnerId::of(&transmission.queued.frame.bytes),
+                    action,
+                    true,
+                    context,
+                )
+            });
+            if !complete {
+                self.queue.push_back(transmission.queued);
+                return None;
+            }
+        }
+        if transmission.queued.settings_origin == SettingsOrigin::FramingOffer
+            && let Some((_, body)) = decode(&transmission.queued.frame.bytes)
+                && let Some(state) = self.settings_framing.as_mut() {
+                    state.offer_completed(body);
+                }
+        self.retire_settings_parent(&transmission.queued);
         self.discovery_balance_bytes = self.discovery_balance_bytes.saturating_add(fair_delta);
-        if transmission.queued.independent_discovery {
+        if transmission.queued.independent_discovery() {
             self.receipt_service_pending = false;
         }
         self.bytes -= owned_bytes;
@@ -945,7 +1752,13 @@ impl Mesh {
             for frame in core::iter::once(&transmission.queued.frame)
                 .chain(transmission.follower.iter().map(|queued| &queued.frame))
             {
-                if matches!(frame.bytes.get(3), Some(&DOWN_DATA) | Some(&DOWN_COMMAND) | Some(&AV_BAY_DATA) | Some(&AV_BAY_COMMAND)) {
+                if matches!(
+                    frame.bytes.get(3),
+                    Some(&DOWN_DATA)
+                        | Some(&DOWN_COMMAND)
+                        | Some(&AV_BAY_DATA)
+                        | Some(&AV_BAY_COMMAND)
+                ) {
                     self.relayed_frames += 1;
                     self.relay_envelope_bytes += frame.bytes.len() as u64;
                 }
@@ -957,16 +1770,15 @@ impl Mesh {
         ))
     }
 
-
     /// Replacing a live ordinary/metadata batch with a receipt idle gap costs
     /// ordinary service. Reserve only that charged-byte service before the next
     /// independent snapshot. A successful snapshot must occur before another
     /// allowance can accrue, so repeated receipts cannot starve metadata.
     pub(crate) fn note_receipt_packet_boundary(&mut self, charged_bytes: usize) {
-        let metadata_ready = self.queue.iter().any(|item| item.independent_discovery);
+        let metadata_ready = self.queue.iter().any(|item| item.independent_discovery());
         let ordinary_ready = self.queue.iter().enumerate().any(|(index, item)| {
             item.priority < 254
-                && !item.independent_discovery
+                && !item.independent_discovery()
                 && matches!(
                     item.frame.bytes.get(3),
                     Some(&DOWN_DATA) | Some(&AV_BAY_DATA)
@@ -994,6 +1806,48 @@ impl Mesh {
     /// installation signature. Raw mesh reception never establishes presence.
     pub fn authenticated_settings_peer(&mut self, now: u64) {
         self.settings_peer_seen = Some(now);
+    }
+    /// Link freshness only; signed proxy capability and actor policy remain independent.
+    pub(crate) fn command_proxy_transport(
+        &self,
+        now: u64,
+    ) -> Option<crate::command_proxy::Transport> {
+        let session = self.operating_mode_session(now)?;
+        Some(crate::command_proxy::Transport {
+            session,
+            sequence: if self.role == Role::Primary {
+                self.sequence
+            } else {
+                self.primary_sequence
+            },
+        })
+    }
+    pub(crate) fn queue_command_proxy(&mut self, payload: &[u8], now: u64) -> bool {
+        if payload.len() > crate::command_proxy::MAX_WIRE
+            || crate::command_proxy::wire_boundary(payload).is_none()
+            || self.queue.len() + usize::from(self.active_frame_count) >= MAX_FRAMES
+            || self.bytes + payload.len() + 8 > MAX_BYTES
+            || self
+                .queue
+                .iter()
+                .any(|queued| queued.frame.bytes.get(3) == Some(&HOST_CONTROL))
+        {
+            return false;
+        }
+        // Independent bounded operator control, below owner/HEALTH receipts255.
+        // No extra capacity, eviction, or lease/presence renewal is introduced.
+        self.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(HOST_CONTROL, payload),
+            },
+            254,
+            now,
+        );
+        true
+    }
+    pub(crate) fn take_command_proxy(&mut self) -> Option<Vec<u8>> {
+        self.command_proxy_inbox.pop_front()
     }
     /// Display metadata only: never grants settings authentication or control.
     pub(crate) fn operating_mode_session(&self, now: u64) -> Option<u32> {
@@ -1029,7 +1883,7 @@ impl Mesh {
         self.queue
             .back_mut()
             .expect("accepted settings owner")
-            .mode_reply = true;
+            .settings_origin = SettingsOrigin::Reply;
         true
     }
     fn queue_settings_inner(&mut self, payload: &[u8], now: u64, mode_reply: bool) -> bool {
@@ -1044,21 +1898,64 @@ impl Mesh {
         {
             return false;
         }
-        self.enqueue(
-            Outgoing {
-                command: true,
-                bytes: encode(SETTINGS, payload),
-            },
-            0,
-            now,
-        );
-        true
+        let context = self.settings_context(now);
+        let original = Outgoing {
+            command: true,
+            bytes: encode(SETTINGS, payload),
+        };
+        let owner = settings_framing::OwnerId::of(&original.bytes);
+        let lifetime = if mode_reply || crate::station_mode::recognizes(payload) {
+            5_000
+        } else if crate::launch_clock_sync::recognizes(payload) {
+            30_000
+        } else {
+            5_000
+        };
+        let profile = crate::comms::rfd_profile::active();
+        let usable = profile.map_or(32_000, |p| p.transport.usable_air_bps);
+        let default_share = profile.map_or(25, |p| p.transport.host_default_share_percent as u8);
+        let share = self.recovery_air_share(now).unwrap_or(default_share);
+        let local_bytes_per_second = usable * u64::from(share) / 800;
+        // Conservative existing peer rates: Primary may use15%, standby RRLS25%.
+        let peer_min_bytes_per_second =
+            usable * if self.role == Role::Primary { 25 } else { 15 } / 800;
+        if let Some(state) = self.settings_framing.as_mut() {
+            let own = local_bytes_per_second;
+            let peer = peer_min_bytes_per_second;
+            if state.admit(payload, owner, now, lifetime, context, own, peer)
+                == settings_framing::Admission::Busy
+            {
+                return false;
+            }
+        }
+        let before = self.queue.len();
+        self.enqueue(original, 0, now);
+        let admitted = self.queue.len() > before;
+        if admitted {
+            self.queue
+                .back_mut()
+                .expect("accepted SETTINGS parent")
+                .settings_origin = if mode_reply {
+                SettingsOrigin::Reply
+            } else {
+                SettingsOrigin::Settings
+            };
+        } else if let Some(state) = self.settings_framing.as_mut() {
+            state.cancel_unadmitted(owner);
+        }
+        admitted
     }
     pub fn take_settings(&mut self) -> Option<Vec<u8>> {
+        let index = self.settings_inbox.iter().position(|wire| {
+            !crate::station_mode::recognizes(wire) && !crate::launch_clock_sync::recognizes(wire)
+        })?;
+        self.settings_inbox.remove(index)
+    }
+    pub(crate) fn take_launch_clock(&mut self) -> Option<Vec<u8>> {
         let index = self
             .settings_inbox
             .iter()
-            .position(|wire| !crate::station_mode::recognizes(wire))?;
+            .position(|wire| crate::launch_clock_sync::recognizes(wire))?;
         self.settings_inbox.remove(index)
     }
     pub(crate) fn take_operating_mode(&mut self) -> Option<Vec<u8>> {
@@ -1131,6 +2028,7 @@ impl Mesh {
             let p = sedsnet::wire_format::peek_frame_info(bytes).ok()?;
             let gps = p.envelope.ty == crate::telemetry_schema::data_type("GPS_DATA");
             Some(FrameClass {
+                recovery_control: crate::telemetry_task::is_recovery_control_frame(bytes),
                 priority: if gps {
                     255
                 // Reliable low-priority telemetry keeps its schema priority and
@@ -1191,7 +2089,7 @@ impl Mesh {
                     .find(|entry| entry.id == template && entry.uplink == uplink)
                     .map(|entry| entry.class)
             }
-            3 => Some(FrameClass { priority: 253 }),
+            3 => Some(FrameClass { priority: 253, recovery_control: true }),
             _ => None,
         }
     }
@@ -1220,6 +2118,51 @@ impl Mesh {
         if command && payload.starts_with(b"RR") {
             let (kind, data) = decode(payload)?;
             match (self.role, kind) {
+                (_, BUDGET_CONTROL | RF_PROFILE_CONTROL) => {
+                    if let Some(budget) = self.budget.as_mut() {
+                        budget.incoming(payload, now);
+                    }
+                    self.poll_budget(now);
+                    None
+                }
+                (_, settings_framing::KIND) => {
+                    let context = self.settings_context(now);
+                    let free = MAX_BYTES
+                        .saturating_sub(self.bytes)
+                        .saturating_sub(self.settings_reserved_bytes());
+                    let result = self.settings_framing.as_mut().map(|state| {
+                        state.incoming(data, context, self.settings_inbox.len(), free)
+                    });
+                    if let Some(result) = result {
+                        if let Some(reply) = result.reply {
+                            let live = self
+                                .settings_framing
+                                .as_ref()
+                                .is_some_and(|state| state.offer_is_live(&reply, context));
+                            if live
+                                && self.enqueue_with_origin(
+                                    Outgoing {
+                                        command: true,
+                                        bytes: settings_framing::wrap(&reply),
+                                    },
+                                    0,
+                                    now,
+                                    SettingsOrigin::FramingOffer,
+                                )
+                                && let Some(state) = self.settings_framing.as_mut() {
+                                    state.offer_pending(&reply, true);
+                                }
+                        }
+                        if let Some(original) = result.complete {
+                            if self.settings_inbox.len() < MAX_SETTINGS_INBOX {
+                                self.settings_inbox.push_back(original);
+                            } else {
+                                self.dropped += 1;
+                            }
+                        }
+                    }
+                    None
+                }
                 (_, SETTINGS) => {
                     if data.len() <= paired_settings::auth::MAX_WIRE
                         && self.settings_inbox.len() < MAX_SETTINGS_INBOX
@@ -1286,8 +2229,21 @@ impl Mesh {
                     self.primary_sequence = seq;
                     self.primary_direct = data[8] != 0;
                     self.health_received = Some(now);
+                    if let Some(budget) = self.budget.as_mut() {
+                        budget.health(session, seq, data[8] != 0, now);
+                    }
                     if !self.active(now) {
                         self.clear();
+                    }
+                    None
+                }
+                (_, HOST_CONTROL) => {
+                    // Verify signatures in the bounded dedicated worker, never in a
+                    // radio callback. This metadata grants no HEALTH/settings lease.
+                    if data.len() <= crate::command_proxy::MAX_WIRE
+                        && self.command_proxy_inbox.len() < 4
+                    {
+                        self.command_proxy_inbox.push_back(data.to_vec());
                     }
                     None
                 }
@@ -1453,6 +2409,31 @@ pub(crate) fn topology_observation() -> Option<TopologyObservation> {
 mod tests {
     use super::*;
     #[test]
+    fn host_control_is_bounded_independent_and_retains_serial_ownership() {
+        let mut payload = vec![0; 132];
+        payload[..4].copy_from_slice(b"CP\x01\x00");
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        assert!(mesh.queue_command_proxy(&payload, 0));
+        assert!(!mesh.queue_command_proxy(&payload, 0));
+        let control = mesh.begin_transmission(0).unwrap();
+        assert!(control.closes_packet_batch());
+        assert!(!control.is_receipt());
+        let original = control.frame().bytes.clone();
+        mesh.clear();
+        assert!(mesh.finish_transmission(control, false).is_none());
+        let retry = mesh.begin_transmission(1).unwrap();
+        assert_eq!(retry.frame().bytes, original);
+        mesh.finish_transmission(retry, true);
+        assert_eq!(mesh.bytes, 0);
+        for _ in 0..10 {
+            mesh.incoming(true, &encode(HOST_CONTROL, &payload), 2);
+        }
+        assert_eq!(mesh.command_proxy_inbox.len(), 4);
+        assert!(mesh.take_command_proxy().is_some());
+        assert!(mesh.queue_command_proxy(&payload, 3));
+        assert!(!mesh.queue_command_proxy(&vec![0; 257], 3));
+    }
+    #[test]
     fn receipt_boundary_metadata_survives_downlink_wrapping_and_priority_cap() {
         crate::telemetry_schema::initialize().unwrap();
         let packet = sedsnet::packet::Packet::new(
@@ -1481,30 +2462,57 @@ mod tests {
     #[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
     fn process_restart_uses_its_boot_clock_for_the_initial_loss_deadline() {
         const CHILD: &str = "GS_RELAY_BOOT_CLOCK_CHILD";
-        const NAME: &str = "rrls::tests::process_restart_uses_its_boot_clock_for_the_initial_loss_deadline";
+        const NAME: &str =
+            "rrls::tests::process_restart_uses_its_boot_clock_for_the_initial_loss_deadline";
         if std::env::var_os(CHILD).is_none() {
-            let clock = std::env::temp_dir().join(format!("gs-relay-boot-{}.clock", std::process::id()));
+            let clock =
+                std::env::temp_dir().join(format!("gs-relay-boot-{}.clock", std::process::id()));
             std::fs::write(&clock, "80008").unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
-                .env(CHILD, "1").env("GS_SIM_CLOCK_FILE", &clock).output().unwrap();
+                .env(CHILD, "1")
+                .env("GS_SIM_CLOCK_FILE", &clock)
+                .output()
+                .unwrap();
             let _ = std::fs::remove_file(clock);
-            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
         let mut mesh = Mesh::new(Role::Primary, 3);
         assert_eq!(mesh.now(), 80008);
         for now in [80008, 81008, 83007] {
             mesh.tick(now);
-            assert!(!mesh.fallback, "fresh process has not yet observed three seconds without a direct link");
-            assert_eq!(mesh.topology_observation(now).direct_age_ms, None, "boot clock must never fabricate observed direct traffic");
+            assert!(
+                !mesh.fallback,
+                "fresh process has not yet observed three seconds without a direct link"
+            );
+            assert_eq!(
+                mesh.topology_observation(now).direct_age_ms,
+                None,
+                "boot clock must never fabricate observed direct traffic"
+            );
         }
         mesh.tick(83008);
-        assert!(mesh.fallback, "the original three-second loss threshold remains exact");
+        assert!(
+            mesh.fallback,
+            "the original three-second loss threshold remains exact"
+        );
         mesh.direct(83009);
-        for now in [83509, 84009, 84509, 85008] { mesh.direct(now); }
-        mesh.tick(85008); assert!(mesh.fallback);
-        mesh.tick(85009); assert!(!mesh.fallback, "the original two-second restoration hysteresis remains exact");
+        for now in [83509, 84009, 84509, 85008] {
+            mesh.direct(now);
+        }
+        mesh.tick(85008);
+        assert!(mesh.fallback);
+        mesh.tick(85009);
+        assert!(
+            !mesh.fallback,
+            "the original two-second restoration hysteresis remains exact"
+        );
     }
 
     #[test]
@@ -1948,7 +2956,7 @@ mod tests {
         assert_eq!(decode(&mesh.pop(0).unwrap().bytes).unwrap().0, UP_COMMAND);
         assert!(mesh.pop(181).is_none(), "expired voice is never replayed");
         assert!(mesh.queue.is_empty());
-        mesh.queue_voice(&vec![0; crate::radio_voice::MAX_PACKET + 1], 181);
+        mesh.queue_voice(&[0; crate::radio_voice::MAX_PACKET + 1], 181);
         assert!(
             mesh.pop(181).is_none(),
             "video-sized payloads cannot enter voice"
@@ -2555,7 +3563,7 @@ mod tests {
             );
         }
         let transmission = mesh.begin_transmission(0).unwrap();
-        assert!(transmission.queued.independent_discovery);
+        assert!(transmission.queued.independent_discovery());
         let cost =
             transmission.frame().bytes.len() as i32 + 4 + i32::from(mesh.fair_overhead_bytes);
         mesh.finish_transmission(transmission, false);
@@ -2605,7 +3613,7 @@ mod tests {
         assert_eq!(mesh.discovery_balance_bytes, 154);
         assert!(mesh.receipt_service_pending);
         let tx = mesh.begin_transmission(0).unwrap();
-        assert!(!tx.queued.independent_discovery);
+        assert!(!tx.queued.independent_discovery());
         mesh.finish_transmission(tx, false);
         mesh.note_receipt_packet_boundary(154);
         assert_eq!(
@@ -2614,7 +3622,7 @@ mod tests {
         );
         mesh.pop(0).unwrap();
         let tx = mesh.begin_transmission(0).unwrap();
-        assert!(tx.queued.independent_discovery);
+        assert!(tx.queued.independent_discovery());
         assert!(
             mesh.receipt_service_pending,
             "an empty ordinary lane cannot rearm before metadata"
@@ -2627,7 +3635,7 @@ mod tests {
             "lane flapping cannot renew the allowance"
         );
         let tx = mesh.begin_transmission(0).unwrap();
-        assert!(tx.queued.independent_discovery);
+        assert!(tx.queued.independent_discovery());
         mesh.finish_transmission(tx, true);
         assert!(!mesh.receipt_service_pending);
     }
@@ -2687,13 +3695,13 @@ mod tests {
                 mesh.finish_transmission(tx, false);
                 continue;
             }
-            if tx.queued.independent_discovery && !refused_once {
+            if tx.queued.independent_discovery() && !refused_once {
                 mesh.finish_transmission(tx, false);
                 refused_once = true;
                 continue;
             }
             let age = now.saturating_sub(tx.queued.at);
-            if tx.queued.independent_discovery {
+            if tx.queued.independent_discovery() {
                 metadata += 1;
                 assert!(age <= 3000, "metadata service was starved: {age}");
             } else if tx.queued.priority < 254 {
@@ -3014,22 +4022,32 @@ mod tests {
     #[test]
     fn relay_activity_counters_exclude_presence_and_cancelled_work() {
         let mut relay = Mesh::new(Role::Rrls, 2);
-        relay.enqueue(Outgoing {command:true, bytes:encode(READY, &[0;8])},255,0);
+        relay.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(READY, &[0; 8]),
+            },
+            255,
+            0,
+        );
         assert!(relay.pop(0).is_some());
-        assert_eq!(relay.forwarded,1);
-        assert_eq!(relay.relayed_frames,0);
-        relay.incoming(true,&health(1,0,false),1);
-        relay.incoming(false,b"application",2);
-        let frame=relay.pop(2).unwrap();
-        assert_eq!(relay.relayed_frames,1);
-        assert_eq!(relay.relay_envelope_bytes,frame.bytes.len() as u64);
-        relay.incoming(false,b"queued before restore",3);
-        relay.incoming(true,&health(1,1,true),4);
+        assert_eq!(relay.forwarded, 1);
+        assert_eq!(relay.relayed_frames, 0);
+        relay.incoming(true, &health(1, 0, false), 1);
+        relay.incoming(false, b"application", 2);
+        let frame = relay.pop(2).unwrap();
+        assert_eq!(relay.relayed_frames, 1);
+        assert_eq!(relay.relay_envelope_bytes, frame.bytes.len() as u64);
+        relay.incoming(false, b"queued before restore", 3);
+        relay.incoming(true, &health(1, 1, true), 4);
         assert!(relay.pop(4).is_none());
-        assert_eq!(relay.relayed_frames,1,"cancelled work is not transmitted relay traffic");
-        relay.incoming(false,b"standby traffic",5);
+        assert_eq!(
+            relay.relayed_frames, 1,
+            "cancelled work is not transmitted relay traffic"
+        );
+        relay.incoming(false, b"standby traffic", 5);
         assert!(relay.pop(5).is_none());
-        assert_eq!(relay.relayed_frames,1);
+        assert_eq!(relay.relayed_frames, 1);
     }
 
     #[test]
@@ -3130,9 +4148,15 @@ mod tests {
             assert!(primary.fallback, "restoration still requires two seconds");
         }
         primary.tick(5_100);
-        assert!(!primary.fallback, "one-Hz reports keep the direct link live and must restore it");
+        assert!(
+            !primary.fallback,
+            "one-Hz reports keep the direct link live and must restore it"
+        );
         primary.tick(8_099);
-        assert!(primary.fallback, "the original three-second loss threshold remains exact");
+        assert!(
+            primary.fallback,
+            "the original three-second loss threshold remains exact"
+        );
     }
 
     #[test]
@@ -3207,7 +4231,6 @@ mod tests {
 }
 
 /// RRLS has no fill-system hardware.
-
 pub fn settings_transport() -> Option<Shared> {
     RADIO.get().map(|(_, shared)| shared.clone())
 }
@@ -3267,40 +4290,91 @@ mod pair_tests {
         .to_vec()
     }
     fn enqueue(mesh: &mut Mesh, bytes: &[u8], now: u64) {
-        mesh.enqueue(Outgoing { command: true, bytes: encode(DOWN_DATA, bytes) }, 254, now);
+        mesh.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(DOWN_DATA, bytes),
+            },
+            254,
+            now,
+        );
     }
     #[test]
     fn receipt_can_pass_only_replayed_controls_without_changing_ownership_or_age() {
-        let first = control(false, 10); let second = control(false, 11);
+        let first = control(false, 10);
+        let second = control(false, 11);
         let receipt = control(true, 12);
-        let ids = [&first, &second].map(|p| crate::comms::radio_batch_control_contract(254, p).unwrap().0);
+        let ids = [&first, &second].map(|p| {
+            crate::comms::radio_batch_control_contract(254, p)
+                .unwrap()
+                .0
+        });
         let mut mesh = Mesh::new(Role::Rrls, 2);
-        enqueue(&mut mesh, &first, 10); enqueue(&mut mesh, &second, 11); enqueue(&mut mesh, &receipt, 12);
+        enqueue(&mut mesh, &first, 10);
+        enqueue(&mut mesh, &second, 11);
+        enqueue(&mut mesh, &receipt, 12);
         let bytes = mesh.bytes;
         mesh.prioritize_receipt_over_replays(|id| ids.contains(&id));
-        assert_eq!(mesh.bytes, bytes); assert_eq!(mesh.dropped, 0); assert_eq!(mesh.forwarded, 0);
-        assert_eq!(mesh.queue.iter().map(|q| q.at).collect::<Vec<_>>(), [12, 10, 11]);
+        assert_eq!(mesh.bytes, bytes);
+        assert_eq!(mesh.dropped, 0);
+        assert_eq!(mesh.forwarded, 0);
+        assert_eq!(
+            mesh.queue.iter().map(|q| q.at).collect::<Vec<_>>(),
+            [12, 10, 11]
+        );
         let tx = mesh.begin_bounded_transmission(12, 0, true, 1).unwrap();
         assert_eq!(decode(&tx.frame().bytes).unwrap().1, receipt);
         mesh.finish_bounded_transmission(tx, false);
-        assert_eq!(mesh.bytes, bytes); assert_eq!(mesh.queue.len(), 3);
+        assert_eq!(mesh.bytes, bytes);
+        assert_eq!(mesh.queue.len(), 3);
     }
     #[test]
     fn receipt_retry_preference_preserves_fresh_controls_and_metadata_barriers() {
         let retry = control(false, 10);
-        let id = crate::comms::radio_batch_control_contract(254, &retry).unwrap().0;
-        let gps = serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type("GPS_DATA"),
-            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "RF", 22,
-            Arc::from([0u8; 12])).unwrap()).to_vec();
-        for blocker in [encode(DOWN_DATA, &control(false, 11)), encode(READY, &[0; 8]),
-            encode(DOWN_DATA, b"SDT\x03opaque"), encode(DOWN_DATA, &gps)] {
+        let id = crate::comms::radio_batch_control_contract(254, &retry)
+            .unwrap()
+            .0;
+        let gps = serialize::pack_packet(
+            &Packet::new(
+                crate::telemetry_schema::data_type("GPS_DATA"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "RF",
+                22,
+                Arc::from([0u8; 12]),
+            )
+            .unwrap(),
+        )
+        .to_vec();
+        for blocker in [
+            encode(DOWN_DATA, &control(false, 11)),
+            encode(READY, &[0; 8]),
+            encode(DOWN_DATA, b"SDT\x03opaque"),
+            encode(DOWN_DATA, &gps),
+        ] {
             let mut mesh = Mesh::new(Role::Rrls, 2);
             enqueue(&mut mesh, &retry, 10);
-            mesh.enqueue(Outgoing { command: true, bytes: blocker.clone() }, 254, 11);
+            mesh.enqueue(
+                Outgoing {
+                    command: true,
+                    bytes: blocker.clone(),
+                },
+                254,
+                11,
+            );
             enqueue(&mut mesh, &control(true, 12), 12);
-            let before = mesh.queue.iter().map(|q| (q.frame.bytes.clone(), q.at, q.priority)).collect::<Vec<_>>();
+            let before = mesh
+                .queue
+                .iter()
+                .map(|q| (q.frame.bytes.clone(), q.at, q.priority))
+                .collect::<Vec<_>>();
             mesh.prioritize_receipt_over_replays(|candidate| candidate == id);
-            assert_eq!(mesh.queue.iter().map(|q| (q.frame.bytes.clone(), q.at, q.priority)).collect::<Vec<_>>(), before);
+            assert_eq!(
+                mesh.queue
+                    .iter()
+                    .map(|q| (q.frame.bytes.clone(), q.at, q.priority))
+                    .collect::<Vec<_>>(),
+                before
+            );
         }
     }
 
@@ -3453,3 +4527,190 @@ mod pair_tests {
 #[cfg(test)]
 #[path = "rrls/continuous_service_audit.rs"]
 mod continuous_service_audit;
+
+#[cfg(test)]
+#[path = "rrls/heartbeat_owner_relay_regression.rs"]
+mod heartbeat_owner_relay_regression;
+
+#[cfg(test)]
+#[path = "rrls/ordinary_provenance_tests.rs"]
+mod ordinary_provenance_tests;
+
+#[cfg(test)]
+#[path = "rrls/offer_service_regression.rs"]
+mod offer_service_regression;
+
+#[cfg(test)]
+mod completed_owner_certificate_tests {
+    use super::*;
+    #[test]
+    fn framing_offer_origin_never_certifies_a_completed_owner() {
+        for kind in [SETTINGS, DOWN_DATA] {
+            for action in [None, Some(settings_framing::Action::Legacy)] {
+                let mut mesh = Mesh::new(Role::Primary, 1);
+                mesh.enqueue(
+                    Outgoing {
+                        command: true,
+                        bytes: encode(kind, b"owner"),
+                    },
+                    0,
+                    0,
+                );
+                let mut tx = mesh.begin_transmission(0).unwrap();
+                // Invalid mixed shapes must not turn the new protocol-only tag
+                // into ordinary-data or legacy-reply credit.
+                tx.queued.settings_origin = SettingsOrigin::FramingOffer;
+                tx.settings_action = action;
+                assert_eq!(tx.ordinary_background_service_bytes(), 0);
+                assert_eq!(tx.completed_ordinary_owner_bytes(), 0);
+            }
+        }
+    }
+    #[test]
+    fn completed_owner_negotiated_reply_has_legacy_action_only_after_probe_timeout() {
+        let legacy = include_bytes!("comms/fixtures/legacy374-settings-body.bin");
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        mesh.enable_settings_framing();
+        // Real peer presence, but deliberately no negotiated OFFER.
+        mesh.relay_seen = Some(0);
+        assert!(mesh.queue_operating_mode_reply(&legacy[4..legacy.len() - 4], 0));
+        let probe = mesh.begin_mode_reply_transmission(0).unwrap();
+        assert_eq!(probe.settings_action, Some(settings_framing::Action::Probe));
+        assert_eq!(probe.frame().bytes.len() + 4, 59);
+        assert_eq!(probe.completed_ordinary_owner_bytes(), 0);
+        mesh.note_settings_physical_prefix(&probe, 59);
+        mesh.note_settings_counted_drain(&probe, None);
+        mesh.finish_transmission(probe, true);
+        let tx = mesh.begin_mode_reply_transmission(800).unwrap();
+        assert_eq!(tx.settings_action, Some(settings_framing::Action::Legacy));
+        assert_eq!(tx.queued.settings_origin, SettingsOrigin::Reply);
+        assert_eq!(&tx.frame().bytes, legacy);
+        assert_eq!(tx.completed_ordinary_owner_bytes(), 374);
+        assert_eq!(tx.successful_ordinary_service_bytes(), 0);
+    }
+    #[test]
+    fn completed_owner_negotiation_actions_require_trusted_physical_legacy_settings() {
+        for action in [
+            None,
+            Some(settings_framing::Action::Legacy),
+            Some(settings_framing::Action::Probe),
+            Some(settings_framing::Action::Fragment(0)),
+        ] {
+            for kind in [SETTINGS, settings_framing::KIND, DOWN_DATA, HOST_CONTROL] {
+                for trusted in [false, true] {
+                    let mut mesh = Mesh::new(Role::Primary, 1);
+                    mesh.enqueue(
+                        Outgoing {
+                            command: true,
+                            bytes: encode(kind, b"owner"),
+                        },
+                        0,
+                        0,
+                    );
+                    if trusted {
+                        mesh.queue.back_mut().unwrap().settings_origin = SettingsOrigin::Settings;
+                    }
+                    let mut tx = mesh.begin_transmission(0).unwrap();
+                    tx.settings_action = action;
+                    let expected = match action {
+                        None => kind == DOWN_DATA || (kind == SETTINGS && trusted),
+                        Some(settings_framing::Action::Legacy) => kind == SETTINGS && trusted,
+                        Some(
+                            settings_framing::Action::Probe | settings_framing::Action::Fragment(_),
+                        ) => false,
+                    };
+                    assert_eq!(
+                        tx.completed_ordinary_owner_bytes(),
+                        if expected {
+                            tx.frame().bytes.len() + 4
+                        } else {
+                            0
+                        },
+                        "action={action:?} physical kind={kind} trusted={trusted}"
+                    );
+                    assert_eq!(
+                        tx.successful_ordinary_service_bytes(),
+                        if kind == DOWN_DATA {
+                            tx.frame().bytes.len() + 4
+                        } else {
+                            0
+                        },
+                        "separate ordinary bank remains unchanged"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn only_ordinary_data_or_typed_whole_legacy_settings_certifies_an_owner() {
+        for kind in [
+            DOWN_DATA,
+            UP_DATA,
+            AV_BAY_DATA,
+            SETTINGS,
+            HOST_CONTROL,
+            settings_framing::KIND,
+            HEALTH,
+        ] {
+            let mut mesh = Mesh::new(Role::Primary, 1);
+            mesh.enqueue(
+                Outgoing {
+                    command: true,
+                    bytes: encode(kind, b"payload"),
+                },
+                0,
+                0,
+            );
+            mesh.queue.back_mut().unwrap().settings_origin = SettingsOrigin::Settings;
+            let tx = mesh.begin_transmission(0).unwrap();
+            let expected = if matches!(kind, DOWN_DATA | UP_DATA | AV_BAY_DATA | SETTINGS) {
+                tx.frame().bytes.len() + 4
+            } else {
+                0
+            };
+            assert_eq!(
+                tx.completed_ordinary_owner_bytes(),
+                expected,
+                "physical kind{kind}"
+            );
+        }
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        mesh.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(SETTINGS, b"opaque"),
+            },
+            0,
+            0,
+        );
+        let tx = mesh.begin_transmission(0).unwrap();
+        assert_eq!(
+            tx.completed_ordinary_owner_bytes(),
+            0,
+            "untagged opaque SETTINGS cannot certify"
+        );
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        mesh.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(DOWN_DATA, b"urgent"),
+            },
+            255,
+            0,
+        );
+        let tx = mesh.begin_transmission(0).unwrap();
+        assert_eq!(
+            tx.completed_ordinary_owner_bytes(),
+            0,
+            "urgent frame cannot certify"
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "rrls/budget_mesh_tests.rs"]
+mod budget_mesh_tests;
+
+#[cfg(test)]
+#[path = "rrls/recovery_control_tests.rs"]
+mod recovery_control_tests;

@@ -5,7 +5,19 @@
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum TailKind { CommandPair, SingleCommand, Receipt }
+enum TailKind {
+    CommandPair,
+    SingleCommand,
+    Receipt,
+}
+
+pub(crate) struct Defaults {
+    pub air_bps: u64,
+    pub overhead_bytes: u64,
+    pub packet_burst_ms: u64,
+    pub packet_gap_ms: u64,
+    pub host_share_percent: u64,
+}
 
 pub(crate) struct Capacity {
     next: Option<(Instant, Option<u64>)>,
@@ -15,9 +27,12 @@ pub(crate) struct Capacity {
     last_receipt_boundary: Option<(Instant, Option<u64>)>,
     promotion_contracts: [u64; 4],
     promotion_flags: u8,
+    spent_loan_flags: u8,
     promotion_contract_count: u8,
     promotion_contract_cursor: u8,
     early_frame_outstanding: bool,
+    ordinary_owner_bytes: u16,
+    completed_ordinary_owner: bool,
     late_command_id: u64,
     late_command_len: u8,
     late_command_virtual: bool,
@@ -42,6 +57,37 @@ fn bounded_env(name: &str, default: u64, min: u64, max: u64) -> u64 {
         .unwrap_or(default)
 }
 impl Capacity {
+    pub(crate) fn effective_budget_snapshot(
+        &self,
+        uart_baud: u32,
+        hardware_flow_control: bool,
+    ) -> super::EffectiveRadioBudget {
+        super::EffectiveRadioBudget {
+            uart_baud,
+            capacity_uart_baud: self.uart_baud,
+            usable_air_bps: self.air_bps,
+            frame_overhead_bytes: self.overhead_bytes,
+            packet_burst_ms: self.packet_burst_ms,
+            packet_gap_ms: self.packet_gap_ms,
+            fixed_share: self.fixed_share,
+            hardware_flow_control,
+        }
+    }
+    pub(crate) fn recovery_profile_matches(
+        &self,
+        expected: crate::rrls::budget_negotiation::Profile,
+    ) -> bool {
+        !self.fixed_share
+            && self.air_bps == u64::from(expected.usable_bps)
+            && self.overhead_bytes == u64::from(expected.overhead)
+            && self.packet_burst_ms == expected.burst_ms
+            && self.packet_gap_ms == expected.gap_ms
+            && self.uart_baud == expected.baud
+            && expected.flags == 0
+    }
+    pub(crate) fn airtime_config(&self) -> (u64, u64) {
+        (self.air_bps, self.share_percent)
+    }
     pub(crate) fn ready_for(&self, wall: Instant, virtual_ms: Option<u64>, critical: bool) -> bool {
         if self.ready(wall, virtual_ms) {
             return true;
@@ -65,6 +111,17 @@ impl Capacity {
         clock: Option<u64>,
         id: u64,
         encoded_len: usize,
+        canonical: bool,
+    ) -> bool {
+        self.ready_for_existing_command(wall, clock, id, encoded_len, canonical)
+            || self.completed_owner_control_ready(wall, clock, id, encoded_len, canonical, false)
+    }
+    pub(crate) fn ready_for_existing_command(
+        &self,
+        wall: Instant,
+        clock: Option<u64>,
+        id: u64,
+        encoded_len: usize,
         canonical_unsequenced: bool,
     ) -> bool {
         if self.replayed_command(id) {
@@ -72,7 +129,8 @@ impl Capacity {
             // not glue it onto an ordinary packet or extend a previous retry's
             // packet just before the returning owner receipt arrives. Normal
             // airtime plus the actual UART-stop/quiet boundary remain required.
-            return encoded_len > 0 && self.ready(wall, clock)
+            return encoded_len > 0
+                && self.ready(wall, clock)
                 && Self::reached(self.next_packet, wall, clock);
         }
         encoded_len > 0
@@ -80,44 +138,167 @@ impl Capacity {
                 || self.late_sibling_ready(wall, clock, id, encoded_len, canonical_unsequenced)
                 || self.batch_tail_ready(wall, clock, id, encoded_len, canonical_unsequenced))
     }
+    // One fully written ordinary owner may leave more than155ms air debt.
+    // Its bytes remain charged; only a fresh validated control can borrow once.
+    fn completed_owner_control_ready(
+        &self,
+        wall: Instant,
+        clock: Option<u64>,
+        id: u64,
+        bytes: usize,
+        canonical: bool,
+        receipt: bool,
+    ) -> bool {
+        if !canonical
+            || bytes == 0
+            || bytes > super::RADIO_COMMAND_BATCH_MAX_BYTES
+            || !self.completed_ordinary_owner
+            || self.early_frame_outstanding
+            || self.ordinary_owner_bytes == 0
+            || !Self::reached(self.next_packet, wall, clock)
+        {
+            return false;
+        }
+        if self.promotion_contracts[..usize::from(self.promotion_contract_count)]
+            .iter()
+            .position(|stored| *stored == id)
+            .is_some_and(|slot| {
+                (self.promotion_flags | self.spent_loan_flags)
+                    & (1 << (slot + if receipt { 4 } else { 0 }))
+                    != 0
+            })
+        {
+            return false;
+        }
+        let Some((next_wall, next_clock)) = self.next else {
+            return false;
+        };
+        if clock.is_some() != next_clock.is_some() {
+            return false;
+        }
+        let bps = (u128::from(self.air_bps) * u128::from(self.share_percent) / 100).max(1);
+        let cost = ((u128::from(self.ordinary_owner_bytes) + u128::from(self.overhead_bytes))
+            * 8000)
+            .div_ceil(bps) as u64;
+        match (clock, next_clock) {
+            (Some(now), Some(next)) => next.checked_sub(cost).is_some_and(|start| now >= start),
+            _ => next_wall
+                .checked_sub(Duration::from_millis(cost))
+                .is_some_and(|start| wall >= start),
+        }
+    }
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn ready_for_command_batch(
+        &self,
+        wall: Instant,
+        clock: Option<u64>,
+        ids: &[u64],
+        bytes: usize,
+    ) -> bool {
+        if ids.is_empty() || ids.iter().any(|id| self.replayed_command(*id)) {
+            return self.ready(wall, clock) && Self::reached(self.next_packet, wall, clock);
+        }
+        self.ready_for_command(wall, clock, ids[0], bytes, true)
+    }
     pub(crate) fn replayed_command(&self, id: u64) -> bool {
         self.promotion_contracts[..usize::from(self.promotion_contract_count)]
-            .iter().position(|stored| *stored == id)
-            .is_some_and(|slot| self.promotion_flags & (1 << slot) != 0)
+            .iter()
+            .position(|stored| *stored == id)
+            .is_some_and(|slot| (self.promotion_flags | self.spent_loan_flags) & (1 << slot) != 0)
     }
-    fn batch_tail_ready(&self, wall: Instant, clock: Option<u64>, id: u64, bytes: usize, canonical: bool) -> bool {
+    fn batch_tail_ready(
+        &self,
+        wall: Instant,
+        clock: Option<u64>,
+        id: u64,
+        bytes: usize,
+        canonical: bool,
+    ) -> bool {
         self.control_tail_ready(wall, clock, id, bytes, canonical, false)
     }
-    fn control_tail_ready(&self, wall: Instant, clock: Option<u64>, id: u64, bytes: usize, canonical: bool, receipt: bool) -> bool {
-        let Some((quiet, quiet_clock)) = self.next_packet else { return false; };
+    fn control_tail_ready(
+        &self,
+        wall: Instant,
+        clock: Option<u64>,
+        id: u64,
+        bytes: usize,
+        canonical: bool,
+        receipt: bool,
+    ) -> bool {
+        let Some((quiet, quiet_clock)) = self.next_packet else {
+            return false;
+        };
         let gap = u64::from(self.packet_gap_ms);
-        if !self.command_tail_open || (self.tail_kind == TailKind::Receipt) != receipt || !(2..=55).contains(&gap) { return false; }
-        let opened = (quiet - Duration::from_millis(gap), quiet_clock.map(|t| t.saturating_sub(gap)));
-        let until = (opened.0 + Duration::from_millis(gap / 2), opened.1.map(|t| t.saturating_add(gap / 2)));
-        let promoted_command = !receipt && self.promotion_contracts[..usize::from(self.promotion_contract_count)]
-            .contains(&id);
-        canonical && bytes > 0 && self.late_command_len > 0 && !promoted_command
-            && usize::from(self.late_command_len).checked_add(bytes)
+        if !self.command_tail_open
+            || (self.tail_kind == TailKind::Receipt) != receipt
+            || !(2..=55).contains(&gap)
+        {
+            return false;
+        }
+        let opened = (
+            quiet - Duration::from_millis(gap),
+            quiet_clock.map(|t| t.saturating_sub(gap)),
+        );
+        let until = (
+            opened.0 + Duration::from_millis(gap / 2),
+            opened.1.map(|t| t.saturating_add(gap / 2)),
+        );
+        let promoted_command = !receipt
+            && self.promotion_contracts[..usize::from(self.promotion_contract_count)].contains(&id);
+        canonical
+            && bytes > 0
+            && self.late_command_len > 0
+            && !promoted_command
+            && usize::from(self.late_command_len)
+                .checked_add(bytes)
                 .is_some_and(|total| total <= super::RADIO_COMMAND_BATCH_MAX_BYTES)
             && clock.is_some() == self.late_command_virtual
             && Self::reached(Some(opened), wall, clock)
             && !Self::reached(Some(until), wall, clock)
     }
-    pub(crate) fn ready_for_receipt(&self, wall: Instant, clock: Option<u64>, id: u64, bytes: usize) -> bool {
-        self.ready_for(wall, clock, true) || self.control_tail_ready(wall, clock, id, bytes, true, true)
+    pub(crate) fn ready_for_receipt(
+        &self,
+        wall: Instant,
+        clock: Option<u64>,
+        id: u64,
+        bytes: usize,
+    ) -> bool {
+        self.ready_for(wall, clock, true)
+            || self.completed_owner_control_ready(wall, clock, id, bytes, true, true)
+            || self.control_tail_ready(wall, clock, id, bytes, true, true)
     }
-    pub(crate) fn committed_receipt(&mut self, wall: Instant, clock: Option<u64>, id: u64, bytes: usize, accepted: usize, complete: bool) -> bool {
-        if accepted == 0 { return false; }
+    pub(crate) fn committed_receipt(
+        &mut self,
+        wall: Instant,
+        clock: Option<u64>,
+        id: u64,
+        bytes: usize,
+        accepted: usize,
+        complete: bool,
+    ) -> bool {
+        if accepted == 0 {
+            return false;
+        }
         let joined = self.control_tail_ready(wall, clock, id, bytes, true, true);
+        let owner_loan = !self.ready_for(wall, clock, true)
+            && !joined
+            && self.completed_owner_control_ready(wall, clock, id, bytes, true, true);
         self.committed(wall, clock, accepted);
-        if joined && complete && accepted == bytes { self.remember_promotion(id, true); }
+        if owner_loan {
+            self.remember_spent_loan(id, true);
+        }
+        if joined && complete && accepted == bytes {
+            self.remember_promotion(id, true);
+        }
         joined
     }
     /// One later canonical receipt can share the first receipt's already-open
     /// packet. A partial write consumes the slot; no new close credit is given.
     pub(crate) fn allow_single_receipt_tail(&mut self, id: u64, bytes: usize) {
         self.allow_single_command_tail(id, bytes);
-        if self.command_tail_open { self.tail_kind = TailKind::Receipt; }
+        if self.command_tail_open {
+            self.tail_kind = TailKind::Receipt;
+        }
     }
 
     /// A successful pair can accept its third command while the same modem
@@ -125,8 +306,11 @@ impl Capacity {
     /// Use only half the existing quiet gap (at most 27ms); the byte/frame
     /// limit and the separate UART stop-bit check still apply.
     pub(crate) fn allow_command_batch_tail(&mut self, ids: [u64; 2], bytes: usize) {
-        if ids[0] == ids[1] || bytes == 0 || bytes >= super::RADIO_COMMAND_BATCH_MAX_BYTES
-            || !(2..=55).contains(&self.packet_gap_ms) {
+        if ids[0] == ids[1]
+            || bytes == 0
+            || bytes >= super::RADIO_COMMAND_BATCH_MAX_BYTES
+            || !(2..=55).contains(&self.packet_gap_ms)
+        {
             return;
         }
         if let Some((_, clock)) = self.next_packet {
@@ -141,9 +325,11 @@ impl Capacity {
     /// was already written. Reserve only one continuation in that same packet;
     /// it consumes no extra close permit and cannot authorize a fresh pair.
     pub(crate) fn allow_single_command_tail(&mut self, id: u64, bytes: usize) {
-        if bytes == 0 || bytes >= super::RADIO_COMMAND_BATCH_MAX_BYTES
+        if bytes == 0
+            || bytes >= super::RADIO_COMMAND_BATCH_MAX_BYTES
             || !(2..=55).contains(&self.packet_gap_ms)
-            || !self.promotion_contracts[..usize::from(self.promotion_contract_count)].contains(&id) {
+            || !self.promotion_contracts[..usize::from(self.promotion_contract_count)].contains(&id)
+        {
             return;
         }
         if let Some((_, clock)) = self.next_packet {
@@ -197,11 +383,25 @@ impl Capacity {
         let batch_tail = self.batch_tail_ready(wall, clock, id, encoded_len, canonical_unsequenced);
         let late = self.late_sibling_ready(wall, clock, id, encoded_len, canonical_unsequenced);
         let admissible = self.ready_for(wall, clock, true);
+        let owner_loan =
+            !self.ready_for_existing_command(wall, clock, id, encoded_len, canonical_unsequenced)
+                && self.completed_owner_control_ready(
+                    wall,
+                    clock,
+                    id,
+                    encoded_len,
+                    canonical_unsequenced,
+                    false,
+                );
         self.committed(wall, clock, accepted);
+        if owner_loan {
+            self.remember_spent_loan(id, false);
+        }
         // Keep the existing first-loan semantics; historical IDs do not
         // create another slot in the current outstanding loan epoch.
-        if !batch_tail && !late
-            && admissible
+        if !batch_tail
+            && !late
+            && (admissible || owner_loan)
             && canonical_unsequenced
             && full_io_success
             && accepted == encoded_len
@@ -290,23 +490,33 @@ impl Capacity {
         }
         true
     }
-    fn remember_promotion(&mut self, id: u64, receipt: bool) {
-        let slot = self.promotion_contracts[..usize::from(self.promotion_contract_count)]
+    fn contract_slot(&mut self, id: u64) -> usize {
+        self.promotion_contracts[..usize::from(self.promotion_contract_count)]
             .iter()
             .position(|stored| *stored == id)
             .unwrap_or_else(|| {
                 let slot = usize::from(self.promotion_contract_cursor);
                 self.promotion_contracts[slot] = id;
-                self.promotion_flags &= !((1 << slot) | (1 << (slot + 4)));
+                let mask = (1 << slot) | (1 << (slot + 4));
+                self.promotion_flags &= !mask;
+                self.spent_loan_flags &= !mask;
                 self.promotion_contract_cursor = (self.promotion_contract_cursor + 1) % 4;
                 self.promotion_contract_count =
                     self.promotion_contract_count.saturating_add(1).min(4);
                 slot
-            });
+            })
+    }
+    fn remember_promotion(&mut self, id: u64, receipt: bool) {
+        let slot = self.contract_slot(id);
         self.promotion_flags |= 1 << (slot + if receipt { 4 } else { 0 });
+    }
+    fn remember_spent_loan(&mut self, id: u64, receipt: bool) {
+        let slot = self.contract_slot(id);
+        self.spent_loan_flags |= 1 << (slot + if receipt { 4 } else { 0 });
     }
     /// A single physical boundary serves the already-owned commands. Record
     /// every logical ID only when a boundary was actually promoted.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn close_command_batch<const N: usize>(
         &mut self,
         wall: Instant,
@@ -350,6 +560,19 @@ impl Capacity {
             .min(usize::MAX as u128) as usize
     }
 
+    /// Synchronous physical-writer certification, separate from fairness credit.
+    /// The caller holds the write lock and supplies full IO+drain success only
+    /// for eligible ordinary data or a whole retained legacy SETTINGS owner.
+    pub(crate) fn certify_completed_ordinary_owner(&mut self, framed_bytes: usize, complete: bool) {
+        self.completed_ordinary_owner = complete
+            && framed_bytes > 0
+            && !self.early_frame_outstanding
+            && usize::from(self.ordinary_owner_bytes) == framed_bytes;
+        if !self.completed_ordinary_owner {
+            self.ordinary_owner_bytes = 0;
+        }
+    }
+
     /// Bank actual completed ordinary airtime, capped at one 55ms idle gap.
     /// This never changes readiness, air debt, or the early-frame loan.
     pub(crate) fn note_successful_ordinary_service(&mut self, framed_bytes: usize) {
@@ -381,22 +604,53 @@ impl Capacity {
             std::env::var("GS_RRLS_ROLE").as_deref(),
             Ok("primary" | "rrls")
         ) || std::env::var("GS_RRLS_VOICE").as_deref() == Ok("1");
-        let default_share = if recovery { 25 } else { 40 };
+        Self::from_defaults(
+            uart_baud,
+            Defaults {
+                air_bps: 64_000,
+                overhead_bytes: 16,
+                packet_burst_ms: 100,
+                packet_gap_ms: 55,
+                host_share_percent: if recovery { 25 } else { 40 },
+            },
+        )
+    }
+    pub(crate) fn from_defaults(uart_baud: u32, defaults: Defaults) -> Self {
+        let default_share = defaults.host_share_percent;
         let configured_share = std::env::var("GS_RADIO_AIR_SHARE_PERCENT")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| (1..=100).contains(value));
         let mut capacity = Self::new(
-            bounded_env("GS_RADIO_AIR_BIT_RATE_BPS", 64_000, 1_200, 1_000_000),
+            bounded_env(
+                "GS_RADIO_AIR_BIT_RATE_BPS",
+                defaults.air_bps,
+                1_200,
+                1_000_000,
+            ),
             configured_share.unwrap_or(default_share),
-            bounded_env("GS_RADIO_AIR_FRAME_OVERHEAD_BYTES", 16, 0, 256),
+            bounded_env(
+                "GS_RADIO_AIR_FRAME_OVERHEAD_BYTES",
+                defaults.overhead_bytes,
+                0,
+                256,
+            ),
         );
         capacity.uart_baud = uart_baud.max(1);
-        capacity.packet_burst_ms =
-            u16::try_from(bounded_env("GS_RADIO_PACKET_BURST_MS", 100, 0, 500))
-                .expect("bounded burst fits u16");
-        capacity.packet_gap_ms = u16::try_from(bounded_env("GS_RADIO_PACKET_GAP_MS", 55, 0, 1_000))
-            .expect("bounded gap fits u16");
+        capacity.packet_burst_ms = u16::try_from(bounded_env(
+            "GS_RADIO_PACKET_BURST_MS",
+            defaults.packet_burst_ms,
+            0,
+            500,
+        ))
+        .expect("bounded burst fits u16");
+        capacity.packet_gap_ms = u16::try_from(bounded_env(
+            "GS_RADIO_PACKET_GAP_MS",
+            defaults.packet_gap_ms,
+            0,
+            1_000,
+        ))
+        .expect("bounded gap fits u16");
         capacity.default_share_percent = default_share;
         capacity.fixed_share = configured_share.is_some();
         capacity
@@ -410,9 +664,12 @@ impl Capacity {
             last_receipt_boundary: None,
             promotion_contracts: [0; 4],
             promotion_flags: 0,
+            spent_loan_flags: 0,
             promotion_contract_count: 0,
             promotion_contract_cursor: 0,
             early_frame_outstanding: false,
+            ordinary_owner_bytes: 0,
+            completed_ordinary_owner: false,
             late_command_id: 0,
             late_command_len: 0,
             late_command_virtual: false,
@@ -436,6 +693,13 @@ impl Capacity {
         wall: Instant,
         virtual_ms: Option<u64>,
     ) {
+        if self
+            .next
+            .is_some_and(|(_, clock)| clock.is_some() != virtual_ms.is_some())
+        {
+            self.completed_ordinary_owner = false;
+            self.ordinary_owner_bytes = 0;
+        }
         if self.fixed_share {
             return;
         }
@@ -467,6 +731,8 @@ impl Capacity {
             self.next = Some((next_wall, next_virtual));
         }
         if share != self.share_percent {
+            self.completed_ordinary_owner = false;
+            self.ordinary_owner_bytes = 0;
             self.late_command_len = 0;
             self.command_tail_open = false;
         }
@@ -515,6 +781,12 @@ impl Capacity {
         self.next_packet.and_then(|(_, virtual_ms)| virtual_ms)
     }
 
+    /// Read-only native-test ledger observation; never advances clocks/readiness.
+    #[cfg(test)]
+    pub(crate) fn next_air_virtual_ms(&self) -> Option<u64> {
+        self.next.and_then(|(_, value)| value)
+    }
+
     /// A physical tcdrain may complete later than its nominal wire duration.
     /// Anchor the quiet gap to actual completion; virtual time still follows
     /// the modeled 8N1 duration, independently of host scheduling delays.
@@ -527,6 +799,7 @@ impl Capacity {
 
     /// PTYs complete writes before their modeled UART drains. Preserve the
     /// same quiet interval as physical tcdrain, including accumulated lookahead.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn drained_virtual(&mut self, stop_us: u64) {
         let quiet_until = stop_us
             .div_ceil(1_000)
@@ -538,6 +811,40 @@ impl Capacity {
 
     /// One loan admission still charges every original frame's overhead and
     /// individual rounding. A failed prefix charges only frames actually begun.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn committed_canonical_command_batch<const N: usize>(
+        &mut self,
+        wall: Instant,
+        clock: Option<u64>,
+        lengths: [usize; N],
+        ids: [u64; N],
+        accepted: usize,
+    ) {
+        if accepted == 0 {
+            return;
+        }
+        let bytes = lengths
+            .iter()
+            .fold(0usize, |sum, len| sum.saturating_add(*len));
+        let owner_loan = !ids.iter().any(|id| self.replayed_command(*id))
+            && ids.first().is_some_and(|id| {
+                !self.ready_for_existing_command(wall, clock, *id, bytes, true)
+                    && self.completed_owner_control_ready(wall, clock, *id, bytes, true, false)
+            });
+        self.committed_command_batch(wall, clock, lengths, accepted);
+        if owner_loan {
+            let mut remaining = accepted;
+            for (id, length) in ids.into_iter().zip(lengths) {
+                if remaining == 0 {
+                    break;
+                }
+                if length > 0 {
+                    self.remember_spent_loan(id, false);
+                }
+                remaining = remaining.saturating_sub(length);
+            }
+        }
+    }
     pub(crate) fn committed_command_batch<const N: usize>(
         &mut self,
         wall: Instant,
@@ -548,7 +855,11 @@ impl Capacity {
         if accepted == 0 {
             return;
         }
-        let accepted = accepted.min(lengths.iter().fold(0usize, |total, &len| total.saturating_add(len)));
+        let accepted = accepted.min(
+            lengths
+                .iter()
+                .fold(0usize, |total, &len| total.saturating_add(len)),
+        );
         let cost = |bytes: usize| {
             if bytes == 0 {
                 0
@@ -580,6 +891,8 @@ impl Capacity {
         framed_bytes: usize,
     ) {
         if framed_bytes > 0 {
+            self.completed_ordinary_owner = false;
+            self.ordinary_owner_bytes = 0;
             self.late_command_len = 0;
             self.command_tail_open = false;
         }
@@ -624,6 +937,15 @@ impl Capacity {
             base_wall.checked_add(duration).unwrap_or(base_wall),
             base_virtual.map(|now| now.saturating_add(millis)),
         ));
+        // Paid, representable commits are candidates only. The synchronous
+        // full ordinary write+drain path must certify the exact byte count.
+        if framed_bytes > 0
+            && !self.early_frame_outstanding
+            && base_wall.checked_add(duration).is_some()
+            && base_virtual.is_none_or(|now| now.checked_add(millis).is_some())
+        {
+            self.ordinary_owner_bytes = u16::try_from(framed_bytes).unwrap_or(0);
+        }
     }
 }
 #[cfg(test)]
@@ -639,15 +961,33 @@ mod tests {
         cap.committed(wall, Some(35233), 59);
         cap.committed(wall, Some(35294), 150);
         cap.drained_virtual(35307021);
-        assert!(cap.ready_for(wall, Some(35344), true), "the fresh interactive loan remains available");
-        assert!(!cap.ready_for_command(wall, Some(35344), 11, 55, true), "a replay must not glue retries to the current ordinary packet");
-        assert!(!cap.ready_for_command(wall, Some(35360), 11, 55, true), "funded airtime alone does not prove modem idle");
+        assert!(
+            cap.ready_for(wall, Some(35344), true),
+            "the fresh interactive loan remains available"
+        );
+        assert!(
+            !cap.ready_for_command(wall, Some(35344), 11, 55, true),
+            "a replay must not glue retries to the current ordinary packet"
+        );
+        assert!(
+            !cap.ready_for_command(wall, Some(35360), 11, 55, true),
+            "funded airtime alone does not prove modem idle"
+        );
         assert!(cap.ready_for_command(wall, Some(35363), 11, 55, true));
-        assert!(cap.ready_for_command(wall, Some(35344), 13, 55, true), "new command admission is unchanged");
-        assert!(cap.ready_for_receipt(wall, Some(35344), 11, 63), "a returning owner receipt retains its independent permit");
+        assert!(
+            cap.ready_for_command(wall, Some(35344), 13, 55, true),
+            "new command admission is unchanged"
+        );
+        assert!(
+            cap.ready_for_receipt(wall, Some(35344), 11, 63),
+            "a returning owner receipt retains its independent permit"
+        );
         cap.committed_command(wall, Some(35363), (11, 55), true, 55, true);
         cap.drained_virtual(35367775);
-        assert!(!cap.ready_for_command(wall, Some(35390), 12, 61, true), "a second replay cannot extend that new physical packet either");
+        assert!(
+            !cap.ready_for_command(wall, Some(35390), 12, 61, true),
+            "a second replay cannot extend that new physical packet either"
+        );
     }
 
     #[test]
@@ -663,8 +1003,10 @@ mod tests {
         cap.allow_single_command_tail(1, 55);
         assert!(cap.ready_for_command(wall, Some(1008), 2, 55, true));
         assert!(!cap.ready_for_command(wall, Some(1036), 2, 55, true));
-        assert!(cap.ready_for_command(wall, Some(1063), 2, 55, true),
-            "an unused short window must retain the original post-gap loan");
+        assert!(
+            cap.ready_for_command(wall, Some(1063), 2, 55, true),
+            "an unused short window must retain the original post-gap loan"
+        );
         let boundary = cap.last_forced_boundary;
         assert!(cap.committed_command(wall, Some(1008), (2, 55), true, 55, true));
         assert_eq!(cap.last_forced_boundary, boundary);
@@ -791,10 +1133,16 @@ mod tests {
             let mut remaining = accepted;
             for length in [63, 55, 55] {
                 let prefix = remaining.min(length);
-                if prefix > 0 { reference.committed(wall, Some(0), prefix); }
+                if prefix > 0 {
+                    reference.committed(wall, Some(0), prefix);
+                }
                 remaining -= prefix;
             }
-            assert_eq!(batch.next.unwrap().1, reference.next.unwrap().1, "accepted={accepted}");
+            assert_eq!(
+                batch.next.unwrap().1,
+                reference.next.unwrap().1,
+                "accepted={accepted}"
+            );
         }
         let mut cap = Capacity::new(64_000, 15, 16);
         cap.committed(wall, Some(30_000), 21);
@@ -827,7 +1175,7 @@ mod tests {
         );
         assert!(!cap.ready(wall, Some(9146)));
         assert!(cap.ready(wall, Some(9147)));
-        assert!(9147_000 - wire.stop_us() >= 55_000);
+        assert!(9_147_000 - wire.stop_us() >= 55_000);
     }
 
     #[test]
@@ -1542,7 +1890,10 @@ mod command_batch_tail_tests {
         cap.committed_command(wall, Some(30002), (1, 55), true, 55, true);
         cap.drained_virtual(30007000);
         cap.allow_single_command_tail(1, 55);
-        assert!(!cap.command_tail_open, "unpromoted IO cannot grant a continuation");
+        assert!(
+            !cap.command_tail_open,
+            "unpromoted IO cannot grant a continuation"
+        );
         assert!(cap.close_packet_batch_for_contract(wall, Some(30002), Some((1, false))));
         cap.allow_single_command_tail(1, 55);
         assert!(!cap.ready_for_command(wall, Some(30006), 2, 62, true));
@@ -1564,7 +1915,10 @@ mod command_batch_tail_tests {
         assert!(!cap.ready_for(wall, Some(30018), true));
         assert!(cap.ready_for_command(wall, Some(30018), 3, 55, true));
         assert!(cap.committed_command(wall, Some(30018), (3, 55), true, 55, true));
-        assert_eq!(cap.next.unwrap().1, Some(previous_debt + (71u64 * 8000).div_ceil(9600)));
+        assert_eq!(
+            cap.next.unwrap().1,
+            Some(previous_debt + (71u64 * 8000).div_ceil(9600))
+        );
         assert_eq!(cap.last_forced_boundary, boundary);
         assert_eq!(cap.ordinary_service_credit_ms, credit);
         assert!(!cap.close_packet_batch_for_contract(wall, Some(30018), Some((3, false))));
@@ -1575,7 +1929,13 @@ mod command_batch_tail_tests {
     #[test]
     fn tail_never_extends_ids_metadata_bounds_or_clock_domains() {
         let (cap, wall) = pair();
-        for (id, bytes, canonical) in [(1, 55, true), (2, 55, true), (3, 0, true), (3, 75, true), (3, 55, false)] {
+        for (id, bytes, canonical) in [
+            (1, 55, true),
+            (2, 55, true),
+            (3, 0, true),
+            (3, 75, true),
+            (3, 55, false),
+        ] {
             assert!(!cap.ready_for_command(wall, Some(30018), id, bytes, canonical));
         }
         assert!(cap.ready_for_command(wall, Some(30018), 3, 74, true));
@@ -1588,13 +1948,19 @@ mod command_batch_tail_tests {
         for accepted in [0, 1, 54, 55] {
             let (mut cap, wall) = pair();
             let debt = cap.next.unwrap().1.unwrap();
-            assert_eq!(cap.committed_command(wall, Some(30018), (3, 55), true, accepted, false), accepted > 0);
+            assert_eq!(
+                cap.committed_command(wall, Some(30018), (3, 55), true, accepted, false),
+                accepted > 0
+            );
             if accepted == 0 {
                 assert_eq!(cap.next.unwrap().1, Some(debt));
                 assert!(cap.ready_for_command(wall, Some(30039), 3, 55, true));
                 assert!(!cap.ready_for_command(wall, Some(30040), 3, 55, true));
             } else {
-                assert_eq!(cap.next.unwrap().1, Some(debt + ((accepted as u64 + 16) * 8000).div_ceil(9600)));
+                assert_eq!(
+                    cap.next.unwrap().1,
+                    Some(debt + ((accepted as u64 + 16) * 8000).div_ceil(9600))
+                );
                 assert!(!cap.ready_for_command(wall, Some(30018), 4, 1, true));
             }
         }
@@ -1622,5 +1988,265 @@ mod command_batch_tail_tests {
         assert!(cap.ready_for_command(wall + Duration::from_millis(39), None, 3, 55, true));
         assert!(!cap.ready_for_command(wall + Duration::from_millis(40), None, 3, 55, true));
         assert!(!cap.ready_for_command(wall + Duration::from_millis(18), Some(30018), 3, 55, true));
+    }
+}
+
+#[cfg(test)]
+mod completed_owner_pilot_tests {
+    use super::*;
+    #[test]
+    fn legacy374_paid_owner_does_not_hold_fresh_command_until_650_minus155() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(32_000, 15, 16);
+        cap.committed(wall, Some(29_929), 374);
+        cap.drained_virtual(29_962_000);
+        cap.certify_completed_ordinary_owner(374, true);
+        assert_eq!(cap.next_air_virtual_ms(), Some(30_579));
+        assert!(!cap.ready_for(wall, Some(30_020), true));
+        assert!(
+            cap.ready_for_command(wall, Some(30_020), 0x3448f8465a7762b6, 55, true),
+            "fresh command must use one completed ordinary owner, preserving all650ms debt"
+        );
+    }
+}
+
+#[cfg(test)]
+mod completed_owner_invariants {
+    use super::*;
+    fn owner() -> (Capacity, Instant) {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(32_000, 15, 16);
+        cap.committed(wall, Some(29_929), 374);
+        cap.drained_virtual(29_962_000);
+        cap.certify_completed_ordinary_owner(374, true);
+        (cap, wall)
+    }
+    #[test]
+    fn full_exact_ordinary_certification_is_required() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(32_000, 15, 16);
+        cap.certify_completed_ordinary_owner(0, true);
+        assert!(!cap.completed_ordinary_owner);
+        cap.committed(wall, Some(29_929), 374);
+        cap.certify_completed_ordinary_owner(374, false);
+        assert!(
+            !cap.completed_ordinary_owner,
+            "drain error cannot certify full accepted bytes"
+        );
+        let mut cap = Capacity::new(32_000, 15, 16);
+        cap.committed(wall, Some(29_929), 8);
+        assert!(
+            !cap.completed_ordinary_owner,
+            "partial/error cannot certify itself"
+        );
+        cap.certify_completed_ordinary_owner(374, true);
+        assert!(!cap.completed_ordinary_owner, "wrong owner byte count");
+        let (mut cap, wall) = owner();
+        assert!(cap.completed_ordinary_owner);
+        cap.committed(wall, Some(30_020), 1);
+        assert!(!cap.completed_ordinary_owner);
+        cap.certify_completed_ordinary_owner(374, true);
+        assert!(
+            !cap.completed_ordinary_owner,
+            "stale completion cannot revive owner"
+        );
+    }
+    #[test]
+    fn fresh_control_consumes_one_owner_and_preserves_every_air_byte() {
+        let (mut cap, wall) = owner();
+        let before = cap.next_air_virtual_ms();
+        assert!(cap.ready_for_command(wall, Some(30_020), 1, 55, true));
+        assert!(cap.ready_for_command(wall, Some(30_020), 1, 55, true));
+        assert_eq!(
+            cap.next_air_virtual_ms(),
+            before,
+            "readiness is not consumption"
+        );
+        cap.committed_command(wall, Some(30_020), (1, 55), true, 55, true);
+        assert_eq!(cap.next_air_virtual_ms(), Some(30_698));
+        assert!(cap.early_frame_outstanding);
+        assert!(!cap.completed_ordinary_owner);
+        assert!(!cap.ready_for_command(wall, Some(30_020), 2, 55, true));
+        assert!(!cap.ready(wall, Some(30_697)));
+        assert!(cap.ready(wall, Some(30_698)));
+    }
+    #[test]
+    fn existing_155ms_and_noncanonical_paths_do_not_gain_a_permit() {
+        let (cap, wall) = owner();
+        assert!(!cap.ready_for(wall, Some(30_020), true));
+        assert!(!cap.ready_for_existing_command(wall, Some(30_020), 1, 55, true));
+        assert!(!cap.ready_for_command(wall, Some(30_020), 1, 55, false));
+        assert!(!cap.ready_for_command(wall, Some(30_020), 1, 193, true));
+        assert!(!cap.ready_for_command(wall, Some(30_020), 1, 0, true));
+    }
+    #[test]
+    fn queued_pair_is_one_permit_with_separate_original_overheads() {
+        let (mut cap, wall) = owner();
+        assert!(cap.ready_for_command_batch(wall, Some(30_020), &[1, 2], 116));
+        cap.committed_canonical_command_batch(wall, Some(30_020), [55, 61], [1, 2], 116);
+        assert_eq!(cap.next_air_virtual_ms(), Some(30_827));
+        assert!(cap.close_command_batch(wall, Some(30_020), [1, 2]));
+        assert!(cap.replayed_command(1) && cap.replayed_command(2));
+        assert!(!cap.ready_for_command_batch(wall, Some(30_021), &[3, 4], 116));
+    }
+    #[test]
+    fn prior_unpaid_loan_cannot_become_an_ordinary_owner() {
+        let (mut cap, wall) = owner();
+        cap.committed(wall, Some(30_020), 35);
+        cap.certify_completed_ordinary_owner(35, true);
+        assert!(!cap.completed_ordinary_owner);
+        assert!(!cap.ready_for_command(wall, Some(30_021), 2, 55, true));
+    }
+    #[test]
+    fn recent_command_and_receipt_history_still_prevents_fresh_reclassification() {
+        let (mut cap, wall) = owner();
+        assert!(cap.close_packet_batch_for_contract(wall, Some(29_930), Some((1, false))));
+        assert!(!cap.ready_for_command(wall, Some(30_020), 1, 55, true));
+        assert!(!cap.ready_for_command_batch(wall, Some(30_020), &[2, 1], 116));
+        assert!(cap.ready_for_receipt(wall, Some(30_020), 1, 63));
+        cap.close_packet_batch_for_contract(wall, Some(29_930), Some((1, true)));
+        assert!(!cap.completed_owner_control_ready(wall, Some(30_020), 1, 63, true, true));
+    }
+    #[test]
+    fn same_ack_for_multiowner_receipt_tail_is_charged_and_duplicates_eventually_send() {
+        let (mut cap, wall) = owner();
+        assert!(cap.ready_for_receipt(wall, Some(30_020), 7, 63));
+        cap.committed_receipt(wall, Some(30_020), 7, 63, 63, true);
+        assert!(cap.close_packet_batch_for_contract(wall, Some(30_020), Some((7, true))));
+        cap.allow_single_receipt_tail(7, 63);
+        assert!(
+            cap.ready_for_receipt(wall, Some(30_026), 7, 62),
+            "another owner of same command"
+        );
+        assert!(cap.committed_receipt(wall, Some(30_026), 7, 62, 62, true));
+        assert_eq!(cap.next_air_virtual_ms(), Some(30_841));
+        assert!(!cap.ready_for_receipt(wall, Some(30_027), 7, 62));
+        assert!(
+            cap.ready_for_receipt(wall, Some(30_841), 7, 62),
+            "late duplicate is paced, never dropped"
+        );
+    }
+    #[test]
+    fn positive_partial_spends_owner_zero_refusal_does_not_refund_or_reissue_it() {
+        let (mut cap, wall) = owner();
+        assert!(!cap.committed_command(wall, Some(30_020), (1, 55), true, 0, false));
+        assert!(cap.ready_for_command(wall, Some(30_020), 1, 55, true));
+        cap.committed_command(wall, Some(30_020), (1, 55), true, 1, false);
+        assert!(!cap.ready_for_command(wall, Some(30_020), 2, 55, true));
+        assert!(!cap.completed_ordinary_owner);
+        assert_eq!(cap.next_air_virtual_ms(), Some(30_608));
+    }
+    #[test]
+    fn share_domain_backwards_and_overflow_do_not_mint_owner_credit() {
+        let (mut cap, wall) = owner();
+        assert!(!cap.completed_owner_control_ready(wall, Some(29_928), 1, 55, true, false));
+        cap.apply_recovery_share(None, wall, None);
+        assert!(!cap.completed_ordinary_owner);
+        assert!(!cap.ready_for_command(wall, Some(30_020), 1, 55, true));
+        let (mut cap, wall) = owner();
+        cap.apply_recovery_share(Some(10), wall, Some(30_020));
+        assert!(!cap.completed_ordinary_owner);
+        let mut cap = Capacity::new(32_000, 15, 16);
+        cap.committed(wall, Some(u64::MAX - 20), 374);
+        cap.certify_completed_ordinary_owner(374, true);
+        assert!(
+            !cap.completed_ordinary_owner,
+            "saturated deadline cannot certify full owner cost"
+        );
+        let mut cap = Capacity::new(32_000, 15, 16);
+        cap.committed(wall, Some(0), usize::from(u16::MAX) + 1);
+        cap.certify_completed_ordinary_owner(usize::from(u16::MAX) + 1, true);
+        assert!(
+            !cap.completed_ordinary_owner,
+            "unrepresentable size stays on old path"
+        );
+    }
+}
+
+#[cfg(test)]
+mod owner_loan_spent_history_tests {
+    use super::*;
+    fn paid_owner() -> (Capacity, Instant) {
+        let wall = Instant::now();
+        let mut c = Capacity::new(32_000, 15, 16);
+        c.committed(wall, Some(29_929), 374);
+        c.drained_virtual(29_962_000);
+        c.certify_completed_ordinary_owner(374, true);
+        (c, wall)
+    }
+    #[test]
+    fn denied_close_does_not_refund_a_borrowed_command_contract() {
+        let (mut c, w) = paid_owner();
+        assert!(c.close_packet_batch_for_contract(w, Some(29_999), Some((99, false))));
+        assert!(c.ready_for_command(w, Some(30_020), 1, 55, true));
+        c.committed_command(w, Some(30_020), (1, 55), true, 55, true);
+        assert!(c.replayed_command(1), "spent even without a forced close");
+        assert!(!c.close_packet_batch_for_contract(w, Some(30_020), Some((1, false))));
+        c.committed(w, Some(30_700), 374);
+        c.certify_completed_ordinary_owner(374, true);
+        assert!(
+            !c.ready_for_command(w, Some(30_790), 1, 55, true),
+            "same retry is not fresh after another ordinary owner"
+        );
+        assert!(c.ready_for_command(w, Some(30_790), 2, 55, true));
+    }
+    #[test]
+    fn first_real_close_still_works_after_spent_loan_recording() {
+        let (mut c, w) = paid_owner();
+        c.committed_command(w, Some(30_020), (1, 55), true, 55, true);
+        assert!(c.replayed_command(1));
+        assert!(
+            c.close_packet_batch_for_contract(w, Some(30_020), Some((1, false))),
+            "air borrowing is not an already-used close permit"
+        );
+    }
+    #[test]
+    fn partial_batch_records_only_original_frames_actually_begun() {
+        let (mut c, w) = paid_owner();
+        c.committed_canonical_command_batch(w, Some(30_020), [55, 61], [1, 2], 1);
+        assert!(c.replayed_command(1));
+        assert!(!c.replayed_command(2));
+        assert_eq!(c.next_air_virtual_ms(), Some(30_608));
+    }
+    #[test]
+    fn receipt_spent_history_never_drops_another_owner_or_late_duplicate() {
+        let (mut c, w) = paid_owner();
+        c.close_packet_batch_for_contract(w, Some(29_999), Some((99, true)));
+        assert!(c.ready_for_receipt(w, Some(30_020), 1, 63));
+        c.committed_receipt(w, Some(30_020), 1, 63, 63, true);
+        assert!(!c.close_packet_batch_for_contract(w, Some(30_020), Some((1, true))));
+        c.committed(w, Some(30_800), 374);
+        c.certify_completed_ordinary_owner(374, true);
+        assert!(!c.completed_owner_control_ready(w, Some(30_890), 1, 63, true, true));
+        assert!(
+            c.ready_for_receipt(w, Some(31_450), 1, 63),
+            "same ack_for is paced, not discarded"
+        );
+    }
+}
+
+#[cfg(test)]
+mod completed_owner_quiet_phase_tests {
+    use super::*;
+    #[test]
+    fn new_permit_requires_existing_stopbit_quiet_without_changing_155ms_path() {
+        let w = Instant::now();
+        let mut c = Capacity::new(32_000, 15, 16);
+        c.committed(w, Some(29_929), 374);
+        c.drained_virtual(29_962_000);
+        c.certify_completed_ordinary_owner(374, true);
+        assert!(
+            c.packet_ready(w, Some(30_000)),
+            "old within-burst rule remains"
+        );
+        assert!(!c.ready_for_command(w, Some(30_000), 1, 55, true));
+        assert!(!c.ready_for_receipt(w, Some(30_016), 1, 63));
+        assert!(c.ready_for_command(w, Some(30_017), 1, 55, true));
+        assert!(c.ready_for_receipt(w, Some(30_017), 1, 63));
+        assert!(
+            !c.ready_for(w, Some(30_017), true),
+            "generic155ms loan is unchanged"
+        );
+        assert_eq!(c.next_air_virtual_ms(), Some(30_579));
     }
 }

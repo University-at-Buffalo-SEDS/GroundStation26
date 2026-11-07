@@ -51,6 +51,7 @@ impl RecordedReplayPlan {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(super) async fn validate_plan(
     state: &MediaState,
     plan: &mut RecordedReplayPlan,
@@ -137,6 +138,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
 fn no_store(value: impl Serialize) -> Response {
     ([(header::CACHE_CONTROL, "no-store")], Json(value)).into_response()
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn selected(state: &MediaState) -> ApiResult<(RecordedReplayPlan, serde_json::Value)> {
     let presentation = contract::read_presentation(state).await?;
     let plan = presentation
@@ -159,6 +161,7 @@ async fn selected(state: &MediaState) -> ApiResult<(RecordedReplayPlan, serde_js
     // separately normalizes model URLs into narrow media capabilities.
     Ok((plan, config))
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn page(
     State(state): State<Arc<MediaState>>,
     Query(query): Query<contract::MediaQuery>,
@@ -182,6 +185,7 @@ async fn page(
     )
         .into_response())
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn player_asset() -> ApiResult<Response> {
     let bytes = gs_browser_assets::asset_bytes("SAVED_REPLAY_PLAYER_JS")
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Replay player asset unavailable"))?;
@@ -189,6 +193,7 @@ async fn player_asset() -> ApiResult<Response> {
 }
 /// Expand only the selected saved flight, at most once per five seconds for all
 /// viewers together. Never silently jump into a later flight in the same file.
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn refresh_saved(state: &Arc<MediaState>) -> ApiResult<()> {
     let presentation = contract::read_presentation(state).await?;
     let Some(plan) = presentation.broadcast.recorded_replay else {
@@ -248,6 +253,7 @@ async fn refresh_saved(state: &Arc<MediaState>) -> ApiResult<()> {
     ));
     Ok(())
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn scene_state(
     State(state): State<Arc<MediaState>>,
     Query(query): Query<contract::MediaQuery>,
@@ -272,11 +278,10 @@ fn requested_types(config: &serde_json::Value) -> Vec<String> {
     fn visit(value: &serde_json::Value, out: &mut BTreeSet<String>) {
         match value {
             serde_json::Value::Object(values) => {
-                if let Some(ty) = values.get("data_type").and_then(|v| v.as_str()) {
-                    if !ty.is_empty() && ty.len() <= 128 {
+                if let Some(ty) = values.get("data_type").and_then(|v| v.as_str())
+                    && !ty.is_empty() && ty.len() <= 128 {
                         out.insert(ty.to_owned());
                     }
-                }
                 for value in values.values() {
                     visit(value, out);
                 }
@@ -292,6 +297,7 @@ fn requested_types(config: &serde_json::Value) -> Vec<String> {
     visit(config, &mut types);
     types.into_iter().collect()
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn window(
     State(state): State<Arc<MediaState>>,
     Query(query): Query<contract::MediaQuery>,
@@ -340,6 +346,7 @@ struct TrajectoryQuery {
     recording_id: String,
     upper_id: i64,
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn trajectory(
     State(state): State<Arc<MediaState>>,
     Query(query): Query<contract::MediaQuery>,
@@ -355,11 +362,10 @@ async fn trajectory(
         ));
     }
     let mut cache = state.recorded_vehicle_cache.lock().await;
-    if let Some((id, upper, value)) = &cache.track {
-        if id == &plan.recording_id && *upper == plan.upper_id {
+    if let Some((id, upper, value)) = &cache.track
+        && id == &plan.recording_id && *upper == plan.upper_id {
             return Ok(no_store(value.clone()));
         }
-    }
     let value = recording_replay::saved_trajectory(&state.app, &plan.recording_id, plan.upper_id)
         .await
         .map_err(|_| {
@@ -416,6 +422,7 @@ mod tests {
             hls_segments: Mutex::new(Default::default()),
             preview_sessions: Mutex::new(Vec::new()),
             publishers: Mutex::new(Vec::new()),
+            publish_offer: Mutex::new(()),
             transcoding: Mutex::default(),
             recorded_vehicle_cache: Mutex::new(Default::default()),
         })

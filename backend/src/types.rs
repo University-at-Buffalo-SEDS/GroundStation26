@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum TelemetryCommand {
+    #[serde(skip)]
+    #[cfg_attr(not(feature="hitl_mode"), expect(dead_code, reason="Only HITL ingress constructs this non-serializable intent"))]
+    OperatorPhase { intent: crate::operator_phase::Intent },
     Postinit,
     Launch,
     Dump,
@@ -39,6 +42,14 @@ pub enum TelemetryCommand {
     ToggleGroundStationControl,
     #[cfg(feature = "hitl_mode")]
     ToggleLaunchInterlock,
+    #[cfg(feature = "hitl_mode")]
+    TogglePlumbingDelayInterlock,
+    #[cfg(feature = "hitl_mode")]
+    ToggleChecklistInterlock,
+    #[cfg(feature = "hitl_mode")]
+    ToggleSupplyInterlock,
+    #[cfg(feature = "hitl_mode")]
+    ToggleBoardStateProofInterlock,
     #[cfg(feature = "hitl_mode")]
     TogglePhysicalLaunchMode,
     ToggleAvBayUnderglow,
@@ -83,34 +94,70 @@ pub enum TelemetryCommand {
     #[cfg(feature = "hitl_mode")]
     ReinitAfter50,
     StartFill,
+    /// Retained pre-auth Fill admission; never accepted from a client.
+    #[serde(skip)]
+    FillWithRecording {
+        origin: std::sync::Arc<crate::fill_recording::Origin>,
+    },
     PauseFill,
     CancelFill,
     ValveSelfTest,
     NitrogenTest,
+    Turbocharge,
+    /// Original physical EDGE identity only; never deserialized from a client.
+    #[serde(skip)]
+    ColdFlowPanelRelease {
+        key: crate::sequence_progress::RunKey,
+        generation: u64,
+        awaiting_at_edge: bool,
+    },
     /// Internal producer intent; never accepted as a client command.
     #[serde(skip)]
-    AutomaticAbort,
+    // Production SafetyTask uses direct claimed TX; retain this queued-intent
+    // boundary for its real-worker regression without adding production delay.
+    #[cfg_attr(not(test), allow(dead_code))]
+    AutomaticAbort {
+        generation: u64,
+    },
+    /// Authenticated server admission envelope; never accepted from a client.
+    #[serde(skip)]
+    QueuedOperator {
+        recovery_origin: Option<crate::operator_queue::manual_origin::Origin>,
+        generation: u64,
+        launch_revision: Option<u64>,
+        command: Box<TelemetryCommand>,
+        plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+    },
+    #[serde(skip)]
+    AutomaticNitrogenClose {
+        generation: u64,
+    },
+    #[serde(skip)]
+    AutomaticNitrousClose {
+        generation: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 #[repr(u8)]
 pub enum FlightState {
-    Startup,
-    Idle,
-    PreFill,
-    FillTest,
-    NitrogenFill,
-    NitrousFill,
-    Armed,
-    Launch,
-    Ascent,
-    Coast,
-    Apogee,
-    ParachuteDeploy,
-    Descent,
-    Landed,
-    Recovery,
-    Aborted,
+    Startup = 0,
+    Idle = 1,
+    PreFill = 2,
+    FillTest = 3,
+    NitrogenFill = 4,
+    NitrousFill = 5,
+    Armed = 6,
+    Launch = 7,
+    Ascent = 8,
+    Coast = 9,
+    Apogee = 10,
+    #[serde(alias = "ParachuteDeploy")]
+    Descent = 11,
+    Reefing = 12,
+    Landed = 13,
+    Recovery = 14,
+    Aborted = 15,
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -266,8 +313,27 @@ pub struct NetworkTopologyLink {
     pub status: NetworkTopologyStatus,
 }
 
+/// Application-level DAQ SD journal acknowledgement, independently aged.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
+pub struct DaqLaunchLogStatus {
+    pub session: u64,
+    pub deadline_utc_ms: u64,
+    pub revision: u64,
+    pub flags: u32,
+    pub received_age_ms: u64,
+    pub matches_expected: Option<bool>,
+    pub expected_session: Option<u64>,
+    pub expected_deadline_utc_ms: Option<u64>,
+    pub expected_revision: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
 pub struct BoardDiagnostics {
+    /// Internal MCU die temperature, not ambient. Absent on older firmware.
+    #[serde(default)]
+    pub die_temperature_centi_c: Option<i32>,
+    #[serde(default)]
+    pub die_temperature_sample_age_ms: u32,
     pub version: u32,
     pub received_age_ms: u64,
     pub uptime_ticks: u64,
@@ -291,10 +357,36 @@ pub struct BoardDiagnostics {
     pub sd_max_write_ms: Option<u32>,
     pub adc_overruns: Option<u32>,
     pub diagnostic_send_failures: u32,
+    /// DAQ-only SD companion report. Missing on older firmware/other boards.
+    #[serde(default)]
+    pub sd_status_received_age_ms: Option<u64>,
+    #[serde(default)]
+    pub sd_flags: Option<u32>,
+    #[serde(default)]
+    pub sd_last_write_age_ms: Option<u32>,
+    #[serde(default)]
+    pub sd_last_flush_age_ms: Option<u32>,
+    #[serde(default)]
+    pub sd_init_stage: Option<u32>,
+    #[serde(default)]
+    pub sd_retry_count: Option<u32>,
+    #[serde(default)]
+    pub sd_retry_requested_token: Option<u32>,
+    #[serde(default)]
+    pub sd_retry_completed_token: Option<u32>,
+    #[serde(default)]
+    pub sd_init_failures: Option<u32>,
+    #[serde(default)]
+    pub launch_log: Option<DaqLaunchLogStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
 pub struct NetworkBoardHealthEntry {
+    /// Host CPU/package sensor; unsupported platforms report unavailable.
+    #[serde(default)]
+    pub cpu_temperature_centi_c: Option<i32>,
+    #[serde(default)]
+    pub cpu_temperature_age_ms: u64,
     #[serde(default)]
     pub diagnostics: Option<BoardDiagnostics>,
     pub sender_id: String,
@@ -342,8 +434,8 @@ pub fn u8_to_flight_state(value: u8) -> Option<FlightState> {
         8 => Some(FlightState::Ascent),
         9 => Some(FlightState::Coast),
         10 => Some(FlightState::Apogee),
-        11 => Some(FlightState::ParachuteDeploy),
-        12 => Some(FlightState::Descent),
+        11 => Some(FlightState::Descent),
+        12 => Some(FlightState::Reefing),
         13 => Some(FlightState::Landed),
         14 => Some(FlightState::Recovery),
         15 => Some(FlightState::Aborted),
@@ -351,13 +443,115 @@ pub fn u8_to_flight_state(value: u8) -> Option<FlightState> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Application phase names corresponding to the FC's global-state wire bytes.
+pub(crate) const FLIGHT_PHASE_VERSION: u8 = 1;
+
+pub(crate) fn canonical_phase_key(phase: &str, version: u8) -> &str {
+    if phase.eq_ignore_ascii_case("ParachuteDeploy") {
+        "Descent"
+    } else if version == 0 && phase.eq_ignore_ascii_case("Descent") {
+        "Reefing"
+    } else {
+        phase
+    }
+}
+
+/// Preserve the wire meaning of phase-indexed settings written by older GS
+/// builds. Validate the complete replacement before changing the caller's map.
+pub(crate) fn normalize_phase_map<T: Clone>(
+    phases: &mut std::collections::BTreeMap<String, T>,
+    version: u8,
+) -> Result<(), &'static str> {
+    if version > FLIGHT_PHASE_VERSION {
+        return Err("Unsupported flight phase version");
+    }
+    let mut next = std::collections::BTreeMap::new();
+    for (phase, value) in phases.iter() {
+        if next
+            .insert(
+                canonical_phase_key(phase, version).to_owned(),
+                value.clone(),
+            )
+            .is_some()
+        {
+            return Err("Conflicting legacy and current flight phase names");
+        }
+    }
+    *phases = next;
+    Ok(())
+}
+
+#[cfg(test)]
+mod flight_state_wire_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn every_wire_state_matches_the_captured_fc_producer_contract() {
+        let contract: serde_json::Value =
+            serde_json::from_str(include_str!("test-fixtures/fc-global-state-contract.json"))
+                .unwrap();
+        for (wire, expected) in contract["global_states"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            let state = u8_to_flight_state(wire as u8).unwrap();
+            assert_eq!(state as usize, wire);
+            assert_eq!(serde_json::to_value(state).unwrap(), *expected);
+        }
+        assert_eq!(u8_to_flight_state(16), None);
+        assert_eq!(u8_to_flight_state(255), None);
+        let legacy: FlightState = serde_json::from_str("\"ParachuteDeploy\"").unwrap();
+        assert_eq!(legacy, FlightState::Descent);
+        assert_eq!(legacy as u8, 11);
+    }
+
+    #[test]
+    fn legacy_phase_settings_preserve_numeric_meaning_without_repeated_migration() {
+        let mut phases = BTreeMap::from([("ParachuteDeploy".into(), 11), ("Descent".into(), 12)]);
+        normalize_phase_map(&mut phases, 0).unwrap();
+        assert_eq!(
+            phases,
+            BTreeMap::from([("Descent".into(), 11), ("Reefing".into(), 12)])
+        );
+        let migrated = phases.clone();
+        normalize_phase_map(&mut phases, FLIGHT_PHASE_VERSION).unwrap();
+        assert_eq!(phases, migrated);
+        let mut conflict = BTreeMap::from([("Descent".into(), 1), ("Reefing".into(), 2)]);
+        let original = conflict.clone();
+        assert!(normalize_phase_map(&mut conflict, 0).is_err());
+        assert_eq!(conflict, original);
+        assert!(normalize_phase_map(&mut conflict, 2).is_err());
+        assert_eq!(conflict, original);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TelemetryRow {
     pub timestamp_ms: i64,
     pub data_type: String,
     #[serde(default)]
     pub sender_id: String,
     pub values: Vec<Option<f32>>,
+}
+
+impl Serialize for TelemetryRow {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let source = crate::telemetry_provenance::source(self);
+        let mut row =
+            serializer.serialize_struct("TelemetryRow", if source.is_some() { 5 } else { 4 })?;
+        row.serialize_field("timestamp_ms", &self.timestamp_ms)?;
+        row.serialize_field("data_type", &self.data_type)?;
+        row.serialize_field("sender_id", &self.sender_id)?;
+        row.serialize_field("values", &self.values)?;
+        if let Some(source) = source {
+            row.serialize_field("source_timestamp_ms", &source)?;
+        }
+        row.end()
+    }
 }
 
 /// Ground Station router counters, sampled before WebSocket batching.
@@ -376,4 +570,15 @@ pub struct NetworkTrafficSide {
     pub totals: NetworkTopologyStats,
     /// Absent until two samples exist, or if the side/counters reset.
     pub delta: Option<NetworkTopologyStats>,
+}
+
+impl TelemetryCommand {
+    pub(crate) fn automatic_generation(&self) -> Option<u64> {
+        match self {
+            Self::AutomaticAbort { generation }
+            | Self::AutomaticNitrogenClose { generation }
+            | Self::AutomaticNitrousClose { generation } => Some(*generation),
+            _ => None,
+        }
+    }
 }

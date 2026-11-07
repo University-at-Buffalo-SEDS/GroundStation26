@@ -21,6 +21,7 @@ use std::{
 
 const HEADER: &str =
     "id,received_timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json\r\n";
+const RESOLVED_HEADER: &str = "id,received_timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json,canonical_utc_ms,provenance_json\r\n";
 const PAGE_SIZE: i64 = 512;
 
 #[derive(Serialize)]
@@ -32,7 +33,12 @@ struct Recording {
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/api/recordings/{id}/sd/imports", axum::routing::post(crate::recording_sd::init).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024)))
+        .route("/api/recordings/{id}/sd/imports/{token}", axum::routing::put(crate::recording_sd::upload).delete(crate::recording_sd::cancel).layer(axum::extract::DefaultBodyLimit::disable()))
+        .route("/api/recordings/{id}/sd/sources",get(crate::recording_sd::sources))
+        .route("/api/recordings/{id}/sd/sources/{sha}",get(crate::recording_sd::raw_source))
         .route("/api/recordings", get(list))
+        .route("/api/recordings/{id}/replay/export", get(crate::recording_replay::export))
         .route(
             "/api/recordings/{id}/replay",
             get(crate::recording_replay::snapshot),
@@ -137,15 +143,14 @@ async fn list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respons
         if !valid_id(&id) {
             continue;
         }
-        if let Ok(meta) = tokio::fs::symlink_metadata(entry.path()).await {
-            if meta.is_file() && !meta.file_type().is_symlink() {
+        if let Ok(meta) = tokio::fs::symlink_metadata(entry.path()).await
+            && meta.is_file() && !meta.file_type().is_symlink() {
                 recordings.push(Recording {
                     active: active.as_deref() == Some(&id),
                     id,
                     bytes: meta.len(),
                 });
             }
-        }
     }
     recordings.sort_by(|a, b| b.id.cmp(&a.id));
     recording_list_response(recordings)
@@ -198,6 +203,7 @@ async fn download(
                 .into_response();
         }
     };
+    if crate::recording_sd::activate_resolved(&db).await.is_err() { return StatusCode::UNPROCESSABLE_ENTITY.into_response(); }
     let upper = match sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(id), 0) FROM telemetry")
         .fetch_one(&db)
         .await
@@ -212,9 +218,11 @@ async fn download(
                 .into_response();
         }
     };
+    let resolved=sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM main.sqlite_master WHERE name='sd_replay_telemetry'").fetch_one(&db).await.unwrap_or(0)>0;
+    let csv_header=if resolved {RESOLVED_HEADER}else{HEADER};
     let body = stream::try_unfold((db, 0i64, false), move |(db, last, started)| async move {
         if !started {
-            return Ok::<_, std::io::Error>(Some((HEADER.to_owned(), (db, last, true))));
+            return Ok::<_, std::io::Error>(Some((csv_header.to_owned(), (db, last, true))));
         }
         let (chunk, next) = csv_page(&db, last, upper)
             .await
@@ -251,6 +259,22 @@ pub(crate) fn text_cell(value: &str) -> String {
 }
 
 async fn csv_page(db: &SqlitePool, last: i64, upper: i64) -> Result<(String, i64), sqlx::Error> {
+    let resolved=sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM main.sqlite_master WHERE name='sd_replay_telemetry'").fetch_one(db).await?>0;
+    if resolved {
+        let rows=sqlx::query("SELECT id,timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json,provenance_json FROM main.sd_replay_telemetry WHERE id>? AND id<=? ORDER BY id LIMIT ?").bind(last).bind(upper).bind(PAGE_SIZE).fetch_all(db).await?;
+        let mut csv=String::new();let mut next=last;
+        for row in rows {
+            next=row.try_get("id")?;let provenance:String=row.try_get("provenance_json")?;
+            let parsed:serde_json::Value=serde_json::from_str(&provenance).unwrap_or_default();
+            let cells=vec![next.to_string(),parsed["received_timestamp_ms"].as_i64().map(|v|v.to_string()).unwrap_or_default(),
+                row.try_get::<Option<i64>,_>("source_timestamp_ms")?.map(|v|v.to_string()).unwrap_or_default(),
+                text_cell(&row.try_get::<Option<String>,_>("sender_id")?.unwrap_or_default()),text_cell(&row.try_get::<String,_>("data_type")?),
+                text_cell(&row.try_get::<Option<String>,_>("values_json")?.unwrap_or_default()),text_cell(&row.try_get::<Option<String>,_>("payload_json")?.unwrap_or_default()),
+                row.try_get::<i64,_>("timestamp_ms")?.to_string(),text_cell(&provenance)];
+            csv.push_str(&cells.join(","));csv.push_str("\r\n");
+        }
+        return Ok((csv,next));
+    }
     let rows = sqlx::query("SELECT id, timestamp_ms, source_timestamp_ms, sender_id, data_type, values_json, payload_json FROM telemetry WHERE id > ? AND id <= ? ORDER BY id LIMIT ?")
         .bind(last).bind(upper).bind(PAGE_SIZE).fetch_all(db).await?;
     let mut chunk = String::new();
@@ -431,6 +455,28 @@ pub(crate) mod tests {
         assert_eq!(text_cell("=SUM(A1)"), "\"\x27=SUM(A1)\"");
         assert_eq!(text_cell("[0.001,-570,null]"), "\"[0.001,-570,null]\"");
     }
+    #[tokio::test]
+    async fn chamber_pressure_export_preserves_units_channels_and_both_clocks() {
+        let db = crate::telemetry_db::open_in_memory_telemetry_db()
+            .await
+            .unwrap();
+        for (kind, value) in [
+            ("COMBUSTION_CHAMBER_PRESSURE", "[1000.0]"),
+            ("COMBUSTION_CHAMBER_VOLTAGE", "[5.0]"),
+        ] {
+            sqlx::query("INSERT INTO telemetry(timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json) VALUES(123456,98765,'DAQ',?,?,'[0,1,2,3]')")
+                .bind(kind).bind(value).execute(&db).await.unwrap();
+        }
+        let (csv, _) = csv_page(&db, 0, 2).await.unwrap();
+        assert!(csv.contains("123456,98765"));
+        assert!(csv.contains("DAQ"));
+        assert!(csv.contains("COMBUSTION_CHAMBER_PRESSURE"));
+        assert!(csv.contains("COMBUSTION_CHAMBER_VOLTAGE"));
+        assert!(csv.contains("[1000.0]"));
+        assert!(csv.contains("[5.0]"));
+        db.close().await;
+    }
+
     #[tokio::test]
     async fn nullable_metadata_and_empty_recordings_export_cleanly() {
         let db = crate::telemetry_db::open_in_memory_telemetry_db()

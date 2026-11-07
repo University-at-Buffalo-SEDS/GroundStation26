@@ -23,10 +23,20 @@ pub enum SerialProtocol {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SerialLinkConfig {
     pub port: String,
+    /// Enable only when RTS/CTS are wired and enabled on the attached modem.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hardware_flow_control: bool,
+    /// Optional persisted matched profile; defaults are embedded at build time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rfd_profile: Option<PathBuf>,
     #[serde(default = "default_baud_rate")]
     pub baud_rate: usize,
     #[serde(default = "default_serial_protocol")]
     pub protocol: SerialProtocol,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -226,6 +236,8 @@ impl Default for CommsLinksConfig {
             version: default_config_version(),
             av_bay: CommsLinkConfig::Serial {
                 serial: SerialLinkConfig {
+                    hardware_flow_control: false,
+                    rfd_profile: None,
                     port: ROCKET_COMMS_PORT.to_string(),
                     baud_rate: default_av_bay_baud_rate(),
                     protocol: SerialProtocol::RawUart,
@@ -289,16 +301,17 @@ fn default_for_role(rrls: bool) -> CommsLinksConfig {
     if rrls {
         config.fill_box = CommsLinkConfig::Serial {
             serial: SerialLinkConfig {
+                hardware_flow_control: false,
+                rfd_profile: None,
                 port: "unused".into(),
                 baud_rate: 115200,
                 protocol: SerialProtocol::RawUart,
             },
         };
-        if cfg!(target_os = "macos") {
-            if let CommsLinkConfig::Serial { serial } = &mut config.av_bay {
+        if cfg!(target_os = "macos")
+            && let CommsLinkConfig::Serial { serial } = &mut config.av_bay {
                 serial.port = "/dev/cu.RRLS-radio".into();
             }
-        }
     }
     config
 }
@@ -338,16 +351,14 @@ pub fn load_or_default() -> CommsLinksConfig {
             default_for_role(crate::rrls::is_rrls())
         }
     };
-    if crate::rrls::is_rrls() {
-        if let Ok(port) = std::env::var("GS_RRLS_RADIO_PORT") {
-            if !port.trim().is_empty() {
+    if crate::rrls::is_rrls()
+        && let Ok(port) = std::env::var("GS_RRLS_RADIO_PORT")
+            && !port.trim().is_empty() {
                 apply_simulator_serial_override(&mut config.av_bay, port, 115200);
                 if let Err(error) = save(&config) {
                     eprintln!("WARNING: cannot save RRLS radio settings: {error}");
                 }
             }
-        }
-    }
     apply_simulator_serial_overrides(&mut config);
     log::info!(
         "{} communications config: {}; radio: {}",
@@ -363,8 +374,8 @@ pub fn load_or_default() -> CommsLinksConfig {
 }
 
 fn apply_simulator_serial_overrides(config: &mut CommsLinksConfig) {
-    if std::env::var("GS_SIMULATED_SERIAL_PTY").as_deref() == Ok("1") {
-        if let Ok(address) = std::env::var("GS_FILL_PICO_TCP_ADDRESS") {
+    if std::env::var("GS_SIMULATED_SERIAL_PTY").as_deref() == Ok("1")
+        && let Ok(address) = std::env::var("GS_FILL_PICO_TCP_ADDRESS") {
             config.fill_box = CommsLinkConfig::PicoFiTcp {
                 tcp: PicoFiTcpConfig {
                     discovery: false,
@@ -376,7 +387,6 @@ fn apply_simulator_serial_overrides(config: &mut CommsLinksConfig) {
                 },
             };
         }
-    }
     if std::env::var("GS_SIMULATED_SERIAL_PTY").as_deref() == Ok("1")
         && let Ok(port) = std::env::var("GS_FILL_PICO_DISCOVERY_PORT")
         && let Ok(port) = port.parse::<u16>()
@@ -424,6 +434,8 @@ fn apply_simulator_serial_override(
             *link = CommsLinkConfig::Serial {
                 serial: SerialLinkConfig {
                     port,
+                    hardware_flow_control: false,
+                    rfd_profile: None,
                     baud_rate: fallback_baud_rate,
                     protocol: SerialProtocol::RawUart,
                 },
@@ -547,6 +559,26 @@ fn ensure_serial_protocol(link: &mut serde_json::Value, protocol: SerialProtocol
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn serial_hardware_flow_control_is_explicit_and_old_configs_keep_their_shape() {
+        let old = r#"{"port":"/dev/radio","baud_rate":115200,"protocol":"raw_uart"}"#;
+        let mut config: super::SerialLinkConfig = serde_json::from_str(old).unwrap();
+        assert!(!config.hardware_flow_control);
+        assert!(
+            serde_json::to_value(&config)
+                .unwrap()
+                .get("hardware_flow_control")
+                .is_none()
+        );
+        config.hardware_flow_control = true;
+        let saved = serde_json::to_value(&config).unwrap();
+        assert_eq!(saved["hardware_flow_control"], true);
+        assert_eq!(
+            serde_json::from_value::<super::SerialLinkConfig>(saved).unwrap(),
+            config
+        );
+    }
+
     use super::{
         CanLinkConfig, CommsLinkConfig, CommsLinksConfig, I2cLinkConfig, SerialLinkConfig,
         SerialProtocol, SpiLinkConfig, apply_simulator_serial_override, default_for_role,
@@ -608,6 +640,8 @@ mod tests {
             cfg.av_bay,
             CommsLinkConfig::Serial {
                 serial: SerialLinkConfig {
+                    hardware_flow_control: false,
+                    rfd_profile: None,
                     port: "/dev/ttyAMA0".to_string(),
                     baud_rate: 115_200,
                     protocol: SerialProtocol::RawUart,

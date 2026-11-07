@@ -37,6 +37,41 @@
     {
       "name": "AV_BAY_UNDERGLOW_OWNER",
       "doc": "Boards that own the persistent avionics-bay underglow variable"
+    },
+    {
+      "name": "BOARD_RECOVERY_AB",
+      "id": 2000,
+      "doc": "Dedicated explicit board query/recovery endpoint; never a legacy command endpoint."
+    },
+    {
+      "name": "BOARD_RECOVERY_VB",
+      "id": 2001,
+      "doc": "Dedicated explicit board query/recovery endpoint; never a legacy command endpoint."
+    },
+    {
+      "name": "BOARD_RECOVERY_RF",
+      "id": 2002,
+      "doc": "Dedicated explicit board query/recovery endpoint; never a legacy command endpoint."
+    },
+    {
+      "name": "BOARD_RECOVERY_FC",
+      "id": 2003,
+      "doc": "Dedicated explicit board query/recovery endpoint; never a legacy command endpoint."
+    },
+    {
+      "name": "BOARD_RECOVERY_PB",
+      "id": 2004,
+      "doc": "Dedicated explicit board query/recovery endpoint; never a legacy command endpoint."
+    },
+    {
+      "name": "BOARD_RECOVERY_GB",
+      "id": 2005,
+      "doc": "Dedicated explicit board query/recovery endpoint; never a legacy command endpoint."
+    },
+    {
+      "name": "BOARD_RECOVERY_DAQ",
+      "id": 2006,
+      "doc": "Dedicated explicit board query/recovery endpoint; never a legacy command endpoint."
     }
   ],
   "types": [
@@ -644,7 +679,7 @@
     },
     {
       "name": "DAQ_LOG_CLOCK",
-      "doc": "Retained DAQ session ID and T+120s close deadline, two little-endian u64 values; zeros reset recording.",
+      "doc": "Retained DAQ session ID and T+20s close deadline, two little-endian u64 values; zeros reset recording.",
       "reliable": "Ordered",
       "priority": 16,
       "class": "Data",
@@ -800,6 +835,157 @@
         "kind": "Static",
         "data_type": "UInt32",
         "count": 24
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable": "Off",
+      "priority": 0
+    },
+    {
+      "name": "DAQ_LOADCELL_CHAMBER",
+      "doc": "One KG1000 network slot: [uncalibrated KG1000, OMEGA PX309-1KG5V chamber psig (connector V * 200), chamber connector volts]. Only fresh assigned pressure; no extra packet slot.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 3
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable": "Off",
+      "priority": 16
+    },
+    {
+      "name": "DAQ_SD_HEALTH",
+      "doc": "DAQ-only SD status companion: flags, write/flush ages, init stage/retry count, accepted/completed retry tokens and init failures; ages UINT32_MAX mean never.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt32",
+        "count": 8
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable": "Off",
+      "priority": 0
+    },
+    {
+      "name": "DAQ_SD_RETRY",
+      "doc": "One-shot nonzero manual SD reinitialization token; never a retained variable or a format request.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt32",
+        "count": 1
+      },
+      "endpoints": [
+        "SD_CARD"
+      ],
+      "reliable": "Unordered",
+      "priority": 240
+    },
+    {
+      "name": "DAQ_LAUNCH_LOG_STATUS",
+      "doc": "DAQ SD application acknowledgement: actual session/deadline and accepted clock revision as low/high UInt32 pairs, followed by storage flags; independent from transport delivery.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt32",
+        "count": 7
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable": "Off",
+      "priority": 0
+    },
+    {
+      "rust": "BoardRecoveryRequest",
+      "name": "BOARD_RECOVERY_REQUEST",
+      "id": 200,
+      "doc": "App-only manual query/recovery v1. Exact32LE bytes. Caller must supply exactly one explicit board endpoint; no broadcast default. Recovery requires current persisted boot generation, abort epoch, fresh primary request and issuer session.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 32
+      },
+      "endpoints": [],
+      "reliable": "Ordered",
+      "priority": 200
+    },
+    {
+      "rust": "BoardStateStatus",
+      "name": "BOARD_STATE_STATUS",
+      "id": 201,
+      "doc": "App-only recovery readback v1. Exact40LE bytes; echoed request nonce and issuer session, actual state/abort epoch and commanded GPIO/servo register mask. Not physical valve-position proof or protocolACK confirmation.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 40
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable": "Ordered",
+      "priority": 200
+    },
+    {
+      "name": "AB_FILL_DRIVE_SETTINGS",
+      "doc": "Explicit application drive QUERY/SET v1; exact32LE. Address ACTUATOR_BOARD explicitly. SET binds original timestamp, boot generation, abort epoch, nonce and primary issuer.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 32
+      },
+      "endpoints": [],
+      "reliable": "Ordered",
+      "priority": 200
+    },
+    {
+      "name": "AB_FILL_DRIVE_STATUS",
+      "doc": "Actual actuator drive setting and nonblocking timed motion v1; exact40LE. Board confirmation is distinct from SDK delivery ACK and physical position verification.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 40
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable": "Ordered",
+      "priority": 200
+    },
+    {
+      "name": "AB_FILL_MOTION_STATUS_V2",
+      "doc": "Actual accepted motion identity, lifecycle and monotonic minimum45 delay; separate exact56LE application status. Read-only QUERYv2 only; no mechanical position claim.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 56
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "reliable": "Ordered",
+      "priority": 200
+    },
+    {
+      "rust": "GroundStationIgniterSense",
+      "name": "AB_IGNITER_SENSE",
+      "doc": "Read-only igniter current-sense signal v1:12UInt32 words version,flags,boot generation lo/hi,source sequence,source uptime lo/hi,12-bit ADC counts,VDDA mV,sample age ms,reference age ms,hardware profile. Schematic045B5-on3V3 has no specified amperes conversion.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt32",
+        "count": 12
       },
       "endpoints": [
         "GROUND_STATION"
