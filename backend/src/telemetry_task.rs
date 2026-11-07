@@ -1320,6 +1320,10 @@ pub async fn telemetry_task(
                     }
                 }
                 _ = handle_interval.tick() => {
+                    if crate::network_variables::reconcile_owner_outputs_for_state(&state, &router) {
+                        sequences::refresh_action_policy_now(&state);
+                        state.broadcast_action_policy_snapshot();
+                    }
                     for _ in 0..packet_enqueue_burst {
                         match packet_tx.try_reserve() {
                             Ok(permit) => {

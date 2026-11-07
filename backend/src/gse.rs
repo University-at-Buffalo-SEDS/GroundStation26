@@ -923,7 +923,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
     let rt = state.gse.lock().unwrap();
     let input = rt.input(is_prelaunch, interlock(state, policy));
     policy.controls.retain(|c| c.cmd != "Turbocharge");
-    policy.controls.push(ActionControl { disabled_reason: None,
+    policy.controls.push(ActionControl { disabled_reason: None, requested: None,
         cmd: "Turbocharge".into(),
         enabled: turbocharge::allowed(state, &rt, input),
         blink: BlinkMode::None,
@@ -940,7 +940,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
         #[cfg(not(feature = "hitl_mode"))]
         let enabled = enabled && operational_action_allowed(&rt, action);
         policy.controls.retain(|c| c.cmd != cmd);
-        policy.controls.push(ActionControl { disabled_reason: None,
+        policy.controls.push(ActionControl { disabled_reason: None, requested: None,
             cmd: cmd.into(),
             enabled,
             blink: BlinkMode::None,
@@ -957,7 +957,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
         policy
             .controls
             .retain(|c| c.cmd != "ToggleGroundStationControl");
-        policy.controls.push(ActionControl { disabled_reason: None,
+        policy.controls.push(ActionControl { disabled_reason: None, requested: None,
             cmd: "ToggleGroundStationControl".into(),
             enabled: true,
             blink: BlinkMode::None,

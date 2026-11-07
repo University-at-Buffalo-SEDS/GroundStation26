@@ -464,22 +464,8 @@ pub fn publish_bootstrap_for_state(
 
 pub fn publish_current(router: &Router) -> Result<()> {
     let request = crate::qualification_requests::Request::begin("publish_current");
-    request.submit(
-        router,
-        packet(
-            UNDERGLOW_TYPE,
-            "AV_BAY_UNDERGLOW_OWNER",
-            u8::from(underglow_enabled()),
-        )?,
-    )?;
-    request.submit(
-        router,
-        packet(
-            FLIGHT_BUZZER_TYPE,
-            "FLIGHT_CONTROLLER",
-            u8::from(flight_buzzer_enabled()),
-        )?,
-    )?;
+    publish_owner_output(&request, router, OwnerOutput::Underglow, true, 0)?;
+    publish_owner_output(&request, router, OwnerOutput::FlightBuzzer, true, 0)?;
     if let Some(packet) = retained_non_launch_packet()? {
         request.submit(router, packet)?;
     }
@@ -488,51 +474,255 @@ pub fn publish_current(router: &Router) -> Result<()> {
     Ok(())
 }
 
-pub fn toggle_underglow(router: &Router) -> Result<bool> {
-    let enabled = !underglow_enabled();
-    set_underglow(router, enabled)?;
-    Ok(enabled)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnerOutput {
+    Underglow,
+    FlightBuzzer,
 }
-
-pub fn set_underglow(router: &Router, enabled: bool) -> Result<()> {
-    let request = crate::qualification_requests::Request::begin("set_underglow");
-    {
+impl OwnerOutput {
+    const ALL: [Self; 2] = [Self::Underglow, Self::FlightBuzzer];
+    fn index(self) -> usize {
+        self as usize
+    }
+    fn data_type(self) -> &'static str {
+        match self {
+            Self::Underglow => UNDERGLOW_TYPE,
+            Self::FlightBuzzer => FLIGHT_BUZZER_TYPE,
+        }
+    }
+    fn endpoint(self) -> &'static str {
+        match self {
+            Self::Underglow => "AV_BAY_UNDERGLOW_OWNER",
+            Self::FlightBuzzer => "FLIGHT_CONTROLLER",
+        }
+    }
+    /// The board whose periodic reports count as "heard from the owner".
+    pub(crate) fn owner_board(self) -> Board {
+        match self {
+            Self::Underglow => Board::RFBoard,
+            Self::FlightBuzzer => Board::FlightComputer,
+        }
+    }
+    fn requested(self) -> bool {
+        match self {
+            Self::Underglow => underglow_enabled(),
+            Self::FlightBuzzer => flight_buzzer_enabled(),
+        }
+    }
+    fn commit_requested(self, enabled: bool) -> Result<()> {
         let mut guard = store()
             .lock()
             .expect("network-variable store lock poisoned");
         let mut next = guard.values;
-        next.av_bay_underglow = enabled;
-        guard.commit(next)?;
+        match self {
+            Self::Underglow => next.av_bay_underglow = enabled,
+            Self::FlightBuzzer => next.flight_buzzer = enabled,
+        }
+        guard.commit(next)
     }
-    request.submit(
-        router,
-        packet(UNDERGLOW_TYPE, "AV_BAY_UNDERGLOW_OWNER", u8::from(enabled))?,
-    )?;
-    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OwnerOutputView {
+    /// Stored operator request; republished until the owner confirms it.
+    pub(crate) requested: bool,
+    /// Owner-acknowledged value, only when it matches the request.
+    pub(crate) confirmed: Option<bool>,
+}
+
+static OWNER_CONFIRMATION: Mutex<[owner_confirmation::Confirmation; 2]> =
+    Mutex::new([owner_confirmation::Confirmation::DEFAULT; 2]);
+static OWNER_RECONCILE_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn owner_confirmation() -> std::sync::MutexGuard<'static, [owner_confirmation::Confirmation; 2]> {
+    OWNER_CONFIRMATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+static OWNER_TEST_CLOCK: Mutex<Option<fn() -> std::time::Instant>> = Mutex::new(None);
+/// Model-time tests drive retry horizons faster than wall time.
+#[cfg(test)]
+pub(crate) fn set_owner_test_clock(clock: fn() -> std::time::Instant) {
+    *OWNER_TEST_CLOCK.lock().unwrap() = Some(clock);
+}
+fn owner_now() -> std::time::Instant {
+    #[cfg(test)]
+    if let Some(clock) = *OWNER_TEST_CLOCK.lock().unwrap() {
+        return clock();
+    }
+    std::time::Instant::now()
+}
+
+pub(crate) fn owner_output_view(output: OwnerOutput) -> OwnerOutputView {
+    let requested = output.requested();
+    OwnerOutputView {
+        requested,
+        confirmed: owner_confirmation()[output.index()].shown(requested),
+    }
+}
+
+/// Publish the stored request and start tracking its owner ACK. `fresh` marks
+/// an operator request, which earns one immediate republish on loss.
+fn publish_owner_output(
+    request: &crate::qualification_requests::Request,
+    router: &Router,
+    output: OwnerOutput,
+    fresh: bool,
+    reports: u64,
+) -> Result<()> {
+    let value = output.requested();
+    let packet = packet(output.data_type(), output.endpoint(), u8::from(value))?;
+    let id = packet.packet_id();
+    let result = request.submit(router, packet);
+    let now = owner_now();
+    let mut confirmation = owner_confirmation();
+    match &result {
+        Ok(()) => confirmation[output.index()].published(id, value, now, fresh),
+        Err(_) => confirmation[output.index()].publish_failed(now, reports),
+    }
+    OWNER_RECONCILE_ARMED.store(true, Ordering::Release);
+    result
+}
+
+/// Poll the SDK owner rows for in-flight cosmetic outputs and republish the
+/// stored request when delivery is unconfirmed. `owner_reports` counts packets
+/// heard from each output's owner board. `claim` must return a dispatch claim
+/// (held for the publish) or None when publication is closed.
+pub(crate) fn reconcile_owner_outputs<C>(
+    router: &Router,
+    owner_reports: [u64; 2],
+    claim: impl Fn() -> Option<C>,
+) -> bool {
+    if !OWNER_RECONCILE_ARMED.load(Ordering::Acquire) {
+        return false;
+    }
+    let tuning = sedsnet::config::runtime_tuning_config();
+    let retransmit = std::time::Duration::from_millis(u64::from(tuning.reliable_retransmit_ms));
+    let max_retries = tuning.reliable_max_retries;
+    let now = owner_now();
+    let rows = {
+        let confirmation = owner_confirmation();
+        confirmation
+            .iter()
+            .any(|c| c.inflight_id().is_some())
+            .then(|| router.export_reliable_pending_stats())
+    };
+    let mut changed = false;
+    let mut republish = Vec::new();
+    {
+        let mut confirmation = owner_confirmation();
+        for output in OwnerOutput::ALL {
+            let entry = &mut confirmation[output.index()];
+            let reports = owner_reports[output.index()];
+            let step = match (entry.inflight_id(), rows.as_ref()) {
+                (Some(id), Some(rows)) => {
+                    let row = rows.iter().find(|row| row.packet_id == id).map(|row| row.retries);
+                    let queued = row.is_none()
+                        && router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type(
+                            output.data_type(),
+                        ));
+                    entry.observe(row, queued, now, reports, retransmit, max_retries)
+                }
+                _ => entry.owner_report(now, reports),
+            };
+            match step {
+                owner_confirmation::Step::Idle => {}
+                owner_confirmation::Step::Changed => changed = true,
+                owner_confirmation::Step::Republish => {
+                    changed = true;
+                    republish.push(output);
+                }
+            }
+        }
+        if !confirmation.iter().any(|c| c.needs_attention()) {
+            OWNER_RECONCILE_ARMED.store(false, Ordering::Release);
+        }
+    }
+    for output in republish {
+        let reports = owner_reports[output.index()];
+        let Some(_claim) = claim() else {
+            owner_confirmation()[output.index()].publish_failed(now, reports);
+            continue;
+        };
+        let request = crate::qualification_requests::Request::begin("republish_unconfirmed");
+        if let Err(error) = publish_owner_output(&request, router, output, false, reports) {
+            log::warn!("republish of unconfirmed {output:?} failed: {error}");
+        }
+    }
+    changed
+}
+
+/// Production cadence wrapper: primary role only, polled at most every 10 ms.
+pub(crate) fn reconcile_owner_outputs_for_state(
+    state: &crate::state::AppState,
+    router: &Router,
+) -> bool {
+    static NEXT_POLL: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    if crate::rrls::is_rrls() || !OWNER_RECONCILE_ARMED.load(Ordering::Acquire) {
+        return false;
+    }
+    let now = std::time::Instant::now();
+    {
+        let mut next = NEXT_POLL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if next.is_some_and(|next| now < next) {
+            return false;
+        }
+        *next = Some(now + std::time::Duration::from_millis(10));
+    }
+    let reports = {
+        let boards = state.board_status.lock().unwrap();
+        OwnerOutput::ALL.map(|output| {
+            boards
+                .get(&output.owner_board())
+                .map_or(0, |status| status.packet_count)
+        })
+    };
+    reconcile_owner_outputs(router, reports, || {
+        crate::gse::capture_operator_origin(state)
+            .and_then(|generation| crate::gse::claim_operator_dispatch(state, generation))
+    })
+}
+
+fn set_owner_output(router: &Router, output: OwnerOutput, enabled: bool, name: &'static str) -> Result<()> {
+    let request = crate::qualification_requests::Request::begin(name);
+    output.commit_requested(enabled)?;
+    publish_owner_output(&request, router, output, true, 0)
+}
+
+/// Toggle acts on the owner's confirmed state. Pressing again while the same
+/// value is still being delivered keeps that delivery instead of flipping.
+fn toggle_owner_output(router: &Router, output: OwnerOutput, name: &'static str) -> Result<bool> {
+    let requested = output.requested();
+    let (target, delivering) = {
+        let confirmation = owner_confirmation();
+        let entry = &confirmation[output.index()];
+        let target = entry.toggle_target(requested);
+        (target, entry.delivering(target))
+    };
+    if !(delivering && target == requested) {
+        set_owner_output(router, output, target, name)?;
+    }
+    Ok(target)
+}
+
+pub fn toggle_underglow(router: &Router) -> Result<bool> {
+    toggle_owner_output(router, OwnerOutput::Underglow, "set_underglow")
+}
+
+pub fn set_underglow(router: &Router, enabled: bool) -> Result<()> {
+    set_owner_output(router, OwnerOutput::Underglow, enabled, "set_underglow")
 }
 
 #[allow(dead_code)] // Used by the optional direct-command compatibility path.
 pub fn toggle_flight_buzzer(router: &Router) -> Result<bool> {
-    let enabled = !flight_buzzer_enabled();
-    set_flight_buzzer(router, enabled)?;
-    Ok(enabled)
+    toggle_owner_output(router, OwnerOutput::FlightBuzzer, "set_flight_buzzer")
 }
 
 pub fn set_flight_buzzer(router: &Router, enabled: bool) -> Result<()> {
-    let request = crate::qualification_requests::Request::begin("set_flight_buzzer");
-    {
-        let mut guard = store()
-            .lock()
-            .expect("network-variable store lock poisoned");
-        let mut next = guard.values;
-        next.flight_buzzer = enabled;
-        guard.commit(next)?;
-    }
-    request.submit(
-        router,
-        packet(FLIGHT_BUZZER_TYPE, "FLIGHT_CONTROLLER", u8::from(enabled))?,
-    )?;
-    Ok(())
+    set_owner_output(router, OwnerOutput::FlightBuzzer, enabled, "set_flight_buzzer")
 }
 
 pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
@@ -2657,6 +2847,8 @@ pub fn persisted_daq_log_clock() -> Option<[u64; 2]> {
         .expect("network-variable store lock poisoned");
     guard.durable.then_some(guard.values.daq_log_clock)
 }
+
+mod owner_confirmation;
 
 #[cfg(test)]
 #[path = "network_variables/daq_clock_tests.rs"]

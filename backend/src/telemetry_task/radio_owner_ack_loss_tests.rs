@@ -43,6 +43,8 @@ struct Channel {
     active: Option<Writing>,
     written: Vec<(u64, u64, u64)>,
     completed_bytes: usize,
+    /// The SDK reports an exhausted Ordered owner once, from the queue pass.
+    allow_ordered_exhaustion: bool,
 }
 struct Writing {
     priority: u8,
@@ -79,6 +81,7 @@ impl Channel {
                 active: None,
                 written: Vec::new(),
                 completed_bytes: 0,
+                allow_ordered_exhaustion: false,
             },
             sender,
         )
@@ -214,6 +217,9 @@ impl Channel {
                     "exact busy return requires fresh exhaustive actual callback refusal"
                 );
             }
+            Err(sedsnet::TelemetryError::HandlerError(
+                "ordered end-to-end delivery exhausted retries",
+            )) if self.allow_ordered_exhaustion => {}
             Err(error) => panic!("unexpected SDK result remains fatal: {error:?}"),
         }
     }
@@ -668,4 +674,411 @@ fn actual_first_owner_ack_loss_preserves_original_radio_command_and_status_insid
     let _restore = Restore(saved);
     scenario(false);
     scenario(true);
+}
+
+// Owner confirmation for the cosmetic AV-bay outputs. The same modeled UART
+// pair as above, driven through the production network_variables entry points.
+// Measured 10-29 field round trips reached 4976 ms against a 4.5 s retry horizon.
+const FIELD_SLOW_ACK_MS: u64 = 4976;
+const OWNER_REPORT_PERIOD_MS: u64 = 1000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Back {
+    Deliver,
+    Hold,
+}
+
+struct OwnerHarness {
+    gs: Router,
+    rf: Router,
+    outbound: Channel,
+    returning: Channel,
+    gs_side: RouterSideId,
+    rf_side: RouterSideId,
+    now: u64,
+    ty: sedsnet::config::DataType,
+    status: sedsnet::config::DataType,
+    station: sedsnet::config::DataEndpoint,
+    rf_value: Arc<AtomicU8>,
+    rf_applied: Arc<Mutex<Vec<(u64, u8)>>>,
+    reports_seen: Arc<AtomicU64>,
+    next_report: u64,
+    held: Vec<Vec<u8>>,
+    /// Every distinct underglow packet the GS radio side completed on the wire.
+    written: Vec<(u64, u64, u8)>,
+}
+
+impl OwnerHarness {
+    fn new() -> Self {
+        MODEL_MS.store(1000, Ordering::SeqCst);
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        BASE.get_or_init(Instant::now);
+        crate::network_variables::set_owner_test_clock(|| {
+            *BASE.get().unwrap() + std::time::Duration::from_millis(MODEL_MS.load(Ordering::SeqCst))
+        });
+        crate::telemetry_schema::initialize().unwrap();
+        let mut tuning = config::runtime_tuning_config();
+        tuning.payload_compress_threshold = usize::MAX;
+        tuning.reliable_retransmit_ms = 250;
+        tuning.reliable_max_retries = 17;
+        config::set_runtime_tuning_config(tuning).unwrap();
+        let profile = Profile::parse(include_bytes!("../../comms/rfd-profile.json")).unwrap();
+        let ty = crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW");
+        let station = crate::telemetry_schema::endpoint("GROUND_STATION");
+        let status = config::register_data_type_with_description(
+            "RADIO_OWNER_CONFIRMATION_REPORT",
+            "RAM fixture periodic owner report, never physical board readiness",
+            sedsnet::MessageElement::Static(
+                1,
+                sedsnet::MessageDataType::UInt8,
+                sedsnet::MessageClass::Data,
+            ),
+            &[station],
+            sedsnet::ReliableMode::None,
+            16,
+        )
+        .unwrap();
+        let reports_seen = Arc::new(AtomicU64::new(0));
+        let seen = reports_seen.clone();
+        let gs = Router::new_with_clock(
+            RouterConfig::new([EndpointHandler::new_packet_handler(station, move |p| {
+                if p.data_type() == status && p.sender() == "RF" {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            })])
+            .with_sender("GS"),
+            Box::new(|| MODEL_MS.load(Ordering::SeqCst)),
+        );
+        let rf = Router::new_with_clock(
+            RouterConfig::new([])
+                .with_sender("RF")
+                .with_e2e_encryption(sedsnet::router::RouterE2eEncryptionMode::Disabled),
+            Box::new(|| MODEL_MS.load(Ordering::SeqCst)),
+        );
+        for (router, write) in [(&gs, true), (&rf, false)] {
+            router
+                .enable_network_variable(
+                    ty,
+                    sedsnet::router::NetworkVariablePermissions { read: true, write },
+                )
+                .unwrap();
+        }
+        let rf_value = Arc::new(AtomicU8::new(0));
+        let rf_applied = Arc::new(Mutex::new(Vec::new()));
+        let (value, applied) = (rf_value.clone(), rf_applied.clone());
+        rf.on_network_variable_update(ty, move |packet| {
+            let v = packet.payload()[0];
+            value.store(v, Ordering::SeqCst);
+            applied.lock().unwrap().push((packet.packet_id(), v));
+            Ok(())
+        })
+        .unwrap();
+        let (mut outbound, tx) =
+            Channel::new(&profile, profile.transport.host_default_share_percent);
+        outbound.allow_ordered_exhaustion = true;
+        let gs_side = outbound.install(&gs, tx);
+        let (returning, tx) = Channel::new(&profile, profile.transport.rf_share_percent);
+        let rf_side = returning.install(&rf, tx);
+        gs.announce_discovery().unwrap();
+        rf.announce_discovery().unwrap();
+        let mut h = Self {
+            gs,
+            rf,
+            outbound,
+            returning,
+            gs_side,
+            rf_side,
+            now: 1000,
+            ty,
+            status,
+            station,
+            rf_value,
+            rf_applied,
+            reports_seen,
+            next_report: 0,
+            held: Vec::new(),
+            written: Vec::new(),
+        };
+        let ty = h.ty;
+        let warmed = h.run(60_000, |_| false, |_, _| Back::Deliver, |h| {
+            h.gs.export_topology()
+                .routes
+                .iter()
+                .any(|r| r.reachable_network_variables.contains(&ty))
+                && h.outbound.idle()
+                && h.returning.idle()
+                && !h.gs.has_queued_work()
+                && !h.rf.has_queued_work()
+        });
+        assert!(warmed, "real discovery must converge before the owner scene");
+        h
+    }
+
+    fn underglow(body: &[u8], ty: sedsnet::config::DataType) -> Option<(u64, u8)> {
+        let packet = serialize::unpack_packet(body).ok()?;
+        (packet.data_type() == ty && packet.payload().len() == 1)
+            .then(|| (packet.packet_id(), packet.payload()[0]))
+    }
+
+    fn view(&self) -> crate::network_variables::OwnerOutputView {
+        crate::network_variables::owner_output_view(
+            crate::network_variables::OwnerOutput::Underglow,
+        )
+    }
+
+    fn pending_id(&self) -> u64 {
+        self.gs
+            .export_reliable_pending_stats()
+            .iter()
+            .find(|p| p.data_type == self.ty)
+            .map(|p| p.packet_id)
+            .expect("published underglow has a frozen RF owner")
+    }
+
+    fn off_copies(&self) -> Vec<u64> {
+        let mut ids = self
+            .written
+            .iter()
+            .filter(|(_, _, v)| *v == 0)
+            .map(|(_, id, _)| *id)
+            .collect::<Vec<_>>();
+        ids.dedup();
+        ids
+    }
+
+    /// Runs model time in 1 ms steps. `drop_out` discards a GS->RF frame;
+    /// `back` decides whether an RF->GS frame is delivered now or held.
+    fn run(
+        &mut self,
+        limit_ms: u64,
+        mut drop_out: impl FnMut(&[u8]) -> bool,
+        mut back: impl FnMut(&[u8], u64) -> Back,
+        mut done: impl FnMut(&Self) -> bool,
+    ) -> bool {
+        let stop = self.now + limit_ms;
+        while self.now < stop {
+            MODEL_MS.store(self.now, Ordering::SeqCst);
+            if self.next_report != 0 && self.now >= self.next_report {
+                self.rf
+                    .try_tx_queue(
+                        Packet::new(self.status, &[self.station], "RF", self.now, Arc::from([1u8]))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                self.next_report = self.now + OWNER_REPORT_PERIOD_MS;
+            }
+            self.outbound.pump(&self.gs);
+            self.returning.pump(&self.rf);
+            for body in self.outbound.step(self.now) {
+                if let Some((id, v)) = Self::underglow(&body, self.ty) {
+                    self.written.push((self.now, id, v));
+                }
+                if drop_out(&body) {
+                    continue;
+                }
+                self.rf.rx_packed_queue_from_side(&body, self.rf_side).unwrap();
+            }
+            let mut released = Vec::new();
+            for body in std::mem::take(&mut self.held) {
+                match back(&body, self.now) {
+                    Back::Deliver => released.push(body),
+                    Back::Hold => self.held.push(body),
+                }
+            }
+            for body in self.returning.step(self.now) {
+                match back(&body, self.now) {
+                    Back::Deliver => released.push(body),
+                    Back::Hold => self.held.push(body),
+                }
+            }
+            for body in released {
+                self.gs.rx_packed_queue_from_side(&body, self.gs_side).unwrap();
+            }
+            crate::network_variables::reconcile_owner_outputs(
+                &self.gs,
+                [self.reports_seen.load(Ordering::SeqCst), 0],
+                || Some(()),
+            );
+            if done(self) {
+                return true;
+            }
+            self.now += 1;
+        }
+        false
+    }
+
+    fn confirm_on(&mut self) {
+        crate::network_variables::set_underglow(&self.gs, true).unwrap();
+        let ok = self.run(3000, |_| false, |_, _| Back::Deliver, |h| {
+            h.view().confirmed == Some(true)
+                && h.gs.export_reliable_pending_stats().is_empty()
+        });
+        assert!(ok, "a delivered On must become owner-confirmed");
+        assert_eq!(self.rf_value.load(Ordering::SeqCst), 1);
+    }
+}
+
+fn owner_confirmation_case(case: &str) {
+    let mut h = OwnerHarness::new();
+    h.confirm_on();
+    let ty = h.ty;
+    match case {
+        "held_ack" => {
+            // The operator turns it off from the confirmed On state.
+            assert!(!crate::network_variables::toggle_underglow(&h.gs).unwrap());
+            let first = h.pending_id();
+            let issued = h.now;
+            let release = issued + FIELD_SLOW_ACK_MS;
+            let mut claimed_while_outstanding = false;
+            let mut republished_before_release = false;
+            let ok = h.run(
+                FIELD_SLOW_ACK_MS + 4000,
+                |_| false,
+                |body, now| {
+                    if exact_owner_ack(body, first) && now < release {
+                        Back::Hold
+                    } else {
+                        Back::Deliver
+                    }
+                },
+                |h| {
+                    if h.gs.export_reliable_pending_stats().iter().any(|p| p.packet_id == first)
+                        && h.view().confirmed.is_some()
+                    {
+                        claimed_while_outstanding = true;
+                    }
+                    if h.now < release && h.off_copies().len() >= 2 {
+                        republished_before_release = true;
+                    }
+                    h.now >= release && h.view().confirmed == Some(false)
+                },
+            );
+            assert!(
+                !claimed_while_outstanding,
+                "an Off whose ACK is still outstanding is unconfirmed, not Off"
+            );
+            assert!(
+                republished_before_release,
+                "exhaustion at the 4.5 s horizon republishes before the 4976 ms ACK lands"
+            );
+            assert!(ok, "the slow-ACK Off must end owner-confirmed Off");
+            assert_eq!(h.rf_value.load(Ordering::SeqCst), 0);
+            let off = h.off_copies();
+            assert!(
+                off.len() >= 2 && off[0] == first,
+                "GS republishes desired Off after its first retry horizon: {off:?}"
+            );
+            assert!(
+                h.written.iter().all(|(at, _, v)| *at < issued || *v == 0),
+                "no On is ever sent after the operator asked for Off"
+            );
+            assert!(h.view().confirmed == Some(false) && !h.view().requested);
+        }
+        "dropped_off" => {
+            assert!(!crate::network_variables::toggle_underglow(&h.gs).unwrap());
+            let first = h.pending_id();
+            let issued = h.now;
+            // Two full horizons: the original and one immediate republish.
+            let both_lost = h.run(
+                12_000,
+                |body| OwnerHarness::underglow(body, ty).is_some_and(|(_, v)| v == 0),
+                |_, _| Back::Deliver,
+                |h| {
+                    h.off_copies().len() >= 2
+                        && h.gs.export_reliable_pending_stats().iter().all(|p| p.data_type != ty)
+                },
+            );
+            assert!(both_lost, "original and republished Off both reach exhaustion");
+            assert_eq!(h.rf_value.load(Ordering::SeqCst), 1, "RF never saw Off");
+            assert_eq!(h.view().confirmed, None, "GS must not claim Off");
+            assert!(!h.view().requested);
+            assert_ne!(h.off_copies()[0], h.off_copies()[1]);
+            assert_eq!(h.off_copies()[0], first);
+            // A press now acts on the board's confirmed On, so it asks for Off
+            // again instead of flipping the stored desired value to On.
+            let before = h.written.len();
+            assert!(!crate::network_variables::toggle_underglow(&h.gs).unwrap());
+            let ok = h.run(4000, |_| false, |_, _| Back::Deliver, |h| {
+                h.view().confirmed == Some(false)
+            });
+            assert!(ok, "the press after loss delivers Off and confirms it");
+            assert_eq!(h.rf_value.load(Ordering::SeqCst), 0);
+            assert!(
+                h.written[before..].iter().all(|(_, _, v)| *v == 0)
+                    && h.written.iter().all(|(at, _, v)| *at < issued || *v == 0),
+                "a press while unconfirmed never sends On"
+            );
+        }
+        "report_republish" => {
+            assert!(!crate::network_variables::toggle_underglow(&h.gs).unwrap());
+            let both_lost = h.run(
+                12_000,
+                |body| OwnerHarness::underglow(body, ty).is_some_and(|(_, v)| v == 0),
+                |_, _| Back::Deliver,
+                |h| {
+                    h.off_copies().len() >= 2
+                        && h.gs.export_reliable_pending_stats().iter().all(|p| p.data_type != ty)
+                },
+            );
+            assert!(both_lost);
+            assert_eq!(h.view().confirmed, None);
+            let lost = h.off_copies().len();
+            // No owner traffic: GS stays quiet rather than retrying forever.
+            let quiet_from = h.written.len();
+            h.run(15_000, |_| false, |_, _| Back::Deliver, |_| false);
+            assert_eq!(h.written.len(), quiet_from, "no republish without an owner report");
+            assert_eq!(h.view().confirmed, None);
+            // The next RF report re-publishes desired Off.
+            h.next_report = h.now;
+            let ok = h.run(4000, |_| false, |_, _| Back::Deliver, |h| {
+                h.view().confirmed == Some(false)
+            });
+            assert!(ok, "the next owner report republishes and confirms desired Off");
+            assert!(h.off_copies().len() > lost);
+            assert_eq!(h.rf_value.load(Ordering::SeqCst), 0);
+        }
+        other => panic!("unknown case {other}"),
+    }
+    let applied = h.rf_applied.lock().unwrap();
+    assert!(applied.iter().filter(|(_, v)| *v == 1).count() == 1, "RF applied On exactly once: {applied:?}");
+}
+
+fn owner_confirmation_test(name: &str, case: &str) {
+    if crate::operator_queue::isolated_native_case(module_path!(), name) {
+        return;
+    }
+    let saved = config::runtime_tuning_config();
+    struct Restore(config::RuntimeTuningConfig);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            config::set_runtime_tuning_config(self.0).unwrap();
+        }
+    }
+    let _restore = Restore(saved);
+    owner_confirmation_case(case);
+}
+
+#[test]
+fn underglow_off_with_ack_held_past_retry_horizon_is_unconfirmed_then_republished() {
+    owner_confirmation_test(
+        "underglow_off_with_ack_held_past_retry_horizon_is_unconfirmed_then_republished",
+        "held_ack",
+    );
+}
+
+#[test]
+fn dropped_underglow_off_stays_unconfirmed_and_toggle_acts_on_confirmed_on() {
+    owner_confirmation_test(
+        "dropped_underglow_off_stays_unconfirmed_and_toggle_acts_on_confirmed_on",
+        "dropped_off",
+    );
+}
+
+#[test]
+fn unconfirmed_underglow_republishes_on_next_owner_report_only() {
+    owner_confirmation_test(
+        "unconfirmed_underglow_republishes_on_next_owner_report_only",
+        "report_republish",
+    );
 }

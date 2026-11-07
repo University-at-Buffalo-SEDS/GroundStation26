@@ -2133,6 +2133,12 @@ impl AppState {
             }
         }
         for control in &mut policy.controls {
+            if let Some((requested, confirmed)) = crate::sequences::owner_output_state(&control.cmd)
+                && !crate::rrls::is_rrls()
+            {
+                control.requested = Some(requested);
+                control.actuated = confirmed;
+            }
             if let Some((enabled, actuated)) = recording_command_state(&control.cmd, recording_mode)
             {
                 control.enabled = enabled;

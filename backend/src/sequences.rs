@@ -38,6 +38,10 @@ pub struct ActionControl {
     pub enabled: bool,
     pub blink: BlinkMode,
     pub actuated: Option<bool>,
+    /// Stored request for owner-confirmed outputs; `actuated` stays None
+    /// until the owner acknowledges this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,10 +117,21 @@ fn default_recording_command_actuated(cmd: &str) -> Option<bool> {
 fn default_command_actuated(cmd: &str) -> Option<bool> {
     match cmd {
         "ResetSim" => Some(true),
-        "ToggleAvBayUnderglow" => Some(crate::network_variables::underglow_enabled()),
-        "ToggleFlightBuzzer" => Some(crate::network_variables::flight_buzzer_enabled()),
+        "ToggleAvBayUnderglow" | "ToggleFlightBuzzer" => None,
         _ => default_recording_command_actuated(cmd),
     }
+}
+
+/// Underglow and buzzer: (requested, owner-confirmed) from the network store.
+pub(crate) fn owner_output_state(cmd: &str) -> Option<(bool, Option<bool>)> {
+    use crate::network_variables::{OwnerOutput, owner_output_view};
+    let output = match cmd {
+        "ToggleAvBayUnderglow" => OwnerOutput::Underglow,
+        "ToggleFlightBuzzer" => OwnerOutput::FlightBuzzer,
+        _ => return None,
+    };
+    let view = owner_output_view(output);
+    Some((view.requested, view.confirmed))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1169,7 +1184,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
                 let enabled = is_station_utility_command(cmd)
                     || default_recording_command_enabled(cmd)
                         .unwrap_or(matches!(cmd, "Abort" | "Postinit" | "ResetSim"));
-                ActionControl { disabled_reason: None,
+                ActionControl { disabled_reason: None, requested: None,
                     cmd: cmd.to_string(),
                     enabled,
                     blink: backend_blink_for(cmd, enabled, None),
@@ -1215,7 +1230,7 @@ fn policy_with_overrides(
             } else {
                 key_enabled
             };
-            ActionControl { disabled_reason: None,
+            ActionControl { disabled_reason: None, requested: None,
                 cmd: cmd.to_string(),
                 enabled,
                 blink: backend_blink_for(cmd, enabled, recommended.get(cmd)),
@@ -2245,7 +2260,7 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
         .into_iter()
         .map(|cmd| {
             let actuated = default_command_actuated(cmd).or_else(|| valves.actuated_for_cmd(cmd));
-            ActionControl { disabled_reason: None,
+            ActionControl { disabled_reason: None, requested: None,
                 cmd: cmd.to_string(),
                 enabled: true,
                 blink: BlinkMode::None,
