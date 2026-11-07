@@ -701,6 +701,7 @@ impl FlightSimState {
             // Only telemetry_task may authorize and normalize this internal
             // intent; direct model calls must not bypass the dispatch check.
             TelemetryCommand::QueuedOperator { .. }
+            | TelemetryCommand::OperatorPhase { .. }
             | TelemetryCommand::FillWithRecording { .. }
             | TelemetryCommand::ColdFlowPanelRelease { .. }
             | TelemetryCommand::AutomaticAbort { .. }
