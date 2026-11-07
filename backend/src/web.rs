@@ -393,7 +393,10 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
             "/api/calibration",
             get(get_loadcell_calibration).post(set_loadcell_calibration),
         )
-        .route("/api/calibration/kg50_input", post(set_kg50_input))
+        .route(
+            "/api/calibration/kg50_input",
+            get(get_kg50_input_status).post(set_kg50_input),
+        )
         .route(
             "/api/calibration/long_zero",
             get(long_zero_status).post(long_zero_start),
@@ -959,6 +962,21 @@ struct Kg50InputRequest {
     input: loadcell::Kg50Input,
 }
 
+/// The operator's selection against what the DAQ is reporting right now.
+async fn get_kg50_input_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let selected = state.loadcell_calibration.lock().unwrap().kg50_input;
+    Json(state.kg50_input_sync.status(selected)).into_response()
+}
+
+/// The selection is durable once saved. A send the SDK refuses here is retried
+/// from the board's next report, so it does not fail the operator's request.
+fn publish_kg50_input(state: &AppState, cfg: &loadcell::LoadcellCalibrationFile) {
+    state.kg50_input_sync.note_published();
+    if let Err(error) = publish_daq_calibration(state, cfg) {
+        log::warn!("sending DAQ 50 kg input: {error}");
+    }
+}
+
 async fn set_kg50_input(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -995,21 +1013,19 @@ async fn set_kg50_input(
     }
     let mut cfg = state.loadcell_calibration.lock().unwrap().clone();
     if cfg.kg50_input == req.input {
-        if let Err(err) = publish_daq_calibration(&state, &cfg) {
-            return (StatusCode::SERVICE_UNAVAILABLE, err).into_response();
-        }
+        publish_kg50_input(&state, &cfg);
         return Json(cfg).into_response();
     }
     loadcell::switch_kg50_input(&mut cfg, req.input);
+    cfg.kg50_input_stamp_ms = crate::telemetry_task::get_current_timestamp_ms()
+        .max(cfg.kg50_input_stamp_ms.saturating_add(1));
     if let Err(err) = loadcell::save(&cfg) {
         return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
     }
     *state.loadcell_calibration.lock().unwrap() = cfg.clone();
     state.clear_kg50_samples();
     state.gse.lock().unwrap().observe_mass(None);
-    if let Err(err) = publish_daq_calibration(&state, &cfg) {
-        return (StatusCode::SERVICE_UNAVAILABLE, err).into_response();
-    }
+    publish_kg50_input(&state, &cfg);
     Json(cfg).into_response()
 }
 
@@ -6301,6 +6317,66 @@ mod recovery_direct_ingress_tests {
                 .into_response()
             }
         }
+    }
+    #[tokio::test]
+    async fn kg50_input_selection_persists_and_is_compared_with_the_board_report() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "kg50_input_selection_persists_and_is_compared_with_the_board_report",
+        ) {
+            return;
+        }
+        use crate::kg50_input_sync::SyncState;
+        use loadcell::Kg50Input;
+        let (_root, state, headers, router, _) = fixture().await;
+        let ty = crate::telemetry_schema::data_type("DAQ_KG50_INPUT");
+        router
+            .enable_network_variable(ty, sedsnet::router::NetworkVariablePermissions::READ_WRITE)
+            .unwrap();
+        let status = |state: &Arc<AppState>| {
+            let selected = state.loadcell_calibration.lock().unwrap().kg50_input;
+            state.kg50_input_sync.status(selected)
+        };
+        assert_eq!(status(&state).state, SyncState::NoReadback);
+        state.kg50_input_sync.observe(Kg50Input::Amp2);
+        assert_eq!(status(&state).state, SyncState::Synced);
+        let previous_stamp = {
+            let mut cfg = state.loadcell_calibration.lock().unwrap();
+            // A revision ahead of the wall clock must still move forwards.
+            cfg.kg50_input_stamp_ms = u64::MAX / 2;
+            cfg.kg50_input_stamp_ms
+        };
+        let response = set_kg50_input(
+            State(state.clone()),
+            headers,
+            Json(Kg50InputRequest {
+                input: Kg50Input::P6Differential,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = state.loadcell_calibration.lock().unwrap().clone();
+        assert_eq!(saved.kg50_input, Kg50Input::P6Differential);
+        assert_eq!(saved.kg50_input_stamp_ms, previous_stamp + 1);
+        assert_eq!(
+            loadcell::load_or_default().kg50_input,
+            Kg50Input::P6Differential,
+            "a restarted station reads the same selection"
+        );
+        let sent = router.get_cached_network_variable(ty).unwrap().unwrap();
+        assert_eq!(sent.payload()[..], [1]);
+        assert_eq!(sent.timestamp(), saved.kg50_input_stamp_ms);
+        // The board has not switched yet, so the UI must not claim it has.
+        let reply = status(&state);
+        assert_eq!(reply.state, SyncState::Syncing);
+        assert_eq!(reply.board_input, Some(Kg50Input::Amp2));
+        state.kg50_input_sync.observe(Kg50Input::P6Differential);
+        assert_eq!(status(&state).state, SyncState::Synced);
+        let wire = serde_json::to_value(status(&state)).unwrap();
+        assert_eq!(wire["selected"], "p6_differential");
+        assert_eq!(wire["board_input"], "p6_differential");
+        assert_eq!(wire["state"], "synced");
     }
     #[tokio::test]
     async fn real_calibration_ingress_keeps_preauth_origin_before_file_ram_and_sdk_effects() {

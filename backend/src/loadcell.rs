@@ -143,6 +143,9 @@ pub struct Kg50InputProfile {
 pub struct LoadcellCalibrationFile {
     #[serde(default)]
     pub kg50_input: Kg50Input,
+    /// Revision of `kg50_input`; never moves backwards. See `kg50_input_packet`.
+    #[serde(default)]
+    pub kg50_input_stamp_ms: u64,
     #[serde(default)]
     pub kg50_input_profiles: BTreeMap<String, Kg50InputProfile>,
     #[serde(default)]
@@ -182,6 +185,7 @@ impl Default for LoadcellCalibrationFile {
     fn default() -> Self {
         Self {
             kg50_input: Kg50Input::default(),
+            kg50_input_stamp_ms: 0,
             kg50_input_profiles: BTreeMap::new(),
             noise: BTreeMap::new(),
             temperature_captures: BTreeMap::new(),
@@ -391,6 +395,9 @@ pub fn load_or_default() -> LoadcellCalibrationFile {
         })
         .unwrap_or_default();
     normalize_calibration(&mut cfg);
+    if cfg.kg50_input_stamp_ms == 0 {
+        cfg.kg50_input_stamp_ms = crate::telemetry_task::get_current_timestamp_ms();
+    }
     let _ = save(&cfg);
     cfg
 }
@@ -524,6 +531,17 @@ pub fn amp2_calibration(cfg: &LoadcellCalibrationFile) -> LoadcellCalibrationFil
     let mut result = cfg.clone();
     switch_kg50_input(&mut result, Kg50Input::Amp2);
     result
+}
+
+/// The input a DAQ loadcell report proves the board was scanning.
+pub fn reported_kg50_input(data_type: &str, values: &[Option<f32>]) -> Option<Kg50Input> {
+    match data_type {
+        "KG50" => Some(Kg50Input::Amp2),
+        "DAQ_KG50_SELECTED" if values.first() == Some(&Some(1.0)) => {
+            Some(Kg50Input::P6Differential)
+        }
+        _ => None,
+    }
 }
 
 pub fn selected_kg50_value(
@@ -1922,6 +1940,16 @@ pub fn record_capture_temperature(
 #[cfg(test)]
 mod temperature_capture_tests {
     use super::*;
+    #[test]
+    fn only_a_daq_report_stream_proves_the_scanned_input() {
+        assert_eq!(reported_kg50_input("KG50", &[Some(0.1)]), Some(Kg50Input::Amp2));
+        assert_eq!(
+            reported_kg50_input("DAQ_KG50_SELECTED", &[Some(1.0), Some(0.1)]),
+            Some(Kg50Input::P6Differential)
+        );
+        assert_eq!(reported_kg50_input("DAQ_KG50_SELECTED", &[Some(2.0), Some(0.1)]), None);
+        assert_eq!(reported_kg50_input("KG1000", &[Some(0.1)]), None);
+    }
     #[test]
     fn calibration_keeps_temperature_and_legacy_json_loads() {
         let mut cfg = LoadcellCalibrationFile::default();

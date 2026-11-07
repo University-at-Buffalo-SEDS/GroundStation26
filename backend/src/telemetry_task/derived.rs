@@ -1093,6 +1093,9 @@ pub(super) fn telemetry_rows_from_packet_values(
         if sender_id != "DAQ" {
             return Vec::new();
         }
+        if let Some(reported) = loadcell::reported_kg50_input(&pkt.data_type().as_str(), &values) {
+            state.kg50_input_sync.observe(reported);
+        }
         let input = state.loadcell_calibration.lock().unwrap().kg50_input;
         return loadcell::selected_kg50_value(input, &pkt.data_type().as_str(), &values)
             .map(|value| vec![("KG50".into(), vec![Some(value)])])

@@ -56,6 +56,7 @@ mod launch_analytics;
 mod launch_clock_sync;
 mod launch_history;
 mod layout;
+mod kg50_input_sync;
 mod loadcell;
 mod loadcell_zero;
 mod log_redaction;
@@ -1455,6 +1456,7 @@ async fn main() -> anyhow::Result<()> {
         av_bay_comms_connected: Arc::new(AtomicBool::new(false)),
         fill_comms_connected: Arc::new(AtomicBool::new(false)),
         topology_router: Arc::new(std::sync::OnceLock::new()),
+        kg50_input_sync: Default::default(),
         auth,
     });
 
@@ -2149,6 +2151,10 @@ async fn main() -> anyhow::Result<()> {
         state.shutdown_subscribe(),
     ));
     let _board_abort_queries = tokio::spawn(crate::board_abort::query_service(
+        state.clone(),
+        state.shutdown_subscribe(),
+    ));
+    let _kg50_input_sync = tokio::spawn(crate::kg50_input_sync::service(
         state.clone(),
         state.shutdown_subscribe(),
     ));

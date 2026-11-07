@@ -276,6 +276,7 @@ pub struct AppState {
 
     /// Loadcell calibration data loaded from JSON and editable at runtime.
     pub loadcell_processing: Arc<crate::loadcell_zero::Service>,
+    pub kg50_input_sync: Arc<crate::kg50_input_sync::Tracker>,
     pub network_traffic: Arc<Mutex<crate::network_traffic::Sampler>>,
     pub network_health: Arc<Mutex<crate::network_health::Tracker>>,
     pub loadcell_calibration: Arc<Mutex<LoadcellCalibrationFile>>,
@@ -4359,6 +4360,7 @@ pub(crate) mod tests {
             plumbing_drive: Arc::new(crate::actuator_plumbing::Runtime::default()),
             latest_fill_mass_kg: Arc::new(Mutex::new(None)),
             loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
+            kg50_input_sync: Default::default(),
             network_traffic: Arc::new(Mutex::new(crate::network_traffic::Sampler::default())),
             network_health: Arc::new(Mutex::new(crate::network_health::Tracker::default())),
             loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),

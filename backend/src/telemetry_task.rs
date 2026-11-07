@@ -5616,6 +5616,7 @@ mod tests {
             av_bay_comms_connected: Arc::new(AtomicBool::new(false)),
             fill_comms_connected: Arc::new(AtomicBool::new(false)),
             topology_router: Arc::new(OnceLock::new()),
+            kg50_input_sync: Default::default(),
             auth: Arc::new(AuthManager::new(PathBuf::from(
                 "/tmp/groundstation-test-users.json",
             ))),

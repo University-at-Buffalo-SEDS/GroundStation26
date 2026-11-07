@@ -438,11 +438,7 @@ fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Resu
         router.seed_managed_variable(packet)?;
     }
     let selected = crate::loadcell::load_or_default();
-    router.seed_managed_variable(packet(
-        "DAQ_KG50_INPUT",
-        "SD_CARD",
-        selected.kg50_input.wire(),
-    )?)?;
+    router.seed_managed_variable(kg50_input_packet(&selected)?)?;
     let calibration = crate::loadcell::amp2_calibration(&selected);
     router.seed_managed_variable(calibration_packet(&calibration)?)?;
     router.seed_managed_variable(kg50_calibration_packet(&calibration)?)?;
@@ -738,21 +734,44 @@ pub fn set_daq_calibration(
     cfg: &crate::loadcell::LoadcellCalibrationFile,
 ) -> Result<()> {
     let request = crate::qualification_requests::Request::begin("set_daq_calibration");
-    let selected_input = cfg.kg50_input;
-    let amp2 = crate::loadcell::amp2_calibration(cfg);
-    let cfg = &amp2;
-    let thermal = thermal_packet(cfg)?;
-    let filter = filter_packet(cfg)?;
-    let kg50 = kg50_calibration_packet(cfg)?;
-    request.submit(router, calibration_packet(cfg)?)?;
-    request.submit(router, kg50)?;
-    request.submit(router, thermal)?;
-    request.submit(router, filter)?;
-    request.submit(
-        router,
-        packet("DAQ_KG50_INPUT", "SD_CARD", selected_input.wire())?,
-    )?;
-    Ok(())
+    // The input stands alone: unusable AMP2 coefficients must not hold back a
+    // physical input selection, so it is sent even when they fail.
+    let calibration = (|| -> Result<()> {
+        let amp2 = crate::loadcell::amp2_calibration(cfg);
+        let thermal = thermal_packet(&amp2)?;
+        let filter = filter_packet(&amp2)?;
+        let kg50 = kg50_calibration_packet(&amp2)?;
+        request.submit(router, calibration_packet(&amp2)?)?;
+        request.submit(router, kg50)?;
+        request.submit(router, thermal)?;
+        request.submit(router, filter)
+    })();
+    let input = request.submit(router, kg50_input_packet(cfg)?);
+    calibration.and(input)
+}
+
+/// Stamped with the selection's revision rather than the time of sending. The
+/// SDK drops a value older than the one a board has cached from this sender, so
+/// a station clock stepped backwards would otherwise leave the DAQ stuck on the
+/// old input. Re-sending the same revision is accepted; only the nonce differs.
+fn kg50_input_packet(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Result<Packet> {
+    packet_bytes_at(
+        "DAQ_KG50_INPUT",
+        "SD_CARD",
+        Arc::from([cfg.kg50_input.wire()]),
+        match cfg.kg50_input_stamp_ms {
+            0 => get_current_timestamp_ms(),
+            stamp => stamp,
+        },
+    )
+}
+
+pub fn set_daq_kg50_input(
+    router: &Router,
+    cfg: &crate::loadcell::LoadcellCalibrationFile,
+) -> Result<()> {
+    crate::qualification_requests::Request::begin("set_daq_kg50_input")
+        .submit(router, kg50_input_packet(cfg)?)
 }
 
 fn daq_log_clock_payload(
@@ -1753,6 +1772,116 @@ mod thermal_wire_tests {
 #[cfg(test)]
 mod persistence_callback_tests {
     use super::*;
+    /// A real source and DAQ-style read-only reader joined by discovery.
+    fn kg50_input_pair(
+        apply: impl Fn(u8) + Send + Sync + 'static,
+    ) -> (Arc<Router>, Arc<Router>) {
+        use sedsnet::router::RouterConfig;
+        crate::telemetry_schema::initialize().unwrap();
+        let ty = crate::telemetry_schema::data_type("DAQ_KG50_INPUT");
+        let source = Arc::new(Router::new(RouterConfig::new([]).with_sender("GS")));
+        source
+            .enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)
+            .unwrap();
+        let peer = Arc::new(Router::new(RouterConfig::new([]).with_sender("DAQ")));
+        peer.enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
+            .unwrap();
+        peer.on_network_variable_update(ty, move |packet| {
+            apply(packet.payload()[0]);
+            Ok(())
+        })
+        .unwrap();
+        let target = peer.clone();
+        source.add_side_packed("rocket_comms", move |bytes| {
+            target.rx_packed_from_side(bytes, 0)
+        });
+        let target = source.clone();
+        peer.add_side_packed("GS", move |bytes| target.rx_packed_from_side(bytes, 0));
+        peer.announce_discovery().unwrap();
+        source.announce_discovery().unwrap();
+        kg50_input_pump(&source, &peer);
+        (source, peer)
+    }
+    fn kg50_input_pump(source: &Router, peer: &Router) {
+        for _ in 0..30 {
+            source.process_all_queues().unwrap();
+            peer.process_all_queues().unwrap();
+        }
+    }
+    #[test]
+    fn kg50_input_survives_a_station_clock_stepping_backwards() {
+        const NAME: &str = "network_variables::persistence_callback_tests::kg50_input_survives_a_station_clock_stepping_backwards";
+        if !isolated(NAME) {
+            return;
+        }
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let sink = applied.clone();
+        let (source, peer) = kg50_input_pair(move |input| sink.lock().unwrap().push(input));
+        let mut cfg = crate::loadcell::LoadcellCalibrationFile {
+            kg50_input: crate::loadcell::Kg50Input::P6Differential,
+            kg50_input_stamp_ms: u64::MAX / 2,
+            ..Default::default()
+        };
+        set_daq_kg50_input(&source, &cfg).unwrap();
+        kg50_input_pump(&source, &peer);
+        assert_eq!(*applied.lock().unwrap(), vec![1]);
+        // The wall clock is far behind this revision, as after a station reboot.
+        // A value stamped with the clock is the failure this stamp prevents.
+        source
+            .set_network_variable(packet("DAQ_KG50_INPUT", "SD_CARD", 0).unwrap())
+            .unwrap();
+        kg50_input_pump(&source, &peer);
+        assert_eq!(*applied.lock().unwrap(), vec![1]);
+        // Re-sending the same revision still reaches the application.
+        set_daq_kg50_input(&source, &cfg).unwrap();
+        kg50_input_pump(&source, &peer);
+        assert_eq!(*applied.lock().unwrap(), vec![1, 1]);
+        cfg.kg50_input = crate::loadcell::Kg50Input::Amp2;
+        set_daq_kg50_input(&source, &cfg).unwrap();
+        kg50_input_pump(&source, &peer);
+        assert_eq!(*applied.lock().unwrap(), vec![1, 1, 0]);
+    }
+    #[test]
+    fn unusable_amp2_coefficients_do_not_hold_back_the_kg50_input() {
+        const NAME: &str = "network_variables::persistence_callback_tests::unusable_amp2_coefficients_do_not_hold_back_the_kg50_input";
+        if !isolated(NAME) {
+            return;
+        }
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let sink = applied.clone();
+        let (source, peer) = kg50_input_pair(move |input| sink.lock().unwrap().push(input));
+        for name in [
+            DAQ_CALIBRATION_TYPE,
+            DAQ_KG50_CALIBRATION_TYPE,
+            "DAQ_THERMAL_CALIBRATION",
+            "DAQ_FILTER_CALIBRATION",
+        ] {
+            source
+                .enable_network_variable(
+                    crate::telemetry_schema::data_type(name),
+                    NetworkVariablePermissions::READ_WRITE,
+                )
+                .unwrap();
+        }
+        let mut cfg = crate::loadcell::LoadcellCalibrationFile {
+            kg50_input_stamp_ms: 10,
+            ..Default::default()
+        };
+        crate::loadcell::switch_kg50_input(&mut cfg, crate::loadcell::Kg50Input::P6Differential);
+        // The stored AMP2 profile is what DAQ's SD calibration is built from.
+        cfg.kg50_input_profiles.insert(
+            "amp2".into(),
+            serde_json::from_value(serde_json::json!({
+                "channel": {"linear": {"m": 1.0, "b": 0.0}, "fit": {"type": "poly2", "a": null, "b": null, "c": null, "d": null, "e": null, "x0": null}},
+                "thermal": null, "noise": null, "captures": []
+            }))
+            .unwrap(),
+        );
+        let error = set_daq_calibration(&source, &cfg).unwrap_err();
+        assert!(error.to_string().contains("polynomial"), "{error}");
+        kg50_input_pump(&source, &peer);
+        assert_eq!(*applied.lock().unwrap(), vec![1]);
+    }
     #[test]
     fn bootstrap_cache_without_discovered_readers_is_not_an_operational_receipt() {
         const NAME: &str = "network_variables::persistence_callback_tests::bootstrap_cache_without_discovered_readers_is_not_an_operational_receipt";
