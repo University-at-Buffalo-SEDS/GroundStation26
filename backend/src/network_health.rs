@@ -1,5 +1,5 @@
 //! Diagnostic liveness history. Silence is not evidence of a reboot or a CPU fault.
-use crate::types::{BoardDiagnostics, NetworkBoardHealthEntry, canonical_sender_id};
+use crate::types::{BoardDiagnostics, NetworkBoardHealthEntry, RfTxTiming, canonical_sender_id};
 use std::{collections::HashMap, time::Instant};
 pub const TIMEOUT_MS: u64 = 12_000;
 #[derive(Default)]
@@ -109,9 +109,21 @@ pub(crate) fn decode_diagnostics(w: &[u32]) -> Option<BoardDiagnostics> {
         sd_max_write_ms: value(21, 128),
         adc_overruns: value(22, 32),
         diagnostic_send_failures: w[23],
+        // Tagged words owned by SD/ADC fields on other boards; never both.
+        rf_tx_timing: (w[1] & (16 | 32 | 128) == 0 && w[16] == RF_TX_TIMING_TAG).then(|| {
+            RfTxTiming {
+                ack_frames: w[17],
+                ack_mean_ms: w[18],
+                ack_max_ms: w[19],
+                queue_high_water: w[20],
+                stale_drops: w[21],
+            }
+        }),
         ..Default::default()
     })
 }
+/// "RFT1" little-endian in BOARD_HEALTH word 16.
+const RF_TX_TIMING_TAG: u32 = 0x3154_4652;
 
 impl Tracker {
     fn record(&mut self, sender: &str, now: Instant, wall_ms: u64) -> &mut Record {
@@ -345,6 +357,36 @@ mod tests {
     use std::time::Duration;
     fn at(t: Instant, ms: u64) -> Instant {
         t + Duration::from_millis(ms)
+    }
+    #[test]
+    fn rf_tx_timing_block_is_tagged_and_never_shadows_sd_or_adc_words() {
+        let mut words = [0_u32; 24];
+        words[0] = 1;
+        words[4] = 1000;
+        words[1] = 1 | 2 | 8;
+        assert_eq!(decode_diagnostics(&words).unwrap().rf_tx_timing, None); // older RF
+        words[16..22].copy_from_slice(&[0x3154_4652, 7, 90, 2400, 11, 3]);
+        let decoded = decode_diagnostics(&words).unwrap();
+        assert_eq!(
+            decoded.rf_tx_timing,
+            Some(RfTxTiming {
+                ack_frames: 7,
+                ack_mean_ms: 90,
+                ack_max_ms: 2400,
+                queue_high_water: 11,
+                stale_drops: 3,
+            })
+        );
+        assert_eq!(decoded.sd_accepted_records, None);
+        assert_eq!(decoded.sd_max_write_ms, None);
+        assert_eq!(decoded.adc_overruns, None);
+        for flag in [16, 32, 128] {
+            words[1] = 1 | flag;
+            assert_eq!(decode_diagnostics(&words).unwrap().rf_tx_timing, None);
+        }
+        words[1] = 1;
+        words[16] = 0x3154_4653;
+        assert_eq!(decode_diagnostics(&words).unwrap().rf_tx_timing, None);
     }
     #[test]
     fn signed_temperature_extension_preserves_legacy_diagnostics() {

@@ -378,6 +378,25 @@ pub struct BoardDiagnostics {
     pub sd_init_failures: Option<u32>,
     #[serde(default)]
     pub launch_log: Option<DaqLaunchLogStatus>,
+    /// RF radio TX queue timing block. Missing on older RF firmware/other boards.
+    #[serde(default)]
+    pub rf_tx_timing: Option<RfTxTiming>,
+}
+
+/// RF BOARD_HEALTH words 16..21 ("RFT1" tag). Timing and high-water cover the
+/// interval since the previous report; stale drops are cumulative.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
+pub struct RfTxTiming {
+    /// Canonical ACK frames whose UART DMA completed in the interval.
+    pub ack_frames: u32,
+    /// Mean ACK enqueue-to-DMA-complete time, ms (0 without samples).
+    pub ack_mean_ms: u32,
+    /// Maximum ACK enqueue-to-DMA-complete time, ms.
+    pub ack_max_ms: u32,
+    /// Highest owned radio TX queue depth, descriptors.
+    pub queue_high_water: u32,
+    /// Ordinary frames dropped for exceeding the queue age limit since boot.
+    pub stale_drops: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
