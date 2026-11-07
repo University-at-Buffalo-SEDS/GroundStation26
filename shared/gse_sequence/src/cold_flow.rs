@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 
 const FRESH_MS: u64 = 2000;
 const ORDER: [usize; 5] = [3, 4, 0, 2, 1];
+/// After the station proves no earlier valve command is still owned by the
+/// command SDK, closed reports must keep arriving for this long before a pause
+/// counts as resumable. It covers transport buffering outside the SDK.
+pub const RETIREMENT_QUIET_MS: u64 = 2000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -17,6 +21,8 @@ pub enum Phase {
     Flowing,
     PauseClosing,
     ParkedUnverified,
+    /// Parked closed, with every earlier command retired: resumable.
+    Paused,
     CancelClosing,
     CancelRelieving,
     Cancelled,
@@ -59,6 +65,9 @@ pub struct Controller {
     issue: Option<Issue>,
     closure_confirmed: bool,
     resume_to_hold: bool,
+    /// Time at which the station observed that no earlier valve command could
+    /// still be delivered. Cleared by any new command batch.
+    retired_at: Option<u64>,
 }
 /// Remaining validity of the actual calibrated pressure receipt used by start.
 /// This never refreshes a producer timestamp or authorizes a command.
@@ -110,6 +119,7 @@ impl Controller {
             issue: None,
             closure_confirmed: false,
             resume_to_hold: false,
+            retired_at: None,
         };
         let effects = this.configure(Phase::Isolating, CLOSED, input.now_ms);
         Ok((this, effects))
@@ -128,6 +138,7 @@ impl Controller {
         }
     }
     fn configure(&mut self, phase: Phase, desired: [bool; 5], now: u64) -> Effects {
+        self.retired_at = None;
         self.phase = phase;
         self.desired = desired;
         self.pending = 0b11111;
@@ -226,17 +237,45 @@ impl Controller {
         self.issue = Some(Issue::TransportUnavailable);
         effects
     }
+    /// Fresh closed reports alone cannot retire an older SDK/board-owned open.
+    /// The station calls this only after it has observed, with no earlier
+    /// valve command still owned by the command SDK, that the parked closure
+    /// was confirmed. Closed reports captured after `RETIREMENT_QUIET_MS` past
+    /// this point then make the pause resumable.
+    pub fn commands_retired(&mut self, now: u64) {
+        if self.phase == Phase::ParkedUnverified && self.retired_at.is_none() {
+            self.retired_at = Some(now);
+        }
+    }
+    /// The station saw a valve command owned by the SDK again; restart the barrier.
+    pub fn commands_pending(&mut self) {
+        if matches!(self.phase, Phase::ParkedUnverified | Phase::Paused) {
+            self.retired_at = None;
+            self.phase = Phase::ParkedUnverified;
+        }
+    }
+    fn closed_after_barrier(&self, input: Inputs) -> bool {
+        self.retired_at.is_some_and(|retired| {
+            let floor = retired.saturating_add(RETIREMENT_QUIET_MS);
+            (0..5).all(|i| {
+                input.valves[i].is_some_and(|v| {
+                    !v.open
+                        && v.at_ms > floor
+                        && v.at_ms > self.since[i]
+                        && v.at_ms <= input.now_ms
+                        && input.now_ms - v.at_ms <= FRESH_MS
+                })
+            })
+        })
+    }
     pub fn paused_ready(&self) -> bool {
-        // Fresh closed reports cannot retire an older SDK/board-owned open.
-        // Shared pause supervisor must supply a qualified owner barrier before
-        // this controller can expose a resumable Paused state.
-        false
+        self.phase == Phase::Paused
     }
     /// Caller must supply a newly validated shared-supervisor admission. This
     /// pure precondition check is not authorization. Never restores an open PILOT.
     pub fn resume(&mut self, input: Inputs) -> Result<Effects, &'static str> {
         if !self.paused_ready()
-            || !self.all_reported(input)
+            || !self.closed_after_barrier(input)
             || !input.prelaunch
             || !input.interlock
             || pressure(input).is_none_or(|p| p >= self.ceiling)
@@ -294,6 +333,7 @@ impl Controller {
         self.close_batch(Phase::CancelClosing, now, false)
     }
     fn close_batch(&mut self, phase: Phase, now: u64, all: bool) -> Effects {
+        self.retired_at = None;
         self.phase = phase;
         self.desired = CLOSED;
         self.pending = 0;
@@ -321,7 +361,10 @@ impl Controller {
             return Effects::default();
         }
         let cancelling = matches!(self.phase, Phase::CancelClosing | Phase::CancelRelieving);
-        let parked = matches!(self.phase, Phase::PauseClosing | Phase::ParkedUnverified);
+        let parked = matches!(
+            self.phase,
+            Phase::PauseClosing | Phase::ParkedUnverified | Phase::Paused
+        );
         if !cancelling && !parked {
             if input.valves[4].is_some_and(|v| {
                 v.open && v.at_ms <= input.now_ms && input.now_ms - v.at_ms <= FRESH_MS
@@ -390,6 +433,10 @@ impl Controller {
         if self.pending != 0 {
             return self.next_checked(input);
         }
+        if self.phase == Phase::Paused && !self.closed_after_barrier(input) {
+            // Any missing, stale or open report voids the retirement proof.
+            self.commands_pending();
+        }
         if !self.all_reported(input) {
             self.closure_confirmed = false;
             if matches!(
@@ -425,6 +472,10 @@ impl Controller {
             }
             Phase::PauseClosing => {
                 self.phase = Phase::ParkedUnverified;
+                Effects::default()
+            }
+            Phase::ParkedUnverified if self.closed_after_barrier(input) => {
+                self.phase = Phase::Paused;
                 Effects::default()
             }
             Phase::CancelClosing => self.configure(Phase::CancelRelieving, RELIEVED, input.now_ms),
@@ -665,6 +716,92 @@ mod tests {
         assert!(r.c.resume(r.input).is_err());
         assert_eq!(r.trace.len(), count);
         assert!(r.c.release(r.input).is_err());
+    }
+    fn parked_flowing() -> Rig {
+        let mut r = Rig::new();
+        r.hold();
+        let e = r.c.release(r.input).unwrap();
+        r.apply(e);
+        r.until(Phase::Flowing);
+        let e = r.c.park(r.input.now_ms);
+        r.apply(e);
+        r.until(Phase::ParkedUnverified);
+        r
+    }
+    fn steps(r: &mut Rig, ms: u64) {
+        for _ in 0..ms / 10 {
+            r.step();
+        }
+    }
+    #[test]
+    fn retirement_barrier_and_quiet_closed_reports_make_a_pause_resumable() {
+        let mut r = parked_flowing();
+        // A barrier observed before the closure was confirmed is ignored.
+        let mut early = Rig::new();
+        early.until(Phase::Pressurizing);
+        let e = early.c.park(early.input.now_ms);
+        early.apply(e);
+        early.c.commands_retired(early.input.now_ms);
+        assert_eq!(early.c.retired_at, None);
+        steps(&mut r, 3000);
+        assert_eq!(r.c.phase, Phase::ParkedUnverified, "closed reports alone never retire");
+        let barrier = r.input.now_ms;
+        r.c.commands_retired(barrier);
+        steps(&mut r, RETIREMENT_QUIET_MS - 10);
+        assert_eq!(r.c.phase, Phase::ParkedUnverified);
+        assert!(r.c.resume(r.input).is_err());
+        steps(&mut r, 30);
+        assert_eq!(r.c.phase, Phase::Paused);
+        assert!(r.c.paused_ready());
+        let count = r.trace.len();
+        let e = r.c.resume(r.input).unwrap();
+        r.apply(e);
+        assert_eq!(r.c.phase, Phase::ConfirmingHold, "resume never restores an open PILOT");
+        r.until(Phase::AwaitingRelease);
+        assert!(r.trace[count..].iter().all(|(_, on)| !*on));
+        assert_eq!(r.c.retired_at, None);
+    }
+    #[test]
+    fn pending_command_or_bad_report_voids_the_barrier() {
+        for case in 0..3 {
+            let mut r = parked_flowing();
+            r.c.commands_retired(r.input.now_ms);
+            steps(&mut r, RETIREMENT_QUIET_MS + 20);
+            assert_eq!(r.c.phase, Phase::Paused);
+            match case {
+                0 => r.c.commands_pending(),
+                1 => {
+                    r.input.now_ms += 10;
+                    r.input.valves[0] = Some(ValveState { open: true, at_ms: r.input.now_ms });
+                    let e = r.c.tick(r.input);
+                    assert!(e.valves.is_empty());
+                }
+                _ => {
+                    r.input.now_ms += FRESH_MS + 10;
+                    r.input.pressure.as_mut().unwrap().at_ms = r.input.now_ms;
+                    let e = r.c.tick(r.input);
+                    assert!(e.valves.is_empty());
+                }
+            }
+            assert_eq!(r.c.phase, Phase::ParkedUnverified, "case {case}");
+            assert_eq!(r.c.retired_at, None);
+            assert!(r.c.resume(r.input).is_err());
+        }
+    }
+    #[test]
+    fn cancel_from_a_resumable_pause_relieves_through_dump_and_vent_never_pilot() {
+        let mut r = parked_flowing();
+        r.c.commands_retired(r.input.now_ms);
+        steps(&mut r, RETIREMENT_QUIET_MS + 20);
+        assert_eq!(r.c.phase, Phase::Paused);
+        let count = r.trace.len();
+        let e = r.c.cancel(r.input.now_ms);
+        r.apply(e);
+        r.until(Phase::Cancelled);
+        let tail = &r.trace[count..];
+        assert!(!tail.contains(&(0, true)));
+        assert!(tail.contains(&(1, true)) && tail.contains(&(2, true)));
+        assert_eq!(r.requested, RELIEVED);
     }
     #[test]
     fn getter_is_copy_only_and_regressed_clock_never_admits_an_open() {

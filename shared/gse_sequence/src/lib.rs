@@ -358,6 +358,32 @@ pub struct Engine {
     nitrogen_step_index: usize,
     hold_reference: Option<f32>,
     hold_samples: usize,
+    /// Test phase interrupted by an operator pause. Only a paused valve
+    /// self-test or nitrogen test carries this; fill pauses never do.
+    paused_from: Option<Phase>,
+}
+/// Which qualification test an operator pause interrupted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PausedTest {
+    ValveSelfTest,
+    NitrogenTest,
+}
+fn test_phase(phase: Phase) -> bool {
+    matches!(
+        phase,
+        Phase::BaselineSetup
+            | Phase::Baseline
+            | Phase::SelfSetup
+            | Phase::SelfOpen
+            | Phase::SelfHold
+            | Phase::SelfClose
+            | Phase::SelfFinish
+            | Phase::NitrogenSetup
+            | Phase::Raising
+            | Phase::Settling
+            | Phase::Holding
+            | Phase::Dumping
+    )
 }
 impl Default for Engine {
     fn default() -> Self {
@@ -391,6 +417,7 @@ impl Default for Engine {
             nitrogen_step_index: 0,
             hold_reference: None,
             hold_samples: 0,
+            paused_from: None,
         }
     }
 }
@@ -400,6 +427,7 @@ impl Engine {
     /// held closed; an empty checkout opens dump and vent.
     pub fn prepare_startup(&mut self, now_ms: u64, hold_filled: bool) -> Effects {
         self.resume_existing_inventory = false;
+        self.paused_from = None;
         self.claimed = true;
         self.testing_valves = false;
         self.nitrous_session = hold_filled;
@@ -451,7 +479,7 @@ impl Engine {
             return matches!(
                 self.status.phase,
                 Phase::FillSetup | Phase::Filling | Phase::Paused
-            );
+            ) || test_phase(self.status.phase);
         }
         if self.config.validate().is_err() || Self::fresh_pressure(input).is_none() {
             return false;
@@ -468,6 +496,7 @@ impl Engine {
                     .pressure_limit(self.nitrous_target_psi, 50.0)
                     .is_ok_and(|limit| limit > self.nitrous_target_psi)
                     && (self.status.nitrogen_passed || self.status.nitrogen_overridden)
+                    && self.paused_from.is_none()
                     && matches!(self.status.phase, Phase::Passed | Phase::Paused)
                     && self.fill_entry_pressure_ready(
                         Self::fresh_pressure(input).unwrap(),
@@ -622,6 +651,16 @@ impl Engine {
         self.resume_existing_inventory = action == Action::StartFill
             && self.status.phase == Phase::Paused
             && self.nitrous_session;
+        if action == Action::PauseFill {
+            // Re-pausing an already paused test keeps its resume point.
+            if test_phase(self.status.phase) {
+                self.paused_from = Some(self.status.phase);
+            } else if self.status.phase != Phase::Paused {
+                self.paused_from = None;
+            }
+        } else {
+            self.paused_from = None;
+        }
         self.claimed = true;
         Ok(match action {
             Action::Turbocharge => {
@@ -686,6 +725,7 @@ impl Engine {
     /// A failed qualification is recoverable: stop filling, verify the relief
     /// configuration, and require a new test without globally aborting the vehicle.
     pub fn cancel_failed_test(&mut self, now: u64, message: &str) -> Effects {
+        self.paused_from = None;
         self.status.nitrogen_passed = false;
         self.status.nitrogen_overridden = false;
         let mut effects = self.configure(Phase::CancelSetup, RELIEVED, now, message);
@@ -695,6 +735,7 @@ impl Engine {
         effects
     }
     pub fn fault(&mut self, now: u64, message: &str) -> Effects {
+        self.paused_from = None;
         self.status.nitrogen_passed = false;
         self.status.nitrogen_overridden = false;
         let mut effects = self.configure(Phase::Fault, RELIEVED, now, message);
@@ -705,6 +746,7 @@ impl Engine {
     }
     pub fn manual_override(&mut self) {
         self.resume_existing_inventory = false;
+        self.paused_from = None;
         self.claimed = false;
         self.testing_valves = false;
         self.self_pending = 0;
@@ -719,6 +761,116 @@ impl Engine {
     }
     pub fn nitrous_session(&self) -> bool {
         self.nitrous_session
+    }
+    /// The test an operator pause is closing or holding, if any.
+    pub fn paused_test(&self) -> Option<PausedTest> {
+        (self.paused_from.is_some()
+            && matches!(self.status.phase, Phase::PauseSetup | Phase::Paused))
+        .then_some(if self.testing_valves {
+            PausedTest::ValveSelfTest
+        } else {
+            PausedTest::NitrogenTest
+        })
+    }
+    /// Side-effect-free preview of every gate `resume_test` applies.
+    pub fn resume_test_check(&self, input: Inputs) -> Result<(), String> {
+        if !input.prelaunch {
+            return Err("GSE action blocked: vehicle is not in a prelaunch state".into());
+        }
+        if !input.interlock {
+            return Err("GSE action blocked: enable the key/software interlock".into());
+        }
+        if self.status.phase != Phase::Paused || self.paused_from.is_none() {
+            return Err("Only a paused valve self-test or nitrogen test can resume".into());
+        }
+        self.config.validate()?;
+        let pressure = Self::fresh_pressure(input)
+            .ok_or("GSE action blocked: a fresh tank PT sample is required")?;
+        let limit = self
+            .config
+            .pressure_limit(self.config.nitrogen_target_psi(), 100.0)?;
+        if pressure >= limit {
+            return Err("Tank pressure is at the test pressure ceiling".into());
+        }
+        if !self.confirmed(input) {
+            return Err(
+                "All five valves must freshly report closed after the pause before resuming"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+    /// Resume a paused test from a safe re-entry point:
+    /// - pause during the empty-tank baseline repeats the baseline;
+    /// - valve self-test re-checks resting outputs, then re-tests the valve it
+    ///   was on (or finishes if every valve was already tested);
+    /// - nitrogen test resumes the current pressure step with fresh settle and
+    ///   hold timers; if the tank is still at or above that step it goes
+    ///   straight to settling, so nitrogen is not reopened. A pause while
+    ///   dumping resumes dumping.
+    pub fn resume_test(&mut self, input: Inputs) -> Result<Effects, String> {
+        self.resume_test_check(input)?;
+        let from = self.paused_from.take().expect("checked paused test");
+        self.claimed = true;
+        self.hold_reference = None;
+        self.hold_samples = 0;
+        if matches!(from, Phase::BaselineSetup | Phase::Baseline) || self.status.baseline.is_none()
+        {
+            self.samples.clear();
+            self.status.baseline = None;
+            let message = "Resuming: repeating the empty-tank pressure calibration";
+            return Ok(if self.testing_valves {
+                self.configure_self(Phase::BaselineSetup, RELIEVED, input, message)
+            } else {
+                self.configure(Phase::BaselineSetup, RELIEVED, input.now_ms, message)
+            });
+        }
+        if self.testing_valves {
+            return Ok(if self.self_index >= 5 || from == Phase::SelfFinish {
+                self.configure_self(
+                    Phase::SelfFinish,
+                    RELIEVED,
+                    input,
+                    "Resuming: restoring dump and vent to open",
+                )
+            } else {
+                self.configure_self(
+                    Phase::SelfSetup,
+                    RELIEVED,
+                    input,
+                    "Resuming: checking resting valve states, then re-testing the current valve",
+                )
+            });
+        }
+        if from == Phase::Dumping {
+            return Ok(self.configure(
+                Phase::Dumping,
+                RELIEVED,
+                input.now_ms,
+                "Resuming: dumping tank before enabling fill",
+            ));
+        }
+        let pressure = Self::fresh_pressure(input).expect("checked fresh pressure");
+        let step = self
+            .status
+            .baseline
+            .as_ref()
+            .map(|b| b.average_psi + self.status.current_step_psi);
+        Ok(if step.is_some_and(|step| pressure >= step) {
+            self.configure(
+                Phase::Settling,
+                CLOSED,
+                input.now_ms,
+                "Resuming: tank already at the current step; settling before a fresh hold",
+            )
+        } else {
+            self.configure(
+                Phase::NitrogenSetup,
+                CLOSED,
+                input.now_ms,
+                "Resuming the current nitrogen pressure step",
+            )
+        })
     }
     fn nitrogen_step(&self) -> NitrogenStep {
         self.nitrogen_plan
@@ -919,6 +1071,12 @@ impl Engine {
                     input.now_ms,
                     if phase == Phase::Idle {
                         "Valve self-test complete: dump and vent open"
+                    } else if phase == Phase::Paused && self.paused_from.is_some() {
+                        if self.testing_valves {
+                            "Valve self-test paused: all valves closed"
+                        } else {
+                            "Nitrogen test paused: all valves closed"
+                        }
                     } else if phase == Phase::Paused {
                         "Fill paused: all valves closed"
                     } else {
@@ -2127,3 +2285,6 @@ mod tests {
 
 #[cfg(test)]
 mod operator_coherence_tests;
+
+#[cfg(test)]
+mod pause_resume_tests;

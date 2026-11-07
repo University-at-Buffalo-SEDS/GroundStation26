@@ -1509,6 +1509,66 @@ fn handle_command_inner(
     }
     false
 }
+/// Retirement barrier: no valve or actuator command (from any producer) is
+/// still owned by the command SDK, so none can be transmitted or retried
+/// later and overtake a pause closure. A busy SDK core is never retired.
+pub(super) fn commands_retired(state: &AppState) -> bool {
+    !manual_stop_pending(state)
+        && state.topology_router.get().is_some_and(|router| {
+            ["VALVE_COMMAND", "ACTUATOR_COMMAND"].iter().all(|name| {
+                matches!(
+                    router.try_has_pending_reliable_tx_type(crate::telemetry_schema::data_type(name)),
+                    Ok(false)
+                )
+            })
+        })
+}
+/// Resume the paused valve self-test or nitrogen test. Caller holds DISPATCH
+/// and has validated the run key and ownership epoch.
+pub(super) fn resume_test_under_dispatch(state: &Arc<AppState>) -> Result<(), String> {
+    let is_prelaunch = prelaunch(state);
+    let policy = state.action_policy_snapshot();
+    if !commands_retired(state) {
+        return Err("Earlier valve commands are still being delivered; resume after they retire".into());
+    }
+    let effects = {
+        let mut rt = state.gse.lock().unwrap();
+        let paused = rt.engine.paused_test().ok_or("No paused test")?;
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            let action = match paused {
+                gse_sequence::PausedTest::ValveSelfTest => Action::SelfTest,
+                gse_sequence::PausedTest::NitrogenTest => Action::NitrogenTest,
+            };
+            if !operational_action_allowed(&rt, action) {
+                return Err(
+                    "Complete prerequisites in order and wait for stable fill-system routes".into(),
+                );
+            }
+            // Completion is bound to the run's original qualification generation.
+            if rt.operational.run_generation != rt.operational.saved.qualification.generation() {
+                return Err(
+                    "Qualification was reset during the pause; cancel and start a new test".into(),
+                );
+            }
+        }
+        #[cfg(feature = "hitl_mode")]
+        let _ = paused;
+        let input = rt.input(is_prelaunch, interlock(state, &policy));
+        let effects = rt.engine.resume_test(input)?;
+        rt.manual_control = false;
+        rt.progress_observe(input, crate::sequence_progress_projection::Cause::ResumeAccepted);
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            rt.operational.running = true;
+            rt.operational.target_reached = None;
+        }
+        effects
+    };
+    apply(state, effects);
+    crate::sequences::refresh_action_policy_under_dispatch(state);
+    Ok(())
+}
 #[cfg(any(test, not(feature = "hitl_mode")))]
 fn fill_mass_in_band(config: &Config, mass: f32, target: f32) -> bool {
     mass.is_finite()
@@ -6242,6 +6302,10 @@ pub(crate) fn apply_model_effects_for_test(state: &Arc<AppState>, valves: Vec<(u
 #[cfg(test)]
 #[path = "gse/fill_resume_tests.rs"]
 mod fill_resume_tests;
+
+#[cfg(test)]
+#[path = "gse/pause_resume_tests.rs"]
+mod pause_resume_tests;
 
 #[cfg(test)]
 pub(crate) async fn fill_recording_test_state(

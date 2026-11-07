@@ -553,13 +553,16 @@ pub(super) fn check_report_safety(state: &Arc<AppState>) {
         // resting nitrous-fill policy must not reject its intentional N2 step.
         return;
     }
+    // A paused nitrogen test is not a nitrous session: nitrogen may still be
+    // closing while its pause is confirmed. Once paused, nitrogen must be closed.
+    let test_pause = rt.engine.paused_test().is_some();
     let nitrous_session = rt.engine.nitrous_session()
-        || matches!(
-            phase,
-            Phase::FillSetup | Phase::Filling | Phase::PauseSetup | Phase::Paused
-        );
+        || matches!(phase, Phase::FillSetup | Phase::Filling)
+        || (matches!(phase, Phase::PauseSetup | Phase::Paused) && !test_pause);
     let unexpected_supply = if nitrous_session && rt.valves[3].is_some_and(|v| v.open) {
         Some("Nitrogen opened during nitrous fill")
+    } else if test_pause && phase == Phase::Paused && rt.valves[3].is_some_and(|v| v.open) {
+        Some("Nitrogen opened while the test is paused")
     } else if (!nitrous_session && rt.valves[3].is_some_and(|v| v.open)
         || matches!(phase, Phase::Raising | Phase::Settling | Phase::Holding))
         && rt.valves[4].is_some_and(|v| v.open)

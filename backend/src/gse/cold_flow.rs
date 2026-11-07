@@ -49,7 +49,9 @@ enum Request {
     Release,
     Cancel,
     Park,
+    Resume,
 }
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartRequest {}
@@ -315,7 +317,7 @@ fn apply_bounded(state: &Arc<AppState>, mut plan: Plan, recover: bool) -> bool {
             if rt.cold_flow.as_ref().is_some_and(|s| {
                 s.key == plan.key && s.revision == plan.revision && !s.retired
                     && !matches!(s.controller.observation().phase,
-                        ColdPhase::PauseClosing | ColdPhase::ParkedUnverified
+                        ColdPhase::PauseClosing | ColdPhase::ParkedUnverified | ColdPhase::Paused
                             | ColdPhase::CancelClosing | ColdPhase::CancelRelieving)
             }) {
                 let effects = rt.cold_flow.as_mut().unwrap().controller.park_for_transport(plan.input.now_ms);
@@ -348,6 +350,7 @@ fn perform(
         if !ground_permitted(state) {
             return Err("Cold-flow admission changed or Stop/Launch is active");
         }
+        let retired = matches!(request, Request::Resume) && commands_retired(state);
         let mut rt = state.gse.lock().unwrap();
         let input = input(&rt, state, simulation, interlock(state, &policy));
         let session = rt
@@ -370,7 +373,23 @@ fn perform(
                 }
                 session.controller.cancel(input.now_ms)
             }
-            Request::Park => session.controller.park(input.now_ms),
+            Request::Park => {
+                match session.controller.observation().phase {
+                    ColdPhase::CancelClosing | ColdPhase::CancelRelieving | ColdPhase::Cancelled => {
+                        return Err("Cold-flow cancellation already pending or complete");
+                    }
+                    ColdPhase::PauseClosing | ColdPhase::ParkedUnverified | ColdPhase::Paused => {
+                        return Err("Cold flow is already paused");
+                    }
+                    _ => session.controller.park(input.now_ms),
+                }
+            }
+            Request::Resume => {
+                if !retired || session.pending.is_some() {
+                    return Err("Earlier valve commands are still being delivered; resume after they retire");
+                }
+                session.controller.resume(input)?
+            }
         };
         let mut plan = make_plan(&mut rt, effects, input).ok_or("Cold-flow revision exhausted")?;
         plan.release_rollback = release_rollback;
@@ -831,6 +850,93 @@ pub(super) fn cancel_authenticated(
     };
     reply(perform(state, &key, ticket, Request::Cancel), key)
 }
+pub(super) fn park_authenticated(
+    state: &Arc<AppState>,
+    key: RunKey,
+    ticket: LaunchAdmission,
+) -> Response {
+    let Some(_claim) = claim_operator_dispatch(state, ticket.generation) else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    reply(perform(state, &key, ticket, Request::Park), key)
+}
+pub(super) fn resume_authenticated(
+    state: &Arc<AppState>,
+    key: RunKey,
+    ticket: LaunchAdmission,
+) -> Response {
+    let Some(_claim) = claim_operator_dispatch(state, ticket.generation) else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    reply(perform(state, &key, ticket, Request::Resume), key)
+}
+/// Live Pause/Resume/Cancel admission for the owned cold-flow run.
+pub(super) fn controls(
+    state: &AppState,
+    block: &Option<String>,
+    interlocked: bool,
+) -> Option<crate::sequence_progress::RunControls> {
+    use crate::sequence_progress::Gate;
+    let simulation = crate::simulation_clock_ms();
+    let ticket = state.gse.lock().unwrap().cold_flow.as_ref().filter(|s| s.active())?.ticket;
+    let owned = permitted(state, ticket);
+    let retired = commands_retired(state);
+    let rt = state.gse.lock().unwrap();
+    let session = rt.cold_flow.as_ref().filter(|s| s.active())?;
+    let input = input(&rt, state, simulation, interlocked);
+    let phase = session.controller.observation().phase;
+    let cancelling = matches!(
+        phase,
+        ColdPhase::CancelClosing | ColdPhase::CancelRelieving | ColdPhase::Cancelled
+    );
+    let common = |gate: Result<(), String>| {
+        Gate::from_result(gate.and_then(|()| {
+            if let Some(block) = block {
+                return Err(block.clone());
+            }
+            if !owned {
+                return Err("Cold-flow admission changed or Stop/Launch is active".into());
+            }
+            Ok(())
+        }))
+    };
+    let pause = if cancelling {
+        Err("Cancelling".into())
+    } else if phase == ColdPhase::PauseClosing {
+        Err("Pause in progress: closing valves".into())
+    } else if matches!(phase, ColdPhase::ParkedUnverified | ColdPhase::Paused) {
+        Err("Already paused".into())
+    } else {
+        Ok(())
+    };
+    let resume = match phase {
+        ColdPhase::Paused if !retired || session.pending.is_some() => {
+            Err("Earlier valve commands are still being delivered".into())
+        }
+        ColdPhase::Paused => session
+            .controller
+            .clone()
+            .resume(input)
+            .map(|_| ())
+            .map_err(str::to_string),
+        ColdPhase::ParkedUnverified | ColdPhase::PauseClosing => Err(
+            "Waiting until no earlier valve command can still be delivered and fresh closed reports follow"
+                .into(),
+        ),
+        _ => Err("Resume is available once cold flow is paused".into()),
+    };
+    let cancel = if cancelling {
+        Err("Cancelling".into())
+    } else {
+        Ok(())
+    };
+    Some(crate::sequence_progress::RunControls {
+        key: session.key.clone(),
+        pause: common(pause),
+        resume: common(resume),
+        cancel: common(cancel),
+    })
+}
 pub(crate) async fn dispatch_panel(state: &Arc<AppState>, intent: PanelIntent) {
     if !intent.awaiting_at_edge {
         return;
@@ -883,6 +989,7 @@ pub(super) fn tick(state: &Arc<AppState>, is_interlocked: bool) -> bool {
         };
         let current = ownership_state(state, ticket);
         if current == CurrentState::PendingBusy { return true; }
+        let retired = commands_retired(state);
         let mut rt = state.gse.lock().unwrap();
         let input = input(&rt, state, simulation, is_interlocked);
         if current == CurrentState::Invalid {
@@ -895,6 +1002,12 @@ pub(super) fn tick(state: &Arc<AppState>, is_interlocked: bool) -> bool {
                 crate::sequence_progress_service::now_ms(),
             );
             return true;
+        }
+        let session = rt.cold_flow.as_mut().unwrap();
+        if retired && session.pending.is_none() {
+            session.controller.commands_retired(input.now_ms);
+        } else {
+            session.controller.commands_pending();
         }
         if let Some(pending) = rt.cold_flow.as_mut().unwrap().pending.take() {
             Some(pending)

@@ -182,6 +182,7 @@ impl Fixture {
                 ("VALVE_COMMAND", 4) => (1, false),
                 ("VALVE_COMMAND", 5) => (2, false),
                 ("ACTUATOR_COMMAND", 9) => (3, true),
+                ("ACTUATOR_COMMAND", 10) => (4, true),
                 ("ACTUATOR_COMMAND", 12) => (3, false),
                 ("ACTUATOR_COMMAND", 13) => (4, false),
                 _ => panic!("unexpected cold-flow packet {kind} {code}"),
@@ -1546,4 +1547,228 @@ async fn manual_handoff_retires_cold_flow_without_emitting_automatic_outputs() {
     f.step(100.);
     assert_eq!(f.sent.lock().unwrap().len(), before,
         "retired scheduled effects must not overwrite manual control");
+}
+
+#[tokio::test]
+async fn actual_cold_flow_pause_resumes_only_after_command_retirement_and_cancel_relieves() {
+    const NAME: &str = "gse::cold_flow::tests::actual_cold_flow_pause_resumes_only_after_command_retirement_and_cancel_relieves";
+    const CHILD: &str = "GS_COLD_FLOW_PAUSE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("GS_RRLS_ROLE", "off")
+            .env("GS_SIM_MODE", "0")
+            .env_remove("GS_SIM_CLOCK_FILE")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("1 passed"));
+        return;
+    }
+    let mut f = Fixture::new().await;
+    let key = f.start().await;
+    f.hold();
+    let body = serde_json::to_value(&key).unwrap();
+    let controls = progress::controls(&f.state).unwrap();
+    assert_eq!(controls.key, key);
+    assert!(controls.pause.allowed && controls.cancel.allowed, "{controls:?}");
+    assert!(!controls.resume.allowed);
+    assert!(matches!(
+        f.call("/api/gse/sequences/pause", body.clone(), None).await.0,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ));
+    let (code, value) = f
+        .call("/api/gse/sequences/pause", body.clone(), Some("cold-origin-token"))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{value}");
+    assert_eq!(f.phase(), ColdPhase::PauseClosing);
+    let pause_start = f.sent.lock().unwrap().len();
+    f.until(ColdPhase::ParkedUnverified, 100.);
+    assert_eq!(f.actual, CLOSED);
+    let (code, _) = f
+        .call("/api/gse/sequences/resume", body.clone(), Some("cold-origin-token"))
+        .await;
+    assert_eq!(code, StatusCode::CONFLICT, "no resume before the quiet window");
+    for _ in 0..300 {
+        if f.phase() == ColdPhase::Paused {
+            break;
+        }
+        f.step(100.);
+    }
+    assert_eq!(f.phase(), ColdPhase::Paused);
+    progress::flush(&f.state);
+    let envelope = progress::envelope(&f.state);
+    assert_eq!(envelope["active"][0]["outcome"], "paused", "{envelope}");
+    assert_eq!(envelope["controls"][0]["resume"]["allowed"], true, "{envelope}");
+    // Any valve command still owned by the SDK voids the barrier.
+    crate::telemetry_task::queue_automatic_controller_command(
+        f.state.topology_router.get().unwrap(),
+        crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
+        CLOSE[3],
+    )
+    .unwrap();
+    assert!(!super::commands_retired(&f.state));
+    let (code, _) = f
+        .call("/api/gse/sequences/resume", body.clone(), Some("cold-origin-token"))
+        .await;
+    assert_eq!(code, StatusCode::CONFLICT, "pending SDK command blocks resume");
+    crate::gse::tick(&f.state, true);
+    assert_eq!(f.phase(), ColdPhase::ParkedUnverified);
+    for _ in 0..300 {
+        if f.phase() == ColdPhase::Paused {
+            break;
+        }
+        f.step(100.);
+    }
+    assert_eq!(f.phase(), ColdPhase::Paused);
+    let (code, value) = f
+        .call("/api/gse/sequences/resume", body.clone(), Some("cold-origin-token"))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{value}");
+    assert_eq!(f.phase(), ColdPhase::ConfirmingHold);
+    f.until(ColdPhase::AwaitingRelease, 100.);
+    f.pump();
+    assert!(
+        !f.sent.lock().unwrap()[pause_start..].contains(&("VALVE_COMMAND".into(), vec![0x80])),
+        "pause and resume never open PILOT/main"
+    );
+    // Cancel from a fresh pause relieves through dump and vent, never PILOT.
+    let (code, _) = f
+        .call("/api/gse/sequences/pause", body.clone(), Some("cold-origin-token"))
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    f.until(ColdPhase::ParkedUnverified, 100.);
+    let (code, value) = f
+        .call("/api/gse/sequences/cancel", body.clone(), Some("cold-origin-token"))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{value}");
+    for _ in 0..200 {
+        if f.state.gse.lock().unwrap().cold_flow.as_ref().unwrap().controller.observation().phase == ColdPhase::Cancelled {
+            break;
+        }
+        f.step(100.);
+    }
+    f.pump();
+    assert_eq!(f.actual, RELIEVED);
+    assert!(!f.sent.lock().unwrap()[pause_start..].contains(&("VALVE_COMMAND".into(), vec![0x80])));
+    progress::flush(&f.state);
+    assert!(progress::controls(&f.state).is_none());
+}
+
+#[tokio::test]
+async fn actual_sequence_pause_resume_cancel_routes_follow_live_server_gates() {
+    const NAME: &str = "gse::cold_flow::tests::actual_sequence_pause_resume_cancel_routes_follow_live_server_gates";
+    const CHILD: &str = "GS_SEQUENCE_PAUSE_ROUTE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("GS_RRLS_ROLE", "off")
+            .env("GS_SIM_MODE", "0")
+            .env_remove("GS_SIM_CLOCK_FILE")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("1 passed"));
+        return;
+    }
+    let mut f = Fixture::new().await;
+    let boards = |state: &AppState| {
+        for board in [
+            crate::types::Board::GatewayBoard,
+            crate::types::Board::ValveBoard,
+            crate::types::Board::ActuatorBoard,
+            crate::types::Board::DaqBoard,
+        ] {
+            state.mark_board_seen(board.sender_id(), crate::telemetry_task::get_current_timestamp_ms());
+        }
+    };
+    boards(&f.state);
+    f.actual = RELIEVED;
+    {
+        let mut rt = f.state.gse.lock().unwrap();
+        rt.engine.config.dry_self_test_confirmed = true;
+        for (key, open) in KEYS.into_iter().zip(RELIEVED) {
+            rt.observe_valve(key, open);
+        }
+    }
+    let step = |f: &mut Fixture| {
+        f.pump();
+        boards(&f.state);
+        {
+            let mut rt = f.state.gse.lock().unwrap();
+            let now = rt.test_now_ms.unwrap() + 100;
+            rt.test_now_ms = Some(now);
+            rt.observe_pressure(Some(0.));
+            for (i, key) in KEYS.into_iter().enumerate() {
+                rt.observe_valve(key, f.actual[i]);
+            }
+        }
+        crate::gse::tick(&f.state, true);
+        let phase = f.state.gse.lock().unwrap().engine.status.phase;
+        assert_ne!(phase, Phase::Fault, "{}", f.state.gse.lock().unwrap().engine.status.message);
+        phase
+    };
+    assert!(crate::gse::handle_command(&f.state, &TelemetryCommand::ValveSelfTest));
+    for _ in 0..400 {
+        if step(&mut f) == Phase::SelfHold {
+            break;
+        }
+    }
+    let key = f.state.gse.lock().unwrap().progress.current().unwrap().key.clone();
+    let body = serde_json::to_value(&key).unwrap();
+    let mut wrong = key.clone();
+    wrong.run_id = "f".repeat(32);
+    assert!(matches!(
+        f.call("/api/gse/sequences/pause", body.clone(), None).await.0,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ));
+    assert_eq!(
+        f.call("/api/gse/sequences/pause", serde_json::to_value(&wrong).unwrap(), Some("cold-origin-token")).await.0,
+        StatusCode::CONFLICT
+    );
+    let (code, value) = f.call("/api/gse/sequences/resume", body.clone(), Some("cold-origin-token")).await;
+    assert_eq!(code, StatusCode::CONFLICT, "nothing to resume while running: {value}");
+    let (code, value) = f.call("/api/gse/sequences/pause", body.clone(), Some("cold-origin-token")).await;
+    assert_eq!(code, StatusCode::OK, "{value}");
+    assert_eq!(f.state.gse.lock().unwrap().engine.status.phase, Phase::PauseSetup);
+    for _ in 0..100 {
+        if step(&mut f) == Phase::Paused {
+            break;
+        }
+    }
+    step(&mut f);
+    assert_eq!(f.actual, CLOSED);
+    let (code, _) = f.call("/api/gse/sequences/pause", body.clone(), Some("cold-origin-token")).await;
+    assert_eq!(code, StatusCode::CONFLICT, "already paused");
+    let (code, value) = f.call("/api/gse/sequences/resume", body.clone(), Some("cold-origin-token")).await;
+    assert_eq!(code, StatusCode::OK, "{value}");
+    assert_eq!(f.state.gse.lock().unwrap().engine.status.phase, Phase::SelfSetup);
+    for _ in 0..50 {
+        step(&mut f);
+    }
+    let (code, value) = f.call("/api/gse/sequences/cancel", body.clone(), Some("cold-origin-token")).await;
+    assert_eq!(code, StatusCode::OK, "{value}");
+    for _ in 0..100 {
+        if step(&mut f) == Phase::Cancelled {
+            break;
+        }
+    }
+    step(&mut f);
+    assert_eq!(f.actual, RELIEVED);
+    progress::flush(&f.state);
+    assert!(progress::controls(&f.state).is_none());
+    let envelope = progress::envelope(&f.state);
+    assert_eq!(envelope["terminal"][0]["outcome"], "cancelled", "{envelope}");
 }

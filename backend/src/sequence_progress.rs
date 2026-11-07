@@ -450,6 +450,36 @@ impl Journal {
     }
 }
 
+/// Live server admission for one run control. `reason` explains a refusal.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gate {
+    pub allowed: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+impl Gate {
+    pub fn from_result(result: Result<(), String>) -> Self {
+        match result {
+            Ok(()) => Self {
+                allowed: true,
+                reason: None,
+            },
+            Err(reason) => Self {
+                allowed: false,
+                reason: Some(reason.chars().take(256).collect()),
+            },
+        }
+    }
+}
+/// Presentation of the current run's Pause/Resume/Cancel admission. It is
+/// recomputed for every status read and never stored in a run revision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunControls {
+    pub key: RunKey,
+    pub pause: Gate,
+    pub resume: Gate,
+    pub cancel: Gate,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelPhase {
     Baseline,
@@ -461,7 +491,6 @@ pub enum CancelPhase {
     Turbocharge,
     Cancelling,
     Terminal,
-    Unknown,
 }
 /// Produced from the actual current runtime under existing admission ordering, not client JSON.
 pub struct LiveCancelContext<'a> {
@@ -483,10 +512,13 @@ pub fn validate_cancel(expected: &RunKey, live: &LiveCancelContext<'_>) -> Resul
         return Err(Error::Kind);
     }
     let phase_allowed = match live.kind {
-        Kind::ValveSelfTest => matches!(live.phase, CancelPhase::Baseline | CancelPhase::SelfTest),
+        Kind::ValveSelfTest => matches!(
+            live.phase,
+            CancelPhase::Baseline | CancelPhase::SelfTest | CancelPhase::Paused
+        ),
         Kind::NitrogenTest => matches!(
             live.phase,
-            CancelPhase::Baseline | CancelPhase::NitrogenTest
+            CancelPhase::Baseline | CancelPhase::NitrogenTest | CancelPhase::Paused
         ),
         Kind::Fill => matches!(
             live.phase,

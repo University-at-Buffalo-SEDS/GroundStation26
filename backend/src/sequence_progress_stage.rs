@@ -65,6 +65,7 @@ const EMPTY_STEP: PlanStep = PlanStep {
 enum Proof {
     Durable(Kind, Text<128>),
     Safe(ProgressObservation),
+    Stopped(ProgressObservation),
     Interrupted,
     Failed(Text<512>),
     #[cfg(any(test, feature = "hitl_mode"))]
@@ -79,6 +80,7 @@ impl Proof {
                 Self::Durable(kind, Text::new(&event_id))
             }
             TerminalProof::SafeCancelled(v) => Self::Safe(v),
+            TerminalProof::SafeStopped(v) => Self::Stopped(v),
             TerminalProof::Interrupted => Self::Interrupted,
             TerminalProof::Failed { message } => Self::Failed(Text::new(&message)),
             #[cfg(any(test, feature = "hitl_mode"))]
@@ -98,6 +100,7 @@ impl Proof {
                 event_id: id.string(),
             },
             Self::Safe(v) => TerminalProof::SafeCancelled(v),
+            Self::Stopped(v) => TerminalProof::SafeStopped(v),
             Self::Interrupted => TerminalProof::Interrupted,
             Self::Failed(message) => TerminalProof::Failed {
                 message: message.string(),
@@ -340,6 +343,8 @@ impl Stage {
                 Outcome::Cancelled
             } else if matches!(cold.phase, C::CancelClosing | C::CancelRelieving) {
                 Outcome::Cancelling
+            } else if matches!(cold.phase, C::ParkedUnverified | C::Paused) {
+                Outcome::Paused
             } else {
                 Outcome::Running
             };
@@ -373,7 +378,7 @@ impl Stage {
             s.outcome = match proof {
                 Proof::Interrupted => Outcome::Interrupted,
                 Proof::Failed(_) => Outcome::Failed,
-                Proof::Safe(_) => Outcome::Cancelled,
+                Proof::Safe(_) | Proof::Stopped(_) => Outcome::Cancelled,
                 _ => Outcome::Passed,
             };
             s.cancel_allowed = false;

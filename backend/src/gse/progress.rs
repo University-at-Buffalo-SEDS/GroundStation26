@@ -82,6 +82,18 @@ impl Runtime {
                 crate::sequence_progress_service::now_ms(),
             );
         }
+        // Turbocharge cannot resume: its pause ends the run once every valve
+        // is confirmed closed.
+        if view.phase == Phase::Paused
+            && view.all_valves_confirmed_by_engine
+            && self.turbocharge.is_none()
+            && self.progress.current().is_some_and(|s| s.kind == Kind::Turbocharge)
+        {
+            self.progress.complete(
+                TerminalProof::SafeStopped(view),
+                crate::sequence_progress_service::now_ms(),
+            );
+        }
     }
     pub(super) fn progress_failed_current(&mut self) {
         self.progress.complete_failure(
@@ -215,6 +227,8 @@ fn publish(
 }
 pub(crate) fn envelope(state: &AppState) -> serde_json::Value {
     let epoch = automatic_generation(state);
+    // Computed before the journal lock; it takes GSE and policy locks.
+    let live = controls(state);
     let observation = state
         .sequence_progress
         .lock()
@@ -223,13 +237,218 @@ pub(crate) fn envelope(state: &AppState) -> serde_json::Value {
     observation
         .and_then(|mut value| {
             value.board_display = crate::board_recovery::sequence_board_display(state);
+            if let Some(mut live) = live
+                && let Some(active) = value.active.iter().find(|s| s.key == live.key)
+            {
+                // A reporting gap or stale epoch also withdraws every control.
+                if !active.cancel_allowed {
+                    live.cancel = wire::Gate::from_result(Err(active
+                        .reporting_error
+                        .clone()
+                        .unwrap_or_else(|| "Cancel is not available in this step".into())));
+                }
+                if active.reporting_error.is_some() {
+                    let reason = active.reporting_error.clone();
+                    for gate in [&mut live.pause, &mut live.resume] {
+                        if gate.allowed {
+                            *gate = wire::Gate::from_result(Err(reason.clone().unwrap_or_default()));
+                        }
+                    }
+                }
+                value.controls.push(live);
+            }
             serde_json::to_value(value).ok()
         })
         .unwrap_or_default()
 }
+
+/// Common station-level refusals shared by every run control.
+pub(super) fn station_block(state: &AppState) -> Option<String> {
+    if let Err((_, message)) = require_primary_operational_station() {
+        return Some(message);
+    }
+    if !super::prelaunch(state) {
+        return Some("Vehicle is not in a prelaunch state".into());
+    }
+    if state
+        .launch_history
+        .lock()
+        .unwrap()
+        .automatic_actions_inhibited()
+    {
+        return Some("Automatic GSE actions are inhibited after Launch".into());
+    }
+    if manual_stop_pending(state) {
+        return Some("A Stop is still being delivered".into());
+    }
+    None
+}
+fn with_common(
+    gate: Result<(), String>,
+    block: &Option<String>,
+    interlock_needed: bool,
+    interlocked: bool,
+    command_allowed: bool,
+) -> wire::Gate {
+    wire::Gate::from_result(gate.and_then(|()| {
+        if let Some(block) = block {
+            return Err(block.clone());
+        }
+        if interlock_needed && !interlocked {
+            return Err("Enable the key and software interlock".into());
+        }
+        if !command_allowed {
+            return Err("The station is not accepting this command right now".into());
+        }
+        Ok(())
+    }))
+}
+fn cancel_phase(rt: &Runtime, kind: Kind) -> wire::CancelPhase {
+    if kind == Kind::Fill && rt.fill_trim.is_some() {
+        wire::CancelPhase::FillTrim
+    } else {
+        phase(rt.engine.status.phase)
+    }
+}
+/// Live Pause/Resume/Cancel admission for the current run. The endpoints use
+/// the same gates, then re-check under the dispatch gate before acting.
+pub(crate) fn controls(state: &AppState) -> Option<wire::RunControls> {
+    if crate::rrls::is_rrls() {
+        return None;
+    }
+    let block = station_block(state);
+    let policy = state.action_policy_snapshot();
+    let interlocked = interlock(state, &policy);
+    if super::cold_flow::active(state) {
+        return super::cold_flow::controls(state, &block, interlocked);
+    }
+    let is_prelaunch = super::prelaunch(state);
+    let pause_command = state.is_command_allowed(&TelemetryCommand::PauseFill);
+    let cancel_command = state.is_command_allowed(&TelemetryCommand::CancelFill);
+    let fill_command = state.is_command_allowed(&TelemetryCommand::StartFill);
+    let mass_target = state.fill_targets_snapshot().nitrous.target_mass_kg;
+    let retired = super::commands_retired(state);
+    let rt = state.gse.lock().unwrap();
+    let summary = rt.progress.current().filter(|s| !s.outcome.terminal())?;
+    let (key, kind) = (summary.key.clone(), summary.kind);
+    let phase_now = rt.engine.status.phase;
+    let input = rt.input(is_prelaunch, interlocked);
+    let test = matches!(kind, Kind::ValveSelfTest | Kind::NitrogenTest);
+    let pause = match phase_now {
+        _ if kind == Kind::Turbocharge => {
+            if rt.turbocharge.is_some() {
+                Ok(())
+            } else {
+                Err("Turbocharge is no longer running".into())
+            }
+        }
+        _ if kind == Kind::Fill && rt.fill_trim.is_some() => Ok(()),
+        Phase::PauseSetup => Err("Pause in progress: closing valves".into()),
+        Phase::Paused => Err("Already paused".into()),
+        Phase::CancelSetup | Phase::Cancelled => Err("Cancelling".into()),
+        Phase::FillSetup | Phase::Filling if kind == Kind::Fill => Ok(()),
+        _ if test && rt.engine.allows(Action::PauseFill, input) => Ok(()),
+        _ => Err("Pause is not available in this step".into()),
+    };
+    let resume: Result<(), String> = match kind {
+        Kind::Turbocharge => {
+            Err("Turbocharge cannot resume after a pause; start it again from Actions".into())
+        }
+        Kind::Fill if phase_now != Phase::Paused || rt.fill_trim.is_some() => {
+            Err("Resume is available once the fill is paused".into())
+        }
+        Kind::Fill => {
+            let mass = rt.fresh_mass(input.now_ms);
+            let target_psi = state.fill_targets_snapshot().nitrous.target_pressure_psi;
+            if rt.ground_station_control
+                && rt.valve_pressure.is_some_and(|p| {
+                    p.value >= target_psi
+                        && p.at_ms <= input.now_ms
+                        && input.now_ms - p.at_ms <= 2000
+                })
+            {
+                Err("Nitrous pressure is already at its target".into())
+            } else if rt.ground_station_control && mass.is_none() {
+                Err("Automatic fill requires fresh calibrated fill weight".into())
+            } else {
+                match rt.engine.fill_resume_required(input, mass, mass_target) {
+                    Ok(true) => operational_gate(&rt, Action::StartFill),
+                    Ok(false) => Err("Fill weight is within 0.2 kg of the target or above it; no refill needed".into()),
+                    Err(error) => Err(error),
+                }
+            }
+        }
+        _ if test => match rt.engine.paused_test() {
+            Some(paused) if phase_now == Phase::Paused => rt
+                .engine
+                .resume_test_check(input)
+                .and_then(|()| {
+                    operational_gate(
+                        &rt,
+                        match paused {
+                            gse_sequence::PausedTest::ValveSelfTest => Action::SelfTest,
+                            gse_sequence::PausedTest::NitrogenTest => Action::NitrogenTest,
+                        },
+                    )
+                }),
+            _ => Err("Resume is available once the test is paused".into()),
+        },
+        _ => Err("This sequence cannot resume".into()),
+    };
+    let resume = resume.and_then(|()| {
+        if retired {
+            Ok(())
+        } else {
+            Err("Earlier valve commands are still being delivered".into())
+        }
+    });
+    let cancel = wire::validate_cancel(
+        &key,
+        &wire::LiveCancelContext {
+            key: &key,
+            kind,
+            phase: cancel_phase(&rt, kind),
+            current_send_commands: true,
+            admission_epoch_current: true,
+        },
+    )
+    .map_err(|_| "Cancel is not available in this step".to_string())
+    .and_then(|()| {
+        if summary.cancel_allowed {
+            Ok(())
+        } else {
+            Err("Cancel is not available in this step".into())
+        }
+    });
+    let fill_resume = kind == Kind::Fill;
+    Some(wire::RunControls {
+        key,
+        pause: with_common(pause, &block, true, interlocked, pause_command),
+        resume: with_common(resume, &block, true, interlocked, !fill_resume || fill_command),
+        cancel: with_common(cancel, &block, false, interlocked, cancel_command),
+    })
+}
+#[cfg(not(feature = "hitl_mode"))]
+fn operational_gate(rt: &Runtime, action: Action) -> Result<(), String> {
+    if !operational_action_allowed(rt, action) {
+        return Err("Complete prerequisites in order and wait for stable fill-system routes".into());
+    }
+    if action != Action::StartFill
+        && rt.operational.run_generation != rt.operational.saved.qualification.generation()
+    {
+        return Err("Qualification was reset during the pause; cancel and start a new test".into());
+    }
+    Ok(())
+}
+#[cfg(feature = "hitl_mode")]
+fn operational_gate(_rt: &Runtime, _action: Action) -> Result<(), String> {
+    Ok(())
+}
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/gse/sequences/cancel", axum::routing::post(cancel))
+        .route("/api/gse/sequences/pause", axum::routing::post(pause))
+        .route("/api/gse/sequences/resume", axum::routing::post(resume))
         .route(
             "/api/gse/sequences/results/{backend}/{epoch}/{run}",
             get(result),
@@ -284,11 +503,10 @@ fn phase(value: Phase) -> wire::CancelPhase {
         | Phase::Holding
         | Phase::Dumping => C::NitrogenTest,
         Phase::FillSetup | Phase::Filling => C::Fill,
-        Phase::Paused => C::Paused,
+        Phase::PauseSetup | Phase::Paused => C::Paused,
         Phase::Turbocharge => C::Turbocharge,
         Phase::CancelSetup => C::Cancelling,
         Phase::Idle | Phase::Passed | Phase::Cancelled | Phase::Fault => C::Terminal,
-        _ => C::Unknown,
     }
 }
 fn same_ticket(a: LaunchAdmission, b: LaunchAdmission) -> bool {
@@ -382,6 +600,143 @@ async fn cancel(
         )
             .into_response()
     }
+}
+
+/// Re-check the caller's run, ownership epoch and live gate under DISPATCH.
+fn admitted(
+    state: &AppState,
+    key: &RunKey,
+    requested: LaunchAdmission,
+    pick: fn(&wire::RunControls) -> &wire::Gate,
+) -> Result<(), String> {
+    let current = LaunchAdmission::capture(state);
+    let saved = state.gse.lock().unwrap().progress_admission;
+    if !(saved.is_some_and(|saved| same_ticket(saved, current)) && same_ticket(requested, current))
+    {
+        return Err("Sequence ownership changed".into());
+    }
+    let live = controls(state).ok_or("No sequence is running")?;
+    if live.key != *key {
+        return Err("Sequence changed".into());
+    }
+    let gate = pick(&live);
+    if !gate.allowed {
+        return Err(gate.reason.clone().unwrap_or_else(|| "Not permitted".into()));
+    }
+    Ok(())
+}
+fn control_reply(result: Result<(), String>, key: RunKey) -> Response {
+    match result {
+        Ok(()) => Json(serde_json::json!({"version":1,"accepted":true,"key":key,"completion":"pending_authoritative_confirmation"})).into_response(),
+        Err(message) => (StatusCode::CONFLICT, message).into_response(),
+    }
+}
+async fn pause(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(key): Json<RunKey>,
+) -> Response {
+    let requested = LaunchAdmission::capture(&state);
+    let principal =
+        match crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await {
+            Ok(p) => p,
+            Err(error) => return error,
+        };
+    if !principal.allows_command_name("PauseFill") {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Err(error) = require_primary_operational_station() {
+        return error.into_response();
+    }
+    if super::cold_flow::owns_run(&state, &key) {
+        return super::cold_flow::park_authenticated(&state, key, requested);
+    }
+    let Some(_claim) = claim_operator_dispatch(&state, requested.generation) else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    let result = {
+        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        admitted(&state, &key, requested, |c| &c.pause).and_then(|()| {
+            handle_command_inner(&state, &TelemetryCommand::PauseFill, None, None);
+            let rt = state.gse.lock().unwrap();
+            if rt.progress.current().is_some_and(|s| s.key == key)
+                && matches!(rt.engine.status.phase, Phase::PauseSetup | Phase::Paused)
+            {
+                Ok(())
+            } else {
+                Err(rt.engine.status.message.clone())
+            }
+        })
+    };
+    flush_effects(&state);
+    flush(&state);
+    crate::sequences::refresh_action_policy_projection(&state);
+    control_reply(result, key)
+}
+async fn resume(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(key): Json<RunKey>,
+) -> Response {
+    let requested = LaunchAdmission::capture(&state);
+    let principal =
+        match crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await {
+            Ok(p) => p,
+            Err(error) => return error,
+        };
+    if let Err(error) = require_primary_operational_station() {
+        return error.into_response();
+    }
+    if super::cold_flow::owns_run(&state, &key) {
+        if !principal.allows_command_name("AutoColdFlow") {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        return super::cold_flow::resume_authenticated(&state, key, requested);
+    }
+    let kind = state
+        .gse
+        .lock()
+        .unwrap()
+        .progress
+        .current()
+        .filter(|s| s.key == key)
+        .map(|s| s.kind);
+    let command = match kind {
+        Some(Kind::Fill) => "StartFill",
+        Some(Kind::ValveSelfTest) => "ValveSelfTest",
+        Some(Kind::NitrogenTest) => "NitrogenTest",
+        _ => {
+            return (StatusCode::CONFLICT, "This sequence cannot resume").into_response();
+        }
+    };
+    if !principal.allows_command_name(command) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(_claim) = claim_operator_dispatch(&state, requested.generation) else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    let result = {
+        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        admitted(&state, &key, requested, |c| &c.resume).and_then(|()| {
+            if kind == Some(Kind::Fill) {
+                handle_command_inner(&state, &TelemetryCommand::StartFill, None, None);
+                let rt = state.gse.lock().unwrap();
+                if rt.progress.current().is_some_and(|s| s.key == key)
+                    && matches!(rt.engine.status.phase, Phase::FillSetup | Phase::Filling)
+                {
+                    Ok(())
+                } else {
+                    Err(rt.engine.status.message.clone())
+                }
+            } else {
+                super::resume_test_under_dispatch(&state)
+            }
+        })
+    };
+    flush_effects(&state);
+    flush(&state);
+    crate::sequences::refresh_action_policy_projection(&state);
+    control_reply(result, key)
 }
 
 /// Exact current engine observation copied into this programme frame; all

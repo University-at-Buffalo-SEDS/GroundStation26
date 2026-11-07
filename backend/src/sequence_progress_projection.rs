@@ -17,9 +17,14 @@ pub enum Cause {
     Reset,
 }
 #[derive(Clone, Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Bounded terminal evidence is captured into the fixed Copy stage; boxing would add heap allocation to owner-held capture paths"
+// Without the two-observation test/HITL proofs, the two safe-stop variants
+// are the same size and the lint does not apply.
+#[cfg_attr(
+    any(test, feature = "hitl_mode"),
+    expect(
+        clippy::large_enum_variant,
+        reason = "Bounded terminal evidence is captured into the fixed Copy stage; boxing would add heap allocation to owner-held capture paths"
+    )
 )]
 pub enum TerminalProof {
     /// The caller supplies the actual successful persisted completion event ID.
@@ -29,6 +34,9 @@ pub enum TerminalProof {
     },
     /// Safe cancellation is backed by the engine's actual confirmed transition.
     SafeCancelled(ProgressObservation),
+    /// A sequence that cannot resume was stopped by an operator pause; the
+    /// engine confirmed every valve closed.
+    SafeStopped(ProgressObservation),
     /// Only the actual engine tick hook supplies these consecutive observations
     /// when this build has no durable operational qualification store (HITL).
     #[cfg(any(test, feature = "hitl_mode"))]
@@ -180,7 +188,7 @@ fn plan(kind: Kind, nitrogen: &[NitrogenStep]) -> Result<Vec<Step>, Error> {
                     "Confirm supplies and PILOT/main closed",
                 ),
                 ("cold-relieve", "Confirm dump and vent relief outputs"),
-                ("cold-park", "Parking: owner barrier unverified"),
+                ("cold-park", "Pause: confirm closure and command retirement"),
             ] {
                 values.push(step(id.into(), label.into()));
             }
@@ -642,6 +650,17 @@ impl Cursor {
             return Err(Error::NotCurrent);
         }
         self.snapshot.revision = self.snapshot.revision.checked_add(1).ok_or(Error::Bounds)?;
+        if cause == Cause::ResumeAccepted
+            && matches!(self.snapshot.kind, Kind::ValveSelfTest | Kind::NitrogenTest)
+        {
+            // A paused test re-runs the interrupted step; pause marked it skipped.
+            self.control_step = None;
+            for step in &mut self.snapshot.steps {
+                if step.state == StepState::Skipped && !step.id.starts_with("control-") {
+                    step.state = StepState::Planned;
+                }
+            }
+        }
         if cause == Cause::ResumeAccepted && self.snapshot.kind == Kind::Fill {
             self.control_step = None;
             self.trim_progress = None;
@@ -751,7 +770,7 @@ impl Cursor {
             C::Flowing => 5,
             C::CancelClosing => 6,
             C::CancelRelieving | C::Cancelled => 7,
-            C::PauseClosing | C::ParkedUnverified => 8,
+            C::PauseClosing | C::ParkedUnverified | C::Paused => 8,
         };
         let previous = self.snapshot.current_step.clone();
         let id = self.snapshot.steps[index].id.clone();
@@ -811,6 +830,8 @@ impl Cursor {
             Outcome::Cancelled
         } else if matches!(cold.phase, C::CancelClosing | C::CancelRelieving) {
             Outcome::Cancelling
+        } else if matches!(cold.phase, C::ParkedUnverified | C::Paused) {
+            Outcome::Paused
         } else {
             Outcome::Running
         };
@@ -826,7 +847,7 @@ impl Cursor {
                 .valves
                 .iter()
                 .all(|v| v.fresh_readback_open == Some(false));
-        self.snapshot.message=match cold.phase{C::AwaitingRelease=>"Isolated hold. Explicit Cold Flow release required; no ignition or countdown.",C::Flowing=>"PILOT/main output reported open. Flow is not measured; cancel to close and relieve through dump/vent.",C::PauseClosing|C::ParkedUnverified=>"Parking requested. Shared owner barrier unavailable: hardware pause and resume are unverified.",C::Cancelled=>"Supplies and PILOT/main reported closed; dump and vent reported open.",C::CancelClosing=>"Closing nitrogen, nitrous and PILOT/main before relief.",C::CancelRelieving=>"Supply and PILOT/main closure verified; confirming dump and vent.",_=>"Cold-flow sequence awaiting current pressure and valve readbacks."}.into();
+        self.snapshot.message=match cold.phase{C::AwaitingRelease=>"Isolated hold. Explicit Cold Flow release required; no ignition or countdown.",C::Flowing=>"PILOT/main output reported open. Flow is not measured; cancel to close and relieve through dump/vent.",C::PauseClosing=>"Pausing: closing nitrogen, nitrous, PILOT/main, dump and vent.",C::ParkedUnverified=>"Paused closed. Resume waits until no earlier valve command can still be delivered and fresh closed reports follow.",C::Paused=>"Paused closed; earlier valve commands retired. Resume re-confirms isolation; PILOT/main is never reopened without a new release.",C::Cancelled=>"Supplies and PILOT/main reported closed; dump and vent reported open.",C::CancelClosing=>"Closing nitrogen, nitrous and PILOT/main before relief.",C::CancelRelieving=>"Supply and PILOT/main closure verified; confirming dump and vent.",_=>"Cold-flow sequence awaiting current pressure and valve readbacks."}.into();
         if cold.issue.is_some() && !self.snapshot.outcome.terminal() {
             self.snapshot.message.push_str(" A safety/readback condition requires attention; requested outputs are not completion proof.");
         }
@@ -879,6 +900,8 @@ impl Cursor {
                     | Phase::SelfHold
                     | Phase::SelfClose
                     | Phase::SelfFinish
+                    | Phase::PauseSetup
+                    | Phase::Paused
             ),
             Kind::NitrogenTest => matches!(
                 view.phase,
@@ -889,10 +912,12 @@ impl Cursor {
                     | Phase::Settling
                     | Phase::Holding
                     | Phase::Dumping
+                    | Phase::PauseSetup
+                    | Phase::Paused
             ),
             Kind::Fill => matches!(
                 view.phase,
-                Phase::FillSetup | Phase::Filling | Phase::Paused
+                Phase::FillSetup | Phase::Filling | Phase::PauseSetup | Phase::Paused
             ),
             Kind::Turbocharge => matches!(view.phase, Phase::Turbocharge | Phase::Paused),
             Kind::ColdFlow => false,
@@ -987,6 +1012,7 @@ impl Cursor {
     }
     pub fn seal(&mut self, proof: TerminalProof) -> Result<&Snapshot, Error> {
         let mut failure_message = None;
+        let mut stopped = false;
         let outcome = match proof {
             TerminalProof::DurablePass { kind, event_id }
                 if kind == self.snapshot.kind && !event_id.is_empty() && event_id.len() <= 128 =>
@@ -996,6 +1022,12 @@ impl Cursor {
             TerminalProof::SafeCancelled(view)
                 if view.phase == Phase::Cancelled && view.all_valves_confirmed_by_engine =>
             {
+                Outcome::Cancelled
+            }
+            TerminalProof::SafeStopped(view)
+                if view.phase == Phase::Paused && view.all_valves_confirmed_by_engine =>
+            {
+                stopped = true;
                 Outcome::Cancelled
             }
             #[cfg(any(test, feature = "hitl_mode"))]
@@ -1059,6 +1091,10 @@ impl Cursor {
         .into();
         if let Some(message) = failure_message {
             self.snapshot.message = message;
+        }
+        if stopped {
+            self.snapshot.message =
+                "Stopped by pause with all valves confirmed closed; this sequence cannot resume. Start it again to continue.".into();
         }
         self.snapshot.validate()?;
         Ok(&self.snapshot)

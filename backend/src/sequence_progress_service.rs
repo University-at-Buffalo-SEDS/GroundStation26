@@ -41,6 +41,9 @@ pub struct Envelope {
     pub result_links: Vec<ResultLink>,
     #[serde(default)]
     pub board_display: std::collections::BTreeMap<String, BoardDisplay>,
+    /// Live Pause/Resume/Cancel admission for the current run, if any.
+    #[serde(default)]
+    pub controls: Vec<super::sequence_progress::RunControls>,
 }
 pub struct Service {
     instance: String,
@@ -189,6 +192,7 @@ impl Service {
         };
         Envelope {
             board_display: Default::default(),
+            controls: Vec::new(),
             version: VERSION,
             backend_instance: self.instance.clone(),
             reset_epoch: format!("{reset_epoch:016x}"),
