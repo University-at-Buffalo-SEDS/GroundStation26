@@ -804,6 +804,9 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
         return Some(prelaunch(state) && interlock(state, &state.action_policy_snapshot()));
     }
 
+    if matches!(cmd, TelemetryCommand::StartFill) && fill_resume_awaits_retirement(state) {
+        return Some(false);
+    }
     if matches!(cmd, TelemetryCommand::Turbocharge) {
         let rt = state.gse.lock().unwrap();
         let input = rt.input(
@@ -920,6 +923,7 @@ fn sequence_button_enabled(engine: &Engine, action: Action, input: Inputs) -> bo
 
 pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
     let is_prelaunch = prelaunch(state);
+    let fill_waits = fill_resume_awaits_retirement(state);
     let rt = state.gse.lock().unwrap();
     let input = rt.input(is_prelaunch, interlock(state, policy));
     policy.controls.retain(|c| c.cmd != "Turbocharge");
@@ -939,8 +943,10 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
         };
         #[cfg(not(feature = "hitl_mode"))]
         let enabled = enabled && operational_action_allowed(&rt, action);
+        let waits = action == Action::StartFill && fill_waits;
+        let enabled = enabled && !waits;
         policy.controls.retain(|c| c.cmd != cmd);
-        policy.controls.push(ActionControl { disabled_reason: None, requested: None,
+        policy.controls.push(ActionControl { disabled_reason: waits.then(|| RETIREMENT_PENDING.into()), requested: None,
             cmd: cmd.into(),
             enabled,
             blink: BlinkMode::None,
@@ -1379,6 +1385,7 @@ fn handle_command_inner(
         let policy = state.action_policy_snapshot();
         let nitrous_target = state.fill_targets_snapshot().nitrous.target_pressure_psi;
         let progress_mass_target=state.fill_targets_snapshot().nitrous.target_mass_kg;
+        let fill_waits = action == Action::StartFill && fill_resume_awaits_retirement(state);
         let result = {
             let mut rt = state.gse.lock().unwrap();
             #[cfg(not(feature = "hitl_mode"))]
@@ -1414,6 +1421,11 @@ fn handle_command_inner(
                 && rt.fresh_mass(input.now_ms).is_none()
             {
                 Err("Automatic fill requires fresh calibrated fill weight before starting".into())
+            } else if action == Action::StartFill
+                && fill_waits
+                && fill_resume_candidate(&rt, input, progress_mass_target)
+            {
+                Err(RETIREMENT_PENDING.into())
             } else {
                 let previous_phase = rt.engine.status.phase;
                 let resuming_fill = previous_phase == Phase::Paused
@@ -1509,6 +1521,35 @@ fn handle_command_inner(
     }
     false
 }
+/// Refusal shown wherever a resume waits for earlier valve commands to retire.
+pub(crate) const RETIREMENT_PENDING: &str =
+    "Earlier valve commands are still being delivered; resume after they retire";
+/// A StartFill that would actually resume a paused fill session (not a 0.2 kg
+/// no-op) must wait for the same SDK command retirement as the modal Resume.
+fn fill_resume_awaits_retirement(state: &AppState) -> bool {
+    let target_kg = state.fill_targets_snapshot().nitrous.target_mass_kg;
+    let input = {
+        let policy = state.action_policy_snapshot();
+        (prelaunch(state), interlock(state, &policy))
+    };
+    let candidate = {
+        let rt = state.gse.lock().unwrap();
+        let input = rt.input(input.0, input.1);
+        fill_resume_candidate(&rt, input, target_kg)
+    };
+    // Probe the SDK only when a StartFill would actually resume a paused fill.
+    candidate && !commands_retired(state)
+}
+fn fill_resume_candidate(rt: &Runtime, input: Inputs, target_kg: f32) -> bool {
+    rt.engine.status.phase == Phase::Paused
+        && rt.engine.nitrous_session()
+        && rt.fill_trim.is_none()
+        && rt.turbocharge.is_none()
+        && rt
+            .engine
+            .fill_resume_required(input, rt.fresh_mass(input.now_ms), target_kg)
+            .is_ok_and(|required| required)
+}
 /// Retirement barrier: no valve or actuator command (from any producer) is
 /// still owned by the command SDK, so none can be transmitted or retried
 /// later and overtake a pause closure. A busy SDK core is never retired.
@@ -1529,7 +1570,7 @@ pub(super) fn resume_test_under_dispatch(state: &Arc<AppState>) -> Result<(), St
     let is_prelaunch = prelaunch(state);
     let policy = state.action_policy_snapshot();
     if !commands_retired(state) {
-        return Err("Earlier valve commands are still being delivered; resume after they retire".into());
+        return Err(RETIREMENT_PENDING.into());
     }
     let effects = {
         let mut rt = state.gse.lock().unwrap();

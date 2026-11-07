@@ -399,7 +399,7 @@ pub(crate) fn controls(state: &AppState) -> Option<wire::RunControls> {
         if retired {
             Ok(())
         } else {
-            Err("Earlier valve commands are still being delivered".into())
+            Err(super::RETIREMENT_PENDING.into())
         }
     });
     let cancel = wire::validate_cancel(

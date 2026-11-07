@@ -386,7 +386,7 @@ fn perform(
             }
             Request::Resume => {
                 if !retired || session.pending.is_some() {
-                    return Err("Earlier valve commands are still being delivered; resume after they retire");
+                    return Err(super::RETIREMENT_PENDING);
                 }
                 session.controller.resume(input)?
             }
@@ -911,7 +911,7 @@ pub(super) fn controls(
     };
     let resume = match phase {
         ColdPhase::Paused if !retired || session.pending.is_some() => {
-            Err("Earlier valve commands are still being delivered".into())
+            Err(super::RETIREMENT_PENDING.into())
         }
         ColdPhase::Paused => session
             .controller

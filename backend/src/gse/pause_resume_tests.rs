@@ -377,3 +377,51 @@ async fn turbocharge_pause_ends_its_run_once_every_valve_is_confirmed_closed() {
     assert_eq!(result["outcome"], "cancelled", "{envelope}");
     assert!(result["message"].as_str().unwrap().contains("cannot resume"));
 }
+
+#[tokio::test]
+async fn actions_tab_start_fill_resume_waits_for_sdk_command_retirement() {
+    let mut plant = Plant::new().await;
+    assert!(handle_command(&plant.state, &TelemetryCommand::ValveSelfTest));
+    plant.until(|rt| rt.engine.status.phase == Phase::Idle);
+    assert!(handle_command(&plant.state, &TelemetryCommand::NitrogenTest));
+    plant.until(|rt| rt.engine.status.phase == Phase::Passed);
+    plant.mass = 0.0;
+    plant.step();
+    assert!(handle_command(&plant.state, &TelemetryCommand::StartFill));
+    plant.until(|rt| rt.engine.status.phase == Phase::Filling);
+    plant.until(|rt| rt.fresh_mass(rt.now()).is_some_and(|m| m.value >= 2.0));
+    plant.pause();
+    plant.receive();
+    // An earlier valve command still owned by the SDK.
+    crate::telemetry_task::queue_automatic_controller_command(
+        plant.state.topology_router.get().unwrap(),
+        crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
+        CLOSE[3],
+    )
+    .unwrap();
+    assert!(!commands_retired(&plant.state));
+    assert_eq!(command_allowed(&plant.state, &TelemetryCommand::StartFill), Some(false));
+    let mut policy = plant.state.action_policy_snapshot();
+    decorate_policy(&plant.state, &mut policy);
+    let control = policy.controls.iter().find(|c| c.cmd == "StartFill").unwrap();
+    assert!(!control.enabled);
+    assert_eq!(control.disabled_reason.as_deref(), Some(RETIREMENT_PENDING));
+    let resume = plant.controls().resume;
+    assert_eq!(resume.reason.as_deref(), Some(RETIREMENT_PENDING));
+    // The backend refuses the Actions-tab press itself, whatever the client shows.
+    assert!(handle_command(&plant.state, &TelemetryCommand::StartFill));
+    assert_eq!(plant.phase(), Phase::Paused, "no resume while a command is pending");
+    assert_eq!(plant.state.gse.lock().unwrap().engine.status.message, RETIREMENT_PENDING);
+    // Once delivered, StartFill resumes normally.
+    plant.receive();
+    assert!(commands_retired(&plant.state));
+    plant.step();
+    assert_eq!(command_allowed(&plant.state, &TelemetryCommand::StartFill), Some(true));
+    let mut policy = plant.state.action_policy_snapshot();
+    decorate_policy(&plant.state, &mut policy);
+    let control = policy.controls.iter().find(|c| c.cmd == "StartFill").unwrap();
+    assert!(control.enabled && control.disabled_reason.is_none(), "{control:?}");
+    assert!(handle_command(&plant.state, &TelemetryCommand::StartFill));
+    assert_eq!(plant.phase(), Phase::FillSetup);
+    plant.until(|rt| rt.engine.status.phase == Phase::Filling);
+}
