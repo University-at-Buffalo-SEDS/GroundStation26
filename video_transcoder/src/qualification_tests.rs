@@ -123,3 +123,6 @@ async fn actual_missing_heartbeat_falls_back_without_offer_false() {
     for job in jobs {job.abort();let _=job.await;}
     println!("PASS actual omitted-heartbeat original15s fallback {}ms; no Offer(false) or synthetic last_seen rewrite",elapsed.as_millis());
 }
+
+#[path = "finite_pipeline_tests.rs"]
+mod finite_pipeline_tests;

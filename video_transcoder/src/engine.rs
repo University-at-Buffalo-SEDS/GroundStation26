@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -57,7 +57,10 @@ impl Controller {
         let shared = view.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().expect("worker runtime");
-            runtime.block_on(control(rx, shared));
+            let final_view = shared.clone();
+            if runtime.block_on(control(rx, shared)).is_err() {
+                update(&final_view, |v| v.message = "video_processing_shutdown_failed: cleanup was not verified; new work remains blocked.".into());
+            }
         });
         Self { tx, view }
     }
@@ -518,6 +521,7 @@ async fn proxy_request(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     tokio::select! {
+        biased;
         _ = proxy.cancelled.cancelled() => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
         result = tokio::time::timeout(Duration::from_secs(15), proxy.response(uri.path(), &headers)) => {
             match result {
@@ -527,12 +531,99 @@ async fn proxy_request(
         }
     }
 }
-struct ProxyGuard(CancellationToken);
-impl Drop for ProxyGuard {
-    fn drop(&mut self) {
-        self.0.cancel();
+#[derive(Clone, Copy, Debug)]
+enum CleanupUncertain {
+    #[cfg(unix)]
+    EncoderGroup,
+    EncoderKillAndWait,
+    EncoderWait,
+    EncoderTimeout,
+    ProxyJoin,
+    ProxyAbort,
+    ProxyTimeout,
+    RemoteCompletion,
+    JobJoin,
+}
+impl CleanupUncertain {
+    fn code(self) -> &'static str {
+        match self {
+            #[cfg(unix)]
+            Self::EncoderGroup => "video_processing_encoder_group_cleanup_unverified",
+            Self::EncoderKillAndWait => "video_processing_encoder_kill_and_wait_unverified",
+            Self::EncoderWait => "video_processing_encoder_wait_unverified",
+            Self::EncoderTimeout => "video_processing_encoder_cleanup_timeout",
+            Self::ProxyJoin => "video_processing_proxy_join_unverified",
+            Self::ProxyAbort => "video_processing_proxy_abort_unverified",
+            Self::ProxyTimeout => "video_processing_proxy_cleanup_timeout",
+            Self::RemoteCompletion => "video_processing_remote_completion_unverified",
+            Self::JobJoin => "video_processing_job_join_unverified",
+        }
     }
 }
+#[derive(Clone, Copy, Debug)]
+enum JobOutcome {
+    Completed,
+    Cancelled,
+    Failed(&'static str),
+    CleanupUncertain(CleanupUncertain),
+}
+#[derive(Default)]
+struct StopReport {
+    failed: Option<&'static str>,
+    uncertain: Option<CleanupUncertain>,
+}
+impl StopReport {
+    fn observe(&mut self, outcome: Result<JobOutcome, tokio::task::JoinError>) {
+        match outcome {
+            Ok(JobOutcome::Completed | JobOutcome::Cancelled) => {},
+            Ok(JobOutcome::Failed(code)) => self.failed = Some(code),
+            Ok(JobOutcome::CleanupUncertain(reason)) => self.uncertain = Some(reason),
+            Err(_) => self.uncertain = Some(CleanupUncertain::JobJoin),
+        }
+    }
+}
+fn publish_cleanup_blocked(view: &Arc<Mutex<View>>, reason: CleanupUncertain) {
+    update(view, |v| {
+        v.offered = false;
+        v.passed = false;
+        v.busy = false;
+        v.message = format!("{}: cleanup was not verified; new processing work is blocked.", reason.code());
+    });
+}
+
+struct ProxyGuard {
+    cancelled: CancellationToken,
+    task: Option<JoinHandle<std::io::Result<()>>>,
+}
+impl ProxyGuard {
+    async fn close(mut self) -> Result<(), CleanupUncertain> {
+        self.cancelled.cancel();
+        let Some(mut task) = self.task.take() else { return Ok(()); };
+        // Existing proxy requests already observe cancellation. Give graceful
+        // shutdown its existing request budget, then abort AND join the server.
+        match tokio::time::timeout(Duration::from_secs(15), &mut task).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(_) => Err(CleanupUncertain::ProxyJoin),
+            Err(_) => {
+                task.abort();
+                let joined = task.await;
+                if !matches!(joined, Err(ref error) if error.is_cancelled()) {
+                    return Err(CleanupUncertain::ProxyAbort);
+                }
+                Err(CleanupUncertain::ProxyTimeout)
+            }
+        }
+    }
+}
+impl Drop for ProxyGuard {
+    fn drop(&mut self) {
+        self.cancelled.cancel();
+        // Panic/foreign-abort fallback only, never a quiescence proof. Normal
+        // production paths consume close() and await the actual JoinHandle.
+        if let Some(task) = &self.task { task.abort(); }
+    }
+}
+
 async fn proxy(session: Session, input: &str) -> Result<(ProxyGuard, String)> {
     let input = endpoint(&session.base, input)?;
     ensure!(
@@ -561,20 +652,127 @@ async fn proxy(session: Session, input: &str) -> Result<(ProxyGuard, String)> {
     };
     let url = state.address(&input, input.as_str())?;
     let cancelled = state.cancelled.clone();
-    let guard = ProxyGuard(cancelled.clone());
     let app = axum::Router::new()
         .fallback(axum::routing::get(proxy_request))
         .with_state(state);
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(cancelled.cancelled_owned())
-            .await;
+    let server_cancelled = cancelled.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(server_cancelled.cancelled_owned())
+            .await
     });
-    Ok((guard, url))
+    Ok((ProxyGuard { cancelled, task: Some(task) }, url))
 }
+#[cfg(test)]
 async fn transcode(session: Session, job: Job) -> Result<()> {
-    let (_proxy, input) = proxy(session.clone(), &job.input).await?;
-    let mut child = Command::new("ffmpeg")
+    match transcode_until_cancelled(session, job, CancellationToken::new()).await {
+        JobOutcome::Completed | JobOutcome::Cancelled => Ok(()),
+        JobOutcome::Failed(code) => Err(anyhow::anyhow!(code)),
+        JobOutcome::CleanupUncertain(reason) => Err(anyhow::anyhow!(reason.code())),
+    }
+}
+// No crate dependency is added for POSIX group ownership. These calls use
+// only an owned/unreaped Child id, and are never compiled on non-Unix hosts.
+#[cfg(unix)]
+mod encoder_group {
+    unsafe extern "C" {
+        fn getpgid(pid: std::ffi::c_int) -> std::ffi::c_int;
+        fn getpgrp() -> std::ffi::c_int;
+        fn kill(pid: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    pub fn verified(pid: u32) -> bool {
+        // SAFETY: caller holds the unreaped Child that supplied this id.
+        unsafe { getpgid(pid as std::ffi::c_int) == pid as std::ffi::c_int
+            && pid as std::ffi::c_int != getpgrp() }
+    }
+    pub fn terminate(pid: u32) -> bool {
+        if !verified(pid) { return false; }
+        // SIGKILL is 9 on the supported Unix platforms. Revalidate first so a
+        // failed setpgid or parent group can never receive a group signal.
+        unsafe { kill(-(pid as std::ffi::c_int), 9) == 0 }
+    }
+}
+async fn stop_encoder(child: &mut tokio::process::Child) -> Result<(), CleanupUncertain> {
+    #[cfg(unix)]
+    let group_failed = child.id().is_some_and(|pid| !encoder_group::terminate(pid));
+    #[cfg(not(unix))]
+    let group_failed = false;
+    // A direct-kill error never bypasses wait. A completed child can make the
+    // kill redundant; actual wait is authoritative for reaping its pid.
+    let killed = child.start_kill();
+    let waited = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    match waited {
+        Ok(Ok(_)) if !group_failed => Ok(()),
+        #[cfg(unix)]
+        Ok(Ok(_)) => Err(CleanupUncertain::EncoderGroup),
+        #[cfg(not(unix))]
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(_)) if killed.is_err() => Err(CleanupUncertain::EncoderKillAndWait),
+        Ok(Err(_)) => Err(CleanupUncertain::EncoderWait),
+        Err(_) => Err(CleanupUncertain::EncoderTimeout),
+    }
+}
+async fn rejected_upload(response: reqwest::Response, cancelled: &CancellationToken) -> JobOutcome {
+    let status = response.status();
+    // Auth rejection is pre-spawn or follows known cleanup in this backend.
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return JobOutcome::Failed("video_processing_authorization_rejected");
+    }
+    // Read only the bounded stable error code, never log an error body. Unknown
+    // remote completion is not evidence that another remux process is gone.
+    let read = async {
+        let mut response = response;
+        if response.content_length().is_some_and(|length| length > 256) { return None; }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            if body.len() + chunk.len() > 256 { return None; }
+            body.extend_from_slice(&chunk);
+        }
+        String::from_utf8(body).ok()
+    };
+    let code = tokio::select! {
+        biased;
+        _ = cancelled.cancelled() => None,
+        code = tokio::time::timeout(Duration::from_secs(15), read) => code.ok().flatten(),
+    };
+    match (status.as_u16(), code.as_deref()) {
+        (400, Some("Invalid source camera" | "IDs must be 1–64 ASCII letters, digits, hyphens or underscores" | "video_upload_interrupted"))
+        | (409, Some("Host is no longer selected" | "video_processing_assignment_revoked"))
+        | (408, Some("video_upload_cancelled"))
+        | (502, Some("video_remux_failed" | "video_remux_ended_before_input" | "video_remux_input_failed" | "video_remux_pipe_missing"))
+        | (503, Some("FFmpeg remuxer is unavailable" | "Invalid local video receiver" | "Invalid receiver"))
+        | (504, Some("video_remux_timeout")) => JobOutcome::Failed("video_processing_upload_rejected_after_known_cleanup"),
+        _ => JobOutcome::CleanupUncertain(CleanupUncertain::RemoteCompletion),
+    }
+}
+
+async fn transcode_until_cancelled(
+    session: Session,
+    job: Job,
+    cancelled: CancellationToken,
+) -> JobOutcome {
+    let destination = match endpoint(&session.base, &job.output) {
+        Ok(destination) => destination,
+        Err(_) => return JobOutcome::Failed("video_processing_output_address_rejected"),
+    };
+    if cancelled.is_cancelled() { return JobOutcome::Cancelled; }
+    let (proxy, input) = tokio::select! {
+        biased;
+        _ = cancelled.cancelled() => return JobOutcome::Cancelled,
+        input = proxy(session.clone(), &job.input) => match input {
+            Ok(input) => input,
+            Err(_) => return JobOutcome::Failed("video_processing_proxy_start_failed"),
+        },
+    };
+    let work = async {
+        if cancelled.is_cancelled() { return JobOutcome::Cancelled; }
+        let mut command = Command::new("ffmpeg");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.as_std_mut().process_group(0);
+        }
+        let spawned = command
         .args([
             "-hide_banner",
             "-loglevel",
@@ -634,54 +832,275 @@ async fn transcode(session: Session, job: Job) -> Result<()> {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(if cfg!(test) {
+        .stderr(if cfg!(test) && std::env::var_os("GS_VIDEO_COMPLETION_TEST").is_some() {
+            Stdio::null()
+        } else if cfg!(test) {
             Stdio::inherit()
         } else {
             Stdio::null()
         })
-        .kill_on_drop(true)
-        .spawn()
-        .context("Cannot start FFmpeg")?;
-    let output = child.stdout.take().unwrap();
-    let upload = session
-        .upload_client
-        .post(endpoint(&session.base, &job.output)?)
-        .bearer_auth(&session.token)
-        .header("Content-Type", "video/x-matroska")
-        .body(reqwest::Body::wrap_stream(
-            tokio_util::io::ReaderStream::new(output),
-        ))
-        .send();
-    let result = tokio::select! {response=upload=>{let response=response.context("Encoded upload interrupted")?;ensure!(response.status().is_success(),"Station rejected encoded video (HTTP {})", response.status().as_u16());Ok(())},status=child.wait()=>{status.context("Encoder stopped")?;bail!("Encoder stopped")}};
-    let _ = child.kill().await;
-    result
+
+            .kill_on_drop(true)
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(_) => return JobOutcome::Failed("video_processing_encoder_spawn_failed"),
+        };
+        #[cfg(unix)]
+        if !child.id().is_some_and(encoder_group::verified) {
+            return match stop_encoder(&mut child).await {
+                Ok(()) => JobOutcome::Failed("video_processing_encoder_group_unverified"),
+                Err(reason) => JobOutcome::CleanupUncertain(reason),
+            };
+        }
+        let Some(output) = child.stdout.take() else {
+            return match stop_encoder(&mut child).await {
+                Ok(()) => JobOutcome::Failed("video_processing_encoder_pipe_missing"),
+                Err(reason) => JobOutcome::CleanupUncertain(reason),
+            };
+        };
+
+        let mut upload = Box::pin(session.upload_client.post(destination)
+            .bearer_auth(&session.token)
+            .header("Content-Type", "video/x-matroska")
+            .body(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(output)))
+            .send());
+        let mut encoder_status = None;
+        enum Transfer {
+            Cancelled,
+            Reply(Result<reqwest::Response, reqwest::Error>),
+            EncoderFailed,
+            UploadTimedOut,
+        }
+        let transfer = tokio::select! {
+            biased;
+            _ = cancelled.cancelled() => Transfer::Cancelled,
+            response = &mut upload => Transfer::Reply(response),
+            status = child.wait() => {
+                match status {
+                    Ok(status) if status.success() => {
+                        encoder_status = Some(status);
+                        tokio::select! {
+                            biased;
+                            _ = cancelled.cancelled() => Transfer::Cancelled,
+                            response = tokio::time::timeout(Duration::from_secs(15), &mut upload) => {
+                                match response {
+                                    Ok(response) => Transfer::Reply(response),
+                                    Err(_) => Transfer::UploadTimedOut,
+                                }
+                            }
+                        }
+                    }
+                    _ => Transfer::EncoderFailed,
+                }
+            }
+        };
+        drop(upload);
+        match transfer {
+            Transfer::Cancelled => {
+                proxy.cancelled.cancel();
+                match stop_encoder(&mut child).await {
+                    // The upload may already have reached the station. A
+                    // local reap does not acknowledge its asynchronous remux
+                    // cleanup after the request future is dropped.
+                    Ok(()) => JobOutcome::CleanupUncertain(CleanupUncertain::RemoteCompletion),
+                    Err(reason) => JobOutcome::CleanupUncertain(reason),
+                }
+            }
+            Transfer::EncoderFailed => {
+                proxy.cancelled.cancel();
+                match stop_encoder(&mut child).await {
+                    // No backend completion response was received before
+                    // encoder failure, so remote cleanup remains unverified.
+                    Ok(()) => JobOutcome::CleanupUncertain(CleanupUncertain::RemoteCompletion),
+                    Err(reason) => JobOutcome::CleanupUncertain(reason),
+                }
+            }
+            Transfer::Reply(Err(_)) | Transfer::UploadTimedOut => {
+                proxy.cancelled.cancel();
+                match stop_encoder(&mut child).await {
+                    Ok(()) => JobOutcome::CleanupUncertain(CleanupUncertain::RemoteCompletion),
+                    Err(reason) => JobOutcome::CleanupUncertain(reason),
+                }
+            }
+            Transfer::Reply(Ok(response)) if !response.status().is_success() => {
+                // Stop/join local work BEFORE reading any rejection body. The
+                // existing control budget bounds that small completion read;
+                // it adds no delay or timeout to a healthy live upload.
+                proxy.cancelled.cancel();
+                match stop_encoder(&mut child).await {
+                    Ok(()) => rejected_upload(response, &cancelled).await,
+                    Err(reason) => JobOutcome::CleanupUncertain(reason),
+                }
+            }
+            Transfer::Reply(Ok(_)) => {
+                let completion = if let Some(status) = encoder_status {
+                    Some(Ok(Ok(status)))
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = cancelled.cancelled() => None,
+                        completion = tokio::time::timeout(Duration::from_secs(5), child.wait()) => Some(completion),
+                    }
+                };
+                match completion {
+                    None => {
+                        proxy.cancelled.cancel();
+                        match stop_encoder(&mut child).await {
+                            Ok(()) => JobOutcome::Cancelled,
+                            Err(reason) => JobOutcome::CleanupUncertain(reason),
+                        }
+                    }
+                    Some(Ok(Ok(status))) if status.success() => JobOutcome::Completed,
+                    Some(Ok(Ok(_))) => JobOutcome::Failed("video_processing_encoder_failed"),
+                    Some(_) => {
+                        proxy.cancelled.cancel();
+                        match stop_encoder(&mut child).await {
+                            Ok(()) => JobOutcome::Failed("video_processing_encoder_completion_failed"),
+                            Err(reason) => JobOutcome::CleanupUncertain(reason),
+                        }
+                    }
+                }
+            }
+        }
+    }.await;
+    let proxy_closed = proxy.close().await;
+    match (work, proxy_closed) {
+        (JobOutcome::CleanupUncertain(reason), _) => JobOutcome::CleanupUncertain(reason),
+        (_, Err(reason)) => JobOutcome::CleanupUncertain(reason),
+        (outcome, Ok(())) => outcome,
+    }
 }
-async fn control(mut rx: mpsc::UnboundedReceiver<Action>, view: Arc<Mutex<View>>) {
+
+struct EncodingJob {
+    cancelled: CancellationToken,
+    task: JoinHandle<JobOutcome>,
+}
+async fn stop_jobs(jobs: &mut HashMap<String, EncodingJob>) -> StopReport {
+    for job in jobs.values() { job.cancelled.cancel(); }
+    let mut report = StopReport::default();
+    for (_, job) in jobs.drain() { report.observe(job.task.await); }
+    report
+}
+async fn control(mut rx: mpsc::UnboundedReceiver<Action>, view: Arc<Mutex<View>>) -> Result<()> {
     let mut session: Option<Session> = None;
-    let mut jobs = HashMap::<String, JoinHandle<Result<()>>>::new();
+    let mut jobs = HashMap::<String, EncodingJob>::new();
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     let mut offered = false;
+    // This latch is never cleared by a tick, disconnect or new credentials.
+    // There is no API in this slice that can manufacture missing reap proof.
+    let mut uncertain: Option<CleanupUncertain> = None;
     loop {
         tokio::select! {
-        action=rx.recv()=>{let Some(action)=action else{break;};
-         match action{
-          Action::Connect{station,username,password,local_certificate}=>{for(_,job)in jobs.drain(){job.abort();}offered=false;update(&view,|v|{*v=View::default();v.busy=true;v.message="Connecting…".into();});match connect(station,username,password,local_certificate).await{Ok(s)=>{session=Some(s);update(&view,|v|{v.connected=true;v.message="Connected. Test encoding and network capacity before offering this host.".into();});},Err(_)=>{session=None;update(&view,|v|v.message="Connection failed. Check the station address, certificate, account and stream-manager permission.".into());}}update(&view,|v|v.busy=false);},
-          Action::Test{name}=>{if let Some(s)=session.as_mut(){update(&view,|v|{v.busy=true;v.message="Testing network bandwidth and H.264/AAC encoding…".into();});match tokio::time::timeout(Duration::from_secs(60),test(s,name)).await{Ok(Ok(report))=>update(&view,|v|{v.passed=report["passed"].as_bool().unwrap_or(false);v.capacity=report["capacity"].as_u64().unwrap_or(0)as usize;v.encoding_ms=report["encoding_ms"].as_u64().unwrap_or(0);v.upload_bps=report["upload_bps"].as_u64().unwrap_or(0);v.download_bps=report["download_bps"].as_u64().unwrap_or(0);v.message=if v.passed{"Tests passed. Make this computer available, then select it in Stream Manager."}else{"Insufficient compute or bandwidth. This host cannot be selected."}.into();}),_=>update(&view,|v|{v.passed=false;v.message="Test failed. Check FFmpeg availability and the network connection.".into();})}update(&view,|v|v.busy=false);}},
-          Action::Offer(value)=>{offered=value;update(&view,|v|v.offered=value);if !value{for(_,job)in jobs.drain(){job.abort();}if let Some(s)=&session{let _=heartbeat(s,false).await;}}},
-          Action::Disconnect=>{offered=false;for(_,job)in jobs.drain(){job.abort();}if let Some(s)=&session{let _=heartbeat(s,false).await;}session=None;update(&view,|v|*v=View::default());}
-         }
-        },
-        _=tick.tick()=>{if offered && let Some(s)=&session{match heartbeat(s,true).await{Ok(reply)=>{
-           let wanted:HashSet<_>=reply.jobs.iter().map(|j|j.id.clone()).collect();let remove:Vec<_>=jobs.iter().filter(|(id,h)|!wanted.contains(*id)||h.is_finished()).map(|(id,_)|id.clone()).collect();for id in remove{if let Some(task)=jobs.remove(&id){task.abort();}}
-           for job in reply.jobs{if !jobs.contains_key(&job.id){jobs.insert(job.id.clone(),tokio::spawn(transcode(s.clone(),job)));}}
-           update(&view,|v|{v.jobs=jobs.len();v.message=if reply.selected{format!("Selected by GroundStation · encoding {} camera(s)",jobs.len())}else{"Available · waiting for Stream Manager selection".into()};});
-          },Err(_)=>{for(_,job)in jobs.drain(){job.abort();}update(&view,|v|{v.jobs=0;v.message="Station unavailable or permission changed. Encoding stopped; reconnect if the station restarted.".into();});}}}}
+            action = rx.recv() => {
+                let Some(action) = action else { break; };
+                match action {
+                    Action::Connect { station, username, password, local_certificate } => {
+                        if let Some(reason) = uncertain { publish_cleanup_blocked(&view,reason); continue; }
+                        let stopped = stop_jobs(&mut jobs).await;
+                        if let Some(reason) = stopped.uncertain {
+                            uncertain = Some(reason); offered = false;
+                            if let Some(s)=&session { let _=heartbeat(s,false).await; }
+                            publish_cleanup_blocked(&view,reason); continue;
+                        }
+                        offered = false;
+                        update(&view,|v|{*v=View::default();v.busy=true;v.message="Connecting…".into();});
+match connect(station,username,password,local_certificate).await{Ok(s)=>{session=Some(s);update(&view,|v|{v.connected=true;v.message="Connected. Test encoding and network capacity before offering this host.".into();});},Err(_)=>{session=None;update(&view,|v|v.message="Connection failed. Check the station address, certificate, account and stream-manager permission.".into());}}update(&view,|v|v.busy=false);
+                    }
+                    Action::Test { name } => {
+                        if let Some(reason) = uncertain { publish_cleanup_blocked(&view,reason); continue; }
+                        // The real UI already disables Test while offered. Keep
+                        // that guard in the worker too, before any benchmark.
+                        if offered || !jobs.is_empty() {
+                            update(&view,|v|v.message="Stop offering and finish current processing before testing this host.".into());
+                            continue;
+                        }
+if let Some(s)=session.as_mut(){update(&view,|v|{v.busy=true;v.message="Testing network bandwidth and H.264/AAC encoding…".into();});match tokio::time::timeout(Duration::from_secs(60),test(s,name)).await{Ok(Ok(report))=>update(&view,|v|{v.passed=report["passed"].as_bool().unwrap_or(false);v.capacity=report["capacity"].as_u64().unwrap_or(0)as usize;v.encoding_ms=report["encoding_ms"].as_u64().unwrap_or(0);v.upload_bps=report["upload_bps"].as_u64().unwrap_or(0);v.download_bps=report["download_bps"].as_u64().unwrap_or(0);v.message=if v.passed{"Tests passed. Make this computer available, then select it in Stream Manager."}else{"Insufficient compute or bandwidth. This host cannot be selected."}.into();}),_=>update(&view,|v|{v.passed=false;v.message="Test failed. Check FFmpeg availability and the network connection.".into();})}update(&view,|v|v.busy=false);}
+                    }
+                    Action::Offer(value) => {
+                        if value && let Some(reason)=uncertain { publish_cleanup_blocked(&view,reason);continue; }
+                        offered=value; update(&view,|v|v.offered=value);
+                        if !value {
+                            let stopped=stop_jobs(&mut jobs).await;
+                            if let Some(reason)=stopped.uncertain { uncertain=Some(reason); }
+                            if let Some(s)=&session { let _=heartbeat(s,false).await; }
+                            if let Some(reason)=uncertain { publish_cleanup_blocked(&view,reason); }
+                            else { update(&view,|v|{v.jobs=0;v.message=stopped.failed.unwrap_or("Processing stopped; this host is no longer offered.").into();}); }
+                        }
+                    }
+                    Action::Disconnect => {
+                        offered=false;
+                        let stopped=stop_jobs(&mut jobs).await;
+                        if let Some(reason)=stopped.uncertain { uncertain=Some(reason); }
+                        if let Some(s)=&session { let _=heartbeat(s,false).await; }
+                        session=None;
+                        if let Some(reason)=uncertain {
+                            update(&view,|v|v.connected=false);
+                            publish_cleanup_blocked(&view,reason);
+                        } else { update(&view,|v|*v=View::default()); }
+                    }
+                }
+            }
+            _ = tick.tick() => {
+                if uncertain.is_some() || !offered { continue; }
+                let Some(s)=&session else { continue; };
+                match heartbeat(s,true).await {
+                    Ok(reply) => {
+                        let wanted:HashSet<_>=reply.jobs.iter().map(|job|job.id.clone()).collect();
+                        let remove:Vec<_>=jobs.iter().filter(|(id,job)|!wanted.contains(*id)||job.task.is_finished()).map(|(id,_)|id.clone()).collect();
+                        let mut report=StopReport::default();
+                        let mut completed=false;
+                        for id in remove {
+                            if let Some(job)=jobs.remove(&id) {
+                                job.cancelled.cancel();
+                                let outcome=job.task.await;
+                                completed |= matches!(&outcome,Ok(JobOutcome::Completed));
+                                report.observe(outcome);
+                            }
+                        }
+                        if let Some(reason)=report.uncertain {
+                            uncertain=Some(reason);offered=false;
+                            let remaining=stop_jobs(&mut jobs).await;
+                            if let Some(reason)=remaining.uncertain { uncertain=Some(reason); }
+                            let _=heartbeat(s,false).await;
+                            if let Some(reason)=uncertain { publish_cleanup_blocked(&view,reason); }
+                            continue;
+                        }
+                        // Only proven-cleanup failures can retry the same
+                        // assigned camera on the unchanged 3-second heartbeat.
+                        for job in reply.jobs {
+                            if let std::collections::hash_map::Entry::Vacant(entry) = jobs.entry(job.id.clone()) {
+                                let cancelled=CancellationToken::new();
+                                let task=tokio::spawn(transcode_until_cancelled(s.clone(),job.clone(),cancelled.clone()));
+                                entry.insert(EncodingJob{cancelled,task});
+                            }
+                        }
+                        update(&view,|v|{
+                            v.jobs=jobs.len();
+                            v.message=if !reply.selected {"Available · waiting for Stream Manager selection".into()}
+                            else if let Some(code)=report.failed {format!("{code}: processing failed after verified cleanup; retrying the assigned camera job.")}
+                            else if completed {"video_processing_finished: encoder and upload completed; restarting the assigned camera job.".into()}
+                            else {format!("Selected by GroundStation · encoding {} camera(s)",jobs.len())};
+                        });
+                    }
+                    Err(_) => {
+                        let stopped=stop_jobs(&mut jobs).await;
+                        if let Some(reason)=stopped.uncertain {
+                            uncertain=Some(reason);offered=false;publish_cleanup_blocked(&view,reason);
+                        } else {
+                            update(&view,|v|{v.jobs=0;v.message="Station unavailable or permission changed. Encoding stopped; reconnect if the station restarted.".into();});
+                        }
+                    }
+                }
+            }
         }
     }
-    for (_, job) in jobs {
-        job.abort();
-    }
+    let stopped=stop_jobs(&mut jobs).await;
+    if let Some(reason)=stopped.uncertain.or(uncertain) { anyhow::bail!(reason.code()); }
+    if let Some(code)=stopped.failed { update(&view,|v|v.message=code.into()); }
+    Ok(())
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1027,7 +1446,7 @@ mod tests {
             reqwest::StatusCode::BAD_GATEWAY
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        drop(guard);
+        guard.close().await.unwrap();
         tokio::task::yield_now().await;
         assert!(
             client

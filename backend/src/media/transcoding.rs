@@ -373,7 +373,13 @@ async fn output(
     } else {
         "mpegts"
     };
-    let mut child = tokio::process::Command::new("ffmpeg")
+    let mut command = tokio::process::Command::new("ffmpeg");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
+    let child = command
         .args([
             "-hide_banner",
             "-loglevel",
@@ -403,7 +409,9 @@ async fn output(
         ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .stderr(if cfg!(test) {
+        .stderr(if cfg!(test) && std::env::var_os("GS_VIDEO_COMPLETION_TEST").is_some() {
+            std::process::Stdio::null()
+        } else if cfg!(test) {
             std::process::Stdio::inherit()
         } else {
             std::process::Stdio::null()
@@ -416,20 +424,236 @@ async fn output(
                 "FFmpeg remuxer is unavailable",
             )
         })?;
-    let mut input = child.stdin.take().unwrap();
-    let mut stream = request.into_body().into_data_stream();
-    let mut lease = tokio::time::interval(Duration::from_secs(3));
-    loop {
-        tokio::select! {
-            chunk=stream.next()=>{match chunk{Some(Ok(bytes))=>input.write_all(&bytes).await.map_err(|_|error(StatusCode::BAD_GATEWAY,"Remuxer stopped"))?,Some(Err(_))=>break,None=>break}},
-            _=lease.tick()=>{manager(&state,&headers).await?;let registry=state.transcoding.lock().await;if registry.selected.as_deref()!=Some(&host_id)||!registry.hosts.iter().any(|h|h.id==host_id&&eligible(h)){break;}}
-        }
-    }
-    let _ = input.shutdown().await;
-    drop(input);
-    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-    Ok(StatusCode::NO_CONTENT)
+    // The HTTP future may be dropped at any await. Its sender then closes,
+    // while this owned task retains the child until kill/wait completes.
+    let (cancel_on_drop, cancelled) = tokio::sync::oneshot::channel::<()>();
+    let relay = tokio::spawn(relay_output(
+        state, host_id, headers, request, child, cancelled,
+    ));
+    let result = relay.await.map_err(|_| {
+        error(StatusCode::BAD_GATEWAY, "video_remux_task_failed")
+    })?;
+    drop(cancel_on_drop);
+    result.map_err(|response| *response)
 }
+
+async fn terminate_remux(child: &mut tokio::process::Child) -> Result<(), &'static str> {
+    // Signal only our still-unreaped child and its own verified Unix group.
+    // An already-reaped child has no id, so a recycled pid is never signalled.
+    #[cfg(unix)]
+    let group_failed = if let Some(pid) = child.id() {
+        // SAFETY: process_group(0) was applied before spawning this owned child.
+        // Recheck the live group before any negative-pid signal.
+        unsafe {
+            let group = libc::getpgid(pid as libc::pid_t);
+            if group != pid as libc::pid_t || group == libc::getpgrp() {
+                true
+            } else if libc::kill(-group, libc::SIGKILL) != 0 {
+                std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+            } else {
+                false
+            }
+        }
+    } else { false };
+    #[cfg(not(unix))]
+    let group_failed = false;
+    // start_kill can fail even when wait observes a completed child. Always
+    // perform the bounded wait and classify both results; never use kill? here.
+    let killed = child.start_kill();
+    let waited = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    match waited {
+        Ok(Ok(_)) if !group_failed => Ok(()),
+        Ok(Ok(_)) => Err("video_remux_group_stop_failed"),
+        Ok(Err(_)) if killed.is_err() => Err("video_remux_kill_and_wait_failed"),
+        Ok(Err(_)) => Err("video_remux_wait_failed"),
+        Err(_) => Err("video_remux_stop_timeout"),
+    }
+}
+
+fn natural_remux_completion(status: std::process::ExitStatus) -> Result<StatusCode, &'static str> {
+    if status.success() { Ok(StatusCode::NO_CONTENT) } else { Err("video_remux_failed") }
+}
+
+async fn original_processing_assignment(state: &MediaState, headers: &HeaderMap, host_id: &str) -> Result<(), Box<Response>> {
+    manager(state,headers).await.map_err(Box::new)?;
+    let registry=state.transcoding.lock().await;
+    if registry.selected.as_deref()!=Some(host_id) || !registry.hosts.iter().any(|host|host.id==host_id&&eligible(host)) {
+        return Err(Box::new(error(StatusCode::CONFLICT,"video_processing_assignment_revoked")));
+    }
+    Ok(())
+}
+enum RemuxFinalization {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    Refused(Box<Response>),
+    Cancelled,
+    TimedOut,
+}
+
+async fn relay_output(
+    state: Arc<MediaState>,
+    host_id: String,
+    headers: HeaderMap,
+    request: Request,
+    mut child: tokio::process::Child,
+    mut cancelled: tokio::sync::oneshot::Receiver<()>,
+) -> Result<StatusCode, Box<Response>> {
+    let outcome: ApiResult<StatusCode> = async {
+        #[cfg(unix)]
+        {
+            let valid = child.id().is_some_and(|pid| {
+                // SAFETY: this pid is held by our unreaped Child, never a saved id.
+                unsafe { libc::getpgid(pid as libc::pid_t) == pid as libc::pid_t
+                    && pid as libc::pid_t != libc::getpgrp() }
+            });
+            if !valid {
+                let cleanup = terminate_remux(&mut child).await;
+                return Err(error(StatusCode::BAD_GATEWAY, cleanup.err().unwrap_or("video_remux_group_unverified")));
+            }
+        }
+        let Some(mut input) = child.stdin.take() else {
+            let cleanup = terminate_remux(&mut child).await;
+            return Err(error(StatusCode::BAD_GATEWAY, cleanup.err().unwrap_or("video_remux_pipe_missing")));
+        };
+        let mut stream = request.into_body().into_data_stream();
+        let mut lease = tokio::time::interval(Duration::from_secs(3));
+        let mut caller_dropped = false;
+        let transfer = 'relay: loop {
+            tokio::select! {
+                biased;
+                _ = &mut cancelled => { caller_dropped = true; break Ok(()); }
+                status = child.wait() => {
+                    break match status {
+                        Ok(status) if status.success() => Err(error(StatusCode::BAD_GATEWAY, "video_remux_ended_before_input")),
+                        Ok(_) => Err(error(StatusCode::BAD_GATEWAY, "video_remux_failed")),
+                        Err(_) => Err(error(StatusCode::BAD_GATEWAY, "video_remux_wait_failed")),
+                    };
+                }
+                _ = lease.tick() => {
+                    let authorized = tokio::select! {
+                        biased;
+                        _ = &mut cancelled => { caller_dropped = true; break Ok(()); }
+                        authorized = original_processing_assignment(&state,&headers,&host_id) => authorized,
+                    };
+                    if let Err(response)=authorized { break Err(*response); }
+                }
+                chunk = stream.next() => {
+                    match chunk {
+                        Some(Ok(bytes)) => {
+                            let write = input.write_all(&bytes);
+                            tokio::pin!(write);
+                            loop {
+                            tokio::select! {
+                                biased;
+                                _ = &mut cancelled => { caller_dropped = true; break 'relay Ok(()); }
+                                status = child.wait() => {
+                                    break 'relay match status {
+                                        Ok(status) if status.success() => Err(error(StatusCode::BAD_GATEWAY, "video_remux_ended_before_input")),
+                                        Ok(_) => Err(error(StatusCode::BAD_GATEWAY, "video_remux_failed")),
+                                        Err(_) => Err(error(StatusCode::BAD_GATEWAY, "video_remux_wait_failed")),
+                                    };
+                                }
+                                _ = lease.tick() => {
+                                    let authorized = tokio::select! {
+                                        biased;
+                                        _ = &mut cancelled => { caller_dropped = true; break 'relay Ok(()); }
+                                        authorized = original_processing_assignment(&state,&headers,&host_id) => authorized,
+                                    };
+                                    if let Err(response)=authorized { break 'relay Err(*response); }
+                                }
+                                written = std::future::poll_fn(|context| {
+                                    std::future::Future::poll(write.as_mut(),context)
+                                }) => {
+                                    if written.is_err() {
+                                        break 'relay Err(error(StatusCode::BAD_GATEWAY, "video_remux_input_failed"));
+                                    }
+                                    break;
+                                }
+                            }
+                            }
+                        }
+                        Some(Err(_)) => break Err(error(StatusCode::BAD_REQUEST, "video_upload_interrupted")),
+                        None => break Ok(()),
+                    }
+                }
+            }
+        };
+        // Closing stdin sends actual EOF. Neither EOF nor accepted input bytes
+        // establish that the copy-remux process succeeded.
+        drop(input);
+        if caller_dropped || transfer.is_err() {
+            let cleanup = terminate_remux(&mut child).await;
+            if let Err(code) = cleanup {
+                return Err(error(StatusCode::BAD_GATEWAY, code));
+            }
+            transfer?;
+            // No HTTP caller remains to receive this cancellation outcome. It must
+            // never be mistaken for successful natural encoder completion.
+            return Err(error(StatusCode::REQUEST_TIMEOUT, "video_upload_cancelled"));
+        }
+        let completion = {
+            let deadline=tokio::time::sleep(Duration::from_secs(5));tokio::pin!(deadline);
+            let wait=child.wait();tokio::pin!(wait);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut cancelled => break RemuxFinalization::Cancelled,
+                    _ = &mut deadline => break RemuxFinalization::TimedOut,
+                    _ = lease.tick() => {
+                        let authorized=tokio::select! {
+                            biased;
+                            _ = &mut cancelled => break RemuxFinalization::Cancelled,
+                            _ = &mut deadline => break RemuxFinalization::TimedOut,
+                            authorized=original_processing_assignment(&state,&headers,&host_id)=>authorized,
+                        };
+                        if let Err(response)=authorized { break RemuxFinalization::Refused(response); }
+                    }
+                    status = std::future::poll_fn(|context| {
+                        std::future::Future::poll(wait.as_mut(),context)
+                    }) => {
+                        // Revalidate the original caller/assignment before the
+                        // sole success response, within the SAME deadline.
+                        if status.as_ref().is_ok_and(|status|status.success()) {
+                            let authorized=tokio::select! {
+                                biased;
+                                _ = &mut cancelled => break RemuxFinalization::Cancelled,
+                                _ = &mut deadline => break RemuxFinalization::TimedOut,
+                                authorized=original_processing_assignment(&state,&headers,&host_id)=>authorized,
+                            };
+                            if let Err(response)=authorized { break RemuxFinalization::Refused(response); }
+                        }
+                        break RemuxFinalization::Exited(status);
+                    }
+                }
+            }
+        };
+        match completion {
+            RemuxFinalization::Exited(Ok(status)) => natural_remux_completion(status).map_err(|code|error(StatusCode::BAD_GATEWAY,code)),
+            RemuxFinalization::Exited(Err(_)) => {
+                let cleanup=terminate_remux(&mut child).await;
+                Err(error(StatusCode::BAD_GATEWAY,cleanup.err().unwrap_or("video_remux_wait_failed")))
+            }
+            RemuxFinalization::Refused(response) => {
+                if let Err(code)=terminate_remux(&mut child).await { return Err(error(StatusCode::BAD_GATEWAY,code)); }
+                Err(*response)
+            }
+            RemuxFinalization::Cancelled => {
+                match terminate_remux(&mut child).await {
+                    Ok(())=>Err(error(StatusCode::REQUEST_TIMEOUT,"video_upload_cancelled")),
+                    Err(code)=>Err(error(StatusCode::BAD_GATEWAY,code)),
+                }
+            }
+            RemuxFinalization::TimedOut => {
+                match terminate_remux(&mut child).await {
+                    Ok(())=>Err(error(StatusCode::GATEWAY_TIMEOUT,"video_remux_timeout")),
+                    Err(code)=>Err(error(StatusCode::BAD_GATEWAY,code)),
+                }
+            }
+        }
+
+    }.await;
+    outcome.map_err(Box::new)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,4 +844,17 @@ mod tests {
             "expired workers fall back to the original source"
         );
     }
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn natural_completion_requires_successful_process_exit() {
+        #[cfg(unix)] use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)] use std::os::windows::process::ExitStatusExt;
+        let successful = std::process::ExitStatus::from_raw(0);
+        #[cfg(unix)] let failed = std::process::ExitStatus::from_raw(256);
+        #[cfg(windows)] let failed = std::process::ExitStatus::from_raw(1);
+        assert_eq!(natural_remux_completion(successful), Ok(StatusCode::NO_CONTENT));
+        assert_eq!(natural_remux_completion(failed), Err("video_remux_failed"));
+        #[cfg(unix)] assert_eq!(natural_remux_completion(std::process::ExitStatus::from_raw(9)), Err("video_remux_failed"));
+    }
+
 }
