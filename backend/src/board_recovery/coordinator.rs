@@ -55,6 +55,23 @@ mod explicit_launch_reset_tests {
         *state.state.lock().unwrap() = crate::types::FlightState::Idle;
         assert!(host_action_allowed(&state, "reset_startup"));
     }
+    /// A test fire happens with the fill sequence holding Paused. Reset all
+    /// boards is the only Launch unlock, so it must stay available then, and
+    /// still refuse while a sequence is moving valves.
+    #[tokio::test]
+    async fn reset_after_fire_is_allowed_with_fill_paused_but_not_while_filling() {
+        let state = crate::state::tests::test_app_state().await;
+        let endpoint = crate::telemetry_schema::endpoint("ACTUATOR_BOARD");
+        let router = Arc::new(sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([
+            sedsnet::router::EndpointHandler::new_packet_handler(endpoint, |_| Ok(())),
+        ])));
+        state.topology_router.set(router).unwrap();
+        *state.state.lock().unwrap() = crate::types::FlightState::Launch;
+        state.gse.lock().unwrap().engine.status.phase = gse_sequence::Phase::Paused;
+        assert!(host_action_allowed(&state, "reset_startup"), "paused fill must not hold the reset after a fire");
+        state.gse.lock().unwrap().engine.status.phase = gse_sequence::Phase::Filling;
+        assert!(!host_action_allowed(&state, "reset_startup"), "a sequence moving valves still blocks the reset");
+    }
 }
 
 #[cfg(test)]

@@ -3064,6 +3064,12 @@ fn require_primary_operational_station() -> Result<(), (StatusCode, String)> {
         Ok(())
     }
 }
+/// A sequence holding Paused has confirmed its valves closed and is waiting for
+/// the operator, which is where a fill sits through a test fire. The reset is
+/// the operator ending it, so only a sequence still moving valves blocks it.
+fn engine_blocks_operator_reset(rt: &Runtime) -> bool {
+    rt.engine.active() && rt.engine.status.phase != Phase::Paused
+}
 pub(crate) fn verified_recovery_host_idle(state: &AppState) -> bool {
     let rt = state.gse.lock().unwrap();
     if rt.engine.active() {
@@ -3080,12 +3086,13 @@ pub(crate) fn verified_recovery_host_idle(state: &AppState) -> bool {
 /// Launch waiting on its Valve Board, or the latch left by an earlier Stop, is
 /// not work: this reset is the way out of both.
 pub(crate) fn operator_reset_host_idle(state: &AppState) -> bool {
-    if !verified_recovery_host_idle(state) {
-        return false;
-    }
     {
         let rt = state.gse.lock().unwrap();
-        if cold_flow::runtime_active(&rt) {
+        if engine_blocks_operator_reset(&rt) || cold_flow::runtime_active(&rt) {
+            return false;
+        }
+        #[cfg(not(feature = "hitl_mode"))]
+        if rt.operational.running || rt.automatic_abort_in_flight {
             return false;
         }
     }
@@ -3104,7 +3111,7 @@ pub(crate) fn operator_reset_host_idle(state: &AppState) -> bool {
 /// applied Startup. This does not publish state, reopen, or dispatch outputs.
 pub(crate) fn prepare_verified_startup(state: &Arc<AppState>) -> Result<(), &'static str> {
     let mut rt = state.gse.lock().unwrap();
-    if rt.engine.active() {
+    if engine_blocks_operator_reset(&rt) {
         return Err("Sequence still active");
     }
     #[cfg(not(feature = "hitl_mode"))]
