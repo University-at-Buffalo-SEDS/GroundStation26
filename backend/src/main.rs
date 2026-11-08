@@ -82,6 +82,7 @@ mod recovery_events;
 mod recording_range;
 mod recording_report;
 mod recording_sd;
+mod sd_download;
 mod ring_buffer;
 mod rocket_commands;
 mod rrls;

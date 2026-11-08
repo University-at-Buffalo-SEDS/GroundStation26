@@ -61,7 +61,7 @@ fn disk_limit() -> u64 {
         1024 * 1024 * 1024 * 1024,
     )
 }
-fn reserve_bytes() -> u64 {
+pub(crate) fn reserve_bytes() -> u64 {
     configured_limit(
         "GS_SD_IMPORT_DISK_RESERVE_BYTES",
         2 * 1024 * 1024 * 1024,
@@ -73,7 +73,7 @@ fn available_disk_bytes(blocks: impl Into<u64>, fragment_bytes: impl Into<u64>) 
     blocks.into().saturating_mul(fragment_bytes.into())
 }
 #[cfg(unix)]
-fn free_disk(path: &std::path::Path) -> std::io::Result<u64> {
+pub(crate) fn free_disk(path: &std::path::Path) -> std::io::Result<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::other("Invalid disk path"))?;
@@ -85,7 +85,7 @@ fn free_disk(path: &std::path::Path) -> std::io::Result<u64> {
     Ok(available_disk_bytes(info.f_bavail, info.f_frsize))
 }
 #[cfg(not(unix))]
-fn free_disk(_: &std::path::Path) -> std::io::Result<u64> {
+pub(crate) fn free_disk(_: &std::path::Path) -> std::io::Result<u64> {
     Err(std::io::Error::other(
         "SD recovery disk preflight is unavailable on this backend platform",
     ))
@@ -118,7 +118,7 @@ fn effective_limit(root: &std::path::Path, source: &std::path::Path) -> Result<u
     Ok(limit)
 }
 #[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
-async fn admin(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), Response> {
+pub(crate) async fn admin(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), Response> {
     let p = crate::web::authorize_headers(state, headers, Permission::ViewData).await?;
     if p.anonymous || !p.roles.contains(&StreamRole::Admin) {
         return Err((
