@@ -846,7 +846,8 @@ impl Engine {
     }
     /// End the nitrogen test at pressure: close every valve and hold. A leak
     /// verdict holds for a leak search; a pass offers Cold flow or Dump.
-    fn hold_test_pressure(&mut self, now: u64, hold: TestHold) -> Effects {
+    /// Public for station fixtures; the engine calls it from its own verdicts.
+    pub fn hold_test_pressure(&mut self, now: u64, hold: TestHold) -> Effects {
         let message = hold.message();
         self.paused_from = None;
         self.hold_reference = None;

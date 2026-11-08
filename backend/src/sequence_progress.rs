@@ -479,6 +479,18 @@ pub struct RunControls {
     pub pause: Gate,
     pub resume: Gate,
     pub cancel: Gate,
+    /// The nitrogen test holds pressure and offers Cold flow or Dump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_choice: Option<HoldChoice>,
+}
+/// Server-provided choice at a nitrogen-test pressure hold. Cold flow uses
+/// the cold-flow start endpoint; Dump is the run's Cancel (dump and vent).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldChoice {
+    pub message: String,
+    pub passed: bool,
+    pub cold_flow: Gate,
+    pub dump: Gate,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelPhase {

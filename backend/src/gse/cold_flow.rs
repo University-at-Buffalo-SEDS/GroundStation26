@@ -74,6 +74,57 @@ pub(super) fn desired(rt: &Runtime) -> Option<[bool; 5]> {
         .filter(|s| s.active())
         .map(|s| s.controller.observation().desired)
 }
+/// The nitrogen test holds its pressure (confirmed closed) and offers the
+/// Cold flow choice. Cold flow then takes over through this same path.
+pub(super) fn hold_handoff(rt: &Runtime) -> bool {
+    rt.engine.status.phase == Phase::Paused && rt.engine.test_hold().is_some()
+}
+/// Cold-flow target. From the nitrogen-test hold the test's top step replaces
+/// the separate cold-flow target, capped at the held pressure, so cold flow
+/// releases what the tank holds and never re-pressurises it.
+fn start_target(rt: &Runtime, input: Inputs) -> Option<f32> {
+    if !hold_handoff(rt) {
+        return rt.engine.config.cold_flow_target_psi;
+    }
+    let top = rt
+        .engine
+        .status
+        .baseline
+        .as_ref()
+        .map_or(0.0, |b| b.average_psi)
+        + rt.engine.config.nitrogen_target_psi();
+    let held = input
+        .pressure
+        .filter(|p| p.value.is_finite() && p.at_ms <= input.now_ms && input.now_ms - p.at_ms <= 2000)
+        .map(|p| p.value)?;
+    let target = rt.engine.config.cold_flow_target_psi.map_or(top, |t| t.min(top)).min(held);
+    (target > 0.0).then_some(target)
+}
+/// Complete the held nitrogen-test run before Cold flow claims the valves.
+fn finish_held_test(rt: &mut Runtime) {
+    let Some(hold) = rt.engine.test_hold().cloned() else {
+        return;
+    };
+    match hold {
+        gse_sequence::TestHold::Passed => {
+            #[cfg(not(feature = "hitl_mode"))]
+            {
+                rt.operational.saved.baseline = rt.engine.status.baseline.clone();
+                // Also completes the "Nitrogen cold-flow test passed" checklist item.
+                if let Err(error) = rt
+                    .operational
+                    .complete(Milestone::NitrogenTest)
+                    .and_then(|()| rt.operational.flush_checklists())
+                {
+                    log::error!("nitrogen test pass before cold flow could not be saved: {error}");
+                }
+            }
+            let event = format!("nitrogen-hold-cold-flow:{}", rt.now());
+            rt.progress_pass(Kind::NitrogenTest, event);
+        }
+        gse_sequence::TestHold::Failed(_) => rt.progress_failed_current(),
+    }
+}
 /// Tank overpressure owns the valves: retire scheduled effects, emit nothing.
 pub(super) fn retire_for_overpressure(rt: &mut Runtime) {
     if let Some(session) = &mut rt.cold_flow {
@@ -433,11 +484,11 @@ async fn authorized(
 pub(super) struct Status {
     version: u16,
     target_psi: Option<f32>,
-    start_available: bool,
+    pub(super) start_available: bool,
     valid_for_ms: u64,
     backend_instance: String,
     reset_epoch: String,
-    reason: &'static str,
+    pub(super) reason: &'static str,
     active: bool,
     phase: Option<ColdPhase>,
     key: Option<RunKey>,
@@ -458,10 +509,10 @@ pub(super) fn status(state: &AppState) -> Status {
         #[cfg(feature = "hitl_mode")]
         let ready = true;
         (
-            rt.engine.config.cold_flow_target_psi,
+            start_target(&rt, input(&rt, state, simulation, interlock(state, &policy))),
             rt.engine.config.pressure_ceiling_psi,
             input(&rt, state, simulation, interlock(state, &policy)),
-            rt.engine.active() || rt.fill_trim.is_some() || rt.turbocharge.is_some(),
+            (rt.engine.active() && !hold_handoff(&rt)) || rt.fill_trim.is_some() || rt.turbocharge.is_some(),
             ready,
             rt.cold_flow
                 .as_ref()
@@ -556,7 +607,7 @@ fn recording_preflight(
         ));
     }
     let rt = state.gse.lock().unwrap();
-    if rt.engine.active()
+    if (rt.engine.active() && !hold_handoff(&rt))
         || runtime_active(&rt)
         || rt.fill_trim.is_some()
         || rt.turbocharge.is_some()
@@ -579,7 +630,7 @@ fn recording_preflight(
     }
     let input = input(&rt, state, simulation, interlock(state, &policy));
     let (_controller, _effects) = Controller::start(
-        rt.engine.config.cold_flow_target_psi,
+        start_target(&rt, input),
         rt.engine.config.pressure_ceiling_psi,
         input,
     )
@@ -699,7 +750,7 @@ async fn start(
                 ));
             }
             let mut rt = state.gse.lock().unwrap();
-            if rt.engine.active()
+            if (rt.engine.active() && !hold_handoff(&rt))
                 || runtime_active(&rt)
                 || rt.fill_trim.is_some()
                 || rt.turbocharge.is_some()
@@ -722,7 +773,7 @@ async fn start(
             }
             let input = input(&rt, &state, simulation, interlock(&state, &policy));
             let (controller, effects) = Controller::start(
-                rt.engine.config.cold_flow_target_psi,
+                start_target(&rt, input),
                 rt.engine.config.pressure_ceiling_psi,
                 input,
             )
@@ -742,6 +793,7 @@ async fn start(
                 }
                 origin_headers.insert(axum::http::header::AUTHORIZATION, value.clone());
             }
+            finish_held_test(&mut rt);
             rt.engine.manual_override();
             rt.engine.claimed = true;
             rt.engine.status.phase = Phase::Paused;
@@ -938,6 +990,7 @@ pub(super) fn controls(
         Ok(())
     };
     Some(crate::sequence_progress::RunControls {
+        hold_choice: None,
         key: session.key.clone(),
         pause: common(pause),
         resume: common(resume),

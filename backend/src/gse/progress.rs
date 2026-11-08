@@ -421,11 +421,30 @@ pub(crate) fn controls(state: &AppState) -> Option<wire::RunControls> {
         }
     });
     let fill_resume = kind == Kind::Fill;
+    let cancel = with_common(cancel, &block, false, interlocked, cancel_command);
+    let hold = rt.engine.test_hold().cloned();
+    drop(rt);
+    let hold_choice = hold.map(|hold| wire::HoldChoice {
+        message: hold.message(),
+        passed: hold == gse_sequence::TestHold::Passed,
+        cold_flow: {
+            let status = super::cold_flow::status(state);
+            wire::Gate::from_result(if status.start_available {
+                Ok(())
+            } else if status.reason.is_empty() {
+                Err("Waiting for the valves to confirm closed".into())
+            } else {
+                Err(status.reason.into())
+            })
+        },
+        dump: cancel.clone(),
+    });
     Some(wire::RunControls {
         key,
         pause: with_common(pause, &block, true, interlocked, pause_command),
         resume: with_common(resume, &block, true, interlocked, !fill_resume || fill_command),
-        cancel: with_common(cancel, &block, false, interlocked, cancel_command),
+        cancel,
+        hold_choice,
     })
 }
 #[cfg(not(feature = "hitl_mode"))]

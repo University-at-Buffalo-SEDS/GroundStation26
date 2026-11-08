@@ -1772,3 +1772,93 @@ async fn actual_sequence_pause_resume_cancel_routes_follow_live_server_gates() {
     let envelope = progress::envelope(&f.state);
     assert_eq!(envelope["terminal"][0]["outcome"], "cancelled", "{envelope}");
 }
+
+#[tokio::test]
+async fn nitrogen_hold_offers_cold_flow_that_releases_the_held_pressure_without_repressurising() {
+    if crate::operator_queue::isolated_native_case(module_path!(),
+        "nitrogen_hold_offers_cold_flow_that_releases_the_held_pressure_without_repressurising") { return; }
+    let mut f = Fixture::new().await;
+    let path = f._root.0.join("qualification.json");
+    {
+        let mut rt = f.state.gse.lock().unwrap();
+        rt.engine.status.baseline = Some(gse_sequence::Baseline {
+            average_psi: 0.0, min_psi: 0.0, max_psi: 0.0, noise_psi: 0.5, samples: 50,
+        });
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            rt.operational.path = Some(path.clone());
+            rt.operational.saved.qualification.complete(Milestone::SelfTest, 0).unwrap();
+            rt.operational.running = true;
+        }
+        let now = rt.now();
+        let reserved = super::progress::reserve(&f.state);
+        let input = rt.input(true, true);
+        rt.progress_start(reserved, Kind::NitrogenTest, input);
+        let _ = rt.engine.hold_test_pressure(now, gse_sequence::TestHold::Passed);
+    }
+    #[cfg(feature = "hitl_mode")]
+    let _ = &path;
+    for _ in 0..20 {
+        f.step(115.);
+    }
+    // The fixture has no live board topology; restore the readiness the
+    // operational tick withdrew while the engine settled its hold.
+    #[cfg(not(feature = "hitl_mode"))]
+    { f.state.gse.lock().unwrap().operational.topology_stable = true; }
+    assert_eq!(f.state.gse.lock().unwrap().engine.status.phase, Phase::Paused);
+    assert_eq!(f.actual, CLOSED, "the hold keeps pressure: every valve closed");
+    super::progress::flush(&f.state);
+    let controls = super::progress::controls(&f.state).expect("held run controls");
+    let choice = controls.hold_choice.expect("Cold flow / Dump choice");
+    assert!(choice.passed);
+    assert!(choice.cold_flow.allowed, "{:?}", choice.cold_flow);
+    assert_eq!(choice.dump, controls.cancel, "Dump is the run's Cancel");
+    let before = f.sent.lock().unwrap().len();
+    f.start().await;
+    // The configured 100 psi target is below the 115 psi held: no nitrogen.
+    f.until(ColdPhase::AwaitingRelease, 115.);
+    let sent: Vec<_> = f.sent.lock().unwrap()[before..].iter().map(|(k, b)| (k.clone(), b[0] & 0x7f)).collect();
+    assert!(!sent.iter().any(|(k, c)| k == "ACTUATOR_COMMAND" && *c == 9), "never re-pressurises: {sent:?}");
+    assert!(!sent.iter().any(|(k, c)| k == "VALVE_COMMAND" && *c == 0), "pilot waits for release");
+    let rt = f.state.gse.lock().unwrap();
+    assert!(rt.engine.test_hold().is_none());
+    #[cfg(not(feature = "hitl_mode"))]
+    assert!(
+        rt.operational.saved.qualification.completed(Milestone::NitrogenTest),
+        "the passed hold completes the nitrogen (cold-flow) qualification"
+    );
+}
+
+#[tokio::test]
+async fn nitrogen_hold_cold_flow_target_is_capped_at_the_test_top_step() {
+    if crate::operator_queue::isolated_native_case(module_path!(),
+        "nitrogen_hold_cold_flow_target_is_capped_at_the_test_top_step") { return; }
+    let mut f = Fixture::new().await;
+    {
+        let mut rt = f.state.gse.lock().unwrap();
+        rt.engine.config.cold_flow_target_psi = None; // folded into the test top step
+        rt.engine.status.baseline = Some(gse_sequence::Baseline {
+            average_psi: 0.0, min_psi: 0.0, max_psi: 0.0, noise_psi: 0.5, samples: 50,
+        });
+        #[cfg(not(feature = "hitl_mode"))]
+        { rt.operational.running = true; }
+        let now = rt.now();
+        let reserved = super::progress::reserve(&f.state);
+        let input = rt.input(true, true);
+        rt.progress_start(reserved, Kind::NitrogenTest, input);
+        let _ = rt.engine.hold_test_pressure(now, gse_sequence::TestHold::Failed("leak".into()));
+    }
+    for _ in 0..20 {
+        f.step(110.);
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    { f.state.gse.lock().unwrap().operational.topology_stable = true; }
+    super::progress::flush(&f.state);
+    let choice = super::progress::controls(&f.state).unwrap().hold_choice.unwrap();
+    assert!(!choice.passed);
+    assert!(choice.message.starts_with("Nitrogen test failed: leak"));
+    assert!(choice.cold_flow.allowed, "{:?}", choice.cold_flow);
+    f.start().await;
+    let target = f.state.gse.lock().unwrap().cold_flow.as_ref().unwrap().controller.observation().target_psi;
+    assert_eq!(target, 110.0, "min(top step 120, held 110)");
+}
