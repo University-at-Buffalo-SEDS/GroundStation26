@@ -435,7 +435,9 @@ impl Runtime {
 /// RRLS simulation only: the primary half of the signed mode protocol, held by
 /// the simulated primary with its own isolated generation file. It answers a
 /// verified RRLS query with this build's mode and can never author a change.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct SimulatedPrimaryMode(Runtime);
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl SimulatedPrimaryMode {
     pub(crate) fn new(pairing: &Pairing, path: PathBuf) -> anyhow::Result<Self> {
         Ok(Self(Runtime::new(pairing, false, path)?))

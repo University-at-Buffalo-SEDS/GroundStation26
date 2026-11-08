@@ -10,6 +10,8 @@
 //! network output is opened. A fresh simulated installation pairing and
 //! redirected state paths keep every saved trust, mode and configuration file
 //! inside `GS_RRLS_SIM_ROOT`, so the real primary pairing is never used.
+// The simulated primary runs only where a pseudo-terminal radio exists (Linux).
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 use crate::comms_config::{CommsLinkConfig, CommsLinksConfig, SerialLinkConfig, SerialProtocol};
 use crate::rrls::{Mesh, Outgoing, Role};
 use crate::station_pairing::Pairing;
