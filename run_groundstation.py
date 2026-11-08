@@ -119,6 +119,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rrls", action="store_true", help="Run the headless recovery receiver/relay with local web and mobile access.")
     parser.add_argument("--frontend-dev", "--frontend_dev", action="store_true", help="Build the WebUI from the frontend dev branch (also accepts frontend_dev, like build.py).")
+    parser.add_argument("--switchable-modes", metavar="MODES", help="Build one backend per mode (comma list of normal,hitl,test_fire,testing, or all) and supervise it so the UI can switch station mode by a controlled restart. The usual mode flag picks the default when no switch was saved.")
     parser.add_argument("--pairing", type=Path, metavar="FILE", help="Station pairing.json from pair_stations.py (sets GS_STATION_PAIRING_FILE). Without it, a pairing made in the UI is used.")
     arguments=["--frontend-dev" if argument in {"frontend_dev", "frontend-dev"} else argument for argument in sys.argv[1:]]
     args=parser.parse_args(arguments)
@@ -152,6 +153,10 @@ def main() -> None:
             print(f"Error: pairing file not found: {pairing}", file=sys.stderr)
             sys.exit(2)
         os.environ["GS_STATION_PAIRING_FILE"] = str(pairing)
+    if args.switchable_modes:
+        if flight_sim_mode:
+            raise ValueError("FlightSim is an isolated session; it does not use switchable station modes")
+        return run_switchable(args, testing_mode, hitl_mode, test_fire_mode, debug_mode)
     cmd = ["cargo", "run"]
     if not debug_mode:
         cmd.append("--release")
@@ -194,6 +199,38 @@ def main() -> None:
     except subprocess.CalledProcessError as e:
         print("Backend exited with error.", file=sys.stderr)
         sys.exit(e.returncode)
+
+
+def build_frontend(args: argparse.Namespace, repo_root: Path, debug_mode: bool) -> None:
+    if args.frontend_dev or not args.backend_only_build:
+        frontend_cmd = [sys.executable, str(repo_root / "build.py"), "frontend_web"]
+        if args.frontend_dev:
+            frontend_cmd.append("--frontend-dev")
+        if debug_mode:
+            frontend_cmd.append("debug")
+        print(f"Running: {' '.join(frontend_cmd)} (cwd={repo_root})")
+        subprocess.run(frontend_cmd, cwd=repo_root, check=True)
+    prepare_browser_asset_source(repo_root, frontend_dev=args.frontend_dev, refresh=False)
+
+
+def run_switchable(args: argparse.Namespace, testing_mode: bool, hitl_mode: bool, test_fire_mode: bool, debug_mode: bool) -> None:
+    """Build every requested mode, then supervise: a confirmed UI mode switch
+    exits the backend with station_modes.RESTART_EXIT_CODE and the selected
+    build starts. Without a saved selection the usual mode runs."""
+    import station_modes
+
+    default_mode = "testing" if testing_mode else "hitl" if hitl_mode else "test_fire" if test_fire_mode else "normal"
+    modes = station_modes.parse_modes(args.switchable_modes)
+    if default_mode not in modes:
+        modes.insert(0, default_mode)
+    repo_root = Path(__file__).resolve().parent
+    build_frontend(args, repo_root, debug_mode)
+    refresh_sedsnet_dependency(repo_root)
+    root = station_modes.build_modes(repo_root, modes, debug=debug_mode, pi=is_raspberry_pi() and not args.rrls)
+    code = station_modes.supervise(repo_root, root, default_mode, args.rrls, cwd=repo_root)
+    warn_if_db_sidecars_present(repo_root)
+    if code != 0:
+        raise subprocess.CalledProcessError(code, [str(root / default_mode / station_modes.BINARY)])
 
 
 if __name__ == "__main__":
