@@ -222,7 +222,10 @@ async fn actual_http_invalid_fill_limits_preserve_mode_policy_and_have_no_effect
     {
         // The ordinary action-policy gate rejects this invalid setup first.
         assert_eq!(result.0, StatusCode::FORBIDDEN, "{}", result.1);
-        assert_eq!(result.1, "command disabled");
+        assert_eq!(
+            result.1,
+            "StartFill: This command is unavailable under the current GroundStation policy."
+        );
     }
     f.pump();
     assert!(f.files().is_empty());
