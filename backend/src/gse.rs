@@ -3081,6 +3081,10 @@ pub(crate) fn verified_recovery_host_idle(state: &AppState) -> bool {
     }
     true
 }
+/// Read-only: a cold-flow session currently owns the outputs.
+pub(crate) fn cold_flow_active(state: &AppState) -> bool {
+    cold_flow::runtime_active(&state.gse.lock().unwrap())
+}
 /// Explicit reset may retire host Launch metadata only after host work has
 /// drained. Board completion is still verified by the recovery transaction. A
 /// Launch waiting on its Valve Board, or the latch left by an earlier Stop, is

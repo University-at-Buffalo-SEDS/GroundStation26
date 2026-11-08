@@ -2,6 +2,7 @@
 //! Local RRLS hardware execution remains denied, including when offline.
 pub(crate) mod recovery;
 pub(crate) mod retained_config;
+pub(crate) mod simulated_primary;
 mod wire;
 // Staged coordinator seam; this module does not authorize reset completion.
 #[cfg_attr(not(test), allow(dead_code))]

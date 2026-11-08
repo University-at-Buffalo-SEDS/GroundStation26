@@ -404,6 +404,31 @@ pub fn encode_control_observation(state: &AppState, max_bytes: usize) -> Vec<u8>
     }
     out.encode()
 }
+/// RRLS simulation only: a basic observation with every control disabled and
+/// every valve, board and CPU sample unknown. Never derived from live state.
+pub(crate) fn simulated_idle_observation() -> Vec<u8> {
+    Observation {
+        flags: 0,
+        enabled: 0,
+        slow: 0,
+        fast: 0,
+        valve_known: 0,
+        valve_open: 0,
+        valve_ages: [UNKNOWN; 5],
+        board_ages: [UNKNOWN; 4],
+        cpu: 0,
+        cpu_age: UNKNOWN,
+        edges: 0,
+        phase: 0,
+        step_bits: 0f32.to_bits(),
+        board_guard: None,
+        launch_revision: None,
+        safety: None,
+        board_proof_policy: None,
+        board_proof_test_fire: false,
+    }
+    .encode()
+}
 /// Caller authenticates and matches the current boot + nonce/digest before invoking.
 /// Whole original request RTT bounds transit even with replayed cached replies.
 #[cfg(test)]

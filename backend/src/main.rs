@@ -83,6 +83,7 @@ mod ring_buffer;
 mod rocket_commands;
 mod rrls;
 mod rrls_radio;
+mod rrls_sim_primary;
 mod rrls_topology;
 #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 mod safety_task;
@@ -96,6 +97,7 @@ mod sequences;
 mod sim_daq_cadence;
 mod state;
 mod station_mode;
+mod station_mode_switch;
 mod station_pairing;
 mod system_clock;
 mod telemetry_db;
@@ -1105,14 +1107,21 @@ async fn shutdown_signal(state: Arc<AppState>) {
         }
     };
 
+    // An accepted station mode switch takes the same clean shutdown path.
     #[cfg(unix)]
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
+        _ = station_mode_switch::restart_requested() => {
+            log::info!("station mode switch requested a clean restart");
+        }
     }
 
     #[cfg(not(unix))]
-    ctrl_c.await;
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = station_mode_switch::restart_requested() => {}
+    }
 
     if state.request_shutdown() {
         log::info!("shutdown requested from signal handler");
@@ -1199,6 +1208,7 @@ fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevic
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     flight_sim_runtime::validate_startup()?;
+    rrls_sim_primary::validate_startup()?;
     let daq_loadcell_cadence = DaqLoadcellCadence::from_env()?;
     telemetry_schema::initialize()?;
     sedsnet::config::set_runtime_tuning_config(network_delivery_tuning())?;
@@ -1283,6 +1293,8 @@ async fn main() -> anyhow::Result<()> {
     let loadcell_calibration = loadcell::load_or_default();
     let comms_links = if flight_sim_runtime::enabled() {
         comms_config::CommsLinksConfig::default()
+    } else if rrls_sim_primary::enabled() {
+        rrls_sim_primary::comms_links()?
     } else {
         comms_config::load_or_default()
     };
@@ -2989,6 +3001,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let _mission_sync = mission_sync::start(state.clone());
     let _station_mode = station_mode::start(state.clone());
+    station_mode_switch::start();
     let _launch_clock_sync = launch_clock_sync::start(state.clone());
     let _command_proxy = command_proxy::start(state.clone());
     let _station_pairing = station_pairing::manage::start(state.clone());
@@ -3203,6 +3216,11 @@ async fn main() -> anyhow::Result<()> {
         log::error!("failed to reset GPIO outputs low during shutdown: {err}");
     }
     log::info!("groundstation backend shutdown complete");
+    if let Some(code) = station_mode_switch::exit_code() {
+        log::info!("exiting with status {code} so the supervisor starts the selected station mode");
+        log::logger().flush();
+        std::process::exit(code);
+    }
     Ok(())
 }
 

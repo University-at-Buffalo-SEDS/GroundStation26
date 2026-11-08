@@ -59,8 +59,8 @@ impl Snapshot {
         Self {
             effective_mode: None,
             local_build_mode: local_mode(),
-            execution_mode: if crate::flight_sim_runtime::enabled() { "flight_sim" } else { "compiled_mode" },
-            output_domain: if crate::flight_sim_runtime::enabled() { "simulated" } else { "build_defined" },
+            execution_mode: execution_mode(),
+            output_domain: output_domain(),
             primary_station: None,
             synchronized: false,
             persisted: false,
@@ -71,14 +71,30 @@ impl Snapshot {
         }
     }
 }
+fn execution_mode() -> &'static str {
+    if crate::flight_sim_runtime::enabled() {
+        "flight_sim"
+    } else if crate::rrls_sim_primary::enabled() {
+        "simulated_primary"
+    } else {
+        "compiled_mode"
+    }
+}
+fn output_domain() -> &'static str {
+    if crate::flight_sim_runtime::enabled() || crate::rrls_sim_primary::enabled() {
+        "simulated"
+    } else {
+        "build_defined"
+    }
+}
 static STATUS: OnceLock<Mutex<Snapshot>> = OnceLock::new();
 pub fn snapshot() -> Snapshot {
     if !crate::rrls::is_rrls() {
         return Snapshot {
             effective_mode: Some(local_mode()),
             local_build_mode: local_mode(),
-            execution_mode: if crate::flight_sim_runtime::enabled() { "flight_sim" } else { "compiled_mode" },
-            output_domain: if crate::flight_sim_runtime::enabled() { "simulated" } else { "build_defined" },
+            execution_mode: execution_mode(),
+            output_domain: output_domain(),
             primary_station: None,
             synchronized: true,
             persisted: false,
@@ -269,8 +285,8 @@ impl Runtime {
         Snapshot {
             effective_mode: self.mode,
             local_build_mode: local_mode(),
-            execution_mode: if crate::flight_sim_runtime::enabled() { "flight_sim" } else { "compiled_mode" },
-            output_domain: if crate::flight_sim_runtime::enabled() { "simulated" } else { "build_defined" },
+            execution_mode: execution_mode(),
+            output_domain: output_domain(),
             primary_station: self.primary.clone(),
             synchronized: self.connected && self.last_verified.is_some_and(|v| now >= v),
             persisted: self.persisted,
@@ -414,6 +430,24 @@ impl Runtime {
             }
         }
         Ok(())
+    }
+}
+/// RRLS simulation only: the primary half of the signed mode protocol, held by
+/// the simulated primary with its own isolated generation file. It answers a
+/// verified RRLS query with this build's mode and can never author a change.
+pub(crate) struct SimulatedPrimaryMode(Runtime);
+impl SimulatedPrimaryMode {
+    pub(crate) fn new(pairing: &Pairing, path: PathBuf) -> anyhow::Result<Self> {
+        Ok(Self(Runtime::new(pairing, false, path)?))
+    }
+    pub(crate) fn receive(&mut self, pairing: &Pairing, wire: &[u8], now: u64) -> Option<Vec<u8>> {
+        match self.0.receive(pairing, wire, now) {
+            Ok(()) => self.0.reply.take(),
+            Err(error) => {
+                log::debug!("Simulated primary ignored a mode frame: {error}");
+                None
+            }
+        }
     }
 }
 // This protocol is deliberately non-authorizing. Its session is the already
@@ -572,8 +606,8 @@ impl DisplayRuntime {
         Snapshot {
             effective_mode: self.mode,
             local_build_mode: local_mode(),
-            execution_mode: if crate::flight_sim_runtime::enabled() { "flight_sim" } else { "compiled_mode" },
-            output_domain: if crate::flight_sim_runtime::enabled() { "simulated" } else { "build_defined" },
+            execution_mode: execution_mode(),
+            output_domain: output_domain(),
             primary_station: None,
             synchronized: self.session.is_some() && self.verified.is_some_and(|v| now >= v),
             persisted: self.persisted,
@@ -1019,6 +1053,45 @@ mod tests {
         let root = root();
         let pair = fixture(&root, "rrls", 1);
         assert!(open(&pair, &display_frame(1, 2, Some(Mode::Hitl))).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn rrls_signed_mode_sync_follows_the_simulated_primary() {
+        use crate::rrls::{Mesh, Role};
+        let root = root();
+        crate::rrls_sim_primary::write_pairing(&root).unwrap();
+        let rr_pairing = Pairing::from_file(&root.join("rrls/pairing.json")).unwrap();
+        let gs_pairing = Pairing::from_file(&root.join("primary/pairing.json")).unwrap();
+        let mut gs =
+            crate::rrls_sim_primary::SimulatedPrimary::new(gs_pairing, root.join("generation"))
+                .unwrap();
+        let mut rr = Mesh::new(Role::Rrls, 5);
+        let mut observer = Runtime::new(&rr_pairing, true, root.join("rrls-mode")).unwrap();
+        let mut up = Vec::new();
+        for step in 0..40u64 {
+            let now = step * 50;
+            for frame in gs.step(now, std::mem::take(&mut up)) {
+                rr.incoming(frame.command, &frame.bytes, now);
+            }
+            observer.connect_mesh(rr.settings_available(now), rr.operating_mode_session(now));
+            while let Some(wire) = rr.take_operating_mode() {
+                observer.receive(&rr_pairing, &wire, now).unwrap();
+            }
+            if observer.connected && observer.last_verified.is_none() && observer.pending.is_none() {
+                let nonce = format!("{:032x}", rand::random::<u128>());
+                observer.pending = Some((nonce.clone(), now));
+                let query = seal(&rr_pairing, crate::rrls_sim_primary::PRIMARY_ID, Message::Query { nonce }).unwrap();
+                assert!(rr.queue_settings(&query, now));
+            }
+            rr.tick(now);
+            while let Some(frame) = rr.pop(now) {
+                up.push((frame.command, frame.bytes));
+            }
+        }
+        let snapshot = observer.snapshot(2_000);
+        assert_eq!(snapshot.effective_mode, Some(local_mode()));
+        assert!(snapshot.synchronized && snapshot.persisted);
+        assert_eq!(snapshot.primary_station.as_deref(), Some(crate::rrls_sim_primary::PRIMARY_ID));
         std::fs::remove_dir_all(root).unwrap();
     }
     fn fixture(root: &Path, id: &str, seed: u8) -> Pairing {

@@ -484,6 +484,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::client_settings::routes())
         .merge(crate::mission_sync::routes())
         .merge(crate::station_mode::routes())
+        .merge(crate::station_mode_switch::routes())
         .merge(crate::station_pairing::manage::routes())
         .merge(crate::launch_history::api::routes())
         // anything that doesn’t match the above routes goes to the static files
