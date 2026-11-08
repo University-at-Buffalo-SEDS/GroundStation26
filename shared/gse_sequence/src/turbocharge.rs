@@ -383,6 +383,18 @@ impl Controller {
                         };
                     }
                 }
+                // A board snapshot captured after the command was sent but
+                // before the board applied an opening still reports closed.
+                // Treat it as not yet acknowledged, exactly like the engine and
+                // fill trim do, until the same acknowledgement deadline. A
+                // supply still reporting open after a close is never excused.
+                Some(_)
+                    if self.desired[i]
+                        && input.now_ms.saturating_sub(self.command_since)
+                            < VALVE_ACK_TIMEOUT_MS =>
+                {
+                    return Update::default();
+                }
                 Some(_) => {
                     return self.cancel(
                         "Turbocharge valve reported the opposite state; pausing",
@@ -954,6 +966,110 @@ mod tests {
             context(),
         );
         assert!(u.cancelled.is_some());
+    }
+    /// Firmware-sim run g1: Turbocharge cancelled right after its Nitrogen-open
+    /// command because the actuator board's periodic snapshot, captured after
+    /// the command left the station but before the board applied it, still
+    /// reported Nitrogen closed. That is a pending acknowledgement, not an
+    /// opposite report; only the acknowledgement deadline may cancel.
+    #[test]
+    fn pre_actuation_closed_snapshot_after_nitrogen_open_is_not_an_opposite_report() {
+        let mut r = Rig::new(10.0);
+        while r.c.phase() != Phase::OpeningNitrogen {
+            r.step();
+        }
+        assert_eq!(r.events.last(), Some(&(3, true)));
+        let commanded = r.c.command_since;
+        // Undo the rig's instant actuation: the board has not applied it yet.
+        for offset in [1, 40, 160, VALVE_ACK_TIMEOUT_MS - 1] {
+            r.now = commanded + offset;
+            for state in r.valves.iter_mut().flatten() {
+                state.at_ms = r.now;
+            }
+            r.valves[3] = Some(ValveState {
+                open: false,
+                at_ms: r.now,
+            });
+            let u = r.c.tick(
+                r.input(),
+                Some(Sample {
+                    value: r.mass,
+                    at_ms: r.now,
+                }),
+                context(),
+            );
+            assert!(u.cancelled.is_none(), "cancelled at +{offset} ms: {u:?}");
+            assert!(u.effects.valves.is_empty());
+            assert_eq!(r.c.phase(), Phase::OpeningNitrogen);
+        }
+        // The real open report then advances normally.
+        r.valves[3] = Some(ValveState {
+            open: true,
+            at_ms: r.now,
+        });
+        let u = r.c.tick(
+            r.input(),
+            Some(Sample {
+                value: r.mass,
+                at_ms: r.now,
+            }),
+            context(),
+        );
+        assert!(u.cancelled.is_none());
+        assert_eq!(r.c.phase(), Phase::Raising);
+    }
+    #[test]
+    fn nitrogen_that_never_opens_still_cancels_at_the_ack_deadline() {
+        let mut r = Rig::new(10.0);
+        while r.c.phase() != Phase::OpeningNitrogen {
+            r.step();
+        }
+        let commanded = r.c.command_since;
+        r.now = commanded + VALVE_ACK_TIMEOUT_MS;
+        for state in r.valves.iter_mut().flatten() {
+            state.at_ms = r.now;
+        }
+        r.valves[3] = Some(ValveState {
+            open: false,
+            at_ms: r.now,
+        });
+        let u = r.c.tick(
+            r.input(),
+            Some(Sample {
+                value: r.mass,
+                at_ms: r.now,
+            }),
+            context(),
+        );
+        assert_eq!(
+            u.cancelled.as_deref(),
+            Some("Turbocharge valve reported the opposite state; pausing")
+        );
+        assert!(u.effects.valves.iter().all(|(_, open)| !*open));
+    }
+    #[test]
+    fn nitrogen_still_open_after_its_close_command_cancels_immediately() {
+        let mut r = Rig::new(10.0);
+        r.reach_raising();
+        r.pressure = 745.0;
+        let u = r.step();
+        assert_eq!(u.effects.valves, vec![(3, false)]);
+        assert_eq!(r.c.phase(), Phase::ClosingNitrogen);
+        r.now += 1;
+        r.valves[3] = Some(ValveState {
+            open: true,
+            at_ms: r.now,
+        });
+        let u = r.c.tick(
+            r.input(),
+            Some(Sample {
+                value: r.mass,
+                at_ms: r.now,
+            }),
+            context(),
+        );
+        assert!(u.cancelled.is_some());
+        assert!(u.effects.valves.iter().all(|(_, open)| !*open));
     }
     #[test]
     fn accepted_open_report_already_at_target_closes_n2_in_same_tick() {
