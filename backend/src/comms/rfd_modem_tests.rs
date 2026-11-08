@@ -758,3 +758,13 @@ fn field_403_layout_writes_flow_control_to_its_named_register() {
     assert_eq!(modem.eeprom[&18], 0, "LBT_RSSI untouched");
     assert_eq!(modem.eeprom[&19], 0);
 }
+
+#[test]
+fn forwarding_table_in_403_arrow_format_is_parsed_per_entry() {
+    let empty = vec!["0:0->0,1:0->0,2:0->0,3:0->0,4:0->0,5:0->0,6:0->0,7:0->0,8:0->0,9:0->0, | FwdBuff=13320".to_string()];
+    assert!(!forwarding_has_entries(&empty), "all-zero slots are an empty table");
+    let used = vec!["0:0->0,1:4->2,2:0->0, | FwdBuff=13320".to_string()];
+    assert!(forwarding_has_entries(&used));
+    assert!(forwarding_has_entries(&["AT+F1=4,2".to_string()]));
+    assert!(!forwarding_has_entries(&["0,0".to_string()]));
+}

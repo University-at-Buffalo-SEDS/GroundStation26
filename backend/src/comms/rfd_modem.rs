@@ -974,6 +974,19 @@ fn run_inner(
 }
 
 fn forwarding_has_entries(lines: &[String]) -> bool {
+    // ASYNC 4.03 prints "slot:src->dst" entries separated by commas, e.g.
+    // "0:0->0,1:0->0,...| FwdBuff=13320". An entry exists when src or dst != 0.
+    let arrow = lines.iter().any(|line| line.contains("->"));
+    if arrow {
+        return lines.iter().any(|line| {
+            line.split(',').filter_map(|entry| {
+                let (_, pair) = entry.split_once(':')?;
+                let (src, dst) = pair.split_once("->")?;
+                let digits = |s: &str| s.trim().chars().take_while(char::is_ascii_digit).collect::<String>();
+                Some((digits(src).parse::<u32>().ok()?, digits(dst).parse::<u32>().ok()?))
+            }).any(|(src, dst)| src != 0 || dst != 0)
+        });
+    }
     // Manual: "AT+Fx=Src,Dst". Any pair other than 0,0 is an entry.
     lines.iter().any(|line| {
         line.split(|c: char| !(c.is_ascii_digit() || c == ','))
