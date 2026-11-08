@@ -1097,7 +1097,8 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
         // Completed state transitions are informational, not unresolved alarms.
         // Keep faults persistent until acknowledged, but do not replay ordinary
         // pause/cancel/pass/self-test notices every time a client reconnects.
-        let persistent = state.gse.lock().unwrap().engine.status.phase == Phase::Fault;
+        let persistent = state.gse.lock().unwrap().engine.status.phase == Phase::Fault
+            || message.starts_with(gse_sequence::FAILURE_PAUSE_PREFIX);
         state.add_notification_with_persistence(message, persistent);
     }
 }
@@ -1483,11 +1484,12 @@ fn handle_command_inner(
                     if action == Action::StartFill
                         && let Err(error) = rt.operational.begin_fill() {
                             rt.operational.running = false;
-                            let now = rt.now();
                             return {
-                                let effects = rt
-                                    .engine
-                                    .fault(now, &format!("Fill stage could not be saved: {error}"));
+                                let effects = pause_for_failure(
+                                    &mut rt,
+                                    input,
+                                    &format!("Fill stage could not be saved: {error}"),
+                                );
                                 drop(rt);
                                 apply(state, effects);
                                 true
@@ -1699,16 +1701,43 @@ pub(crate) fn queue_automatic_supply_close(
     Ok(true)
 }
 
-/// Recoverable/unclassified faults cancel an active fill instead of latching
-/// the entire vehicle aborted. Serialize with launch so no delayed cancel can
-/// close a supply after Fire admission.
-#[cfg(any(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
-pub(crate) fn cancel_fill_for_recoverable_fault(state: &Arc<AppState>, reason: &str) {
-    let generation = capture_operator_origin(state).unwrap_or(0);
-    cancel_fill_for_recoverable_fault_for_generation(state, reason, generation);
+/// A sequence failure that is not a physical hazard. Retire any trim or
+/// Turbocharge controller, close both supplies, then every valve, and hold
+/// Paused with fresh board confirmation for the operator (Resume, Cancel or
+/// manual valves). Never opens vent or dump and never latches a
+/// qualification fault; Launch stays refused until the operator acknowledges.
+pub(super) fn pause_for_failure(rt: &mut Runtime, input: Inputs, reason: &str) -> Effects {
+    if let Some(mut controller) = rt.fill_trim.take() {
+        controller.cancel();
+    }
+    if rt.turbocharge.take().is_some() {
+        rt.turbo_evidence = None;
+    }
+    let effects = rt.engine.pause_for_failure(input.now_ms, reason);
+    if rt.engine.status.phase == Phase::PauseSetup {
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            rt.operational.running = true;
+            rt.operational.target_reached = None;
+        }
+        rt.progress_observe(
+            input,
+            crate::sequence_progress_projection::Cause::PauseAccepted,
+        );
+    }
+    effects
 }
 
-pub(crate) fn cancel_fill_for_recoverable_fault_for_generation(
+/// Recoverable/unclassified faults pause an active sequence closed instead of
+/// latching the entire vehicle aborted or dumping the tank. Serialize with
+/// launch so no delayed pause can close a supply after Fire admission.
+#[cfg(any(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
+pub(crate) fn pause_fill_for_recoverable_fault(state: &Arc<AppState>, reason: &str) {
+    let generation = capture_operator_origin(state).unwrap_or(0);
+    pause_fill_for_recoverable_fault_for_generation(state, reason, generation);
+}
+
+pub(crate) fn pause_fill_for_recoverable_fault_for_generation(
     state: &Arc<AppState>,
     reason: &str,
     generation: u64,
@@ -1721,13 +1750,20 @@ pub(crate) fn cancel_fill_for_recoverable_fault_for_generation(
         if !automatic_abort_allowed(state) {
             return;
         }
-        let active = {
-            let rt = state.gse.lock().unwrap();
-            rt.engine.active() || rt.fill_trim.is_some()
-        };
-        if active && prelaunch(state) {
-            handle_command_inner(state, &TelemetryCommand::CancelFill, None, None);
-            state.add_temporary_notification(format!("Fill cancelled: {reason}"));
+        if prelaunch(state) {
+            let policy = state.action_policy_snapshot();
+            let interlock = interlock(state, &policy);
+            let effects = {
+                let mut rt = state.gse.lock().unwrap();
+                let active = rt.engine.active() || rt.fill_trim.is_some() || rt.turbocharge.is_some();
+                active.then(|| {
+                    let input = rt.input(true, interlock);
+                    pause_for_failure(&mut rt, input, reason)
+                })
+            };
+            if let Some(effects) = effects {
+                apply(state, effects);
+            }
         }
         claim
     };
@@ -1807,7 +1843,7 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                 update.fault.as_deref(),
                 crate::sequence_progress_service::now_ms(),
             );
-            if let Some(message) = update.fault {
+            if let Some(message) = update.fault.clone().filter(|_| update.hazard) {
                 #[cfg(not(feature = "hitl_mode"))]
                 {
                     rt.operational
@@ -1817,9 +1853,12 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                     rt.operational.running = false;
                     let _ = rt.operational.persist();
                 }
-                // Backend owns the established emergency relief policy:
-                // close both supplies and open vent/dump without ACK gating.
+                // Backend owns the established emergency relief policy for a
+                // hazard: close both supplies and open vent/dump without ACK gating.
                 rt.engine.fault(input.now_ms, &message)
+            } else if let Some(message) = update.fault {
+                // Every other trim failure pauses closed for the operator.
+                pause_for_failure(&mut rt, input, &message)
             } else if update.completed {
                 let inventory_retired=turbocharge::liquid_inventory_requalified(&mut rt);
                 if let Err(error) = inventory_retired {
@@ -1924,14 +1963,15 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                             effects.notification = Some("Automatic fill cutoff: closing valves, then settling and verifying final mass".into());
                             effects
                         }
-                        Err(error) => rt.engine.fault(input.now_ms, &error),
+                        Err(error) => pause_for_failure(&mut rt, input, &error),
                     }
                 } else {
                     effects
                 }
             } else {
-                rt.engine.fault(
-                    input.now_ms,
+                pause_for_failure(
+                    &mut rt,
+                    input,
                     "Automatic fill stopped: fresh calibrated fill weight is required",
                 )
             }

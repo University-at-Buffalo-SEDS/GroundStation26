@@ -666,7 +666,7 @@ pub async fn safety_task(
                     pending_abort = None;
                     first_abort_reason = None;
                 }
-                SafetyDispatch::RecoverableFaultCancelled => {
+                SafetyDispatch::RecoverableFaultPaused => {
                     pending_abort = None;
                     first_abort_reason = None;
                 }
@@ -690,7 +690,7 @@ pub(crate) fn dispatch_safety_abort(state: &Arc<AppState>, router: &Router) -> b
 enum SafetyDispatch {
     Claimed,
     IdleLivenessCancelled(FlightState),
-    RecoverableFaultCancelled,
+    RecoverableFaultPaused,
     Unavailable,
 }
 
@@ -702,8 +702,8 @@ fn dispatch_safety_abort_reason(
     // GENERIC_ERROR has no severity contract. It is not evidence of a massive,
     // unrecoverable hazard; preserve diagnostics and cancel fill, never global Abort.
     if matches!(reason, SafetyAbortReason::GenericError { .. }) {
-        crate::gse::cancel_fill_for_recoverable_fault(state, "board reported an unclassified error");
-        return SafetyDispatch::RecoverableFaultCancelled;
+        crate::gse::pause_fill_for_recoverable_fault(state, "board reported an unclassified error");
+        return SafetyDispatch::RecoverableFaultPaused;
     }
     let claim = if matches!(reason, SafetyAbortReason::BoardOffline { .. }) {
         match crate::gse::claim_liveness_abort(state) {

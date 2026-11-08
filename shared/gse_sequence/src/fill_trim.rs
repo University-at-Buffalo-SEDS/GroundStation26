@@ -32,6 +32,10 @@ pub struct Update {
     pub effects: Effects,
     pub completed: bool,
     pub fault: Option<String>,
+    /// The fault is a physical hazard (pressure limit, overfill trim limit or
+    /// lost interlock/prelaunch) that keeps the established relief policy.
+    /// Every other fault pauses with all valves closed for the operator.
+    pub hazard: bool,
 }
 pub struct Controller {
     phase: Phase,
@@ -150,6 +154,12 @@ impl Controller {
         }
     }
     fn fail(&mut self, message: &str) -> Update {
+        self.fail_with(message, false)
+    }
+    fn fail_hazard(&mut self, message: &str) -> Update {
+        self.fail_with(message, true)
+    }
+    fn fail_with(&mut self, message: &str, hazard: bool) -> Update {
         self.phase = Phase::Fault;
         self.pending = 0;
         self.waiting = None;
@@ -161,6 +171,7 @@ impl Controller {
             },
             fault: Some(message.into()),
             completed: false,
+            hazard,
         }
     }
     pub fn tick(&mut self, input: Inputs, mass: Option<Sample>) -> Update {
@@ -171,15 +182,15 @@ impl Controller {
             return Update::default();
         }
         if !input.interlock || !input.prelaunch {
-            return self.fail("Fill trim interlock or prelaunch state lost");
+            return self.fail_hazard("Fill trim interlock or prelaunch state lost");
         }
-        if !input.pressure.is_some_and(|p| {
-            p.value.is_finite()
-                && p.at_ms <= input.now_ms
-                && input.now_ms - p.at_ms <= 2000
-                && p.value < self.pressure_limit
-        }) {
-            return self.fail("Fill trim pressure is missing, stale or above its limit");
+        let Some(pressure) = input.pressure.filter(|p| {
+            p.value.is_finite() && p.at_ms <= input.now_ms && input.now_ms - p.at_ms <= 2000
+        }) else {
+            return self.fail("Fill trim pressure is missing or stale");
+        };
+        if pressure.value >= self.pressure_limit {
+            return self.fail_hazard("Fill trim pressure is at or above its limit");
         }
         let Some(mass) = mass.filter(|p| {
             p.value.is_finite() && p.at_ms <= input.now_ms && input.now_ms - p.at_ms <= 2000
@@ -282,7 +293,7 @@ impl Controller {
             return self.fail("Settled fill mass is below target; manual review required");
         }
         if self.pulses >= MAX_PULSES {
-            return self.fail("Fill trim pulse limit reached");
+            return self.fail_hazard("Fill trim pulse limit reached");
         }
         self.pulses += 1;
         let mut vent = CLOSED;
@@ -511,7 +522,7 @@ mod tests {
     }
     #[test]
     fn stale_mass_pressure_interlock_and_mismatched_valve_fail_closed() {
-        for kind in 0..5 {
+        for kind in 0..6 {
             let mut rig = Rig::new(10.0, 10.0);
             rig.until(Phase::Settling);
             rig.now += 2100;
@@ -525,12 +536,16 @@ mod tests {
                 1 => input.pressure = None,
                 2 => input.interlock = false,
                 3 => input.prelaunch = false,
+                4 => input.pressure.as_mut().unwrap().value = rig.controller.pressure_limit,
                 _ => input.valves[4].as_mut().unwrap().open = true,
             };
             let update = rig.controller.tick(input, mass);
             assert!(update.fault.is_some());
             assert_eq!(rig.controller.phase(), Phase::Fault);
             assert!(update.effects.valves.iter().all(|(_, open)| !*open));
+            // Only the pressure limit and lost interlock/prelaunch keep relief;
+            // missing data and a mismatched report pause for the operator.
+            assert_eq!(update.hazard, matches!(kind, 2..=4), "kind {kind}");
         }
     }
     #[test]
@@ -577,6 +592,7 @@ mod tests {
         assert_eq!(under.controller.phase(), Phase::Fault);
         assert!(!under.completed);
         let mut over = Rig::new(10.0, 10.2);
+        let mut hazard = false;
         for _ in 0..2000 {
             let update = over.tick();
             assert!(
@@ -587,11 +603,14 @@ mod tests {
                     .all(|(i, open)| *i < 3 || !*open)
             );
             if update.fault.is_some() {
+                hazard = update.hazard;
                 break;
             }
         }
         assert_eq!(over.controller.phase(), Phase::Fault);
         assert_eq!(over.controller.pulses, MAX_PULSES);
+        // Still above target after every pulse: kept as an overfill hazard.
+        assert!(hazard);
     }
     #[test]
     fn cancellation_is_pure_and_never_replays_outputs() {

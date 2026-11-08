@@ -15,6 +15,15 @@ pub const CLOSED: [bool; 5] = [false; 5];
 pub const FILL_READY: [bool; 5] = [false, true, false, false, false];
 
 pub const MAX_NITROGEN_STEPS: usize = 32;
+/// Every non-safety sequence failure notification starts with this text.
+pub const FAILURE_PAUSE_PREFIX: &str = "Sequence paused:";
+/// A supply that still reports open after its close deadline is a hazard only
+/// while tank pressure climbs; a missing pressure reading counts as climbing.
+pub const STUCK_SUPPLY_PRESSURE_RISE_PSI: f32 = 5.0;
+/// Operator-facing text for a failure that paused (never dumped) the tank.
+pub fn failure_pause_notice(reason: &str) -> String {
+    format!("{FAILURE_PAUSE_PREFIX} {reason}. Review and Resume or Cancel.")
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NitrogenStep {
@@ -361,6 +370,11 @@ pub struct Engine {
     /// Test phase interrupted by an operator pause. Only a paused valve
     /// self-test or nitrogen test carries this; fill pauses never do.
     paused_from: Option<Phase>,
+    /// Reason a non-safety failure paused this sequence. Cleared only by an
+    /// explicit operator request (pause, resume, cancel, start) or a fault.
+    failure: Option<String>,
+    /// Fresh tank pressure when the current pause began closing.
+    pause_reference_psi: Option<f32>,
 }
 /// Which qualification test an operator pause interrupted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,6 +432,8 @@ impl Default for Engine {
             hold_reference: None,
             hold_samples: 0,
             paused_from: None,
+            failure: None,
+            pause_reference_psi: None,
         }
     }
 }
@@ -428,6 +444,7 @@ impl Engine {
     pub fn prepare_startup(&mut self, now_ms: u64, hold_filled: bool) -> Effects {
         self.resume_existing_inventory = false;
         self.paused_from = None;
+        self.failure = None;
         self.claimed = true;
         self.testing_valves = false;
         self.nitrous_session = hold_filled;
@@ -515,6 +532,9 @@ impl Engine {
         self.status.message = message.into();
     }
     fn configure(&mut self, phase: Phase, desired: [bool; 5], now: u64, message: &str) -> Effects {
+        if phase == Phase::PauseSetup && self.status.phase != Phase::PauseSetup {
+            self.pause_reference_psi = self.status.pressure_psi;
+        }
         self.self_waiting = None;
         self.command_since = now;
         self.target = desired;
@@ -648,6 +668,8 @@ impl Engine {
 
     pub fn request(&mut self, action: Action, input: Inputs) -> Result<Effects, String> {
         self.validate_request(action, input)?;
+        // An explicit operator request acknowledges an earlier failure pause.
+        self.failure = None;
         self.resume_existing_inventory = action == Action::StartFill
             && self.status.phase == Phase::Paused
             && self.nitrous_session;
@@ -734,7 +756,82 @@ impl Engine {
         ));
         effects
     }
+    /// Reason the sequence is held in a failure pause, if any.
+    pub fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
+    }
+    /// The supply/pressure ceiling for the current session.
+    pub fn session_pressure_limit(&self) -> Result<f32, String> {
+        if self.nitrous_session {
+            self.config.pressure_limit(self.nitrous_target_psi, 50.0)
+        } else {
+            self.config
+                .pressure_limit(self.config.nitrogen_target_psi(), 100.0)
+        }
+    }
+    /// A non-safety failure never opens vent or dump. Close both supplies
+    /// first, then every valve, and hold Paused (fresh board confirmation is
+    /// still required) until the operator resumes, cancels or takes manual
+    /// control. An operator cancel or an existing fault keeps its relief.
+    pub fn pause_for_failure(&mut self, now: u64, message: &str) -> Effects {
+        let from = self.status.phase;
+        if matches!(
+            from,
+            Phase::Idle | Phase::Passed | Phase::Cancelled | Phase::CancelSetup | Phase::Fault
+        ) {
+            return Effects::default();
+        }
+        let repeated = from == Phase::PauseSetup && self.failure.as_deref() == Some(message);
+        if test_phase(from) || from == Phase::SelfFinish {
+            // Infrastructure failures resume from the interrupted test step.
+            self.paused_from = Some(from);
+        } else if !matches!(from, Phase::PauseSetup | Phase::Paused) {
+            self.paused_from = None;
+        }
+        self.claimed = true;
+        self.failure = Some(message.into());
+        self.hold_reference = None;
+        self.hold_samples = 0;
+        let mut effects = self.configure(
+            Phase::PauseSetup,
+            CLOSED,
+            now,
+            &format!("{FAILURE_PAUSE_PREFIX} {message}; closing all valves"),
+        );
+        // Both supplies close at once; the sequenced confirmation still
+        // re-commands and confirms each valve individually.
+        if effects.valves == [(3, false)] {
+            effects.valves.push((4, false));
+        }
+        if !repeated {
+            effects.notification = Some(failure_pause_notice(message));
+        }
+        effects
+    }
+    /// Already-closed pause: record the reason once and command nothing.
+    fn hold_paused_for_failure(&mut self, message: &str) -> Effects {
+        if self.failure.as_deref() == Some(message) {
+            return Effects::default();
+        }
+        self.failure = Some(message.into());
+        self.status.message = format!("{FAILURE_PAUSE_PREFIX} {message}; holding all valves closed");
+        Effects {
+            valves: Vec::new(),
+            notification: Some(failure_pause_notice(message)),
+        }
+    }
+    fn pause_or_hold_for_failure(&mut self, input: Inputs, message: &str) -> Effects {
+        if self.status.phase != Phase::Paused {
+            return self.pause_for_failure(input.now_ms, message);
+        }
+        // Valve supervision continues while the pause holds.
+        if self.valve_ack_expired(input) {
+            return self.valve_ack_timeout(input);
+        }
+        self.hold_paused_for_failure(message)
+    }
     pub fn fault(&mut self, now: u64, message: &str) -> Effects {
+        self.failure = None;
         self.paused_from = None;
         self.status.nitrogen_passed = false;
         self.status.nitrogen_overridden = false;
@@ -747,6 +844,7 @@ impl Engine {
     pub fn manual_override(&mut self) {
         self.resume_existing_inventory = false;
         self.paused_from = None;
+        self.failure = None;
         self.claimed = false;
         self.testing_valves = false;
         self.self_pending = 0;
@@ -811,6 +909,7 @@ impl Engine {
     pub fn resume_test(&mut self, input: Inputs) -> Result<Effects, String> {
         self.resume_test_check(input)?;
         let from = self.paused_from.take().expect("checked paused test");
+        self.failure = None;
         self.claimed = true;
         self.hold_reference = None;
         self.hold_samples = 0;
@@ -1011,7 +1110,37 @@ impl Engine {
             self.status.phase,
             pending.join("; ")
         );
-        self.fault(input.now_ms, &message)
+        match self.status.phase {
+            // An operator cancel is already relieving; keep requesting it.
+            Phase::CancelSetup => self.fault(input.now_ms, &message),
+            Phase::PauseSetup => {
+                let stuck_supply = [3, 4].into_iter().any(|i| {
+                    !self.target[i]
+                        && self.self_pending & (1 << i) == 0
+                        && input.valves[i].is_some_and(|v| {
+                            v.open
+                                && v.at_ms >= self.self_ack_since[i]
+                                && v.at_ms <= input.now_ms
+                                && input.now_ms - v.at_ms <= 2000
+                        })
+                });
+                let climbing = match (Self::fresh_pressure(input), self.pause_reference_psi) {
+                    (Some(pressure), Some(reference)) => {
+                        pressure >= reference + STUCK_SUPPLY_PRESSURE_RISE_PSI
+                    }
+                    _ => true,
+                };
+                if stuck_supply && climbing {
+                    return self.fault(
+                        input.now_ms,
+                        &format!("{message}; a supply valve is stuck open while tank pressure climbs"),
+                    );
+                }
+                // Keep closing and keep waiting for fresh confirmation.
+                self.pause_for_failure(input.now_ms, &message)
+            }
+            _ => self.pause_for_failure(input.now_ms, &message),
+        }
     }
     fn sample_mean(&self, since: u64) -> Option<f32> {
         let samples: Vec<_> = self.samples.iter().filter(|s| s.at_ms >= since).collect();
@@ -1042,6 +1171,20 @@ impl Engine {
             self.status.phase,
             Phase::CancelSetup | Phase::PauseSetup | Phase::SelfFinish
         ) {
+            // A pause that began without fresh pressure takes its reference
+            // from the first fresh sample while closing.
+            if self.status.phase == Phase::PauseSetup && self.pause_reference_psi.is_none() {
+                self.pause_reference_psi = Self::fresh_pressure(input);
+            }
+            // Closing does not suspend the pressure ceiling.
+            if self.status.phase == Phase::PauseSetup
+                && let Some(pressure) = Self::fresh_pressure(input)
+                && self
+                    .session_pressure_limit()
+                    .is_ok_and(|limit| pressure >= limit)
+            {
+                return self.fault(input.now_ms, "Pressure ceiling reached");
+            }
             if self.valve_ack_expired(input) {
                 return self.valve_ack_timeout(input);
             }
@@ -1077,14 +1220,26 @@ impl Engine {
                         } else {
                             "Nitrogen test paused: all valves closed"
                         }
+                    } else if phase == Phase::Paused && self.failure.is_some() {
+                        "Sequence paused after a failure: all valves closed"
                     } else if phase == Phase::Paused {
                         "Fill paused: all valves closed"
                     } else {
                         "Fill cancelled: dump and vent open"
                     },
                 );
+                let notification = match (phase, self.failure.as_deref()) {
+                    (Phase::Paused, Some(reason)) => {
+                        let reason = reason.to_string();
+                        self.status.message = format!(
+                            "{FAILURE_PAUSE_PREFIX} {reason}; all valves closed"
+                        );
+                        failure_pause_notice(&format!("{reason}; all valves are confirmed closed"))
+                    }
+                    _ => self.status.message.clone(),
+                };
                 return Effects {
-                    notification: Some(self.status.message.clone()),
+                    notification: Some(notification),
                     ..Effects::default()
                 };
             }
@@ -1107,15 +1262,18 @@ impl Engine {
             return self.fault(input.now_ms, "Interlock lost");
         }
         let Some(pressure) = Self::fresh_pressure(input) else {
-            return self.fault(input.now_ms, "Tank pressure is missing, invalid or stale");
+            return self.pause_or_hold_for_failure(
+                input,
+                "Tank pressure is missing, invalid or stale",
+            );
         };
-        let limit = if self.nitrous_session {
-            self.config.pressure_limit(self.nitrous_target_psi, 50.0)
-        } else {
-            self.config
-                .pressure_limit(self.config.nitrogen_target_psi(), 100.0)
+        let Ok(limit) = self.session_pressure_limit() else {
+            return self.pause_or_hold_for_failure(
+                input,
+                "Pressure limit settings are invalid",
+            );
         };
-        if limit.is_err() || limit.is_ok_and(|limit| pressure >= limit) {
+        if pressure >= limit {
             return self.fault(input.now_ms, "Pressure ceiling reached");
         }
         let setup = matches!(
@@ -1282,8 +1440,7 @@ impl Engine {
                     );
                 }
                 if elapsed > 60000 {
-                    return self
-                        .cancel_failed_test(input.now_ms, "Nitrogen pressure step timed out");
+                    return self.pause_for_failure(input.now_ms, "Nitrogen pressure step timed out");
                 }
             }
             Phase::Settling => {
@@ -1322,7 +1479,7 @@ impl Engine {
                 }
                 if elapsed >= self.nitrogen_step().hold_ms {
                     if self.hold_samples < 10 {
-                        return self.cancel_failed_test(
+                        return self.pause_for_failure(
                             input.now_ms,
                             "Too few samples to verify pressure hold",
                         );
@@ -1383,7 +1540,7 @@ impl Engine {
             }
             Phase::FillSetup if self.confirmed(input) => {
                 if !self.fill_entry_pressure_ready(pressure, self.resume_existing_inventory) {
-                    return self.fault(
+                    return self.pause_for_failure(
                         input.now_ms,
                         "Tank is not within the calibrated zero-pressure band",
                     );
@@ -1845,16 +2002,19 @@ mod tests {
         }
     }
     #[test]
-    fn stale_pressure_faults_instead_of_reporting_pass() {
+    fn stale_pressure_pauses_closed_instead_of_reporting_pass() {
         let mut rig = Rig::new();
         rig.baseline();
         rig.until(Phase::Raising);
         let mut input = rig.input();
         input.pressure.as_mut().unwrap().at_ms = 0;
         let effects = rig.engine.tick(input);
+        assert_eq!(effects.valves, vec![(3, false), (4, false)]);
+        assert!(effects.notification.as_deref().unwrap().starts_with("Sequence paused: Tank pressure"));
         rig.effects(effects);
-        assert_eq!(rig.engine.status.phase, Phase::Fault);
-        assert_eq!(rig.valves, RELIEVED);
+        assert_eq!(rig.engine.status.phase, Phase::PauseSetup);
+        assert_eq!(rig.valves, CLOSED);
+        assert!(!rig.engine.status.nitrogen_passed);
     }
     #[test]
     fn missing_valve_ack_never_opens_supply() {
@@ -1865,8 +2025,10 @@ mod tests {
         input.pressure.as_mut().unwrap().at_ms = input.now_ms;
         input.valves = [None; 5];
         let effects = rig.engine.tick(input);
+        assert!(!effects.valves.iter().any(|(_, open)| *open));
         rig.effects(effects);
-        assert_eq!(rig.engine.status.phase, Phase::Fault);
+        assert_eq!(rig.engine.status.phase, Phase::PauseSetup);
+        assert!(rig.engine.failure().is_some());
         assert!(!rig.valves[3] && !rig.valves[4]);
     }
     #[test]
@@ -1895,8 +2057,11 @@ mod tests {
             at_ms: input.now_ms,
         });
         let effects = rig.engine.tick(input);
-        assert_eq!(rig.engine.status.phase, Phase::Fault);
+        assert_eq!(rig.engine.status.phase, Phase::PauseSetup);
+        assert!(!effects.valves.iter().any(|(_, open)| *open));
         let message = effects.notification.unwrap();
+        assert!(message.starts_with("Sequence paused: Valve acknowledgement timed out"));
+        assert!(message.ends_with("Review and Resume or Cancel."));
         assert!(message.contains("Pilot closed: no report"));
         assert!(message.contains("Vent open: no fresh report"));
         assert!(message.contains("Dump open: opposite state reported"));
@@ -1952,7 +2117,7 @@ mod tests {
         );
     }
     #[test]
-    fn self_test_waits_for_each_unknown_resting_state_and_faults_without_reply() {
+    fn self_test_waits_for_each_unknown_resting_state_and_pauses_without_reply() {
         let mut rig = Rig::new();
         let mut input = rig.input();
         input.valves = [None; 5];
@@ -1969,7 +2134,8 @@ mod tests {
         input.now_ms += 5100;
         input.pressure.as_mut().unwrap().at_ms = input.now_ms;
         let effects = rig.engine.tick(input);
-        assert_eq!(rig.engine.status.phase, Phase::Fault);
+        assert_eq!(rig.engine.status.phase, Phase::PauseSetup);
+        assert!(!effects.valves.iter().any(|(_, open)| *open));
         assert!(
             effects
                 .notification
@@ -2002,8 +2168,9 @@ mod tests {
         assert_ne!(rig.engine.status.phase, Phase::Fault);
         input.now_ms += 1;
         input.pressure.as_mut().unwrap().at_ms = input.now_ms;
-        rig.engine.tick(input);
-        assert_eq!(rig.engine.status.phase, Phase::Fault);
+        let effects = rig.engine.tick(input);
+        assert_eq!(rig.engine.status.phase, Phase::PauseSetup);
+        assert!(!effects.valves.iter().any(|(_, open)| *open));
     }
     #[test]
     fn every_automatic_valve_phase_uses_the_same_ack_deadline() {
@@ -2227,8 +2394,11 @@ mod tests {
             })
         });
         let effects = rig.engine.tick(input);
-        assert_eq!(rig.engine.status.phase, Phase::Fault);
-        assert!(effects.notification.unwrap().contains("no fresh report"));
+        assert_eq!(rig.engine.status.phase, Phase::PauseSetup);
+        assert_eq!(effects.valves, vec![(3, false), (4, false)]);
+        let message = effects.notification.unwrap();
+        assert!(message.starts_with("Sequence paused:"));
+        assert!(message.contains("no fresh report"));
     }
     #[test]
     fn progress_getter_preserves_actual_sequence_outputs_and_transitions() {
@@ -2288,3 +2458,6 @@ mod operator_coherence_tests;
 
 #[cfg(test)]
 mod pause_resume_tests;
+
+#[cfg(test)]
+mod failure_pause_tests;

@@ -417,7 +417,7 @@ fn commit_tare_captured(
 }
 
 fn cancel_after_capture_failure(state: &Arc<AppState>, arm_generation: u64) {
-    crate::gse::cancel_fill_for_recoverable_fault_for_generation(
+    crate::gse::pause_fill_for_recoverable_fault_for_generation(
         state,
         "automatic zero failed",
         arm_generation,

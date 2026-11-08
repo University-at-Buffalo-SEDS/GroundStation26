@@ -575,27 +575,15 @@ pub(super) fn tick(state: &Arc<AppState>, interlock: bool) -> bool {
         } else if let Some(reason) = update.cancelled {
             rt.turbo_evidence = None;
             rt.engine.status.message = reason.clone();
-            // Controller cancellation requests closes only, never Abort or launch.
-            // Engine owns the ordinary ACK-gated pause continuation.
+            // Controller cancellation requests closes only, never Abort, dump
+            // or launch. Engine owns the ordinary ACK-gated pause continuation.
             if !update.effects.valves.is_empty() {
-                rt.engine.status.phase = Phase::Filling;
-                let mut effects = rt
-                    .engine
-                    .request(
-                        Action::PauseFill,
-                        Inputs {
-                            interlock: true,
-                            ..original
-                        },
-                    )
-                    .unwrap_or_default();
+                let reason = reason.trim_end_matches("; pausing").to_string();
+                let effects = super::pause_for_failure(&mut rt, original, &reason);
                 #[cfg(not(feature = "hitl_mode"))]
                 {
-                    rt.operational.running = true;
                     rt.operational.run_generation = rt.operational.saved.qualification.generation();
-                    rt.operational.target_reached = None;
                 }
-                effects.notification = Some(reason);
                 drop(rt);
                 apply(state, effects);
                 return true;
@@ -1377,6 +1365,156 @@ mod tests {
         #[cfg(feature = "hitl_mode")]
         let _ = path;
     }
+    /// Firmware-sim run g1 race: Turbocharge is cancelled right after its
+    /// Nitrogen-open command, then the board's in-flight Nitrogen-open report
+    /// arrives while the cancel is closing. That report must not latch
+    /// UnsafeSupplyFlow or dump: the pause closes it and holds Paused.
+    #[tokio::test]
+    async fn late_nitrogen_open_report_after_turbo_cancel_pauses_closed_without_dump() {
+        let (state, sent, peer) = super::super::tests::button_test_state().await;
+        state.loadcell_calibration.lock().unwrap().full_mass_kg = None;
+        let mut targets = state.fill_targets_snapshot();
+        targets.nitrous.target_mass_kg = 10.0;
+        targets.nitrous.target_pressure_psi = 745.0;
+        state.set_fill_targets(targets);
+        let mut policy = state.action_policy_snapshot();
+        policy.key_enabled = true;
+        policy.software_buttons_enabled = true;
+        state.set_action_policy(policy);
+        for b in [
+            crate::types::Board::GatewayBoard,
+            crate::types::Board::ValveBoard,
+            crate::types::Board::ActuatorBoard,
+            crate::types::Board::DaqBoard,
+        ] {
+            state.mark_board_seen(b.sender_id(), crate::telemetry_task::get_current_timestamp_ms());
+        }
+        let path =
+            std::env::temp_dir().join(format!("turbo-late-report-{}.json", rand::random::<u128>()));
+        let calibration = mass_calibration_signature(&state.loadcell_calibration.lock().unwrap());
+        {
+            let mut rt = state.gse.lock().unwrap();
+            rt.test_now_ms = Some(10_000);
+            rt.turbo_audit_path = Some(path.with_extension("audit.json"));
+            rt.engine.config.pressure_ceiling_psi = Some(1000.0);
+            rt.engine.config.turbocharge_max_added_mass_kg = Some(0.3);
+            rt.engine.config.fill_settle_ms = 1000;
+            rt.engine.status.phase = Phase::Paused;
+            rt.engine.nitrous_target_psi = 745.0;
+            rt.engine.status.nitrogen_passed = true;
+            rt.engine.status.baseline = Some(gse_sequence::Baseline {
+                average_psi: 0.0,
+                min_psi: 0.0,
+                max_psi: 0.0,
+                noise_psi: 0.1,
+                samples: 50,
+            });
+            let seed = Inputs {
+                now_ms: rt.now(),
+                pressure: Some(Sample { value: 0.0, at_ms: rt.now() }),
+                valves: [None; 5],
+                prelaunch: true,
+                interlock: true,
+            };
+            rt.engine.request(Action::StartFill, seed).unwrap();
+            rt.engine.manual_override();
+            rt.engine.status.phase = Phase::Paused;
+            rt.observe_mass(Some(10.0));
+            rt.mass_calibration = Some(calibration);
+            rt.valve_pressure = Some(Sample { value: 100.0, at_ms: rt.now() });
+            #[cfg(not(feature = "hitl_mode"))]
+            {
+                rt.operational.path = Some(path.clone());
+                rt.operational.topology_stable = true;
+                rt.operational.startup_configured = true;
+                rt.operational.saved.baseline = rt.engine.status.baseline.clone();
+                for milestone in [Milestone::SelfTest, Milestone::NitrogenTest, Milestone::FillTarget] {
+                    rt.operational.saved.qualification.complete(milestone, 0).unwrap();
+                }
+                rt.operational.saved.fill_target_kg = Some(10.0);
+            }
+        }
+        assert!(handle_command(&state, &TelemetryCommand::Turbocharge));
+        assert!(
+            state.gse.lock().unwrap().turbocharge.is_some(),
+            "{}",
+            state.gse.lock().unwrap().engine.status.message
+        );
+        let mut actual = [false; 5];
+        let mut consumed = 0;
+        let mut nitrogen_commanded_open = false;
+        let mut late_report_delivered = false;
+        let mut relief_commanded = false;
+        for step in 1..200u64 {
+            super::super::tests::pump_test_link(&state, &peer);
+            {
+                let commands = sent.lock().unwrap();
+                for (kind, bytes) in &commands[consumed..] {
+                    let code = bytes[0] & 0x7f;
+                    let i = (if kind == "VALVE_COMMAND" { 0..3 } else { 3..5 })
+                        .find(|i| code == OPEN[*i] || code == CLOSE[*i])
+                        .unwrap();
+                    let open = code == OPEN[i];
+                    relief_commanded |= open && (i == 1 || i == 2);
+                    if (i, open) == (3, true) {
+                        // The board has not applied it yet.
+                        nitrogen_commanded_open = true;
+                        continue;
+                    }
+                    if !(i == 3 && !late_report_delivered && nitrogen_commanded_open) {
+                        actual[i] = open;
+                    }
+                }
+                consumed = commands.len();
+            }
+            let phase = {
+                let mut rt = state.gse.lock().unwrap();
+                rt.test_now_ms = Some(10_000 + step * 100);
+                let cancelled = nitrogen_commanded_open && rt.turbocharge.is_none();
+                if cancelled && !late_report_delivered {
+                    // The Nitrogen-open command was executed after all.
+                    actual[3] = true;
+                    late_report_delivered = true;
+                } else if late_report_delivered && actual[3] {
+                    // ...and the cancel's queued close follows it.
+                    actual[3] = false;
+                }
+                for (key, open) in KEYS.into_iter().zip(actual) {
+                    rt.observe_valve(key, open);
+                }
+                rt.observe_mass(Some(10.0));
+                rt.mass_calibration = Some(calibration);
+                // A non-safety cancel cause: raw valve-board pressure goes
+                // missing right after the Nitrogen-open command.
+                rt.valve_pressure = (!nitrogen_commanded_open || late_report_delivered)
+                    .then_some(Sample { value: 100.0, at_ms: rt.now() });
+                rt.engine.status.phase
+            };
+            let _ = phase;
+            super::super::report_safety(&state);
+            super::super::tick(&state, true);
+            flush_effects(&state);
+            let rt = state.gse.lock().unwrap();
+            assert_ne!(rt.engine.status.phase, Phase::Fault, "{}", rt.engine.status.message);
+            #[cfg(not(feature = "hitl_mode"))]
+            assert_eq!(rt.operational.saved.qualification.fault(), None);
+            if late_report_delivered && rt.engine.status.phase == Phase::Paused {
+                break;
+            }
+        }
+        assert!(nitrogen_commanded_open && late_report_delivered);
+        assert!(!relief_commanded, "no vent or dump may be commanded");
+        {
+            let rt = state.gse.lock().unwrap();
+            assert_eq!(rt.engine.status.phase, Phase::Paused, "{}", rt.engine.status.message);
+            assert!(rt.engine.failure().is_some());
+            assert!(rt.valves.iter().all(|v| v.is_some_and(|v| !v.open)));
+            #[cfg(not(feature = "hitl_mode"))]
+            assert!(!super::super::operational_launch_allowed(&state, &rt));
+        }
+        let _ = std::fs::remove_file(path.with_extension("audit.json"));
+        let _ = std::fs::remove_file(path);
+    }
     #[test]
     fn pressure_target_stops_short_liquid_fill_with_fresh_ack_gated_pause_not_qualification() {
         let mut rt = Runtime::default();
@@ -1405,6 +1543,15 @@ mod tests {
         assert!(!effects.valves.is_empty());
         assert!(effects.valves.iter().all(|(_, open)| !*open));
         assert_eq!(rt.engine.status.phase, Phase::PauseSetup);
+        // Closing still enforces the session ceiling, so the engine's own
+        // pressure must be below it for the closure to complete.
+        let input = Inputs {
+            pressure: Some(Sample {
+                value: 100.0,
+                at_ms: 1000,
+            }),
+            ..input
+        };
         rt.engine.tick(input);
         assert_eq!(
             rt.engine.status.phase,

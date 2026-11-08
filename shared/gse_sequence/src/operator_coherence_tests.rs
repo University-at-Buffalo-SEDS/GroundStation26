@@ -45,7 +45,10 @@ fn initial_fill_does_not_borrow_its_new_session_to_bypass_delayed_zero_gate() {
     let FillStart::Started(effects)=e.request_fill(input(10_000,0.),Some(Sample{value:0.,at_ms:10_000}),8.).unwrap() else {panic!()};
     assert!(e.nitrous_session());assert!(!e.resume_existing_inventory);
     let events=drive_setup(&mut e,effects,500.);
-    assert_eq!(e.status.phase,Phase::Fault);assert!(!events.contains(&(4,true)));
+    // Not a hazard (500 psi is below the 800 psi limit): pause closed, never dump.
+    assert!(matches!(e.status.phase,Phase::PauseSetup|Phase::Paused),"{:?}",e.status);
+    assert!(e.failure().is_some());assert!(!events.contains(&(4,true)));assert!(!events.contains(&(2,true)));
+    assert_eq!(events.iter().rev().find(|(i,_)|*i==1),Some(&(1,false)),"vent must be commanded closed");
 }
 #[test]
 fn pressure_freshness_ceiling_and_operating_guards_remain_at_resume_admission() {
@@ -63,7 +66,15 @@ fn pressure_loss_or_ceiling_after_admission_never_opens_nitrous() {
         let mut e=engine(true);
         let FillStart::Started(first)=e.request_fill(input(10_000,500.),Some(Sample{value:7.7,at_ms:10_000}),8.).unwrap() else {panic!()};
         let events=drive_setup(&mut e,first,pressure);
-        assert_eq!(e.status.phase,Phase::Fault);assert!(!events.contains(&(4,true)));assert!(!e.resume_existing_inventory);
+        assert!(!events.contains(&(4,true)));assert!(!e.resume_existing_inventory);
+        if pressure==800. {
+            // Ceiling: the established relief policy remains.
+            assert_eq!(e.status.phase,Phase::Fault);
+        } else {
+            // Invalid/negative reading is missing data, not a hazard: pause closed.
+            assert!(matches!(e.status.phase,Phase::PauseSetup|Phase::Paused),"{pressure}: {:?}",e.status);
+            assert!(e.failure().is_some());assert!(!events.contains(&(2,true)));
+        }
     }
 }
 #[test]

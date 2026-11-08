@@ -691,7 +691,7 @@ mod launch_inhibition_tests {
                 "T-clock reset cannot admit launch twice"
             );
             super::super::tick(&state, false);
-            super::super::cancel_fill_for_recoverable_fault(&state, "late board error");
+            super::super::pause_fill_for_recoverable_fault(&state, "late board error");
             super::super::start_fill_after_automatic_zero(
                 &state,
                 crate::gse::automatic_generation(&state),

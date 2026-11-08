@@ -59,6 +59,8 @@ pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool
             rt.engine.status.phase,
             Phase::Passed | Phase::Paused | Phase::Idle
         )
+        // A failure pause holds for explicit operator review first.
+        && rt.engine.failure().is_none()
         && rt
             .turbo_evidence
             .as_ref()
@@ -123,6 +125,27 @@ fn topology(state: &AppState) -> (bool, String) {
     keys.sort();
     (fresh && routes, keys.join("|"))
 }
+/// Fresh tank pressure (the engine's own source) at or above the session limit.
+fn pressure_hazard(rt: &Runtime) -> bool {
+    let input = rt.input(true, true);
+    input
+        .pressure
+        .filter(|p| p.value.is_finite() && p.at_ms <= input.now_ms && input.now_ms - p.at_ms <= 2_000)
+        .zip(rt.engine.session_pressure_limit().ok())
+        .is_some_and(|(p, limit)| p.value >= limit)
+}
+/// An unexpected supply report alone is not a hazard: close both supplies and
+/// pause. Only a fresh pressure at or above the limit keeps the relief policy.
+fn pause_or_relieve_unexpected_supply(rt: &mut Runtime, message: &str) -> Effects {
+    // Without an active sequence (manual control, Passed, Cancelled) there
+    // is no pause to return to; keep the established crossflow relief.
+    let sequence_owned = rt.engine.active() || rt.fill_trim.is_some() || rt.turbocharge.is_some();
+    if !sequence_owned || pressure_hazard(rt) {
+        return fault(rt, Fault::UnsafeSupplyFlow, message);
+    }
+    let input = rt.input(true, true);
+    super::pause_for_failure(rt, input, message)
+}
 fn fault(rt: &mut Runtime, reason: Fault, message: &str) -> Effects {
     rt.operational.saved.qualification.latch(reason);
     rt.operational.running = false;
@@ -142,7 +165,10 @@ pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase,
     // Copy the actual completed engine transition before qualification restoration
     // can replace Cancelled with a previously retained Passed display state.
     rt.progress_observe(progress_input,crate::sequence_progress_projection::Cause::Tick);
-    if phase == Phase::CancelSetup
+    // A failed nitrogen-test run never retains an older pass, whether it
+    // relieves (leak) or pauses closed for the operator (timeout, stale data).
+    let failed_test = phase == Phase::PauseSetup && rt.engine.failure().is_some();
+    if (phase == Phase::CancelSetup || failed_test)
         && matches!(
             previous,
             Phase::Baseline | Phase::Raising | Phase::Settling | Phase::Holding
@@ -167,6 +193,7 @@ pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase,
         Some(Milestone::NitrogenTest)
     } else if previous == Phase::PauseSetup
         && phase == Phase::Paused
+        && rt.engine.failure().is_none()
         && rt.operational.target_reached.is_some_and(|target| {
             rt.fresh_mass(rt.now())
                 .is_some_and(|mass| fill_mass_in_band(&rt.engine.config, mass.value, target))
@@ -321,12 +348,24 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
             || rt.operational.saved.qualification.stage()
                 != gse_sequence::qualification::MissionStage::Idle
             || !matches!(stage, FlightState::Startup | FlightState::Idle);
-        if operating && !healthy {
+        let sequence_owned = rt.engine.active() || rt.fill_trim.is_some() || rt.turbocharge.is_some();
+        if operating && !healthy && sequence_owned {
+            // Missing routes/boards are missing data, not a tank hazard: pause
+            // closed once and hold for the operator (no relief, no latch).
+            if rt.engine.failure().is_none()
+                || !matches!(rt.engine.status.phase, Phase::PauseSetup | Phase::Paused)
+            {
+                let input = rt.input(true, interlock);
+                effects = super::pause_for_failure(&mut rt, input, "Fill-system connectivity lost");
+            }
+        } else if operating && !healthy {
+            // No sequence owns the valves: keep the latch, close supplies only.
             effects = fault(
                 &mut rt,
                 Fault::TopologyLost,
                 "Fill-system connectivity lost",
             );
+            effects.valves.retain(|(index, _)| *index >= 3);
         } else if rt.operational.running && !interlock {
             effects = fault(&mut rt, Fault::ValveMismatch, "Interlock lost");
         }
@@ -545,12 +584,20 @@ pub(super) fn check_report_safety(state: &Arc<AppState>) {
             None
         };
         if let Some(message) = unsafe_supply {
-            let effects = fault(&mut rt, Fault::UnsafeSupplyFlow, message);
+            let effects = pause_or_relieve_unexpected_supply(&mut rt, message);
             drop(rt);
             apply(state, effects);
         }
         // The typed controller owns fresh ACKs and all five CLOSED contracts;
         // resting nitrous-fill policy must not reject its intentional N2 step.
+        return;
+    }
+    // While a pause or cancel is closing the supplies, a supply report that
+    // is still (or just became) open is the in-flight state being closed,
+    // e.g. the Nitrogen-open report of a command sent just before a
+    // Turbocharge cancel. The engine's ACK-gated closure, its stuck-supply
+    // check and the pressure ceiling own that window.
+    if matches!(phase, Phase::PauseSetup | Phase::CancelSetup) && rt.fill_trim.is_none() {
         return;
     }
     // A paused nitrogen test is not a nitrous session: nitrogen may still be
@@ -572,7 +619,7 @@ pub(super) fn check_report_safety(state: &Arc<AppState>) {
         None
     };
     if let Some(message) = unexpected_supply {
-        let effects = fault(&mut rt, Fault::UnsafeSupplyFlow, message);
+        let effects = pause_or_relieve_unexpected_supply(&mut rt, message);
         drop(rt);
         apply(state, effects);
         return;
@@ -804,7 +851,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn trim_failure_uses_existing_emergency_relief_without_waiting_for_ack() {
+    async fn trim_data_failure_pauses_closed_without_relief_or_latch() {
         let state = fixture().await;
         {
             let mut rt = state.gse.lock().unwrap();
@@ -815,6 +862,93 @@ mod tests {
             rt.engine.status.phase = Phase::PauseSetup;
             rt.operational.running = true;
             rt.observe_mass(None);
+        }
+        tick(&state, true);
+        {
+            let rt = state.gse.lock().unwrap();
+            assert_eq!(rt.engine.status.phase, Phase::PauseSetup);
+            assert_eq!(rt.engine.failure(), Some("Fill mass is missing, invalid or stale"));
+            assert_eq!(rt.operational.saved.qualification.fault(), None);
+            assert!(rt.fill_trim.is_none());
+        }
+        assert_eq!(state.get_pending_umbilical_valve_state(9), Some(false));
+        assert_eq!(state.get_pending_umbilical_valve_state(10), Some(false));
+        for key in [1, 2] {
+            assert_ne!(state.get_pending_umbilical_valve_state(key), Some(true));
+        }
+        // Fresh closed reports complete the hold: Paused, everything closed.
+        for _ in 0..12 {
+            {
+                let mut rt = state.gse.lock().unwrap();
+                let now = rt.now() + 10;
+                rt.test_now_ms = Some(now);
+                for key in KEYS {
+                    rt.observe_valve(key, false);
+                }
+                rt.observe_pressure(Some(0.0));
+            }
+            tick(&state, true);
+        }
+        assert_eq!(state.gse.lock().unwrap().engine.status.phase, Phase::Paused);
+        cleanup(&state);
+    }
+    fn assert_paused_closed_without_relief(state: &AppState, reason: &str) {
+        {
+            let rt = state.gse.lock().unwrap();
+            assert_eq!(rt.engine.status.phase, Phase::PauseSetup, "{}", rt.engine.status.message);
+            assert_eq!(rt.engine.failure(), Some(reason));
+            assert_eq!(rt.operational.saved.qualification.fault(), None);
+            assert!(!operational_launch_allowed(state, &rt));
+        }
+        assert_eq!(state.get_pending_umbilical_valve_state(9), Some(false));
+        assert_eq!(state.get_pending_umbilical_valve_state(10), Some(false));
+        for key in [1, 2] {
+            assert_ne!(state.get_pending_umbilical_valve_state(key), Some(true));
+        }
+    }
+    #[tokio::test]
+    async fn stale_fill_mass_during_fill_pauses_closed_without_relief() {
+        let state = fixture().await;
+        {
+            let mut rt = state.gse.lock().unwrap();
+            rt.engine.status.phase = Phase::Filling;
+            rt.engine.claimed = true;
+            rt.operational.running = true;
+            rt.observe_mass(None);
+        }
+        tick(&state, true);
+        assert_paused_closed_without_relief(
+            &state,
+            "Automatic fill stopped: fresh calibrated fill weight is required",
+        );
+        cleanup(&state);
+    }
+    #[tokio::test]
+    async fn unclassified_board_error_pauses_an_active_fill_instead_of_dumping() {
+        let state = fixture().await;
+        {
+            let mut rt = state.gse.lock().unwrap();
+            rt.engine.status.phase = Phase::Filling;
+            rt.engine.claimed = true;
+            rt.operational.running = true;
+        }
+        super::super::pause_fill_for_recoverable_fault(&state, "board reported an unclassified error");
+        assert_paused_closed_without_relief(&state, "board reported an unclassified error");
+        cleanup(&state);
+    }
+    #[tokio::test]
+    async fn trim_pressure_limit_uses_existing_emergency_relief_without_waiting_for_ack() {
+        let state = fixture().await;
+        {
+            let mut rt = state.gse.lock().unwrap();
+            let (controller, _) =
+                gse_sequence::fill_trim::Controller::start(rt.now(), 5., 200., &rt.engine.config)
+                    .unwrap();
+            rt.fill_trim = Some(controller);
+            rt.engine.status.phase = Phase::PauseSetup;
+            rt.operational.running = true;
+            rt.observe_mass(Some(5.0));
+            rt.observe_pressure(Some(200.0));
         }
         tick(&state, true);
         assert_eq!(state.gse.lock().unwrap().engine.status.phase, Phase::Fault);
@@ -1166,7 +1300,7 @@ mod tests {
         cleanup(&state);
     }
     #[tokio::test]
-    async fn incompatible_nitrogen_report_faults_immediately_but_never_after_launch() {
+    async fn incompatible_nitrogen_report_pauses_closed_immediately_but_never_after_launch() {
         let state = fixture().await;
         {
             let mut rt = state.gse.lock().unwrap();
@@ -1176,14 +1310,18 @@ mod tests {
         }
         check_report_safety(&state);
         {
+            // An unexpected report alone, below the pressure limit: close both
+            // supplies and pause for the operator, without relief or a latch.
             let rt = state.gse.lock().unwrap();
-            assert_eq!(rt.engine.status.phase, Phase::Fault);
-            assert_eq!(
-                rt.operational.saved.qualification.fault(),
-                Some(Fault::UnsafeSupplyFlow)
-            );
+            assert_eq!(rt.engine.status.phase, Phase::PauseSetup);
+            assert_eq!(rt.engine.failure(), Some("Nitrogen opened during nitrous fill"));
+            assert_eq!(rt.operational.saved.qualification.fault(), None);
+            assert!(!operational_launch_allowed(&state, &rt));
         }
         assert_eq!(state.get_pending_umbilical_valve_state(9), Some(false));
+        assert_eq!(state.get_pending_umbilical_valve_state(10), Some(false));
+        assert_ne!(state.get_pending_umbilical_valve_state(1), Some(true));
+        assert_ne!(state.get_pending_umbilical_valve_state(2), Some(true));
         state.set_preexisting_flight_state_for_test(FlightState::Launch);
         {
             let mut rt = state.gse.lock().unwrap();
@@ -1229,7 +1367,7 @@ mod tests {
         cleanup(&state);
     }
     #[tokio::test]
-    async fn nitrous_opening_during_nitrogen_test_latches_immediate_crossflow_fault() {
+    async fn nitrous_opening_during_nitrogen_test_closes_both_supplies_and_pauses() {
         let state = fixture().await;
         {
             let mut rt = state.gse.lock().unwrap();
@@ -1239,20 +1377,45 @@ mod tests {
             rt.observe_valve(10, true);
         }
         check_report_safety(&state);
-        assert_eq!(
-            state
-                .gse
-                .lock()
-                .unwrap()
-                .operational
-                .saved
-                .qualification
-                .fault(),
-            Some(Fault::UnsafeSupplyFlow)
-        );
+        {
+            let rt = state.gse.lock().unwrap();
+            assert_eq!(rt.operational.saved.qualification.fault(), None);
+            assert_eq!(rt.engine.status.phase, Phase::PauseSetup);
+            assert_eq!(rt.engine.failure(), Some("Nitrous opened outside nitrous fill"));
+        }
         assert_eq!(state.get_pending_umbilical_valve_state(9), Some(false));
         assert_eq!(state.get_pending_umbilical_valve_state(10), Some(false));
+        assert_ne!(state.get_pending_umbilical_valve_state(1), Some(true));
+        assert_ne!(state.get_pending_umbilical_valve_state(2), Some(true));
         cleanup(&state);
+    }
+    #[tokio::test]
+    async fn unexpected_supply_at_the_pressure_limit_keeps_crossflow_relief() {
+        for phase in [Phase::Filling, Phase::Raising, Phase::Paused] {
+            let state = fixture().await;
+            {
+                let mut rt = state.gse.lock().unwrap();
+                rt.engine.status.phase = phase;
+                rt.operational.running = true;
+                // At or above the 500 + 100 psi session limit.
+                rt.observe_pressure(Some(600.0));
+                rt.observe_valve(9, true);
+                if phase == Phase::Raising {
+                    rt.observe_valve(10, true);
+                }
+            }
+            check_report_safety(&state);
+            let rt = state.gse.lock().unwrap();
+            assert_eq!(rt.engine.status.phase, Phase::Fault, "{phase:?}");
+            assert_eq!(
+                rt.operational.saved.qualification.fault(),
+                Some(Fault::UnsafeSupplyFlow)
+            );
+            drop(rt);
+            assert_eq!(state.get_pending_umbilical_valve_state(1), Some(true));
+            assert_eq!(state.get_pending_umbilical_valve_state(2), Some(true));
+            cleanup(&state);
+        }
     }
     #[tokio::test]
     async fn stale_cached_qd_status_and_wrong_sender_never_start_settling() {
@@ -2092,17 +2255,23 @@ mod tests {
                 .unwrap()
                 .last_seen_instant = Some(Instant::now() - std::time::Duration::from_secs(4));
             assert!(operational_tick(&state, true));
-            assert_eq!(
-                state
-                    .gse
-                    .lock()
-                    .unwrap()
-                    .operational
-                    .saved
-                    .qualification
-                    .fault(),
-                Some(Fault::TopologyLost)
-            );
+            {
+                // Lost routes are missing data: the filled hold re-closes and
+                // waits for the operator; no relief and no qualification latch.
+                let rt = state.gse.lock().unwrap();
+                assert_eq!(rt.operational.saved.qualification.fault(), None);
+                assert_eq!(rt.engine.status.phase, Phase::PauseSetup);
+                assert_eq!(rt.engine.failure(), Some("Fill-system connectivity lost"));
+                assert!(!operational_launch_allowed(&state, &rt));
+            }
+            assert_eq!(state.get_pending_umbilical_valve_state(9), Some(false));
+            assert_eq!(state.get_pending_umbilical_valve_state(10), Some(false));
+            assert_ne!(state.get_pending_umbilical_valve_state(1), Some(true));
+            assert_ne!(state.get_pending_umbilical_valve_state(2), Some(true));
+            // Repeated unhealthy ticks do not re-issue the pause.
+            state.pending_umbilical_valve_states.lock().unwrap().clear();
+            operational_tick(&state, true);
+            assert!(state.pending_umbilical_valve_states.lock().unwrap().is_empty());
             cleanup(&state);
         }
     }
