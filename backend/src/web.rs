@@ -478,6 +478,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::gse::routes())
         .merge(crate::admin::routes())
         .merge(crate::checklists::routes())
+        .merge(crate::client_settings::routes())
         .merge(crate::mission_sync::routes())
         .merge(crate::station_mode::routes())
         .merge(crate::station_pairing::manage::routes())

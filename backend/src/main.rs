@@ -30,6 +30,7 @@ mod board_recovery;
 mod igniter_sense;
 mod ignition_pair;
 mod checklists;
+mod client_settings;
 mod command_probe;
 mod command_proxy;
 mod comms;
