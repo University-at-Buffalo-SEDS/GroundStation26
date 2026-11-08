@@ -444,4 +444,129 @@ mod tests {
         assert_eq!(s.snapshot(), remote);
         fs::remove_dir_all(dir).unwrap();
     }
+    fn temp_path(tag: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "station-position-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .join("positions.json")
+    }
+    #[test]
+    fn saving_one_station_keeps_the_other_and_stale_drafts_change_nothing() {
+        let path = temp_path("independent");
+        let mut s = Store::open(path.clone()).unwrap();
+        let rrls = Coordinate {
+            latitude: 42.9,
+            longitude: -78.7,
+            accuracy_m: Some(9.0),
+            source: Source::DeviceLocation,
+            ..position()
+        };
+        s.save(
+            Update {
+                expected_revision: 0,
+                ground_station: None,
+                rrls: Some(rrls.clone()),
+            },
+            "rrls admin",
+        )
+        .unwrap();
+        // The GroundStation row is edited from a draft that carries the saved RRLS row.
+        let saved = s
+            .save(
+                Update {
+                    rrls: Some(rrls.clone()),
+                    ..update(1)
+                },
+                "gs admin",
+            )
+            .unwrap();
+        assert_eq!(saved.rrls.as_ref(), Some(&rrls));
+        assert_eq!(saved.ground_station.as_ref(), Some(&position()));
+        // A draft loaded before that save is rejected without touching either row.
+        let stale = Update {
+            expected_revision: 1,
+            ground_station: None,
+            rrls: None,
+        };
+        assert!(s.save(stale, "late").is_err());
+        let reopened = Store::open(path.clone()).unwrap();
+        assert_eq!(reopened.document.revision, 2);
+        assert_eq!(reopened.snapshot().rrls, Some(rrls));
+        assert_eq!(reopened.snapshot().ground_station, Some(position()));
+        assert_eq!(reopened.document.updated_by.as_deref(), Some("gs admin"));
+        assert!(reopened.document.updated_at_ms.is_some());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn requests_validate_ranges_sources_and_unknown_fields() {
+        let ok: Update = serde_json::from_str(
+            r#"{"expected_revision":3,"ground_station":{"latitude":-90,"longitude":180,"altitude_m":-10.5,"accuracy_m":4.2,"source":"device_location"},"rrls":null}"#,
+        )
+        .unwrap();
+        let gs = ok.ground_station.unwrap();
+        assert_eq!(gs.source, Source::DeviceLocation);
+        assert!(gs.validate().is_ok());
+        for bad in [
+            r#"{"expected_revision":0,"ground_station":null,"rrls":null,"extra":1}"#,
+            r#"{"expected_revision":0,"ground_station":{"latitude":1,"longitude":2,"source":"gps"},"rrls":null}"#,
+            r#"{"expected_revision":0,"ground_station":{"latitude":"43,1","longitude":2},"rrls":null}"#,
+        ] {
+            assert!(serde_json::from_str::<Update>(bad).is_err(), "{bad}");
+        }
+        let mut p = position();
+        p.longitude = -180.5;
+        assert!(p.validate().is_err());
+        p = position();
+        p.altitude_m = Some(150_000.0);
+        assert!(p.validate().is_err());
+        p = position();
+        p.accuracy_m = Some(-1.0);
+        assert!(p.validate().is_err());
+        p = position();
+        p.accuracy_m = Some(f64::NAN);
+        assert!(p.validate().is_err());
+    }
+    #[test]
+    fn saved_fix_labels_device_location_and_keeps_its_accuracy() {
+        let fix = Coordinate {
+            accuracy_m: Some(12.0),
+            source: Source::DeviceLocation,
+            ..position()
+        }
+        .fix("GroundStation");
+        assert_eq!(fix.source, "Saved GroundStation (device location)");
+        assert_eq!(fix.accuracy_m, Some(12.0));
+        assert_eq!(position().fix("RRLS").source, "Saved RRLS (manual)");
+    }
+    #[test]
+    fn fresh_station_gps_wins_and_saved_positions_are_only_fallbacks() {
+        let live = |stale: bool| Fix {
+            latitude: 43.1,
+            longitude: -78.9,
+            altitude_m: Some(180.0),
+            altitude_reference: AltitudeReference::MeanSeaLevel,
+            accuracy_m: Some(3.0),
+            geoid_separation_m: None,
+            age_ms: if stale { 20_000 } else { 500 },
+            stale,
+            source: "RRLS GPS".into(),
+            manual: false,
+        };
+        let saved = Some(position().fix("RRLS"));
+        let chosen = super::super::station_position(Some(live(false)), saved.clone()).unwrap();
+        assert!(!chosen.manual && chosen.latitude == 43.1);
+        let chosen = super::super::station_position(Some(live(true)), saved.clone()).unwrap();
+        assert!(chosen.manual && chosen.latitude == 43.0);
+        let chosen = super::super::station_position(None, saved).unwrap();
+        assert!(chosen.manual);
+        let chosen = super::super::station_position(Some(live(true)), None).unwrap();
+        assert!(chosen.stale && !chosen.manual);
+        assert!(super::super::station_position(None, None).is_none());
+    }
 }

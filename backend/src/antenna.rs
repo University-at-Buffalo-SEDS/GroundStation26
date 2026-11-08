@@ -325,20 +325,23 @@ pub fn snapshot() -> Snapshot {
     });
     drop(cache);
     let (saved_gs, saved_rrls) = positions::fallbacks();
-    let choose = |live: Option<Fix>, saved: Option<Fix>| {
-        live.as_ref()
-            .filter(|f| !f.stale)
-            .cloned()
-            .or(saved)
-            .or(live)
-    };
     Snapshot {
         rocket,
-        ground_station: choose(ground_station, saved_gs),
-        rrls: choose(rrls, saved_rrls),
+        ground_station: station_position(ground_station, saved_gs),
+        rrls: station_position(rrls, saved_rrls),
         rssi,
         gpsd_configured: std::env::var_os("GS_GPSD_ADDR").is_some(),
     }
+}
+
+/// Fresh station GPS wins; the administrator-saved position is only a fallback
+/// for an absent or stale fix, and a stale fix is shown only when nothing is saved.
+fn station_position(live: Option<Fix>, saved: Option<Fix>) -> Option<Fix> {
+    live.as_ref()
+        .filter(|f| !f.stale)
+        .cloned()
+        .or(saved)
+        .or(live)
 }
 
 fn gpsd_fix(line: &[u8]) -> Option<Fix> {
