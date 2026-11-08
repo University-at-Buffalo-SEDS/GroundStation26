@@ -145,16 +145,17 @@ station sends the same command at its own 850 psi relief and immediately at
 950 psi; its broadcast Abort still follows the 3 s main-valve window. Nothing is
 sent or obeyed after Launch. Recovery is Reset all boards, as for any Abort.
 
-The inventory found these paths that can act after Launch. Firmware was not changed:
+The inventory found these paths that could act after Launch. Status after the follow-up firmware fixes:
 
-- **FC vigilant watchdog.** It can advance to Descent or Reefing without firing, so both
-  pyro events are suppressed.
-- **FC watchdog-reset recovery.** When resume is rejected, all pyro is inhibited.
-- **AB/VB launch-latch verification failure.** It latches Abort.
-- **AB/VB backup-domain failure at boot.** The board latches Abort in any state.
-- **VB reset defaults.** Vent and Dump open after any reset.
-- **FC auto-Launch.** The FC sends itself a Launch signal when it loses the GS while in its
-  aborted state.
+- **FC vigilant watchdog.** Fixed: it now corrects only to Apogee, so the normal detectors fire
+  the drogue and main.
+- **FC watchdog-reset recovery.** Partly fixed: automatic pyro stays inhibited after a rejected
+  resume, but operator forced deploy commands are accepted (drogue before main).
+- **AB/VB launch-latch and backup-domain failures.** Fixed: they keep only an in-RAM launch
+  inhibit and never latch Abort.
+- **VB reset defaults.** Fixed for Launch: after an accepted, unaborted Launch a reset keeps Vent
+  and Dump closed; otherwise they open at boot as before.
+- **FC auto-Launch.** Removed: the FC no longer sends itself a Launch on GS loss.
 
 ## Later firmware migration
 

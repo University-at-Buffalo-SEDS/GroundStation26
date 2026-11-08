@@ -486,7 +486,8 @@ const BOARDS: &[Spec] = &[
         title: "Board abort latch and boot",
         summary: "AB and VB keep the abort and launch latches in backup registers, so they survive NRST, software and watchdog resets and are replayed to the outputs at boot. A network flight state of Aborted latches only before the launch latch is set.",
         details: &[
-            "Reported to Launch rules: if backup-register access fails at boot, the board latches Abort and launch in any state. If a board that missed Launch admission cannot verify its launch latch when the network state reaches Launch or later, it latches Abort (AB igniter off; VB Dump/Vent open, PILOT closed). Both can act after Launch.",
+            "If backup-register access, a write or its readback fails, the board keeps only an in-RAM launch inhibit and refuses Launch; it never latches Abort for this, so it cannot act after Launch. Manual Stop still works.",
+            "After an accepted, unaborted Launch, a Valve Board reset keeps Dump and Vent closed so a burning motor keeps its propellant; manual Stop and overpressure relief still open them. Run Reset all boards before each session so a stale launch latch does not hold them closed at boot.",
             "Cleared by Reset all boards (board-recovery job) or loss of backup power.",
         ],
         modes: ALL,
