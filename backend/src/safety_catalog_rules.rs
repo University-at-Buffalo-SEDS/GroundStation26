@@ -73,13 +73,16 @@ const TANK: &[Spec] = &[
     Spec {
         id: "valve-board-autonomy",
         title: "What the Valve Board enforces on its own",
-        summary: "The Valve Board has no pressure limits of its own: overpressure protection runs on the ground station and needs the link. On Abort or a 5 s heartbeat loss (between Idle and Launch) it forces Vent and Dump open and PILOT closed, then latches.",
+        summary: "The Valve Board enforces tank overpressure itself, without the link: at or above 850 psi it opens Dump and Vent and commands the Actuator Board to close Nitrogen and Nitrous; at or above 950 psi it also opens PILOT for 3 s, then closes PILOT and takes its own Abort. On Abort or a 5 s heartbeat loss (between Idle and Launch) it forces Vent and Dump open and PILOT closed, then latches.",
         details: &[
+            "Board thresholds are fixed at 850/950 psi and 3 s with 2 consecutive fresh samples; this station's overpressure settings change only the station's own layer.",
+            "From Launch admission (or flight state Launch onward) the board only reports. A full-scale, clamped or miscalibrated reading is reported as a sensor fault and never trips.",
+            "The board latch refuses closing Dump or Vent, opening PILOT and Launch admission until acknowledged with a fresh reading below 850 psi. The station adopts a reported board latch, refuses the same re-closes and forwards its acknowledgement.",
             "The Actuator Board drives Nitrogen, Nitrous and the igniter low on Abort.",
-            "An on-board overpressure check is feasible (tens to hundreds of bytes); see the firmware note in the release notes.",
+            "Requires Valve Board firmware with on-board overpressure protection.",
         ],
         modes: ALL,
-        enforced_in: &["ValveBoard26/Core/Src/main_thread.c:main_thread_force_outputs_safe_off", "ValveBoard26/Core/Src/safety_thread.c"],
+        enforced_in: &["ValveBoard26/Core/Src/main_thread.c:main_thread_force_outputs_safe_off", "ValveBoard26/Core/Src/safety_thread.c", "ValveBoard26/Core/Src/main_thread.c:service_overpressure", "ValveBoard26/Core/Src/overpressure.c:overpressure_step", "backend/src/gse/overpressure.rs:board_warning"],
         config_keys: &[],
     },
 ];

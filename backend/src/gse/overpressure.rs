@@ -51,6 +51,49 @@ pub(crate) struct Monitor {
     relief_streak: u8,
     abort_streak: u8,
     pub(crate) latch: Option<Latch>,
+    /// The Valve Board's own latch, from its WARNING reports.
+    pub(crate) board: Option<BoardReport>,
+    board_ack_at: Option<u64>,
+}
+
+/// The Valve Board enforces the same rules autonomously (fixed 850/950 psi,
+/// 3 s; this station's configuration does not change them) and reports them
+/// as WARNING text such as "Valve Board overpressure relief: 912 psi [R3]".
+/// The tag is the stage (R relief, P main valve open, A Abort, L launch
+/// alarm, C acknowledged, F/S sensor invalid/stale) and the trip number. A
+/// live latch is re-announced every second.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BoardReport {
+    pub(crate) code: char,
+    pub(crate) psi: u32,
+    pub(crate) trip: u32,
+    pub(crate) at_ms: u64,
+}
+const BOARD_PREFIX: &str = "Valve Board overpressure ";
+/// Three missed one-second announcements and more.
+const BOARD_FRESH_MS: u64 = 5_000;
+/// A report already in flight when the operator acknowledged does not relatch.
+const BOARD_ACK_SETTLE_MS: u64 = 3_000;
+/// VALVE_COMMAND that acknowledges the board latch; it never moves a valve and
+/// the board accepts it only below its relief pressure.
+pub(crate) const BOARD_ACK_COMMAND: u8 = 16;
+
+pub(crate) fn parse_board_report(text: &str) -> Option<(char, u32, u32)> {
+    let body = text.strip_prefix(BOARD_PREFIX)?.strip_suffix(']')?;
+    let open = body.rfind(" [")?;
+    let mut tag = body[open + 2..].chars();
+    let code = tag.next().filter(|c| "RPALCFS".contains(*c))?;
+    let trip = tag.as_str().parse().ok()?;
+    let psi = if code == 'S' {
+        0
+    } else {
+        body[..open]
+            .rsplit(' ')
+            .find(|word| !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()))?
+            .parse()
+            .ok()?
+    };
+    Some((code, psi, trip))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -116,6 +159,12 @@ impl Monitor {
     /// The latch owns the valves: no sequence, hold or correction may run.
     pub(crate) fn owns_valves(&self) -> bool {
         self.latch.as_ref().is_some_and(|l| l.relief_commanded)
+    }
+    /// The Valve Board latch holds dump and vent open right now.
+    pub(crate) fn board_owns(&self, now: u64) -> bool {
+        self.board.as_ref().is_some_and(|b| {
+            matches!(b.code, 'R' | 'P' | 'A') && now.saturating_sub(b.at_ms) <= BOARD_FRESH_MS
+        })
     }
 }
 
@@ -329,6 +378,84 @@ pub(crate) fn evaluate(state: &Arc<AppState>) {
     }
 }
 
+/// Valve Board WARNING ingress. Returns the text to show the operator, or
+/// None for a repeat of the same stage and trip. A board relief the station
+/// has not latched itself (link was down, or a different configured
+/// threshold) is adopted: station automation is retired so nothing re-opens
+/// a supply or re-closes dump/vent, and the same relief outputs are commanded
+/// (harmless duplicates). The board owns its main-valve window and Abort.
+pub(crate) fn board_warning(state: &Arc<AppState>, text: &str) -> Option<String> {
+    let Some((code, psi, trip)) = parse_board_report(text) else {
+        return Some(text.to_string());
+    };
+    let display = text[..text.rfind(" [").unwrap_or(text.len())].to_string();
+    let burn = launched(state);
+    let action = {
+        let mut rt = state.gse.lock().unwrap();
+        let now = rt.now();
+        let changed = rt
+            .overpressure
+            .board
+            .as_ref()
+            .is_none_or(|b| b.code != code || b.trip != trip);
+        match code {
+            'C' => rt.overpressure.board = None,
+            'F' | 'S' => return Some(display),
+            _ => rt.overpressure.board = Some(BoardReport { code, psi, trip, at_ms: now }),
+        }
+        let settling = rt
+            .overpressure
+            .board_ack_at
+            .is_some_and(|at| now.saturating_sub(at) < BOARD_ACK_SETTLE_MS);
+        let adopt = code != 'C' && rt.overpressure.latch.is_none() && (changed || !settling);
+        if !adopt {
+            return changed.then_some(display);
+        }
+        let relief_psi = Thresholds::from_config(&rt.engine.config).relief_psi;
+        if code == 'L' || burn || fire_committed(&rt) {
+            rt.overpressure.latch = Some(Latch {
+                peak_psi: psi as f32,
+                threshold_psi: relief_psi,
+                at_ms: now,
+                message: display.clone(),
+                relief_commanded: false,
+                abort: AbortStage::NotRequired,
+            });
+            Action::Alarm(display)
+        } else {
+            log::error!("{display}; adopting the Valve Board overpressure latch");
+            retire_automation(&mut rt, now, &display);
+            let notice = format!(
+                "{display}. Supplies closed, dump and vent open by the Valve Board. Acknowledge after pressure drops."
+            );
+            rt.engine.status.message = notice.clone();
+            rt.overpressure.latch = Some(Latch {
+                peak_psi: psi as f32,
+                threshold_psi: relief_psi,
+                at_ms: now,
+                message: display,
+                relief_commanded: true,
+                abort: if code == 'R' {
+                    AbortStage::NotRequired
+                } else {
+                    AbortStage::Aborted
+                },
+            });
+            Action::Commands(Effects {
+                valves: RELIEF.to_vec(),
+                notification: Some(notice),
+            })
+        }
+    };
+    match action {
+        Action::Commands(effects) => apply(state, effects),
+        Action::Alarm(message) => {
+            state.add_notification_with_persistence(message, true);
+        }
+    }
+    None
+}
+
 fn dispatch_abort(state: &Arc<AppState>) {
     let generation = automatic_generation(state);
     let Some(router) = state.topology_router.get() else {
@@ -365,7 +492,8 @@ fn dispatch_abort(state: &Arc<AppState>) {
 
 /// While the latch owns the valves, only relief-direction controls remain.
 pub(crate) fn command_allowed(rt: &Runtime, cmd: &TelemetryCommand) -> Option<bool> {
-    if !rt.overpressure.owns_valves() {
+    // The board latch refuses these itself; the station never fights it.
+    if !rt.overpressure.owns_valves() && !rt.overpressure.board_owns(rt.now()) {
         return None;
     }
     let open = |i: usize| rt.valves[i].is_some_and(|v| v.open);
@@ -393,13 +521,27 @@ pub(crate) fn command_allowed(rt: &Runtime, cmd: &TelemetryCommand) -> Option<bo
 // Safety catalog (About safety): overpressure-latch. Keep backend/src/safety_catalog_rules.rs in step.
 pub(crate) fn acknowledge(state: &AppState) -> Result<(), String> {
     let mut rt = state.gse.lock().unwrap();
-    let Some(latch) = rt.overpressure.latch.clone() else {
-        return Err("No tank overpressure error is latched".into());
+    let now = rt.now();
+    let board = rt.overpressure.board.clone();
+    let latch = match (rt.overpressure.latch.clone(), &board) {
+        (Some(latch), _) => latch,
+        (None, Some(b)) => Latch {
+            peak_psi: b.psi as f32,
+            threshold_psi: 0.0,
+            at_ms: b.at_ms,
+            message: String::new(),
+            relief_commanded: false,
+            abort: AbortStage::NotRequired,
+        },
+        (None, None) => return Err("No tank overpressure error is latched".into()),
     };
-    if matches!(latch.abort, AbortStage::PilotOpen { .. }) {
+    if matches!(latch.abort, AbortStage::PilotOpen { .. })
+        || board
+            .as_ref()
+            .is_some_and(|b| b.code == 'P' && now.saturating_sub(b.at_ms) <= BOARD_FRESH_MS)
+    {
         return Err("Main-valve overpressure relief is still running".into());
     }
-    let now = rt.now();
     let thresholds = Thresholds::from_config(&rt.engine.config);
     match fresh(rt.valve_pressure, now) {
         Some(p) if p.value < thresholds.relief_psi => {}
@@ -418,7 +560,22 @@ pub(crate) fn acknowledge(state: &AppState) -> Result<(), String> {
         "Tank overpressure acknowledged (peak {:.0} psi); valves unchanged, manual control",
         latch.peak_psi
     );
-    Ok(())
+    if board.is_none() {
+        return Ok(());
+    }
+    // The board validates its own fresh pressure; while it stays latched it
+    // keeps re-announcing and the station adopts it again.
+    rt.overpressure.board_ack_at = Some(now);
+    drop(rt);
+    let Some(router) = state.topology_router.get() else {
+        return Err("Valve Board overpressure acknowledgement not sent: no hardware command router".into());
+    };
+    crate::telemetry_task::queue_controller_command(
+        router,
+        crate::telemetry_schema::data_type("VALVE_COMMAND"),
+        &[BOARD_ACK_COMMAND],
+    )
+    .map_err(|error| format!("Valve Board overpressure acknowledgement not sent: {error:?}"))
 }
 
 pub(super) fn decorate_status(rt: &Runtime, response: &mut serde_json::Value) {
@@ -434,6 +591,17 @@ pub(super) fn decorate_status(rt: &Runtime, response: &mut serde_json::Value) {
                 "relief_commanded": l.relief_commanded,
                 "abort": format!("{:?}", l.abort),
                 "at_ms": l.at_ms,
+            })
+        },
+    );
+    response["overpressure"]["valve_board"] = rt.overpressure.board.as_ref().map_or(
+        serde_json::Value::Null,
+        |b| {
+            serde_json::json!({
+                "stage": b.code.to_string(),
+                "psi": b.psi,
+                "trip": b.trip,
+                "holds_relief": rt.overpressure.board_owns(rt.now()),
             })
         },
     );

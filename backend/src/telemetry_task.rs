@@ -2394,7 +2394,11 @@ async fn handle_packet_inner(
 
     if pkt.data_type() == crate::telemetry_schema::data_type("WARNING") {
         if let Ok(msg) = pkt.data_as_string() {
-            emit_warning(state, msg.to_string());
+            if sender_id != Board::ValveBoard.sender_id() {
+                emit_warning(state, msg.to_string());
+            } else if let Some(shown) = crate::gse::overpressure::board_warning(state, &msg) {
+                emit_warning(state, shown);
+            }
         } else {
             emit_warning(state, "Warning packet with invalid UTF-8 payload");
             report_parse_error(

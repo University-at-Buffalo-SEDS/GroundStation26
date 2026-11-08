@@ -314,3 +314,162 @@ fn older_clients_saving_settings_keep_the_overpressure_thresholds() {
     assert_eq!(config_from_request(&current, explicit).unwrap().overpressure_relief_psi, 850.0);
     assert!(config_from_request(&current, serde_json::json!({"unknown": 1})).is_err());
 }
+
+const BOARD_ACK: (&str, u8) = ("VALVE_COMMAND", overpressure::BOARD_ACK_COMMAND);
+
+impl Fixture {
+    fn board(&mut self, text: &str) -> Option<String> {
+        let shown = overpressure::board_warning(&self.state, text);
+        pump_test_link(&self.state, &self.peer);
+        shown
+    }
+    fn allowed(&self, cmd: TelemetryCommand) -> Option<bool> {
+        overpressure::command_allowed(&self.state.gse.lock().unwrap(), &cmd)
+    }
+}
+
+#[test]
+fn valve_board_reports_parse_only_their_exact_tag() {
+    use overpressure::parse_board_report as parse;
+    assert_eq!(parse("Valve Board overpressure relief: 912 psi [R3]"), Some(('R', 912, 3)));
+    assert_eq!(parse("Valve Board overpressure relief, main valve open: 955 psi [P4]"), Some(('P', 955, 4)));
+    assert_eq!(
+        parse("Valve Board overpressure relief, main valve closed, Abort: 970 psi [A1]"),
+        Some(('A', 970, 1))
+    );
+    assert_eq!(parse("Valve Board overpressure during launch, no valve action: 990 psi [L1]"), Some(('L', 990, 1)));
+    assert_eq!(parse("Valve Board overpressure acknowledged: 870 psi [C1]"), Some(('C', 870, 1)));
+    assert_eq!(parse("Valve Board overpressure sensor invalid, raw ADC 4095 [F0]"), Some(('F', 4095, 0)));
+    assert_eq!(parse("Valve Board overpressure sensor stale [S2]"), Some(('S', 0, 2)));
+    for text in [
+        "Valve Board overpressure relief: 912 psi [X3]",
+        "Valve Board overpressure relief: 912 psi [R]",
+        "Valve Board overpressure relief: 912 psi",
+        "Valve Board overpressure relief: psi [R3]",
+        "Tank overpressure: 912 psi [R3]",
+        "",
+    ] {
+        assert_eq!(parse(text), None, "{text}");
+    }
+}
+
+#[tokio::test]
+async fn valve_board_relief_is_adopted_once_and_blocks_reclosure() {
+    let mut f = Fixture::new().await;
+    // Ordinary warnings pass through untouched.
+    assert_eq!(f.board("Low battery").as_deref(), Some("Low battery"));
+    assert!(f.board("Valve Board overpressure relief: 912 psi [R3]").is_none());
+    assert_relief_order(&f);
+    assert!(!f.has(PILOT_OPEN), "the board owns the main valve");
+    let latch = f.latch().expect("adopted");
+    assert!(latch.relief_commanded && latch.abort == overpressure::AbortStage::NotRequired);
+    assert_eq!(latch.message, "Valve Board overpressure relief: 912 psi");
+    assert_eq!(f.state.gse.lock().unwrap().engine.status.phase, Phase::Fault);
+    let sent = f.commands().len();
+    // Re-announcements are silent and command nothing new.
+    for _ in 0..5 {
+        f.advance(1_000);
+        assert!(f.board("Valve Board overpressure relief: 912 psi [R3]").is_none());
+    }
+    assert_eq!(f.commands().len(), sent);
+    {
+        let mut rt = f.state.gse.lock().unwrap();
+        for (key, open) in KEYS.into_iter().zip([false, true, true, false, false]) {
+            rt.observe_valve(key, open);
+        }
+    }
+    assert_eq!(f.allowed(TelemetryCommand::Dump), Some(false));
+    assert_eq!(f.allowed(TelemetryCommand::NormallyOpen), Some(false));
+    assert_eq!(f.allowed(TelemetryCommand::Nitrous), Some(false));
+    assert_eq!(f.allowed(TelemetryCommand::Launch), Some(false));
+    assert_eq!(f.allowed(TelemetryCommand::Abort), Some(true));
+}
+
+#[tokio::test]
+async fn station_acknowledgement_also_acknowledges_the_board() {
+    let mut f = Fixture::new().await;
+    f.board("Valve Board overpressure relief: 900 psi [R1]");
+    f.sample(400.0);
+    overpressure::acknowledge(&f.state).unwrap();
+    assert!(f.latch().is_none());
+    pump_test_link(&f.state, &f.peer);
+    assert!(f.has(BOARD_ACK), "{:?}", f.commands());
+    // A report already in flight does not relatch, but the board latch still
+    // refuses re-closing dump and vent until the board confirms.
+    assert!(f.board("Valve Board overpressure relief: 900 psi [R1]").is_none());
+    assert!(f.latch().is_none());
+    {
+        let mut rt = f.state.gse.lock().unwrap();
+        rt.observe_valve(KEYS[2], true);
+    }
+    assert_eq!(f.allowed(TelemetryCommand::Dump), Some(false));
+    // Board confirmation releases the station.
+    assert_eq!(
+        f.board("Valve Board overpressure acknowledged: 900 psi [C1]").as_deref(),
+        Some("Valve Board overpressure acknowledged: 900 psi")
+    );
+    assert_eq!(f.allowed(TelemetryCommand::Dump), None);
+}
+
+#[tokio::test]
+async fn board_refusing_acknowledgement_is_adopted_again() {
+    let mut f = Fixture::new().await;
+    f.board("Valve Board overpressure relief: 900 psi [R1]");
+    f.sample(400.0);
+    overpressure::acknowledge(&f.state).unwrap();
+    f.advance(3_000);
+    f.board("Valve Board overpressure relief: 900 psi [R1]");
+    assert!(f.latch().is_some_and(|l| l.relief_commanded));
+}
+
+#[tokio::test]
+async fn board_latch_alone_can_be_acknowledged_and_expires_when_silent() {
+    let mut f = Fixture::new().await;
+    f.board("Valve Board overpressure relief: 900 psi [R1]");
+    f.state.gse.lock().unwrap().overpressure.latch = None; // station restarted
+    {
+        let mut rt = f.state.gse.lock().unwrap();
+        rt.observe_valve(KEYS[1], true);
+    }
+    assert_eq!(f.allowed(TelemetryCommand::NormallyOpen), Some(false));
+    f.sample(870.0);
+    assert!(overpressure::acknowledge(&f.state).is_err(), "still high");
+    f.sample(400.0);
+    overpressure::acknowledge(&f.state).unwrap();
+    pump_test_link(&f.state, &f.peer);
+    assert!(f.has(BOARD_ACK));
+    // No longer announced (board reset or link loss): the station stops refusing.
+    f.advance(5_001);
+    assert_eq!(f.allowed(TelemetryCommand::NormallyOpen), None);
+}
+
+#[tokio::test]
+async fn board_main_valve_window_blocks_acknowledgement_and_station_window() {
+    let mut f = Fixture::new().await;
+    assert!(f.board("Valve Board overpressure relief, main valve open: 960 psi [P1]").is_none());
+    let latch = f.latch().unwrap();
+    assert_eq!(latch.abort, overpressure::AbortStage::Aborted, "board owns the window and Abort");
+    f.sample(960.0);
+    f.sample(960.0);
+    assert!(!f.has(PILOT_OPEN), "no second, station-timed window");
+    f.sample(100.0);
+    assert!(overpressure::acknowledge(&f.state).is_err());
+    f.board("Valve Board overpressure relief, main valve closed, Abort: 960 psi [A1]");
+    f.sample(100.0);
+    overpressure::acknowledge(&f.state).unwrap();
+}
+
+#[tokio::test]
+async fn board_launch_alarm_and_sensor_faults_command_nothing() {
+    let mut f = Fixture::new().await;
+    assert!(f.board("Valve Board overpressure during launch, no valve action: 990 psi [L1]").is_none());
+    assert!(f.commands().is_empty());
+    assert!(f.latch().is_some_and(|l| !l.relief_commanded));
+    assert_eq!(f.allowed(TelemetryCommand::Dump), None);
+    let mut g = Fixture::new().await;
+    assert_eq!(
+        g.board("Valve Board overpressure sensor invalid, raw ADC 4095 [F0]").as_deref(),
+        Some("Valve Board overpressure sensor invalid, raw ADC 4095")
+    );
+    assert!(g.commands().is_empty() && g.latch().is_none());
+}
