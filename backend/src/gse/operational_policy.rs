@@ -1219,6 +1219,13 @@ mod tests {
                 if !rt.operational.running && rt.engine.status.phase == done {
                     break;
                 }
+                // The operator's Dump choice at the passed nitrogen-test hold.
+                let hold = rt.engine.status.phase == Phase::Paused
+                    && rt.engine.test_hold() == Some(&gse_sequence::TestHold::Passed);
+                drop(rt);
+                if hold {
+                    handle_command(&state, &TelemetryCommand::CancelFill);
+                }
             }
             let saved = operational::Saved::load(&path).unwrap();
             assert!(

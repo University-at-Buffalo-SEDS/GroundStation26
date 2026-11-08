@@ -1448,6 +1448,9 @@ fn handle_command_inner(
                         s.kind == crate::sequence_progress::Kind::Fill && !s.outcome.terminal()
                     });
                 let mass = rt.fresh_mass(input.now_ms);
+                // Dump from a nitrogen-test pressure hold continues the same
+                // test run (it ends Passed or Failed at ~0 psi), not a cancel.
+                let hold_dump = action == Action::CancelFill && rt.engine.test_hold().is_some();
                 let result = if action == Action::StartFill {
                     match rt.engine.request_fill(input, mass, progress_mass_target) {
                         Ok(gse_sequence::fill_resume::FillStart::Noop) => {
@@ -1484,6 +1487,7 @@ fn handle_command_inner(
                             input,
                             match action {
                                 Action::PauseFill => Cause::PauseAccepted,
+                                Action::CancelFill if hold_dump => Cause::Tick,
                                 Action::CancelFill => Cause::CancelAccepted,
                                 _ => Cause::ResumeAccepted,
                             },
@@ -1920,8 +1924,13 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
         } else {
             #[cfg(feature = "hitl_mode")]
             let progress_before = rt.engine.progress_observation(input);
+            let phase_before = rt.engine.status.phase;
             let effects = turbocharge::pressure_cutoff(&mut rt, input)
                 .unwrap_or_else(|| rt.engine.tick(input));
+            // A failed nitrogen test that the operator dumped ends Failed.
+            if phase_before == Phase::Dumping && rt.engine.status.phase == Phase::Cancelled {
+                rt.progress_failed_current();
+            }
             #[cfg(feature = "hitl_mode")]
             {
                 let after = rt.engine.progress_observation(input);

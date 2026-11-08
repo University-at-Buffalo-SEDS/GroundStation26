@@ -242,6 +242,10 @@ fn pause_during_baseline_repeats_baseline_and_pause_while_dumping_resumes_dumpin
             rig.until_raising(step + 1);
         }
     }
+    // The passed test holds its top-step pressure until the operator dumps.
+    rig.until(Phase::Paused);
+    assert_eq!(rig.engine.test_hold(), Some(&TestHold::Passed));
+    rig.request(Action::CancelFill);
     rig.until(Phase::Dumping);
     rig.pressure = 60.0;
     rig.pause();

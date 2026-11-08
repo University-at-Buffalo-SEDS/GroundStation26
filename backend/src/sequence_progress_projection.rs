@@ -248,6 +248,8 @@ fn completed_edge(before: ProgressObservation, after: ProgressObservation) -> bo
         | (CancelSetup, Cancelled) => true,
         (SelfClose, SelfOpen) => after.self_index == before.self_index + 1,
         (Holding, NitrogenSetup) => after.nitrogen_step_index == before.nitrogen_step_index + 1,
+        // The final hold passed and the test now holds its top-step pressure.
+        (Holding, PauseSetup) => after.test_hold_passed,
         _ => false,
     }
 }
@@ -1284,7 +1286,12 @@ mod tests {
                 })
             });
             let before = engine.progress_observation(input);
-            let effects = engine.tick(input);
+            // The operator's Dump choice at the passed top-step hold.
+            let effects = if engine.status.phase == Phase::Paused && engine.test_hold().is_some() {
+                engine.request(Action::CancelFill, input).unwrap()
+            } else {
+                engine.tick(input)
+            };
             for (i, open) in effects.valves {
                 valves[i] = open;
             }

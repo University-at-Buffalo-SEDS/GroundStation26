@@ -14,6 +14,8 @@ struct Plant {
     elapsed: u64,
     pressure: f32,
     mass: f32,
+    /// Closed-tank pressure loss per 100 ms step (a leak).
+    leak: f32,
     #[cfg(not(feature = "hitl_mode"))]
     path: std::path::PathBuf,
 }
@@ -37,6 +39,7 @@ impl Plant {
             elapsed: 3000,
             pressure: 0.0,
             mass: 0.0,
+            leak: 0.0,
             #[cfg(not(feature = "hitl_mode"))]
             path,
         };
@@ -118,6 +121,8 @@ impl Plant {
             self.pressure = (self.pressure - 20.0).max(0.0);
         } else if self.valves[3] {
             self.pressure += 4.0;
+        } else {
+            self.pressure = (self.pressure - self.leak).max(0.0);
         }
         if self.valves[4] {
             let target = self.state.fill_targets_snapshot().nitrous.target_mass_kg;
@@ -127,6 +132,15 @@ impl Plant {
         self.state.gse.lock().unwrap().test_now_ms = Some(self.elapsed);
         self.observe();
         tick(&self.state, true);
+        // The operator's Dump choice at a passed nitrogen-test hold.
+        let hold = {
+            let rt = self.state.gse.lock().unwrap();
+            rt.engine.status.phase == Phase::Paused
+                && rt.engine.test_hold() == Some(&gse_sequence::TestHold::Passed)
+        };
+        if hold {
+            handle_command(&self.state, &TelemetryCommand::CancelFill);
+        }
         let rt = self.state.gse.lock().unwrap();
         assert_ne!(rt.engine.status.phase, Phase::Fault, "{}", rt.engine.status.message);
         received
@@ -424,4 +438,47 @@ async fn actions_tab_start_fill_resume_waits_for_sdk_command_retirement() {
     assert!(handle_command(&plant.state, &TelemetryCommand::StartFill));
     assert_eq!(plant.phase(), Phase::FillSetup);
     plant.until(|rt| rt.engine.status.phase == Phase::Filling);
+}
+
+#[tokio::test]
+async fn routed_nitrogen_leak_holds_pressure_until_dump_then_ends_at_zero() {
+    let mut plant = Plant::new().await;
+    assert!(handle_command(&plant.state, &TelemetryCommand::ValveSelfTest));
+    plant.until(|rt| rt.engine.status.phase == Phase::Idle);
+    plant.step();
+    assert!(handle_command(&plant.state, &TelemetryCommand::NitrogenTest));
+    plant.until(|rt| rt.engine.status.phase == Phase::Holding);
+    plant.receive();
+    plant.leak = 1.0;
+    let commanded = plant.until(|rt| rt.engine.status.phase == Phase::Paused);
+    plant.leak = 0.0;
+    assert!(
+        !commanded.iter().any(|&(i, open)| open && (i == 1 || i == 2)),
+        "a leak verdict never vents or dumps: {commanded:?}"
+    );
+    assert_eq!(plant.valves, gse_sequence::CLOSED);
+    let held = plant.pressure;
+    assert!(held > 10.0, "pressure is held for the leak search");
+    {
+        let rt = plant.state.gse.lock().unwrap();
+        assert!(rt.engine.status.message.starts_with("Nitrogen test failed: "));
+        assert!(rt.engine.status.message.ends_with("Holding pressure for leak search. Dump when ready."));
+        #[cfg(not(feature = "hitl_mode"))]
+        assert!(!rt.operational.saved.qualification.nitrogen_satisfied());
+    }
+    for _ in 0..200 {
+        plant.step();
+    }
+    assert_eq!(plant.phase(), Phase::Paused, "waits indefinitely");
+    assert_eq!(plant.pressure, held);
+    let controls = plant.controls();
+    assert!(controls.cancel.allowed, "Dump is available: {:?}", controls.cancel);
+    assert!(!controls.resume.allowed, "a leak verdict cannot resume");
+    assert!(handle_command(&plant.state, &TelemetryCommand::CancelFill));
+    let dumped = plant.until(|rt| rt.engine.status.phase == Phase::Cancelled);
+    assert!(dumped.contains(&(1, true)) && dumped.contains(&(2, true)));
+    assert!(!dumped.contains(&(0, true)), "Dump never opens the main valve");
+    assert_eq!(plant.pressure, 0.0);
+    plant.step();
+    assert_eq!(plant.outcome(), Some(Outcome::Failed));
 }

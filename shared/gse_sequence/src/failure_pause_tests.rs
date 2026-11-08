@@ -253,15 +253,88 @@ fn nitrogen_step_timeout_pauses_closed_and_can_resume_the_step() {
 }
 
 #[test]
-fn hold_leak_keeps_its_current_relief() {
+fn hold_leak_holds_pressure_until_the_operator_dumps_to_zero() {
+    let mut rig = Rig::new();
+    rig.request(Action::NitrogenTest);
+    rig.until(Phase::Raising);
+    rig.pressure = 55.0;
+    rig.until(Phase::Holding);
+    rig.trace.clear();
+    rig.pressure = 40.0;
+    rig.until(Phase::Paused);
+    assert_eq!(rig.valves, CLOSED, "supplies, vent and dump closed: holding pressure");
+    assert!(!rig.opened_relief_since_failure());
+    assert!(matches!(rig.engine.test_hold(), Some(TestHold::Failed(_))));
+    assert_eq!(
+        rig.engine.status.message,
+        "Nitrogen test failed: Pressure drop exceeds 3 psi beyond the measured noise envelope. Holding pressure for leak search. Dump when ready."
+    );
+    assert!(rig.engine.paused_test().is_none(), "a leak verdict cannot resume");
+    assert!(rig.engine.failure().is_some());
+    // Holds indefinitely.
+    for _ in 0..2000 {
+        rig.tick();
+    }
+    assert_eq!(rig.engine.status.phase, Phase::Paused);
+    assert_eq!(rig.valves, CLOSED);
+    // Dump: dump and vent only, never the main valve; waits for ~0 psi.
+    rig.request(Action::CancelFill);
+    for _ in 0..20 {
+        rig.tick();
+    }
+    assert!(rig.valves[1] && rig.valves[2] && !rig.valves[0]);
+    for _ in 0..2000 {
+        rig.tick();
+        assert_eq!(rig.engine.status.phase, Phase::Dumping, "no deadline while dumping");
+    }
+    rig.pressure = 0.0;
+    rig.until(Phase::Cancelled);
+    assert!(!rig.engine.status.nitrogen_passed);
+    assert!(rig.engine.test_hold().is_none());
+    assert!(!rig.trace.contains(&(0, true)));
+}
+
+#[test]
+fn passed_test_holds_top_step_pressure_and_dump_ends_in_passed() {
+    let mut rig = Rig::new();
+    rig.request(Action::NitrogenTest);
+    for target in [50.0, 100.0, 120.0] {
+        rig.until(Phase::Raising);
+        rig.pressure = target + 1.0;
+        rig.until(Phase::Holding);
+        while rig.engine.status.phase == Phase::Holding {
+            rig.tick();
+        }
+    }
+    rig.until(Phase::Paused);
+    assert_eq!(rig.valves, CLOSED);
+    assert_eq!(rig.engine.test_hold(), Some(&TestHold::Passed));
+    assert!(rig.engine.failure().is_none());
+    assert!(rig.engine.status.message.contains("Choose Cold flow or Dump"));
+    rig.request(Action::CancelFill);
+    rig.until(Phase::Dumping);
+    assert!(rig.valves[1] && rig.valves[2] && !rig.valves[0]);
+    rig.pressure = 0.0;
+    rig.until(Phase::Passed);
+    assert!(rig.engine.status.nitrogen_passed);
+}
+
+#[test]
+fn overpressure_is_not_masked_by_a_test_hold() {
+    // The engine still relieves at the session ceiling while holding.
     let mut rig = Rig::new();
     rig.request(Action::NitrogenTest);
     rig.until(Phase::Raising);
     rig.pressure = 55.0;
     rig.until(Phase::Holding);
     rig.pressure = 40.0;
-    rig.until(Phase::Cancelled);
-    assert_eq!(rig.valves, RELIEVED);
+    while rig.engine.status.phase != Phase::PauseSetup {
+        rig.tick();
+    }
+    rig.pressure = 220.0;
+    rig.tick();
+    assert_eq!(rig.engine.status.phase, Phase::Fault);
+    assert!(rig.valves[1] && rig.valves[2]);
 }
 
 #[test]

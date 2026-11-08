@@ -309,6 +309,8 @@ pub struct ProgressObservation {
     pub all_valves_confirmed_by_engine: bool,
     pub hold_samples: usize,
     pub hold_reference_psi: Option<f32>,
+    /// The nitrogen test's final hold passed and now holds pressure.
+    pub test_hold_passed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -413,6 +415,29 @@ pub struct Engine {
     failure: Option<String>,
     /// Fresh tank pressure when the current pause began closing.
     pause_reference_psi: Option<f32>,
+    /// Nitrogen test result held at pressure for the operator's choice.
+    test_hold: Option<TestHold>,
+    /// The operator chose Dump: wait (without a deadline) for ~0 psi.
+    dump_to_zero: bool,
+}
+/// The nitrogen test ended at pressure and holds it closed for the operator.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "verdict", content = "reason", rename_all = "snake_case")]
+pub enum TestHold {
+    /// Every hold step passed; the tank holds the top-step pressure.
+    Passed,
+    /// A leak verdict; pressure is held for a leak search.
+    Failed(String),
+}
+impl TestHold {
+    pub fn message(&self) -> String {
+        match self {
+            Self::Passed => "Nitrogen test passed: holding top-step pressure. Choose Cold flow or Dump.".into(),
+            Self::Failed(reason) => format!(
+                "Nitrogen test failed: {reason}. Holding pressure for leak search. Dump when ready."
+            ),
+        }
+    }
 }
 /// Which qualification test an operator pause interrupted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -474,6 +499,8 @@ impl Default for Engine {
             paused_from: None,
             failure: None,
             pause_reference_psi: None,
+            test_hold: None,
+            dump_to_zero: false,
         }
     }
 }
@@ -485,6 +512,8 @@ impl Engine {
         self.resume_existing_inventory = false;
         self.paused_from = None;
         self.failure = None;
+        self.test_hold = None;
+        self.dump_to_zero = false;
         self.claimed = true;
         self.testing_valves = false;
         self.nitrous_session = hold_filled;
@@ -728,6 +757,17 @@ impl Engine {
             Action::Turbocharge => {
                 return Err("Turbocharge requires its qualified inventory controller".into());
             }
+            // From a nitrogen-test pressure hold, Cancel is the Dump choice:
+            // dump and vent, never the main valve, then end at ~0 psi.
+            Action::CancelFill if self.test_hold.is_some() || self.dump_to_zero => {
+                self.dump_to_zero = true;
+                self.configure(
+                    Phase::Dumping,
+                    RELIEVED,
+                    input.now_ms,
+                    "Dumping: dump and vent open; ends when the tank reaches its zero-pressure band",
+                )
+            }
             Action::CancelFill => {
                 self.status.nitrogen_passed = false;
                 self.status.nitrogen_overridden = false;
@@ -794,6 +834,32 @@ impl Engine {
         effects.notification = Some(format!(
             "GSE test cancelled: {message}. Verify pressure and correct the cause before repeating the test."
         ));
+        effects
+    }
+    /// The nitrogen test result held at pressure, if any.
+    pub fn test_hold(&self) -> Option<&TestHold> {
+        self.test_hold.as_ref()
+    }
+    /// The operator's Dump choice is venting the held test pressure.
+    pub fn dumping_to_zero(&self) -> bool {
+        self.dump_to_zero && self.status.phase == Phase::Dumping
+    }
+    /// End the nitrogen test at pressure: close every valve and hold. A leak
+    /// verdict holds for a leak search; a pass offers Cold flow or Dump.
+    fn hold_test_pressure(&mut self, now: u64, hold: TestHold) -> Effects {
+        let message = hold.message();
+        self.paused_from = None;
+        self.hold_reference = None;
+        self.hold_samples = 0;
+        self.status.nitrogen_passed = hold == TestHold::Passed;
+        self.status.nitrogen_overridden = false;
+        self.failure = match &hold {
+            TestHold::Failed(reason) => Some(format!("Nitrogen test failed: {reason}")),
+            TestHold::Passed => None,
+        };
+        self.test_hold = Some(hold);
+        let mut effects = self.configure(Phase::PauseSetup, CLOSED, now, &message);
+        effects.notification = Some(message);
         effects
     }
     /// Reason the sequence is held in a failure pause, if any.
@@ -891,6 +957,8 @@ impl Engine {
     }
     pub fn fault(&mut self, now: u64, message: &str) -> Effects {
         self.failure = None;
+        self.test_hold = None;
+        self.dump_to_zero = false;
         self.paused_from = None;
         self.status.nitrogen_passed = false;
         self.status.nitrogen_overridden = false;
@@ -904,6 +972,8 @@ impl Engine {
         self.resume_existing_inventory = false;
         self.paused_from = None;
         self.failure = None;
+        self.test_hold = None;
+        self.dump_to_zero = false;
         self.claimed = false;
         self.testing_valves = false;
         self.self_pending = 0;
@@ -1076,6 +1146,7 @@ impl Engine {
             all_valves_confirmed_by_engine:self.confirmed(input),
             hold_samples:self.hold_samples,
             hold_reference_psi:self.hold_reference.filter(|value|value.is_finite()),
+            test_hold_passed:self.test_hold==Some(TestHold::Passed),
         }
     }
     /// The actual already validated plan, bounded by MAX_NITROGEN_STEPS.
@@ -1290,6 +1361,15 @@ impl Engine {
                         "Fill cancelled: dump and vent open"
                     },
                 );
+                if phase == Phase::Paused
+                    && let Some(hold) = &self.test_hold
+                {
+                    self.status.message = hold.message();
+                    return Effects {
+                        notification: Some(self.status.message.clone()),
+                        ..Effects::default()
+                    };
+                }
                 let notification = match (phase, self.failure.as_deref()) {
                     (Phase::Paused, Some(reason)) => {
                         let reason = reason.to_string();
@@ -1521,9 +1601,9 @@ impl Engine {
                             - 3.0
                             - baseline.noise_psi
                     {
-                        return self.cancel_failed_test(
+                        return self.hold_test_pressure(
                             input.now_ms,
-                            "Pressure fell below the test step while settling",
+                            TestHold::Failed("Pressure fell below the test step while settling".into()),
                         );
                     }
                     self.hold_reference = Some(mean);
@@ -1538,9 +1618,9 @@ impl Engine {
                 if let Some(mean) = self.sample_mean(input.now_ms.saturating_sub(1000)) {
                     let noise = self.status.baseline.as_ref().unwrap();
                     if self.hold_reference.unwrap() - mean > 3.0 + 2.0 * noise.noise_psi {
-                        return self.cancel_failed_test(
+                        return self.hold_test_pressure(
                             input.now_ms,
-                            "Pressure drop exceeds 3 psi beyond the measured noise envelope",
+                            TestHold::Failed("Pressure drop exceeds 3 psi beyond the measured noise envelope".into()),
                         );
                     }
                 }
@@ -1553,15 +1633,15 @@ impl Engine {
                     }
                     let hold_mean = self.sample_mean(self.phase_since).unwrap();
                     if self.hold_reference.unwrap() - hold_mean > 3.0 {
-                        return self.cancel_failed_test(input.now_ms, "Sustained mean pressure loss exceeds 3 psi; leak or inconclusive noisy hold, test not passed");
+                        return self.hold_test_pressure(
+                            input.now_ms,
+                            TestHold::Failed(
+                                "Sustained mean pressure loss exceeds 3 psi; leak or inconclusive noisy hold".into(),
+                            ),
+                        );
                     }
                     if self.nitrogen_step_index + 1 >= self.nitrogen_plan.len() {
-                        return self.configure(
-                            Phase::Dumping,
-                            RELIEVED,
-                            input.now_ms,
-                            "Nitrogen holds passed; dumping tank before enabling fill",
-                        );
+                        return self.hold_test_pressure(input.now_ms, TestHold::Passed);
                     }
                     self.nitrogen_step_index += 1;
                     self.status.current_step_psi = self.nitrogen_step().target_psi;
@@ -1574,7 +1654,8 @@ impl Engine {
                 }
             }
             Phase::Dumping => {
-                if elapsed > 60000 {
+                // The operator's Dump choice waits indefinitely for ~0 psi.
+                if elapsed > 60000 && !self.dump_to_zero {
                     return self.fault(
                         input.now_ms,
                         "Tank did not return to its zero-pressure band",
@@ -1593,6 +1674,22 @@ impl Engine {
                         .is_some_and(|s| input.now_ms.saturating_sub(s.at_ms) >= 900)
                     && window.iter().all(|s| zero.is_zero(s.value));
                 if self.confirmed(input) && empty && zero.is_zero(pressure) {
+                    let failed = matches!(self.test_hold, Some(TestHold::Failed(_)));
+                    self.test_hold = None;
+                    self.dump_to_zero = false;
+                    if failed {
+                        self.failure = None;
+                        self.status.nitrogen_passed = false;
+                        self.transition(
+                            Phase::Cancelled,
+                            input.now_ms,
+                            "Nitrogen test failed; tank vented to its zero-pressure band",
+                        );
+                        return Effects {
+                            notification: Some(self.status.message.clone()),
+                            ..Effects::default()
+                        };
+                    }
                     self.status.nitrogen_passed = true;
                     self.transition(
                         Phase::Passed,
@@ -1857,8 +1954,12 @@ mod tests {
         rig.pressure = 55.0;
         rig.until(Phase::Holding);
         rig.pressure = 51.0;
-        rig.until(Phase::Cancelled);
+        rig.until(Phase::Paused);
         assert!(!rig.engine.status.nitrogen_passed);
+        assert_eq!(rig.valves, CLOSED);
+        rig.request(Action::CancelFill);
+        rig.pressure = 5.0;
+        rig.until(Phase::Cancelled);
         assert_eq!(rig.valves, RELIEVED);
         assert!(!rig.engine.active());
         rig.pressure = 0.0;
@@ -1943,10 +2044,12 @@ mod tests {
             }
             rig.tick();
         }
-        assert_eq!(rig.engine.status.phase, Phase::Dumping);
+        assert_eq!(rig.engine.status.phase, Phase::PauseSetup);
+        rig.until(Phase::Paused);
+        assert_eq!(rig.valves, CLOSED, "holds the top-step pressure");
+        rig.request(Action::CancelFill);
         rig.until(Phase::Dumping);
         assert_eq!(rig.valves, RELIEVED);
-        assert!(!rig.engine.status.nitrogen_passed);
         rig.pressure = 5.0;
         rig.until(Phase::Passed);
         assert!(rig.engine.status.nitrogen_passed);
@@ -2010,8 +2113,9 @@ mod tests {
                 assert_eq!(rig.engine.status.phase, Phase::Raising);
             }
         }
-        assert_eq!(rig.engine.status.phase, Phase::Dumping);
-        assert!(!rig.engine.status.nitrogen_passed);
+        assert_eq!(rig.engine.status.phase, Phase::PauseSetup);
+        rig.until(Phase::Paused);
+        rig.request(Action::CancelFill);
         rig.pressure = 0.0;
         rig.until(Phase::Passed);
         assert!(rig.engine.status.nitrogen_passed);
@@ -2033,11 +2137,15 @@ mod tests {
             assert_eq!(rig.engine.status.current_step_psi, 50.0);
             if matches!(
                 rig.engine.status.phase,
-                Phase::CancelSetup | Phase::Cancelled
+                Phase::PauseSetup | Phase::Paused
             ) {
                 break;
             }
         }
+        rig.until(Phase::Paused);
+        assert_eq!(rig.valves, CLOSED);
+        rig.request(Action::CancelFill);
+        rig.pressure = 0.0;
         rig.until(Phase::Cancelled);
         assert_eq!(rig.engine.status.phase, Phase::Cancelled);
         assert!(!rig.engine.status.nitrogen_passed);
@@ -2059,7 +2167,8 @@ mod tests {
                 rig.tick();
             }
         }
-        assert_eq!(rig.engine.status.phase, Phase::Dumping);
+        assert_eq!(rig.engine.status.phase, Phase::PauseSetup);
+        assert_eq!(rig.engine.test_hold(), Some(&TestHold::Passed));
     }
     #[test]
     fn pressure_step_must_be_finite_and_positive() {
@@ -2080,6 +2189,10 @@ mod tests {
         rig.pressure = 55.0;
         rig.until(Phase::Holding);
         rig.pressure = 45.0;
+        rig.until(Phase::Paused);
+        assert_eq!(rig.valves, CLOSED);
+        rig.request(Action::CancelFill);
+        rig.pressure = 5.0;
         rig.until(Phase::Cancelled);
         assert_eq!(rig.valves, RELIEVED);
         assert!(!rig.engine.active());
@@ -2376,6 +2489,8 @@ mod tests {
             assert!(rig.now - held_at >= step.hold_ms);
             assert_ne!(rig.engine.status.phase, Phase::Fault);
         }
+        rig.until(Phase::Paused);
+        rig.request(Action::CancelFill);
         rig.pressure = 0.0;
         rig.until(Phase::Passed);
         assert!(rig.engine.status.nitrogen_passed);
@@ -2517,6 +2632,9 @@ mod tests {
                     assert_eq!(view.phase,observed.engine.status.phase);
                     assert_eq!(view.all_valves_confirmed_by_engine,observed.engine.confirmed(observed.input()));
                     assert_eq!(view.fresh_pressure_psi,Engine::fresh_pressure(observed.input()));
+                }
+                if control.engine.status.phase==Phase::Paused&&control.engine.test_hold().is_some(){
+                    control.request(Action::CancelFill);observed.request(Action::CancelFill);
                 }
                 control.now+=100;observed.now+=100;
                 let expected=control.engine.tick(control.input());
