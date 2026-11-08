@@ -170,11 +170,11 @@ impl Plan {
                 link(5, &["GLOBAL_RETRIES"], n(p.broadcast_retries)),
                 fix(
                     6,
-                    &["SER_BREAK_DETECT_MS", "SER_BREAK_DETECT", "SERIAL_BREAK"],
+                    &["SER_BREAK_DETECT_MS", "SER_BREAK_DETECT", "SERIAL_BREAK", "SER_BRK_DETMS"],
                     n(p.serial_break_ms),
                 ),
-                link(7, &["TXENCAP", "TX_ENCAP"], n(p.tx_encapsulation)),
-                link(8, &["RXENCAP", "RX_ENCAP"], n(p.rx_encapsulation)),
+                link(7, &["TXENCAP", "TX_ENCAP", "TX_ENCAP_METHOD"], n(p.tx_encapsulation)),
+                link(8, &["RXENCAP", "RX_ENCAP", "RX_ENCAP_METHOD"], n(p.rx_encapsulation)),
                 info(9, &["NETID", "NET_ID"]),
                 info(10, &["NODEID", "NODE_ID"]),
                 fix(11, &["DESTID", "DEST_ID"], Some(BROADCAST_DESTID)),
@@ -183,13 +183,17 @@ impl Plan {
                 info(14, &["MIN_FREQ"]),
                 info(15, &["MAX_FREQ"]),
                 info(16, &["NUM_CHANNELS"]),
+                // Registers are matched by the name the modem reports (ATI5); the
+                // number is only the documented fallback. ASYNC 4.03 on RFD900x2
+                // inserts DUTY_CYCLE at S17, shifting LBT_RSSI to S18 and RTSCTS to S19.
                 // "This parameter shouldn't be changed" and must match (Table 3-2).
                 report(17, &["LBT_RSSI"], Some(0)),
+                info(17, &["DUTY_CYCLE"]),
                 // Local. Must agree with the host's flow control, or the
                 // modem can hold its serial output on an unwired CTS line.
                 fix(18, &["RTSCTS"], Some(i64::from(p.hardware_flow_control))),
                 info(19, &["ENCRYPTION_LEVEL", "ENCRYPTION"]),
-                info(22, &["ANTMODE", "ANT_MODE"]),
+                info(22, &["ANTMODE", "ANT_MODE", "RESV"]),
             ],
         }
     }
@@ -654,10 +658,9 @@ fn read_snapshot(d: &mut Driver<'_>, plan: &Plan) -> Result<Snapshot, Abort> {
 /// Whether a register's number is trusted for a write.
 fn map_source(identity: Option<&str>, snap: &Snapshot, plan: &Plan) -> MapSource {
     let fixed = plan.regs.iter().filter(|e| e.policy == Policy::Fix);
+    // Every writable register must be found by its own name somewhere in ATI5.
     let all_named = fixed.clone().all(|e| {
-        snap.named
-            .iter()
-            .any(|(n, name, _)| *n == e.number && names_match(name, e.names))
+        snap.named.iter().any(|(_, name, _)| names_match(name, e.names))
     });
     if all_named {
         return MapSource::Ati5Names;
@@ -693,16 +696,23 @@ fn map_source(identity: Option<&str>, snap: &Snapshot, plan: &Plan) -> MapSource
     }
 }
 
+/// The register the modem itself names as `e`, else the documented number.
+fn resolve(e: &Expect, snap: &Snapshot) -> (u8, Option<String>, Option<i64>) {
+    if let Some((n, name, value)) = snap.named.iter().find(|(_, name, _)| names_match(name, e.names)) {
+        return (*n, Some(name.clone()), Some(*value));
+    }
+    snap.values
+        .iter()
+        .find(|(n, _, _)| *n == e.number)
+        .cloned()
+        .unwrap_or((e.number, None, None))
+}
+
 fn compare(plan: &Plan, snap: &Snapshot, source: MapSource) -> Vec<RegisterRow> {
     plan.regs
         .iter()
         .map(|e| {
-            let (_, name, observed) = snap
-                .values
-                .iter()
-                .find(|(n, _, _)| *n == e.number)
-                .cloned()
-                .unwrap_or((e.number, None, None));
+            let (number, name, observed) = resolve(e, snap);
             let name_ok = match (&name, source) {
                 (Some(name), _) => names_match(name, e.names),
                 (None, MapSource::Fingerprint) => true,
@@ -720,7 +730,7 @@ fn compare(plan: &Plan, snap: &Snapshot, source: MapSource) -> Vec<RegisterRow> 
                 "differs"
             };
             RegisterRow {
-                number: e.number,
+                number,
                 name,
                 observed,
                 expected: e.value,
@@ -1071,7 +1081,23 @@ fn store(report: Report) {
             report.summary
         );
     }
+    let passed = matches!(report.outcome, Outcome::Matched | Outcome::Applied);
+    if !matches!(report.outcome, Outcome::Skipped) {
+        let line = format!(
+            "Radio modem check {}: {}",
+            if passed { "passed" } else { "needs attention" },
+            report.summary
+        );
+        *NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(line);
+    }
     GLOBAL.lock().unwrap_or_else(|e| e.into_inner()).report = Some(report);
+}
+
+/// One operator notification per finished check (pass or fail), taken by the
+/// station loop that owns AppState.
+static NOTICE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+pub(crate) fn take_notice() -> Option<String> {
+    NOTICE.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 pub(crate) fn configured_mode() -> Mode {

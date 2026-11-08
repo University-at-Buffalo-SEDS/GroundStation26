@@ -1507,6 +1507,9 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 comms::rfd_modem::set_gate(comms::rfd_modem::station_block_reason(&state));
+                if let Some(notice) = comms::rfd_modem::take_notice() {
+                    web::emit_notification_warning(&state, notice);
+                }
             }
         });
     }

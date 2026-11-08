@@ -711,3 +711,50 @@ fn ati5_and_forwarding_parsers() {
     assert!(!forwarding_has_entries(&["F0=0,0".into()]));
     assert!(forwarding_has_entries(&["F0=1,3".into()]));
 }
+
+/// RFD ASYNC 4.03 on RFD900x2 as read from the field: S6-S8 use different
+/// names and DUTY_CYCLE at S17 shifts LBT_RSSI to S18 and RTSCTS to S19.
+fn field_403_layout() -> SimModem {
+    let mut modem = SimModem::new();
+    let layout: [(u8, &'static str, i64); 8] = [
+        (6, "SER_BRK_DETMS", 50),
+        (7, "TX_ENCAP_METHOD", 0),
+        (8, "RX_ENCAP_METHOD", 0),
+        (17, "DUTY_CYCLE", 100),
+        (18, "LBT_RSSI", 0),
+        (19, "RTSCTS", 0),
+        (20, "MAX_WINDOW", 131),
+        (22, "RESV", 0),
+    ];
+    for (n, name, v) in layout {
+        modem.names.insert(n, name);
+        modem.ram.insert(n, v);
+        modem.eeprom.insert(n, v);
+    }
+    modem
+}
+
+#[test]
+fn field_403_layout_is_matched_by_register_name() {
+    let mut modem = field_403_layout();
+    let report = run(&mut modem, &deployed_plan(), Trigger::Operator, Mode::Fix, TIMING, &open, true);
+    assert_eq!(report.map_source, MapSource::Ati5Names, "{report:?}");
+    assert_eq!(report.outcome, Outcome::Matched, "{report:?}");
+    assert!(report.writes.is_empty() && modem.eeprom_writes == 0);
+    assert!(report.warnings.iter().all(|w| !w.contains("not as documented")), "{:?}", report.warnings);
+    let rts = report.registers.iter().find(|r| r.name.as_deref() == Some("RTSCTS")).unwrap();
+    assert_eq!(rts.number, 19);
+}
+
+#[test]
+fn field_403_layout_writes_flow_control_to_its_named_register() {
+    let mut modem = field_403_layout();
+    modem.ram.insert(19, 1);
+    modem.eeprom.insert(19, 1);
+    let report = run(&mut modem, &deployed_plan(), Trigger::Operator, Mode::Fix, TIMING, &open, true);
+    assert_eq!(report.outcome, Outcome::Applied, "{report:?}");
+    assert_eq!(report.writes.len(), 1);
+    assert_eq!((report.writes[0].number, report.writes[0].to), (19, 0));
+    assert_eq!(modem.eeprom[&18], 0, "LBT_RSSI untouched");
+    assert_eq!(modem.eeprom[&19], 0);
+}
