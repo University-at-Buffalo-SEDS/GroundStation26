@@ -757,18 +757,11 @@ impl Engine {
             Action::Turbocharge => {
                 return Err("Turbocharge requires its qualified inventory controller".into());
             }
-            // From a nitrogen-test pressure hold, Cancel is the Dump choice:
-            // dump and vent, never the main valve, then end at ~0 psi.
-            Action::CancelFill if self.test_hold.is_some() || self.dump_to_zero => {
-                self.dump_to_zero = true;
-                self.configure(
-                    Phase::Dumping,
-                    RELIEVED,
-                    input.now_ms,
-                    "Dumping: dump and vent open; ends when the tank reaches its zero-pressure band",
-                )
-            }
+            // Cancel (including from a nitrogen-test hold or its Dump) opens
+            // dump and vent and ends the sequence; venting continues.
             Action::CancelFill => {
+                self.test_hold = None;
+                self.dump_to_zero = false;
                 self.status.nitrogen_passed = false;
                 self.status.nitrogen_overridden = false;
                 self.configure(
@@ -839,6 +832,30 @@ impl Engine {
     /// The nitrogen test result held at pressure, if any.
     pub fn test_hold(&self) -> Option<&TestHold> {
         self.test_hold.as_ref()
+    }
+    /// Side-effect-free check of the Dump choice at a nitrogen-test hold.
+    pub fn dump_test_hold_check(&self, input: Inputs) -> Result<(), String> {
+        if !input.prelaunch {
+            return Err("GSE action blocked: vehicle is not in a prelaunch state".into());
+        }
+        if self.test_hold.is_none() || self.status.phase != Phase::Paused {
+            return Err("Dump is offered once the nitrogen test holds pressure".into());
+        }
+        Ok(())
+    }
+    /// The operator's Dump choice: open dump and vent (never the main valve)
+    /// and keep the same test run until the tank reaches its zero band.
+    pub fn dump_test_hold(&mut self, input: Inputs) -> Result<Effects, String> {
+        self.dump_test_hold_check(input)?;
+        self.failure = None;
+        self.dump_to_zero = true;
+        self.claimed = true;
+        Ok(self.configure(
+            Phase::Dumping,
+            RELIEVED,
+            input.now_ms,
+            "Dumping: dump and vent open; ends when the tank reaches its zero-pressure band",
+        ))
     }
     /// The operator's Dump choice is venting the held test pressure.
     pub fn dumping_to_zero(&self) -> bool {
@@ -1831,6 +1848,11 @@ mod tests {
             let effects = self.engine.tick(self.input());
             self.effects(effects);
         }
+        /// The operator's Dump choice at a nitrogen-test hold.
+        fn dump(&mut self) {
+            let effects = self.engine.dump_test_hold(self.input()).unwrap();
+            self.effects(effects);
+        }
         fn until(&mut self, phase: Phase) {
             for _ in 0..1000 {
                 if self.engine.status.phase == phase
@@ -1963,7 +1985,7 @@ mod tests {
         rig.until(Phase::Paused);
         assert!(!rig.engine.status.nitrogen_passed);
         assert_eq!(rig.valves, CLOSED);
-        rig.request(Action::CancelFill);
+        rig.dump();
         rig.pressure = 5.0;
         rig.until(Phase::Cancelled);
         assert_eq!(rig.valves, RELIEVED);
@@ -2053,7 +2075,7 @@ mod tests {
         assert_eq!(rig.engine.status.phase, Phase::PauseSetup);
         rig.until(Phase::Paused);
         assert_eq!(rig.valves, CLOSED, "holds the top-step pressure");
-        rig.request(Action::CancelFill);
+        rig.dump();
         rig.until(Phase::Dumping);
         assert_eq!(rig.valves, RELIEVED);
         rig.pressure = 5.0;
@@ -2121,7 +2143,7 @@ mod tests {
         }
         assert_eq!(rig.engine.status.phase, Phase::PauseSetup);
         rig.until(Phase::Paused);
-        rig.request(Action::CancelFill);
+        rig.dump();
         rig.pressure = 0.0;
         rig.until(Phase::Passed);
         assert!(rig.engine.status.nitrogen_passed);
@@ -2150,7 +2172,7 @@ mod tests {
         }
         rig.until(Phase::Paused);
         assert_eq!(rig.valves, CLOSED);
-        rig.request(Action::CancelFill);
+        rig.dump();
         rig.pressure = 0.0;
         rig.until(Phase::Cancelled);
         assert_eq!(rig.engine.status.phase, Phase::Cancelled);
@@ -2197,7 +2219,7 @@ mod tests {
         rig.pressure = 45.0;
         rig.until(Phase::Paused);
         assert_eq!(rig.valves, CLOSED);
-        rig.request(Action::CancelFill);
+        rig.dump();
         rig.pressure = 5.0;
         rig.until(Phase::Cancelled);
         assert_eq!(rig.valves, RELIEVED);
@@ -2496,7 +2518,7 @@ mod tests {
             assert_ne!(rig.engine.status.phase, Phase::Fault);
         }
         rig.until(Phase::Paused);
-        rig.request(Action::CancelFill);
+        rig.dump();
         rig.pressure = 0.0;
         rig.until(Phase::Passed);
         assert!(rig.engine.status.nitrogen_passed);
@@ -2640,7 +2662,7 @@ mod tests {
                     assert_eq!(view.fresh_pressure_psi,Engine::fresh_pressure(observed.input()));
                 }
                 if control.engine.status.phase==Phase::Paused&&control.engine.test_hold().is_some(){
-                    control.request(Action::CancelFill);observed.request(Action::CancelFill);
+                    control.dump();observed.dump();
                 }
                 control.now+=100;observed.now+=100;
                 let expected=control.engine.tick(control.input());

@@ -1288,7 +1288,7 @@ mod tests {
             let before = engine.progress_observation(input);
             // The operator's Dump choice at the passed top-step hold.
             let effects = if engine.status.phase == Phase::Paused && engine.test_hold().is_some() {
-                engine.request(Action::CancelFill, input).unwrap()
+                engine.dump_test_hold(input).unwrap()
             } else {
                 engine.tick(input)
             };

@@ -1450,9 +1450,6 @@ fn handle_command_inner(
                         s.kind == crate::sequence_progress::Kind::Fill && !s.outcome.terminal()
                     });
                 let mass = rt.fresh_mass(input.now_ms);
-                // Dump from a nitrogen-test pressure hold continues the same
-                // test run (it ends Passed or Failed at ~0 psi), not a cancel.
-                let hold_dump = action == Action::CancelFill && rt.engine.test_hold().is_some();
                 let result = if action == Action::StartFill {
                     match rt.engine.request_fill(input, mass, progress_mass_target) {
                         Ok(gse_sequence::fill_resume::FillStart::Noop) => {
@@ -1489,7 +1486,6 @@ fn handle_command_inner(
                             input,
                             match action {
                                 Action::PauseFill => Cause::PauseAccepted,
-                                Action::CancelFill if hold_dump => Cause::Tick,
                                 Action::CancelFill => Cause::CancelAccepted,
                                 _ => Cause::ResumeAccepted,
                             },
@@ -1542,6 +1538,29 @@ fn handle_command_inner(
         rt.cancel_automation_for_manual();
     }
     false
+}
+/// The operator's Dump choice at a nitrogen-test hold. Caller holds DISPATCH
+/// and has validated the run key and ownership epoch. The same test run
+/// continues until the tank reaches its zero band (Cancel ends it at once).
+pub(super) fn dump_test_hold_under_dispatch(state: &Arc<AppState>) -> Result<(), String> {
+    let is_prelaunch = prelaunch(state);
+    let policy = state.action_policy_snapshot();
+    let interlock = interlock(state, &policy);
+    let effects = {
+        let mut rt = state.gse.lock().unwrap();
+        let input = rt.input(is_prelaunch, interlock);
+        let effects = rt.engine.dump_test_hold(input)?;
+        rt.manual_control = false;
+        #[cfg(not(feature = "hitl_mode"))]
+        {
+            rt.operational.running = true;
+        }
+        rt.progress_observe(input, crate::sequence_progress_projection::Cause::Tick);
+        effects
+    };
+    apply(state, effects);
+    crate::sequences::refresh_action_policy_under_dispatch(state);
+    Ok(())
 }
 /// Refusal shown wherever a resume waits for earlier valve commands to retire.
 pub(crate) const RETIREMENT_PENDING: &str =

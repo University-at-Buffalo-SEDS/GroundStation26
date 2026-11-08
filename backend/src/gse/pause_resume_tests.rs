@@ -139,7 +139,8 @@ impl Plant {
                 && rt.engine.test_hold() == Some(&gse_sequence::TestHold::Passed)
         };
         if hold {
-            handle_command(&self.state, &TelemetryCommand::CancelFill);
+            let _dispatch = DISPATCH_GATE.lock().unwrap();
+            dump_test_hold_under_dispatch(&self.state).unwrap();
         }
         let rt = self.state.gse.lock().unwrap();
         assert_ne!(rt.engine.status.phase, Phase::Fault, "{}", rt.engine.status.message);
@@ -472,13 +473,45 @@ async fn routed_nitrogen_leak_holds_pressure_until_dump_then_ends_at_zero() {
     assert_eq!(plant.phase(), Phase::Paused, "waits indefinitely");
     assert_eq!(plant.pressure, held);
     let controls = plant.controls();
-    assert!(controls.cancel.allowed, "Dump is available: {:?}", controls.cancel);
+    let choice = controls.hold_choice.clone().expect("Dump / Cold flow prompt");
+    assert!(choice.dump.allowed, "Dump is available: {:?}", choice.dump);
+    assert!(controls.cancel.allowed, "Cancel is available");
     assert!(!controls.resume.allowed, "a leak verdict cannot resume");
-    assert!(handle_command(&plant.state, &TelemetryCommand::CancelFill));
+    {
+        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        dump_test_hold_under_dispatch(&plant.state).unwrap();
+    }
+    // The same run stays open (its modal stays) until the tank is empty.
+    plant.step();
+    assert_eq!(plant.outcome(), Some(Outcome::Running), "Dump keeps the run open");
     let dumped = plant.until(|rt| rt.engine.status.phase == Phase::Cancelled);
     assert!(dumped.contains(&(1, true)) && dumped.contains(&(2, true)));
     assert!(!dumped.contains(&(0, true)), "Dump never opens the main valve");
     assert_eq!(plant.pressure, 0.0);
     plant.step();
     assert_eq!(plant.outcome(), Some(Outcome::Failed));
+}
+
+#[tokio::test]
+async fn routed_cancel_at_the_nitrogen_hold_relieves_and_ends_the_run_at_once() {
+    let mut plant = Plant::new().await;
+    assert!(handle_command(&plant.state, &TelemetryCommand::ValveSelfTest));
+    plant.until(|rt| rt.engine.status.phase == Phase::Idle);
+    plant.step();
+    assert!(handle_command(&plant.state, &TelemetryCommand::NitrogenTest));
+    plant.until(|rt| rt.engine.status.phase == Phase::Holding);
+    plant.receive();
+    plant.leak = 1.0;
+    plant.until(|rt| rt.engine.status.phase == Phase::Paused);
+    plant.leak = 0.0;
+    let held = plant.pressure;
+    assert!(handle_command(&plant.state, &TelemetryCommand::CancelFill));
+    let relieved = plant.until(|rt| rt.engine.status.phase == Phase::Cancelled);
+    assert!(relieved.contains(&(1, true)) && relieved.contains(&(2, true)));
+    assert!(!relieved.contains(&(0, true)), "Cancel never opens the main valve");
+    plant.step();
+    assert!(plant.outcome().is_some_and(|o| o.terminal()), "the run ends: the modal can close");
+    assert!(progress::controls(&plant.state).is_none());
+    assert!(plant.pressure < held, "dump and vent stay open after the run ends");
+    assert_eq!(plant.valves, gse_sequence::RELIEVED);
 }

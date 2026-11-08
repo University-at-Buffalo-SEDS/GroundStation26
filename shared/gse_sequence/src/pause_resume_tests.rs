@@ -64,6 +64,10 @@ impl Rig {
         let effects = self.engine.resume_test(self.input()).unwrap();
         self.apply(effects);
     }
+    fn dump(&mut self) {
+        let effects = self.engine.dump_test_hold(self.input()).unwrap();
+        self.apply(effects);
+    }
     fn tick(&mut self) {
         self.now += 100;
         let effects = self.engine.tick(self.input());
@@ -245,7 +249,7 @@ fn pause_during_baseline_repeats_baseline_and_pause_while_dumping_resumes_dumpin
     // The passed test holds its top-step pressure until the operator dumps.
     rig.until(Phase::Paused);
     assert_eq!(rig.engine.test_hold(), Some(&TestHold::Passed));
-    rig.request(Action::CancelFill);
+    rig.dump();
     rig.until(Phase::Dumping);
     rig.pressure = 60.0;
     rig.pause();

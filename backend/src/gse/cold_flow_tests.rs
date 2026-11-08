@@ -1812,7 +1812,8 @@ async fn nitrogen_hold_offers_cold_flow_that_releases_the_held_pressure_without_
     let choice = controls.hold_choice.expect("Cold flow / Dump choice");
     assert!(choice.passed);
     assert!(choice.cold_flow.allowed, "{:?}", choice.cold_flow);
-    assert_eq!(choice.dump, controls.cancel, "Dump is the run's Cancel");
+    assert!(choice.dump.allowed, "{:?}", choice.dump);
+    assert!(controls.cancel.allowed, "Cancel stays separate from Dump");
     let before = f.sent.lock().unwrap().len();
     f.start().await;
     // The configured 100 psi target is below the 115 psi held: no nitrogen.
@@ -1861,4 +1862,43 @@ async fn nitrogen_hold_cold_flow_target_is_capped_at_the_test_top_step() {
     f.start().await;
     let target = f.state.gse.lock().unwrap().cold_flow.as_ref().unwrap().controller.observation().target_psi;
     assert_eq!(target, 110.0, "min(top step 120, held 110)");
+}
+
+#[tokio::test]
+async fn dump_route_is_offered_only_at_a_nitrogen_hold_and_keeps_the_run() {
+    if crate::operator_queue::isolated_native_case(module_path!(),
+        "dump_route_is_offered_only_at_a_nitrogen_hold_and_keeps_the_run") { return; }
+    let mut f = Fixture::new().await;
+    let key = {
+        let mut rt = f.state.gse.lock().unwrap();
+        rt.engine.status.baseline = Some(gse_sequence::Baseline {
+            average_psi: 0.0, min_psi: 0.0, max_psi: 0.0, noise_psi: 0.5, samples: 50,
+        });
+        #[cfg(not(feature = "hitl_mode"))]
+        { rt.operational.running = true; }
+        let reserved = super::progress::reserve(&f.state);
+        let input = rt.input(true, true);
+        rt.progress_start(reserved, Kind::NitrogenTest, input);
+        rt.progress.current().unwrap().key.clone()
+    };
+    // Not offered before the hold.
+    let (code, _) = f.call("/api/gse/sequences/dump", serde_json::to_value(&key).unwrap(), Some("cold-origin-token")).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    {
+        let mut rt = f.state.gse.lock().unwrap();
+        let now = rt.now();
+        let _ = rt.engine.hold_test_pressure(now, gse_sequence::TestHold::Passed);
+    }
+    for _ in 0..20 {
+        f.step(115.);
+    }
+    #[cfg(not(feature = "hitl_mode"))]
+    { f.state.gse.lock().unwrap().operational.topology_stable = true; }
+    let (code, value) = f.call("/api/gse/sequences/dump", serde_json::to_value(&key).unwrap(), Some("cold-origin-token")).await;
+    assert_eq!(code, StatusCode::OK, "{value}");
+    let rt = f.state.gse.lock().unwrap();
+    assert_eq!(rt.engine.status.phase, Phase::Dumping);
+    assert!(rt.engine.dumping_to_zero());
+    assert_eq!(rt.progress.current().unwrap().key, key, "same run; its modal stays open");
+    assert!(!rt.progress.current().unwrap().outcome.terminal());
 }

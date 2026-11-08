@@ -1227,7 +1227,8 @@ mod tests {
                     && rt.engine.test_hold() == Some(&gse_sequence::TestHold::Passed);
                 drop(rt);
                 if hold {
-                    handle_command(&state, &TelemetryCommand::CancelFill);
+                    let _dispatch = DISPATCH_GATE.lock().unwrap();
+                    super::super::dump_test_hold_under_dispatch(&state).unwrap();
                 }
             }
             let saved = operational::Saved::load(&path).unwrap();

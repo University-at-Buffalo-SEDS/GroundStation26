@@ -65,6 +65,10 @@ impl Rig {
         let effects = self.engine.request(action, self.input()).unwrap();
         self.apply(effects);
     }
+    fn dump(&mut self) {
+        let effects = self.engine.dump_test_hold(self.input()).unwrap();
+        self.apply(effects);
+    }
     fn tick(&mut self) {
         self.now += 100;
         let effects = self.engine.tick(self.input());
@@ -278,7 +282,7 @@ fn hold_leak_holds_pressure_until_the_operator_dumps_to_zero() {
     assert_eq!(rig.engine.status.phase, Phase::Paused);
     assert_eq!(rig.valves, CLOSED);
     // Dump: dump and vent only, never the main valve; waits for ~0 psi.
-    rig.request(Action::CancelFill);
+    rig.dump();
     for _ in 0..20 {
         rig.tick();
     }
@@ -311,7 +315,7 @@ fn passed_test_holds_top_step_pressure_and_dump_ends_in_passed() {
     assert_eq!(rig.engine.test_hold(), Some(&TestHold::Passed));
     assert!(rig.engine.failure().is_none());
     assert!(rig.engine.status.message.contains("Choose Cold flow or Dump"));
-    rig.request(Action::CancelFill);
+    rig.dump();
     rig.until(Phase::Dumping);
     assert!(rig.valves[1] && rig.valves[2] && !rig.valves[0]);
     rig.pressure = 0.0;
@@ -409,4 +413,30 @@ fn manual_control_never_suppresses_the_nitrogen_test_ceiling() {
     rig.pressure = 220.0; // nitrogen session: not a nitrous overfill
     rig.tick();
     assert_eq!(rig.engine.status.phase, Phase::Fault);
+}
+
+#[test]
+fn cancel_at_a_hold_or_while_dumping_relieves_and_ends_without_waiting_for_zero() {
+    for during_dump in [false, true] {
+        let mut rig = Rig::new();
+        rig.request(Action::NitrogenTest);
+        rig.until(Phase::Raising);
+        rig.pressure = 55.0;
+        rig.until(Phase::Holding);
+        rig.pressure = 40.0;
+        rig.until(Phase::Paused);
+        if during_dump {
+            rig.dump();
+            rig.until(Phase::Dumping);
+            assert!(rig.engine.dumping_to_zero());
+        }
+        // Dump is refused outside a hold; Cancel always ends the run.
+        rig.request(Action::CancelFill);
+        assert!(rig.engine.dump_test_hold(rig.input()).is_err());
+        rig.until(Phase::Cancelled);
+        assert_eq!(rig.valves, RELIEVED, "dump and vent open, PILOT closed");
+        assert!(rig.pressure > 30.0, "ended before the tank vented");
+        assert!(rig.engine.test_hold().is_none() && !rig.engine.dumping_to_zero());
+        assert!(!rig.engine.active());
+    }
 }

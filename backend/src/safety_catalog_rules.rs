@@ -142,9 +142,10 @@ const SEQUENCES: &[Spec] = &[
     Spec {
         id: "nitrogen-hold",
         title: "Nitrogen test hold on failure",
-        summary: "A leak verdict closes every valve and holds pressure: \"Nitrogen test failed: <reason>. Holding pressure for leak search. Dump when ready.\" It waits indefinitely.",
+        summary: "A leak verdict closes every valve, holds pressure and immediately prompts: \"Nitrogen test failed: <reason>. Holding pressure for leak search. Dump when ready.\" with Dump or Cold flow. It waits indefinitely for the choice.",
         details: &[
-            "Dump opens Dump and Vent (never PILOT) and ends once the tank is inside its calibrated zero-pressure band (the empty-tank baseline noise band).",
+            "Dump opens Dump and Vent (never PILOT); the prompt stays open showing progress until the tank is inside its calibrated zero-pressure band (the empty-tank baseline noise band), then the run finishes and the prompt closes.",
+            "Cancel opens Dump and Vent and ends the run at once; the prompt closes and venting continues in the background with normal status.",
             "A failed run never keeps an older nitrogen pass. Overpressure relief still applies.",
         ],
         modes: ALL,
@@ -154,10 +155,12 @@ const SEQUENCES: &[Spec] = &[
     Spec {
         id: "nitrogen-hold-choice",
         title: "Cold flow or Dump at the top step",
-        summary: "After the last hold passes (top step {gse.nitrogen_target_psi} psi above the empty-tank baseline) the test holds pressure and offers Cold flow or Dump.",
+        summary: "After the last hold passes (set point {gse.nitrogen_target_psi} psi above the empty-tank baseline) the test holds pressure and prompts for the Dump step or Cold flow.",
         details: &[
-            "Cold flow starts the existing Cold Flow sequence and its interlocks with a target of the lower of the test's top step, the Cold Flow target ({gse.cold_flow_target_psi} psi) and the held pressure, so it never re-pressurises. PILOT opens only on explicit release; panel Launch can release it. Cold Flow Cancel closes supplies and PILOT, then opens Dump and Vent.",
-            "Dump vents to ~0 psi and completes the nitrogen test (fill unlocked).",
+            "Cold flow from this prompt releases the pressure the test holds (capped at the set point); it never uses the standalone Auto Cold Flow target and never re-pressurises. It runs through the Cold Flow interlocks: PILOT opens only on explicit release (panel Launch can release it); its Cancel closes supplies and PILOT, then opens Dump and Vent.",
+            "Dump vents to ~0 psi with the prompt open, then completes the nitrogen test (fill unlocked) and closes.",
+            "Cancel ends the run at once with Dump and Vent open; the prompt closes.",
+            "Standalone Auto Cold Flow keeps its own settings: it pressurises to its own target ({gse.cold_flow_target_psi} psi) before release.",
         ],
         modes: ALL,
         enforced_in: &["backend/src/gse/cold_flow.rs:start_target", "backend/src/gse/progress.rs:controls"],
@@ -166,7 +169,7 @@ const SEQUENCES: &[Spec] = &[
     Spec {
         id: "pause-resume-cancel",
         title: "Pause, Resume and Cancel",
-        summary: "Pause closes supplies first, then every valve, and waits for fresh board confirmation. Cancel closes supplies and PILOT, then opens Dump and Vent. Resume re-checks interlocks, pressure and closed reports.",
+        summary: "Pause closes supplies first, then every valve, and waits for fresh board confirmation. Cancel closes supplies and PILOT, then opens Dump and Vent and ends the run (the nitrogen test's prompt closes; venting continues). Resume re-checks interlocks, pressure and closed reports.",
         details: &[
             "Valve self-test and nitrogen test resume at the interrupted step (fresh settle and hold timers). Fill resumes through Start fill. Turbocharge cannot resume. Cold Flow resumes only after earlier commands retire.",
             "Resume waits until no earlier valve command is still being delivered.",

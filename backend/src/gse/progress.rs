@@ -423,6 +423,7 @@ pub(crate) fn controls(state: &AppState) -> Option<wire::RunControls> {
     let fill_resume = kind == Kind::Fill;
     let cancel = with_common(cancel, &block, false, interlocked, cancel_command);
     let hold = rt.engine.test_hold().cloned();
+    let dump_check = rt.engine.dump_test_hold_check(input);
     drop(rt);
     let hold_choice = hold.map(|hold| wire::HoldChoice {
         message: hold.message(),
@@ -437,7 +438,7 @@ pub(crate) fn controls(state: &AppState) -> Option<wire::RunControls> {
                 Err(status.reason.into())
             })
         },
-        dump: cancel.clone(),
+        dump: with_common(dump_check.clone(), &block, false, interlocked, cancel_command),
     });
     Some(wire::RunControls {
         key,
@@ -467,6 +468,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/gse/sequences/cancel", axum::routing::post(cancel))
         .route("/api/gse/sequences/pause", axum::routing::post(pause))
+        .route("/api/gse/sequences/dump", axum::routing::post(dump))
         .route("/api/gse/sequences/resume", axum::routing::post(resume))
         .route(
             "/api/gse/sequences/results/{backend}/{epoch}/{run}",
@@ -686,6 +688,42 @@ async fn pause(
                 Err(rt.engine.status.message.clone())
             }
         })
+    };
+    flush_effects(&state);
+    flush(&state);
+    crate::sequences::refresh_action_policy_projection(&state);
+    control_reply(result, key)
+}
+static NOT_OFFERED: wire::Gate = wire::Gate { allowed: false, reason: None };
+fn hold_dump_gate(controls: &wire::RunControls) -> &wire::Gate {
+    controls.hold_choice.as_ref().map_or(&NOT_OFFERED, |choice| &choice.dump)
+}
+/// The Dump choice at a nitrogen-test hold: dump and vent, keep the run
+/// (and its modal) until the tank reaches its zero band.
+async fn dump(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(key): Json<RunKey>,
+) -> Response {
+    let requested = LaunchAdmission::capture(&state);
+    let principal =
+        match crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await {
+            Ok(p) => p,
+            Err(error) => return error,
+        };
+    if !principal.allows_command_name("CancelFill") {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Err(error) = require_primary_operational_station() {
+        return error.into_response();
+    }
+    let Some(_claim) = claim_operator_dispatch(&state, requested.generation) else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    let result = {
+        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        admitted(&state, &key, requested, hold_dump_gate)
+            .and_then(|()| super::dump_test_hold_under_dispatch(&state))
     };
     flush_effects(&state);
     flush(&state);
