@@ -2527,6 +2527,17 @@ async fn send_command_entry(
 
 fn command_disabled_message(state:&AppState,command:&TelemetryCommand)->String {
     let name=command_name(command);
+    let phase_step=match name {
+        "AdvanceFlightState"=>Some(true),
+        "RewindFlightState"=>Some(false),
+        _=>match command {
+            TelemetryCommand::OperatorPhase{intent}=>Some(intent.name()=="AdvanceFlightState"),
+            _=>None,
+        },
+    };
+    if let Some(forward)=phase_step && crate::operator_phase::local_mode(state) {
+        return format!("{name}: {}",crate::operator_phase::refusal_reason(state,forward));
+    }
     let policy=state.action_policy_snapshot();
     let reason=policy.controls.iter().find(|control|control.cmd==name)
         .and_then(|control|control.disabled_reason.as_deref());
@@ -2758,7 +2769,16 @@ async fn dispatch_command_inner(
             return (StatusCode::CONFLICT, message);
         }
     }
-    if !state.is_command_allowed(&cmd) {
+    // Phase-step gates read shared state with try_lock; a lock that is merely
+    // busy at this instant must not refuse a valid step. Re-check briefly.
+    let mut allowed=state.is_command_allowed(&cmd);
+    if !allowed && crate::operator_phase::is_local(&cmd) {
+        for _ in 0..5 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if state.is_command_allowed(&cmd) { allowed=true; break; }
+        }
+    }
+    if !allowed {
         let message=command_disabled_message(&state,&cmd);
         emit_notification_warning(&state,&message);
         return (StatusCode::FORBIDDEN, message);

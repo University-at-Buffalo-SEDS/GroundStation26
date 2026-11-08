@@ -109,6 +109,37 @@ pub(crate) fn local_allowed(state: &AppState) -> bool {
         && state.board_abort.masks().0 == 0
         && crate::gse::operator_phase_runtime_available(state)
 }
+/// Plain-language reason a phase step is refused, checked in admission order.
+pub(crate) fn refusal_reason(state: &AppState, forward: bool) -> String {
+    if !local_mode(state) {
+        return "Phase steps need HITL local phase control selected on the primary station.".into();
+    }
+    if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
+        return "The station is shutting down.".into();
+    }
+    if state.abort_indicator_latched() {
+        return "An Abort indicator is latched. Use Reset all boards first.".into();
+    }
+    if crate::gse::manual_stop_state(state) != crate::gse::CurrentState::Current {
+        return "A manual Stop is not yet confirmed by the boards.".into();
+    }
+    if state.board_abort.masks().0 != 0 {
+        return "A board reports Abort. Recover it or use Reset all boards first.".into();
+    }
+    if !crate::gse::operator_phase_runtime_available(state) {
+        return "Cold flow is running or the GSE runtime is busy; try again.".into();
+    }
+    if !button_allowed(state) {
+        return "The HITL button interlock is not satisfied.".into();
+    }
+    if !controls_allowed(state) {
+        return "GroundStation key or software controls are disabled (or the policy was updating); try again.".into();
+    }
+    if adjacent(state.local_flight_state_snapshot(), forward).is_none() {
+        return if forward { "There is no later flight state to advance to.".into() } else { "There is no earlier flight state to rewind to.".into() };
+    }
+    "The request expired or the flight state changed before it was sent. Press it again.".into()
+}
 pub(crate) fn enabled_for_name(state: &AppState, name: &str) -> Option<bool> {
     if !local_mode(state) {
         return None;
