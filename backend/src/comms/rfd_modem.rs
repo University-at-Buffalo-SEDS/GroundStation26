@@ -1142,7 +1142,7 @@ pub(crate) fn before_av_bay_open(link: &CommsLinkConfig) {
         Some(_) if mode == Mode::Skip => Report::skipped(
             Trigger::Startup,
             mode,
-            "modem check disabled (GS_RFD_MODEM_CHECK=skip or simulator build)",
+            "modem check off: skipped by default in HITL, testing and simulator builds (set GS_RFD_MODEM_CHECK=verify or fix to run it)",
         ),
         Some(_) if simulated_link() => {
             Report::skipped(Trigger::Startup, mode, "simulated serial link")
