@@ -86,6 +86,7 @@ impl Exchange {
         };
         Self::prepare_at(board, query, nonce, desired, now, router, boundary)
     }
+    #[cfg(test)]
     pub(super) fn prepare_at(
         board: Board,
         query: &Observation,
@@ -95,7 +96,22 @@ impl Exchange {
         router: Arc<sedsnet::router::Router>,
         boundary: ConfirmBoundary,
     ) -> Result<Self, &'static str> {
-        Self::prepare_bound(board, query, nonce, desired, now, router, boundary, None)
+        Self::prepare_bound(board, query, nonce, OP_RECOVER, desired, now, router, boundary, None)
+    }
+    /// RECOVER, or RESYNC to a frozen station phase. RESYNC never carries a
+    /// commissioning or FIRST binding; its completion proof is the same.
+    #[expect(clippy::too_many_arguments, reason = "Independent owner query and original boundary remain explicit")]
+    pub(super) fn prepare_operation_at(
+        board: Board,
+        query: &Observation,
+        nonce: u64,
+        operation: u8,
+        desired: u8,
+        now: Stamp,
+        router: Arc<sedsnet::router::Router>,
+        boundary: ConfirmBoundary,
+    ) -> Result<Self, &'static str> {
+        Self::prepare_bound(board, query, nonce, operation, desired, now, router, boundary, None)
     }
     #[expect(clippy::too_many_arguments, reason = "Independent owner query, original boundary and retained FIRST proof remain explicit")]
     pub(super) fn prepare_first_reconciliation_at(
@@ -115,6 +131,7 @@ impl Exchange {
             board,
             query,
             nonce,
+            OP_RECOVER,
             desired,
             now,
             router,
@@ -127,6 +144,7 @@ impl Exchange {
         board: Board,
         query: &Observation,
         nonce: u64,
+        operation: u8,
         desired: u8,
         now: Stamp,
         router: Arc<sedsnet::router::Router>,
@@ -134,8 +152,20 @@ impl Exchange {
         first: Option<&super::coordinator::FirstBinding>,
     ) -> Result<Self, &'static str> {
         let q = &query.value;
-        let desired_allowed = desired == 0
-            || (desired == 1 && matches!(board, Board::ActuatorBoard | Board::ValveBoard));
+        let desired_allowed = match operation {
+            OP_RECOVER => desired == 0
+                || (desired == 1 && matches!(board, Board::ActuatorBoard | Board::ValveBoard)),
+            // The fill phases and Armed only, on a board that advertises it,
+            // from a known identity and outputs that already read safe.
+            OP_RESYNC => resync_board(board)
+                && crate::types::u8_to_flight_state(desired).and_then(resync_target) == Some(desired)
+                && first.is_none()
+                && query.value.flags & RESYNC_IMPLEMENTATION != 0
+                && query.value.result == 0
+                && query.value.boot != u64::MAX
+                && resync_outputs_safe(board, &query.value),
+            _ => false,
+        };
         if index(board).is_none()
             || !desired_allowed
             || !query_domain_consistent(board, q)
@@ -157,7 +187,7 @@ impl Exchange {
         let utc = boundary.utc;
         let mut wire = [0u8; 32];
         wire[0] = 1;
-        wire[1] = 1;
+        wire[1] = operation;
         wire[2] = desired;
         wire[4..12].copy_from_slice(&nonce.to_le_bytes());
         wire[12..20].copy_from_slice(&expected_boot.to_le_bytes());
@@ -348,6 +378,65 @@ mod tests {
             Arc::from(bytes),
         )
         .unwrap()
+    }
+
+    /// RESYNC carries the frozen phase as operation 2 and completes only on a
+    /// fresh reply in that phase with the same safe outputs; nothing else.
+    #[test]
+    fn resync_packet_carries_the_phase_and_needs_the_same_terminal_proof() {
+        let router = Arc::new(Router::new(RouterConfig::new([]).with_sender("GS")));
+        router
+            .try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(
+                1_793_000_000_000,
+            ))
+            .unwrap();
+        let boundary = ConfirmBoundary::capture(&router).unwrap();
+        let now = Stamp::now();
+        let query = |flags: u8, outputs: u32, boot: u64| Observation {
+            value: Readback { result: 0, state: Some(15), flags, nonce: 1, boot, epoch: 8, uptime: 10, outputs, issuer: 99 },
+            received: now,
+            observed_after: now,
+        };
+        let ready = 0x3f | RESYNC_IMPLEMENTATION;
+        let prepare = |board, q: &Observation, desired| {
+            Exchange::prepare_operation_at(board, q, 2, OP_RESYNC, desired, now, router.clone(), boundary)
+        };
+        for phase in 2..=6 {
+            let exchange = prepare(Board::ActuatorBoard, &query(ready, 0, 42), phase).unwrap();
+            assert_eq!(&exchange.packet(now).unwrap().payload()[..4], &[1, OP_RESYNC, phase, 0]);
+        }
+        // Startup/Idle, Launch onward, other boards, no capability bit, unsafe
+        // outputs and the commissioning sentinel are refused before any packet.
+        for phase in [0, 1, 7, 8, 13, 14, 15] {
+            assert!(prepare(Board::ActuatorBoard, &query(ready, 0, 42), phase).is_err(), "{phase}");
+        }
+        for board in [Board::FlightComputer, Board::GatewayBoard, Board::DaqBoard] {
+            assert!(prepare(board, &query(ready, 0, 42), 5).is_err(), "{board:?}");
+        }
+        assert!(prepare(Board::ActuatorBoard, &query(0x3f, 0, 42), 5).is_err());
+        assert!(prepare(Board::ActuatorBoard, &query(ready & !2, 2, 42), 5).is_err());
+        assert!(prepare(Board::ActuatorBoard, &query(ready, 0, u64::MAX), 5).is_err());
+        assert!(prepare(Board::ValveBoard, &query(ready, 0, 42), 5).is_err(), "VB safe mask is 6");
+        let mut exchange = prepare(Board::ValveBoard, &query(ready, 6, 42), 5).unwrap();
+        let mut terminal = |state: u8, flags: u8, outputs: u32| {
+            let mut bytes = [0; 40];
+            bytes[0] = 1;
+            bytes[2] = state;
+            bytes[3] = flags;
+            bytes[4..12].copy_from_slice(&exchange.nonce.to_le_bytes());
+            bytes[12..20].copy_from_slice(&42u64.to_le_bytes());
+            bytes[20..24].copy_from_slice(&9u32.to_le_bytes());
+            bytes[28..32].copy_from_slice(&outputs.to_le_bytes());
+            bytes[32..40].copy_from_slice(&99u64.to_le_bytes());
+            let packet = Packet::new(crate::telemetry_schema::data_type(STATUS_TYPE),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")], "VB", 1_793_000_000_001, Arc::from(bytes)).unwrap();
+            exchange.observe(&packet, now)
+        };
+        assert!(terminal(1, 0xbe, 6).is_err(), "Idle is not the frozen phase");
+        assert!(terminal(5, 0xbc, 6).is_err(), "outputs must still read safe");
+        assert!(terminal(5, 0xbe, 2).is_err(), "outputs must be the unchanged safe mask");
+        assert!(terminal(5, 0xbf, 6).is_err(), "Abort must be cleared");
+        assert_eq!(terminal(5, 0xbe, 6), Ok(Outcome::Applied));
     }
 
     #[test]

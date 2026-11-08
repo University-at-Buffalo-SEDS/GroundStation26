@@ -44,7 +44,7 @@ fn query(router:&sedsnet::router::Router,board:Board,nonce:u64)->Packet {
   crate::system_clock::required_control_network_utc_ms(router).unwrap(),Arc::from(wire)).unwrap()
 }
 fn target(board:Board,row:Observation)->Target {
- Target{board,desired:0,context:row.value.clone(),prepared_query:row,intent:None,original_first:None,uncertain_first:None,first_binding:None}
+ Target{board,desired:0,operation:OP_RECOVER,context:row.value.clone(),prepared_query:row,intent:None,original_first:None,uncertain_first:None,first_binding:None}
 }
 #[test]
 #[ignore="requires sibling firmware C sources and prebuilt inert bridges; run qualification explicitly"]

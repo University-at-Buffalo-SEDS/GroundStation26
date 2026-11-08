@@ -91,6 +91,11 @@ const QUERY_TYPE: &str = "BOARD_RECOVERY_REQUEST";
 const STATUS_TYPE: &str = "BOARD_STATE_STATUS";
 const STATE_VALID: u8 = 8;
 const OUTPUTS_VALID: u8 = 16;
+/// Readback flag: the board accepts RESYNC (operation 2) to a station phase.
+const RESYNC_IMPLEMENTATION: u8 = 0x80;
+/// Wire operations. RESYNC carries the station phase in the desired byte.
+const OP_RECOVER: u8 = 1;
+const OP_RESYNC: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Readback {
@@ -106,7 +111,8 @@ struct Readback {
 }
 impl Readback {
     fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != 40 || bytes[0] != 1 || bytes[1] > 7 || bytes[3] & !0x7f != 0 {
+        // Every flag bit is defined; bit 7 advertises Resync (AB/VB only).
+        if bytes.len() != 40 || bytes[0] != 1 || bytes[1] > 7 {
             return None;
         }
         let flags = bytes[3];
@@ -221,6 +227,72 @@ fn targeted_recovery_state(board: Board) -> Option<u8> {
         | Board::GatewayBoard | Board::DaqBoard => Some(0),
         Board::GroundStation => None,
     }
+}
+
+/// Boards whose firmware owns a RESYNC path. The Flight Computer owns its own
+/// flight states, and the metadata boards already follow the published phase.
+fn resync_board(board: Board) -> bool {
+    matches!(board, Board::ActuatorBoard | Board::ValveBoard)
+}
+/// Station phases a board may be resynced to: the fill phases and Armed.
+/// Startup and Idle use Recover/Reset, whose board paths drive or re-assert
+/// outputs; from Launch onward nothing aborts, recovers or acts automatically.
+// Safety catalog (About safety): board-resync. Keep backend/src/safety_catalog_rules.rs in step.
+pub(crate) fn resync_target(state: crate::types::FlightState) -> Option<u8> {
+    use crate::types::FlightState as F;
+    matches!(state, F::PreFill | F::FillTest | F::NitrogenFill | F::NitrousFill | F::Armed)
+        .then_some(state as u8)
+}
+fn phase_label(state: u8) -> String {
+    crate::types::u8_to_flight_state(state).map_or_else(|| "Unknown".into(), |value| format!("{value:?}"))
+}
+/// Plain-language reason the station cannot resync any board right now,
+/// including commands still waiting on the network. Used at PREPARE.
+pub(crate) fn resync_host_block_reason(state: &AppState) -> Option<String> {
+    resync_work_block_reason(state).or_else(|| crate::gse::operator_reset_block_reason(state))
+}
+/// The same window from RAM owners only. A confirmed resync rechecks this while
+/// its own recovery packets keep the router busy.
+pub(crate) fn resync_work_block_reason(state: &AppState) -> Option<String> {
+    use crate::types::FlightState as F;
+    let phase = state.local_flight_state_snapshot();
+    match phase {
+        F::Startup => return Some("The station is in Startup and moves to Idle on its own. Resync matches a board to a fill phase or Armed; use Review recovery or Reset all boards to return a board to Startup or Idle.".into()),
+        F::Idle => return Some("The station is Idle. Use Review recovery (Recover to Idle) to return a board to Idle; Resync is for the fill phases and Armed.".into()),
+        F::Aborted => return Some("The station is Aborted, so Resync cannot clear a board's Abort. Use Review recovery or Reset all boards.".into()),
+        _ if resync_target(phase).is_none() => return Some("Resync is not available from Launch onward: nothing aborts or acts automatically after Launch, and the Flight Computer owns the flight states.".into()),
+        _ => {}
+    }
+    if crate::gse::overpressure_holds_abort(state) {
+        return Some("A tank overpressure is latched, so a board Abort may still be protecting the tank. Acknowledge the overpressure once pressure is below relief, then use Review recovery or Reset all boards.".into());
+    }
+    crate::gse::operator_work_block_reason(state)
+}
+/// Plain-language reason this board cannot be resynced, from its last readback.
+/// PREPARE repeats every check against a fresh dedicated query.
+fn resync_board_block_reason(board: Board, row: Option<&Readback>, target: Option<u8>) -> Option<String> {
+    let Some(row) = row else {
+        return Some("No board readback yet. Query the board first.".into());
+    };
+    if row.flags & RESYNC_IMPLEMENTATION == 0 {
+        return Some("This board's firmware does not support Resync.".into());
+    }
+    if matches!(row.boot, 0 | u64::MAX) || row.result == 7 {
+        return Some("The board needs commissioning first. Use Review recovery.".into());
+    }
+    if !resync_outputs_safe(board, row) {
+        return Some("Resync never moves outputs, and this board's outputs do not read safe. Use Review recovery or Reset all boards.".into());
+    }
+    if target.is_some() && row.state == target && row.flags & 1 == 0 {
+        return Some(format!("The board already matches the station ({}).", phase_label(target.unwrap())));
+    }
+    None
+}
+/// The board refuses RESYNC unless its commanded outputs already read safe;
+/// it never drives them. Mirror that here so the operator sees why.
+fn resync_outputs_safe(board: Board, row: &Readback) -> bool {
+    row.flags & (STATE_VALID | OUTPUTS_VALID | 2) == STATE_VALID | OUTPUTS_VALID | 2
+        && safe_output_mask(board) == Some(row.outputs)
 }
 
 /// Commanded-register safe domains from the actual board owners. VB's safe
@@ -392,6 +464,9 @@ pub(crate) fn observe(state: &AppState, packet: &Packet) -> Result<(), &'static 
         )
     {
         return Err("Metadata node advertised physical manual Stop capability");
+    }
+    if value.flags & RESYNC_IMPLEMENTATION != 0 && !resync_board(board) {
+        return Err("Board advertised Resync without a resync owner");
     }
 
     let id = state
@@ -687,6 +762,23 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         if let Some(reason) = crate::gse::operator_reset_block_reason(&state) { return reason; }
         format!("Reset is not allowed in the current station state ({:?}).", state.local_flight_state_snapshot())
     });
+    // Descriptive only. PREPARE and CONFIRM recheck all of this against a fresh
+    // dedicated query and the frozen station phase.
+    let resync_target_state = resync_target(state.local_flight_state_snapshot());
+    let resync_station_reason: Option<String> = if !primary {
+        Some("Only the primary ground station can resync boards.".into())
+    } else if principal.anonymous {
+        Some("Sign in to resync boards.".into())
+    } else if !principal.permissions.send_commands {
+        Some("Your account cannot send commands.".into())
+    } else if !network_utc_available {
+        Some("Network time is not available yet.".into())
+    } else if !state.launch_history.lock().unwrap().recovery_available() {
+        Some("Launch history storage is unavailable, so a resync cannot be recorded.".into())
+    } else {
+        // A momentarily busy router is not a reason to show; PREPARE waits it out.
+        resync_host_block_reason(&state).filter(|reason| !reason.contains("router is busy"))
+    };
     let principal_identity = principal_context(&identity, &headers, &principal);
     let confirmation = state
         .board_recovery
@@ -713,6 +805,14 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
             && readback.is_some_and(|row|query_domain_consistent(board,row)&&row.flags&0x24==0x24
                 &&matches!(row.result,0|7)&&(row.boot!=0||coordinator::first_uncertainty(host_pending.as_ref(),board,row))
                 &&row.epoch!=0&&row.epoch<u32::MAX-1);
+        let resync_capable = verified && resync_board(board)
+            && readback.is_some_and(|row| row.flags & RESYNC_IMPLEMENTATION != 0);
+        let resync_reason = resync_capable.then(|| resync_station_reason.clone()
+            .or_else(|| host_pending.as_ref().filter(|pending| !pending.published
+                && pending.targets.iter().any(|target| target.board != board.sender_id()))
+                .map(|pending| format!("Finish the incomplete recovery of {} first.",
+                    pending.targets.iter().map(|target| target.board.as_str()).collect::<Vec<_>>().join(", "))))
+            .or_else(|| resync_board_block_reason(board, readback, resync_target_state))).flatten();
         let (readback_status, message) = recovery_diagnostic(primary, verified, network_utc_available,
             observation, queries[at].as_ref(), now, reconcilable);
         let operation=queries[at].as_ref().map(|query| {
@@ -729,7 +829,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
             "boot":known.map(|row|format!("{:016x}",row.boot)),"epoch":known.map(|row|row.epoch),"nonce":known.map(|row|format!("{:016x}",row.nonce)),"age_ms":age,"readback_valid_for_ms":observation.map(|row|READBACK_TTL.saturating_sub(row.age(now)).as_millis().min(u64::MAX as u128)as u64),
             "receipt_age_ms":observation.map(|row|now.duration_since(row.received).as_millis().min(u64::MAX as u128)as u64),"uptime_ms":readback.map(|row|row.uptime),"abort_latched":readback.filter(|_|matches!(board,Board::ActuatorBoard|Board::ValveBoard|Board::FlightComputer)).map(|row|row.flags&1!=0),"safe_outputs":readback.filter(|row|row.flags&OUTPUTS_VALID!=0).map(|row|row.flags&2!=0&&query_domain_consistent(board,row)),"commanded_outputs":readback.filter(|row|row.flags&OUTPUTS_VALID!=0).map(|row|row.outputs),
             "output_readback":if readback.is_some_and(|row|row.flags&OUTPUTS_VALID!=0){"gpio_servo_command_registers"}else{"unknown"},"physical_position_verified":false,
-            "capabilities":{"query":primary&&verified,"endpoint_verified":verified,"hardened_transport":verified&&fresh&&readback.is_some_and(|row|row.flags&0x20!=0),"known_utc_manual_stop":verified&&fresh&&matches!(board,Board::ActuatorBoard|Board::ValveBoard|Board::FlightComputer)&&readback.is_some_and(|row|row.flags&0x40!=0),"recover":supported&&targeted_recovery_state(board).is_some(),"prepare_recover":prepare_recover,"resync":false,"reset_startup":supported},"operation":operation,
+            "capabilities":{"query":primary&&verified,"endpoint_verified":verified,"hardened_transport":verified&&fresh&&readback.is_some_and(|row|row.flags&0x20!=0),"known_utc_manual_stop":verified&&fresh&&matches!(board,Board::ActuatorBoard|Board::ValveBoard|Board::FlightComputer)&&readback.is_some_and(|row|row.flags&0x40!=0),"recover":supported&&targeted_recovery_state(board).is_some(),"prepare_recover":prepare_recover,"resync":resync_capable,"reset_startup":supported},"resync_blocked_reason":resync_reason,"operation":operation,
             "result":readback.filter(|_|fresh).map(|row|row.result),"commissioning_required":fresh&&readback.is_some_and(|row|row.boot==u64::MAX||row.result==7),"first_uncertainty_reconcilable":reconcilable,"identity_kind":if reconcilable{"retained_first_uncertainty"}else if readback.is_some_and(|row|row.boot==u64::MAX){"commissioning_sentinel"}else if known.is_some(){"retained_generation"}else{"unknown"},
             "readback_status":readback_status,"message":message})
     }).collect::<Vec<_>>();
@@ -742,6 +842,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
     Json(json!({"version":1,"backend_instance":hex(&identity),"principal":{"username":principal.username,"context":principal_context(&identity,&headers,&principal)},"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state)),"flight_state":state.local_flight_state_snapshot()as u8,"automatic_actions_inhibited":state.launch_history.lock().unwrap().automatic_actions_inhibited(),
         "clock":{"network_utc_available":network_utc_available,"required_for_recovery":true},
         "permissions":{"query":primary,"recover":can_recover,"reset_startup":can_reset_startup,"change_mode":false},"reset_startup_blocked_reason":reset_startup_blocked,
+        "resync_target_state":resync_target_state,"resync_target_label":resync_target_state.map(phase_label),
         "reset_startup_policy":reset_startup_policy,
         "confirmation":confirmation,"host_recovery":host_pending.map(|pending|json!({"pending":!pending.published,"verified":pending.verified,"publication_acknowledged":pending.published,"targets":pending.targets.iter().map(|target|target.board.as_str()).collect::<Vec<_>>()})),
         "rejected_statuses":rejected_statuses,"last_rejection":last_rejection,
@@ -1445,7 +1546,7 @@ mod tests {
         .unwrap()
     }
     #[tokio::test]
-    async fn hardened_transport_bit_is_readonly_and_unknown_flags_remain_rejected() {
+    async fn hardened_transport_bit_is_readonly_and_resync_bit_is_ab_vb_only() {
         let fixture = http_fixture().await;
         let state = fixture.state.clone();
         let host = Arc::new(sedsnet::router::Router::new(
@@ -1469,9 +1570,10 @@ mod tests {
         let mut wire = status_wire(&state, 7);
         wire[3] |= 0x20;
         assert!(Readback::decode(&wire).is_some());
-        let mut unknown = wire;
-        unknown[3] |= 0x80;
-        assert!(Readback::decode(&unknown).is_none());
+        // Bit 7 advertises Resync. It decodes, but only an AB/VB may claim it.
+        let mut resync = wire;
+        resync[3] |= RESYNC_IMPLEMENTATION;
+        assert!(Readback::decode(&resync).is_some());
         wire[3] |= 0x40;
         let mut metadata = wire;
         metadata[2] = 255;
@@ -1479,6 +1581,11 @@ mod tests {
         assert_eq!(
             observe(&state, &status_packet("DAQ", metadata)),
             Err("Metadata node advertised physical manual Stop capability")
+        );
+        metadata[3] = 0x24 | RESYNC_IMPLEMENTATION;
+        assert_eq!(
+            observe(&state, &status_packet("DAQ", metadata)),
+            Err("Board advertised Resync without a resync owner")
         );
         observe(&state, &status_packet("AB", wire)).unwrap();
         let response = http(

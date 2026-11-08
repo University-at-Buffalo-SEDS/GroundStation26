@@ -3212,7 +3212,9 @@ pub(crate) fn cold_flow_active(state: &AppState) -> bool {
 /// Launch waiting on its Valve Board, or the latch left by an earlier Stop, is
 /// not work: this reset is the way out of both.
 /// Plain-language reason `operator_reset_host_idle` is false, for the operator.
-pub(crate) fn operator_reset_block_reason(state: &AppState) -> Option<String> {
+/// Host work that blocks a reset or resync, from RAM owners only: never waits
+/// on the network router, so a recovery in flight can recheck it.
+pub(crate) fn operator_work_block_reason(state: &AppState) -> Option<String> {
     {
         let rt = state.gse.lock().unwrap();
         if engine_blocks_operator_reset(&rt) {
@@ -3229,6 +3231,12 @@ pub(crate) fn operator_reset_block_reason(state: &AppState) -> Option<String> {
     if state.manual_abort_intent.pending_epoch().is_some() || state.deferred_abort.manual_pending() {
         return Some("A manual Abort is still being delivered.".into());
     }
+    None
+}
+pub(crate) fn operator_reset_block_reason(state: &AppState) -> Option<String> {
+    if let Some(reason) = operator_work_block_reason(state) {
+        return Some(reason);
+    }
     let Some(router) = state.topology_router.get() else {
         return Some("The hardware network router is not running.".into());
     };
@@ -3240,6 +3248,19 @@ pub(crate) fn operator_reset_block_reason(state: &AppState) -> Option<String> {
         }
     }
     None
+}
+/// A latched tank overpressure, at the station or freshly reported by the Valve
+/// Board, is an active safety condition: a board Abort may still be protecting
+/// the tank. Resync never clears an Abort while this holds.
+// Safety catalog (About safety): board-resync. Keep backend/src/safety_catalog_rules.rs in step.
+#[cfg(test)]
+pub(crate) fn set_overpressure_latch_for_test(state: &AppState, latch: Option<overpressure::Latch>) {
+    state.gse.lock().unwrap().overpressure.latch = latch;
+}
+pub(crate) fn overpressure_holds_abort(state: &AppState) -> bool {
+    let rt = state.gse.lock().unwrap();
+    let now = rt.now();
+    rt.overpressure.latched() || rt.overpressure.board_owns(now)
 }
 pub(crate) fn operator_reset_host_idle(state: &AppState) -> bool {
     {

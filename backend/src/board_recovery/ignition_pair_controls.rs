@@ -20,7 +20,7 @@ async fn ignition_valid_fixture() -> Fixture {
                     fail_result: None,
                     output_override: None,
                     fail_first_readback: false,
-                    retained_first: None,
+                    retained_first: None, resync: false,
                 })),
             )
         })
@@ -440,7 +440,7 @@ async fn ignition_pair_actual_core_busy_then_route_loss_has_zero_sdk_owners() {
                     fail_result: None,
                     output_override: None,
                     fail_first_readback: false,
-                    retained_first: None,
+                    retained_first: None, resync: false,
                 })),
             )
         })

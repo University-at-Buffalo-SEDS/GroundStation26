@@ -150,11 +150,17 @@ impl RecoveryIntent {
             self.body[24..32] == issuer_bytes,
             "Sealed intent issuer differs from original backend identity"
         );
+        // RECOVER (1) targets Startup, or Idle on AB/VB. RESYNC (2) targets a
+        // fill phase or Armed on AB/VB only, from a known boot generation.
+        let resync = self.body[1] == 2
+            && matches!(board, "AB" | "VB")
+            && (2..=6).contains(&self.body[2])
+            && self.boot() != u64::MAX;
         ensure!(
             self.body[0] == 1
-                && self.body[1] == 1
+                && (self.body[1] == 1 || resync)
                 && self.body[3] == 0
-                && (self.body[2] == 0 || self.body[2] == 1 && matches!(board, "AB" | "VB"))
+                && (resync || self.body[2] == 0 || self.body[2] == 1 && matches!(board, "AB" | "VB"))
                 && self.source_utc_ms != 0
                 && self.nonce() != 0
                 && self.boot() != 0
@@ -215,7 +221,9 @@ impl RecoveryPending {
                     && target.epoch != 0
                     && target.epoch < u32::MAX - 1
                     && (target.desired == 0
-                        || (target.desired == 1 && matches!(target.board.as_str(), "AB" | "VB"))),
+                        || (target.desired == 1 && matches!(target.board.as_str(), "AB" | "VB"))
+                        || (target.intent.body[1] == 2 && target.kind == RecoveryIntentKind::Normal
+                            && matches!(target.board.as_str(), "AB" | "VB"))),
                 "Invalid pending recovery target"
             );
             target.intent.validate(&target.board)?;
@@ -1397,3 +1405,6 @@ mod tests;
 #[cfg(test)]
 #[path = "launch_history/reset_policy_tests.rs"]
 mod reset_policy_tests;
+#[cfg(test)]
+#[path = "launch_history/resync_journal_tests.rs"]
+mod resync_journal_tests;

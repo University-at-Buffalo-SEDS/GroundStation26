@@ -352,6 +352,19 @@ const STOP: &[Spec] = &[
         enforced_in: &["backend/src/board_recovery.rs:safe_output_mask", "backend/src/board_abort.rs:note_reset_completed"],
         config_keys: &[],
     },
+    Spec {
+        id: "board-resync",
+        title: "Resync a board",
+        summary: "Resync sets one Actuator or Valve Board's state machine, phase and recovery epoch to the station's current phase without resetting it to Startup or Idle. No outputs move: it never commands, replays or restores valves, servos, supplies, igniter or stepper, and the board refuses unless its outputs already read safe. Allowed only in the fill phases and Armed, with no sequence moving valves.",
+        details: &[
+            "Same flow as Review recovery: PREPARE takes a fresh dedicated query and freezes the board and the phase; the typed confirmation names both (RESYNC AB TO NITROUSFILL); CONFIRM rechecks session, mode, Stop epoch and that the station is still in that phase. The board checks boot, epoch, nonce and source time and advances its epoch.",
+            "It clears a board Abort only while the station is not Aborted and no tank overpressure is latched; otherwise it refuses and points to Review recovery or Reset all boards.",
+            "Refused in Startup and Idle (use Review recovery or Reset all boards) and from Launch onward. The flight computer and the metadata boards are not resynced: the FC owns its flight states, and the others already follow the published phase.",
+        ],
+        modes: ALL,
+        enforced_in: &["backend/src/board_recovery.rs:resync_target", "backend/src/board_recovery.rs:resync_work_block_reason", "backend/src/gse.rs:overpressure_holds_abort", "ActuatorBoard26/Core/Src/board_recovery_wire.c", "ValveBoard26/Core/Src/thread_comm.c"],
+        config_keys: &[],
+    },
 ];
 
 const PHASES: &[Spec] = &[
