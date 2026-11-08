@@ -40,15 +40,29 @@ const TANK: &[Spec] = &[
     },
     Spec {
         id: "overpressure-debounce",
-        title: "Overpressure debounce and freshness",
-        summary: "A threshold trips on {station.overpressure_debounce_samples} consecutive fresh valve-board samples (about 20 ms apart at 50 Hz). Single-sample spikes, repeated captures and samples older than {station.pressure_fresh_ms} ms never trip.",
+        title: "Overpressure sustained time and freshness",
+        summary: "A threshold trips only when fresh valve-board readings stay at or above it continuously for {station.overpressure_sustain_ms} ms, measured on capture timestamps (about 13 samples at 50 Hz). Brief spikes, repeated captures and samples older than {station.pressure_fresh_ms} ms never trip.",
         details: &[
+            "Real tank pressure rises over seconds; a floating transducer input or a solenoid switching glitch lasts tens of milliseconds. A gap longer than the sustained time between readings restarts it.",
             "Only the valve-board FUEL_TANK_PRESSURE lane is used; the station's calibrated IADC never substitutes.",
             "Invalid threshold settings fall back to 850/950 psi and 3 s: protection is never disabled.",
         ],
         modes: ALL,
         enforced_in: &["backend/src/gse/overpressure.rs:Monitor::observe"],
-        config_keys: &["station.overpressure_debounce_samples", "station.pressure_fresh_ms"],
+        config_keys: &["station.overpressure_sustain_ms", "station.pressure_fresh_ms"],
+    },
+    Spec {
+        id: "overpressure-plausibility",
+        title: "Implausible tank pressure sensor",
+        summary: "A step of more than {station.overpressure_max_step_psi} psi per {station.overpressure_step_ms} ms between consecutive valve-board readings is not tank pressure (typically an unconnected, floating transducer). It resets the trip timers and is reported as \"tank pressure sensor implausible or not connected\", never as an overpressure. Readings count again only after {station.overpressure_settle_ms} ms with no further implausible step.",
+        details: &[
+            "The fault shows in the GSE panel and in /api/gse/status (overpressure.sensor), with the Valve Board's own sensor reports (invalid, stale, implausible).",
+            "Acknowledging an overpressure latch is refused while readings settle.",
+            "A genuine high reading after an implausible step still trips, delayed by the settle time.",
+        ],
+        modes: ALL,
+        enforced_in: &["backend/src/gse/overpressure.rs:Monitor::observe", "backend/src/gse/overpressure.rs:board_warning"],
+        config_keys: &["station.overpressure_max_step_psi", "station.overpressure_step_ms", "station.overpressure_settle_ms"],
     },
     Spec {
         id: "overpressure-latch",
@@ -76,8 +90,8 @@ const TANK: &[Spec] = &[
         title: "What the Valve Board enforces on its own",
         summary: "The Valve Board enforces tank overpressure itself, without the link: at or above 850 psi it opens Dump and Vent, commands the Actuator Board to close Nitrogen and Nitrous and sends it the overpressure abort, so the Actuator Board enters its Abort safe state (all AB outputs off, fill-line retraction stopped); at or above 950 psi it also opens PILOT for 3 s, then closes PILOT and takes its own Abort. On Abort or a 5 s heartbeat loss (between Idle and Launch) it forces Vent and Dump open and PILOT closed, then latches.",
         details: &[
-            "Board thresholds are fixed at 850/950 psi and 3 s with 2 consecutive fresh samples; this station's overpressure settings change only the station's own layer.",
-            "From Launch admission (or flight state Launch onward) the board only reports. A full-scale, clamped or miscalibrated reading is reported as a sensor fault and never trips.",
+            "Board thresholds are fixed at 850/950 psi and 3 s, with the same 250 ms sustained time, 150 psi per 20 ms plausibility limit and 1 s settle time as the station; this station's overpressure settings change only the station's own layer.",
+            "From Launch admission (or flight state Launch onward) the board only reports. A full-scale, clamped or miscalibrated reading, or an implausible step (floating, unconnected transducer), is reported as a sensor fault and never trips.",
             "The board latch refuses closing Dump or Vent, opening PILOT and Launch admission until acknowledged with a fresh reading below 850 psi. The station adopts a reported board latch, refuses the same re-closes and forwards its acknowledgement.",
             "The Actuator Board drives Nitrogen, Nitrous and the igniter low on Abort. It acts on the overpressure abort (and on the Valve Board's tank overpressure Abort report) before Launch, Startup included, and ignores it after Launch.",
             "When the station adopts a board relief it had not latched itself, it also sends the Actuator Board overpressure abort (a harmless duplicate of the board's own).",
@@ -457,11 +471,11 @@ const BOARDS: &[Spec] = &[
     Spec {
         id: "board-vb-overpressure",
         title: "Tank overpressure on the boards (850/950 psi)",
-        summary: "On two fresh samples at or above 850 psi the Valve Board opens Dump and Vent, tells the Actuator Board to close Nitrogen and Nitrous and sends it the overpressure abort; at or above 950 psi it also opens PILOT for 3 s, closes it and latches its own Abort. At 850 and 950 psi the Actuator Board enters its Abort safe state: Nitrogen and Nitrous closed, igniter off, fill-line retraction stopped and unpowered, all AB outputs off. Active from Startup; from Launch (launch latch, accepted launch or Launch..Recovery) neither board acts on it and the Valve Board only reports.",
+        summary: "On fresh samples at or above 850 psi for 250 ms the Valve Board opens Dump and Vent, tells the Actuator Board to close Nitrogen and Nitrous and sends it the overpressure abort; at or above 950 psi it also opens PILOT for 3 s, closes it and latches its own Abort. At 850 and 950 psi the Actuator Board enters its Abort safe state: Nitrogen and Nitrous closed, igniter off, fill-line retraction stopped and unpowered, all AB outputs off. Active from Startup; from Launch (launch latch, accepted launch or Launch..Recovery) neither board acts on it and the Valve Board only reports.",
         details: &[
             "The Actuator Board takes its Abort from the Valve Board's overpressure abort command (automatic ACTUATOR_COMMAND 16, sent at 850 psi) and also treats the Valve Board's tank overpressure automatic Abort report as overpressure, in Startup too. It ignores either after Launch and when stale after a board recovery.",
             "The station sends the same Actuator Board overpressure abort at its own relief and immediately at its abort pressure; its broadcast Abort still follows the 3 s main-valve window.",
-            "Stale or invalid pressure only reports. The Valve Board relief clears on a GS acknowledgement once a fresh sample is below 850 psi; any Abort (Valve Board or Actuator Board) needs Reset all boards.",
+            "Stale, invalid or implausible pressure (a step over 150 psi per 20 ms, then 1 s to settle) only reports. The Valve Board relief clears on a GS acknowledgement once a fresh sample is below 850 psi; any Abort (Valve Board or Actuator Board) needs Reset all boards.",
         ],
         modes: ALL,
         enforced_in: &["ValveBoard26/Core/Src/overpressure.c:88", "ValveBoard26/Core/Src/thread_comm.c:220", "ActuatorBoard26/Core/Src/telemetry.c:266", "ActuatorBoard26/Core/Src/telemetry.c:305", "ActuatorBoard26/Core/Src/thread_comm.c:455"],

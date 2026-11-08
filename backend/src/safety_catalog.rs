@@ -110,7 +110,10 @@ fn station_values(state: &AppState) -> Value {
         "unconfirmed_valve_timeout_ms": crate::state::UMBILICAL_PENDING_VALVE_TIMEOUT.as_millis() as u64,
         "board_recent_ms": 3000,
         "refill_noop_kg": 0.2,
-        "overpressure_debounce_samples": crate::gse::overpressure::DEBOUNCE_SAMPLES,
+        "overpressure_sustain_ms": crate::gse::overpressure::SUSTAIN_MS,
+        "overpressure_max_step_psi": crate::gse::overpressure::MAX_STEP_PSI,
+        "overpressure_step_ms": crate::gse::overpressure::STEP_MS,
+        "overpressure_settle_ms": crate::gse::overpressure::SETTLE_MS,
         "stuck_supply_pressure_rise_psi": gse_sequence::STUCK_SUPPLY_PRESSURE_RISE_PSI,
         "supply_enforcement_enabled": state.supply_enforcement_enabled(),
         "key_enabled": policy.key_enabled,
@@ -274,7 +277,7 @@ mod tests {
         let ids: std::collections::BTreeSet<_> = all.iter().map(|r| r.id).collect();
         assert_eq!(ids.len(), all.len(), "rule ids are unique");
         for required in [
-            "overpressure-relief", "overpressure-abort", "overpressure-after-t0", "overpressure-debounce",
+            "overpressure-relief", "overpressure-abort", "overpressure-after-t0", "overpressure-debounce", "overpressure-plausibility",
             "overpressure-latch", "nitrous-overfill", "failure-pause", "failure-dump", "stuck-supply",
             "nitrogen-hold", "nitrogen-hold-choice", "pause-resume-cancel", "launch-board-abort",
             "launch-lock-reset", "launch-turbocharge", "launch-failure-pause", "launch-signoff",

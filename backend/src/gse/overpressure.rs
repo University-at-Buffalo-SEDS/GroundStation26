@@ -17,15 +17,37 @@
 //!   Board command is AB-only and never touches the main valve, so it does
 //!   not wait for the window.
 //!
+//! A threshold counts only when readings stay at or above it for
+//! `SUSTAIN_MS`. A physically impossible step between readings (an
+//! unconnected, floating transducer) is a sensor fault, reported to the
+//! operator and in the status, never a trip; readings must then settle for
+//! `SETTLE_MS` before they count again. The Valve Board applies the same rules.
+//!
 //! Once Launch is admitted or Fire is committed (T0 onward) the main valve is
 //! already open for firing: the monitor only logs and alarms, never commands.
 //! The latch never re-closes anything automatically; the operator
 //! acknowledges it after a fresh reading is back below the relief pressure.
 use super::*;
 
-/// Consecutive distinct valve-board samples (50 Hz, so about 20 ms apart)
-/// required at or above a threshold. A single-sample spike never trips.
-pub(crate) const DEBOUNCE_SAMPLES: u8 = 2;
+/// A threshold trips only when every counted valve-board reading has stayed
+/// at or above it for this long, measured on capture timestamps (about 13
+/// samples at 50 Hz), so it does not depend on the sample rate. Real tank
+/// pressure rises over seconds; a floating (unconnected) transducer input or a
+/// solenoid switching glitch lasts tens of milliseconds. A gap longer than
+/// this between readings restarts the timer. Same value as the Valve Board.
+pub(crate) const SUSTAIN_MS: u64 = 250;
+/// A step larger than `MAX_STEP_PSI` per `STEP_MS` (7500 psi/s) between
+/// consecutive readings is not tank pressure. It resets the trip timers and
+/// raises an implausible-sensor fault, never a trip. Same as the Valve Board.
+pub(crate) const MAX_STEP_PSI: f32 = 150.0;
+pub(crate) const STEP_MS: u64 = 20;
+/// After an implausible step readings count again only once this long has
+/// passed with no further implausible step, so a glitch that sits high for a
+/// few samples cannot trip. Same as the Valve Board.
+pub(crate) const SETTLE_MS: u64 = 1_000;
+/// A sensor fault stays reported to the operator this long after the last
+/// implausible step, and is notified at most once per this interval.
+const SENSOR_FAULT_SHOW_MS: u64 = 60_000;
 /// A sample older than this is stale and neither counts nor clears a streak.
 const FRESH_MS: u64 = 2000;
 
@@ -52,14 +74,37 @@ pub(crate) struct Latch {
     pub(crate) ab_abort_sent: bool,
 }
 
+/// The valve-board tank pressure made a physically impossible step: most
+/// likely the transducer is not connected and the ADC input is floating.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SensorFault {
+    pub(crate) from_psi: f32,
+    pub(crate) to_psi: f32,
+    pub(crate) step_ms: u64,
+    pub(crate) at_ms: u64,
+    /// Implausible steps since the fault was first raised.
+    pub(crate) count: u32,
+    first_at_ms: u64,
+    notified_at_ms: Option<u64>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Monitor {
     last_sample_at: Option<u64>,
-    relief_streak: u8,
-    abort_streak: u8,
+    /// Last fresh reading, the reference for the plausible-rate check.
+    last_valid: Option<Sample>,
+    /// Capture time since which readings stayed at or above each threshold.
+    relief_since: Option<u64>,
+    abort_since: Option<u64>,
+    /// Capture time of the last implausible step while readings settle.
+    settle_from: Option<u64>,
+    pub(crate) sensor_fault: Option<SensorFault>,
     pub(crate) latch: Option<Latch>,
     /// The Valve Board's own latch, from its WARNING reports.
     pub(crate) board: Option<BoardReport>,
+    /// The Valve Board's latest sensor fault report (F invalid, S stale,
+    /// I implausible), shown to the operator; never a trip.
+    pub(crate) board_sensor: Option<BoardReport>,
     board_ack_at: Option<u64>,
 }
 
@@ -67,7 +112,8 @@ pub(crate) struct Monitor {
 /// 3 s; this station's configuration does not change them) and reports them
 /// as WARNING text such as "Valve Board overpressure relief: 912 psi [R3]".
 /// The tag is the stage (R relief, P main valve open, A Abort, L launch
-/// alarm, C acknowledged, F/S sensor invalid/stale) and the trip number. A
+/// alarm, C acknowledged, F/S/I sensor invalid/stale/implausible) and the
+/// trip number. A
 /// live latch is re-announced every second.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BoardReport {
@@ -89,7 +135,7 @@ pub(crate) fn parse_board_report(text: &str) -> Option<(char, u32, u32)> {
     let body = text.strip_prefix(BOARD_PREFIX)?.strip_suffix(']')?;
     let open = body.rfind(" [")?;
     let mut tag = body[open + 2..].chars();
-    let code = tag.next().filter(|c| "RPALCFS".contains(*c))?;
+    let code = tag.next().filter(|c| "RPALCFSI".contains(*c))?;
     let trip = tag.as_str().parse().ok()?;
     let psi = if code == 'S' {
         0
@@ -136,29 +182,98 @@ fn fresh(sample: Option<Sample>, now: u64) -> Option<Sample> {
 }
 
 impl Monitor {
-    /// Count each new fresh sample once. Returns the debounced level.
-    // Safety catalog (About safety): overpressure-debounce. Keep backend/src/safety_catalog_rules.rs in step.
+    /// Count each new fresh sample once. Returns the sustained level.
+    // Safety catalog (About safety): overpressure-debounce, overpressure-plausibility. Keep backend/src/safety_catalog_rules.rs in step.
     pub(crate) fn observe(&mut self, sample: Option<Sample>, now: u64, t: &Thresholds) -> Level {
-        if let Some(sample) = fresh(sample, now)
-            && self.last_sample_at.is_none_or(|last| sample.at_ms > last)
-        {
-            self.last_sample_at = Some(sample.at_ms);
-            let bump = |streak: &mut u8, over: bool| {
-                *streak = if over { streak.saturating_add(1) } else { 0 };
-            };
-            bump(&mut self.relief_streak, sample.value >= t.relief_psi);
-            bump(&mut self.abort_streak, sample.value >= t.abort_psi);
-            if let Some(latch) = &mut self.latch {
-                latch.peak_psi = latch.peak_psi.max(sample.value);
-            }
-            if self.abort_streak >= DEBOUNCE_SAMPLES {
-                return Level::Abort(sample.value);
-            }
-            if self.relief_streak >= DEBOUNCE_SAMPLES {
-                return Level::Relief(sample.value);
+        let Some(sample) = fresh(sample, now) else {
+            return Level::Normal;
+        };
+        if self.last_sample_at.is_some_and(|last| sample.at_ms <= last) {
+            return Level::Normal;
+        }
+        self.last_sample_at = Some(sample.at_ms);
+        let previous = self.last_valid.replace(sample);
+        let gap = previous.map(|p| sample.at_ms - p.at_ms);
+        if let (Some(p), Some(gap)) = (previous, gap) {
+            let limit = MAX_STEP_PSI * gap.max(STEP_MS) as f32 / STEP_MS as f32;
+            if (sample.value - p.value).abs() > limit {
+                self.settle_from = Some(sample.at_ms);
+                let fault = self.sensor_fault.get_or_insert(SensorFault {
+                    from_psi: p.value,
+                    to_psi: sample.value,
+                    step_ms: gap,
+                    at_ms: sample.at_ms,
+                    count: 0,
+                    first_at_ms: sample.at_ms,
+                    notified_at_ms: None,
+                });
+                fault.from_psi = p.value;
+                fault.to_psi = sample.value;
+                fault.step_ms = gap;
+                fault.at_ms = sample.at_ms;
+                fault.count = fault.count.saturating_add(1);
             }
         }
-        Level::Normal
+        if self
+            .settle_from
+            .is_some_and(|from| sample.at_ms - from >= SETTLE_MS)
+        {
+            self.settle_from = None;
+        }
+        if self.settle_from.is_some() {
+            self.relief_since = None;
+            self.abort_since = None;
+            return Level::Normal;
+        }
+        let restart = gap.is_none_or(|gap| gap > SUSTAIN_MS);
+        let sustained = |since: &mut Option<u64>, over: bool| {
+            if !over {
+                *since = None;
+                return false;
+            }
+            if since.is_none() || restart {
+                *since = Some(sample.at_ms);
+            }
+            since.is_some_and(|from| sample.at_ms - from >= SUSTAIN_MS)
+        };
+        let relief = sustained(&mut self.relief_since, sample.value >= t.relief_psi);
+        let abort = sustained(&mut self.abort_since, sample.value >= t.abort_psi);
+        if let Some(latch) = &mut self.latch {
+            latch.peak_psi = latch.peak_psi.max(sample.value);
+        }
+        if abort {
+            Level::Abort(sample.value)
+        } else if relief {
+            Level::Relief(sample.value)
+        } else {
+            Level::Normal
+        }
+    }
+    /// Readings are settling after an implausible step: they are neither
+    /// trip nor acknowledgement evidence.
+    pub(crate) fn settling(&self) -> bool {
+        self.settle_from.is_some()
+    }
+    /// The station's sensor fault while it is still recent.
+    pub(crate) fn sensor_fault_recent(&self, now: u64) -> Option<&SensorFault> {
+        self.sensor_fault
+            .as_ref()
+            .filter(|f| self.settling() || now.saturating_sub(f.at_ms) <= SENSOR_FAULT_SHOW_MS)
+    }
+    /// Operator notice for a new implausible step, at most once a minute.
+    fn take_sensor_notice(&mut self, now: u64) -> Option<String> {
+        let fault = self.sensor_fault.as_mut()?;
+        if fault.at_ms != self.settle_from? {
+            return None;
+        }
+        if fault
+            .notified_at_ms
+            .is_some_and(|at| now.saturating_sub(at) < SENSOR_FAULT_SHOW_MS)
+        {
+            return None;
+        }
+        fault.notified_at_ms = Some(now);
+        Some(sensor_fault_message(fault))
     }
     pub(crate) fn latched(&self) -> bool {
         self.latch.is_some()
@@ -173,6 +288,13 @@ impl Monitor {
             matches!(b.code, 'R' | 'P' | 'A') && now.saturating_sub(b.at_ms) <= BOARD_FRESH_MS
         })
     }
+}
+
+pub(crate) fn sensor_fault_message(fault: &SensorFault) -> String {
+    format!(
+        "Tank pressure sensor implausible or not connected: valve-board reading jumped {:.0} -> {:.0} psi in {} ms. Overpressure protection ignores readings until they settle; this is not an overpressure.",
+        fault.from_psi, fault.to_psi, fault.step_ms
+    )
 }
 
 /// Launch admitted (T-clock sticky inhibit) or in flight. Read without the
@@ -260,12 +382,16 @@ enum Action {
 // Safety catalog (About safety): overpressure-relief, overpressure-abort, overpressure-after-t0. Keep backend/src/safety_catalog_rules.rs in step.
 pub(crate) fn evaluate(state: &Arc<AppState>) {
     let launched = launched(state);
-    let (action, abort) = {
+    let (action, abort, notice) = {
         let mut rt = state.gse.lock().unwrap();
         let now = rt.now();
         let thresholds = Thresholds::from_config(&rt.engine.config);
         let sample = rt.valve_pressure;
         let level = rt.overpressure.observe(sample, now, &thresholds);
+        let notice = rt.overpressure.take_sensor_notice(now);
+        if let Some(notice) = &notice {
+            log::warn!("{notice}");
+        }
         let burn = launched || fire_committed(&rt);
         let mut action = None;
         let mut abort = false;
@@ -394,7 +520,7 @@ pub(crate) fn evaluate(state: &Arc<AppState>) {
             }
             (None, Level::Normal) => {}
         }
-        (action, abort)
+        (action, abort, notice)
     };
     match action {
         Some(Action::Commands { effects, ab_abort }) => {
@@ -407,6 +533,9 @@ pub(crate) fn evaluate(state: &Arc<AppState>) {
             state.add_notification_with_persistence(message, true);
         }
         None => {}
+    }
+    if let Some(notice) = notice {
+        state.add_notification_with_persistence(notice, true);
     }
     if abort {
         dispatch_abort(state);
@@ -437,7 +566,19 @@ pub(crate) fn board_warning(state: &Arc<AppState>, text: &str) -> Option<String>
             .is_none_or(|b| b.code != code || b.trip != trip);
         match code {
             'C' => rt.overpressure.board = None,
-            'F' | 'S' => return Some(display),
+            'F' | 'S' | 'I' => {
+                // A sensor fault is reported, never adopted as a trip.
+                let repeat = rt.overpressure.board_sensor.as_ref().is_some_and(|b| {
+                    b.code == code && now.saturating_sub(b.at_ms) < SENSOR_FAULT_SHOW_MS
+                });
+                rt.overpressure.board_sensor = Some(BoardReport { code, psi, trip, at_ms: now });
+                return (!repeat).then(|| match code {
+                    'I' => format!(
+                        "{display}. Tank pressure sensor implausible or not connected (reading {psi} psi); not an overpressure."
+                    ),
+                    _ => display,
+                });
+            }
             _ => rt.overpressure.board = Some(BoardReport { code, psi, trip, at_ms: now }),
         }
         let settling = rt
@@ -630,6 +771,11 @@ pub(crate) fn acknowledge(state: &AppState) -> Result<(), String> {
         return Err("Main-valve overpressure relief is still running".into());
     }
     let thresholds = Thresholds::from_config(&rt.engine.config);
+    if rt.overpressure.settling() {
+        return Err(
+            "Tank pressure sensor implausible or not connected: wait for a settled reading to acknowledge".into(),
+        );
+    }
     match fresh(rt.valve_pressure, now) {
         Some(p) if p.value < thresholds.relief_psi => {}
         Some(p) => {
@@ -641,8 +787,8 @@ pub(crate) fn acknowledge(state: &AppState) -> Result<(), String> {
         None => return Err("A fresh valve-board tank pressure is required to acknowledge".into()),
     }
     rt.overpressure.latch = None;
-    rt.overpressure.relief_streak = 0;
-    rt.overpressure.abort_streak = 0;
+    rt.overpressure.relief_since = None;
+    rt.overpressure.abort_since = None;
     rt.engine.status.message = format!(
         "Tank overpressure acknowledged (peak {:.0} psi); valves unchanged, manual control",
         latch.peak_psi
@@ -692,6 +838,50 @@ pub(super) fn decorate_status(rt: &Runtime, response: &mut serde_json::Value) {
             })
         },
     );
+    response["overpressure"]["sensor"] = sensor_status(rt);
+}
+
+/// Tank pressure sensor health for the operator: an implausible step on the
+/// station's own check, or a Valve Board sensor fault report. Never a trip.
+fn sensor_status(rt: &Runtime) -> serde_json::Value {
+    let now = rt.now();
+    let station = rt.overpressure.sensor_fault_recent(now);
+    let board = rt
+        .overpressure
+        .board_sensor
+        .as_ref()
+        .filter(|b| now.saturating_sub(b.at_ms) <= SENSOR_FAULT_SHOW_MS);
+    let message = match (station, board) {
+        (Some(fault), _) => Some(sensor_fault_message(fault)),
+        (None, Some(b)) => Some(match b.code {
+            'I' => format!(
+                "Valve Board: tank pressure sensor implausible or not connected (reading {} psi); not an overpressure.",
+                b.psi
+            ),
+            'F' => format!("Valve Board: tank pressure sensor invalid (raw ADC {}); not an overpressure.", b.psi),
+            _ => "Valve Board: tank pressure sensor stale; overpressure protection has no reading.".to_string(),
+        }),
+        (None, None) => None,
+    };
+    serde_json::json!({
+        "fault": message.is_some(),
+        "implausible": station.is_some() || board.is_some_and(|b| b.code == 'I'),
+        "settling": rt.overpressure.settling(),
+        "message": message,
+        "station": station.map(|f| serde_json::json!({
+            "from_psi": f.from_psi,
+            "to_psi": f.to_psi,
+            "step_ms": f.step_ms,
+            "at_ms": f.at_ms,
+            "count": f.count,
+            "first_at_ms": f.first_at_ms,
+        })),
+        "valve_board": board.map(|b| serde_json::json!({
+            "code": b.code.to_string(),
+            "value": b.psi,
+            "at_ms": b.at_ms,
+        })),
+    })
 }
 
 pub(super) async fn acknowledge_route(
