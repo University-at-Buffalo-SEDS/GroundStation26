@@ -69,6 +69,7 @@ mod map;
 mod media;
 mod media_runtime;
 mod mission_phase;
+mod valve_report_health;
 mod mission_sync;
 mod network_health;
 mod network_traffic;
@@ -2205,6 +2206,10 @@ async fn main() -> anyhow::Result<()> {
         state.shutdown_subscribe(),
     ));
     let _mission_phase = tokio::spawn(crate::mission_phase::service(
+        state.clone(),
+        state.shutdown_subscribe(),
+    ));
+    let _valve_report_health = tokio::spawn(crate::valve_report_health::service(
         state.clone(),
         state.shutdown_subscribe(),
     ));

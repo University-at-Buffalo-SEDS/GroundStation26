@@ -2014,6 +2014,16 @@ async fn queue_db_write(
 // Status ownership follows the raw firmware command, before close aliases are
 // normalized. Relays preserve the original sender; compact addresses resolve
 // through the router's discovered hostname before the owner comparison.
+const UNOWNED_UMBILICAL_STATUS: &str = "umbilical status sender does not own command";
+
+fn umbilical_status_owner(command: u8) -> Option<Board> {
+    match command {
+        0..=6 => Some(Board::ValveBoard),
+        7..=13 => Some(Board::ActuatorBoard),
+        _ => None,
+    }
+}
+
 fn owned_umbilical_status(
     state: &AppState,
     pkt: &Packet,
@@ -2027,13 +2037,9 @@ fn owned_umbilical_status(
     if data[1] > 1 {
         return Err("umbilical status state must be 0 or 1");
     }
-    let owner = match data[0] {
-        0..=6 => Board::ValveBoard,
-        7..=13 => Board::ActuatorBoard,
-        _ => return Err("unknown umbilical status command"),
-    };
+    let owner = umbilical_status_owner(data[0]).ok_or("unknown umbilical status command")?;
     if state.board_from_network_sender(pkt.sender()) != Some(owner) {
-        return Err("umbilical status sender does not own command");
+        return Err(UNOWNED_UMBILICAL_STATUS);
     }
     Ok((owner, data[0], data[1] == 1))
 }
@@ -2093,6 +2099,21 @@ pub(crate) fn capture_umbilical_status_at_ingress(
         Ok(capture) => Some(capture),
         Err(detail) => {
             let sender_id = pkt.sender().to_string();
+            if detail == UNOWNED_UMBILICAL_STATUS {
+                if let Some(board) = pkt
+                    .data_as_u8()
+                    .ok()
+                    .and_then(|data| data.first().copied())
+                    .and_then(umbilical_status_owner)
+                {
+                    crate::valve_report_health::observe(
+                        board,
+                        u8::MAX,
+                        false,
+                        crate::valve_report_health::Refusal::Unowned,
+                    );
+                }
+            }
             report_parse_error(state, &sender_id, &pkt.data_type().as_str(), detail);
             let row = TelemetryRow {
                 timestamp_ms: get_current_timestamp_ms() as i64,
@@ -2169,6 +2190,16 @@ fn apply_captured_status_inner(
                 pkt.timestamp() as i64,
                 pkt.packet_id(),
                 receipt,
+            );
+            // Operator-facing freshness only; valve evidence is unchanged.
+            crate::valve_report_health::observe(
+                owner,
+                key_cmd_id,
+                fresh_confirmation,
+                crate::valve_report_health::classify_refusal(
+                    pkt.timestamp() as i64,
+                    receipt.network_ms,
+                ),
             );
             if fresh_confirmation {
                 crate::gse::qd_confirmation(state, &sender_id, key_cmd_id, key_on, pkt.timestamp());

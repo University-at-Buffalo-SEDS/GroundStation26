@@ -2349,6 +2349,8 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     }
     turbocharge::decorate_status(&state, &mut response);
     overpressure::decorate_status(&state.gse.lock().unwrap(), &mut response);
+    response["valve_reports"] = serde_json::to_value(crate::valve_report_health::status(&state))
+        .expect("valve report health serializable");
     response["sequence_progress"]=progress::envelope(&state);
     response["cold_flow"]=serde_json::to_value(cold_flow::status(&state)).expect("Cold-flow status serializable");
     Json(response).into_response()
