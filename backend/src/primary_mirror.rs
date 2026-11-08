@@ -406,7 +406,7 @@ pub fn encode_control_observation(state: &AppState, max_bytes: usize) -> Vec<u8>
 }
 /// RRLS simulation only: a basic observation with every control disabled and
 /// every valve, board and CPU sample unknown. Never derived from live state.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn simulated_idle_observation() -> Vec<u8> {
     Observation {
         flags: 0,

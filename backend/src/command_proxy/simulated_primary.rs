@@ -2,8 +2,8 @@
 //! It answers capability/observation queries with an all-unknown idle
 //! observation and answers every forwarded command as Unavailable. Nothing is
 //! ever executed, queued or dispatched.
-// The simulated primary runs only where a pseudo-terminal radio exists (Linux).
-#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
+// The simulated primary needs a Unix pseudo-terminal (Linux or macOS).
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 use super::{Received, Runtime, Transport, wire::Outcome};
 use crate::{rrls::Role, station_mode::Mode, station_pairing::Pairing};
 

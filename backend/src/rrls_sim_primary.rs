@@ -10,8 +10,8 @@
 //! network output is opened. A fresh simulated installation pairing and
 //! redirected state paths keep every saved trust, mode and configuration file
 //! inside `GS_RRLS_SIM_ROOT`, so the real primary pairing is never used.
-// The simulated primary runs only where a pseudo-terminal radio exists (Linux).
-#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
+// The simulated primary needs a Unix pseudo-terminal (Linux or macOS).
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 use crate::comms_config::{CommsLinkConfig, CommsLinksConfig, SerialLinkConfig, SerialProtocol};
 use crate::rrls::{Mesh, Outgoing, Role};
 use crate::station_pairing::Pairing;
@@ -318,7 +318,7 @@ fn take_frame(buffer: &mut Vec<u8>) -> Option<(bool, Vec<u8>)> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod pty {
     use std::fs::File;
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -337,8 +337,9 @@ mod pty {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                // *mut coerces to Linux's *const; macOS declares these *mut.
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         };
         if status != 0 {
@@ -363,9 +364,15 @@ mod pty {
                 return Err(std::io::Error::last_os_error());
             }
         }
-        let path = std::fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd()))?
-            .to_string_lossy()
-            .into_owned();
+        // ttyname works on Linux and macOS (no /proc on macOS). Called once at
+        // startup before any other thread uses ttyname.
+        // SAFETY: the slave descriptor is a valid open terminal.
+        let name = unsafe { libc::ttyname(slave.as_raw_fd()) };
+        if name.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: ttyname returned a NUL-terminated string valid until the next call.
+        let path = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned();
         Ok(Pty {
             master,
             _slave: slave,
@@ -375,7 +382,7 @@ mod pty {
 }
 
 /// Byte pump between the pseudo-terminal master and the simulated primary.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn run(mut master: std::fs::File, mut primary: SimulatedPrimary) {
     use std::io::{ErrorKind, Read, Write};
     let started = std::time::Instant::now();
@@ -431,7 +438,7 @@ fn run(mut master: std::fs::File, mut primary: SimulatedPrimary) {
 /// Opens the pseudo-terminal, starts the simulated primary and returns the
 /// RRLS link configuration pointing at it. Called only when [`enabled`].
 pub(crate) fn comms_links() -> anyhow::Result<CommsLinksConfig> {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         let root = root()?;
         let pairing = Pairing::from_file(&root.join("primary/pairing.json"))
@@ -465,8 +472,8 @@ pub(crate) fn comms_links() -> anyhow::Result<CommsLinksConfig> {
             },
         })
     }
-    #[cfg(not(target_os = "linux"))]
-    anyhow::bail!("The RRLS simulated primary requires Linux pseudo-terminals")
+    #[cfg(not(unix))]
+    anyhow::bail!("The RRLS simulated primary requires Unix pseudo-terminals (Linux or macOS)")
 }
 
 #[cfg(test)]
@@ -640,7 +647,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn simulated_primary_runs_over_a_pseudo_terminal_without_radio() {
         use std::io::{Read, Write};
