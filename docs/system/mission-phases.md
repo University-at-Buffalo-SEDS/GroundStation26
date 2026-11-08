@@ -66,7 +66,8 @@ and `since_ms`.
   automatic path:
   - liveness abort;
   - general fault/ADC abort;
-  - overpressure abort;
+  - overpressure abort, including the Actuator Board overpressure abort
+    (`gse/overpressure_tests.rs::no_actuator_board_abort_after_launch_admission`);
   - queued automatic abort;
   - automatic supply closes;
   - dispatch filter;
@@ -133,6 +134,16 @@ second. A T-clock reset, which Reset all boards also performs, clears them.
 About safety has a Board behaviour section, inventoried from the firmware source. It
 lists what each board does on its own: heartbeat and fault aborts, the abort latch,
 overpressure, watchdog resets and igniter timing.
+
+Tank overpressure before Launch puts the Actuator Board in its Abort safe state
+(Nitrogen and Nitrous closed, igniter off, fill-line retraction stopped and
+unpowered, all AB outputs off) at both 850 and 950 psi. The Valve Board sends the
+AB the automatic overpressure-abort command (`ACTUATOR_COMMAND` 16 with the 0x80
+automatic tag, byte 0x90) at its 850 psi relief, and the AB also treats the Valve
+Board's tank overpressure Abort report as overpressure, in Startup too. The
+station sends the same command at its own 850 psi relief and immediately at
+950 psi; its broadcast Abort still follows the 3 s main-valve window. Nothing is
+sent or obeyed after Launch. Recovery is Reset all boards, as for any Abort.
 
 The inventory found these paths that can act after Launch. Firmware was not changed:
 

@@ -5,9 +5,10 @@ const TANK: &[Spec] = &[
     Spec {
         id: "overpressure-relief",
         title: "Tank overpressure relief",
-        summary: "At or above {gse.overpressure_relief_psi} psi valve-board tank pressure, in every mode and state before Launch, the station closes Nitrous and Nitrogen, opens Dump and Vent, and latches an error.",
+        summary: "At or above {gse.overpressure_relief_psi} psi valve-board tank pressure, in every mode and state before Launch, the station closes Nitrous and Nitrogen, opens Dump and Vent, puts the Actuator Board in its Abort safe state, and latches an error.",
         details: &[
-            "Order: Nitrous close, Nitrogen close, Dump open, Vent open. These are abort-safe directions and are sent even after a Stop or Abort.",
+            "Order: Nitrous close, Nitrogen close, Dump open, Vent open, then the Actuator Board overpressure abort (automatic ACTUATOR_COMMAND 16): Nitrogen and Nitrous closed, igniter off, fill-line retraction stopped and unpowered, all AB outputs off. These are abort-safe directions and are sent even after a Stop or Abort.",
+            "The Actuator Board command does not touch the Valve Board; no broadcast Abort is sent at this stage. Recovery is Reset all boards, as for any Abort.",
             "It overrides every sequence, pause, hold, Turbocharge, fill trim and Cold Flow: they are retired and nothing re-closes the relief path automatically.",
             "While latched, only relief-direction controls are accepted (close a supply, open Dump/Vent, close PILOT, Abort). Sequences, Turbocharge and Launch are refused.",
             "Tank rating (optional): {gse.tank_rating_psi} psi. Both thresholds must stay below it.",
@@ -19,9 +20,9 @@ const TANK: &[Spec] = &[
     Spec {
         id: "overpressure-abort",
         title: "Tank overpressure abort",
-        summary: "At or above {gse.overpressure_abort_psi} psi the station also opens the main valve (PILOT) for {gse.overpressure_pilot_ms} ms, then closes PILOT and sends Abort.",
+        summary: "At or above {gse.overpressure_abort_psi} psi the station puts the Actuator Board in its Abort safe state at once, opens the main valve (PILOT) for {gse.overpressure_pilot_ms} ms, then closes PILOT and sends Abort.",
         details: &[
-            "Order: relief (as above), PILOT open; after the window: PILOT close, then the automatic Abort. Abort is sent only after the window, so neither the station's abort fence nor the boards' abort safe state (which closes PILOT) can cut it short.",
+            "Order: relief (as above), PILOT open, and the Actuator Board overpressure abort immediately if the relief stage has not already sent it; after the window: PILOT close, then the broadcast automatic Abort. The Actuator Board command never touches PILOT, so it does not wait. The broadcast Abort is sent only after the window, so neither the station's abort fence nor the Valve Board's abort safe state (which closes PILOT) can cut it short.",
             "If Abort is not admitted (already aborted, Stop pending, Launch admitted) the station alarms; Dump and Vent stay open.",
         ],
         modes: ALL,
@@ -31,7 +32,7 @@ const TANK: &[Spec] = &[
     Spec {
         id: "overpressure-after-t0",
         title: "Overpressure after T0",
-        summary: "From Launch admission (or test-fire Fire commitment) onward the station only logs and alarms: PILOT is already open for firing, so no valve action and no Abort.",
+        summary: "From Launch admission (or test-fire Fire commitment) onward the station only logs and alarms: PILOT is already open for firing, so no valve action, no Actuator Board overpressure abort and no Abort.",
         details: &[],
         modes: ALL,
         enforced_in: &["backend/src/gse/overpressure.rs:launched", "backend/src/gse/overpressure.rs:fire_committed"],
@@ -73,12 +74,13 @@ const TANK: &[Spec] = &[
     Spec {
         id: "valve-board-autonomy",
         title: "What the Valve Board enforces on its own",
-        summary: "The Valve Board enforces tank overpressure itself, without the link: at or above 850 psi it opens Dump and Vent and commands the Actuator Board to close Nitrogen and Nitrous; at or above 950 psi it also opens PILOT for 3 s, then closes PILOT and takes its own Abort. On Abort or a 5 s heartbeat loss (between Idle and Launch) it forces Vent and Dump open and PILOT closed, then latches.",
+        summary: "The Valve Board enforces tank overpressure itself, without the link: at or above 850 psi it opens Dump and Vent, commands the Actuator Board to close Nitrogen and Nitrous and sends it the overpressure abort, so the Actuator Board enters its Abort safe state (all AB outputs off, fill-line retraction stopped); at or above 950 psi it also opens PILOT for 3 s, then closes PILOT and takes its own Abort. On Abort or a 5 s heartbeat loss (between Idle and Launch) it forces Vent and Dump open and PILOT closed, then latches.",
         details: &[
             "Board thresholds are fixed at 850/950 psi and 3 s with 2 consecutive fresh samples; this station's overpressure settings change only the station's own layer.",
             "From Launch admission (or flight state Launch onward) the board only reports. A full-scale, clamped or miscalibrated reading is reported as a sensor fault and never trips.",
             "The board latch refuses closing Dump or Vent, opening PILOT and Launch admission until acknowledged with a fresh reading below 850 psi. The station adopts a reported board latch, refuses the same re-closes and forwards its acknowledgement.",
-            "The Actuator Board drives Nitrogen, Nitrous and the igniter low on Abort.",
+            "The Actuator Board drives Nitrogen, Nitrous and the igniter low on Abort. It acts on the overpressure abort (and on the Valve Board's tank overpressure Abort report) before Launch, Startup included, and ignores it after Launch.",
+            "When the station adopts a board relief it had not latched itself, it also sends the Actuator Board overpressure abort (a harmless duplicate of the board's own).",
             "Requires Valve Board firmware with on-board overpressure protection.",
         ],
         modes: ALL,
@@ -313,7 +315,7 @@ const STOP: &[Spec] = &[
         id: "no-automatic-abort-after-launch",
         title: "No automatic abort after Launch",
         summary: "From Launch admission onward (the Launch, In flight and Landed mission phases) the station issues no automatic abort of any kind, valve correction or sequence action. Disconnect aborts apply only in Idle and Fill. Operator Abort and Stop stay available.",
-        details: &["Covered paths: board-offline (disconnect) aborts, unclassified-fault and ADC/tare-failure aborts, tank overpressure abort, queued automatic aborts and automatic supply closes, and acceptance of observed automatic aborts."],
+        details: &["Covered paths: board-offline (disconnect) aborts, unclassified-fault and ADC/tare-failure aborts, tank overpressure abort and the Actuator Board overpressure abort, queued automatic aborts and automatic supply closes, and acceptance of observed automatic aborts."],
         modes: ALL,
         enforced_in: &["backend/src/gse/automatic_abort.rs:stage_allows_automatic_abort", "backend/src/gse.rs:automatic_abort_allowed", "backend/src/mission_phase.rs:MissionPhase::automatic_aborts_allowed"],
         config_keys: &[],
@@ -321,7 +323,7 @@ const STOP: &[Spec] = &[
     Spec {
         id: "manual-stop",
         title: "Manual Stop and Abort",
-        summary: "Stop/Abort is admitted ahead of other commands, retires every automatic owner and latches the abort indicator; afterwards only abort-safe outputs (close supplies or PILOT, open Dump or Vent, igniter off) are sent until the abort is cleared.",
+        summary: "Stop/Abort is admitted ahead of other commands, retires every automatic owner and latches the abort indicator; afterwards only abort-safe outputs (close supplies or PILOT, open Dump or Vent, igniter off, the Actuator Board overpressure abort) are sent until the abort is cleared.",
         details: &[],
         modes: ALL,
         enforced_in: &["backend/src/gse.rs:abort_safe_control", "backend/src/gse.rs:handle_command_inner", "backend/src/gse.rs:clear_abort"],
@@ -451,21 +453,29 @@ const BOARDS: &[Spec] = &[
         config_keys: &[],
     },
     // VB Core/Src/overpressure.c:48-134,179-204; main_thread.c:300-376; thread_comm.c:218-278; overpressure.h:14-18
+    // AB Core/Src/telemetry.c Actuator command handler (CMD_OVERPRESSURE_ABORT) and Abort_handler; thread_comm.c thread_comm_request_automatic_abort
     Spec {
         id: "board-vb-overpressure",
-        title: "Valve Board overpressure (850/950 psi)",
-        summary: "On two fresh samples at or above 850 psi the Valve Board opens Dump and Vent and tells the Actuator Board to close Nitrogen and Nitrous; at or above 950 psi it also opens PILOT for 3 s, closes it and latches its own Abort. Active from Startup; from Launch (launch latch, accepted launch or Launch..Recovery) it only reports.",
-        details: &["Stale or invalid pressure only reports. The relief clears on a GS acknowledgement once a fresh sample is below 850 psi; the abort needs Reset all boards."],
+        title: "Tank overpressure on the boards (850/950 psi)",
+        summary: "On two fresh samples at or above 850 psi the Valve Board opens Dump and Vent, tells the Actuator Board to close Nitrogen and Nitrous and sends it the overpressure abort; at or above 950 psi it also opens PILOT for 3 s, closes it and latches its own Abort. At 850 and 950 psi the Actuator Board enters its Abort safe state: Nitrogen and Nitrous closed, igniter off, fill-line retraction stopped and unpowered, all AB outputs off. Active from Startup; from Launch (launch latch, accepted launch or Launch..Recovery) neither board acts on it and the Valve Board only reports.",
+        details: &[
+            "The Actuator Board takes its Abort from the Valve Board's overpressure abort command (automatic ACTUATOR_COMMAND 16, sent at 850 psi) and also treats the Valve Board's tank overpressure automatic Abort report as overpressure, in Startup too. It ignores either after Launch and when stale after a board recovery.",
+            "The station sends the same Actuator Board overpressure abort at its own relief and immediately at its abort pressure; its broadcast Abort still follows the 3 s main-valve window.",
+            "Stale or invalid pressure only reports. The Valve Board relief clears on a GS acknowledgement once a fresh sample is below 850 psi; any Abort (Valve Board or Actuator Board) needs Reset all boards.",
+        ],
         modes: ALL,
-        enforced_in: &["ValveBoard26/Core/Src/overpressure.c:88", "ValveBoard26/Core/Src/thread_comm.c:220"],
+        enforced_in: &["ValveBoard26/Core/Src/overpressure.c:88", "ValveBoard26/Core/Src/thread_comm.c:220", "ActuatorBoard26/Core/Src/telemetry.c:266", "ActuatorBoard26/Core/Src/telemetry.c:305", "ActuatorBoard26/Core/Src/thread_comm.c:455"],
         config_keys: &[],
     },
-    // AB telemetry.c:299-318, thread_comm.c:455-503; VB telemetry.c:357-373, thread_comm.c:574-589; FC telemetry.c:849-861
+    // AB telemetry.c:297-326 (Abort_handler), thread_comm.c:455-470 (thread_comm_request_automatic_abort); VB telemetry.c:357-373, thread_comm.c:574-589; FC telemetry.c:849-861
     Spec {
         id: "board-peer-abort",
         title: "Abort from another board (AB, VB)",
-        summary: "An automatic ABORT from another board (SEDS_AUTO_ABORT_V1) is obeyed by AB and VB only before Launch. An ABORT without a recognised tag is treated as a manual Stop in every state; no firmware sends one today. The FC obeys only a manual Stop.",
-        details: &["The GS accepts an observed automatic abort only before Launch (gse::accept_observed_abort)."],
+        summary: "An automatic ABORT from another board (SEDS_AUTO_ABORT_V1) is obeyed by AB and VB only before Launch, and by AB not in Startup except for the Valve Board's tank overpressure Abort. An ABORT without a recognised tag is treated as a manual Stop in every state; no firmware sends one today. The FC obeys only a manual Stop.",
+        details: &[
+            "The GS accepts an observed automatic abort only before Launch (gse::accept_observed_abort).",
+            "Tank overpressure also reaches the AB as the automatic ACTUATOR_COMMAND 16 (from the VB at 850 psi, from the GS at 850 and 950 psi), obeyed before Launch, Startup included.",
+        ],
         modes: ALL,
         enforced_in: &["ActuatorBoard26/Core/Src/thread_comm.c:455", "ValveBoard26/Core/Src/thread_comm.c:574", "FlightComputer26/Core/Src/telemetry.c:849"],
         config_keys: &[],

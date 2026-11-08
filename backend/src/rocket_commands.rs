@@ -58,6 +58,11 @@ pub enum ActuatorBoardCommands {
     NitrousClose = 13,
     #[allow(unused)]
     IgniterSequence = 14,
+    /// Automatic only (always sent with the 0x80 origin tag): tank
+    /// overpressure before Launch. The Actuator Board enters its Abort safe
+    /// state; it ignores the command after Launch. Sent by the station and by
+    /// the Valve Board at its own relief.
+    OverpressureAbort = 16,
 }
 
 #[cfg(test)]

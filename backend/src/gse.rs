@@ -3982,6 +3982,9 @@ fn abort_safe_control(kind: sedsnet::config::DataType, payload: &[u8]) -> bool {
         command == ActuatorBoardCommands::IgniterOff as u8
             || command == ActuatorBoardCommands::NitrogenClose as u8
             || command == ActuatorBoardCommands::NitrousClose as u8
+            // Tank overpressure: the AB enters its Abort safe state (all
+            // outputs off). Automatic origin only; never a manual control.
+            || payload[0] == overpressure::AB_ABORT_PAYLOAD
     } else {
         false
     }

@@ -399,6 +399,52 @@ fn tagged_automatic_domains_preserve_origin_and_launch_floor_guards() {
     }
 }
 #[test]
+fn actuator_overpressure_abort_stops_the_actuator_board_only_before_launch() {
+    prepare();
+    let payload = crate::gse::overpressure::AB_ABORT_PAYLOAD;
+    assert_eq!(payload, 0x90);
+    for case in 0..5 {
+        let mut o = Owner::new();
+        o.initialize(0, 0, 0);
+        complete(&mut o, Board::ActuatorBoard, 10005);
+        if case == 1 {
+            o.note_launch(Board::ActuatorBoard);
+        }
+        let source = if case == 2 { 10004 } else { 10010 };
+        let now = if case == 3 { 16000 } else { 10010 };
+        let p = Packet::new(
+            protocol().actuator,
+            &[crate::telemetry_schema::endpoints::ACTUATOR_BOARD],
+            "GS",
+            source,
+            Arc::from([payload]),
+        )
+        .unwrap();
+        let d = o.receive(Board::ActuatorBoard, &p, now);
+        let stopped = matches!(d.action, Action::Stop);
+        assert_eq!(stopped, case == 0 || case == 4, "case {case}: {:?}", d.action);
+        if stopped {
+            assert!(o.blocked(Board::ActuatorBoard));
+            assert_eq!(o.nodes[at(Board::ActuatorBoard)].state, Some(15));
+        }
+        // Untagged 16 is not the automatic overpressure abort.
+        if case == 4 {
+            let mut o = Owner::new();
+            o.initialize(0, 0, 0);
+            complete(&mut o, Board::ActuatorBoard, 10005);
+            let p = Packet::new(
+                protocol().actuator,
+                &[crate::telemetry_schema::endpoints::ACTUATOR_BOARD],
+                "GS",
+                10010,
+                Arc::from([16u8]),
+            )
+            .unwrap();
+            assert!(!matches!(o.receive(Board::ActuatorBoard, &p, 10010).action, Action::Stop));
+        }
+    }
+}
+#[test]
 fn endpoint_allocation_provenance_clone_reparse_wrap_and_eviction() {
     if std::env::var_os("MODEL_REGISTRY_CHILD").is_none() {
         let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","testing_board_lifecycle::tests::endpoint_allocation_provenance_clone_reparse_wrap_and_eviction","--nocapture"]).env("MODEL_REGISTRY_CHILD","1").env("GS_SIM_MODE","1").env("GS_RRLS_ROLE","primary").output().unwrap();

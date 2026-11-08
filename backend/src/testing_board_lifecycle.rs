@@ -682,6 +682,18 @@ impl Owner {
         };
         let raw = packet.payload()[0];
         if kind==Kind::Actuator && raw==14 && n.accepted_launch {return Decision::none();}
+        // Tank overpressure abort (automatic origin only): AB Abort safe state
+        // before Launch, Startup included; ignored from Launch onward.
+        if kind == Kind::Actuator && raw == crate::gse::overpressure::AB_ABORT_PAYLOAD {
+            if n.launched {
+                return Decision::none();
+            }
+            self.manual_stop(board);
+            return Decision {
+                action: Action::Stop,
+                reply: None,
+            };
+        }
         let mut kind = kind;
         let mut value = raw;
         if raw & 0x80 != 0 && matches!(kind, Kind::Actuator | Kind::Valve) {

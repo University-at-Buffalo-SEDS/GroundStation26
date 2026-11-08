@@ -10,6 +10,7 @@ const DUMP_OPEN: (&str, u8) = ("VALVE_COMMAND", 2);
 const VENT_OPEN: (&str, u8) = ("VALVE_COMMAND", 1);
 const PILOT_OPEN: (&str, u8) = ("VALVE_COMMAND", 0);
 const PILOT_CLOSE: (&str, u8) = ("VALVE_COMMAND", 3);
+const AB_ABORT: (&str, u8) = ("ACTUATOR_COMMAND", 16);
 
 struct Fixture {
     state: Arc<AppState>,
@@ -472,4 +473,120 @@ async fn board_launch_alarm_and_sensor_faults_command_nothing() {
         Some("Valve Board overpressure sensor invalid, raw ADC 4095")
     );
     assert!(g.commands().is_empty() && g.latch().is_none());
+}
+
+impl Fixture {
+    /// Raw wire payloads of every Actuator Board overpressure abort sent.
+    fn ab_aborts(&self) -> usize {
+        self.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(kind, bytes)| kind == "ACTUATOR_COMMAND" && bytes[..] == [0x90])
+            .count()
+    }
+}
+
+#[tokio::test]
+async fn relief_threshold_sends_the_actuator_board_overpressure_abort_once() {
+    let mut f = Fixture::new().await;
+    f.sample(851.0);
+    assert_eq!(f.ab_aborts(), 0, "debounced");
+    f.sample(860.0);
+    assert_eq!(f.ab_aborts(), 1, "AB abort [0x90] at relief: {:?}", f.sent.lock().unwrap());
+    assert_relief_order(&f);
+    assert!(f.position(AB_ABORT).unwrap() > f.position(VENT_OPEN).unwrap());
+    assert!(!f.has(PILOT_OPEN));
+    assert!(!f.state.abort_indicator_latched(), "relief alone never broadcasts Abort");
+    assert!(f.latch().unwrap().ab_abort_sent);
+    // Re-evaluation, more samples and the escalation to the abort stage do
+    // not repeat it; the broadcast Abort still waits for the pilot window.
+    f.sample(870.0);
+    f.advance(1_000);
+    f.sample(955.0);
+    f.sample(960.0);
+    assert!(f.has(PILOT_OPEN));
+    assert_eq!(f.ab_aborts(), 1);
+    f.advance(3_000);
+    assert!(f.has(PILOT_CLOSE) && f.state.abort_indicator_latched());
+    assert_eq!(f.ab_aborts(), 1);
+}
+
+#[tokio::test]
+async fn abort_threshold_sends_the_actuator_board_abort_before_the_pilot_window_ends() {
+    let mut f = Fixture::new().await;
+    f.sample(960.0);
+    f.sample(965.0);
+    // Sent with the trip, while the main valve window is still running and
+    // before the pilot close and the broadcast Abort.
+    assert_eq!(f.ab_aborts(), 1, "{:?}", f.sent.lock().unwrap());
+    assert!(f.has(PILOT_OPEN) && !f.has(PILOT_CLOSE));
+    assert!(!f.state.abort_indicator_latched());
+    assert!(matches!(f.latch().unwrap().abort, overpressure::AbortStage::PilotOpen { .. }));
+    f.advance(2_999);
+    assert!(!f.has(PILOT_CLOSE) && !f.state.abort_indicator_latched());
+    f.advance(1);
+    let ab = f.position(AB_ABORT).unwrap();
+    assert!(ab < f.position(PILOT_CLOSE).unwrap());
+    assert!(f.state.abort_indicator_latched(), "broadcast Abort after the window");
+    assert_eq!(f.ab_aborts(), 1);
+}
+
+#[tokio::test]
+async fn abort_stage_retries_an_actuator_board_abort_the_relief_stage_did_not_send() {
+    let mut f = Fixture::new().await;
+    f.sample(860.0);
+    f.sample(860.0);
+    // As if the relief-stage send had failed.
+    f.state.gse.lock().unwrap().overpressure.latch.as_mut().unwrap().ab_abort_sent = false;
+    let before = f.ab_aborts();
+    f.sample(955.0);
+    f.sample(955.0);
+    assert!(f.has(PILOT_OPEN) && !f.has(PILOT_CLOSE));
+    assert_eq!(f.ab_aborts(), before + 1, "sent at once at 950");
+    assert!(!f.state.abort_indicator_latched());
+}
+
+#[tokio::test]
+async fn no_actuator_board_abort_after_launch_admission() {
+    let mut f = Fixture::new().await;
+    f.state.launch_history.lock().unwrap().inhibit_automatic_actions().unwrap();
+    f.sample(870.0);
+    f.sample(880.0);
+    f.sample(960.0);
+    f.sample(990.0);
+    f.advance(4_000);
+    assert_eq!(f.ab_aborts(), 0);
+    assert!(f.commands().is_empty(), "{:?}", f.commands());
+    // A Valve Board report adopted after Launch admission only alarms too.
+    let mut g = Fixture::new().await;
+    g.state.launch_history.lock().unwrap().inhibit_automatic_actions().unwrap();
+    assert!(g.board("Valve Board overpressure relief: 912 psi [R3]").is_none());
+    assert_eq!(g.ab_aborts(), 0);
+    assert!(g.commands().is_empty(), "{:?}", g.commands());
+}
+
+#[tokio::test]
+async fn adopted_valve_board_relief_also_sends_the_actuator_board_abort() {
+    let mut f = Fixture::new().await;
+    assert!(f.board("Valve Board overpressure relief: 912 psi [R3]").is_none());
+    assert_eq!(f.ab_aborts(), 1);
+    for _ in 0..3 {
+        f.advance(1_000);
+        f.board("Valve Board overpressure relief: 912 psi [R3]");
+    }
+    assert_eq!(f.ab_aborts(), 1, "re-announcements send nothing new");
+    let mut g = Fixture::new().await;
+    g.board("Valve Board overpressure during launch, no valve action: 990 psi [L1]");
+    assert_eq!(g.ab_aborts(), 0);
+}
+
+#[tokio::test]
+async fn actuator_board_abort_passes_a_pending_stop_like_the_supply_closes() {
+    let mut f = Fixture::new().await;
+    f.state.set_abort_indicator_latched(true);
+    f.sample(860.0);
+    f.sample(860.0);
+    assert!(f.has(NITROUS_CLOSE) && f.has(NITROGEN_CLOSE));
+    assert_eq!(f.ab_aborts(), 1);
 }

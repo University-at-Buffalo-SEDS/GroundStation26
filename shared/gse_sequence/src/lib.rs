@@ -53,9 +53,11 @@ pub struct Config {
     pub dry_self_test_confirmed: bool,
     pub grouped_panel: bool,
     /// Tank overpressure relief: at or above this valve-board psi, in every
-    /// mode and state before Launch, close both supplies and open dump/vent.
+    /// mode and state before Launch, close both supplies, open dump/vent and
+    /// put the Actuator Board in its Abort safe state.
     pub overpressure_relief_psi: f32,
-    /// Tank overpressure abort: also open the main (pilot) valve, then Abort.
+    /// Tank overpressure abort: Actuator Board Abort at once (if not already
+    /// sent), open the main (pilot) valve, then Abort.
     pub overpressure_abort_psi: f32,
     /// How long the main (pilot) valve stays open before the Abort.
     pub overpressure_pilot_ms: u64,

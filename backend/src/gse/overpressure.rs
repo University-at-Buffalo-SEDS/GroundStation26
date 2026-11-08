@@ -3,14 +3,19 @@
 //! Independent of every sequence, mode (HITL, test-fire, flight) and
 //! pause/hold state before Launch:
 //! - at or above `overpressure_relief_psi` (default 850): close Nitrous, close
-//!   Nitrogen, open Dump, open Vent, and latch an error;
+//!   Nitrogen, open Dump, open Vent, send the Actuator Board overpressure
+//!   abort (automatic ACTUATOR_COMMAND 16, all AB outputs off), and latch an
+//!   error;
 //! - at or above `overpressure_abort_psi` (default 950): additionally open the
-//!   main (pilot) valve. After `overpressure_pilot_ms` (default 3 s) the
-//!   station commands the pilot closed and then dispatches an automatic Abort.
-//!   The Abort is sent only after the pilot window, so neither the station's
-//!   own abort fence (which refuses non-relief outputs once the abort latch is
-//!   set) nor the boards' abort safe state (which closes the pilot) can cut
-//!   the window short.
+//!   main (pilot) valve, and send the Actuator Board overpressure abort at once
+//!   if this latch has not sent it yet. After `overpressure_pilot_ms` (default
+//!   3 s) the station commands the pilot closed and then dispatches an
+//!   automatic Abort. The broadcast Abort is sent only after the pilot window,
+//!   so neither the station's own abort fence (which refuses non-relief
+//!   outputs once the abort latch is set) nor the Valve Board's abort safe
+//!   state (which closes the pilot) can cut the window short. The Actuator
+//!   Board command is AB-only and never touches the main valve, so it does
+//!   not wait for the window.
 //!
 //! Once Launch is admitted or Fire is committed (T0 onward) the main valve is
 //! already open for firing: the monitor only logs and alarms, never commands.
@@ -43,6 +48,8 @@ pub(crate) struct Latch {
     /// False when it tripped after T0: alarm only, nothing commanded.
     pub(crate) relief_commanded: bool,
     pub(crate) abort: AbortStage,
+    /// The Actuator Board overpressure abort was queued for this latch.
+    pub(crate) ab_abort_sent: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -204,6 +211,11 @@ fn fire_committed(rt: &Runtime) -> bool {
 }
 
 const RELIEF: [(usize, bool); 4] = [(4, false), (3, false), (2, true), (1, true)];
+/// ACTUATOR_COMMAND payload (with the automatic-origin tag) that puts the
+/// Actuator Board in its Abort safe state before Launch. Only the AB handles
+/// ACTUATOR_COMMAND, so the Valve Board (and its main-valve window) is never
+/// touched by it.
+pub(crate) const AB_ABORT_PAYLOAD: u8 = ActuatorBoardCommands::OverpressureAbort as u8 | 0x80;
 
 /// Retire every automatic owner so nothing re-closes the relief path.
 fn retire_automation(rt: &mut Runtime, now: u64, message: &str) {
@@ -234,7 +246,12 @@ fn retire_automation(rt: &mut Runtime, now: u64, message: &str) {
 }
 
 enum Action {
-    Commands(Effects),
+    /// Relief valve effects, plus the Actuator Board overpressure abort when
+    /// `ab_abort` is set.
+    Commands {
+        effects: Effects,
+        ab_abort: bool,
+    },
     Alarm(String),
 }
 
@@ -272,6 +289,7 @@ pub(crate) fn evaluate(state: &Arc<AppState>) {
                         message: message.clone(),
                         relief_commanded: false,
                         abort: AbortStage::NotRequired,
+                        ab_abort_sent: false,
                     });
                     action = Some(Action::Alarm(message));
                 } else {
@@ -307,11 +325,15 @@ pub(crate) fn evaluate(state: &Arc<AppState>) {
                         message,
                         relief_commanded: true,
                         abort: stage,
+                        ab_abort_sent: false,
                     });
-                    action = Some(Action::Commands(Effects {
-                        valves,
-                        notification: Some(notice),
-                    }));
+                    action = Some(Action::Commands {
+                        effects: Effects {
+                            valves,
+                            notification: Some(notice),
+                        },
+                        ab_abort: true,
+                    });
                 }
             }
             (Some(latch), Level::Abort(psi)) if latch.abort == AbortStage::NotRequired => {
@@ -331,10 +353,15 @@ pub(crate) fn evaluate(state: &Arc<AppState>) {
                         };
                     }
                     rt.engine.status.message = message.clone();
-                    action = Some(Action::Commands(Effects {
-                        valves,
-                        notification: Some(message),
-                    }));
+                    // Normally already sent at the relief stage; never wait
+                    // for the main-valve window.
+                    action = Some(Action::Commands {
+                        effects: Effects {
+                            valves,
+                            notification: Some(message),
+                        },
+                        ab_abort: !latch.ab_abort_sent,
+                    });
                 } else if !latch.relief_commanded {
                     let message = format!(
                         "Tank overpressure during launch: {psi:.0} psi >= {:.0}. No automatic valve action or Abort after T0.",
@@ -355,10 +382,13 @@ pub(crate) fn evaluate(state: &Arc<AppState>) {
                         l.abort = AbortStage::Aborted;
                     }
                     // Pilot closed first, then Abort, in that order.
-                    action = Some(Action::Commands(Effects {
-                        valves: vec![(0, false)],
-                        notification: None,
-                    }));
+                    action = Some(Action::Commands {
+                        effects: Effects {
+                            valves: vec![(0, false)],
+                            notification: None,
+                        },
+                        ab_abort: false,
+                    });
                     abort = true;
                 }
             }
@@ -367,7 +397,12 @@ pub(crate) fn evaluate(state: &Arc<AppState>) {
         (action, abort)
     };
     match action {
-        Some(Action::Commands(effects)) => apply(state, effects),
+        Some(Action::Commands { effects, ab_abort }) => {
+            apply(state, effects);
+            if ab_abort {
+                dispatch_ab_abort(state);
+            }
+        }
         Some(Action::Alarm(message)) => {
             state.add_notification_with_persistence(message, true);
         }
@@ -382,8 +417,10 @@ pub(crate) fn evaluate(state: &Arc<AppState>) {
 /// None for a repeat of the same stage and trip. A board relief the station
 /// has not latched itself (link was down, or a different configured
 /// threshold) is adopted: station automation is retired so nothing re-opens
-/// a supply or re-closes dump/vent, and the same relief outputs are commanded
-/// (harmless duplicates). The board owns its main-valve window and Abort.
+/// a supply or re-closes dump/vent, and the same relief outputs and the
+/// Actuator Board overpressure abort are commanded (harmless duplicates of the
+/// board's own; they also cover a lost Valve Board to Actuator Board command).
+/// The board owns its main-valve window and Abort.
 pub(crate) fn board_warning(state: &Arc<AppState>, text: &str) -> Option<String> {
     let Some((code, psi, trip)) = parse_board_report(text) else {
         return Some(text.to_string());
@@ -420,6 +457,7 @@ pub(crate) fn board_warning(state: &Arc<AppState>, text: &str) -> Option<String>
                 message: display.clone(),
                 relief_commanded: false,
                 abort: AbortStage::NotRequired,
+                ab_abort_sent: false,
             });
             Action::Alarm(display)
         } else {
@@ -440,20 +478,68 @@ pub(crate) fn board_warning(state: &Arc<AppState>, text: &str) -> Option<String>
                 } else {
                     AbortStage::Aborted
                 },
+                ab_abort_sent: false,
             });
-            Action::Commands(Effects {
-                valves: RELIEF.to_vec(),
-                notification: Some(notice),
-            })
+            Action::Commands {
+                effects: Effects {
+                    valves: RELIEF.to_vec(),
+                    notification: Some(notice),
+                },
+                ab_abort: true,
+            }
         }
     };
     match action {
-        Action::Commands(effects) => apply(state, effects),
+        Action::Commands { effects, ab_abort } => {
+            apply(state, effects);
+            if ab_abort {
+                dispatch_ab_abort(state);
+            }
+        }
         Action::Alarm(message) => {
             state.add_notification_with_persistence(message, true);
         }
     }
     None
+}
+
+/// Queue the Actuator Board overpressure abort through the same controller
+/// fence as the automatic supply closes. It is an abort-safe direction (all
+/// AB outputs off), so a pending Stop never holds it back. Recorded on the
+/// latch only once queued, so a later abort stage retries a failed send.
+// Safety catalog (About safety): overpressure-relief, overpressure-abort. Keep backend/src/safety_catalog_rules.rs in step.
+fn dispatch_ab_abort(state: &Arc<AppState>) {
+    let Some(router) = state.topology_router.get() else {
+        let _ = state.add_notification_with_persistence(
+            "Tank overpressure: Actuator Board abort could not be sent: no hardware command router".to_string(),
+            true,
+        );
+        return;
+    };
+    let queued = queue_controller_with_stop_fence(
+        state,
+        router,
+        crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
+        &[AB_ABORT_PAYLOAD],
+    );
+    match queued {
+        Ok(true) => {
+            log::warn!("tank overpressure: Actuator Board abort queued payload={AB_ABORT_PAYLOAD:02x}");
+            let mut rt = state.gse.lock().unwrap();
+            rt.effects_queued = true;
+            if let Some(latch) = &mut rt.overpressure.latch {
+                latch.ab_abort_sent = true;
+            }
+        }
+        Ok(false) => log::error!("tank overpressure: Actuator Board abort not admitted"),
+        Err(error) => {
+            log::error!("tank overpressure: Actuator Board abort failed: {error:?}");
+            let _ = state.add_notification_with_persistence(
+                "Tank overpressure: Actuator Board abort could not be sent".to_string(),
+                true,
+            );
+        }
+    }
 }
 
 fn dispatch_abort(state: &Arc<AppState>) {
@@ -532,6 +618,7 @@ pub(crate) fn acknowledge(state: &AppState) -> Result<(), String> {
             message: String::new(),
             relief_commanded: false,
             abort: AbortStage::NotRequired,
+            ab_abort_sent: false,
         },
         (None, None) => return Err("No tank overpressure error is latched".into()),
     };
