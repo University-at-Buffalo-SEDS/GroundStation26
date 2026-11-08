@@ -4417,11 +4417,19 @@ pub(crate) fn queue_prepared_launch_packets(
     let mut first_sdk_attempt: Option<Instant> = None;
     let mut last_zero_busy = None;
     let mut retry_controller_types = None;
+    // Packets already owned by the SDK in an earlier attempt of this same
+    // prepared Launch. A zero-owner CoreBusy refusal of a later packet admits
+    // nothing, so (flight builds) only the unadmitted suffix of the SAME
+    // vector is offered again inside the same window, after the same
+    // admission checks; an accepted packet is never offered twice. Test-fire
+    // keeps the original no-suffix-retry behavior.
+    let mut admitted_prefix = 0usize;
+    let suffix_retry = !cfg!(feature = "test_fire_mode");
     let result = loop {
         if first_sdk_attempt.is_some_and(|at| at.elapsed() >= retry_window) {
-            break Err((0, last_zero_busy.take().expect("retry follows a real zero-owner CoreBusy")));
+            break Err((admitted_prefix, last_zero_busy.take().expect("retry follows a real zero-owner CoreBusy")));
         }
-        if last_zero_busy.is_some() {
+        if last_zero_busy.is_some() && admitted_prefix == 0 {
             // A zero-owner refusal must not outlive a newly retained controller
             // command. These conservative snapshots run outside ALL app guards;
             // they are not an atomic multi-type check-and-queue operation.
@@ -4450,12 +4458,12 @@ pub(crate) fn queue_prepared_launch_packets(
                 continue;
             }
         }
-        let mut attempt_packets = packets.iter().cloned().map(Some).collect::<Vec<_>>();
+        let mut attempt_packets = packets[admitted_prefix..].iter().cloned().map(Some).collect::<Vec<_>>();
         let guarded = with_launch_admission(state, ticket, ignition_pair_required, || {
             let mut accepted = 0;
             for slot in &mut attempt_packets {
                 // A guard may have waited. No retry call starts after this
-                // window; after ANY accepted prefix, preserve legacy behavior.
+                // window; after a non-busy refusal, preserve legacy behavior.
                 if accepted == 0
                     && first_sdk_attempt.is_some_and(|at| at.elapsed() >= retry_window)
                 {
@@ -4476,11 +4484,21 @@ pub(crate) fn queue_prepared_launch_packets(
         // In particular, drop all unattempted clones outside application
         // guards. SDK consumption of an attempted clone is unchanged legacy.
         drop(attempt_packets);
-        let attempt = match guarded? {
-            QueueAttempt::WindowExpired => {
-                break Err((0, last_zero_busy.take().expect("expired retry retains its actual refusal")));
+        let attempt = match guarded {
+            Ok(QueueAttempt::WindowExpired) => {
+                break Err((admitted_prefix, last_zero_busy.take().expect("expired retry retains its actual refusal")));
             }
-            QueueAttempt::Completed(attempt) => attempt,
+            Ok(QueueAttempt::Completed(attempt)) => attempt
+                .map(|n| admitted_prefix + n)
+                .map_err(|(n, error)| (admitted_prefix + n, error)),
+            // A refused suffix re-admission (new Abort, Stop, stale proof)
+            // still reports the packets the SDK already owns.
+            Err(message) if admitted_prefix > 0 => {
+                log::warn!("Launch suffix re-admission refused after {admitted_prefix}/{total} packets: {message}");
+                break Err((admitted_prefix, sedsnet::TelemetryError::Io(
+                    "launch suffix re-admission refused")));
+            }
+            Err(message) => return Err(message),
         };
         match attempt {
             Err((0, error @ sedsnet::TelemetryError::Io("router core busy"))) => {
@@ -4490,6 +4508,12 @@ pub(crate) fn queue_prepared_launch_packets(
                 // All admission guards have returned. Keep the same ticket,
                 // vector, IDs, UTC and optional PreparedLaunchState; never
                 // reprepare or rerun an accepted prefix as a new intention.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err((owned, error @ sedsnet::TelemetryError::Io("router core busy"))) if suffix_retry => {
+                #[cfg(test)] nonwaiting_admission_tests::core_busy_refused(state);
+                admitted_prefix = owned;
+                last_zero_busy = Some(error);
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             terminal => break terminal,

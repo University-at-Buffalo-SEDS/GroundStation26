@@ -109,6 +109,28 @@ struct Hook {
     launch_calls:Arc<std::sync::atomic::AtomicUsize>,
     retry_gate:Arc<(Mutex<bool>,Condvar)>,
     trace: Arc<Trace>,
+    suffix: Arc<SuffixGate>,
+}
+/// Test-only: pause the launch thread right after the Nth SDK admission so a
+/// test can take the real SDK core before the next packet is offered.
+#[derive(Default)]
+pub(crate) struct SuffixGate {
+    after: Mutex<Option<usize>>,
+    reached: Mutex<Option<mpsc::Sender<()>>>,
+    go: (Mutex<bool>, Condvar),
+}
+impl SuffixGate {
+    #[cfg_attr(feature = "test_fire_mode", allow(dead_code))]
+    pub(crate) fn arm(&self, after_accepted: usize) -> mpsc::Receiver<()> {
+        let (tx, rx) = mpsc::channel();
+        *self.reached.lock().unwrap() = Some(tx);
+        *self.after.lock().unwrap() = Some(after_accepted);
+        rx
+    }
+    pub(crate) fn proceed(&self) {
+        *self.go.0.lock().unwrap() = true;
+        self.go.1.notify_all();
+    }
 }
 static HOOK: OnceLock<Mutex<Option<Arc<Hook>>>> = OnceLock::new();
 pub(crate) struct Pause {
@@ -122,6 +144,7 @@ pub(crate) struct Pause {
     pub(crate) launch_calls:Arc<std::sync::atomic::AtomicUsize>,
     retry_gate:Arc<(Mutex<bool>,Condvar)>,
     pub(crate) trace: Arc<Trace>,
+    pub(crate) suffix: Arc<SuffixGate>,
 }
 impl Pause {
     pub(crate) fn install(state: &AppState) -> Self {
@@ -136,6 +159,7 @@ impl Pause {
         let launch_packets=Arc::new(Mutex::new(Vec::new()));
         let launch_calls=Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let retry_gate=Arc::new((Mutex::new(false),Condvar::new()));
+        let suffix=Arc::new(SuffixGate::default());
         *HOOK.get_or_init(Default::default).lock().unwrap() = Some(Arc::new(Hook {
             owner: state as *const AppState as usize,
             prepared,
@@ -146,6 +170,7 @@ impl Pause {
             core_release: release.clone(),
             launch_packets:launch_packets.clone(),launch_calls:launch_calls.clone(),retry_gate:retry_gate.clone(),
             trace: trace.clone(),
+            suffix: suffix.clone(),
         }));
         Self {
             prepared: received,
@@ -154,7 +179,7 @@ impl Pause {
             busy:busy_received,
             packet,
             release,
-            launch_packets,launch_calls,retry_gate,trace,
+            launch_packets,launch_calls,retry_gate,trace,suffix,
         }
     }
     pub(crate) fn release_core(&self) {
@@ -167,7 +192,7 @@ impl Pause {
     pub(crate) fn hold_retry(&self){*self.retry_gate.0.lock().unwrap()=true;}
     pub(crate) fn resume_retry(&self){*self.retry_gate.0.lock().unwrap()=false;self.retry_gate.1.notify_all();}
     pub(crate) fn release(&self) {
-        self.release_core();self.resume_retry();
+        self.release_core();self.resume_retry();self.suffix.proceed();
         let _ = self.proceed.send(());
     }
 }
@@ -251,6 +276,16 @@ pub(crate) fn record_holder_clock_return(owner: usize, sampled_at: Instant, orig
     }
 }
 pub(crate) fn record_launch_sdk_return(state: &AppState, accepted: usize, error: Option<&sedsnet::TelemetryError>) {
+    if error.is_none() && let Some(h) = hook(state as *const AppState as usize) {
+        let armed = { let mut after = h.suffix.after.lock().unwrap();
+            if *after == Some(accepted + 1) { after.take(); true } else { false } };
+        if armed {
+            if let Some(tx) = h.suffix.reached.lock().unwrap().take() { let _ = tx.send(()); }
+            let go = h.suffix.go.0.lock().unwrap();
+            let (go, _) = h.suffix.go.1.wait_timeout_while(go, Duration::from_secs(5), |go| !*go).unwrap();
+            assert!(*go, "suffix gate was never released");
+        }
+    }
     if let Some(trace) = trace_for(state as *const AppState as usize) {
         let class = match error {
             None => 0,

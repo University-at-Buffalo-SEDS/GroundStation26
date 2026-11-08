@@ -537,8 +537,9 @@ async fn send_flight_computer_launch(
     };
     if let Err(error) = crate::gse::queue_admitted_launch_packets(&state, &router, ticket, packets)
     {
-        // An accepted first packet remains an honest SDK owner. Do not retry
-        // the second packet or undo durable inhibition after partial admission.
+        // An accepted first packet remains an honest SDK owner. Only a
+        // zero-owner CoreBusy suffix was re-offered (inside the same window);
+        // never retry here or undo durable inhibition after partial admission.
         emit_notification_warning(&state, error);
         flush_command_tx(
             &router,
@@ -3799,6 +3800,18 @@ mod tests {
         launch_queue_case(true).await;
     }
 
+    /// The SDK core is taken right after the FC Launch was admitted, so the
+    /// valve Sequence (ignition) is refused with a zero-owner CoreBusy. Flight
+    /// builds re-offer only that unadmitted packet inside the same window:
+    /// the FC Launch is sent once and the Sequence follows. Test-fire keeps
+    /// the original partial-admission inhibition (suffix_retry is false there).
+    #[cfg(not(feature = "test_fire_mode"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn launch_core_busy_after_fc_launch_completes_only_the_unadmitted_sequence() {
+        if launch_core_fixture_in_fresh_process("telemetry_task::tests::launch_core_busy_after_fc_launch_completes_only_the_unadmitted_sequence") { return; }
+        launch_suffix_busy_case().await;
+    }
+
     // These three legacy cases own fresh processes, so process-wide checklist
     // STORE initialization and prior background tasks are independent. Their
     // original case bodies and all deadlines stay unchanged.
@@ -3855,6 +3868,79 @@ mod tests {
         assert!(status.success(),"fresh-process actual Launch fixture failed: {text}");
         assert!(text.contains("1 passed"),"child did not execute original case: {text}");
         println!("{text}");true
+    }
+
+
+    #[cfg(not(feature = "test_fire_mode"))]
+    async fn launch_suffix_busy_case() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sent_clone = sent.clone();
+        let owner = Arc::as_ptr(&state) as usize;
+        let clock = std::time::Instant::now();
+        let router = Arc::new(Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([crate::ignition_pair::fixture::handler(&state, |_| Ok(()))]),
+            Box::new(move || {
+                crate::gse::nonwaiting_admission_tests::clock_pause(owner);
+                clock.elapsed().as_millis() as u64
+            }),
+        ));
+        let valve_side = router.add_side_packed_with_options(
+            "umbilical_comms",
+            move |bytes| { sent_clone.lock().unwrap().push(bytes.to_vec()); Ok(()) },
+            sedsnet::router::RouterSideOptions { reliable_enabled: true, link_local_enabled: true, ..Default::default() },
+        );
+        let discovery = sedsnet::discovery::build_discovery_announce(
+            Board::ValveBoard.sender_id(), 123, &[crate::telemetry_schema::endpoint("VALVE_BOARD")],
+        ).unwrap();
+        router.rx_packed_from_side(&serialize::pack_packet(&discovery), valve_side).unwrap();
+        router.process_all_queues_with_timeout(0).unwrap();
+        #[cfg(not(feature = "hitl_mode"))]
+        let qualification = crate::gse::armed_fixture_for_test(&state, &router);
+        let _actual_peers = crate::ignition_pair::fixture::Peers::warm(&state, router.clone()).await;
+        let launch_revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        if state.topology_router.get().is_none() {
+            state.topology_router.set(router.clone()).unwrap();
+        }
+        let pause = crate::gse::nonwaiting_admission_tests::Pause::install(&state);
+        // [state, FLIGHT_COMMAND Launch, VALVE_COMMAND Sequence] (HITL has no
+        // state packet): stop right after the FC Launch admission.
+        let reached = pause.suffix.arm(if cfg!(feature = "hitl_mode") { 1 } else { 2 });
+        let (owned_state, owned_router) = (state.clone(), router.clone());
+        let worker = tokio::spawn(async move {
+            handle_flight_computer_launch_command(owned_state, owned_router, launch_revision).await;
+        });
+        pause.prepared.recv_timeout(Duration::from_secs(2)).unwrap();
+        pause.proceed.send(()).unwrap();
+        reached.recv_timeout(Duration::from_secs(2)).unwrap();
+        let seed = Packet::new(
+            crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            "GS", 100, Arc::from([0u8]),
+        ).unwrap();
+        let held = router.clone();
+        let holder = std::thread::Builder::new().name("production-sdk-core-holder".into())
+            .spawn(move || held.seed_managed_variable(seed)).unwrap();
+        pause.core_entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        pause.suffix.proceed();
+        // The third offer is refused while the core is held.
+        pause.busy.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+        pause.release_core();
+        holder.join().unwrap().unwrap();
+        worker.await.unwrap();
+        drop(pause);
+        router.process_all_queues_with_timeout(0).unwrap();
+        let notes = state.notifications_snapshot();
+        let partial = notes.iter().any(|n| n.message.contains("Launch SDK admission accepted"));
+        let wires: Vec<_> = sent.lock().unwrap().iter().filter_map(|w| serialize::unpack_packet(w).ok()).collect();
+        let sequences = wires.iter().filter(|p| p.data_type() == crate::telemetry_schema::data_type("VALVE_COMMAND")
+            && p.payload() == [ValveBoardCommands::Sequence as u8]).count();
+        assert!(!partial, "a zero-owner CoreBusy suffix must complete the same Launch: {notes:?}");
+        assert_eq!(sequences, 1, "exactly one valve Sequence; SDK={:?}", router.export_runtime_stats());
+        #[cfg(not(feature = "hitl_mode"))]
+        std::fs::remove_file(qualification).unwrap();
     }
 
     async fn launch_queue_case(force_core_busy: bool) {
