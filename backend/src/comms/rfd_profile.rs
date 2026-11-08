@@ -11,7 +11,7 @@ pub(crate) struct Profile {
     modem: Modem,
     pub transport: Transport,
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Modem {
     serial_baud: u64,
@@ -37,6 +37,34 @@ pub(crate) struct Transport {
 static ACTIVE: OnceLock<Option<Profile>> = OnceLock::new();
 
 impl Profile {
+    /// Modem register targets for the startup modem check.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+    /// True for the embedded profile: the settings the deployed modems run.
+    pub(crate) fn is_embedded_default(&self) -> bool {
+        Self::parse(include_bytes!("../../comms/rfd-profile.json"))
+            .is_ok_and(|d| d.name == self.name && d.modem == self.modem)
+    }
+    pub(crate) fn modem_values(
+        &self,
+        hardware_flow_control: bool,
+        rolled_out_all_nodes: bool,
+    ) -> super::rfd_modem::ProfileValues {
+        let m = &self.modem;
+        super::rfd_modem::ProfileValues {
+            serial_baud: m.serial_baud,
+            air_bps: m.air_bps,
+            max_data_bytes: m.max_data_bytes,
+            max_retries: m.max_retries,
+            broadcast_retries: m.broadcast_retries,
+            serial_break_ms: m.serial_break_ms,
+            tx_encapsulation: m.tx_encapsulation,
+            rx_encapsulation: m.rx_encapsulation,
+            hardware_flow_control,
+            rolled_out_all_nodes,
+        }
+    }
     pub(crate) fn recovery_budget_tuple(&self) -> Option<crate::rrls::budget_negotiation::Profile> {
         // Derived only from this validated local application profile. This is
         // not a claim about live modem AT values; RF must prove its own tuple.
@@ -194,7 +222,7 @@ pub(crate) fn initialize(link: &CommsLinkConfig) -> anyhow::Result<()> {
             }
         }
         log::info!(
-            "RFD profile selected: {} (modem settings require separate matched configuration)",
+            "RFD profile selected: {} (the startup modem check applies its modem registers to this station's modem only)",
             profile.name
         );
         Some(profile)
@@ -222,12 +250,29 @@ mod tests {
         assert_eq!(p.transport.packet_gap_ms, 15);
     }
     #[test]
-    fn shipping_profile_retains_existing_modem_idle_boundary() {
+    fn shipping_profile_is_the_deployed_matched_modem_settings() {
+        // The startup check enforces this by default, so it must equal what
+        // all three modems run today (RRLS readback 10-28: S4=10, S5=10, S6=50).
         let p = Profile::parse(include_bytes!("../../comms/rfd-profile.json")).unwrap();
+        assert!(p.is_embedded_default());
+        assert_eq!(p.modem.max_retries, 10);
+        assert_eq!(p.modem.broadcast_retries, 10);
         assert_eq!(p.modem.serial_break_ms, 50);
+        assert_eq!(p.modem.max_data_bytes, 3968);
         assert_eq!(p.transport.packet_gap_ms, 55);
         assert_eq!(p.transport.usable_air_bps, 32000);
         assert_eq!(p.transport.host_default_share_percent, 25);
+    }
+    #[test]
+    fn one_retry_layer_profile_is_opt_in_and_keeps_the_transport_tuple() {
+        let p = Profile::parse(include_bytes!(
+            "../../../config/radio/rfd-async-64k-one-retry-layer.json"
+        ))
+        .unwrap();
+        assert!(!p.is_embedded_default());
+        assert_eq!((p.modem.broadcast_retries, p.modem.serial_break_ms), (0, 20));
+        let d = Profile::parse(include_bytes!("../../comms/rfd-profile.json")).unwrap();
+        assert_eq!(p.recovery_budget_tuple(), d.recovery_budget_tuple());
     }
     #[test]
     fn mismatched_or_unbounded_profiles_are_rejected() {

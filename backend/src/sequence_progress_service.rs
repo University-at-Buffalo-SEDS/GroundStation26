@@ -169,6 +169,10 @@ impl Service {
         self.result_links.push_back(link);
         Ok(())
     }
+    /// True while any run is not terminal. Used to refuse radio reconfiguration.
+    pub fn has_active_run(&self) -> bool {
+        !self.journal.active().is_empty()
+    }
     pub fn result(&self, key: &RunKey) -> Result<Snapshot, Error> {
         self.journal.result(key).cloned()
     }

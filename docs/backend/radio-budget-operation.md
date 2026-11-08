@@ -3,8 +3,15 @@
 The default raw-UART profile budgets 32 kbit/s of usable application capacity
 on a 64 kbit/s modem link. UART remains 115200 baud, with a maximum 100 ms
 transmit batch followed by 55 ms of serial silence. CTS remains disabled.
-These are application settings; loading the profile does not change modem
-registers or verify their live values. There are no LoRa uplink/downlink turn
+These are application settings. The profile's modem section is applied
+to this station's own modem by the startup modem check
+(`docs/backend/rfd-modem-check.md`). The default profile holds the deployed,
+matched settings, so a correct install is left unchanged. The check repairs
+local drift; registers that must match across nodes are only reported unless
+the selected profile is marked as rolled out to all nodes. It never
+runs in a flight state or during a launch or sequence. RT remote commands
+are not supported by ASYNC firmware, so each node's modem must be checked
+by that node. There are no LoRa uplink/downlink turn
 windows in this RFD configuration.
 
 Deploy matching GroundStation, RRLS and RF firmware together. The RF profile

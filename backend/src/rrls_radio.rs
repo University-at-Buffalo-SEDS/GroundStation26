@@ -26,6 +26,8 @@ struct Connection {
     failures: u64,
     retry_tracker: Option<sedsnet::router::RetryTracker>,
     capacity_enabled: bool,
+    /// AV-bay radio: an operator modem check may hold the port closed.
+    av_bay: bool,
 }
 pub struct RecoveryRadio {
     shared: Arc<Mutex<Connection>>,
@@ -46,11 +48,35 @@ impl RecoveryRadio {
                 failures: 0,
                 retry_tracker: None,
                 capacity_enabled: true,
+                av_bay: false,
             })),
             tx: false,
             side: None,
             ready_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+    /// The AV-bay radio. Its opener runs the RFD modem startup check once per
+    /// process, and an operator modem check can hold the port closed.
+    pub fn new_av_bay(config: CommsLinkConfig) -> Self {
+        let radio = Self::new(config);
+        {
+            let mut state = radio.shared.lock().unwrap();
+            state.opener = Box::new(open_av_bay_link);
+            state.av_bay = true;
+        }
+        radio
+    }
+    pub(crate) fn from_open_av_bay(
+        config: CommsLinkConfig,
+        rx: Box<dyn CommsDevice>,
+    ) -> anyhow::Result<Self> {
+        let radio = Self::from_open(config, rx)?;
+        {
+            let mut state = radio.shared.lock().unwrap();
+            state.opener = Box::new(open_av_bay_link);
+            state.av_bay = true;
+        }
+        Ok(radio)
     }
     /// Preserve the already opened primary handle and its configuration.
     /// Capacity control remains off until the existing worker enables it.
@@ -74,6 +100,22 @@ impl RecoveryRadio {
     }
     fn connect(&self) -> Option<(u64, Device)> {
         let mut state = self.shared.lock().unwrap();
+        if state.av_bay && crate::comms::rfd_modem::hold_requested() {
+            if state.rx.is_some() {
+                self.ready_generation.store(0, Ordering::Release);
+                if let Some(tracker) = &state.retry_tracker
+                    && let Err(error) = tracker.invalidate_generation()
+                {
+                    log::warn!("radio retry fence unavailable: {error}");
+                }
+                state.rx = None;
+                state.tx = None;
+                log::info!("AV-bay radio released for an operator modem check");
+            }
+            state.retry_at = Instant::now();
+            crate::comms::rfd_modem::acknowledge_release();
+            return None;
+        }
         if state.rx.is_none() && Instant::now() >= state.retry_at {
             state.retry_at = Instant::now() + Duration::from_secs(1);
             match (state.opener)(&state.config).and_then(|mut rx| {
@@ -153,6 +195,11 @@ impl RecoveryRadio {
         }
         result
     }
+}
+/// Opens the AV-bay radio after the once-per-process RFD modem check.
+pub(crate) fn open_av_bay_link(config: &CommsLinkConfig) -> anyhow::Result<Box<dyn CommsDevice>> {
+    crate::comms::rfd_modem::before_av_bay_open(config);
+    open_link(config)
 }
 fn io_failure(error: &TelemetryError) -> bool {
     // SDK Io values describe logical queue/routing ownership, not OS socket
@@ -463,6 +510,42 @@ mod tests {
             });
             assert_eq!(retry.discard_if_retired(), !disconnect);
         }
+    }
+
+    #[test]
+    fn operator_modem_check_holds_only_the_av_bay_radio_closed() {
+        let opened = Arc::new(AtomicUsize::new(0));
+        let make = |av_bay: bool| {
+            let radio = missing();
+            let counter = opened.clone();
+            {
+                let mut state = radio.shared.lock().unwrap();
+                state.av_bay = av_bay;
+                state.opener = Box::new(move |_| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(Box::new(TestRadio {
+                        online: Arc::new(AtomicBool::new(true)),
+                        ready: Arc::new(AtomicBool::new(true)),
+                        sent: Arc::new(Mutex::new(Vec::new())),
+                        alive: Arc::new(AtomicUsize::new(1)),
+                    }))
+                });
+            }
+            radio
+        };
+        let av_bay = make(true);
+        let other = make(false);
+        assert!(av_bay.connect().is_some());
+        assert!(other.connect().is_some());
+        let releases = crate::comms::rfd_modem::test_releases();
+        crate::comms::rfd_modem::test_set_hold(true);
+        assert!(av_bay.connect().is_none(), "held radio stays closed");
+        assert!(av_bay.shared.lock().unwrap().rx.is_none());
+        assert!(crate::comms::rfd_modem::test_releases() > releases);
+        assert!(other.connect().is_some(), "only the AV-bay radio is held");
+        crate::comms::rfd_modem::test_set_hold(false);
+        assert!(av_bay.connect().is_some(), "reopens once the check is done");
+        assert_eq!(opened.load(Ordering::SeqCst), 3);
     }
 
     #[test]

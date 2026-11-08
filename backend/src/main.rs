@@ -1126,16 +1126,24 @@ fn open_primary_link(link: &CommsLinkConfig) -> anyhow::Result<Box<dyn CommsDevi
     } else { Ok(device) }
 }
 
+/// The AV-bay radio. The RFD modem check runs once, before the first open.
+fn open_av_bay_primary_link(link: &CommsLinkConfig) -> anyhow::Result<Box<dyn CommsDevice>> {
+    let device = rrls_radio::open_av_bay_link(link)?;
+    if matches!(link,CommsLinkConfig::Serial{..}|CommsLinkConfig::RaspberryPiGpioUart{..}|CommsLinkConfig::CustomSerial{..}) {
+        Ok(Box::new(rrls_radio::RecoveryRadio::from_open_av_bay(link.clone(),device)?))
+    } else { Ok(device) }
+}
+
 fn open_rocket_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>>, bool) {
     if rrls::is_rrls() {
         return (
-            Arc::new(Mutex::new(Box::new(rrls_radio::RecoveryRadio::new(
+            Arc::new(Mutex::new(Box::new(rrls_radio::RecoveryRadio::new_av_bay(
                 link.clone(),
             )))),
             false,
         );
     }
-    match open_primary_link(link) {
+    match open_av_bay_primary_link(link) {
         Ok(r) => {
             gs_debug_println!("Rocket comms online");
             (Arc::new(Mutex::new(r)), true)
@@ -1280,6 +1288,7 @@ async fn main() -> anyhow::Result<()> {
     };
     if !flight_sim_runtime::enabled() {
         comms::rfd_profile::initialize(&comms_links.av_bay)?;
+        comms::rfd_modem::remember_av_bay(&comms_links.av_bay);
         if let comms_config::CommsLinkConfig::PicoFiTcp { tcp } = &comms_links.fill_box {
             ethernet_autoconfig::prepare(tcp.discovery_interface.clone()).await;
         } else if rrls::is_rrls() {
@@ -1470,6 +1479,19 @@ async fn main() -> anyhow::Result<()> {
         kg50_input_sync: Default::default(),
         auth,
     });
+    // The RFD modem check may enter command mode only outside flight and
+    // with no launch or sequence running. Seed it from the restored state
+    // before the radio opens, then keep it current.
+    comms::rfd_modem::set_gate(comms::rfd_modem::station_block_reason(&state));
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                comms::rfd_modem::set_gate(comms::rfd_modem::station_block_reason(&state));
+            }
+        });
+    }
 
     #[cfg(all(
         feature = "testing",

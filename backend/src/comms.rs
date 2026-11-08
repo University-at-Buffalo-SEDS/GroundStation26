@@ -8,6 +8,8 @@ mod picofi_tcp;
 pub(crate) mod retry_tracker_tests;
 #[path = "comms/rfd_capacity.rs"]
 pub(crate) mod rfd_capacity;
+#[path = "comms/rfd_modem.rs"]
+pub(crate) mod rfd_modem;
 #[path = "comms/rfd_profile.rs"]
 pub(crate) mod rfd_profile;
 #[cfg(any(target_os = "linux", test))]

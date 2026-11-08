@@ -425,6 +425,8 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
             "/api/rrls/status",
             get(|| async { Json(crate::rrls::status()) }),
         )
+        .route("/api/radio/modem", get(get_radio_modem))
+        .route("/api/radio/modem/check", post(post_radio_modem_check))
         .route("/api/firmware/targets", get(get_firmware_targets))
         .route("/api/firmware/updates", get(get_firmware_updates))
         .route("/api/firmware/updates/{id}", get(get_firmware_update))
@@ -2142,6 +2144,58 @@ async fn get_network_topology(
 }
 
 /// Read-only detail beyond the dashboard's summarized topology.
+async fn get_radio_modem(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(crate::comms::rfd_modem::status()).into_response()
+}
+
+#[derive(Deserialize)]
+struct RadioModemCheckRequest {
+    mode: String,
+}
+
+/// Explicit operator request to verify (read only) or fix the local RFD modem.
+/// Refused in a flight state, during a launch or sequence, or while a check runs.
+async fn post_radio_modem_check(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<RadioModemCheckRequest>,
+) -> Response {
+    let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if principal.anonymous {
+        return (StatusCode::UNAUTHORIZED, "Sign in to check the radio modem.").into_response();
+    }
+    if !principal.allows_command_name("RadioModemCheck") {
+        return (
+            StatusCode::FORBIDDEN,
+            "RadioModemCheck command permission is required.",
+        )
+            .into_response();
+    }
+    let Some(mode) = crate::comms::rfd_modem::Mode::parse(&request.mode) else {
+        return (StatusCode::BAD_REQUEST, "mode must be verify or fix").into_response();
+    };
+    // Re-evaluate now rather than trusting the 250 ms refresh.
+    crate::comms::rfd_modem::set_gate(crate::comms::rfd_modem::station_block_reason(&state));
+    match crate::comms::rfd_modem::request_operator_check(mode) {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"accepted": true})),
+        )
+            .into_response(),
+        Err(reason) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"accepted": false, "reason": reason})),
+        )
+            .into_response(),
+    }
+}
+
 async fn get_network_diagnostics(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
