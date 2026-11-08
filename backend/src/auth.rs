@@ -1043,8 +1043,15 @@ impl AuthManager {
         db: &SqlitePool,
         token: Option<&str>,
     ) -> Result<SessionStatus, AuthFailure> {
+        // A token that was sent but no longer resolves must be reported as 401,
+        // exactly as every data endpoint does, so clients drop it and sign in
+        // again instead of looking "anonymous" here while all other requests fail.
+        let presented = token.is_some_and(|token| !token.trim().is_empty());
         match self.authorize_token(db, token, Permission::ViewData).await {
             Ok(principal) => Ok(principal.session_status()),
+            Err(AuthFailure::Unauthorized(message)) if presented => {
+                Err(AuthFailure::Unauthorized(message))
+            }
             Err(AuthFailure::Unauthorized(_)) => {
                 let config = self.load_users_file().map_err(|e| {
                     AuthFailure::Internal(format!("failed to load users.json: {e}"))

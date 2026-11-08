@@ -679,6 +679,15 @@ mod tests {
         assert!(status.allowed_commands.is_empty());
     }
     #[tokio::test]
+    async fn session_status_rejects_a_presented_invalid_token_but_allows_anonymous() {
+        let (_root, state, _headers) = fixture("admin").await;
+        let stale = state.auth.session_status(&state.auth_db, Some("no-such-token")).await;
+        assert!(matches!(stale, Err(crate::auth::AuthFailure::Unauthorized(_))));
+        for absent in [None, Some(""), Some("   ")] {
+            assert!(state.auth.session_status(&state.auth_db, absent).await.is_ok(), "{absent:?}");
+        }
+    }
+    #[tokio::test]
     async fn admin_can_delete_another_account_and_its_sessions_end() {
         let (_root, state, headers) = fixture("admin").await;
         assert_eq!(delete(&state, headers.clone(), "OPERATOR").await, StatusCode::OK);
