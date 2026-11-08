@@ -421,6 +421,140 @@ const INTERLOCKS: &[Spec] = &[
     },
 ];
 
+// Board-side automatic aborts and safe states, inventoried from firmware source
+// (read-only): ActuatorBoard26 339df77, ValveBoard26 813f7e5, DAQ-Board 24aaa87,
+// gateway-board26 1715cf1, RFBoard26 b4b8ceb, PowerBoard26 156826a,
+// FlightComputer26 0ba9746. Citations are repo-relative file:line.
+const BOARDS: &[Spec] = &[
+    // AB Core/Src/safety_task.c:23,299-345; thread_comm.c:198-212; main_task.c:160-181,588-603
+    // VB Core/Src/safety_thread.c:17,52-80; main_thread.c:153-172,435-443,566-584
+    Spec {
+        id: "board-heartbeat-abort",
+        title: "Board heartbeat abort (AB, VB)",
+        summary: "The Actuator and Valve Boards latch Abort by themselves after 5 s without a GS heartbeat, only between Idle and Launch and never once their launch latch is set. AB drives the igniter, supply solenoids and backup valve low and stops fill; VB closes PILOT and opens Vent and Dump. AB also aborts if no heartbeat ever arrives within 5 s of PreFill..Armed.",
+        details: &[
+            "The GS sees it as an ABORT packet tagged SEDS_AUTO_ABORT_V1 (heartbeat timeout) and as ABORT_LATCHED in board recovery. It is not active after Launch.",
+            "Cleared only by an authenticated board-recovery job (Reset all boards). The latch survives board resets (TAMP backup registers) unless backup power is lost.",
+        ],
+        modes: ALL,
+        enforced_in: &["ActuatorBoard26/Core/Src/safety_task.c:299", "ValveBoard26/Core/Src/safety_thread.c:52"],
+        config_keys: &[],
+    },
+    // VB safety_thread.c:82-119; AB safety_task.c:390-405 (ADC start); AB safety_task.c:367-372 (mismatch inert)
+    Spec {
+        id: "board-fault-abort",
+        title: "Board fault aborts (AB, VB)",
+        summary: "VB latches Abort when igniter continuity is lost and AB when its safety ADC fails to start, both only between Startup and Launch. AB's ADC output-mismatch check only counts and does not abort.",
+        details: &["After Launch the VB continuity timer is diagnostic only. Reported as SEDS_AUTO_ABORT_V1 packets; cleared by Reset all boards."],
+        modes: ALL,
+        enforced_in: &["ValveBoard26/Core/Src/safety_thread.c:82", "ActuatorBoard26/Core/Src/safety_task.c:390"],
+        config_keys: &[],
+    },
+    // VB Core/Src/overpressure.c:48-134,179-204; main_thread.c:300-376; thread_comm.c:218-278; overpressure.h:14-18
+    Spec {
+        id: "board-vb-overpressure",
+        title: "Valve Board overpressure (850/950 psi)",
+        summary: "On two fresh samples at or above 850 psi the Valve Board opens Dump and Vent and tells the Actuator Board to close Nitrogen and Nitrous; at or above 950 psi it also opens PILOT for 3 s, closes it and latches its own Abort. Active from Startup; from Launch (launch latch, accepted launch or Launch..Recovery) it only reports.",
+        details: &["Stale or invalid pressure only reports. The relief clears on a GS acknowledgement once a fresh sample is below 850 psi; the abort needs Reset all boards."],
+        modes: ALL,
+        enforced_in: &["ValveBoard26/Core/Src/overpressure.c:88", "ValveBoard26/Core/Src/thread_comm.c:220"],
+        config_keys: &[],
+    },
+    // AB telemetry.c:299-318, thread_comm.c:455-503; VB telemetry.c:357-373, thread_comm.c:574-589; FC telemetry.c:849-861
+    Spec {
+        id: "board-peer-abort",
+        title: "Abort from another board (AB, VB)",
+        summary: "An automatic ABORT from another board (SEDS_AUTO_ABORT_V1) is obeyed by AB and VB only before Launch. An ABORT without a recognised tag is treated as a manual Stop in every state; no firmware sends one today. The FC obeys only a manual Stop.",
+        details: &["The GS accepts an observed automatic abort only before Launch (gse::accept_observed_abort)."],
+        modes: ALL,
+        enforced_in: &["ActuatorBoard26/Core/Src/thread_comm.c:455", "ValveBoard26/Core/Src/thread_comm.c:574", "FlightComputer26/Core/Src/telemetry.c:849"],
+        config_keys: &[],
+    },
+    // AB board_abort_latch.c:4-42,72-86,106-120; thread_comm.c:170-192,304,610-654,1228; VB thread_comm.c:170-191,373,751,776-794
+    Spec {
+        id: "board-abort-latch",
+        title: "Board abort latch and boot",
+        summary: "AB and VB keep the abort and launch latches in backup registers, so they survive NRST, software and watchdog resets and are replayed to the outputs at boot. A network flight state of Aborted latches only before the launch latch is set.",
+        details: &[
+            "Reported to Launch rules: if backup-register access fails at boot, the board latches Abort and launch in any state. If a board that missed Launch admission cannot verify its launch latch when the network state reaches Launch or later, it latches Abort (AB igniter off; VB Dump/Vent open, PILOT closed). Both can act after Launch.",
+            "Cleared by Reset all boards (board-recovery job) or loss of backup power.",
+        ],
+        modes: ALL,
+        enforced_in: &["ActuatorBoard26/Core/Src/board_abort_latch.c:32", "ActuatorBoard26/Core/Src/thread_comm.c:646", "ValveBoard26/Core/Src/thread_comm.c:786"],
+        config_keys: &[],
+    },
+    // Core/Src/board_watchdog.c:37-42 (FC :32-37); VB main_thread.c:547-550,562; AB main_task.c:378-380,585
+    Spec {
+        id: "board-watchdog-reset",
+        title: "Board watchdog reset and safe defaults",
+        summary: "Every board resets through its independent watchdog after about 16 s without a task check-in and reports the cause in BOARD_HEALTH. After any reset VB starts with PILOT closed and Vent and Dump open, and AB and VB hold outputs safe while storage is not ready with no launch continuity.",
+        details: &["Reported to Launch rules: an in-flight VB reset vents the tank and an in-flight AB reset with a storage fault keeps the igniter and fill off. No abort latch is set by the reset itself."],
+        modes: ALL,
+        enforced_in: &["ValveBoard26/Core/Src/main_thread.c:547", "ActuatorBoard26/Core/Src/main_task.c:585"],
+        config_keys: &[],
+    },
+    // AB main_task.c:41-47,150,168,300-334; VB main_thread.c:26-28,214-259
+    Spec {
+        id: "board-igniter-safing",
+        title: "Igniter and launch-sequence timing",
+        summary: "AB turns the igniter on 4.25 s after an accepted Launch and off automatically after 10 s, then holds it off for 1.5 s; VB opens PILOT 10 s after acceptance for 1.5 s. A Launch timestamp more than 5 s old or 1 s in the future is refused, and any Abort or Stop drives the igniter low.",
+        details: &[],
+        modes: ALL,
+        enforced_in: &["ActuatorBoard26/Core/Src/main_task.c:300", "ValveBoard26/Core/Src/main_thread.c:214"],
+        config_keys: &[],
+    },
+    // FC recovery.c:273-297,643-669,868-871; fcconfig.h:143-144
+    Spec {
+        id: "board-fc-sensor-abort",
+        title: "FC sensor-failure abort",
+        summary: "Before flight the FC enters its aborted state after 120 bad IMU or barometer samples and waits for a command. After Launch the same fault only restarts its evaluator with a tenfold limit, which can delay deployment but never aborts.",
+        details: &["Reported to the GS as ABORT_LATCHED in board recovery. Cleared by a Launch command or a Startup reset."],
+        modes: FLIGHT,
+        enforced_in: &["FlightComputer26/Core/Src/recovery.c:643"],
+        config_keys: &[],
+    },
+    // FC evaluation.c:342-381,460-462; fcapi.h:366-370; recovery.c:672-701; fcconfig.h:168-174
+    Spec {
+        id: "board-fc-vigilant",
+        title: "FC vigilant watchdog (reported)",
+        summary: "Reported to Launch rules: the FC's vigilant watchdog (on by default, also forced on by GPS faults) can advance Ascent..Descent to Descent or Reefing without firing, because its pyro calls are commented out. That suppresses the drogue, and the main then refuses because the drogue did not fire.",
+        details: &["The GS sees only the flight-state change; the deployment notification then reads the state change, not a confirmed pulse. Not changed in this release."],
+        modes: FLIGHT,
+        enforced_in: &["FlightComputer26/Core/Src/evaluation.c:357"],
+        config_keys: &[],
+    },
+    // FC fc_watchdog_recovery.c:149,194-276; fc_recovery_owner.c:36-68,121-133,319-341; deployment_pulse.c:72
+    Spec {
+        id: "board-fc-reset-inhibit",
+        title: "FC reset in flight (reported)",
+        summary: "Reported to Launch rules: after a watchdog reset in flight the FC resumes only from a valid checkpoint (same image, CRC, at most 60 s gap, no Stop). Otherwise, or if storage is not ready at resume, it blocks all pyro until a Startup reset and a new Launch. Any other reset loses the flight.",
+        details: &["Shown to the GS as ABORT_LATCHED and BOARD_HEALTH reset flags."],
+        modes: FLIGHT,
+        enforced_in: &["FlightComputer26/Core/Src/fc_watchdog_recovery.c:222"],
+        config_keys: &[],
+    },
+    // FC recovery.c:752-797; evaluation.c:478-487; distribution.c:864-872
+    Spec {
+        id: "board-fc-lost-gs",
+        title: "FC lost ground station (reported)",
+        summary: "After 3 s without the GS the FC marks the ground station lost. If it is in its aborted state it then sends itself a Launch signal, which resumes evaluation and can request ignition through the Valve Board. This is an automatic launch path, not an abort, and is reported for review.",
+        details: &[],
+        modes: FLIGHT,
+        enforced_in: &["FlightComputer26/Core/Src/recovery.c:785"],
+        config_keys: &[],
+    },
+    // DAQ/GW/RF/PB: no abort sender, handler or latch; LTC2990 telemetry only (PB ltc2990.c:318-325, GW ltc2990.c:250,270)
+    Spec {
+        id: "board-no-abort",
+        title: "DAQ, Gateway, RF and Power Boards",
+        summary: "These boards never abort or switch a rail off by themselves; only the watchdog reset applies. A Gateway outage stops GS heartbeats reaching AB and VB, which can trigger their heartbeat abort before Launch.",
+        details: &[],
+        modes: ALL,
+        enforced_in: &["PowerBoard26/Core/Src/ltc2990.c:318", "gateway-board26/Core/Src/ltc2990.c:250"],
+        config_keys: &[],
+    },
+];
+
 #[allow(clippy::type_complexity)]
 const SECTIONS: &[(&str, &str, &str, &[Spec])] = &[
     ("tank", "Tank pressure", "Overpressure relief and abort, overfill, and what the Valve Board does on its own.", TANK),
@@ -428,6 +562,7 @@ const SECTIONS: &[(&str, &str, &str, &[Spec])] = &[
     ("sequences", "Sequences", "Nitrogen test hold, Cold flow or Dump, Pause/Resume/Cancel, Turbocharge and fill limits.", SEQUENCES),
     ("launch", "Launch", "What must be true before Launch, and what refuses it.", LAUNCH),
     ("stop", "Stop, abort and recovery", "Automatic abort rules, manual Stop/Abort and Reset all boards.", STOP),
+    ("boards", "Board behaviour", "What each board does by itself: heartbeat and fault aborts, the abort latch, overpressure, watchdog resets and igniter timing. Entries marked reported can act after Launch.", BOARDS),
     ("phases", "Mission phases", "Startup, Idle, Fill, Launch, In flight and Landed, and who decides Landed.", PHASES),
     ("interlocks", "Interlocks", "Key, button and launch interlocks, ignition pair, igniter sense and checklists.", INTERLOCKS),
 ];

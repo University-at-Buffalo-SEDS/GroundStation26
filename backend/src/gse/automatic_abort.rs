@@ -362,7 +362,12 @@ pub(super) mod tests {
             ] {
                 assert!(crate::telemetry_task::command_at_dispatch(&state, command).is_none());
             }
-            // 6. Observed automatic abort acceptance.
+            // 6. Observed automatic abort acceptance. This is where the GS sees
+            // board-side automatic aborts: AB heartbeat/initial-heartbeat/ADC
+            // and VB heartbeat/continuity/overpressure aborts arrive as ABORT
+            // packets tagged SEDS_AUTO_ABORT_V1 (About safety: Board behaviour).
+            // The boards gate them before Launch themselves; the GS must not
+            // adopt one after Launch either.
             assert!(!accept_observed_abort(&state, true, generation));
         }
         router.process_all_queues_with_timeout(0).unwrap();

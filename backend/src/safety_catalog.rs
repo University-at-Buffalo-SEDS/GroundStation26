@@ -282,7 +282,7 @@ mod tests {
             "automatic-abort", "no-automatic-abort-after-launch", "manual-stop", "reset-all-boards",
             "ignition-pair", "hitl-interlocks", "key-interlock", "plumbing-retraction", "checklists",
             "valve-freshness", "supply-interlock", "fill-limits", "qd-settle", "igniter-sense",
-            "stale-data", "connectivity-loss", "mission-phases", "fc-owns-landing",
+            "stale-data", "connectivity-loss", "mission-phases", "fc-owns-landing", "board-heartbeat-abort", "board-vb-overpressure", "board-abort-latch", "board-fc-vigilant",
         ] {
             assert!(ids.contains(required), "missing safety rule {required}");
         }
@@ -308,8 +308,9 @@ mod citation_tests {
         for (_, _, _, specs) in SECTIONS {
             for spec in *specs {
                 for cite in spec.enforced_in {
-                    if cite.starts_with("ValveBoard26/") {
-                        continue; // firmware lives in its own repository
+                    const FIRMWARE: [&str; 7] = ["ValveBoard26/", "ActuatorBoard26/", "FlightComputer26/", "DAQ-Board/", "gateway-board26/", "RFBoard26/", "PowerBoard26/"];
+                    if FIRMWARE.iter().any(|repo| cite.starts_with(repo)) {
+                        continue; // firmware lives in its own repository (file:line citations)
                     }
                     let (path, function) = cite.split_once(':').unwrap_or((cite, ""));
                     let source = std::fs::read_to_string(repo.join(path))
