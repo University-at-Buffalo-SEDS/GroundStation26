@@ -74,6 +74,13 @@ pub(super) fn desired(rt: &Runtime) -> Option<[bool; 5]> {
         .filter(|s| s.active())
         .map(|s| s.controller.observation().desired)
 }
+/// Tank overpressure owns the valves: retire scheduled effects, emit nothing.
+pub(super) fn retire_for_overpressure(rt: &mut Runtime) {
+    if let Some(session) = &mut rt.cold_flow {
+        session.retired = true;
+        session.pending = None;
+    }
+}
 pub(super) fn runtime_active(rt: &Runtime) -> bool {
     rt.cold_flow.as_ref().is_some_and(Session::active)
 }

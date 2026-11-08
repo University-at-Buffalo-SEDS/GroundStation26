@@ -188,7 +188,7 @@ async fn bulk_settings_cannot_grant_dry_consent_but_preserve_or_revoke_existing_
     let mut request = state.gse.lock().unwrap().engine.config.clone();
     request.dry_self_test_confirmed = true;
     assert_eq!(
-        save_config(State(state.clone()), headers.clone(), Json(request.clone()))
+        save_config(State(state.clone()), headers.clone(), Json(serde_json::to_value(&request).unwrap()))
             .await
             .status(),
         StatusCode::FORBIDDEN
@@ -209,7 +209,7 @@ async fn bulk_settings_cannot_grant_dry_consent_but_preserve_or_revoke_existing_
     request.dry_self_test_confirmed = false;
     request.maximum_zero_offset_psi = Some(12.0);
     assert_eq!(
-        save_config(State(state.clone()), headers.clone(), Json(request.clone()))
+        save_config(State(state.clone()), headers.clone(), Json(serde_json::to_value(&request).unwrap()))
             .await
             .status(),
         StatusCode::OK,
@@ -228,7 +228,7 @@ async fn bulk_settings_cannot_grant_dry_consent_but_preserve_or_revoke_existing_
     assert_eq!(dedicated.status(), StatusCode::OK);
     request.dry_self_test_confirmed = true;
     assert_eq!(
-        save_config(State(state.clone()), headers.clone(), Json(request.clone()))
+        save_config(State(state.clone()), headers.clone(), Json(serde_json::to_value(&request).unwrap()))
             .await
             .status(),
         StatusCode::OK
@@ -245,7 +245,7 @@ async fn bulk_settings_cannot_grant_dry_consent_but_preserve_or_revoke_existing_
     // Current frontend can POST a stale false; retain its explicit revocation.
     request.dry_self_test_confirmed = false;
     assert_eq!(
-        save_config(State(state.clone()), headers.clone(), Json(request.clone()))
+        save_config(State(state.clone()), headers.clone(), Json(serde_json::to_value(&request).unwrap()))
             .await
             .status(),
         StatusCode::OK
@@ -297,7 +297,7 @@ async fn bulk_settings_cannot_grant_dry_consent_but_preserve_or_revoke_existing_
     let mut stale = state.gse.lock().unwrap().engine.config.clone();
     stale.dry_self_test_confirmed = true;
     assert_eq!(
-        save_config(State(state), headers, Json(stale))
+        save_config(State(state), headers, Json(serde_json::to_value(&stale).unwrap()))
             .await
             .status(),
         StatusCode::FORBIDDEN,

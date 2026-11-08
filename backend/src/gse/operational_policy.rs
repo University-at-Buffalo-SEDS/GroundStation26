@@ -61,6 +61,7 @@ pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool
         )
         // A failure pause holds for explicit operator review first.
         && rt.engine.failure().is_none()
+        && !rt.overpressure.latched()
         && rt
             .turbo_evidence
             .as_ref()
@@ -563,7 +564,7 @@ pub(super) fn check_report_safety(state: &Arc<AppState>) {
         return;
     }
     let mut rt = state.gse.lock().unwrap();
-    if rt.operational.saved.qualification.fault().is_some() {
+    if rt.operational.saved.qualification.fault().is_some() || rt.overpressure.owns_valves() {
         return;
     }
     let phase = rt.engine.status.phase;

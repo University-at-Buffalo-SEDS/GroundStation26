@@ -2766,6 +2766,11 @@ async fn handle_packet_inner(
             pkt.timestamp() as i64,
             live_receipt,
         );
+        if sender_id == Board::ValveBoard.sender_id()
+            && rows.iter().any(|(kind, _)| kind == "FUEL_TANK_PRESSURE")
+        {
+            crate::gse::overpressure::evaluate(state);
+        }
         // Prepare every live mass/PT row before even the composite raw row
         // can await recorder capacity. Filters and calibration run once.
         let prepared: Vec<_> = rows

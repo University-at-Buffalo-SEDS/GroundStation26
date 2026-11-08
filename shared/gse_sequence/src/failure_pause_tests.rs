@@ -297,3 +297,43 @@ fn operator_cancel_and_existing_fault_are_never_converted_to_a_pause() {
     assert!(rig.engine.pause_for_failure(rig.now, "late").valves.is_empty());
     assert_eq!(rig.engine.status.phase, Phase::Fault);
 }
+
+#[test]
+fn nitrous_overfill_dumps_only_under_automatic_fill() {
+    for manual in [false, true] {
+        let mut rig = Rig::new();
+        rig.filling();
+        rig.engine.manual_fill_control = manual;
+        rig.pressure = 190.0; // limit is min(140 + 50, 200)
+        for _ in 0..20 {
+            rig.tick();
+        }
+        if manual {
+            assert_eq!(rig.engine.status.phase, Phase::Filling);
+            assert!(!rig.opened_relief_since_failure(), "{:?}", rig.trace);
+            assert!(rig.trace.is_empty(), "no valve commands under manual control");
+            let warnings: Vec<_> = rig.notes.iter().filter(|n| n.contains("Nitrous overfill warning")).collect();
+            assert_eq!(warnings.len(), 1, "warn once per excursion: {:?}", rig.notes);
+            // Below the limit re-arms the warning.
+            rig.pressure = 100.0;
+            rig.tick();
+            rig.pressure = 195.0;
+            rig.tick();
+            assert_eq!(rig.notes.iter().filter(|n| n.contains("overfill warning")).count(), 2);
+        } else {
+            assert_eq!(rig.engine.status.phase, Phase::Fault);
+            assert!(rig.valves[1] && rig.valves[2] && !rig.valves[3] && !rig.valves[4]);
+        }
+    }
+}
+
+#[test]
+fn manual_control_never_suppresses_the_nitrogen_test_ceiling() {
+    let mut rig = Rig::new();
+    rig.engine.manual_fill_control = true;
+    rig.request(Action::NitrogenTest);
+    rig.until(Phase::Raising);
+    rig.pressure = 220.0; // nitrogen session: not a nitrous overfill
+    rig.tick();
+    assert_eq!(rig.engine.status.phase, Phase::Fault);
+}

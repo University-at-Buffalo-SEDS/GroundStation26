@@ -93,7 +93,14 @@ pub(super) fn config_for_binding(config: &Config) -> serde_json::Value {
     let object = value.as_object().unwrap();
     let mut filtered = serde_json::Map::new();
     for (key, value) in object {
-        if key != "cold_flow_target_psi" {
+        if !matches!(
+            key.as_str(),
+            "cold_flow_target_psi"
+                | "overpressure_relief_psi"
+                | "overpressure_abort_psi"
+                | "overpressure_pilot_ms"
+                | "tank_rating_psi"
+        ) {
             filtered.insert(key.clone(), value.clone());
         }
     }
@@ -637,6 +644,17 @@ pub(super) fn guard_closed_pressure(state: &Arc<AppState>) -> bool {
         state.fill_targets_snapshot().nitrous.target_pressure_psi,
         50.0,
     );
+    if pressure
+        .zip(limit.as_ref().ok().copied())
+        .is_some_and(|(p, limit)| p.value >= limit)
+        && (!rt.ground_station_control || rt.manual_control)
+    {
+        // Overfill relief belongs to automatic fill only; overpressure
+        // protection (overpressure.rs) still applies in every mode.
+        rt.engine.status.message =
+            "Nitrous overfill warning: valve-board pressure is at the fill limit under manual control; no automatic dump".into();
+        return false;
+    }
     if pressure
         .zip(limit.as_ref().ok().copied())
         .is_some_and(|(p, limit)| p.value >= limit)

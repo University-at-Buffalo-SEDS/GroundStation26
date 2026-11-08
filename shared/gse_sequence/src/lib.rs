@@ -52,6 +52,15 @@ pub struct Config {
     pub maximum_zero_offset_psi: Option<f32>,
     pub dry_self_test_confirmed: bool,
     pub grouped_panel: bool,
+    /// Tank overpressure relief: at or above this valve-board psi, in every
+    /// mode and state before Launch, close both supplies and open dump/vent.
+    pub overpressure_relief_psi: f32,
+    /// Tank overpressure abort: also open the main (pilot) valve, then Abort.
+    pub overpressure_abort_psi: f32,
+    /// How long the main (pilot) valve stays open before the Abort.
+    pub overpressure_pilot_ms: u64,
+    /// Optional physical tank rating; both thresholds must stay below it.
+    pub tank_rating_psi: Option<f32>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -69,10 +78,33 @@ impl Default for Config {
             maximum_zero_offset_psi: None,
             dry_self_test_confirmed: false,
             grouped_panel: true,
+            overpressure_relief_psi: 850.0,
+            overpressure_abort_psi: 950.0,
+            overpressure_pilot_ms: 3000,
+            tank_rating_psi: None,
         }
     }
 }
 impl Config {
+    pub fn validate_overpressure(&self) -> Result<(), String> {
+        let relief = self.overpressure_relief_psi;
+        let abort = self.overpressure_abort_psi;
+        if !relief.is_finite() || !abort.is_finite() || relief <= 0.0 || relief >= abort {
+            return Err("Overpressure relief must be finite, positive and below the overpressure abort pressure".into());
+        }
+        if !(500..=10_000).contains(&self.overpressure_pilot_ms) {
+            return Err("Overpressure main-valve opening must be 0.5 to 10 seconds".into());
+        }
+        match self.tank_rating_psi {
+            Some(rating) if !rating.is_finite() || rating <= 0.0 => {
+                Err("Tank rating must be finite and positive, or unset".into())
+            }
+            Some(rating) if abort >= rating => Err(
+                "Overpressure relief and abort pressures must both be below the tank rating".into(),
+            ),
+            _ => Ok(()),
+        }
+    }
     pub fn validate_turbocharge_deadband(&self) -> Result<(), String> {
         let band = self.turbocharge_pressure_deadband_psi;
         if !band.is_finite() || !(8.0..=16.0).contains(&band) {
@@ -170,6 +202,7 @@ impl Config {
         self.nitrogen_plan()?;
         self.validate_fill_trim()?;
         self.validate_turbocharge_deadband()?;
+        self.validate_overpressure()?;
         if self
             .turbocharge_max_added_mass_kg
             .is_some_and(|v| !v.is_finite() || v <= 0.0)
@@ -347,6 +380,11 @@ pub struct Effects {
 
 pub struct Engine {
     pub config: Config,
+    /// The operator, not an automatic fill sequence, controls nitrous flow
+    /// (e.g. automatic cutoff disabled). A nitrous overfill then warns and
+    /// never dumps; tank overpressure relief is enforced separately.
+    pub manual_fill_control: bool,
+    overfill_warned: bool,
     /// Supplied from the nitrous fill target before requesting StartFill.
     pub nitrous_target_psi: f32,
     nitrous_session: bool,
@@ -403,6 +441,8 @@ impl Default for Engine {
     fn default() -> Self {
         Self {
             config: Config::default(),
+            manual_fill_control: false,
+            overfill_warned: false,
             nitrous_target_psi: 750.0,
             nitrous_session: false,
             resume_existing_inventory: false,
@@ -830,6 +870,25 @@ impl Engine {
         }
         self.hold_paused_for_failure(message)
     }
+    /// Session ceiling: an automatic sequence relieves; a nitrous overfill
+    /// under manual fill control only warns (once per excursion).
+    fn pressure_ceiling_reached(&mut self, now: u64, pressure: f32) -> Effects {
+        if !(self.nitrous_session && self.manual_fill_control) {
+            return self.fault(now, "Pressure ceiling reached");
+        }
+        if self.overfill_warned {
+            return Effects::default();
+        }
+        self.overfill_warned = true;
+        let message = format!(
+            "Nitrous overfill warning: tank pressure {pressure:.0} psi is at the fill limit under manual control; no automatic dump"
+        );
+        self.status.message = message.clone();
+        Effects {
+            valves: Vec::new(),
+            notification: Some(message),
+        }
+    }
     pub fn fault(&mut self, now: u64, message: &str) -> Effects {
         self.failure = None;
         self.paused_from = None;
@@ -1183,7 +1242,10 @@ impl Engine {
                     .session_pressure_limit()
                     .is_ok_and(|limit| pressure >= limit)
             {
-                return self.fault(input.now_ms, "Pressure ceiling reached");
+                let effects = self.pressure_ceiling_reached(input.now_ms, pressure);
+                if self.status.phase == Phase::Fault || effects.notification.is_some() {
+                    return effects;
+                }
             }
             if self.valve_ack_expired(input) {
                 return self.valve_ack_timeout(input);
@@ -1274,7 +1336,12 @@ impl Engine {
             );
         };
         if pressure >= limit {
-            return self.fault(input.now_ms, "Pressure ceiling reached");
+            let effects = self.pressure_ceiling_reached(input.now_ms, pressure);
+            if self.status.phase == Phase::Fault || effects.notification.is_some() {
+                return effects;
+            }
+        } else {
+            self.overfill_warned = false;
         }
         let setup = matches!(
             self.status.phase,
@@ -1619,6 +1686,7 @@ mod tests {
                     maximum_zero_offset_psi: Some(8.0),
                     dry_self_test_confirmed: true,
                     grouped_panel: true,
+                    ..Config::default()
                 },
                 ..Engine::default()
             };
@@ -1796,6 +1864,38 @@ mod tests {
         rig.pressure = 0.0;
         rig.request(Action::NitrogenTest);
         assert_eq!(rig.engine.status.phase, Phase::BaselineSetup);
+    }
+    #[test]
+    fn overpressure_thresholds_default_and_validate_against_tank_rating() {
+        let config = Config::default();
+        assert_eq!(
+            (config.overpressure_relief_psi, config.overpressure_abort_psi, config.overpressure_pilot_ms),
+            (850.0, 950.0, 3000)
+        );
+        assert!(config.validate_overpressure().is_ok());
+        let legacy: Config = serde_json::from_str(r#"{"nitrogen_target_psi":120}"#).unwrap();
+        assert_eq!(legacy.overpressure_relief_psi, 850.0);
+        for (relief, abort, pilot, rating) in [
+            (950.0, 950.0, 3000, None),
+            (960.0, 950.0, 3000, None),
+            (f32::NAN, 950.0, 3000, None),
+            (0.0, 950.0, 3000, None),
+            (850.0, 950.0, 0, None),
+            (850.0, 950.0, 3000, Some(900.0)),
+            (850.0, 950.0, 3000, Some(950.0)),
+        ] {
+            let bad = Config {
+                overpressure_relief_psi: relief,
+                overpressure_abort_psi: abort,
+                overpressure_pilot_ms: pilot,
+                tank_rating_psi: rating,
+                ..Config::default()
+            };
+            assert!(bad.validate_overpressure().is_err(), "{relief} {abort} {pilot} {rating:?}");
+            assert!(bad.validate_settings().is_err());
+        }
+        let rated = Config { tank_rating_psi: Some(1200.0), ..Config::default() };
+        assert!(rated.validate_overpressure().is_ok());
     }
     #[test]
     fn incomplete_settings_can_select_manual_panel_without_enabling_automation() {

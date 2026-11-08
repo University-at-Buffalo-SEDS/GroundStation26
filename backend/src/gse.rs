@@ -1,5 +1,8 @@
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
 pub(crate) mod cold_flow;
+pub(crate) mod overpressure;
+#[cfg(test)]
+mod overpressure_tests;
 pub(crate) mod progress;
 mod turbocharge;
 #[cfg(all(test, feature = "firmware_sim"))]
@@ -188,6 +191,7 @@ pub struct Runtime {
     manual_control: bool,
     effects_queued: bool,
     automatic_abort_in_flight: bool,
+    overpressure: overpressure::Monitor,
 }
 impl Default for Runtime {
     fn default() -> Self {
@@ -228,6 +232,7 @@ impl Default for Runtime {
             manual_control: false,
             effects_queued: false,
             automatic_abort_in_flight: false,
+            overpressure: Default::default(),
         }
     }
 }
@@ -783,6 +788,9 @@ pub fn valve_command(cmd: &TelemetryCommand) -> bool {
 }
 
 pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool> {
+    if let Some(allowed) = overpressure::command_allowed(&state.gse.lock().unwrap(), cmd) {
+        return Some(allowed);
+    }
     if matches!(crate::sequences::command_name(cmd), "Launch" | "GroundStationLaunch" | "IgniterSequence")
         && turbocharge_active_nowait(state)
     {
@@ -1312,6 +1320,12 @@ fn handle_command_inner(
 ) -> bool {
     #[cfg(feature = "hitl_mode")]
     let _ = (plumbing_origin, launch_revision);
+    if overpressure::command_allowed(&state.gse.lock().unwrap(), cmd) == Some(false) {
+        state.add_temporary_notification(
+            "Blocked: a tank overpressure error holds dump and vent open; acknowledge it after pressure drops",
+        );
+        return true;
+    }
     if matches!(cmd, TelemetryCommand::Abort) {
         // Engine may already be Fault/inactive while its operational owner is
         // still retained. Retire it even on that path and before ColdFlow's
@@ -1772,6 +1786,12 @@ pub(crate) fn pause_fill_for_recoverable_fault_for_generation(
 }
 
 pub fn tick(state: &Arc<AppState>, interlock: bool) {
+    // Overpressure precedes cold flow, sequences, pause and hold logic.
+    overpressure::evaluate(state);
+    if state.gse.lock().unwrap().overpressure.owns_valves() {
+        flush_effects(state);
+        return;
+    }
     let automatic_observation = crate::automatic_flight_state::Observation::begin(state);
     #[cfg(feature = "hitl_mode")]
     let _ = &automatic_observation;
@@ -1830,6 +1850,8 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
         }
         #[cfg(not(feature = "hitl_mode"))]
         let previous_phase = rt.engine.status.phase;
+        // Overfill relief belongs to automatic fill only.
+        rt.engine.manual_fill_control = !rt.ground_station_control || rt.manual_control;
         if let Some(mut controller) = rt.fill_trim.take() {
             let mass = rt.fresh_mass(input.now_ms);
             let update = controller.tick(input, mass);
@@ -2015,6 +2037,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/api/gse/abort/clear", axum::routing::post(clear_abort))
         .route(
+            "/api/gse/overpressure/acknowledge",
+            axum::routing::post(overpressure::acknowledge_route),
+        )
+        .route(
             "/api/gse/qualification/reset",
             axum::routing::post(reset_qualification),
         )
@@ -2153,16 +2179,38 @@ fn invalidate_changed_configuration(rt: &mut Runtime, config: &Config) -> Result
     }
     Ok(())
 }
+/// Overpressure settings an older client does not know are kept, never reset.
+pub(super) const OVERPRESSURE_CONFIG_KEYS: [&str; 4] = [
+    "overpressure_relief_psi",
+    "overpressure_abort_psi",
+    "overpressure_pilot_ms",
+    "tank_rating_psi",
+];
+pub(super) fn config_from_request(current: &Config, mut body: serde_json::Value) -> Result<Config, String> {
+    let object = body.as_object_mut().ok_or("GSE configuration must be an object")?;
+    let saved = serde_json::to_value(current).map_err(|e| e.to_string())?;
+    for key in OVERPRESSURE_CONFIG_KEYS {
+        if !object.contains_key(key) {
+            object.insert(key.into(), saved[key].clone());
+        }
+    }
+    serde_json::from_value(body).map_err(|e| e.to_string())
+}
 async fn save_config(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(config): Json<Config>,
+    Json(body): Json<serde_json::Value>,
 ) -> Response {
     let admission_generation = capture_operator_origin(&state).unwrap_or(0);
     if let Err(e) = crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await
     {
         return e;
     }
+    let current = state.gse.lock().unwrap().engine.config.clone();
+    let config = match config_from_request(&current, body) {
+        Ok(config) => config,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error).into_response(),
+    };
     let Some(_claim) = claim_operator_dispatch(&state, admission_generation) else {
         return (
             StatusCode::CONFLICT,
@@ -2269,6 +2317,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         response["qd"] = serde_json::json!(format!("{:?}", rt.operational.qd.status(rt.now())));
     }
     turbocharge::decorate_status(&state, &mut response);
+    overpressure::decorate_status(&state.gse.lock().unwrap(), &mut response);
     response["sequence_progress"]=progress::envelope(&state);
     response["cold_flow"]=serde_json::to_value(cold_flow::status(&state)).expect("Cold-flow status serializable");
     Json(response).into_response()
