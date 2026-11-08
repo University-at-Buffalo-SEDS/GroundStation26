@@ -291,7 +291,7 @@ impl Controller {
             };
         }
         if mean < target - self.tolerance {
-            return self.fail("Settled fill mass is below target; manual review required");
+            return self.fail(SETTLED_BELOW_TARGET);
         }
         if self.pulses >= MAX_PULSES {
             return self.fail_hazard("Fill trim pulse limit reached");
@@ -305,6 +305,9 @@ impl Controller {
         }
     }
 }
+
+/// Pause reason when the settled mass ends below the target tolerance.
+pub const SETTLED_BELOW_TARGET: &str = "Settled fill mass is below target; manual review required";
 
 #[cfg(test)]
 mod tests {

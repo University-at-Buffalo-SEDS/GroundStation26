@@ -719,6 +719,21 @@ impl Engine {
         target_mass_kg: f32,
     ) -> Result<bool, String> {
         self.validate_request(Action::StartFill, input)?;
+        // A trim pause below target is resumable once the settled mass is
+        // short by more than the fill tolerance. The 0.2 kg deadband exists so
+        // a completed fill is not topped up for small losses; applied here it
+        // left masses between target - 0.2 kg and target - tolerance paused
+        // with no way to resume ("Review and Resume" was a no-op).
+        if !cfg!(feature = "legacy_resume_deadband")
+            && self.failure() == Some(fill_trim::SETTLED_BELOW_TARGET)
+        {
+            let required = fill_resume::resume_required(input.now_ms, mass, target_mass_kg)?;
+            let short = mass.is_some_and(|m| {
+                m.value * target_mass_kg.signum()
+                    < target_mass_kg.abs() - self.config.fill_tolerance_kg
+            });
+            return Ok(required || short);
+        }
         fill_resume::resume_required(input.now_ms, mass, target_mass_kg)
     }
 
@@ -2056,6 +2071,43 @@ mod tests {
         rig.until(Phase::Fault);
         assert!(!rig.engine.status.nitrogen_passed);
         assert_eq!(rig.valves, RELIEVED);
+    }
+    /// A trim pause below target must be resumable for any shortfall beyond
+    /// the fill tolerance; the 0.2 kg deadband only spares a completed fill.
+    #[test]
+    fn trim_pause_below_target_is_resumable_beyond_the_fill_tolerance() {
+        let mut rig = Rig::new();
+        rig.baseline();
+        for target in [50.0, 100.0, 120.0] {
+            rig.until(Phase::Raising);
+            rig.pressure = 5.0 + target;
+            rig.until(Phase::Holding);
+            for _ in 0..50 { rig.tick(); }
+        }
+        rig.until(Phase::Paused);
+        rig.dump();
+        rig.pressure = 5.0;
+        rig.until(Phase::Passed);
+        rig.engine.nitrous_target_psi = 140.0;
+        rig.request(Action::StartFill);
+        rig.until(Phase::Filling);
+        let mass = |value: f32, now: u64| Some(Sample { value, at_ms: now });
+        // Trim ends 0.114 kg short of a 5 kg target (tolerance 0.07 kg).
+        let effects = rig.engine.pause_for_failure(rig.now, fill_trim::SETTLED_BELOW_TARGET);
+        rig.effects(effects);
+        rig.until(Phase::Paused);
+        let short = rig.engine.fill_resume_required(rig.input(), mass(4.886, rig.now), 5.0).unwrap();
+        let within = rig.engine.fill_resume_required(rig.input(), mass(4.95, rig.now), 5.0).unwrap();
+        assert!(!within, "inside the fill tolerance there is nothing to resume");
+        assert_eq!(short, !cfg!(feature = "legacy_resume_deadband"));
+        // Any other pause keeps the explicit 0.2 kg resume deadband.
+        rig.request(Action::StartFill);
+        rig.until(Phase::Filling);
+        let effects = rig.engine.pause_for_failure(rig.now, "Fill mass did not settle");
+        rig.effects(effects);
+        rig.until(Phase::Paused);
+        assert!(!rig.engine.fill_resume_required(rig.input(), mass(4.886, rig.now), 5.0).unwrap());
+        assert!(rig.engine.fill_resume_required(rig.input(), mass(4.80, rig.now), 5.0).unwrap());
     }
     #[test]
     fn nitrogen_steps_hold_and_dump_before_unlocking_fill() {
