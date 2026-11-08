@@ -42,6 +42,11 @@ pub struct ActionControl {
     /// until the owner acknowledges this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested: Option<bool>,
+    /// Owner-confirmed outputs only: set while the owner has not confirmed
+    /// and its board is not reachable, e.g. "RF Board not reachable; applies
+    /// when it reconnects". The stored request is republished on reconnect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,6 +140,35 @@ pub(crate) fn owner_output_state(cmd: &str) -> Option<(bool, Option<bool>)> {
     };
     let view = owner_output_view(output);
     Some((view.requested, view.confirmed))
+}
+
+/// Owner board for an owner-confirmed output command.
+pub(crate) fn owner_output_board(cmd: &str) -> Option<crate::types::Board> {
+    use crate::network_variables::OwnerOutput;
+    match cmd {
+        "ToggleAvBayUnderglow" => Some(OwnerOutput::Underglow.owner_board()),
+        "ToggleFlightBuzzer" => Some(OwnerOutput::FlightBuzzer.owner_board()),
+        _ => None,
+    }
+}
+
+/// How recently the owner board must have sent an application packet to
+/// count as reachable. Discovery announcements alone do not count: a relay
+/// that only announces itself cannot deliver or acknowledge the value.
+pub(crate) const OWNER_REACHABLE_MS: u64 = 5_000;
+
+/// Operator-facing note for an unconfirmed owner output whose owner is not
+/// reachable. None when confirmed, or when the owner is reachable (the
+/// ordinary "owner unconfirmed" delivery state applies).
+pub(crate) fn owner_unreachable_note(
+    board: crate::types::Board,
+    confirmed: Option<bool>,
+    packet_count: u64,
+    packet_age_ms: Option<u64>,
+) -> Option<String> {
+    let reachable = packet_count > 0 && packet_age_ms.is_some_and(|age| age < OWNER_REACHABLE_MS);
+    (confirmed.is_none() && !reachable)
+        .then(|| format!("{} not reachable; applies when it reconnects", board.as_str()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -536,6 +570,46 @@ fn begin_sequence_tick(
         *last_flight_state = None;
     }
     Some(claim)
+}
+
+#[cfg(test)]
+mod owner_note_tests {
+    use super::*;
+    use crate::types::Board;
+
+    #[test]
+    fn unreachable_owner_explains_when_the_toggle_applies() {
+        assert_eq!(owner_output_board("ToggleAvBayUnderglow"), Some(Board::RFBoard));
+        assert_eq!(owner_output_board("ToggleFlightBuzzer"), Some(Board::FlightComputer));
+        assert_eq!(owner_output_board("Launch"), None);
+        // Discovery-only RF board (live 2026-11-08): seen, but no packets.
+        assert_eq!(
+            owner_unreachable_note(Board::RFBoard, None, 0, Some(400)).as_deref(),
+            Some("RF Board not reachable; applies when it reconnects")
+        );
+        assert_eq!(
+            owner_unreachable_note(Board::FlightComputer, None, 0, None).as_deref(),
+            Some("Flight Computer not reachable; applies when it reconnects")
+        );
+        assert!(
+            owner_unreachable_note(Board::RFBoard, None, 10, Some(OWNER_REACHABLE_MS)).is_some(),
+            "stale packets do not count as reachable"
+        );
+        assert_eq!(owner_unreachable_note(Board::RFBoard, None, 10, Some(100)), None,
+            "reachable owner keeps the ordinary unconfirmed state");
+        assert_eq!(owner_unreachable_note(Board::RFBoard, Some(true), 0, None), None,
+            "a confirmed value needs no note");
+    }
+
+    #[test]
+    fn owner_note_round_trips_and_is_omitted_when_absent() {
+        let mut control = ActionControl { disabled_reason: None, requested: None, owner_note: None,
+            cmd: "ToggleAvBayUnderglow".into(), enabled: true, blink: BlinkMode::None, actuated: None };
+        assert!(!serde_json::to_string(&control).unwrap().contains("owner_note"));
+        control.owner_note = Some("RF Board not reachable; applies when it reconnects".into());
+        let json = serde_json::to_string(&control).unwrap();
+        assert_eq!(serde_json::from_str::<ActionControl>(&json).unwrap(), control);
+    }
 }
 
 #[cfg(test)]
@@ -1254,7 +1328,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
                 let enabled = is_station_utility_command(cmd)
                     || default_recording_command_enabled(cmd)
                         .unwrap_or(matches!(cmd, "Abort" | "Postinit" | "ResetSim"));
-                ActionControl { disabled_reason: None, requested: None,
+                ActionControl { disabled_reason: None, requested: None, owner_note: None,
                     cmd: cmd.to_string(),
                     enabled,
                     blink: backend_blink_for(cmd, enabled, None),
@@ -1301,7 +1375,7 @@ fn policy_with_overrides(
             } else {
                 key_enabled
             };
-            ActionControl { disabled_reason: None, requested: None,
+            ActionControl { disabled_reason: None, requested: None, owner_note: None,
                 cmd: cmd.to_string(),
                 enabled,
                 blink: backend_blink_for(cmd, enabled, recommended.get(cmd)),
@@ -2341,7 +2415,7 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
         .into_iter()
         .map(|cmd| {
             let actuated = default_command_actuated(cmd).or_else(|| valves.actuated_for_cmd(cmd));
-            ActionControl { disabled_reason: None, requested: None,
+            ActionControl { disabled_reason: None, requested: None, owner_note: None,
                 cmd: cmd.to_string(),
                 enabled: true,
                 blink: BlinkMode::None,

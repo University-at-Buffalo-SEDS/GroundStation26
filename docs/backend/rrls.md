@@ -46,8 +46,23 @@ path until RRLS confirms readiness for the current session. That readiness
 expires after two seconds: an unplugged relay cannot retain the command path.
 RRLS sends readiness only during requested recovery, keeping standby silent.
 RRLS forwards while that request's two-second lease
-is fresh. Two seconds of continuous direct reception restores the direct path.
+is fresh. Five seconds of continuous direct reception (no gap of 1.5 s or more)
+restores the direct path, and only after the relay request has stood for at
+least 10 s. After a restore, a new relay request needs both the three-second
+loss and 10 s on the direct path. A marginal link therefore changes at most once
+per 10 s instead of flapping; one-Hz direct reports still count as continuous,
+sparse discovery bursts every 2–3 s do not.
 A relayed reception never counts as proof that the direct path has recovered.
+
+RRLS offers readiness, and relays the primary's uplink, only while it has heard
+a CRC-valid AV-bay frame itself in the last 5 s. With all three radios in one
+room and a silent AV bay, a relay cannot help and would only repeat every
+primary uplink on the same air (more collisions and CRC rejections); those
+frames are counted in `relay_decision.rrls_suppressed_no_av_bay` instead.
+`GET /api/rrls/status` reports `relay_decision`: the current request, the
+reason and age of its last change (also logged and shown on the topology
+page's RRLS node), the transition count, and the direct-frame age and
+continuous span.
 If the main station disappears altogether, RRLS stops forwarding when the lease
 expires but continues receiving and serving its own local recovery data.
 

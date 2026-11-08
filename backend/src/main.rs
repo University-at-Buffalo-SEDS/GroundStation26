@@ -2054,6 +2054,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         TxQueueBudget::new(2048)
     });
+    telemetry_task::register_radio_tx_budget(rocket_tx_budget.clone());
     let (rocket_side, rocket_retry_tracker) = {
         let rocket_tx = rocket_tx.clone();
         let budget = rocket_tx_budget.clone();

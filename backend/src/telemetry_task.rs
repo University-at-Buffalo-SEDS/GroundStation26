@@ -25,7 +25,7 @@ pub(crate) mod procedure_clock;
 mod radio_io;
 pub(crate) mod recording_owner;
 pub(crate) mod recording_diagnostics;
-pub use radio_io::{CommsWorkerHandle, TransportTxActivity, TxQueueBudget,RecoveryFrameClassifier};
+pub use radio_io::{CommsWorkerHandle, TransportTxActivity, TxQueueBudget,RecoveryFrameClassifier,register_radio_tx_budget,radio_tx_budget_diagnostics};
 pub(crate) use radio_io::{is_recovery_control_frame,RECOVERY_CONTROL_TYPES};
 #[cfg(test)]
 use radio_io::{radio_command_log_line, spawn_dedicated_radio_io_threads};

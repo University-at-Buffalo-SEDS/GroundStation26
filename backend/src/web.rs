@@ -2308,7 +2308,8 @@ async fn get_network_diagnostics(
         "handler_failures": stats.total_handler_failures,
         "handler_retries": stats.total_handler_retries,
         "discovery": {"interval_ms": stats.discovery.current_announce_interval_ms,
-            "next_announce_ms": stats.discovery.next_announce_ms}
+            "next_announce_ms": stats.discovery.next_announce_ms},
+        "radio_tx_budget": crate::telemetry_task::radio_tx_budget_diagnostics(),
     })).into_response()
 }
 

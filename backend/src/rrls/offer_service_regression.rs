@@ -193,6 +193,7 @@ fn peer(role: Role) -> (Mesh, Vec<u8>) {
         mesh.incoming(true, &encode(HEALTH, &h), 10000);
     } else {
         let mut recovery = Mesh::new(Role::Rrls, 77);
+        recovery.av_bay_heard = Some(10000); // READY needs the relay to hear the AV bay
         mesh.tick(10000);
         let health = mesh.pop(10000).unwrap();
         recovery.incoming(true, &health.bytes, 10000);

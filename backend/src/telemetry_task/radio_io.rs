@@ -103,6 +103,36 @@ pub struct TxQueueBudget {
     // Keys identify the accepted Vec allocation, never equal application bytes.
     write_leases: Mutex<Vec<(usize, usize, sedsnet::router::PackedWriteLease)>>,
     recovery_classifier: RecoveryFrameClassifier,
+    refusals: TxRefusalCounters,
+}
+
+/// Why the radio side callback refused a frame. Every refusal is a
+/// backpressure retry the SDK repeats on its next queue pass: the frame is
+/// never written, so refusals cost CPU, not airtime.
+#[derive(Default)]
+pub struct TxRefusalCounters {
+    duplicate_command: std::sync::atomic::AtomicU64,
+    control_budget: std::sync::atomic::AtomicU64,
+    ordinary_budget: std::sync::atomic::AtomicU64,
+    aggregate_ceiling: std::sync::atomic::AtomicU64,
+    transport_busy: std::sync::atomic::AtomicU64,
+    other: std::sync::atomic::AtomicU64,
+}
+impl TxRefusalCounters {
+    fn bump(counter: &std::sync::atomic::AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+static RADIO_TX_BUDGET: OnceLock<Arc<TxQueueBudget>> = OnceLock::new();
+/// Publish the radio side budget for `/api/network_diagnostics`.
+pub fn register_radio_tx_budget(budget: Arc<TxQueueBudget>) {
+    let _ = RADIO_TX_BUDGET.set(budget);
+}
+/// Radio side refusal reasons and the bytes currently owned by the writer.
+pub fn radio_tx_budget_diagnostics() -> Option<serde_json::Value> {
+    let budget = RADIO_TX_BUDGET.get()?;
+    Some(budget.diagnostics())
 }
 
 impl TxQueueBudget {
@@ -117,6 +147,7 @@ impl TxQueueBudget {
             pending_commands: Mutex::new(Vec::new()),
             write_leases: Mutex::new(Vec::new()),
             recovery_classifier:Default::default(),
+            refusals: TxRefusalCounters::default(),
         }
     }
 
@@ -152,6 +183,27 @@ impl TxQueueBudget {
         lease:sedsnet::router::PackedWriteLease,activity:&TransportTxActivity)->sedsnet::TelemetryResult<()> {
         self.try_send_inner(sender,priority,lease.bytes(),Some(&lease),Some(activity))
     }
+    pub fn diagnostics(&self) -> serde_json::Value {
+        let r = &self.refusals;
+        let load = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
+        serde_json::json!({
+            "pending_bytes": self.pending.load(Ordering::Acquire),
+            "pending_control_bytes": self.pending_control.load(Ordering::Acquire),
+            "pending_ordinary_bytes": self.pending_ordinary.load(Ordering::Acquire),
+            "control_limit_bytes": self.limit,
+            "ordinary_limit_bytes": self.ordinary_limit,
+            "refusals": {
+                "duplicate_command": load(&r.duplicate_command),
+                "control_budget": load(&r.control_budget),
+                "ordinary_budget": load(&r.ordinary_budget),
+                "aggregate_ceiling": load(&r.aggregate_ceiling),
+                "transport_busy": load(&r.transport_busy),
+                "other": load(&r.other),
+            },
+            "meaning": "refusals are writer backpressure (frame kept by the router and retried); none of them reached the air",
+        })
+    }
+
     fn try_send_inner(
         &self,
         sender: &mpsc::UnboundedSender<(u8, Vec<u8>)>,
@@ -159,6 +211,31 @@ impl TxQueueBudget {
         payload: &[u8],
         lease: Option<&sedsnet::router::PackedWriteLease>,
         activity:Option<&TransportTxActivity>,
+    ) -> sedsnet::TelemetryResult<()> {
+        let mut stage = RefusalStage::Other;
+        let result = self.try_send_admit(sender, priority, payload, lease, activity, &mut stage);
+        if result.is_err() {
+            let r = &self.refusals;
+            TxRefusalCounters::bump(match stage {
+                RefusalStage::DuplicateCommand => &r.duplicate_command,
+                RefusalStage::ControlBudget => &r.control_budget,
+                RefusalStage::OrdinaryBudget => &r.ordinary_budget,
+                RefusalStage::AggregateCeiling => &r.aggregate_ceiling,
+                RefusalStage::TransportBusy => &r.transport_busy,
+                RefusalStage::Other => &r.other,
+            });
+        }
+        result
+    }
+
+    fn try_send_admit(
+        &self,
+        sender: &mpsc::UnboundedSender<(u8, Vec<u8>)>,
+        priority: u8,
+        payload: &[u8],
+        lease: Option<&sedsnet::router::PackedWriteLease>,
+        activity:Option<&TransportTxActivity>,
+        stage: &mut RefusalStage,
     ) -> sedsnet::TelemetryResult<()> {
         if payload.is_empty() {
             return Err(sedsnet::TelemetryError::HandlerError(
@@ -182,6 +259,7 @@ impl TxQueueBudget {
             // The router retains this retry on transient refusal. Reporting
             // success here would invent another accepted transport owner;
             // discarding the original would risk losing the command.
+            *stage = RefusalStage::DuplicateCommand;
             return Err(sedsnet::TelemetryError::Io("side tx busy"));
         }
         // Side callbacks receive schema chunks individually. Once the first
@@ -207,6 +285,7 @@ impl TxQueueBudget {
         // their own bounded allowance, even while accepted schema chunks
         // exceed the ordinary target. Ownership still lasts until the write.
         let control = uses_command_reserve(priority, payload);
+        *stage = if control { RefusalStage::ControlBudget } else { RefusalStage::OrdinaryBudget };
         if control {
             // Receipts are essential but must leave room for a new operator
             // command. Keep the same aggregate bound and retain refused frames
@@ -247,6 +326,7 @@ impl TxQueueBudget {
             self.limit
                 .saturating_add(if continuation { 64 * 1024 } else { 0 })
         };
+        *stage = RefusalStage::AggregateCeiling;
         let reserved = self
             .pending
             .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
@@ -274,6 +354,7 @@ impl TxQueueBudget {
         // The receiver may pop immediately, but every worker takes this lock
         // before IO. Publish admission/progress atomically with actual channel
         // acceptance; a closed channel never admits the SDK offer.
+        *stage = RefusalStage::TransportBusy;
         let mut records = self.write_leases.lock().unwrap();
         let offer=|bytes| sender.send((priority,bytes)).map_err(|_|sedsnet::TelemetryError::HandlerError("radio tx queue closed"));
         let accepted=if let Some(activity)=activity {
@@ -339,6 +420,16 @@ impl TxQueueBudget {
             self.pending_ordinary.fetch_sub(len, Ordering::AcqRel);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum RefusalStage {
+    DuplicateCommand,
+    ControlBudget,
+    OrdinaryBudget,
+    AggregateCeiling,
+    TransportBusy,
+    Other,
 }
 
 fn discard_retired_write(
@@ -2315,6 +2406,25 @@ mod priority_tests {
         }
         assert_eq!(frames, 4);
         assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn radio_refusals_are_counted_by_reason_and_never_reach_the_writer() {
+        let budget = TxQueueBudget::new_radio(2048, 256);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        budget.try_send(&tx, 0, &[1; 200]).unwrap();
+        for _ in 0..3 {
+            assert!(budget.try_send(&tx, 0, &[2; 100]).is_err());
+        }
+        let d = budget.diagnostics();
+        assert_eq!(d["refusals"]["ordinary_budget"], 3);
+        assert_eq!(d["pending_ordinary_bytes"], 200);
+        assert_eq!(d["ordinary_limit_bytes"], 256);
+        let (priority, payload) = rx.try_recv().unwrap();
+        assert!(rx.try_recv().is_err(), "refused frames are never queued for the UART");
+        budget.complete(priority, &payload);
+        budget.try_send(&tx, 0, &[2; 100]).unwrap();
+        assert_eq!(budget.diagnostics()["refusals"]["ordinary_budget"], 3);
     }
 
     #[test]

@@ -19,6 +19,7 @@ fn fallback_forwards_gs_heartbeat_identity_without_manufacturing_watchdog_pulses
         .sender
         .to_string();
     let mut relay = Mesh::new(Role::Rrls, 2);
+    relay.av_bay_heard = Some(3000); // the relay itself hears the AV bay
     assert!(
         relay.local_tx(false, &wire, 3000).is_none(),
         "observer has no local GS transmit authority"

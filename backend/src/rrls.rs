@@ -19,7 +19,22 @@ const BUDGET_CONTROL: u8 = 13;
 const RF_PROFILE_CONTROL: u8 = 14;
 
 const LOSS_MS: u64 = 3_000;
-const RESTORE_MS: u64 = 2_000;
+/// Direct AV-bay frames must arrive with no gap longer than `DIRECT_GAP_MS`
+/// for this long before the primary leaves relay mode.
+const RESTORE_MS: u64 = 5_000;
+/// Longest gap between direct frames that still counts as a continuous direct
+/// path while restoring. One-Hz reports qualify; sparse discovery bursts from a
+/// relay board that keeps restarting its router (about every 2-3 s) do not.
+const DIRECT_GAP_MS: u64 = 1_500;
+/// Minimum time in relay mode before the direct path may be restored, and in
+/// direct mode (after a restore) before relay may be requested again. Together
+/// with `RESTORE_MS` this bounds a marginal link to one change per 10 s.
+const RELAY_MIN_DWELL_MS: u64 = 10_000;
+const DIRECT_MIN_DWELL_MS: u64 = 10_000;
+/// RRLS only: how recently it must have heard the AV bay itself before it
+/// offers or performs uplink relaying. A relay that cannot hear the AV bay
+/// only duplicates the primary's uplink on the air.
+const RRLS_AV_BAY_FRESH_MS: u64 = 5_000;
 const LEASE_MS: u64 = 2_000;
 const MAX_FRAMES: usize = 64;
 const MAX_BYTES: usize = 65_536;
@@ -174,6 +189,8 @@ pub struct Status {
     pub settings_framing: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_budget: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_decision: Option<RelayDecision>,
 }
 pub fn status() -> Status {
     if let Some((_, shared)) = RADIO.get() {
@@ -196,6 +213,7 @@ pub fn status() -> Status {
                 "tuple_scope":"application and UART configuration, not live modem AT readback",
                 "expected_tuple":m.budget_profile.map(|p|serde_json::json!({"uart_baud":p.baud,"usable_air_bps":p.usable_bps,"rf_share_percent":p.rf_share,"frame_overhead_bytes":p.overhead,"packet_burst_ms":p.burst_ms,"packet_gap_ms":p.gap_ms,"flags":p.flags})),
                 "actual_effective_tuple":m.budget_actual,"pending_queued_owner":m.queue.iter().any(|q|Mesh::budget_kind(&q.frame.bytes)),"inflight_owner":m.budget_inflight})),
+            relay_decision: Some(m.relay_decision(now)),
         }
     } else {
         Status {
@@ -211,6 +229,7 @@ pub fn status() -> Status {
             relay_envelope_bytes: 0,
             settings_framing: None,
             recovery_budget: None,
+            relay_decision: None,
         }
     }
 }
@@ -428,6 +447,14 @@ pub struct Mesh {
     last_direct: Option<u64>,
     direct_since: Option<u64>,
     fallback: bool,
+    /// Primary relay decision record, for diagnostics and topology.
+    relay_changed_at: Option<u64>,
+    relay_reason: Option<RelayReason>,
+    relay_transitions: u64,
+    /// RRLS: last CRC-valid frame heard directly from the AV bay.
+    av_bay_heard: Option<u64>,
+    /// RRLS: uplink frames not relayed because it could not hear the AV bay.
+    relay_suppressed_no_av_bay: u64,
     relay_seen: Option<u64>,
     topology_peer_seen: Option<u64>,
     topology_relay_rx: Option<u64>,
@@ -489,6 +516,11 @@ impl Mesh {
             last_direct: None,
             direct_since: None,
             fallback: false,
+            relay_changed_at: None,
+            relay_reason: None,
+            relay_transitions: 0,
+            av_bay_heard: None,
+            relay_suppressed_no_av_bay: 0,
             relay_seen: None,
             topology_peer_seen: None,
             topology_relay_rx: None,
@@ -529,11 +561,11 @@ impl Mesh {
             .unwrap_or_else(|| self.started.elapsed().as_millis().min(u64::MAX as u128) as u64)
     }
     fn direct(&mut self, now: u64) {
-        // Use the same loss boundary as tick(): slower valid reports must
-        // not restart restoration while the direct link is still live.
+        // A gap longer than DIRECT_GAP_MS restarts restoration. One-Hz reports
+        // keep it running; sparse bursts every few seconds never complete it.
         if self
             .last_direct
-            .is_none_or(|v| now.saturating_sub(v) >= LOSS_MS)
+            .is_none_or(|v| now.saturating_sub(v) >= DIRECT_GAP_MS)
         {
             self.direct_since = Some(now);
         }
@@ -573,23 +605,73 @@ impl Mesh {
         }
     }
 
+    /// Primary relay decision with hysteresis. Enter relay only after
+    /// LOSS_MS with no direct AV-bay frame (and not within DIRECT_MIN_DWELL_MS
+    /// of a restore); leave only after RESTORE_MS of continuous direct frames
+    /// and at least RELAY_MIN_DWELL_MS in relay.
+    fn decide_relay(&mut self, now: u64) {
+        let gap = self
+            .last_direct
+            .map_or(now.saturating_sub(self.clock_origin_ms), |v| now.saturating_sub(v));
+        let dwell = self.relay_changed_at.map(|at| now.saturating_sub(at));
+        if !self.fallback {
+            // The first request after startup has no prior restore to respect.
+            let settled = dwell.is_none_or(|d| d >= DIRECT_MIN_DWELL_MS);
+            if gap >= LOSS_MS && settled {
+                self.set_relay(true, now, RelayReason::DirectLost { gap_ms: gap });
+            }
+        } else {
+            let continuous = self
+                .direct_since
+                .filter(|_| gap < DIRECT_GAP_MS)
+                .map(|since| now.saturating_sub(since));
+            let settled = dwell.is_none_or(|d| d >= RELAY_MIN_DWELL_MS);
+            if let Some(continuous) = continuous
+                && continuous >= RESTORE_MS
+                && settled
+            {
+                self.set_relay(false, now, RelayReason::DirectRestored { continuous_ms: continuous });
+            }
+        }
+    }
+    fn set_relay(&mut self, fallback: bool, now: u64, reason: RelayReason) {
+        if self.fallback != fallback {
+            self.relay_transitions = self.relay_transitions.saturating_add(1);
+            log::info!(
+                "Radio recovery: {} ({})",
+                if fallback { "requesting RRLS relay" } else { "direct AV-bay path restored" },
+                reason.describe()
+            );
+        }
+        self.fallback = fallback;
+        self.relay_changed_at = Some(now);
+        self.relay_reason = Some(reason);
+    }
+    /// RRLS: it heard the AV bay recently enough for relaying to help.
+    fn hears_av_bay(&self, now: u64) -> bool {
+        self.av_bay_heard
+            .is_some_and(|heard| now.saturating_sub(heard) < RRLS_AV_BAY_FRESH_MS)
+    }
+    pub(crate) fn relay_decision(&self, now: u64) -> RelayDecision {
+        RelayDecision {
+            relay_requested: self.fallback,
+            changed_ago_ms: self.relay_changed_at.map(|at| now.saturating_sub(at)),
+            reason: self.relay_reason.map(|reason| reason.describe()),
+            transitions: self.relay_transitions,
+            direct_age_ms: self.last_direct.map(|last| now.saturating_sub(last)),
+            direct_continuous_ms: self
+                .direct_since
+                .filter(|_| self.last_direct.is_some_and(|l| now.saturating_sub(l) < DIRECT_GAP_MS))
+                .map(|since| now.saturating_sub(since)),
+            rrls_hears_av_bay: (self.role == Role::Rrls).then(|| self.hears_av_bay(now)),
+            rrls_suppressed_no_av_bay: self.relay_suppressed_no_av_bay,
+        }
+    }
+
     pub fn tick(&mut self, now: u64) {
         self.observe_settings_framing(now);
         if self.role == Role::Primary {
-            if self
-                .last_direct
-                .map_or(now.saturating_sub(self.clock_origin_ms), |v| {
-                    now.saturating_sub(v)
-                })
-                >= LOSS_MS
-            {
-                self.fallback = true;
-            } else if self
-                .direct_since
-                .is_some_and(|v| now.saturating_sub(v) >= RESTORE_MS)
-            {
-                self.fallback = false;
-            }
+            self.decide_relay(now);
             if self
                 .last_health_sent
                 .is_none_or(|v| now.saturating_sub(v) >= 500)
@@ -621,7 +703,10 @@ impl Mesh {
             let peer_fresh = self
                 .health_received
                 .is_some_and(|last| now.saturating_sub(last) < LEASE_MS);
-            if (self.active(now) || self.voice_enabled && peer_fresh)
+            // READY moves the primary's uplink onto this relay. Offer it only
+            // while this station hears the AV bay; otherwise relaying would
+            // just repeat the primary's uplink on the same air.
+            if (self.active(now) && self.hears_av_bay(now) || self.voice_enabled && peer_fresh)
                 && self
                     .last_ready_sent
                     .is_none_or(|last| now.saturating_sub(last) >= 500)
@@ -2329,7 +2414,10 @@ impl Mesh {
                                 class.priority
                             })
                     };
-                    if self.active(now) {
+                    if self.active(now) && !self.hears_av_bay(now) {
+                        self.relay_suppressed_no_av_bay =
+                            self.relay_suppressed_no_av_bay.saturating_add(1);
+                    } else if self.active(now) {
                         self.enqueue(
                             Outgoing {
                                 command: true,
@@ -2373,7 +2461,14 @@ impl Mesh {
                 if !command && frame_class.is_some() {
                     self.direct(now);
                 }
-            } else if self.active(now) {
+            } else {
+                if (!command && frame_class.is_some())
+                    || (command && payload.starts_with(b"RS\x01") && payload.len() == 9)
+                {
+                    self.av_bay_heard = Some(now);
+                }
+            }
+            if self.role == Role::Rrls && self.active(now) {
                 let priority = if command {
                     254
                 } else {
@@ -2434,13 +2529,51 @@ fn decode(bytes: &[u8]) -> Option<(u8, &[u8])> {
         .then_some((bytes[3], &bytes[4..n]))
 }
 
+/// Why the primary last changed its relay request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RelayReason {
+    DirectLost { gap_ms: u64 },
+    DirectRestored { continuous_ms: u64 },
+}
+impl RelayReason {
+    pub(crate) fn describe(self) -> String {
+        match self {
+            Self::DirectLost { gap_ms } => format!(
+                "no direct AV-bay frame for {:.1} s",
+                gap_ms as f64 / 1000.0
+            ),
+            Self::DirectRestored { continuous_ms } => format!(
+                "direct AV-bay frames continuous for {:.1} s",
+                continuous_ms as f64 / 1000.0
+            ),
+        }
+    }
+}
+
+/// Relay decision diagnostics for `/api/rrls/status` and the topology page.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub(crate) struct RelayDecision {
+    pub relay_requested: bool,
+    pub changed_ago_ms: Option<u64>,
+    pub reason: Option<String>,
+    pub transitions: u64,
+    pub direct_age_ms: Option<u64>,
+    pub direct_continuous_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rrls_hears_av_bay: Option<bool>,
+    pub rrls_suppressed_no_av_bay: u64,
+}
+
 /// Observed physical recovery path, separate from SEDSnet's logical routes.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct TopologyObservation {
     pub peer_age_ms: Option<u64>,
     pub direct_age_ms: Option<u64>,
     pub relaying: bool,
     pub command_ready: bool,
+    pub relay_requested: bool,
+    /// "since N s: reason" for the last relay request change, if any.
+    pub relay_change: Option<String>,
 }
 impl Mesh {
     fn topology_observation(&self, now: u64) -> TopologyObservation {
@@ -2452,6 +2585,10 @@ impl Mesh {
                     .topology_relay_rx
                     .is_some_and(|last| now.saturating_sub(last) < LOSS_MS),
             command_ready: self.active(now),
+            relay_requested: self.fallback,
+            relay_change: self.relay_reason.zip(self.relay_changed_at).map(|(reason, at)| {
+                format!("{} s ago: {}", now.saturating_sub(at) / 1000, reason.describe())
+            }),
         }
     }
 }
@@ -3086,19 +3223,23 @@ mod tests {
                     .0,
                 UP_DATA
             );
-            for delta in [100, 600, 1100, 1600, 2100] {
-                primary.incoming(false, &fixtures[0], lost_at + delta);
-                primary.relay_seen = Some(lost_at + delta);
-                primary.tick(lost_at + delta);
+            let restored = lost_at + RELAY_MIN_DWELL_MS;
+            for at in (lost_at + 100..restored).step_by(500) {
+                primary.incoming(false, &fixtures[0], at);
+                primary.relay_seen = Some(at);
+                primary.tick(at);
+                assert!(primary.active(at), "relay keeps its minimum dwell");
             }
+            primary.incoming(false, &fixtures[0], restored);
+            primary.tick(restored);
             assert!(
-                !primary.active(lost_at + 2100),
+                !primary.active(restored),
                 "stable direct recovery must exit fallback"
             );
             assert_eq!(
                 decode(
                     &primary
-                        .local_tx(false, b"pending", lost_at + 2100)
+                        .local_tx(false, b"pending", restored)
                         .unwrap()
                         .bytes
                 )
@@ -3174,6 +3315,11 @@ mod tests {
         assert!(relay.queue.is_empty());
         relay.incoming(true, &health(1, 0, false), 1);
         let observed = relay.incoming(true, &data, 1).unwrap();
+        assert!(relay.queue.is_empty(), "a relay that cannot hear the AV bay never repeats the uplink");
+        assert_eq!(relay.relay_suppressed_no_av_bay, 1);
+        relay.av_bay_heard = Some(1);
+        let observed_again = relay.incoming(true, &data, 1).unwrap();
+        assert_eq!(observed_again.bytes, observed.bytes);
         assert!(!observed.command);
         assert_eq!(
             decode(&relay.queue.back().unwrap().frame.bytes).unwrap().0,
@@ -4068,6 +4214,8 @@ mod tests {
                     downlinks += 1;
                 }
                 r.incoming(false, b"unchanged opaque telemetry fragment", now);
+                // The RRLS keeps hearing the AV bay while the primary does not.
+                r.av_bay_heard = Some(now);
             }
             if !direct && now % 1000 == 0 && p.active(now) {
                 let f = p.local_tx(false, b"original command bytes", now).unwrap();
@@ -4205,11 +4353,15 @@ mod tests {
             90,
             "RF share remains unchanged and total default reservation stays90%"
         );
-        primary.direct(3_100);
-        primary.tick(5_100);
-        assert_eq!(primary.recovery_air_share(5_100), None);
-        relay.incoming(true, &health(1, 1, true), 5_100);
-        assert_eq!(relay.recovery_air_share(5_100), None);
+        let mut now = 3_100;
+        while now <= 3_100 + RELAY_MIN_DWELL_MS {
+            primary.direct(now);
+            primary.tick(now);
+            now += 500;
+        }
+        assert_eq!(primary.recovery_air_share(now), None);
+        relay.incoming(true, &health(1, 1, true), now);
+        assert_eq!(relay.recovery_air_share(now), None);
     }
 
     #[test]
@@ -4246,33 +4398,78 @@ mod tests {
         let mut primary = Mesh::new(Role::Primary, 1);
         primary.tick(3_000);
         assert!(primary.fallback);
-        for now in [3_100, 4_100, 5_099] {
+        // One-Hz reports count as continuous; restoration still waits for
+        // both RESTORE_MS of them and the relay's minimum dwell.
+        let mut now = 3_100;
+        while now < 3_000 + RELAY_MIN_DWELL_MS {
             primary.direct(now);
             primary.tick(now);
-            assert!(primary.fallback, "restoration still requires two seconds");
+            assert!(primary.fallback, "relay keeps its minimum dwell");
+            now += 1_000;
         }
-        primary.tick(5_100);
-        assert!(
-            !primary.fallback,
-            "one-Hz reports keep the direct link live and must restore it"
-        );
-        primary.tick(8_099);
-        assert!(
-            primary.fallback,
-            "the original three-second loss threshold remains exact"
-        );
+        primary.direct(now);
+        primary.tick(now);
+        assert!(!primary.fallback, "one-Hz reports keep the direct link live and restore it");
+        // A real loss right after a restore waits for the direct dwell.
+        let restored_at = now;
+        primary.tick(now + LOSS_MS);
+        assert!(!primary.fallback, "no flap back within the direct dwell");
+        primary.tick(restored_at + DIRECT_MIN_DWELL_MS);
+        assert!(primary.fallback, "a sustained loss still requests the relay");
+        assert_eq!(primary.relay_transitions, 3);
     }
 
     #[test]
     fn direct_loss_gap_restarts_the_restoration_hysteresis() {
         let mut primary = Mesh::new(Role::Primary, 1);
         primary.tick(3_000);
-        primary.direct(3_100);
-        primary.direct(3_100 + LOSS_MS);
-        primary.tick(3_100 + LOSS_MS + RESTORE_MS - 1);
-        assert!(primary.fallback, "a real loss must restart restoration");
-        primary.tick(3_100 + LOSS_MS + RESTORE_MS);
-        assert!(!primary.fallback);
+        // Frames separated by a gap of DIRECT_GAP_MS or more restart it.
+        let mut now = 3_100;
+        while now < 3_000 + RELAY_MIN_DWELL_MS + RESTORE_MS {
+            primary.direct(now);
+            primary.tick(now);
+            now += DIRECT_GAP_MS;
+        }
+        assert!(primary.fallback, "gapped frames never form a continuous direct path");
+        let since = now;
+        while now < since + RESTORE_MS {
+            primary.direct(now);
+            primary.tick(now);
+            assert!(primary.fallback);
+            now += 500;
+        }
+        primary.direct(now);
+        primary.tick(now);
+        assert!(!primary.fallback, "continuous direct frames restore");
+    }
+
+    #[test]
+    fn sparse_direct_bursts_never_flap_the_relay() {
+        // Live 2026-11-08: the RF board restarted its router every 2-3 s, so
+        // only a discovery burst arrived every 2-3.3 s. The old rule (3 s
+        // loss, 2 s restore, restoration reset only by a 3 s gap) flapped.
+        let mut primary = Mesh::new(Role::Primary, 1);
+        let mut changes = 0;
+        let mut last = primary.fallback;
+        let gaps = [2_300u64, 3_300, 2_100, 2_900, 3_350, 2_500];
+        let mut now = 0;
+        for i in 0..400 {
+            let next = now + gaps[i % gaps.len()];
+            for t in (now..next).step_by(100) {
+                primary.tick(t);
+                if primary.fallback != last {
+                    changes += 1;
+                    last = primary.fallback;
+                }
+            }
+            now = next;
+            primary.direct(now);
+        }
+        assert!(primary.fallback, "sparse bursts are not a direct path");
+        assert_eq!(changes, 1, "exactly one request, never a flap");
+        let d = primary.relay_decision(now);
+        assert!(d.relay_requested && d.transitions == 1);
+        assert!(d.reason.unwrap().starts_with("no direct AV-bay frame"));
     }
 
     #[test]

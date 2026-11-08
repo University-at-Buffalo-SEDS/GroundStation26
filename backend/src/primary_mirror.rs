@@ -675,7 +675,7 @@ pub fn action_policy(state: &AppState) -> Option<ActionPolicyMsg> {
                             .position(|v| v == name)
                             .and_then(|index| valve_observation(r, index, elapsed)),
                     };
-                    ActionControl { disabled_reason: None, requested: None,
+                    ActionControl { disabled_reason: None, requested: None, owner_note: None,
                         cmd: (*name).into(),
                         enabled: fresh
                             && (*name!="ToggleBoardStateProofInterlock"||r.board_proof_policy.is_some())

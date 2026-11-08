@@ -2142,6 +2142,19 @@ impl AppState {
             {
                 control.requested = Some(requested);
                 control.actuated = confirmed;
+                control.owner_note = crate::sequences::owner_output_board(&control.cmd)
+                    .and_then(|board| {
+                        let boards = self.board_status.lock().unwrap();
+                        let status = boards.get(&board);
+                        crate::sequences::owner_unreachable_note(
+                            board,
+                            confirmed,
+                            status.map_or(0, |s| s.packet_count),
+                            status
+                                .and_then(|s| s.last_seen_instant)
+                                .map(|at| at.elapsed().as_millis().min(u64::MAX as u128) as u64),
+                        )
+                    });
             }
             if let Some((enabled, actuated)) = recording_command_state(&control.cmd, recording_mode)
             {
