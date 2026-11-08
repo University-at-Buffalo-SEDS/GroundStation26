@@ -111,6 +111,40 @@ notification per deployment per launch cycle, for example "Drogue parachute depl
 that comes only as a state change uses the latest received altitude. The FC firmware was
 not changed.
 
+## Flight maxima
+
+`backend/src/flight_maxima.rs` tracks maximum altitude, speed and acceleration while the
+T clock counts up. It keeps one value per source, each with its T+ time:
+
+- **Altitude:** FC Kalman, then barometer, then GPS.
+- **Speed:** FC Kalman velocity, then GS vehicle speed.
+- **Acceleration:** raw accelerometer magnitude.
+
+The FC's own "EV apogee guess" and "EV maxvel guess" messages are kept alongside these
+and shown as authoritative.
+
+The maxima are served on `GET /api/flight_maxima` and on WebSocket as `FlightMaxima`. They
+are written to `backend/data/flight-maxima.json`, so they survive a restart as long as the
+T+ anchor is the same. They are also recorded as `GS_FLIGHT_MAXIMA` rows at most once a
+second. A T-clock reset, which Reset all boards also performs, clears them.
+
+## Board behaviour
+
+About safety has a Board behaviour section, inventoried from the firmware source. It
+lists what each board does on its own: heartbeat and fault aborts, the abort latch,
+overpressure, watchdog resets and igniter timing.
+
+The inventory found these paths that can act after Launch. Firmware was not changed:
+
+- **FC vigilant watchdog.** It can advance to Descent or Reefing without firing, so both
+  pyro events are suppressed.
+- **FC watchdog-reset recovery.** When resume is rejected, all pyro is inhibited.
+- **AB/VB launch-latch verification failure.** It latches Abort.
+- **AB/VB backup-domain failure at boot.** The board latches Abort in any state.
+- **VB reset defaults.** Vent and Dump open after any reset.
+- **FC auto-Launch.** The FC sends itself a Launch signal when it loses the GS while in its
+  aborted state.
+
 ## Later firmware migration
 
 1. **Extend the schema.** Add an optional `MISSION_PHASE` network variable, one byte with
