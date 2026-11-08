@@ -109,8 +109,9 @@ async fn actual_all_seven_slow_verified_marker_preserves_legacy_final_completion
     let writer=crate::web::clock_worker_tests::WriterGuard::install(fixture.http.directory.join("clock.json"));
     marker.release();
     writer.entered().await;
-    // Actual durable writer wait exceeds the old CONFIRM5s. Existing final
-    // queries happen AFTER this wait, and their2s/domain proof remains current.
+    // A durable writer wait of several seconds (longer than the old 5 s
+    // window, shorter than the journal quiescence bound). Final queries happen
+    // AFTER this wait, and their own proof remains current.
     tokio::time::sleep(Duration::from_millis(5100)).await;
     assert!(!state.launch_history.lock().unwrap().recovery_pending().unwrap().published);
     writer.release();

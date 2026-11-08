@@ -790,10 +790,9 @@ pub(crate) fn block_policy(state: &AppState, policy: &mut crate::sequences::Acti
     if !crate::rrls::is_rrls() {
         let fire_reason = if crate::gse::turbocharge_active_nowait(state) {
             Some(crate::gse::TURBOCHARGE_UNFINISHED_MESSAGE)
-        } else if state.launch_history.try_lock().is_ok_and(|history| history.automatic_actions_inhibited()) {
-            Some(crate::gse::LAUNCH_LOCKED_MESSAGE)
         } else {
-            None
+            // Presentation only; launch admission rechecks under the lock.
+            state.launch_history.try_lock().ok().and_then(|history| crate::gse::launch_journal_block(&history))
         };
         if let Some(fire_reason) = fire_reason {
             for control in &mut policy.controls {
@@ -932,6 +931,7 @@ pub(crate) async fn query_service(
             tokio::select! {biased;_=shutdown.recv()=>return,_=tokio::time::sleep(Duration::from_millis(100))=>{}}
         }
         let _ = refresh.poll(&state);
+        crate::board_recovery::try_release_launch_lock(&state);
     }
 }
 pub(crate) async fn get_status(

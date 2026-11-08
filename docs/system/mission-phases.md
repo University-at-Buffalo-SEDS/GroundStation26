@@ -73,12 +73,28 @@ and `since_ms`.
   - dispatch filter;
   - observed automatic abort.
 - **Rules that stay keyed on the detailed state, unchanged:**
-  - launch lock and reset;
+  - launch lock and reset (see "Launch lock" below);
   - Abort blocks Launch;
   - turbocharge;
   - overpressure;
   - pause-on-failure;
   - sequence policy.
+
+## Launch lock
+
+- **What sets it.** Only a real Launch or Fire attempt. A failed or unfinished board reset, an
+  Abort, or a T-clock reset never sets it (`launch_history.rs:launch_locked`). A journal written
+  before this rule keeps any earlier inhibition as a lock until it is released.
+- **What releases it.** Either Reset all boards, or the verified healthy-board release
+  (`board_recovery.rs:try_release_launch_lock`): every board on the network has a fresh verified
+  readback, taken at least 10 s after the attempt, that is not aborted, is in Startup or Idle with
+  safe outputs and has no unfinished recovery; no board Abort or missed reset remains; and the
+  station is in Startup or Idle. A board that is not on the network does not block it, but at
+  least one board must be present. Resetting only the T-clock changes none of these inputs and
+  never unlocks Launch.
+- **Unfinished recovery.** While a board reset has not finished, Launch is refused with its own
+  message. A board of that reset that later reads back healthy (same boot, same or newer
+  recovery epoch) no longer needs recovery, so recovering only the remaining boards finishes it.
 
 ## FC owns landing
 

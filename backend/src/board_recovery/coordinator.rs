@@ -12,7 +12,8 @@ use tokio::task::JoinHandle;
 
 const CONFIRM_TTL: Duration = Duration::from_secs(30);
 const QUIESCE_TTL: Duration = Duration::from_secs(12);
-const POLL: Duration = Duration::from_millis(300);
+const POLL: Duration = Duration::from_millis(500);
+const _: () = assert!(POLL.as_millis() * super::exchange::POLL_BUDGET as u128 > QUERY_TTL.as_millis());
 #[cfg(test)]
 #[path = "coordinator_c_board_tests.rs"]
 mod c_board_ordering_tests;
@@ -84,14 +85,14 @@ mod shutdown_durability_tests {
         let released=release.clone();
         {
             let mut control=state.board_recovery.coordinator.0.lock().unwrap();
-            control.expected=Some((Board::DaqBoard,123));
+            control.expected[index(Board::DaqBoard).unwrap()]=Some(123);
             control.operation=Some(json!({"completed":false,"phase":"applying"}));
             control.task=Some(tokio::spawn(async move { released.notified().await; }));
         }
         let origin=Token::capture(&state,0);
         let mut owner=state.board_recovery.coordinator.seal_shutdown_and_take_owner().unwrap();
         assert!(!manual_utc_idle(&state),"taken handle incorrectly reopened idle");
-        assert_eq!(state.board_recovery.coordinator.0.lock().unwrap().expected,Some((Board::DaqBoard,123)),"shutdown destroyed admitted application context");
+        assert_eq!(state.board_recovery.coordinator.0.lock().unwrap().expected[index(Board::DaqBoard).unwrap()],Some(123),"shutdown destroyed admitted application context");
         assert!(tokio::time::timeout(Duration::from_millis(1),&mut owner).await.is_err());
         // Taking/awaiting this owner holds no coordinator or Stop lock.
         assert!(state.board_recovery.coordinator.0.try_lock().is_ok());
@@ -118,9 +119,12 @@ struct Control {
     ticket: Option<Ticket>,
     operation: Option<Value>,
     task: Option<JoinHandle<()>>,
-    expected: Option<(Board, u64)>,
+    /// Expected application nonce and reply inbox, one slot per board, so the
+    /// concurrent per-board exchanges of one operation never see each other's
+    /// replies. Indexed by `index(board)`.
+    expected: [Option<u64>; 7],
     boundary: Option<u64>,
-    inbox: VecDeque<Packet>,
+    inbox: [VecDeque<Packet>; 7],
 }
 #[derive(Clone)]
 struct Target {
@@ -516,12 +520,14 @@ impl Runtime {
             .is_some_and(|v| v["completed"] == false)
     }
     fn expected(&self, board: Board, nonce: u64) {
+        let Some(at) = index(board) else { return; };
         let mut control = self.0.lock().unwrap();
-        control.expected = Some((board, nonce));
-        control.inbox.clear();
+        control.expected[at] = Some(nonce);
+        control.inbox[at].clear();
     }
-    fn pop(&self) -> Option<Packet> {
-        self.0.lock().unwrap().inbox.pop_front()
+    fn pop(&self, board: Board) -> Option<Packet> {
+        let at = index(board)?;
+        self.0.lock().unwrap().inbox[at].pop_front()
     }
 }
 pub(super) fn retain_status(state: &AppState, packet: &Packet) {
@@ -536,9 +542,10 @@ pub(super) fn retain_status(state: &AppState, packet: &Packet) {
     let Some(row) = Readback::decode(packet.payload()) else {
         return;
     };
+    let Some(at) = index(board) else { return; };
     let mut control = state.board_recovery.coordinator.0.lock().unwrap();
-    if control.expected == Some((board, row.nonce)) && control.inbox.len() < 16 {
-        control.inbox.push_back(packet.clone());
+    if control.expected[at] == Some(row.nonce) && control.inbox[at].len() < 16 {
+        control.inbox[at].push_back(packet.clone());
     }
 }
 
@@ -626,7 +633,10 @@ async fn refresh_prepare_queries(
         ],
         _ => return Err("Unsupported recovery action"),
     };
-    for board in boards {
+    // Query every board at once, so the earliest prepared query is not aged
+    // by the later boards' round trips before CONFIRM. Each board keeps its own
+    // read-only slot, nonce and freshness wait.
+    let results = futures::future::join_all(boards.into_iter().map(|board| async move {
         // Background status collection may already own this read-only slot.
         // Wait for that request to finish/expire, then create a DISTINCT nonce;
         // its old reply is never reused as the explicit preparation's proof.
@@ -681,7 +691,10 @@ async fn refresh_prepare_queries(
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-    }
+        Ok::<(), &'static str>(())
+    }))
+    .await;
+    results.into_iter().collect::<Result<Vec<()>, _>>()?;
     Ok(())
 }
 // Retry only a rejected, never-owned read-only offer, before Confirm seals UTC.
@@ -863,19 +876,25 @@ fn prepare_inner(
             first_binding,
         });
     }
+    // An interrupted operation cannot be forgotten by choosing a smaller set,
+    // unless a fresh verified readback shows the omitted board already
+    // healthy: not aborted, Startup or Idle, safe outputs, the same boot and
+    // the same or a newer recovery epoch. That board needs nothing more.
+    if let Some(pending) = retained.as_ref().filter(|p| !p.published)
+        && pending.targets.iter().any(|old| {
+            !targets.iter().any(|new| new.board.sender_id() == old.board)
+                && !BOARDS.iter().enumerate().any(|(at, board)| {
+                    super::pending_target_satisfied(*board, old, inner.values[at].as_ref(),
+                        endpoint_verified(state, *board, &topology), now)
+                })
+        })
+    {
+        return Err(
+            "Explicit retry must include every board of the unfinished recovery that has not since read back healthy",
+        );
+    }
     drop(inner);
-    // An interrupted operation cannot be forgotten by choosing a smaller set.
     let history = state.launch_history.lock().unwrap();
-    if let Some(pending) = history.recovery_pending().filter(|p| !p.published)
-        && pending
-            .targets
-            .iter()
-            .any(|old| !targets.iter().any(|new| new.board.sender_id() == old.board))
-        {
-            return Err(
-                "Explicit retry must include every target retained in the durable pending recovery",
-            );
-        }
     if !history.recovery_available() {
         return Err(
             "Healthy durable primary journal required; unreadable history cannot be repaired by board recovery",
@@ -1163,8 +1182,8 @@ fn admit_confirmation(
             && old.await.is_err() { owned.board_recovery.coordinator.0.lock().unwrap().shutdown_failure = true; }
         let result = run(&owned, &headers, &ticket).await;
         let mut control = owned.board_recovery.coordinator.0.lock().unwrap();
-        control.expected = None;
-        control.inbox.clear();
+        control.expected = Default::default();
+        control.inbox.iter_mut().for_each(VecDeque::clear);
         if let Some(operation) = control.operation.as_mut() {
             operation["phase"] = json!(if result.is_ok() {
                 "completed"
@@ -1330,7 +1349,7 @@ async fn fresh_query(
         if crate::gse::with_closed_operator_queue(state, token, || ()).is_none() {
             return Err("Stop superseded dedicated query");
         }
-        if let Some(packet) = state.board_recovery.coordinator.pop() {
+        if let Some(packet) = state.board_recovery.coordinator.pop(board) {
             let row = Readback::decode(packet.payload()).ok_or("Malformed query reply")?;
             if row.issuer != issuer(&state.board_recovery.identity.unwrap()) {
                 return Err("Query issuer changed");
@@ -1354,6 +1373,30 @@ async fn fresh_query(
 enum BoardResult {
     Applied(Readback),
     Io(Readback),
+}
+/// One target's whole exchange: its own original PREPARE query (or a fresh
+/// dedicated query for commissioning), the context check, then the request.
+async fn exchange_target(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    ticket: &Ticket,
+    token: Token,
+    target: &Target,
+    router: Arc<sedsnet::router::Router>,
+) -> Result<BoardResult, &'static str> {
+    // NORMAL completion is armed by the dedicated PREPARE query A.
+    // CONFIRM seals immutable source B>A. A new QUERY C after confirmation
+    // would overwrite that proof and make B<C permanently stale on-device.
+    // Do not renew the original observation or confirmation clock after IO.
+    let query = if let Some(original) = normal_pre_exchange_query(target, Stamp::now())? {
+        original
+    } else {
+        fresh_query(state, headers, ticket, token, target.board, &router).await?
+    };
+    if !context_same(&target.context, &query.value) {
+        return Err("Fresh query differs from immutable board confirmation context");
+    }
+    exchange(state, headers, ticket, token, target, &query, router).await
 }
 async fn exchange(
     state: &Arc<AppState>,
@@ -1413,7 +1456,7 @@ async fn exchange(
         if crate::gse::with_closed_operator_queue(state, token, || ()).is_none() {
             return Err("Stop superseded board recovery");
         }
-        while let Some(packet) = state.board_recovery.coordinator.pop() {
+        while let Some(packet) = state.board_recovery.coordinator.pop(target.board) {
             match exchange.observe(&packet, Stamp::now())? {
                 Outcome::Pending => (),
                 Outcome::Applied => {
@@ -1604,47 +1647,73 @@ async fn run(
         generation,
         ..ticket.token
     };
-    let mut completed = Vec::new();
     let reconcile_only = ticket
         .targets
         .iter()
         .any(|target| target.first_binding.is_some());
-    for target in &ticket.targets {
-        if reconcile_only && target.first_binding.is_none() {
+    // Every board receives its request immediately after CONFIRM, concurrently.
+    // Each request carries the one canonical CONFIRM timestamp, and the boards
+    // refuse a request that is too old by their own clock, so exchanging the
+    // targets one after another made later boards miss that window on real
+    // CAN/radio links. Each exchange keeps its own proofs: the board's own
+    // fresh PREPARE query, its own nonce (expected-reply slot and inbox keyed
+    // by board), its own terminal reply, and the shared Stop/authority fences
+    // checked on every step. All exchanges are driven to their own end before
+    // any failure is reported, so no board is left half-observed.
+    //
+    // A commissioning leg (FIRST identity) never completes in the same
+    // attempt: its IO reply keeps the operation closed. Those legs run first,
+    // and the other boards are exchanged only if they did not fail, so a
+    // commissioning attempt never also resets the rest.
+    let selected = ticket
+        .targets
+        .iter()
+        .filter(|target| !reconcile_only || target.first_binding.is_some())
+        .collect::<Vec<_>>();
+    let (commissioning, normal): (Vec<_>, Vec<_>) = selected
+        .iter()
+        .copied()
+        .partition(|target| target.first_binding.is_some() || target.context.boot == u64::MAX);
+    let mut results = Vec::new();
+    for wave in [commissioning, normal] {
+        if wave.is_empty() {
             continue;
         }
-        // NORMAL completion is armed by the dedicated PREPARE query A.
-        // CONFIRM seals immutable source B>A. A new QUERY C after confirmation
-        // would overwrite that proof and make B<C permanently stale on-device.
-        // Do not renew the original observation or confirmation clock after IO.
-        let query = if let Some(original)=normal_pre_exchange_query(target,Stamp::now())? {original} else {
-            fresh_query(state, headers, ticket, token, target.board, &router).await?
-        };
-        if !context_same(&target.context, &query.value) {
-            return Err("Fresh query differs from immutable board confirmation context");
+        let outcomes = futures::future::join_all(wave.iter().map(|target| {
+            exchange_target(state, headers, ticket, token, target, router.clone())
+        }))
+        .await;
+        let wave_failed = outcomes.iter().any(|outcome| match outcome {
+            Ok(BoardResult::Applied(_)) => reconcile_only,
+            Ok(BoardResult::Io(row)) => !(reconcile_only && matches!(row.boot, 0 | 1)),
+            Err(_) => true,
+        });
+        results.extend(wave.into_iter().zip(outcomes));
+        if wave_failed {
+            break;
         }
-        match exchange(
-            state,
-            headers,
-            ticket,
-            token,
-            target,
-            &query,
-            router.clone(),
-        )
-        .await?
-        {
-            BoardResult::Applied(row) if !reconcile_only => completed.push((target.board, row)),
-            BoardResult::Applied(_) => {
-                return Err("Identity reconciliation cannot apply/reset any target");
+    }
+    let mut completed = Vec::new();
+    let mut failure = None;
+    for (target, result) in results {
+        match result {
+            Ok(BoardResult::Applied(row)) if !reconcile_only => completed.push((target.board, row)),
+            Ok(BoardResult::Applied(_)) => {
+                failure.get_or_insert("Identity reconciliation cannot apply/reset any target");
             }
-            BoardResult::Io(row) if reconcile_only && matches!(row.boot, 0 | 1) => (),
-            BoardResult::Io(_) => {
-                return Err(
+            Ok(BoardResult::Io(row)) if reconcile_only && matches!(row.boot, 0 | 1) => (),
+            Ok(BoardResult::Io(_)) => {
+                failure.get_or_insert(
                     "Commissioning/IO is not success: remain closed; explicit fresh QUERY and NEW confirmation required",
                 );
             }
+            Err(message) => {
+                failure.get_or_insert(message);
+            }
         }
+    }
+    if let Some(message) = failure {
+        return Err(message);
     }
     if reconcile_only {
         return Err(
@@ -1680,9 +1749,15 @@ async fn run(
     authorize(state, headers, ticket).await?;
     // Durability can take seconds. Refresh ALL final proofs AFTER its wait;
     // never claim old observations remain fresh merely because IO finished.
+    // Final readbacks are concurrent too, so the first proof cannot age out
+    // while later boards answer. Each is a distinct dedicated query per board.
+    let finals = futures::future::join_all(completed.iter().map(|(board, _)| {
+        fresh_query(state, headers, ticket, token, *board, &router)
+    }))
+    .await;
     let mut rows = Vec::new();
-    for (board, terminal) in &completed {
-        let query = fresh_query(state, headers, ticket, token, *board, &router).await?;
+    for ((board, terminal), query) in completed.iter().zip(finals) {
+        let query = query?;
         if !context_same(terminal, &query.value) {
             return Err("Fresh final QUERY differs from owned terminal completion");
         }
@@ -1777,6 +1852,7 @@ mod tests {
     mod normal_automatic_phase { include!("normal_automatic_phase_tests.rs"); }
     include!("targeted_recovery_tests.rs");
     include!("resync_tests.rs");
+    include!("concurrent_exchange_tests.rs");
     #[cfg(any(feature="hitl_mode",feature="firmware_sim"))]
     include!("final_clock_tests.rs");
     use super::*;
@@ -1896,6 +1972,10 @@ mod tests {
         /// AB/VB firmware RESYNC: advertised as bit 7 and applied like RECOVER
         /// to the carried phase, refused when outputs do not read safe.
         resync: bool,
+        /// Link latency for recovery-request replies (RECOVER/RESYNC), counted
+        /// from the board's first receipt of that nonce. Polls do not shorten it.
+        recover_delay: Duration,
+        first_receipt: HashMap<u64, WallInstant>,
     }
     #[cfg(feature="test_fire_mode")]
     type NativePeerRouter = Arc<Router>;
@@ -1912,6 +1992,7 @@ mod tests {
         model: Arc<Mutex<Model>>,
         pending_rx: VecDeque<Vec<u8>>,
         c_bridge: Option<super::c_board_ordering_tests::Bridge>,
+        held: Vec<(WallInstant, Packet)>,
     }
     struct Fixture {
         http: super::super::tests::HttpFixture,
@@ -1923,6 +2004,9 @@ mod tests {
         managed_state_receipts: Arc<Mutex<Vec<(Board, Packet)>>>,
         controller_receipts: Arc<Mutex<Vec<Packet>>>,
         ignition_wire_hold: Arc<std::sync::atomic::AtomicU8>,
+        /// Ask the pump to re-announce every board's dedicated endpoint, as
+        /// real boards do periodically, after a test waits past discovery age.
+        rediscover: Arc<std::sync::atomic::AtomicBool>,
         _db: mpsc::Sender<crate::telemetry_db::DbQueueItem>,
         #[cfg(feature="test_fire_mode")]
         native_peers: Vec<(Board,Arc<Router>)>,
@@ -2297,6 +2381,8 @@ mod tests {
                             fail_first_readback: false,
                             retained_first: None,
                             resync: false,
+                            recover_delay: Duration::ZERO,
+                            first_receipt: HashMap::new(),
                         }))
                     });
                 models.push((board, model.clone()));
@@ -2312,11 +2398,14 @@ mod tests {
                     requests,
                     model,
                     pending_rx: VecDeque::new(),
+                    held: Vec::new(),
                     c_bridge: (actual_c_boards && matches!(board,Board::ActuatorBoard|Board::ValveBoard)).then(||super::c_board_ordering_tests::Bridge::start(board)),
                 });
             }
             let ignition_wire_hold = Arc::new(std::sync::atomic::AtomicU8::new(0));
             let pump_hold = ignition_wire_hold.clone();
+            let rediscover = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let pump_rediscover = rediscover.clone();
             let pump_host = host.clone();
             let pump = tokio::spawn(async move {
                 loop {
@@ -2324,6 +2413,17 @@ mod tests {
                         pump_hold.store(2, Ordering::Release);
                         tokio::time::sleep(Duration::from_millis(2)).await;
                         continue;
+                    }
+                    if pump_rediscover.load(Ordering::Acquire) {
+                        for link in &links {
+                            let announce = sedsnet::discovery::build_discovery_announce(
+                                link.board.sender_id(),
+                                crate::telemetry_task::get_current_timestamp_ms(),
+                                &[crate::telemetry_schema::endpoint(endpoint(link.board)), crate::telemetry_schema::endpoint("FLIGHT_STATE")],
+                            ).unwrap();
+                            let _ = pump_host.rx_from_side(&announce, link.host_side);
+                        }
+                        pump_rediscover.store(false, Ordering::Release);
                     }
                     // The actual telemetry task is the sole host queue owner.
                     for link in &mut links {
@@ -2428,6 +2528,10 @@ mod tests {
                                     }
                                 }
                             }
+                            let due = (wire[1] != 0 && !m.recover_delay.is_zero()).then(|| {
+                                let delay = m.recover_delay;
+                                *m.first_receipt.entry(nonce).or_insert_with(WallInstant::now) + delay
+                            });
                             if !m.seen.contains_key(&nonce) || wire[1] == 0 {
                                 response[1] = result;
                                 response[2] = m.state;
@@ -2465,6 +2569,13 @@ mod tests {
                                 Arc::from(response),
                             )
                             .unwrap();
+                            match due {
+                                Some(due) if due > WallInstant::now() => link.held.push((due, reply)),
+                                _ => link.router.tx_queue(reply).unwrap(),
+                            }
+                        }
+                        let now = WallInstant::now();
+                        for (_, reply) in link.held.extract_if(.., |(due, _)| *due <= now) {
                             link.router.tx_queue(reply).unwrap();
                         }
                         let result=link.router.process_all_queues_with_timeout(0);
@@ -2515,6 +2626,7 @@ mod tests {
                 managed_state_receipts,
                 controller_receipts,
                 ignition_wire_hold,
+                rediscover,
                 _db: db,
                 #[cfg(feature="test_fire_mode")]
                 native_peers,
@@ -2611,6 +2723,14 @@ mod tests {
             .await
             .unwrap();
         }
+        async fn rediscover(&self) {
+            self.rediscover.store(true, Ordering::Release);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self.rediscover.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }).await.unwrap();
+        }
         async fn prepare(&self, action: &str, board: Option<&str>) -> Value {
             let state = self.state();
             let response = super::super::tests::http(state.clone(), "POST", "/api/board-recovery/prepare", Some("operator"), json!({"action":action,"boards":if action=="reset_startup" {BOARDS.iter().map(|b|b.sender_id()).collect::<Vec<_>>()}else{vec![]},"board":board,"mode":null,"backend_instance":hex(&state.board_recovery.identity.unwrap()),"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state))})).await;
@@ -2623,7 +2743,7 @@ mod tests {
             super::super::tests::http(self.state(), "POST", "/api/board-recovery/confirm", Some("operator"), json!({"ticket":ticket["ticket"],"backend_instance":ticket["backend_instance"],"principal_context":ticket["principal_context"],"reset_epoch":ticket["reset_epoch"],"confirmation":ticket["confirmation"]})).await
         }
         async fn terminal(&self) -> Value {
-            let terminal = tokio::time::timeout(Duration::from_secs(8), async {
+            let terminal = tokio::time::timeout(QUERY_TTL + Duration::from_secs(8), async {
                 loop {
                     assert!(
                         !self.pump.is_finished() && !self.receiver.is_finished(),
@@ -2649,9 +2769,9 @@ mod tests {
                             "selected_proof_count":operation.get("selected_proof_count"),
                             "reset_applied_state":operation.get("reset_applied_state"),
                         })),
-                        "expected":control.expected.map(|(board,nonce)|json!({"board":board.sender_id(),"nonce":nonce})),
+                        "expected":BOARDS.iter().zip(control.expected).filter_map(|(board,nonce)|nonce.map(|nonce|json!({"board":board.sender_id(),"nonce":nonce}))).collect::<Vec<_>>(),
                         "task_finished":control.task.as_ref().map(JoinHandle::is_finished),
-                        "inbox_len":control.inbox.len(),
+                        "inbox_len":control.inbox.iter().map(VecDeque::len).sum::<usize>(),
                         "shutdown_closed":control.shutdown_closed,
                         "shutdown_failure":control.shutdown_failure,
                     }),
@@ -4835,6 +4955,7 @@ mod tests {
         assert!(fixture.models.iter().all(|(_, model)| model.lock().unwrap().applied == 0));
         // Fresh read-only metadata does not replace the ORIGINAL preparation
         // observation retained inside this ticket.
+        fixture.rediscover().await;
         fixture.query(Board::ActuatorBoard).await;
         let after_readonly = original_offers();
         let response = fixture.confirm(&ticket).await;

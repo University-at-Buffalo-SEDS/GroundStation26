@@ -3807,7 +3807,20 @@ fn launch_controller_delivery_state(
     }
     CurrentState::Current
 }
-pub(crate) const LAUNCH_LOCKED_MESSAGE: &str = "Launch is locked after the last attempt. Use Reset all boards to unlock it.";
+pub(crate) const LAUNCH_LOCKED_MESSAGE: &str = "Launch is locked after the last attempt. It unlocks when every board on the network reads back healthy in Startup or Idle, or use Reset all boards.";
+pub(crate) const LAUNCH_RECOVERY_UNFINISHED_MESSAGE: &str = "Launch is unavailable until the unfinished board recovery completes. Recover the listed boards or use Reset all boards.";
+/// Why the launch journal refuses Launch: a real earlier attempt, or an
+/// unfinished recovery that still inhibits automation. None when clear.
+// Safety catalog (About safety): launch-lock-reset. Keep backend/src/safety_catalog_rules.rs in step.
+pub(crate) fn launch_journal_block(history: &crate::launch_history::Store) -> Option<&'static str> {
+    if history.launch_locked() {
+        Some(LAUNCH_LOCKED_MESSAGE)
+    } else if history.automatic_actions_inhibited() {
+        Some(LAUNCH_RECOVERY_UNFINISHED_MESSAGE)
+    } else {
+        None
+    }
+}
 pub(crate) const TURBOCHARGE_UNFINISHED_MESSAGE: &str = "Turbocharge must finish or be cancelled before firing.";
 /// Turbocharge is a pre-fire operation. Busy reads as unfinished so contention
 /// cannot admit a fire; presentation callers use `turbocharge_active_nowait`.
@@ -4587,13 +4600,8 @@ pub(crate) fn inhibit_automatic_actions_for_pressed_launch(
         )
         .map_err(|error| error.to_string())?;
     let runtime = state.gse.lock().unwrap();
-    if state
-        .launch_history
-        .lock()
-        .unwrap()
-        .automatic_actions_inhibited()
-    {
-        return Err(LAUNCH_LOCKED_MESSAGE.into());
+    if let Some(reason) = launch_journal_block(&state.launch_history.lock().unwrap()) {
+        return Err(reason.into());
     }
     if runtime.automatic_abort_in_flight {
         return Err("Automatic abort is pending; launch was not dispatched".into());
@@ -4658,13 +4666,8 @@ pub(crate) fn commit_fire_intent_for_pressed_launch(
     let _clock_claim = claim_operator_dispatch_under_gate(state, ticket.generation)
         .ok_or_else(|| "Recovery admission is closed; Fire was not admitted".to_string())?;
     let mut rt = state.gse.lock().unwrap();
-    if state
-        .launch_history
-        .lock()
-        .unwrap()
-        .automatic_actions_inhibited()
-    {
-        return Err(LAUNCH_LOCKED_MESSAGE.into());
+    if let Some(reason) = launch_journal_block(&state.launch_history.lock().unwrap()) {
+        return Err(reason.into());
     }
     if rt.operational.saved.automatic_abort_claimed || rt.automatic_abort_in_flight {
         return Err("Automatic abort is pending; clear GSE abort before Fire".into());

@@ -356,12 +356,13 @@ does not advertise it and the RRLS refuses the request.
 
 Launch, GroundStation Launch and phase steps requested from RRLS are admitted by
 the same primary code as a local Launch: a present board reporting Abort blocks
-it, the launch lock still needs Reset all boards, and Launch is refused while
+it, the launch lock still needs its release (Reset all boards, or every
+present board verified healthy at the primary), and Launch is refused while
 turbocharge runs. The RRLS additionally needs fresh signed primary board state.
 
 These stay at the primary on purpose: **Reset all boards** and per-board
 recovery (their frozen-ticket confirmation is bound to the primary session, and
-Reset all boards is the only way to clear the launch lock), GSE sequence start,
+the launch lock clears only at the primary), GSE sequence start,
 pause and cancel, cold-flow override, the dry self-test confirmation,
 qualification reset and pressure-limit configuration.
 

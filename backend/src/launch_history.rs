@@ -274,9 +274,16 @@ struct Disk {
     manual_abort_utc_ceiling: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery_pending: Option<RecoveryPending>,
-    /// Sticky across clock resets; only explicit board/startup recovery may clear it.
+    /// Sticky across clock resets; only explicit board/startup recovery, or the
+    /// verified healthy-board release of a launch attempt, may clear it.
     #[serde(default)]
     automatic_actions_inhibited: bool,
+    /// A real Launch/Fire attempt since the last release. Only the launch
+    /// admission path sets it; a recovery attempt never does. `None` is a
+    /// journal written before this field: its inhibition might have come from
+    /// a launch, so it is kept as a launch lock until released.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_attempt: Option<bool>,
     current: ClockRecord,
     past_sessions: Vec<ClockRecord>,
     events: Vec<RecoveryEvent>,
@@ -350,6 +357,9 @@ pub struct Store {
     pub synchronized: bool,
     pub error: Option<String>,
     born: Instant,
+    /// When the current launch lock began (process start for a restored lock).
+    /// Board readbacks must be observed after this to release it.
+    launch_locked_at: Instant,
     baseline_mono_ms: u64,
     baseline_elapsed_ms: Option<i64>,
 }
@@ -423,6 +433,7 @@ impl Store {
                 manual_abort_utc_ceiling: 0,
                 recovery_pending: None,
                 automatic_actions_inhibited: false,
+                launch_attempt: Some(false),
                 current: ClockRecord::fresh(),
                 past_sessions: Vec::new(),
                 events: Vec::new(),
@@ -476,6 +487,7 @@ impl Store {
             synchronized: !observer,
             error: None,
             born: Instant::now(),
+            launch_locked_at: Instant::now(),
             baseline_mono_ms: mono,
             baseline_elapsed_ms,
         })
@@ -496,6 +508,7 @@ impl Store {
                 manual_abort_utc_ceiling: 0,
                 recovery_pending: None,
                 automatic_actions_inhibited: false,
+                launch_attempt: Some(false),
                 current: ClockRecord::fresh(),
                 past_sessions: Vec::new(),
                 events: Vec::new(),
@@ -509,6 +522,7 @@ impl Store {
             synchronized: true,
             error: None,
             born: Instant::now(),
+            launch_locked_at: Instant::now(),
             baseline_mono_ms: 0,
             baseline_elapsed_ms: None,
         }
@@ -582,6 +596,41 @@ impl Store {
     pub fn clock_known(&self) -> bool {
         !self.data.legacy_anchor_unknown && self.error.is_none()
     }
+    /// Launch stays locked after a real Launch/Fire attempt until the boards
+    /// verify healthy (`release_launch_lock`) or Reset all boards completes.
+    /// A recovery attempt alone, an Abort or a T-clock reset never sets it.
+    // Safety catalog (About safety): launch-lock-reset. Keep backend/src/safety_catalog_rules.rs in step.
+    pub fn launch_locked(&self) -> bool {
+        self.data.launch_attempt.unwrap_or(self.data.automatic_actions_inhibited)
+    }
+    pub(crate) fn launch_locked_at(&self) -> Instant {
+        self.launch_locked_at
+    }
+    /// Release the post-attempt launch lock after the caller verified every
+    /// present required board healthy by fresh readbacks taken after the lock
+    /// began. Refused while any recovery is open, pending or unpublished.
+    /// Clears automation inhibition exactly as a completed Reset all boards.
+    pub(crate) fn release_launch_lock(&mut self) -> Result<bool> {
+        ensure!(
+            !self.closed && !self.observer && self.error.is_none() && self.recovery_owner == 0
+                && !self.recovery_activation_pending,
+            "Launch journal is not open for a release"
+        );
+        ensure!(
+            self.data.recovery_pending.as_ref().is_none_or(|p| p.published && p.verified),
+            "An unfinished board recovery keeps Launch locked"
+        );
+        if !self.launch_locked() && !self.data.automatic_actions_inhibited {
+            return Ok(false);
+        }
+        let writer = self.writer.clone().context("A journal writer is required")?;
+        let mut next = self.data.clone();
+        next.launch_attempt = Some(false);
+        next.automatic_actions_inhibited = false;
+        self.last_write = writer.enqueue(next.clone())?;
+        self.data = next;
+        Ok(true)
+    }
     pub fn automatic_actions_inhibited(&self) -> bool {
         self.recovery_activation_pending || self.data.automatic_actions_inhibited
             || self.data.recovery_pending.as_ref().is_some_and(|p| p.published && p.reset_policy.is_some() && !p.verified_startup_policy())
@@ -591,6 +640,9 @@ impl Store {
     pub fn inhibit_automatic_actions(&mut self) -> Result<()> {
         ensure!(!self.closed, "Launch journal is closed");
         self.data.automatic_actions_inhibited = true;
+        // Only launch admission calls this: it is the real attempt.
+        self.data.launch_attempt = Some(true);
+        self.launch_locked_at = Instant::now();
         if let Some(writer) = &self.writer {
             self.last_write = writer.enqueue(self.data.clone())?;
             writer.wait(self.last_write)?;
@@ -950,6 +1002,9 @@ impl Store {
             self.recovery_available(),
             "Healthy durable primary journal required"
         );
+        // A legacy journal keeps whatever lock it had; this recovery itself is
+        // never recorded as a launch attempt.
+        self.data.launch_attempt = Some(self.launch_locked());
         self.data.automatic_actions_inhibited = true;
         if !self.closed {
             self.last_write = self.writer.as_ref().unwrap().enqueue(self.data.clone())?;
@@ -1040,9 +1095,11 @@ impl Store {
             "Recovery journal exceeds limit"
         );
         let disk: Disk = serde_json::from_slice(&bytes)?;
+        // After publication only a real launch attempt keeps automation
+        // inhibited (see acknowledge_recovery_publication).
         let expected_inhibited = !expected.published
             || !expected.verified_startup_policy()
-                && expected.prior_automatic_actions_inhibited;
+                && disk.launch_attempt.unwrap_or(expected.prior_automatic_actions_inhibited);
         ensure!(
             disk.version == 1
                 && (!expected_inhibited || disk.automatic_actions_inhibited)
@@ -1073,12 +1130,12 @@ impl Store {
         );
         marker.published = true;
         let expected = marker.clone();
-        next.automatic_actions_inhibited = if expected.verified_startup_policy()
-        {
-            false
-        } else {
-            expected.prior_automatic_actions_inhibited
-        };
+        // Reset all boards releases the launch lock. A targeted recovery keeps
+        // only a real launch attempt's lock: the recovery's own inhibition
+        // (and a failed earlier reset's) ends with its publication.
+        let launch_attempt = !expected.verified_startup_policy() && self.launch_locked();
+        next.launch_attempt = Some(launch_attempt);
+        next.automatic_actions_inhibited = launch_attempt;
         let writer = self.writer.clone().context("Writer missing")?;
         let ticket = writer.enqueue(next.clone())?;
         self.data = next;

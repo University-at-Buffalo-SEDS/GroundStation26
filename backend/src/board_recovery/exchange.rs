@@ -6,6 +6,9 @@ const HARDENED: u8 = 0x20;
 const SUPPORTED: u8 = 4;
 const ABORT: u8 = 1;
 const SAFE: u8 = 2;
+/// Application polls per request. With the coordinator's poll interval this
+/// covers the whole QUERY_TTL request lifetime.
+pub(super) const POLL_BUDGET: usize = 32;
 
 /// One immutable source-time boundary captured at CONFIRM admission. QUERY
 /// may occur later; neither per-board preparation nor polls may restamp this.
@@ -237,7 +240,7 @@ impl Exchange {
     /// rate control belong to the coordinator, which must still own its fences.
     pub(super) fn poll_packet(&mut self, now: Stamp) -> Result<Packet, &'static str> {
         self.packet(now)?;
-        if self.poll_ids.len() >= 16 {
+        if self.poll_ids.len() >= POLL_BUDGET {
             return Err("Recovery application poll budget exhausted");
         }
         let packet = Packet::new(
@@ -463,11 +466,11 @@ mod tests {
             exchange.observe(&pending, now + Duration::from_secs(4)),
             Ok(Outcome::Pending)
         );
-        assert!(exchange.packet(now + Duration::from_millis(5001)).is_err());
+        assert!(exchange.packet(now + QUERY_TTL + Duration::from_millis(1)).is_err());
         let complete = reply(&exchange, 0, 0x3e, 9);
         assert!(
             exchange
-                .observe(&complete, now + Duration::from_millis(5001))
+                .observe(&complete, now + QUERY_TTL + Duration::from_millis(1))
                 .is_err()
         );
     }
@@ -663,7 +666,7 @@ mod tests {
                 &query,
                 2,
                 0,
-                now + Duration::from_millis(5001),
+                now + QUERY_TTL + Duration::from_millis(1),
                 router.clone()
             )
             .is_err()
@@ -718,7 +721,7 @@ mod tests {
     #[test]
     fn application_polls_change_only_sdk_envelope_and_have_finite_budget() {
         let (mut e, now) = setup(Board::ActuatorBoard);
-        for i in 0..16 {
+        for i in 0..POLL_BUDGET as u64 {
             let packet = e.poll_packet(now + Duration::from_millis(i)).unwrap();
             assert_ne!(packet.packet_id(), e.packet.packet_id());
             assert_eq!(packet.timestamp(), e.packet.timestamp());
@@ -728,7 +731,7 @@ mod tests {
         }
         assert!(e.poll_packet(now).is_err());
         let (mut e, now) = setup(Board::ActuatorBoard);
-        assert!(e.poll_packet(now + Duration::from_millis(5001)).is_err());
+        assert!(e.poll_packet(now + QUERY_TTL + Duration::from_millis(1)).is_err());
     }
 
     #[test]

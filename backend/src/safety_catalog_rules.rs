@@ -249,11 +249,15 @@ const LAUNCH: &[Spec] = &[
     },
     Spec {
         id: "launch-lock-reset",
-        title: "Launch lock and Reset all boards",
-        summary: "The launch lock clears only through Reset all boards.",
-        details: &[],
+        title: "Launch lock after a launch attempt",
+        summary: "Only a real Launch or Fire attempt locks Launch; a failed or unfinished board reset, an Abort or a T-clock reset never does. The lock releases when every board on the network has a fresh verified readback, taken at least 10 s after the attempt, that is not aborted, is in Startup or Idle with safe outputs, and has no unfinished recovery, while the station is in Startup or Idle; Reset all boards also releases it.",
+        details: &[
+            "A board that is not on the network does not block the release, but at least one board must be present; a board that reports Abort, missed the last reset or still needs recovery keeps Launch locked.",
+            "Resetting only the T-clock changes none of these inputs and never unlocks Launch.",
+            "While a board recovery is unfinished, Launch is refused with its own message until the recovery completes.",
+        ],
         modes: ALL,
-        enforced_in: &["backend/src/board_abort.rs:blocked_message", "backend/src/board_abort.rs:note_reset_completed"],
+        enforced_in: &["backend/src/board_abort.rs:blocked_message", "backend/src/board_abort.rs:note_reset_completed", "backend/src/launch_history.rs:launch_locked", "backend/src/board_recovery.rs:try_release_launch_lock", "backend/src/gse.rs:launch_journal_block"],
         config_keys: &[],
     },
     Spec {
@@ -347,9 +351,13 @@ const STOP: &[Spec] = &[
         id: "reset-all-boards",
         title: "Reset all boards",
         summary: "Reset all boards resets every present board into its safe outputs: Valve Board Vent and Dump open, PILOT off; Actuator Board and flight computer all outputs off (supplies and igniter off). These are commanded registers, not verified positions.",
-        details: &["On Abort the Actuator Board also drives supplies and igniter low and puts the plumbing stepper to sleep."],
+        details: &[
+            "On Abort the Actuator Board also drives supplies and igniter low and puts the plumbing stepper to sleep.",
+            "Every selected board receives its request at the same time, right after confirmation, carrying one confirmation timestamp; each board is still proven by its own fresh query, its own reply and a fresh final readback, and boards accept the request for up to 15 s.",
+            "If a reset does not finish, a board of it that later reads back healthy (not aborted, Startup or Idle, safe outputs, the same or a newer recovery epoch) no longer needs recovery, so a retry may cover only the boards that still do.",
+        ],
         modes: ALL,
-        enforced_in: &["backend/src/board_recovery.rs:safe_output_mask", "backend/src/board_abort.rs:note_reset_completed"],
+        enforced_in: &["backend/src/board_recovery.rs:safe_output_mask", "backend/src/board_abort.rs:note_reset_completed", "backend/src/board_recovery.rs:pending_target_satisfied"],
         config_keys: &[],
     },
     Spec {

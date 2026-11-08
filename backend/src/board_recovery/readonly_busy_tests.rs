@@ -135,10 +135,10 @@ async fn actual_sdk_poll_skips_cooling_boards_and_advances_round_robin_after_eac
     );
 }
 #[tokio::test]
-async fn real_unrefreshed_query_still_expires_at_the_unchanged_five_second_ttl() {
+async fn real_unrefreshed_query_still_expires_at_the_readback_ttl() {
     if crate::operator_queue::isolated_native_case(
         module_path!(),
-        "real_unrefreshed_query_still_expires_at_the_unchanged_five_second_ttl",
+        "real_unrefreshed_query_still_expires_at_the_readback_ttl",
     ) {
         return;
     }
@@ -150,7 +150,7 @@ async fn real_unrefreshed_query_still_expires_at_the_unchanged_five_second_ttl()
         .clone()
         .unwrap();
     assert!(original.fresh(Stamp::now()));
-    tokio::time::sleep(Duration::from_millis(5100)).await;
+    tokio::time::sleep(READBACK_TTL + Duration::from_millis(100)).await;
     assert!(
         !original.fresh(Stamp::now()),
         "scheduler cannot refresh an actual old query by bookkeeping or receipt time"

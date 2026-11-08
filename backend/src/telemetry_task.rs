@@ -613,13 +613,8 @@ fn held_launch_precheck(state: &Arc<AppState>) -> Result<(), String> {
     if state.launch_sequence_command_pending.load(Ordering::SeqCst) {
         return Err("Launch not sent: the last Launch is still waiting for the Valve Board to start its sequence. Use Reset all boards to send Launch again.".into());
     }
-    if state
-        .launch_history
-        .lock()
-        .unwrap()
-        .automatic_actions_inhibited()
-    {
-        return Err(crate::gse::LAUNCH_LOCKED_MESSAGE.into());
+    if let Some(reason) = crate::gse::launch_journal_block(&state.launch_history.lock().unwrap()) {
+        return Err(reason.into());
     }
     if crate::gse::turbocharge_active_nowait(state) {
         return Err(crate::gse::TURBOCHARGE_UNFINISHED_MESSAGE.into());

@@ -481,3 +481,66 @@ fn analytics_io_failure_cannot_change_launch_admission_or_safety_disk_shape() {
     std::fs::remove_dir(path.with_extension("analytics.json")).unwrap();
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn only_a_real_launch_attempt_locks_launch_and_a_tclock_reset_never_unlocks_it() {
+    let path = path();
+    let mut store = Store::open(path.clone(), false, None, 10_000, 0).unwrap();
+    // A recovery attempt inhibits automation but is not a launch attempt.
+    store.inhibit_for_recovery().unwrap();
+    wait(&store);
+    assert!(store.automatic_actions_inhibited());
+    assert!(!store.launch_locked(), "a failed or pending reset is not a launch attempt");
+    drop(store);
+    let mut store = Store::open(path.clone(), false, None, 11_000, 0).unwrap();
+    assert!(!store.launch_locked());
+    store.inhibit_automatic_actions().unwrap();
+    assert!(store.launch_locked());
+    store.reset_primary(12_000, 1000).unwrap();
+    wait(&store);
+    drop(store);
+    let mut store = Store::open(path.clone(), false, None, 13_000, 0).unwrap();
+    assert!(store.launch_locked(), "resetting only the T-clock never unlocks Launch");
+    assert!(store.release_launch_lock().unwrap());
+    assert!(!store.launch_locked() && !store.automatic_actions_inhibited());
+    wait(&store);
+    drop(store);
+    let store = Store::open(path.clone(), false, None, 14_000, 0).unwrap();
+    assert!(!store.launch_locked() && !store.automatic_actions_inhibited(), "the release is durable");
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn legacy_inhibited_journal_stays_locked_until_released() {
+    let path = path();
+    let mut store = Store::open(path.clone(), false, None, 10_000, 0).unwrap();
+    store.inhibit_automatic_actions().unwrap();
+    wait(&store);
+    drop(store);
+    // Rewrite as a journal from before launch_attempt existed.
+    let mut disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    disk.as_object_mut().unwrap().remove("launch_attempt");
+    std::fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+    let mut store = Store::open(path.clone(), false, None, 11_000, 0).unwrap();
+    assert!(store.launch_locked(), "an unknown legacy inhibition is kept as a lock");
+    // A recovery attempt keeps, but does not create, that lock.
+    store.inhibit_for_recovery().unwrap();
+    assert!(store.launch_locked());
+    assert!(store.release_launch_lock().unwrap());
+    assert!(!store.launch_locked());
+    wait(&store);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn launch_lock_release_is_refused_while_a_recovery_is_unfinished() {
+    let path = path();
+    let mut store = Store::open(path.clone(), false, None, 10_000, 0).unwrap();
+    store.inhibit_automatic_actions().unwrap();
+    let fence = store.close_for_recovery(7).unwrap();
+    assert!(store.release_launch_lock().is_err(), "an open recovery owner keeps Launch locked");
+    assert!(store.launch_locked());
+    drop(fence);
+    wait(&store);
+    std::fs::remove_file(path).unwrap();
+}

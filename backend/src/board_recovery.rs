@@ -85,8 +85,11 @@ const BOARDS: [Board; 7] = [
     Board::GatewayBoard,
     Board::DaqBoard,
 ];
-const READBACK_TTL: Duration = Duration::from_secs(5);
-const QUERY_TTL: Duration = Duration::from_secs(5);
+const READBACK_TTL: Duration = Duration::from_secs(15);
+const QUERY_TTL: Duration = Duration::from_secs(15);
+/// Actuator motion/configuration gates keep their own 5 s proof age. The
+/// longer recovery windows above exist for slow links, not for these gates.
+const CONTROL_PROOF_TTL: Duration = Duration::from_secs(5);
 const QUERY_TYPE: &str = "BOARD_RECOVERY_REQUEST";
 const STATUS_TYPE: &str = "BOARD_STATE_STATUS";
 const STATE_VALID: u8 = 8;
@@ -283,8 +286,8 @@ fn resync_board_block_reason(board: Board, row: Option<&Readback>, target: Optio
     if !resync_outputs_safe(board, row) {
         return Some("Resync never moves outputs, and this board's outputs do not read safe. Use Review recovery or Reset all boards.".into());
     }
-    if target.is_some() && row.state == target && row.flags & 1 == 0 {
-        return Some(format!("The board already matches the station ({}).", phase_label(target.unwrap())));
+    if let Some(phase) = target && row.state == Some(phase) && row.flags & 1 == 0 {
+        return Some(format!("The board already matches the station ({}).", phase_label(phase)));
     }
     None
 }
@@ -368,7 +371,7 @@ fn recovery_diagnostic(
         } else {
             (
                 "readback_expired",
-                "The board readback is older than five seconds. Status refreshes automatically; preparing Recover requests a fresh readback.",
+                "The board readback is older than fifteen seconds. Status refreshes automatically; preparing Recover requests a fresh readback.",
             )
         };
     }
@@ -651,7 +654,7 @@ pub(crate) fn actuator_cached_motion_safe_proof(state: &AppState) -> Option<Actu
     let inner = state.board_recovery.inner.lock().unwrap();
     let row = inner.values[index(Board::ActuatorBoard)?].as_ref()?;
     let value = &row.value;
-    if row.observed_after.wall.elapsed() > READBACK_TTL
+    if row.observed_after.wall.elapsed() > CONTROL_PROOF_TTL
         || value.result != 0
         || !value.state.is_some_and(|state| state <= 6)
         || value.flags & (STATE_VALID | OUTPUTS_VALID) != (STATE_VALID | OUTPUTS_VALID)
@@ -678,7 +681,7 @@ pub(crate) fn actuator_configuration_proof(state: &AppState) -> Option<ActuatorI
     let inner = state.board_recovery.inner.lock().unwrap();
     let row = inner.values[index(Board::ActuatorBoard)?].as_ref()?;
     let value = &row.value;
-    if !row.fresh(Stamp::now())
+    if row.age(Stamp::now()) > CONTROL_PROOF_TTL
         || value.result != 0
         || !matches!(value.state, Some(0 | 1))
         || value.flags & (STATE_VALID | OUTPUTS_VALID) != (STATE_VALID | OUTPUTS_VALID)
@@ -689,6 +692,138 @@ pub(crate) fn actuator_configuration_proof(state: &AppState) -> Option<ActuatorI
         return None;
     }
     Some(ActuatorIdleProof { boot: value.boot, epoch: value.epoch, outputs: value.outputs })
+}
+/// A board's fresh correlated readback that needs no further recovery: not
+/// aborted, in Startup or Idle, with safe commanded outputs (or no physical
+/// outputs for metadata boards). Presentation and launch-lock helpers only;
+/// it never authorizes a recovery write.
+fn readback_healthy_idle(board: Board, observation: &Observation, now: Stamp) -> bool {
+    let row = &observation.value;
+    observation.fresh(now)
+        && row.result == 0
+        && row.flags & 1 == 0
+        && row.flags & STATE_VALID != 0
+        && matches!(row.state, Some(0 | 1))
+        && !matches!(row.boot, 0 | u64::MAX)
+        && row.epoch != 0
+        && row.epoch < u32::MAX - 1
+        && query_domain_consistent(board, row)
+        && match safe_output_mask(board) {
+            Some(mask) => row.flags & (OUTPUTS_VALID | 2) == OUTPUTS_VALID | 2 && row.outputs == mask,
+            None => true,
+        }
+}
+/// A durable pending recovery target that a later fresh verified readback has
+/// satisfied: the same boot identity, the same or a newer recovery epoch, and
+/// a healthy Startup/Idle state. Commissioning (FIRST) uncertainty is never
+/// satisfied this way; it needs its explicit reconciliation.
+// Safety catalog (About safety): reset-all-boards. Keep backend/src/safety_catalog_rules.rs in step.
+fn pending_target_satisfied(
+    board: Board,
+    target: &crate::launch_history::RecoveryTarget,
+    observation: Option<&Observation>,
+    endpoint_verified: bool,
+    now: Stamp,
+) -> bool {
+    let Some(observation) = observation else { return false; };
+    endpoint_verified
+        && target.board == board.sender_id()
+        && target.kind == crate::launch_history::RecoveryIntentKind::Normal
+        && target.uncertain_first.is_none()
+        && target.original_first.is_none()
+        && observation.value.boot == target.boot
+        && observation.value.epoch >= target.epoch
+        && readback_healthy_idle(board, observation, now)
+}
+/// Boards of the durable unpublished pending recovery that still need it.
+pub(crate) fn unsatisfied_pending_mask(state: &AppState) -> u8 {
+    let Some(pending) = state.launch_history.lock().unwrap().recovery_pending().filter(|p| !p.published) else {
+        return 0;
+    };
+    let topology = state.topology_router.get().map(|router| router.export_topology());
+    let now = Stamp::now();
+    let inner = state.board_recovery.inner.lock().unwrap();
+    pending.targets.iter().fold(0, |mask, target| {
+        let Some((at, board)) = BOARDS.iter().enumerate().find(|(_, b)| b.sender_id() == target.board) else {
+            return mask | 0x80;
+        };
+        let verified = topology.as_ref().is_some_and(|topology| endpoint_verified(state, *board, topology));
+        if pending_target_satisfied(*board, target, inner.values[at].as_ref(), verified, now) { mask } else { mask | (1 << at) }
+    })
+}
+/// Board readbacks must be sampled at least this long after a launch attempt
+/// before they can release its lock, so a pre-launch reply still in flight, or
+/// a board that has not yet acted on Launch, can never release it.
+const LAUNCH_LOCK_SETTLE: Duration = Duration::from_secs(10);
+/// Present required boards must all read back healthy, and at least one board
+/// must be present: an empty network never unlocks Launch.
+fn launch_lock_release_ready(station_ready: bool, required_present: u8, healthy_after_lock: u8) -> bool {
+    station_ready && required_present != 0 && required_present & !healthy_after_lock == 0
+}
+/// Release the post-attempt launch lock once every present required board has
+/// a fresh verified readback, taken after the attempt, that is not aborted, in
+/// Startup or Idle with safe outputs, while no board Abort, missed reset or
+/// unfinished recovery remains and the station itself is in Startup or Idle.
+/// Missing boards do not block (the Abort presence mask). Resetting the T-clock
+/// alone changes none of these inputs and so never unlocks Launch. Returns true
+/// when it released the lock.
+// Safety catalog (About safety): launch-lock-reset. Keep backend/src/safety_catalog_rules.rs in step.
+pub(crate) fn try_release_launch_lock(state: &Arc<AppState>) -> bool {
+    use std::sync::atomic::Ordering;
+    if crate::rrls::is_rrls() {
+        return false;
+    }
+    let locked_at = {
+        let Ok(history) = state.launch_history.try_lock() else { return false; };
+        if !history.launch_locked() && !history.automatic_actions_inhibited() {
+            return false;
+        }
+        if history.recovery_pending().is_some_and(|pending| !pending.published) {
+            return false;
+        }
+        history.launch_locked_at()
+    };
+    let station_ready = matches!(state.local_flight_state_snapshot(),
+            crate::types::FlightState::Startup | crate::types::FlightState::Idle)
+        && !state.launch_sequence_command_pending.load(Ordering::Acquire)
+        && state.operator_admission_barrier.load(Ordering::Acquire) == 0
+        && coordinator::readonly_query_idle(state)
+        && crate::board_abort::blocked_message(state).is_none();
+    if !station_ready {
+        return false;
+    }
+    let Some(router) = state.topology_router.get() else { return false; };
+    let topology = router.export_topology();
+    let required = crate::board_recovery::scope::mode_scope(crate::station_mode::local_mode())
+        & crate::board_abort::present_mask(state);
+    let now = Stamp::now();
+    let healthy = {
+        let inner = state.board_recovery.inner.lock().unwrap();
+        BOARDS.iter().enumerate().fold(0u8, |mask, (at, board)| {
+            let ok = inner.values[at].as_ref().is_some_and(|row| {
+                row.observed_after.wall.checked_duration_since(locked_at)
+                    .is_some_and(|after| after >= LAUNCH_LOCK_SETTLE)
+                    && readback_healthy_idle(*board, row, now)
+            }) && endpoint_verified(state, *board, &topology);
+            if ok { mask | (1 << at) } else { mask }
+        })
+    };
+    if !launch_lock_release_ready(station_ready, required, healthy) {
+        return false;
+    }
+    let released = {
+        let Ok(mut history) = state.launch_history.try_lock() else { return false; };
+        // Recheck under the owner: a new attempt moves the lock start forward.
+        if history.launch_locked_at() != locked_at { return false; }
+        history.release_launch_lock().unwrap_or(false)
+    };
+    if released {
+        state.set_launch_indicator_latched(false);
+        state.add_notification("Launch unlocked: every board on the network reads back healthy in Startup or Idle.".to_string());
+        crate::sequences::refresh_action_policy_now(state);
+        state.broadcast_action_policy_snapshot();
+    }
+    released
 }
 fn recovery_requirement_reason(actual_abort: bool, unfinished_target: bool) -> Option<&'static str> {
     if actual_abort { Some("abort_latched") }
@@ -786,10 +921,12 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         .confirmation(&state, &principal_identity);
     let host_pending = state.launch_history.lock().unwrap().recovery_pending();
     let actual_abort_mask = state.board_abort.masks().0;
+    let unsatisfied_pending = unsatisfied_pending_mask(&state);
     let boards=BOARDS.iter().enumerate().map(|(at,&board)| {
+        // A pending target that a fresh verified readback shows healthy no
+        // longer needs recovery; only the unsatisfied ones are shown.
         let recovery_reason = recovery_requirement_reason(actual_abort_mask & (1 << at) != 0,
-            host_pending.as_ref().is_some_and(|pending| !pending.published
-                && pending.targets.iter().any(|target| target.board == board.sender_id())));
+            unsatisfied_pending & (1 << at) != 0);
         let health=network.iter().find(|entry|entry.sender_id==board.sender_id());
         let verified=topology.as_ref().is_some_and(|topology|endpoint_verified(&state,board,topology));
         let observation=values[at].as_ref();
@@ -808,10 +945,9 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         let resync_capable = verified && resync_board(board)
             && readback.is_some_and(|row| row.flags & RESYNC_IMPLEMENTATION != 0);
         let resync_reason = resync_capable.then(|| resync_station_reason.clone()
-            .or_else(|| host_pending.as_ref().filter(|pending| !pending.published
-                && pending.targets.iter().any(|target| target.board != board.sender_id()))
-                .map(|pending| format!("Finish the incomplete recovery of {} first.",
-                    pending.targets.iter().map(|target| target.board.as_str()).collect::<Vec<_>>().join(", "))))
+            .or_else(|| (unsatisfied_pending & !(1 << at) != 0).then(|| format!("Finish the incomplete recovery of {} first.",
+                    BOARDS.iter().enumerate().filter(|(i, _)| unsatisfied_pending & (1 << i) != 0)
+                        .map(|(_, b)| b.sender_id()).collect::<Vec<_>>().join(", "))))
             .or_else(|| resync_board_block_reason(board, readback, resync_target_state))).flatten();
         let (readback_status, message) = recovery_diagnostic(primary, verified, network_utc_available,
             observation, queries[at].as_ref(), now, reconcilable);
@@ -1610,7 +1746,7 @@ mod tests {
             .find(|row| row["id"] == "AB")
             .unwrap();
         let remaining = board["readback_valid_for_ms"].as_u64().unwrap();
-        assert!(remaining > 0 && remaining <= 4_900, "query age, not fresh receipt, spends the server lease");
+        assert!(remaining > 0 && remaining <= READBACK_TTL.as_millis() as u64 - 100, "query age, not fresh receipt, spends the server lease");
         assert!(body["boards"].as_array().unwrap().iter()
             .find(|row| row["id"] == "RF").unwrap()["readback_valid_for_ms"].is_null());
         assert_eq!(board["capabilities"]["hardened_transport"], true);
@@ -1621,7 +1757,7 @@ mod tests {
         state.board_recovery.inner.lock().unwrap().values[at]
             .as_mut()
             .unwrap()
-            .observed_after = Stamp::now() - Duration::from_secs(6);
+            .observed_after = Stamp::now() - READBACK_TTL - Duration::from_secs(1);
         let response = http(
             state.clone(),
             "GET",
@@ -1939,8 +2075,8 @@ mod tests {
         assert!(!readonly_query_candidate(true, true, Some(&row), Some(&answered), start + Duration::from_millis(1_999)));
         assert!(!readonly_query_due(Some(start.wall), start.wall + Duration::from_millis(1_999)));
         assert!(readonly_query_due(Some(start.wall), at.wall));
-        assert!(row.fresh(start + Duration::from_secs(5)));
-        assert!(!row.fresh(start + Duration::from_millis(5_001)));
+        assert!(row.fresh(start + Duration::from_secs(15)));
+        assert!(!row.fresh(start + Duration::from_millis(15_001)));
         assert_eq!(row.observed_after, start);
     }
 
@@ -2030,16 +2166,16 @@ mod final_clock_freshness_tests {
         } }
     }
     #[test]
-    fn five_second_freshness_preserves_paused_model_and_rejects_domain_loss() {
+    fn readback_freshness_preserves_paused_model_and_rejects_domain_loss() {
         let wall=WallInstant::now();
         let at=Stamp {wall:wall-Duration::from_secs(60),model_ms:Some(1000)};
         let row=observation(at);
         assert!(row.fresh(Stamp {wall,model_ms:Some(1000)}));
-        assert!(row.fresh(Stamp {wall,model_ms:Some(6000)}));
-        assert!(!row.fresh(Stamp {wall,model_ms:Some(6001)}));
+        assert!(row.fresh(Stamp {wall,model_ms:Some(16000)}));
+        assert!(!row.fresh(Stamp {wall,model_ms:Some(16001)}));
         assert!(!row.fresh(Stamp {wall,model_ms:Some(999)}));
         assert!(!row.fresh(Stamp {wall,model_ms:None}));
-        let wall_row=observation(Stamp {wall:wall-Duration::from_secs(6),model_ms:None});
+        let wall_row=observation(Stamp {wall:wall-Duration::from_secs(16),model_ms:None});
         assert!(!wall_row.fresh(Stamp {wall,model_ms:None}));
     }
 }
@@ -2076,5 +2212,86 @@ mod recovery_requirement_tests {
             }
         }
         assert!(state.topology_router.get().is_none(),"read-only badge metadata never installs a transport or sends commands");
+    }
+}
+#[cfg(test)]
+mod launch_lock_release_tests {
+    use super::*;
+    fn row(board: Board, state: u8, flags: u8, epoch: u32) -> Observation {
+        // Sampled a moment ago, so a later "now" sees it fresh.
+        let now = Stamp::now() - Duration::from_secs(1);
+        Observation {
+            received: now,
+            observed_after: now,
+            value: Readback { result: 0, state: Some(state), flags, nonce: 9, boot: 42, epoch, uptime: 1,
+                outputs: safe_output_mask(board).unwrap_or(0), issuer: 1 },
+        }
+    }
+    const PHYSICAL_OK: u8 = 0x04 | 0x20 | STATE_VALID | OUTPUTS_VALID | 2;
+    const METADATA_OK: u8 = 0x04 | 0x20 | STATE_VALID;
+    fn target(board: Board, epoch: u32) -> crate::launch_history::RecoveryTarget {
+        crate::launch_history::RecoveryTarget {
+            board: board.sender_id().into(), desired: 0, boot: 42, epoch,
+            intent: crate::launch_history::RecoveryIntent { body: [0; 32], source_utc_ms: 1,
+                backend: "0".repeat(32), principal_context: "0".repeat(32) },
+            kind: crate::launch_history::RecoveryIntentKind::Normal,
+            original_first: None, uncertain_first: None,
+        }
+    }
+    #[test]
+    fn healthy_idle_needs_no_abort_startup_or_idle_and_safe_outputs() {
+        let now = Stamp::now();
+        assert!(readback_healthy_idle(Board::ActuatorBoard, &row(Board::ActuatorBoard, 0, PHYSICAL_OK, 3), now));
+        assert!(readback_healthy_idle(Board::ValveBoard, &row(Board::ValveBoard, 1, PHYSICAL_OK, 3), now));
+        assert!(readback_healthy_idle(Board::DaqBoard, &row(Board::DaqBoard, 1, METADATA_OK, 3), now));
+        assert!(!readback_healthy_idle(Board::ActuatorBoard, &row(Board::ActuatorBoard, 0, PHYSICAL_OK | 1, 3), now), "aborted");
+        assert!(!readback_healthy_idle(Board::ActuatorBoard, &row(Board::ActuatorBoard, 7, PHYSICAL_OK, 3), now), "Launch state");
+        assert!(!readback_healthy_idle(Board::ActuatorBoard, &row(Board::ActuatorBoard, 0, PHYSICAL_OK & !2, 3), now), "unsafe outputs");
+        let mut unsafe_outputs = row(Board::ValveBoard, 1, PHYSICAL_OK, 3);
+        unsafe_outputs.value.outputs = 1;
+        assert!(!readback_healthy_idle(Board::ValveBoard, &unsafe_outputs, now));
+        assert!(!readback_healthy_idle(Board::ActuatorBoard, &row(Board::ActuatorBoard, 0, PHYSICAL_OK, 3), now + READBACK_TTL + Duration::from_millis(1)), "stale");
+    }
+    #[test]
+    fn pending_target_is_satisfied_only_by_a_fresh_healthy_same_identity_readback() {
+        let now = Stamp::now();
+        let ab = Board::ActuatorBoard;
+        assert!(pending_target_satisfied(ab, &target(ab, 3), Some(&row(ab, 0, PHYSICAL_OK, 3)), true, now), "same epoch");
+        assert!(pending_target_satisfied(ab, &target(ab, 3), Some(&row(ab, 1, PHYSICAL_OK, 4)), true, now), "newer epoch");
+        assert!(!pending_target_satisfied(ab, &target(ab, 4), Some(&row(ab, 0, PHYSICAL_OK, 3)), true, now), "older epoch");
+        assert!(!pending_target_satisfied(ab, &target(ab, 3), Some(&row(ab, 0, PHYSICAL_OK | 1, 3)), true, now), "aborted");
+        assert!(!pending_target_satisfied(ab, &target(ab, 3), Some(&row(ab, 0, PHYSICAL_OK, 3)), false, now), "endpoint unverified");
+        assert!(!pending_target_satisfied(ab, &target(ab, 3), None, true, now), "no readback");
+        let mut rebooted = row(ab, 0, PHYSICAL_OK, 3);
+        rebooted.value.boot = 43;
+        assert!(!pending_target_satisfied(ab, &target(ab, 3), Some(&rebooted), true, now), "identity changed");
+        let mut first = target(ab, 3);
+        first.kind = crate::launch_history::RecoveryIntentKind::First;
+        assert!(!pending_target_satisfied(ab, &first, Some(&row(ab, 0, PHYSICAL_OK, 3)), true, now), "commissioning uncertainty");
+        assert!(!pending_target_satisfied(Board::ValveBoard, &target(ab, 3), Some(&row(Board::ValveBoard, 0, PHYSICAL_OK, 3)), true, now), "other board");
+    }
+    #[test]
+    fn launch_lock_releases_only_when_every_present_required_board_is_healthy() {
+        let ab = 1 << index(Board::ActuatorBoard).unwrap();
+        let vb = 1 << index(Board::ValveBoard).unwrap();
+        let daq = 1 << index(Board::DaqBoard).unwrap();
+        assert!(launch_lock_release_ready(true, ab | vb, ab | vb));
+        assert!(launch_lock_release_ready(true, ab | vb, ab | vb | daq), "a missing board does not block");
+        assert!(!launch_lock_release_ready(true, ab | vb, ab), "an aborted or unproven board blocks");
+        assert!(!launch_lock_release_ready(true, 0, 0), "an empty network never unlocks Launch");
+        assert!(!launch_lock_release_ready(false, ab, ab), "station not in Startup/Idle or a board Abort/missed reset");
+    }
+    #[tokio::test]
+    async fn tclock_reset_alone_never_releases_and_an_aborted_board_still_blocks() {
+        let state = crate::state::tests::test_app_state().await;
+        state.launch_history.lock().unwrap().inhibit_automatic_actions().unwrap();
+        state.try_reset_launch_clock().ok();
+        assert!(!try_release_launch_lock(&state), "no fresh board proof: a T-clock reset cannot unlock");
+        assert!(state.launch_history.lock().unwrap().launch_locked());
+        // A board readback that reports Abort is never healthy.
+        state.board_recovery.inner.lock().unwrap().values[index(Board::ActuatorBoard).unwrap()] =
+            Some(row(Board::ActuatorBoard, 15, PHYSICAL_OK | 1, 3));
+        assert!(!try_release_launch_lock(&state));
+        assert!(state.launch_history.lock().unwrap().launch_locked());
     }
 }
