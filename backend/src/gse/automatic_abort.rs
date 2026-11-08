@@ -31,7 +31,7 @@ pub(super) fn stage_allows_automatic_abort(rt: &Runtime, stage: FlightState) -> 
 #[cfg(not(feature = "hitl_mode"))]
 pub(crate) enum LivenessAbortDecision {
     Claimed(AutomaticAbortClaim),
-    IdleOrStartup(FlightState),
+    Startup(FlightState),
     Unavailable,
 }
 
@@ -77,8 +77,8 @@ pub(crate) fn claim_automatic_abort_for_generation(
     {
         match claim_from_source(state, false, generation) {
             LivenessAbortDecision::Claimed(claim) => Some(claim),
-            LivenessAbortDecision::IdleOrStartup(stage) => {
-                debug_assert!(matches!(stage, FlightState::Startup | FlightState::Idle));
+            LivenessAbortDecision::Startup(stage) => {
+                debug_assert_eq!(stage, FlightState::Startup);
                 None
             }
             LivenessAbortDecision::Unavailable => None,
@@ -113,9 +113,12 @@ fn claim_from_source(state: &AppState, liveness: bool, generation: u64) -> Liven
         }
         let stage = state.local_flight_state_snapshot();
         // Source-specific eligibility is checked at the same serialized claim
-        // decision as the durable latch. Other producers retain Idle policy.
-        if liveness && matches!(stage, FlightState::Startup | FlightState::Idle) {
-            return LivenessAbortDecision::IdleOrStartup(stage);
+        // decision as the durable latch. Disconnect aborts arm from the Idle
+        // mission phase onward; only Startup is exempt.
+        if liveness
+            && crate::mission_phase::safety_phase(stage) == crate::mission_phase::MissionPhase::Startup
+        {
+            return LivenessAbortDecision::Startup(stage);
         }
         if !stage_allows_automatic_abort(&rt, stage) {
             return LivenessAbortDecision::Unavailable;
@@ -247,12 +250,12 @@ pub(super) mod tests {
     }
     #[cfg(not(feature = "test_fire_mode"))]
     #[tokio::test]
-    async fn liveness_claim_rechecks_idle_without_weakening_general_fault_claims() {
+    async fn liveness_claim_rechecks_startup_without_weakening_general_fault_claims() {
         let (state, _router, _seen, path) = fixture().await;
-        state.set_local_flight_state(FlightState::Idle);
+        state.set_preexisting_flight_state_for_test(FlightState::Startup);
         assert!(matches!(
             claim_liveness_abort(&state),
-            LivenessAbortDecision::IdleOrStartup(FlightState::Idle)
+            LivenessAbortDecision::Startup(FlightState::Startup)
         ));
         assert!(
             !state
@@ -264,7 +267,7 @@ pub(super) mod tests {
                 .automatic_abort_claimed
         );
         // GENERIC_ERROR and automatic ADC failure use this unchanged general path.
-        let claim = claim_automatic_abort(&state).expect("general fault remains eligible in Idle");
+        let claim = claim_automatic_abort(&state).expect("general fault remains eligible in Startup");
         assert!(
             state
                 .gse
@@ -279,6 +282,92 @@ pub(super) mod tests {
             claim_automatic_abort(&state).is_none(),
             "durable claim remains latched"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(not(feature = "test_fire_mode"))]
+    #[tokio::test]
+    async fn liveness_claim_is_armed_from_the_idle_phase() {
+        let (state, _router, _seen, path) = fixture().await;
+        state.set_local_flight_state(FlightState::Idle);
+        assert!(matches!(
+            claim_liveness_abort(&state),
+            LivenessAbortDecision::Claimed(_)
+        ));
+        assert!(
+            state
+                .gse
+                .lock()
+                .unwrap()
+                .operational
+                .saved
+                .automatic_abort_claimed
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Every GS automatic-abort producer, enumerated: none may act from Launch
+    /// admission onward (Launch, In flight and Landed mission phases).
+    /// Operator manual Abort/Stop is a separate path and is not gated here.
+    #[tokio::test]
+    async fn no_automatic_abort_path_acts_after_launch() {
+        let (state, router, seen, path) = fixture().await;
+        let post_launch = [
+            FlightState::Launch,
+            FlightState::Ascent,
+            FlightState::Coast,
+            FlightState::Apogee,
+            FlightState::Descent,
+            FlightState::Reefing,
+            FlightState::Landed,
+            FlightState::Recovery,
+        ];
+        for stage in post_launch {
+            state.set_preexisting_flight_state_for_test(stage);
+            let phase = crate::mission_phase::safety_phase(stage);
+            assert!(matches!(
+                phase,
+                crate::mission_phase::MissionPhase::Launch
+                    | crate::mission_phase::MissionPhase::InFlight
+                    | crate::mission_phase::MissionPhase::Landed
+            ));
+            assert!(!phase.automatic_aborts_allowed(), "{stage:?}");
+            assert!(!phase.disconnect_aborts_armed(), "{stage:?}");
+            let generation = automatic_generation(&state);
+            // 1. Shared stage boundary used by every producer.
+            assert!(!automatic_abort_allowed(&state), "{stage:?}");
+            // 2. General claim: safety-task faults, ADC/tare failure, overpressure.
+            assert!(claim_automatic_abort(&state).is_none(), "{stage:?}");
+            assert!(claim_automatic_abort_for_generation(&state, generation).is_none());
+            // 3. Disconnect (board-offline) claim.
+            #[cfg(not(feature = "test_fire_mode"))]
+            assert!(!matches!(
+                claim_liveness_abort(&state),
+                LivenessAbortDecision::Claimed(_)
+            ));
+            // 4. Queued automatic abort and automatic supply closes.
+            assert!(!queue_automatic_abort_for_generation(&state, &router, generation, "test").unwrap());
+            assert!(!queue_automatic_supply_close(
+                &state,
+                &router,
+                crate::rocket_commands::ActuatorBoardCommands::NitrousClose as u8,
+                generation
+            )
+            .unwrap());
+            // 5. Final dispatch filter for automatic command intents.
+            for command in [
+                TelemetryCommand::AutomaticAbort { generation },
+                TelemetryCommand::AutomaticNitrogenClose { generation },
+                TelemetryCommand::AutomaticNitrousClose { generation },
+            ] {
+                assert!(crate::telemetry_task::command_at_dispatch(&state, command).is_none());
+            }
+            // 6. Observed automatic abort acceptance.
+            assert!(!accept_observed_abort(&state, true, generation));
+        }
+        router.process_all_queues_with_timeout(0).unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 0, "no ABORT left the station");
+        assert!(!state.abort_indicator_latched());
         let _ = std::fs::remove_file(path);
     }
 

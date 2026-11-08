@@ -646,6 +646,8 @@ impl AppState {
         self.clear_launch_sequence_command_pending();
         *current = next.clone();
         drop(current);
+        // A T-clock reset (also part of Reset all boards) starts a new flight.
+        crate::flight_maxima::reset();
         self.publish_daq_launch_clock(&next, &claim);
         let _ = self.launch_clock_tx.send(next);
         Ok(())
@@ -2509,6 +2511,7 @@ impl AppState {
         if row.data_type != "GPS_DATA" {
             crate::antenna::observe(&row);
         }
+        crate::flight_maxima::observe_row(self, &row);
         const CACHE_WINDOW_MS: i64 = 20 * 60 * 1000;
         const CACHE_MAX_ROWS: usize = 250_000;
 

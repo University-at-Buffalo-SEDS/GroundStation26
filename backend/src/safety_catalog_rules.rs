@@ -303,7 +303,7 @@ const STOP: &[Spec] = &[
     Spec {
         id: "automatic-abort",
         title: "Automatic abort",
-        summary: "Before Launch the safety task aborts when a board other than the Valve Board has been silent for {station.board_offline_abort_ms} ms (shown offline after {station.board_offline_display_ms} ms); never in Startup or Idle. Unclassified board errors pause the sequence instead of aborting.",
+        summary: "Before Launch the safety task aborts when a board other than the Valve Board has been silent for {station.board_offline_abort_ms} ms (shown offline after {station.board_offline_display_ms} ms). Disconnect aborts arm in the Idle mission phase, once every required board has been seen, and never apply in Startup. Unclassified board errors pause the sequence instead of aborting.",
         details: &["Flight builds only: the safety task does not run in HITL or test-fire builds. The thresholds are fixed in code."],
         modes: FLIGHT,
         enforced_in: &["backend/src/safety_task.rs:dispatch_safety_abort_reason", "backend/src/gse/automatic_abort.rs:claim_automatic_abort_for_generation"],
@@ -312,10 +312,10 @@ const STOP: &[Spec] = &[
     Spec {
         id: "no-automatic-abort-after-launch",
         title: "No automatic abort after Launch",
-        summary: "From Launch admission onward the station issues no automatic abort, valve correction or sequence action.",
-        details: &[],
+        summary: "From Launch admission onward (the Launch, In flight and Landed mission phases) the station issues no automatic abort of any kind, valve correction or sequence action. Disconnect aborts apply only in Idle and Fill. Operator Abort and Stop stay available.",
+        details: &["Covered paths: board-offline (disconnect) aborts, unclassified-fault and ADC/tare-failure aborts, tank overpressure abort, queued automatic aborts and automatic supply closes, and acceptance of observed automatic aborts."],
         modes: ALL,
-        enforced_in: &["backend/src/gse/automatic_abort.rs:stage_allows_automatic_abort", "backend/src/gse.rs:automatic_abort_allowed"],
+        enforced_in: &["backend/src/gse/automatic_abort.rs:stage_allows_automatic_abort", "backend/src/gse.rs:automatic_abort_allowed", "backend/src/mission_phase.rs:MissionPhase::automatic_aborts_allowed"],
         config_keys: &[],
     },
     Spec {
@@ -334,6 +334,30 @@ const STOP: &[Spec] = &[
         details: &["On Abort the Actuator Board also drives supplies and igniter low and puts the plumbing stepper to sleep."],
         modes: ALL,
         enforced_in: &["backend/src/board_recovery.rs:safe_output_mask", "backend/src/board_abort.rs:note_reset_completed"],
+        config_keys: &[],
+    },
+];
+
+const PHASES: &[Spec] = &[
+    Spec {
+        id: "mission-phases",
+        title: "Mission phases",
+        summary: "The station shows six phases derived from the boards' detailed flight state: Startup until every board this build requires has been seen, Idle, Fill (nitrogen test, fill, turbocharge and cold flow holds), Launch (Launch admission to liftoff), In flight and Landed. Rules keyed on the detailed state are unchanged.",
+        details: &[
+            "Test-fire builds ignore the AV bay (FC, RF, PB) for Startup and have no flight: Launch covers the burn until the reset returns to Idle.",
+            "HITL builds follow only the operator-assigned state; nothing changes the phase automatically.",
+        ],
+        modes: ALL,
+        enforced_in: &["backend/src/mission_phase.rs:mission_phase"],
+        config_keys: &[],
+    },
+    Spec {
+        id: "fc-owns-landing",
+        title: "FC owns landing",
+        summary: "In flight changes to Landed only when the FC reports it. The one exception: once the T clock is past T+5 min, 2.5 continuous minutes without FC contact marks the phase Landed. When contact returns, the FC's reported state wins again. Before T+5 min comms loss never changes the phase.",
+        details: &["The fallback only changes the displayed phase; it sends nothing to any board and the detailed flight state is untouched."],
+        modes: FLIGHT,
+        enforced_in: &["backend/src/mission_phase.rs:fc_contact_lost_after_flight"],
         config_keys: &[],
     },
 ];
@@ -404,5 +428,6 @@ const SECTIONS: &[(&str, &str, &str, &[Spec])] = &[
     ("sequences", "Sequences", "Nitrogen test hold, Cold flow or Dump, Pause/Resume/Cancel, Turbocharge and fill limits.", SEQUENCES),
     ("launch", "Launch", "What must be true before Launch, and what refuses it.", LAUNCH),
     ("stop", "Stop, abort and recovery", "Automatic abort rules, manual Stop/Abort and Reset all boards.", STOP),
+    ("phases", "Mission phases", "Startup, Idle, Fill, Launch, In flight and Landed, and who decides Landed.", PHASES),
     ("interlocks", "Interlocks", "Key, button and launch interlocks, ignition pair, igniter sense and checklists.", INTERLOCKS),
 ];

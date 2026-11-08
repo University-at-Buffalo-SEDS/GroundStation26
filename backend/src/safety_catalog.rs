@@ -282,7 +282,7 @@ mod tests {
             "automatic-abort", "no-automatic-abort-after-launch", "manual-stop", "reset-all-boards",
             "ignition-pair", "hitl-interlocks", "key-interlock", "plumbing-retraction", "checklists",
             "valve-freshness", "supply-interlock", "fill-limits", "qd-settle", "igniter-sense",
-            "stale-data", "connectivity-loss",
+            "stale-data", "connectivity-loss", "mission-phases", "fc-owns-landing",
         ] {
             assert!(ids.contains(required), "missing safety rule {required}");
         }

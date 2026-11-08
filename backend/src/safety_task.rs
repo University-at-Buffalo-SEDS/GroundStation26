@@ -72,8 +72,11 @@ const SAFETY_WARNING_COOLDOWN_MS_DEFAULT: u64 = 5_000;
 
 // This applies only to board-liveness silence. Shared automatic-abort policy
 // still includes Idle for independent faults such as failed ADC zero capture.
+/// Disconnect (board-offline) aborts are armed from the Idle mission phase
+/// onward. Post-Launch and Aborted detailed states stay suppressed by the
+/// caller's existing detailed-state rules (no automatic abort after Launch).
 fn liveness_abort_allowed_in_state(stage: FlightState) -> bool {
-    !matches!(stage, FlightState::Startup | FlightState::Idle)
+    crate::mission_phase::safety_phase(stage).disconnect_aborts_armed()
 }
 
 // An explicitly configured MCU simulation clock must compare like domains.
@@ -659,7 +662,7 @@ pub async fn safety_task(
         if let Some(reason) = pending_abort.as_ref() {
             match dispatch_safety_abort_reason(&state, &router, reason) {
                 SafetyDispatch::Claimed => break,
-                SafetyDispatch::IdleLivenessCancelled(stage) => {
+                SafetyDispatch::StartupLivenessCancelled(stage) => {
                     log::warn!(
                         "automatic_abort_intent_cancelled source=board_offline state={stage:?}"
                     );
@@ -689,7 +692,7 @@ pub(crate) fn dispatch_safety_abort(state: &Arc<AppState>, router: &Router) -> b
 
 enum SafetyDispatch {
     Claimed,
-    IdleLivenessCancelled(FlightState),
+    StartupLivenessCancelled(FlightState),
     RecoverableFaultPaused,
     Unavailable,
 }
@@ -708,8 +711,8 @@ fn dispatch_safety_abort_reason(
     let claim = if matches!(reason, SafetyAbortReason::BoardOffline { .. }) {
         match crate::gse::claim_liveness_abort(state) {
             crate::gse::LivenessAbortDecision::Claimed(claim) => claim,
-            crate::gse::LivenessAbortDecision::IdleOrStartup(stage) => {
-                return SafetyDispatch::IdleLivenessCancelled(stage);
+            crate::gse::LivenessAbortDecision::Startup(stage) => {
+                return SafetyDispatch::StartupLivenessCancelled(stage);
             }
             crate::gse::LivenessAbortDecision::Unavailable => return SafetyDispatch::Unavailable,
         }
@@ -756,9 +759,9 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn actual_safety_task_cancels_unclassified_faults_and_idle_liveness() {
+    async fn actual_safety_task_cancels_unclassified_faults_and_startup_liveness() {
         const CHILD: &str = "GS_ACTUAL_LIVENESS_POLICY_CHILD";
-        const NAME: &str = "safety_task::tests::actual_safety_task_cancels_unclassified_faults_and_idle_liveness";
+        const NAME: &str = "safety_task::tests::actual_safety_task_cancels_unclassified_faults_and_startup_liveness";
         if std::env::var_os(CHILD).is_none() {
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
@@ -778,21 +781,23 @@ mod tests {
         }
         assert!(!crate::flight_sim::sim_mode_enabled());
         assert_eq!(crate::simulation_clock_ms(), None);
-        for (stage, generic, transition_idle, expect_abort) in [
-            (FlightState::Idle, false, false, false),
+        // Disconnect aborts arm from the Idle mission phase; a state that
+        // returns to Startup between selection and claim still cancels.
+        for (stage, generic, transition_startup, expect_abort) in [
+            (FlightState::Idle, false, false, true),
             (FlightState::PreFill, false, false, true),
             (FlightState::Idle, true, false, false),
             (FlightState::PreFill, false, true, false),
             (FlightState::PreFill, true, true, false),
         ] {
-            actual_safety_scene(stage, generic, transition_idle, expect_abort).await;
+            actual_safety_scene(stage, generic, transition_startup, expect_abort).await;
         }
     }
 
     async fn actual_safety_scene(
         stage: FlightState,
         generic: bool,
-        transition_idle: bool,
+        transition_startup: bool,
         expect_abort: bool,
     ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -848,7 +853,7 @@ mod tests {
             .push(crate::ring_buffer::ReceivedPacket::Telemetry {
                 packet: packet("FLIGHT_STATE"), ingress_generation: crate::gse::automatic_generation(&state),
             });
-        if generic && !transition_idle {
+        if generic && !transition_startup {
             state
                 .ring_buffer
                 .lock()
@@ -858,7 +863,7 @@ mod tests {
                 });
         }
         let mut statuses = state.board_status_tx.subscribe();
-        let blocker = if transition_idle {
+        let blocker = if transition_startup {
             let blocked_state = state.clone();
             let generic_packet = packet("GENERIC_ERROR");
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -888,7 +893,7 @@ mod tests {
         if let Some((release, worker)) = blocker {
             // The real task has selected the stale-board intent and broadcast
             // status, but cannot read its ring/claim yet. No runtime hook/bypass.
-            state.set_local_flight_state(FlightState::Idle);
+            state.set_local_flight_state(FlightState::Startup);
             release.send(generic).unwrap();
             worker.await.unwrap();
         }
@@ -930,10 +935,12 @@ mod tests {
     }
 
     #[test]
-    fn liveness_idle_exemption_is_only_a_caller_policy() {
+    fn liveness_startup_exemption_is_only_a_caller_policy() {
         for wire in 0..16 {
             let stage = crate::types::u8_to_flight_state(wire).unwrap();
-            assert_eq!(liveness_abort_allowed_in_state(stage), wire > 1);
+            // Startup only is exempt; Aborted and post-Launch states are
+            // excluded by the caller's detailed-state suppression.
+            assert_eq!(liveness_abort_allowed_in_state(stage), (1..=6).contains(&wire) || wire == 15);
         }
         // Preserve both existing thresholds; actual selection still requires
         // the outer age >12s gate before the >=6s abort-trigger check.

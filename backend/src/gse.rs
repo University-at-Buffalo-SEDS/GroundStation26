@@ -4819,6 +4819,41 @@ mod valve_capture_tests;
 
 /// Lock-free producer snapshot: sequence producers may hold their own mutex.
 /// Only a verified explicit Startup reset may advance this value.
+/// Nonwaiting mission-phase probe: whether fill work is running or propellant
+/// is loaded. Covers the nitrogen test (including its passed pressure hold),
+/// fill and pause, turbocharge and cold flow holds. `None` when the GSE owner
+/// is busy; the caller keeps its last observation.
+pub(crate) fn mission_fill_activity(state: &AppState) -> Option<bool> {
+    let rt = state.gse.try_lock().ok()?;
+    Some(runtime_fill_activity(&rt))
+}
+
+fn runtime_fill_activity(rt: &Runtime) -> bool {
+    let engine = matches!(
+        rt.engine.status.phase,
+        Phase::NitrogenSetup
+            | Phase::Raising
+            | Phase::Settling
+            | Phase::Holding
+            | Phase::Dumping
+            | Phase::Passed
+            | Phase::FillSetup
+            | Phase::Filling
+            | Phase::PauseSetup
+            | Phase::Paused
+            | Phase::Turbocharge
+    );
+    #[cfg(not(feature = "hitl_mode"))]
+    let loaded = matches!(
+        rt.operational.saved.qualification.stage(),
+        gse_sequence::qualification::MissionStage::Fill
+            | gse_sequence::qualification::MissionStage::Armed
+    );
+    #[cfg(feature = "hitl_mode")]
+    let loaded = false;
+    engine || loaded || rt.turbocharge.is_some() || cold_flow::runtime_active(rt)
+}
+
 pub(crate) fn automatic_generation(state: &AppState) -> u64 {
     state
         .automatic_generation

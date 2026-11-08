@@ -47,6 +47,7 @@ mod firmware_update;
 mod flight_setup;
 mod flight_sim;
 mod flight_sim_runtime;
+mod flight_maxima;
 mod gpio;
 mod gpio_panel;
 mod gse;
@@ -67,6 +68,7 @@ mod manual_abort_utc;
 mod map;
 mod media;
 mod media_runtime;
+mod mission_phase;
 mod mission_sync;
 mod network_health;
 mod network_traffic;
@@ -76,6 +78,7 @@ mod operator_phase;
 mod primary_mirror;
 mod qualification_requests;
 mod recording_export;
+mod recovery_events;
 mod recording_range;
 mod recording_report;
 mod recording_sd;
@@ -2197,6 +2200,10 @@ async fn main() -> anyhow::Result<()> {
         state.shutdown_subscribe(),
     ));
     let _board_abort_queries = tokio::spawn(crate::board_abort::query_service(
+        state.clone(),
+        state.shutdown_subscribe(),
+    ));
+    let _mission_phase = tokio::spawn(crate::mission_phase::service(
         state.clone(),
         state.shutdown_subscribe(),
     ));

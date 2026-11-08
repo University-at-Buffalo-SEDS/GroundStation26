@@ -462,6 +462,8 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         )
         .route("/favicon", get(get_favicon))
         .route("/flightstate", get(get_flight_state))
+        .route("/api/mission_phase", get(get_mission_phase))
+        .route("/api/flight_maxima", get(get_flight_maxima))
         .route("/api/gps", get(get_gps))
         .route("/api/antenna/status", get(get_antenna_status))
         .route(
@@ -596,6 +598,8 @@ pub enum WsOutMsg {
     TelemetryBatch(Vec<TelemetryRow>),
     Warning(WarningMsg),
     FlightState(FlightStateMsg),
+    MissionPhase(crate::mission_phase::MissionPhaseMsg),
+    FlightMaxima(crate::flight_maxima::FlightMaxima),
     LaunchClock(LaunchClockMsg),
     Error(ErrorMsg),
     AlertAckState(AlertAckStateMsg),
@@ -1785,6 +1789,37 @@ async fn get_flight_state(
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
         Json(state.local_flight_state_snapshot()),
+    )
+        .into_response()
+}
+
+/// Operator phase (Startup/Idle/Fill/Launch/In flight/Landed) with the
+/// detailed shared FlightState kept alongside for the details view.
+async fn get_mission_phase(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(crate::mission_phase::refresh(&state)),
+    )
+        .into_response()
+}
+
+/// Current-flight maxima (GS-computed per source, plus FC-reported values).
+async fn get_flight_maxima(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(crate::flight_maxima::snapshot()),
     )
         .into_response()
 }
@@ -4964,6 +4999,8 @@ async fn handle_ws(
     let mut dashboard_reset_rx = state.dashboard_reset_tx.subscribe();
     let mut alert_ack_rx = state.alert_ack_tx.subscribe();
     let mut alert_conditions_rx=state.alert_conditions.tx.subscribe();
+    let mut mission_phase_rx = crate::mission_phase::subscribe();
+    let mut flight_maxima_rx = crate::flight_maxima::subscribe();
 
     let cmd_tx = state.cmd_tx.clone();
     let state_for_send = state.clone();
@@ -5024,6 +5061,22 @@ async fn handle_ws(
         }))
         .unwrap_or_default();
         if ws_out_tx.send(initial_flight_state).await.is_err() {
+            return;
+        }
+        let initial_maxima = flight_maxima_rx.borrow_and_update().clone();
+        if ws_out_tx
+            .send(serde_json::to_string(&WsOutMsg::FlightMaxima(initial_maxima)).unwrap_or_default())
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let initial_phase = mission_phase_rx.borrow_and_update().clone();
+        if ws_out_tx
+            .send(serde_json::to_string(&WsOutMsg::MissionPhase(initial_phase)).unwrap_or_default())
+            .await
+            .is_err()
+        {
             return;
         }
         let initial_fill_targets = serde_json::to_string(&WsOutMsg::FillTargets(
@@ -5185,6 +5238,26 @@ async fn handle_ws(
                     }
                 }
 
+                changed = flight_maxima_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let maxima = flight_maxima_rx.borrow_and_update().clone();
+                    let text = serde_json::to_string(&WsOutMsg::FlightMaxima(maxima)).unwrap_or_default();
+                    if ws_out_tx.send(text).await.is_err() {
+                        break;
+                    }
+                }
+                changed = mission_phase_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let phase = mission_phase_rx.borrow_and_update().clone();
+                    let text = serde_json::to_string(&WsOutMsg::MissionPhase(phase)).unwrap_or_default();
+                    if ws_out_tx.send(text).await.is_err() {
+                        break;
+                    }
+                }
                 recv=alert_conditions_rx.recv()=>{
                     let snapshot=match recv {Ok(snapshot)=>snapshot,Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>state_for_send.alert_conditions.snapshot(),Err(tokio::sync::broadcast::error::RecvError::Closed)=>break};
                     if ws_out_tx.send(serde_json::to_string(&WsOutMsg::AlertConditions(snapshot)).unwrap()).await.is_err(){break;}
@@ -6029,7 +6102,7 @@ pub fn emit_warning_db_only<S: Into<String>>(state: &AppState, message: S) {
     spawn_alert_insert(state, timestamp, "warning", msg_string, None);
 }
 
-fn persist_message_db_only(state: &AppState, message: String) {
+pub(crate) fn persist_message_db_only(state: &AppState, message: String) {
     let timestamp_ms = now_ms_i64();
     let id = state.next_message_id.fetch_add(1, Ordering::Relaxed) + 1;
     if let Err(err) = state

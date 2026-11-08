@@ -2429,6 +2429,10 @@ async fn handle_packet_inner(
                 "Telemetry message with invalid UTF-8 payload".to_string()
             }
         };
+        if sender_id == Board::FlightComputer.sender_id() {
+            crate::recovery_events::observe_fc_message(state, &message, pkt.timestamp() as i64);
+            crate::flight_maxima::observe_fc_message(state, &message, pkt.timestamp() as i64);
+        }
         let message = format!("{sender_id}: {message}");
         let (message_id, inserted) = state.add_backend_message(message.clone());
         if inserted
@@ -2539,6 +2543,7 @@ async fn handle_packet_inner(
                 values: vec![Some(pkt_data as f32)],
             }];
         }
+        let accepted_previous;
         {
             let mut fs = state.state.lock().unwrap();
             // The original snapshot is not final authority across a local Stop
@@ -2554,7 +2559,16 @@ async fn handle_packet_inner(
                     values: vec![Some(pkt_data as f32)],
                 }];
             }
+            accepted_previous = *fs;
             *fs = new_flight_state;
+        }
+        if fc {
+            crate::recovery_events::observe_fc_state(
+                state,
+                accepted_previous,
+                new_flight_state,
+                pkt.timestamp() as i64,
+            );
         }
         let purpose = procedure_clock::now();
         let explicit_model = purpose.model_monotonic_ms().is_some();
