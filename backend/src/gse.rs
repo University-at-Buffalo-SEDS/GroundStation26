@@ -3211,6 +3211,36 @@ pub(crate) fn cold_flow_active(state: &AppState) -> bool {
 /// drained. Board completion is still verified by the recovery transaction. A
 /// Launch waiting on its Valve Board, or the latch left by an earlier Stop, is
 /// not work: this reset is the way out of both.
+/// Plain-language reason `operator_reset_host_idle` is false, for the operator.
+pub(crate) fn operator_reset_block_reason(state: &AppState) -> Option<String> {
+    {
+        let rt = state.gse.lock().unwrap();
+        if engine_blocks_operator_reset(&rt) {
+            return Some("A GSE sequence is running; pause or cancel it first.".into());
+        }
+        if cold_flow::runtime_active(&rt) {
+            return Some("Cold flow is running; stop it first.".into());
+        }
+        #[cfg(not(feature = "hitl_mode"))]
+        if rt.operational.running || rt.automatic_abort_in_flight {
+            return Some("An operation or automatic abort is still running.".into());
+        }
+    }
+    if state.manual_abort_intent.pending_epoch().is_some() || state.deferred_abort.manual_pending() {
+        return Some("A manual Abort is still being delivered.".into());
+    }
+    let Some(router) = state.topology_router.get() else {
+        return Some("The hardware network router is not running.".into());
+    };
+    for name in ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND"] {
+        match router.try_has_pending_reliable_tx_type(crate::telemetry_schema::data_type(name)) {
+            Ok(false) => {}
+            Ok(true) => return Some(format!("A {name} is still waiting for a board acknowledgement; wait for it to finish or time out.")),
+            Err(_) => return Some("The network router is busy; try again in a moment.".into()),
+        }
+    }
+    None
+}
 pub(crate) fn operator_reset_host_idle(state: &AppState) -> bool {
     {
         let rt = state.gse.lock().unwrap();

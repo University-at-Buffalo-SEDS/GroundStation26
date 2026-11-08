@@ -676,6 +676,17 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         && principal.permissions.send_commands
         && coordinator::host_action_allowed(&state, "reset_startup")
         && state.launch_history.lock().unwrap().recovery_available();
+    let reset_startup_blocked = (!can_reset_startup).then(|| {
+        if !primary { return "Only the primary ground station can reset boards.".to_string(); }
+        if principal.anonymous { return "Sign in to reset boards.".to_string(); }
+        if !principal.permissions.send_commands { return "Your account cannot send commands.".to_string(); }
+        if !network_utc_available { return "Network time is not available yet.".to_string(); }
+        if !state.launch_history.lock().unwrap().recovery_available() {
+            return "Launch history storage is unavailable, so a reset cannot be recorded.".to_string();
+        }
+        if let Some(reason) = crate::gse::operator_reset_block_reason(&state) { return reason; }
+        format!("Reset is not allowed in the current station state ({:?}).", state.local_flight_state_snapshot())
+    });
     let principal_identity = principal_context(&identity, &headers, &principal);
     let confirmation = state
         .board_recovery
@@ -730,7 +741,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
     let build = serde_json::to_value(mode.local_build_mode).unwrap();
     Json(json!({"version":1,"backend_instance":hex(&identity),"principal":{"username":principal.username,"context":principal_context(&identity,&headers,&principal)},"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state)),"flight_state":state.local_flight_state_snapshot()as u8,"automatic_actions_inhibited":state.launch_history.lock().unwrap().automatic_actions_inhibited(),
         "clock":{"network_utc_available":network_utc_available,"required_for_recovery":true},
-        "permissions":{"query":primary,"recover":can_recover,"reset_startup":can_reset_startup,"change_mode":false},
+        "permissions":{"query":primary,"recover":can_recover,"reset_startup":can_reset_startup,"change_mode":false},"reset_startup_blocked_reason":reset_startup_blocked,
         "reset_startup_policy":reset_startup_policy,
         "confirmation":confirmation,"host_recovery":host_pending.map(|pending|json!({"pending":!pending.published,"verified":pending.verified,"publication_acknowledged":pending.published,"targets":pending.targets.iter().map(|target|target.board.as_str()).collect::<Vec<_>>()})),
         "rejected_statuses":rejected_statuses,"last_rejection":last_rejection,
