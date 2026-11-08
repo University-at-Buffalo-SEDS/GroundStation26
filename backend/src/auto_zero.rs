@@ -1031,3 +1031,10 @@ pub(crate) mod deadline_tests;
 #[cfg(test)]
 #[path = "auto_zero/terminal_sync_tests.rs"]
 mod terminal_sync_tests;
+
+/// Live automatic-zero preferences for the read-only safety catalog.
+/// Serialized with `before_launch` always present so the catalog key exists.
+pub(crate) fn catalog_settings(state: &crate::state::AppState) -> serde_json::Value {
+    let settings = state.auto_zero.lock().unwrap().settings();
+    serde_json::json!({"enabled": settings.enabled, "before_launch": settings.before_launch})
+}

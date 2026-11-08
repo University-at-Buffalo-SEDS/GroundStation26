@@ -33,6 +33,7 @@ fn flight_routes(state: &AppState) -> bool {
             })
         })
 }
+// Safety catalog (About safety): launch-failure-pause, launch-signoff. Keep backend/src/safety_catalog_rules.rs in step.
 pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool {
     let now = rt.now();
     let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
@@ -137,6 +138,7 @@ fn pressure_hazard(rt: &Runtime) -> bool {
 }
 /// An unexpected supply report alone is not a hazard: close both supplies and
 /// pause. Only a fresh pressure at or above the limit keeps the relief policy.
+// Safety catalog (About safety): failure-pause, failure-dump. Keep backend/src/safety_catalog_rules.rs in step.
 fn pause_or_relieve_unexpected_supply(rt: &mut Runtime, message: &str) -> Effects {
     // Without an active sequence (manual control, Passed, Cancelled) there
     // is no pause to return to; keep the established crossflow relief.
@@ -281,6 +283,7 @@ pub(super) fn publish_qualified_flight_armed_with_observation(
 }
 
 /// Returns true when automation must not advance this tick.
+// Safety catalog (About safety): connectivity-loss, qd-settle. Keep backend/src/safety_catalog_rules.rs in step.
 pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
     let blocked = {
         let rt = state.gse.lock().unwrap();

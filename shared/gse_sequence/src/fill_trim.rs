@@ -156,6 +156,7 @@ impl Controller {
     fn fail(&mut self, message: &str) -> Update {
         self.fail_with(message, false)
     }
+    // Safety catalog (About safety): failure-dump, fill-limits. Keep backend/src/safety_catalog_rules.rs in step.
     fn fail_hazard(&mut self, message: &str) -> Update {
         self.fail_with(message, true)
     }

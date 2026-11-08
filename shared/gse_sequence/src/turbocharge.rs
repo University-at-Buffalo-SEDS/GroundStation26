@@ -326,6 +326,7 @@ impl Controller {
             severe_pressure: false,
         }
     }
+    // Safety catalog (About safety): turbocharge-limits. Keep backend/src/safety_catalog_rules.rs in step.
     pub fn tick(&mut self, input: Inputs, mass: Option<Sample>, context: Context) -> Update {
         if matches!(self.phase, Phase::Cancelled | Phase::Complete) {
             return Update::default();

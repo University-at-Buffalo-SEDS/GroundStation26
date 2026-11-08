@@ -114,6 +114,7 @@ pub(crate) fn controller_can_launch(kind: sedsnet::config::DataType, payload: &[
 fn unreset_message(mask: u8) -> String {
     format!("Launch locked: {} missed the last reset. Use Reset all boards.", board_names(mask))
 }
+// Safety catalog (About safety): launch-board-abort, launch-lock-reset. Keep backend/src/safety_catalog_rules.rs in step.
 pub(crate) fn blocked_message(state: &AppState) -> Option<String> {
     let seen = present_mask(state);
     let register = state.board_abort.register.lock().unwrap();

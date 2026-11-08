@@ -847,6 +847,7 @@ impl Engine {
     /// End the nitrogen test at pressure: close every valve and hold. A leak
     /// verdict holds for a leak search; a pass offers Cold flow or Dump.
     /// Public for station fixtures; the engine calls it from its own verdicts.
+    // Safety catalog (About safety): nitrogen-hold, nitrogen-hold-choice. Keep backend/src/safety_catalog_rules.rs in step.
     pub fn hold_test_pressure(&mut self, now: u64, hold: TestHold) -> Effects {
         let message = hold.message();
         self.paused_from = None;
@@ -880,6 +881,7 @@ impl Engine {
     /// first, then every valve, and hold Paused (fresh board confirmation is
     /// still required) until the operator resumes, cancels or takes manual
     /// control. An operator cancel or an existing fault keeps its relief.
+    // Safety catalog (About safety): failure-pause. Keep backend/src/safety_catalog_rules.rs in step.
     pub fn pause_for_failure(&mut self, now: u64, message: &str) -> Effects {
         let from = self.status.phase;
         if matches!(
@@ -939,6 +941,7 @@ impl Engine {
     }
     /// Session ceiling: an automatic sequence relieves; a nitrous overfill
     /// under manual fill control only warns (once per excursion).
+    // Safety catalog (About safety): nitrous-overfill, failure-dump. Keep backend/src/safety_catalog_rules.rs in step.
     fn pressure_ceiling_reached(&mut self, now: u64, pressure: f32) -> Effects {
         if !(self.nitrous_session && self.manual_fill_control) {
             return self.fault(now, "Pressure ceiling reached");
@@ -1036,6 +1039,7 @@ impl Engine {
     ///   hold timers; if the tank is still at or above that step it goes
     ///   straight to settling, so nitrogen is not reopened. A pause while
     ///   dumping resumes dumping.
+    // Safety catalog (About safety): pause-resume-cancel. Keep backend/src/safety_catalog_rules.rs in step.
     pub fn resume_test(&mut self, input: Inputs) -> Result<Effects, String> {
         self.resume_test_check(input)?;
         let from = self.paused_from.take().expect("checked paused test");
@@ -1203,6 +1207,7 @@ impl Engine {
                 }) && input.now_ms.saturating_sub(since) >= VALVE_ACK_TIMEOUT_MS
             })
     }
+    // Safety catalog (About safety): stuck-supply. Keep backend/src/safety_catalog_rules.rs in step.
     fn valve_ack_timeout(&mut self, input: Inputs) -> Effects {
         let names = ["Pilot", "Vent", "Dump", "Nitrogen", "Nitrous"];
         let pending: Vec<String> = input

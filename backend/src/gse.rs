@@ -787,6 +787,7 @@ pub fn valve_command(cmd: &TelemetryCommand) -> bool {
     )
 }
 
+// Safety catalog (About safety): launch-turbocharge, supply-interlock. Keep backend/src/safety_catalog_rules.rs in step.
 pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool> {
     if let Some(allowed) = overpressure::command_allowed(&state.gse.lock().unwrap(), cmd) {
         return Some(allowed);
@@ -903,6 +904,7 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
     }
     None
 }
+// Safety catalog (About safety): key-interlock. Keep backend/src/safety_catalog_rules.rs in step.
 fn interlock(state: &AppState, policy: &ActionPolicyMsg) -> bool {
     #[cfg(feature = "hitl_mode")]
     {
@@ -2045,6 +2047,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             axum::routing::post(override_cold_flow),
         )
         .route("/api/gse/abort/clear", axum::routing::post(clear_abort))
+        .route("/api/safety/about", get(crate::safety_catalog::about_route))
         .route(
             "/api/gse/overpressure/acknowledge",
             axum::routing::post(overpressure::acknowledge_route),
@@ -3941,6 +3944,7 @@ pub(crate) fn manual_stop_pending(state: &AppState) -> bool {
             router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT"))
         })
 }
+// Safety catalog (About safety): manual-stop. Keep backend/src/safety_catalog_rules.rs in step.
 fn abort_safe_control(kind: sedsnet::config::DataType, payload: &[u8]) -> bool {
     if payload.len() != 1 {
         return false;

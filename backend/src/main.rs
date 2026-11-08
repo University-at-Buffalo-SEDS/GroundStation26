@@ -93,6 +93,7 @@ mod sequence_progress_projection;
 mod sequence_progress_service;
 mod sequence_progress_stage;
 mod sequence_stream;
+mod safety_catalog;
 mod sequences;
 mod sim_daq_cadence;
 mod state;

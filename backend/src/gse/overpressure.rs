@@ -87,6 +87,7 @@ fn fresh(sample: Option<Sample>, now: u64) -> Option<Sample> {
 
 impl Monitor {
     /// Count each new fresh sample once. Returns the debounced level.
+    // Safety catalog (About safety): overpressure-debounce. Keep backend/src/safety_catalog_rules.rs in step.
     pub(crate) fn observe(&mut self, sample: Option<Sample>, now: u64, t: &Thresholds) -> Level {
         if let Some(sample) = fresh(sample, now)
             && self.last_sample_at.is_none_or(|last| sample.at_ms > last)
@@ -190,6 +191,7 @@ enum Action {
 
 /// Evaluate the freshest valve-board pressure. Called on every valve-board
 /// pressure receipt and every GSE tick. Never under the dispatch gate.
+// Safety catalog (About safety): overpressure-relief, overpressure-abort, overpressure-after-t0. Keep backend/src/safety_catalog_rules.rs in step.
 pub(crate) fn evaluate(state: &Arc<AppState>) {
     let launched = launched(state);
     let (action, abort) = {
@@ -388,6 +390,7 @@ pub(crate) fn command_allowed(rt: &Runtime, cmd: &TelemetryCommand) -> Option<bo
 }
 
 /// Explicit operator acknowledgement once a fresh reading is below relief.
+// Safety catalog (About safety): overpressure-latch. Keep backend/src/safety_catalog_rules.rs in step.
 pub(crate) fn acknowledge(state: &AppState) -> Result<(), String> {
     let mut rt = state.gse.lock().unwrap();
     let Some(latch) = rt.overpressure.latch.clone() else {

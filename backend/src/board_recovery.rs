@@ -226,6 +226,7 @@ fn targeted_recovery_state(board: Board) -> Option<u8> {
 /// Commanded-register safe domains from the actual board owners. VB's safe
 /// state opens both servos (bits1/2) and switches its pilot solenoid off.
 /// These are commanded registers, never mechanical position verification.
+// Safety catalog (About safety): reset-all-boards. Keep backend/src/safety_catalog_rules.rs in step.
 fn safe_output_mask(board: Board) -> Option<u32> {
     match board {
         Board::ActuatorBoard | Board::FlightComputer => Some(0),

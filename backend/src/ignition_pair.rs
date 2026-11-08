@@ -96,6 +96,7 @@ pub(crate) fn validate_route_token(
 }
 
 /// HITL's board-state proof switch is opt-in; normal builds always enforce it.
+// Safety catalog (About safety): ignition-pair. Keep backend/src/safety_catalog_rules.rs in step.
 pub(crate) fn proof_enforced(state: &AppState) -> bool {
     state.board_state_proof_enforced()
 }

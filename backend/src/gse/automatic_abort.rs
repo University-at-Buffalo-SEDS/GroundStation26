@@ -13,6 +13,7 @@ impl Drop for AutomaticAbortClaim {
 }
 
 #[cfg(not(feature = "hitl_mode"))]
+// Safety catalog (About safety): no-automatic-abort-after-launch. Keep backend/src/safety_catalog_rules.rs in step.
 pub(super) fn stage_allows_automatic_abort(rt: &Runtime, stage: FlightState) -> bool {
     rt.operational.saved.qualification.stage() != gse_sequence::qualification::MissionStage::Fire
         && matches!(

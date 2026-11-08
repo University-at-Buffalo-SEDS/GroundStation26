@@ -82,6 +82,7 @@ pub(super) fn hold_handoff(rt: &Runtime) -> bool {
 /// Cold-flow target. From the nitrogen-test hold the test's top step replaces
 /// the separate cold-flow target, capped at the held pressure, so cold flow
 /// releases what the tank holds and never re-pressurises it.
+// Safety catalog (About safety): nitrogen-hold-choice. Keep backend/src/safety_catalog_rules.rs in step.
 fn start_target(rt: &Runtime, input: Inputs) -> Option<f32> {
     if !hold_handoff(rt) {
         return rt.engine.config.cold_flow_target_psi;
