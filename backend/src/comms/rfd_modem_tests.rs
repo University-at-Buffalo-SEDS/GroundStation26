@@ -768,3 +768,119 @@ fn forwarding_table_in_403_arrow_format_is_parsed_per_entry() {
     assert!(forwarding_has_entries(&["AT+F1=4,2".to_string()]));
     assert!(!forwarding_has_entries(&["0,0".to_string()]));
 }
+
+/// RF BOARD_HEALTH words as RFBoard26 `rfd_status_words` packs them.
+fn rf_health(w13: u32, w15: u32, w22: u32, uptime: u32) -> Vec<u32> {
+    let mut words = vec![0u32; 24];
+    words[0] = 1;
+    words[1] = 1 | 8;
+    words[2] = uptime;
+    words[4] = 1000;
+    words[13] = w13;
+    words[15] = w15;
+    words[22] = w22;
+    words
+}
+
+#[test]
+fn rf_board_status_block_decodes() {
+    // Applied, ATI5 names, fix, flags saved|rebooted|resumed, S5=10, RTSCTS 0.
+    let w13 = 1 | (2 << 4) | (2 << 10) | (0x07 << 16) | (10 << 24);
+    let status = decode_rf_status(&rf_health(
+        w13,
+        3968 | (50 << 16),
+        32768 | (64 << 16) | (10 << 24),
+        5,
+    ))
+    .unwrap();
+    assert_eq!(status.outcome, Outcome::Applied);
+    assert_eq!(status.map_source, MapSource::Ati5Names);
+    assert_eq!(status.mode, Mode::Fix);
+    assert!(status.eeprom_saved && status.rebooted && status.resumed_with_ato);
+    assert!(!status.needs_attention && !status.pending);
+    assert_eq!(
+        (
+            status.air_speed,
+            status.max_data,
+            status.max_retries,
+            status.global_retries
+        ),
+        (Some(64), Some(3968), Some(10), Some(10))
+    );
+    assert_eq!(
+        (status.serial_break_ms, status.dest_id, status.rtscts),
+        (Some(50), Some(32768), Some(0))
+    );
+    // Unread fields, no response.
+    let none = decode_rf_status(&rf_health(
+        1 | (6 << 4) | (2 << 8) | (2 << 10) | (3 << 13) | (0x40 << 16) | (0xFF << 24),
+        u32::MAX,
+        u32::MAX,
+        5,
+    ))
+    .unwrap();
+    assert_eq!(none.outcome, Outcome::NoResponse);
+    assert!(none.needs_attention);
+    assert_eq!(
+        (none.max_data, none.rtscts, none.air_speed),
+        (None, None, None)
+    );
+    // Older RF firmware (zero words) and other boards' flag-owned words.
+    assert!(decode_rf_status(&rf_health(0, 0, 0, 5)).is_none());
+    let mut adc = rf_health(w13, 0, 0, 5);
+    adc[1] |= 32;
+    assert!(decode_rf_status(&adc).is_none());
+}
+
+#[test]
+fn rf_board_check_notifies_once_per_result_and_again_after_reboot() {
+    *RF_BOARD.lock().unwrap() = None;
+    let pending = rf_health(1 | (2 << 10) | (0x20 << 16), 0, 0, 1);
+    assert_eq!(observe_rf_board_health(&pending), None, "still running");
+    let matched = rf_health(
+        1 | (1 << 4) | (2 << 10) | (0x04 << 16) | (10 << 24),
+        3968 | (50 << 16),
+        32768 | (64 << 16) | (10 << 24),
+        9,
+    );
+    let notice = observe_rf_board_health(&matched).unwrap();
+    assert!(
+        notice.starts_with("RF radio modem check passed"),
+        "{notice}"
+    );
+    let mut later = matched.clone();
+    later[2] = 20;
+    assert_eq!(
+        observe_rf_board_health(&later),
+        None,
+        "same boot, same result"
+    );
+    let mut rebooted = matched.clone();
+    rebooted[2] = 3;
+    assert!(
+        observe_rf_board_health(&rebooted).is_some(),
+        "new boot reports again"
+    );
+    let mismatch = rf_health(
+        1 | (3 << 4) | (2 << 10) | (0x44 << 16) | (0 << 24),
+        3968 | (50 << 16),
+        32768 | (64 << 16) | (10 << 24),
+        30,
+    );
+    let notice = observe_rf_board_health(&mismatch).unwrap();
+    assert!(
+        notice.starts_with("RF radio modem check needs attention"),
+        "{notice}"
+    );
+    // A flight-gate skip is shown in the card but raises no notification.
+    let skipped = rf_health(
+        1 | (2 << 8) | (2 << 10) | (3 << 13) | (0x10 << 16) | (0xFF << 24),
+        u32::MAX,
+        u32::MAX,
+        2,
+    );
+    assert_eq!(observe_rf_board_health(&skipped), None);
+    let status = rf_board_status().unwrap();
+    assert!(status.skipped_by_flight_gate && status.summary.contains("flight state"));
+    *RF_BOARD.lock().unwrap() = None;
+}

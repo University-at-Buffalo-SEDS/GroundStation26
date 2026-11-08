@@ -1,7 +1,8 @@
 # RFD modem check
 
-GroundStation and RRLS check their own RFD900x ASYNC modem against the selected
-RFD profile before the AV-bay radio carries data. If a setting differs and may
+GroundStation, RRLS and the RF board each check their own RFD900x ASYNC modem
+against the selected RFD profile. GS and RRLS do it before the AV-bay radio
+carries data; the RF board does it once per boot (see "Phase 2" below). If a setting differs and may
 be written by one node, they write only that setting, save it, reboot the
 modem and verify it.
 
@@ -113,8 +114,9 @@ only when the operator selects it, with `GS_RADIO_PROFILE` or the link's
 budget negotiation is unaffected. Before selecting it:
 
 1. confirm it with the hardware A/B (model doc, hardware test plan);
-2. set it on all three modems: GS, RRLS, and the RF board (phase 2 firmware,
-   or a one-time matched write);
+2. set it on all three modems: GS, RRLS, and the RF board (flash RF with
+   `config/rfd-profile.json` replaced by this profile and
+   `build.py build --rfd-profile-rolled-out`);
 3. only then set `GS_RFD_PROFILE_ROLLED_OUT=rfd-async-64k-one-retry-layer`
    on GS and RRLS.
 
@@ -135,65 +137,125 @@ sets `needs_attention`. The UI shows this as a warning in Connectivity, and
 the backend logs it at warn level. The station always continues on the
 modem's current settings.
 
-## Phase 2: RF firmware specification
+`rf_board` holds the RF board's own result once its BOARD_HEALTH carries it
+(see phase 2): outcome, map source, mode, `rolled_out_all_nodes`, flags
+(`eeprom_saved`, `rebooted`, `resumed_with_ato`, `forwarding_entries`,
+`skipped_by_flight_gate`, `pending`, `needs_attention`), the observed
+`air_speed`, `max_data`, `max_retries`, `global_retries`, `serial_break_ms`,
+`dest_id` and `rtscts`, and a summary. Connectivity → Radio modem shows it
+below the station result, or "RF modem not reported" for older RF firmware.
+Every finished RF check (pass or needs attention, not a skip) raises one
+operator notification, again after an RF reboot.
 
-Phase 1 changes nothing on a correctly configured install: GS and RRLS
-enforce the deployed default profile, and link-wide registers are written
-only for a profile marked as rolled out to all nodes. Nothing in phase 1
-depends on RF support, so no capability gate is needed yet. In phase 2 the
-RF board enforces **the same selected profile** as GS and RRLS, with the
-same rules.
+## Phase 2: RF board check (implemented)
 
-**R1. Startup check in RF firmware.** Use the same algorithm and constants
-as `rfd_modem.rs`:
+Implemented in RFBoard26: `Core/Src/rfd_modem.c` (hardware-independent check,
+the same algorithm and constants as `rfd_modem.rs`), `Core/Src/rfd_modem_port.c`
+(gate, UART, status) and `radio.c` (UART hold). Native tests against a
+simulated modem: `tests/native/rfd_modem_test.c`, run by
+`tests/test_rfd_modem.py` (`build.py test`).
 
-* guard 1100 ms, `+++`, accept `OK` only at least 1200 ms after `+++` and
-  after 200 ms of quiet, confirm with `AT`;
-* two attempts plus one already-in-command-mode probe;
-* `ATI`, `ATI5`, `ATSn?` fallback, `AT+F?`;
-* writes only for registers named as in V1.1, `AT&W`, `ATZ`, 4000 ms reboot
-  wait, re-enter, verify, `ATO` with an `ATZ` fallback;
-* a 40 s bound, at most one `AT&W` per MCU boot, no retry after a failed
-  verification.
+**Algorithm.** As GS: guard 1100 ms, `+++`, `OK` accepted only 1200 ms after
+`+++` and after 200 ms of quiet, confirmed with `AT`; two attempts plus one
+already-in-command-mode probe; `ATI`, `ATI5`, `ATSn?` for registers `ATI5`
+did not list, `AT+F?`; writes, `AT&W`, `ATZ`, 4000 ms reboot wait, re-enter,
+verify, `ATO` with an `ATZ` fallback; 40 s bound, no retry after a failed
+verification, at most one `AT&W` per MCU boot. The `AT+F?` forwarding table is parsed
+per entry in the 4.03 `slot:src->dst` format (an entry exists only when src or
+dst is nonzero), or as the manual's `Src,Dst` pairs. If the modem does not answer,
+the board gives up and runs on the modem's current settings.
 
-Profile: the RF board uses the same profile file GS and RRLS select. That is
-`RFBoard26/config/rfd-profile.json`, kept byte-identical to the GS embedded
-default, or to the opt-in profile when that is rolled out. The RF build
-takes a matching rolled-out flag (CMake option `RFD_PROFILE_ROLLED_OUT`,
-default OFF). Only with it ON may RF write link-wide registers (S3, S4, S5,
-S7, S8). Local registers (S6, S11, S13, S18) are always repaired. Never
-write S1, S2, S9, S14-S17 or S19. Keep `RADIO_PACKET_GAP_MS` at 55, which
-is at least S6 + 5 for both profiles. Rollout order for the opt-in profile:
-hardware A/B first, then flash RF with the profile and the flag ON, then set
-`GS_RADIO_PROFILE` and `GS_RFD_PROFILE_ROLLED_OUT` on GS and RRLS in the same
-session.
+**Registers are matched by the name the modem reports in `ATI5`**, as GS does
+since the RFD ASYNC 4.03 field readback (S6 `SER_BRK_DETMS`, S7/S8
+`TX_ENCAP_METHOD`/`RX_ENCAP_METHOD`, S17 `DUTY_CYCLE`, S18 `LBT_RSSI`, S19
+`RTSCTS`, S20 `MAX_WINDOW`, S22 `RESV`). A write goes to the register number
+the modem itself gives that name, so a flow-control fix lands on S19 and
+never on `LBT_RSSI`. The documented number is used only to read a modem that
+lists no names (V1.1 fingerprint, as GS). If `ATI5` lists names but a
+writable register's name is missing, nothing is written. The RF plan holds
+only registers with an expectation: S1 and S2 (report), S3, S4, S5, S7, S8
+(link-wide), S6, S11, S13, RTSCTS (local, always repaired) and `LBT_RSSI`
+(report). Info-only registers are not read, which keeps the link down for
+less time.
 
-**R2. Flight gate on RF.** Run the check only before the RF radio task
-starts sending. Run it only after a FLIGHT_STATE value arrives over CAN (not
-the radio) within 10 s of boot, and only if that value is Startup, Idle,
-PreFill or FillTest. If no value arrives, or it is any other state, skip the
-check. This covers a brown-out reboot in flight. The modem's UART is
-unavailable to the radio task while the check runs.
+**Profile.** `RFBoard26/config/rfd-profile.json`, byte-identical to the GS
+embedded default (`tests/test_rfd_modem.py` checks the deployed values, and byte identity when a sibling GroundStation26 checkout is present). CMake reads its `modem` section into
+the build. Link-wide registers are written only with
+`build.py build --rfd-profile-rolled-out` (CMake `RFD_PROFILE_ROLLED_OUT`,
+default OFF). S1, S2 and `LBT_RSSI` are never written. RTSCTS must be 0: USART1
+has no RTS/CTS. A compile-time check keeps `RADIO_PACKET_GAP_MS` at least
+S6 + 5.
 
-**R3. Report the result (capability-gated).** Add a SEDSnet telemetry type
-`RFD_MODEM_STATUS` (schema change: build it on the released SDK and do not
-rely on 4.3.12). Send it once after the check, then every 60 s at the lowest
-priority. Payload, little-endian:
+**Mode.** `build.py build --rfd-modem-check default|skip|verify|fix` (CMake
+`RFD_MODEM_CHECK`). `default` is `fix` for operational builds and `skip` for
+simulator builds (`SEDS_FIRMWARE_SIM_TEST=1`), like GS. LoRa builds never
+check. `skip` compiles the check out.
 
-| Bytes | Field |
-|---|---|
-| 0 | version = 1 |
-| 1 | outcome: 0 skipped, 1 matched, 2 applied, 3 mismatch, 4 apply_failed, 5 verify_failed, 6 no_response, 7 failed |
-| 2 | map source: 0 ATI5 names, 1 fingerprint, 2 unconfirmed |
-| 3 | flags: bit0 EEPROM saved, bit1 rebooted, bit2 data mode resumed with ATO, bit3 forwarding entries present, bit4 skipped by flight gate |
-| 4-17 | u16 observed S2, S3, S4, S5, S6, S11, S18 (0xFFFF = unread) |
+**Flight gate (differs from the original R2).** R2 asked for a FLIGHT_STATE
+received over CAN within 10 s of boot, with the radio held until then.
+FLIGHT_STATE is written only by the ground station (FC and RF are read-only
+replicas, and a replica never answers a refresh from its own cache), so on
+the real bay it reaches RF only over the radio. Holding the radio would have
+cost a 10 s outage on every boot and the check would never have run. The
+implemented gate:
 
-GS shows the RF modem row only when it has received this type. Older RF
-firmware never sends it, and the UI then says "RF modem not reported".
+* a restored (persisted) flight phase other than Startup, Idle, PreFill or
+  FillTest, for example after a brown-out reboot in flight, skips the check
+  at once and never holds the radio;
+* otherwise the radio runs normally. The first validated FLIGHT_STATE
+  received after boot (the same authorization path as every managed update)
+  decides: Startup, Idle, PreFill or FillTest runs the check, anything else
+  skips it for this boot. GS answers RF's refresh with its stored flight
+  state, so this is normally a few seconds after the link comes up; on a
+  fresh install with no stored state it is the operator's first flight-state
+  change (for example Startup to Idle);
+* only the check itself holds the RF radio: no frame TX and air RX ignored,
+  about 3 s if nothing differs and about 11 s if it writes, bounded at 40 s.
+  CAN, routing, time sync and the watchdog keep running during the check.
+  A flight-state change seen over CAN closes the gate before the first write
+  and before `AT&W`. Queued radio frames age out as on a busy link.
+
+**Report (reuses BOARD_HEALTH; no SEDSnet schema change).** Instead of a new
+`RFD_MODEM_STATUS` type, RF reports in BOARD_HEALTH words 13, 15 and 22,
+which other boards use only with flags 4, 64 and 32 (RF leaves those flags
+clear; older RF firmware leaves the words zero). It is sent in every
+5-second BOARD_HEALTH report at priority 0.
+
+| Word | Bits | Field |
+|---|---|---|
+| 13 | 3:0 | version = 1 (0: not reported) |
+| 13 | 7:4 | outcome: 0 skipped, 1 matched, 2 applied, 3 mismatch, 4 apply_failed, 5 verify_failed, 6 no_response, 7 failed |
+| 13 | 9:8 | map source: 0 ATI5 names, 1 fingerprint, 2 unconfirmed |
+| 13 | 11:10 | mode: 0 skip, 1 verify, 2 fix |
+| 13 | 12 | built with the profile rolled out |
+| 13 | 14:13 | RTSCTS observed (3 unread) |
+| 13 | 23:16 | flags: 0x01 EEPROM saved, 0x02 rebooted, 0x04 data mode resumed with ATO, 0x08 forwarding entries, 0x10 skipped or stopped by the flight gate, 0x20 pending (waiting for the flight state or running), 0x40 needs attention |
+| 13 | 31:24 | S5 observed (u8) |
+| 15 | 15:0 / 31:16 | S3 / S6 observed |
+| 22 | 15:0 / 23:16 / 31:24 | S11 / S2 / S4 observed |
+
+u16 fields use 0xFFFF and u8 fields 0xFF for unread; 0xFE means 254 or more.
+Values are those read after the last write and verification. GS decodes the
+block (`rfd_modem::decode_rf_status`), shows it in Connectivity and raises a
+notification for every finished RF check.
+
+**Build cost.** Release RF image: flash 471,332 B of 474,624 B (unmodified
+dev 465,968 B, +5.2 KiB), RAM 112,840 B of 114,688 B (+16 B static). The
+check runs on the existing telemetry stack. The tightest combination,
+`SEDS_FIRMWARE_SIM_TEST=1` with `--rfd-modem-check fix`, leaves 36 B of flash.
+
+**Simulator.** `FirmwareSimulator` models the RFD command mode per radio
+station (`FIRMWARE_SIM_RFD_MODEM`, see its `docs/rfd-async-mesh-model.md`).
+In a linked RF + FC + GroundStation scene the RF board, booted with S6=20,
+S11=1 and RTSCTS=1 in the 4.03 layout, received Idle from GS about 1 s after
+boot, wrote S6, S11 and S19 (never S18 `LBT_RSSI`), saved, rebooted, verified
+and reported `applied`, with the radio held for about 10 s; the link then
+resumed. With S5=0 (not rolled out) it repaired S6, left S5 and reported
+`mismatch`. A silent modem gave `no_response` after an 8 s hold, and an
+Ascent flight state skipped the check without touching the radio.
 
 **R4. Not needed.** The model gives no gain for RF ACK piggybacking, an RF
-host backlog cap, or larger batches (see the model doc). Do not implement
-them.
+host backlog cap, or larger batches (see the model doc). Not implemented.
 
 **SDK change (described, not made): per-side adaptive reliable retry.**
 The model ranks RTT-derived retry as the only host change that removes

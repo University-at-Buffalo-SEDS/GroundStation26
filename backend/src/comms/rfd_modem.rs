@@ -1302,6 +1302,178 @@ pub(crate) fn request_operator_check(mode: Mode) -> Result<(), String> {
     Ok(())
 }
 
+// --- RF board modem check (BOARD_HEALTH words 13, 15, 22) --------------------
+
+/// The RF board's own startup modem check, reported in its BOARD_HEALTH
+/// (RFBoard26 `rfd_status_words`). Older RF firmware leaves these words zero.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct RfModemStatus {
+    pub outcome: Outcome,
+    pub map_source: MapSource,
+    pub mode: Mode,
+    pub rolled_out_all_nodes: bool,
+    pub eeprom_saved: bool,
+    pub rebooted: bool,
+    pub resumed_with_ato: bool,
+    pub forwarding_entries: bool,
+    pub skipped_by_flight_gate: bool,
+    /// Waiting for the first flight state, or running (the RF radio is held).
+    pub pending: bool,
+    pub needs_attention: bool,
+    pub air_speed: Option<u16>,
+    pub max_data: Option<u16>,
+    pub max_retries: Option<u16>,
+    pub global_retries: Option<u16>,
+    pub serial_break_ms: Option<u16>,
+    pub dest_id: Option<u16>,
+    pub rtscts: Option<u16>,
+    pub summary: String,
+    pub received_unix_ms: u64,
+}
+
+const RF_FLAG_SAVED: u32 = 0x01;
+const RF_FLAG_REBOOTED: u32 = 0x02;
+const RF_FLAG_RESUMED: u32 = 0x04;
+const RF_FLAG_FORWARDING: u32 = 0x08;
+const RF_FLAG_GATE: u32 = 0x10;
+const RF_FLAG_PENDING: u32 = 0x20;
+const RF_FLAG_ATTENTION: u32 = 0x40;
+
+/// Decodes the RF block. BOARD_HEALTH flags 4, 32 and 64 own these words on
+/// other boards, so the block exists only when they are clear.
+pub(crate) fn decode_rf_status(words: &[u32]) -> Option<RfModemStatus> {
+    if words.len() != 24 || words[1] & (4 | 32 | 64) != 0 || words[13] & 0xF != 1 {
+        return None;
+    }
+    let (a, b, c) = (words[13], words[15], words[22]);
+    let outcome = match (a >> 4) & 0xF {
+        0 => Outcome::Skipped,
+        1 => Outcome::Matched,
+        2 => Outcome::Applied,
+        3 => Outcome::Mismatch,
+        4 => Outcome::ApplyFailed,
+        5 => Outcome::VerifyFailed,
+        6 => Outcome::NoResponse,
+        7 => Outcome::Failed,
+        _ => return None,
+    };
+    let map_source = match (a >> 8) & 3 {
+        0 => MapSource::Ati5Names,
+        1 => MapSource::Fingerprint,
+        _ => MapSource::Unconfirmed,
+    };
+    let mode = match (a >> 10) & 3 {
+        0 => Mode::Skip,
+        1 => Mode::Verify,
+        _ => Mode::Fix,
+    };
+    let flags = (a >> 16) & 0xFF;
+    let u16f = |v: u32| (v & 0xFFFF != 0xFFFF).then_some((v & 0xFFFF) as u16);
+    let u8f = |v: u32| (v & 0xFF != 0xFF).then_some((v & 0xFF) as u16);
+    let rtscts = match (a >> 13) & 3 {
+        3 => None,
+        v => Some(v as u16),
+    };
+    let pending = flags & RF_FLAG_PENDING != 0;
+    let gate = flags & RF_FLAG_GATE != 0;
+    let summary = if pending {
+        "RF modem check pending: it runs once the RF board receives a Startup, Idle, PreFill or FillTest flight state".to_string()
+    } else {
+        match outcome {
+            Outcome::Skipped if gate => {
+                "RF modem not checked this boot: the flight state was not Startup, Idle, PreFill or FillTest".into()
+            }
+            Outcome::Skipped if mode == Mode::Skip => "RF modem check off in this RF build".into(),
+            Outcome::Skipped => "RF modem not checked".into(),
+            Outcome::Matched => "RF modem settings match the profile; nothing written".into(),
+            Outcome::Applied => "RF modem settings written, saved and verified after reboot".into(),
+            Outcome::Mismatch if gate => {
+                "RF modem settings differ; not written because the flight state changed".into()
+            }
+            Outcome::Mismatch => "RF modem settings differ from the profile and were left in place (verify-only, link-wide or unconfirmed register map)".into(),
+            Outcome::ApplyFailed => "RF modem refused a setting or the save; changes discarded".into(),
+            Outcome::VerifyFailed => "RF modem settings did not verify after the save; not retried".into(),
+            Outcome::NoResponse => "RF modem did not enter command mode; RF runs on its current settings".into(),
+            Outcome::Failed => "RF modem check failed (serial error or time bound)".into(),
+        }
+    };
+    Some(RfModemStatus {
+        outcome,
+        map_source,
+        mode,
+        rolled_out_all_nodes: (a >> 12) & 1 != 0,
+        eeprom_saved: flags & RF_FLAG_SAVED != 0,
+        rebooted: flags & RF_FLAG_REBOOTED != 0,
+        resumed_with_ato: flags & RF_FLAG_RESUMED != 0,
+        forwarding_entries: flags & RF_FLAG_FORWARDING != 0,
+        skipped_by_flight_gate: gate,
+        pending,
+        needs_attention: flags & RF_FLAG_ATTENTION != 0
+            || !matches!(
+                outcome,
+                Outcome::Matched | Outcome::Applied | Outcome::Skipped
+            ),
+        air_speed: u8f(c >> 16),
+        max_data: u16f(b),
+        max_retries: u8f(c >> 24),
+        global_retries: u8f(a >> 24),
+        serial_break_ms: u16f(b >> 16),
+        dest_id: u16f(c),
+        rtscts,
+        summary,
+        received_unix_ms: 0,
+    })
+}
+
+struct RfSeen {
+    status: RfModemStatus,
+    uptime_ticks: u64,
+    notified: bool,
+}
+static RF_BOARD: Mutex<Option<RfSeen>> = Mutex::new(None);
+
+/// Records the RF block from an RF BOARD_HEALTH report. Returns one operator
+/// notice per finished RF check (pass or needs attention), as for GS checks:
+/// again after an RF reboot, or when the result changes.
+pub(crate) fn observe_rf_board_health(words: &[u32]) -> Option<String> {
+    let mut status = decode_rf_status(words)?;
+    status.received_unix_ms = unix_ms();
+    let uptime = u64::from(words[2]) | (u64::from(words[3]) << 32);
+    let mut seen = RF_BOARD.lock().unwrap_or_else(|e| e.into_inner());
+    let same_run = seen.as_ref().is_some_and(|s| {
+        uptime >= s.uptime_ticks && {
+            let mut a = s.status.clone();
+            a.received_unix_ms = status.received_unix_ms;
+            a == status
+        }
+    });
+    let notified = same_run && seen.as_ref().is_some_and(|s| s.notified);
+    let notify = !notified && !status.pending && status.outcome != Outcome::Skipped;
+    let notice = notify.then(|| {
+        let passed = matches!(status.outcome, Outcome::Matched | Outcome::Applied)
+            && !status.needs_attention;
+        format!(
+            "RF radio modem check {}: {}",
+            if passed { "passed" } else { "needs attention" },
+            status.summary
+        )
+    });
+    *seen = Some(RfSeen {
+        status,
+        uptime_ticks: uptime,
+        notified: notified || notify,
+    });
+    notice
+}
+
+fn rf_board_status() -> Option<RfModemStatus> {
+    RF_BOARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|s| s.status.clone())
+}
+
 #[derive(Serialize)]
 pub(crate) struct Status {
     pub available: bool,
@@ -1315,6 +1487,8 @@ pub(crate) struct Status {
     pub blocked_reason: Option<String>,
     pub needs_attention: bool,
     pub report: Option<Report>,
+    /// The RF board's own check, once its BOARD_HEALTH carries it.
+    pub rf_board: Option<RfModemStatus>,
 }
 
 pub(crate) fn status() -> Status {
@@ -1340,6 +1514,7 @@ pub(crate) fn status() -> Status {
         blocked_reason: gate.err(),
         needs_attention: report.as_ref().is_some_and(Report::needs_attention),
         report,
+        rf_board: rf_board_status(),
     }
 }
 

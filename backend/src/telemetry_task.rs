@@ -2421,6 +2421,11 @@ async fn handle_packet_inner(
             );
             if accepted {
                 recording_diagnostics::raw_health(state, db_tx, &pkt, &sender_id);
+                if crate::types::canonical_sender_id(sender_id.trim()) == "RF"
+                    && let Some(notice) = crate::comms::rfd_modem::observe_rf_board_health(&words)
+                {
+                    crate::web::emit_notification_warning(state, notice);
+                }
             }
         }
         return Vec::new();
