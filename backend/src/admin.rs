@@ -17,6 +17,56 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/admin/users", get(users).post(save_user))
         .route("/api/admin/users/create", axum::routing::post(create_user))
+        .route("/api/admin/users/delete", axum::routing::post(delete_user))
+}
+const LAST_ADMIN: &str = "Keep at least one enabled application administrator. Make another account an administrator first.";
+const MISSING_ACCOUNT: &str = "That account no longer exists";
+fn enabled_admin_count(config: &auth::UsersFile) -> usize {
+    config
+        .users
+        .iter()
+        .filter(|u| !u.disabled && u.roles.contains(&StreamRole::Admin))
+        .count()
+}
+fn same_user(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+/// A short, secret-free description of what an account edit changed.
+fn describe_change(before: Option<&auth::UserRecord>, after: &auth::UserRecord, password_reset: bool) -> String {
+    let Some(before) = before else {
+        return format!(
+            "created with roles {:?}{}",
+            after.roles,
+            if after.disabled { ", disabled" } else { "" }
+        );
+    };
+    let mut changes = Vec::new();
+    if before.roles != after.roles {
+        changes.push(format!("roles {:?} -> {:?}", before.roles, after.roles));
+    }
+    for permission in Permission::ALL {
+        let (old, new) = (before.permissions.flag(*permission), after.permissions.flag(*permission));
+        if old != new {
+            changes.push(format!("{} {}", permission.field_name(), if new { "granted" } else { "revoked" }));
+        }
+    }
+    if before.command_access != after.command_access {
+        changes.push("command limits changed".into());
+    }
+    if before.calibration_access != after.calibration_access {
+        changes.push("calibration access changed".into());
+    }
+    if before.disabled != after.disabled {
+        changes.push(if after.disabled { "disabled" } else { "enabled" }.into());
+    }
+    if password_reset {
+        changes.push("password reset".into());
+    }
+    if changes.is_empty() {
+        "no changes".into()
+    } else {
+        changes.join(", ")
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,7 +150,11 @@ async fn save_user_inner(
         || account.username.chars().any(char::is_control)
         || account.command_access.allowed_commands.len() > 128
     {
-        return (StatusCode::BAD_REQUEST, "Invalid username or command list").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "Usernames must be 1–64 characters without control characters, with at most 128 allowed commands",
+        )
+            .into_response();
     }
     // Reject self-demotion before hashing passwords or invalidating sessions.
     if principal
@@ -111,7 +165,7 @@ async fn save_user_inner(
     {
         return (
             StatusCode::CONFLICT,
-            "You cannot remove your own administrator access or disable your account",
+            "You cannot remove your own administrator role or disable your own account. Ask another administrator to make that change.",
         )
             .into_response();
     }
@@ -157,6 +211,7 @@ async fn save_user_inner(
             .into_response();
     }
     let actor = principal.username.unwrap_or_default();
+    let password_reset = hash.is_some();
     let result = state.auth.update_users(|config| {
         if !config.users.iter().any(|u| {
             u.username.eq_ignore_ascii_case(&actor)
@@ -196,25 +251,93 @@ async fn save_user_inner(
             password,
         };
         let result = Account::from(user.clone());
+        let change = describe_change(existing.map(|i| &config.users[i]), &user, password_reset && existing.is_some());
         if let Some(index) = existing {
             config.users[index] = user;
         } else {
             if config.users.len() >= 128 {
-                return Err("Account limit reached".into());
+                return Err("Account limit reached (128 accounts)".into());
             }
             config.users.push(user);
         }
-        if !config.users.iter().any(|u| {
-            !u.disabled
-                && u.permissions.for_roles(&u.roles).view_data
-                && u.roles.contains(&StreamRole::Admin)
-        }) {
-            return Err("Keep at least one enabled application administrator".into());
+        if enabled_admin_count(config) == 0 {
+            return Err(LAST_ADMIN.into());
         }
-        Ok(result)
+        Ok((result, change))
     });
     match result {
-        Ok(profile) => Json(profile).into_response(),
+        Ok((profile, change)) => {
+            log::info!(
+                "Account {} {} by administrator {}: {}",
+                profile.username,
+                if create_only { "created" } else { "updated" },
+                actor,
+                change
+            );
+            Json(profile).into_response()
+        }
+        Err(error) => (StatusCode::CONFLICT, error).into_response(),
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteRequest {
+    username: String,
+}
+#[derive(Serialize)]
+struct Deleted {
+    deleted: String,
+}
+async fn delete_user(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<DeleteRequest>,
+) -> Response {
+    let principal = match administrator(&state, &headers).await {
+        Ok(p) => p,
+        Err(error) => return error,
+    };
+    let target = request.username.trim().to_string();
+    if target.is_empty() || target.len() > 64 || target.chars().any(char::is_control) {
+        return (StatusCode::BAD_REQUEST, "Choose an account to delete").into_response();
+    }
+    let actor = principal.username.unwrap_or_default();
+    if same_user(&actor, &target) {
+        return (
+            StatusCode::CONFLICT,
+            "You cannot delete your own account. Ask another administrator to remove it.",
+        )
+            .into_response();
+    }
+    let result = state.auth.update_users(|config| {
+        if !config.users.iter().any(|u| {
+            same_user(&u.username, &actor) && !u.disabled && u.roles.contains(&StreamRole::Admin)
+        }) {
+            return Err("Administrator permission changed".to_string());
+        }
+        let index = config
+            .users
+            .iter()
+            .position(|u| same_user(&u.username, &target))
+            .ok_or_else(|| MISSING_ACCOUNT.to_string())?;
+        let removed = config.users.remove(index);
+        if enabled_admin_count(config) == 0 {
+            return Err(LAST_ADMIN.to_string());
+        }
+        Ok(removed.username)
+    });
+    match result {
+        Ok(username) => {
+            // Authorization already rejects sessions of removed accounts; also
+            // drop their rows so nothing lingers if the name is reused.
+            let _ = sqlx::query("DELETE FROM auth_sessions WHERE username = ? COLLATE NOCASE AND session_type <> 'revoked'")
+                .bind(&username)
+                .execute(&state.auth_db)
+                .await;
+            log::info!("Account {username} deleted by administrator {actor}");
+            Json(Deleted { deleted: username }).into_response()
+        }
+        Err(error) if error == MISSING_ACCOUNT => (StatusCode::NOT_FOUND, error).into_response(),
         Err(error) => (StatusCode::CONFLICT, error).into_response(),
     }
 }
@@ -509,5 +632,117 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+    async fn delete(state: &Arc<AppState>, headers: HeaderMap, username: &str) -> StatusCode {
+        delete_user(
+            State(state.clone()),
+            headers,
+            Json(DeleteRequest { username: username.into() }),
+        )
+        .await
+        .status()
+    }
+    #[tokio::test]
+    async fn admin_session_holds_every_permission_with_any_stored_flags_or_stale_row() {
+        let (_root, state, _) = fixture("admin").await;
+        state
+            .auth
+            .update_users(|config| {
+                config.users[0].roles = vec![StreamRole::StreamViewer, StreamRole::Admin];
+                config.users[0].permissions = Permissions::default();
+                config.users[0].command_access.allowed_commands = vec!["Pilot".into()];
+                config.users[0].calibration_access = CalibrationAccess::default();
+                Ok(())
+            })
+            .unwrap();
+        sqlx::query("UPDATE auth_sessions SET can_view_data=0, can_send_commands=0, allowed_commands_json='[\"Pilot\"]' WHERE token='admin-test'")
+            .execute(&state.auth_db).await.unwrap();
+        for permission in Permission::ALL {
+            let principal = state
+                .auth
+                .authorize_token(&state.auth_db, Some("admin-test"), *permission)
+                .await
+                .unwrap_or_else(|_| panic!("admin lacks {permission:?}"));
+            assert_eq!(principal.permissions, Permissions::all());
+            for command in ["FirmwareUpdate", "RetractPlumbing", "StreamControl", "Abort"] {
+                assert!(principal.allows_command_name(command), "{command}");
+            }
+            assert!(principal.can_manage_stream() && principal.can_publish_camera());
+            assert!(principal.calibration_access.edit);
+        }
+        let status = state
+            .auth
+            .session_status(&state.auth_db, Some("admin-test"))
+            .await
+            .unwrap();
+        assert_eq!(status.permissions, Permissions::all());
+        assert!(status.allowed_commands.is_empty());
+    }
+    #[tokio::test]
+    async fn admin_can_delete_another_account_and_its_sessions_end() {
+        let (_root, state, headers) = fixture("admin").await;
+        assert_eq!(delete(&state, headers.clone(), "OPERATOR").await, StatusCode::OK);
+        assert!(state.auth.load_users_file().unwrap().users.iter().all(|u| u.username != "operator"));
+        assert!(
+            state
+                .auth
+                .authorize_token(&state.auth_db, Some("operator-test"), Permission::ViewData)
+                .await
+                .is_err()
+        );
+        assert_eq!(delete(&state, headers, "operator").await, StatusCode::NOT_FOUND);
+    }
+    #[tokio::test]
+    async fn admin_cannot_delete_self_or_the_last_admin() {
+        let (_root, state, headers) = fixture("admin").await;
+        assert_eq!(delete(&state, headers.clone(), "Administrator").await, StatusCode::CONFLICT);
+        assert_eq!(state.auth.load_users_file().unwrap().users.len(), 2);
+        // With a second admin, one admin may delete the other.
+        state
+            .auth
+            .update_users(|config| {
+                config.users[1].roles = vec![StreamRole::Admin];
+                Ok(())
+            })
+            .unwrap();
+        let mut operator = HeaderMap::new();
+        operator.insert(axum::http::header::AUTHORIZATION, "Bearer operator-test".parse().unwrap());
+        state
+            .auth
+            .update_users(|config| {
+                config.users.push(auth::UserRecord {
+                    username: "third".into(),
+                    roles: vec![],
+                    ..config.users[1].clone()
+                });
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(delete(&state, operator.clone(), "administrator").await, StatusCode::OK);
+        // The remaining (last) admin can neither be demoted nor deleted.
+        assert_eq!(delete(&state, operator.clone(), "operator").await, StatusCode::CONFLICT);
+        let mut last = Account::from(state.auth.load_users_file().unwrap().users.remove(0));
+        last.roles.clear();
+        assert_eq!(
+            save_user(State(state.clone()), operator, Json(last)).await.status(),
+            StatusCode::CONFLICT
+        );
+    }
+    #[tokio::test]
+    async fn non_admins_cannot_delete_accounts() {
+        let (_root, state, _) = fixture("stream_admin").await;
+        let mut operator = HeaderMap::new();
+        operator.insert(axum::http::header::AUTHORIZATION, "Bearer operator-test".parse().unwrap());
+        assert_eq!(delete(&state, operator, "administrator").await, StatusCode::FORBIDDEN);
+        assert_eq!(state.auth.load_users_file().unwrap().users.len(), 2);
+    }
+    #[tokio::test]
+    async fn last_admin_demotion_by_another_path_is_rejected() {
+        let (_root, state, headers) = fixture("admin").await;
+        let mut account = Account::from(state.auth.load_users_file().unwrap().users.remove(0));
+        account.roles = vec![StreamRole::StreamAdmin];
+        let response = save_user(State(state.clone()), headers, Json(account)).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(state.auth.load_users_file().unwrap().users[0].roles.contains(&StreamRole::Admin));
     }
 }

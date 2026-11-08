@@ -680,7 +680,9 @@ async fn set_role(
             if change.stream_master {
                 user.roles.push(StreamRole::StreamMaster);
                 user.permissions.view_data = true;
-            } else {
+            } else if !user.roles.contains(&StreamRole::Admin) {
+                // Administrators keep every capability; never store a
+                // viewer restriction on them.
                 user.roles.push(StreamRole::StreamViewer);
             }
             Ok(!change.stream_master
