@@ -69,6 +69,9 @@ pub(crate) enum Mode {
     Skip,
     Verify,
     Fix,
+    /// Operator "Reset radio": reboot the modem with ATZ. Never configurable
+    /// as the startup mode (`Mode::parse` does not accept it).
+    Reset,
 }
 
 impl Mode {
@@ -211,6 +214,8 @@ pub(crate) enum Outcome {
     VerifyFailed,
     NoResponse,
     Failed,
+    /// Operator reset: the modem accepted command mode and was rebooted.
+    Reset,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -315,7 +320,10 @@ impl Report {
     }
     /// Anything other than a clean match or a successful fix needs the operator.
     pub(crate) fn needs_attention(&self) -> bool {
-        !matches!(self.outcome, Outcome::Matched | Outcome::Applied) || !self.warnings.is_empty()
+        !matches!(
+            self.outcome,
+            Outcome::Matched | Outcome::Applied | Outcome::Reset
+        ) || !self.warnings.is_empty()
     }
 }
 
@@ -792,6 +800,61 @@ pub(crate) fn run(
     report
 }
 
+/// Operator "Reset radio": enter command mode and reboot the modem with ATZ
+/// (settings are reloaded from EEPROM; nothing is written). The caller closes
+/// the serial port before and reopens it after, so even when the modem does
+/// not answer, the host side of the link restarts.
+pub(crate) fn run_reset(io: &mut dyn ModemIo, timing: Timing, gate: Gate<'_>) -> Report {
+    let started = io.now();
+    let trigger = Trigger::Operator;
+    if let Err(reason) = gate() {
+        return Report::skipped(trigger, Mode::Reset, format!("not reset: {reason}"));
+    }
+    let mut report = Report::new(trigger, Mode::Reset);
+    let mut d = Driver {
+        deadline: started + timing.overall,
+        io,
+        t: timing,
+        rx: Vec::with_capacity(256),
+        saw_plus_ok: false,
+    };
+    let result = (|| -> Result<(), Abort> {
+        if !d.enter_command_mode()? {
+            report.outcome = Outcome::NoResponse;
+            report.summary = "modem did not enter command mode; the serial port was closed and reopened".into();
+            if d.saw_plus_ok {
+                d.exit_command_mode(&mut report);
+            }
+            return Ok(());
+        }
+        report.data_mode = DataMode::Unknown;
+        if let Err(reason) = gate() {
+            report.outcome = Outcome::Skipped;
+            report.summary = format!("not reset: {reason}");
+            d.exit_command_mode(&mut report);
+            return Ok(());
+        }
+        d.reboot()?;
+        report.rebooted = true;
+        report.data_mode = DataMode::Rebooted;
+        report.outcome = Outcome::Reset;
+        report.summary = "modem rebooted with ATZ (settings reloaded from EEPROM) and the serial port reopened".into();
+        Ok(())
+    })();
+    if let Err(abort) = result {
+        let what = match abort {
+            Abort::Io(e) => format!("serial error: {e}"),
+            Abort::Deadline => "reset exceeded its time bound".into(),
+        };
+        report.outcome = Outcome::Failed;
+        report.summary = what.clone();
+        report.warnings.push(what);
+    }
+    report.duration_ms = d.io.now().saturating_sub(started).as_millis() as u64;
+    report.finished_unix_ms = unix_ms();
+    report
+}
+
 fn run_inner(
     d: &mut Driver<'_>,
     plan: &Plan,
@@ -1094,13 +1157,24 @@ fn store(report: Report) {
             report.summary
         );
     }
-    let passed = matches!(report.outcome, Outcome::Matched | Outcome::Applied);
+    let passed = matches!(
+        report.outcome,
+        Outcome::Matched | Outcome::Applied | Outcome::Reset
+    );
     if !matches!(report.outcome, Outcome::Skipped) {
-        let line = format!(
-            "Radio modem check {}: {}",
-            if passed { "passed" } else { "needs attention" },
-            report.summary
-        );
+        let line = if report.mode == Mode::Reset {
+            format!(
+                "Radio reset {}: {}",
+                if passed { "succeeded" } else { "needs attention" },
+                report.summary
+            )
+        } else {
+            format!(
+                "Radio modem check {}: {}",
+                if passed { "passed" } else { "needs attention" },
+                report.summary
+            )
+        };
         *NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(line);
     }
     GLOBAL.lock().unwrap_or_else(|e| e.into_inner()).report = Some(report);
@@ -1196,6 +1270,7 @@ fn run_on_port(serial: &SerialLinkConfig, plan: &Plan, trigger: Trigger, mode: M
         return Report::skipped(trigger, mode, "another modem check is running");
     }
     let report = match open_port(serial) {
+        Ok(mut io) if mode == Mode::Reset => run_reset(&mut io, TIMING, &gate),
         Ok(mut io) => {
             let report = run(
                 &mut io,
@@ -1256,6 +1331,7 @@ pub(crate) fn test_releases() -> u64 {
 
 /// Operator request. Refused in a flight state, during a launch or a
 /// sequence, while another check runs, or without an RFD radio.
+/// `Mode::Reset` reboots the modem ("Reset radio") and needs no profile.
 pub(crate) fn request_operator_check(mode: Mode) -> Result<(), String> {
     let link = AV_BAY
         .get()
@@ -1263,9 +1339,13 @@ pub(crate) fn request_operator_check(mode: Mode) -> Result<(), String> {
     let serial = raw_radio(link)
         .ok_or_else(|| "the AV-bay link is not a raw-UART RFD radio".to_string())?
         .clone();
-    let plan = plan_for(&serial).ok_or_else(|| "no RFD profile is selected".to_string())?;
+    let plan = match plan_for(&serial) {
+        Some(plan) => plan,
+        None if mode == Mode::Reset => Plan { regs: Vec::new() },
+        None => return Err("no RFD profile is selected".to_string()),
+    };
     if mode == Mode::Skip {
-        return Err("choose verify or fix".into());
+        return Err("choose verify, fix or reset".into());
     }
     if simulated_link() {
         return Err("the AV-bay link is simulated".into());
@@ -1395,6 +1475,7 @@ pub(crate) fn decode_rf_status(words: &[u32]) -> Option<RfModemStatus> {
             Outcome::VerifyFailed => "RF modem settings did not verify after the save; not retried".into(),
             Outcome::NoResponse => "RF modem did not enter command mode; RF runs on its current settings".into(),
             Outcome::Failed => "RF modem check failed (serial error or time bound)".into(),
+            Outcome::Reset => "RF modem reset".into(),
         }
     };
     Some(RfModemStatus {
@@ -1489,6 +1570,8 @@ pub(crate) struct Status {
     pub report: Option<Report>,
     /// The RF board's own check, once its BOARD_HEALTH carries it.
     pub rf_board: Option<RfModemStatus>,
+    /// Raw-UART radio receive quality (good and CRC-rejected frames).
+    pub receive_quality: super::link_quality::Snapshot,
 }
 
 pub(crate) fn status() -> Status {
@@ -1515,6 +1598,7 @@ pub(crate) fn status() -> Status {
         needs_attention: report.as_ref().is_some_and(Report::needs_attention),
         report,
         rf_board: rf_board_status(),
+        receive_quality: super::link_quality::snapshot(),
     }
 }
 

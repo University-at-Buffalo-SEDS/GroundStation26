@@ -2231,8 +2231,16 @@ async fn post_radio_modem_check(
         )
             .into_response();
     }
-    let Some(mode) = crate::comms::rfd_modem::Mode::parse(&request.mode) else {
-        return (StatusCode::BAD_REQUEST, "mode must be verify or fix").into_response();
+    let mode = if request.mode.trim().eq_ignore_ascii_case("reset") {
+        crate::comms::rfd_modem::Mode::Reset
+    } else {
+        match crate::comms::rfd_modem::Mode::parse(&request.mode) {
+            Some(mode) => mode,
+            None => {
+                return (StatusCode::BAD_REQUEST, "mode must be verify, fix or reset")
+                    .into_response();
+            }
+        }
     };
     // Re-evaluate now rather than trusting the 250 ms refresh.
     crate::comms::rfd_modem::set_gate(crate::comms::rfd_modem::station_block_reason(&state));

@@ -30,7 +30,18 @@ profile selected.
   `RadioModemCheck` command permission. The radio is held closed for the
   check (about 3 s to read, about 11 s if it writes) and then reopens.
 
-It never runs, not even to read, when:
+* **Reset radio** (Connectivity → Radio modem → *Reset radio*,
+  `POST /api/radio/modem/check` with `{"mode":"reset"}`, same permission):
+  the radio port is held closed as for a check, the modem enters command mode
+  and is rebooted with `ATZ` (settings reload from EEPROM; nothing is
+  written), then the port reopens. If the modem does not enter command mode,
+  the port is still closed and reopened, which restarts the host side of the
+  link, and the result is `no_response`. A successful reset is `reset`. Every
+  reset raises a "Radio reset succeeded / needs attention" notification. It
+  works on GS and RRLS and needs no RFD profile. `reset` is never accepted as
+  the startup mode.
+
+Neither the check nor the reset runs, not even to read, when:
 
 * the flight state is anything other than Startup, Idle, PreFill or
   FillTest. Launch through Landed are blocked as required. Fill states,
@@ -136,6 +147,23 @@ left in place, or writes blocked), `apply_failed`, `verify_failed`, `no_response
 sets `needs_attention`. The UI shows this as a warning in Connectivity, and
 the backend logs it at warn level. The station always continues on the
 modem's current settings.
+
+`receive_quality` counts raw-UART radio frames taken and frames rejected by
+their CRC32, over the last minute and in total. Connectivity → Radio modem
+shows "Receive quality (last minute): N good frames, M CRC failures (x%)".
+The radio worker no longer logs each rejected frame; it logs one line per
+30 s while rejections occur: "N raw UART CRC mismatches in the last 30 s, M
+good frames (x% rejected)".
+
+Rejected frames are expected on a mesh at a low rate. The RFD checks its own
+air CRC, so a host-level mismatch means a frame reached the UART incomplete
+or interleaved; RRLS hears both GS and RF, and ASYNC can send a packet that
+holds only part of a UART frame when it gets channel access, so fragments
+from two senders can interleave at RRLS. A parser bug made this worse: after
+a CRC rejection it resynchronized on an apparent sync inside the rejected
+frame's payload, which surfaced garbage as a frame, caused further CRC
+mismatches, or swallowed the next real frame. The parser now waits for a
+header after the rejected span (`rejected_rr_v1_span_is_never_reparsed_for_a_false_sync`).
 
 `rf_board` holds the RF board's own result once its BOARD_HEALTH carries it
 (see phase 2): outcome, map source, mode, `rolled_out_all_nodes`, flags

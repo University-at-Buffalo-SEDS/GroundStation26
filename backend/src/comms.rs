@@ -6,6 +6,8 @@ mod picofi_tcp;
 #[cfg(test)]
 #[path = "comms/retry_tracker_tests.rs"]
 pub(crate) mod retry_tracker_tests;
+#[path = "comms/link_quality.rs"]
+pub(crate) mod link_quality;
 #[path = "comms/rfd_capacity.rs"]
 pub(crate) mod rfd_capacity;
 #[path = "comms/rfd_modem.rs"]
@@ -2023,6 +2025,12 @@ fn take_raw_uart_framed_payload_with_clock(
             discard_raw_uart_prefix(rx_buf, offset, &mut wait.failed_prefix);
             wait.failed_prefix = 0;
             wait.started = None;
+        } else if wait.failed_prefix != 0 {
+            // Never resynchronize on an apparent sync inside the rejected
+            // span: its bytes are payload of a frame that failed its CRC, and
+            // a false header there would surface garbage or swallow the next
+            // real frame. Wait for a header after the span.
+            return Ok(None);
         }
     }
     loop {
@@ -2169,6 +2177,39 @@ mod native_uart_integrity_tests {
             serialize::unpack_packet(&recovered).unwrap().timestamp(),
             42
         );
+        assert!(stream.is_empty());
+    }
+
+    /// One corrupted RR-v1 relay frame whose payload happens to contain a
+    /// UART sync and short length. Before the fix the parser resynchronized
+    /// inside the rejected span: it delivered the fake inner bytes as a frame
+    /// (or rejected them again as another CRC mismatch) instead of skipping to
+    /// the next real frame.
+    #[test]
+    fn rejected_rr_v1_span_is_never_reparsed_for_a_false_sync() {
+        let mut body = b"RR\x01\x05".to_vec();
+        body.extend_from_slice(&[9, 9, 0xA5, 0x5A, 0x04, 0x00, 1, 2, 3, 4, 9, 9]);
+        let crc = crc32fast::hash(&body) ^ 0xDEAD_BEEF; // damaged
+        body.extend_from_slice(&crc.to_le_bytes());
+        let mut stream = build_raw_uart_frame(&body).unwrap();
+        let following = native_heartbeat(43);
+        let now = Instant::now();
+        let mut wait = RawUartFrameWait::default();
+        assert!(matches!(
+            take_raw_uart_framed_payload_with_clock(&mut stream, &mut wait, now, Some(0)),
+            Err(TelemetryError::Unpack("raw UART RR-v1 crc32 mismatch"))
+        ));
+        // Nothing beyond the rejected span has arrived yet.
+        for ms in 1..4 {
+            let got = take_raw_uart_framed_payload_with_clock(&mut stream, &mut wait, now, Some(ms));
+            assert!(matches!(got, Ok(None)), "false inner frame surfaced: {got:?}");
+        }
+        stream.extend_from_slice(&build_raw_uart_frame(&following).unwrap());
+        let (_, recovered) =
+            take_raw_uart_framed_payload_with_clock(&mut stream, &mut wait, now, Some(5))
+                .unwrap()
+                .expect("the next real frame is taken");
+        assert_eq!(recovered, following);
         assert!(stream.is_empty());
     }
 
@@ -2440,11 +2481,13 @@ fn take_raw_uart_framed_payload_recovering(
             };
             discard_raw_uart_prefix(rx_buf, 1, failed_prefix);
             *failed_prefix = total_len - 1;
+            link_quality::crc_failure();
             return Err(TelemetryError::Unpack(error));
         }
     let payload = body.to_vec();
     discard_raw_uart_prefix(rx_buf, total_len, failed_prefix);
     *failed_prefix = 0;
+    link_quality::good_frame();
     Ok(Some((frame_kind, payload)))
 }
 

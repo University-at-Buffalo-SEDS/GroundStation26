@@ -3415,6 +3415,17 @@ fn handle_worker_recv_error(
 
     #[cfg(not(feature = "testing"))]
     {
+        // A CRC-rejected radio frame is a receive-quality event, not a worker
+        // fault: log one summary line per interval with the good-frame count.
+        if detail.contains("crc32 mismatch") {
+            if let Some(line) = crate::comms::link_quality::crc_summary(
+                std::time::Duration::from_millis(COMMS_ERROR_LOG_INTERVAL_MS),
+            ) {
+                let worker = context.split_whitespace().next().unwrap_or(context);
+                eprintln!("{worker} radio receive: {line}");
+            }
+            return true;
+        }
         log_repeated_worker_error(context, detail, last_log_ms, suppressed_count);
         true
     }

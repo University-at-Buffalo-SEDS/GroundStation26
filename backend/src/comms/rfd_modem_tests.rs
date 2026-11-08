@@ -884,3 +884,57 @@ fn rf_board_check_notifies_once_per_result_and_again_after_reboot() {
     assert!(status.skipped_by_flight_gate && status.summary.contains("flight state"));
     *RF_BOARD.lock().unwrap() = None;
 }
+
+#[test]
+fn reset_reboots_the_modem_without_writing_settings() {
+    let mut modem = SimModem::new();
+    // A RAM-only change (never saved) is discarded by the reboot.
+    modem.ram.insert(6, 20);
+    let report = run_reset(&mut modem, TIMING, &open);
+    assert_eq!(report.outcome, Outcome::Reset, "{report:?}");
+    assert_eq!(report.mode, Mode::Reset);
+    assert!(report.rebooted && !report.eeprom_saved && report.writes.is_empty());
+    assert!(!report.needs_attention());
+    assert_eq!(modem.eeprom_writes, 0);
+    modem.tick();
+    assert_eq!(modem.state, State::Data, "ATZ boots into data mode");
+    assert_eq!(modem.ram[&6], 50, "EEPROM settings reloaded");
+    assert!(report.duration_ms < 12_000, "{}", report.duration_ms);
+}
+
+#[test]
+fn reset_of_a_silent_modem_reports_no_response() {
+    let mut modem = SimModem::new();
+    modem.dead = true;
+    let report = run_reset(&mut modem, TIMING, &open);
+    assert_eq!(report.outcome, Outcome::NoResponse, "{report:?}");
+    assert!(report.summary.contains("closed and reopened"));
+    assert!(report.needs_attention() && !report.rebooted);
+    assert_eq!(modem.eeprom_writes, 0);
+}
+
+#[test]
+fn reset_is_refused_by_the_flight_gate() {
+    let mut modem = SimModem::new();
+    let blocked = || Err::<(), _>("station is in flight state Ascent".to_string());
+    let report = run_reset(&mut modem, TIMING, &blocked);
+    assert_eq!(report.outcome, Outcome::Skipped);
+    assert!(report.summary.contains("Ascent"));
+    assert_eq!(modem.written, 0, "not even +++ may be sent");
+    // The gate closing after command mode is entered: no ATZ, data mode resumed.
+    let mut modem = SimModem::new();
+    let calls = std::cell::Cell::new(0);
+    let closing = || {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 { Ok(()) } else { Err("a sequence is running".to_string()) }
+    };
+    let report = run_reset(&mut modem, TIMING, &closing);
+    assert_eq!(report.outcome, Outcome::Skipped, "{report:?}");
+    assert!(!report.rebooted && report.data_mode == DataMode::Resumed);
+    assert_eq!(modem.state, State::Data);
+}
+
+#[test]
+fn reset_is_never_a_startup_mode() {
+    assert_eq!(Mode::parse("reset"), None);
+}
