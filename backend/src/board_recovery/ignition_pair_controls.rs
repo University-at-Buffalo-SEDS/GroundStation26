@@ -191,6 +191,7 @@ async fn ignition_pair_policy_disables_sequence_without_disabling_manual_off_cat
     let mut policy = crate::sequences::ActionPolicyMsg {
         local_phase_controls: false,
         local_phase_controls_reason: None,
+        launch_zero: None,
         key_enabled: true,
         software_buttons_enabled: true,
         controls: [

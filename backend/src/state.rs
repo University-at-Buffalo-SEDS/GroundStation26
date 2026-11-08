@@ -2021,6 +2021,7 @@ impl AppState {
             crate::board_abort::block_policy(self, &mut local);
             crate::ignition_pair::project_fresh_proof(self, &mut local);
             crate::operator_phase::project(self,&mut local);
+            local.launch_zero = crate::auto_zero::before_launch::status(self);
             if self.operator_queue.fill_launch_active() {
                 for control in &mut local.controls {
                     if crate::sequences::is_fill_system_control(&control.cmd) {
@@ -2037,6 +2038,7 @@ impl AppState {
             crate::primary_mirror::action_policy(self).unwrap_or_else(|| ActionPolicyMsg {
                 local_phase_controls: false,
                 local_phase_controls_reason: None,
+                launch_zero: None,
                 key_enabled: false,
                 software_buttons_enabled: false,
                 controls: Vec::new(),

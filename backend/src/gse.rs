@@ -3755,9 +3755,18 @@ impl LaunchAdmission {
         self.manual_epoch != u64::MAX && self.observed_manual_epoch != u64::MAX
     }
     fn capture_for_launch(state: &AppState, revision: Option<u64>) -> Result<Self, String> {
+        Self::capture_for_launch_from(state, revision, None)
+    }
+    /// A held Launch (zero before Launch) keeps the Stop/reset ownership it
+    /// had when pressed: any Stop or reset since then refuses admission.
+    fn capture_for_launch_from(
+        state: &AppState,
+        revision: Option<u64>,
+        pressed: Option<Self>,
+    ) -> Result<Self, String> {
         // Capture Stop first: a concurrent Stop cannot become a fresh epoch
         // between validating an older launch revision and taking its ticket.
-        let mut ticket = Self::capture(state);
+        let mut ticket = pressed.unwrap_or_else(|| Self::capture(state));
         if !ticket.trackable() {return Err("Stop epoch exhausted; unsafe launch admission refused".into());}
         let revision = crate::board_abort::validate_launch_revision(state, revision)?;
         ticket.board_abort_revision = revision;
@@ -4364,13 +4373,23 @@ pub(crate) fn admit_simulated_launch(
 
 /// Serialize launch admission against automatic valve-effect preparation in every mode.
 /// T-clock reset and delayed flight-state packets cannot re-enable automation.
-#[cfg(any(test, feature = "hitl_mode", feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 pub(crate) fn inhibit_automatic_actions_for_launch_revision(
     state: &Arc<AppState>,
     launch_revision: Option<u64>,
 ) -> Result<LaunchAdmission, String> {
+    inhibit_automatic_actions_for_pressed_launch(state, launch_revision, None)
+}
+
+/// `pressed` is the ticket captured when a held Launch was pressed.
+#[cfg(any(test, feature = "hitl_mode", feature = "testing"))]
+pub(crate) fn inhibit_automatic_actions_for_pressed_launch(
+    state: &Arc<AppState>,
+    launch_revision: Option<u64>,
+    pressed: Option<LaunchAdmission>,
+) -> Result<LaunchAdmission, String> {
     // Freeze the original ticket once, before provider work or retry waits.
-    let ticket = LaunchAdmission::capture_for_launch(state, launch_revision)?;
+    let ticket = LaunchAdmission::capture_for_launch_from(state, launch_revision, pressed)?;
     if !ticket.trackable() {
         return Err("Stop epoch exhausted; launch was not admitted".into());
     }
@@ -4423,13 +4442,23 @@ pub(crate) fn inhibit_automatic_actions_for_launch(
 }
 
 /// Commit once before dispatch, so service restart never repeats an irreversible Fire intent.
-#[cfg(not(feature = "hitl_mode"))]
+#[cfg(all(test, not(feature = "hitl_mode")))]
 pub(crate) fn commit_fire_intent_revision(
     state: &Arc<AppState>,
     launch_revision: Option<u64>,
 ) -> Result<LaunchAdmission, String> {
+    commit_fire_intent_for_pressed_launch(state, launch_revision, None)
+}
+
+/// `pressed` is the ticket captured when a held Launch was pressed.
+#[cfg(not(feature = "hitl_mode"))]
+pub(crate) fn commit_fire_intent_for_pressed_launch(
+    state: &Arc<AppState>,
+    launch_revision: Option<u64>,
+    pressed: Option<LaunchAdmission>,
+) -> Result<LaunchAdmission, String> {
     // Freeze the original ticket once, before provider work or retry waits.
-    let ticket = LaunchAdmission::capture_for_launch(state, launch_revision)?;
+    let ticket = LaunchAdmission::capture_for_launch_from(state, launch_revision, pressed)?;
     if !ticket.trackable() {
         return Err("Stop epoch exhausted; launch was not admitted".into());
     }

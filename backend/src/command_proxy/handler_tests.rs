@@ -491,6 +491,7 @@ async fn recovery_websocket_policy_uses_primary_projection_and_new_signed_observ
     state.set_action_policy(crate::sequences::ActionPolicyMsg {
         local_phase_controls: false,
         local_phase_controls_reason: None,
+        launch_zero: None,
         key_enabled: true,
         software_buttons_enabled: true,
         controls: vec![crate::sequences::ActionControl { disabled_reason: None, requested: None,

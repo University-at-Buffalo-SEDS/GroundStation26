@@ -5,6 +5,7 @@ use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 mod capture_clock;
 use capture_clock::CaptureClock;
+pub(crate) mod before_launch;
 
 const COUNT: usize = 200;
 // The live DAQ stream is nominally 40 Hz (39.86 Hz in the incident recording).
@@ -20,10 +21,33 @@ const ZERO_KG: f32 = 0.8;
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct Settings {
     pub enabled: bool,
+    /// Opt-in: zero KG1000 and apply it to the DAQ before Launch is sent.
+    /// Omitted from the wire while off so existing peers see no change.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub before_launch: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
-        Self { enabled: true }
+        Self { enabled: true, before_launch: false }
+    }
+}
+/// Partial operator update; an omitted field keeps its saved value.
+#[derive(Clone, Copy, Default, Deserialize)]
+pub struct SettingsUpdate {
+    pub enabled: Option<bool>,
+    pub before_launch: Option<bool>,
+}
+impl Settings {
+    pub fn updated(self, update: SettingsUpdate) -> Self {
+        Self {
+            enabled: update.enabled.unwrap_or(self.enabled),
+            before_launch: update.before_launch.unwrap_or(self.before_launch),
+        }
+    }
+}
+impl From<Settings> for SettingsUpdate {
+    fn from(settings: Settings) -> Self {
+        Self { enabled: Some(settings.enabled), before_launch: Some(settings.before_launch) }
     }
 }
 
@@ -43,6 +67,7 @@ pub struct Runtime {
     fill_pending: bool,
     // Authority observation only, never a measurement freshness timestamp.
     last_capture_clock: Option<CaptureClock>,
+    launch: before_launch::Hold,
 }
 fn path() -> std::path::PathBuf {
     std::env::var_os("GS_AUTO_ZERO_CONFIG")
@@ -66,12 +91,12 @@ impl Runtime {
             .get_or_insert_with(|| match std::fs::read(path()) {
                 Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                     log::error!("Invalid automatic-zero settings: {e}; automatic zero disabled");
-                    Settings { enabled: false }
+                    Settings { enabled: false, before_launch: false }
                 }),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::default(),
                 Err(e) => {
                     log::error!("Reading automatic-zero settings: {e}");
-                    Settings { enabled: false }
+                    Settings { enabled: false, before_launch: false }
                 }
             })
     }
@@ -113,6 +138,12 @@ impl Runtime {
         self.generation == token && !self.pending && self.fill_pending
     }
     pub fn cancel_for_command(&mut self, command: &TelemetryCommand) {
+        if matches!(
+            command,
+            TelemetryCommand::Abort | TelemetryCommand::CancelFill | TelemetryCommand::PauseFill
+        ) {
+            self.launch.cancel_requested();
+        }
         if (self.pending && self.fill_pending && !matches!(command, TelemetryCommand::StartFill))
             || matches!(
                 command,
@@ -127,7 +158,14 @@ impl Runtime {
     #[cfg(test)]
     pub fn testing(enabled: bool) -> Self {
         Self {
-            settings: Some(Settings { enabled }),
+            settings: Some(Settings { enabled, before_launch: false }),
+            ..Self::default()
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn testing_settings(settings: Settings) -> Self {
+        Self {
+            settings: Some(settings),
             ..Self::default()
         }
     }
@@ -199,8 +237,17 @@ fn stable(
     cfg: &loadcell::LoadcellCalibrationFile,
     sensor: &str,
 ) -> Result<(f32, bool), String> {
-    if raw.len() != COUNT {
-        return Err("Need 200 fresh loadcell samples".into());
+    stable_count(raw, cfg, sensor, COUNT)
+}
+
+fn stable_count(
+    raw: &[f32],
+    cfg: &loadcell::LoadcellCalibrationFile,
+    sensor: &str,
+    count: usize,
+) -> Result<(f32, bool), String> {
+    if count < 20 || raw.len() != count {
+        return Err(format!("Need {count} fresh loadcell samples"));
     }
     if sensor == "KG50" && !cfg.extra_channels.contains_key("kg50") {
         return Err("Save a 50 kg loadcell calibration before automatic zeroing".into());
@@ -215,7 +262,7 @@ fn stable(
         })
         .collect::<Result<_, _>>()?;
     values.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let kept = &values[COUNT / 20..COUNT - COUNT / 20];
+    let kept = &values[count / 20..count - count / 20];
     if kept.last().unwrap().0 - kept[0].0 > ZERO_KG {
         return Err("Loadcell is moving or unstable; no automatic zero was applied".into());
     }
@@ -272,6 +319,13 @@ fn pause_commit_save_for_test(state: &AppState) {
     }
 }
 
+/// The ORIGINAL capture clock and the bounded budget it was admitted with.
+#[derive(Clone, Copy)]
+struct CaptureBudget {
+    start: CaptureClock,
+    window: Duration,
+}
+
 #[derive(Debug)]
 enum TareCommitError {
     NotPublished(String),
@@ -295,7 +349,7 @@ fn commit_tare(
     state: &AppState, cfg: &loadcell::LoadcellCalibrationFile,
     sensor: &str, token: u64, arm_generation: u64, raw: f32,
 ) -> Result<(), String> {
-    commit_tare_captured(state, cfg, sensor, token, arm_generation, raw, CaptureClock::now())
+    commit_tare_captured(state, cfg, sensor, token, arm_generation, raw, CaptureBudget { start: CaptureClock::now(), window: WINDOW })
         .map_err(|error| error.to_string())
 }
 
@@ -306,9 +360,10 @@ fn commit_tare_captured(
     token: u64,
     arm_generation: u64,
     raw: f32,
-    original_capture: CaptureClock,
+    budget: CaptureBudget,
 ) -> Result<(), TareCommitError> {
-    if !original_capture.within(WINDOW) {
+    let CaptureBudget { start: original_capture, window } = budget;
+    if !original_capture.within(window) {
         return Err("Original automatic-zero capture deadline expired or its clock changed".into());
     }
     // Acquire before zero Runtime; retain the lease across save without holding DISPATCH.
@@ -317,7 +372,7 @@ fn commit_tare_captured(
     if crate::gse::manual_stop_pending(state) {
         return Err("Automatic zero cancelled by manual Stop".into());
     }
-    if !original_capture.within(WINDOW) {
+    if !original_capture.within(window) {
         return Err("Original automatic-zero capture deadline expired while checking admission".into());
     }
     // Lock order: zero Runtime -> calibration. No DISPATCH/GSE acquisition or
@@ -342,14 +397,14 @@ fn commit_tare_captured(
     );
     #[cfg(test)]
     pause_commit_save_for_test(state);
-    if !original_capture.within(WINDOW) {
+    if !original_capture.within(window) {
         return Err("Original automatic-zero capture deadline expired before persistence".into());
     }
     // CaptureClock may read the explicit model clock file. These are the
     // EXISTING zero/calibration persistence locks, never DISPATCH/Stop/GSE.
     // The final guard executes immediately before atomic file replacement.
     let saved = loadcell::save_guarded(&updated, |_| {
-        if original_capture.within(WINDOW) { Ok(()) }
+        if original_capture.within(window) { Ok(()) }
         else { Err("Original automatic-zero deadline expired before calibration replacement".into()) }
     })?;
     // A successful rename is actual publication, even if directory fsync
@@ -507,7 +562,7 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
             }
         }
         let result = result.map_err(TareCommitError::NotPublished)
-            .and_then(|raw| commit_tare_captured(&state, &cfg, sensor, token, arm_generation, raw, start));
+            .and_then(|raw| commit_tare_captured(&state, &cfg, sensor, token, arm_generation, raw, CaptureBudget { start, window: WINDOW }));
         {
             let mut rt = state.auto_zero.lock().unwrap();
             if rt.generation != token {
@@ -805,11 +860,11 @@ mod tests {
         ));
         let path = dir.join("auto_zero.json");
         let mut rt = Runtime::testing(true);
-        rt.configure_at(Settings { enabled: false }, &path).unwrap();
+        rt.configure_at(Settings { enabled: false, before_launch: false }, &path).unwrap();
         let loaded: Settings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(!loaded.enabled);
         rt.pending = true;
-        assert!(rt.configure_at(Settings { enabled: true }, &path).is_err());
+        assert!(rt.configure_at(Settings { enabled: true, before_launch: false }, &path).is_err());
         let loaded: Settings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(!loaded.enabled);
         std::fs::remove_file(&path).unwrap();

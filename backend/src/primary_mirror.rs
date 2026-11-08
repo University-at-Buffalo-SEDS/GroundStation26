@@ -620,6 +620,7 @@ pub fn action_policy(state: &AppState) -> Option<ActionPolicyMsg> {
         ActionPolicyMsg {
             local_phase_controls: false,
             local_phase_controls_reason: None,
+            launch_zero: None,
             key_enabled: fresh && r.flags & 1 != 0,
             software_buttons_enabled: fresh && r.flags & 2 != 0,
             controls: crate::command_proxy::command_catalog()

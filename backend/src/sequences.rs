@@ -50,6 +50,9 @@ pub struct ActionPolicyMsg {
     pub local_phase_controls: bool,
     #[serde(default, skip_serializing_if="Option::is_none")]
     pub local_phase_controls_reason: Option<String>,
+    /// A Launch press held behind the opt-in loadcell zero. Presentation only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_zero: Option<crate::auto_zero::before_launch::Status>,
     pub key_enabled: bool,
     pub software_buttons_enabled: bool,
     pub controls: Vec<ActionControl>,
@@ -1262,6 +1265,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
         ActionPolicyMsg {
             local_phase_controls: false,
             local_phase_controls_reason: None,
+            launch_zero: None,
             key_enabled: true,
             software_buttons_enabled: true,
             controls,
@@ -1309,6 +1313,7 @@ fn policy_with_overrides(
     ActionPolicyMsg {
         local_phase_controls: false,
         local_phase_controls_reason: None,
+        launch_zero: None,
         key_enabled,
         software_buttons_enabled,
         controls,
@@ -2348,6 +2353,7 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
     ActionPolicyMsg {
         local_phase_controls: false,
         local_phase_controls_reason: None,
+        launch_zero: None,
         key_enabled: true,
         software_buttons_enabled: true,
         controls,

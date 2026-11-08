@@ -1,6 +1,8 @@
 mod prelude;
 #[cfg(test)]
 mod umbilical_owner_tests;
+#[cfg(test)]
+mod held_launch_tests;
 use prelude::*;
 
 mod commands;
@@ -303,6 +305,18 @@ async fn handle_local_ground_station_launch_command(
     router: Arc<Router>,
     launch_revision: Option<u64>,
 ) {
+    send_local_ground_station_launch(state, router, launch_revision, None).await;
+}
+
+/// `pressed` is the press-time ticket of a Launch held behind the loadcell
+/// zero; `None` is an immediate press.
+#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+async fn send_local_ground_station_launch(
+    state: Arc<AppState>,
+    router: Arc<Router>,
+    launch_revision: Option<u64>,
+    pressed: Option<crate::gse::LaunchAdmission>,
+) {
     if let Some(reason) =
         crate::checklists::launch_block().filter(|_| state.checklist_enforcement_enabled())
     {
@@ -348,17 +362,20 @@ async fn handle_local_ground_station_launch_command(
         return;
     }
     #[cfg(feature = "hitl_mode")]
-    let ticket =
-        match crate::gse::inhibit_automatic_actions_for_launch_revision(&state, launch_revision) {
-            Ok(ticket) => ticket,
-            Err(error) => {
-                state.clear_launch_sequence_command_pending();
-                emit_notification_warning(&state, error);
-                return;
-            }
-        };
+    let ticket = match crate::gse::inhibit_automatic_actions_for_pressed_launch(
+        &state,
+        launch_revision,
+        pressed,
+    ) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            state.clear_launch_sequence_command_pending();
+            emit_notification_warning(&state, error);
+            return;
+        }
+    };
     #[cfg(not(feature = "hitl_mode"))]
-    let ticket = match crate::gse::commit_fire_intent_revision(&state, launch_revision) {
+    let ticket = match crate::gse::commit_fire_intent_for_pressed_launch(&state, launch_revision, pressed) {
         Ok(ticket) => ticket,
         Err(error) => {
             state.clear_launch_sequence_command_pending();
@@ -397,7 +414,10 @@ async fn handle_local_ground_station_launch_command(
         &[ValveBoardCommands::Sequence as u8],
     );
     flush_command_tx(&router, "Valve launch sequence command tx");
-    crate::auto_zero::launch(&state);
+    // Zero before Launch already replaced the at-launch capture.
+    if pressed.is_none() {
+        crate::auto_zero::launch(&state);
+    }
     state.set_launch_indicator_latched(true);
     sequences::refresh_action_policy_now(&state);
     state.broadcast_action_policy_snapshot();
@@ -411,6 +431,18 @@ async fn handle_flight_computer_launch_command(
     state: Arc<AppState>,
     router: Arc<Router>,
     launch_revision: Option<u64>,
+) {
+    send_flight_computer_launch(state, router, launch_revision, None).await;
+}
+
+/// `pressed` is the press-time ticket of a Launch held behind the loadcell
+/// zero; `None` is an immediate press.
+#[cfg(any(test, not(all(feature = "test_fire_mode", not(feature = "hitl_mode")))))]
+async fn send_flight_computer_launch(
+    state: Arc<AppState>,
+    router: Arc<Router>,
+    launch_revision: Option<u64>,
+    pressed: Option<crate::gse::LaunchAdmission>,
 ) {
     if let Some(reason) =
         crate::checklists::launch_block().filter(|_| state.checklist_enforcement_enabled())
@@ -453,17 +485,20 @@ async fn handle_flight_computer_launch_command(
         return;
     }
     #[cfg(feature = "hitl_mode")]
-    let ticket =
-        match crate::gse::inhibit_automatic_actions_for_launch_revision(&state, launch_revision) {
-            Ok(ticket) => ticket,
-            Err(error) => {
-                state.clear_launch_sequence_command_pending();
-                emit_notification_warning(&state, error);
-                return;
-            }
-        };
+    let ticket = match crate::gse::inhibit_automatic_actions_for_pressed_launch(
+        &state,
+        launch_revision,
+        pressed,
+    ) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            state.clear_launch_sequence_command_pending();
+            emit_notification_warning(&state, error);
+            return;
+        }
+    };
     #[cfg(not(feature = "hitl_mode"))]
-    let ticket = match crate::gse::commit_fire_intent_revision(&state, launch_revision) {
+    let ticket = match crate::gse::commit_fire_intent_for_pressed_launch(&state, launch_revision, pressed) {
         Ok(ticket) => ticket,
         Err(error) => {
             state.clear_launch_sequence_command_pending();
@@ -527,7 +562,9 @@ async fn handle_flight_computer_launch_command(
     let valve_command_sent = true;
     if flight_command_sent || valve_command_sent {
         #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-        crate::auto_zero::launch(&state);
+        if pressed.is_none() {
+            crate::auto_zero::launch(&state);
+        }
         state.set_launch_indicator_latched(true);
         sequences::refresh_action_policy_now(&state);
         state.broadcast_action_policy_snapshot();
@@ -537,6 +574,143 @@ async fn handle_flight_computer_launch_command(
         flight_command_sent,
         valve_command_sent
     );
+}
+
+/// A Launch press held behind the opt-in loadcell zero, with everything the
+/// worker needs to re-run its send-time checks.
+struct HeldLaunch {
+    command: TelemetryCommand,
+    launch_revision: Option<u64>,
+    recovery_origin: Option<crate::operator_queue::manual_origin::Origin>,
+    queued_generation: Option<u64>,
+    /// Stop/reset ownership at the press; any later Stop or reset refuses it.
+    pressed: crate::gse::LaunchAdmission,
+}
+
+/// Refusals a Launch press would meet anyway, checked before the zero so a
+/// refused Launch never changes the tare. All are checked again at send time.
+fn held_launch_precheck(state: &Arc<AppState>) -> Result<(), String> {
+    if let Some(reason) =
+        crate::checklists::launch_block().filter(|_| state.checklist_enforcement_enabled())
+    {
+        return Err(reason.to_string());
+    }
+    if !cfg!(feature = "hitl_mode") && vent_valve_known_open_for_launch(state) {
+        return Err(
+            "Vent valve is still reported open. Close it before initiating the launch sequence."
+                .into(),
+        );
+    }
+    if matches!(
+        state.launch_clock_snapshot().kind,
+        LaunchClockKind::TMinus | LaunchClockKind::TPlus
+    ) {
+        return Err("Launch not sent: the T-clock is already running. Use Reset all boards to send Launch again.".into());
+    }
+    if state.launch_sequence_command_pending.load(Ordering::SeqCst) {
+        return Err("Launch not sent: the last Launch is still waiting for the Valve Board to start its sequence. Use Reset all boards to send Launch again.".into());
+    }
+    if state
+        .launch_history
+        .lock()
+        .unwrap()
+        .automatic_actions_inhibited()
+    {
+        return Err(crate::gse::LAUNCH_LOCKED_MESSAGE.into());
+    }
+    if crate::gse::turbocharge_active_nowait(state) {
+        return Err(crate::gse::TURBOCHARGE_UNFINISHED_MESSAGE.into());
+    }
+    crate::ignition_pair::readiness(state).map_err(|reason| reason.to_string())
+}
+
+/// Zero before Launch (opt-in). Returns true when this press was taken over:
+/// it is either refused now or held and sent later by `send_held_launch`.
+fn hold_launch_for_loadcell_zero(
+    state: &Arc<AppState>,
+    router: &Arc<Router>,
+    held: HeldLaunch,
+) -> bool {
+    if !crate::auto_zero::before_launch::enabled(state) {
+        return false;
+    }
+    if crate::auto_zero::before_launch::held(state) {
+        emit_notification_warning(state, crate::auto_zero::before_launch::ALREADY_PENDING);
+        return true;
+    }
+    if let Err(reason) = held_launch_precheck(state) {
+        emit_notification_warning(state, reason);
+        sequences::refresh_action_policy_now(state);
+        state.broadcast_action_policy_snapshot();
+        return true;
+    }
+    let owned_state = state.clone();
+    let owned_router = router.clone();
+    let started = crate::auto_zero::before_launch::start(state, move |outcome| async move {
+        if let crate::auto_zero::before_launch::Outcome::Failed(reason) = &outcome {
+            emit_notification_warning(
+                &owned_state,
+                format!(
+                    "Loadcell zero before Launch failed: {reason}. Sending Launch with the PREVIOUS loadcell calibration."
+                ),
+            );
+        }
+        send_held_launch(owned_state, owned_router, held).await;
+    });
+    if let Err(reason) = started {
+        emit_notification_warning(state, reason);
+    }
+    true
+}
+
+/// The worker's own send-time checks, re-run for a held press, then the
+/// ordinary Launch path with the press-time Stop/reset ticket.
+async fn send_held_launch(state: Arc<AppState>, router: Arc<Router>, held: HeldLaunch) {
+    #[cfg(test)]
+    held_launch_tests::entered();
+    let refuse = |reason: String| {
+        emit_notification_warning(&state, format!("Held Launch not sent: {reason}"));
+        sequences::refresh_action_policy_now(&state);
+        state.broadcast_action_policy_snapshot();
+    };
+    let _operator_claim = match held.queued_generation {
+        Some(generation) => {
+            match crate::gse::claim_manual_dispatch(&state, generation, held.recovery_origin) {
+                Some(claim) => Some(claim),
+                None => return refuse("a reset or recovery closed command admission".into()),
+            }
+        }
+        None => None,
+    };
+    let Some(cmd) =
+        command_at_dispatch_with_manual_origin(&state, held.command, held.recovery_origin)
+    else {
+        return refuse("command admission is closed".into());
+    };
+    if let Err(error) = crate::board_abort::validate_launch_revision(&state, held.launch_revision) {
+        return refuse(error);
+    }
+    if !state.is_command_allowed(&cmd) {
+        return refuse(format!("Command {cmd:?} blocked by sequence/key interlock"));
+    }
+    if crate::gse::manual_stop_pending(&state) {
+        return refuse("Manual Stop is pending".into());
+    }
+    #[cfg(test)]
+    held_launch_tests::before_send(&state);
+    match cmd {
+        TelemetryCommand::Launch => {
+            #[cfg(all(feature = "test_fire_mode", not(feature = "hitl_mode")))]
+            send_local_ground_station_launch(state, router, held.launch_revision, Some(held.pressed)).await;
+            #[cfg(not(all(feature = "test_fire_mode", not(feature = "hitl_mode"))))]
+            send_flight_computer_launch(state, router, held.launch_revision, Some(held.pressed)).await;
+        }
+        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
+        TelemetryCommand::GroundStationLaunch => {
+            send_local_ground_station_launch(state, router, held.launch_revision, Some(held.pressed)).await;
+        }
+        _ => {}
+    }
 }
 
 /// Explicit inner-worker outcome. An outer Tokio join success is insufficient:
@@ -675,13 +849,13 @@ pub async fn telemetry_task(
                         TelemetryCommand::QueuedOperator {recovery_origin,..}=>*recovery_origin,
                         _=>None,
                     };
-                    let (cmd, _operator_claim, plumbing_origin, launch_revision) = match cmd {
+                    let (cmd, _operator_claim, plumbing_origin, launch_revision, queued_generation) = match cmd {
                         TelemetryCommand::QueuedOperator { recovery_origin, launch_revision, generation, command, plumbing_origin } => {
                             if command.automatic_generation().is_some() || matches!(*command, TelemetryCommand::QueuedOperator { .. }) { continue; }
                             let Some(claim) = crate::gse::claim_manual_dispatch(&state, generation, recovery_origin) else { continue; };
-                            (*command, Some(claim), plumbing_origin, launch_revision)
+                            (*command, Some(claim), plumbing_origin, launch_revision, Some(generation))
                         }
-                        command => (command, None, None, None),
+                        command => (command, None, None, None, None),
                     };
                     let sealed_phase=matches!(cmd,TelemetryCommand::OperatorPhase{..});
                     let cmd = if let TelemetryCommand::OperatorPhase { mut intent } = cmd {
@@ -1038,6 +1212,10 @@ pub async fn telemetry_task(
                                 gs_debug_println!("Postinit command sent to flight computer");
                             }
                         TelemetryCommand::Launch => {
+                                if hold_launch_for_loadcell_zero(&state, &router, HeldLaunch {
+                                    command: TelemetryCommand::Launch, launch_revision, recovery_origin, queued_generation,
+                                    pressed: crate::gse::LaunchAdmission::capture(&state),
+                                }) { continue; }
                                 #[cfg(all(feature = "test_fire_mode", not(feature = "hitl_mode")))]
                                 handle_local_ground_station_launch_command(state.clone(), router.clone(),launch_revision).await;
                                 #[cfg(not(all(feature = "test_fire_mode", not(feature = "hitl_mode"))))]
@@ -1045,6 +1223,10 @@ pub async fn telemetry_task(
                             }
                         #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
                         TelemetryCommand::GroundStationLaunch => {
+                                if hold_launch_for_loadcell_zero(&state, &router, HeldLaunch {
+                                    command: TelemetryCommand::GroundStationLaunch, launch_revision, recovery_origin, queued_generation,
+                                    pressed: crate::gse::LaunchAdmission::capture(&state),
+                                }) { continue; }
                                 handle_local_ground_station_launch_command(state.clone(), router.clone(),launch_revision).await;
                             }
                         TelemetryCommand::MonitorAltitude => {

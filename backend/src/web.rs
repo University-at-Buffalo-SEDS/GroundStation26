@@ -363,6 +363,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         )
         .route("/api/rrls/control", get(crate::command_proxy::get_status))
         .route("/api/auto_zero", get(get_auto_zero).post(set_auto_zero))
+        .route("/api/auto_zero/launch/cancel", post(cancel_launch_zero))
         .route("/api/alerts", get(get_alerts))
         .route("/api/alert_conditions", get(get_alert_conditions))
         .route("/api/boards", get(get_boards))
@@ -1967,7 +1968,7 @@ async fn get_auto_zero(
 async fn set_auto_zero(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(settings): Json<crate::auto_zero::Settings>,
+    Json(update): Json<crate::auto_zero::SettingsUpdate>,
 ) -> impl IntoResponse {
     let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
@@ -1997,9 +1998,25 @@ async fn set_auto_zero(
         )
             .into_response();
     }
-    match state.auto_zero.lock().unwrap().configure(settings) {
+    let mut zero = state.auto_zero.lock().unwrap();
+    let settings = zero.settings().updated(update);
+    match zero.configure(settings) {
         Ok(()) => Json(settings).into_response(),
         Err(e) => (StatusCode::CONFLICT, e).into_response(),
+    }
+}
+
+/// Cancels a Launch press held behind the loadcell zero. Launch is not sent.
+async fn cancel_launch_zero(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::SendCommands).await {
+        return response;
+    }
+    match crate::auto_zero::before_launch::cancel(&state) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(message) => (StatusCode::CONFLICT, message).into_response(),
     }
 }
 
@@ -6718,7 +6735,7 @@ mod recovery_control_settings_tests {
         desired: Desired,
     ) -> axum::response::Response {
         match desired {
-            Desired::Automatic(value) => set_auto_zero(State(state), headers, Json(value))
+            Desired::Automatic(value) => set_auto_zero(State(state), headers, Json(value.into()))
                 .await
                 .into_response(),
             Desired::Fill(value) => set_fill_targets(State(state), headers, Json(value))
@@ -6751,6 +6768,7 @@ mod recovery_control_settings_tests {
             let desired = match kind {
                 0 => Desired::Automatic(crate::auto_zero::Settings {
                     enabled: !state.auto_zero.lock().unwrap().settings().enabled,
+                    before_launch: false,
                 }),
                 1 => {
                     let mut value = state.fill_targets.lock().unwrap().clone();
