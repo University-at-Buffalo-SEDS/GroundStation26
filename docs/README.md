@@ -18,6 +18,8 @@ independently.
 - [GSE sequences](backend/gse-sequences.md): grouped control and equipment scene.
 - [Per-account client settings](backend/client-settings.md): watch companion preferences
   synced to the signed-in account.
+- [Station mode switch](backend/station-modes.md): switch build and simulation
+  from the UI by a controlled restart, on the primary and the RRLS.
 
 - `docs/frontend/api.md`
   Frontend-facing API contract, endpoint details, websocket message shapes, bootstrap flow, and backend expectations.

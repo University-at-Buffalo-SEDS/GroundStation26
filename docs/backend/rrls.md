@@ -136,7 +136,8 @@ it always enables RRLS mode. As with `build.py`, the frontend defaults to `main`
 `--frontend-dev` selects the matching development WebUI. Run `python3 run_rrls.py --help` to list options.
 
 For boot-time operation, adapt [rrls.service](rrls.service) to the installed user
-and paths. `GS_USERS_FILE` selects RRLS's own users file; provision accounts using
+and paths. To switch the RRLS build or run it against a simulated paired primary
+from the UI, see [Station mode switch](station-modes.md). `GS_USERS_FILE` selects RRLS's own users file; provision accounts using
 the existing GroundStation authentication process. Serve the existing frontend
 bundle at `frontend/dist/public` under the service working directory. Connect the
 phone/tablet to RRLS's router and use `https://<pi-address>` for a native
