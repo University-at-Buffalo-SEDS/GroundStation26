@@ -14,8 +14,11 @@ pub(crate) use commands::{
     queue_automatic_controller_command, queue_locally_routed_flight_command,
     queue_manual_abort_wire_receipted,
 };
+// The Valve Board overpressure acknowledgement must still reach the board while
+// an Abort is latched, so it uses the raw controller queue in every build.
+pub(crate) use commands::queue_controller_command;
 #[cfg(test)]
-pub(crate) use commands::{queue_controller_command, queue_priority_manual_abort_packet, queue_manual_abort_wire};
+pub(crate) use commands::{queue_priority_manual_abort_packet, queue_manual_abort_wire};
 mod heartbeat;
 mod periodic;
 pub(crate) mod procedure_clock;
