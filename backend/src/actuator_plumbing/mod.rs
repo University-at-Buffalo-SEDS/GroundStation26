@@ -35,7 +35,7 @@ use wire::{Mode, Request, Status};
 
 const REQUEST_TYPE: &str = "AB_FILL_DRIVE_SETTINGS";
 const STATUS_TYPE: &str = "AB_FILL_DRIVE_STATUS";
-const FRESH_MS: u64 = 5_000;
+pub(crate) const FRESH_MS: u64 = 5_000;
 const REQUEST_TTL: u64 = 5_000;
 
 #[derive(Clone, Copy)]
@@ -373,7 +373,7 @@ pub(crate) fn schedule_motion_under_dispatch(
         {
             let inner = state.plumbing_drive.inner.lock().unwrap();
             let proof = inner.motion_observed.as_ref().filter(|row|
-            row.after.wall.elapsed().as_millis() <= FRESH_MS as u128
+            row.after.wall.elapsed().as_millis() <= crate::sim_freshness::wall_ms(FRESH_MS) as u128
             && row.generation == crate::gse::automatic_generation(state)
             && row.mode_revision == inner.desired.revision
             && row.value.setting.ready() && !row.value.setting.busy
@@ -1050,7 +1050,7 @@ pub(crate) fn retraction_gate(state: &AppState) -> RetractionGate {
             "Fresh same-operation retraction proof is required. Check readiness, then make a separate Launch request.",
         );
     }
-    if after.elapsed().as_millis() > FRESH_MS as u128 {
+    if after.elapsed().as_millis() > crate::sim_freshness::wall_ms(FRESH_MS) as u128 {
         let remaining = (proof.minimum_delay_remaining_ms != 0).then(|| {
             proof
                 .minimum_delay_remaining_ms

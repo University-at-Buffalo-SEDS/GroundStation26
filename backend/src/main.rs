@@ -101,6 +101,7 @@ mod sequence_stream;
 mod safety_catalog;
 mod sequences;
 mod sim_daq_cadence;
+mod sim_freshness;
 mod state;
 mod station_mode;
 mod station_mode_switch;

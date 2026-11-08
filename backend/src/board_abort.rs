@@ -22,7 +22,11 @@ pub(crate) const BOARDS: [Board; 7] = [
     Board::GatewayBoard,
     Board::DaqBoard,
 ];
-const PROOF_TTL: Duration = Duration::from_secs(5);
+pub(crate) const PROOF_TTL: Duration = Duration::from_secs(5);
+/// Wall-clock proof window; stretched only by a simulator build (`sim_freshness`).
+fn proof_ttl() -> Duration {
+    crate::sim_freshness::wall(PROOF_TTL)
+}
 /// A retained Abort blocks Launch only while its board is on the network. The
 /// row and its alert stay until a fresh non-Abort proof; an absent board just
 /// cannot veto Launch, since it could never report the proof that clears it.
@@ -515,7 +519,7 @@ impl Runtime {
                 }
             } else if proven & (1 << i) != 0 && *age != u16::MAX {
                 let age = u64::from(ages[i]).saturating_add(transit_ms);
-                if age <= PROOF_TTL.as_millis() as u64
+                if age <= proof_ttl().as_millis() as u64
                     && let Some(after) = now.checked_sub(Duration::from_millis(age))
                         && row.last_local_abort.is_none_or(|abort| after > abort) {
                             changed |= row.aborted;
@@ -559,7 +563,7 @@ impl Runtime {
                 aborted |= 1 << i;
             } else if row.proof_after.is_some_and(|after| {
                 now.checked_duration_since(after)
-                    .is_some_and(|age| age <= PROOF_TTL)
+                    .is_some_and(|age| age <= proof_ttl())
             }) {
                 proven |= 1 << i;
             }
