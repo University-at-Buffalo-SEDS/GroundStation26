@@ -321,7 +321,7 @@ impl Tracker {
             .collect()
     }
     pub(crate) fn recording_snapshot(&mut self, now: Instant) -> Vec<NetworkBoardHealthEntry> {
-        self.snapshot_with_launch_expected(now, false, None)
+        self.snapshot_with_launch_expected(now, false, None, false)
     }
     pub fn snapshot(&mut self, now: Instant, test_fire: bool) -> Vec<NetworkBoardHealthEntry> {
         let expected = self
@@ -329,13 +329,17 @@ impl Tracker {
             .get("DAQ")
             .and_then(|r| r.launch_log.as_ref())
             .and_then(|_| crate::network_variables::persisted_daq_log_clock_with_revision());
-        self.snapshot_with_launch_expected(now, test_fire, expected)
+        self.snapshot_with_launch_expected(now, test_fire, expected, true)
     }
+    /// `status_without_health`: the DAQ SD and launch-log reports are separate
+    /// packets from BOARD_HEALTH. Live views show them even before (or without)
+    /// a board health report, as a version 0 report with only those fields.
     fn snapshot_with_launch_expected(
         &mut self,
         now: Instant,
         test_fire: bool,
         expected: Option<([u64; 2], u64)>,
+        status_without_health: bool,
     ) -> Vec<NetworkBoardHealthEntry> {
         let mut rows = Vec::new();
         for (sender, r) in &mut self.boards {
@@ -352,9 +356,20 @@ impl Tracker {
             rows.push(NetworkBoardHealthEntry {
                 cpu_temperature_centi_c: None,
                 cpu_temperature_age_ms: 0,
-                diagnostics: r.diagnostics.as_ref().map(|(report, received)| {
-                    let mut report = report.clone();
-                    report.received_age_ms = elapsed(now, *received);
+                diagnostics: match &r.diagnostics {
+                    Some((report, received)) => {
+                        let mut report = report.clone();
+                        report.received_age_ms = elapsed(now, *received);
+                        Some(report)
+                    }
+                    None if status_without_health
+                        && (r.sd_status.is_some() || r.launch_log.is_some()) =>
+                    {
+                        Some(BoardDiagnostics::default())
+                    }
+                    None => None,
+                }
+                .map(|mut report| {
                     if let Some((status, received)) = &r.sd_status {
                         status.overlay(&mut report, elapsed(now, *received));
                     }
@@ -590,7 +605,7 @@ mod diagnostic_tests {
         assert!(tracker.observe_launch_log_status("DAQB", &launch, at(now, 100), 1100, 0, 0));
         let projected = |tracker: &mut Tracker, time, expected| {
             tracker
-                .snapshot_with_launch_expected(time, false, expected)
+                .snapshot_with_launch_expected(time, false, expected, true)
                 .remove(0)
                 .diagnostics
                 .unwrap()
@@ -652,7 +667,7 @@ mod diagnostic_tests {
         tracker.clear();
         assert!(
             tracker
-                .snapshot_with_launch_expected(at(now, 16_000), false, expected)
+                .snapshot_with_launch_expected(at(now, 16_000), false, expected, true)
                 .is_empty()
         );
     }
@@ -697,5 +712,32 @@ mod diagnostic_tests {
             decode_diagnostics(&[0; 32]).is_none(),
             "BOARD_HEALTH remains exactly24 words/version1"
         );
+    }
+
+    #[test]
+    fn daq_recording_status_is_published_before_and_without_a_board_health_report() {
+        let now = Instant::now();
+        let mut tracker = Tracker::default();
+        tracker.observe("DAQ", now, 1000);
+        assert!(tracker.observe_sd_status("DAQ", &[7, 0, 0, 0, 0, 0, 0, 0], at(now, 100), 1100));
+        let rows = tracker.snapshot(at(now, 200), false);
+        let report = rows[0]
+            .diagnostics
+            .as_ref()
+            .expect("SD status reaches the operator without BOARD_HEALTH");
+        assert_eq!(report.version, 0, "version 0 marks a report without board health");
+        assert_eq!(report.sd_flags, Some(7));
+        assert_eq!(report.sd_status_received_age_ms, Some(100));
+        assert!(
+            tracker.recording_snapshot(at(now, 200))[0].diagnostics.is_none(),
+            "recordings never store a board health report the board did not send"
+        );
+        let mut base = [0_u32; 24];
+        base[0] = 1;
+        base[4] = 1000;
+        assert!(tracker.observe_diagnostics("DAQ", &base, at(now, 300), 1300));
+        let report = tracker.snapshot(at(now, 400), false)[0].diagnostics.clone().unwrap();
+        assert_eq!(report.version, 1);
+        assert_eq!(report.sd_flags, Some(7));
     }
 }
