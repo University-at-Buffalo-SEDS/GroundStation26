@@ -6130,15 +6130,22 @@ mod final_launch_admission_tests {
         let worker_state = state.clone();
         let worker =
             std::thread::spawn(move || inhibit_automatic_actions_for_launch(&worker_state));
-        let limit = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        // Generous bound: a loaded host can take well over a second to reach
+        // the wait. Never panic while holding the journal: unwinding would
+        // poison it, the worker would then panic inside DISPATCH_GATE, and
+        // that process-wide gate would fail every later test that takes it.
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if state.gse.try_lock().is_err() {
                 break;
             }
-            assert!(
-                std::time::Instant::now() < limit,
-                "launch must reach the actual journal wait"
-            );
+            if worker.is_finished() || std::time::Instant::now() >= limit {
+                drop(journal);
+                panic!(
+                    "launch must reach the actual journal wait: {:?}",
+                    worker.join().map(|result| result.map(|_| ()))
+                );
+            }
             std::thread::yield_now();
         }
         // The real launch function holds GSE and waits on the held journal.
