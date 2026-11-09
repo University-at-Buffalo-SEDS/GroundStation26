@@ -341,7 +341,9 @@ impl Peers {
     async fn refresh_boards_with(&mut self,state:&Arc<AppState>,boards:&[Board],mut other:impl FnMut()){
         for board in boards.iter().copied() {
             other();self.pump();
-            assert_eq!(crate::board_recovery::request_board_query(state,board).status(),axum::http::StatusCode::OK,"actual nonce QUERY must be admitted");
+            // Same admission as the operator Query route: an offer the SDK refused
+            // only because the router worker held its core is retried briefly.
+            assert_eq!(crate::board_recovery::operator_board_query(state,board).await.status(),axum::http::StatusCode::OK,"actual nonce QUERY must be admitted");
             let nonce=crate::board_recovery::query_nonce_for_test(state,board).expect("admitted QUERY installs actual correlation");
             tokio::time::timeout(Duration::from_secs(2),async {loop{
                 other();self.pump();

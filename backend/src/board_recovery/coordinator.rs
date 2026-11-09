@@ -786,7 +786,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Response>,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let deadline = tokio::time::Instant::now() + super::CORE_BUSY_RETRY_WINDOW;
     loop {
         current()?;
         let response = tokio::time::timeout_at(deadline, offer()).await
@@ -3319,19 +3319,29 @@ mod tests {
         let required: Vec<_> = Board::ALL.iter().copied()
             .filter(|board| state.board_required_for_progression(*board)).collect();
         assert!(!required.is_empty());
-        for board in required {
-            let peer = &fixture.native_peers.iter().find(|(seen, _)| *seen == board).unwrap().1;
+        let send_fresh = || for board in &required {
+            let peer = &fixture.native_peers.iter().find(|(seen, _)| seen == board).unwrap().1;
             assert_eq!(peer.sender().as_ref(), board.sender_id());
             let utc = state.topology_router.get().unwrap().network_time_ms().unwrap();
             let packet = Packet::new(crate::telemetry_schema::data_type("HEARTBEAT"),
                 &[crate::telemetry_schema::endpoint("GROUND_STATION")], board.sender_id(), utc,
                 Arc::<[u8]>::from([])).unwrap();
             peer.tx_queue(packet).unwrap();
-        }
+        };
+        // Each fresh packet gets ONE nonwaiting readiness attempt, which the
+        // SDK refuses (CoreBusy/Busy) while the router worker holds its core.
+        // Real MCUs keep sending heartbeats, so the next fresh packet
+        // qualifies on its own; send them on a cadence as the boards do,
+        // instead of betting the whole wait on a single packet.
         tokio::time::timeout(Duration::from_secs(3), async {
-            while state.local_flight_state_snapshot() != crate::types::FlightState::Idle {
-                assert!(!fixture.pump.is_finished() && !fixture.receiver.is_finished());
-                tokio::task::yield_now().await;
+            loop {
+                send_fresh();
+                let next = tokio::time::Instant::now() + Duration::from_millis(100);
+                while tokio::time::Instant::now() < next {
+                    if state.local_flight_state_snapshot() == crate::types::FlightState::Idle { return; }
+                    assert!(!fixture.pump.is_finished() && !fixture.receiver.is_finished());
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
             }
         }).await.expect("fresh real MCU packet must drive TF readiness through actual telemetry worker");
         assert_eq!(crate::network_variables::flight_state(), 0,
@@ -3348,6 +3358,28 @@ mod tests {
     fn isolated(name: &str) -> bool {
         crate::operator_queue::isolated_case(module_path!(), name)
     }
+    /// Normal Startup->Idle is published by a nonwaiting SDK admission that
+    /// refuses with CoreBusy while the router worker holds the core. In
+    /// production the 200 ms sequence tick simply proposes it again; these
+    /// fixtures run no sequence task, so stand in for that tick (the same
+    /// Observation/drive_observed_prelaunch_state path) until `done`.
+    async fn normal_sequence_ticks_until(
+        state: &Arc<AppState>,
+        done: impl Fn() -> bool,
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut tick = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                tick.tick().await;
+                let next = tokio::time::Instant::now() + Duration::from_millis(200);
+                while tokio::time::Instant::now() < next {
+                    if done() { return; }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                crate::sequences::refresh_action_policy_now(state);
+            }
+        }).await
+    }
 
     #[tokio::test(flavor="multi_thread",worker_threads=2)]
     async fn actual_mode_reset_preserves_global_broadcast_but_verifies_only_frozen_policy() {
@@ -3358,10 +3390,23 @@ mod tests {
         let request=json!({"action":"reset_startup","board":null,"mode":null,
             "backend_instance":hex(&state.board_recovery.identity.unwrap()),
             "reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state))});
+        // Prepare freezes the reset selection from board presence at that
+        // moment, and presence arrives asynchronously from the peers' traffic.
+        // Settle it BEFORE Prepare and take the expected mask from that same
+        // snapshot; re-reading presence afterwards races boards first heard
+        // while Prepare was running. TF peers send nothing the host counts as
+        // presence until the fresh MCU receipts below.
+        let scope=super::super::scope::mode_scope(crate::station_mode::local_mode());
+        let expected=if crate::runtime_mode::is_test_fire() { 0 } else { scope };
+        tokio::time::timeout(Duration::from_secs(2),async {
+            while crate::board_abort::present_mask(&state)&scope!=expected {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }).await.expect("every managed peer's presence must settle before the reset selection");
+        let mask=expected;
         let first=super::super::tests::http(state.clone(),"POST","/api/board-recovery/prepare",Some("operator"),request.clone()).await;
         let first_status=first.status();
         let first_body=body(first).await;
-        let mask=crate::board_abort::present_mask(&state)&super::super::scope::mode_scope(crate::station_mode::local_mode());
         let ticket=if mask!=0 {
             // Actual QUERY discovered seeded Abort episodes AFTER the original
             // selection. That intent must die; never auto retry/restamp it.
@@ -3455,14 +3500,11 @@ mod tests {
                 // Startup delivery and the owner's next Idle publication are
                 // asynchronous. Observe both real completion signals instead
                 // of assuming that receiving Startup already completed Idle.
-                tokio::time::timeout(Duration::from_secs(2), async {
-                    loop {
-                        let idle = state.local_flight_state_snapshot() == crate::types::FlightState::Idle;
-                        let cached_idle = router.cached_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"))
-                            .is_some_and(|packet| packet.sender() == "GS" && packet.payload() == [1]);
-                        if idle && cached_idle { break; }
-                        tokio::time::sleep(Duration::from_millis(2)).await;
-                    }
+                normal_sequence_ticks_until(&state, || {
+                    let idle = state.local_flight_state_snapshot() == crate::types::FlightState::Idle;
+                    let cached_idle = router.cached_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"))
+                        .is_some_and(|packet| packet.sender() == "GS" && packet.payload() == [1]);
+                    idle && cached_idle
                 }).await.expect("actual normal owner must advance Startup to Idle and publish its own cached Idle");
                 assert_eq!(state.local_flight_state_snapshot(),crate::types::FlightState::Idle);
                 let idle = router.cached_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).unwrap();
@@ -5130,6 +5172,14 @@ mod tests {
         assert_eq!(fixture.confirm(&ticket).await.status(), StatusCode::OK);
         let operation = fixture.terminal().await;
         assert_eq!(operation["success"], true, "{operation}");
+        if !crate::runtime_mode::is_hitl_or_test_fire() {
+            // The reset's own Idle proposal can lose one nonwaiting SDK offer;
+            // the sequence tick re-proposes it after Startup cleanup.
+            let state = fixture.state();
+            normal_sequence_ticks_until(&state, || {
+                state.local_flight_state_snapshot() == crate::types::FlightState::Idle
+            }).await.expect("existing normal power-up policy must reach Idle after Startup cleanup");
+        }
         let mut observed_startup = false;
         let mut observed_idle_after_startup = false;
         while let Ok(message) = publications.try_recv() {
@@ -6467,10 +6517,12 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(
-            super::super::request_board_query(&state, Board::ActuatorBoard).status(),
-            StatusCode::OK
-        );
+        // The outstanding query is the operator's own Query. The router worker
+        // keeps running while the peer wire is held, so its SDK core can be
+        // busy at this instant; the operator path must still admit it.
+        let response = super::super::operator_board_query(&state, Board::ActuatorBoard).await;
+        let status = response.status();
+        assert_eq!(status, StatusCode::OK, "{}", body(response).await);
         let at = index(Board::ActuatorBoard).unwrap();
         let old = state.board_recovery.inner.lock().unwrap().queries[at]
             .as_ref()

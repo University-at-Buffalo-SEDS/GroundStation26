@@ -1265,7 +1265,29 @@ pub(crate) async fn query(
             "Select one known board.",
         );
     };
-    request_board_query(&state, board)
+    operator_board_query(&state, board).await
+}
+/// How long a never-admitted query offer is retried while the router worker
+/// holds the SDK core. Shared by the operator Query route and Prepare.
+pub(crate) const CORE_BUSY_RETRY_WINDOW: Duration = Duration::from_millis(300);
+/// The operator's Query. A router worker mid-pass holds the SDK core for
+/// moments at a time; that offer was never admitted (no nonce, no budget
+/// spent), so it is retried briefly instead of refusing the operator. Every
+/// other answer, including query_pending and owner refusals, returns at once.
+pub(crate) async fn operator_board_query(state: &Arc<AppState>, board: Board) -> Response {
+    let deadline = tokio::time::Instant::now() + CORE_BUSY_RETRY_WINDOW;
+    loop {
+        let response = request_board_query(state, board);
+        if response.extensions().get::<QueryAdmissionCoreBusy>().is_none()
+            || tokio::time::Instant::now() >= deadline
+        {
+            return response;
+        }
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + Duration::from_millis(10)).min(deadline),
+        )
+        .await;
+    }
 }
 /// Internal read-only collection shares EXACT HTTP nonce/correlation/budget rules.
 /// It cannot emit RECOVER, change board state or bypass primary identity checks.
