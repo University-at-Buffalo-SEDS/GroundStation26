@@ -174,42 +174,42 @@
       "actuated": false,
       "blink": "none",
       "cmd": "Turbocharge",
-      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
+      "disabled_reason": "Configure maximum added nitrogen mass before Turbocharge",
       "enabled": false
     },
     {
       "actuated": false,
       "blink": "none",
       "cmd": "StartFill",
-      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
+      "disabled_reason": "GSE action blocked: vehicle is not in a prelaunch state",
       "enabled": false
     },
     {
       "actuated": false,
       "blink": "none",
       "cmd": "PauseFill",
-      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
+      "disabled_reason": "GSE action blocked: vehicle is not in a prelaunch state",
       "enabled": false
     },
     {
       "actuated": false,
       "blink": "none",
       "cmd": "CancelFill",
-      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
+      "disabled_reason": "GSE action blocked: vehicle is not in a prelaunch state",
       "enabled": false
     },
     {
       "actuated": false,
       "blink": "none",
       "cmd": "ValveSelfTest",
-      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
+      "disabled_reason": "GSE action blocked: vehicle is not in a prelaunch state",
       "enabled": false
     },
     {
       "actuated": false,
       "blink": "none",
       "cmd": "NitrogenTest",
-      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
+      "disabled_reason": "GSE action blocked: vehicle is not in a prelaunch state",
       "enabled": false
     },
     {

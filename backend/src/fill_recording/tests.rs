@@ -217,11 +217,12 @@ async fn actual_http_invalid_fill_limits_preserve_mode_policy_and_have_no_effect
         assert_eq!(error["reason"]["validation"], "Set the maximum acceptable empty-tank PT offset");
         assert!(!result.1.contains("expired"));
     } else {
-        // The ordinary action-policy gate rejects this invalid setup first.
+        // The ordinary action-policy gate rejects this setup first and names
+        // the missing sequence step (here the nitrogen test).
         assert_eq!(result.0, StatusCode::FORBIDDEN, "{}", result.1);
         assert_eq!(
             result.1,
-            "StartFill: This command is unavailable under the current GroundStation policy."
+            "StartFill: Fill blocked: pass the nitrogen test (or override it) before filling"
         );
     }
     f.pump();
