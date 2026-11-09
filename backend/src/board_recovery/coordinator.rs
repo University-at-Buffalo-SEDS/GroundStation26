@@ -4399,10 +4399,17 @@ mod tests {
         }
         worker.abort();
         let mut total = 0;
-        for ((_,model),before) in fixture.models.iter().zip(baseline) {
+        // Test-fire has no AV bay: RF, FC and PB are not network peers there
+        // and are never refreshed. Every board this mode tracks must be.
+        let scope = super::scope::mode_scope(crate::station_mode::local_mode());
+        for ((board,model),before) in fixture.models.iter().zip(baseline) {
             let model=model.lock().unwrap();
             let added=&model.requests[before..];
-            assert!(!added.is_empty(), "healthy board was never refreshed");
+            if scope & (1 << index(*board).unwrap()) == 0 {
+                assert!(added.is_empty(), "{board:?} is outside this mode and must not be queried");
+                continue;
+            }
+            assert!(!added.is_empty(), "healthy board {board:?} was never refreshed");
             assert!(added.iter().all(|packet|packet.payload()[..4]==[1,0,0,0]), "background must emit QUERY only");
             total+=added.len();
         }

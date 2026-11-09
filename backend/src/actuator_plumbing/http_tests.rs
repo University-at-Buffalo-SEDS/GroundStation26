@@ -351,6 +351,25 @@ impl Fixture {
         }
         self.host_worker_running = running;
     }
+    /// The Actuator Board's periodic UMBILICAL_STATUS for the plumbing
+    /// retraction (firmware publishes every board state once per second).
+    #[cfg(not(feature = "hitl_mode"))]
+    fn report_plumbing_status(&mut self, retracted: bool) {
+        let stamp = self.host.network_time_ms().unwrap_or(1);
+        self.board.tx_queue(Packet::new(
+            crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            "AB",
+            stamp,
+            Arc::from([crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8, u8::from(retracted)]),
+        ).unwrap()).unwrap();
+        self.pump();
+        assert_eq!(
+            self.state.get_umbilical_valve_state(crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8),
+            Some(retracted),
+            "the board's plumbing status reached the station"
+        );
+    }
     pub(crate) fn pump(&mut self) {
         for _ in 0..80 {
             // The real owner uses the shared elapsed-wall clock. Polling
@@ -1048,6 +1067,12 @@ async fn public_motion_queue_cannot_cross_mode_commit_and_fresh_motion_keeps_ori
     let started = std::time::Instant::now();
     let mut warnings = f.state.warnings_tx.subscribe();
     let mut notifications = f.state.notifications_tx.subscribe();
+    // Test-fire dispatches RetractPlumbing on the umbilical, which needs the
+    // Actuator Board's confirmed plumbing state. The real board reports it
+    // every second; report it here as that board would.
+    if cfg!(feature = "test_fire_mode") {
+        f.report_plumbing_status(false);
+    }
     let journal_pause = Pause::install(f.state.plumbing_drive.motion_journal.path(), true, true, false);
     let fresh = f
         .http(

@@ -488,7 +488,14 @@ async fn r4_new_abort_episode_refuses_second_prepare_after_actual_quiet() {
     while start.elapsed() < Duration::from_secs(7) {
         let s = f.state();
         let r = s.topology_router.get().unwrap();
-        if !super::super::sdk_pending(&s, r) {
+        // A momentary SDK core-busy try is unknown, not pending: the managed
+        // refresh of this test-fire cohort keeps the core briefly busy. Only
+        // an actually pending control frame breaks the quiet window.
+        let pending = s.has_pending_recovery_control_tx()
+            || crate::telemetry_task::RECOVERY_CONTROL_TYPES.iter().any(|name| {
+                matches!(r.try_has_pending_reliable_tx_type(crate::telemetry_schema::data_type(name)), Ok(true))
+            });
+        if !pending {
             let since = quiet.get_or_insert_with(Instant::now);
             if since.elapsed() >= Duration::from_millis(1250) {
                 break;
