@@ -676,7 +676,7 @@ fn actual_first_owner_ack_loss_preserves_original_radio_command_and_status_insid
     scenario(true);
 }
 
-// Owner confirmation for the cosmetic AV-bay outputs. The same modeled UART
+// Network confirmation for the cosmetic AV-bay network variables. The same modeled UART
 // pair as above, driven through the production network_variables entry points.
 // Measured 10-29 field round trips reached 4976 ms against a 4.5 s retry horizon.
 const FIELD_SLOW_ACK_MS: u64 = 4976;
@@ -713,7 +713,7 @@ impl OwnerHarness {
         MODEL_MS.store(1000, Ordering::SeqCst);
         static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         BASE.get_or_init(Instant::now);
-        crate::network_variables::set_owner_test_clock(|| {
+        crate::network_variables::set_network_test_clock(|| {
             *BASE.get().unwrap() + std::time::Duration::from_millis(MODEL_MS.load(Ordering::SeqCst))
         });
         crate::telemetry_schema::initialize().unwrap();
@@ -821,9 +821,9 @@ impl OwnerHarness {
             .then(|| (packet.packet_id(), packet.payload()[0]))
     }
 
-    fn view(&self) -> crate::network_variables::OwnerOutputView {
-        crate::network_variables::owner_output_view(
-            crate::network_variables::OwnerOutput::Underglow,
+    fn view(&self) -> crate::network_variables::NetworkOutputView {
+        crate::network_variables::network_output_view(
+            crate::network_variables::NetworkOutput::Underglow,
         )
     }
 
@@ -895,7 +895,7 @@ impl OwnerHarness {
             for body in released {
                 self.gs.rx_packed_queue_from_side(&body, self.gs_side).unwrap();
             }
-            crate::network_variables::reconcile_owner_outputs(
+            crate::network_variables::reconcile_network_outputs(
                 &self.gs,
                 [self.reports_seen.load(Ordering::SeqCst), 0],
                 || Some(()),
@@ -914,7 +914,7 @@ impl OwnerHarness {
             h.view().confirmed == Some(true)
                 && h.gs.export_reliable_pending_stats().is_empty()
         });
-        assert!(ok, "a delivered On must become owner-confirmed");
+        assert!(ok, "a delivered On must become network-confirmed");
         assert_eq!(self.rf_value.load(Ordering::SeqCst), 1);
     }
 }
@@ -962,7 +962,7 @@ fn owner_confirmation_case(case: &str) {
                 republished_before_release,
                 "exhaustion at the 4.5 s horizon republishes before the 4976 ms ACK lands"
             );
-            assert!(ok, "the slow-ACK Off must end owner-confirmed Off");
+            assert!(ok, "the slow-ACK Off must end network-confirmed Off");
             assert_eq!(h.rf_value.load(Ordering::SeqCst), 0);
             let off = h.off_copies();
             assert!(

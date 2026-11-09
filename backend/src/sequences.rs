@@ -38,15 +38,14 @@ pub struct ActionControl {
     pub enabled: bool,
     pub blink: BlinkMode,
     pub actuated: Option<bool>,
-    /// Stored request for owner-confirmed outputs; `actuated` stays None
-    /// until the owner acknowledges this value.
+    /// Stored request for network-variable outputs (underglow, buzzer);
+    /// `actuated` stays None until the network carries this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested: Option<bool>,
-    /// Owner-confirmed outputs only: set while the owner has not confirmed
-    /// and its board is not reachable, e.g. "RF Board not reachable; applies
-    /// when it reconnects". The stored request is republished on reconnect.
+    /// Network-variable outputs only: "Waiting for network confirmation"
+    /// while the GS has seen no network value for the variable at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_note: Option<String>,
+    pub network_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,45 +127,25 @@ fn default_command_actuated(cmd: &str) -> Option<bool> {
     }
 }
 
-/// Underglow and buzzer: (requested, owner-confirmed) from the network store.
-pub(crate) fn owner_output_state(cmd: &str) -> Option<(bool, Option<bool>)> {
-    use crate::network_variables::{OwnerOutput, owner_output_view};
+/// Underglow and buzzer are SEDSnet network variables with no owner board:
+/// the view compares the GS request with the value seen on the network.
+pub(crate) fn network_output_view(cmd: &str) -> Option<crate::network_variables::NetworkOutputView> {
+    use crate::network_variables::NetworkOutput;
     let output = match cmd {
-        "ToggleAvBayUnderglow" => OwnerOutput::Underglow,
-        "ToggleFlightBuzzer" => OwnerOutput::FlightBuzzer,
+        "ToggleAvBayUnderglow" => NetworkOutput::Underglow,
+        "ToggleFlightBuzzer" => NetworkOutput::FlightBuzzer,
         _ => return None,
     };
-    let view = owner_output_view(output);
-    Some((view.requested, view.confirmed))
+    Some(crate::network_variables::network_output_view(output))
 }
 
-/// Owner board for an owner-confirmed output command.
-pub(crate) fn owner_output_board(cmd: &str) -> Option<crate::types::Board> {
-    use crate::network_variables::OwnerOutput;
-    match cmd {
-        "ToggleAvBayUnderglow" => Some(OwnerOutput::Underglow.owner_board()),
-        "ToggleFlightBuzzer" => Some(OwnerOutput::FlightBuzzer.owner_board()),
-        _ => None,
-    }
-}
+pub(crate) const WAITING_FOR_NETWORK: &str = "Waiting for network confirmation";
 
-/// How recently the owner board must have sent an application packet to
-/// count as reachable. Discovery announcements alone do not count: a relay
-/// that only announces itself cannot deliver or acknowledge the value.
-pub(crate) const OWNER_REACHABLE_MS: u64 = 5_000;
-
-/// Operator-facing note for an unconfirmed owner output whose owner is not
-/// reachable. None when confirmed, or when the owner is reachable (the
-/// ordinary "owner unconfirmed" delivery state applies).
-pub(crate) fn owner_unreachable_note(
-    board: crate::types::Board,
-    confirmed: Option<bool>,
-    packet_count: u64,
-    packet_age_ms: Option<u64>,
-) -> Option<String> {
-    let reachable = packet_count > 0 && packet_age_ms.is_some_and(|age| age < OWNER_REACHABLE_MS);
-    (confirmed.is_none() && !reachable)
-        .then(|| format!("{} not reachable; applies when it reconnects", board.as_str()))
+/// Note for an unconfirmed network-variable output: only when the GS has no
+/// network value for the variable at all. Otherwise the plain "Unconfirmed"
+/// state applies and no note is sent.
+pub(crate) fn network_output_note(view: crate::network_variables::NetworkOutputView) -> Option<String> {
+    (view.confirmed.is_none() && !view.readback_seen).then(|| WAITING_FOR_NETWORK.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -571,40 +550,34 @@ fn begin_sequence_tick(
 }
 
 #[cfg(test)]
-mod owner_note_tests {
+mod network_note_tests {
     use super::*;
-    use crate::types::Board;
+    use crate::network_variables::NetworkOutputView;
 
     #[test]
-    fn unreachable_owner_explains_when_the_toggle_applies() {
-        assert_eq!(owner_output_board("ToggleAvBayUnderglow"), Some(Board::RFBoard));
-        assert_eq!(owner_output_board("ToggleFlightBuzzer"), Some(Board::FlightComputer));
-        assert_eq!(owner_output_board("Launch"), None);
-        // Discovery-only RF board (live 2026-11-08): seen, but no packets.
-        assert_eq!(
-            owner_unreachable_note(Board::RFBoard, None, 0, Some(400)).as_deref(),
-            Some("RF Board not reachable; applies when it reconnects")
-        );
-        assert_eq!(
-            owner_unreachable_note(Board::FlightComputer, None, 0, None).as_deref(),
-            Some("Flight Computer not reachable; applies when it reconnects")
-        );
-        assert!(
-            owner_unreachable_note(Board::RFBoard, None, 10, Some(OWNER_REACHABLE_MS)).is_some(),
-            "stale packets do not count as reachable"
-        );
-        assert_eq!(owner_unreachable_note(Board::RFBoard, None, 10, Some(100)), None,
-            "reachable owner keeps the ordinary unconfirmed state");
-        assert_eq!(owner_unreachable_note(Board::RFBoard, Some(true), 0, None), None,
-            "a confirmed value needs no note");
+    fn network_outputs_have_no_owner_board_text() {
+        assert!(network_output_view("ToggleAvBayUnderglow").is_some());
+        assert!(network_output_view("ToggleFlightBuzzer").is_some());
+        assert!(network_output_view("Launch").is_none());
+        let none = NetworkOutputView { requested: true, confirmed: None, readback_seen: false };
+        assert_eq!(network_output_note(none).as_deref(), Some(WAITING_FOR_NETWORK));
+        let stale = NetworkOutputView { readback_seen: true, ..none };
+        assert_eq!(network_output_note(stale), None, "plain Unconfirmed carries no note");
+        let ok = NetworkOutputView { requested: true, confirmed: Some(true), readback_seen: true };
+        assert_eq!(network_output_note(ok), None);
+        for view in [none, stale, ok] {
+            let note = network_output_note(view).unwrap_or_default();
+            assert!(!note.contains("Board") && !note.contains("reconnect") && !note.contains("Owner"));
+        }
     }
 
     #[test]
-    fn owner_note_round_trips_and_is_omitted_when_absent() {
-        let mut control = ActionControl { disabled_reason: None, requested: None, owner_note: None,
+    fn network_note_round_trips_and_is_omitted_when_absent() {
+        let mut control = ActionControl { disabled_reason: None, requested: None, network_note: None,
             cmd: "ToggleAvBayUnderglow".into(), enabled: true, blink: BlinkMode::None, actuated: None };
-        assert!(!serde_json::to_string(&control).unwrap().contains("owner_note"));
-        control.owner_note = Some("RF Board not reachable; applies when it reconnects".into());
+        let json = serde_json::to_string(&control).unwrap();
+        assert!(!json.contains("network_note") && !json.contains("owner_note"));
+        control.network_note = Some(WAITING_FOR_NETWORK.into());
         let json = serde_json::to_string(&control).unwrap();
         assert_eq!(serde_json::from_str::<ActionControl>(&json).unwrap(), control);
     }
@@ -1302,7 +1275,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
                 let enabled = is_station_utility_command(cmd)
                     || default_recording_command_enabled(cmd)
                         .unwrap_or(matches!(cmd, "Abort" | "Postinit" | "ResetSim"));
-                ActionControl { disabled_reason: None, requested: None, owner_note: None,
+                ActionControl { disabled_reason: None, requested: None, network_note: None,
                     cmd: cmd.to_string(),
                     enabled,
                     blink: backend_blink_for(cmd, enabled, None),
@@ -1349,7 +1322,7 @@ fn policy_with_overrides(
             } else {
                 key_enabled
             };
-            ActionControl { disabled_reason: None, requested: None, owner_note: None,
+            ActionControl { disabled_reason: None, requested: None, network_note: None,
                 cmd: cmd.to_string(),
                 enabled,
                 blink: backend_blink_for(cmd, enabled, recommended.get(cmd)),
@@ -2389,7 +2362,7 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
         .into_iter()
         .map(|cmd| {
             let actuated = default_command_actuated(cmd).or_else(|| valves.actuated_for_cmd(cmd));
-            ActionControl { disabled_reason: None, requested: None, owner_note: None,
+            ActionControl { disabled_reason: None, requested: None, network_note: None,
                 cmd: cmd.to_string(),
                 enabled: true,
                 blink: BlinkMode::None,

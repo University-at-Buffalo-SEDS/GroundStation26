@@ -932,7 +932,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
     let rt = state.gse.lock().unwrap();
     let input = rt.input(is_prelaunch, interlock(state, policy));
     policy.controls.retain(|c| c.cmd != "Turbocharge");
-    policy.controls.push(ActionControl { disabled_reason: None, requested: None, owner_note: None,
+    policy.controls.push(ActionControl { disabled_reason: None, requested: None, network_note: None,
         cmd: "Turbocharge".into(),
         enabled: turbocharge::allowed(state, &rt, input),
         blink: BlinkMode::None,
@@ -951,7 +951,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
         let waits = action == Action::StartFill && fill_waits;
         let enabled = enabled && !waits;
         policy.controls.retain(|c| c.cmd != cmd);
-        policy.controls.push(ActionControl { disabled_reason: waits.then(|| RETIREMENT_PENDING.into()), requested: None, owner_note: None,
+        policy.controls.push(ActionControl { disabled_reason: waits.then(|| RETIREMENT_PENDING.into()), requested: None, network_note: None,
             cmd: cmd.into(),
             enabled,
             blink: BlinkMode::None,
@@ -967,7 +967,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
         policy
             .controls
             .retain(|c| c.cmd != "ToggleGroundStationControl");
-        policy.controls.push(ActionControl { disabled_reason: None, requested: None, owner_note: None,
+        policy.controls.push(ActionControl { disabled_reason: None, requested: None, network_note: None,
             cmd: "ToggleGroundStationControl".into(),
             enabled: true,
             blink: BlinkMode::None,

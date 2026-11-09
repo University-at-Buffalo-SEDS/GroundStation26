@@ -1469,7 +1469,7 @@ pub async fn telemetry_task(
                     }
                 }
                 _ = handle_interval.tick() => {
-                    if crate::network_variables::reconcile_owner_outputs_for_state(&state, &router) {
+                    if crate::network_variables::reconcile_network_outputs_for_state(&state, &router) {
                         sequences::refresh_action_policy_now(&state);
                         state.broadcast_action_policy_snapshot();
                     }

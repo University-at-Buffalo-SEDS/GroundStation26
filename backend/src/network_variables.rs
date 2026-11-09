@@ -348,6 +348,17 @@ fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Resu
             },
         )?;
     }
+    // Inbound values of the cosmetic variables, from any sender, are their
+    // network readback. The router only calls this for inbound updates.
+    for output in NetworkOutput::ALL {
+        router.on_network_variable_update(
+            crate::telemetry_schema::data_type(output.data_type()),
+            move |packet| {
+                record_network_value(output, packet);
+                Ok(())
+            },
+        )?;
+    }
     router.on_network_variable_update(
         crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE),
         move |packet| {
@@ -464,8 +475,8 @@ pub fn publish_bootstrap_for_state(
 
 pub fn publish_current(router: &Router) -> Result<()> {
     let request = crate::qualification_requests::Request::begin("publish_current");
-    publish_owner_output(&request, router, OwnerOutput::Underglow, true, 0)?;
-    publish_owner_output(&request, router, OwnerOutput::FlightBuzzer, true, 0)?;
+    publish_network_output(&request, router, NetworkOutput::Underglow, true, 0)?;
+    publish_network_output(&request, router, NetworkOutput::FlightBuzzer, true, 0)?;
     if let Some(packet) = retained_non_launch_packet()? {
         request.submit(router, packet)?;
     }
@@ -474,12 +485,14 @@ pub fn publish_current(router: &Router) -> Result<()> {
     Ok(())
 }
 
+/// The two cosmetic SEDSnet network variables. Neither has an owner board:
+/// the GS owns writing them and confirmation comes from the network value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OwnerOutput {
+pub(crate) enum NetworkOutput {
     Underglow,
     FlightBuzzer,
 }
-impl OwnerOutput {
+impl NetworkOutput {
     const ALL: [Self; 2] = [Self::Underglow, Self::FlightBuzzer];
     fn index(self) -> usize {
         self as usize
@@ -494,13 +507,6 @@ impl OwnerOutput {
         match self {
             Self::Underglow => "AV_BAY_UNDERGLOW_OWNER",
             Self::FlightBuzzer => "FLIGHT_CONTROLLER",
-        }
-    }
-    /// The board whose periodic reports count as "heard from the owner".
-    pub(crate) fn owner_board(self) -> Board {
-        match self {
-            Self::Underglow => Board::RFBoard,
-            Self::FlightBuzzer => Board::FlightComputer,
         }
     }
     fn requested(self) -> bool {
@@ -523,53 +529,76 @@ impl OwnerOutput {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct OwnerOutputView {
-    /// Stored operator request; republished until the owner confirms it.
+pub(crate) struct NetworkOutputView {
+    /// Stored GS request; republished until the network carries it.
     pub(crate) requested: bool,
-    /// Owner-acknowledged value, only when it matches the request.
+    /// The latest network value, only when it matches a fresh request.
     pub(crate) confirmed: Option<bool>,
+    /// True once any network value for the variable has been seen.
+    pub(crate) readback_seen: bool,
 }
 
-static OWNER_CONFIRMATION: Mutex<[owner_confirmation::Confirmation; 2]> =
-    Mutex::new([owner_confirmation::Confirmation::DEFAULT; 2]);
-static OWNER_RECONCILE_ARMED: std::sync::atomic::AtomicBool =
+static NETWORK_CONFIRMATION: Mutex<[network_confirmation::Confirmation; 2]> =
+    Mutex::new([network_confirmation::Confirmation::DEFAULT; 2]);
+static NETWORK_RECONCILE_ARMED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-fn owner_confirmation() -> std::sync::MutexGuard<'static, [owner_confirmation::Confirmation; 2]> {
-    OWNER_CONFIRMATION
+fn network_confirmation() -> std::sync::MutexGuard<'static, [network_confirmation::Confirmation; 2]> {
+    NETWORK_CONFIRMATION
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
-static OWNER_TEST_CLOCK: Mutex<Option<fn() -> std::time::Instant>> = Mutex::new(None);
+static NETWORK_TEST_CLOCK: Mutex<Option<fn() -> std::time::Instant>> = Mutex::new(None);
 /// Model-time tests drive retry horizons faster than wall time.
 #[cfg(test)]
-pub(crate) fn set_owner_test_clock(clock: fn() -> std::time::Instant) {
-    *OWNER_TEST_CLOCK.lock().unwrap() = Some(clock);
+pub(crate) fn set_network_test_clock(clock: fn() -> std::time::Instant) {
+    *NETWORK_TEST_CLOCK.lock().unwrap() = Some(clock);
 }
-fn owner_now() -> std::time::Instant {
+fn network_now() -> std::time::Instant {
     #[cfg(test)]
-    if let Some(clock) = *OWNER_TEST_CLOCK.lock().unwrap() {
+    if let Some(clock) = *NETWORK_TEST_CLOCK.lock().unwrap() {
         return clock();
     }
     std::time::Instant::now()
 }
 
-pub(crate) fn owner_output_view(output: OwnerOutput) -> OwnerOutputView {
+pub(crate) fn network_output_view(output: NetworkOutput) -> NetworkOutputView {
     let requested = output.requested();
-    OwnerOutputView {
+    let confirmation = network_confirmation();
+    let entry = &confirmation[output.index()];
+    NetworkOutputView {
         requested,
-        confirmed: owner_confirmation()[output.index()].shown(requested),
+        confirmed: entry.shown(requested),
+        readback_seen: entry.readback_seen(),
     }
 }
 
-/// Publish the stored request and start tracking its owner ACK. `fresh` marks
-/// an operator request, which earns one immediate republish on loss.
-fn publish_owner_output(
+/// Record an inbound network update of a cosmetic variable, from any sender
+/// (a board, a relay or another station). This is the variable's readback.
+fn record_network_value(output: NetworkOutput, packet: &Packet) {
+    let Some(&byte) = packet.payload().first() else {
+        return;
+    };
+    let requested = output.requested();
+    network_confirmation()[output.index()].network_value(byte != 0, requested, network_now());
+    NETWORK_RECONCILE_ARMED.store(true, Ordering::Release);
+    NETWORK_VALUE_CHANGED.store(true, Ordering::Release);
+}
+
+/// Set when an inbound value changed what the controls show, so the next
+/// reconcile pass refreshes the action policy even with nothing to publish.
+static NETWORK_VALUE_CHANGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Publish the stored request and start tracking its network delivery.
+/// `fresh` marks a new request, which starts a new freshness epoch and earns
+/// one immediate republish on loss.
+fn publish_network_output(
     request: &crate::qualification_requests::Request,
     router: &Router,
-    output: OwnerOutput,
+    output: NetworkOutput,
     fresh: bool,
     reports: u64,
 ) -> Result<()> {
@@ -577,46 +606,47 @@ fn publish_owner_output(
     let packet = packet(output.data_type(), output.endpoint(), u8::from(value))?;
     let id = packet.packet_id();
     let result = request.submit(router, packet);
-    let now = owner_now();
-    let mut confirmation = owner_confirmation();
+    let now = network_now();
+    let mut confirmation = network_confirmation();
     match &result {
         Ok(()) => confirmation[output.index()].published(id, value, now, fresh),
-        Err(_) => confirmation[output.index()].publish_failed(now, reports),
+        Err(_) => confirmation[output.index()].publish_failed(now, reports, fresh),
     }
-    OWNER_RECONCILE_ARMED.store(true, Ordering::Release);
+    NETWORK_RECONCILE_ARMED.store(true, Ordering::Release);
     result
 }
 
-/// Poll the SDK owner rows for in-flight cosmetic outputs and republish the
-/// stored request when delivery is unconfirmed. `owner_reports` counts packets
-/// heard from each output's owner board. `claim` must return a dispatch claim
-/// (held for the publish) or None when publication is closed.
-pub(crate) fn reconcile_owner_outputs<C>(
+/// Poll the SDK reliable rows for in-flight cosmetic variables and republish
+/// the stored request when the network has not confirmed it. `network_reports`
+/// counts packets heard from the network for each variable (any board; it
+/// only paces retries and never gates confirmation). `claim` must return a
+/// dispatch claim (held for the publish) or None when publication is closed.
+pub(crate) fn reconcile_network_outputs<C>(
     router: &Router,
-    owner_reports: [u64; 2],
+    network_reports: [u64; 2],
     claim: impl Fn() -> Option<C>,
 ) -> bool {
-    if !OWNER_RECONCILE_ARMED.load(Ordering::Acquire) {
-        return false;
+    let mut changed = NETWORK_VALUE_CHANGED.swap(false, Ordering::AcqRel);
+    if !NETWORK_RECONCILE_ARMED.load(Ordering::Acquire) {
+        return changed;
     }
     let tuning = sedsnet::config::runtime_tuning_config();
     let retransmit = std::time::Duration::from_millis(u64::from(tuning.reliable_retransmit_ms));
     let max_retries = tuning.reliable_max_retries;
-    let now = owner_now();
+    let now = network_now();
     let rows = {
-        let confirmation = owner_confirmation();
+        let confirmation = network_confirmation();
         confirmation
             .iter()
             .any(|c| c.inflight_id().is_some())
             .then(|| router.export_reliable_pending_stats())
     };
-    let mut changed = false;
     let mut republish = Vec::new();
     {
-        let mut confirmation = owner_confirmation();
-        for output in OwnerOutput::ALL {
+        let mut confirmation = network_confirmation();
+        for output in NetworkOutput::ALL {
             let entry = &mut confirmation[output.index()];
-            let reports = owner_reports[output.index()];
+            let reports = network_reports[output.index()];
             let step = match (entry.inflight_id(), rows.as_ref()) {
                 (Some(id), Some(rows)) => {
                     let row = rows.iter().find(|row| row.packet_id == id).map(|row| row.retries);
@@ -626,29 +656,29 @@ pub(crate) fn reconcile_owner_outputs<C>(
                         ));
                     entry.observe(row, queued, now, reports, retransmit, max_retries)
                 }
-                _ => entry.owner_report(now, reports),
+                _ => entry.network_report(now, reports),
             };
             match step {
-                owner_confirmation::Step::Idle => {}
-                owner_confirmation::Step::Changed => changed = true,
-                owner_confirmation::Step::Republish => {
+                network_confirmation::Step::Idle => {}
+                network_confirmation::Step::Changed => changed = true,
+                network_confirmation::Step::Republish => {
                     changed = true;
                     republish.push(output);
                 }
             }
         }
         if !confirmation.iter().any(|c| c.needs_attention()) {
-            OWNER_RECONCILE_ARMED.store(false, Ordering::Release);
+            NETWORK_RECONCILE_ARMED.store(false, Ordering::Release);
         }
     }
     for output in republish {
-        let reports = owner_reports[output.index()];
+        let reports = network_reports[output.index()];
         let Some(_claim) = claim() else {
-            owner_confirmation()[output.index()].publish_failed(now, reports);
+            network_confirmation()[output.index()].publish_failed(now, reports, false);
             continue;
         };
         let request = crate::qualification_requests::Request::begin("republish_unconfirmed");
-        if let Err(error) = publish_owner_output(&request, router, output, false, reports) {
+        if let Err(error) = publish_network_output(&request, router, output, false, reports) {
             log::warn!("republish of unconfirmed {output:?} failed: {error}");
         }
     }
@@ -656,12 +686,15 @@ pub(crate) fn reconcile_owner_outputs<C>(
 }
 
 /// Production cadence wrapper: primary role only, polled at most every 10 ms.
-pub(crate) fn reconcile_owner_outputs_for_state(
+pub(crate) fn reconcile_network_outputs_for_state(
     state: &crate::state::AppState,
     router: &Router,
 ) -> bool {
     static NEXT_POLL: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    if crate::rrls::is_rrls() || !OWNER_RECONCILE_ARMED.load(Ordering::Acquire) {
+    if crate::rrls::is_rrls()
+        || !(NETWORK_RECONCILE_ARMED.load(Ordering::Acquire)
+            || NETWORK_VALUE_CHANGED.load(Ordering::Acquire))
+    {
         return false;
     }
     let now = std::time::Instant::now();
@@ -672,57 +705,57 @@ pub(crate) fn reconcile_owner_outputs_for_state(
         }
         *next = Some(now + std::time::Duration::from_millis(10));
     }
-    let reports = {
-        let boards = state.board_status.lock().unwrap();
-        OwnerOutput::ALL.map(|output| {
-            boards
-                .get(&output.owner_board())
-                .map_or(0, |status| status.packet_count)
-        })
-    };
-    reconcile_owner_outputs(router, reports, || {
+    // Any board heard from counts as network traffic; no owner board.
+    let heard: u64 = state
+        .board_status
+        .lock()
+        .unwrap()
+        .values()
+        .map(|status| status.packet_count)
+        .fold(0, u64::saturating_add);
+    reconcile_network_outputs(router, [heard; 2], || {
         crate::gse::capture_operator_origin(state)
             .and_then(|generation| crate::gse::claim_operator_dispatch(state, generation))
     })
 }
 
-fn set_owner_output(router: &Router, output: OwnerOutput, enabled: bool, name: &'static str) -> Result<()> {
+fn set_network_output(router: &Router, output: NetworkOutput, enabled: bool, name: &'static str) -> Result<()> {
     let request = crate::qualification_requests::Request::begin(name);
     output.commit_requested(enabled)?;
-    publish_owner_output(&request, router, output, true, 0)
+    publish_network_output(&request, router, output, true, 0)
 }
 
-/// Toggle acts on the owner's confirmed state. Pressing again while the same
+/// Toggle acts on the latest network value. Pressing again while the same
 /// value is still being delivered keeps that delivery instead of flipping.
-fn toggle_owner_output(router: &Router, output: OwnerOutput, name: &'static str) -> Result<bool> {
+fn toggle_network_output(router: &Router, output: NetworkOutput, name: &'static str) -> Result<bool> {
     let requested = output.requested();
     let (target, delivering) = {
-        let confirmation = owner_confirmation();
+        let confirmation = network_confirmation();
         let entry = &confirmation[output.index()];
         let target = entry.toggle_target(requested);
         (target, entry.delivering(target))
     };
     if !(delivering && target == requested) {
-        set_owner_output(router, output, target, name)?;
+        set_network_output(router, output, target, name)?;
     }
     Ok(target)
 }
 
 pub fn toggle_underglow(router: &Router) -> Result<bool> {
-    toggle_owner_output(router, OwnerOutput::Underglow, "set_underglow")
+    toggle_network_output(router, NetworkOutput::Underglow, "set_underglow")
 }
 
 pub fn set_underglow(router: &Router, enabled: bool) -> Result<()> {
-    set_owner_output(router, OwnerOutput::Underglow, enabled, "set_underglow")
+    set_network_output(router, NetworkOutput::Underglow, enabled, "set_underglow")
 }
 
 #[allow(dead_code)] // Used by the optional direct-command compatibility path.
 pub fn toggle_flight_buzzer(router: &Router) -> Result<bool> {
-    toggle_owner_output(router, OwnerOutput::FlightBuzzer, "set_flight_buzzer")
+    toggle_network_output(router, NetworkOutput::FlightBuzzer, "set_flight_buzzer")
 }
 
 pub fn set_flight_buzzer(router: &Router, enabled: bool) -> Result<()> {
-    set_owner_output(router, OwnerOutput::FlightBuzzer, enabled, "set_flight_buzzer")
+    set_network_output(router, NetworkOutput::FlightBuzzer, enabled, "set_flight_buzzer")
 }
 
 pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
@@ -1812,6 +1845,70 @@ mod tests {
     }
 
     #[test]
+    fn cosmetic_variables_confirm_from_any_network_publisher_without_an_owner_board() {
+        if crate::operator_queue::isolated_native_case(
+            module_path!(),
+            "cosmetic_variables_confirm_from_any_network_publisher_without_an_owner_board",
+        ) {
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let gs = Arc::new(Router::new(
+            RouterConfig::new([]).with_sender(Board::GroundStation.sender_id()),
+        ));
+        initialize_for_role_seed(&gs, false, false).unwrap();
+        for output in NetworkOutput::ALL {
+            output.commit_requested(true).unwrap();
+            let view = network_output_view(output);
+            assert_eq!(
+                (view.requested, view.confirmed, view.readback_seen),
+                (true, None, false),
+                "{output:?}: no network value yet means waiting for network confirmation"
+            );
+        }
+        // No owner board ever reports; a relay that is not the RF Board or
+        // FC publishes the values the GS asked for.
+        let relay = Arc::new(Router::new(RouterConfig::new([]).with_sender("GW")));
+        for output in NetworkOutput::ALL {
+            relay
+                .enable_network_variable(
+                    crate::telemetry_schema::data_type(output.data_type()),
+                    NetworkVariablePermissions::READ_WRITE,
+                )
+                .unwrap();
+        }
+        let gs_side = gs.add_side_packet("to-gw", |_| Ok(()));
+        let gs_rx = gs.clone();
+        relay.add_side_packet("to-gs", move |packet| gs_rx.rx_from_side(packet, gs_side));
+        let publish = |output: NetworkOutput, value: u8| {
+            relay
+                .set_network_variable(packet(output.data_type(), output.endpoint(), value).unwrap())
+                .unwrap();
+            relay.process_all_queues().unwrap();
+            gs.process_all_queues().unwrap();
+        };
+        publish(NetworkOutput::Underglow, 0);
+        let view = network_output_view(NetworkOutput::Underglow);
+        assert_eq!((view.confirmed, view.readback_seen), (None, true), "different value is plain Unconfirmed");
+        assert!(reconcile_network_outputs(&gs, [0; 2], || None::<()>), "inbound value refreshes the controls");
+        for output in NetworkOutput::ALL {
+            publish(output, 1);
+            let view = network_output_view(output);
+            assert_eq!((view.confirmed, view.readback_seen), (Some(true), true), "{output:?}");
+        }
+        // Requesting Off again is unconfirmed until the network carries Off.
+        output_off_then_confirm(&gs, &publish);
+
+        fn output_off_then_confirm(gs: &Router, publish: &dyn Fn(NetworkOutput, u8)) {
+            let output = NetworkOutput::FlightBuzzer;
+            let _ = set_network_output(gs, output, false, "set_flight_buzzer");
+            assert_eq!(network_output_view(output).confirmed, None);
+            publish(output, 0);
+            assert_eq!(network_output_view(output).confirmed, Some(false));
+        }
+    }
+
+    #[test]
     fn flight_buzzer_targets_only_the_discovered_flight_controller() {
         crate::telemetry_schema::initialize().unwrap();
         let packet = packet(FLIGHT_BUZZER_TYPE, "FLIGHT_CONTROLLER", 1).unwrap();
@@ -2858,7 +2955,7 @@ pub fn persisted_daq_log_clock() -> Option<[u64; 2]> {
     guard.durable.then_some(guard.values.daq_log_clock)
 }
 
-mod owner_confirmation;
+mod network_confirmation;
 
 #[cfg(test)]
 #[path = "network_variables/daq_clock_tests.rs"]
