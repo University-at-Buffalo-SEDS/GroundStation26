@@ -15,6 +15,12 @@ pub const CLOSED: [bool; 5] = [false; 5];
 pub const FILL_READY: [bool; 5] = [false, true, false, false, false];
 
 pub const MAX_NITROGEN_STEPS: usize = 32;
+/// Pressure samples the engine needs across the last second before an
+/// operator Dump may end at zero. The engine takes one sample per tick and the
+/// station ticks every 200 ms, so a full second holds five or six.
+pub const DUMP_ZERO_MIN_SAMPLES: usize = 4;
+/// Largest gap between those samples (and from the newest to now).
+pub const DUMP_ZERO_MAX_GAP_MS: u64 = 500;
 /// Every non-safety sequence failure notification starts with this text.
 pub const FAILURE_PAUSE_PREFIX: &str = "Sequence paused:";
 /// A supply that still reports open after its close deadline is a hazard only
@@ -1748,16 +1754,26 @@ impl Engine {
                     );
                 }
                 let zero = self.status.baseline.as_ref().unwrap();
-                let window: Vec<_> = self
+                // The tank has stayed in its zero band for the last second:
+                // from the newest sample at least a second old, every sample
+                // is in the band and no gap exceeds DUMP_ZERO_MAX_GAP_MS.
+                let since = input.now_ms.saturating_sub(1000);
+                let window = self
                     .samples
                     .iter()
-                    .filter(|s| s.at_ms >= input.now_ms.saturating_sub(1000))
-                    .collect();
+                    .rposition(|s| s.at_ms <= since)
+                    .map_or(&[][..], |anchor| &self.samples[anchor..]);
                 let empty = elapsed >= 1000
-                    && window.len() >= 10
+                    && window.len() >= DUMP_ZERO_MIN_SAMPLES
                     && window
                         .first()
-                        .is_some_and(|s| input.now_ms.saturating_sub(s.at_ms) >= 900)
+                        .is_some_and(|s| since - s.at_ms <= DUMP_ZERO_MAX_GAP_MS)
+                    && window
+                        .windows(2)
+                        .all(|pair| pair[1].at_ms - pair[0].at_ms <= DUMP_ZERO_MAX_GAP_MS)
+                    && window.last().is_some_and(|s| {
+                        input.now_ms.saturating_sub(s.at_ms) <= DUMP_ZERO_MAX_GAP_MS
+                    })
                     && window.iter().all(|s| zero.is_zero(s.value));
                 if self.confirmed(input) && empty && zero.is_zero(pressure) {
                     let failed = matches!(self.test_hold, Some(TestHold::Failed(_)));
@@ -1866,6 +1882,8 @@ mod tests {
         engine: Engine,
         now: u64,
         pressure: f32,
+        /// How old each tick's pressure sample already is.
+        pressure_age_ms: u64,
         valves: [bool; 5],
     }
     impl Rig {
@@ -1893,6 +1911,7 @@ mod tests {
                 engine,
                 now: 100,
                 pressure: 5.0,
+                pressure_age_ms: 0,
                 valves: RELIEVED,
             }
         }
@@ -1901,7 +1920,7 @@ mod tests {
                 now_ms: self.now,
                 pressure: Some(Sample {
                     value: self.pressure,
-                    at_ms: self.now,
+                    at_ms: self.now - self.pressure_age_ms,
                 }),
                 valves: std::array::from_fn(|i| {
                     Some(ValveState {
@@ -1923,7 +1942,10 @@ mod tests {
             self.effects(effects);
         }
         fn tick(&mut self) {
-            self.now += 100;
+            self.tick_by(100);
+        }
+        fn tick_by(&mut self, ms: u64) {
+            self.now += ms;
             let effects = self.engine.tick(self.input());
             self.effects(effects);
         }
@@ -2212,6 +2234,103 @@ mod tests {
         rig.request(Action::CancelFill);
         rig.until(Phase::Cancelled);
         assert_eq!(rig.valves, RELIEVED);
+    }
+    /// The station ticks the engine every 200 ms, so a one-second window
+    /// holds five or six pressure samples, never ten.
+    #[test]
+    fn operator_dump_ends_at_the_station_tick_rate() {
+        let mut rig = Rig::new();
+        rig.baseline();
+        for target in [50.0, 100.0, 120.0] {
+            rig.until(Phase::Raising);
+            rig.pressure = 5.0 + target;
+            rig.until(Phase::Holding);
+            for _ in 0..50 {
+                rig.tick();
+            }
+        }
+        rig.until(Phase::Paused);
+        rig.dump();
+        rig.until(Phase::Dumping);
+        rig.pressure = 5.0;
+        for _ in 0..20 {
+            rig.tick_by(200);
+        }
+        assert_eq!(rig.engine.status.phase, Phase::Passed, "{}", rig.engine.status.message);
+        assert!(rig.engine.status.nitrogen_passed);
+    }
+    /// gse_flows Normal sim: each tick's sample was already ~27 ms old, so
+    /// the samples of the last second were 27..827 ms old and none reached
+    /// back the full second; the dump ended only when tick jitter lined up.
+    #[test]
+    fn operator_dump_ends_when_each_sample_lags_its_tick() {
+        let mut rig = Rig::new();
+        rig.baseline();
+        for target in [50.0, 100.0, 120.0] {
+            rig.until(Phase::Raising);
+            rig.pressure = 5.0 + target;
+            rig.until(Phase::Holding);
+            for _ in 0..50 {
+                rig.tick();
+            }
+        }
+        rig.until(Phase::Paused);
+        rig.dump();
+        rig.until(Phase::Dumping);
+        rig.pressure = 5.0;
+        rig.pressure_age_ms = 27;
+        for _ in 0..10 {
+            rig.tick_by(200);
+        }
+        assert_eq!(rig.engine.status.phase, Phase::Passed, "{}", rig.engine.status.message);
+    }
+    #[test]
+    fn dump_to_zero_still_needs_a_full_second_in_the_zero_band() {
+        let mut rig = Rig::new();
+        rig.baseline();
+        for target in [50.0, 100.0, 120.0] {
+            rig.until(Phase::Raising);
+            rig.pressure = 5.0 + target;
+            rig.until(Phase::Holding);
+            for _ in 0..50 {
+                rig.tick();
+            }
+        }
+        rig.until(Phase::Paused);
+        rig.dump();
+        rig.until(Phase::Dumping);
+        for _ in 0..10 {
+            rig.tick_by(200);
+        }
+        rig.pressure = 5.0;
+        // Zero for 800 ms only.
+        for _ in 0..4 {
+            rig.tick_by(200);
+            assert_eq!(rig.engine.status.phase, Phase::Dumping);
+        }
+        // A sample outside the band restarts the second.
+        rig.pressure = 30.0;
+        rig.tick_by(200);
+        rig.pressure = 5.0;
+        for _ in 0..5 {
+            rig.tick_by(200);
+            assert_eq!(rig.engine.status.phase, Phase::Dumping);
+        }
+        rig.pressure = 30.0;
+        rig.tick_by(200);
+        rig.pressure = 5.0;
+        // Samples too sparse to show the tank stayed in the band (one every
+        // 600 ms, still fresh) never end the dump.
+        for _ in 0..10 {
+            rig.tick_by(600);
+            assert_eq!(rig.engine.status.phase, Phase::Dumping);
+        }
+        rig.tick_by(200);
+        rig.tick_by(200);
+        rig.tick_by(200);
+        rig.tick_by(200);
+        rig.tick_by(200);
+        assert_eq!(rig.engine.status.phase, Phase::Passed);
     }
     #[test]
     fn nitrogen_pt_overshoot_settles_then_holds_before_each_next_level() {

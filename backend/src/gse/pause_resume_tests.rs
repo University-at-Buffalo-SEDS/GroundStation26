@@ -14,8 +14,11 @@ struct Plant {
     elapsed: u64,
     pressure: f32,
     mass: f32,
-    /// Closed-tank pressure loss per 100 ms step (a leak).
+    /// Closed-tank pressure loss per step (a leak).
     leak: f32,
+    /// Simulated time per step. The station's sequence loop ticks every
+    /// 200 ms; most cases step faster.
+    step_ms: u64,
     path: std::path::PathBuf,
 }
 impl Drop for Plant {
@@ -46,6 +49,7 @@ impl Plant {
             pressure: 0.0,
             mass: 0.0,
             leak: 0.0,
+            step_ms: 100,
             path,
         };
         plant.refresh_boards();
@@ -119,7 +123,7 @@ impl Plant {
     }
     fn step(&mut self) -> Vec<(usize, bool)> {
         let received = self.receive();
-        self.elapsed += 100;
+        self.elapsed += self.step_ms;
         self.refresh_boards();
         if self.valves[1] || self.valves[2] {
             self.pressure = (self.pressure - 20.0).max(0.0);
@@ -576,4 +580,53 @@ async fn routed_cancel_at_the_nitrogen_hold_relieves_and_ends_the_run_at_once() 
     assert!(progress::controls(&plant.state).is_none());
     assert!(plant.pressure < held, "dump and vent stay open after the run ends");
     assert_eq!(plant.valves, gse_sequence::RELIEVED);
+}
+
+/// The current step's live watch row `id` from the published progress.
+fn watch(state: &Arc<AppState>, id: &str) -> serde_json::Value {
+    progress::flush(state);
+    let envelope = progress::envelope(state);
+    let run = &envelope["active"][0];
+    let step = run["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == run["current_step"])
+        .unwrap_or_else(|| panic!("no current step: {envelope}"));
+    step["watch"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["id"] == id)
+        .unwrap_or_else(|| panic!("no {id} watch: {step}"))
+        .clone()
+}
+
+/// Normal nitrogen test (gse_flows sim): Dump at the passed hold stayed in
+/// progress for minutes with the tank at 0 psi and dump/vent open, and its
+/// step's watch still showed the hold pressure and closed valves. At the
+/// station's 200 ms tick the dump must follow the live tank and end.
+#[tokio::test]
+async fn nitrogen_dump_at_the_station_tick_rate_follows_the_tank_and_ends() {
+    let mut plant = Plant::new().await;
+    plant.step_ms = 200;
+    assert!(handle_command(&plant.state, &TelemetryCommand::ValveSelfTest));
+    plant.until(|rt| rt.engine.status.phase == Phase::Idle);
+    assert!(handle_command(&plant.state, &TelemetryCommand::NitrogenTest));
+    // The plant presses Dump as soon as the passed hold is offered.
+    plant.until(|rt| rt.engine.dumping_to_zero());
+    let held = plant.pressure;
+    assert!(held > 100.0, "{held}");
+    while plant.pressure > 0.0 {
+        plant.step();
+    }
+    plant.step();
+    assert_eq!(plant.phase(), Phase::Dumping);
+    assert_eq!(watch(&plant.state, "tank-pressure")["observed"], 0.0, "the watch follows the tank");
+    for valve in ["board-output-1", "board-output-2"] {
+        assert_eq!(watch(&plant.state, valve)["observed"], true, "{valve} watch follows the board");
+    }
+    plant.until(|rt| rt.engine.status.phase == Phase::Passed);
+    plant.step();
+    assert_eq!(plant.outcome(), Some(Outcome::Passed));
 }

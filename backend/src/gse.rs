@@ -2014,6 +2014,12 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                 }
             }
             if !hitl {
+                // A long step (a dump to zero, a hold) changes no phase; keep
+                // its live watch on the current tank and valve reports, as
+                // HITL does above.
+                if rt.engine.status.phase == previous_phase && rt.engine.active() {
+                    rt.progress_observe(input, crate::sequence_progress_projection::Cause::Tick);
+                }
                 complete_operational_milestones(&mut rt, previous_phase, input);
             }
             if rt.engine.status.phase != Phase::Filling || !rt.ground_station_control {
