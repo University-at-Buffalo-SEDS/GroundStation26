@@ -53,7 +53,8 @@ fn healthy() -> (Mesh, Mesh) {
         "inactiveclear retains BASE_ACK"
     );
     assert_eq!(send(&mut r, &mut p, 0)[3], BUDGET_CONTROL);
-    assert_eq!(p.recovery_air_share(0), Some(25));
+    assert_eq!(p.negotiated_air_share(0), Some(25));
+    assert_eq!(p.recovery_air_share(0), None, "the primary always keeps its profile share");
     r.tick(0);
     (p, r)
 }
@@ -83,7 +84,7 @@ fn healthy_query_is_one_owned_frame_and_never_application_forwarding() {
             "healthyprofileproof doesn't churn queue"
         );
     }
-    assert_eq!(p.recovery_air_share(19), Some(25));
+    assert_eq!(p.negotiated_air_share(19), Some(25));
     assert_eq!(r.recovery_air_share(19), Some(35));
 }
 #[test]
@@ -183,18 +184,18 @@ fn unknown_budget_frames_never_renew_presence_or_reach_sdk() {
         ),
         before
     );
-    assert_eq!(p.recovery_air_share(0), Some(15));
+    assert_eq!(p.negotiated_air_share(0), Some(15));
     assert_eq!(r.recovery_air_share(0), Some(35));
 }
 #[test]
 fn effective_capacity_mismatch_disables_context_without_silent_upgrade() {
     let (mut p, _) = paired();
     assert!(!p.budget_effective_transport(false));
-    assert_eq!(p.recovery_air_share(0), Some(15));
+    assert_eq!(p.negotiated_air_share(0), Some(15));
     assert!(p.budget_transport_fault);
     assert!(p.budget_effective_transport(true));
     assert!(!p.budget_transport_fault);
-    assert_eq!(p.recovery_air_share(0), Some(15));
+    assert_eq!(p.negotiated_air_share(0), Some(15));
 }
 
 #[test]
@@ -244,7 +245,7 @@ fn dropped_initial_health_does_not_pin_owned_revoke_forever() {
         let bytes = tx.frame().bytes.clone();
         r.finish_transmission(tx, true);
         p.incoming(true, &bytes, 5000);
-        if p.recovery_air_share(5000) == Some(25) {
+        if p.negotiated_air_share(5000) == Some(25) {
             restored = true;
             break;
         }

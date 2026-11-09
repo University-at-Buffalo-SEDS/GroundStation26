@@ -210,7 +210,7 @@ pub fn status() -> Status {
             relayed_frames: m.relayed_frames,
             relay_envelope_bytes: m.relay_envelope_bytes,
             settings_framing: m.settings_framing.as_ref().map(|state| state.diagnostics()),
-            recovery_budget:m.budget_requested.then(||serde_json::json!({"requested_share_percent":m.recovery_air_share(now),"initialized":m.budget.is_some(),"effective_transport_compatible":!m.budget_transport_fault,"outbound_paused":m.budget_transport_fault,
+            recovery_budget:m.budget_requested.then(||serde_json::json!({"requested_share_percent":m.negotiated_air_share(now),"effective_share_percent":m.recovery_air_share(now),"initialized":m.budget.is_some(),"effective_transport_compatible":!m.budget_transport_fault,"outbound_paused":m.budget_transport_fault,
                 "fault_reason":if m.budget_transport_fault {Some("effective application/UART tuple differs from validated profile")}else{None},
                 "tuple_scope":"application and UART configuration, not live modem AT readback",
                 "expected_tuple":m.budget_profile.map(|p|serde_json::json!({"uart_baud":p.baud,"usable_air_bps":p.usable_bps,"rf_share_percent":p.rf_share,"frame_overhead_bytes":p.overhead,"packet_burst_ms":p.burst_ms,"packet_gap_ms":p.gap_ms,"flags":p.flags})),
@@ -595,6 +595,22 @@ impl Mesh {
         }
     }
     pub(crate) fn recovery_air_share(&self, now: u64) -> Option<u8> {
+        // The AV-bay link comes first: the primary always keeps its profile
+        // share. It used to drop to 15% as soon as it requested a relay (no
+        // direct AV-bay frame for 3 s), RRLS present or not, and to hold that
+        // until 5 s of continuous direct frames. On the bench (no RRLS) that
+        // left the uplink about 390 B/s: one ACK-sized frame per burst cycle,
+        // under the AV bay's ACK demand, so the router queue grew without
+        // bound and commands, heartbeats and time sync got no airtime.
+        if self.role == Role::Primary {
+            return None;
+        }
+        self.negotiated_air_share(now)
+    }
+    /// The share the relay budget protocol negotiated (or would request) for
+    /// this station. Applied as airtime only for an RRLS; for the primary it
+    /// is protocol state and diagnostics.
+    pub(crate) fn negotiated_air_share(&self, now: u64) -> Option<u8> {
         if self.budget_requested {
             return Some(
                 self.budget
@@ -2130,8 +2146,7 @@ impl Mesh {
             }
     }
     /// Voice may be sent: the link is fresh and this station's airtime share
-    /// leaves room for commands and telemetry. A primary held at 15% while
-    /// an RRLS relays still receives voice but does not send it.
+    /// leaves room for commands and telemetry.
     pub fn voice_sendable(&self, now: u64) -> bool {
         self.voice_available(now)
             && (self.role == Role::Rrls
@@ -3187,18 +3202,16 @@ mod tests {
         );
     }
     #[test]
-    fn primary_held_at_fifteen_percent_receives_but_does_not_send_voice() {
+    fn primary_keeps_its_share_and_voice_while_a_relay_is_requested() {
         let mut mesh = Mesh::new(Role::Primary, 1);
         mesh.voice_enabled = true;
         mesh.relay_seen = Some(0);
         assert!(mesh.voice_sendable(0));
-        // Relay requested: the primary's share drops to 15%.
+        // Relay requested: the primary keeps its profile share.
         mesh.fallback = true;
-        assert_eq!(mesh.recovery_air_share(0), Some(15));
+        assert_eq!(mesh.recovery_air_share(0), None);
         assert!(mesh.voice_available(0), "RRLS voice is still received");
-        assert!(!mesh.voice_sendable(0));
-        mesh.queue_voice(&[0; crate::radio_voice::MAX_PACKET], 0);
-        assert!(mesh.queue.is_empty());
+        assert!(mesh.voice_sendable(0));
         // The RRLS always has at least 35%.
         let mut rrls = Mesh::new(Role::Rrls, 2);
         rrls.voice_enabled = true;
@@ -4376,13 +4389,13 @@ mod tests {
         assert_eq!(relay.recovery_air_share(0), None);
         primary.tick(3_000);
         assert!(!primary.active(3_000), "no READY proof yet");
-        assert_eq!(primary.recovery_air_share(3_000), Some(15));
+        assert!(primary.fallback, "relay requested");
+        assert_eq!(primary.recovery_air_share(3_000), None, "the primary keeps its share");
         relay.incoming(true, &health(1, 0, false), 3_000);
         assert_eq!(relay.recovery_air_share(3_000), Some(35));
-        assert_eq!(
-            40 + 15 + 35,
-            90,
-            "RF share remains unchanged and total default reservation stays90%"
+        assert!(
+            40 + 25 + 35 <= 100,
+            "legacy RF40, the primary's full share and the relay fit the link"
         );
         let mut now = 3_100;
         while now <= 3_100 + RELAY_MIN_DWELL_MS {

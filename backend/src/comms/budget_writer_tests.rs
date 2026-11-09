@@ -115,15 +115,16 @@ fn actual_budget_uart_entropy_and_effective_override() {
                 .as_ref()
                 .unwrap()
                 .airtime_config(),
-            (32000, 15)
+            (32000, 25)
         );
         let bytes = drain(&mut peer);
         assert!(
             !bytes.is_empty(),
-            "actualHEALTHphysicalwriteuses15despiteconstructorfailure"
+            "actual HEALTH physical write uses the primary's full share despite constructor failure"
         );
-        assert_eq!(shared.lock().unwrap().recovery_air_share(0), Some(15));
-        println!("entropyfailure actualHEALTH {}B capacity15", bytes.len());
+        assert_eq!(shared.lock().unwrap().negotiated_air_share(0), Some(15));
+        assert_eq!(shared.lock().unwrap().recovery_air_share(0), None);
+        println!("entropyfailure actualHEALTH {}B capacity25", bytes.len());
     }
     let (mut uart, mut peer, shared) = pair(None);
     uart.write_lock.lock().unwrap().radio_capacity =
@@ -135,7 +136,7 @@ fn actual_budget_uart_entropy_and_effective_override() {
         "contradictory64kdoesnotwriteANYbytes"
     );
     assert!(shared.lock().unwrap().budget_transport_fault_for_test());
-    assert_eq!(shared.lock().unwrap().recovery_air_share(0), Some(15));
+    assert_eq!(shared.lock().unwrap().negotiated_air_share(0), Some(15));
     uart.write_lock.lock().unwrap().radio_capacity =
         Some(rfd_capacity::Capacity::new(32000, 25, 16));
     clock(&path, 10);
@@ -153,7 +154,7 @@ fn actual_budget_uart_entropy_and_effective_override() {
             .as_ref()
             .unwrap()
             .airtime_config(),
-        (32000, 15)
+        (32000, 25)
     );
     writer_debt_case(&path, 204, 10_000);
     writer_debt_case(&path, 374, 20_000);
@@ -176,7 +177,7 @@ fn healthy_writer(shared: &crate::rrls::Shared, now: u64) -> crate::rrls::Mesh {
     assert_eq!(logical_send(&mut primary, &mut relay, now)[3], 13);
     relay.tick(now);
     assert_eq!(logical_send(&mut relay, &mut primary, now)[3], 13);
-    assert_eq!(primary.recovery_air_share(now), Some(25));
+    assert_eq!(primary.negotiated_air_share(now), Some(25));
     relay
 }
 fn rf_reply(query: &[u8]) -> Vec<u8> {
@@ -237,13 +238,12 @@ fn writer_debt_case(path: &std::path::Path, wire_bytes: usize, start: u64) {
     let after_next = {
         let guard = uart.write_lock.lock().unwrap();
         let cap = guard.radio_capacity.as_ref().unwrap();
-        assert_eq!(cap.airtime_config(), (32000, 15));
+        // A relay request no longer downshifts the primary: its share and
+        // its unpaid air debt are both kept exactly.
+        assert_eq!(cap.airtime_config(), (32000, 25));
         cap.next_air_virtual_ms().unwrap()
     };
-    assert!(
-        after_next >= start + 3080 + ((before_next - (start + 3080)) * 25).div_ceil(15),
-        "downshiftmustretainandrescaleallunpaidairdebt"
-    );
+    assert_eq!(after_next, before_next, "unpaid air debt is retained, never forgiven");
     let mut buffered = Vec::new();
     let mut grant_at = None;
     let mut false_health_at = None;
@@ -282,7 +282,7 @@ fn writer_debt_case(path: &std::path::Path, wire_bytes: usize, start: u64) {
                     .as_ref()
                     .unwrap()
                     .airtime_config(),
-                (32000, 15)
+                (32000, 25)
             );
             if body[3] == 0 {
                 assert_eq!(body[12], 0);
@@ -332,10 +332,11 @@ fn writer_debt_case(path: &std::path::Path, wire_bytes: usize, start: u64) {
     }
     assert!(false_health_at.is_some());
     let grant_at = grant_at.expect("realwriter makesprotocolprogressafterpaid204/374Bowner");
-    assert!(grant_at - (start + 2999) >= (wire_bytes as u64 + 16) * 1000 / 600);
+    // The primary keeps its 25% share (1000 B/s at 32 kbit/s) throughout.
+    assert!(grant_at - (start + 2999) >= (wire_bytes as u64 + 16) * 1000 / 1000);
     assert!(grant_at < start + 5000);
     println!(
-        "actualpaidowner{wire_bytes}B falseHEALTHat{:?} GRANTat{} capacity15",
+        "actualpaidowner{wire_bytes}B falseHEALTHat{:?} GRANTat{} capacity25",
         false_health_at.map(|t| t - start),
         grant_at - start
     );
@@ -463,7 +464,7 @@ fn reserved_revoke_keeps_wire_context_after_actual_refusal(
             .as_ref()
             .unwrap()
             .airtime_config(),
-        (32000, 15)
+        (32000, 25)
     );
     println!(
         "ACTUAL_RESERVED_REVOKE prefix{limit} frozen_seq0_after_full_HEALTH1 fullretry{}B",

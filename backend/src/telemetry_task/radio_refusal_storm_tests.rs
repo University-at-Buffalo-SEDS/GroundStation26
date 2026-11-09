@@ -433,3 +433,72 @@ fn modeled_bench_uplink_keeps_receipts_time_sync_and_commands_flowing() {
         "refusals are re-offers of frames that cannot move: {report:#?}"
     );
 }
+
+/// Frames per second the RFD writer's capacity model admits for a queue of
+/// small frames (receipts and heartbeats), driven like the generic worker.
+fn capacity_frames_per_second(share: u64, gap_ms: u64, receipts: bool) -> (f64, f64) {
+    use crate::comms::rfd_capacity::{Capacity, Defaults};
+    use crate::comms::virtual_uart::WireDrain;
+    let mut cap = Capacity::from_defaults(115200, Defaults {
+        air_bps: 32_000, overhead_bytes: 16, packet_burst_ms: 100, packet_gap_ms: gap_ms, host_share_percent: share,
+    });
+    let mut wire = WireDrain::default();
+    let (mut frames, mut bytes) = (0u64, 0u64);
+    let seconds = 20u64;
+    let mut n = 0u64;
+    for now in 1_000..1_000 + seconds * 1000 {
+        if !wire.ready(now) { continue; }
+        n += 1;
+        let body = if receipts {
+            serialize::pack_packet(&Packet::new(DataType::ReliableAck, &[sedsnet::config::DataEndpoint::TelemetryError], "GS", now, Arc::from(n.to_le_bytes())).unwrap()).to_vec()
+        } else {
+            vec![0x55; 40]
+        };
+        let priority = 255;
+        let contract = crate::comms::radio_packet_boundary_contract(priority, &body);
+        let framed = crate::comms::reference_decoder::frame_data(&body).unwrap();
+        let wall = std::time::Instant::now();
+        let ready = match contract {
+            Some((id, true)) => cap.ready_for_receipt(wall, Some(now), id, framed.len()),
+            Some((id, false)) => cap.ready_for_command(wall, Some(now), id, framed.len(), false),
+            None => cap.ready_for(wall, Some(now), false),
+        };
+        if !ready { n -= 1; continue; }
+        let len = framed.len();
+        match contract {
+            Some((id, true)) => { cap.committed_receipt(wall, Some(now), id, len, len, true); }
+            _ => cap.committed(wall, Some(now), len),
+        }
+        wire.committed(now, len, 115200);
+        cap.drained_virtual(wire.stop_us());
+        if crate::comms::closes_radio_packet_batch(priority, &body) {
+            cap.close_packet_batch_for_contract(wall, Some(now), contract);
+        }
+        frames += 1;
+        bytes += len as u64;
+    }
+    (frames as f64 / seconds as f64, bytes as f64 / seconds as f64)
+}
+
+/// Bench, Normal mode, no RRLS (Pi, aed4351): after one 3 s gap in direct
+/// AV-bay frames the primary requested a relay and dropped to the 15% relay
+/// share, held until 5 s of continuous direct frames. Its uplink then carried
+/// about 390 B/s, 6.3 ACK-sized frames per second, against about 5.8 ACKs/s
+/// of demand (253 reliable AV-bay messages per minute plus retransmission
+/// copies), so heartbeats, time sync and commands got no airtime and the
+/// router queue grew to 14k frames. Drives the real recovery Mesh into that
+/// state and the real capacity model at whatever share it then applies.
+#[test]
+fn primary_requesting_a_relay_still_carries_the_bench_receipt_load() {
+    crate::telemetry_schema::initialize().unwrap();
+    let mut primary = crate::rrls::Mesh::new(crate::rrls::Role::Primary, 1);
+    primary.tick(3_000); // no direct AV-bay frame for 3 s, no RRLS answers
+    let profile_share = 25;
+    let share = primary.recovery_air_share(3_000).map_or(profile_share, u64::from);
+    let bench_ack_bytes_per_s = 5.8 * 67.0;
+    let (frames, bytes) = capacity_frames_per_second(share, 55, true);
+    assert!(
+        bytes > bench_ack_bytes_per_s * 1.5,
+        "share {share}%: {frames:.1} receipt frames/s, {bytes:.0} B/s against {bench_ack_bytes_per_s:.0} B/s of ACK demand"
+    );
+}

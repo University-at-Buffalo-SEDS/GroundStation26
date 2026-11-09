@@ -840,7 +840,7 @@ async fn queued_revoke_follows_completed_health_before_startup_controls() {
             shared.lock().unwrap().incoming(command, &body, now);
         }
         if now == 1495 {
-            share_before_controls = shared.lock().unwrap().recovery_air_share(now);
+            share_before_controls = shared.lock().unwrap().negotiated_air_share(now);
         }
         if now >= 1502 && !submitted {
             for (n, name) in ["FLIGHT_STATE", "AV_BAY_UNDERGLOW", "FLIGHT_BUZZER"]

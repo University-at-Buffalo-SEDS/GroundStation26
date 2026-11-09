@@ -287,7 +287,8 @@ async fn root_profile_clock_and_catalog_share_ordinary_service() {
     relay.tick(30843);
     boot(&mut relay, &mut primary);
     boot(&mut primary, &mut relay);
-    assert_eq!(primary.recovery_air_share(30843), Some(15));
+    assert_eq!(primary.negotiated_air_share(30843), Some(15));
+    assert_eq!(primary.recovery_air_share(30843), None, "the primary keeps its share");
     assert_eq!(relay.recovery_air_share(30843), Some(35));
     let primary = Arc::new(Mutex::new(primary));
     let relay = Arc::new(Mutex::new(relay));
