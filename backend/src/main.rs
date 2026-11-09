@@ -709,6 +709,120 @@ mod router_link_policy_tests {
         );
     }
 
+    /// Discovery types (the test above) are never compressed whatever the
+    /// threshold, so that test cannot catch a station that compresses board
+    /// traffic. Every board builds SEDSnet with zstd and so advertises the
+    /// payload-compression link capability, yet none has the heap to run it
+    /// (decompression needs a ~96 KiB context; the largest board heap is
+    /// ~14 KiB). A compressed command is not decoded, not acknowledged and is
+    /// retransmitted until retries run out. Send an ordinary, compressible
+    /// board-bound command over the station's radio side options to a
+    /// codec-capable peer and require plain payloads on the air.
+    #[test]
+    fn board_bound_commands_stay_plain_to_a_codec_capable_board() {
+        use std::collections::VecDeque;
+        let _tuning = crate::RUNTIME_TUNING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = sedsnet::config::runtime_tuning_config();
+        sedsnet::config::set_runtime_tuning_config(super::network_delivery_tuning()).unwrap();
+
+        let ty = super::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST");
+        let endpoint = super::telemetry_schema::endpoint("BOARD_RECOVERY_RF");
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let seen = delivered.clone();
+        let now = Arc::new(AtomicU64::new(1_000));
+        let (gs_clock, rf_clock) = (now.clone(), now.clone());
+        let to_rf: Arc<Mutex<VecDeque<Vec<u8>>>> = Default::default();
+        let to_gs: Arc<Mutex<VecDeque<Vec<u8>>>> = Default::default();
+        let gs = sedsnet::router::Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([]).with_sender("GS"),
+            Box::new(move || gs_clock.load(Ordering::Relaxed)),
+        );
+        let rf = sedsnet::router::Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([EndpointHandler::new_packet_handler(
+                endpoint,
+                move |_packet: &Packet| {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                },
+            )])
+            .with_sender("RF"),
+            Box::new(move || rf_clock.load(Ordering::Relaxed)),
+        );
+        let link = || {
+            RouterSideOptions {
+                reliable_enabled: false,
+                ..Default::default()
+            }
+            .with_small_packet_transport(RADIO_SIDE_MAX_FRAME_BYTES)
+        };
+        let queue = to_rf.clone();
+        let gs_side = gs.add_side_packed_with_options(
+            "radio",
+            move |frame: &[u8]| {
+                queue.lock().unwrap().push_back(frame.to_vec());
+                Ok(())
+            },
+            link(),
+        );
+        let queue = to_gs.clone();
+        let rf_side = rf.add_side_packed_with_options(
+            "radio",
+            move |frame: &[u8]| {
+                queue.lock().unwrap().push_back(frame.to_vec());
+                Ok(())
+            },
+            link(),
+        );
+        let mut command_frames = Vec::new();
+        let mut pump = |watch: bool| {
+            for _ in 0..8 {
+                let frames: Vec<_> = to_rf.lock().unwrap().drain(..).collect();
+                for frame in frames {
+                    if watch
+                        && sedsnet::wire_format::peek_frame_info(&frame)
+                            .is_ok_and(|info| info.envelope.ty == ty)
+                    {
+                        command_frames.push(frame.clone());
+                    }
+                    let _ = rf.rx_packed_from_side(&frame, rf_side);
+                    let _ = rf.process_all_queues();
+                }
+                let frames: Vec<_> = to_gs.lock().unwrap().drain(..).collect();
+                for frame in frames {
+                    let _ = gs.rx_packed_from_side(&frame, gs_side);
+                    let _ = gs.process_all_queues();
+                }
+                let _ = gs.periodic(0);
+                let _ = rf.periodic(0);
+            }
+        };
+        // Both learn each other's link capabilities, zstd included.
+        for _ in 0..40 {
+            let _ = gs.announce_discovery();
+            let _ = rf.announce_discovery();
+            pump(false);
+            now.fetch_add(50, Ordering::Relaxed);
+        }
+        // 32 B, all zero: zstd shrinks it, so only the station's policy keeps it plain.
+        let packet = Packet::new(ty, &[endpoint], "GS", now.load(Ordering::Relaxed), vec![0u8; 32].into())
+            .unwrap();
+        gs.tx(packet).unwrap();
+        for _ in 0..20 {
+            pump(true);
+            now.fetch_add(50, Ordering::Relaxed);
+        }
+        sedsnet::config::set_runtime_tuning_config(previous).unwrap();
+
+        assert!(!command_frames.is_empty(), "the command never reached the radio side");
+        for frame in &command_frames {
+            assert_eq!(frame[0] & 0x01, 0, "board-bound command was zstd-compressed on the air");
+        }
+        assert_eq!(command_frames.len(), 1, "a plain command is delivered and acknowledged once");
+        assert_eq!(delivered.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn no_explicit_clock_preserves_wall_runtime_in_an_isolated_process() {
         const NAME: &str = "router_link_policy_tests::no_explicit_clock_preserves_wall_runtime_in_an_isolated_process";
