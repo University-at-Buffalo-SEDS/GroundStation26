@@ -797,7 +797,10 @@ pub(crate) fn try_release_launch_lock(state: &Arc<AppState>) -> bool {
     let required = crate::board_recovery::scope::mode_scope(crate::station_mode::local_mode())
         & crate::board_abort::present_mask(state);
     let now = Stamp::now();
-    let healthy = {
+    // HITL locks Launch only while a board reports Abort (station_ready above).
+    // Absent, unreachable or not-yet-read-back boards do not hold it.
+    let hitl = crate::station_mode::local_mode() == crate::station_mode::Mode::Hitl;
+    let healthy = if hitl { required } else {
         let inner = state.board_recovery.inner.lock().unwrap();
         BOARDS.iter().enumerate().fold(0u8, |mask, (at, board)| {
             let ok = inner.values[at].as_ref().is_some_and(|row| {
@@ -808,7 +811,7 @@ pub(crate) fn try_release_launch_lock(state: &Arc<AppState>) -> bool {
             if ok { mask | (1 << at) } else { mask }
         })
     };
-    if !launch_lock_release_ready(station_ready, required, healthy) {
+    if !(hitl || launch_lock_release_ready(station_ready, required, healthy)) {
         return false;
     }
     let released = {

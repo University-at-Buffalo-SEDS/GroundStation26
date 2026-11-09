@@ -253,6 +253,7 @@ const LAUNCH: &[Spec] = &[
         summary: "Only a real Launch or Fire attempt locks Launch; a failed or unfinished board reset, an Abort or a T-clock reset never does. The lock releases when every board on the network has a fresh verified readback, taken at least 10 s after the attempt, that is not aborted, is in Startup or Idle with safe outputs, and has no unfinished recovery, while the station is in Startup or Idle; Reset all boards also releases it.",
         details: &[
             "A board that is not on the network does not block the release, but at least one board must be present; a board that reports Abort, missed the last reset or still needs recovery keeps Launch locked.",
+            "HITL releases the lock whenever no board reports Abort and the station is in Startup or Idle; absent, unreachable or not-yet-read-back boards never hold it.",
             "Resetting only the T-clock changes none of these inputs and never unlocks Launch.",
             "While a board recovery is unfinished, Launch is refused with its own message until the recovery completes.",
         ],
