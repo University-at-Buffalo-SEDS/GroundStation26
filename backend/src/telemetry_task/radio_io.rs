@@ -673,8 +673,11 @@ impl TxQueueBudget {
                             .filter(|total| *total + reserved_for_large <= allowance)
                     })
             };
-            // Request rate refusals stay with the router, which owns the share.
-            if admitted.is_err() && self.short_lookahead && !is_managed_variable_request(payload) {
+            // A managed-variable request already passed its rate share
+            // above (refusals for the share stay with the router); like any
+            // ordinary frame it then queues behind parked frames instead of
+            // being refused on every pass and never sent.
+            if admitted.is_err() && self.short_lookahead {
                 drop(commands.take());
                 if let Some(result) =
                     self.try_park(sender, priority, payload, lease, activity, protected, reserved_for_large)

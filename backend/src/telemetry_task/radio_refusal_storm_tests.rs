@@ -718,3 +718,30 @@ fn schema_transfer_does_not_hold_frames_queued_behind_it() {
     assert!(heartbeat_at.is_some_and(|ms| ms < 1_000), "heartbeat waited {heartbeat_at:?} ms");
     assert_eq!(chunks_written, (0..20).collect::<Vec<_>>(), "the schema still completes, in order");
 }
+
+/// MANAGED_VARIABLE_REQUEST was excluded from the park, and nothing may pass
+/// a parked frame, so on a busy radio every request was refused on every
+/// router pass and never sent (faithful simulation: 0 sent, about 230
+/// refusals/s, the largest remaining spin). Within its rate share it now
+/// queues behind the parked frames like any other ordinary frame.
+#[test]
+fn managed_variable_request_is_not_starved_by_parked_frames() {
+    use sedsnet::config::{DataEndpoint, DataType};
+    let request = serialize::pack_packet(&Packet::new(DataType::ManagedVariableRequest, &[DataEndpoint::Discovery], "GS", 1, Arc::from(vec![1u8; 4])).unwrap()).to_vec();
+    let budget = TxQueueBudget::new_radio(2048, 256);
+    let (tx, mut rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
+    budget.try_send(&tx, 0, &[1; 200]).unwrap();
+    budget.try_send(&tx, 0, &[2; 100]).unwrap();
+    assert_eq!(budget.diagnostics()["parked_frames"], 1);
+    budget.try_send(&tx, 254, &request).expect("a request within its share is accepted");
+    let mut written = Vec::new();
+    while let Ok((p, f)) = rx.try_recv() {
+        budget.complete(p, &f);
+        written.push(f);
+        while let Ok((p, f)) = rx.try_recv() {
+            budget.complete(p, &f);
+            written.push(f);
+        }
+    }
+    assert!(written.iter().any(|f| *f == request), "the request reaches the writer");
+}
