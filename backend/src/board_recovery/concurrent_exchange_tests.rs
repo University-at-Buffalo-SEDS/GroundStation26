@@ -267,6 +267,6 @@ async fn prepare_replaces_a_lost_background_query_at_once_and_never_accepts_its_
     wire[32..40].copy_from_slice(&issuer(&state.board_recovery.identity.unwrap()).to_le_bytes());
     let late = Packet::new(crate::telemetry_schema::data_type(STATUS_TYPE),
         &[crate::telemetry_schema::endpoint("GROUND_STATION")], "AB", 1, Arc::from(wire)).unwrap();
-    assert_eq!(super::super::observe(&state, &late), Err("Expired or different recovery query"));
+    assert!(super::super::observe(&state, &late).unwrap_err().contains("Query the board again"));
     assert_ne!(state.board_recovery.inner.lock().unwrap().values[at].as_ref().unwrap().value.nonce, lost);
 }

@@ -131,13 +131,15 @@ async fn resync_refusals_name_the_reason_and_send_nothing() {
     let f = Fixture::new().await;
     let state = f.state();
     resync_model(&f, Board::ActuatorBoard).lock().unwrap().resync = true;
-    for (phase, needle) in [
-        (crate::types::FlightState::Idle, "Recover to Idle"),
-        (crate::types::FlightState::Startup, "Startup"),
+    // Startup and Idle refuse only in test fire; elsewhere they are Resync targets.
+    let test_fire = if crate::runtime_mode::is_test_fire() {
+        vec![(crate::types::FlightState::Idle, "Recover to Idle"), (crate::types::FlightState::Startup, "Startup")]
+    } else { Vec::new() };
+    for (phase, needle) in test_fire.into_iter().chain([
         (crate::types::FlightState::Aborted, "Reset all boards"),
         (crate::types::FlightState::Launch, "Launch onward"),
         (crate::types::FlightState::Landed, "Launch onward"),
-    ] {
+    ]) {
         *state.state.lock().unwrap() = phase;
         let (code, value) = resync_prepare_raw(&f, "AB").await;
         assert_eq!(code, StatusCode::CONFLICT, "{phase:?}: {value}");
@@ -174,7 +176,8 @@ async fn resync_window_is_the_fill_phases_and_armed_without_active_safety() {
         F::Launch, F::Ascent, F::Coast, F::Apogee, F::Descent, F::Reefing, F::Landed,
         F::Recovery, F::Aborted,
     ] {
-        let allowed = matches!(phase, F::PreFill | F::FillTest | F::NitrogenFill | F::NitrousFill | F::Armed);
+        let allowed = matches!(phase, F::PreFill | F::FillTest | F::NitrogenFill | F::NitrousFill | F::Armed)
+            || matches!(phase, F::Startup | F::Idle) && !crate::runtime_mode::is_test_fire();
         *state.state.lock().unwrap() = phase;
         assert_eq!(resync_target(phase), allowed.then_some(phase as u8), "{phase:?}");
         assert_eq!(host_action_allowed(&state, "resync"), allowed, "{phase:?}");
@@ -237,4 +240,56 @@ fn resync_board_reasons_follow_the_readback() {
     let mut commissioning = row(safe | RESYNC_IMPLEMENTATION, 0, 0);
     commissioning.boot = u64::MAX;
     assert!(resync_board_block_reason(Board::ActuatorBoard, Some(&commissioning), Some(5)).unwrap().contains("commissioning"));
+}
+
+/// HITL bench: after a launch the station is back in Idle but AB is still in
+/// Launch (not aborted). Resync to Idle brings it back without an Abort first
+/// and without latching one; unsafe outputs or a latched overpressure refuse.
+#[tokio::test]
+async fn resync_returns_a_board_left_in_launch_to_idle_without_an_abort() {
+    if isolated("resync_returns_a_board_left_in_launch_to_idle_without_an_abort") {
+        return;
+    }
+    if crate::runtime_mode::is_test_fire() { return; }
+    let f = Fixture::new().await;
+    let state = f.state();
+    *state.state.lock().unwrap() = crate::types::FlightState::Idle;
+    let model = resync_model(&f, Board::ActuatorBoard);
+    { let mut m = model.lock().unwrap(); m.resync = true; m.state = crate::types::FlightState::Launch as u8; }
+    f.query(Board::ActuatorBoard).await;
+    let status = resync_status(&f).await;
+    let row = resync_row(&status, "AB");
+    assert_eq!(row["abort_latched"], false, "{status}");
+    assert!(row["resync_blocked_reason"].is_null(), "{status}");
+    // A latched tank overpressure refuses, naming the next action.
+    crate::gse::set_overpressure_latch_for_test(&state, Some(crate::gse::overpressure::Latch {
+        peak_psi: 900.0, threshold_psi: 850.0, at_ms: 1, message: "fixture".into(),
+        relief_commanded: true, abort: crate::gse::overpressure::AbortStage::NotRequired, ab_abort_sent: false,
+    }));
+    let (code, refused) = resync_prepare_raw(&f, "AB").await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert!(refused["message"].as_str().unwrap().contains("overpressure"), "{refused}");
+    crate::gse::set_overpressure_latch_for_test(&state, None);
+    // Outputs that do not read safe refuse too, before anything is sent.
+    model.lock().unwrap().output_override = Some(2);
+    f.query(Board::ActuatorBoard).await;
+    let (code, refused) = resync_prepare_raw(&f, "AB").await;
+    assert_eq!(code, StatusCode::CONFLICT, "{refused}");
+    assert!(model.lock().unwrap().requests.iter().all(|p| p.payload()[1] == 0), "nothing but queries was sent");
+    model.lock().unwrap().output_override = None;
+    f.query(Board::ActuatorBoard).await;
+    let ticket = f.prepare("resync", Some("AB")).await;
+    assert_eq!(ticket["confirmation"], "RESYNC AB TO IDLE");
+    assert_eq!(ticket["resync_target_state"], 1);
+    assert_eq!(ticket["outputs_unchanged"], false);
+    assert!(ticket["summary"].as_str().unwrap().contains("without an Abort"), "{ticket}");
+    assert_eq!(f.confirm(&ticket).await.status(), StatusCode::OK);
+    let op = f.terminal().await;
+    assert_eq!(op["success"], true, "{op}");
+    let m = model.lock().unwrap();
+    assert_eq!((m.state, m.applied), (1, 1));
+    assert!(m.requests.iter().filter(|p| p.payload()[1] != 0).all(|p| p.payload()[1] == 2), "RESYNC, never a RECOVER");
+    drop(m);
+    assert_eq!(state.manual_abort_intent.epoch(), 0, "no Stop was sent");
+    assert!(state.board_abort.masks().0 == 0, "no board Abort");
 }

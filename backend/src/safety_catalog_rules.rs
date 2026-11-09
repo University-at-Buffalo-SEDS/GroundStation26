@@ -365,11 +365,11 @@ const STOP: &[Spec] = &[
     Spec {
         id: "board-resync",
         title: "Resync a board",
-        summary: "Resync sets one Actuator or Valve Board's state machine, phase and recovery epoch to the station's current phase without resetting it to Startup or Idle. No outputs move: it never commands, replays or restores valves, servos, supplies, igniter or stepper, and the board refuses unless its outputs already read safe. Allowed only in the fill phases and Armed, with no sequence moving valves.",
+        summary: "Resync sets one Actuator or Valve Board's state machine, phase and recovery epoch to the station's current phase. To a fill phase or Armed no outputs move: it never commands, replays or restores valves, servos, supplies, igniter or stepper. To Startup or Idle (not in test fire) it brings the board back from any state, including Launch, without an Abort first: the board stops its own launch sequence and drives its outputs to their safe state. The station refuses unless the board's outputs already read safe, no tank overpressure is latched and no sequence is moving valves.",
         details: &[
             "Same flow as Review recovery: PREPARE takes a fresh dedicated query and freezes the board and the phase; the typed confirmation names both (RESYNC AB TO NITROUSFILL); CONFIRM rechecks session, mode, Stop epoch and that the station is still in that phase. The board checks boot, epoch, nonce and source time and advances its epoch.",
             "It clears a board Abort only while the station is not Aborted and no tank overpressure is latched; otherwise it refuses and points to Review recovery or Reset all boards.",
-            "Refused in Startup and Idle (use Review recovery or Reset all boards) and from Launch onward. The flight computer and the metadata boards are not resynced: the FC owns its flight states, and the others already follow the published phase.",
+            "Refused while the station is Aborted, from Launch onward, and in test fire while the station is in Startup or Idle (use Review recovery or Reset all boards there). A board left in Launch after the station returned to Idle is resynced to Idle without an Abort and without latching one. The flight computer and the metadata boards are not resynced: the FC owns its flight states, and the others already follow the published phase.",
         ],
         modes: ALL,
         enforced_in: &["backend/src/board_recovery.rs:resync_target", "backend/src/board_recovery.rs:resync_work_block_reason", "backend/src/gse.rs:overpressure_holds_abort", "ActuatorBoard26/Core/Src/board_recovery_wire.c", "ValveBoard26/Core/Src/thread_comm.c"],

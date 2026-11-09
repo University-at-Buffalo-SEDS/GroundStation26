@@ -454,7 +454,7 @@ pub(super) fn host_action_allowed(state: &AppState, action: &str) -> bool {
 /// which in-flight frames matter to its boards, and an unrelated command
 /// still retrying to another board must not abort it midway.
 fn host_action_allowed_with(state: &AppState, action: &str, router_drained: bool) -> bool {
-    // Resync has its own phase window: the fill phases and Armed, with no
+    // Resync has its own phase window (resync_target), with no
     // sequence moving valves and no active overpressure latch.
     if action == "resync" { return resync_work_block_reason(state).is_none(); }
     if host_safe(state) { return true; }
@@ -474,7 +474,7 @@ fn host_action_allowed_with(state: &AppState, action: &str, router_drained: bool
 /// Why PREPARE's host check failed, naming what to do next.
 fn prepare_host_block_reason(state: &AppState, action: &str) -> String {
     if action == "resync" {
-        return resync_work_block_reason(state).unwrap_or_else(|| "Resync is allowed only in the fill phases and Armed.".into());
+        return resync_work_block_reason(state).unwrap_or_else(|| "Resync is not allowed in the station's current phase.".into());
     }
     if let Some(reason) = crate::gse::operator_reset_block_reason(state) {
         return reason;
@@ -855,7 +855,7 @@ fn prepare_inner(
     // require the station to still be in exactly this phase.
     let resync_phase = if request.action == "resync" {
         Some(resync_target(state.local_flight_state_snapshot())
-            .ok_or("Resync is allowed only in the fill phases and Armed")?)
+            .ok_or("Resync is not allowed in the station's current phase")?)
     } else {
         None
     };
@@ -1016,8 +1016,9 @@ fn prepare_inner(
         .iter()
         .any(|t| t.context.boot == u64::MAX || t.context.result == 7 || t.first_binding.is_some());
     let resync_label = resync_phase.map(phase_label);
-    let resync_summary = resync_label.as_ref().zip(names.first()).map(|(label, board)| format!(
-        "Resync {board} to {label}. This sets only the board's state machine, phase and recovery epoch to match the station, and clears a latched board Abort. No outputs move: valves, servos, supplies, igniter and stepper stay exactly as they are and must already read safe. Command any output explicitly afterwards."));
+    let resync_summary = resync_label.as_ref().zip(names.first()).map(|(label, board)| if resync_phase.is_some_and(|phase| phase <= 1) { format!(
+        "Resync {board} to {label}. The board leaves whatever state it is in, including Launch, without an Abort: it stops its own launch sequence, drives its outputs to their safe state, and sets its state machine, phase and recovery epoch to match the station. Its outputs must already read safe.") } else { format!(
+        "Resync {board} to {label}. This sets only the board's state machine, phase and recovery epoch to match the station, and clears a latched board Abort. No outputs move: valves, servos, supplies, igniter and stepper stay exactly as they are and must already read safe. Command any output explicitly afterwards.") });
     let phrase = if let (Some(label), Some(board)) = (resync_label.as_ref(), names.first()) {
         format!("RESYNC {board} TO {}", label.to_ascii_uppercase())
     } else { format!(
@@ -1031,7 +1032,7 @@ fn prepare_inner(
         if commissioning { " COMMISSION" } else { "" }
     ) };
     let context = principal_context(&identity, headers, principal);
-    let value = json!({"ticket":id,"backend_instance":hex(&identity),"principal_context":context,"reset_epoch":format!("{:016x}",token.generation),"expires_in_ms":original_query_remaining(&targets,Stamp::now()).as_millis() as u64,"action":request.action,"targets":names,"global_startup_best_effort":matches!(request.action.as_str(),"reset_startup"|"reset_startup_all7"),"required_proof_boards":reset_selection.map(|s|s.required_boards()),"unselected_board_verification":"unverified_best_effort","resync_target_state":resync_phase,"resync_target_label":resync_label,"outputs_unchanged":resync_phase.is_some(),"summary":if let Some(text)=resync_summary.as_deref() {text} else if targets.iter().any(|target| target.first_binding.is_some()) {"Identity reconciliation ONLY for retained uncertain FIRST targets. Other targets will not reset/apply in this attempt. IO cannot clear state; a fresh Query and another distinct human confirmation are required."}else if commissioning{"Explicit commissioning leg; IO is not completion. A separate fresh confirmation is required after provisioning."}else if request.action=="recover_abort" {match targets.first().map(|target|target.board) {Some(Board::FlightComputer)=>"Reset/recover FC to Startup with verified evaluator and safe-output ownership. Preserve deployment history; a separate new flight is required. No MCU reboot or output replay.",Some(Board::RFBoard|Board::PowerBoard|Board::GatewayBoard|Board::DaqBoard)=>"Reset only selected cached application metadata to Startup. No physical recovery, power cycling, acquisition reset, reboot or resync.",_=>"Recover selected AB/VB application state to Idle with verified safe outputs. A completed launch can recover directly; active launch work must finish or be explicitly stopped first. No MCU reboot or physical-position proof."}}else{"Explicit GLOBAL Startup broadcast to ALL boards (best effort). Selected boards are verified; active launch work must finish or be explicitly stopped first. Clock, calibration and network power are preserved. Unselected boards remain unverified."},"confirmation":phrase,"still_unfinished_after":carried.iter().map(|t|t.board.as_str()).collect::<Vec<_>>()});
+    let value = json!({"ticket":id,"backend_instance":hex(&identity),"principal_context":context,"reset_epoch":format!("{:016x}",token.generation),"expires_in_ms":original_query_remaining(&targets,Stamp::now()).as_millis() as u64,"action":request.action,"targets":names,"global_startup_best_effort":matches!(request.action.as_str(),"reset_startup"|"reset_startup_all7"),"required_proof_boards":reset_selection.map(|s|s.required_boards()),"unselected_board_verification":"unverified_best_effort","resync_target_state":resync_phase,"resync_target_label":resync_label,"outputs_unchanged":resync_phase.is_some_and(|phase| phase > 1),"summary":if let Some(text)=resync_summary.as_deref() {text} else if targets.iter().any(|target| target.first_binding.is_some()) {"Identity reconciliation ONLY for retained uncertain FIRST targets. Other targets will not reset/apply in this attempt. IO cannot clear state; a fresh Query and another distinct human confirmation are required."}else if commissioning{"Explicit commissioning leg; IO is not completion. A separate fresh confirmation is required after provisioning."}else if request.action=="recover_abort" {match targets.first().map(|target|target.board) {Some(Board::FlightComputer)=>"Reset/recover FC to Startup with verified evaluator and safe-output ownership. Preserve deployment history; a separate new flight is required. No MCU reboot or output replay.",Some(Board::RFBoard|Board::PowerBoard|Board::GatewayBoard|Board::DaqBoard)=>"Reset only selected cached application metadata to Startup. No physical recovery, power cycling, acquisition reset, reboot or resync.",_=>"Recover selected AB/VB application state to Idle with verified safe outputs. A completed launch can recover directly; active launch work must finish or be explicitly stopped first. No MCU reboot or physical-position proof."}}else{"Explicit GLOBAL Startup broadcast to ALL boards (best effort). Selected boards are verified; active launch work must finish or be explicitly stopped first. Clock, calibration and network power are preserved. Unselected boards remain unverified."},"confirmation":phrase,"still_unfinished_after":carried.iter().map(|t|t.board.as_str()).collect::<Vec<_>>()});
     let mut control = state.board_recovery.coordinator.0.lock().unwrap();
     if control.shutdown_closed || state.shutdown_requested.load(Ordering::Acquire) { return Err("Ground station is shutting down"); }
     if control

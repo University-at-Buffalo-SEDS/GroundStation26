@@ -237,13 +237,17 @@ fn targeted_recovery_state(board: Board) -> Option<u8> {
 fn resync_board(board: Board) -> bool {
     matches!(board, Board::ActuatorBoard | Board::ValveBoard)
 }
-/// Station phases a board may be resynced to: the fill phases and Armed.
-/// Startup and Idle use Recover/Reset, whose board paths drive or re-assert
-/// outputs; from Launch onward nothing aborts, recovers or acts automatically.
+/// Station phases a board may be resynced to: Startup, Idle, the fill phases
+/// and Armed. Resync to Startup or Idle brings a board back from any state,
+/// including Launch, without an Abort first: the board stops its own launch
+/// owner and drives its outputs safe (AB/VB firmware that accepts RESYNC to
+/// Startup/Idle). Test fire keeps Startup/Idle on Recover/Reset. From Launch
+/// onward the station itself never resyncs: the Flight Computer owns flight.
 // Safety catalog (About safety): board-resync. Keep backend/src/safety_catalog_rules.rs in step.
 pub(crate) fn resync_target(state: crate::types::FlightState) -> Option<u8> {
     use crate::types::FlightState as F;
-    matches!(state, F::PreFill | F::FillTest | F::NitrogenFill | F::NitrousFill | F::Armed)
+    (matches!(state, F::PreFill | F::FillTest | F::NitrogenFill | F::NitrousFill | F::Armed)
+        || matches!(state, F::Startup | F::Idle) && !crate::runtime_mode::is_test_fire())
         .then_some(state as u8)
 }
 fn phase_label(state: u8) -> String {
@@ -260,8 +264,8 @@ pub(crate) fn resync_work_block_reason(state: &AppState) -> Option<String> {
     use crate::types::FlightState as F;
     let phase = state.local_flight_state_snapshot();
     match phase {
-        F::Startup => return Some("The station is in Startup and moves to Idle on its own. Resync matches a board to a fill phase or Armed; use Review recovery or Reset all boards to return a board to Startup or Idle.".into()),
-        F::Idle => return Some("The station is Idle. Use Review recovery (Recover to Idle) to return a board to Idle; Resync is for the fill phases and Armed.".into()),
+        F::Startup if crate::runtime_mode::is_test_fire() => return Some("The station is in Startup and moves to Idle on its own. In test fire, Resync matches a board to a fill phase or Armed; use Review recovery or Reset all boards to return a board to Startup or Idle.".into()),
+        F::Idle if crate::runtime_mode::is_test_fire() => return Some("The station is Idle. In test fire, use Review recovery (Recover to Idle) to return a board to Idle; Resync is for the fill phases and Armed.".into()),
         F::Aborted => return Some("The station is Aborted, so Resync cannot clear a board's Abort. Use Review recovery or Reset all boards.".into()),
         _ if resync_target(phase).is_none() => return Some("Resync is not available from Launch onward: nothing aborts or acts automatically after Launch, and the Flight Computer owns the flight states.".into()),
         _ => {}
@@ -489,7 +493,7 @@ pub(crate) fn observe(state: &AppState, packet: &Packet) -> Result<(), &'static 
             .checked_duration_since(query.sent)
             .is_none_or(|age| age > QUERY_TTL)
     {
-        return Err("Expired or different recovery query");
+        return Err("Ignored a late reply to an expired or superseded board query (harmless). Query the board again, or open Review recovery, which takes its own fresh query.");
     }
     if query.received {
         return Ok(());
@@ -889,6 +893,19 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         && principal.permissions.send_commands
         && coordinator::host_action_allowed(&state, "reset_startup")
         && state.launch_history.lock().unwrap().recovery_available();
+    // Why Recover is unavailable, so an operator (or an anonymous view) sees
+    // the next action instead of a bare false capability.
+    let recover_blocked = (!can_recover).then(|| {
+        if !primary { return "Only the primary ground station can recover boards.".to_string(); }
+        if principal.anonymous { return "Sign in with an account that can send commands to recover boards.".to_string(); }
+        if !principal.permissions.send_commands { return "Your account cannot send commands.".to_string(); }
+        if !network_utc_available { return "Network time is not available yet; wait for the boards' time sync.".to_string(); }
+        if !state.launch_history.lock().unwrap().recovery_available() {
+            return "Launch history storage is unavailable, so a recovery cannot be recorded.".to_string();
+        }
+        if let Some(reason) = crate::gse::operator_work_block_reason(&state) { return reason; }
+        format!("Review recovery needs the station in Startup, Idle or Aborted (now {:?}). Use Reset all boards, or Resync an Actuator or Valve Board.", state.local_flight_state_snapshot())
+    });
     let reset_startup_blocked = (!can_reset_startup).then(|| {
         if !primary { return "Only the primary ground station can reset boards.".to_string(); }
         if principal.anonymous { return "Sign in to reset boards.".to_string(); }
@@ -980,7 +997,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
     let build = serde_json::to_value(mode.local_build_mode).unwrap();
     Json(json!({"version":1,"backend_instance":hex(&identity),"principal":{"username":principal.username,"context":principal_context(&identity,&headers,&principal)},"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state)),"flight_state":state.local_flight_state_snapshot()as u8,"automatic_actions_inhibited":state.launch_history.lock().unwrap().automatic_actions_inhibited(),
         "clock":{"network_utc_available":network_utc_available,"required_for_recovery":true},
-        "permissions":{"query":primary,"recover":can_recover,"reset_startup":can_reset_startup,"change_mode":false},"reset_startup_blocked_reason":reset_startup_blocked,
+        "permissions":{"query":primary,"recover":can_recover,"reset_startup":can_reset_startup,"change_mode":false},"reset_startup_blocked_reason":reset_startup_blocked,"recover_blocked_reason":recover_blocked,
         "resync_target_state":resync_target_state,"resync_target_label":resync_target_state.map(phase_label),
         "reset_startup_policy":reset_startup_policy,
         "confirmation":confirmation,"host_recovery":host_pending.map(|pending|json!({"pending":!pending.published,"verified":pending.verified,"publication_acknowledged":pending.published,"targets":pending.targets.iter().map(|target|target.board.as_str()).collect::<Vec<_>>()})),

@@ -154,7 +154,7 @@ impl RecoveryIntent {
         // fill phase or Armed on AB/VB only, from a known boot generation.
         let resync = self.body[1] == 2
             && matches!(board, "AB" | "VB")
-            && (2..=6).contains(&self.body[2])
+            && self.body[2] <= 6
             && self.boot() != u64::MAX;
         ensure!(
             self.body[0] == 1

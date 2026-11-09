@@ -158,7 +158,8 @@ impl Exchange {
         let desired_allowed = match operation {
             OP_RECOVER => desired == 0
                 || (desired == 1 && matches!(board, Board::ActuatorBoard | Board::ValveBoard)),
-            // The fill phases and Armed only, on a board that advertises it,
+            // The station's phase (Startup/Idle outside test fire, the fill
+            // phases and Armed), on a board that advertises it,
             // from a known identity and outputs that already read safe.
             OP_RESYNC => resync_board(board)
                 && crate::types::u8_to_flight_state(desired).and_then(resync_target) == Some(desired)
@@ -404,13 +405,15 @@ mod tests {
         let prepare = |board, q: &Observation, desired| {
             Exchange::prepare_operation_at(board, q, 2, OP_RESYNC, desired, now, router.clone(), boundary)
         };
-        for phase in 2..=6 {
+        let first = if crate::runtime_mode::is_test_fire() { 2 } else { 0 };
+        for phase in first..=6 {
             let exchange = prepare(Board::ActuatorBoard, &query(ready, 0, 42), phase).unwrap();
             assert_eq!(&exchange.packet(now).unwrap().payload()[..4], &[1, OP_RESYNC, phase, 0]);
         }
-        // Startup/Idle, Launch onward, other boards, no capability bit, unsafe
-        // outputs and the commissioning sentinel are refused before any packet.
-        for phase in [0, 1, 7, 8, 13, 14, 15] {
+        // Launch onward (and Startup/Idle in test fire), other boards, no
+        // capability bit, unsafe outputs and the commissioning sentinel are
+        // refused before any packet.
+        for phase in (0..first).chain([7, 8, 13, 14, 15]) {
             assert!(prepare(Board::ActuatorBoard, &query(ready, 0, 42), phase).is_err(), "{phase}");
         }
         for board in [Board::FlightComputer, Board::GatewayBoard, Board::DaqBoard] {

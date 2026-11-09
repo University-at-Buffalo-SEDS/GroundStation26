@@ -42,11 +42,11 @@ fn pending(board: &str, operation: u8, desired: u8, boot: u64) -> RecoveryPendin
 #[test]
 fn resync_intent_is_journaled_only_for_ab_vb_fill_phases_and_armed() {
     for board in ["AB", "VB"] {
-        for phase in 2..=6 {
+        for phase in 0..=6 {
             assert!(pending(board, 2, phase, 42).validate().is_ok(), "{board} {phase}");
-            assert!(pending(board, 1, phase, 42).validate().is_err(), "RECOVER {board} {phase}");
+            if phase > 1 { assert!(pending(board, 1, phase, 42).validate().is_err(), "RECOVER {board} {phase}"); }
         }
-        for phase in [0, 1, 7, 8, 13, 14, 15] {
+        for phase in [7, 8, 13, 14, 15] {
             assert!(pending(board, 2, phase, 42).validate().is_err(), "{board} {phase}");
         }
         assert!(pending(board, 2, 5, u64::MAX).validate().is_err(), "no commissioning resync");
