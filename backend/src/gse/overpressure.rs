@@ -52,6 +52,9 @@ const SENSOR_FAULT_SHOW_MS: u64 = 60_000;
 /// (re)connecting describes the outage or its restart, which the board-offline
 /// alert already covers, so it is recorded but not raised as a warning.
 const SENSOR_STALE_RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Likewise a "sensor stale" report while the Valve Board applies a recover
+/// or resync (recorded, shown in the GSE panel, not raised as a warning).
+const SENSOR_STALE_RECOVERY_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 /// A sample older than this is stale and neither counts nor clears a streak.
 const FRESH_MS: u64 = 2000;
 
@@ -552,12 +555,17 @@ pub(crate) fn board_warning(state: &Arc<AppState>, text: &str) -> Option<String>
     };
     let display = text[..text.rfind(" [").unwrap_or(text.len())].to_string();
     let burn = launched(state);
-    let settled_connection = state
+    let quiet_period_over = state
         .network_health
         .lock()
         .unwrap()
         .connected_for(crate::types::Board::ValveBoard.sender_id(), std::time::Instant::now())
-        .is_some_and(|connected| connected >= SENSOR_STALE_RECONNECT_GRACE);
+        .is_some_and(|connected| connected >= SENSOR_STALE_RECONNECT_GRACE)
+        // While it applies a recover or resync the board drives its outputs
+        // safe and can miss samples; that gap is not a sensor fault.
+        && !state
+            .board_recovery
+            .apply_requested_within(crate::types::Board::ValveBoard, SENSOR_STALE_RECOVERY_GRACE);
     let action = {
         let mut rt = state.gse.lock().unwrap();
         let now = rt.now();
@@ -574,7 +582,7 @@ pub(crate) fn board_warning(state: &Arc<AppState>, text: &str) -> Option<String>
                     b.code == code && now.saturating_sub(b.at_ms) < SENSOR_FAULT_SHOW_MS
                 });
                 rt.overpressure.board_sensor = Some(BoardReport { code, psi, trip, at_ms: now });
-                if code == 'S' && !settled_connection {
+                if code == 'S' && !quiet_period_over {
                     return None;
                 }
                 return (!repeat).then(|| match code {

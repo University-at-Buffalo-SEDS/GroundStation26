@@ -197,6 +197,28 @@ pub(crate) struct Runtime {
     coordinator: coordinator::Runtime,
     inner: Mutex<Inner>,
     pub(crate) manual_utc: crate::manual_abort_utc::Runtime,
+    /// When the station last asked each board (by `index`) to apply a recover
+    /// or resync, in station wall ms. A board may briefly stop sampling while
+    /// it drives its outputs safe; its warnings from that window are not faults.
+    apply_requested_ms: [std::sync::atomic::AtomicU64; 7],
+}
+impl Runtime {
+    pub(crate) fn note_apply_requested(&self, board: Board) {
+        if let Some(i) = index(board) {
+            self.apply_requested_ms[i].store(
+                crate::telemetry_task::get_current_timestamp_ms(),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+    }
+    pub(crate) fn apply_requested_within(&self, board: Board, window: Duration) -> bool {
+        index(board).is_some_and(|i| {
+            let at = self.apply_requested_ms[i].load(std::sync::atomic::Ordering::Acquire);
+            at != 0
+                && crate::telemetry_task::get_current_timestamp_ms().saturating_sub(at)
+                    <= window.as_millis() as u64
+        })
+    }
 }
 impl Default for Runtime {
     fn default() -> Self {
@@ -217,6 +239,7 @@ impl Default for Runtime {
                 rejected_statuses: 0,
                 last_rejection: None,
             }),
+            apply_requested_ms: Default::default(),
         }
     }
 }

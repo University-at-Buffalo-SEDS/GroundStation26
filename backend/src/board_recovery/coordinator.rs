@@ -1555,6 +1555,7 @@ async fn exchange(
     {
         return Err("Prepared SDK request differs from sealed durable intent");
     }
+    state.board_recovery.note_apply_requested(target.board);
     state
         .board_recovery
         .coordinator

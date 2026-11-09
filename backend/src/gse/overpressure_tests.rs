@@ -390,6 +390,13 @@ async fn stale_sensor_reports_stay_quiet_while_the_valve_board_is_offline_or_rec
     observe(&f2, now - std::time::Duration::from_secs(11));
     observe(&f2, now);
     assert_eq!(f2.board(stale).as_deref(), Some("Valve Board overpressure sensor stale"));
+    // While the Valve Board applies a recover or resync it drives its outputs
+    // safe and can miss samples: that stale report is not raised either.
+    let mut f3 = Fixture::new().await;
+    observe(&f3, now - std::time::Duration::from_secs(11));
+    observe(&f3, now);
+    f3.state.board_recovery.note_apply_requested(crate::types::Board::ValveBoard);
+    assert!(f3.board(stale).is_none());
     // Invalid and implausible sensors are real faults and always warn.
     assert!(f.board("Valve Board overpressure sensor invalid: 4095 [F1]").is_some());
 }
