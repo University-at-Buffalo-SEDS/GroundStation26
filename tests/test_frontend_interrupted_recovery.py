@@ -59,6 +59,56 @@ p.joinpath('index.html').write_text(json.dumps({'source':str(Path.cwd()),'target
         values={k:v for k,v in os.environ.items() if k not in ['CARGO_TARGET_DIR',build.BROWSER_ASSET_SOURCE_ENV,'ISOLATION_READY','ISOLATION_RELEASE','ISOLATION_FAIL']}
         return patch.dict(os.environ,values,clear=True)
 
+    def dead_pid(self):
+        process=subprocess.Popen([sys.executable,'-c','pass']);process.wait()
+        return process.pid
+
+    def interrupted(self, source, pid, mtime=None):
+        """Leave the markers and quarantine an interrupted build leaves behind."""
+        public=source/'dist/public';public.mkdir(parents=True);(public/'index.html').write_text('partial')
+        prior=source/'dist/.gs-public-prior-x/public';prior.mkdir(parents=True);(prior/'index.html').write_text('old-good')
+        markers=[self.source_marker(source),source.parent/'.target.gs-frontend-in-progress.json']
+        for marker in markers:
+            marker.write_text(json.dumps({'version':1,'pid':pid,'source':str(source),'target':str(source.parent/'target')}))
+            if mtime is not None:os.utime(marker,(mtime,mtime))
+        return markers
+
+    def test_build_resumes_on_its_own_after_its_writer_stopped(self):
+        with tempfile.TemporaryDirectory() as temp, self.clean_env():
+            root=Path(temp);source=self.source(root);markers=self.interrupted(source,self.dead_pid())
+            result=self.invoke(root/'gs',source)
+            self.assertEqual(result['value'],'committed-safe-output')
+            self.assertEqual(Path(result['source']).resolve(),source.resolve(),'resumed in place, no recovery copy')
+            self.assertFalse(any(marker.exists() for marker in markers))
+            self.assertEqual(list((source/'dist').glob('.gs-public-prior-*')),[])
+
+    def test_build_resumes_after_a_reboot_even_if_the_pid_was_reused(self):
+        boot=build._boot_time()
+        if boot is None:self.skipTest('boot time unavailable')
+        with tempfile.TemporaryDirectory() as temp, self.clean_env():
+            root=Path(temp);source=self.source(root)
+            markers=self.interrupted(source,os.getpid(),mtime=boot-60)
+            self.assertEqual(self.invoke(root/'gs',source)['value'],'committed-safe-output')
+            self.assertFalse(any(marker.exists() for marker in markers))
+
+    def test_a_marker_whose_build_is_still_running_is_never_cleared(self):
+        with tempfile.TemporaryDirectory() as temp, self.clean_env():
+            root=Path(temp);source=self.source(root);marker=self.source_marker(source)
+            marker.write_text(json.dumps({'version':1,'pid':os.getpid()}))
+            self.assertIn('still running',build._stale_writer_reason(marker,[source]))
+            stopped=self.source_marker(source).with_name('.other.json')
+            stopped.write_text(json.dumps({'version':1,'pid':self.dead_pid()}))
+            self.assertIsNone(build._stale_writer_reason(stopped,[source]))
+            stopped.write_text(json.dumps({'version':1,'pid':self.dead_pid()}))
+            child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'],cwd=source)
+            try:
+                deadline=time.monotonic()+5
+                while child.pid not in (build._processes_using([source]) or []):
+                    self.assertLess(time.monotonic(),deadline);time.sleep(.05)
+                self.assertIn(str(child.pid),build._stale_writer_reason(stopped,[source]))
+            finally:
+                child.kill();child.wait()
+
     def test_public_wrapper_recovers_source_marker_without_touching_pid_output_or_quarantine(self):
         with tempfile.TemporaryDirectory() as temp, self.clean_env():
             root=Path(temp);source=self.source(root);marker=self.source_marker(source);before=self.mark(marker)

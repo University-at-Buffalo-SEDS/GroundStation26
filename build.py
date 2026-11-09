@@ -337,6 +337,145 @@ def _frontend_public_attempt(checkout: Path, reuse: bool, lifecycle: dict, desti
                 shutil.rmtree(backup)
 
 
+def _boot_time() -> Optional[float]:
+    """When this machine last booted, in Unix seconds, if it can be read."""
+    try:
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True).stdout
+        match = re.search(r"sec = (\d+)", out)
+        return float(match.group(1)) if match else None
+    except OSError:
+        return None
+
+
+def _processes_using(paths: list[Path]) -> Optional[list[int]]:
+    """Live processes working in, naming, or building into one of `paths`, or
+    None when processes cannot be inspected. The environment is matched only
+    on CARGO_TARGET_DIR: a parallel backend build carries the frontend source
+    in GS_FRONTEND_SOURCE_DIR and is not a frontend writer."""
+    needles = {str(path.resolve()) for path in paths}
+    targets = {f"CARGO_TARGET_DIR={needle}" for needle in needles}
+    me = os.getpid()
+    found: set[int] = set()
+    proc = Path("/proc")
+    if proc.is_dir():
+        for entry in proc.iterdir():
+            if not entry.name.isdigit() or int(entry.name) == me:
+                continue
+            try:
+                cwd = os.readlink(entry / "cwd")
+                if any(cwd == n or cwd.startswith(n + "/") for n in needles):
+                    found.add(int(entry.name))
+                    continue
+            except OSError:
+                pass
+            try:
+                command = (entry / "cmdline").read_bytes().split(b"\0")
+                if any(n.encode() in part for part in command for n in needles):
+                    found.add(int(entry.name))
+                    continue
+            except OSError:
+                pass
+            try:
+                environ = (entry / "environ").read_bytes().split(b"\0")
+                if any(t.encode() == part for part in environ for t in targets):
+                    found.add(int(entry.name))
+            except OSError:
+                pass
+        return sorted(found)
+    try:
+        listing = subprocess.run(["ps", "-Eww", "-axo", "pid=,command="], capture_output=True, text=True, check=True).stdout
+        cwds = subprocess.run(["lsof", "-a", "-d", "cwd", "-F", "pn"], capture_output=True, text=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    for line in listing.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if pid.isdigit() and int(pid) != me and any(n in command for n in needles):
+            found.add(int(pid))
+    pid = None
+    for line in cwds.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n") and pid not in (None, me) and any(
+                line[1:] == n or line[1:].startswith(n + "/") for n in needles):
+            found.add(pid)
+    return sorted(found)
+
+
+def _stale_writer_reason(marker: Path, paths: list[Path]) -> Optional[str]:
+    """None when the build that wrote `marker` has provably stopped (with every
+    descendant), else why it may still be writing."""
+    try:
+        if marker.is_symlink() or marker.stat().st_size > 4096:
+            return f"{marker} is not a regular build marker"
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return f"{marker} is unreadable"
+    boot = _boot_time()
+    if boot is not None:
+        recorded = data.get("boot_time")
+        # A reboot since the marker was written ended every writer.
+        if (isinstance(recorded, (int, float)) and abs(recorded - boot) > 2) or marker.stat().st_mtime < boot:
+            return None
+    pid = data.get("pid")
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.kill(pid, 0)
+            return f"its build process {pid} is still running"
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return f"its build process {pid} is still running"
+    users = _processes_using(paths)
+    if users is None:
+        return "running processes could not be inspected"
+    if users:
+        return f"process(es) {', '.join(map(str, users))} still use its source or target"
+    return None
+
+
+def _retire_stale_marker(marker: Path, paths: list[Path], kind: str) -> None:
+    """Clear an interrupted build's marker once its writer has provably stopped,
+    so a rebuild resumes on its own; otherwise refuse and say what is still
+    running. Never kills anything."""
+    reason = _stale_writer_reason(marker, paths)
+    if reason is not None:
+        raise FrontendBuildInterrupted(
+            f"Frontend {kind} has an interrupted/uncertain build that may still be writing: {marker} ({reason}). "
+            "Wait for it to finish, or use a separate checkout and CARGO_TARGET_DIR.", kind)
+    message = f"Resuming after an interrupted frontend build: its writer has stopped; clearing {marker}"
+    print(message)
+    _append_log(message + "\n")
+    if kind == "source":
+        _restore_public_quarantine(paths[0])
+    marker.unlink(missing_ok=True)
+
+
+def _restore_public_quarantine(checkout: Path) -> None:
+    """Put back the prior output an interrupted build moved aside."""
+    for public in (checkout / "dist/public", checkout / "frontend/dist/public"):
+        if not public.parent.is_dir() or not public.parent.resolve().is_relative_to(checkout.resolve()):
+            continue
+        backups = sorted((b for b in public.parent.glob(".gs-public-prior-*") if b.is_dir() and not b.is_symlink()),
+                         key=lambda b: b.stat().st_mtime)
+        if not backups:
+            continue
+        newest = backups[-1] / "public"
+        if newest.is_dir():
+            if public.is_symlink() or public.is_file():
+                public.unlink()
+            elif public.is_dir():
+                shutil.rmtree(public)
+            newest.rename(public)
+        for backup in backups:
+            shutil.rmtree(backup)
+
+
 class FrontendBuildInterrupted(RuntimeError):
     """An ownership marker is evidence of uncertainty, never a PID kill ticket."""
     def __init__(self, message: str, kind: str):
@@ -352,6 +491,8 @@ def _frontend_recovery_target(shared: Path) -> Path:
     expected = {"version": 1, "normal_target": str(shared), "recovery_target": str(target)}
     with _frontend_cache_lock(target.parent / ("." + target.name + ".gs-frontend-selection.lock")):
         interrupted = target.parent / ("." + target.name + ".gs-frontend-in-progress.json")
+        if (interrupted.exists() or interrupted.is_symlink()) and _stale_writer_reason(interrupted, [target]) is None:
+            interrupted.unlink(missing_ok=True)
         if interrupted.exists() or interrupted.is_symlink():
             raise RuntimeError("The fixed frontend recovery source/target is also interrupted or active. "
                                "All writers and markers were preserved; no further caches were allocated. "
@@ -442,9 +583,7 @@ def _run_frontend_script_with_wasm_opt_fallback(
     with _frontend_cache_lock(lease):
         source_marker = checkout.parent / ("." + checkout.name + ".gs-frontend-output-in-progress.json")
         if source_marker.exists() or source_marker.is_symlink():
-            raise FrontendBuildInterrupted(f"interrupted/uncertain frontend checkout output: {source_marker}. "
-                               "Use a separate checkout and CARGO_TARGET_DIR, or confirm all prior writers "
-                               "have stopped before removing its source/target markers and restoring quarantines.", "source")
+            _retire_stale_marker(source_marker, [checkout], "source")
         _run_frontend_script_with_source_lease(script, checkout, args, finish,
                                                publication_destination, source_marker, target_override)
 
@@ -468,9 +607,7 @@ def _run_frontend_script_with_source_lease(
     with _frontend_cache_lock(target.parent / ("." + target.name + ".gs-frontend-build.lock")):
         marker = target.parent / ("." + target.name + ".gs-frontend-in-progress.json")
         if marker.exists() or marker.is_symlink():
-            raise FrontendBuildInterrupted(f"Frontend target has an interrupted/uncertain build: {marker}. "
-                               "Use a separate checkout and CARGO_TARGET_DIR, or confirm all prior build descendants "
-                               "have stopped before manually removing this marker. No stale PID is killed.", "target")
+            _retire_stale_marker(marker, [target, checkout], "target")
         files = _frontend_source_files(checkout)
         digest = hashlib.sha256()
         for path in files:
@@ -509,7 +646,8 @@ def _run_frontend_script_with_source_lease(
         lifecycle = {"stopped": False}
         for ownership_marker in (marker, source_marker):
             with ownership_marker.open("x", encoding="utf-8") as output:
-                json.dump({"version": 1, "source": str(checkout), "target": str(target), "pid": os.getpid()}, output)
+                json.dump({"version": 1, "source": str(checkout), "target": str(target), "pid": os.getpid(),
+                           "boot_time": _boot_time()}, output)
                 output.flush()
                 os.fsync(output.fileno())
         try:
