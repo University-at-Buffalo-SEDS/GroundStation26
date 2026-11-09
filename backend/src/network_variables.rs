@@ -602,6 +602,9 @@ fn publish_network_output(
     fresh: bool,
     reports: u64,
 ) -> Result<()> {
+    if fresh {
+        REPUBLISH_BACKOFF.lock().unwrap()[output.index()].reset();
+    }
     let value = output.requested();
     let packet = packet(output.data_type(), output.endpoint(), u8::from(value))?;
     let id = packet.packet_id();
@@ -615,6 +618,37 @@ fn publish_network_output(
     NETWORK_RECONCILE_ARMED.store(true, Ordering::Release);
     result
 }
+
+/// Automatic republishes of one unconfirmed variable: 10 s, then 20 s, then
+/// at most 30 s apart while the owner stays unreachable (bench S5=10: each
+/// republish exhausted its ordered retries, 90 frames per variable in 75 s).
+/// An operator request publishes at once and starts over, as does a
+/// confirmation.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RepublishBackoff {
+    republishes: u32,
+    last: Option<std::time::Instant>,
+}
+impl RepublishBackoff {
+    fn wait(&self) -> std::time::Duration {
+        let step = network_confirmation::REPUBLISH_GAP;
+        match self.republishes {
+            0 => std::time::Duration::ZERO,
+            n => step.saturating_mul(n.min(3)),
+        }
+    }
+    pub(crate) fn due(&self, now: std::time::Instant) -> bool {
+        self.last.is_none_or(|last| now.saturating_duration_since(last) >= self.wait())
+    }
+    pub(crate) fn republished(&mut self, now: std::time::Instant) {
+        self.republishes = self.republishes.saturating_add(1);
+        self.last = Some(now);
+    }
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+static REPUBLISH_BACKOFF: Mutex<[RepublishBackoff; 2]> = Mutex::new([RepublishBackoff { republishes: 0, last: None }; 2]);
 
 /// Poll the SDK reliable rows for in-flight cosmetic variables and republish
 /// the stored request when the network has not confirmed it. `network_reports`
@@ -667,12 +701,27 @@ pub(crate) fn reconcile_network_outputs<C>(
                 }
             }
         }
+        let mut backoff = REPUBLISH_BACKOFF.lock().unwrap();
+        for output in NetworkOutput::ALL {
+            if !confirmation[output.index()].needs_attention() {
+                backoff[output.index()].reset();
+            }
+        }
         if !confirmation.iter().any(|c| c.needs_attention()) {
             NETWORK_RECONCILE_ARMED.store(false, Ordering::Release);
         }
     }
     for output in republish {
         let reports = network_reports[output.index()];
+        {
+            let mut backoff = REPUBLISH_BACKOFF.lock().unwrap();
+            if !backoff[output.index()].due(now) {
+                // Not yet: wait for more network traffic and the gap again.
+                network_confirmation()[output.index()].publish_failed(now, reports, false);
+                continue;
+            }
+            backoff[output.index()].republished(now);
+        }
         let Some(_claim) = claim() else {
             network_confirmation()[output.index()].publish_failed(now, reports, false);
             continue;
@@ -3047,5 +3096,31 @@ impl AutomaticIdleTestSnapshot {
     }
     pub(crate) fn durable_unchanged(&self, previous: &Self) -> bool {
         self.values == previous.values && self.bytes == previous.bytes
+    }
+}
+
+#[cfg(test)]
+mod republish_backoff_tests {
+    use super::*;
+    /// Faithful bench run (S5=10, downlink lost): AV_BAY_UNDERGLOW and
+    /// FLIGHT_BUZZER republishes exhausted their ordered retries every
+    /// 10-15 s (90 frames each in 75 s) with the FC unreachable. Automatic
+    /// republishes now back off 10 -> 20 -> 30 s; an operator request
+    /// publishes at once and starts over.
+    #[test]
+    fn automatic_republish_backs_off_while_unconfirmed_and_resets_on_a_fresh_request() {
+        let second = std::time::Duration::from_secs(1);
+        let mut t = std::time::Instant::now();
+        let mut backoff = RepublishBackoff::default();
+        assert!(backoff.due(t), "the first republish is not held");
+        backoff.republished(t);
+        for wait in [10u32, 20, 30, 30] {
+            assert!(!backoff.due(t + second * wait - std::time::Duration::from_millis(1)), "{wait}");
+            t += second * wait;
+            assert!(backoff.due(t), "{wait}");
+            backoff.republished(t);
+        }
+        backoff.reset();
+        assert!(backoff.due(t), "a fresh operator request or a confirmation starts over");
     }
 }
