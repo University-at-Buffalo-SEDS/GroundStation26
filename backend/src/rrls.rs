@@ -657,7 +657,6 @@ impl Mesh {
     /// Test fixtures that model an RRLS which hears the AV bay throughout
     /// (the relay case) without feeding it direct AV-bay frames.
     #[cfg(test)]
-    #[allow(dead_code)] // Used only by hitl_mode/firmware_sim fixtures.
     pub(crate) fn assume_av_bay_heard_for_test(&mut self) {
         // hears_av_bay() saturates now - heard to 0: always fresh.
         self.av_bay_heard = Some(u64::MAX);

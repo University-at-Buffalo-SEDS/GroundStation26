@@ -353,7 +353,6 @@ impl Fixture {
     }
     /// The Actuator Board's periodic UMBILICAL_STATUS for the plumbing
     /// retraction (firmware publishes every board state once per second).
-    #[cfg(not(feature = "hitl_mode"))]
     fn report_plumbing_status(&mut self, retracted: bool) {
         let stamp = self.host.network_time_ms().unwrap_or(1);
         self.board.tx_queue(Packet::new(
@@ -1070,7 +1069,7 @@ async fn public_motion_queue_cannot_cross_mode_commit_and_fresh_motion_keeps_ori
     // Test-fire dispatches RetractPlumbing on the umbilical, which needs the
     // Actuator Board's confirmed plumbing state. The real board reports it
     // every second; report it here as that board would.
-    if cfg!(feature = "test_fire_mode") {
+    if crate::runtime_mode::is_test_fire() {
         f.report_plumbing_status(false);
     }
     let journal_pause = Pause::install(f.state.plumbing_drive.motion_journal.path(), true, true, false);

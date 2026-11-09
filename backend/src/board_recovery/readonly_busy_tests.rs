@@ -125,7 +125,7 @@ async fn actual_sdk_poll_skips_cooling_boards_and_advances_round_robin_after_eac
     refresh.last[1] = Some(now);
     // Test-fire has no AV bay: RF, FC and PB are not network peers there, so
     // the first eligible peer after the cooling ones is AB (index 3).
-    let first = if cfg!(feature = "test_fire_mode") { 3 } else { 2 };
+    let first = if crate::runtime_mode::is_test_fire() { 3 } else { 2 };
     let _ = refresh.poll(&state);
     assert_eq!(
         refresh.cursor, first + 1,
