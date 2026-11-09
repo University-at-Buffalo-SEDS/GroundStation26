@@ -117,6 +117,16 @@ const DUMMY_UMBILICAL_TIMESYNC_SOURCES: &[&str] = &["GB", "VB", "AB", "DAQ"];
 /// A trusted command/receipt queue selection can request an immediate packet
 /// boundary. Header presence alone is insufficient: unsequenced SDK headers
 /// also occur on best-effort traffic. Stateful SDT stays opaque and ordered.
+/// Radio priority the station's HEARTBEAT carries when it travels as SDT
+/// (set by the radio budget): it may borrow airtime like a receipt, so the FC
+/// (GND_TIMEOUT 3 s) never waits for an ordinary turn.
+pub(crate) const RADIO_LIVENESS_PRIORITY: u8 = 251;
+/// The same for SDT time sync, which goes after receipts.
+pub(crate) const RADIO_TIME_SYNC_PRIORITY: u8 = 250;
+fn radio_liveness_frame(priority: u8, payload: &[u8]) -> bool {
+    matches!(priority, RADIO_LIVENESS_PRIORITY | RADIO_TIME_SYNC_PRIORITY) && payload.starts_with(b"SDT")
+}
+
 pub(crate) fn closes_radio_packet_batch(priority: u8, payload: &[u8]) -> bool {
     if priority < 200 || payload.starts_with(b"SDT") {
         return false;
@@ -3238,7 +3248,7 @@ impl UartComms {
         }
         if command_id.is_none() && canonical_receipt.is_none() {
             let ready = write_state.radio_capacity.as_ref().is_none_or(|cap| {
-                cap.ready_for(capacity_wall, capacity_clock, close_batch)
+                cap.ready_for(capacity_wall, capacity_clock, close_batch || radio_liveness_frame(priority, payload))
                     || (!close_batch
                         && write_state.ordinary_waiting.is_some_and(|(wall, clock)| match (clock, capacity_clock) {
                             (Some(then), Some(now)) => now.saturating_sub(then) >= ORDINARY_STARVATION_MS,
@@ -3658,7 +3668,13 @@ impl CommsDevice for UartComms {
         }) {
             return false;
         }
-        if control.is_none() && !state.ordinary_ready(wall, clock, closes_radio_packet_batch(priority, payload)) {
+        if control.is_none()
+            && !state.ordinary_ready(
+                wall,
+                clock,
+                closes_radio_packet_batch(priority, payload) || radio_liveness_frame(priority, payload),
+            )
+        {
             return false;
         }
         #[cfg(target_os = "linux")]

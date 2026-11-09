@@ -49,6 +49,11 @@ pub(super) struct UplinkReport {
     /// Age (receive time minus creation stamp) of what the FC received.
     pub heartbeats_received: u64,
     pub heartbeat_age_max_ms: u64,
+    /// Longest time between consecutive heartbeats arriving at the FC.
+    /// FC GND_TIMEOUT is 3 s.
+    pub heartbeat_gap_max_ms: u64,
+    /// Time from the last heartbeat arrival to the end of the run.
+    pub heartbeat_tail_ms: u64,
     pub gps_received: u64,
     pub gps_age_max_ms: u64,
     pub park_bytes_peak: u64,
@@ -146,6 +151,9 @@ pub(super) fn run_uplink_model(
     let fc_clock = clock.clone();
     // (count, max age) for GPS_DATA and HEARTBEAT received by the FC.
     let ages: Arc<Mutex<[(u64, u64); 2]>> = Default::default();
+    // (last heartbeat arrival, longest gap between arrivals)
+    let gaps: Arc<Mutex<(Option<u64>, u64)>> = Default::default();
+    let beat_gaps = gaps.clone();
     let gps_ages = ages.clone();
     let beat_ages = ages.clone();
     let beat_now = clock.clone();
@@ -171,6 +179,11 @@ pub(super) fn run_uplink_model(
                     let now = beat_now.load(Ordering::Acquire);
                     let mut a = beat_ages.lock().unwrap();
                     a[1] = (a[1].0 + 1, a[1].1.max(now.saturating_sub(pkt.timestamp())));
+                    let mut g = beat_gaps.lock().unwrap();
+                    if let Some(last) = g.0 {
+                        g.1 = g.1.max(now.saturating_sub(last));
+                    }
+                    g.0 = Some(now);
                     Ok(())
                 },
             ),
@@ -374,6 +387,9 @@ pub(super) fn run_uplink_model(
     let a = *ages.lock().unwrap();
     (report.gps_received, report.gps_age_max_ms) = a[0];
     (report.heartbeats_received, report.heartbeat_age_max_ms) = a[1];
+    let g = *gaps.lock().unwrap();
+    report.heartbeat_gap_max_ms = if g.0.is_some() { g.1 } else { virtual_ms };
+    report.heartbeat_tail_ms = g.0.map_or(virtual_ms, |last| (start + virtual_ms).saturating_sub(last));
     let fc_stats = fc.export_runtime_stats();
     for side in &fc_stats.sides {
         for ty in &side.data_types {
@@ -1080,12 +1096,20 @@ fn slow_bench_air_keeps_queued_frames_within_two_seconds() {
     assert!(report.park_bytes_peak <= 720, "the park holds about 1.5 s of air: {report:#?}");
     assert!(report.heartbeats_received >= 3, "{report:#?}");
     assert!(report.heartbeat_age_max_ms <= 5_000, "heartbeats arrive within the FC's reach: {report:#?}");
-    assert!(report.gps_received >= 1, "{report:#?}");
-    assert!(report.gps_age_max_ms <= 2_500, "telemetry is never sent stale: {report:#?}");
+    // The link is oversubscribed: receipts, heartbeats (FC GND_TIMEOUT),
+    // time sync and commands win, so the station's own GPS-to-FC telemetry
+    // may not get through at all; what does arrive is never stale.
+    assert!(report.gps_received == 0 || report.gps_age_max_ms <= 2_500, "telemetry is never sent stale: {report:#?}");
+    assert!(report.heartbeat_gap_max_ms <= 2_000, "heartbeats keep the FC alive: {report:#?}");
+    assert!(report.timesync_announces >= 20, "time sync keeps flowing: {report:#?}");
     assert_eq!(report.flight_states_delivered, report.flight_states_sent, "{report:#?}");
     assert_eq!(report.commands_delivered, report.commands_sent, "{report:#?}");
     assert!(report.command_latency_max_ms < 1_000, "{report:#?}");
-    assert!(report.refusals < 25 * report.written_frames, "{report:#?}");
+    // Re-offers of deferred bulk frames (schema chunks, discovery) stay an
+    // order of magnitude below the bench storm (about 4000/s). With heartbeat
+    // and time sync now always served first on this oversubscribed link, more
+    // bulk SDT waits and is re-offered (about 300/s).
+    assert!(report.refusals * 1000 / report.virtual_ms <= 400, "{report:#?}");
 }
 
 /// Faithful bench run (GS fix, bench RF, S5=10): with the downlink dead, the
@@ -1257,4 +1281,38 @@ fn heartbeat_template_install_parks_even_when_schema_chunks_fill_the_park() {
     assert_eq!(budget.diagnostics()["parked_frames"].as_u64().unwrap(), parked + 1);
     budget.try_send(&tx, 255, &install(2)).expect("a newer install of the same template replaces it");
     assert_eq!(budget.diagnostics()["parked_frames"].as_u64().unwrap(), parked + 1, "one install per template");
+}
+
+/// FC GND_TIMEOUT is 3 s and Lost_GroundStation latches, so heartbeats must
+/// keep arriving with gaps well under 3 s even while schema chunks saturate
+/// the radio and other threads make packets concurrently (which changes the
+/// SDK's process-wide packet nonce sequence; one sequence made the SDK re-send
+/// template installs and once held heartbeats off the air for about 9 s).
+#[test]
+fn fc_heartbeat_gap_stays_under_two_seconds_under_schema_saturation_and_nonce_churn() {
+    if crate::operator_queue::isolated_native_case(module_path!(), "fc_heartbeat_gap_stays_under_two_seconds_under_schema_saturation_and_nonce_churn") {
+        return;
+    }
+    crate::telemetry_schema::initialize().unwrap();
+    let mut worst = Vec::new();
+    for _ in 0..8 {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn_stop = stop.clone();
+        let churn = std::thread::spawn(move || {
+            let mut n = 0u64;
+            while !churn_stop.load(Ordering::Relaxed) {
+                n += 1;
+                let _ = Packet::new(DataType::ReliableAck, &[sedsnet::config::DataEndpoint::TelemetryError], "AB", n, Arc::from([0u8; 8]));
+            }
+        });
+        let report = run_uplink_model(40_000, 0.4, 20, true, 250);
+        stop.store(true, Ordering::Relaxed);
+        let _ = churn.join();
+        worst.push((report.heartbeat_gap_max_ms, report.heartbeats_received, report.heartbeat_tail_ms));
+    }
+    eprintln!("FC_HEARTBEAT_GAPS {worst:?}");
+    assert!(
+        worst.iter().all(|(gap, _, tail)| *gap <= 2_000 && *tail <= 2_000),
+        "worst FC heartbeat gaps (gap ms, count, ms since the last at the end): {worst:?}"
+    );
 }

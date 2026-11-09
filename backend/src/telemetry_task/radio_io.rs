@@ -18,6 +18,29 @@ use super::{
 // Managed values retain their application type on wire but use discovery's
 // scheduling priority (254). Only self-contained application frames can safely
 // bypass the schema FIFO. This is a host transport tag, not a wire/API change.
+/// Radio priority tag for the station's HEARTBEAT when it travels as SDT
+/// (template install or compact frame). The FC latches Lost_GroundStation
+/// after GND_TIMEOUT (3 s) without one, so heartbeats leave the park and the
+/// writer's ordered SDT queue ahead of schema chunks and other bulk SDT
+/// frames. Only HEARTBEAT frames carry it, in their own order, so the
+/// install still precedes the compact frames that use it.
+const LIVENESS_PRIORITY: u8 = crate::comms::RADIO_LIVENESS_PRIORITY;
+/// SDT time sync: ahead of bulk SDT like the heartbeat, but after receipts.
+const TIME_SYNC_PRIORITY: u8 = crate::comms::RADIO_TIME_SYNC_PRIORITY;
+
+/// The first heartbeat compact frame that may go ahead: SDT installs keep
+/// their place in the stateful stream, so a compact frame only passes other
+/// frames when no heartbeat install is still waiting ahead of it.
+fn liveness_compact_index<'a>(frames: impl Iterator<Item = (u8, &'a [u8])>, tag: u8) -> Option<usize> {
+    for (index, (priority, bytes)) in frames.enumerate() {
+        if priority != tag || !bytes.starts_with(b"SDT") {
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
 fn radio_transport_priority(priority: u8, payload: &[u8]) -> u8 {
     if (priority == 254
         && !payload.starts_with(b"SDT")
@@ -770,6 +793,18 @@ impl TxQueueBudget {
         }
         let priority = radio_transport_priority(priority, payload);
         let priority = if self.short_lookahead { radio_lane_priority(priority, payload) } else { priority };
+        let sdt_type = (self.short_lookahead && payload.starts_with(b"SDT"))
+            .then(|| self.recovery_classifier.peek_type(payload))
+            .flatten();
+        let priority = match sdt_type {
+            Some(ty) if ty == crate::telemetry_schema::data_type("HEARTBEAT") => LIVENESS_PRIORITY,
+            Some(
+                sedsnet::config::DataType::TimeSyncAnnounce
+                | sedsnet::config::DataType::TimeSyncRequest
+                | sedsnet::config::DataType::TimeSyncResponse,
+            ) => TIME_SYNC_PRIORITY,
+            _ => priority,
+        };
         let mut commands = (priority >= 16
             && payload.len() <= crate::comms::RADIO_COMMAND_BATCH_MAX_BYTES
             && crate::comms::is_radio_batch_command(255, payload))
@@ -877,7 +912,10 @@ impl TxQueueBudget {
         } else {
             let kind = self.recovery_classifier.peek_type(payload);
             // Radio only: the wired budget has no reservation or headroom.
-            let protected = self.short_lookahead && is_protected_type(kind);
+            // The station heartbeat (FC GND_TIMEOUT 3 s) also gets the
+            // protected headroom, so bulk SDT in the writer cannot hold it.
+            let protected = self.short_lookahead
+                && (is_protected_type(kind) || priority == LIVENESS_PRIORITY || priority == TIME_SYNC_PRIORITY);
             let allowance = self
                 .ordinary_limit
                 .saturating_add(if continuation && !self.short_lookahead {
@@ -1128,7 +1166,12 @@ impl TxQueueBudget {
         // number of templates. Refused, it was re-offered on every router
         // pass while schema chunks filled the park, and no heartbeat reached
         // the FC for seconds.
-        let cap = if install.is_some() { PARK_MAX_BYTES } else { cap };
+        // The station heartbeat likewise: only its newest frame waits.
+        let cap = if install.is_some() || priority == LIVENESS_PRIORITY || priority == TIME_SYNC_PRIORITY {
+            PARK_MAX_BYTES
+        } else {
+            cap
+        };
         let fits = |parked: &VecDeque<Parked>| {
             parked.is_empty()
                 || (parked.len() < self.park_frames
@@ -1274,12 +1317,14 @@ impl TxQueueBudget {
                         || !parked.iter().take(i).any(|earlier| earlier.chunk_dictionary))
             });
             let chunk_turn = self.park_chunk_turn.load(Ordering::Relaxed);
-            let index = match (first_other, first_chunk) {
+            let liveness = liveness_compact_index(parked.iter().map(|p| (p.priority, &p.bytes[..])), LIVENESS_PRIORITY)
+                .or_else(|| liveness_compact_index(parked.iter().map(|p| (p.priority, &p.bytes[..])), TIME_SYNC_PRIORITY));
+            let index = if let Some(index) = liveness { index } else { match (first_other, first_chunk) {
                 (Some(other), Some(chunk)) => if chunk_turn { chunk } else { other },
                 (Some(other), None) => other,
                 (None, Some(chunk)) => chunk,
                 (None, None) => break,
-            };
+            } };
             let front = &parked[index];
             if front.lease.as_ref().is_some_and(|lease| lease.discard_if_retired())
                 || crate::abort_retirement::suppress_write(&front.bytes)
@@ -1630,6 +1675,8 @@ struct WireBacklog {
     control_bytes: usize,
     /// Control bytes before ordinary frames get a turn.
     control_burst: usize,
+    /// When the station heartbeat last went ahead of receipts.
+    heartbeat_overtook: Option<TxDeadline>,
 }
 impl WireBacklog {
     fn new(preserve_order: bool) -> Self {
@@ -1644,6 +1691,7 @@ impl WireBacklog {
             preserve_order,
             control_bytes: 0,
             control_burst: MAX_CONTROL_BYTES,
+            heartbeat_overtook: None,
         }
     }
     fn push(&mut self, priority: u8, payload: Vec<u8>, front: bool) {
@@ -1901,6 +1949,32 @@ impl WireBacklog {
         Some((priority, bytes))
     }
     fn pop(&mut self) -> Option<(u8, Vec<u8>)> {
+        // The station heartbeat first (FC GND_TIMEOUT 3 s, about 70 B/s),
+        // then receipts, then time sync, all ahead of bulk SDT.
+        // A heartbeat goes ahead of waiting receipts at most once a second,
+        // which bounds the FC's heartbeat gap without starving receipts.
+        let overtake = self.receipts.is_empty()
+            || self.heartbeat_overtook.is_none_or(|at| at.after(Duration::from_millis(1_000)).ready());
+        if self.preserve_order
+            && let Some(index) = overtake
+                .then(|| liveness_compact_index(self.ordered.iter().map(|(p, b)| (*p, &b[..])), LIVENESS_PRIORITY))
+                .flatten()
+                .inspect(|_| {
+                    if !self.receipts.is_empty() {
+                        self.heartbeat_overtook = Some(TxDeadline::now());
+                    }
+                })
+                .or_else(|| {
+                    self.receipts
+                        .is_empty()
+                        .then(|| liveness_compact_index(self.ordered.iter().map(|(p, b)| (*p, &b[..])), TIME_SYNC_PRIORITY))
+                        .flatten()
+                })
+        {
+            // The station heartbeat goes first (FC GND_TIMEOUT 3 s); it
+            // depends only on its own earlier install, kept in order here.
+            return self.ordered.remove(index);
+        }
         if self.preserve_order {
             // Bound control bursts so schema/bootstrap still makes progress.
             if (!self.priorities.is_empty() || !self.receipts.is_empty())
