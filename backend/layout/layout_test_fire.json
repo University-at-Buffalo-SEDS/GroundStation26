@@ -174,7 +174,7 @@
         "group": "Flight controls"
       },
       {
-        "label": "Flight State +1",
+        "label": "State +1",
         "cmd": "AdvanceFlightState",
         "border": "#38bdf8",
         "bg": "#0b1220",
@@ -182,7 +182,7 @@
         "group": "Flight controls"
       },
       {
-        "label": "Flight State -1",
+        "label": "State -1",
         "cmd": "RewindFlightState",
         "border": "#38bdf8",
         "bg": "#0b1220",

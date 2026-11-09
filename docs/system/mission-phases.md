@@ -42,10 +42,44 @@ Notes on the inputs:
   In flight and Landed are never shown. The operator reset returns the detailed state to
   Idle, which brings the phase back to Idle.
 
+## One state
+
+Phase and flight state are one concept. The operator sees one state, the phase. The
+detailed flight state is shown only as the phase's secondary detail, never as a second,
+separate state:
+
+| Shown | When |
+|---|---|
+| `Idle`, `Launch`, `Landed`, `Startup` | the detailed state is the phase's own state |
+| `Fill · Nitrous fill`, `In flight · Coast`, `Landed · Recovery` | the detailed state adds information |
+| `Startup · Waiting for boards` | the required-boards overlay holds detailed Idle at Startup |
+| `Fill · GSE fill active` | the fill-activity overlay shows detailed Idle as Fill |
+| `Landed · FC contact lost · Descent` | the comms-loss fallback; the last FC-reported state follows |
+| `Idle · Aborted`, `In flight · Aborted` | detailed Aborted always shows in the detail |
+| `Launch · Coast` | test-fire builds only: flight states collapse into Launch |
+
+`mission_phase.rs::phase_detail` builds the detail. It is pure: the overlay that made
+the phase differ from the detailed state's own phase comes first, then the detailed
+state's label when it differs from the phase label. Detailed Idle is left out under the
+boards and fill overlays, which only apply to it. A test checks, for every input, that a
+phase that differs from the detailed state's own phase always names its overlay (or is
+the test-fire collapse), and that the detail never repeats the phase.
+
+HITL builds are not marked "(manual)" any more. The phase there is the operator-assigned
+detailed state's own phase, so there is nothing to disagree with; `manual_only` stays in
+the payload. The HITL operator controls step the detailed state, which moves the state
+through its detail (Fill · Pre-fill, Fill · Fill test, ...) and across phases.
+
 The phase is published on WebSocket as `{"ty":"MissionPhase"}` and on `GET /api/mission_phase`.
-The payload carries `phase`, `label`, `detailed` (for the details view), `mode`,
-`manual_only`, `aborted`, `fill_activity`, `disconnect_aborts_armed`, `comms_loss_landed`
-and `since_ms`.
+The payload carries `phase`, `label`, `detail`, `detailed` (the detailed state it was
+derived from), `mode`, `manual_only`, `aborted`, `fill_activity`, `disconnect_aborts_armed`,
+`comms_loss_landed` and `since_ms`. The service refreshes the phase on every flight-state
+publication as well as every 250 ms, so it does not trail the `FlightState` message.
+
+The UI takes everything it shows from this one message. `{"ty":"FlightState"}` is still
+sent for older clients and for logic keyed on the detailed state (abort and GSE gates);
+a client talking to a station without `MissionPhase` derives the phase from the detailed
+state alone (the HITL column above).
 
 ## Safety boundaries
 

@@ -379,8 +379,9 @@ const PHASES: &[Spec] = &[
     Spec {
         id: "mission-phases",
         title: "Mission phases",
-        summary: "The station shows six phases derived from the boards' detailed flight state: Startup until every board this build requires has been seen, Idle, Fill (nitrogen test, fill, turbocharge and cold flow holds), Launch (Launch admission to liftoff), In flight and Landed. Rules keyed on the detailed state are unchanged.",
+        summary: "The station shows one state, in six phases derived from the boards' detailed flight state: Startup until every board this build requires has been seen, Idle, Fill (nitrogen test, fill, turbocharge and cold flow holds), Launch (Launch admission to liftoff), In flight and Landed. Rules keyed on the detailed state are unchanged.",
         details: &[
+            "The detailed flight state is shown only as the phase's secondary detail, for example Fill · Nitrous fill or In flight · Coast, so the two can never disagree. When an overlay changes the phase the detail names it: Waiting for boards, GSE fill active or FC contact lost. Aborted always shows in the detail.",
             "Test-fire builds ignore the AV bay (FC, RF, PB) for Startup and have no flight: Launch covers the burn until the reset returns to Idle.",
             "HITL builds follow only the operator-assigned state; nothing changes the phase automatically.",
         ],

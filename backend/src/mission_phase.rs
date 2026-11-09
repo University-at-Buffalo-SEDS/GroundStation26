@@ -19,6 +19,11 @@
 //! - HITL builds: the phase is manual-only. It follows the operator-assigned
 //!   detailed state and never uses board presence or GSE activity.
 //!
+//! Phase and flight state are one concept for the operator. The phase is the
+//! state; the detailed `FlightState` is only its secondary detail
+//! (`phase_detail`, e.g. "Fill · Nitrous fill"). Every operator-visible state
+//! comes from one `MissionPhaseMsg`, so the two can never disagree.
+//!
 //! Firmware migration path: see docs/system/mission-phases.md.
 use crate::types::FlightState;
 use serde::{Deserialize, Serialize};
@@ -153,6 +158,66 @@ pub fn detailed_phase(detailed: FlightState, previous: Option<MissionPhase>) -> 
     }
 }
 
+/// Operator label of one detailed state, used only as secondary detail.
+pub fn detailed_label(detailed: FlightState) -> &'static str {
+    use FlightState as S;
+    match detailed {
+        S::Startup => "Startup",
+        S::Idle => "Idle",
+        S::PreFill => "Pre-fill",
+        S::FillTest => "Fill test",
+        S::NitrogenFill => "Nitrogen fill",
+        S::NitrousFill => "Nitrous fill",
+        S::Armed => "Armed",
+        S::Launch => "Launch",
+        S::Ascent => "Ascent",
+        S::Coast => "Coast",
+        S::Apogee => "Apogee",
+        S::Descent => "Descent",
+        S::Reefing => "Reefing",
+        S::Landed => "Landed",
+        S::Recovery => "Recovery",
+        S::Aborted => "Aborted",
+    }
+}
+
+/// Overlay text when the phase is not the detailed state's own phase.
+pub const DETAIL_WAITING_FOR_BOARDS: &str = "Waiting for boards";
+pub const DETAIL_GSE_FILL_ACTIVE: &str = "GSE fill active";
+pub const DETAIL_FC_CONTACT_LOST: &str = "FC contact lost";
+
+/// Secondary detail shown after the phase ("Fill · Nitrous fill"). Pure.
+///
+/// It first names the overlay that made the phase differ from the detailed
+/// state's own phase (FC contact lost, waiting for boards, GSE fill active),
+/// then the detailed state when its label adds information. Detailed Idle is
+/// left out under the boards and fill overlays because those overlays only
+/// apply to detailed Idle. `None` means the phase says everything.
+pub fn phase_detail(inputs: &PhaseInputs, phase: MissionPhase) -> Option<String> {
+    let mut parts: Vec<&'static str> = Vec::with_capacity(2);
+    let mut idle_implied = false;
+    let comms_loss = phase == MissionPhase::Landed
+        && inputs.fc_contact_lost
+        && mission_phase(&PhaseInputs {
+            fc_contact_lost: false,
+            ..*inputs
+        }) != MissionPhase::Landed;
+    if comms_loss {
+        parts.push(DETAIL_FC_CONTACT_LOST);
+    } else if phase == MissionPhase::Startup && inputs.detailed != FlightState::Startup {
+        parts.push(DETAIL_WAITING_FOR_BOARDS);
+        idle_implied = true;
+    } else if phase == MissionPhase::Fill && inputs.detailed == FlightState::Idle {
+        parts.push(DETAIL_GSE_FILL_ACTIVE);
+        idle_implied = true;
+    }
+    let label = detailed_label(inputs.detailed);
+    if label != phase.label() && !(idle_implied && inputs.detailed == FlightState::Idle) {
+        parts.push(label);
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 /// The single mapping from detailed state and GS context to the mission phase.
 pub fn mission_phase(inputs: &PhaseInputs) -> MissionPhase {
     let base = detailed_phase(inputs.detailed, inputs.previous);
@@ -205,7 +270,11 @@ pub fn safety_phase(detailed: FlightState) -> MissionPhase {
 pub struct MissionPhaseMsg {
     pub phase: MissionPhase,
     pub label: String,
-    /// Detailed shared FlightState, kept for the details view.
+    /// Secondary detail for the phase (`phase_detail`). The operator sees
+    /// `label` alone or `label · detail`; never a second, separate state.
+    pub detail: Option<String>,
+    /// Detailed shared FlightState the phase was derived from. Same value as
+    /// the `FlightState` message; clients use it only to build the detail.
     pub detailed: FlightState,
     pub mode: PhaseMode,
     pub manual_only: bool,
@@ -226,6 +295,7 @@ impl MissionPhaseMsg {
         Self {
             phase,
             label: phase.label().to_string(),
+            detail: phase_detail(inputs, phase),
             detailed: inputs.detailed,
             mode: inputs.mode,
             manual_only: inputs.mode == PhaseMode::Hitl,
@@ -353,16 +423,28 @@ pub fn refresh(state: &crate::state::AppState) -> MissionPhaseMsg {
 }
 
 /// Cheap periodic projection: one state lock, one board-status lock and a
-/// nonwaiting GSE probe every 250 ms.
+/// nonwaiting GSE probe every 250 ms, plus an immediate refresh on every
+/// flight-state publication so the phase never trails the `FlightState`
+/// message it is derived from.
 pub async fn service(
     state: Arc<crate::state::AppState>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
+    let mut flight_state_rx = state.state_tx.subscribe();
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        refresh(&state);
-        crate::flight_maxima::tick(&state);
         tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+            _ = tick.tick() => {
+                refresh(&state);
+                crate::flight_maxima::tick(&state);
+            }
+            changed = flight_state_rx.recv() => match changed {
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    refresh(&state);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
             _ = shutdown_rx.recv() => break,
         }
     }
@@ -610,6 +692,191 @@ mod tests {
                 "{detailed:?}"
             );
         }
+    }
+
+    fn every_input() -> Vec<PhaseInputs> {
+        let mut out = Vec::new();
+        for mode in MODES {
+            for detailed in all_states() {
+                for required_boards_seen in [false, true] {
+                    for fill_activity in [false, true] {
+                        for previous in PREVIOUS {
+                            for fc_contact_lost in [false, true] {
+                                out.push(PhaseInputs {
+                                    mode,
+                                    detailed,
+                                    required_boards_seen,
+                                    fill_activity,
+                                    previous,
+                                    fc_contact_lost,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn detail_never_contradicts_the_phase() {
+        for inputs in every_input() {
+            let phase = mission_phase(&inputs);
+            let detail = phase_detail(&inputs, phase);
+            let own = detailed_phase(inputs.detailed, inputs.previous);
+            let text = detail.clone().unwrap_or_default();
+            let names_overlay = [
+                DETAIL_WAITING_FOR_BOARDS,
+                DETAIL_GSE_FILL_ACTIVE,
+                DETAIL_FC_CONTACT_LOST,
+            ]
+            .iter()
+            .any(|overlay| text.starts_with(overlay));
+            // A phase that differs from the detailed state's own phase always
+            // names its overlay, except the documented test-fire collapse of
+            // flight states into Launch.
+            let test_fire_collapse = inputs.mode == PhaseMode::TestFire
+                && phase == MissionPhase::Launch
+                && matches!(own, MissionPhase::InFlight | MissionPhase::Landed);
+            assert!(
+                phase == own || names_overlay || test_fire_collapse,
+                "{inputs:?} -> {phase:?} {detail:?}"
+            );
+            // The detail never repeats the phase and never shows a second
+            // phase label for a state that maps to the same phase.
+            assert_ne!(detail.as_deref(), Some(phase.label()), "{inputs:?}");
+            if phase == own && !names_overlay {
+                let expected = (detailed_label(inputs.detailed) != phase.label())
+                    .then(|| detailed_label(inputs.detailed).to_string());
+                assert_eq!(detail, expected, "{inputs:?}");
+            }
+            // Aborted is always visible.
+            if inputs.detailed == FlightState::Aborted {
+                assert!(text.ends_with("Aborted"), "{inputs:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn detail_examples_match_the_documented_table() {
+        let base = PhaseInputs {
+            mode: PhaseMode::Flight,
+            detailed: FlightState::Idle,
+            required_boards_seen: true,
+            fill_activity: false,
+            previous: None,
+            fc_contact_lost: false,
+        };
+        let shown = |i: PhaseInputs| {
+            let msg = MissionPhaseMsg::from_inputs(&i, 1);
+            match msg.detail {
+                Some(detail) => format!("{} · {detail}", msg.label),
+                None => msg.label,
+            }
+        };
+        assert_eq!(shown(base), "Idle");
+        assert_eq!(
+            shown(PhaseInputs {
+                required_boards_seen: false,
+                ..base
+            }),
+            "Startup · Waiting for boards"
+        );
+        assert_eq!(
+            shown(PhaseInputs {
+                fill_activity: true,
+                ..base
+            }),
+            "Fill · GSE fill active"
+        );
+        assert_eq!(
+            shown(PhaseInputs {
+                detailed: FlightState::NitrousFill,
+                ..base
+            }),
+            "Fill · Nitrous fill"
+        );
+        assert_eq!(
+            shown(PhaseInputs {
+                detailed: FlightState::Coast,
+                ..base
+            }),
+            "In flight · Coast"
+        );
+        assert_eq!(
+            shown(PhaseInputs {
+                detailed: FlightState::Launch,
+                ..base
+            }),
+            "Launch"
+        );
+        assert_eq!(
+            shown(PhaseInputs {
+                detailed: FlightState::Aborted,
+                ..base
+            }),
+            "Idle · Aborted"
+        );
+        assert_eq!(
+            shown(PhaseInputs {
+                detailed: FlightState::Aborted,
+                previous: Some(MissionPhase::InFlight),
+                ..base
+            }),
+            "In flight · Aborted"
+        );
+        assert_eq!(
+            shown(PhaseInputs {
+                detailed: FlightState::Descent,
+                fc_contact_lost: true,
+                ..base
+            }),
+            "Landed · FC contact lost · Descent"
+        );
+        assert_eq!(
+            shown(PhaseInputs {
+                mode: PhaseMode::Hitl,
+                detailed: FlightState::Armed,
+                ..base
+            }),
+            "Fill · Armed"
+        );
+        assert_eq!(
+            shown(PhaseInputs {
+                mode: PhaseMode::TestFire,
+                detailed: FlightState::Coast,
+                ..base
+            }),
+            "Launch · Coast"
+        );
+    }
+
+    #[tokio::test]
+    async fn phase_follows_a_flight_state_publication_without_waiting_for_the_tick() {
+        let state = crate::state::tests::test_app_state().await;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let mut rx = subscribe();
+        let task = tokio::spawn(service(state.clone(), shutdown_rx));
+        // Let the first periodic refresh run, then publish well inside the
+        // 250 ms tick: only the flight-state subscription can meet 150 ms.
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        state.set_preexisting_flight_state_for_test(FlightState::NitrousFill);
+        let seen = tokio::time::timeout(std::time::Duration::from_millis(150), async {
+            loop {
+                if rx.borrow_and_update().detailed == FlightState::NitrousFill {
+                    return;
+                }
+                rx.changed().await.unwrap();
+            }
+        })
+        .await;
+        let _ = shutdown_tx.send(());
+        let _ = task.await;
+        assert!(seen.is_ok(), "phase did not follow the flight state");
+        let msg = rx.borrow().clone();
+        assert_eq!(msg.phase, MissionPhase::Fill);
+        assert_eq!(msg.detail.as_deref(), Some("Nitrous fill"));
     }
 
     #[test]
