@@ -2557,6 +2557,18 @@ fn command_disabled_message(state:&AppState,command:&TelemetryCommand)->String {
     reason.map_or_else(||format!("{name} is unavailable under the current GroundStation policy. Check its control details."),|reason|format!("{name}: {reason}"))
 }
 
+/// Why a Launch press must be refused at once, matching the action policy's
+/// launch-journal and turbocharge reasons. The send path checks these again.
+fn launch_press_block(state: &AppState, cmd: &TelemetryCommand) -> Option<&'static str> {
+    if crate::rrls::is_rrls() || !matches!(command_name(cmd), "Launch" | "GroundStationLaunch") {
+        return None;
+    }
+    if crate::gse::turbocharge_active_now(state) {
+        return Some(crate::gse::TURBOCHARGE_UNFINISHED_MESSAGE);
+    }
+    crate::gse::launch_journal_block(&state.launch_history.lock().unwrap())
+}
+
 /// Validates and forwards a frontend command into the backend command channel.
 async fn send_command(
     State(state): State<Arc<AppState>>,
@@ -2794,6 +2806,15 @@ async fn dispatch_command_inner(
     if !allowed {
         let message=command_disabled_message(&state,&cmd);
         emit_notification_warning(&state,&message);
+        return (StatusCode::FORBIDDEN, message);
+    }
+    // The launch journal (a real earlier attempt, or an unfinished board
+    // recovery) and an active turbocharge disable Launch in the action
+    // policy. Refuse the press here with that reason instead of answering
+    // "ok" and dropping it at send time.
+    if let Some(reason) = launch_press_block(&state, &cmd) {
+        let message = format!("{cmd_name}: {reason}");
+        emit_notification_warning(&state, &message);
         return (StatusCode::FORBIDDEN, message);
     }
     if matches!(cmd, TelemetryCommand::RetractPlumbing)
@@ -3037,6 +3058,18 @@ pub(crate) mod command_dispatch_tests {
             check(&serde_json::from_str(layout).unwrap()) > 0,
             "the shipped layout must advertise controls"
         );
+    }
+
+    /// A Launch press that the launch journal blocks (a real earlier attempt
+    /// or an unfinished board recovery) is refused with the action policy's
+    /// reason, never answered "ok" and dropped at send time.
+    #[tokio::test]
+    async fn launch_press_is_refused_with_the_launch_journal_reason() {
+        let state = crate::state::tests::test_app_state().await;
+        assert_eq!(launch_press_block(&state, &TelemetryCommand::Launch), None);
+        state.launch_history.lock().unwrap().inhibit_automatic_actions().unwrap();
+        assert_eq!(launch_press_block(&state, &TelemetryCommand::Launch), Some(crate::gse::LAUNCH_LOCKED_MESSAGE));
+        assert_eq!(launch_press_block(&state, &TelemetryCommand::Abort), None, "Abort is never refused by it");
     }
 
     #[tokio::test]

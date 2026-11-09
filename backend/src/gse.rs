@@ -3787,6 +3787,10 @@ pub(crate) const TURBOCHARGE_UNFINISHED_MESSAGE: &str = "Turbocharge must finish
 fn turbocharge_active(rt: &Runtime) -> bool {
     rt.turbocharge.is_some() || rt.engine.status.phase == Phase::Turbocharge
 }
+/// Waits for the GSE owner: for refusing an operator press, not presentation.
+pub(crate) fn turbocharge_active_now(state: &AppState) -> bool {
+    turbocharge_active(&state.gse.lock().unwrap())
+}
 pub(crate) fn turbocharge_active_nowait(state: &AppState) -> bool {
     state.gse.try_lock().map_or(true, |rt| turbocharge_active(&rt))
 }
