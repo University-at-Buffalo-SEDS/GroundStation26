@@ -87,6 +87,13 @@ const BOARDS: [Board; 7] = [
 ];
 const READBACK_TTL: Duration = Duration::from_secs(15);
 const QUERY_TTL: Duration = Duration::from_secs(15);
+/// An unanswered read-only query may be re-issued after this long (the
+/// superseded one stays acceptable as `previous`), so one lost reply costs a
+/// few seconds of board-state freshness instead of a whole QUERY_TTL.
+const QUERY_RETRY: Duration = Duration::from_secs(3);
+fn query_retry() -> Duration {
+    crate::sim_freshness::wall(QUERY_RETRY)
+}
 /// Actuator motion/configuration gates keep their own 5 s proof age. The
 /// longer recovery windows above exist for slow links, not for these gates.
 const CONTROL_PROOF_TTL: Duration = Duration::from_secs(5);
@@ -177,6 +184,11 @@ struct Query {
 struct Inner {
     values: [Option<Observation>; 7],
     queries: [Option<Query>; 7],
+    /// The query a background or operator re-query superseded while it was
+    /// still unanswered. Its reply, if it arrives within QUERY_TTL and before
+    /// the current query is answered, still counts (with its own, older send
+    /// time), so a slow link never turns every reply into a rejection.
+    previous: [Option<Query>; 7],
     rejected_statuses: u64,
     last_rejection: Option<&'static str>,
 }
@@ -201,6 +213,7 @@ impl Default for Runtime {
             inner: Mutex::new(Inner {
                 values: array::from_fn(|_| None),
                 queries: array::from_fn(|_| None),
+                previous: array::from_fn(|_| None),
                 rejected_statuses: 0,
                 last_rejection: None,
             }),
@@ -501,17 +514,23 @@ pub(crate) fn observe(state: &AppState, packet: &Packet) -> Result<(), &'static 
     }
     let now = Stamp::now();
     let mut inner = state.board_recovery.inner.lock().unwrap();
-    let query = inner.queries[at]
-        .as_mut()
-        .ok_or("Unsolicited recovery status")?;
-    if query.nonce != value.nonce
-        || now
-            .checked_duration_since(query.sent)
-            .is_none_or(|age| age > QUERY_TTL)
-    {
+    let live = |query: &Query| query.nonce == value.nonce
+        && now.checked_duration_since(query.sent).is_some_and(|age| age <= QUERY_TTL);
+    let current_matches = inner.queries[at].as_ref().is_some_and(live);
+    // The reply to the query a re-query superseded still counts while the
+    // current query is unanswered: same issuer, its own nonce and its own
+    // (older) send time, so it never claims fresher state than it carries.
+    let previous_matches = !current_matches
+        && inner.queries[at].as_ref().is_some_and(|query| !query.received)
+        && inner.previous[at].as_ref().is_some_and(live);
+    if inner.queries[at].is_none() {
+        return Err("Unsolicited recovery status");
+    }
+    if !current_matches && !previous_matches {
         return Err("Ignored a late reply to an expired or superseded board query (harmless). Query the board again, or open Review recovery, which takes its own fresh query.");
     }
-    if query.received {
+    let received = if previous_matches { &inner.previous } else { &inner.queries }[at].as_ref().unwrap().received;
+    if received {
         return Ok(());
     } // Duplicate replies do not slide freshness.
     // PENDING is an interim wire result, not a completed correlated query.
@@ -523,6 +542,7 @@ pub(crate) fn observe(state: &AppState, packet: &Packet) -> Result<(), &'static 
         }
         return Ok(());
     }
+    let query = if previous_matches { &mut inner.previous } else { &mut inner.queries }[at].as_mut().unwrap();
     query.received = true;
     let observed_after = query.sent;
     let abort_revision = query.abort_revision;
@@ -1060,7 +1080,7 @@ impl ReadonlyQueryRefresh {
         // a recovery PREPARE is waiting on); it answers the same demand.
         let stamp = Stamp::now();
         if state.board_recovery.inner.lock().unwrap().queries[at].as_ref().is_some_and(|query| {
-            !query.received && stamp.checked_duration_since(query.sent).is_none_or(|age| age <= QUERY_TTL)
+            !query.received && stamp.checked_duration_since(query.sent).is_none_or(|age| age <= query_retry())
         }) {
             return false;
         }
@@ -1123,7 +1143,7 @@ fn readonly_query_candidate(
         && row.is_none_or(|row| row.age(now) >= Duration::from_secs(2))
         && !query.is_some_and(|query| {
             !query.received && now.checked_duration_since(query.sent)
-                .is_none_or(|age| age <= QUERY_TTL)
+                .is_none_or(|age| age <= query_retry())
         })
 }
 
@@ -1275,7 +1295,7 @@ fn send_board_query(state: &Arc<AppState>, board: Board, supersede_pending: bool
         !query.received
             && now
                 .checked_duration_since(query.sent)
-                .is_some_and(|age| age <= QUERY_TTL)
+                .is_some_and(|age| age <= query_retry())
     }) {
         return error(
             StatusCode::CONFLICT,
@@ -1295,6 +1315,12 @@ fn send_board_query(state: &Arc<AppState>, board: Board, supersede_pending: bool
         inner.queries[at] = previous;
         return rejected_query_offer(reason);
     }
+    // A recovery PREPARE wants its own reply only; a re-query keeps the
+    // superseded unanswered one acceptable.
+    inner.previous[at] = if supersede_pending { None } else {
+        previous.filter(|query| !query.received
+            && now.checked_duration_since(query.sent).is_some_and(|age| age <= QUERY_TTL))
+    };
     drop(inner);
     Json(json!({"accepted":true,"operation":null,"message":"Query admitted to SDK; fresh board readback is still required."})).into_response()
     }).unwrap_or_else(||error(StatusCode::CONFLICT,"query_recovery_owned",
@@ -2265,6 +2291,65 @@ mod recovery_requirement_tests {
             }
         }
         assert!(state.topology_router.get().is_none(),"read-only badge metadata never installs a transport or sends commands");
+    }
+}
+#[cfg(test)]
+mod slow_link_freshness_tests {
+    use super::*;
+    fn status(state: &AppState, sender: &str, nonce: u64) -> Packet {
+        let mut wire = [0u8; 40];
+        wire[0] = 1; wire[2] = 1; wire[3] = 0x3e;
+        wire[4..12].copy_from_slice(&nonce.to_le_bytes());
+        wire[12..20].copy_from_slice(&42u64.to_le_bytes());
+        wire[20..24].copy_from_slice(&9u32.to_le_bytes());
+        wire[28..32].copy_from_slice(&6u32.to_le_bytes());
+        wire[32..40].copy_from_slice(&issuer(&state.board_recovery.identity.unwrap()).to_le_bytes());
+        Packet::new(crate::telemetry_schema::data_type(STATUS_TYPE),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")], sender, 1, Arc::from(wire)).unwrap()
+    }
+    /// Bench fault: replies arrive a few seconds late, after the next
+    /// background re-query, so every reply named a superseded nonce and was
+    /// rejected ("Expired or different recovery query"), and the 5 s launch
+    /// proof was valid only now and then. The reply to the superseded query now
+    /// still counts (from its own send time) and the proof outlasts the cycle.
+    #[tokio::test]
+    async fn a_late_reply_to_the_superseded_query_still_proves_the_board() {
+        crate::telemetry_schema::initialize().unwrap();
+        let state = crate::state::tests::test_app_state().await;
+        let board = Board::ValveBoard;
+        let at = index(board).unwrap();
+        let revision = state.board_abort.query_revision(board);
+        let old_sent = Stamp::now() - Duration::from_secs(4);
+        {
+            let mut inner = state.board_recovery.inner.lock().unwrap();
+            inner.previous[at] = Some(Query { abort_revision: revision, nonce: 1, sent: old_sent, received: false });
+            inner.queries[at] = Some(Query { abort_revision: revision, nonce: 2, sent: Stamp::now(), received: false });
+        }
+        assert_eq!(observe(&state, &status(&state, "VB", 1)), Ok(()), "the superseded query's late reply counts");
+        {
+            let inner = state.board_recovery.inner.lock().unwrap();
+            let row = inner.values[at].as_ref().unwrap();
+            assert_eq!(row.value.nonce, 1);
+            assert!(row.observed_after == old_sent, "proof dates from the old query's send time");
+            assert!(!inner.queries[at].as_ref().unwrap().received, "the current query is still pending");
+        }
+        assert!(state.board_abort.masks().1 & (1 << crate::board_abort::BOARDS.iter().position(|b| *b == board).unwrap()) != 0,
+            "a 4 s old proof is still within the launch proof window");
+        // A duplicate of the old reply never slides freshness; the current reply also counts.
+        assert_eq!(observe(&state, &status(&state, "VB", 1)), Ok(()));
+        assert_eq!(observe(&state, &status(&state, "VB", 2)), Ok(()));
+        assert_eq!(state.board_recovery.inner.lock().unwrap().values[at].as_ref().unwrap().value.nonce, 2);
+        // Once the current query is answered, an older reply is never taken.
+        state.board_recovery.inner.lock().unwrap().previous[at] = Some(Query { abort_revision: revision, nonce: 3, sent: old_sent, received: false });
+        assert!(observe(&state, &status(&state, "VB", 3)).is_err());
+        assert!(observe(&state, &status(&state, "VB", 99)).is_err(), "an unknown nonce is rejected");
+    }
+    /// A board whose reply was lost is asked again well inside the launch
+    /// proof window, instead of after the whole QUERY_TTL.
+    #[test]
+    fn an_unanswered_query_is_retried_inside_the_launch_proof_window() {
+        assert!(QUERY_RETRY < crate::board_abort::PROOF_TTL);
+        assert!(crate::board_abort::PROOF_TTL < READBACK_TTL);
     }
 }
 #[cfg(test)]

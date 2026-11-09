@@ -1443,12 +1443,17 @@ async fn fresh_query(
     )
     .map_err(|_| "Query packet rejected")?;
     state.board_recovery.coordinator.expected(board, nonce);
-    state.board_recovery.inner.lock().unwrap().queries[index(board).unwrap()] = Some(Query {
-        abort_revision: state.board_abort.query_revision(board),
-        nonce,
-        sent: now,
-        received: false,
-    });
+    {
+        let mut inner = state.board_recovery.inner.lock().unwrap();
+        inner.queries[index(board).unwrap()] = Some(Query {
+            abort_revision: state.board_abort.query_revision(board),
+            nonce,
+            sent: now,
+            received: false,
+        });
+        // A recovery's own query never accepts an older reply in its place.
+        inner.previous[index(board).unwrap()] = None;
+    }
     send(state,headers,ticket,router,token,packet,|| {
         Stamp::now().checked_duration_since(now).filter(|age|*age<=QUERY_TTL)
             .map(|_|()).ok_or("Original dedicated query expired before SDK ownership")
