@@ -3,7 +3,7 @@
 //! raised afterwards is delivered normally. Actual SDK router, radio budget
 //! and writer drop rule; the AV bay is advertised but never acknowledges.
 use super::*;
-use crate::abort_retirement::{self as retirement, AbortOrigin, RetireReason};
+use crate::abort_retirement::{self as retirement, AbortCause, AbortOrigin, RetireReason};
 use crate::types::{Board, FlightState};
 use sedsnet::router::{RetryTrackerLimits, RouterConfig, RouterSideOptions};
 use std::sync::atomic::AtomicU64;
@@ -94,10 +94,15 @@ impl Bench {
             .collect()
     }
 
-    /// Raise an automatic abort; returns the SDK's tracking id.
+    /// Raise the GB-offline automatic abort; returns the SDK's tracking id.
     fn raise(&self) -> u64 {
+        self.raise_for(AbortCause::BoardOffline(Board::GatewayBoard))
+    }
+
+    fn raise_for(&self, cause: AbortCause) -> u64 {
         let before = self.abort_ids();
-        crate::telemetry_task::queue_automatic_abort_packet(&self.router, "Board offline: GB").unwrap();
+        crate::telemetry_task::queue_automatic_abort_packet(&self.router, "Safety Task Abort Command Issued", cause)
+            .unwrap();
         self.pump(0);
         let id = *self
             .abort_ids()
@@ -192,6 +197,11 @@ impl Bench {
         );
     }
 
+    /// The GB is back online and healthy.
+    fn gb_back(&self) {
+        self.state.mark_board_seen(Board::GatewayBoard.sender_id(), crate::telemetry_task::get_current_timestamp_ms());
+    }
+
     fn notified(&self, text: &str) -> bool {
         let notes = self.state.notifications.lock().unwrap();
         let found = notes.iter().any(|n| {
@@ -254,9 +264,11 @@ async fn automatic_abort_is_retired_after_its_bounded_age() {
     bench.saturated();
     retirement::evaluate(&bench.state, &bench.router, after(crate::gse::UNDELIVERABLE_AFTER));
     assert_eq!(retirement::retired_reason(&bench.router, id), None, "no proof yet");
+    bench.gb_back();
     retirement::evaluate(&bench.state, &bench.router, after(retirement::AUTOMATIC_ABORT_MAX_AGE));
     assert_eq!(retirement::retired_reason(&bench.router, id), Some(RetireReason::Expired));
     assert!(bench.notified("still undelivered after 30 s"));
+    assert!(bench.notified("cause: Gateway Board offline (cleared: the board is back online)"));
     assert!(bench.write().is_empty());
     bench.assert_never_aired_again(id);
 }
@@ -286,6 +298,7 @@ async fn fresh_abort_after_a_retirement_is_delivered_normally() {
     let mut bench = Bench::new().await;
     let old = bench.raise();
     bench.saturated();
+    bench.gb_back();
     retirement::evaluate(&bench.state, &bench.router, after(retirement::AUTOMATIC_ABORT_MAX_AGE));
     assert_eq!(retirement::retired_reason(&bench.router, old), Some(RetireReason::Expired));
     std::thread::sleep(std::time::Duration::from_millis(3));
@@ -307,4 +320,56 @@ impl Bench {
             self.pump(250);
         }
     }
+}
+
+#[tokio::test]
+async fn board_offline_abort_is_retired_by_age_only_once_the_board_is_back() {
+    let mut bench = Bench::new().await;
+    let id = bench.raise();
+    bench.saturated();
+    // GB is still offline: the abort keeps being delivered past 30 s.
+    retirement::evaluate(&bench.state, &bench.router, after(retirement::AUTOMATIC_ABORT_MAX_AGE));
+    assert_eq!(retirement::retired_reason(&bench.router, id), None, "GB still offline");
+    assert!(bench.abort_ids().contains(&id), "still owed while GB is offline");
+    assert!(retirement::try_has_pending_reliable_tx_type(&bench.router, abort()).unwrap());
+    bench.gb_back();
+    retirement::evaluate(&bench.state, &bench.router, after(retirement::AUTOMATIC_ABORT_MAX_AGE));
+    assert_eq!(retirement::retired_reason(&bench.router, id), Some(RetireReason::Expired));
+    assert!(bench.notified("cause: Gateway Board offline (cleared: the board is back online)"));
+    bench.assert_never_aired_again(id);
+}
+
+#[tokio::test]
+async fn overpressure_abort_is_retired_by_age_only_after_the_overpressure_clears() {
+    let mut bench = Bench::new().await;
+    crate::gse::set_overpressure_latch_for_test(&bench.state, Some(crate::gse::overpressure::Latch {
+        peak_psi: 900.0,
+        threshold_psi: 850.0,
+        at_ms: 1,
+        message: "fixture".into(),
+        relief_commanded: true,
+        abort: crate::gse::overpressure::AbortStage::Aborted,
+        ab_abort_sent: false,
+    }));
+    let id = bench.raise_for(AbortCause::Overpressure);
+    bench.saturated();
+    retirement::evaluate(&bench.state, &bench.router, after(retirement::AUTOMATIC_ABORT_MAX_AGE));
+    assert_eq!(retirement::retired_reason(&bench.router, id), None, "overpressure persists");
+    assert!(retirement::try_has_pending_reliable_tx_type(&bench.router, abort()).unwrap());
+    crate::gse::set_overpressure_latch_for_test(&bench.state, None);
+    retirement::evaluate(&bench.state, &bench.router, after(retirement::AUTOMATIC_ABORT_MAX_AGE));
+    assert_eq!(retirement::retired_reason(&bench.router, id), Some(RetireReason::Expired));
+    assert!(bench.notified("cause: tank overpressure (cleared: no overpressure is latched)"));
+    bench.assert_never_aired_again(id);
+}
+
+#[tokio::test]
+async fn an_unevaluable_cause_is_never_retired_by_age() {
+    let bench = Bench::new().await;
+    let id = bench.raise_for(AbortCause::Unknown("Automatic zero failure abort".into()));
+    retirement::evaluate(&bench.state, &bench.router, after(retirement::AUTOMATIC_ABORT_MAX_AGE));
+    assert_eq!(retirement::retired_reason(&bench.router, id), None);
+    // The operator can still clear it.
+    assert_eq!(retirement::retire_on_operator_clear(&bench.state, &bench.router), 1);
+    assert!(bench.notified("cause: Automatic zero failure abort (cannot be evaluated; treated as present)"));
 }

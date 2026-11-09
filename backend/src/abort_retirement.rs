@@ -13,7 +13,10 @@
 //!     the abort is past its normal delivery window ([`UNDELIVERABLE_AFTER`]),
 //!     so a frame still in ordinary flight is never cancelled by a reply that
 //!     simply raced it;
-//! (c) it is older than [`AUTOMATIC_ABORT_MAX_AGE`].
+//! (c) it is older than [`AUTOMATIC_ABORT_MAX_AGE`] AND the condition that
+//!     raised it is no longer present (the offline board is back, the
+//!     overpressure cleared). While its cause persists, or when the cause
+//!     cannot be evaluated, an automatic abort is never retired by age.
 //!
 //! Manual operator Aborts are never registered here and keep their delivery.
 //!
@@ -34,12 +37,13 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-/// The longest an automatic ABORT is kept trying. A small ABORT frame takes
+/// The age past which an automatic ABORT whose cause has cleared is retired. A small ABORT frame takes
 /// under 100 ms of RFD airtime and the SDK's whole retry budget is 4.5 s
 /// (18 attempts 250 ms apart); the station already calls an ABORT
 /// undeliverable after 5 s. 30 s is six of those windows: an abort that has
 /// not landed by then is waiting on a dead or saturated link, and landing it
-/// later would abort a board on a condition the operator can no longer see.
+/// later would abort a board on a condition that is gone. A cause still
+/// present keeps it in delivery, however old.
 pub(crate) const AUTOMATIC_ABORT_MAX_AGE: Duration = Duration::from_secs(30);
 /// A retired id stays refused this long after the SDK has let it go, so a
 /// copy already handed to a writer queue is still dropped.
@@ -59,6 +63,65 @@ pub(crate) enum AbortOrigin {
     Manual,
 }
 
+/// What raised an automatic ABORT.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AbortCause {
+    /// A board stopped reporting.
+    BoardOffline(crate::types::Board),
+    /// Tank overpressure.
+    Overpressure,
+    /// A cause the station cannot re-evaluate (its text).
+    Unknown(String),
+}
+
+/// Whether an automatic abort's cause still holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CauseState {
+    Present,
+    Cleared,
+    /// Not evaluable: treated as present.
+    Unknown,
+}
+
+impl AbortCause {
+    pub(crate) fn state(&self, state: &AppState) -> CauseState {
+        match self {
+            Self::BoardOffline(board) => {
+                if state.operational_board_recent(*board, crate::state::BOARD_SEEN_TIMEOUT_MS) {
+                    CauseState::Cleared
+                } else {
+                    CauseState::Present
+                }
+            }
+            Self::Overpressure => {
+                if crate::gse::overpressure_holds_abort(state) {
+                    CauseState::Present
+                } else {
+                    CauseState::Cleared
+                }
+            }
+            Self::Unknown(_) => CauseState::Unknown,
+        }
+    }
+    fn describe(&self) -> String {
+        match self {
+            Self::BoardOffline(board) => format!("{} offline", board.as_str()),
+            Self::Overpressure => "tank overpressure".into(),
+            Self::Unknown(text) => text.clone(),
+        }
+    }
+    fn describe_state(&self, cause_state: CauseState) -> &'static str {
+        match (self, cause_state) {
+            (_, CauseState::Unknown) => "cannot be evaluated; treated as present",
+            (Self::BoardOffline(_), CauseState::Cleared) => "cleared: the board is back online",
+            (Self::BoardOffline(_), CauseState::Present) => "present: the board is still offline",
+            (Self::Overpressure, CauseState::Cleared) => "cleared: no overpressure is latched",
+            (Self::Overpressure, CauseState::Present) => "present: the overpressure is still latched",
+            (Self::Unknown(_), _) => "cannot be evaluated; treated as present",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RetireReason {
     OperatorCleared,
@@ -73,7 +136,7 @@ impl RetireReason {
                 "every board it was owed to reported a fresh non-Abort state after it was raised".into()
             }
             Self::Expired => format!(
-                "it was still undelivered after {} s",
+                "it was still undelivered after {} s and its cause has cleared",
                 AUTOMATIC_ABORT_MAX_AGE.as_secs()
             ),
         }
@@ -83,7 +146,8 @@ impl RetireReason {
 struct Entry {
     router: usize,
     packet_id: u64,
-    cause: String,
+    reason: String,
+    cause: AbortCause,
     raised_at: Instant,
     /// Boards still owed the frame, as `board_abort::BOARDS` bits.
     destinations: u8,
@@ -115,7 +179,7 @@ fn recount(entries: &[Entry]) {
 }
 
 /// Record an automatic ABORT the router has just accepted.
-pub(crate) fn register_automatic(router: &Router, packet_id: u64, cause: &str) {
+pub(crate) fn register_automatic(router: &Router, packet_id: u64, reason: &str, cause: AbortCause) {
     let mut entries = ENTRIES.lock().unwrap();
     let key = router_key(router);
     if entries.iter().any(|e| e.router == key && e.packet_id == packet_id) {
@@ -129,7 +193,8 @@ pub(crate) fn register_automatic(router: &Router, packet_id: u64, cause: &str) {
     entries.push(Entry {
         router: key,
         packet_id,
-        cause: cause.to_string(),
+        reason: reason.to_string(),
+        cause,
         raised_at: Instant::now(),
         destinations: 0,
         unnamed: false,
@@ -170,10 +235,9 @@ pub(crate) fn suppress_write(payload: &[u8]) -> bool {
         // Reliable end-to-end frames are never SDT-compacted by the SDK.
         return false;
     }
-    let Ok(info) = sedsnet::wire_format::peek_frame_info(payload) else {
-        return false;
-    };
-    if info.envelope.ty != abort_type() {
+    // Cheap type peek first: this runs on every radio offer, including
+    // refusal retries. Only an ABORT pays for the CRC-checked id below.
+    if !sedsnet::wire_format::peek_frame_info_unchecked(payload).is_ok_and(|info| info.envelope.ty == abort_type()) {
         return false;
     }
     let Ok(id) = sedsnet::wire_format::packet_id_from_wire(payload) else {
@@ -221,6 +285,7 @@ pub(crate) fn retire_on_operator_clear(state: &AppState, router: &Router) -> usi
     let any_abort_pending = router.try_has_pending_reliable_tx_type(abort_type()).unwrap_or(true);
     let rows = router.export_reliable_pending_stats();
     let key = router_key(router);
+    let causes = cause_states(state, key);
     let retired = {
         let mut entries = ENTRIES.lock().unwrap();
         refresh_locked(&mut entries, key, router, &rows, any_abort_pending, Instant::now());
@@ -228,7 +293,7 @@ pub(crate) fn retire_on_operator_clear(state: &AppState, router: &Router) -> usi
         for entry in entries.iter_mut().filter(|e| e.router == key) {
             if entry.retired.is_none() && entry.gone_since.is_none() {
                 entry.retired = Some(RetireReason::OperatorCleared);
-                retired.push(Retired::of(entry));
+                retired.push(Retired::of(entry, &causes));
             }
         }
         recount(&entries);
@@ -249,6 +314,7 @@ pub(crate) fn evaluate(state: &AppState, router: &Router, now: Instant) {
     let key = router_key(router);
     let delivery_window = crate::sim_freshness::wall(crate::gse::UNDELIVERABLE_AFTER);
     let max_age = crate::sim_freshness::wall(AUTOMATIC_ABORT_MAX_AGE);
+    let causes = cause_states(state, key);
     let (retired, query) = {
         let mut entries = ENTRIES.lock().unwrap();
         refresh_locked(&mut entries, key, router, &rows, any_abort_pending, now);
@@ -259,7 +325,8 @@ pub(crate) fn evaluate(state: &AppState, router: &Router, now: Instant) {
                 continue;
             }
             let age = now.saturating_duration_since(entry.raised_at);
-            if age >= max_age {
+            let cleared = causes.iter().any(|(id, c)| *id == entry.packet_id && *c == CauseState::Cleared);
+            if age >= max_age && cleared {
                 entry.retired = Some(RetireReason::Expired);
             } else if age >= delivery_window && entry.seen_pending && entry.destinations != 0 && !entry.unnamed {
                 let proven = crate::board_abort::BOARDS.iter().enumerate()
@@ -274,7 +341,7 @@ pub(crate) fn evaluate(state: &AppState, router: &Router, now: Instant) {
                 }
             }
             if entry.retired.is_some() {
-                retired.push(Retired::of(entry));
+                retired.push(Retired::of(entry, &causes));
             }
         }
         recount(&entries);
@@ -284,6 +351,19 @@ pub(crate) fn evaluate(state: &AppState, router: &Router, now: Instant) {
         state.board_abort.request_queries(query);
     }
     announce(state, retired);
+}
+
+/// Each unretired entry's cause state, read without holding the registry
+/// (the predicates take station locks).
+fn cause_states(state: &AppState, key: usize) -> Vec<(u64, CauseState)> {
+    let causes = ENTRIES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.router == key && e.retired.is_none())
+        .map(|e| (e.packet_id, e.cause.clone()))
+        .collect::<Vec<_>>();
+    causes.into_iter().map(|(id, cause)| (id, cause.state(state))).collect()
 }
 
 /// Update destinations and SDK presence; forget long-gone entries.
@@ -338,17 +418,24 @@ fn refresh_locked(
 
 struct Retired {
     packet_id: u64,
-    cause: String,
+    reason_text: String,
+    cause: AbortCause,
+    cause_state: CauseState,
     destinations: u8,
     unnamed: bool,
     reason: RetireReason,
     age: Duration,
 }
 impl Retired {
-    fn of(entry: &Entry) -> Self {
+    fn of(entry: &Entry, causes: &[(u64, CauseState)]) -> Self {
         Self {
             packet_id: entry.packet_id,
+            reason_text: entry.reason.clone(),
             cause: entry.cause.clone(),
+            cause_state: causes
+                .iter()
+                .find(|(id, _)| *id == entry.packet_id)
+                .map_or(CauseState::Unknown, |(_, c)| *c),
             destinations: entry.destinations,
             unnamed: entry.unnamed,
             reason: entry.retired.expect("retired entry"),
@@ -370,16 +457,19 @@ impl Retired {
 fn announce(state: &AppState, retired: Vec<Retired>) {
     for r in retired {
         let destinations = r.destinations();
+        let cause = format!("{} ({})", r.cause.describe(), r.cause.describe_state(r.cause_state));
         log::warn!(
-            "automatic_abort_retired id={:#x} cause={:?} reason={:?} age_ms={} destinations=[{}]",
+            "automatic_abort_retired id={:#x} text={:?} cause={:?} cause_state={:?} reason={:?} age_ms={} destinations=[{}]",
             r.packet_id,
+            r.reason_text,
             r.cause,
+            r.cause_state,
             r.reason,
             r.age.as_millis(),
             destinations
         );
         state.add_notification(format!(
-            "Stale automatic Abort retired: it was still owed to {destinations} and will not be sent again, because {}. Send a new Abort if one is still needed.",
+            "Stale automatic Abort retired: it was still owed to {destinations} and will not be sent again, because {}; cause: {cause}. Send a new Abort if one is still needed.",
             r.reason.describe()
         ));
     }

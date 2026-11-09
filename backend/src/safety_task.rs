@@ -771,7 +771,8 @@ pub(crate) fn dispatch_safety_abort(state: &Arc<AppState>, router: &Router) -> b
     let Some(claim) = crate::gse::claim_automatic_abort(state) else {
         return false;
     };
-    dispatch_claimed_safety_abort(state, router, claim);
+    let cause = crate::abort_retirement::AbortCause::Unknown("Safety Task Abort Command Issued".into());
+    dispatch_claimed_safety_abort(state, router, claim, cause);
     true
 }
 
@@ -814,7 +815,18 @@ fn dispatch_safety_abort_reason(
             log::error!("automatic_abort_claimed_cause={reason:?} serialization_error={error}")
         }
     }
-    dispatch_claimed_safety_abort(state, router, claim);
+    // Recorded so a stale abort is retired by age only once its cause cleared.
+    let cause = match reason {
+        SafetyAbortReason::BoardOffline { board, .. } => crate::types::Board::from_sender_id(board)
+            .map_or_else(
+                || crate::abort_retirement::AbortCause::Unknown(format!("{board} offline")),
+                crate::abort_retirement::AbortCause::BoardOffline,
+            ),
+        SafetyAbortReason::GenericError { sender, .. } => {
+            crate::abort_retirement::AbortCause::Unknown(format!("error reported by {sender}"))
+        }
+    };
+    dispatch_claimed_safety_abort(state, router, claim, cause);
     SafetyDispatch::Claimed
 }
 
@@ -822,11 +834,12 @@ fn dispatch_claimed_safety_abort(
     state: &Arc<AppState>,
     router: &Router,
     _claim: crate::gse::AutomaticAbortClaim,
+    cause: crate::abort_retirement::AbortCause,
 ) {
     state.set_abort_indicator_latched(true);
     crate::sequences::refresh_action_policy_now(state);
     state.broadcast_action_policy_snapshot();
-    match queue_automatic_abort_packet(router, "Safety Task Abort Command Issued") {
+    match queue_automatic_abort_packet(router, "Safety Task Abort Command Issued", cause) {
         Ok(()) => {
             if let Err(error) = router.process_all_queues_with_timeout(3) {
                 log::error!("failed to flush automatic abort: {error:?}");

@@ -703,7 +703,11 @@ fn dispatch_abort(state: &Arc<AppState>) {
             state.set_abort_indicator_latched(true);
             crate::sequences::refresh_action_policy_now(state);
             state.broadcast_action_policy_snapshot();
-            match crate::telemetry_task::queue_automatic_abort_packet(router, "Tank overpressure abort") {
+            match crate::telemetry_task::queue_automatic_abort_packet(
+                router,
+                "Tank overpressure abort",
+                crate::abort_retirement::AbortCause::Overpressure,
+            ) {
                 Ok(()) => {
                     if let Err(error) = router.process_all_queues_with_timeout(3) {
                         log::error!("failed to flush overpressure abort: {error:?}");

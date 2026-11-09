@@ -181,13 +181,14 @@ pub(crate) fn queue_abort_packet(router: &Router, reason: &str) -> sedsnet::Tele
 pub(crate) fn queue_automatic_abort_packet(
     router: &Router,
     reason: &str,
+    cause: crate::abort_retirement::AbortCause,
 ) -> sedsnet::TelemetryResult<()> {
     let marked = format!("SEDS_AUTO_ABORT_V1:{reason}");
     let packet = abort_packet(router, &marked)?;
     let packet_id = packet.packet_id();
     router.tx_queue(packet)?;
     // Only automatic aborts are registered, so only they can be retired.
-    crate::abort_retirement::register_automatic(router, packet_id, reason);
+    crate::abort_retirement::register_automatic(router, packet_id, reason, cause);
     Ok(())
 }
 

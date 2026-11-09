@@ -210,6 +210,7 @@ pub(super) mod tests {
             crate::telemetry_task::queue_automatic_abort_packet(
                 router,
                 "Safety Task Abort Command Issued",
+                crate::abort_retirement::AbortCause::Unknown("test".into()),
             )
             .unwrap();
             router.process_all_queues_with_timeout(3).unwrap();
@@ -419,6 +420,7 @@ pub(super) mod tests {
             crate::telemetry_task::queue_automatic_abort_packet(
                 &worker_router,
                 "claimed automatic abort",
+                crate::abort_retirement::AbortCause::Unknown("test".into()),
             )
             .unwrap();
             worker_router.process_all_queues_with_timeout(0).unwrap();
@@ -528,7 +530,8 @@ pub(super) mod tests {
         assert!(
             crate::telemetry_task::queue_automatic_abort_packet(
                 &bounded,
-                "automatic abort cannot fit in tiny queue"
+                "automatic abort cannot fit in tiny queue",
+                crate::abort_retirement::AbortCause::Unknown("test".into()),
             )
             .is_err()
         );

@@ -5013,7 +5013,11 @@ pub(crate) fn queue_automatic_abort_for_generation(
     if generation != automatic_generation(state) || !automatic_abort_allowed(state) {
         return Ok(false);
     }
-    crate::telemetry_task::queue_automatic_abort_packet(router, reason)?;
+    crate::telemetry_task::queue_automatic_abort_packet(
+        router,
+        reason,
+        crate::abort_retirement::AbortCause::Unknown(reason.to_string()),
+    )?;
     Ok(true)
 }
 
