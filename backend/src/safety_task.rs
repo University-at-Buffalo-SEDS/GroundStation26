@@ -570,10 +570,10 @@ async fn safety_loop(
                 .collect::<Vec<_>>()
         };
 
-        if packets.is_empty() {
-            continue;
-        }
-
+        // An empty snapshot only means no packet was ingested this cycle. The
+        // liveness abort selected above must still be dispatched below: a
+        // board that drops off can take every other packet with it (the
+        // Gateway Board carries the whole umbilical).
         let mut cycle_warnings: HashSet<&'static str> = HashSet::new();
         for pkt in packets {
             match pkt.data_type() {
@@ -889,8 +889,12 @@ mod tests {
             (FlightState::PreFill, false, true, false),
             (FlightState::PreFill, true, true, false),
         ] {
-            actual_safety_scene(stage, generic, transition_startup, expect_abort).await;
+            actual_safety_scene(stage, generic, transition_startup, expect_abort, false).await;
         }
+        // An offline board can take every other packet with it: the Gateway
+        // Board carries the whole umbilical and the radio may be silent too.
+        // With nothing received this cycle the liveness abort must still go out.
+        actual_safety_scene(FlightState::Idle, false, false, true, true).await;
     }
 
     async fn actual_safety_scene(
@@ -898,6 +902,7 @@ mod tests {
         generic: bool,
         transition_startup: bool,
         expect_abort: bool,
+        nothing_received: bool,
     ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let state = crate::state::tests::test_app_state().await;
@@ -945,13 +950,15 @@ mod tests {
             )
             .unwrap()
         };
-        state
-            .ring_buffer
-            .lock()
-            .unwrap()
-            .push(crate::ring_buffer::ReceivedPacket::Telemetry {
-                packet: packet("FLIGHT_STATE"), ingress_generation: crate::gse::automatic_generation(&state),
-            });
+        if !nothing_received {
+            state
+                .ring_buffer
+                .lock()
+                .unwrap()
+                .push(crate::ring_buffer::ReceivedPacket::Telemetry {
+                    packet: packet("FLIGHT_STATE"), ingress_generation: crate::gse::automatic_generation(&state),
+                });
+        }
         if generic && !transition_startup {
             state
                 .ring_buffer
