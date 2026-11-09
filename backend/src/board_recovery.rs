@@ -1073,6 +1073,8 @@ pub(crate) struct ReadonlyQueryRefresh {
     /// the radio side's turn.
     cursor: [usize; 2],
     core_busy_last: [Option<WallInstant>; 7],
+    /// Background queries in a row that got no reply, per board.
+    misses: [u8; 7],
 }
 impl ReadonlyQueryRefresh {
     fn due(&self, at: usize, now: WallInstant) -> bool {
@@ -1110,8 +1112,13 @@ impl ReadonlyQueryRefresh {
         }) {
             return false;
         }
+        let previous = state.board_recovery.inner.lock().unwrap().queries[at].clone();
         let response = request_board_query(state, board);
-        self.record_response(at, now, &response)
+        let sent = self.record_response(at, now, &response);
+        if sent {
+            self.misses[at] = next_readonly_misses(previous.as_ref(), self.misses[at]);
+        }
+        sent
     }
     pub(crate) fn poll(&mut self, state: &Arc<AppState>) -> Option<Board> {
         if crate::rrls::is_rrls() || !coordinator::readonly_query_idle(state) {
@@ -1128,7 +1135,7 @@ impl ReadonlyQueryRefresh {
             .lock()
             .unwrap()
             .snapshot(now.wall, crate::runtime_mode::is_test_fire());
-        let (last, core_busy_last) = (self.last, self.core_busy_last);
+        let (last, core_busy_last, misses) = (self.last, self.core_busy_last, self.misses);
         // Only boards this mode tracks (test fire has no AV bay).
         let scope = scope::mode_scope(crate::station_mode::local_mode());
         let picks = {
@@ -1149,6 +1156,12 @@ impl ReadonlyQueryRefresh {
                     inner.queries[at].as_ref(),
                     now,
                 ) && readonly_query_due_for(last[at], now.wall, seen)
+                    && readonly_backoff_due(
+                        last[at],
+                        now.wall,
+                        // A reply ends the backoff at once.
+                        if inner.queries[at].as_ref().is_some_and(|query| query.received) { 0 } else { misses[at] },
+                    )
             })
         };
         let mut first = None;
@@ -1174,6 +1187,27 @@ fn pick_per_link(cursor: &mut [usize; 2], eligible: impl Fn(usize) -> bool) -> V
         }
     }
     picks
+}
+/// Background queries that went unanswered back off per board: the first
+/// retry after QUERY_RETRY, then doubling up to READONLY_BACKOFF_MAX. Any
+/// reply resets it. Operator Query, Prepare/Recover and Resync never wait.
+const READONLY_BACKOFF_MAX: Duration = Duration::from_secs(30);
+fn readonly_backoff_due(last: Option<WallInstant>, now: WallInstant, misses: u8) -> bool {
+    if misses == 0 {
+        return true;
+    }
+    let wait = QUERY_RETRY
+        .saturating_mul(1u32 << u32::from(misses.min(8) - 1))
+        .min(READONLY_BACKOFF_MAX);
+    let wait = crate::sim_freshness::wall(wait);
+    last.is_none_or(|last| now.checked_duration_since(last).is_some_and(|age| age >= wait))
+}
+/// Unanswered background queries in a row after issuing the next one.
+fn next_readonly_misses(previous: Option<&Query>, misses: u8) -> u8 {
+    match previous {
+        Some(query) if !query.received => misses.saturating_add(1).min(200),
+        _ => 0,
+    }
 }
 /// A board network health marks unhealthy is re-queried this often.
 const UNHEALTHY_REQUERY: Duration = Duration::from_secs(10);
@@ -2423,6 +2457,30 @@ mod slow_link_freshness_tests {
     }
     /// A board whose reply was lost is asked again well inside the launch
     /// proof window, instead of after the whole QUERY_TTL.
+    /// Faithful bench run (S5=10, downlink lost): background readback
+    /// queries to RF/PB/FC were retransmitted about every 3 s and exhausted
+    /// their ordered retries every 5-7 s (197 BOARD_RECOVERY_REQUEST in 75 s)
+    /// while no reply ever arrived. Unanswered background queries now back
+    /// off per board, 3 -> 6 -> 12 -> 24 -> 30 s, and reset on any reply.
+    #[test]
+    fn unanswered_background_queries_back_off_per_board_and_reset_on_reply() {
+        let start = WallInstant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        // No unanswered queries: the normal two-second cadence.
+        assert!(readonly_backoff_due(Some(start), at(2), 0));
+        for (misses, wait) in [(1u8, 3u64), (2, 6), (3, 12), (4, 24), (5, 30), (9, 30)] {
+            assert!(!readonly_backoff_due(Some(start), at(wait) - Duration::from_millis(1), misses), "{misses}");
+            assert!(readonly_backoff_due(Some(start), at(wait), misses), "{misses}");
+        }
+        let sent = Stamp::now();
+        let pending = Query { abort_revision: 0, nonce: 1, sent, received: false };
+        let answered = Query { received: true, ..pending };
+        assert_eq!(next_readonly_misses(Some(&pending), 0), 1);
+        assert_eq!(next_readonly_misses(Some(&pending), 3), 4);
+        assert_eq!(next_readonly_misses(Some(&pending), 200), 200, "bounded");
+        assert_eq!(next_readonly_misses(Some(&answered), 4), 0, "a reply resets it");
+        assert_eq!(next_readonly_misses(None, 4), 0);
+    }
     #[test]
     fn an_unanswered_query_is_retried_inside_the_launch_proof_window() {
         assert!(QUERY_RETRY < crate::board_abort::PROOF_TTL);
