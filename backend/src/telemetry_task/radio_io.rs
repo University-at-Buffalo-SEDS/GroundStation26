@@ -30,6 +30,41 @@ fn radio_transport_priority(priority: u8, payload: &[u8]) -> u8 {
     }
 }
 
+/// Exact payload identity for the starvation reservation (not security).
+fn payload_identity(payload: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    payload.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Discovery state the peer needs on a bounded schedule: route announcements,
+/// topology, addresses, time sources, schema and link capabilities. Requests
+/// (including MANAGED_VARIABLE_REQUEST) and LEAVE are excluded.
+fn must_not_starve(payload: &[u8]) -> bool {
+    use sedsnet::config::DataType;
+    !payload.starts_with(b"SDT")
+        && serialize::peek_frame_info_unchecked(payload).is_ok_and(|info| {
+            matches!(
+                info.envelope.ty,
+                DataType::DiscoveryAnnounce
+                    | DataType::DiscoveryTimeSyncSources
+                    | DataType::DiscoveryTopology
+                    | DataType::DiscoverySchema
+                    | DataType::DiscoveryLinkCapabilities
+                    | DataType::DiscoveryAddress
+                    | DataType::ManagedVariableValue
+            )
+        })
+}
+
+fn is_managed_variable_request(payload: &[u8]) -> bool {
+    !payload.starts_with(b"SDT")
+        && serialize::peek_frame_info_unchecked(payload).is_ok_and(|info| {
+            info.envelope.ty == sedsnet::config::DataType::ManagedVariableRequest
+        })
+}
+
 fn is_delivery_receipt(payload: &[u8]) -> bool {
     !payload.starts_with(b"SDT")
         && serialize::peek_frame_info_unchecked(payload).is_ok_and(|info| {
@@ -104,7 +139,38 @@ pub struct TxQueueBudget {
     write_leases: Mutex<Vec<(usize, usize, sedsnet::router::PackedWriteLease)>>,
     recovery_classifier: RecoveryFrameClassifier,
     refusals: TxRefusalCounters,
+    /// The oldest refused ordinary frame that must not starve (discovery
+    /// announcements/topology/address/schema, or any frame over half the
+    /// ordinary allowance): (payload hash, length, first refusal). While
+    /// fresh, every other ordinary frame must leave room for it, so a stream
+    /// of short frames cannot hold it off. Live: DISCOVERY_SCHEMA had 0 sends
+    /// against 1.37M refusals and DISCOVERY_ANNOUNCE about 1 per 30 s, the
+    /// route TTL, so RF lost its route to the station and sent no telemetry.
+    large_waiter: Mutex<Option<Waiter>>,
+    /// Last 16 admitted radio frames, one bit each: set for a
+    /// MANAGED_VARIABLE_REQUEST. Time-free, so model-time tests behave.
+    recent_admissions: std::sync::atomic::AtomicU32,
 }
+
+#[derive(Clone, Copy)]
+struct Waiter {
+    identity: u64,
+    len: usize,
+    since: std::time::Instant,
+    /// Other frames refused for it since its own last attempt. A waiter the
+    /// router stopped offering (retired or superseded) expires after
+    /// WAITER_MAX_MISSES, or after LARGE_WAITER_MS of wall time.
+    misses: u32,
+}
+
+/// How long a refused starving frame holds its reservation.
+const LARGE_WAITER_MS: u128 = 1_000;
+const WAITER_MAX_MISSES: u32 = 256;
+/// MANAGED_VARIABLE_REQUEST may take at most this many of the last 16
+/// admitted radio frames while other traffic is waiting; an idle link always
+/// takes one. Requests toward an owner that never answers were about 78% of
+/// the station's radio airtime (10/s) while the RF route kept reappearing.
+const MANAGED_REQUEST_SHARE_OF_16: u32 = 4;
 
 /// Why the radio side callback refused a frame. Every refusal is a
 /// backpressure retry the SDK repeats on its next queue pass: the frame is
@@ -115,6 +181,8 @@ pub struct TxRefusalCounters {
     control_budget: std::sync::atomic::AtomicU64,
     ordinary_budget: std::sync::atomic::AtomicU64,
     aggregate_ceiling: std::sync::atomic::AtomicU64,
+    large_frame_reservation: std::sync::atomic::AtomicU64,
+    managed_request_rate: std::sync::atomic::AtomicU64,
     transport_busy: std::sync::atomic::AtomicU64,
     other: std::sync::atomic::AtomicU64,
 }
@@ -148,6 +216,8 @@ impl TxQueueBudget {
             write_leases: Mutex::new(Vec::new()),
             recovery_classifier:Default::default(),
             refusals: TxRefusalCounters::default(),
+            large_waiter: Mutex::new(None),
+            recent_admissions: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -197,11 +267,51 @@ impl TxQueueBudget {
                 "control_budget": load(&r.control_budget),
                 "ordinary_budget": load(&r.ordinary_budget),
                 "aggregate_ceiling": load(&r.aggregate_ceiling),
+                "large_frame_reservation": load(&r.large_frame_reservation),
+                "managed_request_rate": load(&r.managed_request_rate),
                 "transport_busy": load(&r.transport_busy),
                 "other": load(&r.other),
             },
             "meaning": "refusals are writer backpressure (frame kept by the router and retried); none of them reached the air",
         })
+    }
+
+    /// Bytes held back for a fresh large waiter that this smaller frame
+    /// must leave free. Zero for the waiter itself or anything larger.
+    fn large_reservation(&self, identity: u64) -> usize {
+        let mut slot = self.large_waiter.lock().unwrap();
+        let Some(waiter) = slot.as_mut() else { return 0 };
+        if waiter.identity == identity {
+            waiter.misses = 0;
+            return 0;
+        }
+        if waiter.misses >= WAITER_MAX_MISSES
+            || waiter.since.elapsed().as_millis() >= LARGE_WAITER_MS
+        {
+            *slot = None;
+            return 0;
+        }
+        waiter.misses += 1;
+        waiter.len
+    }
+    /// First come, first served: a later starving frame waits its turn.
+    fn note_large_waiter(&self, identity: u64, len: usize) {
+        let mut waiter = self.large_waiter.lock().unwrap();
+        if waiter.is_none() {
+            *waiter = Some(Waiter { identity, len, since: std::time::Instant::now(), misses: 0 });
+        }
+    }
+    fn clear_large_waiter(&self, identity: u64) {
+        let mut waiter = self.large_waiter.lock().unwrap();
+        if waiter.is_some_and(|w| w.identity == identity) {
+            *waiter = None;
+        }
+    }
+    /// A request is admissible on an idle radio, or while requests hold
+    /// fewer than MANAGED_REQUEST_SHARE_OF_16 of the last 16 admissions.
+    fn managed_request_admissible(&self) -> bool {
+        self.pending.load(Ordering::Acquire) == 0
+            || self.recent_admissions.load(Ordering::Acquire).count_ones() < MANAGED_REQUEST_SHARE_OF_16
     }
 
     fn try_send_inner(
@@ -214,6 +324,12 @@ impl TxQueueBudget {
     ) -> sedsnet::TelemetryResult<()> {
         let mut stage = RefusalStage::Other;
         let result = self.try_send_admit(sender, priority, payload, lease, activity, &mut stage);
+        if result.is_ok() && self.short_lookahead {
+            let request = u32::from(is_managed_variable_request(payload));
+            let _ = self.recent_admissions.try_update(Ordering::AcqRel, Ordering::Acquire, |bits| {
+                Some(((bits << 1) | request) & 0xFFFF)
+            });
+        }
         if result.is_err() {
             let r = &self.refusals;
             TxRefusalCounters::bump(match stage {
@@ -221,6 +337,8 @@ impl TxQueueBudget {
                 RefusalStage::ControlBudget => &r.control_budget,
                 RefusalStage::OrdinaryBudget => &r.ordinary_budget,
                 RefusalStage::AggregateCeiling => &r.aggregate_ceiling,
+                RefusalStage::LargeFrameReservation => &r.large_frame_reservation,
+                RefusalStage::ManagedRequestRate => &r.managed_request_rate,
                 RefusalStage::TransportBusy => &r.transport_busy,
                 RefusalStage::Other => &r.other,
             });
@@ -284,6 +402,14 @@ impl TxQueueBudget {
         // Discovery uses priority 254. ACKs (255) and board commands have
         // their own bounded allowance, even while accepted schema chunks
         // exceed the ordinary target. Ownership still lasts until the write.
+        // Radio only: the router keeps a rate-refused request and retries it.
+        if self.short_lookahead
+            && is_managed_variable_request(payload)
+            && !self.managed_request_admissible()
+        {
+            *stage = RefusalStage::ManagedRequestRate;
+            return Err(sedsnet::TelemetryError::Io("side tx busy"));
+        }
         let control = uses_command_reserve(priority, payload);
         *stage = if control { RefusalStage::ControlBudget } else { RefusalStage::OrdinaryBudget };
         if control {
@@ -310,13 +436,23 @@ impl TxQueueBudget {
                     } else {
                         0
                     });
-            self.pending_ordinary
+            let identity = payload_identity(payload);
+            let reserved_for_large = self.large_reservation(identity);
+            let admitted = self.pending_ordinary
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                     pending
                         .checked_add(payload.len())
-                        .filter(|total| *total <= allowance)
-                })
-                .map_err(|_| sedsnet::TelemetryError::Io("side tx busy"))?;
+                        .filter(|total| *total + reserved_for_large <= allowance)
+                });
+            if admitted.is_err() {
+                if reserved_for_large != 0 {
+                    *stage = RefusalStage::LargeFrameReservation;
+                } else if payload.len() > self.ordinary_limit / 2 || must_not_starve(payload) {
+                    self.note_large_waiter(identity, payload.len());
+                }
+                return Err(sedsnet::TelemetryError::Io("side tx busy"));
+            }
+            self.clear_large_waiter(identity);
         }
         let ceiling = if self.short_lookahead {
             self.limit.saturating_add(self.ordinary_limit)
@@ -428,6 +564,8 @@ enum RefusalStage {
     ControlBudget,
     OrdinaryBudget,
     AggregateCeiling,
+    LargeFrameReservation,
+    ManagedRequestRate,
     TransportBusy,
     Other,
 }
@@ -2406,6 +2544,88 @@ mod priority_tests {
         }
         assert_eq!(frames, 4);
         assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn large_ordinary_frame_is_not_starved_by_a_stream_of_small_frames() {
+        let budget = TxQueueBudget::new_radio(2048, 256);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // Small frames keep the ordinary allowance partly full.
+        budget.try_send(&tx, 0, &[1; 100]).unwrap();
+        // A 192-byte schema chunk does not fit next to them...
+        assert!(budget.try_send(&tx, 0, &[2; 192]).is_err());
+        // ...and from now on small frames may not take the room it needs.
+        assert!(budget.try_send(&tx, 0, &[3; 60]).is_err());
+        assert_eq!(budget.diagnostics()["refusals"]["large_frame_reservation"], 1);
+        let (priority, payload) = rx.try_recv().unwrap();
+        budget.complete(priority, &payload);
+        // Small frames may still use what the large frame leaves free...
+        budget.try_send(&tx, 0, &[3; 60]).unwrap();
+        assert!(budget.try_send(&tx, 0, &[3; 60]).is_err(), "never its room");
+        budget.try_send(&tx, 0, &[2; 192]).unwrap();
+        for expected in [60, 192] {
+            let (p, f) = rx.try_recv().unwrap();
+            assert_eq!(f.len(), expected);
+            budget.complete(p, &f);
+        }
+        assert!(budget.large_waiter.lock().unwrap().is_none(), "released once admitted");
+        // A small discovery announcement also holds its turn: equal-or-larger
+        // ordinary frames cannot keep jumping ahead of it.
+        use sedsnet::config::{DataEndpoint, DataType};
+        let announce = serialize::pack_packet(&Packet::new(DataType::DiscoveryAddress, &[DataEndpoint::Discovery], "GS", 1, Arc::from(vec![9u8; 40])).unwrap()).to_vec();
+        assert!(must_not_starve(&announce));
+        let filler = vec![4u8; 256 - announce.len() + 1];
+        budget.try_send(&tx, 0, &filler).unwrap();
+        assert!(budget.try_send(&tx, 0, &announce).is_err());
+        let (p, f) = rx.try_recv().unwrap();
+        budget.complete(p, &f);
+        assert!(budget.try_send(&tx, 0, &vec![5u8; 256 - announce.len() + 1]).is_err(), "cannot jump the announcement");
+        budget.try_send(&tx, 0, &announce).unwrap();
+    }
+
+    #[test]
+    fn managed_variable_requests_are_rate_limited_on_the_radio_only() {
+        use sedsnet::config::{DataEndpoint, DataType};
+        let request = |n: u8| {
+            let packet = Packet::new(DataType::ManagedVariableRequest, &[DataEndpoint::Discovery], "GS", u64::from(n), Arc::from(vec![n; 4])).unwrap();
+            serialize::pack_packet(&packet).to_vec()
+        };
+        assert!(is_managed_variable_request(&request(0)));
+        let radio = TxQueueBudget::new_radio(2048, 2048);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // An idle radio always takes a request.
+        for n in 0..8 {
+            radio.try_send(&tx, 0, &request(n)).unwrap();
+            let (p, f) = rx.try_recv().unwrap();
+            radio.complete(p, &f);
+        }
+        // Under load (one other frame in flight) requests get at most 4 of 16.
+        radio.try_send(&tx, 0, &[1; 40]).unwrap();
+        let mut sent = 0;
+        for n in 0..20 {
+            if radio.try_send(&tx, 0, &request(n)).is_ok() {
+                sent += 1;
+            }
+        }
+        assert_eq!(sent, 0, "the last 16 admissions are already mostly requests");
+        for _ in 0..16 {
+            radio.try_send(&tx, 0, &[2; 40]).unwrap();
+            let (p, f) = rx.try_recv().unwrap();
+            radio.complete(p, &f);
+        }
+        for n in 0..20 {
+            if radio.try_send(&tx, 0, &request(n)).is_ok() {
+                sent += 1;
+            }
+        }
+        assert_eq!(sent, MANAGED_REQUEST_SHARE_OF_16 as usize, "bounded share; the router keeps the rest");
+        assert!(radio.diagnostics()["refusals"]["managed_request_rate"].as_u64().unwrap() >= 20);
+        // The wired link is unaffected.
+        let wired = TxQueueBudget::new(2048);
+        wired.try_send(&tx, 0, &[1; 40]).unwrap();
+        for n in 0..20 {
+            wired.try_send(&tx, 0, &request(n)).unwrap();
+        }
     }
 
     #[test]

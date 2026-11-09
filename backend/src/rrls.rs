@@ -58,6 +58,8 @@ const SETTINGS: u8 = 10;
 const HOST_CONTROL: u8 = 11;
 const MAX_SETTINGS_INBOX: usize = 4;
 const SETTINGS_PEER_AGE_MS: u64 = 15_000;
+/// Covers the RRLS's 2 s pairing resend with margin.
+const PAIRING_PEER_AGE_MS: u64 = 5_000;
 #[derive(Clone, Copy)]
 struct FrameClass {
     priority: u8,
@@ -429,6 +431,10 @@ pub struct Mesh {
     pub role: Role,
     voice_enabled: bool,
     settings_peer_seen: Option<u64>,
+    /// A station-pairing frame from the peer arrived over the radio. Link
+    /// freshness only for the pairing exchange's own frames: no settings
+    /// authority, lease or control (the exchange authenticates itself).
+    pairing_peer_seen: Option<u64>,
     settings_inbox: VecDeque<Vec<u8>>,
     command_proxy_inbox: VecDeque<Vec<u8>>,
     started: Instant,
@@ -499,6 +505,7 @@ impl Mesh {
             budget_transport_fault: false,
             voice_enabled: false,
             settings_peer_seen: None,
+            pairing_peer_seen: None,
             settings_inbox: VecDeque::new(),
             command_proxy_inbox: VecDeque::new(),
             started: Instant::now(),
@@ -922,8 +929,20 @@ impl Mesh {
             } else {
                 self.primary_sequence
             },
-            peer_fresh: self.settings_available(now),
+            peer_fresh: self.settings_available(now) || self.pairing_peer_fresh(now),
         }
+    }
+    /// An unpaired standby RRLS sends no READY and holds no authenticated
+    /// settings presence, so without this the primary's framing layer failed
+    /// closed on the first pairing reply too large for one frame (BUNDLE) and
+    /// silently dropped it on every REVEAL retry.
+    fn pairing_peer_fresh(&self, now: u64) -> bool {
+        self.pairing_peer_seen
+            .is_some_and(|last| now >= last && now - last < PAIRING_PEER_AGE_MS)
+    }
+    /// The pairing worker took a station-pairing frame from the peer.
+    pub(crate) fn note_pairing_peer(&mut self, now: u64) {
+        self.pairing_peer_seen = Some(self.pairing_peer_seen.map_or(now, |old| old.max(now)));
     }
     fn observe_settings_framing(&mut self, now: u64) {
         let context = self.settings_context(now);
@@ -4871,6 +4890,31 @@ mod completed_owner_certificate_tests {
             }
         }
     }
+    #[test]
+    fn unpaired_standby_rrls_still_receives_a_bundle_sized_pairing_reply() {
+        // Live 2026-11-08: HELLO/KEY/REVEAL fit one frame, but the primary's
+        // 110-byte BUNDLE went to the framing layer, which failed closed
+        // because an unpaired standby RRLS sends no READY and has no
+        // authenticated settings presence. Pairing frames now travel whole.
+        let mut bundle = crate::station_pairing::exchange::MAGIC.to_vec();
+        bundle.push(4);
+        bundle.extend([7u8; 16 + 90]);
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        mesh.enable_settings_framing();
+        assert!(!mesh.settings_available(0));
+        assert!(mesh.queue_station_pairing(&bundle, 0));
+        let tx = mesh.begin_mode_reply_transmission(0).unwrap();
+        assert_ne!(tx.settings_action, Some(settings_framing::Action::Probe));
+        let (kind, body) = decode(&tx.frame().bytes).unwrap();
+        assert_eq!(kind, SETTINGS);
+        assert_eq!(body, bundle.as_slice());
+        // Pairing link evidence is short-lived and grants no settings presence.
+        mesh.note_pairing_peer(0);
+        assert!(mesh.pairing_peer_fresh(PAIRING_PEER_AGE_MS - 1));
+        assert!(!mesh.pairing_peer_fresh(PAIRING_PEER_AGE_MS));
+        assert!(!mesh.settings_available(0));
+    }
+
     #[test]
     fn completed_owner_negotiated_reply_has_legacy_action_only_after_probe_timeout() {
         let legacy = include_bytes!("comms/fixtures/legacy374-settings-body.bin");

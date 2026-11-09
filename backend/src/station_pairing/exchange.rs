@@ -104,7 +104,55 @@ pub(crate) fn origin(value: &str) -> Result<String, String> {
     }
     Ok(out)
 }
+/// This station's web origin scheme/port, from GS_HTTPS_BIND_ADDRESS (443
+/// default). With HTTPS off the plain HTTP server on 3000 is the reachable one.
+fn local_scheme_port() -> (&'static str, u16) {
+    match std::env::var("GS_HTTPS_BIND_ADDRESS").ok().as_deref() {
+        Some("off") => ("http", 3000),
+        Some(addr) => (
+            "https",
+            addr.parse::<std::net::SocketAddr>().map_or(443, |a| a.port()),
+        ),
+        None => ("https", 443),
+    }
+}
+/// The URL this station advertises in the exchange when the operator gives
+/// none: GS_STATION_PUBLIC_URL if set, otherwise the LAN address of the
+/// interface that routes off-host, with this station's web port. Empty when
+/// neither is known: pairing then completes without a URL, and the peer is
+/// found later through LAN station discovery. URLs are hints for reaching
+/// the peer; they are bound into the transcript and the confirmed code, and
+/// never grant trust on their own.
+pub(crate) fn advertised_origin() -> String {
+    if let Some(url) = std::env::var("GS_STATION_PUBLIC_URL")
+        .ok()
+        .and_then(|url| origin(&url).ok())
+    {
+        return url;
+    }
+    // No packet is sent: connect() on UDP only selects the outgoing interface.
+    let ip = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            socket.connect("192.0.2.1:9")?;
+            socket.local_addr()
+        })
+        .map(|addr| addr.ip())
+        .ok()
+        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
+    ip.map_or_else(String::new, |ip| lan_origin(ip, local_scheme_port()))
+}
+fn lan_origin(ip: std::net::IpAddr, (scheme, port): (&str, u16)) -> String {
+    let host = match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    origin(&format!("{scheme}://{host}:{port}")).unwrap_or_default()
+}
 pub(crate) fn scheme_port(origin: &str) -> (String, u16) {
+    if origin.is_empty() {
+        let (scheme, port) = local_scheme_port();
+        return (scheme.into(), port);
+    }
     let (scheme, rest) = origin.split_once("://").unwrap_or(("https", origin));
     let default = if scheme == "http" { 80 } else { 443 };
     let port = match rest.strip_prefix('[') {
@@ -137,7 +185,10 @@ impl Bundle {
             "signing_seed_file": "identity.seed",
             "scheme": scheme,
             "port": port,
-            "peers": [{"id": peer, "role": peer, "urls": [self.peer_url]}],
+            // Peer URLs are optional hints; LAN discovery finds the peer
+            // when none was exchanged.
+            "peers": [{"id": peer, "role": peer,
+                "urls": if self.peer_url.is_empty() { Vec::new() } else { vec![self.peer_url.clone()] }}],
         })
     }
 }
@@ -309,7 +360,9 @@ fn key_and_url(body: &[u8]) -> Option<([u8; 32], String)> {
     let key: [u8; 32] = body.get(..32)?.try_into().ok()?;
     let len = usize::from(*body.get(32)?);
     let url = std::str::from_utf8(body.get(33..33 + len)?).ok()?;
-    (body.len() == 33 + len && origin(url).ok()? == url).then(|| (key, url.to_string()))
+    // An empty URL is allowed: the station did not know a reachable address.
+    (body.len() == 33 + len && (url.is_empty() || origin(url).ok()? == url))
+        .then(|| (key, url.to_string()))
 }
 
 struct Session {
@@ -389,7 +442,7 @@ impl Exchange {
             expires_in_ms: s.expires.saturating_sub(now),
             local_confirmed: s.local_confirmed,
             peer_confirmed: s.peer_confirmed,
-            peer_url: s.peer_url.clone(),
+            peer_url: s.peer_url.clone().filter(|url| !url.is_empty()),
             message,
         })
     }
@@ -399,8 +452,17 @@ impl Exchange {
         out
     }
     /// Open a window. On the RRLS this also builds the first request.
-    pub(crate) fn start(&mut self, own_url: &str, now: u64) -> Result<(), String> {
-        let own_url = origin(own_url)?;
+    /// `own_url` is optional: without one the station advertises its own
+    /// address (see `advertised_origin`), possibly none at all.
+    pub(crate) fn start(&mut self, own_url: Option<&str>, now: u64) -> Result<(), String> {
+        let own_url = match own_url.map(str::trim).filter(|url| !url.is_empty()) {
+            Some(url) => origin(url)?,
+            None => advertised_origin(),
+        };
+        self.start_origin(own_url, now)
+    }
+    /// Open a window advertising `own_url`, which may be empty.
+    fn start_origin(&mut self, own_url: String, now: u64) -> Result<(), String> {
         if self.undecided(now) {
             return Err("A pairing window is already open; cancel it first.".into());
         }
@@ -791,8 +853,8 @@ mod tests {
     }
 
     fn run_to_codes(p: &mut Exchange, r: &mut Exchange) {
-        p.start("https://GroundStation.local:443/", 0).unwrap();
-        r.start("http://rrls.local:3000", 0).unwrap();
+        p.start(Some("https://GroundStation.local:443/"), 0).unwrap();
+        r.start(Some("http://rrls.local:3000"), 0).unwrap();
         let hello = r.poll(0, true).send;
         assert_eq!(hello.len(), 1);
         let key = pump(r, p, hello, 1).send;
@@ -804,6 +866,59 @@ mod tests {
         let reveal = r.poll(3, true).send;
         let bundle = pump(r, p, reveal, 4).send;
         assert!(pump(p, r, bundle, 5).send.is_empty());
+    }
+
+    #[test]
+    fn pairing_completes_with_no_url_on_either_side() {
+        let (mut p, mut r) = (Exchange::new(Side::Primary), Exchange::new(Side::Rrls));
+        p.start_origin(String::new(), 0).unwrap();
+        r.start_origin(String::new(), 0).unwrap();
+        let hello = r.poll(0, true).send;
+        let key = pump(&mut r, &mut p, hello, 1).send;
+        assert!(pump(&mut p, &mut r, key, 2).send.is_empty());
+        let reveal = r.poll(3, true).send;
+        let bundle = pump(&mut r, &mut p, reveal, 4).send;
+        assert!(pump(&mut p, &mut r, bundle, 5).send.is_empty());
+        let (pv, rv) = (p.view(6).unwrap(), r.view(6).unwrap());
+        assert_eq!(pv.phase, Phase::Compare);
+        assert_eq!(pv.code, rv.code);
+        assert_eq!((pv.peer_url, rv.peer_url), (None, None));
+        let code = pv.code.unwrap();
+        r.confirm(&code, 7).unwrap();
+        let confirm = r.poll(8, true).send;
+        pump(&mut r, &mut p, confirm, 9);
+        let saved = p.confirm(&code, 10).unwrap().save.unwrap();
+        let json = saved.pairing_json();
+        assert_eq!(json["peers"][0]["urls"], serde_json::json!([]));
+        assert!(matches!(json["scheme"].as_str(), Some("https" | "http")));
+        assert!(json["port"].as_u64().is_some_and(|p| p > 0));
+    }
+
+    #[test]
+    fn a_station_without_a_url_still_learns_the_peer_url_bound_in_the_code() {
+        let (mut p, mut r) = (Exchange::new(Side::Primary), Exchange::new(Side::Rrls));
+        p.start_origin("https://192.168.3.7".into(), 0).unwrap();
+        r.start_origin(String::new(), 0).unwrap();
+        let hello = r.poll(0, true).send;
+        let key = pump(&mut r, &mut p, hello, 1).send;
+        pump(&mut p, &mut r, key, 2);
+        let reveal = r.poll(3, true).send;
+        let bundle = pump(&mut r, &mut p, reveal, 4).send;
+        pump(&mut p, &mut r, bundle, 5);
+        assert_eq!(r.view(6).unwrap().peer_url.as_deref(), Some("https://192.168.3.7"));
+        assert_eq!(p.view(6).unwrap().peer_url, None);
+        assert_eq!(p.view(6).unwrap().code, r.view(6).unwrap().code);
+    }
+
+    #[test]
+    fn advertised_lan_origins_are_valid_https_origins() {
+        assert_eq!(lan_origin("192.168.3.7".parse().unwrap(), ("https", 443)), "https://192.168.3.7");
+        assert_eq!(lan_origin("10.0.0.2".parse().unwrap(), ("http", 3000)), "http://10.0.0.2:3000");
+        assert_eq!(lan_origin("fe80::1".parse().unwrap(), ("https", 8443)), "https://[fe80::1]:8443");
+        let advertised = advertised_origin();
+        assert!(advertised.is_empty() || origin(&advertised).as_deref() == Ok(advertised.as_str()));
+        assert!(key_and_url(&[&[1u8; 32][..], &[0]].concat()).is_some(), "empty URL field");
+        assert!(key_and_url(&[&[1u8; 32][..], &[3], b"bad"].concat()).is_none());
     }
 
     #[test]
@@ -895,8 +1010,8 @@ mod tests {
     fn a_relay_cannot_substitute_keys_or_forge_confirmation() {
         // The RRLS's reveal must match its earlier commitment.
         let (mut p, mut r) = (Exchange::new(Side::Primary), Exchange::new(Side::Rrls));
-        p.start("https://gs.local", 0).unwrap();
-        r.start("https://rrls.local", 0).unwrap();
+        p.start(Some("https://gs.local"), 0).unwrap();
+        r.start(Some("https://rrls.local"), 0).unwrap();
         let hello = r.poll(0, true).send;
         let key = pump(&mut r, &mut p, hello, 1).send;
         pump(&mut p, &mut r, key, 2);
@@ -908,8 +1023,8 @@ mod tests {
 
         // A tampered bundle never yields a code on the RRLS.
         let (mut p, mut r) = (Exchange::new(Side::Primary), Exchange::new(Side::Rrls));
-        p.start("https://gs.local", 0).unwrap();
-        r.start("https://rrls.local", 0).unwrap();
+        p.start(Some("https://gs.local"), 0).unwrap();
+        r.start(Some("https://rrls.local"), 0).unwrap();
         let hello = r.poll(0, true).send;
         let key = pump(&mut r, &mut p, hello, 1).send;
         pump(&mut p, &mut r, key, 2);
@@ -929,7 +1044,7 @@ mod tests {
         assert!(p.receive(&forged, 7).save.is_none());
         // A second RRLS cannot take over an owned window.
         let mut other = Exchange::new(Side::Rrls);
-        other.start("https://other.local", 0).unwrap();
+        other.start(Some("https://other.local"), 0).unwrap();
         let hello = other.poll(0, true).send;
         assert!(pump(&mut other, &mut p, hello, 8).send.is_empty());
     }
@@ -938,7 +1053,7 @@ mod tests {
     fn closed_window_and_garbage_are_ignored() {
         let mut p = Exchange::new(Side::Primary);
         let mut r = Exchange::new(Side::Rrls);
-        r.start("https://rrls.local", 0).unwrap();
+        r.start(Some("https://rrls.local"), 0).unwrap();
         let hello = r.poll(0, true).send;
         assert!(
             pump(&mut r, &mut p, hello.clone(), 1).send.is_empty(),
@@ -953,7 +1068,7 @@ mod tests {
             "resend waits for the interval"
         );
         assert_eq!(r.poll(RESEND_MS, true).send, hello);
-        p.start("https://gs.local", 0).unwrap();
+        p.start(Some("https://gs.local"), 0).unwrap();
         for junk in [&b"SP\x01"[..], b"SP\x01\x01short", &[0u8; 600]] {
             assert!(p.receive(junk, 1).send.is_empty());
         }

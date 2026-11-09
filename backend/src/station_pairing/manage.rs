@@ -137,11 +137,41 @@ fn mesh_now() -> Option<(crate::rrls::Shared, u64)> {
     let now = mesh.lock().unwrap().now();
     Some((mesh, now))
 }
-fn flush(mesh: &crate::rrls::Shared, frames: Vec<Vec<u8>>, now: u64) -> bool {
-    let mut m = mesh.lock().unwrap();
-    frames
-        .into_iter()
-        .all(|frame| m.queue_station_pairing(&frame, now))
+/// Most frames one exchange step produces; older duplicates are replaced.
+const PENDING_LIMIT: usize = 4;
+/// Queue pending pairing frames in order. A frame the radio cannot take yet
+/// stays pending (with everything after it) and is retried on the next tick
+/// until it is queued or the exchange window closes; nothing is dropped.
+fn flush(
+    pending: &mut std::collections::VecDeque<Vec<u8>>,
+    mut queue: impl FnMut(&[u8]) -> bool,
+) -> bool {
+    while let Some(frame) = pending.front() {
+        if !queue(frame) {
+            return false;
+        }
+        pending.pop_front();
+    }
+    true
+}
+static PENDING: Mutex<std::collections::VecDeque<Vec<u8>>> =
+    Mutex::new(std::collections::VecDeque::new());
+/// Add frames to the shared pending queue and try to hand them to the radio.
+/// Returns false while some remain deferred (they are retried every tick).
+fn send_frames(mesh: &crate::rrls::Shared, frames: Vec<Vec<u8>>, now: u64) -> bool {
+    let mut pending = PENDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    add_pending(&mut pending, frames);
+    flush(&mut pending, |frame| mesh.lock().unwrap().queue_station_pairing(frame, now))
+}
+fn add_pending(pending: &mut std::collections::VecDeque<Vec<u8>>, frames: Vec<Vec<u8>>) {
+    for frame in frames {
+        // A resent answer to a retried request replaces its queued copy.
+        pending.retain(|queued| *queued != frame);
+        if pending.len() >= PENDING_LIMIT {
+            pending.pop_front();
+        }
+        pending.push_back(frame);
+    }
 }
 fn apply(worker: &mut Worker, effects: exchange::Effects) -> Vec<Vec<u8>> {
     if let Some(bundle) = effects.save {
@@ -178,6 +208,7 @@ pub(crate) fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>>
     Some(tokio::spawn(async move {
         let mut ticks = tokio::time::interval(std::time::Duration::from_millis(250));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut deferred_logged = false;
         loop {
             tokio::select! {
                 _ = shutdown.recv() => break,
@@ -193,10 +224,15 @@ pub(crate) fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>>
                 if !crate::mission_sync::running() {
                     while m.take_settings().is_some() {}
                 }
+                if !frames.is_empty() {
+                    // The peer is on the air now (link freshness only).
+                    m.note_pairing_peer(now);
+                }
                 (now, m.settings_available(now), frames)
             };
             let Some(lock) = worker() else { break };
             if frames.is_empty() && !lock.lock().unwrap().exchange.active(now) {
+                PENDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
                 continue;
             }
             // Crypto and the small file writes run off the async executor and
@@ -214,9 +250,13 @@ pub(crate) fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>>
             })
             .await
             .unwrap_or_default();
-            if !out.is_empty() && !flush(&mesh, out, now) {
-                log::debug!("Pairing frame deferred by settings backpressure; it will be retried");
+            let sent = send_frames(&mesh, out, now);
+            if !sent && !deferred_logged {
+                log::info!(
+                    "Pairing frame deferred by radio settings backpressure; retrying every 250 ms until the window closes"
+                );
             }
+            deferred_logged = !sent;
         }
     }))
 }
@@ -299,7 +339,9 @@ async fn get_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StartBody {
-    own_url: String,
+    /// Optional: without it the station advertises its own address.
+    #[serde(default)]
+    own_url: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -330,7 +372,7 @@ async fn start_pairing(
             .into_response();
     };
     let mut w = lock.lock().unwrap();
-    match w.exchange.start(&body.own_url, now) {
+    match w.exchange.start(body.own_url.as_deref(), now) {
         Ok(()) => {
             w.last_saved_error = None;
             drop(w);
@@ -364,7 +406,7 @@ async fn confirm_pairing(
     match result {
         Ok(out) => {
             if !out.is_empty() {
-                flush(&mesh, out, now);
+                send_frames(&mesh, out, now);
             }
             Json(status_body(true)).into_response()
         }
@@ -378,7 +420,7 @@ async fn cancel_pairing(State(state): State<Arc<AppState>>, headers: HeaderMap) 
     if let (Some(lock), Some((mesh, now))) = (worker(), mesh_now()) {
         let out = lock.lock().unwrap().exchange.cancel().send;
         if !out.is_empty() {
-            flush(&mesh, out, now);
+            send_frames(&mesh, out, now);
         }
     }
     Json(status_body(true)).into_response()
@@ -416,6 +458,30 @@ pub fn routes() -> Router<Arc<AppState>> {
 }
 
 #[cfg(test)]
+mod pending_tests {
+    use super::*;
+    #[test]
+    fn deferred_pairing_frames_are_kept_in_order_until_the_radio_takes_them() {
+        let mut pending = std::collections::VecDeque::new();
+        add_pending(&mut pending, vec![b"KEY".to_vec(), b"BUNDLE".to_vec()]);
+        let mut sent = Vec::new();
+        assert!(!flush(&mut pending, |f| { sent.push(f.to_vec()); false }));
+        assert_eq!(pending.len(), 2, "a refused frame is never dropped");
+        // A retried request's identical answer replaces, not duplicates.
+        add_pending(&mut pending, vec![b"BUNDLE".to_vec()]);
+        assert_eq!(pending, [b"KEY".to_vec(), b"BUNDLE".to_vec()]);
+        let mut accepted = Vec::new();
+        assert!(flush(&mut pending, |f| { accepted.push(f.to_vec()); true }));
+        assert_eq!(accepted, [b"KEY".to_vec(), b"BUNDLE".to_vec()]);
+        assert!(pending.is_empty());
+        for i in 0..10u8 {
+            add_pending(&mut pending, vec![vec![i]]);
+        }
+        assert_eq!(pending.len(), PENDING_LIMIT, "bounded");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn bundle(side: Side) -> Bundle {
@@ -437,6 +503,31 @@ mod tests {
             .into(),
         }
     }
+    #[test]
+    fn bundles_without_urls_save_and_old_pairing_files_still_load() {
+        let root =
+            std::env::temp_dir().join(format!("gs-pair-nourl-{:016x}", rand::random::<u64>()));
+        // Paired over the radio with no URL known on either side.
+        let mut none = bundle(Side::Rrls);
+        none.own_url = String::new();
+        none.peer_url = String::new();
+        save(&root.join("none"), &none).unwrap();
+        let loaded = super::super::Pairing::from_file(&root.join("none/pairing.json")).unwrap();
+        assert!(loaded.public.peers[0].urls.is_empty());
+        // A pairing.json written by the provisioning tool / earlier builds.
+        let old = root.join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("identity.seed"), [9u8; 32]).unwrap();
+        std::fs::write(
+            old.join("pairing.json"),
+            r#"{"version":1,"installation_id":"0b8f1c7e-3c1d-4d6a-9a52-2f9a3c3f8e11","station_id":"rrls","signing_seed_file":"identity.seed","scheme":"https","port":443,"peers":[{"id":"primary","role":"primary","urls":["https://192.168.3.7"]}]}"#,
+        )
+        .unwrap();
+        let old = super::super::Pairing::from_file(&old.join("pairing.json")).unwrap();
+        assert_eq!(old.public.peers[0].urls, vec!["https://192.168.3.7".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn saved_bundles_load_like_the_provisioning_tool_and_never_overwrite() {
         let root =
