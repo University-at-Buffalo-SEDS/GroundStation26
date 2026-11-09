@@ -77,7 +77,6 @@ impl Runtime {
     pub fn snapshot(&self) -> Snapshot {
         self.registry.lock().unwrap().snapshot()
     }
-    #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
     pub fn current_link(&self, key: Key) -> Option<ConditionLink> {
         self.registry.lock().unwrap().current_link(key)
     }

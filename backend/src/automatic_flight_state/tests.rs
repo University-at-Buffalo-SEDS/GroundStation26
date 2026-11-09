@@ -36,7 +36,6 @@ fn cached(router: &Router) -> Option<sedsnet::packet::Packet> {
 }
 // Healthy multi-phase fixtures service the same public SDK queues as the host.
 // This generic observer is an actual Router, not modeled MCU proof or hardware.
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 struct PhasePeer {
     router: Router,
     host_side: usize,
@@ -45,7 +44,6 @@ struct PhasePeer {
     incoming: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     received: Arc<std::sync::Mutex<Vec<sedsnet::packet::Packet>>>,
 }
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 impl PhasePeer {
     async fn connect(host: &Router) -> Self {
         let endpoint = crate::telemetry_schema::endpoint("FLIGHT_STATE");
@@ -115,7 +113,6 @@ impl PhasePeer {
     }
 }
 
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 fn legacy(observation: &Observation, target: FlightState) -> Proposal {
     let original = observation
         .captured()
@@ -129,9 +126,9 @@ fn legacy(observation: &Observation, target: FlightState) -> Proposal {
         )
         .unwrap()
 }
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 #[tokio::test]
 async fn complete_live_phase_chain_preserves_canonical_json_and_original_ids() {
+    crate::mode_suite!(Normal, Testing);
     if isolated("complete_live_phase_chain_preserves_canonical_json_and_original_ids") {
         return;
     }
@@ -179,9 +176,9 @@ async fn complete_live_phase_chain_preserves_canonical_json_and_original_ids() {
         "live identity must suppress conflicting bootstrap seed"
     );
 }
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 #[tokio::test]
 async fn retained_stop_and_stop_after_capture_leave_live_sdk_and_json_unchanged() {
+    crate::mode_suite!(Normal, Testing);
     if isolated("retained_stop_and_stop_after_capture_leave_live_sdk_and_json_unchanged") {
         return;
     }
@@ -204,9 +201,9 @@ async fn retained_stop_and_stop_after_capture_leave_live_sdk_and_json_unchanged(
         before
     );
 }
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 #[tokio::test]
 async fn explicit_same_phase_store_revision_retires_old_automatic_original() {
+    crate::mode_suite!(Normal, Testing);
     if isolated("explicit_same_phase_store_revision_retires_old_automatic_original") {
         return;
     }
@@ -224,9 +221,9 @@ async fn explicit_same_phase_store_revision_retires_old_automatic_original() {
         after_explicit
     );
 }
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 #[tokio::test]
 async fn actual_closed_barrier_refuses_old_original_without_epoch_assumptions() {
+    crate::mode_suite!(Normal, Testing);
     if isolated("actual_closed_barrier_refuses_old_original_without_epoch_assumptions") {
         return;
     }
@@ -249,9 +246,9 @@ async fn actual_closed_barrier_refuses_old_original_without_epoch_assumptions() 
         before
     );
 }
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 #[tokio::test]
 async fn history_launch_inhibit_blocks_auto_even_before_phase_or_lamp_catches_up() {
+    crate::mode_suite!(Normal, Testing);
     if isolated("history_launch_inhibit_blocks_auto_even_before_phase_or_lamp_catches_up") {
         return;
     }
@@ -276,9 +273,9 @@ async fn history_launch_inhibit_blocks_auto_even_before_phase_or_lamp_catches_up
             .automatic_actions_inhibited()
     );
 }
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 #[tokio::test]
 async fn operator_mode_startup_cannot_borrow_normal_readiness_authority() {
+    crate::mode_suite!(Hitl, TestFire);
     if isolated("operator_mode_startup_cannot_borrow_normal_readiness_authority") {
         return;
     }
@@ -299,9 +296,9 @@ async fn operator_mode_startup_cannot_borrow_normal_readiness_authority() {
     assert_eq!(state.local_flight_state_snapshot(), FlightState::Startup);
     assert!(cached(&router).is_none());
 }
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 #[tokio::test]
 async fn every_valid_clock_kind_survives_all_live_prelaunch_phases_byte_exact() {
+    crate::mode_suite!(Normal, Testing);
     if isolated("every_valid_clock_kind_survives_all_live_prelaunch_phases_byte_exact") {
         return;
     }
@@ -343,9 +340,9 @@ async fn every_valid_clock_kind_survives_all_live_prelaunch_phases_byte_exact() 
     }
 }
 
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 #[tokio::test]
 async fn actual_sdk_default_ring_capacity_refuses_next_phase_without_partial_acceptance() {
+    crate::mode_suite!(Normal, Testing);
     if isolated("actual_sdk_default_ring_capacity_refuses_next_phase_without_partial_acceptance") {
         return;
     }

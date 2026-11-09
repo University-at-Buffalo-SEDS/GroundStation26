@@ -75,7 +75,9 @@ async fn actual_get_primary_operator_has_exact_mode_policy_vocabulary() {
     assert_eq!(value["reset_startup_policy"].as_object().unwrap().len(), 5);
     assert_eq!(value["permissions"]["reset_startup"], false);
     assert_eq!(value["clock"]["network_utc_available"], false);
-    assert_eq!(value["mode_capability"]["runtime_switch_supported"], false);
+    assert_eq!(value["mode_capability"]["runtime_switch_supported"], true);
+    assert_eq!(value["mode_capability"]["requires_restart"], json!([]));
+    assert_eq!(value["mode_capability"]["supported_modes"].as_array().unwrap().len(), 4);
     assert_eq!(
         value["reset_startup_policy"]["mode"],
         value["mode_capability"]["current"]
@@ -231,13 +233,10 @@ async fn actual_get_identity_epoch_and_policy_aba_remain_server_owned() {
         viewer["principal"]["context"]
     );
     let original = scope::Selection::capture(&f.state, &[]).unwrap();
-    #[cfg(feature = "hitl_mode")]
-    {
+    if crate::runtime_mode::is_hitl() {
         f.state.toggle_hitl_safety_interlock(3);
         f.state.toggle_hitl_safety_interlock(3);
-    }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    } else {
         assert!(f.state.board_abort.change_launch_context_if(|| true));
         assert!(f.state.board_abort.change_launch_context_if(|| true));
     }

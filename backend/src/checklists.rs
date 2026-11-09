@@ -16,12 +16,10 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
 };
-#[cfg(not(feature = "hitl_mode"))]
 pub(crate) mod paired;
 // Shared wire definitions also serve the bounded paired-checklist model.
 // They are data only: importing a completion never invokes an engine transition.
 pub use paired_settings::checklists::{CompletionSource, Sequence};
-#[cfg(any(test, not(feature = "hitl_mode")))]
 #[derive(Clone, Default, Serialize, Deserialize, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CompletionAction {
@@ -32,7 +30,6 @@ pub(crate) enum CompletionAction {
     },
     Clear,
 }
-#[cfg(any(test, not(feature = "hitl_mode")))]
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CompletionEvent {
@@ -336,7 +333,6 @@ impl Document {
         item.completed_at_ms = request.checked.then_some(now);
         Ok(())
     }
-    #[cfg(any(test, not(feature = "hitl_mode")))]
     fn complete_sequence(&mut self, sequence: Sequence, now: i64) -> bool {
         let mut changed = false;
         for item in self.checklists.iter_mut().flat_map(|list| &mut list.items) {
@@ -353,7 +349,6 @@ impl Document {
         }
         changed
     }
-    #[cfg(any(test, not(feature = "hitl_mode")))]
     fn clear_sequence_completions(&mut self) -> bool {
         let mut changed = false;
         for item in self.checklists.iter_mut().flat_map(|list| &mut list.items) {
@@ -549,8 +544,9 @@ fn access<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, Strin
     }
 }
 pub fn launch_block() -> Option<String> {
-    #[cfg(not(feature = "hitl_mode"))]
-    if let Some(reason) = paired::extra_launch_block() {
+    if !crate::runtime_mode::is_hitl()
+        && let Some(reason) = paired::extra_launch_block()
+    {
         return Some(reason);
     }
     access(|s| Ok(s.document.launch_block()))
@@ -558,11 +554,9 @@ pub fn launch_block() -> Option<String> {
 }
 /// Called only after a successful, durably recorded sequence completion.
 /// It is deliberately event-driven: refreshing/restarting never rechecks a manually cleared item.
-#[cfg(not(feature = "hitl_mode"))]
 pub(crate) fn sequence_completed(event: &CompletionEvent) -> Result<(), String> {
     access(|store| store.record_sequence(event))
 }
-#[cfg(any(test, not(feature = "hitl_mode")))]
 impl Store {
     fn record_sequence(&mut self, event: &CompletionEvent) -> Result<(), String> {
         if !valid_id(&event.id) {
@@ -614,7 +608,6 @@ impl Store {
         Ok(())
     }
 }
-#[cfg(not(feature = "hitl_mode"))]
 pub(crate) fn reset_sequence_completions() -> Result<(), String> {
     if paired::requested() {
         return Ok(());
@@ -656,12 +649,12 @@ async fn sign_list(
             }
             Err(error) => return error,
         };
-    #[cfg(not(feature = "hitl_mode"))]
-    if let Some(reason) = paired::extra_launch_block() {
+    if !crate::runtime_mode::is_hitl()
+        && let Some(reason) = paired::extra_launch_block()
+    {
         return (StatusCode::CONFLICT, reason).into_response();
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    if paired::requested() {
+    if !crate::runtime_mode::is_hitl() && paired::requested() {
         let result = paired::sign(
             &request,
             principal.username.as_deref().expect("authenticated signer"),
@@ -811,8 +804,7 @@ async fn check_item(
         Ok(p) => p,
         Err(e) => return e,
     };
-    #[cfg(not(feature = "hitl_mode"))]
-    if paired::requested() {
+    if !crate::runtime_mode::is_hitl() && paired::requested() {
         let result = paired::check(
             &request,
             p.username.as_deref().unwrap_or("operator"),
@@ -846,8 +838,7 @@ async fn edit_lists(
     if let Err(e) = principal(&state, &headers, true).await {
         return e;
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    if paired::requested() {
+    if !crate::runtime_mode::is_hitl() && paired::requested() {
         let result = paired::edit(request, &state).await;
         if result.is_ok() {
             crate::sequences::refresh_action_policy_now(&state);
@@ -867,13 +858,51 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/checklists/sign", post(sign_list))
         .route("/api/checklists/export", get(export_lists))
         .route("/api/checklists/export.csv", get(export_signoffs));
-    #[cfg(not(feature = "hitl_mode"))]
-    let router = router.merge(paired::routes());
-    router
+    router.merge(
+        paired::routes().route_layer(axum::middleware::from_fn(paired_routes_mode_gate)),
+    )
+}
+/// The shared-checklist routes only existed outside HITL. In HITL they answer
+/// as the old HITL build's static-file fallback did: 404 for GET/HEAD and 405
+/// for any other method.
+async fn paired_routes_mode_gate(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if crate::runtime_mode::is_hitl() {
+        let status = if matches!(*request.method(), axum::http::Method::GET | axum::http::Method::HEAD) {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::METHOD_NOT_ALLOWED
+        };
+        return (status, crate::runtime_mode::unavailable("Shared checklists")).into_response();
+    }
+    next.run(request).await
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn shared_checklist_routes_answer_like_a_missing_route_in_hitl() {
+        use tower::ServiceExt;
+        let _mode = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Hitl);
+        let state = crate::state::tests::test_app_state().await;
+        let app = routes().with_state(state);
+        for (method, uri, status) in [
+            ("GET", "/api/checklists/sync", StatusCode::NOT_FOUND),
+            ("POST", "/api/checklists/resolve", StatusCode::METHOD_NOT_ALLOWED),
+        ] {
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), status, "{method} {uri}");
+            let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(body, "Shared checklists is unavailable in HITL mode.");
+        }
+    }
     fn temp() -> PathBuf {
         std::env::temp_dir()
             .join(format!("gs-checklists-{}", rand::random::<u64>()))

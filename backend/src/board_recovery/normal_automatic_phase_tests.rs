@@ -148,6 +148,7 @@ fn facts(state: &Arc<AppState>, label: &str) -> Value {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn n1_actual_http_stop_then_policy_refresh_must_not_publish_idle() {
+    crate::mode_suite!(Normal, Testing);
     if separate("n1_actual_http_stop_then_policy_refresh_must_not_publish_idle") {
         return;
     }
@@ -168,6 +169,7 @@ async fn n1_actual_http_stop_then_policy_refresh_must_not_publish_idle() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn n2_healthy_normal_policy_keeps_live_idle_and_canonical_startup() {
+    crate::mode_suite!(Normal, Testing);
     if separate("n2_healthy_normal_policy_keeps_live_idle_and_canonical_startup") {
         return;
     }
@@ -197,6 +199,7 @@ async fn n2_healthy_normal_policy_keeps_live_idle_and_canonical_startup() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn n3_actual_counted_safety_blocks_reset_then_old_work_cannot_publish_while_closed() {
+    crate::mode_suite!(Normal, Testing);
     if separate("n3_actual_counted_safety_blocks_reset_then_old_work_cannot_publish_while_closed") {
         return;
     }
@@ -278,6 +281,7 @@ async fn n3_actual_counted_safety_blocks_reset_then_old_work_cannot_publish_whil
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn n4_counted_tick_blocks_actual_reset_epoch_until_it_retires() {
+    crate::mode_suite!(Normal, Testing);
     if separate("n4_counted_tick_blocks_actual_reset_epoch_until_it_retires") {
         return;
     }
@@ -330,6 +334,7 @@ async fn n4_counted_tick_blocks_actual_reset_epoch_until_it_retires() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn n5_original_ticket_before_claim_is_rejected_after_actual_completed_reset() {
+    crate::mode_suite!(Normal, Testing);
     if separate("n5_original_ticket_before_claim_is_rejected_after_actual_completed_reset") {
         return;
     }
@@ -420,6 +425,7 @@ async fn n5_original_ticket_before_claim_is_rejected_after_actual_completed_rese
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn n6_healthy_actual_safety_worker_keeps_live_idle_and_canonical_startup() {
+    crate::mode_suite!(Normal, Testing);
     if separate("n6_healthy_actual_safety_worker_keeps_live_idle_and_canonical_startup") {
         return;
     }
@@ -521,6 +527,7 @@ impl Drop for N6BusyGseOwner {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn n6b_one_actual_safety_tick_refuses_busy_owner_without_partial_idle() {
+    crate::mode_suite!(Normal, Testing);
     if separate("n6b_one_actual_safety_tick_refuses_busy_owner_without_partial_idle") { return; }
     let fixture = normal().await;
     let state = fixture.state();
@@ -571,6 +578,7 @@ async fn n6b_one_actual_safety_tick_refuses_busy_owner_without_partial_idle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn n7_counted_old_tick_must_not_publish_after_actual_http_stop() {
+    crate::mode_suite!(Normal, Testing);
     if separate("n7_counted_old_tick_must_not_publish_after_actual_http_stop") {
         return;
     }
@@ -620,6 +628,7 @@ async fn actual_raw_board_abort(fixture: &Fixture, board: Board) {
 }
 #[tokio::test(flavor="multi_thread",worker_threads=4)]
 async fn board_revision_changed_then_actual_healthy_query_cannot_revive_old_publication() {
+    crate::mode_suite!(Normal, Testing);
     if separate("board_revision_changed_then_actual_healthy_query_cannot_revive_old_publication") {return;}
     let fixture=normal().await;let state=fixture.state();
     let original=crate::automatic_flight_state::Observation::begin(&state).unwrap();
@@ -644,6 +653,7 @@ async fn board_revision_changed_then_actual_healthy_query_cannot_revive_old_publ
 }
 #[tokio::test(flavor="multi_thread",worker_threads=4)]
 async fn active_actual_board_abort_cannot_capture_or_publish_automatic_prelaunch() {
+    crate::mode_suite!(Normal, Testing);
     if separate("active_actual_board_abort_cannot_capture_or_publish_automatic_prelaunch") {return;}
     let fixture=normal().await;let state=fixture.state();
     actual_raw_board_abort(&fixture,Board::ActuatorBoard).await;
@@ -657,6 +667,7 @@ async fn active_actual_board_abort_cannot_capture_or_publish_automatic_prelaunch
 }
 #[tokio::test(flavor="multi_thread",worker_threads=4)]
 async fn actual_healthy_query_allows_only_fresh_original_live_phase_after_clear() {
+    crate::mode_suite!(Normal, Testing);
     if separate("actual_healthy_query_allows_only_fresh_original_live_phase_after_clear") {return;}
     let fixture=normal().await;let state=fixture.state();
     actual_raw_board_abort(&fixture,Board::ActuatorBoard).await;

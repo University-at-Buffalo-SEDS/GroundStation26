@@ -344,7 +344,7 @@ pub(super) async fn read_presentation(state: &MediaState) -> ApiResult<Presentat
     if presentation.stats.is_empty() {
         presentation.stats = default_stats();
     }
-    if cfg!(feature = "test_fire_mode") && !presentation.stats.iter().any(|s| s.label == "Thrust") {
+    if crate::runtime_mode::is_test_fire() && !presentation.stats.iter().any(|s| s.label == "Thrust") {
         presentation.stats.push(BroadcastStat {
             label: "Thrust".into(),
             unit: "N".into(),

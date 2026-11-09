@@ -41,6 +41,9 @@ fn address(n: u32) -> Vec<u8> {
 }
 #[tokio::test]
 async fn cold_routing_cannot_hide_paid_bootstrap_before_catalog_owner_starts() {
+    if !cfg!(feature = "firmware_sim") {
+        crate::mode_suite!(Hitl);
+    }
     const NAME: &str = "telemetry_task::radio_io::budget_bootstrap_tests::cold_routing_cannot_hide_paid_bootstrap_before_catalog_owner_starts";
     if std::env::var_os("GS_BUDGET_COLD_CHILD").is_none() {
         let dir = std::env::temp_dir().join(format!(
@@ -410,6 +413,9 @@ impl CommsDevice for PrefixFailureUart {
 }
 #[tokio::test]
 async fn actual_partial_or_no_write_owner_blocks_protocol_across_unrelated_success() {
+    if !cfg!(feature = "firmware_sim") {
+        crate::mode_suite!(Hitl);
+    }
     const NAME: &str = "telemetry_task::radio_io::budget_bootstrap_tests::actual_partial_or_no_write_owner_blocks_protocol_across_unrelated_success";
     if std::env::var_os("GS_BUDGET_FAILURE_LIMIT").is_none() {
         for limit in [0, 7] {
@@ -715,6 +721,9 @@ fn replay_fault_stream(
 
 #[tokio::test]
 async fn queued_revoke_follows_completed_health_before_startup_controls() {
+    if !cfg!(feature = "firmware_sim") {
+        crate::mode_suite!(Hitl);
+    }
     const NAME: &str = "telemetry_task::radio_io::budget_bootstrap_tests::queued_revoke_follows_completed_health_before_startup_controls";
     if std::env::var_os("GS_REVOKE_HEALTH_ORDER_CHILD").is_none() {
         let dir = std::env::temp_dir().join(format!(

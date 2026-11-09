@@ -292,7 +292,6 @@ pub fn before_fill(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
 }
 
 /// Starts concurrently with launch dispatch, never adding to countdown time.
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode", test))]
 pub fn launch(state: &Arc<AppState>) {
     begin(state, "KG1000", false);
 }
@@ -645,7 +644,8 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
 #[cfg(test)]
 pub(crate) fn acquisition_budget_for_test() -> Duration {
     WINDOW
-}#[cfg(all(test, any(feature = "hitl_mode", feature = "firmware_sim")))]
+}
+#[cfg(test)]
 pub(crate) async fn verify_paused_capture_cancellation_and_shutdown(state: &Arc<AppState>) {
     assert!(
         crate::simulation_clock_ms().is_some(),

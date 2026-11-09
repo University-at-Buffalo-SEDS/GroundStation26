@@ -62,6 +62,7 @@ fn complete(owner: &mut Owner, b: Board, boundary: u64) -> Intent {
 }
 #[test]
 fn all_seven_pending_owned_complete_and_domains() {
+    crate::mode_suite!(Testing);
     prepare();
     for board in BOARDS {
         let mut o = Owner::new();
@@ -88,6 +89,7 @@ fn all_seven_pending_owned_complete_and_domains() {
 }
 #[test]
 fn unknown_hold_is_not_actual_abort_and_cannot_be_visual_idle() {
+    crate::mode_suite!(Testing);
     prepare();
     let mut o = Owner::new();
     let ab = 1 << at(Board::ActuatorBoard);
@@ -104,6 +106,7 @@ fn unknown_hold_is_not_actual_abort_and_cannot_be_visual_idle() {
 }
 #[test]
 fn original_tuple_duplicate_time_binding_and_fresh_stop() {
+    crate::mode_suite!(Testing);
     prepare();
     let b = Board::ActuatorBoard;
     let mut o = Owner::new();
@@ -121,6 +124,7 @@ fn original_tuple_duplicate_time_binding_and_fresh_stop() {
 }
 #[test]
 fn stop_during_pending_requires_new_query_epoch_and_old_ticket_cannot_clobber() {
+    crate::mode_suite!(Testing);
     prepare();
     let b = Board::ValveBoard;
     let mut o = Owner::new();
@@ -144,6 +148,7 @@ fn stop_during_pending_requires_new_query_epoch_and_old_ticket_cannot_clobber() 
 }
 #[test]
 fn fresh_query_fixed_boundary_and_stale_authority_negatives() {
+    crate::mode_suite!(Testing);
     prepare();
     for board in BOARDS {
         for case in 0..6 {
@@ -167,6 +172,7 @@ fn fresh_query_fixed_boundary_and_stale_authority_negatives() {
 }
 #[test]
 fn manual_old_marked_only_strictly_before_completed_boundary() {
+    crate::mode_suite!(Testing);
     prepare();
     let b = Board::FlightComputer;
     for (body, sender, time, retired) in [
@@ -193,6 +199,7 @@ fn manual_old_marked_only_strictly_before_completed_boundary() {
 }
 #[test]
 fn model_reboot_invalidates_proofs_and_retains_stop_floor() {
+    crate::mode_suite!(Testing);
     prepare();
     let b = Board::ActuatorBoard;
     let mut o = Owner::new();
@@ -209,6 +216,7 @@ fn model_reboot_invalidates_proofs_and_retains_stop_floor() {
 }
 #[test]
 fn heartbeat_idle_exemption_does_not_weaken_generic_fault_or_manual_stop() {
+    crate::mode_suite!(Testing);
     prepare();
     let b = Board::ValveBoard;
     for (reason, idle, launch, stop) in [
@@ -238,6 +246,8 @@ fn heartbeat_idle_exemption_does_not_weaken_generic_fault_or_manual_stop() {
 
 #[test]
 fn pending_completion_rechecks_original_boundary_clock_without_restamping() {
+
+    crate::mode_suite!(Testing);
     prepare();
     for now in [0, u64::MAX, 16001] {
         let mut o = Owner::new();
@@ -258,6 +268,7 @@ fn pending_completion_rechecks_original_boundary_clock_without_restamping() {
 }
 #[test]
 fn domain_manual_compatibility_and_registered_endpoint_shapes() {
+    crate::mode_suite!(Testing);
     prepare();
     for b in [
         Board::ActuatorBoard,
@@ -307,6 +318,7 @@ fn domain_manual_compatibility_and_registered_endpoint_shapes() {
 }
 #[test]
 fn unknown_only_boot_is_honest_startup_while_retained_abort_stays_held() {
+    crate::mode_suite!(Testing);
     prepare();
     let mut o = Owner::new();
     let ab = 1 << at(Board::ActuatorBoard);
@@ -324,6 +336,7 @@ fn unknown_only_boot_is_honest_startup_while_retained_abort_stays_held() {
 }
 #[test]
 fn old_fc_state_provenance_never_credits_equal_new_or_manual_stop() {
+    crate::mode_suite!(Testing);
     prepare();
     let b = Board::FlightComputer;
     let mut o = Owner::new();
@@ -344,6 +357,8 @@ fn old_fc_state_provenance_never_credits_equal_new_or_manual_stop() {
 
 #[test]
 fn tagged_automatic_domains_preserve_origin_and_launch_floor_guards() {
+
+    crate::mode_suite!(Testing);
     prepare();
     for b in [
         Board::ActuatorBoard,
@@ -400,6 +415,7 @@ fn tagged_automatic_domains_preserve_origin_and_launch_floor_guards() {
 }
 #[test]
 fn actuator_overpressure_abort_stops_the_actuator_board_only_before_launch() {
+    crate::mode_suite!(Testing);
     prepare();
     let payload = crate::gse::overpressure::AB_ABORT_PAYLOAD;
     assert_eq!(payload, 0x90);
@@ -446,6 +462,7 @@ fn actuator_overpressure_abort_stops_the_actuator_board_only_before_launch() {
 }
 #[test]
 fn endpoint_allocation_provenance_clone_reparse_wrap_and_eviction() {
+    crate::mode_suite!(Testing);
     if std::env::var_os("MODEL_REGISTRY_CHILD").is_none() {
         let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","testing_board_lifecycle::tests::endpoint_allocation_provenance_clone_reparse_wrap_and_eviction","--nocapture"]).env("MODEL_REGISTRY_CHILD","1").env("GS_SIM_MODE","1").env("GS_RRLS_ROLE","primary").output().unwrap();
         assert!(
@@ -526,6 +543,8 @@ fn endpoint_allocation_provenance_clone_reparse_wrap_and_eviction() {
 
 #[test]
 fn observed_cause_clock_expiry_rollback_and_completed_floor_are_conservative() {
+
+    crate::mode_suite!(Testing);
     prepare();
     let mut o = Owner::new();
     o.initialize(0, 0, 0);
@@ -550,6 +569,7 @@ fn observed_cause_clock_expiry_rollback_and_completed_floor_are_conservative() {
 }
 #[test]
 fn runtime_disabled_or_rrls_cannot_enable_dummy_model() {
+    crate::mode_suite!(Testing);
     if let Ok(case) = std::env::var("MODEL_DISABLED_CHILD") {
         prepare();
         bind_selected(true, true);
@@ -580,6 +600,8 @@ fn runtime_disabled_or_rrls_cannot_enable_dummy_model() {
 
 #[test]
 fn postlaunch_recovery_clears_launch_only_on_verified_owned_success() {
+
+    crate::mode_suite!(Testing);
     prepare();
     for board in [
         Board::ActuatorBoard,
@@ -618,6 +640,8 @@ fn postlaunch_recovery_clears_launch_only_on_verified_owned_success() {
 
 #[test]
 fn delayed_prelaunch_recovery_cannot_revoke_an_accepted_model_owner() {
+
+    crate::mode_suite!(Testing);
     prepare();
     for board in [Board::ActuatorBoard,Board::ValveBoard,Board::FlightComputer] {
         let mut o=Owner::new();o.initialize(0,0,0);query(&mut o,board,1,10000);

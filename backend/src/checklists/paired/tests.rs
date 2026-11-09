@@ -1,6 +1,7 @@
 use super::*;
 #[test]
 fn complete_backend_pairing_lifecycle_is_isolated() {
+    crate::mode_suite!(Normal, TestFire, Testing);
     run_isolated(
         "checklists::paired::tests::complete_backend_pairing_lifecycle_is_isolated",
         suite,
@@ -8,6 +9,7 @@ fn complete_backend_pairing_lifecycle_is_isolated() {
 }
 #[test]
 fn startup_reconciles_before_readiness_and_retries_initial_sync_failure() {
+    crate::mode_suite!(Normal, TestFire, Testing);
     run_isolated(
         "checklists::paired::tests::startup_reconciles_before_readiness_and_retries_initial_sync_failure",
         startup_suite,

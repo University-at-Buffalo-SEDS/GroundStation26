@@ -19,12 +19,9 @@ pub enum Cause {
 #[derive(Clone, Debug)]
 // Without the two-observation test/HITL proofs, the two safe-stop variants
 // are the same size and the lint does not apply.
-#[cfg_attr(
-    any(test, feature = "hitl_mode"),
-    expect(
-        clippy::large_enum_variant,
-        reason = "Bounded terminal evidence is captured into the fixed Copy stage; boxing would add heap allocation to owner-held capture paths"
-    )
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Bounded terminal evidence is captured into the fixed Copy stage; boxing would add heap allocation to owner-held capture paths"
 )]
 pub enum TerminalProof {
     /// The caller supplies the actual successful persisted completion event ID.
@@ -39,13 +36,11 @@ pub enum TerminalProof {
     SafeStopped(ProgressObservation),
     /// Only the actual engine tick hook supplies these consecutive observations
     /// when this build has no durable operational qualification store (HITL).
-    #[cfg(any(test, feature = "hitl_mode"))]
     EngineCompleted {
         kind: Kind,
         before: ProgressObservation,
         after: ProgressObservation,
     },
-    #[cfg(any(test, feature = "hitl_mode"))]
     VerifiedFillTrim {
         trim: TrimObservation,
         input: gse_sequence::Inputs,
@@ -1032,7 +1027,6 @@ impl Cursor {
                 stopped = true;
                 Outcome::Cancelled
             }
-            #[cfg(any(test, feature = "hitl_mode"))]
             TerminalProof::EngineCompleted {
                 kind,
                 before,
@@ -1047,7 +1041,6 @@ impl Cursor {
             {
                 Outcome::Passed
             }
-            #[cfg(any(test, feature = "hitl_mode"))]
             TerminalProof::VerifiedFillTrim { trim, input }
                 if self.snapshot.kind == Kind::Fill
                     && trim.phase == TrimPhase::Complete

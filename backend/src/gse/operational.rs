@@ -361,6 +361,7 @@ mod tests {
     use super::*;
     #[test]
     fn saved_template_binding_and_local_reset_receipts_survive_restart() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let path = std::env::temp_dir().join(format!(
             "gse-paired-binding-{}.json",
             rand::random::<u128>()
@@ -411,6 +412,7 @@ mod tests {
     }
     #[test]
     fn restart_retains_ordered_tests_but_never_resumes_outputs_or_queued_launch() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let path = std::env::temp_dir().join(format!(
             "gse-qualification-{}-{}.json",
             std::process::id(),
@@ -447,12 +449,14 @@ mod tests {
     }
     #[test]
     fn corrupt_or_missing_baseline_cannot_restore_fill_permission() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let invalid = r#"{"qualification":{"version":1,"generation":0,"self_test":true,"nitrogen_test":true,"fill_target":false,"fault":null},"baseline":null,"fill_target_kg":null}"#;
         let record: Saved = serde_json::from_str(invalid).unwrap();
         assert!(record.validate().is_err());
     }
     #[test]
     fn topology_must_settle_again_after_loss_or_route_change() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let mut op = Operational::default();
         op.topology(0, true, "a".into());
         op.topology(1999, true, "a".into());
@@ -474,6 +478,7 @@ mod checklist_outbox_tests {
     use super::*;
     #[test]
     fn restart_retries_the_same_saved_event_and_storage_failure_never_acks_it() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let path = std::env::temp_dir().join(format!("gse-outbox-{}.json", rand::random::<u128>()));
         let mut op = Operational {
             path: Some(path.clone()),
@@ -508,6 +513,7 @@ mod checklist_outbox_tests {
     }
     #[test]
     fn unfinished_or_stale_runs_cannot_enqueue_a_success() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let mut op = Operational { run_generation: 1, ..Operational::default() };
         assert!(op.complete(Milestone::SelfTest).is_err());
         assert!(op.saved.pending_checklists.is_empty());
@@ -520,6 +526,7 @@ mod fire_persistence_tests {
     use super::*;
     #[test]
     fn failed_fire_save_never_consumes_the_armed_evidence_in_memory() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let path =
             std::env::temp_dir().join(format!("gse-fire-blocked-{}", rand::random::<u128>()));
         std::fs::create_dir(&path).unwrap();

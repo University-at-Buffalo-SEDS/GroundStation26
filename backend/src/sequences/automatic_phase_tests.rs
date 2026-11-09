@@ -4,6 +4,7 @@ use crate::automatic_flight_state::Observation;
 
 #[tokio::test]
 async fn healthy_original_steps_keep_all_normal_prelaunch_phases_live_only() {
+    crate::mode_suite!(Normal, Testing);
     if crate::operator_queue::isolated_case(
         module_path!(),
         "healthy_original_steps_keep_all_normal_prelaunch_phases_live_only",
@@ -58,6 +59,7 @@ async fn healthy_original_steps_keep_all_normal_prelaunch_phases_live_only() {
 }
 #[tokio::test]
 async fn actual_http_retained_stop_then_actual_refresh_cannot_publish_idle() {
+    crate::mode_suite!(Normal, Testing);
     if crate::operator_queue::isolated_case(
         module_path!(),
         "actual_http_retained_stop_then_actual_refresh_cannot_publish_idle",

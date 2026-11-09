@@ -592,11 +592,12 @@ mod tests {
                 Operation::Command("DeployParachute".into()),
             )
             .unwrap();
-        #[cfg(not(feature = "hitl_mode"))]
-        assert!(
-            serde_json::from_str::<crate::types::TelemetryCommand>("\"DeployParachute\"").is_err(),
-            "normal RRLS must not need a local HITL command variant"
-        );
+        if !crate::runtime_mode::is_hitl() {
+            assert!(
+                serde_json::from_str::<crate::types::TelemetryCommand>("\"DeployParachute\"").is_err(),
+                "normal RRLS must not need a local HITL command variant"
+            );
+        }
         let Received::Execute(work) = primary.receive(&p, pview, Mode::Hitl, &request).unwrap()
         else {
             panic!("one execution")
@@ -2266,5 +2267,6 @@ mod board_abort_readiness_tests {
 #[cfg(test)]
 mod cross_build_tests;
 
-#[cfg(all(test, any(not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "testing")), all(feature = "hitl_mode", feature = "test_fire_mode"))))]
+// Its tests still carry their own per-build cfgs (normal build only).
+#[cfg(test)]
 mod rrls_required_proof_tests;

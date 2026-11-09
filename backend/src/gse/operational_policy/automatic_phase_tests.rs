@@ -17,8 +17,7 @@ fn cached_identity(state: &Arc<AppState>) -> Option<CachedIdentity> {
 async fn qualified() -> Arc<AppState> {
     let (state, _) = crate::automatic_flight_state::tests::ready().await;
     crate::gse::initialize(&state);
-    #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
-    {
+    if !crate::runtime_mode::is_hitl_or_test_fire() {
         // Explicit independent durable fixture authority, NOT readiness,
         // operator permission, real board or sensor qualification evidence.
         // The existing Normal qualified projector requires Idle..Armed.
@@ -58,6 +57,7 @@ async fn qualified() -> Arc<AppState> {
 }
 #[tokio::test]
 async fn qualified_claimed_owner_can_project_armed_live_without_changing_desired_json() {
+    crate::mode_suite!(Normal, TestFire, Testing);
     if crate::operator_queue::isolated_case(
         module_path!(),
         "qualified_claimed_owner_can_project_armed_live_without_changing_desired_json",
@@ -68,7 +68,7 @@ async fn qualified_claimed_owner_can_project_armed_live_without_changing_desired
     let before = crate::network_variables::automatic_idle_test_snapshot();
     let observation = Observation::begin(&state).unwrap();
     publish_qualified_flight_armed_with_observation(&state, &observation);
-    if cfg!(feature = "test_fire_mode") {
+    if crate::runtime_mode::is_test_fire() {
         assert_eq!(state.local_flight_state_snapshot(), FlightState::Startup);
     } else {
         assert_eq!(state.local_flight_state_snapshot(), FlightState::Armed);
@@ -88,6 +88,7 @@ async fn qualified_claimed_owner_can_project_armed_live_without_changing_desired
 }
 #[tokio::test]
 async fn changed_actual_qualification_generation_retires_old_armed_proposal() {
+    crate::mode_suite!(Normal, TestFire, Testing);
     if crate::operator_queue::isolated_case(
         module_path!(),
         "changed_actual_qualification_generation_retires_old_armed_proposal",
@@ -99,7 +100,7 @@ async fn changed_actual_qualification_generation_retires_old_armed_proposal() {
     let baseline_sdk = cached_identity(&state);
     let observation = Observation::begin(&state).unwrap();
     let Some(original) = observation.captured() else {
-        assert_eq!(observation.captured().is_none(), cfg!(feature = "hitl_mode"));
+        assert_eq!(observation.captured().is_none(), crate::runtime_mode::is_hitl());
         return;
     };
     let generation = state
@@ -116,7 +117,7 @@ async fn changed_actual_qualification_generation_retires_old_armed_proposal() {
             qualification_generation: generation,
         },
     );
-    if cfg!(feature = "test_fire_mode") {
+    if crate::runtime_mode::is_test_fire() {
         assert!(proposal.is_none());
         return;
     }
@@ -140,6 +141,7 @@ async fn changed_actual_qualification_generation_retires_old_armed_proposal() {
 
 #[tokio::test]
 async fn known_actual_board_abort_vetoes_otherwise_qualified_claimed_armed_owner() {
+    crate::mode_suite!(Normal, TestFire, Testing);
     if crate::operator_queue::isolated_case(module_path!(),"known_actual_board_abort_vetoes_otherwise_qualified_claimed_armed_owner") {return;}
     let state=qualified().await;
     let baseline_state = state.local_flight_state_snapshot();

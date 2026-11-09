@@ -279,7 +279,7 @@ async fn actual_busy(kind: &str) {
     });
     pause.prepared.recv_timeout(Duration::from_secs(2)).unwrap();
     let originals = pause.launch_packets.lock().unwrap().clone();
-    let expected = if cfg!(feature = "hitl_mode") { 2 } else { 3 };
+    let expected = if crate::runtime_mode::is_hitl() { 2 } else { 3 };
     assert_eq!(originals.len(), expected);
     let seed = Packet::new(
         crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
@@ -356,15 +356,16 @@ async fn actual_busy(kind: &str) {
             pause.resume_retry();
             let result = rx.recv_timeout(Duration::from_secs(2)).unwrap();
             // HITL: an undelivered FC16 (e.g. FC absent) must not hold Launch.
-            #[cfg(feature = "hitl_mode")]
-            assert!(result.is_ok(), "{result:?}");
-            #[cfg(not(feature = "hitl_mode"))]
-            assert!(
-                result
-                    .as_ref()
-                    .unwrap_err()
-                    .contains("Controller command delivery is pending")
-            );
+            if crate::runtime_mode::is_hitl() {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                assert!(
+                    result
+                        .as_ref()
+                        .unwrap_err()
+                        .contains("Controller command delivery is pending")
+                );
+            }
             assert_eq!(
                 rig.state.manual_abort_intent.epoch(),
                 0,
@@ -439,7 +440,7 @@ async fn actual_busy(kind: &str) {
             assert!(!actual.is_empty());
             assert!(actual.iter().all(|p| p.timestamp() == original.timestamp()));
         }
-    } else if cfg!(feature = "hitl_mode") && kind == "new_fc16" {
+    } else if crate::runtime_mode::is_hitl() && kind == "new_fc16" {
         // HITL: an undelivered FC16 (e.g. FC absent) does not hold Launch.
         result.unwrap();
     } else {

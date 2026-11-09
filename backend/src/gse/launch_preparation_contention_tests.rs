@@ -26,8 +26,7 @@ async fn fixture() -> Fixture {
         }),
     ));
     state.topology_router.set(router.clone()).unwrap();
-    #[cfg(feature = "hitl_mode")]
-    {
+    if crate::runtime_mode::is_hitl() {
         state.set_local_flight_state(FlightState::Idle);
         for index in 0..4 {
             if state.hitl_safety_interlock_enabled(index) {
@@ -35,10 +34,11 @@ async fn fixture() -> Fixture {
             }
         }
     }
-    #[cfg(feature = "hitl_mode")]
-    let path = None;
-    #[cfg(not(feature = "hitl_mode"))]
-    let path = Some(armed_fixture_for_test(&state, &router));
+    let path = if crate::runtime_mode::is_hitl() {
+        None
+    } else {
+        Some(armed_fixture_for_test(&state, &router))
+    };
     assert!(
         !state
             .launch_history
@@ -99,12 +99,9 @@ impl Drop for HeldCore {
     }
 }
 fn prepare(state: &Arc<AppState>, revision: Option<u64>) -> Result<LaunchAdmission, String> {
-    #[cfg(feature = "hitl_mode")]
-    {
+    if crate::runtime_mode::is_hitl() {
         inhibit_automatic_actions_for_launch_revision(state, revision)
-    }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    } else {
         commit_fire_intent_revision(state, revision)
     }
 }
@@ -221,10 +218,10 @@ async fn genuine_pending_sdk_controller_owner_refuses_without_durable_inhibition
     assert_eq!(f.router.try_has_pending_reliable_tx_type(kind), Ok(true));
     let revision = crate::board_abort::capture_launch_revision_named(&f.state, "Launch");
     // HITL: a command retained for an absent board must not hold Launch.
-    #[cfg(feature = "hitl_mode")]
-    assert!(prepare(&f.state, revision).is_ok());
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if crate::runtime_mode::is_hitl() {
+        assert!(prepare(&f.state, revision).is_ok());
+    }
+    if !crate::runtime_mode::is_hitl() {
         assert!(prepare(&f.state, revision).unwrap_err().contains("pending"));
         assert!(
             !f.state

@@ -7,10 +7,10 @@
 //! so a reply that takes milliseconds of board time can take seconds of wall
 //! time and those windows expire before Launch admission can use them.
 //!
-//! Only a `firmware_sim` build (never `test_fire_mode` or a Raspberry Pi
-//! build) reads `GS_SIM_WALL_FRESHNESS_SCALE`, an integer 1..=100 that
-//! stretches those windows. Every other build, and a simulator build without
-//! the variable, uses the operational value unchanged.
+//! Only a `firmware_sim` build (never a Raspberry Pi build), outside test-fire
+//! mode, reads `GS_SIM_WALL_FRESHNESS_SCALE`, an integer 1..=100 that
+//! stretches those windows. Every other build or mode, and a simulator build
+//! without the variable, uses the operational value unchanged.
 use std::time::Duration;
 
 /// Environment variable read only by simulator builds.
@@ -19,13 +19,12 @@ pub(crate) const SCALE_ENV: &str = "GS_SIM_WALL_FRESHNESS_SCALE";
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const MAX_SCALE: u64 = 100;
 
-/// True only for builds that may stretch wall-clock proof windows.
+/// True only for builds and modes that may stretch wall-clock proof windows.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const SCALING_BUILD: bool = cfg!(all(
-    feature = "firmware_sim",
-    not(feature = "test_fire_mode"),
-    not(feature = "raspberry_pi")
-));
+pub(crate) fn scaling_build() -> bool {
+    cfg!(all(feature = "firmware_sim", not(feature = "raspberry_pi")))
+        && !crate::runtime_mode::is_test_fire()
+}
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn parse_scale(value: Option<&str>) -> u64 {
@@ -37,14 +36,10 @@ fn parse_scale(value: Option<&str>) -> u64 {
 
 /// The wall-clock stretch factor: always 1 outside simulator builds.
 pub(crate) fn scale() -> u64 {
-    #[cfg(all(
-        feature = "firmware_sim",
-        not(feature = "test_fire_mode"),
-        not(feature = "raspberry_pi")
-    ))]
-    {
+    #[cfg(all(feature = "firmware_sim", not(feature = "raspberry_pi")))]
+    if !crate::runtime_mode::is_test_fire() {
         static SCALE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        *SCALE.get_or_init(|| {
+        return *SCALE.get_or_init(|| {
             let scale = parse_scale(std::env::var(SCALE_ENV).ok().as_deref());
             if scale != 1 {
                 log::warn!(
@@ -52,16 +47,9 @@ pub(crate) fn scale() -> u64 {
                 );
             }
             scale
-        })
+        });
     }
-    #[cfg(not(all(
-        feature = "firmware_sim",
-        not(feature = "test_fire_mode"),
-        not(feature = "raspberry_pi")
-    )))]
-    {
-        1
-    }
+    1
 }
 
 /// `base` milliseconds of wall time, stretched only in a simulator build.
@@ -99,9 +87,9 @@ mod tests {
     #[test]
     fn only_the_simulator_build_may_stretch_windows() {
         assert_eq!(
-            SCALING_BUILD,
+            scaling_build(),
             cfg!(feature = "firmware_sim")
-                && !cfg!(feature = "test_fire_mode")
+                && !crate::runtime_mode::is_test_fire()
                 && !cfg!(feature = "raspberry_pi")
         );
     }
@@ -126,7 +114,7 @@ mod tests {
             );
             return;
         }
-        if SCALING_BUILD {
+        if scaling_build() {
             assert_eq!(wall_ms(5_000), 100_000);
             assert_eq!(wall(Duration::from_secs(5)), Duration::from_secs(100));
         } else {

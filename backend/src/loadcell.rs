@@ -15,12 +15,15 @@ pub const RAW_PRESSURE_TRANSDUCER_DATA_TYPE: &str = "IADC";
 pub const DERIVED_WEIGHT_DATA_TYPE: &str = "LOADCELL_WEIGHT_KG";
 pub const DERIVED_FILL_PERCENT_DATA_TYPE: &str = "LOADCELL_FILL_PERCENT";
 pub const DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE: &str = "PRESSURE_TRANSDUCER_CALIBRATED";
-#[cfg(feature = "testing")]
-const DEFAULT_LOADCELL_CALIBRATION_FILENAME: &str = "loadcell_calibration_testing.json";
-#[cfg(all(not(feature = "testing"), feature = "test_fire_mode"))]
-const DEFAULT_LOADCELL_CALIBRATION_FILENAME: &str = "loadcell_calibration_test_fire.json";
-#[cfg(all(not(feature = "testing"), not(feature = "test_fire_mode")))]
-const DEFAULT_LOADCELL_CALIBRATION_FILENAME: &str = "loadcell_calibration.json";
+fn default_loadcell_calibration_filename() -> &'static str {
+    if crate::runtime_mode::is_testing() {
+        "loadcell_calibration_testing.json"
+    } else if crate::runtime_mode::is_test_fire() {
+        "loadcell_calibration_test_fire.json"
+    } else {
+        "loadcell_calibration.json"
+    }
+}
 
 const ALL_CALIBRATION_FIT_MODES: [&str; 9] = [
     "best",
@@ -340,22 +343,22 @@ struct OldCalibrationFile {
     sensors: Vec<OldSensorCalibration>,
 }
 
+// RUNTIME-MODE-BOOT: the path follows the current mode, but main loads the
+// calibration once into `AppState::loadcell_calibration`; a mode switch must
+// reload it from the new mode's file before anything saves it.
 fn calibration_path() -> PathBuf {
     if let Ok(path) = std::env::var("GS_LOADCELL_CALIBRATION_PATH") {
         return PathBuf::from(path);
     }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    #[cfg(feature = "testing")]
-    {
+    if crate::runtime_mode::is_testing() {
         manifest_dir
             .join("calibration")
-            .join(DEFAULT_LOADCELL_CALIBRATION_FILENAME)
-    }
-    #[cfg(not(feature = "testing"))]
-    {
+            .join(default_loadcell_calibration_filename())
+    } else {
         manifest_dir
             .join("data")
-            .join(DEFAULT_LOADCELL_CALIBRATION_FILENAME)
+            .join(default_loadcell_calibration_filename())
     }
 }
 

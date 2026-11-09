@@ -168,6 +168,7 @@ mod tests {
     use super::*;
     #[test]
     fn nitrogen_adds_inventory_without_erasing_existing_liquid() {
+        crate::mode_suite!(Testing);
         let p = Parameters::default();
         let mut plant = Plant::empty();
         plant.liquid_kg = 8.0;
@@ -190,6 +191,7 @@ mod tests {
     }
     #[test]
     fn repeated_equal_clock_is_physically_inert() {
+        crate::mode_suite!(Testing);
         let p = Parameters::default();
         let mut a = Plant::empty();
         let v = Valves {
@@ -206,6 +208,7 @@ mod tests {
     }
     #[test]
     fn frozen_closed_valve_cannot_fill_and_dump_lowers_pressure() {
+        crate::mode_suite!(Testing);
         let p = Parameters::default();
         let mut a = Plant::empty();
         a.step(1000, Valves::default(), p).unwrap();
@@ -226,6 +229,7 @@ mod tests {
     }
     #[test]
     fn actual_vent_only_releases_nitrogen_inventory() {
+        crate::mode_suite!(Testing);
         let p = Parameters::default();
         let mut a = Plant::empty();
         a.nitrogen_partial_psi = 500.0;
@@ -246,6 +250,7 @@ mod tests {
     }
     #[test]
     fn above_nitrous_supply_a_stuck_open_inlet_cannot_add_liquid() {
+        crate::mode_suite!(Testing);
         let p = Parameters::default();
         let mut a = Plant::empty();
         a.liquid_kg = 8.0;
@@ -265,6 +270,7 @@ mod tests {
     }
     #[test]
     fn finite_supply_cannot_satisfy_an_unreachable_pressure_goal() {
+        crate::mode_suite!(Testing);
         let p = Parameters {
             nitrogen_supply_psi: 100.0,
             ..Parameters::default()
@@ -285,6 +291,7 @@ mod tests {
     }
     #[test]
     fn backwards_or_excessive_clock_gap_cannot_synthesize_data() {
+        crate::mode_suite!(Testing);
         let p = Parameters::default();
         let mut a = Plant::empty();
         a.step(1000, Valves::default(), p).unwrap();

@@ -799,19 +799,11 @@ impl Mesh {
             .map(|b| b.expected())
             .or(self.budget_profile)
     }
-    #[cfg(all(
-        test,
-        target_os = "linux",
-        any(feature = "firmware_sim", feature = "hitl_mode")
-    ))]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn budget_transport_fault_for_test(&self) -> bool {
         self.budget_transport_fault
     }
-    #[cfg(all(
-        test,
-        target_os = "linux",
-        any(feature = "firmware_sim", feature = "hitl_mode")
-    ))]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn queued_budget_for_test(&self) -> Option<(Vec<u8>, bool)> {
         self.queue
             .iter()
@@ -2683,8 +2675,10 @@ mod tests {
         );
     }
     #[test]
-    #[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
     fn process_restart_uses_its_boot_clock_for_the_initial_loss_deadline() {
+        if !cfg!(feature = "firmware_sim") {
+            crate::mode_suite!(Hitl);
+        }
         const CHILD: &str = "GS_RELAY_BOOT_CLOCK_CHILD";
         const NAME: &str =
             "rrls::tests::process_restart_uses_its_boot_clock_for_the_initial_loss_deadline";
@@ -2796,8 +2790,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "hitl_mode")]
     fn recovery_liveness_uses_the_shared_virtual_clock_when_configured() {
+        crate::mode_suite!(Hitl);
         const CHILD: &str = "GS_RRLS_CLOCK_REGRESSION_CHILD";
         const NAME: &str =
             "rrls::tests::recovery_liveness_uses_the_shared_virtual_clock_when_configured";

@@ -617,6 +617,10 @@ pub enum WsOutMsg {
     NetworkTime(NetworkTimeMsg),
     DashboardReset,
     CalibrationChanged,
+    /// The backend switched mode in process:
+    /// `{"mode","label","policy_epoch","layout_revision"}`. A fresh
+    /// `ActionPolicy` follows; the UI refetches the layout.
+    StationModeChanged(serde_json::Value),
 }
 
 #[derive(Clone, Serialize)]
@@ -2765,8 +2769,8 @@ async fn dispatch_command_inner(
             "manual Abort intent retained; board readback required".into(),
         );
     }
-    #[cfg(feature="hitl_mode")]
-    if matches!(cmd,TelemetryCommand::AdvanceFlightState|TelemetryCommand::RewindFlightState) {
+    if crate::runtime_mode::is_hitl()
+        && matches!(cmd,TelemetryCommand::AdvanceFlightState|TelemetryCommand::RewindFlightState) {
         return (StatusCode::CONFLICT,"Phase steps require a fresh request on the primary GroundStation connection.".into());
     }
     if !crate::operator_phase::is_local(&cmd) && crate::board_abort::launch_command(command_name(&cmd)) {
@@ -3004,9 +3008,9 @@ pub(crate) mod command_dispatch_tests {
                 });
             assert_eq!(command_name(&cmd), name);
         }
-        let layout = if cfg!(feature = "hitl_mode") {
+        let layout = if crate::runtime_mode::is_hitl() {
             include_str!("../layout/layout_hitl.json")
-        } else if cfg!(feature = "test_fire_mode") {
+        } else if crate::runtime_mode::is_test_fire() {
             include_str!("../layout/layout_test_fire.json")
         } else {
             include_str!("../layout/layout.json")
@@ -5031,6 +5035,8 @@ async fn handle_ws(
     let mut alert_conditions_rx=state.alert_conditions.tx.subscribe();
     let mut mission_phase_rx = crate::mission_phase::subscribe();
     let mut flight_maxima_rx = crate::flight_maxima::subscribe();
+    let mut station_mode_rx = crate::runtime_mode::subscribe();
+    station_mode_rx.borrow_and_update();
 
     let cmd_tx = state.cmd_tx.clone();
     let state_for_send = state.clone();
@@ -5444,6 +5450,24 @@ async fn handle_ws(
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+
+                changed = station_mode_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    station_mode_rx.borrow_and_update();
+                    if let Some(change) = crate::station_mode_switch::last_change() {
+                        let text = serde_json::to_string(&WsOutMsg::StationModeChanged(change)).unwrap_or_default();
+                        if ws_out_tx.send(text).await.is_err() {
+                            break;
+                        }
+                    }
+                    let msg = WsOutMsg::ActionPolicy(state_for_send.action_policy_snapshot());
+                    let text = serde_json::to_string(&msg).unwrap_or_default();
+                    if ws_out_tx.send(text).await.is_err() {
+                        break;
                     }
                 }
 

@@ -37,6 +37,7 @@ mod tests {
     use super::*;
     #[test]
     fn large_network_wall_offset_is_mapped_once_not_subtracted_directly() {
+        crate::mode_suite!(Testing);
         let mut o = Owner::admitted(10000, 12000, 1_793_000_000_000).unwrap();
         assert_eq!(o.source_utc, 10000);
         assert_eq!(
@@ -49,12 +50,14 @@ mod tests {
     }
     #[test]
     fn a_late_observation_cannot_restart_an_expired_pulse() {
+        crate::mode_suite!(Testing);
         let mut o = Owner::admitted(10000, 25000, 80000).unwrap();
         assert_eq!(o.start_model_ms, o.stop_model_ms);
         assert!(!o.on_at(80000));
     }
     #[test]
     fn a_completed_owner_cannot_resurrect_after_local_clock_rollback() {
+        crate::mode_suite!(Testing);
         let mut o = Owner::admitted(10000, 10000, 1000000).unwrap();
         let start = o.start_model_ms;
         let stop = o.stop_model_ms;

@@ -4,6 +4,7 @@ use sedsnet::router::{EndpointHandler, RouterConfig};
 use std::sync::{Arc, Mutex};
 #[test]
 fn deployed_dummy_returns_correlated_board_query() {
+    crate::mode_suite!(Testing);
     crate::telemetry_schema::initialize().unwrap();
     let received = Arc::new(Mutex::new(Vec::<Packet>::new()));
     let capture = received.clone();

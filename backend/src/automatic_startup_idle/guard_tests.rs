@@ -15,6 +15,7 @@ fn isolated(name: &str) -> bool {
 }
 #[tokio::test]
 async fn retained_launch_history_vetoes_original_tf_idle_before_visible_phase_changes() {
+    crate::mode_suite!(TestFire);
     if isolated("retained_launch_history_vetoes_original_tf_idle_before_visible_phase_changes") {
         return;
     }
@@ -56,6 +57,7 @@ async fn retained_launch_history_vetoes_original_tf_idle_before_visible_phase_ch
 }
 #[tokio::test]
 async fn actual_pending_launch_flag_vetoes_original_tf_idle_without_host_or_sdk_effects() {
+    crate::mode_suite!(TestFire);
     if isolated("actual_pending_launch_flag_vetoes_original_tf_idle_without_host_or_sdk_effects") {
         return;
     }
@@ -79,6 +81,7 @@ async fn actual_pending_launch_flag_vetoes_original_tf_idle_without_host_or_sdk_
 }
 #[tokio::test]
 async fn actual_known_optional_board_abort_retires_original_tf_sdk_publication() {
+    crate::mode_suite!(TestFire);
     if isolated("actual_known_optional_board_abort_retires_original_tf_sdk_publication") {
         return;
     }

@@ -374,15 +374,14 @@ mod tests {
     #[tokio::test]
     async fn effective_unknown_scope_is_separate_from_retained_truth() {
         let state = crate::state::tests::test_app_state().await;
-        #[cfg(feature = "hitl_mode")]
-        {
+        if crate::runtime_mode::is_hitl() {
             assert!(!state.board_state_proof_enforced());
             assert_eq!(crate::board_abort::required_unknown_mask(&state, 0x7f), 0);
             state.hitl_safety_interlocks[3].store(true, std::sync::atomic::Ordering::Release);
         }
         assert_eq!(
             crate::board_abort::required_unknown_mask(&state, 0x7f),
-            if cfg!(feature = "test_fire_mode") {
+            if crate::runtime_mode::is_test_fire() {
                 0x78
             } else {
                 0x7f
@@ -394,7 +393,7 @@ mod tests {
         let _ = crate::board_abort::request_paired_readiness_queries(&state);
         assert_eq!(
             state.board_abort.take_queries(),
-            if cfg!(feature = "test_fire_mode") {
+            if crate::runtime_mode::is_test_fire() {
                 0x78
             } else {
                 0x7f

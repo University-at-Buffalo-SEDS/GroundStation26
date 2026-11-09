@@ -673,18 +673,26 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
     admitted
 }
 
-#[cfg(not(feature = "hitl_mode"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn eval_abort_retained_owner_must_block_public_fresh_launch() {
+    // A non-HITL test inside the HITL-only module: no build compiled it
+    // before modes moved to run time, so no mode runs it.
+    if !crate::runtime_mode::test_support::suite(&[]) {
+        return;
+    }
     assert!(
         !run_case(false, false).await,
         "retained exact FC16 owner did not block public Launch journal admission"
     );
 }
 
-#[cfg(not(feature = "hitl_mode"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn eval_abort_held_retry_must_block_public_fresh_launch() {
+    // A non-HITL test inside the HITL-only module: no build compiled it
+    // before modes moved to run time, so no mode runs it.
+    if !crate::runtime_mode::test_support::suite(&[]) {
+        return;
+    }
     assert!(
         !run_case(false, true).await,
         "held exact FC16 retry did not block public Launch journal admission"
@@ -693,5 +701,6 @@ async fn eval_abort_held_retry_must_block_public_fresh_launch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn eval_abort_settled_owner_public_fresh_launch_control() {
+    crate::mode_suite!(Hitl);
     assert!(run_case(true, false).await);
 }

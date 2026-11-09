@@ -5,6 +5,7 @@ pub(crate) mod overpressure;
 mod overpressure_tests;
 pub(crate) mod progress;
 mod turbocharge;
+pub(crate) mod mode_switch;
 #[cfg(all(test, feature = "firmware_sim"))]
 pub(crate) use turbocharge::mass_ingress_snapshot;
 pub(crate) use turbocharge::{mass_calibration_signature, observe_valve_pressure_ingress};
@@ -13,18 +14,13 @@ mod automatic_abort;
 mod rrls_http_tests;
 // Verified recovery coordinator uses the same bounded owner primitives.
 pub(crate) mod reset_generation;
-#[cfg(any(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
 pub(crate) use automatic_abort::claim_automatic_abort;
 pub(crate) use automatic_abort::claim_automatic_abort_for_generation;
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 pub(crate) use automatic_abort::{
     AutomaticAbortClaim, LivenessAbortDecision, claim_liveness_abort,
 };
-#[cfg(not(feature = "hitl_mode"))]
 mod operational_policy;
-#[cfg(not(feature = "hitl_mode"))]
 use operational_policy::*;
-#[cfg(not(feature = "hitl_mode"))]
 mod operational;
 use crate::{
     auth::Permission,
@@ -40,7 +36,6 @@ use axum::{
     routing::get,
 };
 use gse_sequence::{Action, Config, Effects, Engine, Inputs, Phase, Sample, ValveState};
-#[cfg(not(feature = "hitl_mode"))]
 use gse_sequence::{
     qd_wait::{QdStatus, QdWait},
     qualification::{Fault, Milestone},
@@ -162,7 +157,7 @@ pub struct Runtime {
     progress_admission: Option<LaunchAdmission>,
     progress_fill_target_kg:Option<f32>,
     cold_flow:Option<cold_flow::Session>,
-    #[cfg(not(feature = "hitl_mode"))]
+    /// Operational qualification runtime; untouched (default) in HITL.
     operational: operational::Operational,
     clock: Instant,
     #[cfg(test)]
@@ -195,15 +190,18 @@ pub struct Runtime {
 }
 impl Default for Runtime {
     fn default() -> Self {
-        #[cfg(not(any(test, feature = "hitl_mode")))]
-        crate::checklists::paired::preflight();
+        // RUNTIME-MODE-BOOT: the shared-checklist preflight runs when the
+        // runtime is first built (boot), and only outside HITL.
+        #[cfg(not(test))]
+        if !crate::runtime_mode::is_hitl() {
+            crate::checklists::paired::preflight();
+        }
         Self {
-            engine: Engine::default(),
+            engine: station_engine(),
             progress: Default::default(),
             progress_admission: None,
             progress_fill_target_kg:None,
             cold_flow:None,
-            #[cfg(not(feature = "hitl_mode"))]
             operational: Default::default(),
             clock: Instant::now(),
             #[cfg(test)]
@@ -304,8 +302,7 @@ impl Runtime {
     /// Keep fault/evidence/history and real abort-worker leases unchanged.
     fn retire_automation_owner_for_stop(&mut self) {
         if let Some(mut controller) = self.fill_trim.take() { controller.cancel(); }
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        if !crate::runtime_mode::is_hitl() {
             self.operational.running = false;
             self.operational.target_reached = None;
             self.operational.last_correction_ms = None;
@@ -332,8 +329,7 @@ impl Runtime {
         if let Some(mut controller) = self.fill_trim.take() {
             controller.cancel();
         }
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        if !crate::runtime_mode::is_hitl() {
             self.operational.running = false;
             self.operational.target_reached = None;
             self.operational.last_correction_ms = None;
@@ -367,12 +363,9 @@ impl Runtime {
     /// explicitly clears qualification. Never clear evidence automatically.
     pub fn calibration_import_allowed(&self) -> bool {
         if cold_flow::runtime_active(self) { return false; }
-        #[cfg(feature = "hitl_mode")]
-        {
+        if crate::runtime_mode::is_hitl() {
             false
-        }
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        } else {
             self.engine.status.phase == Phase::Idle
                 && !self.engine.active()
                 && self.operational.saved.qualification.stage()
@@ -386,14 +379,12 @@ impl Runtime {
                 .any(|m| self.operational.saved.qualification.completed(m))
         }
     }
-    #[cfg(not(feature = "hitl_mode"))]
     pub(crate) fn checklist_definition_edit_allowed(&self) -> bool {
         self.calibration_import_allowed()
             && !self.operational.running
             && self.operational.saved.pending_checklists.is_empty()
             && self.operational.saved.qualification.fault().is_none()
     }
-    #[cfg(not(feature = "hitl_mode"))]
     pub(crate) fn checklist_template_bound(&self) -> bool {
         crate::checklists::paired::qualification_allowed(
             self.operational.saved.checklist_digest.as_deref(),
@@ -621,8 +612,7 @@ fn prelaunch(state: &AppState) -> bool {
     prelaunch_flight_state(*state.state.lock().unwrap())
 }
 pub(crate) fn prelaunch_flight_state(state: FlightState) -> bool {
-    #[cfg(feature = "hitl_mode")]
-    if matches!(state, FlightState::Startup | FlightState::Armed) {
+    if crate::runtime_mode::is_hitl() && matches!(state, FlightState::Startup | FlightState::Armed) {
         return true;
     }
     matches!(
@@ -658,10 +648,24 @@ pub(crate) fn persist_settings(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// A fresh engine for the station mode in force: test fire keeps the original
+/// fill-resume deadband (formerly gse_sequence's legacy_resume_deadband
+/// feature, enabled only by the test-fire build).
+fn station_engine() -> Engine {
+    let mut engine = Engine::default();
+    engine.legacy_resume_deadband = crate::runtime_mode::is_test_fire();
+    engine
+}
 pub fn initialize(state: &AppState) {
     turbocharge::restore_pending_inventory(state);
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    restore_operational(state);
+    load_config(state);
+}
+
+/// Qualification restore and the automatic-abort latch, outside HITL only.
+/// Runs at boot and again after an in-process switch (mode_switch.rs).
+fn restore_operational(state: &AppState) {
+    if !crate::runtime_mode::is_hitl() {
         let path = std::env::var_os("GS_GSE_QUALIFICATION")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| config_path().with_file_name("gse_qualification.json"));
@@ -705,8 +709,7 @@ pub fn initialize(state: &AppState) {
             }
         }
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if !crate::runtime_mode::is_hitl() {
         let claimed = {
             let mut rt = state.gse.lock().unwrap();
             let claimed = rt.operational.saved.automatic_abort_claimed;
@@ -725,6 +728,9 @@ pub fn initialize(state: &AppState) {
             state.set_local_flight_state(FlightState::Aborted);
         }
     }
+}
+
+fn load_config(state: &AppState) {
     match std::fs::read(config_path())
         .map_err(|e| e.to_string())
         .and_then(|b| serde_json::from_slice::<Config>(&b).map_err(|e| e.to_string()))
@@ -753,16 +759,11 @@ fn pilot_clock_allowed(engine_active: bool, fire_committed: bool, hitl_mode: boo
 pub(crate) fn pilot_report_can_advance_launch_clock(state: &AppState) -> bool {
     let runtime = state.gse.lock().unwrap();
     if cold_flow::runtime_active(&runtime){return false;}
-    #[cfg(feature = "hitl_mode")]
-    let fire_committed = false;
-    #[cfg(not(feature = "hitl_mode"))]
-    let fire_committed = runtime.operational.saved.qualification.stage()
-        == gse_sequence::qualification::MissionStage::Fire;
-    pilot_clock_allowed(
-        runtime.engine.active(),
-        fire_committed,
-        cfg!(feature = "hitl_mode"),
-    )
+    let hitl = crate::runtime_mode::is_hitl();
+    let fire_committed = !hitl
+        && runtime.operational.saved.qualification.stage()
+            == gse_sequence::qualification::MissionStage::Fire;
+    pilot_clock_allowed(runtime.engine.active(), fire_committed, hitl)
 }
 fn action(cmd: &TelemetryCommand) -> Option<Action> {
     match cmd {
@@ -829,14 +830,11 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
     let policy = state.action_policy_snapshot();
     let rt = state.gse.lock().unwrap();
     if let Some(action) = action(cmd) {
-        #[cfg(feature = "hitl_mode")]
-        {
-            let _ = (action, is_prelaunch);
+        if crate::runtime_mode::is_hitl() {
             // Admit the request, not the actuation: handle_command still
             // enforces every engine prerequisite before emitting effects.
             return Some(is_prelaunch && interlock(state, &policy));
         }
-        #[cfg(not(feature = "hitl_mode"))]
         return Some(
             operational_action_allowed(&rt, action)
                 && rt
@@ -844,8 +842,10 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
                     .allows(action, rt.input(is_prelaunch, interlock(state, &policy))),
         );
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    if rt.operational.saved.qualification.fault().is_some() && valve_command(cmd) {
+    if !crate::runtime_mode::is_hitl()
+        && rt.operational.saved.qualification.fault().is_some()
+        && valve_command(cmd)
+    {
         return Some(matches!(
             cmd,
             TelemetryCommand::NitrogenClose | TelemetryCommand::NitrousClose
@@ -871,17 +871,18 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
     {
         return Some(false);
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    if matches!(
-        crate::sequences::command_name(cmd),
-        "Launch" | "GroundStationLaunch" | "RetractPlumbing"
-    ) {
+    if !crate::runtime_mode::is_hitl()
+        && matches!(
+            crate::sequences::command_name(cmd),
+            "Launch" | "GroundStationLaunch" | "RetractPlumbing"
+        )
+    {
         return Some(
             is_prelaunch
                 && interlock(state, &policy)
                 && operational_launch_allowed(state, &rt)
                 && (crate::sequences::command_name(cmd) == "RetractPlumbing"
-                    || cfg!(feature = "test_fire_mode")
+                    || crate::runtime_mode::is_test_fire()
                     || !matches!(
                         rt.operational.qd.status(rt.now()),
                         QdStatus::NotStarted | QdStatus::AckTimedOut
@@ -906,29 +907,23 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
 }
 // Safety catalog (About safety): key-interlock. Keep backend/src/safety_catalog_rules.rs in step.
 fn interlock(state: &AppState, policy: &ActionPolicyMsg) -> bool {
-    #[cfg(feature = "hitl_mode")]
-    {
-        let _ = policy;
+    if crate::runtime_mode::is_hitl() {
         state.hitl_button_interlock_satisfied()
-    }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
-        let _ = state;
+    } else {
         policy.key_enabled && policy.software_buttons_enabled
     }
 }
 fn sequence_button_enabled(engine: &Engine, action: Action, input: Inputs) -> bool {
-    #[cfg(feature = "hitl_mode")]
-    {
+    if crate::runtime_mode::is_hitl() {
         input.prelaunch
             && input.interlock
             && (action != Action::SelfTest
                 || (engine.config.dry_self_test_confirmed
                     && !engine.status.self_test_locked
                     && !engine.active()))
+    } else {
+        engine.allows(action, input)
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    engine.allows(action, input)
 }
 
 pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
@@ -951,8 +946,8 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
         } else {
             sequence_button_enabled(&rt.engine, action, input)
         };
-        #[cfg(not(feature = "hitl_mode"))]
-        let enabled = enabled && operational_action_allowed(&rt, action);
+        let enabled =
+            enabled && (crate::runtime_mode::is_hitl() || operational_action_allowed(&rt, action));
         let waits = action == Action::StartFill && fill_waits;
         let enabled = enabled && !waits;
         policy.controls.retain(|c| c.cmd != cmd);
@@ -968,8 +963,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
             }),
         });
     }
-    #[cfg(feature = "hitl_mode")]
-    {
+    if crate::runtime_mode::is_hitl() {
         policy
             .controls
             .retain(|c| c.cmd != "ToggleGroundStationControl");
@@ -997,8 +991,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
             }
         }
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if !crate::runtime_mode::is_hitl() {
         let ready = input.prelaunch && input.interlock && operational_launch_allowed(state, &rt);
         for control in &mut policy.controls {
             if matches!(
@@ -1007,7 +1000,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
             ) {
                 control.enabled = ready
                     && (control.cmd == "RetractPlumbing"
-                        || cfg!(feature = "test_fire_mode")
+                        || crate::runtime_mode::is_test_fire()
                         || !matches!(
                             rt.operational.qd.status(rt.now()),
                             QdStatus::NotStarted | QdStatus::AckTimedOut
@@ -1043,8 +1036,7 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
                     let recovery = {
                         let mut rt = state.gse.lock().unwrap();
                         let now = rt.now();
-                        #[cfg(not(feature = "hitl_mode"))]
-                        {
+                        if !crate::runtime_mode::is_hitl() {
                             rt.operational
                                 .saved
                                 .qualification
@@ -1087,8 +1079,7 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
         } else {
             let mut rt = state.gse.lock().unwrap();
             let now = rt.now();
-            #[cfg(not(feature = "hitl_mode"))]
-            {
+            if !crate::runtime_mode::is_hitl() {
                 rt.operational
                     .saved
                     .qualification
@@ -1199,8 +1190,7 @@ fn classify_fill_for_recording_under_gate(
     if matches!(rt.engine.status.phase, Phase::FillSetup | Phase::Filling) || zero_pending {
         return Ok(Disposition::AlreadyFilling);
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    if !operational_action_allowed(&rt, Action::StartFill) {
+    if !crate::runtime_mode::is_hitl() && !operational_action_allowed(&rt, Action::StartFill) {
         return Err(Error::Stale);
     }
     if rt.ground_station_control
@@ -1295,8 +1285,7 @@ pub(crate) fn consume_fill_noop(state: &Arc<AppState>, cmd: &TelemetryCommand) -
     let policy = state.action_policy_snapshot();
     let targets = state.fill_targets_snapshot().nitrous;
     let mut rt = state.gse.lock().unwrap();
-    #[cfg(not(feature = "hitl_mode"))]
-    if !operational_action_allowed(&rt, Action::StartFill) {
+    if !crate::runtime_mode::is_hitl() && !operational_action_allowed(&rt, Action::StartFill) {
         return false;
     }
     let input = rt.input(is_prelaunch, interlock(state, &policy));
@@ -1320,8 +1309,6 @@ fn handle_command_inner(
     plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
     launch_revision: Option<u64>,
 ) -> bool {
-    #[cfg(feature = "hitl_mode")]
-    let _ = (plumbing_origin, launch_revision);
     if overpressure::command_allowed(&state.gse.lock().unwrap(), cmd) == Some(false) {
         state.add_temporary_notification(
             "Blocked: a tank overpressure error holds dump and vent open; acknowledge it after pressure drops",
@@ -1365,12 +1352,12 @@ fn handle_command_inner(
         );
         return true;
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    if handle_operational_command(state, cmd, plumbing_origin, launch_revision) {
+    if !crate::runtime_mode::is_hitl()
+        && handle_operational_command(state, cmd, plumbing_origin, launch_revision)
+    {
         return true;
     }
-    #[cfg(feature = "hitl_mode")]
-    if matches!(cmd, TelemetryCommand::ToggleGroundStationControl) {
+    if crate::runtime_mode::is_hitl() && matches!(cmd, TelemetryCommand::ToggleGroundStationControl) {
         let enabled = {
             let mut rt = state.gse.lock().unwrap();
             rt.ground_station_control = !rt.ground_station_control;
@@ -1405,8 +1392,7 @@ fn handle_command_inner(
         let fill_waits = action == Action::StartFill && fill_resume_awaits_retirement(state);
         let result = {
             let mut rt = state.gse.lock().unwrap();
-            #[cfg(not(feature = "hitl_mode"))]
-            if !operational_action_allowed(&rt, action) {
+            if !crate::runtime_mode::is_hitl() && !operational_action_allowed(&rt, action) {
                 rt.engine.status.message =
                     "Complete prerequisites in order and wait for stable fill-system routes".into();
                 return true;
@@ -1492,8 +1478,7 @@ fn handle_command_inner(
                         );
                     }
                 }
-                #[cfg(not(feature = "hitl_mode"))]
-                if result.is_ok() {
+                if !crate::runtime_mode::is_hitl() && result.is_ok() {
                     rt.operational.running = true;
                     rt.operational.run_generation = rt.operational.saved.qualification.generation();
                     rt.operational.target_reached = None;
@@ -1551,8 +1536,7 @@ pub(super) fn dump_test_hold_under_dispatch(state: &Arc<AppState>) -> Result<(),
         let input = rt.input(is_prelaunch, interlock);
         let effects = rt.engine.dump_test_hold(input)?;
         rt.manual_control = false;
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        if !crate::runtime_mode::is_hitl() {
             rt.operational.running = true;
         }
         rt.progress_observe(input, crate::sequence_progress_projection::Cause::Tick);
@@ -1616,8 +1600,7 @@ pub(super) fn resume_test_under_dispatch(state: &Arc<AppState>) -> Result<(), St
     let effects = {
         let mut rt = state.gse.lock().unwrap();
         let paused = rt.engine.paused_test().ok_or("No paused test")?;
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        if !crate::runtime_mode::is_hitl() {
             let action = match paused {
                 gse_sequence::PausedTest::ValveSelfTest => Action::SelfTest,
                 gse_sequence::PausedTest::NitrogenTest => Action::NitrogenTest,
@@ -1634,14 +1617,11 @@ pub(super) fn resume_test_under_dispatch(state: &Arc<AppState>) -> Result<(), St
                 );
             }
         }
-        #[cfg(feature = "hitl_mode")]
-        let _ = paused;
         let input = rt.input(is_prelaunch, interlock(state, &policy));
         let effects = rt.engine.resume_test(input)?;
         rt.manual_control = false;
         rt.progress_observe(input, crate::sequence_progress_projection::Cause::ResumeAccepted);
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        if !crate::runtime_mode::is_hitl() {
             rt.operational.running = true;
             rt.operational.target_reached = None;
         }
@@ -1651,7 +1631,6 @@ pub(super) fn resume_test_under_dispatch(state: &Arc<AppState>) -> Result<(), St
     crate::sequences::refresh_action_policy_under_dispatch(state);
     Ok(())
 }
-#[cfg(any(test, not(feature = "hitl_mode")))]
 fn fill_mass_in_band(config: &Config, mass: f32, target: f32) -> bool {
     mass.is_finite()
         && target.is_finite()
@@ -1664,7 +1643,6 @@ fn fill_stop_reached(config: &Config, mass: f32, target: f32) -> bool {
         && target != 0.0
         && mass * target.signum() >= target.abs() + config.fill_overfill_kg
 }
-#[cfg(not(feature = "hitl_mode"))]
 fn remember_automatic_cutoff_target(runtime: &mut Runtime, mass: f32, target: f32) {
     // The stop and qualification candidate must agree on the existing target
     // tolerance. A pressure plateau alone must never qualify a short fill.
@@ -1754,8 +1732,7 @@ pub(super) fn pause_for_failure(rt: &mut Runtime, input: Inputs, reason: &str) -
     }
     let effects = rt.engine.pause_for_failure(input.now_ms, reason);
     if rt.engine.status.phase == Phase::PauseSetup {
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        if !crate::runtime_mode::is_hitl() {
             rt.operational.running = true;
             rt.operational.target_reached = None;
         }
@@ -1770,7 +1747,6 @@ pub(super) fn pause_for_failure(rt: &mut Runtime, input: Inputs, reason: &str) -
 /// Recoverable/unclassified faults pause an active sequence closed instead of
 /// latching the entire vehicle aborted or dumping the tank. Serialize with
 /// launch so no delayed pause can close a supply after Fire admission.
-#[cfg(any(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
 pub(crate) fn pause_fill_for_recoverable_fault(state: &Arc<AppState>, reason: &str) {
     let generation = capture_operator_origin(state).unwrap_or(0);
     pause_fill_for_recoverable_fault_for_generation(state, reason, generation);
@@ -1818,8 +1794,6 @@ pub fn tick(state: &Arc<AppState>, interlock: bool) {
         return;
     }
     let automatic_observation = crate::automatic_flight_state::Observation::begin(state);
-    #[cfg(feature = "hitl_mode")]
-    let _ = &automatic_observation;
     if cold_flow::active(state) {
         let Some(_claim)=claim_operator_dispatch(state,automatic_generation(state))else{return;};
         cold_flow::tick(state,interlock);
@@ -1835,8 +1809,9 @@ pub fn tick(state: &Arc<AppState>, interlock: bool) {
         tick_inner(state, interlock);
         claim
     };
-    #[cfg(not(feature = "hitl_mode"))]
-    if let Some(observation) = automatic_observation.as_ref() {
+    if !crate::runtime_mode::is_hitl()
+        && let Some(observation) = automatic_observation.as_ref()
+    {
         publish_qualified_flight_armed_with_observation(state, observation);
     }
     flush_effects(state);
@@ -1857,8 +1832,8 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
     if turbocharge::guard_closed_pressure(state) {
         return;
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    if operational_tick(state, interlock) {
+    let hitl = crate::runtime_mode::is_hitl();
+    if !hitl && operational_tick(state, interlock) {
         return;
     }
     let is_prelaunch = prelaunch(state);
@@ -1873,7 +1848,6 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
         {
             rt.progress_fill_target_kg = Some(target);
         }
-        #[cfg(not(feature = "hitl_mode"))]
         let previous_phase = rt.engine.status.phase;
         // Overfill relief belongs to automatic fill only.
         rt.engine.manual_fill_control = !rt.ground_station_control || rt.manual_control;
@@ -1891,8 +1865,7 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                 crate::sequence_progress_service::now_ms(),
             );
             if let Some(message) = update.fault.clone().filter(|_| update.hazard) {
-                #[cfg(not(feature = "hitl_mode"))]
-                {
+                if !hitl {
                     rt.operational
                         .saved
                         .qualification
@@ -1918,21 +1891,20 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                 rt.engine.status.valves = completion_valve_snapshot(input);
                 rt.engine.status.message =
                     "Fill mass settled within tolerance; all valves confirmed closed".into();
-                #[cfg(not(feature = "hitl_mode"))]
-                {
+                if !hitl {
                     if let Some(mass) = mass {
                         remember_automatic_cutoff_target(&mut rt, mass.value, target);
                     }
                     complete_operational_milestones(&mut rt, Phase::PauseSetup, input);
+                } else {
+                    rt.progress.complete(
+                        crate::sequence_progress_projection::TerminalProof::VerifiedFillTrim {
+                            trim: reporting_trim,
+                            input,
+                        },
+                        crate::sequence_progress_service::now_ms(),
+                    );
                 }
-                #[cfg(feature = "hitl_mode")]
-                rt.progress.complete(
-                    crate::sequence_progress_projection::TerminalProof::VerifiedFillTrim {
-                        trim: reporting_trim,
-                        input,
-                    },
-                    crate::sequence_progress_service::now_ms(),
-                );
                 let mut effects = update.effects;
                 effects.notification = Some("Fill complete: settled mass is within tolerance and all valves are confirmed closed".into());
                 effects
@@ -1943,8 +1915,7 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                 update.effects
             }
         } else {
-            #[cfg(feature = "hitl_mode")]
-            let progress_before = rt.engine.progress_observation(input);
+            let progress_before = hitl.then(|| rt.engine.progress_observation(input));
             let phase_before = rt.engine.status.phase;
             let effects = turbocharge::pressure_cutoff(&mut rt, input)
                 .unwrap_or_else(|| rt.engine.tick(input));
@@ -1952,8 +1923,7 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
             if phase_before == Phase::Dumping && rt.engine.status.phase == Phase::Cancelled {
                 rt.progress_failed_current();
             }
-            #[cfg(feature = "hitl_mode")]
-            {
+            if let Some(progress_before) = progress_before {
                 let after = rt.engine.progress_observation(input);
                 rt.progress_observe(input, crate::sequence_progress_projection::Cause::Tick);
                 let kind = match (progress_before.phase, after.phase) {
@@ -1976,8 +1946,9 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                     );
                 }
             }
-            #[cfg(not(feature = "hitl_mode"))]
-            complete_operational_milestones(&mut rt, previous_phase, input);
+            if !hitl {
+                complete_operational_milestones(&mut rt, previous_phase, input);
+            }
             if rt.engine.status.phase != Phase::Filling || !rt.ground_station_control {
                 rt.fill_cutoff.reset();
                 effects
@@ -2150,8 +2121,7 @@ fn invalidate_changed_configuration(rt: &mut Runtime, config: &Config) -> Result
     if !nitrogen && !fill {
         return Ok(());
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if !crate::runtime_mode::is_hitl() {
         if !rt.operational.saved.pending_checklists.is_empty() {
             return Err(
                 "Save pending checklist progress before changing procedure settings".into(),
@@ -2316,7 +2286,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     let mode = crate::station_mode::snapshot();
     response["operating_mode"] = serde_json::to_value(&mode).expect("mode serializable");
     response["request_gate"] = serde_json::json!({
-        "hitl_mode": cfg!(feature = "hitl_mode"),
+        "hitl_mode": crate::runtime_mode::is_hitl(),
         "flight_state": flight_state,
         "prelaunch": prelaunch,
         "button_interlock_satisfied": interlock,
@@ -2333,8 +2303,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     response["configuration_error"] =
         serde_json::json!(state.gse.lock().unwrap().engine.config.validate().err());
     response["physical_panel"] = crate::gpio_panel::panel_indicators(&state);
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if !crate::runtime_mode::is_hitl() {
         let rt = state.gse.lock().unwrap();
         response["qualification"] =
             serde_json::to_value(&rt.operational.saved.qualification).unwrap();
@@ -2380,9 +2349,9 @@ mod tests {
         };
         assert_eq!(completion_valve_snapshot(input), [Some(true), Some(false), None, None, None]);
     }
-    #[cfg(not(feature = "hitl_mode"))]
     #[test]
     fn template_switch_waits_for_local_reset_receipts() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let mut runtime = super::Runtime::default();
         assert!(runtime.checklist_definition_edit_allowed());
         runtime
@@ -2413,9 +2382,9 @@ mod tests {
         let old_guard_allowed = !engine.active();
         assert!(!old_guard_allowed);
     }
-    #[cfg(feature = "hitl_mode")]
     #[tokio::test]
     async fn hitl_pilot_clock_wrapper_keeps_the_original_active_engine_guard() {
+        crate::mode_suite!(Hitl);
         let state = crate::state::tests::test_app_state().await;
         state.gse.lock().unwrap().engine.status.phase = Phase::Paused;
         assert!(!pilot_report_can_advance_launch_clock(&state));
@@ -2430,9 +2399,9 @@ mod tests {
             assert!(pilot_clock_allowed(false, fire, false));
         }
     }
-    #[cfg(not(feature = "hitl_mode"))]
     #[test]
     fn quantized_automatic_target_cutoff_keeps_the_existing_qualification_tolerance() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let mut runtime = Runtime::default();
         let target = 5.0;
         let quantized_mass = target * 0.996;
@@ -2449,9 +2418,9 @@ mod tests {
             "The candidate alone must not grant qualification before fresh mass and valve ACKs"
         );
     }
-    #[cfg(not(feature = "hitl_mode"))]
     #[test]
     fn below_target_plateau_and_invalid_inputs_do_not_record_a_fill_target() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         for (mass, target) in [
             (4.9, 5.0),
             (f32::NAN, 5.0),
@@ -2577,14 +2546,13 @@ mod tests {
         )
         .unwrap();
         let clock = state.launch_clock_snapshot();
-        #[cfg(not(feature = "hitl_mode"))]
+        let hitl = crate::runtime_mode::is_hitl();
         let path = std::env::temp_dir().join(format!("gs-clear-abort-{}.json", std::process::id()));
         {
             let mut rt = state.gse.lock().unwrap();
             rt.engine.fault(0, "Operator abort");
             rt.engine.config.dry_self_test_confirmed = true;
-            #[cfg(not(feature = "hitl_mode"))]
-            {
+            if !hitl {
                 rt.operational.path = Some(path.clone());
                 rt.operational
                     .saved
@@ -2616,8 +2584,7 @@ mod tests {
         let rt = state.gse.lock().unwrap();
         assert_eq!(rt.engine.status.phase, Phase::Idle);
         assert!(!rt.engine.config.dry_self_test_confirmed);
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        if !hitl {
             let saved = operational::Saved::load(&path).unwrap();
             assert!(saved.qualification.fault().is_none());
             assert!(!saved.qualification.completed(Milestone::SelfTest));
@@ -2635,17 +2602,19 @@ mod tests {
             sedsnet::router::RouterConfig::new([]).with_sender("GS"),
         ));
         state.topology_router.set(router).unwrap();
-        #[cfg(not(feature = "hitl_mode"))]
-        let saved = serde_json::to_value(&state.gse.lock().unwrap().operational.saved).unwrap();
+        let hitl = crate::runtime_mode::is_hitl();
+        let saved = (!hitl)
+            .then(|| serde_json::to_value(&state.gse.lock().unwrap().operational.saved).unwrap());
         let error = clear_ground_abort(&state).unwrap_err();
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.1.contains("synchronized network time"));
         assert_eq!(state.local_flight_state_snapshot(), FlightState::Aborted);
-        #[cfg(not(feature = "hitl_mode"))]
-        assert_eq!(
-            serde_json::to_value(&state.gse.lock().unwrap().operational.saved).unwrap(),
-            saved
-        );
+        if let Some(saved) = saved {
+            assert_eq!(
+                serde_json::to_value(&state.gse.lock().unwrap().operational.saved).unwrap(),
+                saved
+            );
+        }
     }
 
     pub(super) type TestCommands = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
@@ -2800,7 +2769,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "hitl_mode"))]
     pub(super) fn confirm_test_valves(state: &AppState, valves: [bool; 5]) {
         let mut rt = state.gse.lock().unwrap();
         for (key, open) in KEYS.into_iter().zip(valves) {
@@ -2810,7 +2778,6 @@ mod tests {
         rt.observe_mass(Some(0.0));
     }
 
-    #[cfg(feature = "hitl_mode")]
     fn drive_button_phase(
         state: &Arc<AppState>,
         sent: &TestCommands,
@@ -2866,8 +2833,8 @@ mod tests {
         panic!("routed sequence did not reach {done:?}");
     }
     #[tokio::test]
-    #[cfg(feature = "hitl_mode")]
     async fn nitrogen_button_enters_baseline_and_requests_safe_valve_configuration() {
+        crate::mode_suite!(Hitl);
         let (state, sent, peer) = button_test_state().await;
         assert_eq!(
             command_allowed(&state, &TelemetryCommand::NitrogenTest),
@@ -2888,9 +2855,9 @@ mod tests {
         );
     }
     #[tokio::test]
-    #[cfg(feature = "hitl_mode")]
     async fn fill_button_requires_nitrogen_pass_then_opens_only_after_confirmations_and_stops_at_mass()
      {
+        crate::mode_suite!(Hitl);
         let (state, sent, peer) = button_test_state().await;
         assert!(handle_command(&state, &TelemetryCommand::StartFill));
         assert!(sent.lock().unwrap().is_empty());
@@ -2951,8 +2918,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "hitl_mode")]
     async fn disabling_mass_control_cancels_trim_without_changing_valves() {
+        crate::mode_suite!(Hitl);
         let (state, sent, peer) = button_test_state().await;
         {
             let mut rt = state.gse.lock().unwrap();
@@ -2981,8 +2948,8 @@ mod tests {
         );
     }
     #[tokio::test]
-    #[cfg(feature = "hitl_mode")]
     async fn button_rejections_are_visible_and_do_not_enqueue_valve_actions() {
+        crate::mode_suite!(Hitl);
         for cmd in [TelemetryCommand::NitrogenTest, TelemetryCommand::StartFill] {
             let (state, sent, peer) = button_test_state().await;
             state
@@ -3045,7 +3012,7 @@ mod tests {
         assert!(prelaunch_flight_state(FlightState::Armed));
         assert_eq!(
             prelaunch_flight_state(FlightState::Startup),
-            cfg!(feature = "hitl_mode")
+            crate::runtime_mode::is_hitl()
         );
         for state in [
             FlightState::Launch,
@@ -3060,14 +3027,15 @@ mod tests {
         ] {
             assert!(!prelaunch_flight_state(state));
         }
-        #[cfg(feature = "hitl_mode")]
-        for (_, action) in ACTIONS {
+        if crate::runtime_mode::is_hitl() {
+            for (_, action) in ACTIONS {
             let rt = Runtime::default();
             assert!(!sequence_button_enabled(
                 &rt.engine,
                 action,
                 rt.input(false, true)
             ));
+            }
         }
     }
 
@@ -3092,16 +3060,17 @@ mod tests {
         let mut rt = Runtime::default();
         let input = rt.input(true, true);
         for (_, action) in ACTIONS {
-            #[cfg(feature = "hitl_mode")]
-            assert_eq!(
-                sequence_button_enabled(&rt.engine, action, input),
-                action != Action::SelfTest
-            );
-            #[cfg(not(feature = "hitl_mode"))]
-            assert_eq!(
-                sequence_button_enabled(&rt.engine, action, input),
-                rt.engine.allows(action, input)
-            );
+            if crate::runtime_mode::is_hitl() {
+                assert_eq!(
+                    sequence_button_enabled(&rt.engine, action, input),
+                    action != Action::SelfTest
+                );
+            } else {
+                assert_eq!(
+                    sequence_button_enabled(&rt.engine, action, input),
+                    rt.engine.allows(action, input)
+                );
+            }
         }
         let before = rt.engine.status.phase;
         assert!(
@@ -3112,8 +3081,7 @@ mod tests {
         );
         assert_eq!(rt.engine.status.phase, before);
         rt.engine.config.dry_self_test_confirmed = true;
-        #[cfg(feature = "hitl_mode")]
-        {
+        if crate::runtime_mode::is_hitl() {
             assert!(sequence_button_enabled(&rt.engine, Action::SelfTest, input));
             rt.engine.status.self_test_locked = true;
             assert!(!sequence_button_enabled(
@@ -3138,8 +3106,7 @@ pub fn report_safety(state: &Arc<AppState>) {
     // Its typed controller checks fresh PT/outputs on the existing GSE tick.
     // Paused here is a proxy, never proof of a nitrous-fill session.
     if cold_flow::active(state){return;}
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if !crate::runtime_mode::is_hitl() {
         let _claim = {
             let _dispatch = DISPATCH_GATE.lock().unwrap();
             let Some(claim) =
@@ -3153,12 +3120,10 @@ pub fn report_safety(state: &Arc<AppState>) {
         flush_effects(state);
     progress::flush(state);
     }
-    #[cfg(feature = "hitl_mode")]
-    let _ = state;
 }
 pub fn qd_confirmation(state: &AppState, sender: &str, key: u8, open: bool, source_ms: u64) {
-    #[cfg(not(feature = "hitl_mode"))]
-    if sender == crate::types::Board::ActuatorBoard.sender_id()
+    if !crate::runtime_mode::is_hitl()
+        && sender == crate::types::Board::ActuatorBoard.sender_id()
         && key == crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8
         && open
     {
@@ -3172,8 +3137,6 @@ pub fn qd_confirmation(state: &AppState, sender: &str, key: u8, open: bool, sour
             rt.operational.qd.confirm(now);
         }
     }
-    #[cfg(feature = "hitl_mode")]
-    let _ = (state, sender, key, open, source_ms);
 }
 /// RRLS relays telemetry and shared settings but cannot change live operation.
 fn require_primary_operational_station() -> Result<(), (StatusCode, String)> {
@@ -3197,8 +3160,7 @@ pub(crate) fn verified_recovery_host_idle(state: &AppState) -> bool {
     if rt.engine.active() {
         return false;
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    if rt.operational.running || rt.automatic_abort_in_flight {
+    if !crate::runtime_mode::is_hitl() && (rt.operational.running || rt.automatic_abort_in_flight) {
         return false;
     }
     true
@@ -3223,8 +3185,7 @@ pub(crate) fn operator_work_block_reason(state: &AppState) -> Option<String> {
         if cold_flow::runtime_active(&rt) {
             return Some("Cold flow is running; stop it first.".into());
         }
-        #[cfg(not(feature = "hitl_mode"))]
-        if rt.operational.running || rt.automatic_abort_in_flight {
+        if !crate::runtime_mode::is_hitl() && (rt.operational.running || rt.automatic_abort_in_flight) {
             return Some("An operation or automatic abort is still running.".into());
         }
     }
@@ -3268,8 +3229,7 @@ pub(crate) fn operator_reset_host_idle(state: &AppState) -> bool {
         if engine_blocks_operator_reset(&rt) || cold_flow::runtime_active(&rt) {
             return false;
         }
-        #[cfg(not(feature = "hitl_mode"))]
-        if rt.operational.running || rt.automatic_abort_in_flight {
+        if !crate::runtime_mode::is_hitl() && (rt.operational.running || rt.automatic_abort_in_flight) {
             return false;
         }
     }
@@ -3291,8 +3251,7 @@ pub(crate) fn prepare_verified_startup(state: &Arc<AppState>) -> Result<(), &'st
     if engine_blocks_operator_reset(&rt) {
         return Err("Sequence still active");
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if !crate::runtime_mode::is_hitl() {
         if rt.operational.running || rt.automatic_abort_in_flight {
             return Err("GSE owner still active");
         }
@@ -3319,7 +3278,7 @@ pub(crate) fn prepare_verified_startup(state: &Arc<AppState>) -> Result<(), &'st
         rt.operational.startup_configured = true;
     }
     let config = rt.engine.config.clone();
-    rt.engine = Engine::default();
+    rt.engine = station_engine();
     rt.engine.config = config;
     rt.engine.config.dry_self_test_confirmed = false;
     rt.manual_control = false;
@@ -3329,14 +3288,14 @@ pub(crate) fn prepare_verified_startup(state: &Arc<AppState>) -> Result<(), &'st
 /// Operator recovery only: never dispatch a valve, ignition or launch command.
 fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)> {
     require_primary_operational_station()?;
-    #[cfg(not(feature = "hitl_mode"))]
-    let _clear_reservation;
-    #[allow(unused_mut)] // Operational recovery mutates this guard outside HITL.
+    let hitl = crate::runtime_mode::is_hitl();
+    // Declared before the runtime guard so it is released after it.
+    let mut _clear_reservation: Option<automatic_abort::AutomaticAbortClaim> = None;
     let mut rt = state.gse.lock().unwrap();
     let aborted = *state.state.lock().unwrap() == FlightState::Aborted;
-    #[cfg(not(feature = "hitl_mode"))]
     let aborted = aborted
-        || (rt.operational.saved.automatic_abort_claimed
+        || (!hitl
+            && rt.operational.saved.automatic_abort_claimed
             && matches!(
                 state.local_flight_state_snapshot(),
                 FlightState::Startup | FlightState::Idle | FlightState::Armed
@@ -3344,15 +3303,14 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
     if !aborted {
         return Err((StatusCode::CONFLICT, "GroundStation is not aborted".into()));
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if !hitl {
         if rt.automatic_abort_in_flight {
             return Err((
                 StatusCode::CONFLICT,
                 "Automatic abort dispatch is still in progress".into(),
             ));
         }
-        _clear_reservation = automatic_abort::reserve_abort_clear(state, &mut rt);
+        _clear_reservation = Some(automatic_abort::reserve_abort_clear(state, &mut rt));
     }
     // Preserve the existing validation priority even before a router exists.
     if rt.engine.active() {
@@ -3361,8 +3319,7 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
             "Stop the active sequence first".into(),
         ));
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    if rt.operational.running {
+    if !hitl && rt.operational.running {
         return Err((
             StatusCode::CONFLICT,
             "Stop the active sequence first".into(),
@@ -3375,9 +3332,9 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
         StatusCode::SERVICE_UNAVAILABLE,
         "Network is not initialized".into(),
     ))?;
-    #[cfg(not(feature = "hitl_mode"))]
-    if router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT"))
-        || state.has_pending_recovery_control_tx()
+    if !hitl
+        && (router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT"))
+            || state.has_pending_recovery_control_tx())
     {
         return Err((
             StatusCode::CONFLICT,
@@ -3390,7 +3347,6 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
             format!("Recovery requires synchronized network time: {error}"),
         )
     })?;
-    #[allow(unused_mut)] // Operational recovery mutates this guard outside HITL.
     let mut rt = state.gse.lock().unwrap();
     if rt.engine.active() {
         return Err((
@@ -3398,8 +3354,7 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
             "Stop the active sequence first".into(),
         ));
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if !hitl {
         if rt.operational.running {
             return Err((
                 StatusCode::CONFLICT,
@@ -3436,17 +3391,18 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
     crate::network_variables::set_flight_state(router, FlightState::Idle as u8)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut rt = state.gse.lock().unwrap();
-    #[cfg(not(feature = "hitl_mode"))]
-    rt.operational
-        .clear_automatic_abort_claim()
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    if !hitl {
+        rt.operational
+            .clear_automatic_abort_claim()
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    }
     let config = rt.engine.config.clone();
     rt.progress.complete(
         crate::sequence_progress_projection::TerminalProof::Interrupted,
         crate::sequence_progress_service::now_ms(),
     );
     rt.progress_admission = None;
-    rt.engine = Engine::default();
+    rt.engine = station_engine();
     rt.manual_control = false;
     rt.fill_trim = None;
     rt.engine.config = config;
@@ -3530,16 +3486,13 @@ async fn reset_qualification(State(state): State<Arc<AppState>>, headers: Header
         )
             .into_response();
     };
-    #[cfg(feature = "hitl_mode")]
-    {
+    if crate::runtime_mode::is_hitl() {
         (
             StatusCode::CONFLICT,
             "Operational qualification is not used in HITL",
         )
             .into_response()
-    }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    } else {
         if !matches!(
             *state.state.lock().unwrap(),
             FlightState::Startup | FlightState::Idle
@@ -3571,7 +3524,7 @@ async fn reset_qualification(State(state): State<Arc<AppState>>, headers: Header
             crate::sequence_progress_service::now_ms(),
         );
         rt.progress_admission = None;
-        rt.engine = Engine::default();
+        rt.engine = station_engine();
         rt.engine.config = config;
         rt.engine.config.dry_self_test_confirmed = false;
         rt.operational.startup_configured = false;
@@ -3591,7 +3544,7 @@ async fn reset_qualification(State(state): State<Arc<AppState>>, headers: Header
     }
 }
 
-#[cfg(all(test, not(feature = "hitl_mode")))]
+#[cfg(test)]
 pub(crate) fn set_operational_prerequisites_for_test(state: &AppState) {
     let mut rt = state.gse.lock().unwrap();
     rt.operational.topology_stable = true;
@@ -3613,8 +3566,7 @@ pub fn automatic_abort_allowed(state: &AppState) -> bool {
     {
         return false;
     }
-    #[cfg(feature = "hitl_mode")]
-    {
+    if crate::runtime_mode::is_hitl() {
         let _runtime = state.gse.lock().unwrap();
         !state
             .launch_history
@@ -3631,9 +3583,7 @@ pub fn automatic_abort_allowed(state: &AppState) -> bool {
                     | FlightState::NitrousFill
                     | FlightState::Armed
             )
-    }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    } else {
         let rt = state.gse.lock().unwrap();
         !state
             .launch_history
@@ -3676,17 +3626,13 @@ async fn override_cold_flow(
         )
             .into_response();
     };
-    #[cfg(feature = "hitl_mode")]
-    {
-        let _ = request.reason;
+    if crate::runtime_mode::is_hitl() {
         (
             StatusCode::CONFLICT,
             "Operational cold-flow overrides are not used in HITL",
         )
             .into_response()
-    }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    } else {
         match apply_cold_flow_override(
             &state,
             principal.username.as_deref().unwrap_or(""),
@@ -3700,7 +3646,6 @@ async fn override_cold_flow(
         }
     }
 }
-#[cfg(not(feature = "hitl_mode"))]
 fn apply_cold_flow_override(
     state: &Arc<AppState>,
     operator: &str,
@@ -3788,7 +3733,7 @@ fn launch_controller_delivery_state(
     // been delivered, must not hold a fresh press. A Stop pressed after this
     // press still cancels it through the ticket's epochs, and a Stop that lands
     // makes the board report Abort, which blocks the next press.
-    let hitl = cfg!(feature = "hitl_mode");
+    let hitl = crate::runtime_mode::is_hitl();
     if !hitl && manual_stop_ram_pending(state) {
         return CurrentState::Invalid;
     }
@@ -3890,7 +3835,6 @@ pub(crate) fn operator_phase_public_context(state:&AppState)->Option<(bool,u64,b
 pub(crate) fn operator_phase_runtime_available(state:&AppState)->bool {
     state.gse.try_lock().ok().is_some_and(|runtime|runtime.cold_flow.is_none())
 }
-#[cfg(feature="hitl_mode")]
 pub(crate) fn operator_phase_ticket(state:&AppState,token:crate::operator_queue::Token)->LaunchAdmission {
     LaunchAdmission {board_abort_revision:state.board_abort.abort_revision(),generation:token.generation,
         manual_epoch:token.manual_epoch,observed_manual_epoch:token.observed_manual_epoch}
@@ -3962,7 +3906,6 @@ impl LaunchAdmission {
         ticket.board_abort_revision = revision;
         Ok(ticket)
     }
-    #[cfg(not(feature = "hitl_mode"))]
     fn remains_current(self, state: &AppState) -> bool {
         self.trackable()
             && self.generation == automatic_generation(state)
@@ -4362,7 +4305,7 @@ pub(crate) fn queue_admitted_launch_packets(
     packets: Vec<sedsnet::packet::Packet>,
 ) -> Result<usize, String> {
     with_stop_admission(state, ticket, || ()).map_err(str::to_string)?;
-    let prepared = if cfg!(feature = "hitl_mode") {
+    let prepared = if crate::runtime_mode::is_hitl() {
         None
     } else {
         Some(
@@ -4424,7 +4367,7 @@ pub(crate) fn queue_prepared_launch_packets(
     // admission checks; an accepted packet is never offered twice. Test-fire
     // keeps the original no-suffix-retry behavior.
     let mut admitted_prefix = 0usize;
-    let suffix_retry = !cfg!(feature = "test_fire_mode");
+    let suffix_retry = !crate::runtime_mode::is_test_fire();
     let result = loop {
         if first_sdk_attempt.is_some_and(|at| at.elapsed() >= retry_window) {
             break Err((admitted_prefix, last_zero_busy.take().expect("retry follows a real zero-owner CoreBusy")));
@@ -4445,7 +4388,7 @@ pub(crate) fn queue_prepared_launch_packets(
             for kind in controller_types.iter().copied() {
                 match router.try_has_pending_reliable_tx_type(kind) {
                     Ok(false) => {}
-                    Ok(true) if cfg!(feature = "hitl_mode") => {}
+                    Ok(true) if crate::runtime_mode::is_hitl() => {}
                     Ok(true) => return Err("Controller command delivery is pending; launch was not dispatched".into()),
                     Err(sedsnet::router::TryPendingTypeError::CoreBusy) => {
                         inspection_busy = true;
@@ -4541,12 +4484,15 @@ pub(crate) fn queue_prepared_launch_packets(
     result.map_err(|(accepted,error)|format!("Launch SDK admission accepted {accepted}/{total} packets: {error}; launch remains inhibited, explicit manual recovery required"))
 }
 
-#[cfg(feature = "testing")]
+/// Testing mode only (the old testing build was the only one with it).
 pub(crate) fn admit_simulated_retraction_stamped(
     state: &AppState,
     origin: Option<crate::actuator_plumbing::MotionOrigin>,
     effect: impl FnOnce(u64,u64) -> bool,
 ) -> Result<(), String> {
+    if !crate::runtime_mode::is_testing() {
+        return Err(crate::runtime_mode::unavailable("Modeled retraction"));
+    }
     let ticket = LaunchAdmission::capture(state);
     let router = state
         .topology_router
@@ -4571,7 +4517,6 @@ pub(crate) fn admit_simulated_retraction_stamped(
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
 pub(crate) fn admit_simulated_launch(
     state: &AppState,
     ticket: LaunchAdmission,
@@ -4591,7 +4536,6 @@ pub(crate) fn admit_simulated_launch(
 
 /// Serialize launch admission against automatic valve-effect preparation in every mode.
 /// T-clock reset and delayed flight-state packets cannot re-enable automation.
-#[cfg(any(test, feature = "testing"))]
 pub(crate) fn inhibit_automatic_actions_for_launch_revision(
     state: &Arc<AppState>,
     launch_revision: Option<u64>,
@@ -4600,7 +4544,6 @@ pub(crate) fn inhibit_automatic_actions_for_launch_revision(
 }
 
 /// `pressed` is the ticket captured when a held Launch was pressed.
-#[cfg(any(test, feature = "hitl_mode", feature = "testing"))]
 pub(crate) fn inhibit_automatic_actions_for_pressed_launch(
     state: &Arc<AppState>,
     launch_revision: Option<u64>,
@@ -4655,7 +4598,7 @@ pub(crate) fn inhibit_automatic_actions_for_launch(
 }
 
 /// Commit once before dispatch, so service restart never repeats an irreversible Fire intent.
-#[cfg(all(test, not(feature = "hitl_mode")))]
+#[cfg(test)]
 pub(crate) fn commit_fire_intent_revision(
     state: &Arc<AppState>,
     launch_revision: Option<u64>,
@@ -4664,7 +4607,6 @@ pub(crate) fn commit_fire_intent_revision(
 }
 
 /// `pressed` is the ticket captured when a held Launch was pressed.
-#[cfg(not(feature = "hitl_mode"))]
 pub(crate) fn commit_fire_intent_for_pressed_launch(
     state: &Arc<AppState>,
     launch_revision: Option<u64>,
@@ -4705,7 +4647,7 @@ pub(crate) fn commit_fire_intent_for_pressed_launch(
     {
         return Err("Fire prerequisites changed; launch was not dispatched".into());
     }
-    if !cfg!(feature = "test_fire_mode")
+    if !crate::runtime_mode::is_test_fire()
         && !matches!(rt.operational.qd.status(rt.now()), QdStatus::Ready)
     {
         return Err("Quick disconnect is not acknowledged and settled".into());
@@ -4723,7 +4665,7 @@ pub(crate) fn commit_fire_intent_for_pressed_launch(
     })
 }
 
-#[cfg(all(test, not(feature = "hitl_mode")))]
+#[cfg(test)]
 pub(crate) fn commit_fire_intent(state: &Arc<AppState>) -> Result<LaunchAdmission, String> {
     commit_fire_intent_revision(
         state,
@@ -4740,18 +4682,18 @@ pub(crate) fn qualified_launch_proofs_for_test(state:&AppState) {
         state.board_abort.observe_status(board,42,8,1,Some(1),false,true,at,0,at,1);
     }
 }
-#[cfg(all(test, not(feature = "hitl_mode")))]
+#[cfg(test)]
 pub(crate) fn armed_fixture_for_test(
     state: &Arc<AppState>,
     router: &Arc<sedsnet::router::Router>,
 ) -> std::path::PathBuf {
     armed_fixture_network_for_test(state,router,true)
 }
-#[cfg(all(test, not(feature="hitl_mode"),feature="test_fire_mode"))]
+#[cfg(test)]
 pub(crate) fn armed_fixture_with_real_pair_for_test(state:&Arc<AppState>,router:&Arc<sedsnet::router::Router>)->std::path::PathBuf {
     armed_fixture_network_for_test(state,router,false)
 }
-#[cfg(all(test, not(feature="hitl_mode")))]
+#[cfg(test)]
 fn armed_fixture_network_for_test(state:&Arc<AppState>,router:&Arc<sedsnet::router::Router>,modeled_network:bool)->std::path::PathBuf {
     use crate::types::Board;
     crate::telemetry_task::refresh_host_network_time(
@@ -4762,7 +4704,7 @@ fn armed_fixture_network_for_test(state:&Arc<AppState>,router:&Arc<sedsnet::rout
     if modeled_network {
     let side = router.add_side_packed("test_fixture_other_boards", |_| Ok(()));
     let mut endpoints = vec![crate::telemetry_schema::endpoint("ACTUATOR_BOARD")];
-    if !cfg!(feature = "test_fire_mode") {
+    if !crate::runtime_mode::is_test_fire() {
         endpoints.push(crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"));
     }
     let announce = sedsnet::discovery::build_discovery_announce("GB", 123, &endpoints).unwrap();
@@ -4786,7 +4728,7 @@ fn armed_fixture_network_for_test(state:&Arc<AppState>,router:&Arc<sedsnet::rout
             crate::telemetry_task::get_current_timestamp_ms(),
         );
     }
-    if !cfg!(feature = "test_fire_mode") {
+    if !crate::runtime_mode::is_test_fire() {
         state.mark_board_seen("FC", crate::telemetry_task::get_current_timestamp_ms());
         crate::antenna::observe(&crate::types::TelemetryRow {
             timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
@@ -4849,12 +4791,12 @@ fn armed_fixture_network_for_test(state:&Arc<AppState>,router:&Arc<sedsnet::rout
     path
 }
 
-#[cfg(all(test, not(feature = "hitl_mode")))]
+#[cfg(test)]
 pub(crate) fn reset_plumbing_qd_for_test(state: &AppState) {
     state.gse.lock().unwrap().operational.qd = QdWait::default();
 }
 
-#[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
+#[cfg(test)]
 pub(crate) fn plumbing_qd_probe_for_test(state: &AppState, advance_ms: u64) -> (QdStatus, u64) {
     assert!(
         crate::simulation_clock_ms().is_none(),
@@ -4871,9 +4813,9 @@ pub(crate) fn plumbing_qd_probe_for_test(state: &AppState, advance_ms: u64) -> (
 #[cfg(test)]
 mod mission_calibration_guard_tests {
     use super::*;
-    #[cfg(not(feature = "hitl_mode"))]
     #[test]
     fn imported_calibration_waits_for_idle_and_explicit_qualification_reset() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let mut runtime = Runtime::default();
         assert!(runtime.calibration_import_allowed());
         runtime.engine.status.phase = Phase::BaselineSetup;
@@ -4890,9 +4832,9 @@ mod mission_calibration_guard_tests {
         runtime.operational.saved.qualification.reset().unwrap();
         assert!(runtime.calibration_import_allowed());
     }
-    #[cfg(feature = "hitl_mode")]
     #[test]
     fn hitl_does_not_import_paired_calibration() {
+        crate::mode_suite!(Hitl);
         assert!(!Runtime::default().calibration_import_allowed());
     }
 }
@@ -4926,14 +4868,12 @@ fn runtime_fill_activity(rt: &Runtime) -> bool {
             | Phase::Paused
             | Phase::Turbocharge
     );
-    #[cfg(not(feature = "hitl_mode"))]
-    let loaded = matches!(
-        rt.operational.saved.qualification.stage(),
-        gse_sequence::qualification::MissionStage::Fill
-            | gse_sequence::qualification::MissionStage::Armed
-    );
-    #[cfg(feature = "hitl_mode")]
-    let loaded = false;
+    let loaded = !crate::runtime_mode::is_hitl()
+        && matches!(
+            rt.operational.saved.qualification.stage(),
+            gse_sequence::qualification::MissionStage::Fill
+                | gse_sequence::qualification::MissionStage::Armed
+        );
     engine || loaded || rt.turbocharge.is_some() || cold_flow::runtime_active(rt)
 }
 
@@ -5142,10 +5082,10 @@ mod operator_admission_tests {
         );
     }
 
-    #[cfg(feature = "hitl_mode")]
     #[tokio::test]
     async fn hitl_board_proof_optional_actual_sdk_launch_absent_boards_and_known_abort_always_blocks()
      {
+        crate::mode_suite!(Hitl);
         if crate::operator_queue::isolated_native_case(module_path!(),"hitl_board_proof_optional_actual_sdk_launch_absent_boards_and_known_abort_always_blocks"){return;}
         use std::sync::atomic::{AtomicUsize, Ordering};
         let state = crate::state::tests::test_app_state().await;
@@ -5392,8 +5332,10 @@ fn claim_operator_dispatch_under_gate(
             .load(std::sync::atomic::Ordering::Acquire)
             != 0
     {
-        #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
-        crate::normal_publication_probe::claim_refused(state, generation);
+        #[cfg(all(test, not(feature = "firmware_sim")))]
+        if !crate::runtime_mode::is_hitl_or_test_fire() {
+            crate::normal_publication_probe::claim_refused(state, generation);
+        }
         return None;
     }
     claim_operator_inflight_under_gate(state)
@@ -5542,9 +5484,9 @@ mod recovery_generation_tests {
         }
     }
 
-    #[cfg(not(feature = "hitl_mode"))]
     #[tokio::test]
     async fn launch_refuses_actual_sdk_controller_owners_before_journal_commit() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         use sedsnet::router::{EndpointHandler, Router, RouterConfig};
         for name in ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND"] {
             let state = crate::state::tests::test_app_state().await;
@@ -5576,12 +5518,13 @@ mod recovery_generation_tests {
             );
             let result = inhibit_automatic_actions_for_launch(&state);
             assert!(result.unwrap_err().contains("Controller command delivery"));
-            #[cfg(not(feature = "hitl_mode"))]
-            assert!(
-                commit_fire_intent(&state)
-                    .unwrap_err()
-                    .contains("Controller command delivery")
-            );
+            if !crate::runtime_mode::is_hitl() {
+                assert!(
+                    commit_fire_intent(&state)
+                        .unwrap_err()
+                        .contains("Controller command delivery")
+                );
+            }
             assert!(
                 !state
                     .launch_history
@@ -5782,12 +5725,13 @@ mod final_launch_admission_tests {
                     .unwrap_err()
                     .contains("epoch exhausted")
             );
-            #[cfg(not(feature = "hitl_mode"))]
-            assert!(
-                commit_fire_intent(&state)
-                    .unwrap_err()
-                    .contains("epoch exhausted")
-            );
+            if !crate::runtime_mode::is_hitl() {
+                assert!(
+                    commit_fire_intent(&state)
+                        .unwrap_err()
+                        .contains("epoch exhausted")
+                );
+            }
             assert!(
                 !state
                     .launch_history
@@ -5819,9 +5763,9 @@ mod final_launch_admission_tests {
     }
     /// HITL "no way out" paths: none of these can veto a fresh press when no
     /// board on the network reports Abort.
-    #[cfg(feature = "hitl_mode")]
     #[tokio::test]
     async fn hitl_fresh_press_is_not_held_by_undeliverable_state() {
+        crate::mode_suite!(Hitl);
         let stopped = crate::state::tests::test_app_state().await;
         let router = Arc::new(clocked_router(RouterConfig::new([])));
         stopped.topology_router.set(router.clone()).unwrap();
@@ -5873,9 +5817,9 @@ mod final_launch_admission_tests {
         assert!(inhibit_automatic_actions_for_launch_revision(&state, revision).is_ok());
     }
     /// A Stop pressed after Launch was pressed still cancels that Launch.
-    #[cfg(feature = "hitl_mode")]
     #[tokio::test]
     async fn hitl_stop_pressed_after_launch_press_still_cancels_it() {
+        crate::mode_suite!(Hitl);
         let state = crate::state::tests::test_app_state().await;
         let router = Arc::new(clocked_router(RouterConfig::new([])));
         state.topology_router.set(router.clone()).unwrap();
@@ -5884,9 +5828,9 @@ mod final_launch_admission_tests {
         let _ = state.manual_abort_intent.request();
         assert!(queue_admitted_launch_packets(&state, &router, ticket, vec![launch_packet()]).is_err());
     }
-    #[cfg(not(feature = "hitl_mode"))]
     #[tokio::test]
     async fn retained_or_deferred_manual_abort_blocks_launch_before_sdk_admission() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         for deferred in [false, true] {
             let state = crate::state::tests::test_app_state().await;
             fixture_state_proofs(&state);
@@ -5902,8 +5846,9 @@ mod final_launch_admission_tests {
             let error = inhibit_automatic_actions_for_launch(&state).unwrap_err();
             eprintln!("STOP_PREPARATION_REFUSAL deferred={deferred} error={error}");
             assert_eq!(error, "Manual Abort invalidated launch admission; no launch effect was admitted");
-            #[cfg(not(feature = "hitl_mode"))]
-            assert_eq!(commit_fire_intent(&state).unwrap_err(), "Manual Abort invalidated launch admission; no launch effect was admitted");
+            if !crate::runtime_mode::is_hitl() {
+                assert_eq!(commit_fire_intent(&state).unwrap_err(), "Manual Abort invalidated launch admission; no launch effect was admitted");
+            }
             for kind in ["ABORT", "FLIGHT_COMMAND", "VALVE_COMMAND", "ACTUATOR_COMMAND"] {
                 assert!(!router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type(kind)), "Stop refusal must create no SDK owner: {kind}");
             }
@@ -6013,7 +5958,7 @@ mod final_launch_admission_tests {
         let ticket = inhibit_automatic_actions_for_launch(&state).unwrap();
         assert_eq!(
             queue_admitted_launch_packets(&state, &router, ticket, vec![launch_packet()]).unwrap(),
-            if cfg!(feature = "hitl_mode") { 1 } else { 2 }
+            if crate::runtime_mode::is_hitl() { 1 } else { 2 }
         );
         assert_eq!(
             local.load(Ordering::SeqCst),
@@ -6269,7 +6214,7 @@ mod explicit_fc_stop_tests {
     }
 }
 
-#[cfg(all(test, feature = "hitl_mode"))]
+#[cfg(test)]
 mod pre_target_tests;
 
 #[cfg(test)]
@@ -6311,9 +6256,9 @@ pub(crate) fn with_closed_operator_queue<T>(
 #[cfg(test)]
 mod recovery_quiescence_tests {
     use super::*;
-    #[cfg(feature = "hitl_mode")]
     #[tokio::test]
     async fn direct_hitl_tick_cannot_change_active_engine_while_admission_closed() {
+        crate::mode_suite!(Hitl);
         let state = crate::state::tests::test_app_state().await;
         state.gse.lock().unwrap().engine.status.phase = Phase::Filling;
         state
@@ -6331,9 +6276,9 @@ mod recovery_quiescence_tests {
         );
         assert_eq!(closed, Phase::Filling);
     }
-    #[cfg(not(feature = "hitl_mode"))]
     #[tokio::test]
     async fn actual_report_safety_does_not_publish_old_effects_while_admission_closed() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = crate::state::tests::test_app_state().await;
         {
             let mut runtime = state.gse.lock().unwrap();
@@ -6386,9 +6331,9 @@ mod recovery_quiescence_tests {
         state.manual_abort_intent.request();
         assert!(state.manual_abort_intent.pending_epoch().is_some());
     }
-    #[cfg(not(feature = "hitl_mode"))]
     #[tokio::test]
     async fn actual_worker_old_automatic_abort_cannot_latch_or_persist_new_run() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let mut state = crate::state::tests::test_app_state().await;
         let (commands, receiver) = tokio::sync::mpsc::channel(4);
         Arc::get_mut(&mut state).unwrap().cmd_tx = commands.clone();
@@ -6460,7 +6405,7 @@ mod recovery_quiescence_tests {
     }
 }
 
-#[cfg(all(test, not(feature = "hitl_mode")))]
+#[cfg(test)]
 mod recovery_http_quiescence_tests {
     use super::*;
     use futures::FutureExt;
@@ -6474,6 +6419,7 @@ mod recovery_http_quiescence_tests {
     }
     #[tokio::test]
     async fn real_auth_delayed_clear_cannot_clear_new_run_owner_or_managed_state() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         if crate::operator_queue::isolated_case(
             module_path!(),
             "real_auth_delayed_clear_cannot_clear_new_run_owner_or_managed_state",
@@ -6525,6 +6471,7 @@ mod recovery_http_quiescence_tests {
     }
     #[tokio::test]
     async fn real_auth_delayed_qualification_reset_cannot_revoke_new_run_confirmation() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         if crate::operator_queue::isolated_case(
             module_path!(),
             "real_auth_delayed_qualification_reset_cannot_revoke_new_run_confirmation",
@@ -6578,6 +6525,7 @@ mod recovery_http_quiescence_tests {
     }
     #[tokio::test]
     async fn real_auth_delayed_confirmation_cannot_grant_new_run_consent() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         if crate::operator_queue::isolated_case(
             module_path!(),
             "real_auth_delayed_confirmation_cannot_grant_new_run_consent",
@@ -6632,11 +6580,7 @@ mod recovery_http_quiescence_tests {
 #[cfg(test)]
 pub(crate) mod nonwaiting_admission_tests;
 
-#[cfg(all(
-    test,
-    feature = "testing",
-    not(any(feature = "hitl_mode", feature = "test_fire_mode"))
-))]
+#[cfg(test)]
 pub(crate) fn apply_model_effects_for_test(state: &Arc<AppState>, valves: Vec<(usize, bool)>) {
     apply(
         state,
@@ -6685,8 +6629,7 @@ pub(crate) async fn fill_recording_test_state(
         });
         rt.observe_pressure(Some(0.));
         rt.observe_mass(Some(mass));
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        if !crate::runtime_mode::is_hitl() {
             rt.operational.startup_configured = true;
             rt.operational.topology_stable = true;
             let generation = rt.operational.saved.qualification.generation();
@@ -6792,24 +6735,21 @@ pub(crate) fn try_commit_automatic_phase(
         || state.operator_admission_barrier.load(Ordering::Acquire) != 0
         || state.shutdown_requested.load(Ordering::Acquire)
         || manual_stop_ram_pending(state) || crate::rrls::is_rrls()
-        || cfg!(feature = "hitl_mode") { return Err(Error::Retired); }
+        || crate::runtime_mode::is_hitl() { return Err(Error::Retired); }
     let runtime = state.gse.try_lock().map_err(|_| Error::Busy)?;
+    // HITL returned above.
     let eligible = match proposal.cause {
-        #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
-        Cause::Readiness => original.expected == FlightState::Startup && proposal.target == FlightState::Idle,
+        Cause::Readiness => !crate::runtime_mode::is_test_fire()
+            && original.expected == FlightState::Startup && proposal.target == FlightState::Idle,
         Cause::LegacySequence { .. } => !runtime.engine.claimed && !runtime.manual_control,
-        #[cfg(not(feature = "hitl_mode"))]
         Cause::QualifiedArmed { qualification_generation } => {
-            #[cfg(not(feature = "hitl_mode"))]
-            { !cfg!(feature = "test_fire_mode")
+            !crate::runtime_mode::is_test_fire()
                 && proposal.target == FlightState::Armed
                 && runtime.operational.saved.qualification.generation() == qualification_generation
                 && runtime.operational.saved.qualification.stage() == gse_sequence::qualification::MissionStage::Armed
                 && runtime.operational.persist_error.is_none()
                 && runtime.operational.saved.pending_checklists.is_empty()
-                && matches!(runtime.engine.status.phase, Phase::Paused | Phase::Passed | Phase::Idle) }
-            #[cfg(feature = "hitl_mode")]
-            { let _ = qualification_generation; false }
+                && matches!(runtime.engine.status.phase, Phase::Paused | Phase::Passed | Phase::Idle)
         }
     };
     if !eligible { return Err(Error::Ineligible); }
@@ -6833,9 +6773,7 @@ pub(crate) fn try_commit_automatic_phase(
         *current = proposal.target;
         match proposal.cause {
             Cause::LegacySequence { next_policy } => *policy = next_policy,
-            #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
             Cause::Readiness => (),
-            #[cfg(not(feature = "hitl_mode"))]
             Cause::QualifiedArmed { .. } => (),
         }
         variables.admitted_phase(identity);
@@ -6874,7 +6812,7 @@ pub(crate) fn try_commit_automatic_policy(
 #[cfg(test)]
 mod local_stop_priority_tests { include!("gse/local_stop_priority_tests.rs"); }
 
-#[cfg(all(test,not(feature="hitl_mode")))]
+#[cfg(test)]
 pub(crate) fn native_owned_startup_prime(state:&Arc<AppState>) -> serde_json::Value {
     for now in [10000,12000] {
         {let mut rt=state.gse.lock().unwrap();rt.test_now_ms=Some(now);
@@ -6883,7 +6821,7 @@ pub(crate) fn native_owned_startup_prime(state:&Arc<AppState>) -> serde_json::Va
     }
     native_owned_startup_snapshot(state)
 }
-#[cfg(all(test,not(feature="hitl_mode")))]
+#[cfg(test)]
 pub(crate) fn native_owned_startup_snapshot(state:&AppState) -> serde_json::Value {
     let rt=state.gse.lock().unwrap();serde_json::json!({"phase":format!("{:?}",rt.engine.status.phase),
         "active":rt.engine.active(),"operational_running":rt.operational.running,

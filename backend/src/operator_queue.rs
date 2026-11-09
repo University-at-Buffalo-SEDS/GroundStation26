@@ -145,11 +145,11 @@ pub(crate) fn serve(
 pub(crate) fn isolated_case(module: &str, name: &str) -> bool {
     isolated_case_inner(module, name, false, None)
 }
-#[cfg(all(test, any(feature = "hitl_mode", feature = "firmware_sim")))]
+#[cfg(test)]
 pub(crate) fn isolated_case_with_capture_clock(module: &str, name: &str) -> bool {
     isolated_case_inner(module, name, true, None)
 }
-#[cfg(all(test,feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+#[cfg(test)]
 pub(crate) fn isolated_simulated_case(module:&str,name:&str)->bool {
     isolated_case_inner(module,name,false,Some(true))
 }

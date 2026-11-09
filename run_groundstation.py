@@ -95,17 +95,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--testing",
         action="store_true",
-        help="Enable backend 'testing' feature.",
+        help="Start the backend in testing mode (GS_STATION_MODE=testing).",
     )
     parser.add_argument(
         "--hitl-mode",
         action="store_true",
-        help="Enable backend 'hitl_mode' feature.",
+        help="Start the backend in HITL mode (GS_STATION_MODE=hitl).",
     )
     parser.add_argument(
         "--test-fire-mode",
         action="store_true",
-        help="Enable backend 'test_fire_mode' feature.",
+        help="Start the backend in test-fire mode (GS_STATION_MODE=test_fire).",
     )
     parser.add_argument(
         "--debug",
@@ -119,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rrls", action="store_true", help="Run the headless recovery receiver/relay with local web and mobile access.")
     parser.add_argument("--frontend-dev", "--frontend_dev", action="store_true", help="Build the WebUI from the frontend dev branch (also accepts frontend_dev, like build.py).")
-    parser.add_argument("--switchable-modes", metavar="MODES", help="Build one backend per mode (comma list of normal,hitl,test_fire,testing, or all) and supervise it so the UI can switch station mode by a controlled restart. The usual mode flag picks the default when no switch was saved.")
+    parser.add_argument("--switchable-modes", metavar="MODES", help="Supervise the backend so a Simulation change from the UI can restart it (other mode switches happen in process). MODES (normal,hitl,test_fire,testing or all) is accepted for older callers; one binary holds every mode. The usual mode flag picks the default when no switch was saved.")
     parser.add_argument("--pairing", type=Path, metavar="FILE", help="Station pairing.json from pair_stations.py (sets GS_STATION_PAIRING_FILE). Without it, a pairing made in the UI is used.")
     arguments=["--frontend-dev" if argument in {"frontend_dev", "frontend-dev"} else argument for argument in sys.argv[1:]]
     args=parser.parse_args(arguments)
@@ -164,12 +164,11 @@ def main() -> None:
     features: list[str] = []
     if is_raspberry_pi() and not args.rrls and not flight_sim_mode:
         features.append("raspberry_pi")
-    if testing_mode or flight_sim_mode:
-        features.append("testing")
-    if hitl_mode:
-        features.append("hitl_mode")
-    if test_fire_mode:
-        features.append("test_fire_mode")
+    # One binary holds every mode; the flag picks the boot mode. A selection
+    # saved by an earlier switch (data/station-mode/selection.json) wins.
+    boot_mode = boot_mode_for(testing_mode or flight_sim_mode, hitl_mode, test_fire_mode)
+    os.environ["GS_STATION_MODE"] = boot_mode
+    print(f"Station mode at start: {boot_mode}")
     if features:
         cmd.extend(["--features", ",".join(features)])
     repo_root = Path(__file__).resolve().parent
@@ -213,14 +212,19 @@ def build_frontend(args: argparse.Namespace, repo_root: Path, debug_mode: bool) 
     prepare_browser_asset_source(repo_root, frontend_dev=args.frontend_dev, refresh=False)
 
 
+def boot_mode_for(testing_mode: bool, hitl_mode: bool, test_fire_mode: bool) -> str:
+    return "testing" if testing_mode else "hitl" if hitl_mode else "test_fire" if test_fire_mode else "normal"
+
+
 def run_switchable(args: argparse.Namespace, testing_mode: bool, hitl_mode: bool, test_fire_mode: bool, debug_mode: bool) -> None:
-    """Build every requested mode, then supervise: a confirmed UI mode switch
-    exits the backend with station_modes.RESTART_EXIT_CODE and the selected
-    build starts. Without a saved selection the usual mode runs."""
+    """Build the backend once, then supervise it. Mode switches happen inside
+    the backend; a confirmed Simulation change exits it with
+    station_modes.RESTART_EXIT_CODE and the selection starts. Without a saved
+    selection the usual mode runs."""
     import station_modes
 
-    default_mode = "testing" if testing_mode else "hitl" if hitl_mode else "test_fire" if test_fire_mode else "normal"
-    modes = station_modes.parse_modes(args.switchable_modes)
+    default_mode = boot_mode_for(testing_mode, hitl_mode, test_fire_mode)
+    modes = station_modes.parse_modes(args.switchable_modes)  # validated, then ignored
     if default_mode not in modes:
         modes.insert(0, default_mode)
     repo_root = Path(__file__).resolve().parent
@@ -230,7 +234,7 @@ def run_switchable(args: argparse.Namespace, testing_mode: bool, hitl_mode: bool
     code = station_modes.supervise(repo_root, root, default_mode, args.rrls, cwd=repo_root)
     warn_if_db_sidecars_present(repo_root)
     if code != 0:
-        raise subprocess.CalledProcessError(code, [str(root / default_mode / station_modes.BINARY)])
+        raise subprocess.CalledProcessError(code, [str(root / station_modes.BINARY)])
 
 
 if __name__ == "__main__":

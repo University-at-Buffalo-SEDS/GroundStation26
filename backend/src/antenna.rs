@@ -505,7 +505,6 @@ pub fn decode_position(data: &[u8]) -> Option<Fix> {
     (fix.valid() && fix.age_ms <= FIX_FRESH_MS).then_some(fix)
 }/// RF only emits GPS_DATA when gps_has_fix() is true. FC's GPS_DATA contains
 /// filtered/relative coordinates and cannot prove a current receiver lock.
-#[cfg(not(feature = "hitl_mode"))]
 pub fn rocket_launch_fix_locked() -> bool {
     cache().lock().unwrap().rocket[0]
         .as_ref()

@@ -192,16 +192,13 @@ impl Admission {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    #[cfg(any(feature="hitl_mode", feature="firmware_sim"))]
     struct ReadPause {
         path: std::path::PathBuf,
         entered: std::sync::mpsc::Sender<()>,
         release: Mutex<std::sync::mpsc::Receiver<()>>,
         used: AtomicBool,
     }
-    #[cfg(any(feature="hitl_mode", feature="firmware_sim"))]
     static READ_PAUSE: Mutex<Option<std::sync::Arc<ReadPause>>> = Mutex::new(None);
-    #[cfg(any(feature="hitl_mode", feature="firmware_sim"))]
     pub(crate) fn before_source_read(path: &std::path::Path) {
         let pause = READ_PAUSE.lock().unwrap().as_ref().filter(|pause|pause.path==path).cloned();
         if let Some(pause) = pause
@@ -210,9 +207,11 @@ pub(crate) mod tests {
                 pause.release.lock().unwrap().recv().unwrap();
             }
     }
-    #[cfg(any(feature="hitl_mode", feature="firmware_sim"))]
     #[tokio::test]
     async fn actual_held_model_source_read_refuses_without_holding_stop_or_dispatch() {
+        if !cfg!(feature = "firmware_sim") {
+            crate::mode_suite!(Hitl);
+        }
         let Some(path) = model_child("actual_held_model_source_read_refuses_without_holding_stop_or_dispatch") else {return};
         let state = crate::state::tests::test_app_state().await;
         let original = Prepared::capture(FailureFence::capture()).unwrap();
@@ -261,7 +260,6 @@ pub(crate) mod tests {
         clock.begin().finish(100, None);
         assert!(matches!(clock.snapshot(), Err(Error::Exhausted)));
     }
-    #[cfg(any(feature="hitl_mode", feature="firmware_sim"))]
     fn model_child(name: &str) -> Option<std::path::PathBuf> {
         if std::env::var("GS_FINAL_CLOCK_CHILD").as_deref() == Ok(name) {
             return Some(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap().into());
@@ -279,9 +277,11 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
         None
     }
-    #[cfg(any(feature="hitl_mode", feature="firmware_sim"))]
     #[test]
     fn actual_model_file_invalid_then_good_cannot_revive_original_confirmation() {
+        if !cfg!(feature = "firmware_sim") {
+            crate::mode_suite!(Hitl);
+        }
         let Some(path) = model_child("actual_model_file_invalid_then_good_cannot_revive_original_confirmation") else {return};
         let original = Prepared::capture(FailureFence::capture()).unwrap();
         let held = begin_model_observation();
@@ -295,9 +295,11 @@ pub(crate) mod tests {
         assert!(matches!(original.current(),Err(Error::Invalid)),"old confirmation revived after good source returned");
         assert!(Prepared::capture(FailureFence::capture()).is_ok(),"new explicit intent with actual valid read remains possible");
     }
-    #[cfg(any(feature="hitl_mode", feature="firmware_sim"))]
     #[test]
     fn actual_model_faults_preserve_sdk_clamp_and_new_final_receipt_refuses() {
+        if !cfg!(feature = "firmware_sim") {
+            crate::mode_suite!(Hitl);
+        }
         let Some(path) = model_child("actual_model_faults_preserve_sdk_clamp_and_new_final_receipt_refuses") else {return};
         for raw in [Some(""),Some("bad"),Some("999"),None] {
             std::fs::write(&path,"1000").unwrap();

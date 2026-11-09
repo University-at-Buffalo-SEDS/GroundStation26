@@ -35,7 +35,7 @@ readiness; it does not prove a recent successful write.
 `POST /api/network-health/daq/sd/retry` accepts an empty request or `{}`. It has no
 board-selection or client-token parameter. It requires a current signed-in user
 with `send_commands` and command access to `DaqSdRetry`. RRLS is read-only; use
-the primary GroundStation. Primary normal, test-fire and HITL builds use the same
+the primary GroundStation. Primary normal, test-fire and HITL modes use the same
 storage-maintenance operation.
 
 A successful local SDK admission returns HTTP 202:

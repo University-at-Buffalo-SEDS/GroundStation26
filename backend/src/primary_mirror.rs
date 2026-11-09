@@ -278,13 +278,14 @@ pub fn encode_control_observation(state: &AppState, max_bytes: usize) -> Vec<u8>
             .filter(|_| max_bytes >= ORIGIN_LEN)
             .map(|(_, _, _, revision)| revision),
         safety: (max_bytes >= SAFETY_LEN).then(|| {
-            #[cfg(feature = "hitl_mode")]
-            let policy = 0b111000
-                | (0..3).fold(0, |mask, index| {
-                    mask | u8::from(state.hitl_safety_interlock_enabled(index)) << index
-                });
-            #[cfg(not(feature = "hitl_mode"))]
-            let policy = 0;
+            let policy = if crate::runtime_mode::is_hitl() {
+                0b111000
+                    | (0..3).fold(0, |mask, index| {
+                        mask | u8::from(state.hitl_safety_interlock_enabled(index)) << index
+                    })
+            } else {
+                0
+            };
             let gate = crate::actuator_plumbing::retraction_gate(state);
             let phase = match gate.phase.as_str() {
                 "not_configured" => 0,
@@ -306,7 +307,7 @@ pub fn encode_control_observation(state: &AppState, max_bytes: usize) -> Vec<u8>
             (policy, phase, remaining)
         }),
         board_proof_policy:(max_bytes>=PROOF_POLICY_LEN).then(||state.board_state_proof_enforced()),
-        board_proof_test_fire: cfg!(feature = "test_fire_mode"),
+        board_proof_test_fire: crate::runtime_mode::is_test_fire(),
     };
     for (i, name) in crate::command_proxy::command_catalog()
         .iter()

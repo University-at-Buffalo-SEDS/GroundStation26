@@ -1,19 +1,30 @@
-//! Station mode switch by controlled restart into another installed build.
+//! Station mode switch.
 //!
-//! A mode is a compile-time build (normal, HITL, test fire, testing), so this
-//! process never changes its own mode. An authorised operator on an idle
-//! station selects an installed build; Confirm saves that selection durably,
-//! then the backend shuts down through the normal SIGTERM path and exits with
-//! [`RESTART_EXIT_CODE`]. The supervisor (`station_modes.py`, used by
-//! `run_groundstation.py --switchable-modes` and the systemd units) reads the
-//! selection and starts the matching binary. An RRLS switches only itself; the
-//! primary's mode is never changed from here.
+//! One backend binary holds every mode (normal, HITL, test fire, testing; see
+//! `runtime_mode`). An authorised operator on an idle station selects a mode
+//! and Simulation flag:
+//!
+//! - Same Simulation flag: the switch happens inside this process. Confirm
+//!   saves the selection durably (the next start uses it), then
+//!   `runtime_mode::switch_to` re-checks that the station is idle while every
+//!   mode-dependent admission is held off, publishes the new mode with a new
+//!   epoch, resets the mode-dependent state ([`apply_switch`]) and announces it
+//!   on the websocket (`StationModeChanged`, then a fresh `ActionPolicy`).
+//!   Requests admitted under the old mode carry the old epoch and are refused.
+//! - Simulation changes: Simulation is a start-up property, so the backend
+//!   shuts down through the normal SIGTERM path and exits with
+//!   [`RESTART_EXIT_CODE`]; the supervisor (`station_modes.py`, used by
+//!   `run_groundstation.py --switchable-modes` and the systemd units) restarts
+//!   it into the saved selection.
+//!
+//! An RRLS switches only itself; the primary's mode is never changed from here.
 //!
 //! HTTP contract (UI `station_mode_contract.rs`, wire V2):
 //! `GET /api/station-modes`, `POST /api/station-modes/prepare`,
 //! `POST /api/station-modes/confirm`. Options use `transition_kind: "restart"`
-//! and the restart itself is the fence, so `epoch_fencing_supported` stays
-//! false and ordinary command admission is never closed by this module.
+//! (server-fenced: the backend checks and fences the switch itself) and carry
+//! `in_process: true` when no restart is needed. `epoch_fencing_supported`
+//! stays false: the client never needs the per-request epoch protocol.
 use crate::{
     auth::{AuthPrincipal, Permission, StreamRole},
     state::AppState,
@@ -46,6 +57,8 @@ const TICKET_TTL: Duration = Duration::from_millis(15_000);
 const VALID_FOR_MS: u64 = 5_000;
 /// Gives the Confirm receipt time to reach the client before shutdown starts.
 const RESTART_DELAY: Duration = Duration::from_millis(600);
+/// Gives the Confirm receipt time to reach the client before the mode changes.
+const SWITCH_DELAY: Duration = Duration::from_millis(200);
 const ALL_MODES: [Mode; 4] = [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing];
 /// Operators other than administrators need this command name allowed.
 pub(crate) const COMMAND_NAME: &str = "StationMode";
@@ -70,7 +83,7 @@ fn mode_label(mode: Mode) -> &'static str {
     }
 }
 
-/// One selectable build plus its simulation flag.
+/// One selectable mode plus its simulation flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Target {
     pub mode: Mode,
@@ -112,17 +125,17 @@ impl Target {
             (true, true) => {
                 "Simulated paired primary on a local pseudo-terminal; no radio output".into()
             }
-            (false, true) => "Simulated rocket telemetry and actions from the testing build's internal flight model".into(),
+            (false, true) => "Simulated rocket telemetry and actions from testing mode's internal flight model".into(),
             (false, false) => format!(
-                "Physical station links and outputs as defined by the {} build",
+                "Physical station links and outputs as defined by {} mode",
                 mode_label(self.mode)
             ),
         }
     }
 }
-/// The primary's simulation is the testing build's internal flight model
-/// (GS_SIM_MODE); the HITL, test-fire and normal builds compile it out. An
-/// RRLS can simulate its paired primary in any build.
+/// The primary's simulation is testing mode's internal flight model
+/// (GS_SIM_MODE, fixed at start). An RRLS can simulate its paired primary in
+/// any mode.
 pub(crate) fn simulation_supported(mode: Mode, rrls: bool) -> bool {
     rrls || mode == Mode::Testing
 }
@@ -133,21 +146,25 @@ pub(crate) struct Config {
     pub supervised: bool,
     pub flight_sim: bool,
     pub dir: PathBuf,
-    /// Modes this installation has built binaries for (from the supervisor).
-    pub available: Vec<Mode>,
-    pub current: Target,
+    /// The Simulation flag this process started with. It never changes in
+    /// process; the mode itself is `runtime_mode::current()`.
+    pub simulation: bool,
+    /// Testing mode's internal flight model is running (fixed at start).
+    /// Several checks trust it alone, so leaving testing restarts.
+    pub flight_model: bool,
     pub restart_delay: Duration,
+    pub switch_delay: Duration,
+    /// Station resets that touch files and the boards (GSE qualification
+    /// restore, load-cell calibration reload and its DAQ publication). Route
+    /// tests turn them off and keep the in-memory resets.
+    pub station_resets: bool,
+    /// DummyComms stand-ins alive now (`comms::dummy_links`).
+    pub stand_in_links: fn() -> usize,
 }
 impl Config {
     fn from_env() -> Self {
         let rrls = crate::rrls::is_rrls();
         let supervised = std::env::var("GS_STATION_MODE_SUPERVISOR").as_deref() == Ok("1");
-        let available = std::env::var("GS_STATION_MODE_AVAILABLE")
-            .ok()
-            .filter(|_| supervised)
-            .map(|list| parse_available(&list))
-            .unwrap_or_default();
-        let mode = local_mode();
         Self {
             rrls,
             supervised,
@@ -155,25 +172,32 @@ impl Config {
             dir: std::env::var_os("GS_STATION_MODE_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("data").join("station-mode")),
-            available,
-            current: Target {
-                mode,
-                simulation: if rrls {
-                    crate::rrls_sim_primary::enabled()
-                } else {
-                    mode == Mode::Testing && crate::flight_sim::sim_mode_enabled()
-                },
+            // sim_mode_enabled is true only in a process that started in
+            // testing mode with the internal flight model.
+            simulation: if rrls {
+                crate::rrls_sim_primary::enabled()
+            } else {
+                crate::flight_sim::sim_mode_enabled()
             },
+            flight_model: crate::flight_sim::sim_mode_enabled(),
             restart_delay: RESTART_DELAY,
+            switch_delay: SWITCH_DELAY,
+            station_resets: true,
+            stand_in_links: crate::comms::dummy_links,
         }
     }
     fn role(&self) -> &'static str {
         if self.rrls { "rrls" } else { "primary" }
     }
+    fn current(&self) -> Target {
+        Target {
+            mode: local_mode(),
+            simulation: self.simulation,
+        }
+    }
     fn targets(&self) -> Vec<Target> {
         ALL_MODES
             .into_iter()
-            .filter(|mode| self.available.contains(mode))
             .flat_map(|mode| {
                 [false, true]
                     .into_iter()
@@ -182,27 +206,69 @@ impl Config {
             })
             .collect()
     }
+    /// The switch keeps the Simulation flag, so it happens in this process.
+    fn in_process(&self, target: Target) -> bool {
+        target.simulation == self.simulation && (!self.flight_model || target.mode == Mode::Testing)
+    }
+    /// Why no switch at all is possible here.
     fn change_supported(&self) -> Result<(), String> {
         if self.flight_sim {
-            return Err("This is an isolated FlightSim session; it cannot restart into a station build.".into());
+            return Err("This is an isolated FlightSim session; it cannot change station mode.".into());
         }
-        if !self.supervised {
-            return Err("This backend was started directly, not by the station mode supervisor, so it cannot restart into another build. Start it with run_groundstation.py --switchable-modes or the station-mode systemd unit.".into());
+        Ok(())
+    }
+    /// Why this particular target cannot be selected, apart from busy checks.
+    fn target_supported(&self, target: Target) -> Result<(), String> {
+        self.change_supported()?;
+        if !self.in_process(target) && !self.supervised {
+            return Err("Changing Simulation restarts the backend, and this backend was started directly, not by the station mode supervisor. Start it with run_groundstation.py --switchable-modes or the station-mode systemd unit.".into());
         }
-        if self.targets().len() < 2 {
-            return Err("Only one station build is installed. Build the other modes with run_groundstation.py --switchable-modes.".into());
+        if self.in_process(target) && target.mode == Mode::Normal && !self.rrls {
+            normal_links_present((self.stand_in_links)())?;
         }
         Ok(())
     }
 }
-pub(crate) fn parse_available(list: &str) -> Vec<Mode> {
-    let mut modes: Vec<Mode> = list
-        .split(',')
-        .filter_map(|id| parse_mode(id.trim()))
-        .collect();
-    modes.sort_by_key(|mode| ALL_MODES.iter().position(|m| m == mode));
-    modes.dedup();
-    modes
+
+/// Normal mode refuses to start without its configured links (it never used
+/// stand-ins), so it is never entered while a link is a DummyComms stand-in.
+fn normal_links_present(stand_ins: usize) -> Result<(), String> {
+    if stand_ins == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Normal mode needs every configured link, but {stand_ins} link(s) failed to open at start and use a stand-in. Fix the link and restart the station."
+        ))
+    }
+}
+
+/// Bumped by every in-process switch so connected UIs refetch /api/layout.
+static LAYOUT_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) fn layout_revision() -> u64 {
+    LAYOUT_REVISION.load(Ordering::Acquire)
+}
+/// The websocket announcement of the last in-process switch.
+#[cfg(not(test))]
+static LAST_CHANGE: Mutex<Option<Value>> = Mutex::new(None);
+#[cfg(test)]
+thread_local! {
+    // Tests switch on their own threads (see runtime_mode::test_support).
+    static LAST_CHANGE: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+}
+/// `{"mode","label","policy_epoch","layout_revision"}` of the last switch.
+pub(crate) fn last_change() -> Option<Value> {
+    #[cfg(not(test))]
+    return LAST_CHANGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    #[cfg(test)]
+    return LAST_CHANGE.with(|change| change.borrow().clone());
+}
+fn set_last_change(change: Value) {
+    #[cfg(not(test))]
+    {
+        *LAST_CHANGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(change);
+    }
+    #[cfg(test)]
+    LAST_CHANGE.with(|slot| *slot.borrow_mut() = Some(change));
 }
 
 /// Durable record read by the supervisor at start.
@@ -242,6 +308,21 @@ fn read_selection(dir: &Path) -> Option<Selection> {
     serde_json::from_slice::<Selection>(&bytes)
         .ok()
         .filter(|s| s.version == 1)
+}
+/// Directory holding `selection.json`.
+#[cfg(not(test))]
+pub(crate) fn selection_dir() -> PathBuf {
+    std::env::var_os("GS_STATION_MODE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("data").join("station-mode"))
+}
+/// Mode saved by the last confirmed switch for this station's role.
+#[cfg(not(test))]
+pub(crate) fn saved_mode() -> Option<Mode> {
+    let role = if crate::rrls::is_rrls() { "rrls" } else { "primary" };
+    read_selection(&selection_dir())
+        .filter(|selection| selection.role == role)
+        .and_then(|selection| parse_mode(&selection.mode))
 }
 fn instance_id(dir: &Path) -> String {
     let path = dir.join(INSTANCE_FILE);
@@ -372,12 +453,12 @@ impl Switch {
             .filter(|selection| selection.role == config.role())
             .map(|selection| {
                 let requested = Target::parse(&selection.target_id);
-                if requested == Some(config.current) {
+                if requested == Some(config.current()) {
                     Transition {
                         id: selection.transition_id,
                         target_id: selection.target_id,
                         state: "applied",
-                        phase: format!("Restarted into {}", config.current.label(config.rrls)),
+                        phase: format!("Started in {}", config.current().label(config.rrls)),
                         error: None,
                     }
                 } else {
@@ -385,11 +466,11 @@ impl Switch {
                         id: selection.transition_id,
                         target_id: selection.target_id.clone(),
                         state: "failed",
-                        phase: "Supervisor started a different build".into(),
+                        phase: "Supervisor started a different mode".into(),
                         error: Some(format!(
-                            "Requested {} but this process is {}. Check that the selected build is installed.",
+                            "Requested {} but this process is {}. Check the station mode supervisor configuration.",
                             selection.target_id,
-                            config.current.label(config.rrls)
+                            config.current().label(config.rrls)
                         )),
                     }
                 }
@@ -411,15 +492,19 @@ impl Switch {
     fn authority_id(&self) -> String {
         format!("station-mode-switch/{}", self.config.role())
     }
+    /// Changes with every in-process switch: bindings taken before a switch
+    /// no longer match.
+    fn policy_epoch(&self) -> String {
+        format!("{}:epoch-{}", self.epoch, crate::runtime_mode::epoch())
+    }
     fn revision(&self) -> String {
-        let available: Vec<_> = self.config.available.iter().map(|m| mode_id(*m)).collect();
-        format!("{}:{}", self.epoch, available.join(","))
+        self.policy_epoch()
     }
     fn mode_entry(&self, mode: Mode) -> Value {
         json!({"id": mode_id(mode), "label": mode_label(mode)})
     }
     fn target_json(&self, target: Target, busy: Option<&str>) -> Value {
-        let unsupported = self.config.change_supported().err();
+        let unsupported = self.config.target_supported(target).err();
         let reason = unsupported.as_deref().or(busy);
         json!({
             "id": target.id(),
@@ -429,11 +514,12 @@ impl Switch {
             "available": reason.is_none(),
             "reason": reason,
             "transition_kind": "restart",
+            "in_process": self.config.in_process(target),
             "output_domain": target.output_domain(self.config.rrls),
         })
     }
     fn current_json(&self) -> Value {
-        let current = self.config.current;
+        let current = self.config.current();
         json!({
             "id": current.id(),
             "mode_id": mode_id(current.mode),
@@ -448,23 +534,19 @@ impl Switch {
             principal_context: principal.to_owned(),
             authority_id: self.authority_id(),
             revision: self.revision(),
-            policy_epoch: self.epoch.clone(),
-            current_id: self.config.current.id(),
+            policy_epoch: self.policy_epoch(),
+            current_id: self.config.current().id(),
             target_id: target_id.to_owned(),
         }
     }
     fn snapshot(&self, principal: &AuthPrincipal, busy: Option<String>) -> Value {
         let runtime = self.runtime.lock().unwrap();
         let busy = if runtime.restarting {
-            Some("A mode restart is already in progress.".to_owned())
+            Some("A mode change is already in progress.".to_owned())
         } else {
             busy
         };
-        let mut modes: Vec<Mode> = self.config.available.clone();
-        if !modes.contains(&self.config.current.mode) {
-            modes.push(self.config.current.mode);
-        }
-        modes.sort_by_key(|mode| ALL_MODES.iter().position(|m| m == mode));
+        let modes = ALL_MODES;
         let mut notes = Vec::new();
         if let Err(reason) = self.config.change_supported() {
             notes.push(reason);
@@ -480,12 +562,13 @@ impl Switch {
             "principal_context": principal_context(principal),
             "authority_id": self.authority_id(),
             "revision": self.revision(),
-            "policy_epoch": self.epoch,
+            "policy_epoch": self.policy_epoch(),
             "authority_current": true,
             "valid_for_ms": VALID_FOR_MS,
             "epoch_fencing_supported": false,
             "control_origin_required": false,
-            "admissions_open": true,
+            "admissions_open": !runtime.restarting,
+            "layout_revision": layout_revision(),
             "current": self.current_json(),
             "modes": modes.iter().map(|m| self.mode_entry(*m)).collect::<Vec<_>>(),
             "permissions": {"can_change": can_change(principal), "can_cancel_transition": false},
@@ -496,8 +579,12 @@ impl Switch {
             "reason": (!notes.is_empty()).then(|| notes.join(" ")),
         })
     }
-    fn phrase(target: Target) -> String {
-        format!("RESTART {}", target.id().to_uppercase())
+    fn phrase(&self, target: Target) -> String {
+        if self.config.in_process(target) {
+            format!("SWITCH TO {}", target.id().to_uppercase())
+        } else {
+            format!("RESTART {}", target.id().to_uppercase())
+        }
     }
     fn admit(&self, principal: &AuthPrincipal, state: &AppState, binding: &Binding) -> Result<Target, Refusal> {
         if !can_change(principal) {
@@ -507,19 +594,20 @@ impl Switch {
         }
         self.config.change_supported().map_err(Refusal::conflict)?;
         if self.runtime.lock().unwrap().restarting {
-            return Err(Refusal::conflict("A mode restart is already in progress."));
+            return Err(Refusal::conflict("A mode change is already in progress."));
         }
         let target = Target::parse(&binding.target_id)
             .filter(|target| self.config.targets().contains(target))
-            .ok_or_else(|| Refusal::conflict("That mode and simulation combination is not installed on this station."))?;
+            .ok_or_else(|| Refusal::conflict("That mode and simulation combination is not available on this station."))?;
         if *binding != self.binding(&principal_context(principal), &binding.target_id) {
             return Err(Refusal::conflict(
                 "Station mode status changed since it was read. Refresh and review again.",
             ));
         }
-        if target == self.config.current {
+        if target == self.config.current() {
             return Err(Refusal::conflict("That combination is already active."));
         }
+        self.config.target_supported(target).map_err(Refusal::conflict)?;
         if let Some(busy) = station_busy(state, self.config.rrls) {
             return Err(Refusal::conflict(format!("Station is not idle: {busy}")));
         }
@@ -531,11 +619,18 @@ impl Switch {
         let target = self.admit(principal, state, &binding)?;
         let ticket = format!("{:032x}", rand::random::<u128>());
         let transition_id = format!("switch-{:032x}", rand::random::<u128>());
-        let mut summary = format!(
-            "The station saves this selection, shuts down cleanly and its supervisor restarts it with the {} build{}. Live connections drop for a few seconds and reconnect on their own. The switch is allowed only while the station is idle and is checked again just before the restart.",
-            mode_label(target.mode),
-            if target.simulation { " in simulation" } else { "" },
-        );
+        let mut summary = if self.config.in_process(target) {
+            format!(
+                "The station saves this selection and switches to {} mode in place. Sign-ins and connections are kept; the layout and controls refresh on their own. The switch is allowed only while the station is idle and is checked again at the moment it happens.",
+                mode_label(target.mode),
+            )
+        } else {
+            format!(
+                "Simulation is set at start, so the station saves this selection, shuts down cleanly and its supervisor restarts it in {} mode{}. Live connections drop for a few seconds and reconnect on their own. The switch is allowed only while the station is idle and is checked again just before the restart.",
+                mode_label(target.mode),
+                if target.simulation { " in simulation" } else { "" },
+            )
+        };
         if self.config.rrls {
             summary.push_str(" This changes only this RRLS; the primary's mode is never changed from here.");
             if target.simulation {
@@ -555,7 +650,7 @@ impl Switch {
             "current": self.current_json(),
             "target": self.target_json(target, None),
             "summary": summary,
-            "required_confirmation": Self::phrase(target),
+            "required_confirmation": self.phrase(target),
             "expires_in_ms": TICKET_TTL.as_millis() as u64,
         });
         self.runtime.lock().unwrap().ticket = Some(Ticket {
@@ -593,7 +688,7 @@ impl Switch {
         if ticket.principal != principal_context(principal) || ticket.binding != request.binding {
             return Err(Refusal::conflict("This mode review belongs to another session or target."));
         }
-        if request.confirmation != Self::phrase(ticket.target) {
+        if request.confirmation != self.phrase(ticket.target) {
             return Err(Refusal::conflict("The confirmation phrase did not match. Review again."));
         }
         let target = self.admit(principal, state, &request.binding)?;
@@ -612,11 +707,16 @@ impl Switch {
         let bytes = serde_json::to_vec_pretty(&selection).map_err(|e| Refusal::internal(e.to_string()))?;
         write_durable(&path, &bytes)
             .map_err(|e| Refusal::internal(format!("Could not save the mode selection: {e}")))?;
+        let in_process = self.config.in_process(target);
         let transition = Transition {
             id: ticket.transition_id.clone(),
             target_id: target.id(),
             state: "pending",
-            phase: format!("Restarting into {}", target.label(self.config.rrls)),
+            phase: if in_process {
+                format!("Switching to {}", target.label(self.config.rrls))
+            } else {
+                format!("Restarting into {}", target.label(self.config.rrls))
+            },
             error: None,
         };
         {
@@ -625,16 +725,22 @@ impl Switch {
             runtime.transition = Some(transition.clone());
         }
         log::warn!(
-            "Station mode switch accepted: {} -> {} by {}; restarting",
-            self.config.current.id(),
+            "Station mode switch accepted: {} -> {} by {}; {}",
+            self.config.current().id(),
             target.id(),
-            selection.requested_by
+            selection.requested_by,
+            if in_process { "switching in process" } else { "restarting" }
         );
         let switch = self.clone();
         let state = state.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(switch.config.restart_delay).await;
-            switch.finish_restart(&state, &path, previous);
+            if in_process {
+                tokio::time::sleep(switch.config.switch_delay).await;
+                switch.finish_switch(&state, target, &path, previous);
+            } else {
+                tokio::time::sleep(switch.config.restart_delay).await;
+                switch.finish_restart(&state, &path, previous);
+            }
         });
         Ok(json!({
             "version": 2,
@@ -648,8 +754,76 @@ impl Switch {
             "transition": transition.json(),
         }))
     }
+    /// Changes the mode in this process. The idle check runs again under the
+    /// runtime-mode gate, so no mode-dependent operation can start between
+    /// the check and the change; on refusal the saved selection is restored.
+    fn finish_switch(&self, state: &Arc<AppState>, target: Target, path: &Path, previous: Option<Vec<u8>>) {
+        let rrls = self.config.rrls;
+        let station_resets = self.config.station_resets;
+        let from = crate::runtime_mode::current();
+        let result = crate::runtime_mode::switch_to(
+            target.mode,
+            || {
+                if let Some(busy) = station_busy(state, rrls) {
+                    return Err(format!("Station became active before the switch: {busy}"));
+                }
+                self.config.target_supported(target)
+            },
+            |token| {
+                apply_switch(state, from, token, station_resets);
+                let change = json!({
+                    "mode": mode_id(token.mode),
+                    "label": mode_label(token.mode),
+                    "policy_epoch": self.policy_epoch(),
+                    "layout_revision": layout_revision(),
+                });
+                set_last_change(change);
+            },
+        );
+        let mut runtime = self.runtime.lock().unwrap();
+        runtime.restarting = false;
+        match result {
+            Ok(token) => {
+                if let Some(transition) = runtime.transition.as_mut() {
+                    transition.state = "applied";
+                    transition.phase = format!("Switched to {}", target.label(rrls));
+                    transition.error = None;
+                }
+                drop(runtime);
+                log::warn!(
+                    "Station mode switched in process: {} -> {} (epoch {})",
+                    mode_id(from),
+                    mode_id(token.mode),
+                    token.epoch
+                );
+                if station_resets && (from == Mode::Testing) != (token.mode == Mode::Testing) {
+                    // The calibration file differs in testing mode; the DAQ
+                    // gets the reloaded one as after an operator save.
+                    let calibration = state.loadcell_calibration.lock().unwrap().clone();
+                    if let Err(error) = crate::web::publish_daq_calibration(state, &calibration) {
+                        log::warn!("Load-cell calibration after the mode switch: {error}");
+                    }
+                    state.broadcast_fill_targets_snapshot();
+                }
+            }
+            Err(error) => {
+                let restored = restore_selection(path, previous);
+                if let Some(transition) = runtime.transition.as_mut() {
+                    transition.state = "failed";
+                    transition.phase = "Switch refused; the station stays in its current mode".into();
+                    transition.error = Some(match restored {
+                        Ok(()) => error.clone(),
+                        Err(restore) => format!(
+                            "{error}. The previous selection could not be restored: {restore}. The next start may use the new selection."
+                        ),
+                    });
+                }
+                log::warn!("Station mode switch refused: {error}");
+            }
+        }
+    }
     /// Last check before shutdown: a station that became active keeps running
-    /// in its current build and the saved selection is restored.
+    /// in its current mode and the saved selection is restored.
     fn finish_restart(&self, state: &AppState, path: &Path, previous: Option<Vec<u8>>) {
         let busy = station_busy(state, self.config.rrls);
         let mut runtime = self.runtime.lock().unwrap();
@@ -658,16 +832,11 @@ impl Switch {
             self.signal.fire();
             return;
         };
-        let restored = match previous {
-            Some(bytes) => write_durable(path, &bytes),
-            None => std::fs::remove_file(path).or_else(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }
-            }),
-        };
+        let restored = restore_selection(path, previous);
         runtime.restarting = false;
         if let Some(transition) = runtime.transition.as_mut() {
             transition.state = "failed";
-            transition.phase = "Restart cancelled; the station stays in its current build".into();
+            transition.phase = "Restart cancelled; the station stays in its current mode".into();
             transition.error = Some(match restored {
                 Ok(()) => format!("Station became active before the restart: {busy}"),
                 Err(error) => format!(
@@ -677,6 +846,58 @@ impl Switch {
         }
         log::warn!("Station mode restart cancelled: {busy}");
     }
+}
+
+fn restore_selection(path: &Path, previous: Option<Vec<u8>>) -> std::io::Result<()> {
+    match previous {
+        Some(bytes) => write_durable(path, &bytes),
+        None => std::fs::remove_file(path).or_else(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }
+        }),
+    }
+}
+
+/// Puts the mode-dependent state back to what a fresh start in the new mode
+/// has. Runs inside `runtime_mode::switch_to` after the new mode is in force
+/// and before any mode-dependent admission reopens; the station was found
+/// idle under the same gate. Tasks that exist for one mode (sequence, safety,
+/// paired settings, shared checklists) follow the mode epoch on their own.
+fn apply_switch(state: &Arc<AppState>, from: Mode, token: crate::runtime_mode::ModeToken, station_resets: bool) {
+    // HITL operator interlocks start released, as at start.
+    state.hitl_button_interlock_enabled.store(false, Ordering::SeqCst);
+    state.hitl_launch_interlock_enabled.store(false, Ordering::SeqCst);
+    for interlock in state.hitl_safety_interlocks.iter() {
+        interlock.store(false, Ordering::SeqCst);
+    }
+    state
+        .hitl_physical_launch_uses_ground_station
+        .store(false, Ordering::SeqCst);
+    state.launch_sequence_command_pending.store(false, Ordering::SeqCst);
+    // A testing-mode modeled retraction never survives into another session.
+    crate::actuator_plumbing::clear_modeled_retraction_for_mode_switch(state);
+    {
+        // The sequence step starts over as at start; the generation binding
+        // stays with the current recovery generation.
+        let mut policy = state.sequence_policy_state.lock().unwrap();
+        *policy = crate::sequences::SequencePolicyState {
+            generation: policy.generation,
+            ..Default::default()
+        };
+    }
+    if station_resets {
+        // Qualification state (outside HITL), HITL phase control and
+        // turbocharge evidence, rebuilt as at start.
+        crate::gse::mode_switch::reset_for_mode_switch(state);
+        if (from == Mode::Testing) != (token.mode == Mode::Testing) {
+            // Testing mode keeps its own calibration file.
+            *state.loadcell_calibration.lock().unwrap() = crate::loadcell::load_or_default();
+        }
+    } else {
+        crate::gse::mode_switch::reset_phase_control(state);
+    }
+    LAYOUT_REVISION.fetch_add(1, Ordering::AcqRel);
+    // The policy the UI shows and the server enforces, for the new mode.
+    crate::sequences::refresh_action_policy_projection(state);
 }
 
 fn principal_context(principal: &AuthPrincipal) -> String {
@@ -694,7 +915,7 @@ pub(crate) fn can_change(principal: &AuthPrincipal) -> bool {
             || principal.allows_command_name(COMMAND_NAME))
 }
 
-/// Why the station is not idle enough for a restart, if anything.
+/// Why the station is not idle enough for a mode change, if anything.
 pub(crate) fn station_busy(state: &AppState, rrls: bool) -> Option<String> {
     use crate::types::FlightState;
     if state.shutdown_requested.load(Ordering::SeqCst) {

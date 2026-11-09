@@ -13,12 +13,11 @@ sys.path.insert(0, str(ROOT))
 import station_modes as sm  # noqa: E402
 
 
-def install(root: Path, modes):
-    for mode in modes:
-        binary = root / mode / sm.BINARY
-        binary.parent.mkdir(parents=True, exist_ok=True)
-        binary.write_text("#!/bin/sh\n")
-        binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+def install(root: Path):
+    binary = root / sm.BINARY
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
 
 
 def selection(directory: Path, mode, simulation=False, role="primary"):
@@ -68,11 +67,12 @@ class SelectionTests(unittest.TestCase):
 
 
 class EnvironmentTests(unittest.TestCase):
-    def test_child_env_marks_supervision_and_installed_builds(self):
+    def test_child_env_marks_supervision_and_passes_the_mode(self):
         choice = sm.Choice("hitl", False, "selection")
-        env = sm.child_env({"PATH": "/bin"}, choice, False, ["normal", "hitl"], Path("/x/state"), Path("/x/sim"))
+        env = sm.child_env({"PATH": "/bin", "GS_STATION_MODE_AVAILABLE": "old"}, choice, False, list(sm.MODES), Path("/x/state"), Path("/x/sim"))
         self.assertEqual(env["GS_STATION_MODE_SUPERVISOR"], "1")
-        self.assertEqual(env["GS_STATION_MODE_AVAILABLE"], "normal,hitl")
+        self.assertEqual(env["GS_STATION_MODE"], "hitl")
+        self.assertNotIn("GS_STATION_MODE_AVAILABLE", env)
         self.assertEqual(env["GS_STATION_MODE_DIR"], "/x/state")
         self.assertNotIn("GS_SIM_MODE", env)
 
@@ -111,35 +111,39 @@ class EnvironmentTests(unittest.TestCase):
 
 
 class BuildAndSuperviseTests(unittest.TestCase):
-    def test_build_keeps_one_binary_per_mode_with_its_features(self):
+    def test_build_makes_one_binary_for_every_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             commands = []
 
             def fake_run(command, cwd, check):
                 commands.append(command)
-                built = repo / "target/release" / sm.BINARY
+                built = repo / "target" / ("release" if "--release" in command else "debug") / sm.BINARY
                 built.parent.mkdir(parents=True, exist_ok=True)
                 built.write_text(",".join(command))
                 built.chmod(0o755)
 
             root = sm.build_modes(repo, ["normal", "hitl"], pi=True, run=fake_run)
-            self.assertEqual(commands[0], ["cargo", "build", "--release", "-p", sm.BINARY, "--features", "raspberry_pi"])
-            self.assertEqual(commands[1][-1], "raspberry_pi,hitl_mode")
-            self.assertEqual(sm.installed_modes(root), ["normal", "hitl"])
-            self.assertIn("hitl_mode", (root / "hitl" / sm.BINARY).read_text())
+            self.assertEqual(commands, [["cargo", "build", "--release", "-p", sm.BINARY, "--features", "raspberry_pi"]])
+            self.assertEqual(sm.installed_modes(root), list(sm.MODES))
+            self.assertTrue((root / sm.BINARY).is_file())
+            commands.clear()
+            sm.build_modes(repo, None, debug=True, run=fake_run, firmware_sim=True)
+            self.assertEqual(commands, [["cargo", "build", "-p", sm.BINARY, "--features", "firmware_sim"]])
+            for command in commands:
+                self.assertNotRegex(" ".join(command), "hitl_mode|test_fire_mode|testing")
 
     def test_supervisor_restarts_into_the_saved_selection(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             root = repo / "bins"
-            install(root, ["hitl", "testing"])
+            install(root)
             state = repo / "state"
             started = []
 
             class Process:
                 def __init__(self, argv, cwd, env):
-                    started.append((Path(argv[0]).parent.name, env))
+                    started.append((env["GS_STATION_MODE"], env))
                     self.code = 0
                     if len(started) == 1:
                         selection(state, "testing", True)
@@ -152,12 +156,12 @@ class BuildAndSuperviseTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual([name for name, _ in started], ["hitl", "testing"])
             self.assertEqual(started[1][1]["GS_SIM_MODE"], "1")
-            self.assertEqual(started[1][1]["GS_STATION_MODE_AVAILABLE"], "hitl,testing")
+            self.assertNotIn("GS_STATION_MODE_AVAILABLE", started[1][1])
 
     def test_other_exit_codes_are_returned_not_restarted(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            install(repo / "bins", ["normal"])
+            install(repo / "bins")
 
             class Crash:
                 def __init__(self, *args, **kwargs):
@@ -176,7 +180,7 @@ class BuildAndSuperviseTests(unittest.TestCase):
     def test_rrls_simulation_gets_a_fresh_root_each_start(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            install(repo / "bins", ["normal"])
+            install(repo / "bins")
             state = repo / "state"
             selection(state, "normal", True, role="rrls")
             stale = state / "rrls-simulation" / "stale.json"

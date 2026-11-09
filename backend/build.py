@@ -156,24 +156,10 @@ def build_backend(
         else:
             print("Not running on Raspberry Pi → building without `raspberry_pi` feature.")
 
-    if testing_mode:
-        print("Testing mode enabled → adding `testing` feature.")
-        if "--features" in cmd:
-            cmd[cmd.index("--features") + 1] += ",testing"
-        else:
-            cmd.extend(["--features", "testing"])
-    if hitl_mode:
-        print("HITL mode enabled → adding `hitl_mode` feature.")
-        if "--features" in cmd:
-            cmd[cmd.index("--features") + 1] += ",hitl_mode"
-        else:
-            cmd.extend(["--features", "hitl_mode"])
-    if test_fire_mode:
-        print("Test-fire mode enabled → adding `test_fire_mode` feature.")
-        if "--features" in cmd:
-            cmd[cmd.index("--features") + 1] += ",test_fire_mode"
-        else:
-            cmd.extend(["--features", "test_fire_mode"])
+    if testing_mode or hitl_mode or test_fire_mode:
+        # One binary holds every station mode; the mode is chosen at run time.
+        print("Note: station modes are chosen at run time (GS_STATION_MODE=testing|hitl|test_fire, "
+              "run_groundstation.py, or the UI); building the one backend binary.")
 
     try:
         refresh_sedsnet_dependency(backend_dir.parent)
@@ -195,14 +181,12 @@ def print_usage(exit_code: int = 1) -> None:
     print("What this script owns:")
     print("  - backend cargo builds")
     print("  - Raspberry Pi feature selection")
-    print("  - testing, hitl_mode, and test_fire_mode feature toggles")
+    print("  - (station modes are chosen at run time, not at build time)")
     print("")
     print("Options:")
     print("  pi_build                          # force raspberry_pi feature on")
     print("  no_pi                             # force raspberry_pi feature off")
-    print("  testing                           # enable backend testing feature")
-    print("  hitl-mode                         # enable backend hitl_mode feature")
-    print("  test-fire-mode                    # enable backend test_fire_mode feature")
+    print("  testing|hitl-mode|test-fire-mode  # accepted; same binary (set GS_STATION_MODE at run time)")
     print("  debug                             # build without --release")
     print("  log=<path>                        # tee command output into a log file")
     sys.exit(exit_code)

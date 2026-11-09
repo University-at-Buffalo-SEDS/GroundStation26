@@ -34,7 +34,9 @@ separate deployment checks.
 ## Nitrogen and Auto Fill regression tests
 
 Run `cargo test -p gse_sequence` and
-`cargo test -p groundstation_backend --features hitl_mode`.
+`GS_TEST_STATION_MODE=hitl cargo test -p groundstation_backend` (tests read the
+station mode from `GS_TEST_STATION_MODE`; each mode's suite runs the tests that
+mode's old build ran).
 The nitrogen PT trace exercises 50, 100 and 120 psi steps: each overshoots by
 4 psi, settles to target +2 psi during the two-second settling window, then
 holds with small noise for five seconds. It cannot advance during that hold.

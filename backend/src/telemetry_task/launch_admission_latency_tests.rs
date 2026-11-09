@@ -2,6 +2,7 @@
 // physical side is opened and no device command is executed by this fixture.
 #[tokio::test]
 async fn slow_launch_preparation_keeps_healthy_unchanged_routes_admissible() {
+    crate::mode_suite!(Hitl);
     if crate::operator_queue::isolated_native_case(module_path!(), "slow_launch_preparation_keeps_healthy_unchanged_routes_admissible") { return; }
     let mut failures = Vec::new();
     for local in [false, true] {
@@ -116,6 +117,7 @@ impl LaunchStatusClock {
 
 #[tokio::test]
 async fn accepted_hitl_launch_after_clock_reset_waits_for_valve_status_then_starts_new_cycle() {
+    crate::mode_suite!(Hitl);
     if crate::operator_queue::isolated_native_case(
         module_path!(),
         "accepted_hitl_launch_after_clock_reset_waits_for_valve_status_then_starts_new_cycle",
@@ -211,6 +213,7 @@ async fn accepted_hitl_launch_after_clock_reset_waits_for_valve_status_then_star
 
 #[tokio::test]
 async fn stopped_launch_cannot_rearm_reset_clock_from_late_valve_status() {
+    crate::mode_suite!(Hitl);
     if crate::operator_queue::isolated_native_case(
         module_path!(),
         "stopped_launch_cannot_rearm_reset_clock_from_late_valve_status",
@@ -264,6 +267,7 @@ async fn stopped_launch_cannot_rearm_reset_clock_from_late_valve_status() {
 
 #[tokio::test]
 async fn fresh_valve_sequence_without_accepted_launch_cannot_rearm_reset_clock() {
+    crate::mode_suite!(Hitl);
     if crate::operator_queue::isolated_native_case(
         module_path!(),
         "fresh_valve_sequence_without_accepted_launch_cannot_rearm_reset_clock",

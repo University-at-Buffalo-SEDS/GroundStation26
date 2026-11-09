@@ -384,6 +384,10 @@ pub struct Effects {
 
 pub struct Engine {
     pub config: Config,
+    /// Test fire keeps the original 0.2 kg resume deadband even after a trim
+    /// pause below target (see [`Engine::fill_resume_required`]). The station
+    /// sets it from its mode.
+    pub legacy_resume_deadband: bool,
     /// The operator, not an automatic fill sequence, controls nitrous flow
     /// (e.g. automatic cutoff disabled). A nitrous overfill then warns and
     /// never dumps; tank overpressure relief is enforced separately.
@@ -468,6 +472,7 @@ impl Default for Engine {
     fn default() -> Self {
         Self {
             config: Config::default(),
+            legacy_resume_deadband: false,
             manual_fill_control: false,
             overfill_warned: false,
             nitrous_target_psi: 750.0,
@@ -724,7 +729,7 @@ impl Engine {
         // a completed fill is not topped up for small losses; applied here it
         // left masses between target - 0.2 kg and target - tolerance paused
         // with no way to resume ("Review and Resume" was a no-op).
-        if !cfg!(feature = "legacy_resume_deadband")
+        if !self.legacy_resume_deadband
             && self.failure() == Some(fill_trim::SETTLED_BELOW_TARGET)
         {
             let required = fill_resume::resume_required(input.now_ms, mass, target_mass_kg)?;
@@ -2099,7 +2104,10 @@ mod tests {
         let short = rig.engine.fill_resume_required(rig.input(), mass(4.886, rig.now), 5.0).unwrap();
         let within = rig.engine.fill_resume_required(rig.input(), mass(4.95, rig.now), 5.0).unwrap();
         assert!(!within, "inside the fill tolerance there is nothing to resume");
-        assert_eq!(short, !cfg!(feature = "legacy_resume_deadband"));
+        assert!(short);
+        rig.engine.legacy_resume_deadband = true;
+        assert!(!rig.engine.fill_resume_required(rig.input(), mass(4.886, rig.now), 5.0).unwrap(), "test fire keeps the 0.2 kg deadband");
+        rig.engine.legacy_resume_deadband = false;
         // Any other pause keeps the explicit 0.2 kg resume deadband.
         rig.request(Action::StartFill);
         rig.until(Phase::Filling);

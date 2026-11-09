@@ -32,7 +32,9 @@ fn binding() -> &'static Mutex<BindingState> {
     BINDING.get_or_init(Default::default)
 }
 pub(crate) fn preflight() {
-    if cfg!(feature = "hitl_mode") {
+    // Decided once, the first time the station is outside HITL: at boot, or
+    // from mission_sync::start after a switch out of HITL.
+    if crate::runtime_mode::is_hitl() {
         return;
     }
     PREFLIGHT.get_or_init(|| {
@@ -44,7 +46,8 @@ pub(crate) fn preflight() {
     });
 }
 pub(crate) fn requested() -> bool {
-    REQUESTED.load(Ordering::Acquire)
+    // HITL never had shared checklists.
+    !crate::runtime_mode::is_hitl() && REQUESTED.load(Ordering::Acquire)
 }
 pub(crate) fn ready() -> bool {
     READY.load(Ordering::Acquire)
@@ -97,6 +100,9 @@ enum Input {
     Event(CompletionEvent),
 }
 pub(crate) fn receive_wire(wire: Vec<u8>) -> bool {
+    if crate::runtime_mode::is_hitl() {
+        return false;
+    }
     INBOX
         .get()
         .is_some_and(|sender| sender.try_send(Input::Wire(wire)).is_ok())
@@ -925,6 +931,16 @@ pub(crate) fn start(
             tokio::select! {
                 _ = shutdown.recv() => break,
                 _ = interval.tick() => {
+                    if crate::runtime_mode::is_hitl() {
+                        // HITL has no shared checklists: pause and discard
+                        // radio input until the station leaves HITL.
+                        while let Ok(input) = receiver.try_recv() {
+                            if let Input::Event(event) = input {
+                                binding().lock().unwrap().queued_events.remove(&event.id);
+                            }
+                        }
+                        continue;
+                    }
                     let mut service = service.lock().await;
                     if !startup.ready && !startup.advance(&mut service, &state).await {
                         continue;

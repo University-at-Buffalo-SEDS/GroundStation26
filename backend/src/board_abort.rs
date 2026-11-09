@@ -107,9 +107,9 @@ pub(crate) fn controller_can_launch(kind: sedsnet::config::DataType, payload: &[
     if payload == [crate::rocket_commands::FlightComputerCommands::Launch as u8] {
         return true;
     }
-    #[cfg(feature = "hitl_mode")]
-    if payload == [crate::rocket_commands::FlightComputerCommands::AdvanceFlightState as u8]
-        || payload == [crate::rocket_commands::FlightComputerCommands::RewindFlightState as u8]
+    if crate::runtime_mode::is_hitl()
+        && (payload == [crate::rocket_commands::FlightComputerCommands::AdvanceFlightState as u8]
+            || payload == [crate::rocket_commands::FlightComputerCommands::RewindFlightState as u8])
     {
         return true;
     }
@@ -125,7 +125,7 @@ pub(crate) fn blocked_message(state: &AppState) -> Option<String> {
     if state.shutdown_requested.load(Ordering::Acquire) || register.history_frozen {
         return Some("Ground station is shutting down".into());
     }
-    if !cfg!(feature = "hitl_mode") && let Some(error) = state.board_abort.history_failure() { return Some(format!("Abort history unavailable: {error}")); }
+    if !crate::runtime_mode::is_hitl() && let Some(error) = state.board_abort.history_failure() { return Some(format!("Abort history unavailable: {error}")); }
     let mask = Runtime::launch_abort_mask_at(&register, seen, Instant::now());
     if mask != 0 { return Some(format!("Launch disabled: {} report Abort.", board_names(mask))); }
     let unreset = register.unreset & seen;
@@ -646,7 +646,7 @@ impl Runtime {
         let seen = present_mask(state);
         let register = self.register.lock().unwrap();
         if state.shutdown_requested.load(Ordering::Acquire) || register.history_frozen { return Err("Ground station is shutting down".into()); }
-        if !cfg!(feature = "hitl_mode") && let Some(error) = self.history_failure() { return Err(format!("Abort history unavailable: {error}")); }
+        if !crate::runtime_mode::is_hitl() && let Some(error) = self.history_failure() { return Err(format!("Abort history unavailable: {error}")); }
         let unknown = required_unknown_mask(state, register.history_unknown);
         if unknown != 0 { self.request_queries(unknown); return Err(format!("Fresh actual state required because saved history is missing or was not clean for {}.", board_names(unknown))); }
         let (_, proven) = Self::masks_at(&register, Instant::now());
@@ -719,9 +719,9 @@ pub(crate) fn required_unknown_mask(state: &AppState, unknown: u8) -> u8 {
         return unknown & crate::primary_mirror::board_history_required_scope(state).unwrap_or(0x7f);
     }
     crate::history_policy::uncertain_launch_blockers(unknown,
-        if cfg!(feature="test_fire_mode") {crate::history_policy::LaunchScope::TestFire}
+        if crate::runtime_mode::is_test_fire() {crate::history_policy::LaunchScope::TestFire}
         else {crate::history_policy::LaunchScope::Flight},
-        cfg!(feature="hitl_mode"), state.board_state_proof_enforced())
+        crate::runtime_mode::is_hitl(), state.board_state_proof_enforced())
 }
 /// Inspect only after actual control/receiver/observer owners have joined and
 /// outside application locks. Unknown ownership never earns a Clean receipt.
@@ -760,8 +760,11 @@ pub(crate) fn observe_raw(state: &AppState, packet: &sedsnet::packet::Packet) {
     let Some(value) = crate::types::u8_to_flight_state(packet.payload()[0]) else {
         return;
     };
-    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
-    if crate::testing_board_lifecycle::retired_model_abort_state(board,packet) {return;}
+    if crate::runtime_mode::is_testing()
+        && crate::testing_board_lifecycle::retired_model_abort_state(board, packet)
+    {
+        return;
+    }
     // A board reporting Startup rebooted or was reset, which is what the lock asks for.
     if value == FlightState::Startup {
         state.board_abort.clear_unreset(1 << index(board).unwrap());
@@ -848,7 +851,7 @@ pub(crate) fn snapshot_for_state(state: &AppState) -> Snapshot {
                 error.message = format!("{} last reported Abort and is not on the network. It does not block Launch.", error.board_label);
             }
         }
-        value.history_blocks_launch = !cfg!(feature = "hitl_mode");
+        value.history_blocks_launch = !crate::runtime_mode::is_hitl();
     }
     if !crate::rrls::is_rrls() {
         value.retraction = Some(crate::actuator_plumbing::retraction_gate(state));
@@ -890,7 +893,7 @@ impl ActuatorReadbackRefresh {
             return false;
         }
         let healthy = state.network_health.lock().unwrap()
-            .snapshot(now, cfg!(feature = "test_fire_mode"))
+            .snapshot(now, crate::runtime_mode::is_test_fire())
             .iter().any(|row| row.sender_id == "AB" && row.healthy);
         if !healthy { return false; }
         self.last = Some(now);
@@ -959,7 +962,7 @@ pub(crate) fn request_paired_readiness_queries(state: &AppState) -> Result<(), S
         return Err("Readiness scan requires idle primary recovery admission".into());
     }
     let scope=if !state.board_state_proof_enforced() {0}
-        else if cfg!(feature="test_fire_mode") {0x78} else {0x7f};
+        else if crate::runtime_mode::is_test_fire() {0x78} else {0x7f};
     state.board_abort.request_queries(scope | state.board_abort.masks().0);
     crate::actuator_plumbing::request_motion_query(state)
 }

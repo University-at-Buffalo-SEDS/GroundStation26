@@ -93,10 +93,10 @@ pub enum PhaseMode {
 }
 
 impl PhaseMode {
-    pub const fn current() -> Self {
-        if cfg!(feature = "hitl_mode") {
+    pub fn current() -> Self {
+        if crate::runtime_mode::is_hitl() {
             PhaseMode::Hitl
-        } else if cfg!(feature = "test_fire_mode") {
+        } else if crate::runtime_mode::is_test_fire() {
             PhaseMode::TestFire
         } else {
             PhaseMode::Flight
@@ -254,7 +254,6 @@ pub fn mission_phase(inputs: &PhaseInputs) -> MissionPhase {
 /// detailed state it already selected, so required-board and fill context do
 /// not change the answer: Startup is the only pre-Launch phase without
 /// disconnect aborts.
-#[cfg_attr(feature = "hitl_mode", allow(dead_code))]
 pub fn safety_phase(detailed: FlightState) -> MissionPhase {
     mission_phase(&PhaseInputs {
         mode: PhaseMode::Flight,

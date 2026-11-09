@@ -210,16 +210,13 @@ async fn actual_http_invalid_fill_limits_preserve_mode_policy_and_have_no_effect
     let calibration = serde_json::to_value(&*f.state.loadcell_calibration.lock().unwrap()).unwrap();
     let generation = crate::gse::automatic_generation(&f.state);
     let result = press(f.state.clone(), Some("fill-token")).await;
-    #[cfg(feature = "hitl_mode")]
-    {
+    if crate::runtime_mode::is_hitl() {
         assert_eq!(result.0, StatusCode::CONFLICT, "{}", result.1);
         let error: serde_json::Value = serde_json::from_str(&result.1).unwrap();
         assert_eq!(error["message"], "Set the maximum acceptable empty-tank PT offset");
         assert_eq!(error["reason"]["validation"], "Set the maximum acceptable empty-tank PT offset");
         assert!(!result.1.contains("expired"));
-    }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    } else {
         // The ordinary action-policy gate rejects this invalid setup first.
         assert_eq!(result.0, StatusCode::FORBIDDEN, "{}", result.1);
         assert_eq!(

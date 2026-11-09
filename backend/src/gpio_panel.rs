@@ -154,8 +154,8 @@ fn setup_callbacks(
         if cold_edge.is_none() && !allowed_launch.lock().unwrap().launch {
             return;
         }
-        #[cfg(feature = "hitl_mode")]
-        if state_launch.hitl_button_interlock_enabled()
+        if crate::runtime_mode::is_hitl()
+            && state_launch.hitl_button_interlock_enabled()
             && !is_input_enabled(&gpio_launch, ALL_BUTTONS_ENABLE_PIN)
         {
             emit_notification_warning(
@@ -164,14 +164,15 @@ fn setup_callbacks(
             );
             return;
         }
-        #[cfg(feature = "hitl_mode")]
-        let launch_interlock_ok = if state_launch.hitl_launch_interlock_enabled() {
-            is_input_enabled(&gpio_launch, LAUNCH_ARM_PIN)
+        let launch_interlock_ok = if crate::runtime_mode::is_hitl() {
+            if state_launch.hitl_launch_interlock_enabled() {
+                is_input_enabled(&gpio_launch, LAUNCH_ARM_PIN)
+            } else {
+                true
+            }
         } else {
-            true
+            is_input_enabled(&gpio_launch, LAUNCH_ARM_PIN)
         };
-        #[cfg(not(feature = "hitl_mode"))]
-        let launch_interlock_ok = is_input_enabled(&gpio_launch, LAUNCH_ARM_PIN);
         if !launch_interlock_ok {
             emit_notification_warning(
                 &state_launch,
@@ -183,16 +184,17 @@ fn setup_callbacks(
             let _=queue_cold_flow_panel_edge(&tx_launch,edge);
             return;
         }
-        #[cfg(feature = "hitl_mode")]
-        let launch_command = if state_launch.hitl_physical_launch_uses_ground_station() {
+        let launch_command = if crate::runtime_mode::is_hitl() {
+            if state_launch.hitl_physical_launch_uses_ground_station() {
+                TelemetryCommand::GroundStationLaunch
+            } else {
+                TelemetryCommand::Launch
+            }
+        } else if crate::runtime_mode::is_test_fire() {
             TelemetryCommand::GroundStationLaunch
         } else {
             TelemetryCommand::Launch
         };
-        #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
-        let launch_command = TelemetryCommand::GroundStationLaunch;
-        #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
-        let launch_command = TelemetryCommand::Launch;
 
         if queue_gpio_command(
             &tx_launch,
@@ -429,8 +431,8 @@ where
         };
         let launch_revision = crate::board_abort::capture_launch_revision(&state, &cmd);
         let plumbing_origin = crate::actuator_plumbing::capture_motion_origin(&state, &cmd);
-        #[cfg(feature = "hitl_mode")]
-        if state.hitl_button_interlock_enabled()
+        if crate::runtime_mode::is_hitl()
+            && state.hitl_button_interlock_enabled()
             && !is_input_enabled(&_gpio_for_callback, ALL_BUTTONS_ENABLE_PIN)
         {
             let now_ms = crate::telemetry_task::get_current_timestamp_ms();
@@ -478,10 +480,7 @@ where
             let authority = crate::fill_recording::Authority::Physical { current: Arc::new(move || {
                 let Some(state) = weak.upgrade() else { return false; };
                 if state.control_ingress.is_closed() || crate::gse::panel_name(&state, original_name) != "StartFill" { return false; }
-                #[cfg(feature = "hitl_mode")]
-                if state.hitl_button_interlock_enabled() && !is_input_enabled(&gpio, ALL_BUTTONS_ENABLE_PIN) { return false; }
-                #[cfg(not(feature = "hitl_mode"))]
-                let _ = &gpio;
+                if crate::runtime_mode::is_hitl() && state.hitl_button_interlock_enabled() && !is_input_enabled(&gpio, ALL_BUTTONS_ENABLE_PIN) { return false; }
                 predicate(&allowed.lock().unwrap())
             }) };
             TelemetryCommand::FillWithRecording { origin: captured.bind(authority, None) }
@@ -684,8 +683,8 @@ fn led_for(state: &AppState, policy: &ActionPolicyMsg, cmd: &str, now_ms: u64) -
     let Some(control) = policy.controls.iter().find(|c| c.cmd == cmd) else {
         return LED_DISABLED_BRIGHTNESS;
     };
-    #[cfg(feature = "hitl_mode")]
-    if cmd == "Launch"
+    if crate::runtime_mode::is_hitl()
+        && cmd == "Launch"
         && control.enabled
         && (state.hitl_button_interlock_enabled() || state.hitl_launch_interlock_enabled())
         && state.hitl_button_interlock_satisfied()

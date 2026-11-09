@@ -27,7 +27,6 @@ use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Duration, Instant};
 
 pub const LAUNCH_COUNTDOWN_DURATION_MS: i64 = 10_000;
-#[cfg(feature = "hitl_mode")]
 pub(crate) fn default_hitl_safety_interlocks() -> Arc<[AtomicBool; 4]> {
     Arc::new(std::array::from_fn(|_| AtomicBool::new(false)))
 }
@@ -353,15 +352,11 @@ pub struct AppState {
     /// True after any abort path has triggered until process restart.
     pub abort_indicator_latched: Arc<AtomicBool>,
 
-    #[cfg(feature = "hitl_mode")]
     pub hitl_button_interlock_enabled: Arc<AtomicBool>,
 
-    #[cfg(feature = "hitl_mode")]
     pub hitl_launch_interlock_enabled: Arc<AtomicBool>,
-    #[cfg(feature = "hitl_mode")]
     pub(crate) hitl_safety_interlocks: Arc<[AtomicBool; 4]>,
 
-    #[cfg(feature = "hitl_mode")]
     pub hitl_physical_launch_uses_ground_station: Arc<AtomicBool>,
 
     /// Current recording state snapshot.
@@ -489,7 +484,7 @@ impl AppState {
         *self.sequence_policy_state.lock().unwrap()
     }
 
-    #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
+    #[cfg(test)]
     pub fn set_sequence_policy_state(&self, snapshot: SequencePolicyState) {
         *self.sequence_policy_state.lock().unwrap() = snapshot;
     }
@@ -712,7 +707,6 @@ impl AppState {
             self.add_notification(format!("New launch clock session was not saved: {error}"));
         }
     }
-    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     pub fn begin_daq_launch_log(&self) {
         let generation = crate::gse::automatic_generation(self);
         if crate::rrls::is_rrls() {
@@ -769,7 +763,6 @@ impl AppState {
         }
     }
 
-    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     pub fn try_begin_launch_sequence_command(&self) -> bool {
         self.launch_sequence_command_pending
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -799,12 +792,10 @@ impl AppState {
             .store(latched, Ordering::SeqCst);
     }
 
-    #[cfg(feature = "hitl_mode")]
     pub fn hitl_button_interlock_enabled(&self) -> bool {
         self.hitl_button_interlock_enabled.load(Ordering::SeqCst)
     }
 
-    #[cfg(feature = "hitl_mode")]
     pub fn toggle_hitl_button_interlock(&self) -> bool {
         let mut next = false;
         self.board_abort.change_launch_context_if(|| {
@@ -816,12 +807,10 @@ impl AppState {
         next
     }
 
-    #[cfg(feature = "hitl_mode")]
     pub fn hitl_launch_interlock_enabled(&self) -> bool {
         self.hitl_launch_interlock_enabled.load(Ordering::SeqCst)
     }
 
-    #[cfg(feature = "hitl_mode")]
     pub fn toggle_hitl_launch_interlock(&self) -> bool {
         let mut next = false;
         self.board_abort.change_launch_context_if(|| {
@@ -833,11 +822,9 @@ impl AppState {
         next
     }
 
-    #[cfg(feature = "hitl_mode")]
     pub(crate) fn hitl_safety_interlock_enabled(&self, index: usize) -> bool {
         self.hitl_safety_interlocks[index].load(Ordering::Acquire)
     }
-    #[cfg(feature = "hitl_mode")]
     pub(crate) fn toggle_hitl_safety_interlock(&self, index: usize) -> bool {
         let mut enabled = false;
         self.board_abort.change_launch_context_if(|| {
@@ -847,38 +834,27 @@ impl AppState {
         enabled
     }
     pub(crate) fn board_state_proof_enforced(&self)->bool {
-        #[cfg(feature="hitl_mode")]
-        { self.hitl_safety_interlock_enabled(3) }
-        #[cfg(not(feature="hitl_mode"))]
-        { true }
+        if crate::runtime_mode::is_hitl() { self.hitl_safety_interlock_enabled(3) } else { true }
     }
     pub(crate) fn checklist_enforcement_enabled(&self) -> bool {
-        #[cfg(feature = "hitl_mode")]
-        {
+        if crate::runtime_mode::is_hitl() {
             self.hitl_safety_interlock_enabled(1)
-        }
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        } else {
             true
         }
     }
     pub(crate) fn supply_enforcement_enabled(&self) -> bool {
-        #[cfg(feature = "hitl_mode")]
-        {
+        if crate::runtime_mode::is_hitl() {
             self.hitl_safety_interlock_enabled(2)
-        }
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        } else {
             true
         }
     }
-    #[cfg(feature = "hitl_mode")]
     pub fn hitl_physical_launch_uses_ground_station(&self) -> bool {
         self.hitl_physical_launch_uses_ground_station
             .load(Ordering::SeqCst)
     }
 
-    #[cfg(feature = "hitl_mode")]
     pub fn toggle_hitl_physical_launch_mode(&self) -> bool {
         let mut next = false;
         self.board_abort.change_launch_context_if(|| {
@@ -890,7 +866,6 @@ impl AppState {
         next
     }
 
-    #[cfg(feature = "hitl_mode")]
     pub fn hitl_button_interlock_satisfied(&self) -> bool {
         if !self.hitl_button_interlock_enabled() {
             return true;
@@ -900,7 +875,6 @@ impl AppState {
             .unwrap_or(false)
     }
 
-    #[cfg(feature = "hitl_mode")]
     pub fn hitl_launch_interlock_satisfied(&self) -> bool {
         if !self.hitl_launch_interlock_enabled() {
             return true;
@@ -1057,7 +1031,7 @@ impl AppState {
     /// age. Nested topology nodes/connections are cached reachability, not new
     /// traffic from those boards. Never refresh a leaf from its gateway's ping.
     pub fn mark_discovered_relays_seen(&self) {
-        if cfg!(feature = "test_fire_mode") {
+        if crate::runtime_mode::is_test_fire() {
             return;
         }
         let now_ms = telemetry_task::get_current_timestamp_ms();
@@ -1122,14 +1096,16 @@ impl AppState {
     }
 
     /// Returns whether a board should be required for startup/state gating in the current mode.
-    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     pub fn board_required_for_progression(&self, board: Board) -> bool {
-        if cfg!(feature = "test_fire_mode") {
+        if !crate::runtime_mode::is_hitl_or_test_fire() {
+            return self.layout_expected_boards().contains(&board);
+        }
+        if crate::runtime_mode::is_test_fire() {
             return matches!(
                 board,
                 Board::ValveBoard | Board::GatewayBoard | Board::ActuatorBoard
             ) || (board == Board::DaqBoard
-                && (!cfg!(feature = "hitl_mode") || self.board_state_proof_enforced()));
+                && (!crate::runtime_mode::is_hitl() || self.board_state_proof_enforced()));
         }
 
         if !self.layout_expected_boards().contains(&board) {
@@ -1157,11 +1133,6 @@ impl AppState {
         true
     }
 
-    #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
-    pub fn board_required_for_progression(&self, board: Board) -> bool {
-        self.layout_expected_boards().contains(&board)
-    }
-
     /// Returns whether every board required for the current operating mode has been observed.
     pub fn all_required_boards_seen(&self) -> bool {
         let map = self.board_status.lock().unwrap();
@@ -1182,7 +1153,7 @@ impl AppState {
 
     fn board_status_snapshot_filtered(&self, now_ms: u64, filter_for_mode: bool) -> BoardStatusMsg {
         let map = self.board_status.lock().unwrap();
-        let visible_boards: Vec<Board> = if filter_for_mode && cfg!(feature = "test_fire_mode") {
+        let visible_boards: Vec<Board> = if filter_for_mode && crate::runtime_mode::is_test_fire() {
             vec![
                 Board::ValveBoard,
                 Board::GatewayBoard,
@@ -1235,7 +1206,7 @@ impl AppState {
                         .network_health
                         .lock()
                         .unwrap()
-                        .snapshot(std::time::Instant::now(), cfg!(feature = "test_fire_mode"));
+                        .snapshot(std::time::Instant::now(), crate::runtime_mode::is_test_fire());
                     crate::host_temperature::append_local(&mut rows, now_ms, simulated);
                     rows
                 },
@@ -1262,7 +1233,7 @@ impl AppState {
                     }
                 }
             }
-            let mut rows = tracker.snapshot(now, cfg!(feature = "test_fire_mode"));
+            let mut rows = tracker.snapshot(now, crate::runtime_mode::is_test_fire());
             drop(tracker);
             crate::host_temperature::append_local(&mut rows, now_ms, simulated);
             rows
@@ -2116,8 +2087,7 @@ impl AppState {
     pub fn set_action_policy(&self, policy: ActionPolicyMsg) {
         let recording_mode = self.recording_status_snapshot().mode;
         let mut policy = policy;
-        #[cfg(feature = "hitl_mode")]
-        {
+        if crate::runtime_mode::is_hitl() {
             let button_interlock_ok = self.hitl_button_interlock_satisfied();
             let launch_interlock_ok = self.hitl_launch_interlock_satisfied();
             policy.key_enabled = true;
@@ -2179,35 +2149,36 @@ impl AppState {
             if control.cmd == "Abort" && self.abort_indicator_latched() {
                 control.actuated = Some(true);
             }
-            #[cfg(feature = "hitl_mode")]
-            match control.cmd.as_str() {
-                "ToggleButtonInterlock" => {
-                    control.actuated = Some(self.hitl_button_interlock_enabled())
-                }
-                "ToggleLaunchInterlock" => {
-                    control.actuated = Some(self.hitl_launch_interlock_enabled())
-                }
-                "TogglePlumbingDelayInterlock" => {
-                    control.actuated = Some(self.hitl_safety_interlock_enabled(0));
-                }
-                "ToggleChecklistInterlock" => {
-                    control.actuated = Some(self.hitl_safety_interlock_enabled(1));
-                }
-                "ToggleBoardStateProofInterlock" => {
-                    control.actuated = Some(self.hitl_safety_interlock_enabled(3));
-                }
-                "ToggleSupplyInterlock" => {
-                    control.actuated = Some(self.hitl_safety_interlock_enabled(2));
-                }
-                "TogglePhysicalLaunchMode" => {
-                    control.actuated = Some(self.hitl_physical_launch_uses_ground_station())
-                }
-                "ResetLaunchLatch" => control.actuated = Some(self.launch_indicator_latched()),
-                "Launch" | "GroundStationLaunch"
-                    if self.launch_indicator_latched() => {
-                        control.actuated = Some(true);
+            if crate::runtime_mode::is_hitl() {
+                match control.cmd.as_str() {
+                    "ToggleButtonInterlock" => {
+                        control.actuated = Some(self.hitl_button_interlock_enabled())
                     }
-                _ => {}
+                    "ToggleLaunchInterlock" => {
+                        control.actuated = Some(self.hitl_launch_interlock_enabled())
+                    }
+                    "TogglePlumbingDelayInterlock" => {
+                        control.actuated = Some(self.hitl_safety_interlock_enabled(0));
+                    }
+                    "ToggleChecklistInterlock" => {
+                        control.actuated = Some(self.hitl_safety_interlock_enabled(1));
+                    }
+                    "ToggleBoardStateProofInterlock" => {
+                        control.actuated = Some(self.hitl_safety_interlock_enabled(3));
+                    }
+                    "ToggleSupplyInterlock" => {
+                        control.actuated = Some(self.hitl_safety_interlock_enabled(2));
+                    }
+                    "TogglePhysicalLaunchMode" => {
+                        control.actuated = Some(self.hitl_physical_launch_uses_ground_station())
+                    }
+                    "ResetLaunchLatch" => control.actuated = Some(self.launch_indicator_latched()),
+                    "Launch" | "GroundStationLaunch"
+                        if self.launch_indicator_latched() => {
+                            control.actuated = Some(true);
+                        }
+                    _ => {}
+                }
             }
         }
         crate::gse::decorate_policy(self, &mut policy);
@@ -2369,8 +2340,7 @@ impl AppState {
         if let Some(allowed) = crate::gse::command_allowed(self, cmd) {
             return allowed;
         }
-        #[cfg(feature = "hitl_mode")]
-        {
+        if crate::runtime_mode::is_hitl() {
             let exempt = matches!(
                 cmd,
                 TelemetryCommand::Abort
@@ -2402,9 +2372,7 @@ impl AppState {
                 return false;
             }
             true
-        }
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        } else {
             if crate::flight_sim::sim_mode_enabled() {
                 return true;
             }
@@ -3200,9 +3168,11 @@ pub(crate) mod tests {
         assert_eq!(state.get_pending_umbilical_valve_state(42), None);
     }
 
-    #[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
     #[tokio::test]
     async fn pending_valve_expiry_uses_model_time() {
+        if !cfg!(feature = "firmware_sim") {
+            crate::mode_suite!(Hitl);
+        }
         const CHILD: &str = "GS_VALVE_EXPIRY_CLOCK_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let path =
@@ -3763,7 +3733,7 @@ pub(crate) mod tests {
         assert_eq!(flight.last_seen_ms, Some(1_234));
         drop(tracked);
         let status = state.board_status_snapshot(1_234);
-        if cfg!(feature = "test_fire_mode") {
+        if crate::runtime_mode::is_test_fire() {
             assert!(
                 !status
                     .boards
@@ -3947,8 +3917,8 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(feature = "hitl_mode"))]
     async fn gse_actions_cannot_bypass_software_or_key_interlocks() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = test_app_state().await;
         crate::gse::set_operational_prerequisites_for_test(&state);
         *state.state.lock().unwrap() = FlightState::Idle;
@@ -4000,8 +3970,8 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "hitl_mode")]
     async fn hitl_published_gse_buttons_follow_manual_valve_availability() {
+        crate::mode_suite!(Hitl);
         let state = test_app_state().await;
         for flight_state in [
             FlightState::Startup,
@@ -4077,16 +4047,16 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn gse_active_sequence_blocks_ignition_and_retract_even_with_enabled_policy() {
         let state = active_gse_with_enabled_manual_policy(true).await;
-        for cmd in [
-            TelemetryCommand::Launch,
-            #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-            TelemetryCommand::GroundStationLaunch,
-            TelemetryCommand::Igniter,
-            #[cfg(feature = "hitl_mode")]
-            TelemetryCommand::IgniterSequence,
-            TelemetryCommand::Postinit,
-            TelemetryCommand::RetractPlumbing,
-        ] {
+        let mut cmds = vec![TelemetryCommand::Launch];
+        if crate::runtime_mode::is_hitl_or_test_fire() {
+            cmds.push(TelemetryCommand::GroundStationLaunch);
+        }
+        cmds.push(TelemetryCommand::Igniter);
+        if crate::runtime_mode::is_hitl() {
+            cmds.push(TelemetryCommand::IgniterSequence);
+        }
+        cmds.extend([TelemetryCommand::Postinit, TelemetryCommand::RetractPlumbing]);
+        for cmd in cmds {
             assert!(
                 !state.is_command_allowed(&cmd),
                 "active GSE must block {cmd:?}"
@@ -4143,8 +4113,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn gse_active_sequence_preserves_supply_feedback_interlocks_and_explicit_closes() {
         let state = active_gse_with_enabled_manual_policy(false).await;
-        #[cfg(feature = "hitl_mode")]
-        state.toggle_hitl_safety_interlock(2); // Explicitly qualify enabled supply-feedback enforcement.
+        if crate::runtime_mode::is_hitl() {
+            state.toggle_hitl_safety_interlock(2); // Explicitly qualify enabled supply-feedback enforcement.
+        }
         for cmd in [TelemetryCommand::Nitrogen, TelemetryCommand::Nitrous] {
             assert!(
                 !state.is_command_allowed(&cmd),
@@ -4205,7 +4176,7 @@ pub(crate) mod tests {
         assert!(snapshot.health.iter().any(|r| r.sender_id == "VB"));
         assert_eq!(
             snapshot.health.iter().any(|r| r.sender_id == "FC"),
-            !cfg!(feature = "test_fire_mode")
+            !crate::runtime_mode::is_test_fire()
         );
         state.clear_runtime_data_for_sim_reset();
         assert!(state.network_topology_snapshot(12).health.is_empty());
@@ -4431,13 +4402,9 @@ pub(crate) mod tests {
             launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
             launch_indicator_latched: Arc::new(AtomicBool::new(false)),
             abort_indicator_latched: Arc::new(AtomicBool::new(false)),
-            #[cfg(feature = "hitl_mode")]
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
-            #[cfg(feature = "hitl_mode")]
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
-            #[cfg(feature = "hitl_mode")]
             hitl_safety_interlocks: default_hitl_safety_interlocks(),
-            #[cfg(feature = "hitl_mode")]
             hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
             recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
                 mode: RecordingModeWire::Idle,
@@ -4467,9 +4434,9 @@ pub(crate) mod tests {
             .map(|control| (control.enabled, control.actuated))
     }
 
-    #[cfg(all(feature = "testing", not(feature = "hitl_mode")))]
     #[tokio::test]
     async fn simulator_mode_allows_manual_controls_but_keeps_launch_qualification() {
+        crate::mode_suite!(Testing);
         let state = test_app_state().await;
         let mut policy = crate::sequences::default_action_policy();
         for control in &mut policy.controls {

@@ -12,7 +12,7 @@ use paired_settings::{Document, coordinator::Coordinator, radio::RadioSync};
 use ring::signature::KeyPair;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-#[cfg(all(test, not(feature = "hitl_mode")))]
+#[cfg(test)]
 use std::time::Instant;
 use std::{
     collections::BTreeMap,
@@ -222,8 +222,9 @@ fn step(
     };
     let mut reception_error = None;
     for wire in frames {
-        #[cfg(not(feature = "hitl_mode"))]
-        if paired_settings::journal_replication::JournalRadio::recognizes(&wire) {
+        if !crate::runtime_mode::is_hitl()
+            && paired_settings::journal_replication::JournalRadio::recognizes(&wire)
+        {
             if !crate::checklists::paired::receive_wire(wire) {
                 reception_error = Some(anyhow::anyhow!("Shared checklist inbox is busy"));
             }
@@ -410,9 +411,25 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
     if RUNTIME.set(runtime.clone()).is_err() {
         return None;
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    let _checklists =
-        crate::checklists::paired::start(state.clone(), pairing.clone(), mesh.clone());
+    // Shared checklists never run in HITL. A HITL start brings them up the
+    // first time the station leaves HITL (they pause again in HITL).
+    let _checklists = if !crate::runtime_mode::is_hitl() {
+        crate::checklists::paired::start(state.clone(), pairing.clone(), mesh.clone())
+    } else {
+        let mut modes = crate::runtime_mode::subscribe();
+        let mut shutdown = state.shutdown_subscribe();
+        let (state, pairing, mesh) = (state.clone(), pairing.clone(), mesh.clone());
+        tokio::spawn(async move {
+            while crate::runtime_mode::is_hitl() {
+                tokio::select! {
+                    _ = shutdown.recv() => return,
+                    changed = modes.changed() => if changed.is_err() { return },
+                }
+            }
+            crate::checklists::paired::preflight();
+            let _ = crate::checklists::paired::start(state, pairing, mesh).await;
+        })
+    };
     let mut shutdown = state.shutdown_subscribe();
     Some(tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
@@ -834,10 +851,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     /// Explicitly isolated process: fake config paths supplied by qualification runner.
-    #[cfg(not(feature = "hitl_mode"))]
     #[tokio::test]
     #[ignore = "requires isolated fake settings directory; never use operator configuration"]
     async fn inert_worker_persists_saved_settings_without_outputs_or_qualification_changes() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let dir = PathBuf::from(
             std::env::var("GS_MISSION_ADAPTER_TEST_DIR")
                 .expect("isolated fake settings directory required"),
@@ -963,9 +980,9 @@ mod tests {
         assert!(gse.calibration_import_allowed());
         assert_eq!(serde_json::to_value(&gse.engine.status).unwrap(), before);
     }
-    #[cfg(feature = "hitl_mode")]
     #[tokio::test]
     async fn hitl_start_remains_disabled_before_any_pairing_or_settings_worker() {
+        crate::mode_suite!(Hitl);
         let state = crate::state::tests::test_app_state().await;
         assert!(start(state).is_none());
     }

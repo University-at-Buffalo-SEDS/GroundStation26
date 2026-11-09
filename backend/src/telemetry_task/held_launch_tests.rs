@@ -42,8 +42,7 @@ struct Rig {
 /// The same armed fixtures the existing Launch suites use in each build.
 async fn rig(before_launch: bool) -> Rig {
     let state = crate::state::tests::test_app_state().await;
-    #[cfg(all(feature = "test_fire_mode", not(feature = "hitl_mode")))]
-    let (router, peers) = {
+    let (router, peers) = if crate::runtime_mode::is_test_fire() {
         let router = Arc::new(Router::new(
             sedsnet::router::RouterConfig::new([crate::ignition_pair::fixture::handler(&state, |_| Ok(()))])
                 .with_sender("GS"),
@@ -51,9 +50,7 @@ async fn rig(before_launch: bool) -> Rig {
         let _qualification = crate::gse::armed_fixture_with_real_pair_for_test(&state, &router);
         let peers = crate::ignition_pair::fixture::Peers::warm_pair_only(&state, router.clone()).await;
         (router, peers)
-    };
-    #[cfg(not(all(feature = "test_fire_mode", not(feature = "hitl_mode"))))]
-    let (router, peers) = {
+    } else {
         let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([
             crate::ignition_pair::fixture::handler(&state, |_| Ok(())),
         ])));
@@ -74,8 +71,8 @@ async fn rig(before_launch: bool) -> Rig {
         .unwrap();
         router.rx_packed_from_side(&serialize::pack_packet(&discovery), valve_side).unwrap();
         router.process_all_queues_with_timeout(0).unwrap();
-        #[cfg(not(feature = "hitl_mode"))]
-        let _qualification = crate::gse::armed_fixture_for_test(&state, &router);
+        let _qualification = (!crate::runtime_mode::is_hitl())
+            .then(|| crate::gse::armed_fixture_for_test(&state, &router));
         if state.topology_router.get().is_none() {
             state.topology_router.set(router.clone()).unwrap();
         }
@@ -113,10 +110,11 @@ fn press(rig: &Rig) -> bool {
 /// The worker's immediate (setting off) Launch path in this build.
 async fn immediate(rig: &Rig) {
     let revision = crate::board_abort::capture_launch_revision_named(&rig.state, "Launch");
-    #[cfg(all(feature = "test_fire_mode", not(feature = "hitl_mode")))]
-    handle_local_ground_station_launch_command(rig.state.clone(), rig.router.clone(), revision).await;
-    #[cfg(not(all(feature = "test_fire_mode", not(feature = "hitl_mode"))))]
-    handle_flight_computer_launch_command(rig.state.clone(), rig.router.clone(), revision).await;
+    if crate::runtime_mode::is_test_fire() {
+        handle_local_ground_station_launch_command(rig.state.clone(), rig.router.clone(), revision).await;
+    } else {
+        handle_flight_computer_launch_command(rig.state.clone(), rig.router.clone(), revision).await;
+    }
 }
 
 /// DAQ KG1000 receipts at `hz`, as the ingress path records them.
@@ -174,8 +172,9 @@ async fn setting_off_leaves_launch_and_at_launch_zero_unchanged() {
     immediate(&rig).await;
     assert!(sent(&rig.state), "{:?}", rig.state.notifications_snapshot());
     // Today's concurrent at-launch zero still starts when the fill setting enables it.
-    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-    assert!(rig.state.auto_zero.lock().unwrap().pending());
+    if crate::runtime_mode::is_hitl_or_test_fire() {
+        assert!(rig.state.auto_zero.lock().unwrap().pending());
+    }
     rig.state.request_shutdown();
 }
 
@@ -210,8 +209,9 @@ async fn held_launch_applies_tare_before_t_clock_and_launch_file() {
     assert_eq!(clock, LaunchClockKind::Idle, "T-10 starts only after the tare");
     assert!(notified(&rig.state, "KG1000 zero saved and sent to the DAQ"));
     assert!(sent(&rig.state), "{:?}", rig.state.notifications_snapshot());
-    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-    assert_ne!(*rig.state.daq_log_session.lock().unwrap(), 0);
+    if crate::runtime_mode::is_hitl_or_test_fire() {
+        assert_ne!(*rig.state.daq_log_session.lock().unwrap(), 0);
+    }
     // The held path replaces, never repeats, the at-launch capture.
     assert!(!rig.state.auto_zero.lock().unwrap().pending());
     assert!(tare_kg(&rig.state, 0.25).abs() < 1e-4);
@@ -264,10 +264,11 @@ async fn stalled_stream_times_out_within_ten_seconds_and_launches_with_warning()
     assert_eq!(SENDS.load(Ordering::SeqCst), 1, "the timed-out zero still sends Launch");
     // Operational builds seed their armed readiness once; ten seconds later
     // that modeled evidence is stale and the send-time interlock refuses it.
-    #[cfg(feature = "hitl_mode")]
-    assert!(sent(&rig.state));
-    #[cfg(not(feature = "hitl_mode"))]
-    assert!(sent(&rig.state) || notified(&rig.state, "Held Launch not sent: Command Launch blocked by sequence/key interlock"));
+    if crate::runtime_mode::is_hitl() {
+        assert!(sent(&rig.state));
+    } else {
+        assert!(sent(&rig.state) || notified(&rig.state, "Held Launch not sent: Command Launch blocked by sequence/key interlock"));
+    }
     rig.state.request_shutdown();
 }
 
@@ -324,10 +325,11 @@ async fn pressed_ticket_refuses_admission_after_a_completed_stop_even_with_a_fre
     state.manual_abort_intent.try_claim().unwrap().accepted();
     let revision = crate::board_abort::capture_launch_revision_named(state, "Launch");
     assert!(crate::board_abort::validate_launch_revision(state, revision).is_ok());
-    #[cfg(feature = "hitl_mode")]
-    let refused = crate::gse::inhibit_automatic_actions_for_pressed_launch(state, revision, Some(pressed));
-    #[cfg(not(feature = "hitl_mode"))]
-    let refused = crate::gse::commit_fire_intent_for_pressed_launch(state, revision, Some(pressed));
+    let refused = if crate::runtime_mode::is_hitl() {
+        crate::gse::inhibit_automatic_actions_for_pressed_launch(state, revision, Some(pressed))
+    } else {
+        crate::gse::commit_fire_intent_for_pressed_launch(state, revision, Some(pressed))
+    };
     assert!(refused.unwrap_err().contains("Manual Abort invalidated launch admission"));
     assert!(!state.launch_history.lock().unwrap().automatic_actions_inhibited());
     state.request_shutdown();

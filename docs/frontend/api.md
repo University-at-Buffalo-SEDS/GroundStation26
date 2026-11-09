@@ -682,6 +682,7 @@ The backend sends tagged JSON objects:
 { "ty": "Messages", "data": [ ... ] }
 { "ty": "ActionPolicy", "data": { ... } }
 { "ty": "NetworkTime", "data": { ... } }
+{ "ty": "StationModeChanged", "data": { ... } }
 ```
 
 Notes:
@@ -726,6 +727,18 @@ Notes:
   Replaces current command enable/disable policy.
 - `NetworkTime`
   Updates backend clock reference.
+- `StationModeChanged`
+  `{"mode", "label", "policy_epoch", "layout_revision"}`: the backend switched station mode in
+  process. A fresh `ActionPolicy` follows. Refetch `/api/layout` (it follows the mode in force) and
+  the station mode status; keep the session and connection.
+
+### Station mode API
+
+`GET /api/station-modes`, `POST /api/station-modes/prepare` and `POST /api/station-modes/confirm`
+(wire V2). Every option has `transition_kind: "restart"` (server-fenced) and `in_process: true` when
+the switch keeps the Simulation flag and happens inside the running backend; Simulation changes
+restart the backend. The status carries `policy_epoch` (`<boot>:epoch-<n>`, grows on every switch)
+and `layout_revision`. See `docs/backend/station-modes.md`.
 
 ## Frontend Data Model Assumptions
 

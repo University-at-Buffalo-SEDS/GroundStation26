@@ -52,6 +52,7 @@ impl Drop for PendingEpochWatch {
 // This checks protocol ownership, not MCU application or physical outputs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_next_epoch_actual_sdk_requires_terminal_and_final_query() {
+    crate::mode_suite!(TestFire);
     if crate::operator_queue::isolated_native_case(
         module_path!(),
         "pending_next_epoch_actual_sdk_requires_terminal_and_final_query",

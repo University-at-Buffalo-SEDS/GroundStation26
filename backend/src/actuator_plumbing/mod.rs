@@ -155,7 +155,7 @@ struct MotionObservation {
     generation: u64,
     mode_revision: u64,
 }
-#[cfg(feature = "testing")]
+/// Testing mode only; always `None` in other modes.
 #[derive(Clone, Copy)]
 struct ModeledRetraction {
     source: u64,
@@ -167,7 +167,6 @@ struct ModeledRetraction {
 }
 struct Inner {
     desired: Desired,
-    #[cfg(feature = "testing")]
     modeled_retraction: Option<ModeledRetraction>,
     durable: bool,
     storage_error: Option<String>,
@@ -218,7 +217,6 @@ impl Default for Runtime {
             settings_gate: Mutex::new(()),
             inner: Mutex::new(Inner {
                 desired,
-                #[cfg(feature = "testing")]
                 modeled_retraction: None,
                 durable,
                 storage_error,
@@ -333,7 +331,6 @@ fn motion_stamp(
     };
     Ok(stamp)
 }
-#[cfg(feature = "testing")]
 pub(crate) fn validated_motion_stamp(
     state: &AppState,
     router: &sedsnet::router::Router,
@@ -808,7 +805,6 @@ pub(crate) struct RetractionGate {
 }
 /// RAM-only final admission check. Fresh query ages use local monotonic time;
 /// network UTC remains identity only, and disk/SDK work never enters this gate.
-#[cfg(feature = "testing")]
 pub(crate) fn record_modeled_retraction(
     state: &AppState,
     source: u64,
@@ -835,7 +831,12 @@ pub(crate) fn record_modeled_retraction(
     });
     true
 }
-#[cfg(feature = "testing")]
+/// Drops a Testing-mode modeled retraction without touching the launch
+/// context; a station mode switch calls this so a new Testing session starts
+/// without one, as a fresh process did.
+pub(crate) fn clear_modeled_retraction_for_mode_switch(state: &AppState) {
+    state.plumbing_drive.inner.lock().unwrap().modeled_retraction = None;
+}
 pub(crate) fn invalidate_modeled_retraction(state: &AppState) {
     state.board_abort.change_launch_context_if(|| {
         state
@@ -848,7 +849,6 @@ pub(crate) fn invalidate_modeled_retraction(state: &AppState) {
             .is_some()
     });
 }
-#[cfg(feature = "testing")]
 fn modeled_remaining(started: Instant, now: Instant) -> u32 {
     45_000u32.saturating_sub(
         now.saturating_duration_since(started)
@@ -879,17 +879,18 @@ pub(crate) fn retraction_gate(state: &AppState) -> RetractionGate {
             }),
         )
     };
-    #[cfg(feature = "testing")]
-    let modeled = state
-        .plumbing_drive
-        .inner
-        .lock()
-        .unwrap()
-        .modeled_retraction;
-    #[cfg(feature = "testing")]
-    let modeled_configured = crate::flight_sim::sim_mode_enabled() && modeled.is_some();
-    #[cfg(not(feature = "testing"))]
-    let modeled_configured = false;
+    let testing = crate::runtime_mode::is_testing();
+    let modeled = if testing {
+        state
+            .plumbing_drive
+            .inner
+            .lock()
+            .unwrap()
+            .modeled_retraction
+    } else {
+        None
+    };
+    let modeled_configured = testing && crate::flight_sim::sim_mode_enabled() && modeled.is_some();
     let configured = modeled_configured
         || durable
         || config_error.is_some()
@@ -899,10 +900,12 @@ pub(crate) fn retraction_gate(state: &AppState) -> RetractionGate {
         || pending
         || settings_busy
         || pending_setting;
-    #[cfg(feature = "hitl_mode")]
-    let enforced = configured && state.hitl_safety_interlock_enabled(0);
-    #[cfg(not(feature = "hitl_mode"))]
-    let enforced = configured;
+    let hitl = crate::runtime_mode::is_hitl();
+    let enforced = if hitl {
+        configured && state.hitl_safety_interlock_enabled(0)
+    } else {
+        configured
+    };
     let make = |allowed, phase: &str, remaining_ms, message: &str| RetractionGate {
         configured,
         enforced,
@@ -946,8 +949,7 @@ pub(crate) fn retraction_gate(state: &AppState) -> RetractionGate {
             "A manual Stop is pending. Resolve it before making a new Launch request.",
         );
     }
-    #[cfg(feature = "hitl_mode")]
-    if !enforced {
+    if hitl && !enforced {
         // This is the effective server policy, not a claim that old intent or
         // another boot proves retraction. The explicit HITL override removes
         // the retraction requirement; other Launch admission gates still apply.
@@ -961,8 +963,7 @@ pub(crate) fn retraction_gate(state: &AppState) -> RetractionGate {
     if sealed && record.is_none() {
         return make(false,"needs_check",None,"Retraction history is CLOSED. A fresh durable retraction intent and actual checks are required; optional delay settings do not bypass uncertainty.");
     }
-    #[cfg(feature = "testing")]
-    if crate::flight_sim::sim_mode_enabled() {
+    if testing && crate::flight_sim::sim_mode_enabled() {
         let Some(model) = modeled else {
             return make(
                 false,
@@ -1640,7 +1641,6 @@ fn apply_settings(
 
 /// Legacy firmware retains its existing behavior until an explicit selection.
 /// A selected auxiliary/bridge drive needs fresh matching actual readback.
-#[cfg(any(test, not(feature = "hitl_mode")))]
 pub(crate) fn motion_ready(state: &AppState) -> Result<(), String> {
     let inner = state.plumbing_drive.inner.lock().unwrap();
     motion_ready_inner(state, &inner)
@@ -1679,7 +1679,6 @@ fn motion_ready_inner(state: &AppState, inner: &Inner) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(test, not(feature = "hitl_mode")))]
 pub(crate) fn completion_timeout_ms(state: &AppState) -> u64 {
     let inner = state.plumbing_drive.inner.lock().unwrap();
     if inner.observed.is_some() {

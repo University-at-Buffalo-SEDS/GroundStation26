@@ -22,12 +22,12 @@ pub(crate) struct Captured {
 }
 #[derive(Clone, Copy)]
 pub(crate) enum Cause {
-    #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
+    /// Normal and testing only.
     Readiness,
     LegacySequence {
         next_policy: crate::sequences::SequencePolicyState,
     },
-    #[cfg(not(feature = "hitl_mode"))]
+    /// Never in HITL.
     QualifiedArmed { qualification_generation: u64 },
 }
 #[derive(Clone, Copy)]
@@ -51,20 +51,15 @@ impl Observation {
         // ALL fields in this existing ticket are atomic reads. In particular,
         // do not take Dispatch/GSE/state/Store/provider locks before this point.
         let ticket = LaunchAdmission::capture(state);
-        #[cfg(all(
-            test,
-            not(any(
-                feature = "hitl_mode",
-                feature = "test_fire_mode",
-                feature = "firmware_sim"
-            ))
-        ))]
-        crate::normal_publication_probe::before_claim(state, ticket);
+        #[cfg(all(test, not(feature = "firmware_sim")))]
+        if !crate::runtime_mode::is_hitl_or_test_fire() {
+            crate::normal_publication_probe::before_claim(state, ticket);
+        }
         let generation = ticket.original_ownership().0;
         let claim = crate::gse::claim_operator_dispatch(state, generation)?;
         let board_current = ticket.automatic_board_context_current(state);
         let policy = state.sequence_policy_state.try_lock().ok().map(|p| *p);
-        let captured = if board_current && !cfg!(feature = "hitl_mode")
+        let captured = if board_current && !crate::runtime_mode::is_hitl()
             && !crate::rrls::is_rrls()
             && !matches!(generation, 0 | u64::MAX)
             && ticket.original_ownership().1 != u64::MAX
@@ -131,13 +126,13 @@ impl Captured {
         if self.expected == target || !(1..=6).contains(&(target as u8)) {
             return None;
         }
-        if cfg!(feature = "test_fire_mode")
+        if crate::runtime_mode::is_test_fire()
             && matches!(self.expected, FlightState::Startup | FlightState::Idle)
         {
             return None;
         }
-        #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
-        if matches!(cause, Cause::Readiness)
+        if !crate::runtime_mode::is_hitl_or_test_fire()
+            && matches!(cause, Cause::Readiness)
             && (self.expected != FlightState::Startup || target != FlightState::Idle)
         {
             return None;
@@ -152,17 +147,22 @@ impl Captured {
 /// Called ONLY outside all application/Stop/SDK owners. The caller retains its
 /// original real-work lease; this new same-origin lease owns the DB handoff.
 pub(crate) fn publish(state: &Arc<AppState>, proposal: Proposal) -> bool {
-    #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
-    crate::normal_publication_probe::n6_record(state, 3);
-    #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
-    let publication_trace = crate::normal_publication_probe::PublicationClaim::enter(state, proposal.original.ticket);
+    #[cfg(all(test, not(feature = "firmware_sim")))]
+    if !crate::runtime_mode::is_hitl_or_test_fire() {
+        crate::normal_publication_probe::n6_record(state, 3);
+    }
+    #[cfg(all(test, not(feature = "firmware_sim")))]
+    let publication_trace = (!crate::runtime_mode::is_hitl_or_test_fire())
+        .then(|| crate::normal_publication_probe::PublicationClaim::enter(state, proposal.original.ticket));
     let Some(claim) = crate::gse::claim_operator_dispatch(state, proposal.original.generation)
     else {
-        #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
-        crate::normal_publication_probe::n6_record(state, 4);
+        #[cfg(all(test, not(feature = "firmware_sim")))]
+        if !crate::runtime_mode::is_hitl_or_test_fire() {
+            crate::normal_publication_probe::n6_record(state, 4);
+        }
         return false;
     };
-    #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
+    #[cfg(all(test, not(feature = "firmware_sim")))]
     drop(publication_trace);
     if state.manual_abort_intent.epoch() != proposal.original.ticket.original_ownership().1
         || state.deferred_abort.manual_epoch() != proposal.original.ticket.original_ownership().2
@@ -170,21 +170,27 @@ pub(crate) fn publish(state: &Arc<AppState>, proposal: Proposal) -> bool {
         || state.deferred_abort.manual_pending()
         || state.shutdown_requested.load(Ordering::Acquire)
     {
-        #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
-        crate::normal_publication_probe::n6_record(state, 5);
+        #[cfg(all(test, not(feature = "firmware_sim")))]
+        if !crate::runtime_mode::is_hitl_or_test_fire() {
+            crate::normal_publication_probe::n6_record(state, 5);
+        }
         return false;
     }
     let Some(router) = state.topology_router.get() else {
-        #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
-        crate::normal_publication_probe::n6_record(state, 6);
+        #[cfg(all(test, not(feature = "firmware_sim")))]
+        if !crate::runtime_mode::is_hitl_or_test_fire() {
+            crate::normal_publication_probe::n6_record(state, 6);
+        }
         return false;
     };
     let packet =
         match crate::network_variables::automatic_phase_packet(router, proposal.target as u8) {
             Ok(packet) => packet,
             Err(error) => {
-                #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
-                crate::normal_publication_probe::n6_record(state, 7);
+                #[cfg(all(test, not(feature = "firmware_sim")))]
+                if !crate::runtime_mode::is_hitl_or_test_fire() {
+                    crate::normal_publication_probe::n6_record(state, 7);
+                }
                 log::debug!("Automatic phase preparation refused: {error}");
                 return false;
             }
@@ -205,8 +211,10 @@ pub(crate) fn publish(state: &Arc<AppState>, proposal: Proposal) -> bool {
     ) {
         Ok(prepared) => prepared,
         Err(failure) => {
-            #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
-            crate::normal_publication_probe::n6_record(state, 8);
+            #[cfg(all(test, not(feature = "firmware_sim")))]
+            if !crate::runtime_mode::is_hitl_or_test_fire() {
+                crate::normal_publication_probe::n6_record(state, 8);
+            }
             request.prepared_result(request_id, false);
             log::debug!(
                 "Automatic phase SDK preparation refused: {:?}",
@@ -220,8 +228,10 @@ pub(crate) fn publish(state: &Arc<AppState>, proposal: Proposal) -> bool {
     let result =
         crate::gse::try_commit_automatic_phase(state, proposal, identity, &model, &mut prepared);
     request.prepared_result(request_id, result.is_ok());
-    #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
-    crate::normal_publication_probe::n6_record(state, match &result { Ok(()) => 9, Err(Error::Busy) => 10, Err(Error::Retired) => 11, Err(Error::StateChanged) => 12, Err(Error::StoreChanged) => 13, Err(Error::PolicyChanged) => 14, Err(Error::Ineligible | Error::Sdk(_)) => 15 });
+    #[cfg(all(test, not(feature = "firmware_sim")))]
+    if !crate::runtime_mode::is_hitl_or_test_fire() {
+        crate::normal_publication_probe::n6_record(state, match &result { Ok(()) => 9, Err(Error::Busy) => 10, Err(Error::Retired) => 11, Err(Error::StateChanged) => 12, Err(Error::StoreChanged) => 13, Err(Error::PolicyChanged) => 14, Err(Error::Ineligible | Error::Sdk(_)) => 15 });
+    }
     match result {
         Ok(()) => {
             state.observe_automatic_phase_admission(

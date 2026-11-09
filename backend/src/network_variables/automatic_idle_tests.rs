@@ -126,9 +126,9 @@ fn primary_echo_is_observational_but_rrls_and_manual_persistence_remain() {
     );
 }
 
-#[cfg(feature = "test_fire_mode")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_request_shutdown_retires_unadmitted_automatic_original() {
+    crate::mode_suite!(TestFire);
     if crate::operator_queue::isolated_case(
         module_path!(),
         "actual_request_shutdown_retires_unadmitted_automatic_original",

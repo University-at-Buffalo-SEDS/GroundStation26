@@ -320,16 +320,9 @@ fn launched(state: &AppState) -> bool {
 
 /// Test-fire Fire commitment is T0 for the overpressure policy.
 fn fire_committed(rt: &Runtime) -> bool {
-    #[cfg(not(feature = "hitl_mode"))]
-    {
-        rt.operational.saved.qualification.stage()
+    !crate::runtime_mode::is_hitl()
+        && rt.operational.saved.qualification.stage()
             == gse_sequence::qualification::MissionStage::Fire
-    }
-    #[cfg(feature = "hitl_mode")]
-    {
-        let _ = rt;
-        false
-    }
 }
 
 const RELIEF: [(usize, bool); 4] = [(4, false), (3, false), (2, true), (1, true)];
@@ -349,8 +342,7 @@ fn retire_automation(rt: &mut Runtime, now: u64, message: &str) {
     }
     cold_flow::retire_for_overpressure(rt);
     rt.fill_cutoff.reset();
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if !crate::runtime_mode::is_hitl() {
         rt.operational.running = false;
         rt.operational.target_reached = None;
         rt.operational.qd = QdWait::default();

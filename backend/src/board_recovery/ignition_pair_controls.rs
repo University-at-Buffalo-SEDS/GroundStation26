@@ -26,8 +26,9 @@ async fn ignition_valid_fixture() -> Fixture {
         })
         .collect();
     let fixture = Fixture::from_saved_with_services_profile(None, Some(owners), None, true, false, true).await;
-    #[cfg(feature = "hitl_mode")]
-    fixture.state().toggle_hitl_safety_interlock(3); // These regressions qualify explicitly enabled pair proof.
+    if crate::runtime_mode::is_hitl() {
+        fixture.state().toggle_hitl_safety_interlock(3); // These regressions qualify explicitly enabled pair proof.
+    }
     fixture
 }
 async fn ignition_query_pair(fixture: &Fixture) {
@@ -143,9 +144,9 @@ async fn ignition_pair_route_loss_after_real_proof_refuses_first_owner() {
     );
     // Do not yield the fixture wire after intentionally removing its side.
 }
-#[cfg(feature = "hitl_mode")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ignition_pair_hitl_opt_in_requires_proof_and_off_preserves_viewer_authorization() {
+    crate::mode_suite!(Hitl);
     if crate::operator_queue::isolated_native_case(module_path!(), "ignition_pair_hitl_opt_in_requires_proof_and_off_preserves_viewer_authorization") { return; }
     let fixture = ignition_valid_fixture().await;
     let state = fixture.state();
@@ -290,7 +291,7 @@ async fn ignition_pair_accepted_launch_is_not_automatically_stopped_on_later_rou
     // A newer observation may conservatively retire a pre-offer token while
     // admission waits for existing guards. Retry only that zero-offer result,
     // retaining the original ticket, packet IDs and source UTC throughout.
-    let prepared = if cfg!(feature = "hitl_mode") {
+    let prepared = if crate::runtime_mode::is_hitl() {
         None
     } else {
         Some(crate::network_variables::prepare_launch_state(host).unwrap())
@@ -330,7 +331,7 @@ async fn ignition_pair_accepted_launch_is_not_automatically_stopped_on_later_rou
     })
     .await
     .expect("actual SDK callbacks retain both original IDs and UTC");
-    let accepted_state = if cfg!(feature = "hitl_mode") {
+    let accepted_state = if crate::runtime_mode::is_hitl() {
         crate::types::FlightState::Startup
     } else {
         crate::types::FlightState::Launch
@@ -455,8 +456,9 @@ async fn ignition_pair_actual_core_busy_then_route_loss_has_zero_sdk_owners() {
     )
     .await;
     let state = fixture.state();
-    #[cfg(feature = "hitl_mode")]
-    state.toggle_hitl_safety_interlock(3); // Explicitly qualify enabled fresh-route fencing.
+    if crate::runtime_mode::is_hitl() {
+        state.toggle_hitl_safety_interlock(3); // Explicitly qualify enabled fresh-route fencing.
+    }
 
     owner.store(Arc::as_ptr(&state) as usize, AtomicOrdering::Release);
     ignition_query_pair(&fixture).await;

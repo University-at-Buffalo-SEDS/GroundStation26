@@ -16,10 +16,7 @@ pub(crate) struct Decoder {
     pub(crate) peak_bytes: usize,
 }
 impl Decoder {
-    #[cfg(all(
-        target_os = "linux",
-        any(feature = "firmware_sim", feature = "hitl_mode")
-    ))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn pending_bytes(&self) -> usize {
         self.buffer.len()
     }

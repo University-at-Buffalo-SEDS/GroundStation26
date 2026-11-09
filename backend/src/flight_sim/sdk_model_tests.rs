@@ -39,6 +39,7 @@ fn request(operation: u8, nonce: u64, boot: u64, epoch: u32, source: u64) -> Pac
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_selected_virtual_pair_query_raw14_offset_replay_and_delayed_recovery() {
+    crate::mode_suite!(Testing);
     if crate::operator_queue::isolated_case(
         module_path!(),
         "actual_selected_virtual_pair_query_raw14_offset_replay_and_delayed_recovery",

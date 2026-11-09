@@ -81,7 +81,7 @@ pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool
             .valves
             .iter()
             .all(|v| v.is_some_and(|v| !v.open && v.at_ms <= now && now - v.at_ms <= 2_000))
-        && (cfg!(feature = "test_fire_mode")
+        && (crate::runtime_mode::is_test_fire()
             || (flight_routes(state) && crate::antenna::rocket_launch_fix_locked()))
 }
 fn topology(state: &AppState) -> (bool, String) {
@@ -266,7 +266,7 @@ pub(super) fn publish_qualified_flight_armed(state: &Arc<AppState>) {
 pub(super) fn publish_qualified_flight_armed_with_observation(
     state: &Arc<AppState>, observation: &crate::automatic_flight_state::Observation,
 ) {
-    if cfg!(feature = "test_fire_mode") || !prelaunch(state) { return; }
+    if crate::runtime_mode::is_test_fire() || !prelaunch(state) { return; }
     let qualification_generation = {
         let rt = state.gse.lock().unwrap();
         if rt.operational.saved.qualification.stage() != gse_sequence::qualification::MissionStage::Armed
@@ -433,7 +433,7 @@ pub(super) fn handle_operational_command(
     launch_revision: Option<u64>,
 ) -> bool {
     let name = crate::sequences::command_name(cmd);
-    if name == "RetractPlumbing" && !cfg!(feature = "test_fire_mode") {
+    if name == "RetractPlumbing" && !crate::runtime_mode::is_test_fire() {
         if let Err(message) = crate::actuator_plumbing::motion_ready(state) {
             state.add_notification(message);
             return true;
@@ -479,7 +479,7 @@ pub(super) fn handle_operational_command(
         }
         return true;
     }
-    if matches!(name, "Launch" | "GroundStationLaunch") && !cfg!(feature = "test_fire_mode") {
+    if matches!(name, "Launch" | "GroundStationLaunch") && !crate::runtime_mode::is_test_fire() {
         let mut rt = state.gse.lock().unwrap();
         let now = rt.now();
         if !matches!(rt.operational.qd.status(now), QdStatus::Ready) {
@@ -730,7 +730,6 @@ mod tests {
     }
     // Scenario-only factory: retain every modeled QD/operational prerequisite,
     // but install the real status ingress before the final independent SDK proof.
-    #[cfg(not(feature="test_fire_mode"))]
     async fn fixture_with_status_sender(commands:tokio::sync::mpsc::Sender<TelemetryCommand>)->(Arc<AppState>,usize) {
         let mut state = crate::state::tests::test_app_state().await;
         // Must precede the status handler's Weak binding: Arc::get_mut then
@@ -793,6 +792,7 @@ mod tests {
     }
     #[tokio::test]
     async fn cancelled_leak_test_invalidates_old_pass_without_aborting_vehicle() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         {
             let mut rt = state.gse.lock().unwrap();
@@ -856,6 +856,7 @@ mod tests {
     }
     #[tokio::test]
     async fn trim_data_failure_pauses_closed_without_relief_or_latch() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         {
             let mut rt = state.gse.lock().unwrap();
@@ -912,6 +913,7 @@ mod tests {
     }
     #[tokio::test]
     async fn stale_fill_mass_during_fill_pauses_closed_without_relief() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         {
             let mut rt = state.gse.lock().unwrap();
@@ -929,6 +931,7 @@ mod tests {
     }
     #[tokio::test]
     async fn unclassified_board_error_pauses_an_active_fill_instead_of_dumping() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         {
             let mut rt = state.gse.lock().unwrap();
@@ -942,6 +945,7 @@ mod tests {
     }
     #[tokio::test]
     async fn trim_pressure_limit_uses_existing_emergency_relief_without_waiting_for_ack() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         {
             let mut rt = state.gse.lock().unwrap();
@@ -967,6 +971,7 @@ mod tests {
     }
     #[tokio::test]
     async fn changed_plans_revoke_only_affected_qualification_without_outputs() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         let path = armed_fixture_for_test(&state, state.topology_router.get().unwrap());
         let mut rt = state.gse.lock().unwrap();
@@ -999,6 +1004,7 @@ mod tests {
     }
     #[tokio::test]
     async fn manual_handoff_preserves_reports_and_nitrous_crossflow_guard() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         apply_cold_flow_test_prerequisites(&state);
         {
@@ -1083,6 +1089,7 @@ mod tests {
     }
     #[tokio::test]
     async fn operator_procedure_completes_over_routed_commands_and_persists_each_check() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         use crate::gse::tests::{button_test_state, confirm_test_valves, pump_test_link};
         let (state, sent, peer) = button_test_state().await;
         let path =
@@ -1252,6 +1259,7 @@ mod tests {
     }
     #[tokio::test]
     async fn nitrogen_admission_rejects_real_elapsed_stale_pressure_until_new_sample() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         let original_pressure = {
             let mut rt = state.gse.lock().unwrap();
@@ -1286,6 +1294,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_requires_self_test_before_nitrogen_and_saves_completion() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         assert_eq!(
             command_allowed(&state, &TelemetryCommand::NitrogenTest),
@@ -1313,6 +1322,7 @@ mod tests {
     }
     #[tokio::test]
     async fn incompatible_nitrogen_report_pauses_closed_immediately_but_never_after_launch() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         {
             let mut rt = state.gse.lock().unwrap();
@@ -1362,6 +1372,7 @@ mod tests {
     }
     #[tokio::test]
     async fn resting_valve_mismatch_is_corrected_without_reopening_supplies_or_after_launch() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         {
             let mut rt = state.gse.lock().unwrap();
@@ -1380,6 +1391,7 @@ mod tests {
     }
     #[tokio::test]
     async fn nitrous_opening_during_nitrogen_test_closes_both_supplies_and_pauses() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         {
             let mut rt = state.gse.lock().unwrap();
@@ -1403,6 +1415,7 @@ mod tests {
     }
     #[tokio::test]
     async fn unexpected_supply_at_the_pressure_limit_keeps_crossflow_relief() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         for phase in [Phase::Filling, Phase::Raising, Phase::Paused] {
             let state = fixture().await;
             {
@@ -1431,6 +1444,7 @@ mod tests {
     }
     #[tokio::test]
     async fn stale_cached_qd_status_and_wrong_sender_never_start_settling() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         let key = crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8;
         {
@@ -1455,6 +1469,7 @@ mod tests {
     }
     #[tokio::test]
     async fn durable_armed_publication_is_mode_sensitive_and_once_only() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         if crate::operator_queue::isolated_case(module_path!(), "durable_armed_publication_is_mode_sensitive_and_once_only") { return; }
         let state = fixture().await;
         // The final phase now requires actual SDK admission, not just the old
@@ -1493,7 +1508,7 @@ mod tests {
         );
         state.gse.lock().unwrap().operational.persist_error = None;
         publish_qualified_flight_armed(&state);
-        if cfg!(feature = "test_fire_mode") {
+        if crate::runtime_mode::is_test_fire() {
             assert!(updates.try_recv().is_err());
             assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
         } else {
@@ -1509,6 +1524,7 @@ mod tests {
     #[cfg(feature = "firmware_sim")]
     #[test]
     fn qd_dispatch_uses_the_explicit_model_source_epoch_without_changing_wall_mode() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         const NAME: &str = "gse::operational_policy::tests::qd_dispatch_uses_the_explicit_model_source_epoch_without_changing_wall_mode";
         if let Ok(mode) = std::env::var("GS_QD_CLOCK_CHILD") {
             if mode == "model" {
@@ -1550,9 +1566,9 @@ mod tests {
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
-    #[cfg(not(feature = "test_fire_mode"))]
     #[tokio::test]
     async fn flight_launch_waits_five_seconds_from_qd_ack_and_rechecks_live_gates() {
+        crate::mode_suite!(Normal, Testing);
         const NAME: &str = "gse::operational_policy::tests::flight_launch_waits_five_seconds_from_qd_ack_and_rechecks_live_gates";
         if std::env::var_os("GS_QD_GATES_CHILD").is_none() {
             let clock =
@@ -1594,7 +1610,6 @@ mod tests {
             queued_flight_launch_scenario(revoke).await;
         }
     }
-    #[cfg(not(feature = "test_fire_mode"))]
     async fn queued_flight_launch_scenario(revoke: &str) {
         let (commands, mut received) = tokio::sync::mpsc::channel(8);
         let (state,modeled_fill_side) = fixture_with_status_sender(commands).await;
@@ -1888,6 +1903,7 @@ mod tests {
     }
     #[tokio::test]
     async fn stabilized_below_target_does_not_qualify_launch() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         let mut rt = state.gse.lock().unwrap();
         rt.operational
@@ -1917,6 +1933,7 @@ mod tests {
     }
     #[tokio::test]
     async fn lost_fill_board_latches_fault_and_cancels_pending_launch() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         state.gse.lock().unwrap().operational.running = true;
         state
@@ -2004,6 +2021,7 @@ mod tests {
         }
         #[tokio::test]
         async fn real_persist_hold_expires_old_input_then_new_reports_restore_current_context() {
+            crate::mode_suite!(Normal, TestFire, Testing);
             let state = ready().await;
             let (path, original) = {
                 let rt = state.gse.lock().unwrap();
@@ -2062,6 +2080,7 @@ mod tests {
         }
         #[tokio::test]
         async fn fresh_reports_do_not_repair_changed_prelaunch_or_interlock() {
+            crate::mode_suite!(Normal, TestFire, Testing);
             let state = ready().await;
             apply_cold_flow_override(&state, "alice", "Context negative control").unwrap();
             let mut rt = state.gse.lock().unwrap();
@@ -2109,6 +2128,7 @@ mod tests {
         }
         #[tokio::test]
         async fn fresh_reports_do_not_repair_unsafe_changed_ceiling() {
+            crate::mode_suite!(Normal, TestFire, Testing);
             let state = ready().await;
             apply_cold_flow_override(&state, "alice", "Configuration negative control").unwrap();
             let mut rt = state.gse.lock().unwrap();
@@ -2128,6 +2148,7 @@ mod tests {
     }
     #[tokio::test]
     async fn cold_flow_override_requires_real_self_test_and_live_safe_inputs() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         assert!(apply_cold_flow_override(&state, "alice", "External cold flow reviewed").is_err());
         {
@@ -2179,6 +2200,7 @@ mod tests {
     }
     #[tokio::test]
     async fn durable_fire_intent_is_once_only_and_prevents_restart_abort_or_valve_setup() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         let path = armed_fixture_for_test(&state, state.topology_router.get().unwrap());
         commit_fire_intent(&state).unwrap();
@@ -2229,6 +2251,7 @@ mod tests {
     }
     #[tokio::test]
     async fn paused_fill_and_armed_mission_keep_connectivity_protection_while_fc_state_is_idle() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         for armed in [false, true] {
             let state = fixture().await;
             {
@@ -2289,6 +2312,7 @@ mod tests {
     }
     #[tokio::test]
     async fn accepted_mass_cutoff_can_arm_without_requiring_an_unreachable_exact_float_target() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
         let mut rt = state.gse.lock().unwrap();

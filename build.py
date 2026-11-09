@@ -1010,12 +1010,9 @@ def _backend_args(
         args.append("pi_build")
     if force_no_pi:
         args.append("no_pi")
-    if testing_mode:
-        args.append("testing")
-    if hitl_mode:
-        args.append("hitl-mode")
-    if test_fire_mode:
-        args.append("test-fire-mode")
+    # One backend binary holds every station mode; the mode is chosen at run
+    # time (GS_STATION_MODE or the UI), so mode arguments add no features.
+    del testing_mode, hitl_mode, test_fire_mode
     if debug_mode:
         args.append("debug")
     if log_file_arg:
@@ -1044,9 +1041,7 @@ def print_usage(exit_code: int = 1) -> None:
     print("  ./build.py                         # local: build frontend+backend (parallel)")
     print("  ./build.py pi_build                # local: backend w/ raspberry_pi feature")
     print("  ./build.py no_pi                   # local: backend w/o raspberry_pi feature")
-    print("  ./build.py testing                 # local: backend w/ testing feature")
-    print("  ./build.py hitl-mode               # local: backend w/ hitl_mode feature")
-    print("  ./build.py test-fire-mode          # local: backend w/ test_fire_mode feature")
+    print("  ./build.py testing|hitl-mode|test-fire-mode  # accepted; same binary (modes are chosen at run time)")
     print("  ./build.py debug                   # local: build frontend+backend in debug mode")
     print("  ./build.py max_size                # web wasm: add wasm-opt --converge (slower, smaller)")
     print("  ./build.py --frontend-dev          # build frontend from dev instead of stable main")
@@ -1155,6 +1150,9 @@ def main() -> None:
     if selected_modes > 1:
         print("Error: Cannot specify more than one of 'testing', 'hitl-mode', and 'test-fire-mode'.", file=sys.stderr)
         sys.exit(1)
+    if selected_modes and not docker_mode:
+        print("Note: one backend binary holds every station mode. Start it with GS_STATION_MODE=testing|hitl|test_fire "
+              "or run_groundstation.py --testing/--hitl-mode/--test-fire-mode, or switch from the UI.")
 
     repo_root = Path(__file__).resolve().parent
     _configure_log_file(repo_root, log_file_arg)
@@ -1202,7 +1200,7 @@ def main() -> None:
 
     if docker_mode:
         if hitl_mode or test_fire_mode:
-            print("Error: docker mode currently does not support 'hitl-mode' or 'test-fire-mode'.", file=sys.stderr)
+            print("Error: docker images start in normal or testing mode only ('testing'); switch other modes from the UI.", file=sys.stderr)
             sys.exit(1)
         pi_build_flag = False if force_no_pi else (force_pi or is_raspberry_pi())
         use_plain = plain_mode or (LOG_FILE is not None)

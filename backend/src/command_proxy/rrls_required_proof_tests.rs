@@ -1,10 +1,7 @@
 //! Source-bound signed presentation regressions. These never command hardware.
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "testing")))]
 use super::*;
 use crate::{board_abort, types::Board};
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "testing")))]
 use crate::{primary_mirror, state::AppState};
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "testing")))]
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -36,7 +33,6 @@ fn child(test_name: &str, role: &str) -> bool {
 
 // The signed application observation is deliberately built independently of
 // this RRLS executable's local mode. Every byte passes the production decoder.
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "testing")))]
 fn observation(required: u8, proven: u8, enforced: bool, test_fire: bool) -> Vec<u8> {
     let mut bytes = vec![0; 88];
     bytes[0] = 1;
@@ -60,7 +56,6 @@ fn observation(required: u8, proven: u8, enforced: bool, test_fire: bool) -> Vec
     bytes
 }
 
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "testing")))]
 fn signed_view(state: &Arc<AppState>, bytes: Vec<u8>, mode: Mode, transit_ms: u64) {
     let (_root, p, r, mut primary, mut rr, pv, rv) = super::tests::connected();
     primary.observation = bytes.clone();
@@ -90,7 +85,6 @@ fn signed_view(state: &Arc<AppState>, bytes: Vec<u8>, mode: Mode, transit_ms: u6
     ));
 }
 
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "testing")))]
 fn required_ids(mask: u8) -> Vec<String> {
     board_abort::BOARDS
         .into_iter()
@@ -100,9 +94,9 @@ fn required_ids(mask: u8) -> Vec<String> {
         .collect()
 }
 
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "testing")))]
 #[tokio::test]
 async fn normal_rrls_signed_hitl_off_snapshot_has_no_local_requirements() {
+    crate::mode_suite!(Normal);
     if child(
         "command_proxy::rrls_required_proof_tests::normal_rrls_signed_hitl_off_snapshot_has_no_local_requirements",
         "rrls",
@@ -131,9 +125,9 @@ async fn normal_rrls_signed_hitl_off_snapshot_has_no_local_requirements() {
     );
 }
 
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "testing")))]
 #[tokio::test]
 async fn normal_rrls_signed_test_fire_snapshot_requires_ground_daq_only() {
+    crate::mode_suite!(Normal);
     if child(
         "command_proxy::rrls_required_proof_tests::normal_rrls_signed_test_fire_snapshot_requires_ground_daq_only",
         "rrls",
@@ -178,9 +172,9 @@ async fn normal_rrls_signed_test_fire_snapshot_requires_ground_daq_only() {
     );
 }
 
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "testing")))]
 #[tokio::test]
 async fn normal_rrls_unknown_legacy_stale_revoked_and_known_abort_stay_closed() {
+    crate::mode_suite!(Normal);
     if child(
         "command_proxy::rrls_required_proof_tests::normal_rrls_unknown_legacy_stale_revoked_and_known_abort_stay_closed",
         "rrls",
@@ -256,7 +250,9 @@ async fn normal_rrls_unknown_legacy_stale_revoked_and_known_abort_stay_closed() 
     assert_eq!(state.deferred_abort.manual_epoch(), observed_before);
 }
 
-#[cfg(all(feature = "hitl_mode", feature = "test_fire_mode"))]
+// Never built: no build combined HITL and test fire, and runtime modes are
+// mutually exclusive, so this combination cannot occur.
+#[cfg(any())]
 #[tokio::test]
 async fn hitl_test_fire_enabled_board_proof_requires_daq_without_av_bay() {
     if child(

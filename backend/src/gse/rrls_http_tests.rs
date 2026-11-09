@@ -56,8 +56,7 @@ async fn rrls_http_cannot_clear_abort_or_mutate_operational_qualification() {
     state.topology_router.set(router.clone()).unwrap();
     // Seed a received state without enqueueing a fixture-originated update.
     *state.state.lock().unwrap() = FlightState::Aborted;
-    #[cfg(not(feature = "hitl_mode"))]
-    let saved_before = {
+    let saved_before = (!crate::runtime_mode::is_hitl()).then(|| {
         let mut runtime = state.gse.lock().unwrap();
         runtime.operational.path = Some(root.0.join("qualification.json"));
         runtime
@@ -66,7 +65,7 @@ async fn rrls_http_cannot_clear_abort_or_mutate_operational_qualification() {
             .save(runtime.operational.path.as_ref().unwrap())
             .unwrap();
         std::fs::read(root.0.join("qualification.json")).unwrap()
-    };
+    });
     let mut headers = HeaderMap::new();
     headers.insert(
         axum::http::header::AUTHORIZATION,
@@ -127,11 +126,12 @@ async fn rrls_http_cannot_clear_abort_or_mutate_operational_qualification() {
             .config
             .dry_self_test_confirmed
     );
-    #[cfg(not(feature = "hitl_mode"))]
-    assert_eq!(
-        std::fs::read(root.0.join("qualification.json")).unwrap(),
-        saved_before
-    );
+    if let Some(saved_before) = saved_before {
+        assert_eq!(
+            std::fs::read(root.0.join("qualification.json")).unwrap(),
+            saved_before
+        );
+    }
     assert!(
         !root.0.join("variables.json").exists(),
         "No managed-variable cache mutation"

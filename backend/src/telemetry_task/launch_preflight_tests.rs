@@ -13,6 +13,7 @@ async fn fixture() -> (Arc<AppState>, Arc<Router>) {
 
 #[tokio::test]
 async fn missing_pair_preflight_keeps_both_physical_launch_handlers_unretained() {
+    crate::mode_suite!(Hitl);
     if crate::operator_queue::isolated_native_case(module_path!(), "missing_pair_preflight_keeps_both_physical_launch_handlers_unretained") { return; }
     for local in [false, true] {
         let (state, router) = fixture().await;
@@ -33,6 +34,7 @@ async fn missing_pair_preflight_keeps_both_physical_launch_handlers_unretained()
 
 #[tokio::test]
 async fn actual_pair_preflight_admits_original_launch_once_and_keeps_retained_history() {
+    crate::mode_suite!(Hitl);
     if crate::operator_queue::isolated_native_case(module_path!(), "actual_pair_preflight_admits_original_launch_once_and_keeps_retained_history") { return; }
     let (state, router) = fixture().await;
     let _peers = crate::ignition_pair::fixture::Peers::warm_pair_only(&state, router.clone()).await;
@@ -50,6 +52,7 @@ async fn actual_pair_preflight_admits_original_launch_once_and_keeps_retained_hi
 
 #[tokio::test]
 async fn missing_actual_route_preflight_keeps_journal_unretained_with_fresh_pair() {
+    crate::mode_suite!(Hitl);
     if crate::operator_queue::isolated_native_case(module_path!(), "missing_actual_route_preflight_keeps_journal_unretained_with_fresh_pair") { return; }
     let (state, router) = fixture().await;
     let _peers = crate::ignition_pair::fixture::Peers::warm_pair_only(&state, router.clone()).await;

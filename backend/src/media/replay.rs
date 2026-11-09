@@ -688,9 +688,9 @@ mod tests {
             .unwrap()
             .iter()
             .any(|s| s["label"] == "Fill mass");
-        assert_eq!(fill, cfg!(feature = "test_fire_mode"));
-        assert_eq!(snapshot["test_fire_mode"], cfg!(feature = "test_fire_mode"));
-        if cfg!(feature = "test_fire_mode") {
+        assert_eq!(fill, crate::runtime_mode::is_test_fire());
+        assert_eq!(snapshot["test_fire_mode"], crate::runtime_mode::is_test_fire());
+        if crate::runtime_mode::is_test_fire() {
             let thrust = presentation
                 .stats
                 .iter()

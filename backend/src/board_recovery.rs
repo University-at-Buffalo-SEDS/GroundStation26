@@ -533,7 +533,7 @@ pub(crate) fn observe(state: &AppState, packet: &Packet) -> Result<(), &'static 
 /// Last board-reported output registers for presentation only. No lease or
 /// command capability is granted by connectivity or this retained readback.
 pub(crate) fn sequence_board_display(state:&AppState)->std::collections::BTreeMap<String,crate::sequence_progress_service::BoardDisplay> {
-    let health=state.network_health.lock().unwrap().snapshot(WallInstant::now(),cfg!(feature="test_fire_mode"));
+    let health=state.network_health.lock().unwrap().snapshot(WallInstant::now(),crate::runtime_mode::is_test_fire());
     let now=Stamp::now();
     let inner=state.board_recovery.inner.lock().unwrap();
     [Board::ActuatorBoard,Board::ValveBoard].into_iter().map(|board| {
@@ -860,7 +860,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         .network_health
         .lock()
         .unwrap()
-        .snapshot(now.wall, cfg!(feature = "test_fire_mode"));
+        .snapshot(now.wall, crate::runtime_mode::is_test_fire());
     let router = state.topology_router.get();
     let topology = router.map(|router| router.export_topology());
     let primary =
@@ -985,7 +985,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         "reset_startup_policy":reset_startup_policy,
         "confirmation":confirmation,"host_recovery":host_pending.map(|pending|json!({"pending":!pending.published,"verified":pending.verified,"publication_acknowledged":pending.published,"targets":pending.targets.iter().map(|target|target.board.as_str()).collect::<Vec<_>>()})),
         "rejected_statuses":rejected_statuses,"last_rejection":last_rejection,
-        "mode_capability":{"current":current,"build_mode":build,"supported_modes":[build],"runtime_switch_supported":false,"requires_restart":["normal","hitl","test_fire","testing"],"message":"Only the compiled runtime is supported; changing labels does not switch hardware policy."},"boards":boards,"operation":state.board_recovery.coordinator.operation()})).into_response()
+        "mode_capability":{"current":current,"build_mode":build,"supported_modes":["normal","hitl","test_fire","testing"],"runtime_switch_supported":true,"requires_restart":[],"message":"One backend holds every mode; it switches in process from Station mode settings while the station is idle. Only a Simulation change restarts the backend."},"boards":boards,"operation":state.board_recovery.coordinator.operation()})).into_response()
 }
 /// Background reads share a two-second budget with demand-triggered reads.
 /// No method here prepares, confirms, stops or recovers a board.
@@ -1048,7 +1048,7 @@ impl ReadonlyQueryRefresh {
             .network_health
             .lock()
             .unwrap()
-            .snapshot(now.wall, cfg!(feature = "test_fire_mode"));
+            .snapshot(now.wall, crate::runtime_mode::is_test_fire());
         let candidate = {
             let inner = state.board_recovery.inner.lock().unwrap();
             (0..BOARDS.len())
@@ -1291,10 +1291,10 @@ pub(crate) fn query_reply_current_for_test(state:&AppState,board:Board,nonce:u64
     query.nonce==nonce&&query.received&&row.value.nonce==nonce&&row.value.result==0&&row.fresh(Stamp::now())
 }
 
-#[cfg(all(test, feature = "testing", not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
+#[cfg(test)]
 #[path = "board_recovery/testing_model_tests.rs"]
 mod testing_model_tests;
-#[cfg(all(test, feature="testing", not(any(feature="hitl_mode",feature="test_fire_mode"))))]
+#[cfg(test)]
 pub(crate) use testing_model_tests::{ReadyIgnitionFixture,ready_ignition_fixture_for_test};
 
 #[cfg(test)]

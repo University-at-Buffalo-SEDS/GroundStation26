@@ -339,9 +339,9 @@ async fn decoded_bulk_packed_by_sdk_must_not_assert_stop() {
     assert!(!manual_stop_pending(&state));
 }
 
-#[cfg(feature = "hitl_mode")]
 #[tokio::test]
 async fn unrelated_retained_data_does_not_block_launch_admission() {
+    crate::mode_suite!(Hitl);
     let state = crate::state::tests::test_app_state().await;
     let (router, id, kind) = retained_bulk(&state, true);
     assert!(

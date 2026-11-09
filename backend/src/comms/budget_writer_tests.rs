@@ -44,6 +44,9 @@ fn drain(peer: &mut serialport::TTYPort) -> Vec<u8> {
 }
 #[test]
 fn actual_budget_uart_entropy_and_effective_override() {
+    if !cfg!(feature = "firmware_sim") {
+        crate::mode_suite!(Hitl);
+    }
     const NAME: &str =
         "comms::budget_writer_tests::actual_budget_uart_entropy_and_effective_override";
     if std::env::var_os("GS_BUDGET_WRITER_CHILD").is_none() {

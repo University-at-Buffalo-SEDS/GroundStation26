@@ -63,6 +63,8 @@ def prepare_environment(base: Path, inherited: dict[str, str], public_assets: Pa
         "GS_EXECUTION_MODE": "flight_sim", "GS_FLIGHT_SIM_ROOT": str(root),
         "GS_FLIGHT_SIM_ASSETS": str(public_assets),
         "GS_SIM_MODE": "1", "GS_RRLS_ROLE": "off",
+        # FlightSim runs testing mode's flight model (one binary, mode at start).
+        "GS_STATION_MODE": "testing",
         "GS_VIDEO_MANAGED": "0", "GS_VIDEO_DISCOVERY": "0",
         "GS_BIND_ADDRESS": "127.0.0.1:3000", "GS_HTTPS_BIND_ADDRESS": "off",
     })

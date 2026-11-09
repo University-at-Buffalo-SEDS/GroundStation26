@@ -139,6 +139,9 @@ fn physical_frames(raw: &[u8], require_complete: bool) -> Vec<Vec<u8>> {
 
 #[tokio::test]
 async fn root_profile_clock_and_catalog_share_ordinary_service() {
+    if !cfg!(feature = "firmware_sim") {
+        crate::mode_suite!(Hitl);
+    }
     const NAME: &str = "telemetry_task::radio_io::root_ordinary_turn_tests::root_profile_clock_and_catalog_share_ordinary_service";
     if std::env::var_os("GS_WARM_ADDRESS_CHILD").is_none() {
         for (hz, with_clock) in [(2, true)] {

@@ -27,8 +27,9 @@ fn selected_mask(available: u8, actual_abort: u8, pending: u8, explicit: u8) -> 
 /// AB participates when its retained readback says Launch, or the pair proof
 /// was enforced. Missing/stale selected identities still need a fresh query.
 fn launch_proof_mask(state: &AppState) -> u8 {
-    #[cfg(feature = "hitl_mode")]
-    if state.local_flight_state_snapshot() == crate::types::FlightState::Launch {
+    if crate::runtime_mode::is_hitl()
+        && state.local_flight_state_snapshot() == crate::types::FlightState::Launch
+    {
         let inner = state.board_recovery.inner.lock().unwrap();
         let actuator_launch = inner.values[index(Board::ActuatorBoard).unwrap()]
             .as_ref().is_some_and(|row| row.value.state == Some(crate::types::FlightState::Launch as u8));
@@ -48,7 +49,7 @@ pub(crate) struct PublicationLaunchProof<'a> {
 }
 impl PublicationLaunchProof<'_> {
     fn mask(&self, state: &AppState) -> u8 {
-        if !cfg!(feature = "hitl_mode") || self.host != crate::types::FlightState::Launch {
+        if !crate::runtime_mode::is_hitl() || self.host != crate::types::FlightState::Launch {
             return 0;
         }
         let inner = self.readbacks.as_ref().expect("Launch proof owner pre-acquired");
@@ -122,7 +123,7 @@ impl Selection {
         state: &'a AppState,
         host: crate::types::FlightState,
     ) -> Result<PublicationLaunchProof<'a>, &'static str> {
-        let readbacks = if cfg!(feature = "hitl_mode") && host == crate::types::FlightState::Launch {
+        let readbacks = if crate::runtime_mode::is_hitl() && host == crate::types::FlightState::Launch {
             Some(state.board_recovery.inner.try_lock().map_err(|_| "Launch readback owner busy")?)
         } else {
             None
@@ -238,9 +239,9 @@ mod actual_policy_tests {
         assert_eq!(selection.targets, expected | 3);
         assert!(Selection::capture(&state, &["FC".into(), "FC".into()]).is_err());
     }
-    #[cfg(feature = "hitl_mode")]
     #[tokio::test]
     async fn launch_reset_requires_master_and_cannot_shed_new_pair_participation() {
+        crate::mode_suite!(Hitl);
         let state = crate::state::tests::test_app_state().await;
         seen(&state, &[Board::ValveBoard]);
         *state.state.lock().unwrap() = crate::types::FlightState::Launch;
@@ -253,9 +254,9 @@ mod actual_policy_tests {
         let selection = Selection::capture(&state, &[]).unwrap();
         assert_eq!(selection.boards(), vec![Board::ActuatorBoard, Board::ValveBoard]);
     }
-    #[cfg(feature = "hitl_mode")]
     #[tokio::test]
     async fn launch_reset_keeps_observed_actuator_even_after_its_proof_expires() {
+        crate::mode_suite!(Hitl);
         let state = crate::state::tests::test_app_state().await;
         seen(&state, &[Board::ValveBoard]);
         *state.state.lock().unwrap() = crate::types::FlightState::Launch;
@@ -274,9 +275,9 @@ mod actual_policy_tests {
         assert_eq!(after.boards(), vec![Board::ActuatorBoard, Board::ValveBoard]);
         assert!(!state.board_recovery.inner.lock().unwrap().values[index(Board::ActuatorBoard).unwrap()].as_ref().unwrap().fresh(at));
     }
-    #[cfg(feature = "hitl_mode")]
     #[tokio::test]
     async fn empty_hitl_is_explicit_host_only_and_policy_aba_retires_original_intent() {
+        crate::mode_suite!(Hitl);
         let state = crate::state::tests::test_app_state().await;
         let selection = Selection::capture(&state, &[]).unwrap();
         assert!(selection.boards().is_empty());
@@ -285,9 +286,9 @@ mod actual_policy_tests {
         state.toggle_hitl_safety_interlock(3);
         assert!(selection.current(&state).is_err());
     }
-    #[cfg(feature = "hitl_mode")]
     #[tokio::test]
     async fn publication_uses_held_host_state_without_relocking_and_keeps_scope_fences() {
+        crate::mode_suite!(Hitl);
         let state = crate::state::tests::test_app_state().await;
         let selection = Selection::capture(&state, &[]).unwrap();
         let host = state.state.lock().unwrap();
@@ -296,9 +297,9 @@ mod actual_policy_tests {
         state.toggle_hitl_safety_interlock(3);
         assert!(selection.with_current_publication(&state, &proof, || -> Result<(), &'static str> { panic!("changed context cannot publish") }).is_err());
     }
-    #[cfg(feature = "hitl_mode")]
     #[tokio::test]
     async fn publication_retains_launch_readbacks_and_refuses_new_actuator_participation() {
+        crate::mode_suite!(Hitl);
         let state = crate::state::tests::test_app_state().await;
         seen(&state, &[Board::ValveBoard]);
         *state.state.lock().unwrap() = crate::types::FlightState::Launch;

@@ -325,7 +325,7 @@ const STOP: &[Spec] = &[
         id: "automatic-abort",
         title: "Automatic abort",
         summary: "Before Launch the safety task aborts when a board other than the Valve Board has been silent for {station.board_offline_abort_ms} ms (shown offline after {station.board_offline_display_ms} ms). Disconnect aborts arm in the Idle mission phase, once every required board has been seen, and never apply in Startup. Unclassified board errors pause the sequence instead of aborting.",
-        details: &["Flight builds only: the safety task does not run in HITL or test-fire builds. The thresholds are fixed in code."],
+        details: &["Normal and testing modes only: the safety task does not run in HITL or test-fire mode. The thresholds are fixed in code."],
         modes: FLIGHT,
         enforced_in: &["backend/src/safety_task.rs:dispatch_safety_abort_reason", "backend/src/gse/automatic_abort.rs:claim_automatic_abort_for_generation"],
         config_keys: &["station.board_offline_abort_ms", "station.board_offline_display_ms"],
@@ -381,11 +381,11 @@ const PHASES: &[Spec] = &[
     Spec {
         id: "mission-phases",
         title: "Mission phases",
-        summary: "The station shows one state, in six phases derived from the boards' detailed flight state: Startup until every board this build requires has been seen, Idle, Fill (nitrogen test, fill, turbocharge and cold flow holds), Launch (Launch admission to liftoff), In flight and Landed. Rules keyed on the detailed state are unchanged.",
+        summary: "The station shows one state, in six phases derived from the boards' detailed flight state: Startup until every board this mode requires has been seen, Idle, Fill (nitrogen test, fill, turbocharge and cold flow holds), Launch (Launch admission to liftoff), In flight and Landed. Rules keyed on the detailed state are unchanged.",
         details: &[
             "The detailed flight state is shown only as the phase's secondary detail, for example Fill · Nitrous fill or In flight · Coast, so the two can never disagree. When an overlay changes the phase the detail names it: Waiting for boards, GSE fill active or FC contact lost. Aborted always shows in the detail.",
-            "Test-fire builds ignore the AV bay (FC, RF, PB) for Startup and have no flight: Launch covers the burn until the reset returns to Idle.",
-            "HITL builds follow only the operator-assigned state; nothing changes the phase automatically.",
+            "Test-fire mode ignores the AV bay (FC, RF, PB) for Startup and have no flight: Launch covers the burn until the reset returns to Idle.",
+            "HITL mode follows only the operator-assigned state; nothing changes the phase automatically.",
         ],
         modes: ALL,
         enforced_in: &["backend/src/mission_phase.rs:mission_phase"],
@@ -415,7 +415,7 @@ const INTERLOCKS: &[Spec] = &[
     Spec {
         id: "hitl-interlocks",
         title: "HITL optional interlocks",
-        summary: "HITL interlocks are off by default; each one turned on restores a gate the flight build always enforces.",
+        summary: "HITL interlocks are off by default; each one turned on restores a gate normal mode always enforces.",
         details: &[
             "All-buttons enable switch ({station.hitl_button_interlock_enabled}): sequence actions need the panel enable pin.",
             "Launch interlock ({station.hitl_launch_interlock_enabled}): Launch needs the launch interlock.",
@@ -453,7 +453,7 @@ const INTERLOCKS: &[Spec] = &[
     Spec {
         id: "checklists",
         title: "Checklists and sign-off",
-        summary: "When checklist enforcement is on ({station.checklist_enforcement_enabled}), every required checklist must be complete and signed off before Launch, in flight and test-fire builds. The \"Nitrogen cold-flow test passed\" item completes when the nitrogen test passes (Dump or Cold flow from its top-step hold).",
+        summary: "When checklist enforcement is on ({station.checklist_enforcement_enabled}), every required checklist must be complete and signed off before Launch, in normal, testing and test-fire mode. The \"Nitrogen cold-flow test passed\" item completes when the nitrogen test passes (Dump or Cold flow from its top-step hold).",
         details: &["Shared checklist storage must be durably ready and match the qualified definition."],
         modes: NOT_HITL,
         enforced_in: &["backend/src/checklists.rs:launch_block", "backend/src/checklists/paired/mod.rs:qualification_allowed"],

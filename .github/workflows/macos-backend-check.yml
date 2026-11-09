@@ -49,6 +49,6 @@ jobs:
       - name: Check normal backend and test targets on macOS
         working-directory: station
         run: cargo +stable check -p groundstation_backend --all-targets
-      - name: Check HITL backend and test targets on macOS
+      - name: Check firmware-simulator backend and test targets on macOS
         working-directory: station
-        run: cargo +stable check -p groundstation_backend --all-targets --features hitl_mode
+        run: cargo +stable check -p groundstation_backend --all-targets --features firmware_sim

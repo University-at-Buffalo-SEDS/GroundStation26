@@ -1,7 +1,6 @@
 //! Bind the initial condition producers to existing decoded observations.
 //! Threshold values and warning eligibility are supplied by their current owners.
 use crate::alert_conditions::{ConditionState, Key};
-#[cfg(any(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
 use crate::alert_conditions::BoardKey;
 use sedsnet::{config::DataType, packet::Packet};
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12,7 +11,6 @@ pub struct Evidence {
 }
 /// The caller supplies the already-established liveness/policy decision; this
 /// helper neither changes timeouts nor selects an abort or launch policy.
-#[cfg(any(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
 pub fn board_liveness(
     board: BoardKey,
     affirmative_online: bool,

@@ -868,13 +868,13 @@ async fn metadata_io_retry_is_explicit_and_matching_actual_idle_proof_is_require
     assert!(motion_ready(&f.state).is_ok());
 }
 
-#[cfg(not(feature = "hitl_mode"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_motion_queue_cannot_cross_mode_commit_and_fresh_motion_keeps_original_stamp() {
-    // The testing feature's synthetic FlightSim owns commands; disable it in a
+    crate::mode_suite!(Normal, TestFire, Testing);
+    // Testing mode's synthetic FlightSim owns commands; disable it in a
     // fresh process so normal and test_fire both exercise the production owner.
     const NAME: &str = "actuator_plumbing::http_tests::public_motion_queue_cannot_cross_mode_commit_and_fresh_motion_keeps_original_stamp";
-    if cfg!(feature = "testing") && std::env::var_os("GS_PLUMBING_OWNER_CHILD").is_none() {
+    if crate::runtime_mode::is_testing() && std::env::var_os("GS_PLUMBING_OWNER_CHILD").is_none() {
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
             .env("GS_PLUMBING_OWNER_CHILD", "1")
@@ -1150,8 +1150,7 @@ async fn public_motion_queue_cannot_cross_mode_commit_and_fresh_motion_keeps_ori
         .unwrap()
         .unwrap();
     f.set_host_worker_running(false);
-    #[cfg(not(feature = "test_fire_mode"))]
-    {
+    if !crate::runtime_mode::is_test_fire() {
         use gse_sequence::qd_wait::QdStatus;
         assert_eq!(
             crate::gse::plumbing_qd_probe_for_test(&f.state, 0).0,
@@ -1350,7 +1349,6 @@ impl Fixture {
 
     /// The normal backend service owns every QUERY here. No readiness page,
     /// explicit query endpoint or synthetic observation installs the proof.
-    #[cfg(not(feature = "hitl_mode"))]
     async fn prime_background_motion_identity(&mut self) {
         let mut proof = vec![0; 56];
         proof[0] = 2;
@@ -1543,8 +1541,7 @@ async fn motion_journal_actual_worker_durable_readback_precedes_original_sdk_mot
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn motion_final_gate_uses_actual_minimum_proof_and_original_operation_not_source_utc_age() {
-    #[cfg(feature="testing")]
-    if std::env::var_os("GS_MOTION_SDK_FIXTURE_CHILD").is_none() {
+    if crate::runtime_mode::is_testing() && std::env::var_os("GS_MOTION_SDK_FIXTURE_CHILD").is_none() {
         let output=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","actuator_plumbing::http_tests::motion_final_gate_uses_actual_minimum_proof_and_original_operation_not_source_utc_age","--nocapture","--test-threads=1"])
             .env("GS_MOTION_SDK_FIXTURE_CHILD","1").env("GS_SIM_MODE","0").output().unwrap();
@@ -1617,10 +1614,9 @@ async fn motion_final_gate_uses_actual_minimum_proof_and_original_operation_not_
     request_motion_query(&f.state).unwrap();
     f.pump();
     let gate = retraction_gate(&f.state);
-    #[cfg(not(feature = "hitl_mode"))]
-    assert!(!gate.allowed);
-    #[cfg(feature = "hitl_mode")]
-    {
+    if !crate::runtime_mode::is_hitl() {
+        assert!(!gate.allowed);
+    } else {
         assert!(
             gate.allowed,
             "known board-owned operation may bypass min45 in HITL"
@@ -1735,12 +1731,12 @@ async fn retraction_override_after_actuator_restart_is_hitl_only_and_preserves_o
         let bytes = axum::body::to_bytes(response.into_body(), 32_768).await.unwrap();
         serde_json::from_slice::<Value>(&bytes).unwrap()["retraction_interlock"].clone()
     }
-    #[cfg(feature = "hitl_mode")]
-    assert!(!f.state.hitl_safety_interlock_enabled(0));
+    if crate::runtime_mode::is_hitl() {
+        assert!(!f.state.hitl_safety_interlock_enabled(0));
+    }
     let gate = http_gate(&f).await;
     assert_eq!(gate["configured"], true);
-    #[cfg(feature = "hitl_mode")]
-    {
+    if crate::runtime_mode::is_hitl() {
         assert_eq!(gate["enforced"], false);
         assert_eq!(gate["allowed"], true, "explicit HITL override covers a restarted board: {gate}");
         assert_eq!(gate["phase"], "hitl_bypassed");
@@ -1748,13 +1744,11 @@ async fn retraction_override_after_actuator_restart_is_hitl_only_and_preserves_o
         assert_eq!(f.state.board_abort.admit_launch(&f.state, 0, revision, || "admitted").unwrap(), "admitted",
             "isolated final SDK admission observes the same plumbing policy");
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if !crate::runtime_mode::is_hitl() {
         assert_eq!(gate["enforced"], true);
         assert_eq!(gate["allowed"], false, "normal build cannot use the HITL setting");
     }
-    #[cfg(feature = "hitl_mode")]
-    {
+    if crate::runtime_mode::is_hitl() {
         f.state.toggle_hitl_safety_interlock(0);
         assert_eq!(http_gate(&f).await["allowed"], false, "enforcement ON requires fresh same-operation proof");
         f.state.toggle_hitl_safety_interlock(0);
@@ -1774,8 +1768,9 @@ async fn retraction_override_after_actuator_restart_is_hitl_only_and_preserves_o
     f.state.plumbing_drive.inner.lock().unwrap().storage_error = Some("injected configuration failure".into());
     assert_eq!(http_gate(&f).await["allowed"], false);
     f.state.plumbing_drive.inner.lock().unwrap().storage_error = None;
-    #[cfg(feature = "hitl_mode")]
-    assert_eq!(http_gate(&f).await["allowed"], true, "cleared independent blockers restore explicit override");
+    if crate::runtime_mode::is_hitl() {
+        assert_eq!(http_gate(&f).await["allowed"], true, "cleared independent blockers restore explicit override");
+    }
     f.state.manual_abort_intent.request_untimed();
     assert_eq!(http_gate(&f).await["allowed"], false, "pending manual Stop remains authoritative");
     assert_eq!(fs::read(f.root.join("motion.json")).unwrap(), journal_before);
@@ -1783,9 +1778,9 @@ async fn retraction_override_after_actuator_restart_is_hitl_only_and_preserves_o
     assert_eq!(f.retractions().len(), retractions_before, "read-only status and override do not dispatch motion");
 }
 
-#[cfg(feature = "hitl_mode")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hitl_retraction_override_covers_closed_history_but_not_corrupt_history() {
+    crate::mode_suite!(Hitl);
     let _serial = SERIAL.lock().await;
     let f = Fixture::new_with_history(Some(b"preserved-corrupt-retraction-history\n")).await;
     assert!(!f.state.hitl_safety_interlock_enabled(0));
@@ -1830,8 +1825,9 @@ impl Fixture {
 async fn motion_history_actual_authorized_reset_is_evidence_preserving_one_use_and_always_closed() {
     let _serial = SERIAL.lock().await;
     let f = Fixture::new_with_history(Some(b"preserved-corrupt-retraction-history\n")).await;
-        #[cfg(feature = "hitl_mode")]
-        f.state.toggle_hitl_safety_interlock(0); // This regression qualifies enforced history, not the explicit HITL override.
+        if crate::runtime_mode::is_hitl() {
+            f.state.toggle_hitl_safety_interlock(0); // This regression qualifies enforced history, not the explicit HITL override.
+        }
     let path = f.root.join("motion.json");
     let original = fs::read(&path).unwrap();
     let body = f.history_reset_body();
@@ -1917,8 +1913,9 @@ async fn motion_history_each_durable_prefix_reloads_old_fault_or_sealed_closed_n
     let _serial = SERIAL.lock().await;
     for stage in 0..=6 {
         let f = Fixture::new_with_history(Some(b"preserved-corrupt-retraction-history\n")).await;
-        #[cfg(feature = "hitl_mode")]
-        f.state.toggle_hitl_safety_interlock(0); // This regression qualifies enforced history, not the explicit HITL override.
+        if crate::runtime_mode::is_hitl() {
+            f.state.toggle_hitl_safety_interlock(0); // This regression qualifies enforced history, not the explicit HITL override.
+        }
         let path = f.root.join("motion.json");
         let original = fs::read(&path).unwrap();
         let body = f.history_reset_body();
@@ -2234,18 +2231,17 @@ async fn motion_post_admission_checks_are_two_bounded_queries_and_cancel_before_
     }
 }
 
-#[cfg(feature = "testing")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn modeled_retraction_actual_acceptance_uses_monotonic45_and_original_stop_context_not_utc_age()
  {
+    crate::mode_suite!(Testing);
     if std::env::var_os("MODEL_RETRACTION_CHILD").is_none(){
         let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","actuator_plumbing::http_tests::modeled_retraction_actual_acceptance_uses_monotonic45_and_original_stop_context_not_utc_age","--nocapture"]).env("MODEL_RETRACTION_CHILD","1").env("GS_SIM_MODE","1").env("GS_RRLS_ROLE","primary").output().unwrap();
         assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
     }
     let _serial = SERIAL.lock().await;
     let mut f = Fixture::new().await;
-    #[cfg(not(any(feature="hitl_mode",feature="test_fire_mode")))]
-    {
+    if !crate::runtime_mode::is_hitl_or_test_fire() {
         crate::flight_sim::initialize_model_owners(&f.state,0,0);
         let rocket=crate::comms::DummyComms::new("Rocket Comms");let fill=crate::comms::DummyComms::new("Umbilical Comms");
         crate::testing_board_lifecycle::bind_selected(crate::comms::CommsDevice::testing_model_link(&rocket),crate::comms::CommsDevice::testing_model_link(&fill));
@@ -2259,7 +2255,7 @@ async fn modeled_retraction_actual_acceptance_uses_monotonic45_and_original_stop
     let result = crate::gse::admit_simulated_retraction_stamped(&f.state, Some(origin), |source,now| {
         crate::flight_sim::handle_command_stamped(&command,source,now)
     });
-    if cfg!(any(feature = "hitl_mode", feature = "test_fire_mode")) {
+    if crate::runtime_mode::is_hitl_or_test_fire() {
         // Stamped application owners exist only in pure Testing. Mixed builds
         // must exercise their real refusal, never invent a model acceptance.
         assert_eq!(result.unwrap_err(), "The model did not accept the original retraction intent");
@@ -2345,10 +2341,10 @@ async fn modeled_retraction_actual_acceptance_uses_monotonic45_and_original_stop
     crate::flight_sim::reset_simulation();
 }
 
-#[cfg(feature = "hitl_mode")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hitl_safety_interlocks_actual_http_receiver_changes_require_permission_and_invalidate_old_launch_origin()
  {
+    crate::mode_suite!(Hitl);
     let _serial = SERIAL.lock().await;
     let mut f = Fixture::new().await;
     *f.state.auto_zero.lock().unwrap() = crate::auto_zero::Runtime::testing(true);

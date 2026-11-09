@@ -138,6 +138,7 @@ async fn exercise(cached: bool, test_name: &str) {
 
 #[tokio::test]
 async fn cached_same_tick_capture_cannot_advance_new_controller_command() {
+    crate::mode_suite!(Hitl);
     exercise(
         true,
         "gse::pre_target_tests::cached_same_tick_capture_cannot_advance_new_controller_command",
@@ -147,6 +148,7 @@ async fn cached_same_tick_capture_cannot_advance_new_controller_command() {
 
 #[tokio::test]
 async fn delayed_same_tick_capture_cannot_advance_new_controller_command() {
+    crate::mode_suite!(Hitl);
     exercise(
         false,
         "gse::pre_target_tests::delayed_same_tick_capture_cannot_advance_new_controller_command",

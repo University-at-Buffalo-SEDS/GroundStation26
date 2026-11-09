@@ -16,19 +16,18 @@ struct Plant {
     mass: f32,
     /// Closed-tank pressure loss per 100 ms step (a leak).
     leak: f32,
-    #[cfg(not(feature = "hitl_mode"))]
     path: std::path::PathBuf,
 }
 impl Drop for Plant {
     fn drop(&mut self) {
-        #[cfg(not(feature = "hitl_mode"))]
-        let _ = std::fs::remove_file(&self.path);
+        if !crate::runtime_mode::is_hitl() {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 impl Plant {
     async fn new() -> Self {
         let (state, sent, peer) = button_test_state().await;
-        #[cfg(not(feature = "hitl_mode"))]
         let path = std::env::temp_dir().join(format!("gse-pause-{}.json", rand::random::<u128>()));
         let plant = Self {
             state,
@@ -40,7 +39,6 @@ impl Plant {
             pressure: 0.0,
             mass: 0.0,
             leak: 0.0,
-            #[cfg(not(feature = "hitl_mode"))]
             path,
         };
         plant.refresh_boards();
@@ -53,8 +51,7 @@ impl Plant {
             rt.test_now_ms = Some(plant.elapsed);
             rt.engine.config.dry_self_test_confirmed = true;
             rt.engine.config.nitrogen_target_psi = 120.0;
-            #[cfg(not(feature = "hitl_mode"))]
-            {
+            if !crate::runtime_mode::is_hitl() {
                 let (_, key) = operational_policy_topology_key(&plant.state);
                 rt.operational.path = Some(plant.path.clone());
                 rt.operational.topology(0, true, key.clone());
@@ -205,7 +202,6 @@ impl Plant {
         }
     }
 }
-#[cfg(not(feature = "hitl_mode"))]
 fn operational_policy_topology_key(state: &AppState) -> (bool, String) {
     let Some(router) = state.topology_router.get() else {
         return (false, String::new());
@@ -270,7 +266,7 @@ async fn routed_self_test_nitrogen_and_fill_pause_resume_then_complete() {
     assert!(envelope["controls"][0]["pause"]["reason"].as_str().unwrap().contains("paused"));
     // Fill can never start from a paused test.
     assert!(!plant.state.is_command_allowed(&TelemetryCommand::StartFill)
-        || cfg!(feature = "hitl_mode"));
+        || crate::runtime_mode::is_hitl());
     plant.resume();
     assert_eq!(plant.phase(), Phase::NitrogenSetup);
     plant.until(|rt| rt.engine.status.phase == Phase::Raising);
@@ -342,8 +338,7 @@ async fn resume_gate_reports_server_reasons_without_changing_outputs() {
     let mut policy = plant.state.action_policy_snapshot();
     policy.key_enabled = false;
     plant.state.set_action_policy(policy);
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if !crate::runtime_mode::is_hitl() {
         let resume = plant.controls().resume;
         assert!(!resume.allowed);
         assert!(resume.reason.unwrap().contains("interlock"));
@@ -464,8 +459,9 @@ async fn routed_nitrogen_leak_holds_pressure_until_dump_then_ends_at_zero() {
         let rt = plant.state.gse.lock().unwrap();
         assert!(rt.engine.status.message.starts_with("Nitrogen test failed: "));
         assert!(rt.engine.status.message.ends_with("Holding pressure for leak search. Dump when ready."));
-        #[cfg(not(feature = "hitl_mode"))]
-        assert!(!rt.operational.saved.qualification.nitrogen_satisfied());
+        if !crate::runtime_mode::is_hitl() {
+            assert!(!rt.operational.saved.qualification.nitrogen_satisfied());
+        }
     }
     for _ in 0..200 {
         plant.step();

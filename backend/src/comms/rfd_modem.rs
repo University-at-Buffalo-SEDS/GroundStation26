@@ -1194,11 +1194,12 @@ pub(crate) fn configured_mode() -> Mode {
     {
         return mode;
     }
-    if cfg!(any(
-        feature = "testing",
-        feature = "hitl_mode",
-        feature = "firmware_sim"
-    )) {
+    // Follows the station mode in force. The startup check below still runs
+    // once per process, with the mode at that moment.
+    if crate::runtime_mode::is_testing()
+        || crate::runtime_mode::is_hitl()
+        || cfg!(feature = "firmware_sim")
+    {
         Mode::Skip
     } else {
         Mode::Fix
@@ -1249,13 +1250,16 @@ pub(crate) fn before_av_bay_open(link: &CommsLinkConfig) {
         }
         global.startup_done = true;
     }
+    // RUNTIME-MODE-BOOT: the startup check runs once, under the boot mode. A
+    // later switch into normal or test fire does not rerun it; the manual
+    // check stays available.
     let mode = configured_mode();
     let report = match plan_for(serial) {
         None => Report::skipped(Trigger::Startup, mode, "no RFD profile is selected"),
         Some(_) if mode == Mode::Skip => Report::skipped(
             Trigger::Startup,
             mode,
-            "modem check off: skipped by default in HITL, testing and simulator builds (set GS_RFD_MODEM_CHECK=verify or fix to run it)",
+            "modem check off: skipped by default in HITL and testing modes and simulator builds (set GS_RFD_MODEM_CHECK=verify or fix to run it)",
         ),
         Some(_) if simulated_link() => {
             Report::skipped(Trigger::Startup, mode, "simulated serial link")

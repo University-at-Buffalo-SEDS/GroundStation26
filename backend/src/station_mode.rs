@@ -29,16 +29,9 @@ pub enum Mode {
     TestFire,
     Testing,
 }
+/// The station mode in force now (see [`crate::runtime_mode`]).
 pub fn local_mode() -> Mode {
-    if cfg!(feature = "testing") {
-        Mode::Testing
-    } else if cfg!(feature = "hitl_mode") {
-        Mode::Hitl
-    } else if cfg!(feature = "test_fire_mode") {
-        Mode::TestFire
-    } else {
-        Mode::Normal
-    }
+    crate::runtime_mode::current()
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
@@ -789,7 +782,7 @@ mod tests {
     use super::*;
     #[test]
     fn testing_mode_is_explicit_in_local_signed_display_and_persisted_metadata() {
-        if cfg!(feature = "testing") {
+        if crate::runtime_mode::is_testing() {
             assert_eq!(local_mode(), Mode::Testing);
         }
         let root = root();

@@ -69,7 +69,6 @@ impl Intent {
             && state.local_flight_state_snapshot() == self.expected
             && (!self.local || self.target.is_some() && local_allowed(state))
     }
-    #[cfg(feature = "hitl_mode")]
     pub(crate) fn original_command(&self) -> TelemetryCommand {
         if self.forward {
             TelemetryCommand::AdvanceFlightState
@@ -79,7 +78,7 @@ impl Intent {
     }
 }
 pub(crate) fn local_mode(state: &AppState) -> bool {
-    cfg!(feature = "hitl_mode")
+    crate::runtime_mode::is_hitl()
         && !crate::rrls::is_rrls()
         && state
             .phase_control_selected
@@ -160,8 +159,7 @@ pub(crate) fn is_local(command: &TelemetryCommand) -> bool {
     matches!(command,TelemetryCommand::OperatorPhase{intent} if intent.local())
 }
 pub(crate) fn seal(state: &AppState, command: TelemetryCommand) -> TelemetryCommand {
-    #[cfg(feature = "hitl_mode")]
-    {
+    if crate::runtime_mode::is_hitl() {
         let forward = match command {
             TelemetryCommand::AdvanceFlightState => true,
             TelemetryCommand::RewindFlightState => false,
@@ -190,10 +188,7 @@ pub(crate) fn seal(state: &AppState, command: TelemetryCommand) -> TelemetryComm
                 captured: Instant::now(),
             },
         }
-    }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
-        let _ = state;
+    } else {
         command
     }
 }
@@ -307,18 +302,14 @@ pub(crate) fn controls_allowed(state: &AppState) -> bool {
         .is_some_and(|policy| policy.key_enabled && policy.software_buttons_enabled)
 }
 pub(crate) fn button_allowed(state: &AppState) -> bool {
-    #[cfg(feature = "hitl_mode")]
-    {
+    if crate::runtime_mode::is_hitl() {
         state.hitl_button_interlock_satisfied()
-    }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
-        let _ = state;
+    } else {
         false
     }
 }
 
-#[cfg(all(test, feature = "hitl_mode"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     fn intent(state: &AppState, forward: bool) -> Intent {
@@ -338,6 +329,7 @@ mod tests {
     #[tokio::test]
     async fn local_phase_http_permission_and_actual_managed_publication_need_no_fc_or_launch_proof()
     {
+        crate::mode_suite!(Hitl);
         let mut fixture = crate::actuator_plumbing::http_tests::Fixture::new().await;
         if fixture.state.hitl_button_interlock_enabled() {
             fixture.state.toggle_hitl_safety_interlock(0);
@@ -409,6 +401,7 @@ mod tests {
     }
     #[tokio::test]
     async fn boundaries_stop_and_control_mode_aba_refuse_old_intents() {
+        crate::mode_suite!(Hitl);
         for phase in [
             FlightState::Startup,
             FlightState::Armed,
@@ -465,6 +458,7 @@ mod tests {
     }
     #[test]
     fn external_json_cannot_forge_internal_phase_and_ladder_never_contains_fire() {
+        crate::mode_suite!(Hitl);
         assert!(
             serde_json::from_value::<TelemetryCommand>(
                 serde_json::json!({"OperatorPhase":{"intent":{}}})
@@ -478,6 +472,7 @@ mod tests {
     }
     #[tokio::test]
     async fn websocket_origin_and_old_fc_authority_are_not_retargeted() {
+        crate::mode_suite!(Hitl);
         let mut fixture = crate::actuator_plumbing::http_tests::Fixture::new().await;
         if fixture.state.hitl_button_interlock_enabled() {
             fixture.state.toggle_hitl_safety_interlock(0);
@@ -524,6 +519,7 @@ mod tests {
     }
     #[tokio::test]
     async fn expiry_phase_change_and_software_disable_fail_closed() {
+        crate::mode_suite!(Hitl);
         let fixture = crate::actuator_plumbing::http_tests::Fixture::new().await;
         let mut old = intent(&fixture.state, true);
         old.captured -= Duration::from_secs(6);
@@ -558,6 +554,7 @@ mod tests {
     }
     #[tokio::test]
     async fn prepared_phase_refuses_new_stop_without_any_ram_ws_or_sdk_partial_update() {
+        crate::mode_suite!(Hitl);
         let fixture = crate::actuator_plumbing::http_tests::Fixture::new().await;
         if fixture.state.hitl_button_interlock_enabled() {
             fixture.state.toggle_hitl_safety_interlock(0);
@@ -596,6 +593,7 @@ mod tests {
     }
     #[tokio::test]
     async fn actual_sdk_core_busy_refuses_prepared_phase_without_partial_publication() {
+        crate::mode_suite!(Hitl);
         if crate::operator_queue::isolated_native_case(
             module_path!(),
             "actual_sdk_core_busy_refuses_prepared_phase_without_partial_publication",
@@ -677,6 +675,7 @@ mod tests {
     }
     #[tokio::test]
     async fn public_local_master_selection_survives_unchanged_runtime_contention() {
+        crate::mode_suite!(Hitl);
         let fixture = crate::actuator_plumbing::http_tests::Fixture::new().await;
         assert!(fixture.state.action_policy_snapshot().local_phase_controls);
         let value = intent(&fixture.state, true);

@@ -108,8 +108,7 @@ fn finish_held_test(rt: &mut Runtime) {
     };
     match hold {
         gse_sequence::TestHold::Passed => {
-            #[cfg(not(feature = "hitl_mode"))]
-            {
+            if !crate::runtime_mode::is_hitl() {
                 rt.operational.saved.baseline = rt.engine.status.baseline.clone();
                 // Also completes the "Nitrogen cold-flow test passed" checklist item.
                 if let Err(error) = rt
@@ -500,15 +499,13 @@ pub(super) fn status(state: &AppState) -> Status {
     let ticket = LaunchAdmission::capture(state);
     let (target, ceiling, source, busy, ready, phase, key, owned) = {
         let rt = state.gse.lock().unwrap();
-        #[cfg(not(feature = "hitl_mode"))]
-        let ready = rt.operational.startup_configured
-            && rt.operational.topology_stable
-            && !rt.operational.running
-            && rt.operational.persist_error.is_none()
-            && !rt.operational.saved.automatic_abort_claimed
-            && rt.operational.saved.qualification.fault().is_none();
-        #[cfg(feature = "hitl_mode")]
-        let ready = true;
+        let ready = crate::runtime_mode::is_hitl()
+            || (rt.operational.startup_configured
+                && rt.operational.topology_stable
+                && !rt.operational.running
+                && rt.operational.persist_error.is_none()
+                && !rt.operational.saved.automatic_abort_claimed
+                && rt.operational.saved.qualification.fault().is_none());
         (
             start_target(&rt, input(&rt, state, simulation, interlock(state, &policy))),
             rt.engine.config.pressure_ceiling_psi,
@@ -617,13 +614,13 @@ fn recording_preflight(
             "Another ground sequence owns the valves",
         ));
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    if rt.operational.running
+    if !crate::runtime_mode::is_hitl()
+        && (rt.operational.running
         || rt.operational.saved.automatic_abort_claimed
         || rt.operational.saved.qualification.fault().is_some()
         || !rt.operational.startup_configured
         || !rt.operational.topology_stable
-        || rt.operational.persist_error.is_some()
+        || rt.operational.persist_error.is_some())
     {
         return Err(PreparationError::Invalid(
             "Cold flow requires current ground safety readiness",
@@ -760,13 +757,13 @@ async fn start(
                     "Another ground sequence owns the valves",
                 ));
             }
-            #[cfg(not(feature = "hitl_mode"))]
-            if rt.operational.running
+            if !crate::runtime_mode::is_hitl()
+                && (rt.operational.running
                 || rt.operational.saved.automatic_abort_claimed
                 || rt.operational.saved.qualification.fault().is_some()
                 || !rt.operational.startup_configured
                 || !rt.operational.topology_stable
-                || rt.operational.persist_error.is_some()
+                || rt.operational.persist_error.is_some())
             {
                 return Err(PreparationError::Invalid(
                     "Cold flow requires current ground safety readiness",

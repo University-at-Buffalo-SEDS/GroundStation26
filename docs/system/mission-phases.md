@@ -11,7 +11,7 @@ input.
 
 ## Mapping
 
-| Detailed state (wire) | Flight build | Test-fire build | HITL build |
+| Detailed state (wire) | Flight (normal) mode | Test-fire mode | HITL mode |
 |---|---|---|---|
 | Startup (0) | Startup | Startup | Startup |
 | Idle (1), required boards not all seen | Startup | Startup | Idle |
@@ -26,7 +26,7 @@ input.
 Notes on the inputs:
 
 - **Required boards.** These come from `AppState::board_required_for_progression`. Test-fire
-  builds ignore the AV bay (FC, RF, PB).
+  mode ignores the AV bay (FC, RF, PB).
 - **Fill activity.** True while any of these hold:
   - the GSE engine is in a nitrogen-test, fill, pause or turbocharge phase, including the
     nitrogen test's passed pressure hold;
@@ -34,11 +34,11 @@ Notes on the inputs:
   - a cold-flow session is active;
   - qualification is in the Fill or Armed stage, meaning propellant is loaded.
 
-  Test-fire builds stay at detailed Idle through the whole fill, so this input is what
+  Test-fire mode stays at detailed Idle through the whole fill, so this input is what
   shows Fill there.
 - **HITL is manual-only.** The phase follows the operator-assigned detailed state, and
   board presence and GSE activity are ignored.
-- **Test-fire builds have no flight.** Launch covers the launch admission and the burn.
+- **Test-fire mode has no flight.** Launch covers the launch admission and the burn.
   In flight and Landed are never shown. The operator reset returns the detailed state to
   Idle, which brings the phase back to Idle.
 
@@ -133,7 +133,7 @@ state alone (the HITL column above).
 ## FC owns landing
 
 The GS follows the FC-reported state. In flight changes to Landed only when the FC reports
-Landed or Recovery. There is one comms-loss fallback, in flight builds only:
+Landed or Recovery. There is one comms-loss fallback, in normal (flight) mode only:
 
 - **When it triggers:** the T clock is past T+5 min and the FC has then been silent for
   2.5 continuous minutes. Silence that began before T+5 counts from T+5. The phase then

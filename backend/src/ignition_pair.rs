@@ -37,11 +37,10 @@ pub(crate) fn capture_route_token(state: &AppState) -> Result<observer::Token, &
     {
         return Err("Ground station is shutting down");
     }
-    #[cfg(all(
-        feature = "testing",
-        not(any(feature = "hitl_mode", feature = "test_fire_mode"))
-    ))]
-    if crate::flight_sim::sim_mode_enabled() && !crate::testing_board_lifecycle::enabled() {
+    if crate::runtime_mode::is_testing()
+        && crate::flight_sim::sim_mode_enabled()
+        && !crate::testing_board_lifecycle::enabled()
+    {
         return Err("Ignition requires both selected virtual board links");
     }
     let router = state
@@ -69,11 +68,8 @@ pub(crate) fn validate_route_token(
     state: &AppState,
     token: observer::Token,
 ) -> Result<(), &'static str> {
-    #[cfg(all(
-        feature = "testing",
-        not(any(feature = "hitl_mode", feature = "test_fire_mode"))
-    ))]
-    if crate::flight_sim::sim_mode_enabled()
+    if crate::runtime_mode::is_testing()
+        && crate::flight_sim::sim_mode_enabled()
         && !crate::testing_board_lifecycle::selected_links_present()
     {
         return Err("Ignition virtual board selection changed before SDK admission");
@@ -169,8 +165,7 @@ mod tests {
                 sedsnet::router::RouterConfig::new([]).with_sender("GS")));
             state.topology_router.set(router.clone()).unwrap();
             router.try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(1_793_563_200_000)).unwrap();
-            #[cfg(feature = "hitl_mode")]
-            if blocker == "proof_on" { state.toggle_hitl_safety_interlock(3); }
+            if crate::runtime_mode::is_hitl() && blocker == "proof_on" { state.toggle_hitl_safety_interlock(3); }
             if blocker == "abort" {
                 state.board_abort.observe_abort(crate::types::Board::ActuatorBoard, std::time::Instant::now(), 100);
             }
@@ -182,11 +177,10 @@ mod tests {
                 &state, dispatch_router, crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
                 &[crate::rocket_commands::ActuatorBoardCommands::IgniterSequence as u8]);
             let accepted = result.unwrap_or(false);
-            let expected = cfg!(feature = "hitl_mode") && blocker == "none";
+            let expected = crate::runtime_mode::is_hitl() && blocker == "none";
             assert_eq!(accepted, expected, "blocker={blocker}, optional proof must not bypass actual Abort/Stop/identity");
             if blocker == "none" {
-                #[cfg(feature = "hitl_mode")]
-                {
+                if crate::runtime_mode::is_hitl() {
                     for index in 0..4 { assert!(!state.hitl_safety_interlock_enabled(index)); }
                     state.set_action_policy(crate::sequences::default_action_policy());
                     let policy = state.action_policy_snapshot();
@@ -194,8 +188,8 @@ mod tests {
                         assert_eq!(policy.controls.iter().find(|control|control.cmd==name).unwrap().actuated, Some(false), "public policy default {name}");
                     }
                 }
-                assert_eq!(proof_enforced(&state), !cfg!(feature = "hitl_mode"));
-                assert_eq!(readiness(&state).is_ok(), cfg!(feature = "hitl_mode"));
+                assert_eq!(proof_enforced(&state), !crate::runtime_mode::is_hitl());
+                assert_eq!(readiness(&state).is_ok(), crate::runtime_mode::is_hitl());
             }
             if blocker == "proof_on" || blocker == "abort" || blocker == "shutdown" {
                 assert!(readiness(&state).is_err());

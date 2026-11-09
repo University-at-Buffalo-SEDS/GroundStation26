@@ -956,9 +956,9 @@ mod tests {
         assert!(!layout.state_tab.states.is_empty());
     }
 
-    #[cfg(feature = "testing")]
     #[test]
     fn testing_layout_includes_reset_sim_action() {
+        crate::mode_suite!(Testing);
         let layout = load_layout().expect("layout should parse");
         assert!(
             layout

@@ -179,9 +179,10 @@ async fn actual_auth_case(model: Option<(u64, Option<&'static str>)>, expect_sav
     *AUTH_STARTED.lock().unwrap() = None;
 }
 
-#[cfg(not(any(feature = "hitl_mode", feature = "firmware_sim")))]
+#[cfg(not(feature = "firmware_sim"))]
 #[tokio::test]
 async fn actual_auth_sql_wait_past_original_wall_capture_deadline_never_commits() {
+    crate::mode_suite!(Normal, TestFire, Testing);
     if crate::operator_queue::isolated_case(
         module_path!(),
         "actual_auth_sql_wait_past_original_wall_capture_deadline_never_commits",
@@ -191,11 +192,13 @@ async fn actual_auth_sql_wait_past_original_wall_capture_deadline_never_commits(
     actual_auth_case(None, false).await;
 }
 
-#[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
 macro_rules! model_case {
     ($name:ident, $release:expr, $replace:expr, $saved:expr) => {
         #[tokio::test]
         async fn $name() {
+            if !cfg!(feature = "firmware_sim") {
+                crate::mode_suite!(Hitl);
+            }
             if crate::operator_queue::isolated_case_with_capture_clock(
                 module_path!(),
                 stringify!($name),
@@ -206,49 +209,42 @@ macro_rules! model_case {
         }
     };
 }
-#[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
 model_case!(
     actual_auth_release_just_before_original_seven_seconds_still_commits,
     106999,
     None,
     true
 );
-#[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
 model_case!(
     actual_auth_release_at_original_seven_seconds_is_refused,
     107000,
     None,
     false
 );
-#[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
 model_case!(
     actual_auth_release_after_original_seven_seconds_is_refused,
     107001,
     None,
     false
 );
-#[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
 model_case!(
     actual_original_clock_reaches_deadline_during_staging_cannot_replace_calibration,
     106998,
     Some("107000"),
     false
 );
-#[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
 model_case!(
     actual_truncated_model_clock_cannot_publish_tare_using_wall_fallback,
     106998,
     Some(""),
     false
 );
-#[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
 model_case!(
     actual_backward_model_clock_cannot_renew_original_capture,
     106998,
     Some("99999"),
     false
 );
-#[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
 model_case!(
     actual_missing_model_clock_cannot_publish_tare_using_wall_fallback,
     106998,

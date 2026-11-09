@@ -259,7 +259,6 @@ impl Peers {
         fixture.pump();
         fixture
     }
-    #[cfg(all(feature="test_fire_mode",not(feature="hitl_mode")))]
     pub(crate) fn pending_transport_wires(&self)->Vec<Vec<u8>> {
         // Snapshot actual enqueue Router side callbacks without advancing any
         // peer, ACK, retry or application effect after the original offer.

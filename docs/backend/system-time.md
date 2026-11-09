@@ -24,7 +24,7 @@ the router's synchronized UTC when available. RRLS must receive its time from
 the primary; direct network-clock writes on RRLS return a conflict response.
 
 AV-bay underglow, FC buzzer, and T-clock reset are available in normal, HITL,
-and test-fire builds in every flight state. Account command permissions and
+and test-fire modes in every flight state. Account command permissions and
 an explicit software-control disable still apply. T-clock reset changes the
 displayed launch clock without resetting flight state or board sequences.
 

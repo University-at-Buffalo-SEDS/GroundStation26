@@ -265,6 +265,7 @@ impl Mesh {
 }
 #[tokio::test]
 async fn actual_dummy_http_query_and_all_seven_rpc_recovery() {
+    crate::mode_suite!(Testing);
     if std::env::var_os("MODEL_RPC_CHILD").is_none() {
         let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","board_recovery::testing_model_tests::actual_dummy_http_query_and_all_seven_rpc_recovery","--nocapture"]).env("MODEL_RPC_CHILD","1").env("GS_SIM_MODE","1").env("GS_RRLS_ROLE","primary").output().unwrap();
         assert!(
@@ -427,24 +428,29 @@ fn run_case(case: &str) {
 }
 #[test]
 fn actual_unknown_receipt_boot_and_rpc() {
+    crate::mode_suite!(Testing);
     run_case("unknown");
 }
 #[test]
 fn actual_held_fc15_across_rpc_completion() {
+    crate::mode_suite!(Testing);
     run_case("held");
 }
 #[test]
 fn actual_unselected_transport_cannot_authorize() {
+    crate::mode_suite!(Testing);
     run_case("unselected");
 }
 
 #[test]
 fn actual_gse_tagged_effects_reach_modeled_owner() {
+    crate::mode_suite!(Testing);
     run_case("gse");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_http_confirm_uses_deployed_dummy_and_receiver_owned_journal() {
+    crate::mode_suite!(Testing);
     if std::env::var_os("MODEL_CONFIRM_CHILD").is_none() {
         let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","board_recovery::testing_model_tests::actual_http_confirm_uses_deployed_dummy_and_receiver_owned_journal","--nocapture"]).env("MODEL_CONFIRM_CHILD","1").env("GS_SIM_MODE","1").env("GS_RRLS_ROLE","primary").output().unwrap();
         assert!(
@@ -752,6 +758,7 @@ async fn actual_http_confirm_uses_deployed_dummy_and_receiver_owned_journal() {
 
 #[tokio::test]
 async fn actual_virtual_pair_queries_are_required_for_ignition() {
+    crate::mode_suite!(Testing);
     const CHILD: &str = "IGNITION_PAIR_MODEL_CHILD";
     const NAME: &str = "board_recovery::testing_model_tests::actual_virtual_pair_queries_are_required_for_ignition";
     if std::env::var_os(CHILD).is_none() {
@@ -779,6 +786,7 @@ async fn actual_virtual_pair_queries_are_required_for_ignition() {
 
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 async fn actual_virtual_selection_loss_after_capture_never_acquires_ignition_owner() {
+    crate::mode_suite!(Testing);
     const CHILD:&str="IGNITION_PAIR_SELECTION_RACE_CHILD";
     const NAME:&str="board_recovery::testing_model_tests::actual_virtual_selection_loss_after_capture_never_acquires_ignition_owner";
     if std::env::var_os(CHILD).is_none(){let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact",NAME,"--nocapture","--test-threads=1"]).env(CHILD,"1").env("GS_SIM_MODE","1").env("GS_RRLS_ROLE","primary").output().unwrap();assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));return;}

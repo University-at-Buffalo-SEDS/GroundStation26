@@ -32,7 +32,7 @@ impl DiscoveryRefresh {
         }
         let topology = router.export_topology();
         let health = state.network_health.lock().unwrap()
-            .snapshot(now, cfg!(feature = "test_fire_mode"));
+            .snapshot(now, crate::runtime_mode::is_test_fire());
         let needed = BOARDS.iter().any(|&board| {
             let connected = health.iter().any(|row| {
                 row.sender_id == board.sender_id() && row.healthy

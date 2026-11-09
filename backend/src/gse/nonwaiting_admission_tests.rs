@@ -120,7 +120,6 @@ pub(crate) struct SuffixGate {
     go: (Mutex<bool>, Condvar),
 }
 impl SuffixGate {
-    #[cfg_attr(feature = "test_fire_mode", allow(dead_code))]
     pub(crate) fn arm(&self, after_accepted: usize) -> mpsc::Receiver<()> {
         let (tx, rx) = mpsc::channel();
         *self.reached.lock().unwrap() = Some(tx);

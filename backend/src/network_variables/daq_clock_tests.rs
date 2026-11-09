@@ -122,8 +122,7 @@ async fn proof() {
         .enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)
         .unwrap();
     let anchor = crate::telemetry_task::procedure_clock::timestamp_ms();
-    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-    {
+    if crate::runtime_mode::is_hitl_or_test_fire() {
         state.begin_daq_launch_log(); // command-acceptance path, before Valve ACK
         assert_eq!(state.launch_clock_snapshot().kind, LaunchClockKind::Idle);
     }

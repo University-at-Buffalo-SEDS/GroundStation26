@@ -22,14 +22,14 @@ fn health(mesh:&crate::rrls::Shared,view:Transport){
 }
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 async fn cross_compiled_interlock_exchange_or_local_enum_contract(){
-    for name in NAMES {assert_eq!(serde_json::from_value::<crate::types::TelemetryCommand>(serde_json::json!(name)).is_ok(),cfg!(feature="hitl_mode"));}
+    for name in NAMES {assert_eq!(serde_json::from_value::<crate::types::TelemetryCommand>(serde_json::json!(name)).is_ok(),crate::runtime_mode::is_hitl());}
     let Some(path)=std::env::var_os("GS_CROSS_COMPILED_EXCHANGE") else{return;};
     let shared=std::path::PathBuf::from(path);
     let (root,p,r)=super::tests::fixtures();let mesh=super::handler_tests::configure();
     let mut state=crate::recording_export::tests::export_state(&root.0,false).await;
     let (tx,rx)=tokio::sync::mpsc::channel(8);Arc::get_mut(&mut state).unwrap().cmd_tx=tx;
     super::handler_tests::user(&state.auth,true,false,false,&NAMES);
-    if cfg!(feature="hitl_mode") {
+    if crate::runtime_mode::is_hitl() {
         assert!(!crate::rrls::is_rrls());
         let pv={let m=mesh.lock().unwrap();m.command_proxy_transport(m.now()).unwrap()};
         put(&shared,"transport",&serde_json::to_vec(&(pv.session,pv.sequence)).unwrap());
@@ -48,12 +48,13 @@ async fn cross_compiled_interlock_exchange_or_local_enum_contract(){
             let Received::Execute(request)=runtime.receive(&p,pv,crate::station_mode::local_mode(),&bytes).unwrap()else{panic!("actual primary request")};
             assert_eq!(request.operation,Operation::Command((*name).into()));
             assert_eq!(execute_primary(state.clone(),&request).await,Outcome::Queued);
-            #[cfg(feature="hitl_mode")]
-            tokio::time::timeout(std::time::Duration::from_secs(2),async {
-                let expected=false;
-                while state.hitl_safety_interlock_enabled(index)==expected {tokio::task::yield_now().await;}
-                while state.action_policy_snapshot().controls.iter().find(|c|c.cmd==*name).is_none_or(|c|c.actuated!=Some(!expected)){tokio::task::yield_now().await;}
-            }).await.unwrap();
+            if crate::runtime_mode::is_hitl() {
+                tokio::time::timeout(std::time::Duration::from_secs(2),async {
+                    let expected=false;
+                    while state.hitl_safety_interlock_enabled(index)==expected {tokio::task::yield_now().await;}
+                    while state.action_policy_snapshot().controls.iter().find(|c|c.cmd==*name).is_none_or(|c|c.actuated!=Some(!expected)){tokio::task::yield_now().await;}
+                }).await.unwrap();
+            }
             runtime.observation=crate::primary_mirror::encode_control_observation(&state,96);
             let reply=runtime.finish(&p,request,Outcome::Queued).unwrap();put(&shared,&format!("result{index}"),&reply);
             if index==0 {

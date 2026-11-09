@@ -1,6 +1,8 @@
-//! Route and admission tests. They run unchanged in every build: the current
-//! mode is this build's mode and the installed set is chosen per test.
+//! Route and admission tests. Each test fixes the mode on its own thread
+//! (`thread_mode`; tokio tests run their spawned tasks on that thread), so an
+//! in-process switch never disturbs other tests.
 use super::*;
+use crate::runtime_mode::test_support::thread_mode;
 use crate::recording_export::tests::{TestDirectory, export_state};
 use axum::body::Body;
 use axum::http::Request;
@@ -19,13 +21,22 @@ fn config(root: &Path, rrls: bool, supervised: bool) -> Config {
         supervised,
         flight_sim: false,
         dir: root.join("station-mode"),
-        available: parse_available("normal,hitl,test_fire,testing"),
-        current: Target {
-            mode: local_mode(),
-            simulation: false,
-        },
+        simulation: false,
+        flight_model: false,
         restart_delay: Duration::ZERO,
+        switch_delay: Duration::ZERO,
+        station_resets: false,
+        stand_in_links: || 0,
     }
+}
+async fn wait_for(mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..200 {
+        if done() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    done()
 }
 struct Fixture {
     _root: TestDirectory,
@@ -124,14 +135,15 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn snapshot_follows_the_ui_v2_contract_with_restart_transitions() {
+async fn snapshot_follows_the_ui_v2_contract_with_server_fenced_transitions() {
+    let _mode = thread_mode(Mode::Normal);
     let f = fixture().await;
     let s = f.snapshot("administrator").await;
     assert_eq!(s["version"], 2);
     for key in ["current", "transition", "policy_epoch", "reason"] {
         assert!(s.as_object().unwrap().contains_key(key), "{key}");
     }
-    assert_eq!(s["epoch_fencing_supported"], false, "restart is the fence");
+    assert_eq!(s["epoch_fencing_supported"], false, "the server fences every switch");
     assert_eq!(s["admissions_open"], true, "never closes ordinary command admission");
     assert_eq!(s["current"]["mode_id"], mode_id(local_mode()));
     assert_eq!(s["change_supported"], true);
@@ -142,8 +154,12 @@ async fn snapshot_follows_the_ui_v2_contract_with_restart_transitions() {
     for option in s["options"].as_array().unwrap() {
         assert_eq!(option["transition_kind"], "restart");
         assert_eq!(option["available"], true);
+        // Only a Simulation change restarts the backend.
+        assert_eq!(option["in_process"], option["simulation"] == false, "{option}");
         assert!(s["modes"].as_array().unwrap().iter().any(|m| m["id"] == option["mode_id"]));
     }
+    assert_eq!(s["modes"].as_array().unwrap().len(), 4);
+    assert!(s["policy_epoch"].as_str().unwrap().ends_with(&format!(":epoch-{}", crate::runtime_mode::epoch())));
     // Same installation across restarts; a new epoch per process.
     let again = Switch::new(f.switch.config.clone(), Arc::new(RestartSignal::default()));
     assert_eq!(again.backend_instance(), f.switch.backend_instance());
@@ -151,26 +167,39 @@ async fn snapshot_follows_the_ui_v2_contract_with_restart_transitions() {
 }
 
 #[tokio::test]
-async fn only_installed_builds_are_offered_and_unsupervised_backends_refuse() {
+async fn unsupervised_backends_switch_in_process_but_cannot_change_simulation() {
+    let _mode = thread_mode(Mode::Normal);
     let f = fixture_with(false, false).await;
     let s = f.snapshot("administrator").await;
-    assert_eq!(s["change_supported"], false);
-    assert!(s["reason"].as_str().unwrap().contains("supervisor"));
-    let (status, body) = f.prepare("administrator", mode_id(other_mode())).await;
+    assert_eq!(s["change_supported"], true);
+    let sim = s["options"].as_array().unwrap().iter().find(|o| o["id"] == "testing-simulation").unwrap();
+    assert_eq!(sim["available"], false);
+    assert!(sim["reason"].as_str().unwrap().contains("supervisor"), "{sim}");
+    let (status, body) = f.prepare("administrator", "testing-simulation").await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(body["error"].as_str().unwrap().contains("supervisor"), "{body}");
+    let (status, body) = f.prepare("administrator", "hitl").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["target"]["in_process"], true);
 
+    // An isolated FlightSim session changes nothing.
     let root = TestDirectory::new();
-    let mut only = config(&root.0, false, true);
-    only.available = vec![local_mode(), other_mode()];
-    let switch = Switch::new(only, Arc::new(RestartSignal::default()));
-    let targets: Vec<_> = switch.config.targets().iter().map(|t| t.id()).collect();
-    assert!(targets.contains(&mode_id(other_mode()).to_owned()));
-    assert!(!targets.iter().any(|t| t.ends_with("-simulation")) || local_mode() == Mode::Testing);
+    let mut isolated = config(&root.0, false, true);
+    isolated.flight_sim = true;
+    let switch = Switch::new(isolated, Arc::new(RestartSignal::default()));
+    assert!(switch.config.change_supported().unwrap_err().contains("FlightSim"));
+
+    // A process running testing mode's flight model restarts to leave testing.
+    let mut model = config(&root.0, true, true);
+    model.flight_model = true;
+    let switch = Switch::new(model, Arc::new(RestartSignal::default()));
+    assert!(!switch.config.in_process(Target { mode: Mode::TestFire, simulation: false }));
+    assert!(switch.config.in_process(Target { mode: Mode::Testing, simulation: false }));
 }
 
 #[tokio::test]
 async fn permission_requires_admin_or_operator_allowed_station_mode() {
+    let _mode = thread_mode(Mode::Normal);
     let f = fixture().await;
     for (user, allowed) in [("administrator", true), ("operator", true), ("commander", false), ("viewer", false)] {
         let s = f.snapshot(user).await;
@@ -192,9 +221,10 @@ async fn permission_requires_admin_or_operator_allowed_station_mode() {
 }
 
 #[tokio::test]
-async fn confirmed_switch_saves_the_selection_then_requests_a_clean_restart() {
+async fn confirmed_simulation_change_saves_the_selection_then_requests_a_clean_restart() {
+    let _mode = thread_mode(Mode::Normal);
     let f = fixture().await;
-    let target = mode_id(other_mode());
+    let target = "testing-simulation";
     let (status, challenge) = f.prepare("operator", target).await;
     assert_eq!(status, StatusCode::OK, "{challenge}");
     assert_eq!(challenge["target"]["id"], target);
@@ -232,8 +262,8 @@ async fn confirmed_switch_saves_the_selection_then_requests_a_clean_restart() {
     assert_eq!(receipt["transition"]["state"], "pending");
     assert_eq!(receipt["transition"]["id"], challenge["transition_id"]);
     let selection = f.selection().unwrap();
-    assert_eq!(selection.mode, target);
-    assert!(!selection.simulation);
+    assert_eq!(selection.mode, "testing");
+    assert!(selection.simulation);
     assert_eq!(selection.role, "primary");
     assert_eq!(selection.requested_by, "user:operator");
     for _ in 0..100 {
@@ -243,6 +273,7 @@ async fn confirmed_switch_saves_the_selection_then_requests_a_clean_restart() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(f.signal.requested(), "clean shutdown requested");
+    assert_eq!(crate::runtime_mode::current(), Mode::Normal, "a restart never switches in process");
     // Further reviews are refused while the restart runs.
     let (status, body) = f.prepare("operator", target).await;
     assert_eq!(status, StatusCode::CONFLICT);
@@ -254,6 +285,7 @@ async fn confirmed_switch_saves_the_selection_then_requests_a_clean_restart() {
 async fn busy_station_refuses_with_the_server_reason() {
     use crate::telemetry_db::{LaunchClockKind, LaunchClockMsg};
     use crate::types::FlightState;
+    let _mode = thread_mode(Mode::Normal);
     let f = fixture().await;
     let target = mode_id(other_mode());
     *f.state.launch_clock.lock().unwrap() = LaunchClockMsg {
@@ -295,10 +327,12 @@ async fn busy_station_refuses_with_the_server_reason() {
     assert!(body["error"].as_str().unwrap().contains("NitrousFill"), "{body}");
     assert!(f.selection().is_none());
     assert!(!f.signal.requested());
+    assert_eq!(crate::runtime_mode::current(), Mode::Normal);
 }
 
 #[tokio::test]
 async fn activity_just_before_restart_cancels_it_and_restores_the_selection() {
+    let _mode = thread_mode(Mode::Normal);
     let f = fixture().await;
     let previous = Selection {
         version: 1,
@@ -315,14 +349,14 @@ async fn activity_just_before_restart_cancels_it_and_restores_the_selection() {
     slow.restart_delay = Duration::from_millis(300);
     let switch = Arc::new(Switch::new(slow, f.signal.clone()));
     let f = Fixture { switch, ..f };
-    let target = mode_id(other_mode());
+    let target = "testing-simulation";
     let (_, challenge) = f.prepare("administrator", target).await;
     let phrase = challenge["required_confirmation"].as_str().unwrap().to_owned();
     let (status, _) = f
         .call("POST", "/api/station-modes/confirm", "administrator", Some(Fixture::confirmation(&challenge, &phrase)))
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(f.selection().unwrap().mode, target);
+    assert_eq!(f.selection().unwrap().target_id, target);
     *f.state.state.lock().unwrap() = crate::types::FlightState::PreFill;
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(!f.signal.requested(), "an active station is never restarted");
@@ -337,6 +371,7 @@ async fn activity_just_before_restart_cancels_it_and_restores_the_selection() {
 
 #[tokio::test]
 async fn restarted_process_reports_the_saved_transition_as_applied_or_failed() {
+    let _mode = thread_mode(Mode::Normal);
     let root = TestDirectory::new();
     let cfg = config(&root.0, false, true);
     let mut selection = Selection {
@@ -358,7 +393,7 @@ async fn restarted_process_reports_the_saved_transition_as_applied_or_failed() {
     let switch = Switch::new(cfg.clone(), Arc::new(RestartSignal::default()));
     let transition = switch.runtime.lock().unwrap().transition.clone().unwrap();
     assert_eq!(transition.state, "failed");
-    assert!(transition.error.unwrap().contains("installed"));
+    assert!(transition.error.unwrap().contains("supervisor"));
     // An RRLS selection never describes the primary.
     selection.role = "rrls".into();
     write_durable(&cfg.dir.join(SELECTION_FILE), &serde_json::to_vec(&selection).unwrap()).unwrap();
@@ -366,7 +401,8 @@ async fn restarted_process_reports_the_saved_transition_as_applied_or_failed() {
 }
 
 #[tokio::test]
-async fn rrls_offers_a_simulated_primary_for_every_build_and_switches_only_itself() {
+async fn rrls_offers_a_simulated_primary_for_every_mode_and_switches_only_itself() {
+    let _mode = thread_mode(Mode::Normal);
     let f = fixture_with(true, true).await;
     let s = f.snapshot("administrator").await;
     let ids: Vec<_> = s["options"].as_array().unwrap().iter().map(|o| o["id"].as_str().unwrap().to_owned()).collect();
@@ -383,6 +419,7 @@ async fn rrls_offers_a_simulated_primary_for_every_build_and_switches_only_itsel
     assert_eq!(status, StatusCode::OK, "{challenge}");
     assert!(challenge["summary"].as_str().unwrap().contains("only this RRLS"));
     let phrase = challenge["required_confirmation"].as_str().unwrap().to_owned();
+    assert!(phrase.starts_with("RESTART "), "a Simulation change restarts");
     let (status, _) = f
         .call("POST", "/api/station-modes/confirm", "administrator", Some(Fixture::confirmation(&challenge, &phrase)))
         .await;
@@ -402,5 +439,144 @@ fn target_ids_roundtrip_and_simulation_is_mode_specific_on_the_primary() {
         assert!(simulation_supported(mode, true));
     }
     assert_eq!(Target::parse("flight"), None);
-    assert_eq!(parse_available(" hitl,bogus,normal,hitl"), vec![Mode::Normal, Mode::Hitl]);
+}
+
+/// Confirms `target` and waits until the switch finished.
+async fn switch_in_process(f: &Fixture, user: &str, target: &str) -> (Value, Value) {
+    let before = f.snapshot(user).await;
+    let (status, challenge) = f.prepare(user, target).await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    let phrase = challenge["required_confirmation"].as_str().unwrap().to_owned();
+    assert_eq!(phrase, format!("SWITCH TO {}", target.to_uppercase()));
+    let (status, receipt) = f
+        .call("POST", "/api/station-modes/confirm", user, Some(Fixture::confirmation(&challenge, &phrase)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["transition"]["state"], "pending");
+    assert!(wait_for(|| f.switch.runtime.lock().unwrap().transition.as_ref().is_some_and(|t| t.state != "pending")).await);
+    (before, challenge)
+}
+
+#[tokio::test]
+async fn confirmed_switch_changes_mode_in_process_and_resets_mode_state() {
+    let _mode = thread_mode(Mode::Normal);
+    let f = fixture().await;
+    let layout_before = layout_revision();
+    let epoch_before = crate::runtime_mode::epoch();
+    f.state.hitl_launch_interlock_enabled.store(true, Ordering::SeqCst);
+    f.state.hitl_safety_interlocks[0].store(true, Ordering::SeqCst);
+    f.state.phase_control_selected.store(false, Ordering::SeqCst);
+    let phase_revision = f.state.phase_control_revision.load(Ordering::SeqCst);
+
+    let (before, challenge) = switch_in_process(&f, "operator", "hitl").await;
+    assert_eq!(crate::runtime_mode::current(), Mode::Hitl);
+    assert_eq!(crate::runtime_mode::epoch(), epoch_before + 1);
+    assert!(!f.signal.requested(), "no restart");
+    let s = f.snapshot("operator").await;
+    assert_eq!(s["transition"]["state"], "applied", "{s}");
+    assert_eq!(s["transition"]["id"], challenge["transition_id"]);
+    assert_eq!(s["current"]["mode_id"], "hitl");
+    assert_ne!(s["policy_epoch"], before["policy_epoch"]);
+    assert!(layout_revision() > layout_before);
+    assert_eq!(f.selection().unwrap().mode, "hitl");
+    // Mode-dependent state starts over as after a fresh start.
+    assert!(!f.state.hitl_launch_interlock_enabled.load(Ordering::SeqCst));
+    assert!(!f.state.hitl_safety_interlocks[0].load(Ordering::SeqCst));
+    assert!(f.state.phase_control_selected.load(Ordering::SeqCst));
+    assert!(f.state.phase_control_revision.load(Ordering::SeqCst) > phase_revision);
+    let change = last_change().unwrap();
+    assert_eq!(change["mode"], "hitl");
+    assert_eq!(change["policy_epoch"], s["policy_epoch"]);
+    assert!(change["layout_revision"].as_u64().unwrap() > layout_before);
+
+    // A review or confirmation taken under the old mode epoch is refused.
+    let (status, body) = f
+        .call("POST", "/api/station-modes/prepare", "operator", Some(Fixture::binding(&before, "test_fire")))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body["error"].as_str().unwrap().contains("changed since"), "{body}");
+    let (status, _) = f
+        .call("POST", "/api/station-modes/confirm", "operator", Some(Fixture::confirmation(&challenge, "SWITCH TO HITL")))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(crate::runtime_mode::current(), Mode::Hitl);
+
+    // And back again.
+    switch_in_process(&f, "operator", "normal").await;
+    assert_eq!(crate::runtime_mode::current(), Mode::Normal);
+}
+
+#[tokio::test]
+async fn switch_is_refused_when_the_station_is_not_idle_at_the_moment_of_the_switch() {
+    let _mode = thread_mode(Mode::TestFire);
+    let f = fixture().await;
+    let previous = Selection {
+        version: 1,
+        role: "primary".into(),
+        mode: "test_fire".into(),
+        simulation: false,
+        target_id: "test_fire".into(),
+        transition_id: "older".into(),
+        requested_by: "user:administrator".into(),
+        requested_at_ms: 1,
+    };
+    write_durable(&f.dir.join(SELECTION_FILE), &serde_json::to_vec(&previous).unwrap()).unwrap();
+    let mut slow = f.switch.config.clone();
+    slow.switch_delay = Duration::from_millis(300);
+    let switch = Arc::new(Switch::new(slow, f.signal.clone()));
+    let f = Fixture { switch, ..f };
+    let epoch = crate::runtime_mode::epoch();
+    let (_, challenge) = f.prepare("administrator", "normal").await;
+    let phrase = challenge["required_confirmation"].as_str().unwrap().to_owned();
+    let (status, _) = f
+        .call("POST", "/api/station-modes/confirm", "administrator", Some(Fixture::confirmation(&challenge, &phrase)))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(f.selection().unwrap().mode, "normal");
+    // Further reviews wait for the pending switch.
+    let (status, body) = f.prepare("administrator", "hitl").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body["error"].as_str().unwrap().contains("in progress"), "{body}");
+    f.state.launch_sequence_command_pending.store(true, Ordering::SeqCst);
+    assert!(wait_for(|| f.switch.runtime.lock().unwrap().transition.as_ref().is_some_and(|t| t.state != "pending")).await);
+    assert_eq!(crate::runtime_mode::current(), Mode::TestFire, "an active station never switches");
+    assert_eq!(crate::runtime_mode::epoch(), epoch);
+    assert_eq!(f.selection().unwrap(), previous, "previous selection restored");
+    let s = f.snapshot("administrator").await;
+    assert_eq!(s["transition"]["state"], "failed");
+    assert!(s["transition"]["error"].as_str().unwrap().contains("Launch"), "{s}");
+    f.state.launch_sequence_command_pending.store(false, Ordering::SeqCst);
+    switch_in_process(&f, "administrator", "normal").await;
+    assert_eq!(crate::runtime_mode::current(), Mode::Normal, "a refused switch can be retried");
+}
+
+#[tokio::test]
+async fn normal_is_never_entered_while_a_link_is_a_stand_in() {
+    let _mode = thread_mode(Mode::Hitl);
+    let root = TestDirectory::new();
+    let f = fixture().await;
+    let mut cfg = config(&root.0, false, true);
+    cfg.stand_in_links = || 1;
+    let f = Fixture { switch: Arc::new(Switch::new(cfg, f.signal.clone())), ..f };
+    let s = f.snapshot("administrator").await;
+    let normal = s["options"].as_array().unwrap().iter().find(|o| o["id"] == "normal").unwrap();
+    assert_eq!(normal["available"], false);
+    assert!(normal["reason"].as_str().unwrap().contains("stand-in"), "{normal}");
+    let (status, body) = f.prepare("administrator", "normal").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body["error"].as_str().unwrap().contains("stand-in"), "{body}");
+    // Other modes used stand-ins before too.
+    switch_in_process(&f, "administrator", "test_fire").await;
+    assert_eq!(crate::runtime_mode::current(), Mode::TestFire);
+}
+
+#[tokio::test]
+async fn layout_follows_the_mode_after_an_in_process_switch() {
+    let _mode = thread_mode(Mode::Normal);
+    let f = fixture().await;
+    assert!(!crate::layout::load_layout().unwrap().test_fire_mode);
+    switch_in_process(&f, "administrator", "test_fire").await;
+    assert!(crate::layout::load_layout().unwrap().test_fire_mode);
+    switch_in_process(&f, "administrator", "hitl").await;
+    assert!(!crate::layout::load_layout().unwrap().test_fire_mode);
 }

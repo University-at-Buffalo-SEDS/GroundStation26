@@ -55,9 +55,11 @@ radio opens, so a backend restart in flight skips the check. The gate is
 checked again before the first write and before `AT&W`.
 
 Operator override: `GS_RFD_MODEM_CHECK=skip` (no check), `verify` (read and
-report only) or `fix` (default for operational builds). Builds with `testing`,
-`hitl_mode` or `firmware_sim` default to `skip`, and a simulated PTY link
-(`GS_SIMULATED_SERIAL_PTY=1`) is always skipped.
+report only) or `fix` (default in normal and test-fire modes). HITL and testing
+modes and `firmware_sim` builds default to `skip`, and a simulated PTY link
+(`GS_SIMULATED_SERIAL_PTY=1`) is always skipped. The startup check runs once,
+under the mode the backend started in; a later switch into normal or test fire
+does not rerun it (the operator check stays available).
 
 ## What it does
 

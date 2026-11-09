@@ -5,7 +5,6 @@ use crate::{
     sequence_progress_producer::{Producer, Publication},
     sequence_progress_projection::{Cause, TerminalProof},
 };
-#[cfg(any(test, feature = "hitl_mode"))]
 use gse_sequence::Inputs;
 use gse_sequence::{NitrogenStep, Phase, ProgressObservation, Sample};
 const CAP: usize = 16;
@@ -68,9 +67,7 @@ enum Proof {
     Stopped(ProgressObservation),
     Interrupted,
     Failed(Text<512>),
-    #[cfg(any(test, feature = "hitl_mode"))]
     Engine(Kind, ProgressObservation, ProgressObservation),
-    #[cfg(any(test, feature = "hitl_mode"))]
     Trim(gse_sequence::fill_trim::ProgressObservation, Inputs),
 }
 impl Proof {
@@ -83,13 +80,11 @@ impl Proof {
             TerminalProof::SafeStopped(v) => Self::Stopped(v),
             TerminalProof::Interrupted => Self::Interrupted,
             TerminalProof::Failed { message } => Self::Failed(Text::new(&message)),
-            #[cfg(any(test, feature = "hitl_mode"))]
             TerminalProof::EngineCompleted {
                 kind,
                 before,
                 after,
             } => Self::Engine(kind, before, after),
-            #[cfg(any(test, feature = "hitl_mode"))]
             TerminalProof::VerifiedFillTrim { trim, input } => Self::Trim(trim, input),
         }
     }
@@ -105,13 +100,11 @@ impl Proof {
             Self::Failed(message) => TerminalProof::Failed {
                 message: message.string(),
             },
-            #[cfg(any(test, feature = "hitl_mode"))]
             Self::Engine(kind, before, after) => TerminalProof::EngineCompleted {
                 kind,
                 before,
                 after,
             },
-            #[cfg(any(test, feature = "hitl_mode"))]
             Self::Trim(trim, input) => TerminalProof::VerifiedFillTrim { trim, input },
         }
     }

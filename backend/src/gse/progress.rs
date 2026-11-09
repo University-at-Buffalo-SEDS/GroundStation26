@@ -448,8 +448,10 @@ pub(crate) fn controls(state: &AppState) -> Option<wire::RunControls> {
         hold_choice,
     })
 }
-#[cfg(not(feature = "hitl_mode"))]
 fn operational_gate(rt: &Runtime, action: Action) -> Result<(), String> {
+    if crate::runtime_mode::is_hitl() {
+        return Ok(());
+    }
     if !operational_action_allowed(rt, action) {
         return Err("Complete prerequisites in order and wait for stable fill-system routes".into());
     }
@@ -458,10 +460,6 @@ fn operational_gate(rt: &Runtime, action: Action) -> Result<(), String> {
     {
         return Err("Qualification was reset during the pause; cancel and start a new test".into());
     }
-    Ok(())
-}
-#[cfg(feature = "hitl_mode")]
-fn operational_gate(_rt: &Runtime, _action: Action) -> Result<(), String> {
     Ok(())
 }
 pub(super) fn routes() -> Router<Arc<AppState>> {

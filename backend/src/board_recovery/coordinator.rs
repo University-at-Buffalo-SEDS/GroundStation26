@@ -40,7 +40,7 @@ mod network_wait_tests {
     #[test]
     fn network_waits_keep_operational_values_outside_simulator_builds() {
         let scale = crate::sim_freshness::scale() as u32;
-        if !crate::sim_freshness::SCALING_BUILD {
+        if !crate::sim_freshness::scaling_build() {
             assert_eq!(scale, 1);
         }
         assert_eq!(network_wait(QUERY_TTL), QUERY_TTL * scale);
@@ -481,8 +481,9 @@ fn finish_operator_reset(state: &AppState, reset: u8) {
     }
     state.set_launch_indicator_latched(false);
     state.set_abort_indicator_latched(false);
-    #[cfg(feature = "hitl_mode")]
-    if state.local_flight_state_snapshot() == crate::types::FlightState::Startup {
+    if crate::runtime_mode::is_hitl()
+        && state.local_flight_state_snapshot() == crate::types::FlightState::Startup
+    {
         state.set_local_flight_state(crate::types::FlightState::Idle);
     }
 }
@@ -1858,8 +1859,10 @@ async fn run(
         wait_sdk(state, &router, token, quiesce).await?;
     }
     authorize(state, headers, ticket).await?;
-    #[cfg(all(test, any(feature="hitl_mode",feature="firmware_sim")))]
-    tests::pause_clock_marker(state).await;
+    #[cfg(test)]
+    if crate::runtime_mode::is_hitl() || cfg!(feature = "firmware_sim") {
+        tests::pause_clock_marker(state).await;
+    }
     fence = state
         .launch_history
         .lock()
@@ -1897,8 +1900,10 @@ async fn run(
     let clock = crate::final_proof_clock::Prepared::capture(
         ticket.boundary.ok_or("Original confirmation boundary missing")?.clock_failure(),
     ).map_err(|error| error.message())?;
-    #[cfg(all(test, any(feature="hitl_mode",feature="firmware_sim")))]
-    tests::pause_clock_ready(state).await;
+    #[cfg(test)]
+    if crate::runtime_mode::is_hitl() || cfg!(feature = "firmware_sim") {
+        tests::pause_clock_ready(state).await;
+    }
     let mut admission = None;
     loop {
         authorize(state, headers, ticket).await?;
@@ -1916,8 +1921,10 @@ async fn run(
         ) {
             Ok(()) => break,
             Err(crate::gse::reset_generation::FinalizeError::ClockBusy) => {
-                #[cfg(all(test, any(feature="hitl_mode",feature="firmware_sim")))]
-                tests::notify_final_clock_busy(state);
+                #[cfg(test)]
+                if crate::runtime_mode::is_hitl() || cfg!(feature = "firmware_sim") {
+                    tests::notify_final_clock_busy(state);
+                }
                 clock_admission.note_busy().map_err(|error| error.message())?;
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -1969,19 +1976,17 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim")))]
+    #[cfg(not(feature = "firmware_sim"))]
     mod normal_automatic_phase { include!("normal_automatic_phase_tests.rs"); }
     include!("targeted_recovery_tests.rs");
     include!("resync_tests.rs");
     include!("concurrent_exchange_tests.rs");
-    #[cfg(any(feature="hitl_mode",feature="firmware_sim"))]
     include!("final_clock_tests.rs");
     use super::*;
     include!("postmission_stop_reset_native.rs");
     include!("queued_fc_preentry_native.rs");
     include!("ignition_pair_causal_tests.rs");
     include!("ignition_pair_controls.rs");
-    #[cfg(feature="test_fire_mode")]
     mod pending_native { include!("pending_recovery_native_tests.rs"); }
     use futures::FutureExt;
     use sedsnet::router::{EndpointHandler, Router, RouterConfig, RouterSideOptions};
@@ -1995,11 +2000,8 @@ mod tests {
     static AUTH_RECEIVED: Mutex<Option<(usize, Arc<tokio::sync::Notify>)>> = Mutex::new(None);
     static RESPONSE: Mutex<Option<(usize, Arc<Pause>)>> = Mutex::new(None);
     static FINAL: Mutex<Option<(usize, Arc<Pause>)>> = Mutex::new(None);
-    #[cfg(any(feature="hitl_mode",feature="firmware_sim"))]
     static CLOCK_READY: Mutex<Option<(usize, Arc<Pause>)>> = Mutex::new(None);
-    #[cfg(any(feature="hitl_mode",feature="firmware_sim"))]
     static CLOCK_MARKER: Mutex<Option<(usize, Arc<Pause>)>> = Mutex::new(None);
-    #[cfg(any(feature="hitl_mode",feature="firmware_sim"))]
     static CLOCK_BUSY: Mutex<Option<(usize, Arc<tokio::sync::Notify>)>> = Mutex::new(None);
 
     struct PauseGuard {
@@ -2062,15 +2064,12 @@ mod tests {
     pub(super) async fn pause_finalization(state: &Arc<AppState>) {
         pause(&FINAL, state).await;
     }
-    #[cfg(any(feature="hitl_mode",feature="firmware_sim"))]
     pub(super) async fn pause_clock_ready(state: &Arc<AppState>) {
         pause(&CLOCK_READY, state).await;
     }
-    #[cfg(any(feature="hitl_mode",feature="firmware_sim"))]
     pub(super) async fn pause_clock_marker(state: &Arc<AppState>) {
         pause(&CLOCK_MARKER, state).await;
     }
-    #[cfg(any(feature="hitl_mode",feature="firmware_sim"))]
     pub(super) fn notify_final_clock_busy(state: &Arc<AppState>) {
         if let Some((key, notify)) = CLOCK_BUSY.lock().unwrap().as_ref()
             && *key == Arc::as_ptr(state) as usize { notify.notify_one(); }
@@ -2098,10 +2097,7 @@ mod tests {
         recover_delay: Duration,
         first_receipt: HashMap<u64, WallInstant>,
     }
-    #[cfg(feature="test_fire_mode")]
     type NativePeerRouter = Arc<Router>;
-    #[cfg(not(feature="test_fire_mode"))]
-    type NativePeerRouter = Router;
     struct Link {
         board: Board,
         router: NativePeerRouter,
@@ -2129,14 +2125,14 @@ mod tests {
         /// real boards do periodically, after a test waits past discovery age.
         rediscover: Arc<std::sync::atomic::AtomicBool>,
         _db: mpsc::Sender<crate::telemetry_db::DbQueueItem>,
-        #[cfg(feature="test_fire_mode")]
         native_peers: Vec<(Board,Arc<Router>)>,
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
             let healthy = !self.pump.is_finished() && !self.receiver.is_finished();
-            #[cfg(feature="test_fire_mode")]
-            crate::recovery_pending_probe::clear_for_state(&self.http.state);
+            if crate::runtime_mode::is_test_fire() {
+                crate::recovery_pending_probe::clear_for_state(&self.http.state);
+            }
             self.http.state.request_shutdown();
             self.pump.abort();
             self.receiver.abort();
@@ -2195,7 +2191,6 @@ mod tests {
         ) -> Self {
             Self::from_saved_with_services_profile_and_c_boards(journal, retained, clock, managed_peers, false, false, false).await
         }
-        #[cfg(not(feature="hitl_mode"))]
         async fn new_with_active_startup_peer_services() -> Self {
             Self::from_saved_with_services_profile_and_c_boards(None,None,None,true,true,false,false).await
         }
@@ -2227,9 +2222,7 @@ mod tests {
             let (db, db_rx) = mpsc::channel(64);
             Arc::get_mut(&mut http.state).unwrap().db_queue_tx = db.clone();
             let state = http.state.clone();
-            #[cfg(feature="test_fire_mode")]
-            let native_probe=crate::recovery_pending_probe::take_next();
-            #[cfg(feature="test_fire_mode")]
+            let native_probe=if crate::runtime_mode::is_test_fire() { crate::recovery_pending_probe::take_next() } else { None };
             if let Some(p)=&native_probe { p.bind(&state); }
             *state.launch_history.lock().unwrap() = crate::launch_history::Store::open(
                 http.directory.join("clock.json"),
@@ -2261,7 +2254,6 @@ mod tests {
             let received_raw = raw_state_receipts.clone();
             let controller_receipts=Arc::new(Mutex::new(Vec::<Packet>::new()));
             let received_controls=controller_receipts.clone();
-            #[cfg(feature="test_fire_mode")]
             let native_enabled=native_probe.is_some();
             let weak = Arc::downgrade(&state);
             let config = RouterConfig::new([EndpointHandler::new_packet_handler(
@@ -2295,10 +2287,10 @@ mod tests {
                             );
                         }
                         receive_status(&state, packet);
-                        #[cfg(feature = "test_fire_mode")]
-                        pending_epoch_note_ingress(&state, packet);
-                        #[cfg(feature="test_fire_mode")]
-                        if native_enabled && packet.data_type()==crate::telemetry_schema::data_type("HEARTBEAT") {
+                        if crate::runtime_mode::is_test_fire() {
+                            pending_epoch_note_ingress(&state, packet);
+                        }
+                        if crate::runtime_mode::is_test_fire() && native_enabled && packet.data_type()==crate::telemetry_schema::data_type("HEARTBEAT") {
                             state.ring_buffer.lock().unwrap().push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: packet.clone(), ingress_generation });
                         }
                         if packet.data_type() == crate::telemetry_schema::data_type("FLIGHT_STATE")
@@ -2338,7 +2330,6 @@ mod tests {
             }
             let mut links = Vec::new();
             let mut models = Vec::new();
-            #[cfg(feature="test_fire_mode")]
             let mut native_peers=Vec::new();
             let incoming_startup = Arc::new(Mutex::new(Vec::<(Board,Packet)>::new()));
             let managed_state_receipts = Arc::new(Mutex::new(Vec::<(Board,Packet)>::new()));
@@ -2387,10 +2378,7 @@ mod tests {
                     }
                 }
                 let peer_config = RouterConfig::new(peer_handlers).with_sender(board.sender_id());
-                #[cfg(not(feature="test_fire_mode"))]
-                let router=Router::new(peer_config);
-                #[cfg(feature="test_fire_mode")]
-                let router=Arc::new(if let Some(clock)=native_probe.as_ref().and_then(|p|p.clock.clone()) {
+                let router=Arc::new(if !crate::runtime_mode::is_test_fire() { Router::new(peer_config) } else if let Some(clock)=native_probe.as_ref().and_then(|p|p.clock.clone()) {
                     Router::new_with_clock(peer_config,Box::new(crate::recovery_pending_probe::ClockSource(clock)))
                 } else { Router::new(peer_config) });
                 if managed_peers {
@@ -2399,13 +2387,10 @@ mod tests {
                     let ty=crate::telemetry_schema::data_type("FLIGHT_STATE");
                     router.enable_network_variable(ty,sedsnet::router::NetworkVariablePermissions::READ_ONLY).unwrap();
                     let managed_receipts=managed_state_receipts.clone();
-                    #[cfg(feature="test_fire_mode")]
                     let probe=native_probe.clone();
-                    #[cfg(feature="test_fire_mode")]
                     let weak_peer=Arc::downgrade(&router);
                     router.on_network_variable_update(ty,move |packet| {
                         managed_receipts.lock().unwrap().push((board,packet.clone()));
-                        #[cfg(feature="test_fire_mode")]
                         if let Some(p)=&probe {
                             p.observe(board,packet);
                             if board==Board::GatewayBoard && p.reject_gb.load(Ordering::Acquire) {
@@ -2418,45 +2403,31 @@ mod tests {
                 }
                 let outgoing = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
                 let output = outgoing.clone();
-                #[cfg(feature="test_fire_mode")]
                 let outgoing_wire_probe = native_probe.clone();
                 let hs = host.add_side_packed_with_options(
                     format!("wire-{}", board.sender_id()),
                     move |wire| {
-                        #[cfg(feature="test_fire_mode")]
                         if let Some(p) = &outgoing_wire_probe { p.observe_wire("host_emit", board, wire); }
                         output.lock().unwrap().push(wire.to_vec());
                         Ok(())
                     },
                     RouterSideOptions {
-                        reliable_enabled: {
-                            #[cfg(feature="test_fire_mode")]
-                            {native_probe.is_none()}
-                            #[cfg(not(feature="test_fire_mode"))]
-                            {true}
-                        },
+                        reliable_enabled: if crate::runtime_mode::is_test_fire() { native_probe.is_none() } else { true },
                         ..Default::default()
                     },
                 );
                 let incoming = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
                 let output = incoming.clone();
-                #[cfg(feature="test_fire_mode")]
                 let incoming_wire_probe = native_probe.clone();
                 let bs = router.add_side_packed_with_options(
                     "wire",
                     move |wire| {
-                        #[cfg(feature="test_fire_mode")]
                         if let Some(p) = &incoming_wire_probe { p.observe_wire("peer_emit", board, wire); }
                         output.lock().unwrap().push(wire.to_vec());
                         Ok(())
                     },
                     RouterSideOptions {
-                        reliable_enabled: {
-                            #[cfg(feature="test_fire_mode")]
-                            {native_probe.is_none()}
-                            #[cfg(not(feature="test_fire_mode"))]
-                            {true}
-                        },
+                        reliable_enabled: if crate::runtime_mode::is_test_fire() { native_probe.is_none() } else { true },
                         ..Default::default()
                     },
                 );
@@ -2507,7 +2478,6 @@ mod tests {
                         }))
                     });
                 models.push((board, model.clone()));
-                #[cfg(feature="test_fire_mode")]
                 native_peers.push((board,router.clone()));
                 links.push(Link {
                     board,
@@ -2548,24 +2518,24 @@ mod tests {
                     }
                     // The actual telemetry task is the sole host queue owner.
                     for link in &mut links {
-                        #[cfg(feature="test_fire_mode")]
                         if link.board==Board::GatewayBoard && native_probe.as_ref().is_some_and(|p|p.get_due()) {
                             link.router.request_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).unwrap();
                         }
                         for wire in std::mem::take(&mut *link.outgoing.lock().unwrap()) {
                             let result=link.router.rx_packed_from_side(&wire,link.board_side);
-                            #[cfg(feature="test_fire_mode")]
                             if result.is_ok() && let Some(p) = &native_probe { p.observe_wire("peer_ingress_accepted", link.board, &wire); }
-                            #[cfg(feature="test_fire_mode")]
-                            crate::recovery_pending_probe::peer_result(native_probe.as_ref(),result);
-                            #[cfg(not(feature="test_fire_mode"))]
-                            result.unwrap();
+                            if crate::runtime_mode::is_test_fire() {
+                                crate::recovery_pending_probe::peer_result(native_probe.as_ref(),result);
+                            } else {
+                                result.unwrap();
+                            }
                         }
                         let result=link.router.process_all_queues_with_timeout(0);
-                        #[cfg(feature="test_fire_mode")]
-                        crate::recovery_pending_probe::peer_result(native_probe.as_ref(),result);
-                        #[cfg(not(feature="test_fire_mode"))]
-                        result.unwrap();
+                        if crate::runtime_mode::is_test_fire() {
+                            crate::recovery_pending_probe::peer_result(native_probe.as_ref(),result);
+                        } else {
+                            result.unwrap();
+                        }
                         for packet in std::mem::take(&mut *link.requests.lock().unwrap()) {
                             if let Some(bridge)=&mut link.c_bridge {
                                 let response=bridge.packet(&packet);
@@ -2700,10 +2670,11 @@ mod tests {
                             link.router.tx_queue(reply).unwrap();
                         }
                         let result=link.router.process_all_queues_with_timeout(0);
-                        #[cfg(feature="test_fire_mode")]
-                        crate::recovery_pending_probe::peer_result(native_probe.as_ref(),result);
-                        #[cfg(not(feature="test_fire_mode"))]
-                        result.unwrap();
+                        if crate::runtime_mode::is_test_fire() {
+                            crate::recovery_pending_probe::peer_result(native_probe.as_ref(),result);
+                        } else {
+                            result.unwrap();
+                        }
                         link.pending_rx
                             .extend(std::mem::take(&mut *link.incoming.lock().unwrap()));
                         assert!(
@@ -2711,11 +2682,9 @@ mod tests {
                             "bounded test wire retains backpressure"
                         );
                         while let Some(wire) = link.pending_rx.front() {
-                            #[cfg(feature="test_fire_mode")]
                             if native_probe.as_ref().is_some_and(|p| p.should_hold_get(link.board, wire)) { break; }
                             match pump_host.rx_packed_from_side(wire, link.host_side) {
                                 Ok(()) => {
-                                    #[cfg(feature="test_fire_mode")]
                                     if let Some(p) = &native_probe { p.observe_wire("host_ingress_accepted", link.board, wire); }
                                     link.pending_rx.pop_front();
                                 }
@@ -2749,7 +2718,6 @@ mod tests {
                 ignition_wire_hold,
                 rediscover,
                 _db: db,
-                #[cfg(feature="test_fire_mode")]
                 native_peers,
             };
             if managed_peers {
@@ -2920,7 +2888,6 @@ mod tests {
             terminal.unwrap()
         }
     }
-    #[cfg(feature="test_fire_mode")]
     fn tf_fresh_receipt_probe() -> Arc<crate::recovery_pending_probe::Probe> {
         // Match the existing native fixture's explicit desired-cache load.
         let _ = crate::network_variables::flight_state();
@@ -2929,7 +2896,6 @@ mod tests {
         probe.install();
         probe
     }
-    #[cfg(feature="test_fire_mode")]
     async fn assert_tf_idle_from_fresh_mcu_receipts(fixture: &Fixture) {
         let state = fixture.state();
         let before = crate::network_variables::automatic_idle_test_snapshot();
@@ -2979,8 +2945,7 @@ mod tests {
     #[tokio::test(flavor="multi_thread",worker_threads=2)]
     async fn actual_mode_reset_preserves_global_broadcast_but_verifies_only_frozen_policy() {
         if isolated("actual_mode_reset_preserves_global_broadcast_but_verifies_only_frozen_policy") { return; }
-        #[cfg(feature="test_fire_mode")]
-        let _tf_probe = tf_fresh_receipt_probe();
+        let _tf_probe = crate::runtime_mode::is_test_fire().then(tf_fresh_receipt_probe);
         let fixture=Fixture::new_with_managed_peers().await;
         let state=fixture.state();
         let request=json!({"action":"reset_startup","board":null,"mode":null,
@@ -3073,12 +3038,11 @@ mod tests {
         };
         // Normal may publish Idle after Startup. TF requires a NEW actual MCU
         // packet; the READ_ONLY peer callbacks never grant that authority.
-        if !cfg!(feature="hitl_mode") {
+        if !crate::runtime_mode::is_hitl() {
             assert_eq!(cached.as_ref().unwrap()["sender"],"GS");
-            if cfg!(feature="test_fire_mode") {
+            if crate::runtime_mode::is_test_fire() {
                 assert_eq!(state.local_flight_state_snapshot(),crate::types::FlightState::Startup);
                 assert_eq!(cached.as_ref().unwrap()["payload"],json!([0]));
-                #[cfg(feature="test_fire_mode")]
                 assert_tf_idle_from_fresh_mcu_receipts(&fixture).await;
             } else {
                 // Startup delivery and the owner's next Idle publication are
@@ -4208,10 +4172,11 @@ mod tests {
         assert!(crate::board_abort::blocked_message(&state).is_none());
         // Exiting a board Abort is not authority to bypass the remaining policy.
         *state.state.lock().unwrap() = crate::types::FlightState::Startup;
-        #[cfg(feature = "hitl_mode")]
-        state
-            .hitl_launch_interlock_enabled
-            .store(true, Ordering::Release);
+        if crate::runtime_mode::is_hitl() {
+            state
+                .hitl_launch_interlock_enabled
+                .store(true, Ordering::Release);
+        }
         assert!(!state.is_command_allowed(&crate::types::TelemetryCommand::Launch));
     }
 
@@ -4722,12 +4687,12 @@ mod tests {
         {
             return;
         }
-        #[cfg(feature="test_fire_mode")]
-        let _tf_probe = tf_fresh_receipt_probe();
-        #[cfg(feature="test_fire_mode")]
-        let fixture = Fixture::new_with_managed_peers().await;
-        #[cfg(not(feature="test_fire_mode"))]
-        let fixture = Fixture::new().await;
+        let _tf_probe = crate::runtime_mode::is_test_fire().then(tf_fresh_receipt_probe);
+        let fixture = if crate::runtime_mode::is_test_fire() {
+            Fixture::new_with_managed_peers().await
+        } else {
+            Fixture::new().await
+        };
         *fixture.http.state.state.lock().unwrap() = crate::types::FlightState::Aborted;
         let original = fixture.http.state.launch_history.lock().unwrap().snapshot();
         let mut publications = fixture.http.state.state_tx.subscribe();
@@ -4753,16 +4718,15 @@ mod tests {
             "actual Startup publication must precede policy refresh"
         );
         assert_eq!(operation["reset_applied_state"], 0);
-        if cfg!(feature = "hitl_mode") {
+        if crate::runtime_mode::is_hitl() {
             assert_eq!(
                 fixture.http.state.local_flight_state_snapshot(),
                 crate::types::FlightState::Idle,
                 "HITL reset finishes at Idle"
             );
-        } else if cfg!(feature="test_fire_mode") {
+        } else if crate::runtime_mode::is_test_fire() {
             assert!(!observed_idle_after_startup, "TF reset cleanup must not invent a fresh MCU readiness receipt");
             assert_eq!(fixture.http.state.local_flight_state_snapshot(),crate::types::FlightState::Startup);
-            #[cfg(feature="test_fire_mode")]
             assert_tf_idle_from_fresh_mcu_receipts(&fixture).await;
         } else {
             assert!(
@@ -6062,7 +6026,6 @@ mod tests {
         assert_eq!(model.boot, 1);
         assert_eq!(model.applied, 0);
     }
-    #[cfg(feature = "test_fire_mode")]
     include!("pending_next_epoch_coordinator_tests.rs");
 
     #[tokio::test]

@@ -368,6 +368,7 @@ impl Drop for Release {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r1_actual_auto_publisher_and_initial_recovery_owner() {
+    crate::mode_suite!(TestFire);
     if separate("r1_actual_auto_publisher_and_initial_recovery_owner") {
         return;
     }
@@ -392,6 +393,7 @@ async fn r1_actual_auto_publisher_and_initial_recovery_owner() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r2_slow_model_natural_exhaustion_keeps_original_identity() {
+    crate::mode_suite!(TestFire);
     if separate("r2_slow_model_natural_exhaustion_keeps_original_identity") {
         return;
     }
@@ -449,6 +451,7 @@ async fn r2_slow_model_natural_exhaustion_keeps_original_identity() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r3_managed_get_api_attempt_and_pending_owner_inventory() {
+    crate::mode_suite!(TestFire);
     if separate("r3_managed_get_api_attempt_and_pending_owner_inventory") {
         return;
     }
@@ -475,6 +478,7 @@ async fn r3_managed_get_api_attempt_and_pending_owner_inventory() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r4_new_abort_episode_refuses_second_prepare_after_actual_quiet() {
+    crate::mode_suite!(TestFire);
     if separate("r4_new_abort_episode_refuses_second_prepare_after_actual_quiet") {
         return;
     }
@@ -576,6 +580,7 @@ async fn r4_new_abort_episode_refuses_second_prepare_after_actual_quiet() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r5_unshippable_queue_clear_does_not_retire_owner() {
+    crate::mode_suite!(TestFire);
     if separate("r5_unshippable_queue_clear_does_not_retire_owner") {
         return;
     }
@@ -594,6 +599,7 @@ async fn r5_unshippable_queue_clear_does_not_retire_owner() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r6_abort_launch_and_unknown_origin_owners_not_discarded() {
+    crate::mode_suite!(TestFire);
     if separate("r6_abort_launch_and_unknown_origin_owners_not_discarded") {
         return;
     }
@@ -626,6 +632,7 @@ async fn r6_abort_launch_and_unknown_origin_owners_not_discarded() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r7_old_auto_publication_must_not_cross_closed_recovery() {
+    crate::mode_suite!(TestFire);
     if separate("r7_old_auto_publication_must_not_cross_closed_recovery") {
         return;
     }
@@ -660,6 +667,7 @@ async fn r7_old_auto_publication_must_not_cross_closed_recovery() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r8_original_receive_must_not_survive_real_reset_aba() {
+    crate::mode_suite!(TestFire);
     if separate("r8_original_receive_must_not_survive_real_reset_aba") {
         return;
     }
@@ -701,6 +709,7 @@ async fn r8_original_receive_must_not_survive_real_reset_aba() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r9_actual_auto_publication_requires_inflight_claim() {
+    crate::mode_suite!(TestFire);
     if separate("r9_actual_auto_publication_requires_inflight_claim") {
         return;
     }
@@ -718,6 +727,7 @@ async fn r9_actual_auto_publication_requires_inflight_claim() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r10_actual_stop_during_state_commit_must_prevent_late_idle() {
+    crate::mode_suite!(TestFire);
     if separate("r10_actual_stop_during_state_commit_must_prevent_late_idle") {
         return;
     }
@@ -760,6 +770,7 @@ async fn r10_actual_stop_during_state_commit_must_prevent_late_idle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r11_cancel_prepared_receiver_has_no_late_automatic_effects() {
+    crate::mode_suite!(TestFire);
     if separate("r11_cancel_prepared_receiver_has_no_late_automatic_effects") {
         return;
     }
@@ -975,6 +986,7 @@ async fn r12_healthy_contacts(f:&Fixture,p:&Probe) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r12_healthy_actual_sdk_idle_is_live_only_one_original() {
+    crate::mode_suite!(TestFire);
     if separate("r12_healthy_actual_sdk_idle_is_live_only_one_original") {
         return;
     }
@@ -1041,6 +1053,7 @@ impl Drop for R12PolicyOwner {fn drop(&mut self){self.finish();}}
 
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 async fn r12b_actual_policy_busy_refuses_one_prepared_original_without_effects() {
+    crate::mode_suite!(TestFire);
     if separate("r12b_actual_policy_busy_refuses_one_prepared_original_without_effects"){return;}
     let (f,p)=native(None,false).await;
     let state=f.state();
@@ -1076,6 +1089,7 @@ async fn r12b_actual_policy_busy_refuses_one_prepared_original_without_effects()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r13_policy_refresh_cannot_promote_cached_contacts_while_stop_is_retained() {
+    crate::mode_suite!(TestFire);
     if separate("r13_policy_refresh_cannot_promote_cached_contacts_while_stop_is_retained") {
         return;
     }
@@ -1117,6 +1131,7 @@ async fn r13_policy_refresh_cannot_promote_cached_contacts_while_stop_is_retaine
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r14_policy_refresh_is_observational_without_eligible_fresh_receipt() {
+    crate::mode_suite!(TestFire);
     if separate("r14_policy_refresh_is_observational_without_eligible_fresh_receipt") {
         return;
     }
@@ -1150,6 +1165,7 @@ async fn r14_policy_refresh_is_observational_without_eligible_fresh_receipt() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r15_actual_200ms_sequence_loop_cannot_publish_readiness_from_cached_contacts() {
+    crate::mode_suite!(TestFire);
     if separate("r15_actual_200ms_sequence_loop_cannot_publish_readiness_from_cached_contacts") {
         return;
     }
@@ -1234,6 +1250,7 @@ fn decoded_wire(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r16_single_public_get_wire_waits_for_gs_then_returns_original_observation() {
+    crate::mode_suite!(TestFire);
     if separate("r16_single_public_get_wire_waits_for_gs_then_returns_original_observation") { return; }
     let (f, p) = native(None, false).await;
     r12_healthy_contacts(&f,&p).await;
@@ -1307,9 +1324,9 @@ async fn r16_single_public_get_wire_waits_for_gs_then_returns_original_observati
 // proves all four initial contacts have been processed, leaving no optional
 // first-window event that could publish after owner release. Existing HITL
 // cases/bodies are untouched; their optional-DAQ contract is not claimed here.
-#[cfg(not(feature="hitl_mode"))]
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 async fn r17_real_policy_busy_then_later_fresh_window_accepts_one_original() {
+    crate::mode_suite!(TestFire);
     if separate("r17_real_policy_busy_then_later_fresh_window_accepts_one_original"){return;}
     let (f,p)=native(None,false).await;
     let state=f.state();

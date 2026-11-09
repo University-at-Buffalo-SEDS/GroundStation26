@@ -312,7 +312,7 @@ pub(super) fn telemetry_snapshot(
     let (profile_id, profile) = presentation
         .broadcast
         .rundown
-        .profile(phase, cfg!(feature = "test_fire_mode"));
+        .profile(phase, crate::runtime_mode::is_test_fire());
     let fill_source = app.fill_targets.lock().unwrap().fill_source;
     let stats: Vec<_> = {
         let rows = app.recent_telemetry_cache.lock().unwrap();
@@ -344,7 +344,7 @@ pub(super) fn telemetry_snapshot(
         sampled_timestamp_ms:sampled,anchor_timestamp_ms:clock.anchor_timestamp_ms,duration_ms:clock.duration_ms,remaining_ms:remaining,advancing:false,
     };
     let sequence_visuals=crate::sequence_stream::project(stream_clock,Some(crate::gse::progress::stream_observation(app)),app.umbilical_stream_outputs(),app.umbilical_stream_commands());
-    serde_json::json!({"phase":format!("{phase:?}"),"test_fire_mode":cfg!(feature="test_fire_mode"),"stats":stats,"profile":profile_id,"cycle_seconds":profile.cycle_seconds,"stats_per_page":profile.stats_per_page,"scene":profile.scene,"positions":crate::antenna::snapshot(),"t_clock":program_t_clock(&clock,sampled),"sequence_visuals":sequence_visuals})
+    serde_json::json!({"phase":format!("{phase:?}"),"test_fire_mode":crate::runtime_mode::is_test_fire(),"stats":stats,"profile":profile_id,"cycle_seconds":profile.cycle_seconds,"stats_per_page":profile.stats_per_page,"scene":profile.scene,"positions":crate::antenna::snapshot(),"t_clock":program_t_clock(&clock,sampled),"sequence_visuals":sequence_visuals})
 }
 
 fn valid_hls_file(name: &str) -> bool {

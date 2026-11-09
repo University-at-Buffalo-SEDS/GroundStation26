@@ -1,10 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+/// Every variant exists in every station mode. Client commands that only
+/// exist in HITL (or HITL and test fire) are refused when deserialized in
+/// another mode, with the same "unknown variant" error the per-mode builds
+/// gave, so the wire contract per mode is unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 #[repr(u8)]
 pub enum TelemetryCommand {
     #[serde(skip)]
-    #[cfg_attr(not(feature="hitl_mode"), expect(dead_code, reason="Only HITL ingress constructs this non-serializable intent"))]
     OperatorPhase { intent: crate::operator_phase::Intent },
     Postinit,
     Launch,
@@ -13,7 +17,6 @@ pub enum TelemetryCommand {
     NormallyOpen,
     Pilot,
     Igniter,
-    #[cfg(feature = "hitl_mode")]
     IgniterSequence,
     RetractPlumbing,
     Nitrogen,
@@ -34,64 +37,36 @@ pub enum TelemetryCommand {
     RevokeResetFailures,
     ValidateMeasms,
     RevokeValidateMeasms,
-    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     GroundStationLaunch,
-    #[cfg(feature = "hitl_mode")]
     ToggleButtonInterlock,
-    #[cfg(feature = "hitl_mode")]
     ToggleGroundStationControl,
-    #[cfg(feature = "hitl_mode")]
     ToggleLaunchInterlock,
-    #[cfg(feature = "hitl_mode")]
     TogglePlumbingDelayInterlock,
-    #[cfg(feature = "hitl_mode")]
     ToggleChecklistInterlock,
-    #[cfg(feature = "hitl_mode")]
     ToggleSupplyInterlock,
-    #[cfg(feature = "hitl_mode")]
     ToggleBoardStateProofInterlock,
-    #[cfg(feature = "hitl_mode")]
     TogglePhysicalLaunchMode,
     ToggleAvBayUnderglow,
     ToggleFlightBuzzer,
-    #[cfg(feature = "hitl_mode")]
     ResetLaunchLatch,
-    #[cfg(feature = "hitl_mode")]
     ResetFlightState,
     ResetTClock,
-    #[cfg(feature = "hitl_mode")]
     DeployParachute,
-    #[cfg(feature = "hitl_mode")]
     ExpandParachute,
-    #[cfg(feature = "hitl_mode")]
     EvaluationRelax,
-    #[cfg(feature = "hitl_mode")]
     EvaluationFocus,
-    #[cfg(feature = "hitl_mode")]
     EvaluationAbort,
-    #[cfg(feature = "hitl_mode")]
     ReinitSensors,
-    #[cfg(feature = "hitl_mode")]
     ReinitBarometer,
-    #[cfg(feature = "hitl_mode")]
     EnableIMU,
-    #[cfg(feature = "hitl_mode")]
     DisableIMU,
-    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     AdvanceFlightState,
-    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
     RewindFlightState,
-    #[cfg(feature = "hitl_mode")]
     AbortAfter100,
-    #[cfg(feature = "hitl_mode")]
     AbortAfter40,
-    #[cfg(feature = "hitl_mode")]
     AbortAfter250,
-    #[cfg(feature = "hitl_mode")]
     ReinitAfter15,
-    #[cfg(feature = "hitl_mode")]
     ReinitAfter30,
-    #[cfg(feature = "hitl_mode")]
     ReinitAfter50,
     StartFill,
     /// Retained pre-auth Fill admission; never accepted from a client.
@@ -136,6 +111,116 @@ pub enum TelemetryCommand {
     AutomaticNitrousClose {
         generation: u64,
     },
+}
+
+impl Serialize for TelemetryCommand {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        TelemetryCommand::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TelemetryCommand {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let command = TelemetryCommand::deserialize(deserializer)?;
+        let mode = crate::runtime_mode::current();
+        if command.available_in(mode) {
+            Ok(command)
+        } else {
+            Err(serde::de::Error::unknown_variant(
+                crate::sequences::command_name(&command),
+                client_command_names(mode),
+            ))
+        }
+    }
+}
+
+/// Client-deserializable variants in declaration order, as serde lists them
+/// in an "unknown variant" error for the given mode.
+const NORMAL_CLIENT_COMMANDS: &[&str] = &[
+    "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
+    "RetractPlumbing", "Nitrogen", "NitrogenClose", "Nitrous", "NitrousClose",
+    "StartWritingNow", "StartWritingLastTwoMinutes", "PauseWritingDb", "StopWritingDb",
+    "ResetSim", "ContinueFillSequence", "MonitorAltitude", "RevokeMonitorAltitude",
+    "ConsecutiveSamples", "RevokeConsecutiveSamples", "ResetFailures", "RevokeResetFailures",
+    "ValidateMeasms", "RevokeValidateMeasms", "ToggleAvBayUnderglow", "ToggleFlightBuzzer",
+    "ResetTClock", "StartFill", "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest",
+    "Turbocharge",
+];
+const TEST_FIRE_CLIENT_COMMANDS: &[&str] = &[
+    "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
+    "RetractPlumbing", "Nitrogen", "NitrogenClose", "Nitrous", "NitrousClose",
+    "StartWritingNow", "StartWritingLastTwoMinutes", "PauseWritingDb", "StopWritingDb",
+    "ResetSim", "ContinueFillSequence", "MonitorAltitude", "RevokeMonitorAltitude",
+    "ConsecutiveSamples", "RevokeConsecutiveSamples", "ResetFailures", "RevokeResetFailures",
+    "ValidateMeasms", "RevokeValidateMeasms", "GroundStationLaunch", "ToggleAvBayUnderglow",
+    "ToggleFlightBuzzer", "ResetTClock", "AdvanceFlightState", "RewindFlightState",
+    "StartFill", "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest", "Turbocharge",
+];
+const HITL_CLIENT_COMMANDS: &[&str] = &[
+    "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
+    "IgniterSequence", "RetractPlumbing", "Nitrogen", "NitrogenClose", "Nitrous",
+    "NitrousClose", "StartWritingNow", "StartWritingLastTwoMinutes", "PauseWritingDb",
+    "StopWritingDb", "ResetSim", "ContinueFillSequence", "MonitorAltitude",
+    "RevokeMonitorAltitude", "ConsecutiveSamples", "RevokeConsecutiveSamples", "ResetFailures",
+    "RevokeResetFailures", "ValidateMeasms", "RevokeValidateMeasms", "GroundStationLaunch",
+    "ToggleButtonInterlock", "ToggleGroundStationControl", "ToggleLaunchInterlock",
+    "TogglePlumbingDelayInterlock", "ToggleChecklistInterlock", "ToggleSupplyInterlock",
+    "ToggleBoardStateProofInterlock", "TogglePhysicalLaunchMode", "ToggleAvBayUnderglow",
+    "ToggleFlightBuzzer", "ResetLaunchLatch", "ResetFlightState", "ResetTClock",
+    "DeployParachute", "ExpandParachute", "EvaluationRelax", "EvaluationFocus",
+    "EvaluationAbort", "ReinitSensors", "ReinitBarometer", "EnableIMU", "DisableIMU",
+    "AdvanceFlightState", "RewindFlightState", "AbortAfter100", "AbortAfter40",
+    "AbortAfter250", "ReinitAfter15", "ReinitAfter30", "ReinitAfter50", "StartFill",
+    "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest", "Turbocharge",
+];
+fn client_command_names(mode: crate::station_mode::Mode) -> &'static [&'static str] {
+    use crate::station_mode::Mode;
+    match mode {
+        Mode::Hitl => HITL_CLIENT_COMMANDS,
+        Mode::TestFire => TEST_FIRE_CLIENT_COMMANDS,
+        Mode::Normal | Mode::Testing => NORMAL_CLIENT_COMMANDS,
+    }
+}
+
+impl TelemetryCommand {
+    /// Whether the build for `mode` had this variant.
+    pub(crate) fn available_in(&self, mode: crate::station_mode::Mode) -> bool {
+        use crate::station_mode::Mode;
+        match self {
+            TelemetryCommand::GroundStationLaunch
+            | TelemetryCommand::AdvanceFlightState
+            | TelemetryCommand::RewindFlightState => matches!(mode, Mode::Hitl | Mode::TestFire),
+            TelemetryCommand::OperatorPhase { .. }
+            | TelemetryCommand::IgniterSequence
+            | TelemetryCommand::ToggleButtonInterlock
+            | TelemetryCommand::ToggleGroundStationControl
+            | TelemetryCommand::ToggleLaunchInterlock
+            | TelemetryCommand::TogglePlumbingDelayInterlock
+            | TelemetryCommand::ToggleChecklistInterlock
+            | TelemetryCommand::ToggleSupplyInterlock
+            | TelemetryCommand::ToggleBoardStateProofInterlock
+            | TelemetryCommand::TogglePhysicalLaunchMode
+            | TelemetryCommand::ResetLaunchLatch
+            | TelemetryCommand::ResetFlightState
+            | TelemetryCommand::DeployParachute
+            | TelemetryCommand::ExpandParachute
+            | TelemetryCommand::EvaluationRelax
+            | TelemetryCommand::EvaluationFocus
+            | TelemetryCommand::EvaluationAbort
+            | TelemetryCommand::ReinitSensors
+            | TelemetryCommand::ReinitBarometer
+            | TelemetryCommand::EnableIMU
+            | TelemetryCommand::DisableIMU
+            | TelemetryCommand::AbortAfter100
+            | TelemetryCommand::AbortAfter40
+            | TelemetryCommand::AbortAfter250
+            | TelemetryCommand::ReinitAfter15
+            | TelemetryCommand::ReinitAfter30
+            | TelemetryCommand::ReinitAfter50
+            => mode == Mode::Hitl,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]

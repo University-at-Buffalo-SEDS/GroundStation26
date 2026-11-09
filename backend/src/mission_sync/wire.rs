@@ -7,7 +7,6 @@ pub(crate) enum Class {
     ModeReply,
     ClockQuery,
     ClockReply,
-    #[cfg(not(feature = "hitl_mode"))]
     Checklist,
 }
 #[derive(Default)]
@@ -26,7 +25,6 @@ impl Outbox {
             Class::Legacy => 0,
             Class::ModeQuery | Class::ModeReply => 2,
             Class::ClockQuery | Class::ClockReply => 3,
-            #[cfg(not(feature = "hitl_mode"))]
             Class::Checklist => 1,
         };
         let slot = &mut self.pending[index];
@@ -244,8 +242,9 @@ mod tests {
     fn classes_share_allowance_retain_exact_backpressure_and_take_turns() {
         let mut outbox = Outbox::default();
         assert!(outbox.offer(Class::Legacy, &[1; 128]));
-        #[cfg(not(feature = "hitl_mode"))]
-        assert!(outbox.offer(Class::Checklist, &[2; 128]));
+        if !crate::runtime_mode::is_hitl() {
+            assert!(outbox.offer(Class::Checklist, &[2; 128]));
+        }
         assert!(!outbox.offer(Class::Legacy, &[3]));
         let mut sends = Vec::new();
         outbox.flush(0, |_, wire| {
@@ -264,10 +263,11 @@ mod tests {
             true
         });
         assert_eq!(sends.first(), Some(&vec![1; 128]));
-        #[cfg(not(feature = "hitl_mode"))]
-        assert_eq!(sends, vec![vec![1; 128], vec![2; 128], vec![1; 128]]);
-        #[cfg(feature = "hitl_mode")]
-        assert_eq!(sends, vec![vec![1; 128], vec![1; 128]]);
+        if !crate::runtime_mode::is_hitl() {
+            assert_eq!(sends, vec![vec![1; 128], vec![2; 128], vec![1; 128]]);
+        } else {
+            assert_eq!(sends, vec![vec![1; 128], vec![1; 128]]);
+        }
         assert!(outbox.pending.iter().all(Option::is_none));
     }
     #[test]
@@ -306,10 +306,10 @@ mod tests {
     }
 }
 
-#[cfg(all(test,target_os="linux",any(feature="firmware_sim",feature="hitl_mode")))]
+#[cfg(all(test, target_os = "linux"))]
 #[derive(Default)]
 pub(crate) struct NativeOutbox(Outbox);
-#[cfg(all(test,target_os="linux",any(feature="firmware_sim",feature="hitl_mode")))]
+#[cfg(all(test, target_os = "linux"))]
 impl NativeOutbox {
     pub(crate) fn offer(&mut self,class:Class,wire:&[u8])->bool{self.0.offer(class,wire)}
     pub(crate) fn flush(&mut self,mesh:&crate::rrls::Shared,now:u64){self.0.flush_mesh(mesh,now)}

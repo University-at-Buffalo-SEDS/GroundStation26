@@ -75,26 +75,31 @@ async fn actual_clock_final_scenario(scenario: ClockFinalScenario) {
 }
 #[tokio::test]
 async fn actual_all_seven_clock_busy_retries_same_owner_without_requery_or_restamp() {
+    if !cfg!(feature = "firmware_sim") { crate::mode_suite!(Hitl); }
     if crate::operator_queue::isolated_case_with_capture_clock(module_path!(),"actual_all_seven_clock_busy_retries_same_owner_without_requery_or_restamp") {return;}
     actual_clock_final_scenario(ClockFinalScenario::Release).await;
 }
 #[tokio::test]
 async fn actual_all_seven_clock_invalid_then_good_never_revives_original_owner() {
+    if !cfg!(feature = "firmware_sim") { crate::mode_suite!(Hitl); }
     if crate::operator_queue::isolated_case_with_capture_clock(module_path!(),"actual_all_seven_clock_invalid_then_good_never_revives_original_owner") {return;}
     actual_clock_final_scenario(ClockFinalScenario::InvalidThenGood).await;
 }
 #[tokio::test]
 async fn actual_all_seven_stop_before_clock_retry_cannot_reopen_or_refresh_owner() {
+    if !cfg!(feature = "firmware_sim") { crate::mode_suite!(Hitl); }
     if crate::operator_queue::isolated_case_with_capture_clock(module_path!(),"actual_all_seven_stop_before_clock_retry_cannot_reopen_or_refresh_owner") {return;}
     actual_clock_final_scenario(ClockFinalScenario::Stop).await;
 }
 #[tokio::test]
 async fn actual_all_seven_clock_retry_has_one_bounded_100ms_contention_budget() {
+    if !cfg!(feature = "firmware_sim") { crate::mode_suite!(Hitl); }
     if crate::operator_queue::isolated_case_with_capture_clock(module_path!(),"actual_all_seven_clock_retry_has_one_bounded_100ms_contention_budget") {return;}
     actual_clock_final_scenario(ClockFinalScenario::Expired).await;
 }
 #[tokio::test]
 async fn actual_all_seven_slow_verified_marker_preserves_legacy_final_completion_after_five_seconds() {
+    if !cfg!(feature = "firmware_sim") { crate::mode_suite!(Hitl); }
     if crate::operator_queue::isolated_case_with_capture_clock(module_path!(),"actual_all_seven_slow_verified_marker_preserves_legacy_final_completion_after_five_seconds") {return;}
     let fixture=Fixture::new().await;
     let state=fixture.state();

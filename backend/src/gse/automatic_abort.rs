@@ -12,7 +12,6 @@ impl Drop for AutomaticAbortClaim {
     }
 }
 
-#[cfg(not(feature = "hitl_mode"))]
 // Safety catalog (About safety): no-automatic-abort-after-launch. Keep backend/src/safety_catalog_rules.rs in step.
 pub(super) fn stage_allows_automatic_abort(rt: &Runtime, stage: FlightState) -> bool {
     rt.operational.saved.qualification.stage() != gse_sequence::qualification::MissionStage::Fire
@@ -28,14 +27,12 @@ pub(super) fn stage_allows_automatic_abort(rt: &Runtime, stage: FlightState) -> 
         )
 }
 
-#[cfg(not(feature = "hitl_mode"))]
 pub(crate) enum LivenessAbortDecision {
     Claimed(AutomaticAbortClaim),
     Startup(FlightState),
     Unavailable,
 }
 
-#[cfg(any(test, not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
 pub(crate) fn claim_automatic_abort(state: &AppState) -> Option<AutomaticAbortClaim> {
     claim_automatic_abort_for_generation(state, automatic_generation(state))
 }
@@ -44,8 +41,7 @@ pub(crate) fn claim_automatic_abort_for_generation(
     state: &AppState,
     generation: u64,
 ) -> Option<AutomaticAbortClaim> {
-    #[cfg(feature = "hitl_mode")]
-    {
+    if crate::runtime_mode::is_hitl() {
         let operator_claim = claim_operator_dispatch(state, generation)?;
         let mut runtime = state.gse.lock().unwrap();
         if runtime.automatic_abort_in_flight
@@ -72,9 +68,7 @@ pub(crate) fn claim_automatic_abort_for_generation(
             runtime: state.gse.clone(),
             _operator_claim: Some(operator_claim),
         })
-    }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    } else {
         match claim_from_source(state, false, generation) {
             LivenessAbortDecision::Claimed(claim) => Some(claim),
             LivenessAbortDecision::Startup(stage) => {
@@ -86,14 +80,11 @@ pub(crate) fn claim_automatic_abort_for_generation(
     }
 }
 
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 pub(crate) fn claim_liveness_abort(state: &AppState) -> LivenessAbortDecision {
     claim_from_source(state, true, automatic_generation(state))
 }
 
-#[cfg(not(feature = "hitl_mode"))]
 fn claim_from_source(state: &AppState, liveness: bool, generation: u64) -> LivenessAbortDecision {
-    #[cfg(not(feature = "hitl_mode"))]
     {
         let Some(operator_claim) = claim_operator_dispatch(state, generation) else {
             return LivenessAbortDecision::Unavailable;
@@ -145,7 +136,6 @@ fn claim_from_source(state: &AppState, liveness: bool, generation: u64) -> Liven
     }
 }
 
-#[cfg(not(feature = "hitl_mode"))]
 pub(super) fn reserve_abort_clear(state: &AppState, rt: &mut Runtime) -> AutomaticAbortClaim {
     debug_assert!(!rt.automatic_abort_in_flight);
     rt.automatic_abort_in_flight = true;
@@ -156,7 +146,7 @@ pub(super) fn reserve_abort_clear(state: &AppState, rt: &mut Runtime) -> Automat
     }
 }
 
-#[cfg(all(test, not(feature = "hitl_mode")))]
+#[cfg(test)]
 pub(super) mod tests {
     use super::*;
     use std::sync::{
@@ -210,12 +200,10 @@ pub(super) mod tests {
         state: &Arc<AppState>,
         router: &sedsnet::router::Router,
     ) -> bool {
-        #[cfg(not(feature = "test_fire_mode"))]
-        {
+        if !crate::runtime_mode::is_test_fire() {
+            // The HITL suite skips every caller (HITL builds had no safety task).
             crate::safety_task::dispatch_safety_abort(state, router)
-        }
-        #[cfg(feature = "test_fire_mode")]
-        {
+        } else {
             let Some(_claim) = claim_automatic_abort(state) else {
                 return false;
             };
@@ -248,9 +236,9 @@ pub(super) mod tests {
         }
         router.process_all_queues_with_timeout(0).unwrap();
     }
-    #[cfg(not(feature = "test_fire_mode"))]
     #[tokio::test]
     async fn liveness_claim_rechecks_startup_without_weakening_general_fault_claims() {
+        crate::mode_suite!(Normal, Testing);
         let (state, _router, _seen, path) = fixture().await;
         state.set_preexisting_flight_state_for_test(FlightState::Startup);
         assert!(matches!(
@@ -285,9 +273,9 @@ pub(super) mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[cfg(not(feature = "test_fire_mode"))]
     #[tokio::test]
     async fn liveness_claim_is_armed_from_the_idle_phase() {
+        crate::mode_suite!(Normal, Testing);
         let (state, _router, _seen, path) = fixture().await;
         state.set_local_flight_state(FlightState::Idle);
         assert!(matches!(
@@ -311,6 +299,7 @@ pub(super) mod tests {
     /// Operator manual Abort/Stop is a separate path and is not gated here.
     #[tokio::test]
     async fn no_automatic_abort_path_acts_after_launch() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let (state, router, seen, path) = fixture().await;
         let post_launch = [
             FlightState::Launch,
@@ -340,11 +329,12 @@ pub(super) mod tests {
             assert!(claim_automatic_abort(&state).is_none(), "{stage:?}");
             assert!(claim_automatic_abort_for_generation(&state, generation).is_none());
             // 3. Disconnect (board-offline) claim.
-            #[cfg(not(feature = "test_fire_mode"))]
-            assert!(!matches!(
-                claim_liveness_abort(&state),
-                LivenessAbortDecision::Claimed(_)
-            ));
+            if !crate::runtime_mode::is_test_fire() {
+                assert!(!matches!(
+                    claim_liveness_abort(&state),
+                    LivenessAbortDecision::Claimed(_)
+                ));
+            }
             // 4. Queued automatic abort and automatic supply closes.
             assert!(!queue_automatic_abort_for_generation(&state, &router, generation, "test").unwrap());
             assert!(!queue_automatic_supply_close(
@@ -378,6 +368,7 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn latched_general_claim_returns_without_waiting_for_flight_state_mutex() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let (state, _router, _seen, path) = fixture().await;
         drop(claim_automatic_abort(&state).unwrap());
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -413,6 +404,7 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn abort_claim_first_blocks_fire_and_clear_until_dispatch_finishes() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let (state, router, seen, path) = fixture().await;
         let ready = Arc::new(Barrier::new(2));
         let go = Arc::new(Barrier::new(2));
@@ -478,6 +470,7 @@ pub(super) mod tests {
     }
     #[tokio::test]
     async fn fire_first_denies_automatic_claim_but_manual_abort_remains_available() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let (state, router, seen, path) = fixture().await;
         commit_fire_intent(&state).unwrap();
         assert!(claim_automatic_abort(&state).is_none());
@@ -490,6 +483,7 @@ pub(super) mod tests {
     }
     #[tokio::test]
     async fn persistence_failure_still_dispatches_abort_and_keeps_fire_blocked() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let (state, router, seen, path) = fixture().await;
         state.gse.lock().unwrap().operational.path = Some(path.join("cannot-create-below-file"));
         assert!(
@@ -516,6 +510,7 @@ pub(super) mod tests {
     }
     #[tokio::test]
     async fn failed_final_clear_save_retains_claim_and_queue_failure_does_not_rearm() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let (state, _router, _seen, path) = fixture().await;
         let claim = claim_automatic_abort(&state).unwrap();
         // A genuine router queue-admission failure, not a mocked callback.
@@ -554,6 +549,7 @@ pub(super) mod tests {
     }
     #[tokio::test]
     async fn persisted_claim_restores_abort_and_explicit_clear_recovers_after_restart() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         const CHILD: &str = "GS_ABORT_CLAIM_RESTART_TEST";
         const NAME: &str = "gse::automatic_abort::tests::persisted_claim_restores_abort_and_explicit_clear_recovers_after_restart";
         if std::env::var_os(CHILD).is_none() {
@@ -628,6 +624,7 @@ pub(super) mod tests {
     }
     #[tokio::test]
     async fn clear_waits_for_busy_sdk_retry_then_becomes_available() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         use std::sync::atomic::{AtomicBool, AtomicU64};
         let state = crate::state::tests::test_app_state().await;
         let now = Arc::new(AtomicU64::new(0));
@@ -677,6 +674,7 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn clear_waits_for_no_peer_abort_already_handed_to_software_transport() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = crate::state::tests::test_app_state().await;
         let router = Arc::new(sedsnet::router::Router::new(
             sedsnet::router::RouterConfig::new([]),
@@ -735,6 +733,7 @@ pub(super) mod tests {
 
     #[test]
     fn old_saved_record_defaults_to_no_automatic_abort_claim() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let mut old = serde_json::to_value(operational::Saved::default()).unwrap();
         old.as_object_mut()
             .unwrap()

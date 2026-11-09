@@ -3,6 +3,7 @@
 use super::*;
 #[test]
 fn nitrogen_topup_cannot_erase_already_loaded_nitrous_mass() {
+    crate::mode_suite!(Testing);
     crate::telemetry_schema::initialize().unwrap();
     let mut model = FlightSimState::new();
     let nitrogen_target = sim_nitrogen_target_mass_kg();
@@ -31,6 +32,7 @@ fn nitrogen_topup_cannot_erase_already_loaded_nitrous_mass() {
 }
 #[test]
 fn actual_admitted_raw_igniter_sequence_models_original_compensated_timeline() {
+    crate::mode_suite!(Testing);
     crate::telemetry_schema::initialize().unwrap();
     let mut model = FlightSimState::new();
     // Deliberately invokes the same application-effect function after admission;
@@ -60,6 +62,7 @@ fn actual_admitted_raw_igniter_sequence_models_original_compensated_timeline() {
 }
 #[test]
 fn equal_clock_multisensor_polls_cannot_advance_tank_physics() {
+    crate::mode_suite!(Testing);
     crate::telemetry_schema::initialize().unwrap();
     let mut model = FlightSimState::new();
     model.loadcell_mass_kg = 0.25;
@@ -90,6 +93,8 @@ fn equal_clock_multisensor_polls_cannot_advance_tank_physics() {
 
 #[test]
 fn a_delayed_command_cannot_backfill_flow_before_model_receipt() {
+
+    crate::mode_suite!(Testing);
     crate::telemetry_schema::initialize().unwrap();
     let mut m = FlightSimState::new();
     m.valves.insert(1, false);

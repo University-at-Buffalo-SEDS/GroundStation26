@@ -2852,7 +2852,7 @@ pub(super) fn spawn_comms_worker_threads(
                     // Include accepted channel-tail and active owners, whose
                     // byte charge survives until completion or retirement.
                     let sdk_ordinary_ready = !backlog.ordered.is_empty() || !backlog.priorities.is_empty();
-                    #[cfg(all(test, target_os="linux", any(feature="firmware_sim",feature="hitl_mode")))]
+                    #[cfg(all(test, target_os="linux"))]
                     let sdk_ordinary_owned = sdk_ordinary_ready || comms_handle.tx_budget.as_ref()
                         .is_some_and(|budget| budget.pending_ordinary.load(Ordering::Acquire) != 0);
                     let fully_drained = backlog.empty()
@@ -2896,11 +2896,11 @@ pub(super) fn spawn_comms_worker_threads(
                             // An unavailable shared UART is backpressure, not a
                             // genuine idle lane between SDK cursor offers.
                             if comms.transmit_ready() {
-                                #[cfg(all(test, target_os="linux", any(feature="firmware_sim",feature="hitl_mode")))]
+                                #[cfg(all(test, target_os="linux"))]
                                 let before = ordinary_balance.bytes;
                                 ordinary_balance.observe(state);
-                                #[cfg(all(test, target_os="linux", any(feature="firmware_sim",feature="hitl_mode")))]
-                                if before != ordinary_balance.bytes {
+                                #[cfg(all(test, target_os="linux"))]
+                                if (crate::runtime_mode::is_hitl() || cfg!(feature = "firmware_sim")) && before != ordinary_balance.bytes {
                                     root_ordinary_turn_tests::record_service("ordinary_idle_reset",serde_json::json!({"before":before,"after":ordinary_balance.bytes,"sdk_owned":sdk_ordinary_owned,"sdk_ready":sdk_ordinary_ready,"mesh_state":format!("{state:?}"),"transport_ready":true}));
                                 }
                             }
@@ -2909,8 +2909,10 @@ pub(super) fn spawn_comms_worker_threads(
                         match comms.service_background_transmit_counted(allow_mesh) {
                             Ok(Some(progress)) if progress.physical_completed => {
                                 ordinary_balance.mesh_complete(progress.ordinary_charge, sdk_ordinary_ready);
-                                #[cfg(all(test, target_os="linux", any(feature="firmware_sim",feature="hitl_mode")))]
-                                root_ordinary_turn_tests::record_service("mesh_completed_service",serde_json::json!({"ordinary_charge":progress.ordinary_charge,"sdk_ready":sdk_ordinary_ready,"balance":ordinary_balance.bytes}));
+                                #[cfg(all(test, target_os="linux"))]
+                                if crate::runtime_mode::is_hitl() || cfg!(feature = "firmware_sim") {
+                                    root_ordinary_turn_tests::record_service("mesh_completed_service",serde_json::json!({"ordinary_charge":progress.ordinary_charge,"sdk_ready":sdk_ordinary_ready,"balance":ordinary_balance.bytes}));
+                                }
                                 // Refill and recheck critical/tail ownership after EACH physical owner.
                                 continue;
                             }
@@ -3000,8 +3002,10 @@ pub(super) fn spawn_comms_worker_threads(
                                 && let (Some(charge), Some(state)) = (completed_charge, mesh_ordinary_state) {
                                     ordinary_balance.sdk_complete(charge, state);
                                 }
-                            #[cfg(all(test, target_os="linux", any(feature="firmware_sim",feature="hitl_mode")))]
-                            root_ordinary_turn_tests::record_service("sdk_completed_service",serde_json::json!({"priority":priority,"ordinary":selected_ordinary,"actual_charge":completed_charge,"mesh_state":format!("{mesh_ordinary_state:?}"),"balance":ordinary_balance.bytes,"prefix":&payload[..payload.len().min(4)],"payload_bytes":payload.len()}));
+                            #[cfg(all(test, target_os="linux"))]
+                            if crate::runtime_mode::is_hitl() || cfg!(feature = "firmware_sim") {
+                                root_ordinary_turn_tests::record_service("sdk_completed_service",serde_json::json!({"priority":priority,"ordinary":selected_ordinary,"actual_charge":completed_charge,"mesh_state":format!("{mesh_ordinary_state:?}"),"balance":ordinary_balance.bytes,"prefix":&payload[..payload.len().min(4)],"payload_bytes":payload.len()}));
+                            }
                             if let Some(budget) = &comms_handle.tx_budget {
                                 budget.complete(priority, &payload);
                             }
@@ -3753,7 +3757,6 @@ fn log_repeated_worker_error(
     }
 }
 
-#[cfg(feature = "testing")]
 fn testing_should_disable_rx_loop(detail: &str) -> bool {
     let detail = detail.to_ascii_lowercase();
     [
@@ -3775,18 +3778,14 @@ fn handle_worker_recv_error(
     last_log_ms: &mut u64,
     suppressed_count: &mut u64,
 ) -> bool {
-    #[cfg(feature = "testing")]
-    {
+    if crate::runtime_mode::is_testing() {
         if testing_should_disable_rx_loop(detail) {
             gs_debug_println!("{context}: disabling RX loop in testing mode after {detail}");
             return false;
         }
         let _ = (context, detail, last_log_ms, suppressed_count);
         true
-    }
-
-    #[cfg(not(feature = "testing"))]
-    {
+    } else {
         // A CRC-rejected radio frame is a receive-quality event, not a worker
         // fault: log one summary line per interval with the good-frame count.
         if detail.contains("crc32 mismatch") {
@@ -5196,11 +5195,7 @@ mod transport_pending_tests {
     }
 }
 
-#[cfg(all(
-    test,
-    target_os = "linux",
-    any(feature = "firmware_sim", feature = "hitl_mode")
-))]
+#[cfg(all(test, target_os = "linux"))]
 #[path = "root_ordinary_turn_tests.rs"]
 mod root_ordinary_turn_tests;
 
@@ -5208,11 +5203,7 @@ mod root_ordinary_turn_tests;
 #[path = "ordinary_balance_tests.rs"]
 mod ordinary_balance_tests;
 
-#[cfg(all(
-    test,
-    target_os = "linux",
-    any(feature = "firmware_sim", feature = "hitl_mode")
-))]
+#[cfg(all(test, target_os = "linux"))]
 #[path = "budget_bootstrap_tests.rs"]
 mod budget_bootstrap_tests;
 

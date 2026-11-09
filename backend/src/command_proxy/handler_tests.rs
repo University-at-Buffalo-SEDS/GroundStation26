@@ -782,9 +782,9 @@ async fn authorized_rrls_stop_retains_without_primary_capability_or_clock_but_re
     );
 }
 
-#[cfg(not(feature = "hitl_mode"))]
 #[tokio::test]
 async fn signed_plumbing_origin_preserves_actor_policy_and_rejects_old_peer_or_mode_cutoff() {
+    crate::mode_suite!(Normal, TestFire, Testing);
     const NAME: &str = "command_proxy::handler_tests::signed_plumbing_origin_preserves_actor_policy_and_rejects_old_peer_or_mode_cutoff";
     if !child(NAME, "primary") {
         return;
@@ -881,9 +881,9 @@ async fn signed_plumbing_origin_preserves_actor_policy_and_rejects_old_peer_or_m
     let _ = std::fs::remove_file(path);
 }
 
-#[cfg(not(feature = "hitl_mode"))]
 #[tokio::test]
 async fn signed_plumbing_paused_handler_cannot_rebind_local_mode_revision() {
+    crate::mode_suite!(Normal, TestFire, Testing);
     const NAME: &str = "command_proxy::handler_tests::signed_plumbing_paused_handler_cannot_rebind_local_mode_revision";
     if !child(NAME, "primary") {
         return;

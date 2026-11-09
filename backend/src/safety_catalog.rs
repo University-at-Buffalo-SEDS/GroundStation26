@@ -56,9 +56,9 @@ pub(crate) struct Catalog {
 }
 
 pub(crate) fn build_mode() -> &'static str {
-    if cfg!(feature = "hitl_mode") {
+    if crate::runtime_mode::is_hitl() {
         "hitl"
-    } else if cfg!(feature = "test_fire_mode") {
+    } else if crate::runtime_mode::is_test_fire() {
         "test_fire"
     } else {
         "flight"
@@ -134,30 +134,22 @@ fn station_values(state: &AppState) -> Value {
     })
 }
 fn plumbing_timeout(state: &AppState) -> Value {
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if !crate::runtime_mode::is_hitl() {
         json!(crate::actuator_plumbing::completion_timeout_ms(state))
-    }
-    #[cfg(feature = "hitl_mode")]
-    {
-        let _ = state;
+    } else {
         Value::Null
     }
 }
 /// HITL switches: 0 plumbing delay, 1 checklists, 2 supply, 3 board proof,
 /// 4 all-buttons enable, 5 launch interlock. Null outside HITL (always on).
 fn hitl_flag(state: &AppState, which: usize) -> Value {
-    #[cfg(feature = "hitl_mode")]
-    {
+    if crate::runtime_mode::is_hitl() {
         Value::Bool(match which {
             4 => state.hitl_button_interlock_enabled(),
             5 => state.hitl_launch_interlock_enabled(),
             i => state.hitl_safety_interlock_enabled(i),
         })
-    }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
-        let _ = (state, which);
+    } else {
         Value::Null
     }
 }

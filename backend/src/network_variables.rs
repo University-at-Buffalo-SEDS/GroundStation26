@@ -742,22 +742,32 @@ pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
         let mut next = guard.values;
         next.flight_state = state;
         next.flight_state_stamp = timestamp;
-        #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
-        crate::telemetry_task::flight_state_timeline::event(router, "durable_commit_start", state, Some(packet.packet_id()), Some(timestamp), None);
-        #[cfg(all(test, feature="test_fire_mode"))]
-        crate::recovery_pending_probe::before_state_commit(state);
+        #[cfg(test)]
+        if crate::runtime_mode::is_test_fire() {
+            crate::telemetry_task::flight_state_timeline::event(router, "durable_commit_start", state, Some(packet.packet_id()), Some(timestamp), None);
+        }
+        #[cfg(test)]
+        if crate::runtime_mode::is_test_fire() {
+            crate::recovery_pending_probe::before_state_commit(state);
+        }
         let committed = guard.commit_flight_state(next);
-        #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
-        crate::telemetry_task::flight_state_timeline::event(router, "durable_commit_end", state, Some(packet.packet_id()), Some(timestamp), Some(committed.is_ok()));
+        #[cfg(test)]
+        if crate::runtime_mode::is_test_fire() {
+            crate::telemetry_task::flight_state_timeline::event(router, "durable_commit_end", state, Some(packet.packet_id()), Some(timestamp), Some(committed.is_ok()));
+        }
         committed?;
     }
-    #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
-    crate::telemetry_task::flight_state_timeline::event(router, "sdk_submit_start", state, Some(packet.packet_id()), Some(timestamp), None);
-    #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+    #[cfg(test)]
+    if crate::runtime_mode::is_test_fire() {
+        crate::telemetry_task::flight_state_timeline::event(router, "sdk_submit_start", state, Some(packet.packet_id()), Some(timestamp), None);
+    }
+    #[cfg(test)]
     let submitted_packet_id = packet.packet_id();
     let submitted = request.submit(router, packet);
-    #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
-    crate::telemetry_task::flight_state_timeline::detail(router, "sdk_submit_end", state, Some(submitted_packet_id), Some(timestamp), Some(submitted.is_ok()), Some(format!("{submitted:?}")));
+    #[cfg(test)]
+    if crate::runtime_mode::is_test_fire() {
+        crate::telemetry_task::flight_state_timeline::detail(router, "sdk_submit_end", state, Some(submitted_packet_id), Some(timestamp), Some(submitted.is_ok()), Some(format!("{submitted:?}")));
+    }
     submitted?;
     Ok(())
 }
@@ -2314,7 +2324,7 @@ mod persistence_callback_tests {
         }
         let mut ids = std::collections::BTreeSet::new();
         let states =
-            crate::qualification_requests::policy_states(cfg!(feature = "hitl_mode"), &[1, 0, 1])
+            crate::qualification_requests::policy_states(crate::runtime_mode::is_hitl(), &[1, 0, 1])
                 .unwrap();
         crate::telemetry_task::refresh_host_network_time(&source, get_current_timestamp_ms());
         for (round, state) in states.into_iter().enumerate() {
@@ -2370,7 +2380,7 @@ mod persistence_callback_tests {
         router.clear_queues();
         sent.lock().unwrap().clear();
         let states =
-            crate::qualification_requests::policy_states(cfg!(feature = "hitl_mode"), &[1, 0, 1])
+            crate::qualification_requests::policy_states(crate::runtime_mode::is_hitl(), &[1, 0, 1])
                 .unwrap();
         crate::telemetry_task::refresh_host_network_time(&router, get_current_timestamp_ms());
         for (round, (state, enabled)) in states.iter().zip([true, false, true]).enumerate() {
@@ -2893,11 +2903,10 @@ pub(crate) fn automatic_idle_test_snapshot() -> AutomaticIdleTestSnapshot {
 
 #[cfg(test)]
 impl AutomaticIdleTestSnapshot {
-    #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim")))]
+    #[cfg(not(feature = "firmware_sim"))]
     pub(crate) fn live_phase_identity(&self) -> Option<AutomaticPhaseIdentity> {
         self.volatile.map(|live| AutomaticPhaseIdentity { original: live.original(), phase: live.phase() })
     }
-    #[cfg(any(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
     pub(crate) fn durable_unchanged(&self, previous: &Self) -> bool {
         self.values == previous.values && self.bytes == previous.bytes
     }

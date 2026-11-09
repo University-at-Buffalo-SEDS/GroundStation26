@@ -183,5 +183,5 @@ mod tests {
     }
 }
 
-#[cfg(all(test, any(feature = "hitl_mode", feature = "firmware_sim")))]
+#[cfg(test)]
 mod file_tests;

@@ -319,9 +319,9 @@ async fn manual_origin_http_and_websocket_physical_commands_reach_actual_telemet
         assert_eq!(state.operator_admission_barrier.load(Ordering::Acquire), 77);
     }
 }
-#[cfg(feature = "hitl_mode")]
 #[tokio::test]
 async fn manual_origin_fresh_http_and_websocket_phase_receipt_works_without_resealing_old_intent() {
+    crate::mode_suite!(Hitl);
     if crate::operator_queue::isolated_native_case(module_path!(), "manual_origin_fresh_http_and_websocket_phase_receipt_works_without_resealing_old_intent") {return;}
 
     for websocket in [false, true] {
@@ -449,8 +449,8 @@ async fn manual_origin_actual_unreadable_journal_keeps_startup_manual_control_li
     let private_fixture=std::env::var_os("GS_MANUAL_PRIVATE_JOURNAL_FIXTURE");
     let invalid=private_fixture.as_ref().map_or_else(||b"unreadable test journal: keep original evidence".to_vec(),|path|std::fs::read(path).unwrap());
     let mut names=vec!["NitrogenClose","Nitrogen","ToggleGroundStationControl"];
-    #[cfg(not(feature="hitl_mode"))] {names.pop();}
-    #[cfg(feature="hitl_mode")] {names.push("AdvanceFlightState");}
+    if !crate::runtime_mode::is_hitl() {names.pop();}
+    if crate::runtime_mode::is_hitl() {names.push("AdvanceFlightState");}
     for websocket in [false,true] {
         for name in names.iter().copied() {
             let (_root,state,headers,observed,commands)=fixture().await;
@@ -471,8 +471,9 @@ async fn manual_origin_actual_unreadable_journal_keeps_startup_manual_control_li
             let prior_mode=crate::operator_phase::local_mode(&state);
             let before=state.launch_history.lock().unwrap().snapshot();
             let router=state.topology_router.get().unwrap().clone();
-            #[cfg(feature="hitl_mode")]
-            router.enable_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).unwrap();
+            if crate::runtime_mode::is_hitl() {
+                router.enable_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).unwrap();
+            }
             let (_db_tx,db_rx)=mpsc::channel(8);
             let worker=tokio::spawn(crate::telemetry_task::telemetry_task(state.clone(),router,Vec::new(),commands,db_rx,state.shutdown_subscribe()));
             if websocket {
@@ -507,9 +508,9 @@ async fn manual_origin_actual_unreadable_journal_keeps_startup_manual_control_li
     }
 }
 
-#[cfg(feature="hitl_mode")]
 #[tokio::test]
 async fn manual_origin_duplicate_cannot_retire_the_only_queued_mode_change() {
+    crate::mode_suite!(Hitl);
     let (_root,state,headers,_observed,mut commands)=fixture().await;
     let before=crate::operator_phase::local_mode(&state);
     assert_eq!(http(state.clone(),headers.clone(),"ToggleGroundStationControl").await.status(),StatusCode::OK);

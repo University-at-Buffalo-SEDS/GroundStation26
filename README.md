@@ -63,16 +63,20 @@ Build the default web frontend plus backend:
 python3 build.py
 ```
 
-Common local build modes:
+Common local builds:
 
 ```bash
-python3 build.py testing
-python3 build.py hitl-mode
 python3 build.py backend_only
 python3 build.py frontend_web
 python3 build.py debug
 python3 build.py --frontend-dev
 ```
+
+One backend binary holds every station mode (normal, HITL, test fire and
+testing); the mode is chosen when the backend starts and can be switched from
+the UI while the station is idle (`docs/backend/station-modes.md`). The old
+`testing`, `hitl-mode` and `test-fire-mode` build arguments are still accepted
+and build the same binary.
 
 `--frontend-dev` selects the frontend's `dev` branch; the default selects `main`.
 The branch cache is fast-forwarded, then both builds use a detached copy of that
@@ -86,7 +90,7 @@ Scoped build entry points:
 
 ```bash
 python3 backend/build.py
-python3 backend/build.py testing
+python3 backend/build.py pi_build
 ```
 
 Docker images:
@@ -94,7 +98,7 @@ Docker images:
 ```bash
 python3 build.py docker
 python3 build.py docker pi_build
-python3 build.py docker testing
+python3 build.py docker testing          # image starts in testing mode
 python3 build.py docker --frontend-dev
 ```
 
@@ -116,17 +120,22 @@ Build the frontend, then run the backend:
 python3 run_groundstation.py
 ```
 
-Enable simulator/testing mode:
+Start in simulator/testing mode (sets `GS_STATION_MODE=testing`):
 
 ```bash
 python3 run_groundstation.py --testing
 ```
 
-Enable HITL mode:
+Start in HITL mode (`--test-fire-mode` starts in test fire):
 
 ```bash
 python3 run_groundstation.py --hitl-mode
 ```
+
+Without a flag the backend starts in normal mode. The backend itself reads
+`GS_STATION_MODE` (`normal`, `hitl`, `test_fire`, `testing`); a mode switched
+from the UI is saved in `data/station-mode/selection.json` and is used on the
+next start instead.
 
 Legacy positional forms still work:
 
@@ -137,7 +146,8 @@ python3 run_groundstation.py hitl-mode
 
 Mode notes:
 
-- `testing` enables the flight simulator and uses `backend/calibration/loadcell_calibration_testing.json`.
+- `testing` enables the flight simulator (unless `GS_SIM_MODE=0`; fixed at start) and uses
+  `backend/calibration/loadcell_calibration_testing.json`.
 - `hitl-mode` is for hardware-in-the-loop testing. It uses the HITL layout, ignores the key interlock, starts in
   `Startup`, and does not run the normal fill sequence state machine.
 
@@ -149,7 +159,7 @@ boards join or reboot.
 Networking uses the published crates.io SEDSNet v4.0.33 release. Firmware send rates are configured with the board
 repositories' compile-time macros. Shutdown is latched: workers starting after the initial shutdown request still
 receive it, so a fast service stop cannot leave a late router or database worker waiting indefinitely. Backend tests
-cover the late-subscriber case in normal, HITL, and test-fire builds.
+cover the late-subscriber case in normal, HITL, and test-fire modes.
 
 ## Frontend / Backend Notes
 

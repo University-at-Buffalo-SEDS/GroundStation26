@@ -9,7 +9,6 @@ use prelude::*;
 
 mod commands;
 use commands::log_command_dispatch;
-#[cfg(feature = "hitl_mode")]
 use commands::queue_locally_routed_flight_command_with_launch_revision;
 pub(crate) use commands::{
     controller_packet, flush_command_tx, queue_abort_packet, queue_automatic_abort_packet,
@@ -94,7 +93,6 @@ fn command_at_dispatch_with_manual_origin(
     }
 }
 
-#[cfg(feature = "hitl_mode")]
 fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
     Some(match cmd {
         TelemetryCommand::DeployParachute => FlightComputerCommands::DeployParachute as u8,
@@ -119,7 +117,6 @@ fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
     })
 }
 
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 const OPERATOR_MODE_FLIGHT_STATE_ORDER: [FlightState; 16] = [
     FlightState::Startup,
     FlightState::Idle,
@@ -139,7 +136,6 @@ const OPERATOR_MODE_FLIGHT_STATE_ORDER: [FlightState; 16] = [
     FlightState::Aborted,
 ];
 
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 fn operator_mode_adjacent_flight_state(current: FlightState, delta: i32) -> FlightState {
     let idx = OPERATOR_MODE_FLIGHT_STATE_ORDER
         .iter()
@@ -150,15 +146,16 @@ fn operator_mode_adjacent_flight_state(current: FlightState, delta: i32) -> Flig
     OPERATOR_MODE_FLIGHT_STATE_ORDER[next_idx]
 }
 
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 async fn set_local_flight_state_for_operator_mode(
     state: &Arc<AppState>,
     next_state: FlightState,
     launch_revision: Option<u64>,
 ) {
-    #[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
-    if let Some(router) = state.topology_router.get() {
-        flight_state_timeline::event(router, "processed", next_state as u8, None, None, None);
+    #[cfg(test)]
+    if crate::runtime_mode::is_test_fire() {
+        if let Some(router) = state.topology_router.get() {
+            flight_state_timeline::event(router, "processed", next_state as u8, None, None, None);
+        }
     }
     if next_state == FlightState::Launch {
         state.request_local_launch_state(launch_revision);
@@ -167,13 +164,12 @@ async fn set_local_flight_state_for_operator_mode(
     }
 }
 
-#[cfg(all(test, not(feature = "hitl_mode"), feature = "test_fire_mode"))]
+#[cfg(test)]
 pub(crate) mod flight_state_timeline;
 
 mod derived;
 use derived::*;
 
-#[cfg(feature = "hitl_mode")]
 fn reset_operator_flight_state(state: &Arc<AppState>) {
     // Use the managed network variable and existing persistence path, not a
     // frontend-only display override. Do not operate physical outputs here.
@@ -182,12 +178,13 @@ fn reset_operator_flight_state(state: &Arc<AppState>) {
     state.broadcast_action_policy_snapshot();
 }
 
-#[cfg(all(test, feature = "hitl_mode"))]
+#[cfg(test)]
 mod recovery_tests {
     use super::*;
 
     #[tokio::test]
     async fn reset_state_preserves_clock_and_confirmed_valve_state() {
+        crate::mode_suite!(Hitl);
         let state = crate::state::tests::test_app_state().await;
         state.set_local_flight_state(FlightState::Recovery);
         let clock = state.launch_clock_snapshot();
@@ -205,6 +202,7 @@ mod recovery_tests {
 
     #[tokio::test]
     async fn reset_clock_preserves_flight_state_and_broadcasts_idle_clock() {
+        crate::mode_suite!(Hitl);
         let state = crate::state::tests::test_app_state().await;
         state.set_local_flight_state(FlightState::Ascent);
         let mut updates = state.launch_clock_tx.subscribe();
@@ -304,7 +302,6 @@ fn transition_launch_clock_to_t_plus_from_pilot_open(state: &Arc<AppState>) {
     gs_debug_println!("Pilot valve open status received; launch clock switched to T+");
 }
 
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 async fn handle_local_ground_station_launch_command(
     state: Arc<AppState>,
     router: Arc<Router>,
@@ -315,7 +312,6 @@ async fn handle_local_ground_station_launch_command(
 
 /// `pressed` is the press-time ticket of a Launch held behind the loadcell
 /// zero; `None` is an immediate press.
-#[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
 async fn send_local_ground_station_launch(
     state: Arc<AppState>,
     router: Arc<Router>,
@@ -331,7 +327,7 @@ async fn send_local_ground_station_launch(
     if vent_valve_known_open_for_launch(&state) {
         // HITL warns only: the last report may come from a Valve Board that is
         // gone, leaving no way to close it and no way to send Launch.
-        if cfg!(feature = "hitl_mode") {
+        if crate::runtime_mode::is_hitl() {
             emit_notification_warning(&state, "Vent valve is still reported open; sending Launch anyway (HITL).");
         } else {
             warn_launch_blocked_by_vent_valve(&state);
@@ -366,21 +362,12 @@ async fn send_local_ground_station_launch(
         emit_notification_warning(&state, reason);
         return;
     }
-    #[cfg(feature = "hitl_mode")]
-    let ticket = match crate::gse::inhibit_automatic_actions_for_pressed_launch(
-        &state,
-        launch_revision,
-        pressed,
-    ) {
-        Ok(ticket) => ticket,
-        Err(error) => {
-            state.clear_launch_sequence_command_pending();
-            emit_notification_warning(&state, error);
-            return;
-        }
+    let admitted = if crate::runtime_mode::is_hitl() {
+        crate::gse::inhibit_automatic_actions_for_pressed_launch(&state, launch_revision, pressed)
+    } else {
+        crate::gse::commit_fire_intent_for_pressed_launch(&state, launch_revision, pressed)
     };
-    #[cfg(not(feature = "hitl_mode"))]
-    let ticket = match crate::gse::commit_fire_intent_for_pressed_launch(&state, launch_revision, pressed) {
+    let ticket = match admitted {
         Ok(ticket) => ticket,
         Err(error) => {
             state.clear_launch_sequence_command_pending();
@@ -431,7 +418,6 @@ async fn send_local_ground_station_launch(
     );
 }
 
-#[cfg(any(test, not(all(feature = "test_fire_mode", not(feature = "hitl_mode")))))]
 async fn handle_flight_computer_launch_command(
     state: Arc<AppState>,
     router: Arc<Router>,
@@ -442,7 +428,6 @@ async fn handle_flight_computer_launch_command(
 
 /// `pressed` is the press-time ticket of a Launch held behind the loadcell
 /// zero; `None` is an immediate press.
-#[cfg(any(test, not(all(feature = "test_fire_mode", not(feature = "hitl_mode")))))]
 async fn send_flight_computer_launch(
     state: Arc<AppState>,
     router: Arc<Router>,
@@ -458,7 +443,7 @@ async fn send_flight_computer_launch(
     if vent_valve_known_open_for_launch(&state) {
         // HITL warns only: the last report may come from a Valve Board that is
         // gone, leaving no way to close it and no way to send Launch.
-        if cfg!(feature = "hitl_mode") {
+        if crate::runtime_mode::is_hitl() {
             emit_notification_warning(&state, "Vent valve is still reported open; sending Launch anyway (HITL).");
         } else {
             warn_launch_blocked_by_vent_valve(&state);
@@ -489,21 +474,12 @@ async fn send_flight_computer_launch(
         emit_notification_warning(&state, reason);
         return;
     }
-    #[cfg(feature = "hitl_mode")]
-    let ticket = match crate::gse::inhibit_automatic_actions_for_pressed_launch(
-        &state,
-        launch_revision,
-        pressed,
-    ) {
-        Ok(ticket) => ticket,
-        Err(error) => {
-            state.clear_launch_sequence_command_pending();
-            emit_notification_warning(&state, error);
-            return;
-        }
+    let admitted = if crate::runtime_mode::is_hitl() {
+        crate::gse::inhibit_automatic_actions_for_pressed_launch(&state, launch_revision, pressed)
+    } else {
+        crate::gse::commit_fire_intent_for_pressed_launch(&state, launch_revision, pressed)
     };
-    #[cfg(not(feature = "hitl_mode"))]
-    let ticket = match crate::gse::commit_fire_intent_for_pressed_launch(&state, launch_revision, pressed) {
+    let ticket = match admitted {
         Ok(ticket) => ticket,
         Err(error) => {
             state.clear_launch_sequence_command_pending();
@@ -549,8 +525,9 @@ async fn send_flight_computer_launch(
         );
         return;
     }
-    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-    state.begin_daq_launch_log();
+    if crate::runtime_mode::is_hitl_or_test_fire() {
+        state.begin_daq_launch_log();
+    }
     log_command_dispatch(
         "Launch command",
         "broadcast",
@@ -567,8 +544,7 @@ async fn send_flight_computer_launch(
     let flight_command_sent = true;
     let valve_command_sent = true;
     if flight_command_sent || valve_command_sent {
-        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-        if pressed.is_none() {
+        if crate::runtime_mode::is_hitl_or_test_fire() && pressed.is_none() {
             crate::auto_zero::launch(&state);
         }
         state.set_launch_indicator_latched(true);
@@ -601,7 +577,7 @@ fn held_launch_precheck(state: &Arc<AppState>) -> Result<(), String> {
     {
         return Err(reason.to_string());
     }
-    if !cfg!(feature = "hitl_mode") && vent_valve_known_open_for_launch(state) {
+    if !crate::runtime_mode::is_hitl() && vent_valve_known_open_for_launch(state) {
         return Err(
             "Vent valve is still reported open. Close it before initiating the launch sequence."
                 .into(),
@@ -701,13 +677,13 @@ async fn send_held_launch(state: Arc<AppState>, router: Arc<Router>, held: HeldL
     held_launch_tests::before_send(&state);
     match cmd {
         TelemetryCommand::Launch => {
-            #[cfg(all(feature = "test_fire_mode", not(feature = "hitl_mode")))]
-            send_local_ground_station_launch(state, router, held.launch_revision, Some(held.pressed)).await;
-            #[cfg(not(all(feature = "test_fire_mode", not(feature = "hitl_mode"))))]
-            send_flight_computer_launch(state, router, held.launch_revision, Some(held.pressed)).await;
+            if crate::runtime_mode::is_test_fire() {
+                send_local_ground_station_launch(state, router, held.launch_revision, Some(held.pressed)).await;
+            } else {
+                send_flight_computer_launch(state, router, held.launch_revision, Some(held.pressed)).await;
+            }
         }
-        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-        TelemetryCommand::GroundStationLaunch => {
+        TelemetryCommand::GroundStationLaunch if crate::runtime_mode::is_hitl_or_test_fire() => {
             send_local_ground_station_launch(state, router, held.launch_revision, Some(held.pressed)).await;
         }
         _ => {}
@@ -808,8 +784,10 @@ pub async fn telemetry_task(
         })
     };
 
-    #[cfg(all(test, feature = "test_fire_mode"))]
-    crate::recovery_pending_probe::packet_worker_registered(&state, packet_worker.abort_handle());
+    #[cfg(test)]
+    if crate::runtime_mode::is_test_fire() {
+        crate::recovery_pending_probe::packet_worker_registered(&state, packet_worker.abort_handle());
+    }
     let mut worker_startup_failed = false;
     let router_worker = match spawn_router_worker_thread(router.clone(), state.clone()) {
         Ok(worker) => Some(worker),
@@ -867,14 +845,11 @@ pub async fn telemetry_task(
                             if let Err(error)=crate::operator_phase::apply(&state,&intent){emit_notification_warning(&state,error);}
                             continue;
                         }
-                        #[cfg(feature="hitl_mode")] {intent.original_command()}
-                        #[cfg(not(feature="hitl_mode"))] {continue;}
+                        if crate::runtime_mode::is_hitl() {intent.original_command()} else {continue;}
                     } else {cmd};
-                    #[cfg(feature="hitl_mode")]
-                    if !sealed_phase && matches!(cmd,TelemetryCommand::AdvanceFlightState|TelemetryCommand::RewindFlightState) {
+                    if crate::runtime_mode::is_hitl() && !sealed_phase && matches!(cmd,TelemetryCommand::AdvanceFlightState|TelemetryCommand::RewindFlightState) {
                         emit_notification_warning(&state,"Phase request has no original authority; make a new request from current primary controls.");continue;
                     }
-                    #[cfg(not(feature="hitl_mode"))] let _=sealed_phase;
                     if let TelemetryCommand::FillWithRecording { origin } = cmd {
                         crate::fill_recording::spawn(state.clone(), origin);
                         continue;
@@ -937,8 +912,8 @@ pub async fn telemetry_task(
                             continue;
                         }
                     state.record_command_accepted(&cmd, get_current_timestamp_ms());
-                    #[cfg(feature="hitl_mode")]
-                    if let Some(index)=match &cmd {
+                    if crate::runtime_mode::is_hitl()
+                    && let Some(index)=match &cmd {
                         TelemetryCommand::TogglePlumbingDelayInterlock=>Some(0),
                         TelemetryCommand::ToggleChecklistInterlock=>Some(1),
                         TelemetryCommand::ToggleSupplyInterlock=>Some(2),
@@ -957,8 +932,7 @@ pub async fn telemetry_task(
                     }
                     state.auto_zero.lock().unwrap().cancel_for_command(&cmd);
                     if crate::auto_zero::before_fill(&state, &cmd) { continue; }
-                    #[cfg(feature="testing")]
-                    if matches!(cmd,TelemetryCommand::RetractPlumbing)&&flight_sim::sim_mode_enabled() {
+                    if crate::runtime_mode::is_testing() && matches!(cmd,TelemetryCommand::RetractPlumbing)&&flight_sim::sim_mode_enabled() {
                         if let Err(error)=crate::gse::admit_simulated_retraction_stamped(&state,plumbing_origin,|source,observed|flight_sim::handle_command_stamped(&cmd,source,observed)) {
                             emit_notification_warning(&state,error);
                         }
@@ -973,8 +947,7 @@ pub async fn telemetry_task(
                         sequences::refresh_action_policy_now(&state);
                         state.broadcast_action_policy_snapshot();
                     }
-                    #[cfg(feature = "testing")]
-                    if matches!(crate::sequences::command_name(&cmd), "Launch" | "GroundStationLaunch") && flight_sim::sim_mode_enabled() {
+                    if crate::runtime_mode::is_testing() && matches!(crate::sequences::command_name(&cmd), "Launch" | "GroundStationLaunch") && flight_sim::sim_mode_enabled() {
                         let original_utc=match crate::system_clock::required_control_network_utc_ms(&router){Ok(value)=>value,Err(error)=>{emit_notification_warning(&state,error.to_string());continue;}};
                         let ticket = match crate::gse::inhibit_automatic_actions_for_launch_revision(&state,launch_revision) {
                             Ok(ticket) => ticket,
@@ -1053,8 +1026,7 @@ pub async fn telemetry_task(
                                 );
                                 gs_debug_println!("Igniter command sent {:?}", cmd);
                             }
-                        #[cfg(feature = "hitl_mode")]
-                        TelemetryCommand::IgniterSequence => {
+                        TelemetryCommand::IgniterSequence if crate::runtime_mode::is_hitl() => {
                                 let payload = [ActuatorBoardCommands::IgniterSequence as u8];
                                 match crate::gse::queue_controller_with_stop_fence(&state, &router, crate::telemetry_schema::data_type("ACTUATOR_COMMAND"), &payload) {
                                   Err(e) => log_telemetry_error("failed to log IgniterSequence command", e),
@@ -1217,13 +1189,13 @@ pub async fn telemetry_task(
                                     command: TelemetryCommand::Launch, launch_revision, recovery_origin, queued_generation,
                                     pressed: crate::gse::LaunchAdmission::capture(&state),
                                 }) { continue; }
-                                #[cfg(all(feature = "test_fire_mode", not(feature = "hitl_mode")))]
-                                handle_local_ground_station_launch_command(state.clone(), router.clone(),launch_revision).await;
-                                #[cfg(not(all(feature = "test_fire_mode", not(feature = "hitl_mode"))))]
-                                handle_flight_computer_launch_command(state.clone(), router.clone(),launch_revision).await;
+                                if crate::runtime_mode::is_test_fire() {
+                                    handle_local_ground_station_launch_command(state.clone(), router.clone(),launch_revision).await;
+                                } else {
+                                    handle_flight_computer_launch_command(state.clone(), router.clone(),launch_revision).await;
+                                }
                             }
-                        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-                        TelemetryCommand::GroundStationLaunch => {
+                        TelemetryCommand::GroundStationLaunch if crate::runtime_mode::is_hitl_or_test_fire() => {
                                 if hold_launch_for_loadcell_zero(&state, &router, HeldLaunch {
                                     command: TelemetryCommand::GroundStationLaunch, launch_revision, recovery_origin, queued_generation,
                                     pressed: crate::gse::LaunchAdmission::capture(&state),
@@ -1318,31 +1290,26 @@ pub async fn telemetry_task(
                                 }
                                 gs_debug_println!("RevokeValidateMeasms command sent");
                             }
-                        #[cfg(feature = "hitl_mode")]
-                        TelemetryCommand::ToggleButtonInterlock => {
+                        TelemetryCommand::ToggleButtonInterlock if crate::runtime_mode::is_hitl() => {
                                 let enabled = state.toggle_hitl_button_interlock();
                                 sequences::refresh_action_policy_now(&state);
                                 state.broadcast_action_policy_snapshot();
                                 gs_debug_println!("HITL button interlock toggled: {enabled}");
                         }
-                        #[cfg(feature = "hitl_mode")]
-                        TelemetryCommand::ToggleGroundStationControl => {
+                        TelemetryCommand::ToggleGroundStationControl if crate::runtime_mode::is_hitl() => {
                             // Consumed by gse::handle_command before this match.
                         }
-                        #[cfg(feature = "hitl_mode")]
-                        TelemetryCommand::ToggleLaunchInterlock => {
+                        TelemetryCommand::ToggleLaunchInterlock if crate::runtime_mode::is_hitl() => {
                                 let enabled = state.toggle_hitl_launch_interlock();
                                 sequences::refresh_action_policy_now(&state);
                                 state.broadcast_action_policy_snapshot();
                                 gs_debug_println!("HITL launch interlock toggled: {enabled}");
                         }
-                        #[cfg(feature="hitl_mode")]
                         TelemetryCommand::TogglePlumbingDelayInterlock
                         |TelemetryCommand::ToggleChecklistInterlock
                         |TelemetryCommand::ToggleSupplyInterlock
-                        |TelemetryCommand::ToggleBoardStateProofInterlock=>unreachable!("pure policy handled before capture/GSE handoff"),
-                        #[cfg(feature = "hitl_mode")]
-                        TelemetryCommand::TogglePhysicalLaunchMode => {
+                        |TelemetryCommand::ToggleBoardStateProofInterlock if crate::runtime_mode::is_hitl() =>unreachable!("pure policy handled before capture/GSE handoff"),
+                        TelemetryCommand::TogglePhysicalLaunchMode if crate::runtime_mode::is_hitl() => {
                                 let uses_gs = state.toggle_hitl_physical_launch_mode();
                                 sequences::refresh_action_policy_now(&state);
                                 state.broadcast_action_policy_snapshot();
@@ -1378,22 +1345,19 @@ pub async fn telemetry_task(
                                 }
                             }
                         }
-                        #[cfg(feature = "hitl_mode")]
-                        TelemetryCommand::ResetLaunchLatch => {
+                        TelemetryCommand::ResetLaunchLatch if crate::runtime_mode::is_hitl() => {
                                 state.set_launch_indicator_latched(false);
                                 sequences::refresh_action_policy_now(&state);
                                 state.broadcast_action_policy_snapshot();
                                 gs_debug_println!("Launch indicator latch reset");
                         }
-                        #[cfg(feature = "hitl_mode")]
-                        TelemetryCommand::ResetFlightState => {
+                        TelemetryCommand::ResetFlightState if crate::runtime_mode::is_hitl() => {
                             reset_operator_flight_state(&state);
                         }
                         TelemetryCommand::ResetTClock => {
                             state.reset_launch_clock();
                         }
-                        #[cfg(feature = "hitl_mode")]
-                        TelemetryCommand::AdvanceFlightState => {
+                        TelemetryCommand::AdvanceFlightState if crate::runtime_mode::is_hitl() => {
                             let current = *state.state.lock().unwrap();
                             let next = operator_mode_adjacent_flight_state(current, 1);
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
@@ -1412,8 +1376,7 @@ pub async fn telemetry_task(
                             set_local_flight_state_for_operator_mode(&state, next,launch_revision).await;
                             gs_debug_println!("Operator-mode flight state advanced: {:?} -> {:?}", current, next);
                         }
-                        #[cfg(feature = "hitl_mode")]
-                        TelemetryCommand::RewindFlightState => {
+                        TelemetryCommand::RewindFlightState if crate::runtime_mode::is_hitl() => {
                             let current = *state.state.lock().unwrap();
                             let next = operator_mode_adjacent_flight_state(current, -1);
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
@@ -1432,21 +1395,18 @@ pub async fn telemetry_task(
                             set_local_flight_state_for_operator_mode(&state, next,launch_revision).await;
                             gs_debug_println!("Operator-mode flight state rewound: {:?} -> {:?}", current, next);
                         }
-                        #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
-                        TelemetryCommand::AdvanceFlightState => {
+                        TelemetryCommand::AdvanceFlightState if crate::runtime_mode::is_test_fire() => {
                                 let current = *state.state.lock().unwrap();
                                 let next = operator_mode_adjacent_flight_state(current, 1);
                                 set_local_flight_state_for_operator_mode(&state, next,launch_revision).await;
                                 gs_debug_println!("Operator-mode flight state advanced: {:?} -> {:?}", current, next);
                         }
-                        #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
-                        TelemetryCommand::RewindFlightState => {
+                        TelemetryCommand::RewindFlightState if crate::runtime_mode::is_test_fire() => {
                                 let current = *state.state.lock().unwrap();
                                 let next = operator_mode_adjacent_flight_state(current, -1);
                                 set_local_flight_state_for_operator_mode(&state, next,launch_revision).await;
                                 gs_debug_println!("Operator-mode flight state rewound: {:?} -> {:?}", current, next);
                         }
-                        #[cfg(feature = "hitl_mode")]
                         TelemetryCommand::DeployParachute
                         | TelemetryCommand::ExpandParachute
                         | TelemetryCommand::EvaluationRelax
@@ -1461,7 +1421,7 @@ pub async fn telemetry_task(
                         | TelemetryCommand::AbortAfter250
                         | TelemetryCommand::ReinitAfter15
                         | TelemetryCommand::ReinitAfter30
-                        | TelemetryCommand::ReinitAfter50 => {
+                        | TelemetryCommand::ReinitAfter50 if crate::runtime_mode::is_hitl() => {
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &state,
@@ -1476,6 +1436,12 @@ pub async fn telemetry_task(
                                 gs_debug_println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
                             }
                         }
+                        // Mode-only commands are refused at deserialization
+                        // outside their mode; anything else is reported here.
+                        _ => emit_notification_warning(
+                            &state,
+                            crate::runtime_mode::unavailable(crate::sequences::command_name(&cmd)),
+                        ),
                     }
                 }
                 _ = heartbeat_interval.tick() => {
@@ -1965,8 +1931,10 @@ async fn clear_telemetry_tables(db: &sqlx::SqlitePool) -> Result<(), sqlx::Error
     Ok(())
 }
 
-#[cfg(feature = "test_fire_mode")]
 async fn export_test_fire_csv_if_enabled(state: &Arc<AppState>, db_path: &str) {
+    if !crate::runtime_mode::is_test_fire() {
+        return;
+    }
     let csv_path = test_fire_csv::csv_path_for_db_path(db_path);
     let calibration = state.loadcell_calibration.lock().unwrap().clone();
     match test_fire_csv::export_recording_csv(db_path, &csv_path, &calibration).await {
@@ -1977,9 +1945,6 @@ async fn export_test_fire_csv_if_enabled(state: &Arc<AppState>, db_path: &str) {
         ),
     }
 }
-
-#[cfg(not(feature = "test_fire_mode"))]
-async fn export_test_fire_csv_if_enabled(_state: &Arc<AppState>, _db_path: &str) {}
 
 async fn queue_db_write(
     state: &AppState,
@@ -2290,8 +2255,10 @@ async fn handle_packet_at_ingress(
     state: &Arc<AppState>, db_tx: &mpsc::Sender<DbQueueItem>,
     db_overflow: &DbOverflow, pkt: Packet, receive_generation: u64,
 ) -> Vec<TelemetryRow> {
-    #[cfg(all(test, feature="test_fire_mode"))]
-    crate::recovery_pending_probe::receive_entry(state, &pkt);
+    #[cfg(test)]
+    if crate::runtime_mode::is_test_fire() {
+        crate::recovery_pending_probe::receive_entry(state, &pkt);
+    }
     #[cfg(test)]
     local_stop_phase_tests::after_original_entry(state).await;
     let primary_role = !crate::rrls::is_rrls();
@@ -2366,9 +2333,11 @@ async fn handle_packet_inner(
             std::time::Instant::now(),
         );
     }
-    #[cfg(all(test, feature="test_fire_mode"))]
-    crate::recovery_pending_probe::before_automatic(state, &pkt).await;
-    if cfg!(feature = "test_fire_mode") && state.all_required_boards_seen()
+    #[cfg(test)]
+    if crate::runtime_mode::is_test_fire() {
+        crate::recovery_pending_probe::before_automatic(state, &pkt).await;
+    }
+    if crate::runtime_mode::is_test_fire() && state.all_required_boards_seen()
         && let Some(original) = automatic_origin
     {
         crate::automatic_startup_idle::publish(state, original).await;
@@ -2494,7 +2463,7 @@ async fn handle_packet_inner(
     }
 
     if pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_STATE") {
-        if !cfg!(feature = "testing") && !state.all_required_boards_seen() {
+        if !crate::runtime_mode::is_testing() && !state.all_required_boards_seen() {
             return Vec::new();
         }
         let pkt_data = match pkt.data_as_u8() {
@@ -3069,8 +3038,9 @@ async fn reset_testing_simulation(state: &Arc<AppState>) {
         return;
     }
 
-    #[cfg(feature = "testing")]
-    crate::actuator_plumbing::invalidate_modeled_retraction(state);
+    if crate::runtime_mode::is_testing() {
+        crate::actuator_plumbing::invalidate_modeled_retraction(state);
+    }
     flight_sim::reset_simulation();
     state.clear_runtime_data_for_sim_reset();
     {
@@ -3119,7 +3089,7 @@ pub fn timesync_enabled() -> bool {
     if crate::rrls::is_rrls() {
         return false;
     }
-    if cfg!(feature = "testing") {
+    if crate::runtime_mode::is_testing() {
         return std::env::var("GROUNDSTATION_TIMESYNC").ok().as_deref() == Some("1");
     }
     true
@@ -3344,9 +3314,9 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    #[cfg(not(feature = "testing"))]
     #[test]
     fn timesync_defaults_on_without_testing_feature() {
+        crate::mode_suite!(Normal, Hitl, TestFire);
         let _guard = timesync_env_lock().lock().unwrap();
         unsafe {
             std::env::remove_var("GROUNDSTATION_TIMESYNC");
@@ -3425,9 +3395,9 @@ mod tests {
         assert_eq!(FlightComputerCommands::RevokeValidateMeasms as u8, 9);
     }
 
-    #[cfg(not(feature = "testing"))]
     #[tokio::test]
     async fn postinit_command_routes_flight_command_zero() {
+        crate::mode_suite!(Normal, Hitl, TestFire);
         let (db_tx, db_rx) = mpsc::channel(8);
         let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
 
@@ -3475,14 +3445,13 @@ mod tests {
         telemetry.await.expect("telemetry task join failed");
     }
 
-    #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
     #[tokio::test]
     async fn test_fire_launch_uses_fill_system_without_av_bay() {
+        crate::mode_suite!(TestFire);
         if launch_core_fixture_in_fresh_process("telemetry_task::tests::test_fire_launch_uses_fill_system_without_av_bay") { return; }
         test_fire_launch_uses_fill_system_without_av_bay_case().await;
     }
 
-    #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
     async fn test_fire_launch_uses_fill_system_without_av_bay_case() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
@@ -3531,9 +3500,9 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "hitl_mode")]
     #[test]
     fn hitl_flight_command_mapping_matches_current_layout() {
+        crate::mode_suite!(Hitl);
         let cases = [
             (
                 TelemetryCommand::Postinit,
@@ -3677,9 +3646,7 @@ mod tests {
             FlightComputerCommands::ReinitBarometer,
             FlightComputerCommands::EnableIMU,
             FlightComputerCommands::DisableIMU,
-            #[cfg(feature = "hitl_mode")]
             FlightComputerCommands::AdvanceFlightState,
-            #[cfg(feature = "hitl_mode")]
             FlightComputerCommands::RewindFlightState,
             FlightComputerCommands::AbortAfter40,
             FlightComputerCommands::AbortAfter100,
@@ -3687,7 +3654,16 @@ mod tests {
             FlightComputerCommands::ReinitAfter15,
             FlightComputerCommands::ReinitAfter30,
             FlightComputerCommands::ReinitAfter50,
-        ] {
+        ]
+        .into_iter()
+        .filter(|command| {
+            crate::runtime_mode::is_hitl()
+                || !matches!(
+                    command,
+                    FlightComputerCommands::AdvanceFlightState
+                        | FlightComputerCommands::RewindFlightState
+                )
+        }) {
             let (db_tx, _db_rx) = mpsc::channel(8);
             let state = test_app_state(db_tx).await;
             let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -3817,9 +3793,9 @@ mod tests {
     /// builds re-offer only that unadmitted packet inside the same window:
     /// the FC Launch is sent once and the Sequence follows. Test-fire keeps
     /// the original partial-admission inhibition (suffix_retry is false there).
-    #[cfg(not(feature = "test_fire_mode"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn launch_core_busy_after_fc_launch_completes_only_the_unadmitted_sequence() {
+        crate::mode_suite!(Normal, Hitl, Testing);
         if launch_core_fixture_in_fresh_process("telemetry_task::tests::launch_core_busy_after_fc_launch_completes_only_the_unadmitted_sequence") { return; }
         launch_suffix_busy_case().await;
     }
@@ -3883,7 +3859,6 @@ mod tests {
     }
 
 
-    #[cfg(not(feature = "test_fire_mode"))]
     async fn launch_suffix_busy_case() {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
@@ -3908,8 +3883,8 @@ mod tests {
         ).unwrap();
         router.rx_packed_from_side(&serialize::pack_packet(&discovery), valve_side).unwrap();
         router.process_all_queues_with_timeout(0).unwrap();
-        #[cfg(not(feature = "hitl_mode"))]
-        let qualification = crate::gse::armed_fixture_for_test(&state, &router);
+        let qualification = (!crate::runtime_mode::is_hitl())
+            .then(|| crate::gse::armed_fixture_for_test(&state, &router));
         let _actual_peers = crate::ignition_pair::fixture::Peers::warm(&state, router.clone()).await;
         let launch_revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
         if state.topology_router.get().is_none() {
@@ -3918,7 +3893,7 @@ mod tests {
         let pause = crate::gse::nonwaiting_admission_tests::Pause::install(&state);
         // [state, FLIGHT_COMMAND Launch, VALVE_COMMAND Sequence] (HITL has no
         // state packet): stop right after the FC Launch admission.
-        let reached = pause.suffix.arm(if cfg!(feature = "hitl_mode") { 1 } else { 2 });
+        let reached = pause.suffix.arm(if crate::runtime_mode::is_hitl() { 1 } else { 2 });
         let (owned_state, owned_router) = (state.clone(), router.clone());
         let worker = tokio::spawn(async move {
             handle_flight_computer_launch_command(owned_state, owned_router, launch_revision).await;
@@ -3951,8 +3926,9 @@ mod tests {
             && p.payload() == [ValveBoardCommands::Sequence as u8]).count();
         assert!(!partial, "a zero-owner CoreBusy suffix must complete the same Launch: {notes:?}");
         assert_eq!(sequences, 1, "exactly one valve Sequence; SDK={:?}", router.export_runtime_stats());
-        #[cfg(not(feature = "hitl_mode"))]
-        std::fs::remove_file(qualification).unwrap();
+        if let Some(qualification) = qualification {
+            std::fs::remove_file(qualification).unwrap();
+        }
     }
 
     async fn launch_queue_case(force_core_busy: bool) {
@@ -4001,8 +3977,8 @@ mod tests {
             .process_all_queues_with_timeout(0)
             .expect("failed to process valve-board discovery");
 
-        #[cfg(not(feature = "hitl_mode"))]
-        let qualification = crate::gse::armed_fixture_for_test(&state, &router);
+        let qualification = (!crate::runtime_mode::is_hitl())
+            .then(|| crate::gse::armed_fixture_for_test(&state, &router));
         let _actual_peers=crate::ignition_pair::fixture::Peers::warm(&state,router.clone()).await;
         let launch_revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
         if force_core_busy {
@@ -4046,8 +4022,7 @@ mod tests {
         } else {
             handle_flight_computer_launch_command(state.clone(), router.clone(), launch_revision).await;
         }
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        if let Some(qualification) = qualification {
             let saved: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&qualification).unwrap()).unwrap();
             assert_eq!(saved["qualification"]["fire_started"], true);
@@ -4492,16 +4467,15 @@ mod tests {
             shutdown_rx,
         ));
 
-        #[cfg(feature = "testing")]
-        queue_locally_routed_flight_command(
-            &state,
-            &router,
-            "MonitorAltitude test command",
-            &[FlightComputerCommands::MonitorAltitude as u8],
-        )
-        .expect("failed to queue test command through router");
-        #[cfg(not(feature = "testing"))]
-        {
+        if crate::runtime_mode::is_testing() {
+            queue_locally_routed_flight_command(
+                &state,
+                &router,
+                "MonitorAltitude test command",
+                &[FlightComputerCommands::MonitorAltitude as u8],
+            )
+            .expect("failed to queue test command through router");
+        } else {
             state
                 .cmd_tx
                 .send(TelemetryCommand::MonitorAltitude)
@@ -5275,9 +5249,9 @@ mod tests {
         assert!(statuses.contains(&(7, true)));
     }
 
-    #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
     #[tokio::test]
     async fn advance_flight_state_command_reaches_remote_router_end_to_end() {
+        crate::mode_suite!(TestFire);
         let (db_tx, db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx.clone()).await;
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -5477,9 +5451,9 @@ mod tests {
         assert_eq!(states.as_slice(), expected_states.as_slice());
     }
 
-    #[cfg(feature = "hitl_mode")]
     #[tokio::test]
     async fn advance_flight_state_command_reaches_flight_computer_command_path() {
+        crate::mode_suite!(Hitl);
         let (db_tx, db_rx) = mpsc::channel(8);
         let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
         crate::gse::qualified_launch_proofs_for_test(&state);
@@ -5580,8 +5554,7 @@ mod tests {
         // Disable only that simulator in a fresh process, before its OnceLock
         // initializes, so this remains an actual Router dispatch proof in HITL
         // and cannot race another test's process-global simulator state.
-        #[cfg(feature = "testing")]
-        {
+        if crate::runtime_mode::is_testing() {
             const CHILD: &str = "GS_AUTOMATIC_ABORT_ACTUAL_DISPATCH_CHILD";
             const NAME: &str = "telemetry_task::tests::queued_automatic_abort_claim_reaches_packet_callback_without_gse_lock";
             if std::env::var_os(CHILD).is_none() {
@@ -5620,10 +5593,12 @@ mod tests {
                 },
             ),
         ])));
-        #[cfg(not(feature = "hitl_mode"))]
-        let path = crate::gse::armed_fixture_for_test(&state, &router);
-        #[cfg(feature = "hitl_mode")]
-        state.set_local_flight_state(FlightState::Armed);
+        let path = if crate::runtime_mode::is_hitl() {
+            state.set_local_flight_state(FlightState::Armed);
+            None
+        } else {
+            Some(crate::gse::armed_fixture_for_test(&state, &router))
+        };
         let shutdown = state.shutdown_subscribe();
         let worker = tokio::spawn(telemetry_task(
             state.clone(),
@@ -5645,8 +5620,7 @@ mod tests {
         worker.await.unwrap();
         assert_eq!(result.unwrap(), Some(()));
         assert!(state.is_command_allowed(&TelemetryCommand::Abort));
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        if let Some(path) = path {
             let record: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(record["automatic_abort_claimed"], true);
@@ -5762,9 +5736,9 @@ mod tests {
         assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
     }
 
-    #[cfg(feature = "hitl_mode")]
     #[tokio::test]
     async fn explicit_fc_evaluation_abort_reaches_actual_worker_while_manual_stop_is_retained() {
+        crate::mode_suite!(Hitl);
         let (db_tx, db_rx) = mpsc::channel(8);
         let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
         if state.hitl_button_interlock_enabled() {
@@ -5936,13 +5910,9 @@ mod tests {
             launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
             launch_indicator_latched: Arc::new(AtomicBool::new(false)),
             abort_indicator_latched: Arc::new(AtomicBool::new(false)),
-            #[cfg(feature = "hitl_mode")]
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
-            #[cfg(feature = "hitl_mode")]
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
-            #[cfg(feature = "hitl_mode")]
             hitl_safety_interlocks: crate::state::default_hitl_safety_interlocks(),
-            #[cfg(feature = "hitl_mode")]
             hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
             recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
                 mode: RecordingModeWire::Idle,
@@ -6350,9 +6320,9 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "test_fire_mode")]
     #[tokio::test]
     async fn chamber_testfire_csv_joins_actual_recorded_rows_without_duplicates_or_old_pressure() {
+        crate::mode_suite!(TestFire);
         let (db_tx, mut db_rx) = mpsc::channel(128);
         let state = test_app_state(db_tx.clone()).await;
         let directory = std::env::temp_dir().join(format!(
@@ -6869,17 +6839,8 @@ mod tests {
         let state = test_app_state(db_tx.clone()).await;
         let db_overflow = test_db_overflow();
         let mut ws_rx = state.ws_tx.subscribe();
-        // Presentation mode precedence is Testing, HITL, TestFire, Normal.
-        // A TestFire feature alone does not select that layout in mixed builds.
-        let expected_mode = if cfg!(feature = "testing") {
-            crate::station_mode::Mode::Testing
-        } else if cfg!(feature = "hitl_mode") {
-            crate::station_mode::Mode::Hitl
-        } else if cfg!(feature = "test_fire_mode") {
-            crate::station_mode::Mode::TestFire
-        } else {
-            crate::station_mode::Mode::Normal
-        };
+        // The presentation mode is the runtime station mode.
+        let expected_mode = crate::runtime_mode::current();
         assert_eq!(crate::station_mode::local_mode(), expected_mode);
         let selected_layout = crate::layout::load_layout().unwrap();
         assert_eq!(selected_layout.test_fire_mode, expected_mode == crate::station_mode::Mode::TestFire);
@@ -7389,9 +7350,9 @@ mod tests {
         assert_eq!(writes[1].0, "PB");
     }
 
-    #[cfg(feature="hitl_mode")]
     #[tokio::test]
     async fn fc_prelaunch_reports_follow_explicit_global_master_selection() {
+        crate::mode_suite!(Hitl);
         let (db_tx,_db_rx)=mpsc::channel(64);
         let state=test_app_state(db_tx.clone()).await;
         for board in Board::ALL {state.mark_board_seen(board.sender_id(),get_current_timestamp_ms());}
@@ -7535,9 +7496,9 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "test_fire_mode")]
     #[tokio::test]
     async fn reflected_and_unknown_dequeues_cannot_qualify_cached_startup() {
+        crate::mode_suite!(TestFire);
         if crate::operator_queue::isolated_case(module_path!(), "reflected_and_unknown_dequeues_cannot_qualify_cached_startup") { return; }
         let _ = crate::network_variables::flight_state();
         let baseline = crate::network_variables::automatic_idle_test_snapshot();
@@ -7577,7 +7538,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "test_fire_mode")]
     async fn recognized_dequeue_qualifies_once(compact: bool) {
         let _ = crate::network_variables::flight_state();
         let baseline = crate::network_variables::automatic_idle_test_snapshot();
@@ -7634,16 +7594,16 @@ mod tests {
         assert_eq!((cached.packet_id(),cached.timestamp()),original);
     }
 
-    #[cfg(feature = "test_fire_mode")]
     #[tokio::test]
     async fn recognized_mcu_dequeue_keeps_original_automatic_admission() {
+        crate::mode_suite!(TestFire);
         if crate::operator_queue::isolated_case(module_path!(), "recognized_mcu_dequeue_keeps_original_automatic_admission") { return; }
         recognized_dequeue_qualifies_once(false).await;
     }
 
-    #[cfg(feature = "test_fire_mode")]
     #[tokio::test]
     async fn recognized_compact_mcu_dequeue_keeps_original_automatic_admission() {
+        crate::mode_suite!(TestFire);
         if crate::operator_queue::isolated_case(module_path!(), "recognized_compact_mcu_dequeue_keeps_original_automatic_admission") { return; }
         recognized_dequeue_qualifies_once(true).await;
     }
@@ -7671,7 +7631,7 @@ mod tests {
             assert!(!stdout.contains("panicked at") && !stderr.contains("panicked at"));
             return;
         }
-        let explicit_model = cfg!(any(feature = "hitl_mode", feature = "firmware_sim"));
+        let explicit_model = crate::runtime_mode::is_hitl() || cfg!(feature = "firmware_sim");
         assert_eq!(procedure_clock::now().model_monotonic_ms(), explicit_model.then_some(100000));
         let _ = crate::network_variables::flight_state();
         let original_store = crate::network_variables::automatic_idle_test_snapshot();
@@ -7797,17 +7757,14 @@ mod tests {
         include!("telemetry_task/loadcell_zero_ingress_tests.rs");
     }
 
-    #[cfg(feature = "hitl_mode")]
     mod eval_abort_launch_ingress {
         use super::*;
         include!("telemetry_task/eval_abort_launch_diagnostic.rs");
     }
-    #[cfg(feature = "hitl_mode")]
     mod launch_preflight {
         use super::*;
         include!("telemetry_task/launch_preflight_tests.rs");
     }
-    #[cfg(feature = "hitl_mode")]
     mod launch_admission_latency {
         use super::*;
         include!("telemetry_task/launch_admission_latency_tests.rs");

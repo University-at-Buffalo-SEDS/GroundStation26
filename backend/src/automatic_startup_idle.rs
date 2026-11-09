@@ -17,7 +17,7 @@ impl Captured {
     pub(crate) fn capture(state: &AppState, primary: bool) -> Option<Self> {
         // Finite original ownership precedes the first state/Store wait.
         let ticket = LaunchAdmission::capture(state);
-        if !cfg!(feature = "test_fire_mode")
+        if !crate::runtime_mode::is_test_fire()
             || !primary
             || !ticket.automatic_board_context_current(state)
             || state.local_flight_state_snapshot() != FlightState::Startup
@@ -45,8 +45,10 @@ pub(crate) enum Error {
 }
 pub(crate) async fn publish(state: &Arc<AppState>, original: Captured) {
     publish_inner(state, original).await;
-    #[cfg(all(test, feature = "test_fire_mode"))]
-    crate::recovery_pending_probe::automatic_completed(state);
+    #[cfg(test)]
+    if crate::runtime_mode::is_test_fire() {
+        crate::recovery_pending_probe::automatic_completed(state);
+    }
 }
 async fn publish_inner(state: &Arc<AppState>, original: Captured) {
     let Some(claim) = crate::gse::claim_operator_dispatch(state, original.generation) else {
@@ -86,9 +88,11 @@ async fn publish_inner(state: &Arc<AppState>, original: Captured) {
         }
     };
     let model = crate::flight_sim::prepare_automatic_readiness();
-    #[cfg(all(test, feature = "test_fire_mode"))]
     // This is the real prepared-publication boundary, NOT a fake disk write.
-    crate::recovery_pending_probe::before_state_commit(1);
+    #[cfg(test)]
+    if crate::runtime_mode::is_test_fire() {
+        crate::recovery_pending_probe::before_state_commit(1);
+    }
     // A canceled receiver is observed while this original is still entirely
     // caller-owned. Final admission revalidates every original owner afterward.
     tokio::task::yield_now().await;
@@ -96,8 +100,10 @@ async fn publish_inner(state: &Arc<AppState>, original: Captured) {
     // no actor retains/restamps an unadmitted original or invents a new TTL.
     let outcome =
         crate::gse::try_commit_automatic_idle(state, original, identity, &model, &mut prepared);
-    #[cfg(all(test,feature="test_fire_mode"))]
-    crate::recovery_pending_probe::record_final_commit_outcome(state,&outcome);
+    #[cfg(test)]
+    if crate::runtime_mode::is_test_fire() {
+        crate::recovery_pending_probe::record_final_commit_outcome(state, &outcome);
+    }
     request.prepared_result(id, outcome.is_ok());
     match outcome {
         Ok(()) => {
@@ -111,5 +117,5 @@ async fn publish_inner(state: &Arc<AppState>, original: Captured) {
     // Prepared old maps/unadmitted originals drop only after all final guards.
 }
 
-#[cfg(all(test, feature="test_fire_mode"))]
+#[cfg(test)]
 mod guard_tests;

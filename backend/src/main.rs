@@ -37,7 +37,6 @@ mod comms;
 mod comms_config;
 mod control_ingress;
 mod deferred_abort;
-#[cfg(feature = "testing")]
 mod dummy_packets;
 mod ethernet_autoconfig;
 mod fill_delivery_probe;
@@ -87,10 +86,10 @@ mod sd_download;
 mod ring_buffer;
 mod rocket_commands;
 mod rrls;
+mod runtime_mode;
 mod rrls_radio;
 mod rrls_sim_primary;
 mod rrls_topology;
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
 mod safety_task;
 mod sequence_progress;
 mod sequence_progress_producer;
@@ -111,12 +110,7 @@ mod telemetry_db;
 mod telemetry_provenance;
 mod telemetry_schema;
 mod telemetry_task;
-#[cfg(feature = "test_fire_mode")]
 mod test_fire_csv;
-#[cfg(all(
-    feature = "testing",
-    not(any(feature = "hitl_mode", feature = "test_fire_mode"))
-))]
 mod testing_board_lifecycle;
 mod thermal_fit;
 mod thermal_settling;
@@ -128,8 +122,7 @@ mod web_server;
 use crate::map::{ensure_map_data, selected_map_region};
 use crate::ring_buffer::RingBuffer;
 use crate::rocket_commands::{FlightComputerCommands, ValveBoardCommands};
-#[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
-use crate::safety_task::safety_task;
+use crate::safety_task::safety_supervisor;
 use crate::sequences::{default_action_policy, start_sequence_task};
 use crate::state::{AppState, BoardStatus};
 use crate::telemetry_db::{
@@ -142,7 +135,6 @@ use crate::telemetry_task::{
     queue_locally_routed_flight_command, set_network_time_router, telemetry_task,
 };
 
-#[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 use crate::comms::DummyComms;
 use crate::comms::{CommsDevice, link_description, open_link, startup_failure_hint};
 use crate::comms_config::CommsLinkConfig;
@@ -225,7 +217,6 @@ static SIMULATION_CLOCK_VALID: AtomicBool = AtomicBool::new(false);
 static SIMULATION_CLOCK_SAMPLE: AtomicU64 = AtomicU64::new(0);
 // A configured model source is one coherent observation, including its existing
 // SDK clamp and diagnostic publication. Physical/no-file clocks never take this.
-#[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
 static SIMULATION_CLOCK_OBSERVATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// No filesystem access: used only after the existing SDK clock sampled its source.
@@ -242,7 +233,11 @@ fn cached_simulation_clock_sample() -> Option<(Option<u64>, u64)> {
 fn simulation_clock_ms() -> Option<u64> {
     let path = SIMULATION_CLOCK_PATH
         .get_or_init(|| {
-            if cfg!(any(feature = "hitl_mode", feature = "firmware_sim")) {
+            // RUNTIME-MODE-BOOT: the clock source is chosen once, at the first
+            // sample (during start), from the boot mode. A station clock must not
+            // change source in process; GS_SIM_CLOCK_FILE is set only by the
+            // simulator qualification harness, which never switches modes.
+            if crate::runtime_mode::is_hitl() || cfg!(feature = "firmware_sim") {
                 std::env::var_os("GS_SIM_CLOCK_FILE").map(std::path::PathBuf::from)
             } else {
                 None
@@ -251,13 +246,11 @@ fn simulation_clock_ms() -> Option<u64> {
         .as_ref()?;
     // Serialize only an explicitly configured simulator source. An older parsed
     // value must not race a newer fetch_max and impersonate source rollback.
-    #[cfg(any(feature = "hitl_mode", feature = "firmware_sim"))]
+    // A path is configured only in HITL or simulator builds (see above).
     let (_source_guard, source_poisoned) = match SIMULATION_CLOCK_OBSERVATION.lock() {
         Ok(guard) => (guard, false),
         Err(error) => (error.into_inner(), true),
     };
-    #[cfg(not(any(feature = "hitl_mode", feature = "firmware_sim")))]
-    let source_poisoned = false;
     // The guard remains held through the complete source/clamp/cache/finish
     // observation. Poison never clears: return the existing clamp but invalidate
     // this observation, preserving the original fail-closed recovery fence.
@@ -291,8 +284,10 @@ fn read_simulation_clock_details(
     path: &std::path::Path,
     last: &std::sync::atomic::AtomicU64,
 ) -> (u64, bool, Option<u64>) {
-    #[cfg(all(test, any(feature="hitl_mode",feature="firmware_sim")))]
-    final_proof_clock::tests::before_source_read(path);
+    #[cfg(test)]
+    if crate::runtime_mode::is_hitl() || cfg!(feature = "firmware_sim") {
+        final_proof_clock::tests::before_source_read(path);
+    }
     // Preserve the SDK clock's existing read/parse/monotonic clamp exactly.
     // Raw input is retained ONLY for final recovery-proof eligibility.
     if let Ok(text) = std::fs::read_to_string(path)
@@ -1178,17 +1173,17 @@ fn open_rocket_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>
                 "AV bay link unavailable: {e}. Setup hint: {}",
                 startup_failure_hint(link)
             );
-            #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
-            {
-                (
-                    Arc::new(Mutex::new(Box::new(DummyComms::new("Rocket Comms")))),
-                    false,
-                )
+            // RUNTIME-MODE-BOOT: links open once at start. Normal refuses to
+            // start without them; the other modes use a stand-in, and a later
+            // switch into Normal is refused while a stand-in exists
+            // (comms::dummy_links).
+            if runtime_mode::is_normal() {
+                panic!("Rocket comms missing and testing mode not enabled")
             }
-            #[cfg(not(feature = "testing"))]
-            #[cfg(not(feature = "hitl_mode"))]
-            #[cfg(not(feature = "test_fire_mode"))]
-            panic!("Rocket comms missing and testing mode not enabled")
+            (
+                Arc::new(Mutex::new(Box::new(DummyComms::new("Rocket Comms")))),
+                false,
+            )
         }
     }
 }
@@ -1205,23 +1200,25 @@ fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevic
                 "Fill box link unavailable: {e}. Setup hint: {}",
                 startup_failure_hint(link)
             );
-            #[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
-            {
-                (
-                    Arc::new(Mutex::new(Box::new(DummyComms::new("Umbilical Comms")))),
-                    false,
-                )
+            // RUNTIME-MODE-BOOT: links open once at start. Normal refuses to
+            // start without them; the other modes use a stand-in, and a later
+            // switch into Normal is refused while a stand-in exists
+            // (comms::dummy_links).
+            if runtime_mode::is_normal() {
+                panic!("Umbilical comms missing and testing mode not enabled")
             }
-            #[cfg(not(feature = "testing"))]
-            #[cfg(not(feature = "hitl_mode"))]
-            #[cfg(not(feature = "test_fire_mode"))]
-            panic!("Umbilical comms missing and testing mode not enabled")
+            (
+                Arc::new(Mutex::new(Box::new(DummyComms::new("Umbilical Comms")))),
+                false,
+            )
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let boot_mode = runtime_mode::init_boot();
+    eprintln!("Station mode at start: {}", runtime_mode::label(boot_mode));
     flight_sim_runtime::validate_startup()?;
     rrls_sim_primary::validate_startup()?;
     let daq_loadcell_cadence = DaqLoadcellCadence::from_env()?;
@@ -1230,11 +1227,15 @@ async fn main() -> anyhow::Result<()> {
 
     logger::init()?;
     let _host_temperature = host_temperature::start();
+    // The flag names are kept from the per-mode builds: simulator tooling
+    // parses this line.
     log::info!(
-        "groundstation backend starting features testing={} hitl_mode={} test_fire_mode={}",
-        cfg!(feature = "testing"),
-        cfg!(feature = "hitl_mode"),
-        cfg!(feature = "test_fire_mode")
+        "groundstation backend starting features testing={} hitl_mode={} test_fire_mode={} mode={} firmware_sim={}",
+        boot_mode == station_mode::Mode::Testing,
+        boot_mode == station_mode::Mode::Hitl,
+        boot_mode == station_mode::Mode::TestFire,
+        runtime_mode::label(boot_mode),
+        cfg!(feature = "firmware_sim")
     );
 
     if flight_sim_runtime::enabled() {
@@ -1352,7 +1353,9 @@ async fn main() -> anyhow::Result<()> {
         );
         assert_eq!(std::env::var("SEDSNET_TRACE_RELIABLE").as_deref(), Ok("1"));
         qualification_requests::trace_scope();
-        if !cfg!(feature = "hitl_mode") {
+        // Qualification boots run in one fixed mode; the check runs at start
+        // under the boot mode, exactly as the old non-HITL builds did.
+        if !runtime_mode::is_hitl() {
             network_variables::verify_normal_qualification_boot()?;
         }
     }
@@ -1482,13 +1485,9 @@ async fn main() -> anyhow::Result<()> {
         launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
         launch_indicator_latched: Arc::new(AtomicBool::new(false)),
         abort_indicator_latched: Arc::new(AtomicBool::new(false)),
-        #[cfg(feature = "hitl_mode")]
         hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
-        #[cfg(feature = "hitl_mode")]
         hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
-        #[cfg(feature = "hitl_mode")]
         hitl_safety_interlocks: state::default_hitl_safety_interlocks(),
-        #[cfg(feature = "hitl_mode")]
         hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
         recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
             mode: RecordingModeWire::Idle,
@@ -1524,15 +1523,16 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    #[cfg(all(
-        feature = "testing",
-        not(any(feature = "hitl_mode", feature = "test_fire_mode"))
-    ))]
-    flight_sim::initialize_model_owners(
-        &state,
-        history_restored.snapshot.actual_abort,
-        history_restored.snapshot.unknown,
-    );
+    // The modeled testing boards exist only in a Testing+simulation boot
+    // (testing_board_lifecycle::eligible), which never switches mode in
+    // process (a simulation change restarts), so this stays a start-up step.
+    if runtime_mode::is_testing() {
+        flight_sim::initialize_model_owners(
+            &state,
+            history_restored.snapshot.actual_abort,
+            history_restored.snapshot.unknown,
+        );
+    }
     state.board_abort.publish_initial_history();
     state.set_messages_snapshot(Vec::new());
 
@@ -1970,10 +1970,8 @@ async fn main() -> anyhow::Result<()> {
         link_description(&comms_links.fill_box)
     );
 
-    #[cfg(feature = "testing")]
-    let force_sim_comms = flight_sim::sim_mode_enabled();
+    let force_sim_comms = runtime_mode::is_testing() && flight_sim::sim_mode_enabled();
 
-    #[cfg(feature = "testing")]
     let (rocket_comms, av_bay_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
         if force_sim_comms {
             gs_debug_println!("Testing simulator mode enabled; using DummyComms for rocket comms");
@@ -1984,14 +1982,10 @@ async fn main() -> anyhow::Result<()> {
         } else {
             open_rocket_comms(&comms_links.av_bay)
         };
-    #[cfg(not(feature = "testing"))]
-    let (rocket_comms, av_bay_comms_connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
-        open_rocket_comms(&comms_links.av_bay);
 
     let (umbilical_comms, fill_comms_connected) = if rrls::is_rrls() {
         (None, false)
     } else {
-        #[cfg(feature = "testing")]
         let (comms, connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) = if force_sim_comms {
             gs_debug_println!(
                 "Testing simulator mode enabled; using DummyComms for umbilical comms"
@@ -2003,21 +1997,17 @@ async fn main() -> anyhow::Result<()> {
         } else {
             open_umbilical_comms(&comms_links.fill_box)
         };
-        #[cfg(not(feature = "testing"))]
-        let (comms, connected): (Arc<Mutex<Box<dyn CommsDevice>>>, bool) =
-            open_umbilical_comms(&comms_links.fill_box);
         (Some(comms), connected)
     };
-    #[cfg(all(
-        feature = "testing",
-        not(any(feature = "hitl_mode", feature = "test_fire_mode"))
-    ))]
-    crate::testing_board_lifecycle::bind_selected(
-        rocket_comms.lock().unwrap().testing_model_link(),
-        umbilical_comms
-            .as_ref()
-            .is_some_and(|link| link.lock().unwrap().testing_model_link()),
-    );
+    // The modeled board links exist only in a Testing+simulation boot.
+    if runtime_mode::is_testing() {
+        crate::testing_board_lifecycle::bind_selected(
+            rocket_comms.lock().unwrap().testing_model_link(),
+            umbilical_comms
+                .as_ref()
+                .is_some_and(|link| link.lock().unwrap().testing_model_link()),
+        );
+    }
 
     state
         .av_bay_comms_connected
@@ -2374,7 +2364,7 @@ async fn main() -> anyhow::Result<()> {
                         .as_deref()
                         == Ok("1")
                     {
-                        if !cfg!(feature = "hitl_mode") {
+                        if !runtime_mode::is_hitl() {
                             let boot_started = ValidationInstant::now();
                             while validation_state.local_flight_state_snapshot()
                                 != types::FlightState::Idle
@@ -2391,7 +2381,7 @@ async fn main() -> anyhow::Result<()> {
                             );
                         }
                         qualification_requests::policy_states(
-                            cfg!(feature = "hitl_mode"),
+                            runtime_mode::is_hitl(),
                             &flight_states,
                         )
                         .expect("qualification must use nonactuating prelaunch states")
@@ -2997,20 +2987,17 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
-    #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
+    // The safety task runs in every mode and idles in HITL and test fire (whose
+    // old builds had none), starting over when the mode changes.
     let mut st = {
         let state = state.clone();
         let router = router.clone();
         tokio::spawn(async move {
             if !rrls::is_rrls() {
-                safety_task(state, router, safety_shutdown_rx).await;
+                safety_supervisor(state, router, safety_shutdown_rx).await;
             }
         })
     };
-    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-    let mut st = tokio::spawn(async move {
-        let _ = safety_shutdown_rx;
-    });
 
     let _antenna_gpsd = antenna::start_gpsd(state.shutdown_subscribe());
 
@@ -3330,10 +3317,10 @@ mod validation_loadcell_observer_tests {
     }
 }
 
-#[cfg(all(test, feature="test_fire_mode"))]
+#[cfg(test)]
 mod recovery_pending_probe;
 
 mod automatic_flight_state;
-#[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
+#[cfg(all(test, not(feature = "firmware_sim")))]
 mod normal_publication_probe;
 mod automatic_startup_idle;

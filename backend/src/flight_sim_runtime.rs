@@ -70,14 +70,11 @@ pub(crate) fn validate_startup() -> anyhow::Result<()> {
         _ => anyhow::bail!("Unsupported GS_EXECUTION_MODE; use explicit --flight-sim launcher"),
     }
     anyhow::ensure!(
-        cfg!(feature = "testing")
-            && !cfg!(any(
-                feature = "raspberry_pi",
-                feature = "hitl_mode",
-                feature = "test_fire_mode",
-                feature = "firmware_sim"
-            )),
-        "FlightSim requires the isolated testing build without hardware/HITL/TestFire/FirmwareSim features"
+        // RUNTIME-MODE-BOOT: FlightSim is admitted only when the process boots in
+        // testing mode; a FlightSim process must never switch mode afterwards.
+        crate::runtime_mode::is_testing()
+            && !cfg!(any(feature = "raspberry_pi", feature = "firmware_sim")),
+        "FlightSim requires testing mode (GS_STATION_MODE=testing) in a build without the raspberry_pi or firmware_sim features"
     );
     let root = PathBuf::from(
         std::env::var_os("GS_FLIGHT_SIM_ROOT")

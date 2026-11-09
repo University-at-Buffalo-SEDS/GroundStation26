@@ -22,7 +22,6 @@ type MailboxReceiveResult = Result<Option<(u8, Vec<u8>)>, Box<dyn std::error::Er
 use crate::comms_config::{
     CanLinkConfig, CommsLinkConfig, I2cLinkConfig, SerialLinkConfig, SerialProtocol, SpiLinkConfig,
 };
-#[cfg(feature = "testing")]
 use crate::dummy_packets::get_dummy_packet;
 use anyhow::Context;
 use sedsnet::{
@@ -105,9 +104,7 @@ const I2C_FLAG_END: u8 = 0x02;
 // working, leaving only chatty boards visible at GroundStation.
 const I2C_PARTIAL_PACKET_TIMEOUT: Duration = Duration::from_millis(250);
 
-#[cfg(feature = "testing")]
 const DUMMY_ROCKET_TIMESYNC_SOURCES: &[&str] = &["RF", "FC", "PB"];
-#[cfg(feature = "testing")]
 const DUMMY_UMBILICAL_TIMESYNC_SOURCES: &[&str] = &["GB", "VB", "AB", "DAQ"];
 
 // ======================================================================
@@ -266,7 +263,6 @@ pub trait CommsDevice: Send {
     fn connection_generation(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> { None }
 
     /// True only for the selected pureTesting SDK-backed dummy device.
-    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
     fn testing_model_link(&self)->bool{false}
 
     fn bind_retry_tracker(
@@ -729,11 +725,7 @@ impl UartComms {
         ready.map_err(std::io::Error::other)
     }
 
-    #[cfg(all(
-        test,
-        target_os = "linux",
-        any(feature = "firmware_sim", feature = "hitl_mode")
-    ))]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn test_scalar_limit(&self, limit: Option<usize>) -> Option<usize> {
         SCALAR_UART_WRITE_BUDGET.with(|slot| {
             let old = slot.get().map(|(_, n)| n);
@@ -4453,39 +4445,68 @@ impl CommsDevice for CanComms {
 // ======================================================================
 //  Dummy Comms (fallback when hardware missing)
 // ======================================================================
-#[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 #[derive(Debug)]
 pub struct DummyComms {
-    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
     modeled: Option<crate::testing_board_lifecycle::Link>,
     name: &'static str,
     side_id: Option<RouterSideId>,
-    #[cfg(feature = "testing")]
     discovery_next_announce_ms: u64,
-    #[cfg(feature = "testing")]
     timesync_next_announce_ms: u64,
-    #[cfg(feature = "testing")]
     pending_rx: std::collections::VecDeque<sedsnet::packet::Packet>,
+    /// Mode epoch the testing state above was built under. After a mode
+    /// switch the stand-in starts over as if it had been opened in the new
+    /// mode (it simulates boards only in testing; elsewhere it stays silent).
+    epoch: u64,
 }
 
-#[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
+/// DummyComms stand-ins alive in this process. Normal mode needs every
+/// configured link (its old build refused to start without them), so a switch
+/// into Normal is refused while any link is a stand-in.
+static DUMMY_LINKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub(crate) fn dummy_links() -> usize {
+    DUMMY_LINKS.load(std::sync::atomic::Ordering::SeqCst)
+}
+impl Drop for DummyComms {
+    fn drop(&mut self) {
+        DUMMY_LINKS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl DummyComms {
     pub fn new(name: &'static str) -> Self {
+        DUMMY_LINKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         DummyComms {
-            #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
-            modeled: crate::testing_board_lifecycle::Link::new(name),
+            modeled: Self::modeled_link(name),
             name,
             side_id: None,
-            #[cfg(feature = "testing")]
             discovery_next_announce_ms: 0,
-            #[cfg(feature = "testing")]
             timesync_next_announce_ms: 0,
-            #[cfg(feature = "testing")]
             pending_rx: std::collections::VecDeque::new(),
+            epoch: crate::runtime_mode::epoch(),
         }
     }
 
-    #[cfg(feature = "testing")]
+    fn modeled_link(name: &'static str) -> Option<crate::testing_board_lifecycle::Link> {
+        if crate::runtime_mode::is_testing() {
+            crate::testing_board_lifecycle::Link::new(name)
+        } else {
+            None
+        }
+    }
+
+    /// Rebuild the mode-dependent state when the station mode changed since
+    /// this stand-in was opened.
+    fn follow_mode(&mut self) {
+        let epoch = crate::runtime_mode::epoch();
+        if self.epoch != epoch {
+            self.epoch = epoch;
+            self.modeled = Self::modeled_link(self.name);
+            self.discovery_next_announce_ms = 0;
+            self.timesync_next_announce_ms = 0;
+            self.pending_rx.clear();
+        }
+    }
+
     fn simulated_discovery_sender(&self) -> &'static str {
         match self.name {
             "Rocket Comms" => crate::types::Board::RFBoard.sender_id(),
@@ -4494,7 +4515,6 @@ impl DummyComms {
         }
     }
 
-    #[cfg(feature = "testing")]
     fn simulated_discovery_endpoints(&self) -> &'static [sedsnet::config::DataEndpoint] {
         match self.name {
             "Rocket Comms" => &[
@@ -4512,7 +4532,6 @@ impl DummyComms {
         }
     }
 
-    #[cfg(feature = "testing")]
     fn simulated_timesync_sources(&self) -> &'static [&'static str] {
         match self.name {
             "Rocket Comms" => DUMMY_ROCKET_TIMESYNC_SOURCES,
@@ -4521,7 +4540,6 @@ impl DummyComms {
         }
     }
 
-    #[cfg(feature = "testing")]
     fn simulated_timesync_priority(&self) -> u64 {
         match self.name {
             "Rocket Comms" => 60,
@@ -4530,7 +4548,6 @@ impl DummyComms {
         }
     }
 
-    #[cfg(feature = "testing")]
     fn maybe_queue_discovery(&mut self) -> TelemetryResult<()> {
         let now_ms = crate::telemetry_task::get_current_timestamp_ms();
         if now_ms < self.discovery_next_announce_ms {
@@ -4560,7 +4577,6 @@ impl DummyComms {
         Ok(())
     }
 
-    #[cfg(feature = "testing")]
     fn maybe_queue_timesync(&mut self) -> TelemetryResult<()> {
         if !crate::telemetry_task::timesync_enabled() {
             return Ok(());
@@ -4585,14 +4601,9 @@ impl DummyComms {
     }
 }
 
-#[cfg(any(feature = "testing", feature = "hitl_mode", feature = "test_fire_mode"))]
 impl CommsDevice for DummyComms {
-    #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
     fn testing_model_link(&self)->bool {
-        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
-        {self.modeled.is_some()}
-        #[cfg(not(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode")))))]
-        {false}
+        crate::runtime_mode::is_testing() && self.modeled.is_some()
     }
 
     fn recv_packet(
@@ -4600,21 +4611,17 @@ impl CommsDevice for DummyComms {
         _router: &Router,
         packet_tap: &mut dyn FnMut(&Packet),
     ) -> TelemetryResult<()> {
-        #[cfg(feature = "testing")]
-        {
+        self.follow_mode();
+        if crate::runtime_mode::is_testing() {
             let side_id = self
                 .side_id
                 .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
-            #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
             if let Some(model) = &mut self.modeled
                 && let Some(wire) = model.poll(_router.network_time_ms())?
             {
                 return _router.rx_packed_queue_from_side(&wire, side_id);
             }
-            #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
             if self.modeled.is_none(){self.maybe_queue_discovery()?;}
-            #[cfg(not(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode")))))]
-            self.maybe_queue_discovery()?;
             self.maybe_queue_timesync()?;
             if let Some(pkt) = self.pending_rx.pop_front() {
                 let ty = pkt.data_type();
@@ -4641,35 +4648,30 @@ impl CommsDevice for DummyComms {
                 return _router.rx_queue_from_side(pkt, side_id);
             }
             Ok(())
-        }
-
-        #[cfg(not(feature = "testing"))]
-        {
+        } else {
             let _ = _router;
             let _ = packet_tap;
-            // In hitl_mode, dummy comms links are used only as disconnected-link placeholders.
+            // In HITL and test fire, dummy comms links are used only as disconnected-link placeholders.
             Ok(())
         }
     }
 
     fn send_data(&mut self, payload: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-        #[cfg(all(feature="testing",not(any(feature="hitl_mode",feature="test_fire_mode"))))]
-        if let Some(model)=&mut self.modeled {
+        self.follow_mode();
+        let testing = crate::runtime_mode::is_testing();
+        if testing && let Some(model)=&mut self.modeled {
             model.send(payload)?;
             return Ok(());
         }
-        #[cfg(feature = "testing")]
         use sedsnet::wire_format::peek_envelope;
 
-        #[cfg(feature = "testing")]
-        if peek_envelope(payload)
+        if testing && peek_envelope(payload)
             .map(|envelope| envelope.ty == crate::telemetry_schema::data_type("HEARTBEAT"))
             .unwrap_or(false)
         {
             return Ok(());
         }
-        #[cfg(feature = "testing")]
-        if crate::telemetry_task::timesync_enabled()
+        if testing && crate::telemetry_task::timesync_enabled()
             && let Ok(pkt) = sedsnet::wire_format::unpack_packet(payload)
             && pkt.data_type() == sedsnet::config::DataType::TimeSyncRequest
             && !self.simulated_timesync_sources().is_empty()
@@ -5088,8 +5090,9 @@ mod raw_uart_tests {
         }
     }
     #[test]
-    #[cfg(all(target_os = "linux", feature = "hitl_mode"))]
+    #[cfg(target_os = "linux")]
     fn late_sibling_actual_uart_captured117_and_metadata_limits() {
+        crate::mode_suite!(Hitl);
         const CHILD: &str = "GS_LATE_SIBLING_PTY_CHILD";
         const NAME: &str =
             "comms::raw_uart_tests::late_sibling_actual_uart_captured117_and_metadata_limits";
@@ -5250,8 +5253,9 @@ mod raw_uart_tests {
     }
 
     #[test]
-    #[cfg(all(target_os = "linux", feature = "hitl_mode"))]
+    #[cfg(target_os = "linux")]
     fn virtual_uart_direct_and_mesh_close_wait_for_accumulated_stop() {
+        crate::mode_suite!(Hitl);
         const CHILD: &str = "GS_ACCUMULATED_UART_CHILD";
         const NAME: &str =
             "comms::raw_uart_tests::virtual_uart_direct_and_mesh_close_wait_for_accumulated_stop";
@@ -5925,11 +5929,11 @@ mod raw_uart_tests {
     }
 
     #[test]
-    #[cfg(all(
-        target_os = "linux",
-        any(feature = "hitl_mode", feature = "firmware_sim")
-    ))]
+    #[cfg(target_os = "linux")]
     fn late_third_command_joins_only_the_open_bounded_uart_packet() {
+        if !cfg!(feature = "firmware_sim") {
+            crate::mode_suite!(Hitl);
+        }
         const CHILD: &str = "GS_LATE_THIRD_PTY_CHILD";
         const NAME: &str =
             "comms::raw_uart_tests::late_third_command_joins_only_the_open_bounded_uart_packet";
@@ -6035,11 +6039,11 @@ mod raw_uart_tests {
     }
 
     #[test]
-    #[cfg(all(
-        target_os = "linux",
-        any(feature = "hitl_mode", feature = "firmware_sim")
-    ))]
+    #[cfg(target_os = "linux")]
     fn primary_late_single_command_joins_only_one_existing_uart_packet() {
+        if !cfg!(feature = "firmware_sim") {
+            crate::mode_suite!(Hitl);
+        }
         const CHILD: &str = "GS_PRIMARY_SINGLE_TAIL_PTY_CHILD";
         const NAME: &str = "comms::raw_uart_tests::primary_late_single_command_joins_only_one_existing_uart_packet";
         if std::env::var_os(CHILD).is_none() {
@@ -6122,11 +6126,11 @@ mod raw_uart_tests {
     }
 
     #[test]
-    #[cfg(all(
-        target_os = "linux",
-        any(feature = "hitl_mode", feature = "firmware_sim")
-    ))]
+    #[cfg(target_os = "linux")]
     fn relay_replayed_pair_yields_idle_boundary_and_keeps_owner_receipts_ahead() {
+        if !cfg!(feature = "firmware_sim") {
+            crate::mode_suite!(Hitl);
+        }
         const CHILD: &str = "GS_REPLAYED_PAIR_PTY_CHILD";
         const NAME: &str = "comms::raw_uart_tests::relay_replayed_pair_yields_idle_boundary_and_keeps_owner_receipts_ahead";
         if std::env::var_os(CHILD).is_none() {
@@ -6266,11 +6270,11 @@ mod raw_uart_tests {
     }
 
     #[test]
-    #[cfg(all(
-        target_os = "linux",
-        any(feature = "hitl_mode", feature = "firmware_sim")
-    ))]
+    #[cfg(target_os = "linux")]
     fn relay_air_serialized_command_sibling_keeps_one_packet_and_retained_ownership() {
+        if !cfg!(feature = "firmware_sim") {
+            crate::mode_suite!(Hitl);
+        }
         const CHILD: &str = "GS_RELAY_LATE_SIBLING_PTY_CHILD";
         const NAME: &str = "comms::raw_uart_tests::relay_air_serialized_command_sibling_keeps_one_packet_and_retained_ownership";
         if std::env::var_os(CHILD).is_none() {
@@ -6368,11 +6372,11 @@ mod raw_uart_tests {
     }
 
     #[test]
-    #[cfg(all(
-        target_os = "linux",
-        any(feature = "hitl_mode", feature = "firmware_sim")
-    ))]
+    #[cfg(target_os = "linux")]
     fn relay_air_serialized_receipt_sibling_keeps_one_packet_and_retained_ownership() {
+        if !cfg!(feature = "firmware_sim") {
+            crate::mode_suite!(Hitl);
+        }
         const CHILD: &str = "GS_RELAY_LATE_RECEIPT_PTY_CHILD";
         const NAME: &str = "comms::raw_uart_tests::relay_air_serialized_receipt_sibling_keeps_one_packet_and_retained_ownership";
         if std::env::var_os(CHILD).is_none() {
@@ -6929,8 +6933,9 @@ mod raw_uart_tests {
         }
     }
     #[test]
-    #[cfg(all(target_os = "linux", feature = "hitl_mode"))]
+    #[cfg(target_os = "linux")]
     fn virtual_scalar_uart_partial_preserves_accepted_stop_and_quiet() {
+        crate::mode_suite!(Hitl);
         let path =
             std::env::temp_dir().join(format!("gs-scalar-prefix-clock-{}.txt", std::process::id()));
         std::fs::write(&path, "9080").unwrap();
@@ -8023,14 +8028,10 @@ pub(crate) mod reference_decoder;
 #[path = "comms/captured_prefix_tests.rs"]
 mod captured_prefix_tests;
 
-#[cfg(all(
-    test,
-    target_os = "linux",
-    any(feature = "firmware_sim", feature = "hitl_mode")
-))]
+#[cfg(all(test, target_os = "linux"))]
 #[path = "comms/budget_writer_tests.rs"]
 mod budget_writer_tests;
 
-#[cfg(all(test, feature = "testing", not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
+#[cfg(test)]
 #[path = "comms/testing_recovery_tests.rs"]
 mod testing_recovery_tests;

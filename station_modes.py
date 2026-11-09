@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Station mode supervisor: one installed backend binary per mode.
+"""Station mode supervisor for the single backend binary.
 
-Modes are compile-time Cargo features, so switching mode means restarting into
-another build. The backend's /api/station-modes Confirm saves
-``<state dir>/selection.json`` and exits with RESTART_EXIT_CODE; this
-supervisor (or systemd, through ``exec``) then starts the selected binary.
+One backend binary holds every station mode (normal, HITL, test fire,
+testing). The backend switches mode inside its own process while the station
+is idle. Only a Simulation change needs a restart: the backend's
+/api/station-modes Confirm saves ``<state dir>/selection.json`` and exits with
+RESTART_EXIT_CODE, and this supervisor (or systemd, through ``exec``) starts
+the binary again with the selected mode and Simulation flag.
 
-  python3 station_modes.py build --modes all            # build every mode
+  python3 station_modes.py build                         # build the binary
   python3 station_modes.py exec [--rrls] [--default-mode hitl]   # systemd ExecStart
 
 ``run_groundstation.py --switchable-modes ...`` builds and supervises in one
@@ -27,15 +29,9 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 RESTART_EXIT_CODE = 75
-# Mode id (backend station_mode::Mode, snake_case) -> backend Cargo feature,
-# as build.py / backend/build.py map testing, hitl-mode and test-fire-mode.
-MODE_FEATURES: dict[str, list[str]] = {
-    "normal": [],
-    "hitl": ["hitl_mode"],
-    "test_fire": ["test_fire_mode"],
-    "testing": ["testing"],
-}
-MODES = tuple(MODE_FEATURES)
+# Mode ids (backend station_mode::Mode, snake_case), passed to the backend as
+# GS_STATION_MODE. Every mode is in the one binary.
+MODES = ("normal", "hitl", "test_fire", "testing")
 BINARY = "groundstation_backend"
 SELECTION_FILE = "selection.json"
 # Mirrors backend rrls_sim_primary::ISOLATED. A simulated-primary RRLS keeps
@@ -52,8 +48,8 @@ RRLS_SIM_ISOLATED = {
 
 
 def simulation_supported(mode: str, rrls: bool) -> bool:
-    """The primary's simulation is the testing build's flight model; an RRLS
-    can simulate its paired primary in any build."""
+    """The primary's simulation is testing mode's flight model; an RRLS can
+    simulate its paired primary in any mode."""
     return rrls or mode == "testing"
 
 
@@ -65,7 +61,7 @@ def parse_modes(text: str) -> list[str]:
         item = item.strip().replace("-", "_")
         if item in ("hitl_mode", "test_fire_mode"):
             item = item.removesuffix("_mode")
-        if item not in MODE_FEATURES:
+        if item not in MODES:
             raise ValueError(f"unknown station mode {item!r}; choose from {', '.join(MODES)} or all")
         if item not in modes:
             modes.append(item)
@@ -76,12 +72,14 @@ def binary_root(repo_root: Path, debug: bool = False) -> Path:
     return repo_root / "target" / "station-modes" / ("debug" if debug else "release")
 
 
-def binary_path(repo_root: Path, mode: str, debug: bool = False) -> Path:
-    return binary_root(repo_root, debug) / mode / BINARY
+def binary_path(repo_root: Path, debug: bool = False) -> Path:
+    return binary_root(repo_root, debug) / BINARY
 
 
 def installed_modes(root: Path) -> list[str]:
-    return [mode for mode in MODES if (root / mode / BINARY).is_file() and os.access(root / mode / BINARY, os.X_OK)]
+    """Every mode when the binary is installed, else none."""
+    binary = root / BINARY
+    return list(MODES) if binary.is_file() and os.access(binary, os.X_OK) else []
 
 
 def state_dir(repo_root: Path, environ: Mapping[str, str]) -> Path:
@@ -119,7 +117,7 @@ def choose(selection: dict | None, installed: list[str], default_mode: str, rrls
         mode, simulation = selection.get("mode"), selection.get("simulation")
         if selection.get("role") != role:
             pass
-        elif mode not in MODE_FEATURES or not isinstance(simulation, bool):
+        elif mode not in MODES or not isinstance(simulation, bool):
             print("Warning: ignoring malformed station mode selection", file=sys.stderr)
         elif mode not in installed:
             print(f"Warning: selected mode {mode} is not installed; starting the default {default_mode}", file=sys.stderr)
@@ -134,7 +132,8 @@ def choose(selection: dict | None, installed: list[str], default_mode: str, rrls
 def child_env(base: Mapping[str, str], choice: Choice, rrls: bool, installed: list[str], directory: Path, sim_root: Path) -> dict[str, str]:
     env = dict(base)
     env["GS_STATION_MODE_SUPERVISOR"] = "1"
-    env["GS_STATION_MODE_AVAILABLE"] = ",".join(installed)
+    env["GS_STATION_MODE"] = choice.mode
+    env.pop("GS_STATION_MODE_AVAILABLE", None)
     env["GS_STATION_MODE_DIR"] = str(directory.resolve())
     if rrls:
         env["GS_RRLS_ROLE"] = "rrls"
@@ -164,45 +163,48 @@ def prepare_sim_root(root: Path) -> None:
     root.mkdir(parents=True, mode=0o700)
 
 
-def cargo_command(mode: str, debug: bool, pi: bool) -> list[str]:
+def build_features(pi: bool = False, firmware_sim: bool = False) -> list[str]:
+    return (["raspberry_pi"] if pi else []) + (["firmware_sim"] if firmware_sim else [])
+
+
+def cargo_command(debug: bool, pi: bool, firmware_sim: bool = False) -> list[str]:
     command = ["cargo", "build", "-p", BINARY]
     if not debug:
         command.insert(2, "--release")
-    features = (["raspberry_pi"] if pi else []) + MODE_FEATURES[mode]
+    features = build_features(pi, firmware_sim)
     if features:
         command.extend(["--features", ",".join(features)])
     return command
 
 
-def build_modes(repo_root: Path, modes: list[str], debug: bool = False, pi: bool = False, run: Callable = subprocess.run) -> Path:
-    """Build each mode with its features and keep a copy of each binary.
-    Cargo keeps per-feature artifacts, so an unchanged mode rebuilds quickly."""
+def build_modes(repo_root: Path, modes: list[str] | None = None, debug: bool = False, pi: bool = False, run: Callable = subprocess.run, firmware_sim: bool = False) -> Path:
+    """Build the one backend binary (it holds every mode) and install a copy.
+    ``modes`` is accepted for older callers and ignored."""
     root = binary_root(repo_root, debug)
     built = repo_root / "target" / ("debug" if debug else "release") / BINARY
-    for mode in modes:
-        command = cargo_command(mode, debug, pi)
-        print(f"Building station mode {mode}: {' '.join(command)}")
-        run(command, cwd=repo_root, check=True)
-        destination = root / mode / BINARY
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        staging = destination.with_name(BINARY + ".new")
-        shutil.copy2(built, staging)
-        os.replace(staging, destination)
-        (destination.parent / "build.json").write_text(json.dumps({"mode": mode, "features": MODE_FEATURES[mode] + (["raspberry_pi"] if pi else []), "profile": "debug" if debug else "release"}) + "\n", encoding="utf-8")
+    command = cargo_command(debug, pi, firmware_sim)
+    print(f"Building the station backend (all modes): {' '.join(command)}")
+    run(command, cwd=repo_root, check=True)
+    destination = root / BINARY
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = destination.with_name(BINARY + ".new")
+    shutil.copy2(built, staging)
+    os.replace(staging, destination)
+    (root / "build.json").write_text(json.dumps({"modes": list(MODES), "features": build_features(pi, firmware_sim), "profile": "debug" if debug else "release"}) + "\n", encoding="utf-8")
     return root
 
 
 def plan(repo_root: Path, root: Path, environ: Mapping[str, str], default_mode: str, rrls: bool, default_simulation: bool | None = None) -> tuple[Choice, Path, dict[str, str]]:
     installed = installed_modes(root)
     if default_mode not in installed:
-        raise FileNotFoundError(f"default station mode {default_mode} is not built under {root}")
+        raise FileNotFoundError(f"the station backend is not built under {root}")
     directory = state_dir(repo_root, environ)
     choice = choose(read_selection(directory), installed, default_mode, rrls, default_simulation)
     sim_root = directory / "rrls-simulation"
     env = child_env(environ, choice, rrls, installed, directory, sim_root)
     if rrls and choice.simulation:
         prepare_sim_root(sim_root)
-    return choice, root / choice.mode / BINARY, env
+    return choice, root / BINARY, env
 
 
 def describe(choice: Choice, rrls: bool) -> str:
@@ -232,7 +234,7 @@ def supervise(repo_root: Path, root: Path, default_mode: str, rrls: bool, cwd: P
             return code
         if code != RESTART_EXIT_CODE:
             return code
-        print("Backend requested a station mode restart; starting the selected build.")
+        print("Backend requested a restart for a Simulation change; starting the selected mode.")
 
 
 def exec_selected(repo_root: Path, root: Path, default_mode: str, rrls: bool) -> None:
@@ -246,10 +248,11 @@ def exec_selected(repo_root: Path, root: Path, default_mode: str, rrls: bool) ->
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
-    build = sub.add_parser("build", help="build one backend binary per mode")
-    build.add_argument("--modes", default="all", help="comma list of normal,hitl,test_fire,testing, or all")
+    build = sub.add_parser("build", help="build the backend binary (it holds every mode)")
+    build.add_argument("--modes", default="all", help="accepted for older callers and ignored: one binary holds every mode")
     build.add_argument("--debug", action="store_true")
     build.add_argument("--pi", action="store_true", help="add the raspberry_pi feature (primary on a Pi)")
+    build.add_argument("--firmware-sim", action="store_true", help="add the firmware_sim feature (MCU simulator clocks)")
     for name in ("exec", "list"):
         command = sub.add_parser(name)
         command.add_argument("--rrls", action="store_true")
@@ -258,7 +261,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     repo_root = Path(__file__).resolve().parent
     if args.command == "build":
-        build_modes(repo_root, parse_modes(args.modes), args.debug, args.pi)
+        parse_modes(args.modes)  # still rejects unknown names
+        build_modes(repo_root, None, args.debug, args.pi, firmware_sim=args.firmware_sim)
         return 0
     root = binary_root(repo_root, args.debug)
     default_mode = parse_modes(args.default_mode)[0]

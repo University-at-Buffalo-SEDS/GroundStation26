@@ -99,8 +99,7 @@ impl Fixture {
             for key in KEYS {
                 rt.observe_valve(key, false);
             }
-            #[cfg(not(feature = "hitl_mode"))]
-            {
+            if !crate::runtime_mode::is_hitl() {
                 rt.operational.startup_configured = true;
                 rt.operational.topology_stable = true;
             }
@@ -375,8 +374,7 @@ async fn actual_cold_flow_routes_physical_edge_auth_cancel_and_no_launch_clock()
             .cold_flow_target_psi,
         Some(100.)
     );
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if !crate::runtime_mode::is_hitl() {
         let mut rt = f.state.gse.lock().unwrap();
         rt.operational.startup_configured = true;
         rt.operational.topology_stable = true;
@@ -596,19 +594,13 @@ async fn actual_cold_flow_routes_physical_edge_auth_cancel_and_no_launch_clock()
     assert_eq!(f.phase(), ColdPhase::AwaitingRelease);
     assert_eq!(f.actual, CLOSED);
     assert!(!crate::gse::pilot_report_can_advance_launch_clock(&f.state));
-    let blocked = vec![TelemetryCommand::Launch];
-    #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-    let blocked = {
-        let mut values = blocked;
-        values.push(TelemetryCommand::GroundStationLaunch);
-        values
-    };
-    #[cfg(feature = "hitl_mode")]
-    let blocked = {
-        let mut values = blocked;
-        values.push(TelemetryCommand::IgniterSequence);
-        values
-    };
+    let mut blocked = vec![TelemetryCommand::Launch];
+    if crate::runtime_mode::is_hitl_or_test_fire() {
+        blocked.push(TelemetryCommand::GroundStationLaunch);
+    }
+    if crate::runtime_mode::is_hitl() {
+        blocked.push(TelemetryCommand::IgniterSequence);
+    }
     for cmd in blocked {
         assert_eq!(crate::gse::command_allowed(&f.state, &cmd), Some(false));
         assert!(crate::gse::handle_command(&f.state, &cmd));
@@ -1784,8 +1776,7 @@ async fn nitrogen_hold_offers_cold_flow_that_releases_the_held_pressure_without_
         rt.engine.status.baseline = Some(gse_sequence::Baseline {
             average_psi: 0.0, min_psi: 0.0, max_psi: 0.0, noise_psi: 0.5, samples: 50,
         });
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        if !crate::runtime_mode::is_hitl() {
             rt.operational.path = Some(path.clone());
             rt.operational.saved.qualification.complete(Milestone::SelfTest, 0).unwrap();
             rt.operational.running = true;
@@ -1796,15 +1787,12 @@ async fn nitrogen_hold_offers_cold_flow_that_releases_the_held_pressure_without_
         rt.progress_start(reserved, Kind::NitrogenTest, input);
         let _ = rt.engine.hold_test_pressure(now, gse_sequence::TestHold::Passed);
     }
-    #[cfg(feature = "hitl_mode")]
-    let _ = &path;
     for _ in 0..20 {
         f.step(115.);
     }
     // The fixture has no live board topology; restore the readiness the
     // operational tick withdrew while the engine settled its hold.
-    #[cfg(not(feature = "hitl_mode"))]
-    { f.state.gse.lock().unwrap().operational.topology_stable = true; }
+    if !crate::runtime_mode::is_hitl() { f.state.gse.lock().unwrap().operational.topology_stable = true; }
     assert_eq!(f.state.gse.lock().unwrap().engine.status.phase, Phase::Paused);
     assert_eq!(f.actual, CLOSED, "the hold keeps pressure: every valve closed");
     super::progress::flush(&f.state);
@@ -1823,11 +1811,12 @@ async fn nitrogen_hold_offers_cold_flow_that_releases_the_held_pressure_without_
     assert!(!sent.iter().any(|(k, c)| k == "VALVE_COMMAND" && *c == 0), "pilot waits for release");
     let rt = f.state.gse.lock().unwrap();
     assert!(rt.engine.test_hold().is_none());
-    #[cfg(not(feature = "hitl_mode"))]
-    assert!(
-        rt.operational.saved.qualification.completed(Milestone::NitrogenTest),
-        "the passed hold completes the nitrogen (cold-flow) qualification"
-    );
+    if !crate::runtime_mode::is_hitl() {
+        assert!(
+            rt.operational.saved.qualification.completed(Milestone::NitrogenTest),
+            "the passed hold completes the nitrogen (cold-flow) qualification"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1841,8 +1830,7 @@ async fn nitrogen_hold_cold_flow_target_is_capped_at_the_test_top_step() {
         rt.engine.status.baseline = Some(gse_sequence::Baseline {
             average_psi: 0.0, min_psi: 0.0, max_psi: 0.0, noise_psi: 0.5, samples: 50,
         });
-        #[cfg(not(feature = "hitl_mode"))]
-        { rt.operational.running = true; }
+        if !crate::runtime_mode::is_hitl() { rt.operational.running = true; }
         let now = rt.now();
         let reserved = super::progress::reserve(&f.state);
         let input = rt.input(true, true);
@@ -1852,8 +1840,7 @@ async fn nitrogen_hold_cold_flow_target_is_capped_at_the_test_top_step() {
     for _ in 0..20 {
         f.step(110.);
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    { f.state.gse.lock().unwrap().operational.topology_stable = true; }
+    if !crate::runtime_mode::is_hitl() { f.state.gse.lock().unwrap().operational.topology_stable = true; }
     super::progress::flush(&f.state);
     let choice = super::progress::controls(&f.state).unwrap().hold_choice.unwrap();
     assert!(!choice.passed);
@@ -1874,8 +1861,7 @@ async fn dump_route_is_offered_only_at_a_nitrogen_hold_and_keeps_the_run() {
         rt.engine.status.baseline = Some(gse_sequence::Baseline {
             average_psi: 0.0, min_psi: 0.0, max_psi: 0.0, noise_psi: 0.5, samples: 50,
         });
-        #[cfg(not(feature = "hitl_mode"))]
-        { rt.operational.running = true; }
+        if !crate::runtime_mode::is_hitl() { rt.operational.running = true; }
         let reserved = super::progress::reserve(&f.state);
         let input = rt.input(true, true);
         rt.progress_start(reserved, Kind::NitrogenTest, input);
@@ -1892,8 +1878,7 @@ async fn dump_route_is_offered_only_at_a_nitrogen_hold_and_keeps_the_run() {
     for _ in 0..20 {
         f.step(115.);
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    { f.state.gse.lock().unwrap().operational.topology_stable = true; }
+    if !crate::runtime_mode::is_hitl() { f.state.gse.lock().unwrap().operational.topology_stable = true; }
     let (code, value) = f.call("/api/gse/sequences/dump", serde_json::to_value(&key).unwrap(), Some("cold-origin-token")).await;
     assert_eq!(code, StatusCode::OK, "{value}");
     let rt = f.state.gse.lock().unwrap();

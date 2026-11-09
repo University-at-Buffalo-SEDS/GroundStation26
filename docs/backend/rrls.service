@@ -15,10 +15,11 @@ Environment=GS_USERS_FILE=/var/lib/rrls/users.json
 # directory's data/station-pairing). To use a pair_stations.py bundle instead:
 #Environment=GS_STATION_PAIRING_FILE=/var/lib/rrls/station-pair/rrls/pairing.json
 ExecStart=/opt/rrls/GroundStation26/target/release/groundstation_backend
-# Station mode switch (docs/backend/station-modes.md): build every mode once
-# with `python3 station_modes.py build --modes all`, then use this ExecStart
-# instead. A confirmed switch exits with status 75; Restart= starts the
-# launcher again, which execs the selected build (normal when none is saved).
+# Station modes (docs/backend/station-modes.md): one binary holds every mode
+# and switches in process. To also allow Simulation changes from the UI, build
+# once with `python3 station_modes.py build` and use this ExecStart instead. A
+# Simulation change exits with status 75; Restart= starts the launcher again,
+# which execs the binary with the saved selection (normal when none is saved).
 #ExecStart=/usr/bin/python3 /opt/rrls/GroundStation26/station_modes.py exec --rrls --default-mode normal
 Restart=on-failure
 RestartSec=2

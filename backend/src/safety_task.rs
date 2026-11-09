@@ -34,13 +34,9 @@ const BARO_ALTITUDE_MAX_THRESHOLD: f32 = 11000.0; // m
 
 // GPS thresholds
 // Should be in texas
-#[cfg(not(feature = "hitl_mode"))]
 const GPS_LATITUDE_MIN_THRESHOLD: f32 = 25.0; // degrees
-#[cfg(not(feature = "hitl_mode"))]
 const GPS_LATITUDE_MAX_THRESHOLD: f32 = 36.5; // degrees
-#[cfg(not(feature = "hitl_mode"))]
 const GPS_LONGITUDE_MIN_THRESHOLD: f32 = -106.5; // degrees
-#[cfg(not(feature = "hitl_mode"))]
 const GPS_LONGITUDE_MAX_THRESHOLD: f32 = -93.5; // degrees
 
 // Default battery voltage thresholds (V), used as fallback sender ranges.
@@ -64,9 +60,8 @@ const FUEL_TANK_PRESSURE_MAX_THRESHOLD: f32 = 3000.0; // psi
 const KALMAN_STATE_MIN_THRESHOLD: f32 = -5000.0; // arbitrary units
 const KALMAN_STATE_MAX_THRESHOLD: f32 = 5000.0; // arbitrary units
 
-#[cfg(not(feature = "testing"))]
+// The testing build used the same thresholds.
 const BOARD_TIMEOUT_MS: u64 = 12000;
-#[cfg(not(feature = "testing"))]
 const BOARD_OFFLINE_ABORT_TRIGGER_MS: u64 = 6000;
 const SAFETY_WARNING_COOLDOWN_MS_DEFAULT: u64 = 5_000;
 
@@ -262,16 +257,84 @@ fn check_gyro_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
     }
 }
 
-#[cfg(feature = "testing")]
-const BOARD_TIMEOUT_MS: u64 = 12000;
-#[cfg(feature = "testing")]
-const BOARD_OFFLINE_ABORT_TRIGGER_MS: u64 = 6000;
+/// The station modes whose old builds ran the safety task. HITL and test fire
+/// builds had no safety task at all.
+fn mode_runs_safety_task(mode: crate::station_mode::Mode) -> bool {
+    matches!(
+        mode,
+        crate::station_mode::Mode::Normal | crate::station_mode::Mode::Testing
+    )
+}
 
+/// Why one run of the safety loop ended.
+enum SafetyExit {
+    Shutdown,
+    /// An automatic abort was claimed and dispatched; the old task ended here.
+    Claimed,
+    /// The station mode changed; the run's local state belongs to the old mode.
+    ModeChanged,
+}
+
+/// Runs the safety task for the station's lifetime, following the runtime
+/// station mode. In normal and testing modes it runs [`safety_task`]'s loop
+/// exactly as the old builds did. In HITL and test fire it does nothing, as
+/// those builds had no safety task. Every mode switch ends the current run and
+/// starts a fresh one (fresh local state), exactly as a restarted process would.
+/// After a claimed abort the run ends, as before, and nothing restarts it until
+/// the mode changes.
+pub async fn safety_supervisor(
+    state: Arc<AppState>,
+    router: Arc<Router>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    let mut modes = crate::runtime_mode::subscribe();
+    loop {
+        let token = crate::runtime_mode::token();
+        modes.borrow_and_update();
+        if mode_runs_safety_task(token.mode) {
+            match safety_loop(&state, &router, &mut shutdown_rx, token).await {
+                SafetyExit::Shutdown => return,
+                SafetyExit::ModeChanged => continue,
+                SafetyExit::Claimed => {}
+            }
+        }
+        if token != crate::runtime_mode::token() {
+            continue;
+        }
+        tokio::select! {
+            changed = modes.changed() => {
+                if changed.is_err() {
+                    // The mode can no longer change; wait for shutdown only.
+                    let _ = shutdown_rx.recv().await;
+                    return;
+                }
+            }
+            _ = shutdown_rx.recv() => return,
+        }
+    }
+}
+
+/// One run of the safety task under the mode in force now (used directly by
+/// tests; the station runs [`safety_supervisor`]).
+#[cfg(test)]
 pub async fn safety_task(
     state: Arc<AppState>,
     router: Arc<Router>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
+    let token = crate::runtime_mode::token();
+    if !mode_runs_safety_task(token.mode) {
+        return;
+    }
+    let _ = safety_loop(&state, &router, &mut shutdown_rx, token).await;
+}
+
+async fn safety_loop(
+    state: &Arc<AppState>,
+    router: &Arc<Router>,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+    token: crate::runtime_mode::ModeToken,
+) -> SafetyExit {
     let mut pending_abort = None;
     let mut first_abort_reason = None;
     let mut last_no_packet_warning_ms: u64 = 0;
@@ -286,17 +349,22 @@ pub async fn safety_task(
             recv = shutdown_rx.recv() => {
                 match recv {
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {
-                        break;
+                        return SafetyExit::Shutdown;
                     }
                 }
             }
+        }
+        // Local state (pending abort, warning cooldowns) belongs to the mode
+        // it was built under; a switch starts a fresh run.
+        if !token.is_current() {
+            return SafetyExit::ModeChanged;
         }
 
         // This original finite owner precedes every status/layout/provider wait.
         // Losing eligibility affects only automatic publication, never health
         // observation or independent manual/automatic emergency supervision.
         let automatic_observation = crate::automatic_flight_state::Observation::begin(&state);
-        #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
+        #[cfg(all(test, not(feature = "firmware_sim")))]
         crate::normal_publication_probe::n6_record(&state, match automatic_observation.as_ref() { None => 0, Some(o) if o.captured().is_none() => 1, Some(_) => 2 });
         let current_state = { *state.state.lock().unwrap() };
         let on_ground = matches!(
@@ -450,15 +518,19 @@ pub async fn safety_task(
 
         if current_state == FlightState::Startup
             && all_boards_seen
-            && !cfg!(feature = "hitl_mode")
-            && !cfg!(feature = "test_fire_mode")
+            && !crate::runtime_mode::is_hitl()
+            && !crate::runtime_mode::is_test_fire()
             && *state.state.lock().unwrap() == FlightState::Startup {
-                #[cfg(all(test, not(any(feature = "hitl_mode", feature = "test_fire_mode", feature = "firmware_sim"))))]
+                #[cfg(all(test, not(feature = "firmware_sim")))]
                 crate::normal_publication_probe::point(&state, crate::normal_publication_probe::Site::SafetyReady, current_state as u8).await;
                 if let Some(original) = automatic_observation.as_ref().and_then(|o| o.captured())
                     && original.expected == current_state
                     && let Some(proposal) = original.proposal(FlightState::Idle, crate::automatic_flight_state::Cause::Readiness) {
-                    crate::automatic_flight_state::publish(&state, proposal);
+                    let _admission = crate::runtime_mode::admission();
+                    if !token.is_current() {
+                        return SafetyExit::ModeChanged;
+                    }
+                    crate::automatic_flight_state::publish(state, proposal);
                 }
             }
 
@@ -552,8 +624,7 @@ pub async fn safety_task(
 
                 // GPS: [lat, lon] in "xy"
                 ty if ty == crate::telemetry_schema::data_type("GPS_DATA") => {
-                    #[cfg(not(feature = "hitl_mode"))]
-                    {
+                    if !crate::runtime_mode::is_hitl() {
                         let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
 
                         // Latitude (x)
@@ -660,8 +731,19 @@ pub async fn safety_task(
         }
 
         if let Some(reason) = pending_abort.as_ref() {
-            match dispatch_safety_abort_reason(&state, &router, reason) {
-                SafetyDispatch::Claimed => break,
+            // Hold the mode admission across "still this mode" and the claim so
+            // a switch cannot slip between them.
+            let dispatched = {
+                let _admission = crate::runtime_mode::admission();
+                token
+                    .is_current()
+                    .then(|| dispatch_safety_abort_reason(state, router, reason))
+            };
+            let Some(dispatched) = dispatched else {
+                return SafetyExit::ModeChanged;
+            };
+            match dispatched {
+                SafetyDispatch::Claimed => return SafetyExit::Claimed,
                 SafetyDispatch::StartupLivenessCancelled(stage) => {
                     log::warn!(
                         "automatic_abort_intent_cancelled source=board_offline state={stage:?}"
@@ -760,6 +842,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn actual_safety_task_cancels_unclassified_faults_and_startup_liveness() {
+        crate::mode_suite!(Normal, Testing);
         const CHILD: &str = "GS_ACTUAL_LIVENESS_POLICY_CHILD";
         const NAME: &str = "safety_task::tests::actual_safety_task_cancels_unclassified_faults_and_startup_liveness";
         if std::env::var_os(CHILD).is_none() {
@@ -936,6 +1019,7 @@ mod tests {
 
     #[test]
     fn liveness_startup_exemption_is_only_a_caller_policy() {
+        crate::mode_suite!(Normal, Testing);
         for wire in 0..16 {
             let stage = crate::types::u8_to_flight_state(wire).unwrap();
             // Startup only is exempt; Aborted and post-Launch states are
@@ -950,6 +1034,7 @@ mod tests {
 
     #[test]
     fn first_abort_reason_retains_its_actual_source_and_observation_age() {
+        crate::mode_suite!(Normal, Testing);
         let first = SafetyAbortReason::BoardOffline {
             board: "AB",
             selected_state: FlightState::PreFill,
@@ -986,6 +1071,7 @@ mod tests {
 
     #[test]
     fn slowed_model_cadence_does_not_expire_on_host_wall_time() {
+        crate::mode_suite!(Normal, Testing);
         let age = safety_liveness_age_ms(13_012, Some(1_000), Some(7_364), Some(6_000));
         assert_eq!(age, Some(1_364));
         assert!(!age.is_none_or(|age| age > BOARD_TIMEOUT_MS));
@@ -993,6 +1079,7 @@ mod tests {
 
     #[test]
     fn model_timeout_is_stale_even_when_wall_time_is_fresh() {
+        crate::mode_suite!(Normal, Testing);
         let age = safety_liveness_age_ms(1_001, Some(1_000), Some(18_001), Some(6_000));
         assert_eq!(age, Some(12_001));
         assert!(age.is_none_or(|age| age > BOARD_TIMEOUT_MS));
@@ -1001,6 +1088,7 @@ mod tests {
 
     #[test]
     fn unknown_or_future_model_observations_never_become_fake_fresh() {
+        crate::mode_suite!(Normal, Testing);
         for last in [None, Some(1)] {
             let age = safety_liveness_age_ms(1_000, Some(1_000), Some(0), last);
             assert_eq!(age, None);
@@ -1010,6 +1098,7 @@ mod tests {
 
     #[test]
     fn model_zero_and_exact_timeout_boundary_are_valid() {
+        crate::mode_suite!(Normal, Testing);
         assert_eq!(
             safety_liveness_age_ms(99_000, Some(0), Some(0), Some(0)),
             Some(0)
@@ -1021,6 +1110,7 @@ mod tests {
 
     #[test]
     fn absent_model_clock_preserves_exact_wall_fallback() {
+        crate::mode_suite!(Normal, Testing);
         for (now, last) in [
             (0u64, None),
             (0, Some(0)),
@@ -1037,6 +1127,7 @@ mod tests {
 
     #[test]
     fn low_voltage_floor_always_warns_for_fill_system_battery() {
+        crate::mode_suite!(Normal, Testing);
         assert!(battery_low_voltage_always_warns("GB", 13.0));
         assert!(battery_low_voltage_always_warns("GW", 13.0));
         assert!(battery_low_voltage_always_warns("GB", 12.99));
@@ -1044,6 +1135,7 @@ mod tests {
 
     #[test]
     fn low_voltage_floor_does_not_apply_to_non_fill_system_batteries() {
+        crate::mode_suite!(Normal, Testing);
         assert!(!battery_low_voltage_always_warns("PB", 7.4));
         assert!(!battery_low_voltage_always_warns("PB", 13.0));
         assert!(!battery_low_voltage_always_warns("VB", 13.0));
@@ -1051,6 +1143,7 @@ mod tests {
 
     #[test]
     fn battery_voltage_range_check_includes_non_configurable_fill_system_floor() {
+        crate::mode_suite!(Normal, Testing);
         assert!(battery_voltage_out_of_range("GB", 13.0));
         assert!(battery_voltage_out_of_range("GW", 13.0));
     }

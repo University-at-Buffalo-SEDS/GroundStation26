@@ -22,9 +22,7 @@ pub enum FlightComputerCommands {
     // Historical API name: FC byte 19 reinitializes the IMU.
     EnableIMU = 19,
     DisableIMU = 20,
-    #[cfg(feature = "hitl_mode")]
     AdvanceFlightState = 21,
-    #[cfg(feature = "hitl_mode")]
     RewindFlightState = 22,
     AbortAfter40 = 23,
     AbortAfter100 = 24,
@@ -74,7 +72,7 @@ mod flight_command_wire_tests {
         let contract: serde_json::Value = serde_json::from_str(include_str!(
             "test-fixtures/fc-global-state-contract.json"
         )).unwrap();
-        let cases = [
+        let mut cases = [
             (Postinit, "Compat_Postinit_Signal"),
             (Launch, "Compat_Launch_Signal"),
             (MonitorAltitude, "Compat_Vigilant_Mode"),
@@ -94,17 +92,22 @@ mod flight_command_wire_tests {
             (ReinitBarometer, "Compat_Reinit_Barometer"),
             (EnableIMU, "Compat_Reinit_IMU"),
             (DisableIMU, "Compat_Disable_IMU"),
-            #[cfg(feature = "hitl_mode")]
-            (AdvanceFlightState, "Compat_Advance_State"),
-            #[cfg(feature = "hitl_mode")]
-            (RewindFlightState, "Compat_Rewind_State"),
+        ]
+        .to_vec();
+        if crate::runtime_mode::is_hitl() {
+            cases.extend([
+                (AdvanceFlightState, "Compat_Advance_State"),
+                (RewindFlightState, "Compat_Rewind_State"),
+            ]);
+        }
+        cases.extend([
             (AbortAfter40, "Compat_Abort_After_40"),
             (AbortAfter100, "Compat_Abort_After_100"),
             (AbortAfter250, "Compat_Abort_After_250"),
             (ReinitAfter15, "Compat_Reinit_After_15"),
             (ReinitAfter30, "Compat_Reinit_After_30"),
             (ReinitAfter50, "Compat_Reinit_After_50"),
-        ];
+        ]);
         for (command, expected) in cases {
             assert_eq!(contract["remote_commands_compat"][command as usize], expected);
         }

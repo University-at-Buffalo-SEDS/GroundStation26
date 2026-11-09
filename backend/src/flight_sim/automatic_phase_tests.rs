@@ -2,14 +2,15 @@
 use super::*;
 #[test]
 fn automatic_prelaunch_projection_cannot_create_fc_packets_or_board_epochs() {
+    crate::mode_suite!(Testing);
     crate::telemetry_schema::initialize().unwrap();
     let local = Mutex::new(FlightSimState::new());
     {
         let mut model = local.lock().unwrap();
         model.queued.clear();
     }
-    #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
-    let before = local.lock().unwrap().recovery.publication_state();
+    let before = (!crate::runtime_mode::is_hitl_or_test_fire())
+        .then(|| local.lock().unwrap().recovery.publication_state());
     for target in [
         FlightState::Idle,
         FlightState::PreFill,
@@ -34,20 +35,21 @@ fn automatic_prelaunch_projection_cannot_create_fc_packets_or_board_epochs() {
             model.queued.is_empty(),
             "GS-derived automatic phase must not remint FC authority on periodic source path"
         );
-        #[cfg(not(any(feature = "hitl_mode", feature = "test_fire_mode")))]
-        assert_eq!(
-            model.recovery.publication_state(),
-            before,
-            "GS projection cannot advance actual modeled FC owner"
-        );
+        if let Some(before) = before {
+            assert_eq!(
+                model.recovery.publication_state(),
+                before,
+                "GS projection cannot advance actual modeled FC owner"
+            );
+        }
     }
 }
 #[test]
 fn actual_explicit_model_transition_retires_automatic_provenance() {
+    crate::mode_suite!(Testing);
     crate::telemetry_schema::initialize().unwrap();
     let mut model = FlightSimState::new();
-    #[cfg(all(feature = "testing", not(any(feature = "hitl_mode", feature = "test_fire_mode"))))]
-    {
+    if crate::runtime_mode::is_testing() {
         // This is a NEW local unit-model boot with no retained host holds.
         // Same initializer used by initialize_boot(0,0,0,0), not a flag clear,
         // selected-Dummy substitute or independent hardware/NVM proof.

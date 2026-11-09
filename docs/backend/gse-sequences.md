@@ -265,7 +265,7 @@ In HITL, sequence request buttons follow the manual-button interlock; they do no
 require a successful nitrogen test, fresh PT, or configured pressure limits merely
 to be clickable. This is **not** an execution bypass: the backend engine validates
 all normal prerequisites before emitting any valve commands and reports a rejected
-start as a notification. Regular and test-fire builds retain sequenced availability.
+start as a notification. Regular and test-fire modes retain sequenced availability.
 Missing pressure ceiling/empty-tank offset limits must still be configured by the
 backend operator; clicking a button does not supply or override them.
 # HITL operator recovery

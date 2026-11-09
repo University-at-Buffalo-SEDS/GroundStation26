@@ -312,6 +312,8 @@ mod tests {
 
     #[tokio::test]
     async fn kg50_only_recording_exports_every_sample_with_its_timestamp() {
+
+        crate::mode_suite!(TestFire);
         let dir = std::env::temp_dir().join(format!(
             "gs-kg50-csv-{}-{}",
             std::process::id(),

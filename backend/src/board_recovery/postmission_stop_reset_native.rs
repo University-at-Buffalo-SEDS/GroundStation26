@@ -19,8 +19,7 @@ async fn local_stop_postmission_reset_actual_runtime_diagnostic() {
     use crate::types::FlightState;
     let mut observed = Vec::new();
     for initial in [FlightState::Landed, FlightState::Recovery] {
-        #[cfg(feature="test_fire_mode")]
-        let _tf_probe = tf_fresh_receipt_probe();
+        let _tf_probe = crate::runtime_mode::is_test_fire().then(tf_fresh_receipt_probe);
         let fixture = Fixture::new_with_managed_peers().await;
         let state = fixture.state();
         let _ingress=PostmissionNativeIngress::install(&state);
@@ -97,16 +96,15 @@ async fn local_stop_postmission_reset_actual_runtime_diagnostic() {
     assert!(observed.iter().all(|(_,after,status)|*after==15&&*status==200),"explicit Stop postmission reset remains unavailable: {observed:?}");
 }
 
-#[cfg(not(feature="hitl_mode"))]
 // Private actual-host operator-flow diagnostic; peer application state is an explicit model.
 #[tokio::test]
 async fn local_stop_active_startup_abort_reset_actual_runtime_diagnostic() {
+    crate::mode_suite!(Normal, TestFire, Testing);
     use tower::ServiceExt;
     use crate::types::FlightState;
     let mut observed = Vec::new();
     for initial in [FlightState::Idle] {
-        #[cfg(feature="test_fire_mode")]
-        let _tf_probe = tf_fresh_receipt_probe();
+        let _tf_probe = crate::runtime_mode::is_test_fire().then(tf_fresh_receipt_probe);
         let fixture = Fixture::new_with_active_startup_peer_services().await;
         let state = fixture.state();
         let _ingress=PostmissionNativeIngress::install(&state);

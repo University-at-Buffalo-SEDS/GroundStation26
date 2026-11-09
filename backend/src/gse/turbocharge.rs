@@ -160,10 +160,11 @@ fn context_from_binding(state: &AppState, _rt: &Runtime, binding: &serde_json::V
     let bytes = serde_json::to_vec(binding).expect("serializable GSE binding");
     let mut configuration = [0; 32];
     configuration.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref());
-    #[cfg(not(feature = "hitl_mode"))]
-    let qualification_generation = _rt.operational.saved.qualification.generation();
-    #[cfg(feature = "hitl_mode")]
-    let qualification_generation = 0;
+    let qualification_generation = if crate::runtime_mode::is_hitl() {
+        0
+    } else {
+        _rt.operational.saved.qualification.generation()
+    };
     Context {
         reset_generation: super::automatic_generation(state),
         qualification_generation,
@@ -218,8 +219,8 @@ fn prerequisites(state: &AppState, rt: &Runtime, input: Inputs) -> bool {
     if !routes_current(state) {
         return false;
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    if !rt.operational.topology_stable
+    if !crate::runtime_mode::is_hitl()
+        && (!rt.operational.topology_stable
         || !rt.operational.startup_configured
         || !rt.operational.saved.pending_checklists.is_empty()
         || !crate::checklists::paired::qualification_allowed(
@@ -233,7 +234,7 @@ fn prerequisites(state: &AppState, rt: &Runtime, input: Inputs) -> bool {
             .qualification
             .completed(Milestone::FillTarget)
         || rt.operational.saved.qualification.fault().is_some()
-        || rt.operational.saved.automatic_abort_claimed
+        || rt.operational.saved.automatic_abort_claimed)
     {
         return false;
     }
@@ -287,8 +288,7 @@ pub(super) fn request(state: &Arc<AppState>) {
         rt.turbo_binding = Some(binding);
         write_audit(&rt, "pending", None, Some(controller.inventory_anchor()))?;
         rt.turbo_inventory_pending = true;
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        if !crate::runtime_mode::is_hitl() {
             let generation = rt.operational.saved.qualification.generation();
             rt.operational
                 .saved
@@ -361,8 +361,7 @@ pub(super) fn liquid_inventory_requalified(rt: &mut Runtime) -> Result<(), Strin
     }
     rt.turbo_inventory_pending = false;
     rt.turbo_evidence = None;
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if !crate::runtime_mode::is_hitl() {
         rt.operational.saved.turbocharge = None;
         rt.operational.saved.turbocharge_binding = None;
     }
@@ -415,8 +414,7 @@ pub(super) fn pressure_cutoff(rt: &mut Runtime, input: Inputs) -> Option<Effects
     {
         return None;
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if !crate::runtime_mode::is_hitl() {
         rt.operational.target_reached = None;
     }
     let effects = rt.engine.request(Action::PauseFill, input).ok();
@@ -444,8 +442,7 @@ fn invalidate_for_manual_stop(rt: &mut Runtime) -> bool {
         // Manual Stop owns all resulting physical effects. Keep the durable
         // inventory barrier; cancellation cannot certify prior mass movement.
         rt.turbo_binding = None;
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        if !crate::runtime_mode::is_hitl() {
             rt.operational.saved.turbocharge = None;
             rt.operational.saved.turbocharge_binding = None;
             if rt
@@ -471,11 +468,9 @@ pub(super) fn tick(state: &Arc<AppState>, interlock: bool) -> bool {
     }
     let effects = {
         let mut rt = state.gse.lock().unwrap();
-        #[cfg(not(feature = "hitl_mode"))]
-        let blocked = rt.operational.saved.qualification.fault().is_some()
-            || rt.operational.saved.automatic_abort_claimed;
-        #[cfg(feature = "hitl_mode")]
-        let blocked = false;
+        let blocked = !crate::runtime_mode::is_hitl()
+            && (rt.operational.saved.qualification.fault().is_some()
+                || rt.operational.saved.automatic_abort_claimed);
         if blocked || rt.engine.status.phase == Phase::Fault {
             let active = rt.turbocharge.take().is_some();
             if active {
@@ -511,8 +506,7 @@ pub(super) fn tick(state: &Arc<AppState>, interlock: bool) -> bool {
         );
         if update.severe_pressure {
             rt.turbo_evidence = None;
-            #[cfg(not(feature = "hitl_mode"))]
-            {
+            if !crate::runtime_mode::is_hitl() {
                 rt.operational
                     .saved
                     .qualification
@@ -540,8 +534,7 @@ pub(super) fn tick(state: &Arc<AppState>, interlock: bool) -> bool {
                 rt.progress_failed_current();
                 return true;
             }
-            #[cfg(not(feature = "hitl_mode"))]
-            {
+            if !crate::runtime_mode::is_hitl() {
                 let generation = rt.operational.saved.qualification.generation();
                 if let Err(error) = rt
                     .operational
@@ -587,8 +580,7 @@ pub(super) fn tick(state: &Arc<AppState>, interlock: bool) -> bool {
             if !update.effects.valves.is_empty() {
                 let reason = reason.trim_end_matches("; pausing").to_string();
                 let effects = super::pause_for_failure(&mut rt, original, &reason);
-                #[cfg(not(feature = "hitl_mode"))]
-                {
+                if !crate::runtime_mode::is_hitl() {
                     rt.operational.run_generation = rt.operational.saved.qualification.generation();
                 }
                 drop(rt);
@@ -660,8 +652,7 @@ pub(super) fn guard_closed_pressure(state: &Arc<AppState>) -> bool {
         .is_some_and(|(p, limit)| p.value >= limit)
     {
         rt.turbo_evidence = None;
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        if !crate::runtime_mode::is_hitl() {
             rt.operational
                 .saved
                 .qualification
@@ -684,12 +675,12 @@ pub(super) fn guard_closed_pressure(state: &Arc<AppState>) -> bool {
         return false;
     }
     rt.turbo_evidence = None;
-    #[cfg(not(feature = "hitl_mode"))]
-    if rt
-        .operational
-        .saved
-        .qualification
-        .completed(Milestone::FillTarget)
+    if !crate::runtime_mode::is_hitl()
+        && rt
+            .operational
+            .saved
+            .qualification
+            .completed(Milestone::FillTarget)
     {
         let generation = rt.operational.saved.qualification.generation();
         let _ = rt.operational.saved.qualification.begin_fill(generation);
@@ -712,8 +703,7 @@ pub(super) fn guard_closed_pressure(state: &Arc<AppState>) -> bool {
         .engine
         .request(Action::PauseFill, input)
         .unwrap_or_default();
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+    if !crate::runtime_mode::is_hitl() {
         rt.operational.running = true;
         rt.operational.run_generation = rt.operational.saved.qualification.generation();
         rt.operational.target_reached = None;
@@ -1039,8 +1029,7 @@ mod tests {
                 value: 100.0,
                 at_ms: rt.now(),
             });
-            #[cfg(not(feature = "hitl_mode"))]
-            {
+            if !crate::runtime_mode::is_hitl() {
                 rt.operational.path = Some(path.clone());
                 rt.operational.topology_stable = true;
                 rt.operational.startup_configured = true;
@@ -1087,18 +1076,19 @@ mod tests {
         assert!(command_allowed(&state, &TelemetryCommand::Turbocharge).unwrap());
         assert!(handle_command(&state, &TelemetryCommand::Turbocharge));
         assert!(state.gse.lock().unwrap().turbo_inventory_pending);
-        #[cfg(not(feature = "hitl_mode"))]
-        assert!(
-            !state
-                .gse
-                .lock()
-                .unwrap()
-                .operational
-                .saved
-                .qualification
-                .completed(Milestone::FillTarget),
-            "old fill qualification must not survive an unsettled top-up"
-        );
+        if !crate::runtime_mode::is_hitl() {
+            assert!(
+                !state
+                    .gse
+                    .lock()
+                    .unwrap()
+                    .operational
+                    .saved
+                    .qualification
+                    .completed(Milestone::FillTarget),
+                "old fill qualification must not survive an unsettled top-up"
+            );
+        }
         let pending: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path.with_extension("audit.json")).unwrap())
                 .unwrap();
@@ -1229,13 +1219,14 @@ mod tests {
                 assert!(rt.valves.iter().all(|v| v.is_some_and(|v| !v.open)));
                 assert!(rt.turbocharge.is_none() && rt.turbo_evidence.is_none());
                 assert!(rt.turbo_inventory_pending && rt.valve_pressure.is_none());
-                #[cfg(not(feature = "hitl_mode"))]
-                assert!(
-                    !rt.operational
-                        .saved
-                        .qualification
-                        .completed(Milestone::FillTarget)
-                );
+                if !crate::runtime_mode::is_hitl() {
+                    assert!(
+                        !rt.operational
+                            .saved
+                            .qualification
+                            .completed(Milestone::FillTarget)
+                    );
+                }
             }
             let before = sent.lock().unwrap().len();
             super::super::tick(&state, true);
@@ -1264,8 +1255,7 @@ mod tests {
                 let rt = state.gse.lock().unwrap();
                 assert!(rt.turbocharge.is_none() && rt.turbo_evidence.is_none());
                 assert!(rt.turbo_inventory_pending);
-                #[cfg(not(feature = "hitl_mode"))]
-                {
+                if !crate::runtime_mode::is_hitl() {
                     assert!(
                         !rt.operational
                             .saved
@@ -1321,9 +1311,10 @@ mod tests {
             assert!(evidence.valid());
             assert!((evidence.before_mass.value - inventory).abs() < 0.0001);
             assert!((evidence.added_mass_kg - 0.2).abs() < 0.0001);
-            #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
-            assert!(super::super::operational_launch_allowed(&state, &rt),
-                "actual settled inventory, closed reports and raw750psi must satisfy the TestFire launch gate");
+            if crate::runtime_mode::is_test_fire() {
+                assert!(super::super::operational_launch_allowed(&state, &rt),
+                    "actual settled inventory, closed reports and raw750psi must satisfy the TestFire launch gate");
+            }
         }
         if inventory_loss > 0.0 {
             let mut rt = state.gse.lock().unwrap();
@@ -1336,16 +1327,18 @@ mod tests {
             }
             rt.valve_pressure = Some(Sample { value: target_pressure - band - 0.125, ..original });
             assert!(!accepts_mass(&state, &rt, rt.fresh_mass(rt.now()).unwrap()));
-            #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
-            assert!(!super::super::operational_launch_allowed(&state, &rt));
+            if crate::runtime_mode::is_test_fire() {
+                assert!(!super::super::operational_launch_allowed(&state, &rt));
+            }
             assert_eq!(rt.turbo_evidence.as_ref().unwrap().before_mass.value, anchor);
             // Even a mass still in the liquid-only ready band cannot bypass existing Turbo pressure authority.
             let original_mass = rt.mass.unwrap();
             rt.mass = Some(Sample { value: target_mass + 0.04, ..original_mass });
             let pending = rt.turbo_inventory_pending;
             rt.turbo_inventory_pending = false;
-            #[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
-            assert!(!super::super::operational_launch_allowed(&state, &rt));
+            if crate::runtime_mode::is_test_fire() {
+                assert!(!super::super::operational_launch_allowed(&state, &rt));
+            }
             rt.turbo_inventory_pending = pending;
             rt.mass = Some(original_mass);
             let previous = rt.turbo_evidence.as_ref().unwrap();
@@ -1370,8 +1363,7 @@ mod tests {
         super::super::tick(&state, true);
         super::super::tests::pump_test_link(&state, &peer);
         assert_eq!(sent.lock().unwrap().len(), before);
-        #[cfg(not(feature = "hitl_mode"))]
-        {
+        if !crate::runtime_mode::is_hitl() {
             assert!(
                 operational::Saved::load(&path)
                     .unwrap()
@@ -1380,8 +1372,6 @@ mod tests {
             );
             std::fs::remove_file(path).unwrap();
         }
-        #[cfg(feature = "hitl_mode")]
-        let _ = path;
     }
     /// Firmware-sim run g1 race: Turbocharge is cancelled right after its
     /// Nitrogen-open command, then the board's in-flight Nitrogen-open report
@@ -1440,8 +1430,7 @@ mod tests {
             rt.observe_mass(Some(10.0));
             rt.mass_calibration = Some(calibration);
             rt.valve_pressure = Some(Sample { value: 100.0, at_ms: rt.now() });
-            #[cfg(not(feature = "hitl_mode"))]
-            {
+            if !crate::runtime_mode::is_hitl() {
                 rt.operational.path = Some(path.clone());
                 rt.operational.topology_stable = true;
                 rt.operational.startup_configured = true;
@@ -1514,8 +1503,9 @@ mod tests {
             flush_effects(&state);
             let rt = state.gse.lock().unwrap();
             assert_ne!(rt.engine.status.phase, Phase::Fault, "{}", rt.engine.status.message);
-            #[cfg(not(feature = "hitl_mode"))]
-            assert_eq!(rt.operational.saved.qualification.fault(), None);
+            if !crate::runtime_mode::is_hitl() {
+                assert_eq!(rt.operational.saved.qualification.fault(), None);
+            }
             if late_report_delivered && rt.engine.status.phase == Phase::Paused {
                 break;
             }
@@ -1527,8 +1517,9 @@ mod tests {
             assert_eq!(rt.engine.status.phase, Phase::Paused, "{}", rt.engine.status.message);
             assert!(rt.engine.failure().is_some());
             assert!(rt.valves.iter().all(|v| v.is_some_and(|v| !v.open)));
-            #[cfg(not(feature = "hitl_mode"))]
-            assert!(!super::super::operational_launch_allowed(&state, &rt));
+            if !crate::runtime_mode::is_hitl() {
+                assert!(!super::super::operational_launch_allowed(&state, &rt));
+            }
         }
         let _ = std::fs::remove_file(path.with_extension("audit.json"));
         let _ = std::fs::remove_file(path);
@@ -1595,8 +1586,9 @@ mod tests {
             });
         }
         assert_eq!(rt.engine.status.phase, Phase::Paused);
-        #[cfg(not(feature = "hitl_mode"))]
-        assert!(rt.operational.target_reached.is_none());
+        if !crate::runtime_mode::is_hitl() {
+            assert!(rt.operational.target_reached.is_none());
+        }
     }
     #[tokio::test]
     async fn operator_pause_cancels_turbo_and_ack_gates_closed_without_erasing_pending_inventory() {
