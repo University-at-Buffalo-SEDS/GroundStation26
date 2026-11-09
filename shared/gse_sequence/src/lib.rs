@@ -709,6 +709,43 @@ impl Engine {
                     return Err("GSE action blocked: a fresh tank PT sample is required".into());
                 }
             }
+            // Name the step that is actually missing, in the order the operator
+            // works through them, instead of a list of everything that might be.
+            match action {
+                Action::SelfTest if self.active() => {
+                    return Err("Self-test blocked: another GSE sequence is running".into())
+                }
+                Action::SelfTest if self.status.self_test_locked => {
+                    return Err("Self-test blocked: self-test is locked after the fill began".into())
+                }
+                Action::SelfTest if !self.config.dry_self_test_confirmed => {
+                    return Err("Self-test blocked: confirm the system is dry and isolated first".into())
+                }
+                Action::NitrogenTest if self.active() => {
+                    return Err("Nitrogen test blocked: another GSE sequence is running".into())
+                }
+                Action::StartFill if !(self.status.nitrogen_passed || self.status.nitrogen_overridden) => {
+                    return Err("Fill blocked: pass the nitrogen test (or override it) before filling".into())
+                }
+                Action::StartFill if self.paused_from.is_some() => {
+                    return Err("Fill blocked: resume or cancel the paused sequence first".into())
+                }
+                Action::StartFill if !matches!(self.status.phase, Phase::Passed | Phase::Paused) => {
+                    return Err(format!(
+                        "Fill blocked: the sequence is {:?}; fill starts after the nitrogen test passes",
+                        self.status.phase
+                    ))
+                }
+                Action::StartFill if self.status.baseline.is_none() => {
+                    return Err("Fill blocked: no zero baseline; capture the tank baseline first".into())
+                }
+                Action::StartFill => {
+                    return Err(
+                        "Fill blocked: tank pressure is not at its zero baseline (vent the tank before a new fill)".into(),
+                    )
+                }
+                _ => {}
+            }
             return Err(
                 "GSE action blocked: check limits, fresh PT, sequence state and interlocks".into(),
             );
@@ -1804,6 +1841,22 @@ mod tests {
             partial.validate_settings().is_err(),
             "missing legacy target must not raise the saved hardware ceiling"
         );
+    }
+    #[test]
+    fn a_refused_fill_names_the_missing_step() {
+        let mut rig = Rig::new();
+        rig.engine.nitrous_target_psi = 100.0;
+        // Fresh station: the nitrogen test has not passed.
+        let error = rig.engine.request(Action::StartFill, rig.input()).unwrap_err();
+        assert!(error.contains("pass the nitrogen test"), "{error}");
+        // Overridden, but the sequence is not at Passed or Paused.
+        rig.engine.status.nitrogen_overridden = true;
+        let error = rig.engine.request(Action::StartFill, rig.input()).unwrap_err();
+        assert!(error.contains("sequence is Idle"), "{error}");
+        // Self-test without the dry confirmation.
+        rig.engine.config.dry_self_test_confirmed = false;
+        let error = rig.engine.request(Action::SelfTest, rig.input()).unwrap_err();
+        assert!(error.contains("confirm the system is dry"), "{error}");
     }
     struct Rig {
         engine: Engine,
