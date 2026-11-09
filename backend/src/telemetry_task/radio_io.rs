@@ -244,6 +244,7 @@ pub struct TxQueueBudget {
     /// writer is parked here once instead of being refused hundreds of times.
     parked: Mutex<VecDeque<Parked>>,
     parked_total: std::sync::atomic::AtomicU64,
+    shed_frames: std::sync::atomic::AtomicU64,
     /// Park capacity in frames (zero: never park).
     park_frames: usize,
     /// Accepted offers (including parked) and finished writes, for the
@@ -266,13 +267,22 @@ struct Parked {
     priority: u8,
     bytes: Vec<u8>,
     protected: bool,
+    /// Best-effort telemetry whose loss changes no peer state.
+    sheddable: bool,
     lease: Option<sedsnet::router::PackedWriteLease>,
     activity: Option<Arc<TransportTxActivity>>,
     sender: mpsc::UnboundedSender<(u8, Vec<u8>)>,
 }
-/// At most this many parked frames, and at most the ordinary allowance in
-/// bytes (plus the protected headroom for a protected frame).
-const PARKED_FRAMES: usize = 8;
+/// The park takes every ordinary frame the writer cannot take yet, so the
+/// router's shared TX queue never holds a radio backlog (on the bench it
+/// reached 14k frames; the router serves that queue in priority order inside
+/// a 3 ms pass, so umbilical commands and receipts waited behind refused
+/// radio frames and every pass re-offered each of them). Bounded in frames
+/// and bytes; past PARK_SHED_BYTES the oldest best-effort telemetry is shed
+/// (counted in `shed_frames`) so what waits stays about a second fresh.
+const PARKED_FRAMES: usize = 1024;
+const PARK_MAX_BYTES: usize = 64 * 1024;
+const PARK_SHED_BYTES: usize = 1024;
 
 /// The reservation belongs to the starving class, not to exact bytes: the
 /// router re-encodes a refused frame on every offer (a fresh discovery
@@ -355,6 +365,7 @@ impl TxQueueBudget {
             recent_admissions: std::sync::atomic::AtomicU32::new(0),
             parked: Mutex::new(VecDeque::new()),
             parked_total: std::sync::atomic::AtomicU64::new(0),
+            shed_frames: std::sync::atomic::AtomicU64::new(0),
             park_frames: 0,
             admissions: std::sync::atomic::AtomicU64::new(0),
             completions: std::sync::atomic::AtomicU64::new(0),
@@ -413,6 +424,7 @@ impl TxQueueBudget {
             "parked_frames": self.parked.lock().unwrap().len(),
             "parked_bytes": self.parked.lock().unwrap().iter().map(|p| p.bytes.len()).sum::<usize>(),
             "parked_total": self.parked_total.load(Ordering::Relaxed),
+            "shed_frames": self.shed_frames.load(Ordering::Relaxed),
             "coalesced_receipts": self.coalesced_receipts.load(Ordering::Relaxed),
             "control_limit_bytes": self.limit,
             "ordinary_limit_bytes": self.ordinary_limit,
@@ -806,14 +818,20 @@ impl TxQueueBudget {
         protected: bool,
         reserved_for_large: usize,
     ) -> Option<sedsnet::TelemetryResult<()>> {
-        let mut parked = self.parked.lock().unwrap();
-        let bytes: usize = parked.iter().map(|p| p.bytes.len()).sum();
-        let headroom = if protected { PROTECTED_ORDINARY_HEADROOM } else { 0 };
-        let frames = self.park_frames + usize::from(protected && self.park_frames != 0);
-        if parked.len() >= frames
-            || bytes + payload.len() + reserved_for_large > self.ordinary_limit + headroom
-        {
+        if self.park_frames == 0 {
             return None;
+        }
+        let _ = reserved_for_large;
+        let sheddable = self.sheddable(payload);
+        let mut parked = self.parked.lock().unwrap();
+        let fits = |parked: &VecDeque<Parked>| {
+            parked.len() < self.park_frames
+                && parked.iter().map(|p| p.bytes.len()).sum::<usize>() + payload.len() <= PARK_MAX_BYTES
+        };
+        while !fits(&parked) {
+            if !self.shed_oldest(&mut parked) {
+                return None;
+            }
         }
         let owned = payload.to_vec();
         let identity = (owned.as_ptr() as usize, owned.len());
@@ -823,6 +841,7 @@ impl TxQueueBudget {
                 priority,
                 bytes,
                 protected,
+                sheddable,
                 lease: lease.cloned(),
                 activity: activity.cloned(),
                 sender: sender.clone(),
@@ -845,8 +864,57 @@ impl TxQueueBudget {
                 Err(error) => log::warn!("radio write tracking unavailable: {error}"),
             }
         }
+        drop(records);
         self.parked_total.fetch_add(1, Ordering::Relaxed);
+        while parked.iter().map(|p| p.bytes.len()).sum::<usize>() > PARK_SHED_BYTES
+            && self.shed_oldest(&mut parked)
+        {}
         Some(Ok(()))
+    }
+
+    /// Unreliable, untargeted telemetry: a compact SDT reference (its
+    /// template is already installed, so dropping it changes no peer state)
+    /// or a canonical best-effort frame. Never discovery, time sync, managed
+    /// variables, receipts, operator controls or anything reliable.
+    fn sheddable(&self, payload: &[u8]) -> bool {
+        use sedsnet::config::DataType;
+        if payload.starts_with(b"SDT") {
+            return payload.get(3) == Some(&2)
+                && self.recovery_classifier.peek_type(payload).is_some_and(|ty| {
+                    !is_protected_type(Some(ty))
+                        && !is_operator_control_type(ty)
+                        && !sedsnet::discovery::is_discovery_type(ty)
+                        && !sedsnet::is_reliable_type(ty)
+                });
+        }
+        let Ok(info) = serialize::peek_frame_info(payload) else {
+            return false;
+        };
+        let ty = info.envelope.ty;
+        info.reliable.is_none()
+            && info.envelope.target_senders.is_empty()
+            && !sedsnet::is_reliable_type(ty)
+            && !sedsnet::discovery::is_discovery_type(ty)
+            && !is_protected_type(Some(ty))
+            && !is_operator_control_type(ty)
+            && !matches!(
+                ty,
+                DataType::ManagedVariableRequest | DataType::ManagedVariableValue
+            )
+    }
+
+    /// Drop the oldest sheddable parked frame; false when none is.
+    fn shed_oldest(&self, parked: &mut VecDeque<Parked>) -> bool {
+        let Some(index) = parked.iter().position(|p| p.sheddable) else {
+            return false;
+        };
+        let frame = parked.remove(index).expect("index just found");
+        self.forget_write_lease(&frame.bytes);
+        if let Some(activity) = &frame.activity {
+            activity.complete_frame(&frame.bytes);
+        }
+        self.shed_frames.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     fn forget_write_lease(&self, payload: &[u8]) {
@@ -2646,7 +2714,8 @@ mod priority_tests {
         budget.try_send(&tx, 254, &chunk).unwrap();
         assert_eq!(budget.diagnostics()["parked_frames"], 1);
         chunk[8..10].copy_from_slice(&2u16.to_le_bytes());
-        assert!(budget.try_send(&tx, 254, &chunk).is_err(), "the park holds one allowance");
+        budget.try_send(&tx, 254, &chunk).unwrap();
+        assert_eq!(budget.diagnostics()["parked_frames"], 2, "schema chunks are never shed");
         // The same protected allowance survives a full ordinary lookahead.
         for id in 0..64 {
             let mut control = [0xff; 32];
@@ -2655,11 +2724,9 @@ mod priority_tests {
         }
         let (priority, prefix) = rx.try_recv().unwrap();
         assert_eq!(&prefix[8..10], &[0, 0]);
-        assert!(budget.try_send(&tx, 254, &chunk).is_err());
         budget.complete(priority, &prefix);
-        // Completion moved the parked chunk to the writer; chunk 2 now parks.
-        assert_eq!(budget.diagnostics()["parked_frames"], 0);
-        budget.try_send(&tx, 254, &chunk).unwrap();
+        // Completion moved the next parked chunk to the writer, in order.
+        assert_eq!(budget.diagnostics()["parked_frames"], 1);
         assert_eq!(budget.pending_ordinary.load(Ordering::Acquire), 192);
         while let Ok((priority, bytes)) = rx.try_recv() {
             budget.complete(priority, &bytes);
@@ -3073,25 +3140,41 @@ mod priority_tests {
 
     /// While the writer is full, the next frames are parked once instead of
     /// being refused (and re-offered by the router) on every pass, and they
-    /// reach the writer in order as it drains.
+    /// reach the writer in order as it drains. Past PARK_SHED_BYTES the oldest
+    /// best-effort telemetry is shed; frames that carry state never are.
     #[test]
-    fn full_writer_parks_frames_in_order() {
+    fn full_writer_parks_frames_in_order_and_sheds_only_stale_telemetry() {
+        crate::telemetry_schema::initialize().unwrap();
+        let gps = |stamp: u64| {
+            serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type("GPS_DATA"),
+                &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")], "GS", stamp, Arc::from([0u8; 12])).unwrap()).to_vec()
+        };
         let budget = TxQueueBudget::new_radio(2048, 256);
         let (tx, mut rx) = mpsc::unbounded_channel();
         budget.try_send(&tx, 0, &[1; 200]).unwrap();
         budget.try_send(&tx, 0, &[2; 100]).unwrap();
         budget.try_send(&tx, 0, &[3; 100]).unwrap();
-        assert!(budget.try_send(&tx, 0, &[4; 100]).is_err(), "park is bounded");
         assert_eq!(budget.diagnostics()["parked_frames"], 2);
+        // Best-effort telemetry beyond about a second of airtime is shed,
+        // oldest first; the opaque frames above are kept.
+        for stamp in 0..200 {
+            budget.try_send(&tx, 0, &gps(stamp)).unwrap();
+        }
+        let d = budget.diagnostics();
+        assert!(d["parked_bytes"].as_u64().unwrap() <= PARK_SHED_BYTES as u64 + 64, "{d}");
+        assert!(d["shed_frames"].as_u64().unwrap() > 150, "{d}");
         let (p, f) = rx.try_recv().unwrap();
         assert!(rx.try_recv().is_err());
         budget.complete(p, &f);
         let mut order = Vec::new();
         while let Ok((p, f)) = rx.try_recv() {
-            order.push(f[0]);
+            order.push(f.clone());
             budget.complete(p, &f);
         }
-        assert_eq!(order, [2, 3]);
+        assert_eq!(order[0][0], 2);
+        assert_eq!(order[1][0], 3);
+        let newest = serialize::unpack_packet(order.last().unwrap()).unwrap();
+        assert_eq!(newest.timestamp(), 199, "the freshest telemetry is what remains");
         assert_eq!(budget.pending.load(Ordering::Acquire), 0);
     }
 

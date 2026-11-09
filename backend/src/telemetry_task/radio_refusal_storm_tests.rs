@@ -502,3 +502,108 @@ fn primary_requesting_a_relay_still_carries_the_bench_receipt_load() {
         "share {share}%: {frames:.1} receipt frames/s, {bytes:.0} B/s against {bench_ack_bytes_per_s:.0} B/s of ACK demand"
     );
 }
+
+/// Umbilical command latency through the station's router worker loop while
+/// the radio writer is full and the router keeps queueing radio frames
+/// (a growing radio backlog, as on the bench at Idle in Normal mode).
+fn umbilical_latency_with_saturated_radio(gated: bool) -> (Vec<u64>, u32, u64) {
+    let _tuning = StationTuning::install();
+    crate::telemetry_schema::initialize().unwrap();
+    let host = Arc::new(Router::new(
+        RouterConfig::new([]).with_sender("GS").with_memory_config(crate::network_memory_config()).unwrap(),
+    ));
+    let budget = Arc::new(TxQueueBudget::new_radio(2048, 256));
+    let (tx, _rx_held) = mpsc::unbounded_channel::<(u8, Vec<u8>)>(); // never drained
+    let cb = budget.clone();
+    let radio = host.add_side_packed_with_priority_and_options(
+        "rocket_comms",
+        move |bytes, priority| cb.try_send(&tx, priority, bytes),
+        RouterSideOptions { reliable_enabled: false, ..Default::default() }.with_small_packet_transport(192),
+    );
+    let to_peer: Arc<Mutex<Vec<Vec<u8>>>> = Default::default();
+    let to_host: Arc<Mutex<Vec<Vec<u8>>>> = Default::default();
+    let out = to_peer.clone();
+    let umbilical = host.add_side_packed_with_options(
+        "umbilical_comms",
+        move |bytes| { out.lock().unwrap().push(bytes.to_vec()); Ok(()) },
+        RouterSideOptions { reliable_enabled: true, ..Default::default() },
+    );
+    let received = Arc::new(Mutex::new(Vec::<(u8, std::time::Instant)>::new()));
+    let seen = received.clone();
+    let peer = Router::new(RouterConfig::new([EndpointHandler::new_packet_handler(
+        crate::telemetry_schema::endpoint("ACTUATOR_BOARD"),
+        move |packet| {
+            if packet.data_type() == crate::telemetry_schema::data_type("ACTUATOR_COMMAND") {
+                seen.lock().unwrap().push((packet.payload()[0], std::time::Instant::now()));
+            }
+            Ok(())
+        },
+    )]).with_sender("AB"));
+    let back = to_host.clone();
+    let peer_side = peer.add_side_packed_with_options(
+        "wire",
+        move |bytes| { back.lock().unwrap().push(bytes.to_vec()); Ok(()) },
+        RouterSideOptions { reliable_enabled: true, ..Default::default() },
+    );
+    let announce = |sender: &str, endpoint: &str| sedsnet::discovery::build_discovery_announce(
+        sender, 1, &[crate::telemetry_schema::endpoint(endpoint)]).unwrap();
+    host.rx_from_side(&announce("FC", "FLIGHT_CONTROLLER"), radio).unwrap();
+    host.rx_from_side(&announce("AB", "ACTUATOR_BOARD"), umbilical).unwrap();
+    peer.rx_from_side(&announce("GS", "GROUND_STATION"), peer_side).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (worker_host, worker_stop, worker_budget) = (host.clone(), stop.clone(), budget.clone());
+    let worker = std::thread::spawn(move || {
+        let mut backoff = RadioRefusalBackoff::default();
+        let mut stamp = 0u64;
+        while !worker_stop.load(Ordering::Acquire) {
+            // A steady stream of radio-bound telemetry that cannot be written.
+            stamp += 1;
+            let _ = worker_host.tx_queue(Packet::new(crate::telemetry_schema::data_type("GPS_DATA"),
+                &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")], "GS", stamp, Arc::from([0u8; 12])).unwrap());
+            process_router_queues_with_backoff(&worker_host, gated.then_some(worker_budget.as_ref()), &mut backoff);
+            for bytes in std::mem::take(&mut *to_peer.lock().unwrap()) {
+                let _ = peer.rx_packed_from_side(&bytes, peer_side);
+            }
+            let _ = peer.process_all_queues_with_timeout(0);
+            for bytes in std::mem::take(&mut *to_host.lock().unwrap()) {
+                let _ = worker_host.rx_packed_from_side(&bytes, umbilical);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let mut latencies = Vec::new();
+    for i in 0..10u8 {
+        let sent = std::time::Instant::now();
+        host.tx_queue(Packet::new(crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
+            &[crate::telemetry_schema::endpoint("ACTUATOR_BOARD")], "GS", 100_000 + u64::from(i), Arc::from([i])).unwrap()).unwrap();
+        let arrived = loop {
+            if let Some((_, at)) = received.lock().unwrap().iter().find(|(id, _)| *id == i).copied() { break Some(at); }
+            if sent.elapsed() > Duration::from_secs(3) { break None; }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        latencies.push(arrived.map_or(3_000, |at| (at - sent).as_millis() as u64));
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    stop.store(true, Ordering::Release);
+    worker.join().unwrap();
+    latencies.sort_unstable();
+    let tx_len = host.queue_counters()[2];
+    let refusals = budget.activity_counters().0;
+    eprintln!("UMBILICAL_WITH_SATURATED_RADIO gated={gated} {latencies:?} tx_len={tx_len} radio_refusals={refusals} budget={}", budget.diagnostics());
+    (latencies, tx_len, refusals)
+}
+
+/// A radio that cannot keep up (here: never drains) must not hold the
+/// router's shared TX queue. On the bench the radio backlog reached 14k
+/// router frames; the router serves its queue in priority order inside a
+/// 3 ms pass, so umbilical commands and receipts waited behind refused radio
+/// frames, and each pass re-offered (spun on) every one of them.
+#[test]
+fn saturated_radio_does_not_delay_umbilical_commands() {
+    let (latencies, tx_len, refusals) = umbilical_latency_with_saturated_radio(true);
+    assert!(latencies[5] < 50, "umbilical command p50 {latencies:?}");
+    assert!(latencies[9] < 500, "umbilical command max {latencies:?}");
+    assert!(tx_len < 64, "the router does not hold a radio backlog: tx_len {tx_len}");
+    assert!(refusals < 2_000, "no refusal spin while the radio is full: {refusals}");
+}
