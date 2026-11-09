@@ -102,8 +102,7 @@ fn umbilical_latencies(radio_backlog: u32) -> (Vec<Duration>, u64) {
 struct StationTuning { previous: sedsnet::config::RuntimeTuningConfig, _serial: std::sync::MutexGuard<'static, ()> }
 impl StationTuning {
     fn install() -> Self {
-        static SERIAL: Mutex<()> = Mutex::new(());
-        let guard = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = crate::RUNTIME_TUNING_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = sedsnet::config::runtime_tuning_config();
         sedsnet::config::set_runtime_tuning_config(crate::network_delivery_tuning()).unwrap();
         Self { previous, _serial: guard }

@@ -670,10 +670,17 @@ fn request_startup_topology(router: &sedsnet::router::Router) -> sedsnet::Teleme
     router.request_topology()
 }
 
+/// The SDK's runtime tuning is process-wide. Tests that change it hold this
+/// lock, so a model that depends on retry timing never sees another test's
+/// tuning mid-run.
+#[cfg(test)]
+pub(crate) static RUNTIME_TUNING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod router_link_policy_tests {
     #[test]
     fn embedded_network_packets_do_not_require_a_zstd_decoder() {
+        let _tuning = crate::RUNTIME_TUNING_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = sedsnet::config::runtime_tuning_config();
         sedsnet::config::set_runtime_tuning_config(super::network_delivery_tuning()).unwrap();
         let payload: std::sync::Arc<[u8]> = vec![0; 4096].into();
