@@ -665,3 +665,56 @@ fn radio_keeps_the_full_heartbeat_cadence() {
     assert!(heartbeats.len() >= 19, "every 500 ms heartbeat: {heartbeats:?}");
     assert!(gaps.iter().all(|gap| *gap <= 600), "loss margin of 5 inside the FC's 3 s timeout: {gaps:?}");
 }
+
+/// A peer's DISCOVERY_SCHEMA request makes the station send its whole
+/// schema: about 20 chunks of 192 bytes, four seconds of the radio share.
+/// Chunks never change the compact-frame dictionary, so other frames may
+/// pass them; a station heartbeat (FC timeout 3 s), time sync or telemetry
+/// queued behind a schema transfer must not wait for all of it.
+#[test]
+fn schema_transfer_does_not_hold_frames_queued_behind_it() {
+    crate::telemetry_schema::initialize().unwrap();
+    let budget = TxQueueBudget::new_radio(2048, 256);
+    let (tx, mut rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
+    for index in 0u16..20 {
+        let mut chunk = vec![0u8; 192];
+        chunk[..4].copy_from_slice(b"SDT\x03");
+        chunk[4..8].copy_from_slice(&77u32.to_le_bytes());
+        chunk[8..10].copy_from_slice(&index.to_le_bytes());
+        chunk[10..12].copy_from_slice(&20u16.to_le_bytes());
+        budget.try_send(&tx, 254, &chunk).unwrap();
+    }
+    let heartbeat = serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type("HEARTBEAT"),
+        &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")], "GS", 1, Arc::from([])).unwrap()).to_vec();
+    budget.try_send(&tx, 253, &heartbeat).unwrap();
+    // Drain at the 25% share of 32 kbit/s: 1 byte per ms.
+    let mut credit = 0.0f64;
+    let mut backlog = WireBacklog::new(true);
+    let mut heartbeat_at = None;
+    let mut chunks_written = Vec::new();
+    for now in 0..6_000u64 {
+        let mut drain = 256;
+        backlog.refill(&mut rx, &mut drain);
+        credit = (credit + 1.0).min(256.0);
+        loop {
+            let selection = backlog.selection_state();
+            let Some((priority, bytes)) = backlog.pop() else { break };
+            let cost = (bytes.len() + 16) as f64;
+            if cost > credit {
+                backlog.restore_selected(selection, (priority, bytes), None);
+                break;
+            }
+            credit -= cost;
+            if bytes == heartbeat && heartbeat_at.is_none() {
+                heartbeat_at = Some(now);
+            }
+            if bytes.starts_with(b"SDT\x03") {
+                chunks_written.push(u16::from_le_bytes([bytes[8], bytes[9]]));
+            }
+            budget.complete(priority, &bytes);
+        }
+    }
+    eprintln!("HEARTBEAT_BEHIND_SCHEMA_MS {heartbeat_at:?} chunks {chunks_written:?}");
+    assert!(heartbeat_at.is_some_and(|ms| ms < 1_000), "heartbeat waited {heartbeat_at:?} ms");
+    assert_eq!(chunks_written, (0..20).collect::<Vec<_>>(), "the schema still completes, in order");
+}

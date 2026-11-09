@@ -259,6 +259,10 @@ pub struct TxQueueBudget {
     parked: Mutex<VecDeque<Parked>>,
     parked_total: std::sync::atomic::AtomicU64,
     shed_frames: std::sync::atomic::AtomicU64,
+    /// Chunk transfers seen starting (id -> wraps a template install).
+    chunk_transfers: Mutex<VecDeque<(u32, bool)>>,
+    /// Park drain alternates between chunks and other frames.
+    park_chunk_turn: std::sync::atomic::AtomicBool,
     /// Park capacity in frames (zero: never park).
     park_frames: usize,
     /// Accepted offers (including parked) and finished writes, for the
@@ -281,8 +285,14 @@ struct Parked {
     priority: u8,
     bytes: Vec<u8>,
     protected: bool,
-    /// Best-effort telemetry whose loss changes no peer state.
-    sheddable: bool,
+    /// Best-effort telemetry whose loss changes no peer state: its stream
+    /// (wire type, or the compact template it refers to). Shed only behind a
+    /// fresher parked frame of the same stream.
+    shed_stream: Option<u64>,
+    /// An SDT chunk; `chunk_dictionary` when its transfer wraps a template
+    /// install, which later compact frames depend on.
+    chunk: bool,
+    chunk_dictionary: bool,
     lease: Option<sedsnet::router::PackedWriteLease>,
     activity: Option<Arc<TransportTxActivity>>,
     sender: mpsc::UnboundedSender<(u8, Vec<u8>)>,
@@ -380,6 +390,8 @@ impl TxQueueBudget {
             parked: Mutex::new(VecDeque::new()),
             parked_total: std::sync::atomic::AtomicU64::new(0),
             shed_frames: std::sync::atomic::AtomicU64::new(0),
+            chunk_transfers: Mutex::new(VecDeque::new()),
+            park_chunk_turn: std::sync::atomic::AtomicBool::new(false),
             park_frames: 0,
             admissions: std::sync::atomic::AtomicU64::new(0),
             completions: std::sync::atomic::AtomicU64::new(0),
@@ -545,6 +557,10 @@ impl TxQueueBudget {
         }
         // Earlier parked frames go first; they keep the side's wire order.
         self.drain_parked();
+        if self.short_lookahead {
+            // Learn whether a chunk transfer wraps a template install.
+            let _ = self.chunk_kind(payload);
+        }
         let priority = radio_transport_priority(priority, payload);
         let priority = if self.short_lookahead { radio_lane_priority(priority, payload) } else { priority };
         let mut commands = (priority >= 16
@@ -836,7 +852,8 @@ impl TxQueueBudget {
             return None;
         }
         let _ = reserved_for_large;
-        let sheddable = self.sheddable(payload);
+        let shed_stream = self.shed_stream(payload);
+        let (chunk, chunk_dictionary) = self.chunk_kind(payload);
         let mut parked = self.parked.lock().unwrap();
         let fits = |parked: &VecDeque<Parked>| {
             parked.len() < self.park_frames
@@ -855,7 +872,9 @@ impl TxQueueBudget {
                 priority,
                 bytes,
                 protected,
-                sheddable,
+                shed_stream,
+                chunk,
+                chunk_dictionary,
                 lease: lease.cloned(),
                 activity: activity.cloned(),
                 sender: sender.clone(),
@@ -890,22 +909,29 @@ impl TxQueueBudget {
     /// template is already installed, so dropping it changes no peer state)
     /// or a canonical best-effort frame. Never discovery, time sync, managed
     /// variables, receipts, operator controls or anything reliable.
-    fn sheddable(&self, payload: &[u8]) -> bool {
+    fn shed_stream(&self, payload: &[u8]) -> Option<u64> {
         use sedsnet::config::DataType;
         if payload.starts_with(b"SDT") {
-            return payload.get(3) == Some(&2)
-                && self.recovery_classifier.peek_type(payload).is_some_and(|ty| {
+            let body = sdt_body(payload)?;
+            if payload.get(3) != Some(&2) {
+                return None;
+            }
+            let mut off = 1;
+            let template = sdt_template_id(body, &mut off)?;
+            return self
+                .recovery_classifier
+                .peek_type(payload)
+                .is_some_and(|ty| {
                     !is_protected_type(Some(ty))
                         && !is_operator_control_type(ty)
                         && !sedsnet::discovery::is_discovery_type(ty)
                         && !sedsnet::is_reliable_type(ty)
-                });
+                })
+                .then_some((1u64 << 40) | u64::from(template));
         }
-        let Ok(info) = serialize::peek_frame_info(payload) else {
-            return false;
-        };
+        let info = serialize::peek_frame_info(payload).ok()?;
         let ty = info.envelope.ty;
-        info.reliable.is_none()
+        (info.reliable.is_none()
             && info.envelope.target_senders.is_empty()
             && !sedsnet::is_reliable_type(ty)
             && !sedsnet::discovery::is_discovery_type(ty)
@@ -914,12 +940,39 @@ impl TxQueueBudget {
             && !matches!(
                 ty,
                 DataType::ManagedVariableRequest | DataType::ManagedVariableValue
-            )
+            ))
+        .then_some(u64::from(ty.as_u32()))
     }
 
-    /// Drop the oldest sheddable parked frame; false when none is.
+    /// (is an SDT chunk, its transfer wraps a template install). Transfers
+    /// are learned from their first chunk; an unknown one is conservative.
+    fn chunk_kind(&self, payload: &[u8]) -> (bool, bool) {
+        if !payload.starts_with(b"SDT\x03") || payload.len() < 16 {
+            return (false, false);
+        }
+        let id = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+        let index = u16::from_le_bytes([payload[8], payload[9]]);
+        let mut transfers = self.chunk_transfers.lock().unwrap();
+        if index == 0 {
+            let dictionary = payload[12..payload.len() - 4].starts_with(b"SDT\x01");
+            transfers.retain(|(known, _)| *known != id);
+            if transfers.len() >= 32 {
+                transfers.pop_front();
+            }
+            transfers.push_back((id, dictionary));
+            return (true, dictionary);
+        }
+        (true, transfers.iter().find(|(known, _)| *known == id).is_none_or(|(_, d)| *d))
+    }
+
+    /// Drop the oldest best-effort frame that a fresher parked frame of the
+    /// same stream supersedes; false when none is.
     fn shed_oldest(&self, parked: &mut VecDeque<Parked>) -> bool {
-        let Some(index) = parked.iter().position(|p| p.sheddable) else {
+        let Some(index) = parked.iter().enumerate().position(|(i, p)| {
+            p.shed_stream.is_some_and(|stream| {
+                parked.iter().skip(i + 1).any(|later| later.shed_stream == Some(stream))
+            })
+        }) else {
             return false;
         };
         let frame = parked.remove(index).expect("index just found");
@@ -947,9 +1000,27 @@ impl TxQueueBudget {
             return;
         }
         let mut parked = self.parked.lock().unwrap();
-        while let Some(front) = parked.front() {
+        loop {
+            // Chunks never change the compact dictionary unless they wrap a
+            // template install, so other frames may pass them: a schema
+            // transfer (seconds of airtime) cannot hold a heartbeat or time
+            // sync. Turns alternate so the transfer still progresses.
+            let first_chunk = parked.iter().position(|p| p.chunk);
+            let first_other = parked.iter().enumerate().position(|(i, p)| {
+                !p.chunk
+                    && (!p.bytes.starts_with(b"SDT")
+                        || !parked.iter().take(i).any(|earlier| earlier.chunk_dictionary))
+            });
+            let chunk_turn = self.park_chunk_turn.load(Ordering::Relaxed);
+            let index = match (first_other, first_chunk) {
+                (Some(other), Some(chunk)) => if chunk_turn { chunk } else { other },
+                (Some(other), None) => other,
+                (None, Some(chunk)) => chunk,
+                (None, None) => break,
+            };
+            let front = &parked[index];
             if front.lease.as_ref().is_some_and(|lease| lease.discard_if_retired()) {
-                let frame = parked.pop_front().expect("front just seen");
+                let frame = parked.remove(index).expect("index just chosen");
                 self.forget_write_lease(&frame.bytes);
                 if let Some(activity) = &frame.activity {
                     activity.complete_frame(&frame.bytes);
@@ -979,7 +1050,8 @@ impl TxQueueBudget {
                 self.pending_ordinary.fetch_sub(len, Ordering::AcqRel);
                 break;
             }
-            let frame = parked.pop_front().expect("front just seen");
+            let frame = parked.remove(index).expect("index just chosen");
+            self.park_chunk_turn.store(!frame.chunk, Ordering::Relaxed);
             if let Err(mpsc::error::SendError((_, bytes))) =
                 frame.sender.send((frame.priority, frame.bytes))
             {
