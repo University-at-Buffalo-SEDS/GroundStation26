@@ -253,6 +253,10 @@ struct Ticket {
     action: String,
     phrase: String,
     targets: Vec<Target>,
+    /// Boards of an earlier unfinished recovery that this targeted retry does
+    /// not include and that have not since read back healthy. Their original
+    /// durable targets are kept in the new marker unchanged.
+    carried: Vec<RecoveryTarget>,
     reset_selection: Option<super::scope::Selection>,
 }
 /// Constructed only from the dedicated final QUERY path, never from an SDK
@@ -442,6 +446,14 @@ pub(super) fn host_safe(state: &AppState) -> bool {
 /// descending flight. This grants only a fresh board transaction, never completion
 /// inferred from host time.
 pub(super) fn host_action_allowed(state: &AppState, action: &str) -> bool {
+    host_action_allowed_with(state, action, true)
+}
+/// `router_drained` also requires that no ABORT or output command is still
+/// owed to any board. Admission (PREPARE/CONFIRM) asks for that; an admitted
+/// recovery does not, because its own scoped quiesce (`wait_sdk`) decides
+/// which in-flight frames matter to its boards, and an unrelated command
+/// still retrying to another board must not abort it midway.
+fn host_action_allowed_with(state: &AppState, action: &str, router_drained: bool) -> bool {
     // Resync has its own phase window: the fill phases and Armed, with no
     // sequence moving valves and no active overpressure latch.
     if action == "resync" { return resync_work_block_reason(state).is_none(); }
@@ -453,12 +465,34 @@ pub(super) fn host_action_allowed(state: &AppState, action: &str) -> bool {
             matches!(flight_state, F::Launch | F::Landed | F::Recovery)
                 || crate::gse::prelaunch_flight_state(flight_state)
         }
-        && crate::gse::operator_reset_host_idle(state)
+        && if router_drained { crate::gse::operator_reset_host_idle(state) } else { crate::gse::operator_reset_host_idle_ram(state) }
     {
         return true;
     }
-    let _ = action;
     false
+}
+/// Why PREPARE's host check failed, naming what to do next.
+fn prepare_host_block_reason(state: &AppState, action: &str) -> String {
+    if action == "resync" {
+        return resync_work_block_reason(state).unwrap_or_else(|| "Resync is allowed only in the fill phases and Armed.".into());
+    }
+    if let Some(reason) = crate::gse::operator_reset_block_reason(state) {
+        return reason;
+    }
+    if action == "reset_startup" {
+        return format!("Reset all boards is not allowed while the station is in {:?}; wait for the flight to end.", state.local_flight_state_snapshot());
+    }
+    format!("Review recovery needs the station in Startup, Idle or Aborted (now {:?}). Use Reset all boards instead.", state.local_flight_state_snapshot())
+}
+/// Why an admitted recovery's host check failed, for the operation message.
+fn owned_host_block_reason(state: &AppState, action: &str) -> String {
+    if action == "resync" {
+        return resync_work_block_reason(state).map_or_else(|| "Resync stopped: the station's phase changed.".into(), |reason| format!("Resync stopped: {reason}"));
+    }
+    if let Some(reason) = crate::gse::operator_work_block_reason(state) {
+        return format!("Recovery stopped: {reason}");
+    }
+    format!("Recovery stopped: the station moved to {:?}, where this recovery is not allowed.", state.local_flight_state_snapshot())
 }
 /// The reset itself already cleared retained Launch inhibition. Finish what the
 /// operator asked for: a stopped T-clock, cleared Launch and Stop latches and, in
@@ -662,6 +696,32 @@ async fn refresh_prepare_queries(
         ],
         _ => return Err("Unsupported recovery action"),
     };
+    // A board's abort epoch can still move while copies of an ABORT are being
+    // delivered to it (or re-served to it by its relay). Take the prepared
+    // queries only after that ABORT is delivered or expires, so CONFIRM is not
+    // sealed against an epoch the board is about to leave (refused as STALE).
+    if let Some(router) = state.topology_router.get() {
+        let scope = QuiesceScope { targets: boards.iter().fold(0, |mask, board| mask | index(*board).map_or(0, |i| 1 << i)) };
+        let start = WallInstant::now();
+        let mut waited = false;
+        loop {
+            // A busy SDK core is unknown, so it counts as a pending Abort.
+            let blockers = quiesce_blockers(state, router, scope);
+            if !blockers.iter().any(|b| b.is_abort() || *b == Blocker::RouterBusy) { break; }
+            if start.elapsed() >= network_wait(ABORT_DRAIN) {
+                log::warn!("Recovery PREPARE stopped waiting for an Abort still being delivered: {blockers:?}");
+                break;
+            }
+            if !origin_current(state, token) {
+                return Err("Recovery origin changed while an Abort was still being delivered");
+            }
+            waited = true;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if waited {
+            log::info!("Recovery PREPARE waited {} ms for an Abort to be delivered before its fresh queries", start.elapsed().as_millis());
+        }
+    }
     // Query every board at once, so the earliest prepared query is not aged
     // by the later boards' round trips before CONFIRM. Each board keeps its own
     // read-only slot, nonce and freshness wait.
@@ -759,15 +819,19 @@ fn prepare_inner(
         .board_recovery
         .identity
         .ok_or("Backend identity unavailable")?;
+    if state.board_recovery.coordinator.busy() {
+        return Err("Another board recovery is still running; wait for it to finish, then retry.");
+    }
     if request.backend_instance != hex(&identity)
         || request.reset_epoch != format!("{:016x}", token.generation)
         || !origin_current(state, token)
-        || !host_action_allowed(state, &request.action)
-        || state.board_recovery.coordinator.busy()
         || principal.anonymous
         || request.mode.is_some()
     {
-        return Err("Recovery origin/session changed or host work is active. Recovery sends no Stop; selected boards must independently verify recovery eligibility.");
+        return Err("The station's recovery session changed (a reset, Stop or restart happened since this page loaded). Reload the board status and prepare the recovery again.");
+    }
+    if !host_action_allowed(state, &request.action) {
+        return Err(intern(prepare_host_block_reason(state, &request.action)));
     }
     let router = state.topology_router.get().ok_or("Router unavailable")?;
     crate::system_clock::required_control_network_utc_ms(router)
@@ -897,24 +961,38 @@ fn prepare_inner(
             first_binding,
         });
     }
-    // An interrupted operation cannot be forgotten by choosing a smaller set,
-    // unless a fresh verified readback shows the omitted board already
-    // healthy: not aborted, Startup or Idle, safe outputs, the same boot and
-    // the same or a newer recovery epoch. That board needs nothing more.
-    if let Some(pending) = retained.as_ref().filter(|p| !p.published)
-        && pending.targets.iter().any(|old| {
+    // An interrupted operation is never forgotten by choosing a smaller set.
+    // A board of it that a fresh verified readback shows healthy (not
+    // aborted, Startup or Idle, safe outputs, the same boot and the same or
+    // a newer recovery epoch) needs nothing more. Any other board of it that
+    // this retry leaves out is carried into the new durable marker unchanged,
+    // so the operator can recover the remaining boards one at a time and the
+    // station stays closed until the last of them reads back healthy.
+    let carried = retained.as_ref().filter(|p| !p.published).map_or_else(Vec::new, |pending| {
+        pending.targets.iter().filter(|old| {
             !targets.iter().any(|new| new.board.sender_id() == old.board)
                 && !BOARDS.iter().enumerate().any(|(at, board)| {
                     super::pending_target_satisfied(*board, old, inner.values[at].as_ref(),
                         endpoint_verified(state, *board, &topology), now)
                 })
-        })
-    {
-        return Err(
-            "Explicit retry must include every board of the unfinished recovery that has not since read back healthy",
-        );
-    }
+        }).cloned().collect::<Vec<_>>()
+    });
     drop(inner);
+    if !carried.is_empty() {
+        let names = carried.iter().map(|t| t.board.as_str()).collect::<Vec<_>>().join(", ");
+        if matches!(request.action.as_str(), "reset_startup" | "reset_startup_all7") {
+            return Err(intern(format!(
+                "Reset all boards cannot leave out {names}: the unfinished recovery still needs them and this reset cannot reach them now. Bring them back on the network and retry, or recover the other boards one at a time with Review recovery.")));
+        }
+        if request.action == "resync" {
+            return Err(intern(format!(
+                "Finish the unfinished recovery first: {names} still need Review recovery or Reset all boards. Resync is available afterwards.")));
+        }
+        if carried.iter().any(|t| t.kind != RecoveryIntentKind::Normal || t.original_first.is_some() || t.uncertain_first.is_some()) {
+            return Err(intern(format!(
+                "{names} still need commissioning from the unfinished recovery. Recover {names} first (Review recovery), then the other boards.")));
+        }
+    }
     let history = state.launch_history.lock().unwrap();
     if !history.recovery_available() {
         return Err(
@@ -953,7 +1031,7 @@ fn prepare_inner(
         if commissioning { " COMMISSION" } else { "" }
     ) };
     let context = principal_context(&identity, headers, principal);
-    let value = json!({"ticket":id,"backend_instance":hex(&identity),"principal_context":context,"reset_epoch":format!("{:016x}",token.generation),"expires_in_ms":original_query_remaining(&targets,Stamp::now()).as_millis() as u64,"action":request.action,"targets":names,"global_startup_best_effort":matches!(request.action.as_str(),"reset_startup"|"reset_startup_all7"),"required_proof_boards":reset_selection.map(|s|s.required_boards()),"unselected_board_verification":"unverified_best_effort","resync_target_state":resync_phase,"resync_target_label":resync_label,"outputs_unchanged":resync_phase.is_some(),"summary":if let Some(text)=resync_summary.as_deref() {text} else if targets.iter().any(|target| target.first_binding.is_some()) {"Identity reconciliation ONLY for retained uncertain FIRST targets. Other targets will not reset/apply in this attempt. IO cannot clear state; a fresh Query and another distinct human confirmation are required."}else if commissioning{"Explicit commissioning leg; IO is not completion. A separate fresh confirmation is required after provisioning."}else if request.action=="recover_abort" {match targets.first().map(|target|target.board) {Some(Board::FlightComputer)=>"Reset/recover FC to Startup with verified evaluator and safe-output ownership. Preserve deployment history; a separate new flight is required. No MCU reboot or output replay.",Some(Board::RFBoard|Board::PowerBoard|Board::GatewayBoard|Board::DaqBoard)=>"Reset only selected cached application metadata to Startup. No physical recovery, power cycling, acquisition reset, reboot or resync.",_=>"Recover selected AB/VB application state to Idle with verified safe outputs. A completed launch can recover directly; active launch work must finish or be explicitly stopped first. No MCU reboot or physical-position proof."}}else{"Explicit GLOBAL Startup broadcast to ALL boards (best effort). Selected boards are verified; active launch work must finish or be explicitly stopped first. Clock, calibration and network power are preserved. Unselected boards remain unverified."},"confirmation":phrase});
+    let value = json!({"ticket":id,"backend_instance":hex(&identity),"principal_context":context,"reset_epoch":format!("{:016x}",token.generation),"expires_in_ms":original_query_remaining(&targets,Stamp::now()).as_millis() as u64,"action":request.action,"targets":names,"global_startup_best_effort":matches!(request.action.as_str(),"reset_startup"|"reset_startup_all7"),"required_proof_boards":reset_selection.map(|s|s.required_boards()),"unselected_board_verification":"unverified_best_effort","resync_target_state":resync_phase,"resync_target_label":resync_label,"outputs_unchanged":resync_phase.is_some(),"summary":if let Some(text)=resync_summary.as_deref() {text} else if targets.iter().any(|target| target.first_binding.is_some()) {"Identity reconciliation ONLY for retained uncertain FIRST targets. Other targets will not reset/apply in this attempt. IO cannot clear state; a fresh Query and another distinct human confirmation are required."}else if commissioning{"Explicit commissioning leg; IO is not completion. A separate fresh confirmation is required after provisioning."}else if request.action=="recover_abort" {match targets.first().map(|target|target.board) {Some(Board::FlightComputer)=>"Reset/recover FC to Startup with verified evaluator and safe-output ownership. Preserve deployment history; a separate new flight is required. No MCU reboot or output replay.",Some(Board::RFBoard|Board::PowerBoard|Board::GatewayBoard|Board::DaqBoard)=>"Reset only selected cached application metadata to Startup. No physical recovery, power cycling, acquisition reset, reboot or resync.",_=>"Recover selected AB/VB application state to Idle with verified safe outputs. A completed launch can recover directly; active launch work must finish or be explicitly stopped first. No MCU reboot or physical-position proof."}}else{"Explicit GLOBAL Startup broadcast to ALL boards (best effort). Selected boards are verified; active launch work must finish or be explicitly stopped first. Clock, calibration and network power are preserved. Unselected boards remain unverified."},"confirmation":phrase,"still_unfinished_after":carried.iter().map(|t|t.board.as_str()).collect::<Vec<_>>()});
     let mut control = state.board_recovery.coordinator.0.lock().unwrap();
     if control.shutdown_closed || state.shutdown_requested.load(Ordering::Acquire) { return Err("Ground station is shutting down"); }
     if control
@@ -976,6 +1054,7 @@ fn prepare_inner(
         action: request.action,
         phrase,
         targets,
+        carried,
         reset_selection,
     });
     Ok(value)
@@ -1206,15 +1285,16 @@ fn admit_confirmation(
         control.expected = Default::default();
         control.inbox.iter_mut().for_each(VecDeque::clear);
         if let Some(operation) = control.operation.as_mut() {
-            operation["phase"] = json!(if result.is_ok() {
-                "completed"
-            } else {
-                "failed"
+            operation["phase"] = json!(match result {
+                Ok(RunOutcome::Published) => "completed",
+                Ok(RunOutcome::StillPending(_)) => "completed_still_pending",
+                Err(_) => "failed",
             });
+            operation["still_pending"] = json!(matches!(result, Ok(RunOutcome::StillPending(_))));
             operation["completed"] = json!(true);
             operation["success"] = json!(result.is_ok());
             operation["reset_applied_state"] =
-                json!(if result.is_ok() && matches!(ticket.action.as_str(), "reset_startup" | "reset_startup_all7") {
+                json!(if result == Ok(RunOutcome::Published) && matches!(ticket.action.as_str(), "reset_startup" | "reset_startup_all7") {
                     Some(0u8)
                 } else {
                     None
@@ -1222,19 +1302,20 @@ fn admit_confirmation(
             operation["current_host_state"] = json!(owned.local_flight_state_snapshot() as u8);
             operation["age_ms"] = json!(ticket.created.elapsed().as_millis() as u64);
             operation["message"] = json!(match result {
-                Ok(()) if matches!(ticket.action.as_str(), "reset_startup" | "reset_startup_all7") && ticket.targets.is_empty() =>
+                Ok(RunOutcome::StillPending(message)) => message,
+                Ok(_) if matches!(ticket.action.as_str(), "reset_startup" | "reset_startup_all7") && ticket.targets.is_empty() =>
                     "Host Startup reset completed. Global Startup broadcast was best effort; no board terminal completion or fresh board proof is claimed.",
-                Ok(()) if matches!(ticket.action.as_str(), "reset_startup" | "reset_startup_all7") =>
+                Ok(_) if matches!(ticket.action.as_str(), "reset_startup" | "reset_startup_all7") =>
                     "Host Startup reset completed after terminal completion and fresh final readbacks from the listed proof targets. Global Startup broadcast was best effort; unlisted boards remain unverified. Physical position is not certified.",
-                Ok(()) if ticket.action == "resync" =>
+                Ok(_) if ticket.action == "resync" =>
                     "Board resynced to the station phase and verified by a fresh final readback. No output was commanded; command outputs explicitly. Physical position is not certified.",
-                Ok(()) =>
+                Ok(_) =>
                     "Selected board application terminal completion and fresh final readback verified. Unselected boards were not reset by this targeted recovery. Physical position is not certified.",
                 Err(message) => message,
             });
         }
         drop(control);
-        if result.is_ok() {
+        if result == Ok(RunOutcome::Published) {
             owned.board_recovery.manual_utc.after_completed();
         }
     }));
@@ -1257,9 +1338,15 @@ async fn authorize(
     if principal.anonymous
         || ticket.principal != principal_context(&identity, headers, &principal)
         || ticket.mode != crate::station_mode::local_mode()
-        || !ticket_host_current(state, ticket)
     {
-        return Err("Recovery principal/mode/safe host state changed");
+        return Err("Recovery principal or station mode changed; sign in again and prepare a new recovery.");
+    }
+    if !(host_action_allowed_with(state, &ticket.action, false)
+        && (ticket.action != "resync"
+            || ticket.targets.iter().all(|target|
+                resync_target(state.local_flight_state_snapshot()) == Some(target.desired))))
+    {
+        return Err(intern(owned_host_block_reason(state, &ticket.action)));
     }
     if let Some(selection) = ticket.reset_selection { selection.current(state)?; }
     if let Some(boundary) = ticket.boundary {
@@ -1513,40 +1600,84 @@ async fn exchange(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
-/// Which in-flight control work must drain before a recovery touches boards.
+/// The boards a recovery touches. In-flight control work blocks it only when
+/// that work is owed to one of these boards, or to a board the station cannot
+/// name; work owed only to other boards cannot race this recovery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum QuiesceScope {
-    /// An AV-bay board (RF, FC or PB) is a target: everything must drain.
-    All,
-    /// Only fill boards (AB, VB, GB, DAQ) are targets.
-    FillOnly,
+pub(super) struct QuiesceScope {
+    /// Bit i is `BOARDS[i]` (RF FC PB AB VB GB DAQ).
+    targets: u8,
 }
+/// RF, FC and PB.
+const AV_BAY_MASK: u8 = 0b000_0111;
 impl QuiesceScope {
     fn of(targets: &[Target]) -> Self {
-        if targets.iter().any(|target| matches!(target.board, Board::RFBoard | Board::FlightComputer | Board::PowerBoard)) {
-            Self::All
-        } else {
-            Self::FillOnly
-        }
+        Self { targets: targets.iter().fold(0, |mask, target| mask | index(target.board).map_or(0, |i| 1 << i)) }
+    }
+    #[cfg(test)]
+    pub(super) const ALL: Self = Self { targets: 0x7f };
+    #[cfg(test)]
+    pub(super) const FILL: Self = Self { targets: 0x7f & !AV_BAY_MASK };
+    #[cfg(test)]
+    pub(super) fn boards(boards: &[Board]) -> Self {
+        Self { targets: boards.iter().fold(0, |mask, board| mask | index(*board).map_or(0, |i| 1 << i)) }
+    }
+    fn av_bay(self) -> bool {
+        self.targets & AV_BAY_MASK != 0
+    }
+    /// The targets plus the relay that carries station traffic to them: the
+    /// RF Board for the AV bay and the Gateway Board for the fill boards. A
+    /// frame still retrying to a relay is re-served to the boards behind it,
+    /// so it affects them as well.
+    fn with_relays(self) -> Self {
+        const RF: u8 = 1 << 0;
+        const GB: u8 = 1 << 5;
+        let mut targets = self.targets;
+        if self.targets & AV_BAY_MASK != 0 { targets |= RF; }
+        if self.targets & !AV_BAY_MASK & 0x7f != 0 { targets |= GB; }
+        Self { targets }
+    }
+    fn contains(self, board: Board) -> bool {
+        index(board).is_some_and(|i| self.targets & (1 << i) != 0)
     }
 }
-/// Reliable types that only ever travel to the AV bay. A backlog of them on
-/// the radio never reaches a fill board, so it cannot race a fill reset.
+/// Reliable types that only ever travel to the AV bay.
 const AV_BAY_ONLY_TYPES: &[&str] = &["FLIGHT_COMMAND", "AV_BAY_UNDERGLOW", "FLIGHT_BUZZER"];
-/// FLIGHT_STATE is the station's managed phase publication to every board.
-/// For a fill-only reset it blocks only while one of its undelivered copies
-/// is still owed to a fill board (or to a board the station cannot name);
-/// copies owed only to AV-bay boards do not race the fill boards. ABORT and
-/// every other shared type stay blocking in every scope.
-const FILL_SCOPE_ATTRIBUTED_TYPES: &[&str] = &["FLIGHT_STATE"];
-/// The board an end-to-end pending destination names. SEDSnet 4.3.11 keys
+/// Control types whose late delivery cannot move an output or undo the
+/// recovery unsafely: phase and settings publications (the newest value wins
+/// and the board deduplicates a copy it already holds), ABORT (fail-safe: a
+/// late copy only aborts the board again, which its readback then shows) and
+/// earlier recovery queries and requests (bound to an older nonce and epoch,
+/// which the board refuses). A recovery waits a short time for these and then
+/// supersedes any copy still owed to its own boards instead of waiting on a
+/// board that never acknowledges. Output commands (valve, actuator, flight)
+/// are never superseded: recovery waits for them to be delivered or expire.
+const SUPERSEDABLE_TYPES: &[&str] = &[
+    "FLIGHT_STATE", "BOARD_RECOVERY_REQUEST", "AB_FILL_DRIVE_SETTINGS",
+    "AV_BAY_UNDERGLOW", "FLIGHT_BUZZER", "DAQ_LOADCELL_CALIBRATION", "DAQ_KG50_CALIBRATION",
+    "DAQ_LOG_CLOCK", "DAQ_THERMAL_CALIBRATION", "DAQ_FILTER_CALIBRATION", "DAQ_KG50_INPUT",
+    "DAQ_SD_RETRY",
+];
+/// How long a recovery waits for supersedable control work owed to its own
+/// boards before superseding it. Short, so the board's PREPARE query (15 s)
+/// is still fresh when its request goes out.
+const SUPERSEDE_AFTER: Duration = Duration::from_secs(3);
+/// A supersedable frame retransmitted at least this many times without an
+/// acknowledgement is stale at once, however long this recovery has waited.
+const STALE_RETRIES: u32 = 8;
+/// ABORT is fail-safe if it arrives late, but every copy a board receives can
+/// advance its abort epoch, which makes a recovery prepared against the old
+/// epoch stale. Recovery therefore waits for an ABORT to be delivered or to
+/// exhaust its retries (17 x 250 ms) and supersedes it only after QUIESCE_TTL;
+/// PREPARE also waits up to this long before taking its fresh queries.
+const ABORT_DRAIN: Duration = Duration::from_secs(6);
+/// The board an end-to-end pending destination names. SEDSnet keys
 /// destinations by `hash_bytes_u64(0x517C_C1B7_2722_0A95, sender)`, or by the
 /// compact address for an `@addr:` sender; a test pins this against a live
 /// router so an SDK change cannot silently break the attribution.
 fn pending_destination_board(router: &sedsnet::router::Router, owner: u64) -> Option<Board> {
     const SENDER_HASH_SEED: u64 = 0x517C_C1B7_2722_0A95;
-    let named = [Board::RFBoard, Board::FlightComputer, Board::PowerBoard, Board::ActuatorBoard,
-        Board::ValveBoard, Board::GatewayBoard, Board::DaqBoard]
+    let named = BOARDS
         .into_iter()
         .find(|board| sedsnet::packet::hash_bytes_u64(SENDER_HASH_SEED, board.sender_id().as_bytes()) == owner);
     named.or_else(|| {
@@ -1555,62 +1686,161 @@ fn pending_destination_board(router: &sedsnet::router::Router, owner: u64) -> Op
         Board::from_sender_id(crate::types::canonical_sender_id(peer.hostname.as_ref()))
     })
 }
-/// Whether an undelivered frame of this type is owed to anything but
-/// non-target AV-bay boards. Unattributable pending work counts as owed.
-fn owed_beyond_av_bay(router: &sedsnet::router::Router, ty: sedsnet::config::DataType) -> bool {
-    let rows = router.export_reliable_pending_stats();
-    let rows = rows.iter().filter(|row| row.data_type == ty).collect::<Vec<_>>();
-    if rows.is_empty() {
-        // Pending in the SDK but not as a tracked end-to-end delivery.
-        return true;
-    }
-    rows.iter().any(|row| row.pending_destinations.is_empty() || row.pending_destinations.iter().any(|owner| {
-        !matches!(pending_destination_board(router, *owner),
-            Some(Board::RFBoard | Board::FlightComputer | Board::PowerBoard))
-    }))
+/// Control work still in flight that blocks a recovery of the scope's boards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Blocker {
+    /// A frame a link writer still owns.
+    Link(&'static str),
+    /// The SDK core is busy, so pending work is unknown.
+    RouterBusy,
+    /// An undelivered reliable frame owed to `boards` (scope targets) or,
+    /// when `unnamed`, to a board the station cannot name.
+    Frame { name: &'static str, boards: u8, unnamed: bool, retries: u32, supersedable: bool },
 }
-/// Why the SDK or a writer still owns control work for this scope, if it does.
+impl Blocker {
+    /// Superseded once the recovery has waited this long; never when None.
+    fn supersede_after(&self) -> Option<Duration> {
+        match self {
+            // Already retransmitted this often without an acknowledgement
+            // (about 2 s at the 250 ms retry period): stale now.
+            Self::Frame { supersedable: true, retries, .. } if *retries >= STALE_RETRIES => Some(Duration::ZERO),
+            Self::Frame { supersedable: true, .. } => Some(SUPERSEDE_AFTER),
+            Self::Frame { name: "ABORT", .. } => Some(QUIESCE_TTL),
+            _ => None,
+        }
+    }
+    #[cfg(test)]
+    fn supersedable(&self) -> bool {
+        matches!(self, Self::Frame { supersedable: true, .. })
+    }
+    fn is_abort(&self) -> bool {
+        matches!(self, Self::Frame { name: "ABORT", .. })
+    }
+    pub(super) fn message(&self) -> String {
+        match self {
+            Self::Link(link) => format!(
+                "A control frame is still being written on the {link}; recovery waits until it is written, and sends nothing to the boards before then."),
+            Self::RouterBusy => "The network router stayed busy, so recovery could not confirm that no control frame is still owed to these boards. Try again in a moment.".into(),
+            Self::Frame { name, boards, unnamed, .. } => {
+                let mut owed = BOARDS.iter().enumerate()
+                    .filter(|(i, _)| boards & (1 << i) != 0)
+                    .map(|(_, board)| board.sender_id().to_string())
+                    .collect::<Vec<_>>();
+                if *unnamed { owed.push("a board the station cannot name".into()); }
+                format!(
+                    "The network still has an undelivered {name} frame for {}; recovery waits until it is delivered or expires, and sends nothing to the boards before then. Check that board's link, then retry.",
+                    owed.join(", "))
+            }
+        }
+    }
+}
+/// Whether a link writer can reach any target: from the live route table, or,
+/// for a target with no route on any side, from where that board normally sits.
+fn link_reaches_targets(state: &AppState, router: &sedsnet::router::Router, scope: QuiesceScope, side_name: &str) -> bool {
+    let topology = router.export_topology();
+    let mut routed = 0u8;
+    let mut on_side = false;
+    for route in &topology.routes {
+        for (at, board) in BOARDS.iter().enumerate() {
+            if !scope.contains(*board) {
+                continue;
+            }
+            let names = |sender: &str| state.board_from_network_sender(sender) == Some(*board);
+            if route.announcers.iter().any(|peer| names(&peer.sender_id) || peer.routers.iter().any(|node| names(&node.sender_id))) {
+                routed |= 1 << at;
+                on_side |= route.side_name == side_name;
+            }
+        }
+    }
+    let unrouted = scope.targets & !routed;
+    on_side || match side_name {
+        "rocket_comms" => unrouted & AV_BAY_MASK != 0,
+        _ => unrouted & !AV_BAY_MASK != 0,
+    }
+}
+/// Control work still owed to the scope's boards, if any.
 // Safety catalog (About safety): reset-all-boards. Keep backend/src/safety_catalog_rules.rs in step.
-fn sdk_pending_reason(state: &AppState, router: &sedsnet::router::Router, scope: QuiesceScope) -> Option<&'static str> {
-    static TYPE_REASONS: std::sync::OnceLock<Vec<(&'static str, &'static str)>> = std::sync::OnceLock::new();
-    let reasons = TYPE_REASONS.get_or_init(|| crate::telemetry_task::RECOVERY_CONTROL_TYPES.iter().map(|name| {
-        let text: &'static str = Box::leak(format!(
-            "The network still has an undelivered {name} frame{}; recovery waits until it is delivered or expires, and sends nothing to the boards before then.",
-            if AV_BAY_ONLY_TYPES.contains(name) { " for the AV bay" } else { "" }).into_boxed_str());
-        (*name, text)
-    }).collect());
-    let ledger = |state: &AppState| match scope {
-        QuiesceScope::All => state.has_pending_umbilical_control_tx().then_some(
-            "A control frame is still being written on the umbilical link to the fill boards.")
-            .or_else(|| state.has_pending_radio_control_tx().then_some(
-                "A control frame is still being written on the AV-bay radio link.")),
-        QuiesceScope::FillOnly => state.has_pending_umbilical_control_tx().then_some(
-            "A control frame is still being written on the umbilical link to the fill boards."),
+pub(super) fn quiesce_blockers(state: &AppState, router: &sedsnet::router::Router, scope: QuiesceScope) -> Vec<Blocker> {
+    let ledger = |state: &AppState| {
+        let mut out = Vec::new();
+        if state.has_pending_umbilical_control_tx() && link_reaches_targets(state, router, scope, "umbilical_comms") {
+            out.push(Blocker::Link("umbilical link to the fill boards"));
+        }
+        if state.has_pending_radio_control_tx() && link_reaches_targets(state, router, scope, "rocket_comms") {
+            out.push(Blocker::Link("AV-bay radio link"));
+        }
+        out
     };
-    if let Some(reason) = ledger(state) { return Some(reason); }
-    for (name, reason) in reasons {
-        if scope == QuiesceScope::FillOnly && AV_BAY_ONLY_TYPES.contains(name) {
+    let mut blockers = ledger(state);
+    let mut rows = None;
+    let affected = scope.with_relays();
+    for name in crate::telemetry_task::RECOVERY_CONTROL_TYPES {
+        if !scope.av_bay() && AV_BAY_ONLY_TYPES.contains(name) {
             continue;
         }
         let ty = crate::telemetry_schema::data_type(name);
-        // A busy SDK core is unknown, so it counts as pending.
-        let pending = router.try_has_pending_reliable_tx_type(ty);
-        if matches!(pending, Ok(false)) {
-            continue;
+        match router.try_has_pending_reliable_tx_type(ty) {
+            Ok(false) => continue,
+            Err(_) => {
+                blockers.push(Blocker::RouterBusy);
+                continue;
+            }
+            Ok(true) => {}
         }
-        if scope == QuiesceScope::FillOnly && FILL_SCOPE_ATTRIBUTED_TYPES.contains(name)
-            && matches!(pending, Ok(true)) && !owed_beyond_av_bay(router, ty) {
-            continue;
+        let rows = rows.get_or_insert_with(|| router.export_reliable_pending_stats());
+        let mut boards = 0u8;
+        let mut retries = 0u32;
+        let typed = rows.iter().filter(|row| row.data_type == ty).collect::<Vec<_>>();
+        // Pending in the SDK but not yet a tracked end-to-end delivery: its
+        // destinations are unknown.
+        let mut unnamed = typed.is_empty();
+        for row in typed {
+            let mut owed = row.pending_destinations.is_empty();
+            for owner in &row.pending_destinations {
+                match pending_destination_board(router, *owner) {
+                    Some(board) if affected.contains(board) => {
+                        boards |= 1 << index(board).unwrap();
+                        owed = true;
+                    }
+                    Some(_) => {}
+                    None => unnamed = true,
+                }
+            }
+            unnamed |= row.pending_destinations.is_empty();
+            if owed { retries = retries.max(row.retries); }
         }
-        return Some(reason);
+        if boards != 0 || unnamed {
+            blockers.push(Blocker::Frame { name, boards, unnamed, retries, supersedable: SUPERSEDABLE_TYPES.contains(name) });
+        }
+    }
+    if !blockers.is_empty() {
+        return blockers;
     }
     // Close the SDK→physical ownership handoff window.
     ledger(state)
 }
 #[cfg(test)]
-fn sdk_pending(state:&AppState,router:&sedsnet::router::Router)->bool {
-    sdk_pending_reason(state, router, QuiesceScope::All).is_some()
+fn sdk_pending_reason(state: &AppState, router: &sedsnet::router::Router, scope: QuiesceScope) -> Option<String> {
+    quiesce_blockers(state, router, scope).first().map(Blocker::message)
 }
+#[cfg(test)]
+fn sdk_pending(state:&AppState,router:&sedsnet::router::Router)->bool {
+    sdk_pending_reason(state, router, QuiesceScope::ALL).is_some()
+}
+/// Operation messages are `&'static str`; refusal texts repeat (one per
+/// frame type and board set), so each distinct text is leaked only once.
+fn intern(text: String) -> &'static str {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<&'static str>>> = std::sync::OnceLock::new();
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
+    if let Some(found) = seen.get(text.as_str()) { return found; }
+    let leaked: &'static str = Box::leak(text.into_boxed_str());
+    seen.insert(leaked);
+    leaked
+}
+/// Wait until no control work is owed to the scope's boards. Supersedable
+/// work still owed after `SUPERSEDE_AFTER` is superseded (logged and shown
+/// to the operator) instead of holding the recovery; anything else fails
+/// after `QUIESCE_TTL` with a reason that names the frame and its boards.
 async fn wait_sdk(
     state: &Arc<AppState>,
     router: &sedsnet::router::Router,
@@ -1620,20 +1850,164 @@ async fn wait_sdk(
     let start = WallInstant::now();
     loop {
         if !origin_current(state,token){return Err("Recovery generation, Stop or newer manual control changed");}
-        let Some(reason) = sdk_pending_reason(state, router, scope) else {
+        let blockers = quiesce_blockers(state, router, scope);
+        if blockers.is_empty() {
             return if origin_current(state,token){Ok(())}else{Err("Recovery generation, Stop or newer manual control changed")};
-        };
-        if start.elapsed() > network_wait(QUIESCE_TTL) {
-            return Err(reason);
+        }
+        let elapsed = start.elapsed();
+        if blockers.iter().all(|b| b.supersede_after().is_some_and(|after| elapsed > network_wait(after))) {
+            let text = blockers.iter().map(Blocker::message).collect::<Vec<_>>().join(" ");
+            log::warn!("Recovery superseded undelivered control work owed to its boards after {} ms: {blockers:?}", elapsed.as_millis());
+            state.add_notification(format!(
+                "Recovery went ahead without waiting longer for control frames the boards never acknowledged; the recovery's own request supersedes them. {text}"));
+            return if origin_current(state,token){Ok(())}else{Err("Recovery generation, Stop or newer manual control changed")};
+        }
+        if elapsed > network_wait(QUIESCE_TTL) {
+            let blocker = blockers.iter().find(|b| b.supersede_after().is_none()).unwrap_or(&blockers[0]);
+            log::warn!("Recovery refused after {} ms: control work still owed to its boards: {blockers:?}; reliable pending: {:?}",
+                elapsed.as_millis(), router.export_reliable_pending_stats());
+            return Err(intern(blocker.message()));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+/// Finish an unpublished pending recovery once every one of its boards has a
+/// fresh verified readback that is healthy, not aborted, in Startup or Idle,
+/// with the same boot and the same or a newer recovery epoch than its target
+/// (`pending_target_satisfied`). This is how the station leaves a failed Reset
+/// all whose boards nevertheless read back healthy, and the last step after
+/// the operator recovered the remaining boards one at a time. It runs only
+/// while no recovery is running or being confirmed, sends nothing to any
+/// board and claims no reset: a real Launch attempt keeps Launch locked
+/// (in HITL `try_release_launch_lock` then releases it once the station is
+/// ready). Returns true when it finished the recovery.
+// Safety catalog (About safety): reset-all-boards. Keep backend/src/safety_catalog_rules.rs in step.
+pub(crate) fn complete_satisfied_pending(state: &Arc<AppState>) -> bool {
+    if crate::rrls::is_rrls() || state.shutdown_requested.load(Ordering::Acquire) {
+        return false;
+    }
+    let pending = state.launch_history.try_lock().ok().and_then(|history| history.recovery_pending()).filter(|p| !p.published);
+    if pending.is_none() || super::unsatisfied_pending_mask(state) != 0 {
+        return false;
+    }
+    let Some(router) = state.topology_router.get() else { return false; };
+    let topology = router.export_topology();
+    // Serialize with PREPARE/CONFIRM and any running operation.
+    let Ok(control) = state.board_recovery.coordinator.0.try_lock() else { return false; };
+    if control.shutdown_closed
+        || control.ticket.as_ref().is_some_and(|ticket| ticket.created.elapsed() < CONFIRM_TTL)
+        || control.operation.as_ref().is_some_and(|value| value["completed"] == false)
+    {
+        return false;
+    }
+    let Ok(proxy) = crate::command_proxy::begin_primary_recovery() else { return false; };
+    if proxy.as_ref().is_some_and(|p| !p.is_quiescent()) {
+        return false;
+    }
+    let now = Stamp::now();
+    let finished = crate::gse::reset_generation::finish_satisfied_recovery(state, |pending| {
+        let Ok(inner) = state.board_recovery.inner.try_lock() else { return false; };
+        pending.targets.iter().all(|target| {
+            BOARDS.iter().enumerate().any(|(at, board)| {
+                super::pending_target_satisfied(*board, target, inner.values[at].as_ref(),
+                    endpoint_verified(state, *board, &topology), now)
+            })
+        })
+    });
+    drop(control);
+    if finished.is_err() {
+        return false;
+    }
+    if let Some(proxy) = proxy {
+        let nonce = crate::command_proxy::recovery::Barrier::prepare_reopen_nonce();
+        if let Ok(mut owner) = proxy.try_prepare_reopen(nonce) { owner.commit(); }
+    }
+    let names = pending.map(|p| p.targets.iter().map(|t| t.board.clone()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+    log::info!("Unfinished board recovery finished: {names} read back healthy");
+    state.add_notification(format!(
+        "Board recovery finished: {names} now read back healthy, not aborted, in Startup or Idle. Commands are available again."));
+    crate::sequences::refresh_action_policy_now(state);
+    state.broadcast_action_policy_snapshot();
+    true
+}
+/// Why an operator command found host admission closed, with what to do.
+pub(crate) fn admission_closed_message(state: &AppState, action: &str) -> String {
+    if state.board_recovery.coordinator.busy() {
+        return format!("A board recovery is running. {action} is available when it finishes.");
+    }
+    let pending = state.launch_history.lock().unwrap().recovery_pending().filter(|p| !p.published);
+    if let Some(pending) = pending {
+        let mask = super::unsatisfied_pending_mask(state);
+        let names = pending.targets.iter()
+            .filter(|t| BOARDS.iter().position(|b| b.sender_id() == t.board).is_none_or(|i| mask & (1 << i) != 0))
+            .map(|t| t.board.as_str()).collect::<Vec<_>>();
+        return if names.is_empty() {
+            format!("The unfinished board recovery is finishing now that its boards read back healthy. Retry {action} in a moment.")
+        } else {
+            format!("Board recovery is unfinished for {}. Recover {} with Review recovery or use Reset all boards; {action} is available afterwards.",
+                names.join(", "), if names.len() == 1 { "it" } else { "them" })
+        };
+    }
+    if state.operator_admission_barrier.load(Ordering::Acquire) != 0 {
+        return format!("Commands are closed by an unfinished board recovery. Use Reset all boards; {action} is available afterwards.");
+    }
+    format!("The station's state changed while this request was being sent (a reset or Stop). Retry {action}.")
+}
+/// How an admitted recovery that did not fail ended.
+#[derive(Debug, PartialEq, Eq)]
+enum RunOutcome {
+    /// Verified and published; the station reopened.
+    Published,
+    /// Its own boards recovered and verified, but boards of an earlier
+    /// unfinished recovery that it carried still need recovery, so the
+    /// station stays closed. The text names them and the next action.
+    StillPending(&'static str),
+}
+/// Where an admitted recovery got to before it failed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunStage {
+    /// Only host admission and the proxy were closed: no journal write, no
+    /// board traffic. A failure here is undone so the station is not left
+    /// closed by a recovery that never started.
+    Admission,
+    /// The journal or a board may have been touched: stay closed.
+    Committed,
 }
 async fn run(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     ticket: &Ticket,
-) -> Result<(), &'static str> {
+) -> Result<RunOutcome, &'static str> {
+    let mut stage = RunStage::Admission;
+    let mut proxy = None;
+    let mut opened_admission = false;
+    let result = run_inner(state, headers, ticket, &mut stage, &mut proxy, &mut opened_admission).await;
+    if result.is_err() && stage == RunStage::Admission && opened_admission {
+        undo_admission_close(state, ticket.token.owner, proxy.take());
+    }
+    result
+}
+/// Reopen host admission and the proxy that a recovery closed before it
+/// touched the journal or any board, so a refused quiesce (for example) does
+/// not leave Clear GSE abort and every command refused with no recovery to
+/// finish. Never reopens anything another owner closed.
+fn undo_admission_close(state: &AppState, owner: u64, proxy: Option<crate::command_proxy::recovery::Barrier>) {
+    if crate::gse::reset_generation::reopen_unstarted_recovery_admission(state, owner).is_err() {
+        return;
+    }
+    if let Some(proxy) = proxy {
+        let nonce = crate::command_proxy::recovery::Barrier::prepare_reopen_nonce();
+        if let Ok(mut owner) = proxy.try_prepare_reopen(nonce) { owner.commit(); }
+    }
+}
+async fn run_inner(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    ticket: &Ticket,
+    stage: &mut RunStage,
+    proxy: &mut Option<crate::command_proxy::recovery::Barrier>,
+    opened_admission: &mut bool,
+) -> Result<RunOutcome, &'static str> {
     authorize(state, headers, ticket).await?;
     if !origin_current(state, ticket.token) {
         return Err("Original recovery Stop/generation changed");
@@ -1650,8 +2024,9 @@ async fn run(
             ticket.token.generation,
             ticket.token.owner,
         )?;
+        *opened_admission = true;
     }
-    let mut proxy =
+    *proxy =
         crate::command_proxy::begin_primary_recovery().map_err(|_| "Proxy revocation failed")?;
     let start = WallInstant::now();
     while state.operator_dispatch_inflight.load(Ordering::Acquire) != 0
@@ -1664,6 +2039,7 @@ async fn run(
     }
     let quiesce = QuiesceScope::of(&ticket.targets);
     wait_sdk(state, &router, ticket.token, quiesce).await?;
+    *stage = RunStage::Committed;
     let mut fence = {
         let mut history = state.launch_history.lock().unwrap();
         history
@@ -1752,6 +2128,7 @@ async fn run(
                     uncertain_first: t.uncertain_first.clone(),
                 })
             })
+            .chain(ticket.carried.iter().cloned().map(Ok))
             .collect::<Result<Vec<_>, &'static str>>()?,
         verified: false,
         published: false,
@@ -1858,6 +2235,25 @@ async fn run(
         send(state,headers,ticket,&router,token,packet,||Ok(())).await?;
         wait_sdk(state, &router, token, quiesce).await?;
     }
+    if !ticket.carried.is_empty() {
+        // Its own boards applied; verify each by a fresh final readback, then
+        // stay closed for the carried boards. Their recovery (or a fresh
+        // healthy readback of them) finishes the marker later.
+        authorize(state, headers, ticket).await?;
+        let finals = futures::future::join_all(completed.iter().map(|(board, _)| {
+            fresh_query(state, headers, ticket, token, *board, &router)
+        }))
+        .await;
+        for ((_, terminal), query) in completed.iter().zip(finals) {
+            if !context_same(terminal, &query?.value) {
+                return Err("Fresh final QUERY differs from owned terminal completion");
+            }
+        }
+        let names = ticket.carried.iter().map(|t| t.board.as_str()).collect::<Vec<_>>().join(", ");
+        return Ok(RunOutcome::StillPending(intern(format!(
+            "Selected board recovered and verified by a fresh final readback. The earlier unfinished recovery still needs {names}: recover {} with Review recovery (or Reset all boards). The station stays closed until {} back healthy.",
+            if ticket.carried.len() == 1 { "it" } else { "them" }, if ticket.carried.len() == 1 { "it reads" } else { "they read" }))));
+    }
     authorize(state, headers, ticket).await?;
     #[cfg(test)]
     if crate::runtime_mode::is_hitl() || cfg!(feature = "firmware_sim") {
@@ -1905,6 +2301,7 @@ async fn run(
         tests::pause_clock_ready(state).await;
     }
     let mut admission = None;
+    let proxy = proxy;
     loop {
         authorize(state, headers, ticket).await?;
         // Start the NEW 100ms contention-only budget exactly once, immediately
@@ -1917,7 +2314,7 @@ async fn run(
             (false, _) => crate::gse::reset_generation::StartupPublication::TargetedRecovery,
         };
         match crate::gse::reset_generation::finalize_verified_recovery(
-            state, token, &fence, &mut proxy, &proofs, publication, clock_admission,
+            state, token, &fence, proxy, &proofs, publication, clock_admission,
         ) {
             Ok(()) => break,
             Err(crate::gse::reset_generation::FinalizeError::ClockBusy) => {
@@ -1971,7 +2368,7 @@ async fn run(
         crate::sequences::refresh_action_policy_now(state);
         state.broadcast_action_policy_snapshot();
     }
-    Ok(())
+    Ok(RunOutcome::Published)
 }
 
 #[cfg(test)]

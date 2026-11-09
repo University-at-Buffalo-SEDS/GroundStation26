@@ -79,26 +79,88 @@ async fn failed_reset_pending_targets_that_read_back_healthy_do_not_block_a_sing
     assert_eq!(state.operator_admission_barrier.load(Ordering::Acquire), 0);
     assert!(!state.launch_history.lock().unwrap().launch_locked());
 }
+/// After a failed Reset all, the operator can retry the boards that still
+/// need it one at a time. A retry that leaves out an unhealthy board of the
+/// unfinished recovery carries it: its own board recovers, the station stays
+/// closed and names the rest, and recovering the last board publishes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_reset_retry_still_must_include_an_unhealthy_pending_board() {
-    if isolated("failed_reset_retry_still_must_include_an_unhealthy_pending_board") { return; }
+async fn failed_reset_single_board_retries_carry_the_remaining_unhealthy_boards() {
+    if isolated("failed_reset_single_board_retries_carry_the_remaining_unhealthy_boards") { return; }
+    let fixture = Fixture::new().await;
+    let state = fixture.state();
+    *state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+    for board in BOARDS { fixture.query(board).await; }
+    let model = |wanted: Board| fixture.models.iter().find(|(board, _)| *board == wanted).unwrap().1.clone();
+    let (ab, daq) = (model(Board::ActuatorBoard), model(Board::DaqBoard));
+    ab.lock().unwrap().fail_result = Some(4);
+    daq.lock().unwrap().fail_result = Some(4);
+    let ticket = fixture.prepare("reset_startup", None).await;
+    assert_eq!(fixture.confirm(&ticket).await.status(), StatusCode::OK);
+    assert_eq!(fixture.terminal().await["success"], false);
+    // Clear GSE abort names the boards still to recover.
+    let message = admission_closed_message(&state, "Clear GSE abort");
+    assert!(message.contains("AB") && message.contains("DAQ") && message.contains("Review recovery"), "{message}");
+    // Recover AB alone; DAQ is carried.
+    ab.lock().unwrap().fail_result = None;
+    for board in BOARDS { fixture.query(board).await; }
+    let retry = fixture.prepare("recover_abort", Some("AB")).await;
+    assert_eq!(retry["targets"], json!(["AB"]));
+    assert_eq!(retry["still_unfinished_after"], json!(["DAQ"]));
+    assert_eq!(fixture.confirm(&retry).await.status(), StatusCode::OK);
+    let done = fixture.terminal().await;
+    assert_eq!(done["success"], true, "{done}");
+    assert_eq!(done["still_pending"], true, "{done}");
+    assert!(done["message"].as_str().unwrap().contains("DAQ"), "{done}");
+    let marker = state.launch_history.lock().unwrap().recovery_pending().unwrap();
+    assert!(!marker.published);
+    assert_eq!(marker.targets.iter().map(|t| t.board.as_str()).collect::<Vec<_>>(), ["AB", "DAQ"]);
+    assert_ne!(state.operator_admission_barrier.load(Ordering::Acquire), 0, "still closed for DAQ");
+    let message = admission_closed_message(&state, "Clear GSE abort");
+    assert!(message.contains("DAQ") && !message.contains("AB,"), "{message}");
+    // Recovering DAQ finishes the recovery and reopens the station.
+    daq.lock().unwrap().fail_result = None;
+    for board in BOARDS { fixture.query(board).await; }
+    let last = fixture.prepare("recover_abort", Some("DAQ")).await;
+    assert_eq!(last["still_unfinished_after"], json!([]));
+    assert_eq!(fixture.confirm(&last).await.status(), StatusCode::OK);
+    let done = fixture.terminal().await;
+    assert_eq!(done["success"], true, "{done}");
+    assert_eq!(done["still_pending"], false, "{done}");
+    let marker = state.launch_history.lock().unwrap().recovery_pending().unwrap();
+    assert!(marker.verified && marker.published);
+    assert_eq!(state.operator_admission_barrier.load(Ordering::Acquire), 0);
+}
+/// A failed Reset all whose boards all read back healthy afterwards (the
+/// refusing board recovered by other means) finishes by itself: the marker
+/// is retired, admission reopens and no launch lock is left behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_reset_whose_boards_later_read_back_healthy_finishes_and_reopens() {
+    if isolated("failed_reset_whose_boards_later_read_back_healthy_finishes_and_reopens") { return; }
     let fixture = Fixture::new().await;
     let state = fixture.state();
     *state.state.lock().unwrap() = crate::types::FlightState::Aborted;
     for board in BOARDS { fixture.query(board).await; }
     let daq = fixture.models.iter().find(|(board, _)| *board == Board::DaqBoard).unwrap().1.clone();
-    daq.lock().unwrap().fail_result = Some(5);
+    daq.lock().unwrap().fail_result = Some(4);
     let ticket = fixture.prepare("reset_startup", None).await;
     assert_eq!(fixture.confirm(&ticket).await.status(), StatusCode::OK);
     assert_eq!(fixture.terminal().await["success"], false);
+    assert!(state.launch_history.lock().unwrap().automatic_actions_inhibited());
+    // DAQ still reads back aborted: nothing finishes yet.
     for board in BOARDS { fixture.query(board).await; }
-    let response = super::super::tests::http(state.clone(), "POST", "/api/board-recovery/prepare", Some("operator"),
-        json!({"action":"recover_abort","board":"GB","mode":null,
-            "backend_instance":hex(&state.board_recovery.identity.unwrap()),
-            "reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state))})).await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let value = body(response).await;
-    assert!(value["message"].as_str().unwrap().contains("has not since read back healthy"), "{value}");
+    assert!(!complete_satisfied_pending(&state));
+    assert_ne!(state.operator_admission_barrier.load(Ordering::Acquire), 0);
+    // DAQ now reads back healthy (same boot and epoch, Startup, not aborted).
+    { let mut m = daq.lock().unwrap(); m.fail_result = None; m.state = 0; }
+    for board in BOARDS { fixture.query(board).await; }
+    assert!(complete_satisfied_pending(&state));
+    assert_eq!(state.operator_admission_barrier.load(Ordering::Acquire), 0);
+    let history = state.launch_history.lock().unwrap();
+    assert!(history.recovery_pending().is_none() && !history.recovery_closed());
+    assert!(!history.automatic_actions_inhibited() && !history.launch_locked(), "no real Launch: nothing stays locked");
+    drop(history);
+    assert!(crate::gse::capture_operator_origin(&state).is_some(), "operator commands are admitted again");
+    assert!(!complete_satisfied_pending(&state), "nothing left to finish");
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_query_replies_reach_every_board_with_no_operation_running() {

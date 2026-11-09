@@ -407,10 +407,11 @@ async fn r2_slow_model_natural_exhaustion_keeps_original_identity() {
     assert_eq!(f.confirm(&ticket).await.status(), StatusCode::OK);
     let o = operation(&f, Duration::from_secs(16)).await;
     assert_eq!(o["success"], false);
-    // The Idle publication still owed to the fill boards holds the reset,
-    // and the refusal names it.
-    assert!(o["message"].as_str().unwrap().contains("undelivered FLIGHT_STATE"), "{o}");
-    assert_eq!(applies(&f), 0);
+    // The Idle publication the Gateway Board never acknowledges no longer
+    // holds the reset: after a bounded wait the recovery supersedes it and
+    // goes on to the boards, where GB's own commissioning keeps it from
+    // completing.
+    assert!(!o["message"].as_str().unwrap().contains("undelivered FLIGHT_STATE"), "{o}");
     // This is a FAILED reset: the barrier remains closed and no Startup was
     // applied. Queued prelude tails are not claimed empty or drained.
     assert_ne!(f.state().operator_admission_barrier.load(Ordering::Acquire), 0);

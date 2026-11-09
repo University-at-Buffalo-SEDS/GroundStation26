@@ -3224,6 +3224,17 @@ pub(crate) fn overpressure_holds_abort(state: &AppState) -> bool {
     rt.overpressure.latched() || rt.overpressure.board_owns(now)
 }
 pub(crate) fn operator_reset_host_idle(state: &AppState) -> bool {
+    operator_reset_host_idle_ram(state)
+        // Recovery status is a read-only poll: never wait behind the SDK owner.
+        // Busy means not yet eligible for Reset, never a manual-command veto.
+        && state.topology_router.get().is_some_and(|router| {
+            ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND"]
+                .iter().all(|name| matches!(router.try_has_pending_reliable_tx_type(
+                    crate::telemetry_schema::data_type(name)), Ok(false)))
+        })
+}
+/// Host work owners only (RAM), without the router's in-flight commands.
+pub(crate) fn operator_reset_host_idle_ram(state: &AppState) -> bool {
     {
         let rt = state.gse.lock().unwrap();
         if engine_blocks_operator_reset(&rt) || cold_flow::runtime_active(&rt) {
@@ -3233,16 +3244,7 @@ pub(crate) fn operator_reset_host_idle(state: &AppState) -> bool {
             return false;
         }
     }
-    if state.manual_abort_intent.pending_epoch().is_some() || state.deferred_abort.manual_pending() {
-        return false;
-    }
-    // Recovery status is a read-only poll: never wait behind the SDK owner.
-    // Busy means not yet eligible for Reset, never a manual-command veto.
-    state.topology_router.get().is_some_and(|router| {
-        ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND"]
-            .iter().all(|name| matches!(router.try_has_pending_reliable_tx_type(
-                crate::telemetry_schema::data_type(name)), Ok(false)))
-    })
+    !(state.manual_abort_intent.pending_epoch().is_some() || state.deferred_abort.manual_pending())
 }
 /// Called only by the closed verified Reset ALL owner after all seven boards
 /// applied Startup. This does not publish state, reopen, or dispatch outputs.
@@ -3471,7 +3473,7 @@ async fn clear_abort(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
     let Some(_claim) = claim_operator_dispatch(&state, admission_generation) else {
         return (
             StatusCode::CONFLICT,
-            "Recovery admission is closed or request is stale",
+            crate::board_recovery::coordinator::admission_closed_message(&state, "Clear GSE abort"),
         )
             .into_response();
     };

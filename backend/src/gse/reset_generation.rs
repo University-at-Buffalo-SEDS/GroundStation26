@@ -107,6 +107,54 @@ pub(crate) fn advance_with_clock_fence(
     Ok(next)
 }
 
+/// Undo `close_operator_admission` for a recovery that failed before it
+/// wrote the journal or sent anything to a board (its quiesce was refused).
+/// Only the owner that closed admission can reopen it, and only while the
+/// journal is not closed for recovery.
+pub(crate) fn reopen_unstarted_recovery_admission(state: &AppState, owner: u64) -> Result<(), &'static str> {
+    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    if matches!(owner, 0 | u64::MAX) {
+        return Err("Recovery owner is unavailable");
+    }
+    if state.launch_history.try_lock().map_or(true, |history| history.recovery_closed()) {
+        return Err("The recovery journal is closed or busy; admission stays closed");
+    }
+    state
+        .operator_admission_barrier
+        .compare_exchange(owner, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
+        .map(|_| ())
+        .map_err(|_| "Recovery admission belongs to another owner")
+}
+
+/// Finish an unpublished pending recovery whose every target a fresh
+/// verified readback now shows healthy (the caller checked that under the
+/// coordinator's lock). The closed owner's journal clears the marker and
+/// reopens; host admission reopens with it. Nothing is published to the
+/// boards and no Reset all is claimed: a real Launch attempt keeps its lock.
+pub(crate) fn finish_satisfied_recovery(
+    state: &AppState,
+    satisfied: impl FnOnce(&crate::launch_history::RecoveryPending) -> bool,
+) -> Result<(), &'static str> {
+    // The caller holds the recovery coordinator's lock: never wait here.
+    let _dispatch = DISPATCH_GATE.try_lock().map_err(|_| "Dispatch gate busy")?;
+    let owner = state.operator_admission_barrier.load(std::sync::atomic::Ordering::Acquire);
+    if matches!(owner, 0 | u64::MAX)
+        || state.operator_dispatch_inflight.load(std::sync::atomic::Ordering::Acquire) != 0
+    {
+        return Err("Recovery admission is not closed by a finished recovery");
+    }
+    let mut history = state.launch_history.try_lock().map_err(|_| "Clock journal busy")?;
+    let pending = history.recovery_pending().filter(|p| !p.published).ok_or("No unfinished recovery")?;
+    if !satisfied(&pending) {
+        return Err("A board of the unfinished recovery is not healthy yet");
+    }
+    history
+        .complete_satisfied_recovery(owner, &pending)
+        .map_err(|_| "Recovery journal could not record the finished recovery")?;
+    state.operator_admission_barrier.store(0, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
 /// Staged supervisor handoff. The complete coordinator must first join its
 /// old board workers and revoke the old proxy lease. This helper transfers
 /// only host admission/journal ownership; it grants no board permission.

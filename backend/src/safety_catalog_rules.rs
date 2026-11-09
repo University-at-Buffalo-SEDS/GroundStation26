@@ -355,11 +355,11 @@ const STOP: &[Spec] = &[
         details: &[
             "On Abort the Actuator Board also drives supplies and igniter low and puts the plumbing stepper to sleep.",
             "Every selected board receives its request at the same time, right after confirmation, carrying one confirmation timestamp; each board is still proven by its own fresh query, its own reply and a fresh final readback, and boards accept the request for up to 15 s.",
-            "If a reset does not finish, a board of it that later reads back healthy (not aborted, Startup or Idle, safe outputs, the same or a newer recovery epoch) no longer needs recovery, so a retry may cover only the boards that still do.",
-            "Before touching any board, recovery waits until no control frame is still in flight to the boards it resets. A reset of fill boards only does not wait for AV-bay-only traffic on the radio (Flight Computer commands, underglow, buzzer) or for a phase publication still owed only to AV-bay boards; a phase publication owed to a fill board, or to a board the station cannot name, and any undelivered Abort make it wait. When it gives up, it names the frame still pending.",
+            "If a reset does not finish, a board of it that later reads back healthy (not aborted, Startup or Idle, safe outputs, the same boot and the same or a newer recovery epoch) no longer needs recovery. A retry may cover any single board: boards it leaves out stay part of the unfinished recovery, and the station stays closed until every one of them reads back healthy. Then the recovery finishes by itself; a real Launch attempt still keeps Launch locked.",
+            "Before touching any board, recovery waits until no control frame is still in flight to the boards it resets, or to the relay that carries traffic to them (the RF Board for the AV bay, the Gateway Board for the fill boards). Traffic owed only to other boards does not hold it. A phase or settings publication, or an earlier recovery query, still unacknowledged after 3 s is superseded by the recovery's own request; an undelivered Abort is waited for up to 12 s; an undelivered valve, actuator or flight command is never superseded. When it gives up, it names the frame and the boards it is owed to.",
         ],
         modes: ALL,
-        enforced_in: &["backend/src/board_recovery.rs:safe_output_mask", "backend/src/board_abort.rs:note_reset_completed", "backend/src/board_recovery.rs:pending_target_satisfied", "backend/src/board_recovery/coordinator.rs:sdk_pending_reason"],
+        enforced_in: &["backend/src/board_recovery.rs:safe_output_mask", "backend/src/board_abort.rs:note_reset_completed", "backend/src/board_recovery.rs:pending_target_satisfied", "backend/src/board_recovery/coordinator.rs:quiesce_blockers", "backend/src/board_recovery/coordinator.rs:complete_satisfied_pending"],
         config_keys: &[],
     },
     Spec {

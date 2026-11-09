@@ -191,6 +191,19 @@ pub(crate) struct RecoveryTarget {
     pub original_first: Option<RecoveryIntent>,
     pub uncertain_first: Option<RecoveryIntent>,
 }
+impl RecoveryTarget {
+    /// A target an explicit targeted retry carried unchanged from an earlier
+    /// unfinished attempt (possibly of an earlier backend process): an
+    /// ordinary (non-commissioning) target sealed strictly before this
+    /// attempt's boundary. A Reset all marker never carries targets.
+    fn carried_into(&self, pending: &RecoveryPending) -> bool {
+        pending.reset_policy.is_none()
+            && self.kind == RecoveryIntentKind::Normal
+            && self.original_first.is_none()
+            && self.uncertain_first.is_none()
+            && self.intent.source_utc_ms < pending.origin_utc_ms
+    }
+}
 impl RecoveryPending {
     pub(crate) fn verified_startup_policy(&self) -> bool {
         self.verified && self.targets.iter().all(|t| t.desired == 0)
@@ -209,6 +222,13 @@ impl RecoveryPending {
                 && (!self.published || self.verified)
                 && (self.reset_policy.as_ref().map_or((1..=7).contains(&self.targets.len()), |p| p.valid_for(&self.targets))),
             "Invalid pending recovery identity"
+        );
+        // At least one target is this attempt's own (sealed at its boundary);
+        // the others may be carried unchanged from an earlier attempt.
+        ensure!(
+            self.targets.is_empty()
+                || self.targets.iter().any(|t| t.intent.source_utc_ms == self.origin_utc_ms && t.intent.backend == self.backend),
+            "Pending recovery has no target of its own attempt"
         );
         let mut seen = std::collections::HashSet::new();
         for target in &self.targets {
@@ -232,8 +252,9 @@ impl RecoveryPending {
                     && target.intent.body[2] == target.desired
                     && u32::from_le_bytes(target.intent.body[20..24].try_into().unwrap())
                         == target.epoch
-                    && target.intent.source_utc_ms == self.origin_utc_ms
-                    && target.intent.backend == self.backend,
+                    && (target.intent.source_utc_ms == self.origin_utc_ms
+                        && target.intent.backend == self.backend
+                        || target.carried_into(self)),
                 "Pending intent differs from frozen target/boundary"
             );
             for first in [&target.original_first, &target.uncertain_first]
@@ -988,6 +1009,41 @@ impl Store {
     pub(crate) fn recovery_pending_ref(&self) -> Option<&RecoveryPending> {
         self.data.recovery_pending.as_ref()
     }
+    /// Closed for a recovery owner (admitted, failed or restored at startup).
+    pub(crate) fn recovery_closed(&self) -> bool {
+        self.closed && self.recovery_owner != 0
+    }
+    /// Retire an unpublished pending recovery whose every target the caller
+    /// verified healthy by fresh readbacks, for the owner that holds the
+    /// journal closed. The marker is removed rather than published: it never
+    /// verified a reset, so nothing may read it as one. Inhibition keeps only
+    /// a real launch attempt's lock. RAM reopens now; the write is ordered
+    /// before every later journal write, and a restart before it lands only
+    /// restores the closed marker, which completes the same way again.
+    pub(crate) fn complete_satisfied_recovery(&mut self, owner: u64, expected: &RecoveryPending) -> Result<()> {
+        ensure!(
+            !self.observer && self.error.is_none() && !self.recovery_activation_pending
+                && self.closed && self.recovery_owner == owner && owner != 0,
+            "Journal is not closed by this recovery owner"
+        );
+        ensure!(
+            self.data.recovery_pending.as_ref().is_some_and(|marker| !marker.published && marker == expected),
+            "Pending recovery changed"
+        );
+        let writer = self.writer.clone().context("A journal writer is required")?;
+        ensure!(writer.try_quiescent_through(self.last_write)?, "Journal prefix pending");
+        let mut next = self.data.clone();
+        next.recovery_pending = None;
+        let launch_attempt = self.launch_locked();
+        next.launch_attempt = Some(launch_attempt);
+        next.automatic_actions_inhibited = launch_attempt;
+        self.last_write = writer.enqueue(next.clone())?;
+        self.data = next;
+        self.closed = false;
+        self.recovery_owner = 0;
+        self.recovery_revision_staged = false;
+        Ok(())
+    }
     pub(crate) fn restored_recovery_barrier(&self) -> (u64, u64) {
         if self.error.is_some() {
             return (u64::MAX, 1);
@@ -1465,3 +1521,6 @@ mod reset_policy_tests;
 #[cfg(test)]
 #[path = "launch_history/resync_journal_tests.rs"]
 mod resync_journal_tests;
+#[cfg(test)]
+#[path = "launch_history/carried_recovery_tests.rs"]
+mod carried_recovery_tests;

@@ -938,6 +938,7 @@ pub(crate) async fn query_service(
             tokio::select! {biased;_=shutdown.recv()=>return,_=tokio::time::sleep(Duration::from_millis(100))=>{}}
         }
         let _ = refresh.poll(&state);
+        crate::board_recovery::coordinator::complete_satisfied_pending(&state);
         crate::board_recovery::try_release_launch_lock(&state);
     }
 }

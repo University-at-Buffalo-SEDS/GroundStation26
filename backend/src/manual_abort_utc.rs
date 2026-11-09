@@ -275,7 +275,9 @@ pub(crate) async fn before_prepare(state: &Arc<AppState>) -> Result<(), &'static
     runtime.revoke();
     let start = Instant::now();
     loop {
-        if start.elapsed() > Duration::from_secs(5) {
+        // The ceiling clears when network UTC passes it; a slowed simulator
+        // bay advances network UTC slower than wall time (simulator builds only).
+        if start.elapsed() > crate::sim_freshness::wall(Duration::from_secs(5)) {
             return Err(
                 "Manual UTC ceiling/prefix pending or clock rolled back; wait and prepare a new intent",
             );
@@ -291,7 +293,15 @@ pub(crate) async fn before_prepare(state: &Arc<AppState>) -> Result<(), &'static
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 continue;
             }
-            let bound = retained_bound(state)?;
+            let bound = match retained_bound(state) {
+                Ok(bound) => bound,
+                // A busy owner is not a refusal: look again.
+                Err(message) if message.ends_with("busy") => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+                Err(message) => return Err(message),
+            };
             let router = state.topology_router.get().ok_or("Router unavailable")?;
             let actual = crate::system_clock::required_control_network_utc_ms(router)
                 .map_err(|_| "Network UTC unavailable")?;
