@@ -2415,6 +2415,13 @@ async fn handle_packet_inner(
     }
 
     if pkt.data_type() == crate::telemetry_schema::data_type("WARNING") {
+        // A test fire has no AV bay; its boards raise no warnings there.
+        if crate::station_mode::local_mode() == crate::station_mode::Mode::TestFire
+            && crate::alert_conditions::BoardKey::from_sender(crate::types::canonical_sender_id(sender_id.trim()))
+                .is_some_and(|board| crate::alert_conditions::AV_BAY.contains(&board))
+        {
+            return Vec::new();
+        }
         if let Ok(msg) = pkt.data_as_string() {
             if sender_id != Board::ValveBoard.sender_id() {
                 emit_warning(state, msg.to_string());

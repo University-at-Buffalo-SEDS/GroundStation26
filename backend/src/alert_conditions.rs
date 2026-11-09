@@ -204,6 +204,26 @@ pub struct Snapshot {
     pub history_integrity: Option<IntegrityMarker>,
     pub records: Vec<Record>,
 }
+/// AV-bay boards: a test fire runs without them.
+pub const AV_BAY: [BoardKey; 3] = [BoardKey::Rf, BoardKey::Fc, BoardKey::Pb];
+
+impl Snapshot {
+    /// The same snapshot without conditions about `boards`, for a mode in which
+    /// those boards take no part (a test fire has no AV bay to report on).
+    pub fn without_boards(mut self, boards: &[BoardKey]) -> Self {
+        let excluded = |key: &str| {
+            Key::from_wire(key).is_some_and(|key| match key {
+                Key::BoardOffline(board) | Key::BoardAbort(board) => boards.contains(&board),
+                _ => false,
+            })
+        };
+        self.records.retain(|record| !excluded(&record.key));
+        self.evaluated.retain(|known| !excluded(&known.key));
+        self.awaiting_evidence.retain(|key| !excluded(key));
+        self
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct JournalEntry {
     pub authority: String,
@@ -801,6 +821,45 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn test_fire_view_drops_av_bay_conditions_and_keeps_the_rest() {
+        let record = |key: Key| Record {
+            key: key.wire(),
+            occurrence_id: key.wire(),
+            authority: "a".into(),
+            severity: key.severity(),
+            source: key.source().into(),
+            message: String::new(),
+            state: ConditionState::Active,
+            raised_at_ms: 1,
+            updated_at_ms: 1,
+            resolved_at_ms: None,
+        };
+        let keys = [
+            Key::BoardAbort(BoardKey::Rf),
+            Key::BoardOffline(BoardKey::Fc),
+            Key::BoardAbort(BoardKey::Pb),
+            Key::BoardAbort(BoardKey::Vb),
+            Key::BoardOffline(BoardKey::Gb),
+            Key::GatewayLowVoltage,
+        ];
+        let snapshot = Snapshot {
+            version: 1,
+            authority: "a".into(),
+            revision: 1,
+            complete: true,
+            evaluated: keys.iter().map(|k| KnownCondition { key: k.wire(), source: k.source().into() }).collect(),
+            awaiting_evidence: vec![Key::BoardOffline(BoardKey::Rf).wire()],
+            persistence_error: None,
+            history_integrity: None,
+            records: keys.iter().map(|k| record(*k)).collect(),
+        }
+        .without_boards(&AV_BAY);
+        let kept: Vec<_> = snapshot.records.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(kept, ["board_abort:VB", "board_offline:GB", "gateway_low_voltage:GB"]);
+        assert_eq!(snapshot.evaluated.len(), 3);
+        assert!(snapshot.awaiting_evidence.is_empty());
+    }
     fn registry() -> Registry {
         let mut r = Registry::new("station-epoch".into(), [Key::GatewayLowVoltage]);
         r.restore(Vec::new()).unwrap();

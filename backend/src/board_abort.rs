@@ -715,6 +715,10 @@ impl Runtime {
         };
         let scope = crate::board_recovery::scope::mode_scope(crate::station_mode::local_mode());
         for (i, board) in BOARDS.into_iter().enumerate() {
+            // Boards outside this mode (the AV bay in a test fire) report nothing.
+            if scope & (1 << i) == 0 {
+                continue;
+            }
             if history_unknown & (1 << i) != 0 { out.history_unknown_boards.push(board.sender_id().into()); }
             if required & (1 << i) != 0 {
                 out.required_boards.push(board.sender_id().into());
@@ -725,12 +729,7 @@ impl Runtime {
             if rows[i].aborted {
                 out.active_errors.push(ActiveError{source:format!("board_abort:{}",board.sender_id()),
                 board:board.sender_id().into(),board_label:board.as_str().into(),timestamp_ms:rows[i].first_abort_ms,
-                message:if scope & (1 << i) != 0 {
-                    format!("{} reports Abort. New launch is disabled until a fresh actual non-Abort state is confirmed.",board.as_str())
-                } else {
-                    format!("{} reports Abort. It is not part of this mode, so it does not block Launch.",board.as_str())
-                },
-                launch_blocking:scope & (1 << i) != 0});
+                message:format!("{} reports Abort. New launch is disabled until a fresh actual non-Abort state is confirmed.",board.as_str()),launch_blocking:true});
             }
         }
         out
@@ -875,12 +874,9 @@ pub(crate) fn snapshot_for_state(state: &AppState) -> Snapshot {
         let scope = crate::board_recovery::scope::mode_scope(crate::station_mode::local_mode());
         for error in &mut value.active_errors {
             let Some(i) = BOARDS.iter().position(|board| board.sender_id() == error.board) else { continue };
-            if blocking & (1 << i) == 0 {
+            if blocking & (1 << i) == 0 && scope & (1 << i) != 0 {
                 error.launch_blocking = false;
-                // Out-of-mode boards keep the snapshot's "not part of this mode" text.
-                if scope & (1 << i) != 0 {
-                    error.message = format!("{} last reported Abort and is not on the network. It does not block Launch.", error.board_label);
-                }
+                error.message = format!("{} last reported Abort and is not on the network. It does not block Launch.", error.board_label);
             }
         }
         value.history_blocks_launch = !crate::runtime_mode::is_hitl();
@@ -1123,8 +1119,8 @@ mod launch_presence_tests {
         assert!(capture_launch_revision_named(&state, "Launch").is_none());
         assert!(snapshot_for_state(&state).active_errors[0].launch_blocking);
     }
-    /// A test fire runs without the AV bay: an aborted, present RF stays
-    /// reported but never blocks the stand's Launch; an aborted VB still does.
+    /// A test fire runs without the AV bay: an aborted, present RF neither
+    /// blocks the stand's Launch nor shows an error; an aborted VB still does.
     #[tokio::test]
     async fn test_fire_launch_ignores_av_bay_aborts_but_not_fill_board_aborts() {
         let _mode = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::TestFire);
@@ -1134,10 +1130,7 @@ mod launch_presence_tests {
         state.board_status.lock().unwrap().get_mut(&Board::RFBoard).unwrap().last_seen_instant = Some(now);
         assert_eq!(state.board_abort.launch_abort_mask(&state), 0);
         assert!(blocked_message(&state).is_none());
-        let snapshot = snapshot_for_state(&state);
-        assert_eq!(snapshot.active_errors.len(), 1, "still reported");
-        assert!(!snapshot.active_errors[0].launch_blocking);
-        assert!(snapshot.active_errors[0].message.contains("not part of this mode"));
+        assert!(snapshot_for_state(&state).active_errors.is_empty(), "a test fire shows no AV-bay errors");
 
         state.board_abort.observe_abort(Board::ValveBoard, now, 101);
         state.board_status.lock().unwrap().get_mut(&Board::ValveBoard).unwrap().last_seen_instant = Some(now);

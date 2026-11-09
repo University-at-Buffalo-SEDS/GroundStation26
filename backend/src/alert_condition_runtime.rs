@@ -75,7 +75,13 @@ impl Runtime {
         self.registry.lock().unwrap().authority().to_owned()
     }
     pub fn snapshot(&self) -> Snapshot {
-        self.registry.lock().unwrap().snapshot()
+        let snapshot = self.registry.lock().unwrap().snapshot();
+        // A test fire has no AV bay: its boards raise no warnings or errors.
+        if crate::station_mode::local_mode() == crate::station_mode::Mode::TestFire {
+            snapshot.without_boards(&crate::alert_conditions::AV_BAY)
+        } else {
+            snapshot
+        }
     }
     pub fn current_link(&self, key: Key) -> Option<ConditionLink> {
         self.registry.lock().unwrap().current_link(key)
