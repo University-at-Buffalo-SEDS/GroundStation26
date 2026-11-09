@@ -860,8 +860,12 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
     if let Some(action) = action(cmd) {
         if crate::runtime_mode::is_hitl() {
             // Admit the request, not the actuation: handle_command still
-            // enforces every engine prerequisite before emitting effects.
-            return Some(is_prelaunch && interlock(state, &policy));
+            // enforces every engine prerequisite before emitting effects. A
+            // refusal the button already shows (the self-test isolation
+            // confirmation) is refused here too, with its reason, instead of
+            // answering "ok" and doing nothing.
+            let input = rt.input(is_prelaunch, interlock(state, &policy));
+            return Some(sequence_button_enabled(&rt.engine, action, input));
         }
         return Some(
             operational_action_allowed(&rt, action)

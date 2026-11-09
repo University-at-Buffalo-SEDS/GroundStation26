@@ -53,7 +53,7 @@ impl Fixture {
             target - target.signum()
         }));
         let users = root.0.join("users.json");
-        std::fs::write(&users,serde_json::to_vec(&serde_json::json!({"version":1,"users":[{"username":"fill-operator","password":{"salt_b64":"","hash_b64":""},"roles":[],"permissions":{"view_data":true,"send_commands":true},"command_access":{"allowed_commands":["StartFill","AutoColdFlow"]}}]})).unwrap()).unwrap();
+        std::fs::write(&users,serde_json::to_vec(&serde_json::json!({"version":1,"users":[{"username":"fill-operator","password":{"salt_b64":"","hash_b64":""},"roles":[],"permissions":{"view_data":true,"send_commands":true},"command_access":{"allowed_commands":["StartFill","AutoColdFlow","ValveSelfTest"]}}]})).unwrap()).unwrap();
         let (commands, receive_commands) = tokio::sync::mpsc::channel(4);
         Arc::get_mut(&mut state).unwrap().cmd_tx = commands;
         Arc::get_mut(&mut state).unwrap().auth = Arc::new(crate::auth::AuthManager::new(users));
@@ -94,6 +94,9 @@ impl Fixture {
     }
 }
 async fn press(state: Arc<AppState>, token: Option<&str>) -> (StatusCode, String) {
+    press_command(state, token, "StartFill").await
+}
+async fn press_command(state: Arc<AppState>, token: Option<&str>, command: &str) -> (StatusCode, String) {
     let app = crate::web::router(state, "unused-fixture-video-password".into());
     let mut request = Request::builder()
         .method("POST")
@@ -103,7 +106,7 @@ async fn press(state: Arc<AppState>, token: Option<&str>) -> (StatusCode, String
         request = request.header("authorization", format!("Bearer {token}"));
     }
     let response = app
-        .oneshot(request.body(Body::from("\"StartFill\"")).unwrap())
+        .oneshot(request.body(Body::from(format!("{command:?}"))).unwrap())
         .await
         .unwrap();
     let status = response.status();
@@ -769,4 +772,27 @@ async fn actual_http_fill_is_admitted_against_the_configured_nitrous_target() {
         !f.sent.lock().unwrap().is_empty() || f.state.auto_zero.lock().unwrap().pending(),
         "the accepted fill started"
     );
+}
+
+/// HITL (gse_flows sim): ValveSelfTest before the isolation checkbox answered
+/// 200 "ok" and then nothing ran. Every mode refuses it with 403 naming the
+/// checkbox, and nothing is queued or actuated.
+#[tokio::test]
+async fn actual_http_valve_self_test_is_refused_until_isolation_is_confirmed() {
+    if crate::operator_queue::isolated_case(
+        module_path!(),
+        "actual_http_valve_self_test_is_refused_until_isolation_is_confirmed",
+    ) {
+        return;
+    }
+    let mut f = Fixture::new_phase(false, gse_sequence::Phase::Idle).await;
+    assert!(!f.state.gse.lock().unwrap().engine.config.dry_self_test_confirmed);
+    crate::sequences::refresh_action_policy_projection(&f.state);
+    let result = press_command(f.state.clone(), Some("fill-token"), "ValveSelfTest").await;
+    assert_eq!(result.0, StatusCode::FORBIDDEN, "{}", result.1);
+    assert!(result.1.contains("Unlock dry valve self-test"), "{}", result.1);
+    assert!(f._commands.try_recv().is_err(), "nothing was queued");
+    f.pump();
+    assert!(f.sent.lock().unwrap().is_empty());
+    assert_eq!(f.state.gse.lock().unwrap().engine.status.phase, gse_sequence::Phase::Idle);
 }
