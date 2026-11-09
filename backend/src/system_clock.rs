@@ -279,7 +279,13 @@ fn set_network_utc(router: &sedsnet::router::Router, utc_ms: i64) -> Result<(), 
         .try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(
             utc_ms as u64,
         ))
-        .map_err(|error| format!("Network UTC source was not admitted: {error}"))
+        .map_err(|error| format!("Network UTC source was not admitted: {error}"))?;
+    // SEDSnet marks its clock UTC-anchored on the next time refresh, and steps
+    // (rather than slews) any correction over 5 s that lands before then.
+    // Refresh now so an admitted UTC anchors at once and every later
+    // correction steers the running clock instead of jumping it.
+    let _ = router.network_time();
+    Ok(())
 }
 
 #[cfg(test)]
