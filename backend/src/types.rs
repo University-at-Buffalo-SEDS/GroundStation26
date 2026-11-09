@@ -423,6 +423,10 @@ pub struct NetworkBoardHealthEntry {
     pub offline_ms: u64,
     pub longest_outage_ms: u64,
     pub current_outage_ms: u64,
+    /// Latest packet's board network time minus station receive time. A large
+    /// value means the board's clock is not synced to the station.
+    #[serde(default)]
+    pub clock_offset_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default)]

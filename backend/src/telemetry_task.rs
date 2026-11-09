@@ -2358,6 +2358,14 @@ async fn handle_packet_inner(
     } else {
         state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
     }
+    if crate::simulation_clock_ms().is_none() {
+        state.network_health.lock().unwrap().observe_clock(
+            pkt.sender(),
+            pkt.timestamp(),
+            get_current_timestamp_ms(),
+            std::time::Instant::now(),
+        );
+    }
     #[cfg(all(test, feature="test_fire_mode"))]
     crate::recovery_pending_probe::before_automatic(state, &pkt).await;
     if cfg!(feature = "test_fire_mode") && state.all_required_boards_seen()

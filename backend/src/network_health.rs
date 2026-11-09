@@ -24,6 +24,7 @@ struct Record {
     rocket: bool,
     fill: bool,
     announcements: HashMap<String, u64>,
+    clock: Option<(i64, Instant)>,
 }
 fn elapsed(now: Instant, then: Instant) -> u64 {
     now.saturating_duration_since(then)
@@ -169,6 +170,7 @@ impl Tracker {
                     rocket: false,
                     fill: false,
                     announcements: HashMap::new(),
+                    clock: None,
                 },
             );
         }
@@ -268,6 +270,15 @@ impl Tracker {
         self.record(sender, now, wall_ms)
             .observe(now, wall_ms, true);
     }
+    /// Board packet timestamp against station receive time, for clock sync display.
+    pub fn observe_clock(&mut self, sender: &str, source_ms: u64, wall_ms: u64, now: Instant) {
+        let sender = canonical_sender_id(sender.trim());
+        if sender.is_empty() || sender == "GS" || sender.starts_with('@') || source_ms == 0 {
+            return;
+        }
+        let offset = (source_ms as i128 - wall_ms as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+        self.record(sender, now, wall_ms).clock = Some((offset, now));
+    }
     pub fn membership(&mut self, sender: &str, side: &str) {
         if let Some(r) = self.boards.get_mut(canonical_sender_id(sender)) {
             r.rocket |= side == "rocket_comms";
@@ -366,6 +377,10 @@ impl Tracker {
                 offline_ms: r.offline_ms.saturating_add(outage),
                 longest_outage_ms: r.longest_ms.max(outage),
                 current_outage_ms: outage,
+                clock_offset_ms: r
+                    .clock
+                    .filter(|(_, at)| elapsed(now, *at) <= TIMEOUT_MS)
+                    .map(|(offset, _)| offset),
             });
         }
         rows.sort_by(|a, b| a.sender_id.cmp(&b.sender_id));
