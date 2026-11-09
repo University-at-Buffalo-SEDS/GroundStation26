@@ -101,6 +101,27 @@ class FrontendCopyBackTests(unittest.TestCase):
             self.assertTrue(prior.is_dir())
 
 
+class StationPathTests(unittest.TestCase):
+    def test_backend_compiles_at_the_station_checkout_path(self) -> None:
+        # The station finds config, layout and users through
+        # env!("CARGO_MANIFEST_DIR"); a binary built at another path cannot
+        # find them and starts without users or GSE configuration.
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {remote_build.ENV: "jupiter", "GS_FRONTEND_SOURCE_DIR": tmp}):
+            repo = Path(tmp).resolve()
+            with patch.object(remote_build, "_check_local_target"), \
+                    patch.object(remote_build, "_image", return_value="img"), \
+                    patch.object(remote_build.Remote, "push"), \
+                    patch.object(remote_build.Remote, "pull"), \
+                    patch.object(remote_build.Remote, "run") as run, \
+                    patch.object(Path, "replace"), patch.object(Path, "chmod"):
+                remote_build.build_backend(repo, [], False)
+            command = run.call_args.args[0]
+            self.assertIn(f":{repo} ", command)
+            self.assertIn(f"-w {repo}/backend ", command)
+            self.assertIn(f"GS_FRONTEND_SOURCE_DIR={repo}", command)
+
+
 class ArgumentTests(unittest.TestCase):
     def test_takes_every_remote_form_and_keeps_other_arguments(self) -> None:
         for args, spec in [
