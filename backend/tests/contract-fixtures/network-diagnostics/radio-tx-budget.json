@@ -1,7 +1,9 @@
 {
+  "coalesced_frames": 0,
   "coalesced_receipts": 0,
   "control_limit_bytes": 4096,
   "meaning": "refusals are writer backpressure (frame kept by the router and retried); none of them reached the air. Parked frames were accepted while the writer allowance was full and go to the writer in order as it drains",
+  "ordered_exhausted_by_type": {},
   "ordinary_limit_bytes": 4096,
   "parked_bytes": 0,
   "parked_frames": 0,
