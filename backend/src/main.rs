@@ -1,3 +1,4 @@
+mod abort_input;
 mod abort_retirement;
 mod admin;
 mod daq_launch_log;

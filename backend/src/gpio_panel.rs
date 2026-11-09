@@ -1,3 +1,4 @@
+use crate::abort_input::{self, AbortInputMonitor, BiasedInputLine, GpioLine};
 use crate::gpio::Trigger;
 use crate::sequences::{ActionPolicyMsg, BlinkMode};
 use crate::state::AppState;
@@ -79,11 +80,16 @@ pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::
     let gpio = state.gpio.clone();
     let allowed = Arc::new(Mutex::new(AllowedActions::default()));
 
-    // Inputs (buttons)
-    gpio.setup_input_pulldown_pin(ABORT_PIN)?;
-    log::info!(
-        "GPIO abort button configured on BCM GPIO {ABORT_PIN} as active-high pulldown input"
-    );
+    // Inputs (buttons). The abort input's bias is written explicitly and the
+    // log reports the bias read back from the pad, not the intent.
+    let mut abort_monitor =
+        AbortInputMonitor::new(abort_input::ABORT_INPUT_BIAS, abort_input::ABORT_ACTIVE_HIGH);
+    let abort_line = GpioLine {
+        gpio: &gpio,
+        pin: ABORT_PIN,
+    };
+    let reports = abort_monitor.open(&abort_line)?;
+    publish_abort_input_reports(&state, reports);
     gpio.setup_input_pin(LAUNCH_PIN)?;
     gpio.setup_input_pin(IGNITER_PIN)?;
     gpio.setup_input_pin(LAUNCH_ARM_PIN)?;
@@ -111,6 +117,11 @@ pub fn setup_gpio_panel(state: Arc<AppState>) -> Result<(), Box<dyn std::error::
 
     setup_callbacks(&state, allowed.clone())?;
 
+    // Startup self-check after the edge-event line request.
+    let reports = abort_monitor.self_check(&abort_line, Instant::now());
+    publish_abort_input_reports(&state, reports);
+    spawn_abort_poll_thread(state.clone(), abort_monitor);
+
     spawn_gpio_led_thread(state, allowed);
 
     Ok(())
@@ -135,7 +146,6 @@ fn setup_callbacks(
 
         let _=abort_ingress.run_sync(|| dispatch_gpio_abort(&abort_intent,"interrupt"));
     })?;
-    spawn_abort_poll_thread(state.clone());
 
     let allowed_launch = allowed.clone();
     let tx_launch = tx.clone();
@@ -296,16 +306,34 @@ fn setup_callbacks(
     Ok(())
 }
 
-fn spawn_abort_poll_thread(state: Arc<AppState>) {
+fn publish_abort_input_reports(state: &AppState, reports: Vec<abort_input::Report>) {
+    for report in reports {
+        match report {
+            abort_input::Report::Info(message) => log::info!("{message}"),
+            abort_input::Report::Warning(message) => {
+                log::warn!("{message}");
+                crate::web::emit_warning(state, message);
+            }
+        }
+    }
+}
+
+fn spawn_abort_poll_thread(state: Arc<AppState>, mut monitor: AbortInputMonitor) {
     let gpio = state.gpio.clone();
     let mut shutdown_rx = state.shutdown_subscribe();
     let _ = thread::Builder::new()
         .name("gpio_abort_poll".to_string())
         .spawn(move || {
             log::info!(
-                "GPIO abort polling fallback started on BCM GPIO {ABORT_PIN}; active-high"
+                "GPIO abort polling fallback started on BCM GPIO {ABORT_PIN}; active-high; bias self-check every {} ms",
+                abort_input::SELF_CHECK_INTERVAL.as_millis()
             );
+            let line = GpioLine {
+                gpio: &gpio,
+                pin: ABORT_PIN,
+            };
             let mut last_level: Option<bool> = None;
+            let mut next_bias_check = Instant::now() + abort_input::SELF_CHECK_INTERVAL;
             loop {
                 match shutdown_rx.try_recv() {
                     Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
@@ -313,21 +341,24 @@ fn spawn_abort_poll_thread(state: Arc<AppState>) {
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
                 }
 
-                match gpio.read_input_pin(ABORT_PIN) {
-                    Ok(is_high) => {
-                        if last_level != Some(is_high) {
-                            log::info!(
-                                "GPIO abort poll level changed on BCM GPIO {ABORT_PIN}: is_high={is_high}"
-                            );
-                            if is_high {
-                                let _=state.control_ingress.run_sync(|| dispatch_gpio_abort(&state.manual_abort_intent,"polling fallback"));
-                            }
-                            last_level = Some(is_high);
-                        }
+                let now = Instant::now();
+                let level = line.read_level();
+                if let Ok(is_high) = level
+                    && last_level != Some(is_high)
+                {
+                    log::info!(
+                        "GPIO abort poll level changed on BCM GPIO {ABORT_PIN}: is_high={is_high}"
+                    );
+                    if is_high {
+                        let _=state.control_ingress.run_sync(|| dispatch_gpio_abort(&state.manual_abort_intent,"polling fallback"));
                     }
-                    Err(err) => {
-                        log::error!("GPIO abort poll failed to read BCM GPIO {ABORT_PIN}: {err}");
-                    }
+                    last_level = Some(is_high);
+                }
+                // A failed read re-requests the line with the bias written again.
+                publish_abort_input_reports(&state, monitor.observe_level(&line, now, &level));
+                if now >= next_bias_check {
+                    next_bias_check = now + abort_input::SELF_CHECK_INTERVAL;
+                    publish_abort_input_reports(&state, monitor.check_bias(&line));
                 }
 
                 thread::sleep(Duration::from_millis(ABORT_POLL_INTERVAL_MS));
