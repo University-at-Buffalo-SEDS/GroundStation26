@@ -2,6 +2,8 @@
 use crate::types::{BoardDiagnostics, NetworkBoardHealthEntry, RfTxTiming, canonical_sender_id};
 use std::{collections::HashMap, time::Instant};
 pub const TIMEOUT_MS: u64 = 12_000;
+/// Window for the board clock estimate (see `observe_clock`).
+const CLOCK_WINDOW_MS: u64 = 10_000;
 #[derive(Default)]
 pub struct Tracker {
     boards: HashMap<String, Record>,
@@ -275,13 +277,22 @@ impl Tracker {
             .observe(now, wall_ms, true);
     }
     /// Board packet timestamp against station receive time, for clock sync display.
+    /// Transport delay only ever makes a packet look older, so the least
+    /// negative offset seen in the last CLOCK_WINDOW_MS is the clock estimate;
+    /// the last sample alone reads a queued radio packet as a slow clock.
     pub fn observe_clock(&mut self, sender: &str, source_ms: u64, wall_ms: u64, now: Instant) {
         let sender = canonical_sender_id(sender.trim());
         if sender.is_empty() || sender == "GS" || sender.starts_with('@') || source_ms == 0 {
             return;
         }
         let offset = (source_ms as i128 - wall_ms as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-        self.record(sender, now, wall_ms).clock = Some((offset, now));
+        let record = self.record(sender, now, wall_ms);
+        let keep = record
+            .clock
+            .is_some_and(|(best, at)| best > offset && elapsed(now, at) <= CLOCK_WINDOW_MS);
+        if !keep {
+            record.clock = Some((offset, now));
+        }
     }
     /// How long `sender` has been continuously connected, or `None` while it
     /// is offline or has never been seen.
@@ -419,6 +430,30 @@ mod tests {
     use std::time::Duration;
     fn at(t: Instant, ms: u64) -> Instant {
         t + Duration::from_millis(ms)
+    }
+    #[test]
+    fn clock_offset_ignores_transport_delay_within_its_window() {
+        let t = Instant::now();
+        let mut tracker = Tracker::default();
+        let offset = |tracker: &mut Tracker, now| {
+            tracker
+                .snapshot(now, false)
+                .into_iter()
+                .find(|row| row.sender_id == "RF")
+                .and_then(|row| row.clock_offset_ms)
+        };
+        // A packet that arrives promptly shows the real 20 ms offset; one that
+        // sat 30 s in a radio queue does not replace it.
+        tracker.observe("RF", t, 100_000);
+        tracker.observe_clock("RF", 100_020, 100_000, t);
+        tracker.observe("RF", at(t, 2_000), 102_000);
+        tracker.observe_clock("RF", 102_000 - 30_000, 102_000, at(t, 2_000));
+        assert_eq!(offset(&mut tracker, at(t, 2_000)), Some(20));
+        // Once the prompt sample ages out, the newest sample is the estimate,
+        // so a clock that really is behind still shows.
+        tracker.observe("RF", at(t, 11_000), 111_000);
+        tracker.observe_clock("RF", 111_000 - 30_000, 111_000, at(t, 11_000));
+        assert_eq!(offset(&mut tracker, at(t, 11_000)), Some(-30_000));
     }
     #[test]
     fn rf_tx_timing_block_is_tagged_and_never_shadows_sd_or_adc_words() {
