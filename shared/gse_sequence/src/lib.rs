@@ -723,7 +723,7 @@ impl Engine {
                     return Err("Self-test blocked: self-test is locked after the fill began".into())
                 }
                 Action::SelfTest if !self.config.dry_self_test_confirmed => {
-                    return Err("Self-test blocked: confirm the system is dry and isolated first".into())
+                    return Err("Self-test blocked: tick \"Unlock dry valve self-test\" to confirm the gas supplies are isolated".into())
                 }
                 Action::NitrogenTest if self.active() => {
                     return Err("Nitrogen test blocked: another GSE sequence is running".into())
@@ -1860,7 +1860,7 @@ mod tests {
         // Self-test without the dry confirmation.
         rig.engine.config.dry_self_test_confirmed = false;
         let error = rig.engine.request(Action::SelfTest, rig.input()).unwrap_err();
-        assert!(error.contains("confirm the system is dry"), "{error}");
+        assert!(error.contains("Unlock dry valve self-test"), "{error}");
     }
     struct Rig {
         engine: Engine,
