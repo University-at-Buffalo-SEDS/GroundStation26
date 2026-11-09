@@ -91,7 +91,8 @@ pub(crate) fn decode_diagnostics(w: &[u32]) -> Option<BoardDiagnostics> {
         uptime_ticks: u64::from(w[2]) | (u64::from(w[3]) << 32),
         uptime_frequency_hz: w[4],
         reset_flags: w[5],
-        watchdog_missing_mask: w[6],
+        watchdog_missing_mask: w[6] & 0xFFFF,
+        service_faults: service_fault_labels((w[6] >> 16) & 0xFF),
         heap_live_bytes: value(7, 1),
         heap_peak_bytes: value(8, 1),
         heap_region_bytes: value(9, 1),
@@ -122,6 +123,26 @@ pub(crate) fn decode_diagnostics(w: &[u32]) -> Option<BoardDiagnostics> {
         ..Default::default()
     })
 }
+/// Optional router services that failed to start on RF/PB firmware
+/// (telemetry.c TELEMETRY_SERVICE_*). The board keeps routing and retries
+/// them every 5 s; the operator sees which feature is unavailable.
+pub(crate) fn service_fault_labels(mask: u32) -> Vec<String> {
+    const LABELS: [&str; 4] = [
+        "Time sync setup failed",
+        "OTA storage unavailable",
+        "AV-bay underglow unavailable",
+        "Flight-state cache unavailable",
+    ];
+    (0..8)
+        .filter(|bit| mask & (1 << bit) != 0)
+        .map(|bit| {
+            LABELS
+                .get(bit as usize)
+                .map_or_else(|| format!("Service {bit} unavailable"), |label| label.to_string())
+        })
+        .collect()
+}
+
 /// "RFT1" little-endian in BOARD_HEALTH word 16.
 const RF_TX_TIMING_TAG: u32 = 0x3154_4652;
 
@@ -388,6 +409,25 @@ mod tests {
         words[16] = 0x3154_4653;
         assert_eq!(decode_diagnostics(&words).unwrap().rf_tx_timing, None);
     }
+    #[test]
+    fn service_faults_share_word_six_without_changing_the_watchdog_mask() {
+        let mut words = [0u32; 24];
+        words[0] = 1;
+        words[4] = 1000;
+        words[6] = 5;
+        let d = decode_diagnostics(&words).unwrap();
+        assert_eq!(d.watchdog_missing_mask, 5);
+        assert!(d.service_faults.is_empty());
+        words[6] = 5 | (0x0a << 16);
+        let d = decode_diagnostics(&words).unwrap();
+        assert_eq!(d.watchdog_missing_mask, 5);
+        assert_eq!(d.service_faults, ["OTA storage unavailable", "Flight-state cache unavailable"]);
+        words[6] = 0x80 << 16;
+        assert_eq!(decode_diagnostics(&words).unwrap().service_faults, ["Service 7 unavailable"]);
+        let json = serde_json::to_value(decode_diagnostics(&[1, 0, 0, 0, 1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap()).unwrap();
+        assert!(json.get("service_faults").is_none(), "omitted when every service started");
+    }
+
     #[test]
     fn signed_temperature_extension_preserves_legacy_diagnostics() {
         let mut words = [0_u32; 24];

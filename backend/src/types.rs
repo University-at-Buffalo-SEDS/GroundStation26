@@ -340,6 +340,10 @@ pub struct BoardDiagnostics {
     pub uptime_frequency_hz: u32,
     pub reset_flags: u32,
     pub watchdog_missing_mask: u32,
+    /// RF/PB optional router services that failed to start and are being
+    /// retried (BOARD_HEALTH word 6 bits 16..23); empty when all started.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_faults: Vec<String>,
     pub heap_live_bytes: Option<u32>,
     pub heap_peak_bytes: Option<u32>,
     pub heap_region_bytes: Option<u32>,
