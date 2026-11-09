@@ -104,7 +104,7 @@ async fn ignition_pair_stale_owner_with_fresh_other_owner_refuses() {
     if crate::operator_queue::isolated_native_case(module_path!(), "ignition_pair_stale_owner_with_fresh_other_owner_refuses") { return; }
     let fixture = ignition_valid_fixture().await;
     ignition_query_pair(&fixture).await;
-    tokio::time::sleep(Duration::from_millis(5050)).await;
+    tokio::time::sleep(crate::board_abort::PROOF_TTL + Duration::from_millis(50)).await;
     fixture.query(Board::ValveBoard).await;
     assert!(!fixture.state().board_abort.ignition_pair_current());
     assert!(!matches!(ignition_try_raw(&fixture, 14), Ok(true)));
@@ -375,9 +375,10 @@ async fn ignition_pair_prepared_packet_cannot_outlive_queried_pair_proof() {
     if crate::operator_queue::isolated_native_case(module_path!(), "ignition_pair_prepared_packet_cannot_outlive_queried_pair_proof") { return; }
     let fixture = ignition_valid_fixture().await;
     ignition_query_pair(&fixture).await;
-    // Consume part of the original five-second proof before preparing. The
-    // admission hook itself intentionally has a bounded five-second wait.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Consume most of the original proof window (PROOF_TTL) before preparing,
+    // so the 2.05 s hold below outlives it. The admission hook itself
+    // intentionally has a bounded five-second wait.
+    tokio::time::sleep(crate::board_abort::PROOF_TTL - Duration::from_secs(2)).await;
     let state = fixture.state();
     let host = state.topology_router.get().unwrap().clone();
     let pause = crate::gse::nonwaiting_admission_tests::Pause::install(&state);

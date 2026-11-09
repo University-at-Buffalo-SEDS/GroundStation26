@@ -22,7 +22,7 @@ pub(crate) const BOARDS: [Board; 7] = [
     Board::GatewayBoard,
     Board::DaqBoard,
 ];
-pub(crate) const PROOF_TTL: Duration = Duration::from_secs(5);
+pub(crate) const PROOF_TTL: Duration = Duration::from_secs(10);
 /// Wall-clock proof window; stretched only by a simulator build (`sim_freshness`).
 fn proof_ttl() -> Duration {
     crate::sim_freshness::wall(PROOF_TTL)
@@ -1008,7 +1008,7 @@ pub(crate) async fn refresh_status(
 mod reset_scope_context_tests {
     use super::*;
     #[test]
-    fn ignition_pair_lease_survives_healthy_two_second_refresh_but_expires_at_five() {
+    fn ignition_pair_lease_survives_healthy_two_second_refresh_but_expires_at_ten() {
         let runtime = Runtime::default();
         let start = Instant::now();
         for board in [Board::ActuatorBoard, Board::ValveBoard] {
@@ -1019,9 +1019,10 @@ mod reset_scope_context_tests {
             let register = runtime.register.lock().unwrap();
             assert_eq!(Runtime::masks_at(&register, start + Duration::from_secs(3)).1
                 & crate::ignition_pair::REQUIRED_MASK, crate::ignition_pair::REQUIRED_MASK);
-            assert_eq!(Runtime::masks_at(&register, start + Duration::from_secs(5)).1
+            assert_eq!(Runtime::masks_at(&register, start + PROOF_TTL).1
                 & crate::ignition_pair::REQUIRED_MASK, crate::ignition_pair::REQUIRED_MASK);
-            assert_eq!(Runtime::masks_at(&register, start + Duration::from_millis(5_001)).1
+            assert_eq!(PROOF_TTL, Duration::from_secs(10), "the launch and ignition-pair proof window");
+            assert_eq!(Runtime::masks_at(&register, start + Duration::from_millis(10_001)).1
                 & crate::ignition_pair::REQUIRED_MASK, 0);
         }
         runtime.observe_abort(Board::ActuatorBoard, start + Duration::from_millis(1), 101);

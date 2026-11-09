@@ -53,7 +53,7 @@ async fn held_actual_board_abort_publisher_preserves_accepted_exit_after_proof_e
         0,
         "accepted strong exit must clear actual Abort"
     );
-    tokio::time::sleep(Duration::from_millis(5100)).await;
+    tokio::time::sleep(crate::board_abort::PROOF_TTL + Duration::from_millis(100)).await;
     let daq_bit = 1 << 6;
     assert_eq!(
         state.board_abort.masks().1 & daq_bit,
