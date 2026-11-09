@@ -1461,8 +1461,16 @@ async fn exchange(
                         .map(BoardResult::Io)
                         .ok_or("Malformed commissioning IO reply");
                 }
-                Outcome::Rejected(_) => {
-                    return Err("Board rejected recovery; no reset applied. Wait for the active launch owner to complete, or explicitly stop it, then Query and confirm a new recovery intent.");
+                Outcome::Rejected(code) => {
+                    log::warn!("{:?} rejected recovery with board result {code}", target.board);
+                    return Err(match code {
+                        2 => "Board rejected recovery as UNSUPPORTED (2); no reset applied.",
+                        3 => "Board rejected recovery as UNAUTHORIZED (3); no reset applied.",
+                        4 => "Board rejected recovery as STALE (4): it holds no fresh recorded Query for this request (check board network time sync), or a launch owner is still active. No reset applied.",
+                        5 => "Board rejected recovery as UNSAFE (5); outputs or owner not stopped. No reset applied.",
+                        6 => "Board rejected recovery as INVALID (6); request did not match its recorded recovery. No reset applied.",
+                        _ => "Board rejected recovery with an unknown result; no reset applied.",
+                    });
                 }
             }
         }
