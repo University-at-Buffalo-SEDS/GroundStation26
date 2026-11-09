@@ -6520,7 +6520,15 @@ mod tests {
             .unwrap()
             .observe("AB", now.wall, 100);
         let mut refresh = super::super::ReadonlyQueryRefresh::default();
-        assert_eq!(refresh.poll(&state), Some(Board::ActuatorBoard));
+        // Each link has its own turn (the AV bay may be asked in the same
+        // pass); the fill turn here is AB, the only fill board it can ask.
+        // A busy SDK core is retried after its 250 ms cooldown, never counted as sent.
+        for _ in 0..10 {
+            let _ = refresh.poll(&state);
+            if refresh.last[index(Board::ActuatorBoard).unwrap()].is_some() { break; }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert!(refresh.last[index(Board::ActuatorBoard).unwrap()].is_some(), "AB took the umbilical turn");
         assert_ne!(
             state.board_recovery.inner.lock().unwrap().queries[at]
                 .as_ref()
