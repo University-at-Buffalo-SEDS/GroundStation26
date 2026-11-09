@@ -611,12 +611,81 @@ enum RecoveryEgressSelection {
     PaidBudgetOnly,
 }
 
+/// An ordinary frame that waited this long for radio capacity may take one
+/// bounded critical turn. Receipts and commands keep the air debt a little
+/// ahead, so on a link they fill (faithful HITL: an unproven S5=10 pace and
+/// a busy AV bay) the ordinary lane otherwise never became ready: a parked
+/// schema chunk stayed counted as control and blocked recovery quiesce.
+const ORDINARY_STARVATION_MS: u64 = 1_000;
+
+impl UartWriteState {
+    /// Whether the ordinary frame now asking has waited long enough for a
+    /// critical turn; starts its wait otherwise.
+    fn ordinary_starved(&mut self, wall: Instant, clock: Option<u64>) -> bool {
+        let since = *self.ordinary_waiting.get_or_insert((wall, clock));
+        match (since.1, clock) {
+            (Some(then), Some(now)) => now.saturating_sub(then) >= ORDINARY_STARVATION_MS,
+            _ => wall.saturating_duration_since(since.0) >= Duration::from_millis(ORDINARY_STARVATION_MS),
+        }
+    }
+    /// Ordinary radio readiness: the normal airtime check, or one bounded
+    /// critical turn once the frame has waited ORDINARY_STARVATION_MS.
+    fn ordinary_ready(&mut self, wall: Instant, clock: Option<u64>, close: bool) -> bool {
+        let Some(cap) = self.radio_capacity.as_ref() else {
+            return true;
+        };
+        if cap.ready_for(wall, clock, close) {
+            return true;
+        }
+        let loan = cap.ready_for(wall, clock, true);
+        !close && self.ordinary_starved(wall, clock) && loan
+    }
+}
+
+#[cfg(test)]
+mod ordinary_starvation_tests {
+    use super::*;
+    /// Faithful HITL run (S5=1, unproven so paced for S5=10, busy AV bay):
+    /// receipts kept the radio's air debt just ahead, so the ordinary lane
+    /// never became ready; a parked schema chunk stayed counted as control
+    /// and recovery quiesce failed with "a control frame is still being
+    /// written". An ordinary frame now gets a bounded critical turn after
+    /// waiting ORDINARY_STARVATION_MS.
+    #[test]
+    fn ordinary_frame_gets_a_turn_while_receipts_keep_the_air_busy() {
+        let wall = Instant::now();
+        let mut state = UartWriteState {
+            radio_capacity: Some(rfd_capacity::Capacity::new(30_000, 18, 16)),
+            ..Default::default()
+        };
+        let mut ordinary_at = None;
+        for now in 0..5_000u64 {
+            let cap = state.radio_capacity.as_mut().unwrap();
+            // A receipt whenever a critical turn is open: the debt stays ahead.
+            if cap.ready_for(wall, Some(now), true) {
+                cap.committed(wall, Some(now), 50);
+            }
+            if ordinary_at.is_none() && state.ordinary_ready(wall, Some(now), false) {
+                ordinary_at = Some(now);
+                state.radio_capacity.as_mut().unwrap().committed(wall, Some(now), 200);
+                state.ordinary_waiting = None;
+            }
+        }
+        assert!(
+            ordinary_at.is_some_and(|at| at <= ORDINARY_STARVATION_MS + 300),
+            "ordinary frame sent at {ordinary_at:?}"
+        );
+    }
+}
+
 /// Per-packet air overhead charged for bytes heard from other modems.
 const RADIO_HEARD_PACKET_OVERHEAD_BYTES: u64 = 16;
 
 #[derive(Default)]
 struct UartWriteState {
     radio_capacity: Option<rfd_capacity::Capacity>,
+    /// Since when an ordinary frame has waited for radio capacity.
+    ordinary_waiting: Option<(Instant, Option<u64>)>,
     heard_air: rfd_capacity::HeardAir,
     cts_ready: bool,
     retry_tracker: Option<sedsnet::router::RetryTracker>,
@@ -3159,13 +3228,32 @@ impl UartComms {
                     payload.len() + RAW_UART_FRAME_HEADER_SIZE,
                 );
             }
-            !cap.ready_for(capacity_wall, capacity_clock, close_batch)
+            false
         }) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "radio modem capacity is still draining",
             )
             .into());
+        }
+        if command_id.is_none() && canonical_receipt.is_none() {
+            let ready = write_state.radio_capacity.as_ref().is_none_or(|cap| {
+                cap.ready_for(capacity_wall, capacity_clock, close_batch)
+                    || (!close_batch
+                        && write_state.ordinary_waiting.is_some_and(|(wall, clock)| match (clock, capacity_clock) {
+                            (Some(then), Some(now)) => now.saturating_sub(then) >= ORDINARY_STARVATION_MS,
+                            _ => capacity_wall.saturating_duration_since(wall) >= Duration::from_millis(ORDINARY_STARVATION_MS),
+                        })
+                        && cap.ready_for(capacity_wall, capacity_clock, true))
+            });
+            if !ready {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "radio modem capacity is still draining",
+                )
+                .into());
+            }
+            write_state.ordinary_waiting = None;
         }
         let len = payload.len();
 
@@ -3566,8 +3654,11 @@ impl CommsDevice for UartComms {
                     !cap.ready_for_command(wall, clock, id, len, true)
                 };
             }
-            !cap.ready_for(wall, clock, closes_radio_packet_batch(priority, payload))
+            false
         }) {
+            return false;
+        }
+        if control.is_none() && !state.ordinary_ready(wall, clock, closes_radio_packet_batch(priority, payload)) {
             return false;
         }
         #[cfg(target_os = "linux")]
