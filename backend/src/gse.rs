@@ -3204,7 +3204,7 @@ pub(crate) fn operator_reset_block_reason(state: &AppState) -> Option<String> {
         return Some("The hardware network router is not running.".into());
     };
     for name in ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND"] {
-        match router.try_has_pending_reliable_tx_type(crate::telemetry_schema::data_type(name)) {
+        match crate::abort_retirement::try_has_pending_reliable_tx_type(router, crate::telemetry_schema::data_type(name)) {
             Ok(false) => {}
             Ok(true) => return Some(format!("A {name} is still waiting for a board acknowledgement; wait for it to finish or time out.")),
             Err(_) => return Some("The network router is busy; try again in a moment.".into()),
@@ -3231,8 +3231,8 @@ pub(crate) fn operator_reset_host_idle(state: &AppState) -> bool {
         // Busy means not yet eligible for Reset, never a manual-command veto.
         && state.topology_router.get().is_some_and(|router| {
             ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND"]
-                .iter().all(|name| matches!(router.try_has_pending_reliable_tx_type(
-                    crate::telemetry_schema::data_type(name)), Ok(false)))
+                .iter().all(|name| matches!(crate::abort_retirement::try_has_pending_reliable_tx_type(
+                    router, crate::telemetry_schema::data_type(name)), Ok(false)))
         })
 }
 /// Host work owners only (RAM), without the router's in-flight commands.
@@ -3318,6 +3318,8 @@ pub(crate) fn commands_still_in_delivery(router: &sedsnet::router::Router, kinds
         .collect::<Vec<_>>();
     fresh.extend(rows.iter()
         .filter(|row| kinds.contains(&row.data_type) && !row.waiting_for_predecessor)
+        // A retired automatic ABORT is never sent again: it holds nothing.
+        .filter(|row| !crate::abort_retirement::is_retired(router, row.packet_id))
         .filter(|row| {
             let first = *seen.entry((owner, row.packet_id)).or_insert(now);
             now.duration_since(first) < window
@@ -3486,7 +3488,13 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
     rt.engine.config.dry_self_test_confirmed = false;
     drop(rt);
     state.set_local_flight_state(FlightState::Idle);
-    if undelivered_abort {
+    // Cleared: an automatic ABORT still owed to a board must not land later.
+    // Manual Aborts are not registered there and keep their delivery.
+    let retired = crate::abort_retirement::retire_on_operator_clear(state, router);
+    if undelivered_abort
+        && (retired == 0
+            || crate::abort_retirement::try_has_pending_reliable_tx_type(router, crate::telemetry_schema::data_type("ABORT")).unwrap_or(true))
+    {
         state.add_notification(UNDELIVERED_ABORT_AFTER_CLEAR);
     }
     crate::sequences::refresh_action_policy_now(state);
@@ -4045,7 +4053,7 @@ pub(crate) fn manual_stop_state(state: &AppState) -> CurrentState {
         return CurrentState::Current;
     };
     // Generated identity only: no schema lookup/init under application guards.
-    match router.try_has_pending_reliable_tx_type(crate::telemetry_schema::types::ABORT) {
+    match crate::abort_retirement::try_has_pending_reliable_tx_type(router, crate::telemetry_schema::types::ABORT) {
         Ok(false) => CurrentState::Current,
         Ok(true) => CurrentState::Invalid,
         Err(sedsnet::router::TryPendingTypeError::CoreBusy) => CurrentState::PendingBusy,
@@ -4054,7 +4062,7 @@ pub(crate) fn manual_stop_state(state: &AppState) -> CurrentState {
 pub(crate) fn manual_stop_pending(state: &AppState) -> bool {
     manual_stop_ram_pending(state)
         || state.topology_router.get().is_some_and(|router| {
-            router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT"))
+            crate::abort_retirement::has_pending_reliable_tx_type(router, crate::telemetry_schema::data_type("ABORT"))
         })
 }
 // Safety catalog (About safety): manual-stop. Keep backend/src/safety_catalog_rules.rs in step.
@@ -4471,7 +4479,7 @@ pub(crate) fn queue_prepared_launch_packets(
                     .map(crate::telemetry_schema::data_type)
             });
             for kind in controller_types.iter().copied() {
-                match router.try_has_pending_reliable_tx_type(kind) {
+                match crate::abort_retirement::try_has_pending_reliable_tx_type(router, kind) {
                     Ok(false) => {}
                     Ok(true) if crate::runtime_mode::is_hitl() => {}
                     Ok(true) => return Err("Controller command delivery is pending; launch was not dispatched".into()),

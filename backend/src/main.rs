@@ -1,3 +1,4 @@
+mod abort_retirement;
 mod admin;
 mod daq_launch_log;
 mod daq_sd;
@@ -2045,6 +2046,8 @@ async fn main() -> anyhow::Result<()> {
     set_network_time_router(router.clone());
     let _ = state.topology_router.set(router.clone());
     let (mut abort_observations, abort_observations_stop) = crate::deferred_abort::spawn(state.clone());
+    // Retires stale automatic ABORTs; stops with the station.
+    drop(crate::abort_retirement::spawn(state.clone(), router.clone()));
 
     let (rocket_tx, rocket_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
     let (umbilical_tx, umbilical_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();

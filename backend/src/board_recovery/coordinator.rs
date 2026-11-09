@@ -1681,7 +1681,7 @@ const ABORT_DRAIN: Duration = Duration::from_secs(6);
 /// destinations by `hash_bytes_u64(0x517C_C1B7_2722_0A95, sender)`, or by the
 /// compact address for an `@addr:` sender; a test pins this against a live
 /// router so an SDK change cannot silently break the attribution.
-fn pending_destination_board(router: &sedsnet::router::Router, owner: u64) -> Option<Board> {
+pub(crate) fn pending_destination_board(router: &sedsnet::router::Router, owner: u64) -> Option<Board> {
     const SENDER_HASH_SEED: u64 = 0x517C_C1B7_2722_0A95;
     let named = BOARDS
         .into_iter()
@@ -1785,7 +1785,7 @@ pub(super) fn quiesce_blockers(state: &AppState, router: &sedsnet::router::Route
             continue;
         }
         let ty = crate::telemetry_schema::data_type(name);
-        match router.try_has_pending_reliable_tx_type(ty) {
+        match crate::abort_retirement::try_has_pending_reliable_tx_type(router, ty) {
             Ok(false) => continue,
             Err(_) => {
                 blockers.push(Blocker::RouterBusy);
@@ -1796,7 +1796,10 @@ pub(super) fn quiesce_blockers(state: &AppState, router: &sedsnet::router::Route
         let rows = rows.get_or_insert_with(|| router.export_reliable_pending_stats());
         let mut boards = 0u8;
         let mut retries = 0u32;
-        let typed = rows.iter().filter(|row| row.data_type == ty).collect::<Vec<_>>();
+        // A retired automatic ABORT is never sent again: it owes nothing.
+        let typed = rows.iter()
+            .filter(|row| row.data_type == ty && !crate::abort_retirement::is_retired(router, row.packet_id))
+            .collect::<Vec<_>>();
         // Pending in the SDK but not yet a tracked end-to-end delivery: its
         // destinations are unknown.
         let mut unnamed = typed.is_empty();

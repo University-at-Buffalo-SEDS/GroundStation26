@@ -555,6 +555,11 @@ impl TxQueueBudget {
                 "empty transport write",
             ));
         }
+        // A retired automatic ABORT is accepted and dropped: it never reaches
+        // the air, and each dropped offer spends one of the SDK's retries.
+        if crate::abort_retirement::suppress_write(payload) {
+            return Ok(());
+        }
         // Earlier parked frames go first; they keep the side's wire order.
         self.drain_parked();
         if self.short_lookahead {
@@ -1019,7 +1024,9 @@ impl TxQueueBudget {
                 (None, None) => break,
             };
             let front = &parked[index];
-            if front.lease.as_ref().is_some_and(|lease| lease.discard_if_retired()) {
+            if front.lease.as_ref().is_some_and(|lease| lease.discard_if_retired())
+                || crate::abort_retirement::suppress_write(&front.bytes)
+            {
                 let frame = parked.remove(index).expect("index just chosen");
                 self.forget_write_lease(&frame.bytes);
                 if let Some(activity) = &frame.activity {
@@ -1084,19 +1091,20 @@ fn discard_retired_write(
     priority: u8,
     payload: &[u8],
 ) -> bool {
-    if let Some(budget) = budget
-        && budget
-            .write_lease(payload)
-            .is_some_and(|lease| lease.discard_if_retired())
-    {
-        budget.complete(priority, payload);
-        if let Some(activity) = activity {
-            activity.complete_frame(payload);
-        }
-        true
-    } else {
-        false
+    let retired = budget
+        .and_then(|budget| budget.write_lease(payload))
+        .is_some_and(|lease| lease.discard_if_retired())
+        || crate::abort_retirement::suppress_write(payload);
+    if !retired {
+        return false;
     }
+    if let Some(budget) = budget {
+        budget.complete(priority, payload);
+    }
+    if let Some(activity) = activity {
+        activity.complete_frame(payload);
+    }
+    true
 }
 
 fn send_owned_write(
@@ -1381,7 +1389,8 @@ impl WireBacklog {
         let retain = |priority: u8, bytes: &[u8]| {
             let retired = budget
                 .write_lease(bytes)
-                .is_some_and(|lease| lease.discard_if_retired());
+                .is_some_and(|lease| lease.discard_if_retired())
+                || crate::abort_retirement::suppress_write(bytes);
             if retired {
                 budget.complete(priority, bytes);
                 if let Some(activity) = activity {
@@ -3600,6 +3609,9 @@ pub(super) fn spawn_comms_worker_threads(
                     let Some((priority, payload)) = selected else {
                         break;
                     };
+                    if discard_retired_write(comms_handle.tx_budget.as_deref(), comms_handle.transport_activity.as_deref(), priority, &payload) {
+                        continue;
+                    }
                     if !comms.transmit_ready_for(priority, &payload) {
                         (
                             backlog.application_bytes,
@@ -3621,13 +3633,15 @@ pub(super) fn spawn_comms_worker_threads(
                         backlog.batch_follower(&**comms, (priority, &payload))
                     } else {
                         None
-                    };
+                    }
+                    .filter(|(p, b)| !discard_retired_write(comms_handle.tx_budget.as_deref(), comms_handle.transport_activity.as_deref(), *p, b));
                     backlog.refill(&mut comms_handle.tx_rx, &mut drain_remaining);
                     let third = follower.as_ref().and_then(|(next_priority, next_payload)| {
                         let bytes = comms.command_batch_frame_len(priority, &payload)?
                             .checked_add(comms.command_batch_frame_len(*next_priority, next_payload)?)?;
                         backlog.batch_tail_follower_after_bytes(&**comms, bytes)
-                    });
+                    })
+                    .filter(|(p, b)| !discard_retired_write(comms_handle.tx_budget.as_deref(), comms_handle.transport_activity.as_deref(), *p, b));
                     let mut frames = vec![(priority, &payload[..])];
                     frames.extend(follower.iter().chain(third.iter()).map(|(p, b)| (*p, &b[..])));
                     let leases: Vec<_> = frames.iter().filter_map(|(_, bytes)|
@@ -6006,3 +6020,7 @@ mod owner_ack_loss_tests;
 #[cfg(test)]
 #[path = "radio_refusal_storm_tests.rs"]
 mod refusal_storm_tests;
+
+#[cfg(test)]
+#[path = "radio_abort_retirement_tests.rs"]
+mod abort_retirement_tests;

@@ -150,6 +150,9 @@ struct Record {
     proof_boot: u64,
     proof_epoch: u32,
     proof_nonce: u64,
+    /// Issue time of the latest query whose validated reply proved the board
+    /// out of Abort. Cleared by any later Abort; only ever moves forward.
+    non_abort_query_after: Option<Instant>,
 }
 /// Process-local diagnostic chronology only. These tokens never cross the wire
 /// or restore current proof from disk.
@@ -414,6 +417,7 @@ impl Runtime {
         row.last_abort = Some(received);
         row.last_local_abort = Some(received);
         row.proof_after = None;
+        row.non_abort_query_after = None;
         let raised = !row.aborted;
         if raised { row.first_abort_ms = timestamp_ms; }
         row.aborted = true;
@@ -467,12 +471,22 @@ impl Runtime {
             row.proof_boot = boot;
             row.proof_epoch = epoch;
             row.proof_nonce = nonce;
+            row.non_abort_query_after = Some(row.non_abort_query_after.map_or(query_after, |at| at.max(query_after)));
             if publish_exit { register.alert_edges.push(board, AlertEdgeKind::AcceptedExit, episode, timestamp_ms, None); }
             register.history_unknown &= !(1 << i);
         }
         register.version = register.version.saturating_add(1);
         drop(register);
         self.notify_changed();
+    }
+    /// True when this board's latest validated status reply proved it out of
+    /// Abort for a query issued after `at`, and no Abort has been seen since.
+    pub(crate) fn non_abort_proven_after(&self, board: Board, at: Instant) -> bool {
+        index(board).is_some_and(|i| {
+            let register = self.register.lock().unwrap();
+            let row = &register.rows[i];
+            !row.aborted && row.non_abort_query_after.is_some_and(|after| after > at)
+        })
     }
     pub(crate) fn mirror_proof(&self) -> (u8, u8, [u16; 7], u64) {
         let register = self.register.lock().unwrap();
@@ -735,7 +749,7 @@ pub(crate) fn shutdown_stop_quiesced(state: &AppState) -> bool {
         || state.manual_abort_intent.pending_epoch().is_some() || state.deferred_abort.manual_pending() {
         return false;
     }
-    state.topology_router.get().is_some_and(|router| !router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT")))
+    state.topology_router.get().is_some_and(|router| !crate::abort_retirement::has_pending_reliable_tx_type(router, crate::telemetry_schema::data_type("ABORT")))
 }
 pub(crate) fn required_mask(state: &AppState) -> u8 {
     if crate::rrls::is_rrls() {

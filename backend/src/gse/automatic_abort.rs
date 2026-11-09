@@ -673,6 +673,61 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn clear_retires_an_automatic_abort_the_radio_cannot_deliver() {
+        crate::mode_suite!(Normal, TestFire, Testing);
+        use std::sync::atomic::AtomicU64;
+        let state = crate::state::tests::test_app_state().await;
+        let clock = Arc::new(AtomicU64::new(0));
+        let model = clock.clone();
+        let router = Arc::new(sedsnet::router::Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([]),
+            Box::new(move || model.load(Ordering::SeqCst)),
+        ));
+        let path = armed_fixture_for_test(&state, &router);
+        router.remove_side(0).unwrap();
+        // The AV bay sits behind a saturated radio that refuses every ABORT.
+        let radio = router.add_side_packed("saturated_radio", |wire| {
+            if sedsnet::wire_format::peek_frame_info(wire)
+                .is_ok_and(|f| f.envelope.ty == crate::telemetry_schema::data_type("ABORT"))
+            {
+                return Err(sedsnet::TelemetryError::Io("side tx busy"));
+            }
+            Ok(())
+        });
+        let announce = sedsnet::discovery::build_discovery_announce(
+            "FC",
+            123,
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
+        )
+        .unwrap();
+        router.rx_packed_from_side(&sedsnet::wire_format::pack_packet(&announce), radio).unwrap();
+        router.process_all_queues_with_timeout(0).unwrap();
+        assert!(dispatch_abort_for_shared_policy_test(&state, &router));
+        let abort = crate::telemetry_schema::data_type("ABORT");
+        let id = router.export_reliable_pending_stats().into_iter()
+            .find(|row| row.data_type == abort)
+            .expect("owed to the AV bay").packet_id;
+        assert!(operator_reset_block_reason(&state).is_some_and(|r| r.contains("ABORT")));
+        // The normal delivery window still holds Clear (unchanged rule).
+        assert!(clear_ground_abort(&state).unwrap_err().1.contains("delivery is still pending"));
+        crate::gse::age_delivery_tracking_for_test(crate::sim_freshness::wall(UNDELIVERABLE_AFTER) * 2);
+        clear_ground_abort(&state).unwrap();
+        assert_eq!(
+            crate::abort_retirement::retired_reason(&router, id),
+            Some(crate::abort_retirement::RetireReason::OperatorCleared)
+        );
+        assert!(router.has_pending_reliable_tx_type(abort), "the SDK still holds it");
+        assert!(
+            !operator_reset_block_reason(&state).is_some_and(|r| r.contains("ABORT")),
+            "a retired abort no longer holds Reset"
+        );
+        let notes = state.notifications.lock().unwrap().iter().map(|n| n.message.clone()).collect::<Vec<_>>();
+        assert!(notes.iter().any(|n| n.contains("Stale automatic Abort retired") && n.contains("Flight Computer")), "{notes:?}");
+        assert!(!notes.iter().any(|n| n == UNDELIVERED_ABORT_AFTER_CLEAR), "{notes:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn clear_waits_for_no_peer_abort_already_handed_to_software_transport() {
         crate::mode_suite!(Normal, TestFire, Testing);
         let state = crate::state::tests::test_app_state().await;
