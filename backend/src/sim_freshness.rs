@@ -80,7 +80,9 @@ mod tests {
 
     #[test]
     fn operational_launch_proof_windows_are_unchanged() {
-        assert_eq!(crate::board_abort::PROOF_TTL, Duration::from_secs(5));
+        // Launch / ignition-pair board proof: 10 s (92cee1c). The actuator
+        // plumbing freshness window stays 5 s.
+        assert_eq!(crate::board_abort::PROOF_TTL, Duration::from_secs(10));
         assert_eq!(crate::actuator_plumbing::FRESH_MS, 5_000);
     }
 
