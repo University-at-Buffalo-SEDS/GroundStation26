@@ -97,6 +97,12 @@ impl Tracker {
         }
     }
     /// True when the board currently disagrees and no re-send is outstanding.
+    /// A sustained mismatch means the board holds a newer write than this
+    /// station's stamp; re-stamp at most once per MISMATCH_AFTER.
+    fn restamp_due(&self, selected: Kg50Input, stamp_ms: u64, wall_ms: u64, now: Instant) -> bool {
+        self.status_at(selected, now).state == SyncState::Mismatch
+            && wall_ms.saturating_sub(stamp_ms) >= MISMATCH_AFTER.as_millis() as u64
+    }
     fn republish_due(&self, selected: Kg50Input, now: Instant) -> bool {
         let status = self.status_at(selected, now);
         matches!(status.state, SyncState::Syncing | SyncState::Mismatch)
@@ -121,12 +127,29 @@ pub async fn service(
         let Some(router) = state.topology_router.get().filter(|_| !crate::rrls::is_rrls()) else {
             continue;
         };
-        let calibration = state.loadcell_calibration.lock().unwrap().clone();
-        if !state
-            .kg50_input_sync
-            .republish_due(calibration.kg50_input, Instant::now())
-        {
+        let mut calibration = state.loadcell_calibration.lock().unwrap().clone();
+        let now = Instant::now();
+        if !state.kg50_input_sync.republish_due(calibration.kg50_input, now) {
             continue;
+        }
+        // The input is a network variable: the newest stamp wins. A board that
+        // keeps reporting another input holds a newer write (another station,
+        // or a station run that lost this file), so an older stamp is ignored
+        // forever. This station owns the selection: re-stamp it now, at most
+        // once per MISMATCH_AFTER, so the next send outranks the stray value.
+        let wall = crate::telemetry_task::get_current_timestamp_ms();
+        if state.kg50_input_sync.restamp_due(calibration.kg50_input, calibration.kg50_input_stamp_ms, wall, now) {
+            calibration.kg50_input_stamp_ms = wall.max(calibration.kg50_input_stamp_ms.saturating_add(1));
+            match crate::loadcell::save(&calibration) {
+                Ok(()) => {
+                    *state.loadcell_calibration.lock().unwrap() = calibration.clone();
+                    log::warn!(
+                        "DAQ kept reporting another 50 kg input; re-stamped this station's selection {:?} so it outranks the stray value",
+                        calibration.kg50_input
+                    );
+                }
+                Err(error) => log::warn!("re-stamping the 50 kg input selection failed: {error}"),
+            }
         }
         let Some(generation) = crate::gse::capture_operator_origin(&state) else {
             continue;
@@ -148,6 +171,25 @@ pub async fn service(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_board_holding_a_newer_stray_input_gets_a_fresh_stamp_once_per_window() {
+        // A station run without this file wrote another input with a newer
+        // stamp; re-sends with the old stamp were ignored forever.
+        let sync = Tracker::default();
+        let t = Instant::now();
+        let old_stamp = 1_000;
+        sync.observe_at(Kg50Input::Amp2, t);
+        assert!(!sync.restamp_due(Kg50Input::P6Differential, old_stamp, 100_000, t), "only once it persists");
+        let later = t + MISMATCH_AFTER + Duration::from_secs(1);
+        sync.observe_at(Kg50Input::Amp2, later);
+        assert!(sync.restamp_due(Kg50Input::P6Differential, old_stamp, 100_000, later));
+        // Just re-stamped: wait a full window before stamping again.
+        assert!(!sync.restamp_due(Kg50Input::P6Differential, 99_000, 100_000, later));
+        // An agreeing board never triggers it.
+        sync.observe_at(Kg50Input::P6Differential, later);
+        assert!(!sync.restamp_due(Kg50Input::P6Differential, old_stamp, 100_000, later));
+    }
 
     #[test]
     fn unknown_until_the_board_reports() {
