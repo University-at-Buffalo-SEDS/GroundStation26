@@ -1122,6 +1122,13 @@ impl TxQueueBudget {
         let cap = self.park_cap_bytes();
         // An empty park takes any one frame, so a frame larger than the
         // airtime cap still progresses.
+        // A best-effort template install (heartbeat, time sync, telemetry)
+        // is never refused for the airtime cap: only the newest install of
+        // each template waits (superseded above), so this is bounded by the
+        // number of templates. Refused, it was re-offered on every router
+        // pass while schema chunks filled the park, and no heartbeat reached
+        // the FC for seconds.
+        let cap = if install.is_some() { PARK_MAX_BYTES } else { cap };
         let fits = |parked: &VecDeque<Parked>| {
             parked.is_empty()
                 || (parked.len() < self.park_frames

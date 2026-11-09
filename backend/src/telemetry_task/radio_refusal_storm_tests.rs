@@ -1074,7 +1074,10 @@ fn slow_bench_air_keeps_queued_frames_within_two_seconds() {
     // reliable messages per second), so receipts alone take half the air.
     let report = run_uplink_model(40_000, 0.4, 20, true, 250);
     eprintln!("SLOW_BENCH_UPLINK {report:#?}");
-    assert!(report.park_bytes_peak <= 640, "the park holds about 1.5 s of air: {report:#?}");
+    // About 1.5 s of air (600 B at 400 B/s), plus at most one template
+    // install per best-effort template (GPS, heartbeat), which never waits
+    // for the cap.
+    assert!(report.park_bytes_peak <= 720, "the park holds about 1.5 s of air: {report:#?}");
     assert!(report.heartbeats_received >= 3, "{report:#?}");
     assert!(report.heartbeat_age_max_ms <= 5_000, "heartbeats arrive within the FC's reach: {report:#?}");
     assert!(report.gps_received >= 1, "{report:#?}");
@@ -1210,4 +1213,48 @@ fn time_sync_frames_are_not_recovery_control() {
     let abort = serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type("ABORT"),
         &[crate::telemetry_schema::endpoint("ABORT")], "GS", 1, Arc::from(&b"SEDS_MANUAL_ABORT_V1:K"[..])).unwrap()).to_vec();
     assert!(is_recovery_control_frame(&abort));
+}
+
+/// Found chasing a nondeterministic refusal count: depending on packet
+/// nonces the SDK re-sends GPS and HEARTBEAT template installs while schema
+/// chunks fill the time-bounded park. Installs were never replaceable-dropped
+/// and did not fit, so they were refused on every router pass for about 9 s
+/// (thousands of re-offers) and no heartbeat reached the FC for that long
+/// (its ground timeout is 3 s). A best-effort template install now always
+/// parks: only the newest install of each template waits, so this is bounded
+/// by the number of templates.
+#[test]
+fn heartbeat_template_install_parks_even_when_schema_chunks_fill_the_park() {
+    crate::telemetry_schema::initialize().unwrap();
+    let install = |stamp: u64| {
+        let frame = serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type("HEARTBEAT"),
+            &[crate::telemetry_schema::endpoint("HEART_BEAT")], "GS", stamp, Arc::from([])).unwrap()).to_vec();
+        let mut bytes = b"SDT\x01".to_vec();
+        bytes.push(9);
+        bytes.extend_from_slice(&frame);
+        bytes.extend(crc32fast::hash(&bytes).to_le_bytes());
+        bytes
+    };
+    let budget = TxQueueBudget::new_radio(2048, 256);
+    budget.set_paced_bytes_per_s(400);
+    let (tx, _rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
+    budget.try_send(&tx, 0, &[1; 250]).unwrap();
+    // Schema chunks (never shed) fill the 1.5 s park.
+    let mut transfer = 0u32;
+    loop {
+        let mut chunk = vec![0u8; 192];
+        chunk[..4].copy_from_slice(b"SDT\x03");
+        chunk[4..8].copy_from_slice(&transfer.to_le_bytes());
+        chunk[8..10].copy_from_slice(&1u16.to_le_bytes());
+        chunk[10..12].copy_from_slice(&2u16.to_le_bytes());
+        transfer += 1;
+        if budget.try_send(&tx, 254, &chunk).is_err() {
+            break;
+        }
+    }
+    let parked = budget.diagnostics()["parked_frames"].as_u64().unwrap();
+    budget.try_send(&tx, 255, &install(1)).expect("a heartbeat install is never refused for a full park");
+    assert_eq!(budget.diagnostics()["parked_frames"].as_u64().unwrap(), parked + 1);
+    budget.try_send(&tx, 255, &install(2)).expect("a newer install of the same template replaces it");
+    assert_eq!(budget.diagnostics()["parked_frames"].as_u64().unwrap(), parked + 1, "one install per template");
 }
