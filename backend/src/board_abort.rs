@@ -236,6 +236,10 @@ pub(crate) struct ActiveError {
     pub message: String,
     #[serde(default = "launch_gate_default")]
     pub launch_blocking: bool,
+    /// The operator may dismiss it from the error list: any board's Abort in
+    /// HITL, where boards are often off the bench. Display only.
+    #[serde(default)]
+    pub dismissible: bool,
 }
 fn launch_gate_default() -> bool { true }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -729,7 +733,8 @@ impl Runtime {
             if rows[i].aborted {
                 out.active_errors.push(ActiveError{source:format!("board_abort:{}",board.sender_id()),
                 board:board.sender_id().into(),board_label:board.as_str().into(),timestamp_ms:rows[i].first_abort_ms,
-                message:format!("{} reports Abort. New launch is disabled until a fresh actual non-Abort state is confirmed.",board.as_str()),launch_blocking:true});
+                message:format!("{} reports Abort. New launch is disabled until a fresh actual non-Abort state is confirmed.",board.as_str()),launch_blocking:true,
+                dismissible:crate::runtime_mode::is_hitl()});
             }
         }
         out
@@ -1121,6 +1126,18 @@ mod launch_presence_tests {
     }
     /// A test fire runs without the AV bay: an aborted, present RF neither
     /// blocks the stand's Launch nor shows an error; an aborted VB still does.
+    #[tokio::test]
+    async fn hitl_marks_every_board_abort_dismissible_and_other_modes_none() {
+        for (mode, expected) in [(crate::station_mode::Mode::Hitl, true), (crate::station_mode::Mode::Normal, false)] {
+            let _mode = crate::runtime_mode::test_support::thread_mode(mode);
+            let state = crate::state::tests::test_app_state().await;
+            state.board_abort.observe_abort(Board::RFBoard, Instant::now(), 100);
+            state.board_abort.observe_abort(Board::ValveBoard, Instant::now(), 101);
+            let errors = snapshot_for_state(&state).active_errors;
+            assert_eq!(errors.len(), 2);
+            assert!(errors.iter().all(|e| e.dismissible == expected), "{mode:?}");
+        }
+    }
     #[tokio::test]
     async fn test_fire_launch_ignores_av_bay_aborts_but_not_fill_board_aborts() {
         let _mode = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::TestFire);
