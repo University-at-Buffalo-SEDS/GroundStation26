@@ -589,9 +589,13 @@ impl Runtime {
     }
     /// Aborted boards that are still present: seen recently, or whose Abort
     /// report is itself recent. `seen` comes from `present_mask`.
+    /// Aborted boards that block Launch: present (or recently aborted) and part
+    /// of this mode. A test fire runs without the AV bay, so an aborted FC, RF
+    /// or PB stays reported but cannot hold the stand's Launch.
     fn launch_abort_mask_at(register: &Register, seen: u8, now: Instant) -> u8 {
         let (aborted, _) = Self::masks_at(register, now);
-        register.rows.iter().enumerate().fold(0, |mask, (i, row)| {
+        let scope = crate::board_recovery::scope::mode_scope(crate::station_mode::local_mode());
+        scope & register.rows.iter().enumerate().fold(0, |mask, (i, row)| {
             let recent = row.last_abort.is_some_and(|at| {
                 now.checked_duration_since(at).is_none_or(|age| age <= ABORT_PRESENCE_TTL)
             });
@@ -709,6 +713,7 @@ impl Runtime {
             history_error: self.history_failure(),
             ..Default::default()
         };
+        let scope = crate::board_recovery::scope::mode_scope(crate::station_mode::local_mode());
         for (i, board) in BOARDS.into_iter().enumerate() {
             if history_unknown & (1 << i) != 0 { out.history_unknown_boards.push(board.sender_id().into()); }
             if required & (1 << i) != 0 {
@@ -720,7 +725,12 @@ impl Runtime {
             if rows[i].aborted {
                 out.active_errors.push(ActiveError{source:format!("board_abort:{}",board.sender_id()),
                 board:board.sender_id().into(),board_label:board.as_str().into(),timestamp_ms:rows[i].first_abort_ms,
-                message:format!("{} reports Abort. New launch is disabled until a fresh actual non-Abort state is confirmed.",board.as_str()),launch_blocking:true});
+                message:if scope & (1 << i) != 0 {
+                    format!("{} reports Abort. New launch is disabled until a fresh actual non-Abort state is confirmed.",board.as_str())
+                } else {
+                    format!("{} reports Abort. It is not part of this mode, so it does not block Launch.",board.as_str())
+                },
+                launch_blocking:scope & (1 << i) != 0});
             }
         }
         out
@@ -862,12 +872,15 @@ pub(crate) fn snapshot_for_state(state: &AppState) -> Snapshot {
     if !crate::rrls::is_rrls() {
         // RRLS projects the primary's verdict and has no local board presence.
         let blocking = state.board_abort.launch_abort_mask(state);
+        let scope = crate::board_recovery::scope::mode_scope(crate::station_mode::local_mode());
         for error in &mut value.active_errors {
-            if BOARDS.iter().enumerate().any(|(i, board)| {
-                board.sender_id() == error.board && blocking & (1 << i) == 0
-            }) {
+            let Some(i) = BOARDS.iter().position(|board| board.sender_id() == error.board) else { continue };
+            if blocking & (1 << i) == 0 {
                 error.launch_blocking = false;
-                error.message = format!("{} last reported Abort and is not on the network. It does not block Launch.", error.board_label);
+                // Out-of-mode boards keep the snapshot's "not part of this mode" text.
+                if scope & (1 << i) != 0 {
+                    error.message = format!("{} last reported Abort and is not on the network. It does not block Launch.", error.board_label);
+                }
             }
         }
         value.history_blocks_launch = !crate::runtime_mode::is_hitl();
@@ -1109,6 +1122,28 @@ mod launch_presence_tests {
         assert!(blocked_message(&state).unwrap().contains("Abort"));
         assert!(capture_launch_revision_named(&state, "Launch").is_none());
         assert!(snapshot_for_state(&state).active_errors[0].launch_blocking);
+    }
+    /// A test fire runs without the AV bay: an aborted, present RF stays
+    /// reported but never blocks the stand's Launch; an aborted VB still does.
+    #[tokio::test]
+    async fn test_fire_launch_ignores_av_bay_aborts_but_not_fill_board_aborts() {
+        let _mode = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::TestFire);
+        let state = crate::state::tests::test_app_state().await;
+        let now = Instant::now();
+        state.board_abort.observe_abort(Board::RFBoard, now, 100);
+        state.board_status.lock().unwrap().get_mut(&Board::RFBoard).unwrap().last_seen_instant = Some(now);
+        assert_eq!(state.board_abort.launch_abort_mask(&state), 0);
+        assert!(blocked_message(&state).is_none());
+        let snapshot = snapshot_for_state(&state);
+        assert_eq!(snapshot.active_errors.len(), 1, "still reported");
+        assert!(!snapshot.active_errors[0].launch_blocking);
+        assert!(snapshot.active_errors[0].message.contains("not part of this mode"));
+
+        state.board_abort.observe_abort(Board::ValveBoard, now, 101);
+        state.board_status.lock().unwrap().get_mut(&Board::ValveBoard).unwrap().last_seen_instant = Some(now);
+        let bit = 1 << index(Board::ValveBoard).unwrap();
+        assert_eq!(state.board_abort.launch_abort_mask(&state), bit);
+        assert!(blocked_message(&state).unwrap().contains("Valve Board"));
     }
     /// A board the reset missed locks Launch once it returns, until it is reset
     /// or seen rebooted to Startup. While absent it blocks nothing.
