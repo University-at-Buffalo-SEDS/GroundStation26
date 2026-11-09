@@ -1045,7 +1045,10 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
 #[derive(Default)]
 pub(crate) struct ReadonlyQueryRefresh {
     last: [Option<WallInstant>; 7],
-    cursor: usize,
+    /// Round-robin position per link: AV bay (RF FC PB) and umbilical (AB VB
+    /// GB DAQ) each get their own turn, so fill-board queries never wait for
+    /// the radio side's turn.
+    cursor: [usize; 2],
     core_busy_last: [Option<WallInstant>; 7],
 }
 impl ReadonlyQueryRefresh {
@@ -1102,28 +1105,60 @@ impl ReadonlyQueryRefresh {
             .lock()
             .unwrap()
             .snapshot(now.wall, crate::runtime_mode::is_test_fire());
-        let candidate = {
+        let (last, core_busy_last) = (self.last, self.core_busy_last);
+        // Only boards this mode tracks (test fire has no AV bay).
+        let scope = scope::mode_scope(crate::station_mode::local_mode());
+        let picks = {
             let inner = state.board_recovery.inner.lock().unwrap();
-            (0..BOARDS.len())
-                .map(|offset| (self.cursor + offset) % BOARDS.len())
-                .find(|&at| {
-                    let board = BOARDS[at];
-                    let seen = healthy
-                        .iter()
-                        .any(|row| row.sender_id == board.sender_id() && row.healthy);
-                    self.due(at, now.wall) && readonly_query_candidate(
-                        seen,
-                        endpoint_verified(state, board, &topology),
-                        inner.values[at].as_ref(),
-                        inner.queries[at].as_ref(),
-                        now,
-                    ) && readonly_query_due(self.last[at], now.wall)
-                })
-        }?;
-        self.cursor = (candidate + 1) % BOARDS.len();
-        let board = BOARDS[candidate];
-        self.request(state, board).then_some(board)
+            pick_per_link(&mut self.cursor, |at| {
+                let board = BOARDS[at];
+                let seen = healthy
+                    .iter()
+                    .any(|row| row.sender_id == board.sender_id() && row.healthy);
+                // A board network health marks unhealthy is still asked, at a
+                // slower cadence, so one that comes back becomes fresh without
+                // an operator Query.
+                scope & (1 << at) != 0 && core_busy_last[at].is_none_or(|busy| now.wall.checked_duration_since(busy)
+                    .is_some_and(|age| age >= Duration::from_millis(250))) && readonly_query_candidate(
+                    true,
+                    endpoint_verified(state, board, &topology),
+                    inner.values[at].as_ref(),
+                    inner.queries[at].as_ref(),
+                    now,
+                ) && readonly_query_due_for(last[at], now.wall, seen)
+            })
+        };
+        let mut first = None;
+        for at in picks {
+            let board = BOARDS[at];
+            if self.request(state, board) && first.is_none() {
+                first = Some(board);
+            }
+        }
+        first
     }
+}
+/// AV-bay (radio) and umbilical (fill) board indices into BOARDS.
+const LINK_GROUPS: [&[usize]; 2] = [&[0, 1, 2], &[3, 4, 5, 6]];
+/// At most one due board per link per pass, each link with its own cursor.
+fn pick_per_link(cursor: &mut [usize; 2], eligible: impl Fn(usize) -> bool) -> Vec<usize> {
+    let mut picks = Vec::new();
+    for (group, members) in LINK_GROUPS.iter().enumerate() {
+        let start = cursor[group] % members.len();
+        if let Some(offset) = (0..members.len()).find(|offset| eligible(members[(start + offset) % members.len()])) {
+            picks.push(members[(start + offset) % members.len()]);
+            cursor[group] = (start + offset + 1) % members.len();
+        }
+    }
+    picks
+}
+/// A board network health marks unhealthy is re-queried this often.
+const UNHEALTHY_REQUERY: Duration = Duration::from_secs(10);
+fn readonly_query_due_for(last: Option<WallInstant>, now: WallInstant, healthy: bool) -> bool {
+    if healthy {
+        return readonly_query_due(last, now);
+    }
+    last.is_none_or(|last| now.checked_duration_since(last).is_some_and(|age| age >= UNHEALTHY_REQUERY))
 }
 fn readonly_query_due(last: Option<WallInstant>, now: WallInstant) -> bool {
     last.is_none_or(|last| {
@@ -1646,19 +1681,9 @@ mod tests {
         ));
         let mut refresh = ReadonlyQueryRefresh::default();
         if automatic {
-            // Unseen or unverified targets are never probed.
-            assert_eq!(refresh.poll(&state), None);
-            state
-                .network_health
-                .lock()
-                .unwrap()
-                .observe("GB", WallInstant::now(), 100);
-            assert_eq!(refresh.poll(&state), None);
-            state
-                .network_health
-                .lock()
-                .unwrap()
-                .observe("AB", WallInstant::now(), 100);
+            // A verified board that network health does not (yet) mark
+            // healthy is still asked, at the slower cadence, instead of never;
+            // unverified boards are not probed at all.
             assert_eq!(refresh.poll(&state), Some(Board::ActuatorBoard));
             assert_eq!(refresh.poll(&state), None); // Pending request / shared cooldown.
         } else {
@@ -2291,6 +2316,35 @@ mod recovery_requirement_tests {
             }
         }
         assert!(state.topology_router.get().is_none(),"read-only badge metadata never installs a transport or sends commands");
+    }
+}
+#[cfg(test)]
+mod per_link_poll_tests {
+    use super::*;
+    /// Fill-board queries never wait for the radio's turn: one pass picks a
+    /// due board on each link, each link keeps its own round-robin.
+    #[test]
+    fn each_link_gets_its_own_turn_every_pass() {
+        let mut cursor = [0, 0];
+        // RF and AB due: both are asked in the same pass.
+        assert_eq!(pick_per_link(&mut cursor, |at| at == 0 || at == 3), vec![0, 3]);
+        // Only fill boards due (the radio side is busy or cooling): the fill
+        // side still advances through VB, GB, DAQ in turn.
+        assert_eq!(pick_per_link(&mut cursor, |at| at >= 3), vec![4]);
+        assert_eq!(pick_per_link(&mut cursor, |at| at >= 3), vec![5]);
+        assert_eq!(pick_per_link(&mut cursor, |at| at >= 3), vec![6]);
+        assert_eq!(pick_per_link(&mut cursor, |at| at >= 3), vec![3]);
+        assert!(pick_per_link(&mut cursor, |_| false).is_empty());
+    }
+    /// A board network health marks unhealthy is re-asked every 10 s instead of
+    /// never, so a board that comes back becomes fresh without an operator Query.
+    #[test]
+    fn an_unhealthy_board_is_re_queried_at_a_slower_cadence() {
+        let start = WallInstant::now();
+        assert!(readonly_query_due_for(None, start, false));
+        assert!(!readonly_query_due_for(Some(start), start + Duration::from_secs(9), false));
+        assert!(readonly_query_due_for(Some(start), start + UNHEALTHY_REQUERY, false));
+        assert!(readonly_query_due_for(Some(start), start + Duration::from_secs(2), true));
     }
 }
 #[cfg(test)]

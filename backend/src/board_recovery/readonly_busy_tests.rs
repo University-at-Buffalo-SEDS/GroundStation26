@@ -123,19 +123,16 @@ async fn actual_sdk_poll_skips_cooling_boards_and_advances_round_robin_after_eac
     let now = WallInstant::now();
     refresh.core_busy_last[0] = Some(now);
     refresh.last[1] = Some(now);
-    // Test-fire has no AV bay: RF, FC and PB are not network peers there, so
-    // the first eligible peer after the cooling ones is AB (index 3).
-    let first = if crate::runtime_mode::is_test_fire() { 3 } else { 2 };
+    // Each link has its own turn. Fill boards: AB first, then VB, whatever the
+    // AV bay does (test fire has no AV bay peers; elsewhere PB is the AV-bay
+    // pick, since RF is cooling after Busy and FC after its last query).
     let _ = refresh.poll(&state);
-    assert_eq!(
-        refresh.cursor, first + 1,
-        "first eligible original peer is the next tracked board, whether actual SDK accepts or is Busy"
-    );
+    assert_eq!(refresh.cursor[1], 1, "AB took the umbilical turn");
+    if !crate::runtime_mode::is_test_fire() {
+        assert!(refresh.last[2].is_some(), "PB took the AV-bay turn in the same pass");
+    }
     let _ = refresh.poll(&state);
-    assert_eq!(
-        refresh.cursor, first + 2,
-        "the next peer gets the next turn; Busy never monopolizes selection"
-    );
+    assert_eq!(refresh.cursor[1], 2, "the next fill peer gets the next turn; Busy never monopolizes selection");
 }
 #[tokio::test]
 async fn real_unrefreshed_query_still_expires_at_the_readback_ttl() {
