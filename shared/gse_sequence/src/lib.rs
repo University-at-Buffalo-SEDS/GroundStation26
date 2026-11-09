@@ -1079,6 +1079,28 @@ impl Engine {
     pub fn nitrous_session(&self) -> bool {
         self.nitrous_session
     }
+    /// The fill trim closed every valve and verified the settled mass. Hold
+    /// Paused with the closed configuration as the engine's own command, so a
+    /// paused tick checks the valves against what is actually commanded
+    /// instead of the fill's earlier vent/nitrous opening. Each valve's
+    /// confirming closed report counts as its acknowledgement.
+    pub fn hold_settled_fill(&mut self, input: Inputs, message: &str) {
+        self.paused_from = None;
+        self.failure = None;
+        self.test_hold = None;
+        self.dump_to_zero = false;
+        self.testing_valves = false;
+        self.self_pending = 0;
+        self.self_waiting = None;
+        self.target = CLOSED;
+        self.command_since = input.now_ms;
+        for (i, valve) in input.valves.iter().enumerate() {
+            self.self_ack_since[i] = valve
+                .filter(|v| !v.open && v.at_ms <= input.now_ms)
+                .map_or(input.now_ms, |v| v.at_ms);
+        }
+        self.transition(Phase::Paused, input.now_ms, message);
+    }
     /// The test an operator pause is closing or holding, if any.
     pub fn paused_test(&self) -> Option<PausedTest> {
         (self.paused_from.is_some()
@@ -2234,6 +2256,36 @@ mod tests {
         rig.request(Action::CancelFill);
         rig.until(Phase::Cancelled);
         assert_eq!(rig.valves, RELIEVED);
+    }
+    #[test]
+    fn a_settled_fill_holds_closed_without_checking_the_fill_opening() {
+        let mut rig = Rig::new();
+        rig.engine.status.nitrogen_passed = true;
+        rig.engine.status.phase = Phase::Passed;
+        rig.engine.status.baseline = Some(Baseline {
+            average_psi: 5.0,
+            min_psi: 3.0,
+            max_psi: 7.0,
+            noise_psi: 2.0,
+            samples: 50,
+        });
+        rig.engine.nitrous_target_psi = 140.0;
+        rig.request(Action::StartFill);
+        rig.until(Phase::Filling);
+        assert_eq!(rig.valves, [false, true, false, false, true]);
+        // The backend's trim controller closes every valve, then verifies.
+        rig.valves = CLOSED;
+        rig.now += 100;
+        rig.engine.hold_settled_fill(rig.input(), "Fill mass settled within tolerance");
+        for _ in 0..100 {
+            rig.tick();
+        }
+        assert_eq!(rig.engine.status.phase, Phase::Paused);
+        assert_eq!(rig.engine.failure(), None, "{}", rig.engine.status.message);
+        assert_eq!(rig.engine.status.message, "Fill mass settled within tolerance");
+        assert_eq!(rig.valves, CLOSED);
+        // A resume continues the same nitrous session.
+        assert!(rig.engine.nitrous_session());
     }
     /// The station ticks the engine every 200 ms, so a one-second window
     /// holds five or six pressure samples, never ten.

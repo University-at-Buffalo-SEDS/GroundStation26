@@ -1954,10 +1954,14 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
                     );
                     rt.progress_failed_current();
                 }
-                rt.engine.status.phase = Phase::Paused;
+                // The trim, not the engine, closed the valves: hold Paused with
+                // that closed configuration as the engine's command, or a
+                // paused tick checks the fill's earlier vent/nitrous opening.
+                rt.engine.hold_settled_fill(
+                    input,
+                    "Fill mass settled within tolerance; all valves confirmed closed",
+                );
                 rt.engine.status.valves = completion_valve_snapshot(input);
-                rt.engine.status.message =
-                    "Fill mass settled within tolerance; all valves confirmed closed".into();
                 if !hitl {
                     if let Some(mass) = mass {
                         remember_automatic_cutoff_target(&mut rt, mass.value, target);

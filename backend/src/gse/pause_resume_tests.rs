@@ -602,6 +602,37 @@ fn watch(state: &Arc<AppState>, id: &str) -> serde_json::Value {
         .clone()
 }
 
+/// HITL fill (gse_flows sim): after "Fill mass settled within tolerance" the
+/// station kept checking the fill's open vent/nitrous command and paused with
+/// "Valve acknowledgement timed out in Paused: Vent open: opposite state
+/// reported; Nitrous open: opposite state reported". The settled fill must
+/// hold closed, past the 5 s acknowledgement deadline, without a fault.
+#[tokio::test]
+async fn hitl_settled_fill_holds_closed_past_the_valve_ack_deadline() {
+    let _mode = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Hitl);
+    let mut plant = Plant::new().await;
+    assert!(handle_command(&plant.state, &TelemetryCommand::ValveSelfTest));
+    plant.until(|rt| rt.engine.status.phase == Phase::Idle);
+    assert!(handle_command(&plant.state, &TelemetryCommand::NitrogenTest));
+    plant.until(|rt| rt.engine.status.phase == Phase::Passed);
+    plant.mass = 0.0;
+    plant.step();
+    assert!(handle_command(&plant.state, &TelemetryCommand::StartFill));
+    plant.until(|rt| rt.engine.status.phase == Phase::Filling);
+    plant.until(|rt| rt.engine.status.phase == Phase::Paused && rt.fill_trim.is_none());
+    let settled = plant.state.gse.lock().unwrap().engine.status.message.clone();
+    assert!(settled.contains("settled within tolerance"), "{settled}");
+    for _ in 0..100 {
+        plant.step();
+    }
+    let rt = plant.state.gse.lock().unwrap();
+    assert_eq!(rt.engine.status.phase, Phase::Paused);
+    assert_eq!(rt.engine.failure(), None, "{}", rt.engine.status.message);
+    assert_eq!(rt.engine.status.message, settled);
+    drop(rt);
+    assert_eq!(plant.valves, gse_sequence::CLOSED);
+}
+
 /// Normal nitrogen test (gse_flows sim): Dump at the passed hold stayed in
 /// progress for minutes with the tank at 0 psi and dump/vent open, and its
 /// step's watch still showed the hold pressure and closed valves. At the
