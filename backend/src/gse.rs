@@ -3285,6 +3285,24 @@ pub(crate) fn prepare_verified_startup(state: &Arc<AppState>) -> Result<(), &'st
     rt.fill_trim = None;
     Ok(())
 }
+/// Retries after which a pending ABORT counts as undeliverable rather than
+/// still in delivery.
+const ABORT_CLEAR_DELIVERY_RETRIES: u32 = 3;
+/// An ABORT still in its normal delivery attempts, or a controller frame still
+/// on the umbilical, holds Clear GSE abort. An ABORT that keeps failing (a
+/// dead or saturated radio link) and the radio writer's own backlog do not:
+/// clearing sends no output command and board aborts stay latched on the
+/// boards, and a late ABORT only re-aborts its board, so waiting on a frame
+/// the network cannot deliver would leave the station aborted forever.
+fn abort_delivery_in_progress(state: &AppState, router: &sedsnet::router::Router) -> bool {
+    let abort = crate::telemetry_schema::data_type("ABORT");
+    state.has_pending_umbilical_control_tx()
+        || router.export_reliable_pending_stats().iter().any(|pending| {
+            pending.data_type == abort
+                && pending.retries < ABORT_CLEAR_DELIVERY_RETRIES
+                && !pending.waiting_for_predecessor
+        })
+}
 /// Operator recovery only: never dispatch a valve, ignition or launch command.
 fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)> {
     require_primary_operational_station()?;
@@ -3332,10 +3350,7 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
         StatusCode::SERVICE_UNAVAILABLE,
         "Network is not initialized".into(),
     ))?;
-    if !hitl
-        && (router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT"))
-            || state.has_pending_recovery_control_tx())
-    {
+    if !hitl && abort_delivery_in_progress(state, router) {
         return Err((
             StatusCode::CONFLICT,
             "Abort delivery is still pending; retry after the network drains".into(),
