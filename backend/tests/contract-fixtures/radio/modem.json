@@ -1,0 +1,76 @@
+{
+  "available": true,
+  "blocked_reason": null,
+  "configured_mode": "fix",
+  "needs_attention": true,
+  "opt_in_profile": false,
+  "profile_name": "deployed",
+  "receive_quality": {
+    "crc_failures_last_minute": 2,
+    "crc_failures_total": 7,
+    "good_frames_last_minute": 120,
+    "good_frames_total": 5000
+  },
+  "reconfiguration_allowed": true,
+  "report": {
+    "data_mode": "untouched",
+    "duration_ms": 0,
+    "eeprom_saved": false,
+    "finished_unix_ms": 1,
+    "forwarding": null,
+    "identity": "RFD900x",
+    "map_source": "unconfirmed",
+    "mode": "fix",
+    "outcome": "matched",
+    "rebooted": false,
+    "registers": [
+      {
+        "expected": 10,
+        "name": "GLOBAL_RETRIES",
+        "number": 5,
+        "observed": 10,
+        "policy": "fix",
+        "status": "match"
+      },
+      {
+        "expected": null,
+        "name": "NETID",
+        "number": 3,
+        "observed": 25,
+        "policy": "info",
+        "status": "info"
+      }
+    ],
+    "save_attempted": false,
+    "summary": "Radio modem settings match the profile",
+    "trigger": "startup",
+    "warnings": [
+      "Contract fixture warning"
+    ],
+    "writes": []
+  },
+  "rf_board": {
+    "air_speed": 64,
+    "dest_id": 32768,
+    "eeprom_saved": false,
+    "forwarding_entries": false,
+    "global_retries": 10,
+    "map_source": "ati5_names",
+    "max_data": 3968,
+    "max_retries": 10,
+    "mode": "fix",
+    "needs_attention": false,
+    "outcome": "matched",
+    "pending": false,
+    "rebooted": false,
+    "received_unix_ms": 0,
+    "resumed_with_ato": true,
+    "rolled_out_all_nodes": false,
+    "rtscts": 0,
+    "serial_break_ms": 50,
+    "skipped_by_flight_gate": false,
+    "summary": "RF modem settings match the profile; nothing written"
+  },
+  "rolled_out_all_nodes": true,
+  "running": false
+}

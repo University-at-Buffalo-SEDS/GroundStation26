@@ -1,0 +1,104 @@
+{
+  "admissions_open": true,
+  "authority_current": true,
+  "authority_id": "station-mode-switch/primary",
+  "backend_instance": "primary-contractfixture0001",
+  "cancel_supported": false,
+  "change_supported": true,
+  "control_origin_required": false,
+  "current": {
+    "id": "normal",
+    "label": "Normal · live outputs",
+    "mode_id": "normal",
+    "output_domain": "Physical station links and outputs as defined by Normal mode",
+    "simulation": false
+  },
+  "epoch_fencing_supported": false,
+  "layout_revision": 1,
+  "modes": [
+    {
+      "id": "normal",
+      "label": "Normal"
+    },
+    {
+      "id": "hitl",
+      "label": "HITL"
+    },
+    {
+      "id": "test_fire",
+      "label": "Test fire"
+    },
+    {
+      "id": "testing",
+      "label": "Testing"
+    }
+  ],
+  "options": [
+    {
+      "available": true,
+      "id": "normal",
+      "in_process": true,
+      "label": "Normal · live outputs",
+      "mode_id": "normal",
+      "output_domain": "Physical station links and outputs as defined by Normal mode",
+      "reason": null,
+      "simulation": false,
+      "transition_kind": "restart"
+    },
+    {
+      "available": true,
+      "id": "hitl",
+      "in_process": true,
+      "label": "HITL · live outputs",
+      "mode_id": "hitl",
+      "output_domain": "Physical station links and outputs as defined by HITL mode",
+      "reason": null,
+      "simulation": false,
+      "transition_kind": "restart"
+    },
+    {
+      "available": true,
+      "id": "test_fire",
+      "in_process": true,
+      "label": "Test fire · live outputs",
+      "mode_id": "test_fire",
+      "output_domain": "Physical station links and outputs as defined by Test fire mode",
+      "reason": null,
+      "simulation": false,
+      "transition_kind": "restart"
+    },
+    {
+      "available": true,
+      "id": "testing",
+      "in_process": true,
+      "label": "Testing · hardware links",
+      "mode_id": "testing",
+      "output_domain": "Physical station links and outputs as defined by Testing mode",
+      "reason": null,
+      "simulation": false,
+      "transition_kind": "restart"
+    },
+    {
+      "available": true,
+      "id": "testing-simulation",
+      "in_process": false,
+      "label": "Testing · internal flight simulation",
+      "mode_id": "testing",
+      "output_domain": "Simulated rocket telemetry and actions from testing mode's internal flight model",
+      "reason": null,
+      "simulation": true,
+      "transition_kind": "restart"
+    }
+  ],
+  "permissions": {
+    "can_cancel_transition": false,
+    "can_change": true
+  },
+  "policy_epoch": "boot-fixture:epoch-1",
+  "principal_context": "user:operator",
+  "reason": null,
+  "revision": "boot-fixture:epoch-1",
+  "transition": null,
+  "valid_for_ms": 5000,
+  "version": 2
+}

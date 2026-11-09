@@ -106,11 +106,21 @@ python3 build.py docker --frontend-dev
 
 - Documentation index: `docs/README.md`
 - Frontend/backend API contract: `docs/frontend/api.md`
+- Frontend contract fixtures (regenerate and run): `docs/backend/contract-fixtures.md`
 - Frontend architecture: `docs/frontend/architecture.md`
 - Backend architecture: `docs/backend/architecture.md`
 - Backend I2C transport: `docs/backend/i2c.md`
 - Shared contracts: `docs/shared/contracts.md`
 - System overview: `docs/system/overview.md`
+
+## Frontend contract tests
+
+`backend/tests/contract-fixtures/` holds real backend replies and websocket
+frames that the UI repository decodes with its own types. Check them with
+`cargo test -p groundstation_backend contract_fixtures`; after an intended
+shape change, regenerate with
+`GS_UPDATE_CONTRACT_FIXTURES=1 cargo test -p groundstation_backend contract_fixtures`,
+commit the files and refresh the UI's copy (`docs/backend/contract-fixtures.md`).
 
 ## Run
 

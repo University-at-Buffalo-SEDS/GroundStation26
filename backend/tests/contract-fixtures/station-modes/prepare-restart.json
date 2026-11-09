@@ -1,0 +1,33 @@
+{
+  "authority_id": "station-mode-switch/primary",
+  "backend_instance": "primary-contractfixture0001",
+  "current": {
+    "id": "normal",
+    "label": "Normal · live outputs",
+    "mode_id": "normal",
+    "output_domain": "Physical station links and outputs as defined by Normal mode",
+    "simulation": false
+  },
+  "current_id": "normal",
+  "expires_in_ms": 15000,
+  "policy_epoch": "boot-fixture:epoch-1",
+  "principal_context": "user:operator",
+  "required_confirmation": "RESTART TESTING-SIMULATION",
+  "revision": "boot-fixture:epoch-1",
+  "summary": "Simulation is set at start, so the station saves this selection, shuts down cleanly and its supervisor restarts it in Testing mode in simulation. Live connections drop for a few seconds and reconnect on their own. The switch is allowed only while the station is idle and is checked again just before the restart.",
+  "target": {
+    "available": true,
+    "id": "testing-simulation",
+    "in_process": false,
+    "label": "Testing · internal flight simulation",
+    "mode_id": "testing",
+    "output_domain": "Simulated rocket telemetry and actions from testing mode's internal flight model",
+    "reason": null,
+    "simulation": true,
+    "transition_kind": "restart"
+  },
+  "target_id": "testing-simulation",
+  "ticket": "fixture-ticket-2",
+  "transition_id": "switch-fixture-2",
+  "version": 2
+}

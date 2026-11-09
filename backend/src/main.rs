@@ -3324,6 +3324,8 @@ mod validation_loadcell_observer_tests {
 
 #[cfg(test)]
 mod recovery_pending_probe;
+#[cfg(test)]
+mod contract_fixtures;
 
 mod automatic_flight_state;
 #[cfg(all(test, not(feature = "firmware_sim")))]

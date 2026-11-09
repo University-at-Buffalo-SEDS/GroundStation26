@@ -1,0 +1,33 @@
+{
+  "authority_id": "station-mode-switch/primary",
+  "backend_instance": "primary-contractfixture0001",
+  "current": {
+    "id": "normal",
+    "label": "Normal · live outputs",
+    "mode_id": "normal",
+    "output_domain": "Physical station links and outputs as defined by Normal mode",
+    "simulation": false
+  },
+  "current_id": "normal",
+  "expires_in_ms": 15000,
+  "policy_epoch": "boot-fixture:epoch-1",
+  "principal_context": "user:operator",
+  "required_confirmation": "SWITCH TO HITL",
+  "revision": "boot-fixture:epoch-1",
+  "summary": "The station saves this selection and switches to HITL mode in place. Sign-ins and connections are kept; the layout and controls refresh on their own. The switch is allowed only while the station is idle and is checked again at the moment it happens.",
+  "target": {
+    "available": true,
+    "id": "hitl",
+    "in_process": true,
+    "label": "HITL · live outputs",
+    "mode_id": "hitl",
+    "output_domain": "Physical station links and outputs as defined by HITL mode",
+    "reason": null,
+    "simulation": false,
+    "transition_kind": "restart"
+  },
+  "target_id": "hitl",
+  "ticket": "fixture-ticket-1",
+  "transition_id": "switch-fixture-1",
+  "version": 2
+}

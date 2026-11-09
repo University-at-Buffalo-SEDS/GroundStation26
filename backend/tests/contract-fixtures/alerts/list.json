@@ -1,0 +1,12 @@
+[
+  {
+    "message": "Contract fixture error",
+    "severity": "error",
+    "timestamp_ms": 1767225602000
+  },
+  {
+    "message": "Contract fixture warning",
+    "severity": "warning",
+    "timestamp_ms": 1767225601000
+  }
+]
