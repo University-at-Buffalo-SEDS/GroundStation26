@@ -607,3 +607,59 @@ fn saturated_radio_does_not_delay_umbilical_commands() {
     assert!(tx_len < 64, "the router does not hold a radio backlog: tx_len {tx_len}");
     assert!(refusals < 2_000, "no refusal spin while the radio is full: {refusals}");
 }
+
+/// The FC is the only AV-bay consumer of the station HEARTBEAT and raises
+/// Lost_GroundStation after GND_TIMEOUT = 3000 ms without one
+/// (FlightComputer26 fcconfig.h, recovery.c). The station sends it every
+/// 500 ms to every side; on the radio one per second keeps a 3x margin and
+/// halves its airtime. Bench: HEARTBEAT was 1.40M refused offers.
+#[test]
+fn radio_heartbeat_is_thinned_to_one_per_second() {
+    crate::telemetry_schema::initialize().unwrap();
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let router_clock = clock.clone();
+    let router = Router::new_with_clock(
+        RouterConfig::new([]).with_sender("GS"),
+        Box::new(move || router_clock.load(Ordering::Acquire)),
+    );
+    let budget = Arc::new(TxQueueBudget::new_radio(2048, 256));
+    let (tx, mut rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
+    let cb = budget.clone();
+    let side = router.add_side_packed_with_priority_and_options(
+        "rocket_comms",
+        move |bytes, priority| cb.try_send(&tx, priority, bytes),
+        RouterSideOptions { reliable_enabled: false, ..Default::default() }.with_small_packet_transport(192),
+    );
+    router
+        .rx_from_side(
+            &sedsnet::discovery::build_discovery_announce("FC", 1, &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")]).unwrap(),
+            side,
+        )
+        .unwrap();
+    let classifier = RecoveryFrameClassifier::default();
+    let mut heartbeats = Vec::new();
+    for step in 0..10_000u64 {
+        let now = 1_000 + step;
+        clock.store(now, Ordering::Release);
+        set_test_station_clock(Some(now));
+        if step % 500 == 0 {
+            let packet = Packet::new(crate::telemetry_schema::data_type("HEARTBEAT"),
+                &[crate::telemetry_schema::endpoint("HEART_BEAT"), crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
+                "GS", now, Arc::from([])).unwrap();
+            let _ = router.tx_queue(packet);
+        }
+        let _ = router.process_all_queues_with_timeout(0);
+        while let Ok((priority, bytes)) = rx.try_recv() {
+            classifier.classify(&bytes);
+            if classifier.peek_type(&bytes) == Some(crate::telemetry_schema::data_type("HEARTBEAT")) {
+                heartbeats.push(now);
+            }
+            budget.complete(priority, &bytes);
+        }
+    }
+    set_test_station_clock(None);
+    let gaps: Vec<u64> = heartbeats.windows(2).map(|w| w[1] - w[0]).collect();
+    eprintln!("RADIO_HEARTBEATS {} gaps {gaps:?}", heartbeats.len());
+    assert!((9..=11).contains(&heartbeats.len()), "one per second: {heartbeats:?}");
+    assert!(gaps.iter().all(|gap| *gap <= 1_500), "well inside the FC's 3 s timeout: {gaps:?}");
+}

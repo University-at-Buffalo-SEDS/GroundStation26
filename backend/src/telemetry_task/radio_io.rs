@@ -126,6 +126,11 @@ fn is_operator_control_type(ty: sedsnet::config::DataType) -> bool {
         || ty == crate::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST")
 }
 
+/// Radio station-heartbeat spacing: one per second is a 3x margin on the
+/// FC's GND_TIMEOUT of 3000 ms (FlightComputer26 fcconfig.h). Slightly under
+/// a second so a 500 ms cadence yields exactly every other one.
+const RADIO_HEARTBEAT_INTERVAL_MS: u64 = 950;
+
 /// Extra ordinary bytes a protected compact frame may use. One time-sync or
 /// receipt frame is under 64 bytes; two fit.
 const PROTECTED_ORDINARY_HEADROOM: usize = 128;
@@ -183,8 +188,21 @@ struct TxDeadline {
     wall: std::time::Instant,
     simulated_ms: Option<u64>,
 }
+#[cfg(test)]
+thread_local! {
+    /// A model clock for TxDeadline on this test thread.
+    static TEST_STATION_CLOCK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+pub(super) fn set_test_station_clock(now_ms: Option<u64>) {
+    TEST_STATION_CLOCK.with(|clock| clock.set(now_ms));
+}
 impl TxDeadline {
     fn now() -> Self {
+        #[cfg(test)]
+        if let Some(now) = TEST_STATION_CLOCK.with(std::cell::Cell::get) {
+            return Self { wall: std::time::Instant::now(), simulated_ms: Some(now) };
+        }
         Self {
             wall: std::time::Instant::now(),
             simulated_ms: crate::simulation_clock_ms(),
@@ -205,7 +223,8 @@ impl TxDeadline {
         }
     }
     fn ready(self) -> bool {
-        self.ready_at(std::time::Instant::now(), crate::simulation_clock_ms())
+        let now = Self::now();
+        self.ready_at(now.wall, now.simulated_ms)
     }
 }
 
@@ -245,6 +264,9 @@ pub struct TxQueueBudget {
     parked: Mutex<VecDeque<Parked>>,
     parked_total: std::sync::atomic::AtomicU64,
     shed_frames: std::sync::atomic::AtomicU64,
+    /// Radio only: the next station HEARTBEAT is due no earlier than this.
+    next_heartbeat: Mutex<Option<TxDeadline>>,
+    thinned_heartbeats: std::sync::atomic::AtomicU64,
     /// Park capacity in frames (zero: never park).
     park_frames: usize,
     /// Accepted offers (including parked) and finished writes, for the
@@ -366,6 +388,8 @@ impl TxQueueBudget {
             parked: Mutex::new(VecDeque::new()),
             parked_total: std::sync::atomic::AtomicU64::new(0),
             shed_frames: std::sync::atomic::AtomicU64::new(0),
+            next_heartbeat: Mutex::new(None),
+            thinned_heartbeats: std::sync::atomic::AtomicU64::new(0),
             park_frames: 0,
             admissions: std::sync::atomic::AtomicU64::new(0),
             completions: std::sync::atomic::AtomicU64::new(0),
@@ -425,6 +449,7 @@ impl TxQueueBudget {
             "parked_bytes": self.parked.lock().unwrap().iter().map(|p| p.bytes.len()).sum::<usize>(),
             "parked_total": self.parked_total.load(Ordering::Relaxed),
             "shed_frames": self.shed_frames.load(Ordering::Relaxed),
+            "thinned_heartbeats": self.thinned_heartbeats.load(Ordering::Relaxed),
             "coalesced_receipts": self.coalesced_receipts.load(Ordering::Relaxed),
             "control_limit_bytes": self.limit,
             "ordinary_limit_bytes": self.ordinary_limit,
@@ -489,9 +514,30 @@ impl TxQueueBudget {
         activity:Option<&Arc<TransportTxActivity>>,
     ) -> sedsnet::TelemetryResult<()> {
         let mut stage = RefusalStage::Other;
+        // The FC (the only AV-bay consumer) times out after 3 s without a
+        // station heartbeat; the station sends one every 500 ms to every
+        // side. On the radio, keep one per RADIO_HEARTBEAT_INTERVAL_MS and
+        // accept-and-drop the rest. A template-installing SDT frame is never
+        // dropped: later compact frames refer to it.
+        let heartbeat = self.short_lookahead
+            && self.recovery_classifier.peek_type(payload)
+                == Some(crate::telemetry_schema::data_type("HEARTBEAT"));
+        if heartbeat
+            && !payload.starts_with(b"SDT\x01")
+            && self.next_heartbeat.lock().unwrap().is_some_and(|due| !due.ready())
+        {
+            self.thinned_heartbeats.fetch_add(1, Ordering::Relaxed);
+            self.admissions.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
         let result = self.try_send_admit(sender, priority, payload, lease, activity, &mut stage);
         if result.is_ok() {
             self.admissions.fetch_add(1, Ordering::Relaxed);
+            if heartbeat {
+                *self.next_heartbeat.lock().unwrap() = Some(
+                    TxDeadline::now().after(Duration::from_millis(RADIO_HEARTBEAT_INTERVAL_MS)),
+                );
+            }
         }
         if result.is_ok() && self.short_lookahead {
             let request = u32::from(is_managed_variable_request(payload));
