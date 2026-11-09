@@ -2334,6 +2334,16 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         response["launch_queued"] = serde_json::json!(rt.operational.qd.queued());
         response["qd"] = serde_json::json!(format!("{:?}", rt.operational.qd.status(rt.now())));
     }
+    if crate::runtime_mode::is_hitl() {
+        let interlocked = self::interlock(&state, &state.action_policy_snapshot());
+        let rt = state.gse.lock().unwrap();
+        let blocker = hitl_nitrogen_override_blocker(&rt, interlocked, rt.now());
+        response["nitrogen_override"] = serde_json::json!({
+            "active": rt.engine.status.nitrogen_overridden,
+            "available": blocker.is_none() && !rt.engine.status.nitrogen_overridden,
+            "blocked_reason": blocker,
+        });
+    }
     turbocharge::decorate_status(&state, &mut response);
     let vb_connected = state
         .network_health
@@ -2356,6 +2366,24 @@ mod status_presentation_tests;
 #[cfg(test)]
 mod tests {
     #[test]
+
+    #[test]
+    fn hitl_nitrogen_override_needs_interlock_closed_supplies_and_an_empty_tank() {
+        use super::*;
+        let mut rt = Runtime::default();
+        rt.engine.config.maximum_zero_offset_psi = Some(8.0);
+        let now = rt.now();
+        rt.pressure = Some(Sample { value: 3.0, at_ms: now });
+        let valve = |open| Some(ValveState { open, at_ms: now });
+        rt.valves = [valve(false), valve(false), valve(false), valve(true), valve(false)];
+        assert!(hitl_nitrogen_override_blocker(&rt, true, now).unwrap().contains("supply valves"));
+        rt.valves[3] = valve(false);
+        assert!(hitl_nitrogen_override_blocker(&rt, false, now).unwrap().contains("interlock"));
+        rt.pressure = Some(Sample { value: 40.0, at_ms: now });
+        assert!(hitl_nitrogen_override_blocker(&rt, true, now).unwrap().contains("empty-tank limit"));
+        rt.pressure = Some(Sample { value: 3.0, at_ms: now });
+        assert_eq!(hitl_nitrogen_override_blocker(&rt, true, now), None);
+    }
     fn completion_valve_snapshot_retains_only_fresh_actual_open_and_closed() {
         use super::*;
         let input = Inputs {
@@ -3735,11 +3763,17 @@ async fn override_cold_flow(
             .into_response();
     };
     if crate::runtime_mode::is_hitl() {
-        (
-            StatusCode::CONFLICT,
-            "Operational cold-flow overrides are not used in HITL",
-        )
-            .into_response()
+        match apply_hitl_nitrogen_override(
+            &state,
+            principal.username.as_deref().unwrap_or(""),
+            &request.reason,
+        ) {
+            Ok(()) => {
+                crate::sequences::refresh_action_policy_now(&state);
+                Json(serde_json::json!({"overridden":true})).into_response()
+            }
+            Err(error) => (StatusCode::CONFLICT, error).into_response(),
+        }
     } else {
         match apply_cold_flow_override(
             &state,
@@ -3811,6 +3845,70 @@ fn apply_cold_flow_override(
     rt.engine.status.message =
         "Cold-flow requirement overridden by operator; fresh fill interlocks still apply".into();
     Ok(())
+}
+/// HITL: an operator who knows the tank is good skips the nitrogen test and
+/// goes straight to fill. The physical checks still apply: no running
+/// sequence, interlock, fresh pressure and both supplies confirmed closed.
+/// Without a self-test baseline the current pressure becomes the empty-tank
+/// baseline, within the configured zero offset the self-test enforces.
+fn apply_hitl_nitrogen_override(state: &AppState, operator: &str, reason: &str) -> Result<(), String> {
+    let interlocked = interlock(state, &state.action_policy_snapshot());
+    let mut rt = state.gse.lock().unwrap();
+    let now = rt.now();
+    hitl_nitrogen_override_blocker(&rt, interlocked, now).map_or(Ok(()), Err)?;
+    let pressure = rt.pressure.expect("checked fresh above").value;
+    let baseline = match rt.engine.status.baseline.clone() {
+        Some(baseline) => baseline,
+        None => {
+            let bound = rt.engine.config.maximum_zero_offset_psi.expect("checked above");
+            gse_sequence::Baseline {
+                average_psi: pressure,
+                min_psi: pressure,
+                max_psi: pressure,
+                noise_psi: bound,
+                samples: 1,
+            }
+        }
+    };
+    rt.engine.status.nitrogen_overridden = true;
+    rt.engine.status.nitrogen_passed = false;
+    rt.engine.status.baseline = Some(baseline);
+    rt.engine.status.phase = Phase::Passed;
+    rt.engine.status.self_test_locked = true;
+    rt.engine.claimed = true;
+    rt.engine.status.message = format!(
+        "Nitrogen test overridden by {operator}: {reason}. Fresh fill interlocks still apply"
+    );
+    log::warn!("HITL nitrogen test overridden by {operator}: {reason}");
+    Ok(())
+}
+/// Why the HITL nitrogen-test override is unavailable now, if it is.
+fn hitl_nitrogen_override_blocker(rt: &Runtime, interlocked: bool, now: u64) -> Option<String> {
+    if rt.engine.active() {
+        return Some("Stop the running GSE sequence first".into());
+    }
+    if !interlocked {
+        return Some("Enable the key/software interlock first".into());
+    }
+    let Some(pressure) = rt.pressure.filter(|p| p.at_ms <= now && now - p.at_ms <= 2000) else {
+        return Some("A fresh tank pressure reading is required".into());
+    };
+    if ![3, 4].into_iter().all(|i| rt.valves[i].is_some_and(|v| !v.open && v.at_ms <= now && now - v.at_ms <= 2000)) {
+        return Some("Both supply valves must report closed".into());
+    }
+    match (&rt.engine.status.baseline, rt.engine.config.maximum_zero_offset_psi) {
+        (Some(baseline), _) if !baseline.is_zero(pressure.value) => Some(format!(
+            "Tank reads {:.1} psi, outside its empty-tank baseline; vent before filling",
+            pressure.value
+        )),
+        (Some(_), _) => None,
+        (None, None) => Some("Set the maximum zero offset in GSE settings first".into()),
+        (None, Some(bound)) if pressure.value.abs() > bound => Some(format!(
+            "Tank reads {:.1} psi, above the {bound:.1} psi empty-tank limit; vent before overriding",
+            pressure.value
+        )),
+        (None, Some(_)) => None,
+    }
 }
 /// Accepted controller owners must retire before an irreversible launch is saved.
 /// This inspects SDK ownership, not modem airtime or physical output feedback.
