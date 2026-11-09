@@ -968,8 +968,14 @@ pub(crate) fn station_busy(state: &AppState, _rrls: bool) -> Option<String> {
         }
         _ => {}
     }
-    if crate::gse::turbocharge_active_nowait(state) {
-        return Some("turbocharge is running or its state is busy".into());
+    // A GSE lock held by other work for a moment is waited out; one that
+    // stays held is reported as such, never as turbocharge.
+    match crate::gse::turbocharge_active_retrying(state) {
+        Ok(true) => return Some("turbocharge is running".into()),
+        Ok(false) => {}
+        Err(crate::gse::GseBusy) => {
+            return Some("the GSE state is busy with other work; try again in a moment".into());
+        }
     }
     crate::gse::mode_switch_block_reason(state).map(Into::into)
 }

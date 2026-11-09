@@ -425,6 +425,39 @@ async fn activity_just_before_restart_cancels_it_and_restores_the_selection() {
     assert_eq!(status, StatusCode::OK, "a cancelled restart can be retried");
 }
 
+/// Holds the GSE runtime lock on another thread for `hold`, as a GSE pass does.
+fn hold_gse_lock(state: &Arc<AppState>, hold: Duration) -> std::thread::JoinHandle<()> {
+    let (held, ready) = std::sync::mpsc::channel();
+    let state = state.clone();
+    let holder = std::thread::spawn(move || {
+        let _gse = state.gse.lock().unwrap();
+        held.send(()).unwrap();
+        std::thread::sleep(hold);
+    });
+    ready.recv().unwrap();
+    holder
+}
+
+#[tokio::test]
+async fn a_merely_busy_gse_lock_is_never_reported_as_turbocharge() {
+    let _mode = thread_mode(Mode::Normal);
+    let f = fixture().await;
+    assert_eq!(station_busy(&f.state, false), None);
+    // Held for a moment, as during a GSE pass: the check waits it out.
+    let holder = hold_gse_lock(&f.state, Duration::from_millis(40));
+    assert_eq!(station_busy(&f.state, false), None);
+    holder.join().unwrap();
+    // Held past the retry window: the reason says so, not "turbocharge".
+    let holder = hold_gse_lock(&f.state, crate::core_busy::CORE_BUSY_RETRY_WINDOW * 2);
+    let reason = station_busy(&f.state, false).expect("still busy after the retry window");
+    assert!(!reason.contains("turbocharge"), "{reason}");
+    assert!(reason.contains("busy"), "{reason}");
+    holder.join().unwrap();
+    // Turbocharge itself is still named.
+    f.state.gse.lock().unwrap().engine.status.phase = gse_sequence::Phase::Turbocharge;
+    assert!(station_busy(&f.state, false).unwrap().contains("turbocharge"));
+}
+
 #[tokio::test]
 async fn launch_admission_and_a_committed_mode_change_exclude_each_other() {
     use crate::launch_mode_gate::MODE_CHANGE_IN_PROGRESS;

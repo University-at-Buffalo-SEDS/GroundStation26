@@ -4136,6 +4136,22 @@ pub(crate) fn turbocharge_active_now(state: &AppState) -> bool {
 pub(crate) fn turbocharge_active_nowait(state: &AppState) -> bool {
     state.gse.try_lock().map_or(true, |rt| turbocharge_active(&rt))
 }
+/// Whether turbocharge is active, waiting out a GSE lock that is only busy
+/// for the shared core-busy retry window. `Err` means the lock stayed busy,
+/// which says nothing about turbocharge.
+pub(crate) fn turbocharge_active_retrying(state: &AppState) -> Result<bool, GseBusy> {
+    crate::core_busy::retry_blocking(
+        || match state.gse.try_lock() {
+            Ok(rt) => Ok(turbocharge_active(&rt)),
+            Err(std::sync::TryLockError::Poisoned(rt)) => Ok(turbocharge_active(&rt.into_inner())),
+            Err(std::sync::TryLockError::WouldBlock) => Err(GseBusy),
+        },
+        |_| true,
+    )
+}
+/// The GSE runtime stayed locked by other work for the whole retry window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GseBusy;
 /// Return the real effect gate ONLY after a nonwaiting clear observation.
 /// Every Busy drops DISPATCH/Stop guards before bounded same-ticket retry.
 /// No durable Launch inhibition is written on this preparation-only retry path.
