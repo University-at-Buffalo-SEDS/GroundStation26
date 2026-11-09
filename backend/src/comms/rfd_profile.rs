@@ -124,6 +124,16 @@ impl Profile {
             t.rf_share_percent + (2 * t.host_default_share_percent).max(50) <= 100,
             "RF and host shares exceed the shared link, including the 15/35 relay split"
         );
+        // Every broadcast packet (DESTID 32768) holds the air for 1 +
+        // GLOBAL_RETRIES copies. The application pacing (usable_air_bps) is
+        // only honest if the air can carry it with those copies: 10 retries
+        // left 64000/11 = 5818 bit/s for 32000 bit/s of host pacing, so the
+        // modems' 4 KiB buffers overflowed and most frames never arrived
+        // (bench: AV-bay data 2-4 s old, the GS heard about 11 frames/s).
+        anyhow::ensure!(
+            t.usable_air_bps * (1 + m.broadcast_retries) <= m.air_bps,
+            "usable air rate exceeds what the air carries with every broadcast copy"
+        );
         anyhow::ensure!(
             (5..=100).contains(&t.idle_margin_ms)
                 && t.packet_gap_ms >= m.serial_break_ms + t.idle_margin_ms,
@@ -251,17 +261,36 @@ mod tests {
     }
     #[test]
     fn shipping_profile_is_the_deployed_matched_modem_settings() {
-        // The startup check enforces this by default, so it must equal what
-        // all three modems run today (RRLS readback 10-28: S4=10, S5=10, S6=50).
+        // The startup check enforces this by default. GLOBAL_RETRIES (S5) is
+        // link-wide: it is written only when GS_RFD_PROFILE_ROLLED_OUT names
+        // this profile after all three modems were set to S5=1 (they read
+        // S4=10, S5=10, S6=50 on 10-28).
         let p = Profile::parse(include_bytes!("../../comms/rfd-profile.json")).unwrap();
         assert!(p.is_embedded_default());
+        assert_eq!(p.name(), "rfd-async-64k-global1");
         assert_eq!(p.modem.max_retries, 10);
-        assert_eq!(p.modem.broadcast_retries, 10);
+        assert_eq!(p.modem.broadcast_retries, 1);
         assert_eq!(p.modem.serial_break_ms, 50);
         assert_eq!(p.modem.max_data_bytes, 3968);
         assert_eq!(p.transport.packet_gap_ms, 55);
         assert_eq!(p.transport.usable_air_bps, 32000);
         assert_eq!(p.transport.host_default_share_percent, 25);
+    }
+    /// The deployed modems broadcast every packet 1 + 10 times; the host
+    /// pacing assumed 32000 bit/s of the 64000 bit/s air. Faithful
+    /// simulation (7 boards, Normal, Idle): the GS heard 2.9 frames/s from
+    /// the AV bay with S5=10 and 10.3 frames/s with S5=1; RF data age p50
+    /// 2034 ms -> 254 ms, FC 669 ms -> 203 ms.
+    #[test]
+    fn usable_air_rate_fits_the_broadcast_copies() {
+        let mut v: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../../comms/rfd-profile.json")).unwrap();
+        assert!(Profile::parse(&serde_json::to_vec(&v).unwrap()).is_ok());
+        v["modem"]["broadcast_retries"] = 10.into();
+        assert!(
+            Profile::parse(&serde_json::to_vec(&v).unwrap()).is_err(),
+            "32000 bit/s of pacing cannot fit 11 copies of every packet on 64000 bit/s air"
+        );
     }
     #[test]
     fn one_retry_layer_profile_is_opt_in_and_keeps_the_transport_tuple() {

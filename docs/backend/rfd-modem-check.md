@@ -7,10 +7,14 @@ be written by one node, they write only that setting, save it, reboot the
 modem and verify it.
 
 The default profile is the embedded `backend/comms/rfd-profile.json`
-(`rfd-async-64k-compatible`). It holds the settings all three modems run
-today, per the 10-28 RRLS readback: S3=3968, S4=10, S5=10, S6=50, S11=32768,
-S18=0. On a correctly configured install the check changes nothing; it only
-repairs drift. Code:
+(`rfd-async-64k-global1`): S3=3968, S4=10, **S5=1**, S6=50, S11=32768, S18=0.
+The modems read S5=10 on 10-28. Every broadcast packet (DESTID 32768) holds the
+air for 1 + S5 copies, so S5=10 leaves 64000/11 = 5818 bit/s of air for
+32000 bit/s of host pacing: the modems' buffers overflowed and most AV-bay
+frames never arrived (bench: AV-bay data 2-4 s old, about 11 frames/s heard).
+The profile check now rejects a usable air rate the copies cannot carry.
+S5 is link-wide, so it changes only through the rollout below; on a correctly
+configured install the check then changes nothing and only repairs drift. Code:
 `backend/src/comms/rfd_modem.rs`. Tests against a simulated modem:
 `backend/src/comms/rfd_modem_tests.rs`.
 
@@ -94,13 +98,13 @@ process run. RFDesign does not publish EEPROM endurance.
 
 ### Register plan
 
-| Reg | Name | Default profile | Opt-in one-retry-layer | Policy |
+| Reg | Name | Default profile (global1) | Opt-in one-retry-layer | Policy |
 |---|---|---|---|---|
 | S1 | SERIAL_SPEED | 115 | 115 | report (changing it cuts this host off) |
 | S2 | AIR_SPEED | 64 | 64 | report, always: link-critical |
 | S3 | MAX_DATA | 3968 | 3968 | link-wide |
 | S4 | MAX_RETRIES | 10 | 10 | link-wide |
-| S5 | GLOBAL_RETRIES | 10 | **0** | link-wide |
+| S5 | GLOBAL_RETRIES | **1** (modems read 10 until rolled out) | **0** | link-wide |
 | S6 | SER_BREAK_DETECT_MS | 50 | **20** | fix (local) |
 | S7, S8 | TX/RXENCAP | 0 | 0 | link-wide |
 | S11 | DESTID | 32768 | 32768 | fix (local; broadcast so RRLS hears both ends) |
@@ -117,6 +121,25 @@ unless the selected profile is explicitly marked as rolled out to all nodes:
 profile's `name`. Even then S2 and S17 are never written, and S9, S14-S16
 and S19 have no expectation. Local registers (S6, S11, S13, S18) are always
 repaired.
+
+### Rolling out S5=1 (default profile)
+
+Faithful simulation (FirmwareSimulator `--scenario faithful`, 7 boards, Normal,
+Idle): with S5=10 the GS heard 2.9 frames/s from the AV bay; with S5=1, 10.3
+frames/s. RF data age p50 went from 2034 ms to 254 ms, FC from 669 ms to 203 ms.
+To apply it on all three modems:
+
+1. GS and RRLS: set `GS_RFD_PROFILE_ROLLED_OUT=rfd-async-64k-global1` and run
+   Connectivity → Radio modem → *Fix modem settings* (or restart the backend
+   at Idle). The check writes S5=1, saves, reboots the modem and verifies it.
+2. RF board: flash a build with `build.py build --rfd-profile-rolled-out`
+   (RFBoard26 `config/rfd-profile.json` is byte-identical to this profile). It
+   applies S5=1 on its next boot at Idle.
+3. Check every modem with *Verify modem* (GS, RRLS) and the RF health block.
+
+Until all three run S5=1 the check reports S5 as a link-wide difference. The
+link still works while they differ: each modem just repeats its own packets
+a different number of times.
 
 ### Opt-in low-latency profile
 
