@@ -414,10 +414,13 @@ def build_frontend(checkout: Path, script: Path, args: list[str]) -> None:
         remote_args = [arg for arg in args if not arg.startswith("log=")]
         command = " ".join(shlex.quote(p) for p in ["python3", script.name, *remote_args])
         _container(remote, tag, workdir, command, {})
-        dist = script.resolve().parent / "dist"
-        dist.mkdir(parents=True, exist_ok=True)
-        remote.pull(f"{REMOTE_ROOT}/{workdir}/dist/", dist, delete=True)
-        print(f"Remote frontend build copied to {dist}", flush=True)
+        # Only the published output: the local wrapper keeps its own state in
+        # dist/ (the prior output it set aside), which a mirror of the remote
+        # dist/ would delete.
+        public = script.resolve().parent / "dist" / "public"
+        public.mkdir(parents=True, exist_ok=True)
+        remote.pull(f"{REMOTE_ROOT}/{workdir}/dist/public/", public, delete=True)
+        print(f"Remote frontend build copied to {public}", flush=True)
     finally:
         remote.close()
 

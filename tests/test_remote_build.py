@@ -81,6 +81,26 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(guard.returncode, 7)
 
 
+class FrontendCopyBackTests(unittest.TestCase):
+    def test_copy_back_touches_only_dist_public(self) -> None:
+        # Mirroring the whole remote dist/ deleted the prior output the local
+        # wrapper had set aside in dist/, and its cleanup then failed.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {remote_build.ENV: "jupiter"}):
+            checkout = Path(tmp)
+            (checkout / "build.py").write_text("")
+            prior = checkout / "dist/.gs-public-prior-x/public"
+            prior.mkdir(parents=True)
+            with patch.object(remote_build, "_image", return_value="img"), \
+                    patch.object(remote_build.Remote, "push"), \
+                    patch.object(remote_build, "_container"), \
+                    patch.object(remote_build.Remote, "pull") as pull:
+                remote_build.build_frontend(checkout, checkout / "build.py", ["frontend_web"])
+            source, local = pull.call_args.args[:2]
+            self.assertTrue(source.endswith("/dist/public/"), source)
+            self.assertEqual(Path(local), (checkout / "dist/public").resolve())
+            self.assertTrue(prior.is_dir())
+
+
 class ArgumentTests(unittest.TestCase):
     def test_takes_every_remote_form_and_keeps_other_arguments(self) -> None:
         for args, spec in [
