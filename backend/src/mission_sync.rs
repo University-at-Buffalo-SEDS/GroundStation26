@@ -364,9 +364,8 @@ fn run_settings_step(state: &AppState, generation: u64, work: impl FnOnce()) -> 
 }
 
 pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
-    if cfg!(feature = "hitl_mode") {
-        return None;
-    }
+    // HITL stations sync too: a paired HITL primary and RRLS must share
+    // mission state. Command proxy already requires both to run the same mode.
     let pairing = match crate::station_pairing::Pairing::load() {
         Ok(Some(pairing)) => Arc::new(pairing),
         Ok(None) => return None,
