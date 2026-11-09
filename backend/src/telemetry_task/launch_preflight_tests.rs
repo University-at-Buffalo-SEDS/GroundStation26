@@ -17,6 +17,10 @@ async fn missing_pair_preflight_keeps_both_physical_launch_handlers_unretained()
     if crate::operator_queue::isolated_native_case(module_path!(), "missing_pair_preflight_keeps_both_physical_launch_handlers_unretained") { return; }
     for local in [false, true] {
         let (state, router) = fixture().await;
+        // HITL requires the pair proof only from pair boards on the bench:
+        // both are present here, without a fresh proof.
+        state.mark_board_seen("AB", crate::telemetry_task::get_current_timestamp_ms());
+        state.mark_board_seen("VB", crate::telemetry_task::get_current_timestamp_ms());
         let revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
         if local {
             handle_local_ground_station_launch_command(state.clone(), router.clone(), revision).await;

@@ -1103,6 +1103,7 @@ impl AppState {
     }
 
     /// Returns whether a board should be required for startup/state gating in the current mode.
+    /// In HITL only boards present on the network are required.
     pub fn board_required_for_progression(&self, board: Board) -> bool {
         if !crate::runtime_mode::is_hitl_or_test_fire() {
             return self.layout_expected_boards().contains(&board);
@@ -1136,17 +1137,18 @@ impl AppState {
         {
             return false;
         }
-
-        true
+        // HITL runs with whichever boards are on the bench: a board that is
+        // not on the network (not heard within the presence window) never
+        // holds a step. Only a board that actually reports Abort stops it.
+        crate::board_abort::BOARDS.iter().position(|b| *b == board).is_some_and(|i| crate::board_abort::present_mask(self) & (1 << i) != 0)
     }
 
     /// Returns whether every board required for the current operating mode has been observed.
     pub fn all_required_boards_seen(&self) -> bool {
+        // Decide the required set first: it may read board presence itself.
+        let required = Board::ALL.iter().copied().filter(|board| self.board_required_for_progression(*board)).collect::<Vec<_>>();
         let map = self.board_status.lock().unwrap();
-        Board::ALL.iter().all(|board| {
-            if !self.board_required_for_progression(*board) {
-                return true;
-            }
+        required.iter().all(|board| {
             map.get(board)
                 .and_then(|status| status.last_seen_ms)
                 .is_some()

@@ -96,6 +96,22 @@ pub(crate) fn validate_route_token(
 pub(crate) fn proof_enforced(state: &AppState) -> bool {
     state.board_state_proof_enforced()
 }
+/// Pair members whose proof is required. HITL runs with whichever boards are
+/// on the bench, so an absent Actuator or Valve Board is left out; every other
+/// mode requires both.
+pub(crate) fn required_pair(state: &AppState) -> u8 {
+    if crate::runtime_mode::is_hitl() {
+        REQUIRED_MASK & crate::board_abort::present_mask(state)
+    } else {
+        REQUIRED_MASK
+    }
+}
+/// The fresh non-Abort pair proof, and (with both boards present) their routes.
+fn pair_proof_current(state: &AppState, check_routes: bool) -> bool {
+    let required = required_pair(state);
+    state.board_abort.ignition_pair_current_for(required)
+        && (!check_routes || required != REQUIRED_MASK || require_routes(state).is_ok())
+}
 
 pub(crate) fn readiness(state: &AppState) -> Result<(), &'static str> {
     if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
@@ -110,11 +126,14 @@ pub(crate) fn readiness(state: &AppState) -> Result<(), &'static str> {
     if !proof_enforced(state) {
         return Ok(());
     }
-    if !state.board_abort.ignition_pair_current() {
+    if !state.board_abort.ignition_pair_current_for(required_pair(state)) {
         state
             .board_abort
-            .request_queries(REQUIRED_MASK | crate::board_abort::required_mask(state));
+            .request_queries(required_pair(state) | crate::board_abort::required_mask(state));
         return Err("Ignition requires fresh non-Abort Actuator and Valve Board readbacks");
+    }
+    if required_pair(state) != REQUIRED_MASK {
+        return Ok(());
     }
     require_routes(state)
 }
@@ -137,7 +156,7 @@ pub(crate) fn project_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
     if !crate::rrls::is_rrls()
         && (state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire)
             || state.board_abort.launch_abort_mask(state) != 0
-            || proof_enforced(state) && (!state.board_abort.ignition_pair_current() || require_routes(state).is_err()))
+            || proof_enforced(state) && !pair_proof_current(state, true))
     {
         disable(policy);
     }
@@ -148,7 +167,7 @@ pub(crate) fn project_fresh_proof(state: &AppState, policy: &mut ActionPolicyMsg
     if !crate::rrls::is_rrls()
         && (state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire)
             || state.board_abort.launch_abort_mask(state) != 0
-            || proof_enforced(state) && !state.board_abort.ignition_pair_current()) {
+            || proof_enforced(state) && !pair_proof_current(state, false)) {
         disable(policy);
     }
 }
@@ -156,6 +175,29 @@ pub(crate) fn project_fresh_proof(state: &AppState, policy: &mut ActionPolicyMsg
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// HITL runs the launch sequence with whichever boards are on the bench:
+    /// a board that is not on the network is never required for progression
+    /// or for the ignition pair proof. Other modes keep requiring them.
+    #[tokio::test]
+    async fn hitl_requires_only_the_boards_on_the_bench() {
+        use crate::types::Board;
+        use std::sync::atomic::Ordering;
+        let _mode = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Hitl);
+        let state = crate::state::tests::test_app_state().await;
+        state.av_bay_comms_connected.store(true, Ordering::Relaxed);
+        state.fill_comms_connected.store(true, Ordering::Relaxed);
+        state.mark_board_seen("VB", crate::telemetry_task::get_current_timestamp_ms());
+        assert!(state.board_required_for_progression(Board::ValveBoard));
+        for absent in [Board::ActuatorBoard, Board::GatewayBoard, Board::DaqBoard, Board::FlightComputer, Board::RFBoard, Board::PowerBoard] {
+            assert!(!state.board_required_for_progression(absent), "{absent:?} is not on the bench");
+        }
+        assert!(state.all_required_boards_seen());
+        assert_eq!(required_pair(&state), 1 << 4, "only the Valve Board of the pair is present");
+        drop(_mode);
+        let _normal = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Normal);
+        assert_eq!(required_pair(&state), REQUIRED_MASK);
+    }
+
     #[tokio::test]
     async fn hitl_proof_opt_in_preserves_actual_abort_stop_shutdown_and_router_identity() {
         if crate::operator_queue::isolated_native_case(module_path!(), "hitl_proof_opt_in_preserves_actual_abort_stop_shutdown_and_router_identity") { return; }
@@ -165,7 +207,11 @@ mod tests {
                 sedsnet::router::RouterConfig::new([]).with_sender("GS")));
             state.topology_router.set(router.clone()).unwrap();
             router.try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(1_793_563_200_000)).unwrap();
-            if crate::runtime_mode::is_hitl() && blocker == "proof_on" { state.toggle_hitl_safety_interlock(3); }
+            if crate::runtime_mode::is_hitl() && blocker == "proof_on" {
+                state.toggle_hitl_safety_interlock(3);
+                // HITL requires the proof only from pair boards on the bench.
+                state.mark_board_seen("AB", crate::telemetry_task::get_current_timestamp_ms());
+            }
             if blocker == "abort" {
                 state.board_abort.observe_abort(crate::types::Board::ActuatorBoard, std::time::Instant::now(), 100);
             }

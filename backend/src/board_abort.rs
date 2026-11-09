@@ -613,10 +613,15 @@ impl Runtime {
     /// after its core guard is dropped; held-core/reentrant tests protect that.
     /// Strict proof view; optional HITL admission is selected separately.
     pub(crate) fn ignition_pair_current(&self) -> bool {
+        self.ignition_pair_current_for(crate::ignition_pair::REQUIRED_MASK)
+    }
+    /// The strict proof for only the `required` members of the pair (HITL
+    /// leaves an absent board out). No board may report Abort either way.
+    pub(crate) fn ignition_pair_current_for(&self, required: u8) -> bool {
         let Ok(register) = self.register.try_lock() else { return false; };
         let (aborted, proven) = Self::masks_at(&register, Instant::now());
         !register.history_frozen && register.abort_revision != u64::MAX
-            && aborted == 0 && proven & crate::ignition_pair::REQUIRED_MASK == crate::ignition_pair::REQUIRED_MASK
+            && aborted == 0 && proven & required == required
     }
     /// Direct sequence admission adds no Launch/retraction/history mutation.
     /// Caller owns the original Stop/reset context; callback is SDK.try only.

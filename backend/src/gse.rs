@@ -5161,6 +5161,9 @@ mod operator_admission_tests {
         assert_eq!(owners.load(Ordering::SeqCst), 2);
         state.toggle_hitl_safety_interlock(3);
         assert!(state.board_state_proof_enforced());
+        // With the proof interlock on, a board on the network without a fresh
+        // proof blocks Launch; absent boards would not (HITL bench rule).
+        state.mark_board_seen("FC", crate::telemetry_task::get_current_timestamp_ms());
         assert!(
             !queue_controller_with_launch_revision(
                 &state,

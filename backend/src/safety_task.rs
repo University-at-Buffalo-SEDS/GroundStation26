@@ -395,10 +395,13 @@ async fn safety_loop(
         let mut board_warnings = Vec::new();
         let mut condition_evidence=Vec::new();
         let mut board_log_only = Vec::new();
+        // Decide the required set before taking the status table: in HITL the
+        // requirement itself reads board presence from that table.
+        let required = Board::ALL.iter().copied().filter(|board| state.board_required_for_progression(*board)).collect::<Vec<_>>();
         let all_boards_seen = {
             let mut board_status = state.board_status.lock().unwrap();
             for (board, status) in board_status.iter_mut() {
-                if !state.board_required_for_progression(*board) {
+                if !required.contains(board) {
                     // Disabling a requirement never clears a condition. A real
                     // fresh observation from this same optional board can.
                     if !sim_mode && status.last_seen_ms.is_some() && safety_liveness_age_ms(now_ms,status.last_seen_ms,model_now_ms,status.last_seen_model_ms).is_some_and(|age|age<=BOARD_TIMEOUT_MS)
@@ -455,7 +458,10 @@ async fn safety_loop(
                         status.warned = true;
                     }
 
+                    // HITL never aborts on its own: a board that leaves the
+                    // bench is simply absent. Only a board reporting Abort stops it.
                     let abort_eligible = *board != Board::ValveBoard
+                        && !crate::runtime_mode::is_hitl()
                         && !suppress_disconnect_warnings
                         && (on_ground || !is_ground_board);
                     if liveness_abort_allowed_in_state(current_state)
@@ -491,10 +497,7 @@ async fn safety_loop(
                     status.warned = false;
                 }
             }
-            Board::ALL.iter().all(|board| {
-                if !state.board_required_for_progression(*board) {
-                    return true;
-                }
+            required.iter().all(|board| {
                 board_status
                     .get(board)
                     .and_then(|s| s.last_seen_ms)

@@ -189,6 +189,9 @@ async fn ignition_pair_hitl_opt_in_requires_proof_and_off_preserves_viewer_autho
 async fn ignition_pair_policy_disables_sequence_without_disabling_manual_off_catalog() {
     if crate::operator_queue::isolated_native_case(module_path!(), "ignition_pair_policy_disables_sequence_without_disabling_manual_off_catalog") { return; }
     let fixture = ignition_valid_fixture().await;
+    // The pair boards are on the network (HITL only requires present boards).
+    fixture.state().mark_board_seen("AB", crate::telemetry_task::get_current_timestamp_ms());
+    fixture.state().mark_board_seen("VB", crate::telemetry_task::get_current_timestamp_ms());
     let mut policy = crate::sequences::ActionPolicyMsg {
         local_phase_controls: false,
         local_phase_controls_reason: None,

@@ -269,6 +269,19 @@ fn warn_launch_blocked_by_vent_valve(state: &Arc<AppState>) {
     );
 }
 
+/// HITL runs with whichever boards are on the bench. Normally the Valve
+/// Board's sequence status starts the T-clock; with no Valve Board on the
+/// network nothing would, so the station starts it when it sends Launch.
+fn start_hitl_launch_clock_without_valve_board(state: &Arc<AppState>) {
+    if !crate::runtime_mode::is_hitl() {
+        return;
+    }
+    let valve = crate::board_abort::BOARDS.iter().position(|b| *b == crate::types::Board::ValveBoard);
+    if valve.is_some_and(|i| crate::board_abort::present_mask(state) & (1 << i) == 0) {
+        start_launch_clock_from_valve_sequence_status(state);
+    }
+}
+
 fn start_launch_clock_from_valve_sequence_status(state: &Arc<AppState>) {
     if crate::gse::cold_flow::active(state){return;}
     if matches!(
@@ -413,6 +426,7 @@ async fn send_local_ground_station_launch(
     state.set_launch_indicator_latched(true);
     sequences::refresh_action_policy_now(&state);
     state.broadcast_action_policy_snapshot();
+    start_hitl_launch_clock_without_valve_board(&state);
     gs_debug_println!(
         "Ground-station launch sequence command sent; waiting for valve-board clock start"
     );
@@ -548,6 +562,7 @@ async fn send_flight_computer_launch(
             crate::auto_zero::launch(&state);
         }
         state.set_launch_indicator_latched(true);
+        start_hitl_launch_clock_without_valve_board(&state);
         sequences::refresh_action_policy_now(&state);
         state.broadcast_action_policy_snapshot();
     }
