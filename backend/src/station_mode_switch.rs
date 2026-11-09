@@ -927,25 +927,21 @@ pub(crate) fn station_busy(state: &AppState, rrls: bool) -> Option<String> {
     if crate::gse::turbocharge_active_nowait(state) {
         return Some("turbocharge is running or its state is busy".into());
     }
-    if crate::gse::claimed(state) {
-        return Some("a sequence or manual valve control holds the outputs".into());
-    }
     if state.launch_sequence_command_pending.load(Ordering::SeqCst) {
         return Some("a Launch command is pending".into());
     }
     let flight = state.local_flight_state_snapshot();
-    if !matches!(flight, FlightState::Startup | FlightState::Idle) {
+    // Aborted is a safe resting state: a mode change sends no output command.
+    if !matches!(flight, FlightState::Startup | FlightState::Idle | FlightState::Aborted) {
         return Some(format!(
-            "flight state is {flight:?}; switch only from Startup or Idle"
+            "flight state is {flight:?}; switch only from Startup, Idle or Aborted"
         ));
     }
     if state.launch_clock_snapshot().kind != crate::telemetry_db::LaunchClockKind::Idle {
         return Some("the T clock is running".into());
     }
-    if !outputs_settled(state) {
-        return Some(
-            "outputs are not settled (an abort, cold flow or queued board command is pending)".into(),
-        );
+    if let Some(reason) = crate::gse::mode_switch_block_reason(state) {
+        return Some(reason.into());
     }
     if !crate::board_recovery::coordinator::manual_utc_idle(state) {
         return Some("a board recovery or reset is in progress".into());
@@ -955,17 +951,6 @@ pub(crate) fn station_busy(state: &AppState, rrls: bool) -> Option<String> {
     }
     None
 }
-fn outputs_settled(state: &AppState) -> bool {
-    if state.topology_router.get().is_some() {
-        return crate::gse::operator_reset_host_idle(state);
-    }
-    // No SDK router: nothing can be queued for the boards.
-    crate::gse::verified_recovery_host_idle(state)
-        && !crate::gse::cold_flow_active(state)
-        && state.manual_abort_intent.pending_epoch().is_none()
-        && !state.deferred_abort.manual_pending()
-}
-
 struct Refusal(StatusCode, String);
 impl Refusal {
     fn forbidden(text: impl Into<String>) -> Self {

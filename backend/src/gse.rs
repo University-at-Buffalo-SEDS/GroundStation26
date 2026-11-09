@@ -183,7 +183,7 @@ pub struct Runtime {
     fill_trim: Option<gse_sequence::fill_trim::Controller>,
     ground_station_control: bool,
     phase_control_revision: u64,
-    manual_control: bool,
+    pub(crate) manual_control: bool,
     effects_queued: bool,
     automatic_abort_in_flight: bool,
     overpressure: overpressure::Monitor,
@@ -3304,6 +3304,49 @@ fn abort_delivery_in_progress(state: &AppState, router: &sedsnet::router::Router
                 && pending.retries < ABORT_CLEAR_DELIVERY_RETRIES
                 && !pending.waiting_for_predecessor
         })
+}
+/// Station mode changes wait for host output work, never for frames the
+/// network cannot deliver. A sequence, cold flow, manual valve control, an
+/// automatic abort being dispatched, a manual Abort being delivered, an
+/// umbilical controller frame, or a controller command still in its normal
+/// delivery attempts holds the switch. A latched abort with no motion and a
+/// command that keeps failing over a dead or saturated link do not: switching
+/// mode sends no output command, so waiting on them would pin the station in
+/// its mode forever.
+pub(crate) fn mode_switch_block_reason(state: &AppState) -> Option<&'static str> {
+    {
+        let rt = state.gse.lock().unwrap();
+        if rt.engine.active() || rt.manual_control {
+            return Some("a sequence or manual valve control holds the outputs");
+        }
+        if cold_flow::runtime_active(&rt) {
+            return Some("cold flow is running");
+        }
+        if rt.automatic_abort_in_flight {
+            return Some("an automatic abort is still being dispatched");
+        }
+        if !crate::runtime_mode::is_hitl() && rt.operational.running {
+            return Some("a GSE operation is still running");
+        }
+    }
+    if state.manual_abort_intent.pending_epoch().is_some() || state.deferred_abort.manual_pending() {
+        return Some("a manual Abort is still being delivered");
+    }
+    if state.has_pending_umbilical_control_tx() {
+        return Some("a fill-board command is still being sent");
+    }
+    let router = state.topology_router.get()?;
+    let kinds = ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND"]
+        .map(crate::telemetry_schema::data_type);
+    router
+        .export_reliable_pending_stats()
+        .iter()
+        .any(|pending| {
+            kinds.contains(&pending.data_type)
+                && pending.retries < ABORT_CLEAR_DELIVERY_RETRIES
+                && !pending.waiting_for_predecessor
+        })
+        .then_some("a board command is still being delivered")
 }
 /// Operator recovery only: never dispatch a valve, ignition or launch command.
 fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)> {

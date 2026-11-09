@@ -331,6 +331,33 @@ async fn busy_station_refuses_with_the_server_reason() {
 }
 
 #[tokio::test]
+async fn a_latched_abort_with_nothing_moving_never_pins_the_station_mode() {
+    use crate::types::FlightState;
+    let _mode = thread_mode(Mode::Normal);
+    let f = fixture().await;
+    let target = mode_id(other_mode());
+    // The bench case: a board went offline, Normal auto-aborted at Idle and
+    // the abort stayed latched with the sequence engine claimed but idle.
+    *f.state.state.lock().unwrap() = FlightState::Aborted;
+    f.state.gse.lock().unwrap().engine.claimed = true;
+    let (status, body) = f.prepare("administrator", target).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Manual valve control still holds the outputs.
+    f.state.gse.lock().unwrap().manual_control = true;
+    let (status, body) = f.prepare("administrator", target).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body["error"].as_str().unwrap().contains("manual valve control"), "{body}");
+    f.state.gse.lock().unwrap().manual_control = false;
+
+    // Flight states with live outputs still refuse.
+    *f.state.state.lock().unwrap() = FlightState::NitrousFill;
+    let (status, body) = f.prepare("administrator", target).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body["error"].as_str().unwrap().contains("NitrousFill"), "{body}");
+}
+
+#[tokio::test]
 async fn activity_just_before_restart_cancels_it_and_restores_the_selection() {
     let _mode = thread_mode(Mode::Normal);
     let f = fixture().await;
