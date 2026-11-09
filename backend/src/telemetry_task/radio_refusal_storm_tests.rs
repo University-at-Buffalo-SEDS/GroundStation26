@@ -608,13 +608,15 @@ fn saturated_radio_does_not_delay_umbilical_commands() {
     assert!(refusals < 2_000, "no refusal spin while the radio is full: {refusals}");
 }
 
-/// The FC is the only AV-bay consumer of the station HEARTBEAT and raises
-/// Lost_GroundStation after GND_TIMEOUT = 3000 ms without one
-/// (FlightComputer26 fcconfig.h, recovery.c). The station sends it every
-/// 500 ms to every side; on the radio one per second keeps a 3x margin and
-/// halves its airtime. Bench: HEARTBEAT was 1.40M refused offers.
+/// The FC is the only AV-bay consumer of the station HEARTBEAT. After
+/// GND_TIMEOUT = 3000 ms without one it sets Lost_GroundStation, which is
+/// never cleared until reset: it blocks the Startup/Armed monitor preflight
+/// and makes the failure evaluator treat the mission as active (recovery.c).
+/// Every 500 ms heartbeat must therefore reach the radio, keeping a loss
+/// margin of 5 consecutive heartbeats; stale ones may be shed only behind a
+/// fresher one.
 #[test]
-fn radio_heartbeat_is_thinned_to_one_per_second() {
+fn radio_keeps_the_full_heartbeat_cadence() {
     crate::telemetry_schema::initialize().unwrap();
     let clock = Arc::new(AtomicU64::new(1_000));
     let router_clock = clock.clone();
@@ -660,6 +662,6 @@ fn radio_heartbeat_is_thinned_to_one_per_second() {
     set_test_station_clock(None);
     let gaps: Vec<u64> = heartbeats.windows(2).map(|w| w[1] - w[0]).collect();
     eprintln!("RADIO_HEARTBEATS {} gaps {gaps:?}", heartbeats.len());
-    assert!((9..=11).contains(&heartbeats.len()), "one per second: {heartbeats:?}");
-    assert!(gaps.iter().all(|gap| *gap <= 1_500), "well inside the FC's 3 s timeout: {gaps:?}");
+    assert!(heartbeats.len() >= 19, "every 500 ms heartbeat: {heartbeats:?}");
+    assert!(gaps.iter().all(|gap| *gap <= 600), "loss margin of 5 inside the FC's 3 s timeout: {gaps:?}");
 }
