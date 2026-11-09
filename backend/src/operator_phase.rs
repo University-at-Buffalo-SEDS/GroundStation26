@@ -226,21 +226,37 @@ pub(crate) fn project(state: &AppState, policy: &mut crate::sequences::ActionPol
     };
     let stop = crate::gse::manual_stop_state(state);
     let runtime = crate::gse::operator_phase_public_context(state);
-    let deny = !policy.key_enabled
-        || !policy.software_buttons_enabled
-        || !button_allowed(state)
-        || state
-            .shutdown_requested
-            .load(std::sync::atomic::Ordering::Acquire)
-        || state.abort_indicator_latched()
-        || state.board_abort.masks().0 != 0
-        || binding.revision == u64::MAX
-        || binding.manual == u64::MAX
-        || binding.observed == u64::MAX
-        || matches!(stop, crate::gse::CurrentState::Invalid)
-        || runtime.is_some_and(|(selected, revision, idle)| {
-            !selected || revision != binding.revision || !idle
-        });
+    // Say why stepping is held, in the order an operator can fix it. An
+    // aborted board blocks it only while present and part of this mode (as
+    // for Launch): a powered-off AV bay must not lock HITL phase control.
+    let reason: Option<String> = if !policy.key_enabled {
+        Some("GroundStation key control is disabled.".into())
+    } else if !policy.software_buttons_enabled {
+        Some("Software controls are disabled by GroundStation.".into())
+    } else if !button_allowed(state) {
+        Some("Enable the HITL button interlock to step the flight state.".into())
+    } else if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
+        Some("The ground station is shutting down.".into())
+    } else if state.abort_indicator_latched() {
+        Some("The station Abort is latched; clear it before stepping the flight state.".into())
+    } else if state.board_abort.launch_abort_mask(state) != 0 {
+        Some(format!(
+            "{} report Abort; recover them before stepping the flight state.",
+            crate::board_abort::board_names(state.board_abort.launch_abort_mask(state))
+        ))
+    } else if binding.revision == u64::MAX || binding.manual == u64::MAX || binding.observed == u64::MAX {
+        Some("Phase control state is exhausted; restart the ground station.".into())
+    } else if matches!(stop, crate::gse::CurrentState::Invalid) {
+        Some("A Stop or Abort is still being delivered to the boards.".into())
+    } else if runtime.is_some_and(|(selected, _, _)| !selected) {
+        Some("Select Ground station control to step the flight state.".into())
+    } else if runtime.is_some_and(|(_, revision, idle)| revision != binding.revision || !idle) {
+        Some("A GSE sequence is running; stop it before stepping the flight state.".into())
+    } else {
+        None
+    };
+    let deny = reason.is_some();
+    policy.local_phase_controls_reason = reason;
     let cached = *state.phase_control_public.lock().unwrap();
     let mask = if deny {
         0

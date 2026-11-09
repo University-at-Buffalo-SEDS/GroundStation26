@@ -2366,8 +2366,6 @@ mod status_presentation_tests;
 #[cfg(test)]
 mod tests {
     #[test]
-
-    #[test]
     fn hitl_nitrogen_override_needs_interlock_closed_supplies_and_an_empty_tank() {
         use super::*;
         let mut rt = Runtime::default();
@@ -2384,6 +2382,7 @@ mod tests {
         rt.pressure = Some(Sample { value: 3.0, at_ms: now });
         assert_eq!(hitl_nitrogen_override_blocker(&rt, true, now), None);
     }
+    #[test]
     fn completion_valve_snapshot_retains_only_fresh_actual_open_and_closed() {
         use super::*;
         let input = Inputs {
