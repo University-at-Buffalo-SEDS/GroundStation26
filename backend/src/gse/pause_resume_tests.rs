@@ -305,6 +305,39 @@ async fn routed_self_test_nitrogen_and_fill_pause_resume_then_complete() {
     assert!(progress::controls(&plant.state).is_none(), "completed fill leaves no live run");
 }
 
+/// The Actions-tab Fill pressed while the fill is paused and the SDK core is
+/// held: the press is checked again once the router pass ends, never refused
+/// as delivery-pending, and the paused fill then resumes.
+#[tokio::test]
+async fn start_fill_command_waits_out_a_held_sdk_core() {
+    let (mut plant, core) = Plant::holdable().await;
+    assert!(handle_command(&plant.state, &TelemetryCommand::ValveSelfTest));
+    plant.until(|rt| rt.engine.status.phase == Phase::Idle);
+    assert!(handle_command(&plant.state, &TelemetryCommand::NitrogenTest));
+    plant.until(|rt| rt.engine.status.phase == Phase::Passed);
+    plant.mass = 0.0;
+    plant.step();
+    assert!(handle_command(&plant.state, &TelemetryCommand::StartFill));
+    plant.until(|rt| rt.engine.status.phase == Phase::Filling);
+    plant.until(|rt| rt.fresh_mass(rt.now()).is_some_and(|m| m.value >= 2.0));
+    plant.pause();
+    plant.receive();
+    plant.step();
+    assert_eq!(command_allowed(&plant.state, &TelemetryCommand::StartFill), Some(true));
+    let held = core.hold();
+    assert_eq!(command_allowed(&plant.state, &TelemetryCommand::StartFill), Some(false));
+    assert!(command_gate_core_busy(&plant.state, &TelemetryCommand::StartFill),
+        "a held core is not undelivered commands");
+    let release = held.release_after(std::time::Duration::from_millis(60));
+    assert!(
+        crate::web::command_allowed_waiting_out_core(&plant.state, &TelemetryCommand::StartFill).await,
+        "the same press is admitted once the core is free"
+    );
+    release.join().unwrap();
+    assert!(handle_command(&plant.state, &TelemetryCommand::StartFill));
+    plant.until(|rt| rt.engine.status.phase == Phase::Filling);
+}
+
 /// A held SDK core is not undelivered commands: the operator's Resume waits
 /// out the router pass instead of being refused as delivery-pending.
 #[tokio::test]

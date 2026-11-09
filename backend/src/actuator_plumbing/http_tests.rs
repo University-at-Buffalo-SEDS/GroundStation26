@@ -106,6 +106,24 @@ impl Drop for Pause {
     }
 }
 
+/// One-shot pause right before a drive SET's SDK offer, for the held-core test.
+struct DriveOfferGate {
+    owner: usize,
+    reached: std::sync::mpsc::Sender<()>,
+    proceed: std::sync::mpsc::Receiver<()>,
+}
+static DRIVE_OFFER_GATE: Mutex<Option<DriveOfferGate>> = Mutex::new(None);
+pub(super) fn before_drive_set_offer(state: &AppState) {
+    let gate = {
+        let mut slot = DRIVE_OFFER_GATE.lock().unwrap();
+        if slot.as_ref().is_none_or(|gate| gate.owner != state as *const AppState as usize) {
+            return;
+        }
+        slot.take().unwrap()
+    };
+    gate.reached.send(()).unwrap();
+    gate.proceed.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+}
 /// Holds the fixture host's real SDK core on a named holder thread (through
 /// the host clock's existing pause hook) until released.
 pub(crate) struct HeldCore {
@@ -114,9 +132,10 @@ pub(crate) struct HeldCore {
 }
 pub(crate) fn hold_host_core(fixture: &Fixture) -> HeldCore {
     let pause = crate::gse::nonwaiting_admission_tests::Pause::install(&fixture.state);
-    let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
-    let _ = fixture.host.enable_managed_variable(ty);
-    let seed = Packet::new(ty, &[crate::telemetry_schema::endpoint("FLIGHT_STATE")], "GS", 1, Arc::from([0u8])).unwrap();
+    // A managed value nothing else in these fixtures publishes, so the seed
+    // always reaches the SDK core (and its clock) instead of being dropped as stale.
+    let seed = Packet::new(crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+        &[crate::telemetry_schema::endpoint("GROUND_STATION")], "GS", 100, Arc::from([0u8])).unwrap();
     let host = fixture.host.clone();
     let holder = std::thread::Builder::new()
         .name("production-sdk-core-holder".into())
@@ -586,6 +605,41 @@ async fn startup_drive_change_preserves_motion_interlocks_and_rejects_active_pha
     assert_eq!(f.http("POST", "/api/actuator/plumbing/settings", Some("operator"), f.body("stepper", false)).await.status(), StatusCode::CONFLICT);
     f.pump();
     assert_eq!(f.sets().len(), 1, "Active phase must not queue a second mode change");
+}
+
+/// A drive SET whose SDK offer met a held core admitted nothing: the same
+/// SET is offered again once the router pass ends instead of a 503.
+#[tokio::test]
+async fn drive_set_waits_out_a_held_sdk_core() {
+    let _serial = SERIAL.lock().await;
+    let mut f = Fixture::new().await;
+    f.state.set_local_flight_state(FlightState::Startup);
+    f.board_state = FlightState::Startup;
+    f.prime().await;
+    let (reached, at_offer) = std::sync::mpsc::channel();
+    let (proceed, go) = std::sync::mpsc::channel();
+    *DRIVE_OFFER_GATE.lock().unwrap() = Some(DriveOfferGate {
+        owner: Arc::as_ptr(&f.state) as usize,
+        reached,
+        proceed: go,
+    });
+    let set = f.http("POST", "/api/actuator/plumbing/settings", Some("operator"), f.body("auxiliary", true));
+    let hold = async {
+        tokio::task::spawn_blocking(move || at_offer.recv_timeout(std::time::Duration::from_secs(5)).unwrap())
+            .await
+            .unwrap();
+        // Admission has passed; the router worker now holds the core for
+        // exactly the SET's SDK offer.
+        let core = hold_host_core(&f);
+        proceed.send(()).unwrap();
+        core.release_after(std::time::Duration::from_millis(60))
+    };
+    let (response, release) = tokio::join!(set, hold);
+    release.join().unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    f.pump();
+    assert_eq!(f.sets().len(), 1, "exactly one SET reaches the board");
+    assert_eq!(f.sets()[0].payload()[2], 2);
 }
 
 #[tokio::test]

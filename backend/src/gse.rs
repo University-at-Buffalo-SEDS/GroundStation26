@@ -1296,6 +1296,11 @@ pub(crate) fn apply_recorded_fill(
         if now != Disposition::MayStart {
             return Err(Error::Stale);
         }
+        // A held SDK core decided nothing about earlier commands' retirement;
+        // the recorded Fill owner retries instead of the engine refusing it.
+        if fill_resume_retirement(state).is_err() {
+            return Err(Error::PendingBusy);
+        }
         handle_command_inner(state, &cmd, None, None);
         state.fill_recording.continuation.lock().unwrap().take();
     }
@@ -1590,6 +1595,12 @@ pub(crate) const RETIREMENT_PENDING: &str =
 fn fill_resume_awaits_retirement(state: &AppState) -> bool {
     // A held SDK core is never retired.
     fill_resume_retirement(state) != Ok(false)
+}
+/// Whether `command_allowed` refused only because a StartFill resume probe
+/// found the SDK core held (nothing decided).
+pub(crate) fn command_gate_core_busy(state: &AppState, cmd: &TelemetryCommand) -> bool {
+    matches!(cmd, TelemetryCommand::StartFill | TelemetryCommand::FillWithRecording { .. })
+        && fill_resume_retirement(state).is_err()
 }
 /// Probes the SDK only when a StartFill would actually resume a paused fill.
 /// Err while the SDK core was held (nothing decided).

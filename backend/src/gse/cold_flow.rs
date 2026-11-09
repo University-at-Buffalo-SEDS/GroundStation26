@@ -1121,13 +1121,38 @@ pub(super) fn cancel_or_park_current(state: &Arc<AppState>, park: bool) {
             .filter(|s| s.active())
             .map(|s| (s.key.clone(), s.ticket))
     };
-    if let Some((key, ticket)) = current {
-        let _ = perform(
-            state,
-            &key,
-            ticket,
-            if park { Request::Park } else { Request::Cancel },
-        );
+    let Some((key, ticket)) = current else { return; };
+    let request = if park { Request::Park } else { Request::Cancel };
+    let report = move |state: &AppState, reason: &str| {
+        crate::web::emit_notification_warning(state, format!(
+            "Cold-flow {} was not applied: {reason}",
+            if park { "pause" } else { "cancel" },
+        ));
+    };
+    match perform(state, &key, ticket, request) {
+        Ok(()) => {}
+        // A held SDK core decided nothing. This handler runs synchronously,
+        // so the same request is retried off it, never dropped; a refusal
+        // that outlasts the window is reported to the operator.
+        Err(ADMISSION_BUSY) => match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let state = state.clone();
+                runtime.spawn(async move {
+                    if let Err(reason) = perform_waiting_out_core(&state, &key, ticket, request).await {
+                        report(&state, reason);
+                    }
+                });
+            }
+            Err(_) => {
+                if let Err(reason) = crate::core_busy::retry_blocking(
+                    || perform(state, &key, ticket, request),
+                    |error| *error == ADMISSION_BUSY,
+                ) {
+                    report(state, reason);
+                }
+            }
+        },
+        Err(reason) => report(state, reason),
     }
 }
 pub(super) fn manual_handoff(cmd: &TelemetryCommand) -> bool {

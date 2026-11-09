@@ -2636,10 +2636,7 @@ async fn send_command_inner(
             token: bearer_token_from_headers(&headers).map(str::to_owned),
             actor: principal.username.clone(),
             admission_current: Arc::new(move || {
-                if weak.upgrade()
-                    .is_some_and(|state| state.is_command_allowed(&TelemetryCommand::StartFill)) {
-                    crate::gse::CurrentState::Current
-                } else { crate::gse::CurrentState::Invalid }
+                weak.upgrade().map_or(crate::gse::CurrentState::Invalid, |state| fill_admission_state(&state))
             }),
         };
         TelemetryCommand::FillWithRecording {
@@ -2655,6 +2652,27 @@ async fn send_command_inner(
     .await
 }
 
+/// `is_command_allowed`, except that a refusal only because a StartFill
+/// resume probe found the SDK core held is checked again, briefly.
+pub(crate) async fn command_allowed_waiting_out_core(state: &AppState, cmd: &TelemetryCommand) -> bool {
+    crate::core_busy::retry(
+        || if state.is_command_allowed(cmd) { Ok(()) } else { Err(()) },
+        |_| crate::gse::command_gate_core_busy(state, cmd),
+    )
+    .await
+    .is_ok()
+}
+/// A recorded Fill's live admission. A held SDK core is busy, never stale, so
+/// the Fill owner retries instead of dropping the operator's Fill.
+fn fill_admission_state(state: &AppState) -> crate::gse::CurrentState {
+    if state.is_command_allowed(&TelemetryCommand::StartFill) {
+        crate::gse::CurrentState::Current
+    } else if crate::gse::command_gate_core_busy(state, &TelemetryCommand::StartFill) {
+        crate::gse::CurrentState::PendingBusy
+    } else {
+        crate::gse::CurrentState::Invalid
+    }
+}
 /// Shared primary/local authorization and dispatch. A proxy must supply a
 /// freshly resolved local principal; this never changes RRLS execution policy.
 #[cfg(test)]
@@ -2804,7 +2822,7 @@ async fn dispatch_command_inner(
     }
     // Phase-step gates read shared state with try_lock; a lock that is merely
     // busy at this instant must not refuse a valid step. Re-check briefly.
-    let mut allowed=state.is_command_allowed(&cmd);
+    let mut allowed=command_allowed_waiting_out_core(&state,&cmd).await;
     if !allowed && crate::operator_phase::is_local(&cmd) {
         for _ in 0..5 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -5888,7 +5906,7 @@ pub(crate) async fn handle_ws_control_text_with_source(
                     return;
                 }
             }
-            if !state_for_recv.is_command_allowed(&cmd.cmd) {
+            if !command_allowed_waiting_out_core(&state_for_recv,&cmd.cmd).await {
                 emit_notification_warning(&state_for_recv,command_disabled_message(&state_for_recv,&cmd.cmd));
                 return;
             }
@@ -5979,10 +5997,8 @@ pub(crate) async fn handle_ws_control_text_with_source(
                     token: token.clone(),
                     actor: principal.username.clone(),
                     admission_current: Arc::new(move || {
-                        if source_current()
-                            && weak.upgrade().is_some_and(|state| {
-                                state.is_command_allowed(&TelemetryCommand::StartFill)
-                            }) { crate::gse::CurrentState::Current } else { crate::gse::CurrentState::Invalid }
+                        if !source_current() { return crate::gse::CurrentState::Invalid; }
+                        weak.upgrade().map_or(crate::gse::CurrentState::Invalid, |state| fill_admission_state(&state))
                     }),
                 };
                 let Some(captured) = fill_origin else {

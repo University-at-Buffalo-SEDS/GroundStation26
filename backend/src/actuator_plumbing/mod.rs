@@ -1204,6 +1204,7 @@ pub(crate) fn receive_status(state: &AppState, packet: &Packet) {
     });
 }
 
+#[derive(Clone)]
 struct PreparedRequest {
     request: Request,
     packet: Packet,
@@ -1284,6 +1285,10 @@ fn queue_prepared_request(
         }
     }
     // SDK ingress can take inner; never call into the router while holding it.
+    #[cfg(test)]
+    if nonwaiting {
+        http_tests::before_drive_set_offer(state);
+    }
     let admission = if nonwaiting {
         router.try_tx_queue(packet)
     } else {
@@ -1297,11 +1302,16 @@ fn queue_prepared_request(
             .unwrap()
             .requests
             .retain(|c| c.request.nonce != request.nonce);
+        if crate::core_busy::is_core_busy(&error) {
+            return Err(DRIVE_CORE_BUSY.into());
+        }
         // Desired remains pending; only a new correlated query can reconcile it.
         return Err(format!("Drive request was not admitted: {error}"));
     }
     Ok(())
 }
+/// A drive SET the SDK refused only because its core was held: not admitted.
+const DRIVE_CORE_BUSY: &str = "Drive request was not admitted: router core busy";
 
 pub(crate) fn routes() -> axum::Router<Arc<AppState>> {
     axum::Router::new()
@@ -1623,20 +1633,27 @@ fn apply_settings(
         origin,
     )
     .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?;
-    crate::gse::with_plumbing_admission(state, admission, || {
-        queue_prepared_request(state, prepared, true).map(|()| {
-            // A fresh selected-mode intent must not inherit the old mode's
-            // software dedup. Keep accepted history and all unrelated entries.
-            state
-                .last_command_ms
-                .lock()
-                .unwrap()
-                .remove("dedup:RetractPlumbing");
-        })
-    })
-    .map_err(fail)?
-    .map(|()| true)
-    .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))
+    // A held SDK core admitted nothing: the same prepared SET (same nonce
+    // and timestamp) is offered again, briefly, with admission re-run.
+    crate::core_busy::retry_blocking(
+        || {
+            crate::gse::with_plumbing_admission(state, admission, || {
+                queue_prepared_request(state, prepared.clone(), true).map(|()| {
+                    // A fresh selected-mode intent must not inherit the old mode's
+                    // software dedup. Keep accepted history and all unrelated entries.
+                    state
+                        .last_command_ms
+                        .lock()
+                        .unwrap()
+                        .remove("dedup:RetractPlumbing");
+                })
+            })
+            .map_err(fail)?
+            .map(|()| true)
+            .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))
+        },
+        |error| error.0 == StatusCode::SERVICE_UNAVAILABLE && error.1 == DRIVE_CORE_BUSY,
+    )
 }
 
 /// Legacy firmware retains its existing behavior until an explicit selection.

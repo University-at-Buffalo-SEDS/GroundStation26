@@ -957,6 +957,49 @@ async fn cold_flow_cancel_waits_out_a_held_sdk_core() {
     assert!(release.join().unwrap().is_ok());
     assert!(matches!(f.phase(), ColdPhase::CancelClosing | ColdPhase::CancelRelieving | ColdPhase::Cancelled));
 }
+/// CancelFill sent as a command while the SDK core is held: the synchronous
+/// command handler must not drop the operator's Cancel.
+#[tokio::test]
+async fn cold_flow_cancel_command_is_never_dropped_on_a_held_sdk_core() {
+    const NAME: &str = "gse::cold_flow::tests::cold_flow_cancel_command_is_never_dropped_on_a_held_sdk_core";
+    const CHILD: &str = "GS_COLD_FLOW_CANCEL_COMMAND_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1").env("GS_RRLS_ROLE", "off").env("GS_SIM_MODE", "0")
+            .env_remove("GS_SIM_CLOCK_FILE")
+            .output().unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success() && text.contains("1 passed"), "{text}");
+        return;
+    }
+    let mut f = Fixture::configured(true).await;
+    let _key = f.start().await;
+    f.hold();
+    let pause = super::super::nonwaiting_admission_tests::Pause::install(&f.state);
+    let router = f.state.topology_router.get().unwrap().clone();
+    let seed = sedsnet::packet::Packet::new(crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+        &[crate::telemetry_schema::endpoint("GROUND_STATION")], "GS", 100, Arc::from([0u8])).unwrap();
+    let held = std::thread::Builder::new().name("production-sdk-core-holder".into())
+        .spawn(move || router.seed_managed_variable(seed)).unwrap();
+    pause.core_entered.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        pause.release();
+        let result = held.join().unwrap();
+        drop(pause);
+        result
+    });
+    assert!(super::super::handle_command(&f.state, &TelemetryCommand::CancelFill));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !matches!(f.phase(), ColdPhase::CancelClosing | ColdPhase::CancelRelieving | ColdPhase::Cancelled) {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the operator's Cancel must be applied once the core is free, never dropped");
+    assert!(release.join().unwrap().is_ok());
+}
 #[tokio::test]
 async fn actual_cold_flow_held_core_preserves_run_packet_and_stop_revokes() {
     const NAME: &str = "gse::cold_flow::tests::actual_cold_flow_held_core_preserves_run_packet_and_stop_revokes";
