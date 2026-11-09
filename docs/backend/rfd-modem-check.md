@@ -13,7 +13,9 @@ air for 1 + S5 copies, so S5=10 leaves 64000/11 = 5818 bit/s of air for
 32000 bit/s of host pacing: the modems' buffers overflowed and most AV-bay
 frames never arrived (bench: AV-bay data 2-4 s old, about 11 frames/s heard).
 The profile check now rejects a usable air rate the copies cannot carry.
-S5 is link-wide, so it changes only through the rollout below; on a correctly
+The default profile is applied automatically: GS, RRLS and the RF board's
+default build write its link-wide registers too, so S5=1 lands on all three
+modems with no flag, environment variable or manual AT command. On a correctly
 configured install the check then changes nothing and only repairs drift. Code:
 `backend/src/comms/rfd_modem.rs`. Tests against a simulated modem:
 `backend/src/comms/rfd_modem_tests.rs`.
@@ -115,31 +117,28 @@ process run. RFDesign does not publish EEPROM endurance.
 
 **Link-wide** registers must be the same on every node (manual Table 3-2:
 S2-S5, S7-S9, S14-S17, S19). One node writing them alone would create the
-mismatch the manual forbids. They are therefore reported and left alone
-unless the selected profile is explicitly marked as rolled out to all nodes:
+mismatch the manual forbids. They are written for the embedded default
+profile, which every node's default build applies, and for an opt-in profile
+only when it is explicitly marked as rolled out to all nodes:
 `GS_RFD_PROFILE_ROLLED_OUT=<profile name>`, which must equal the selected
-profile's `name`. Even then S2 and S17 are never written, and S9, S14-S16
+profile's `name`. Otherwise they are reported and left alone. Even then S2 and S17 are never written, and S9, S14-S16
 and S19 have no expectation. Local registers (S6, S11, S13, S18) are always
 repaired.
 
-### Rolling out S5=1 (default profile)
+### S5=1 (default profile)
 
 Faithful simulation (FirmwareSimulator `--scenario faithful`, 7 boards, Normal,
-Idle): with S5=10 the GS heard 2.9 frames/s from the AV bay; with S5=1, 10.3
-frames/s. RF data age p50 went from 2034 ms to 254 ms, FC from 669 ms to 203 ms.
-To apply it on all three modems:
+Idle): with S5=10 the GS heard 2.9 frames/s from the AV bay; with S5=1, 11.8
+frames/s. RF data age p50 went from 2020 ms to 135 ms, FC from 501 ms to 227 ms.
 
-1. GS and RRLS: set `GS_RFD_PROFILE_ROLLED_OUT=rfd-async-64k-global1` and run
-   Connectivity → Radio modem → *Fix modem settings* (or restart the backend
-   at Idle). The check writes S5=1, saves, reboots the modem and verifies it.
-2. RF board: flash a build with `build.py build --rfd-profile-rolled-out`
-   (RFBoard26 `config/rfd-profile.json` is byte-identical to this profile). It
-   applies S5=1 on its next boot at Idle.
-3. Check every modem with *Verify modem* (GS, RRLS) and the RF health block.
-
-Until all three run S5=1 the check reports S5 as a link-wide difference. The
-link still works while they differ: each modem just repeats its own packets
-a different number of times.
+It is applied automatically: by GS and RRLS at their startup check (and on an
+operator *Fix modem settings*), and by the RF board's default build on its
+next boot at Idle. Each node writes it at most once per boot, only at Idle
+(see "When it runs"), saves, reboots the modem, verifies and reports the
+result; a failed write or verification is reported and not retried. The link
+keeps working while the modems differ in S5 during the transition: each modem
+only repeats its own packets a different number of times. Check every modem
+with *Verify modem* (GS, RRLS) and the RF health block.
 
 ### Opt-in low-latency profile
 
@@ -233,9 +232,9 @@ less time.
 
 **Profile.** `RFBoard26/config/rfd-profile.json`, byte-identical to the GS
 embedded default (`tests/test_rfd_modem.py` checks the deployed values, and byte identity when a sibling GroundStation26 checkout is present). CMake reads its `modem` section into
-the build. Link-wide registers are written only with
-`build.py build --rfd-profile-rolled-out` (CMake `RFD_PROFILE_ROLLED_OUT`,
-default OFF). S1, S2 and `LBT_RSSI` are never written. RTSCTS must be 0: USART1
+the build. A default build writes the link-wide registers of this checked-in
+profile; another profile writes them only with
+`build.py build --rfd-profile-rolled-out` (CMake `RFD_PROFILE_ROLLED_OUT`). S1, S2 and `LBT_RSSI` are never written. RTSCTS must be 0: USART1
 has no RTS/CTS. A compile-time check keeps `RADIO_PACKET_GAP_MS` at least
 S6 + 5.
 

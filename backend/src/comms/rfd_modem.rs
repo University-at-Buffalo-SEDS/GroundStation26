@@ -1221,16 +1221,23 @@ fn raw_radio(link: &CommsLinkConfig) -> Option<&SerialLinkConfig> {
 
 fn plan_for(serial: &SerialLinkConfig) -> Option<Plan> {
     let profile = super::rfd_profile::active()?;
-    Some(Plan::new(profile.modem_values(
-        serial.hardware_flow_control,
-        rolled_out(profile.name()),
-    )))
+    Some(plan_for_profile_with_flow(profile, serial.hardware_flow_control))
+}
+#[cfg(test)]
+pub(crate) fn plan_for_profile(profile: &super::rfd_profile::Profile) -> Plan {
+    plan_for_profile_with_flow(profile, false)
+}
+fn plan_for_profile_with_flow(profile: &super::rfd_profile::Profile, hardware_flow_control: bool) -> Plan {
+    Plan::new(profile.modem_values(hardware_flow_control, rolled_out(profile)))
 }
 
-/// `GS_RFD_PROFILE_ROLLED_OUT` must name the selected profile exactly. It
-/// records that the same profile is set on GS, RRLS and the RF board.
-fn rolled_out(profile_name: &str) -> bool {
-    std::env::var("GS_RFD_PROFILE_ROLLED_OUT").is_ok_and(|v| v.trim() == profile_name)
+/// The embedded default profile is the deployed configuration of all three
+/// modems (GS, RRLS and the RF board's default build apply it automatically),
+/// so its link-wide registers are written with no flag. An opt-in profile is
+/// marked rolled out only by `GS_RFD_PROFILE_ROLLED_OUT` naming it exactly.
+fn rolled_out(profile: &super::rfd_profile::Profile) -> bool {
+    profile.is_embedded_default()
+        || std::env::var("GS_RFD_PROFILE_ROLLED_OUT").is_ok_and(|v| v.trim() == profile.name())
 }
 
 fn simulated_link() -> bool {
@@ -1589,7 +1596,7 @@ pub(crate) fn status() -> Status {
     Status {
         profile_name: profile.map(|p| p.name().to_string()),
         opt_in_profile: profile.is_some_and(|p| !p.is_embedded_default()),
-        rolled_out_all_nodes: profile.is_some_and(|p| rolled_out(p.name())),
+        rolled_out_all_nodes: profile.is_some_and(rolled_out),
         available: AV_BAY
             .get()
             .and_then(raw_radio)
