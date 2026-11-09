@@ -17,7 +17,11 @@ receipt, snapshot after a switch and the `StationModeChanged` frame;
 `history_cleared_through_ms`) and `/api/alerts/history/clear`;
 `/api/network_diagnostics` `radio_tx_budget`; `/api/radio/modem`;
 `/api/rrls/status`; `/api/auth/session` (signed in and anonymous) and
-`/api/auth/challenge`.
+`/api/auth/challenge`; `/api/board_abort` in HITL with every board aborted
+(each error `dismissible`, keyed by board and `timestamp_ms`); and one
+request, `requests/gse-self-test-confirmation`: the isolation checkbox's
+`POST /api/gse/self-test-confirmation` as the station accepts it, with its
+reply. The UI checks that its checkbox sends exactly that request.
 
 Values that change from run to run (tickets, boot epochs, random ids, clock
 readings, process-wide counters) are replaced by fixed values of the same type

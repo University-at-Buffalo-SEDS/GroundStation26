@@ -163,12 +163,14 @@ async fn station(root: &Path) -> Arc<AppState> {
             {"username":"administrator","roles":["admin"],"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true}},
             {"username":"operator","roles":[],"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true,"send_commands":true},
              "command_access":{"allowed_commands":["Abort","StationMode"]}},
-            {"username":"viewer","roles":[],"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true}}
+            {"username":"viewer","roles":[],"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true}},
+            {"username":"isolation","roles":[],"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true,"send_commands":true},
+             "command_access":{"allowed_commands":["ValveSelfTest"]}}
         ]})
         .to_string(),
     )
     .unwrap();
-    for name in ["administrator", "operator", "viewer"] {
+    for name in ["administrator", "operator", "viewer", "isolation"] {
         sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,created_at_ms,expires_at_ms) VALUES(?,?,'session',1,1,0,9999999999999)")
             .bind(format!("{name}-token"))
             .bind(name)
@@ -540,6 +542,50 @@ async fn auth(app: &axum::Router, out: &mut Fixtures) {
     out.add("auth/challenge", challenge);
 }
 
+/// `GET /api/board_abort` in HITL with every board aborted: each active error
+/// is marked dismissible, and the UI keys a dismissal by board and abort time
+/// (`timestamp_ms`), so a dismissed Abort stays hidden until the board aborts
+/// again.
+async fn board_abort_hitl(out: &mut Fixtures) {
+    use crate::types::Board;
+    let _mode = thread_mode(Mode::Hitl);
+    let root = TestDirectory::new();
+    let state = station(&root.0).await;
+    let app = crate::web::router(state.clone(), String::new());
+    let boards = [
+        Board::RFBoard,
+        Board::FlightComputer,
+        Board::PowerBoard,
+        Board::ActuatorBoard,
+        Board::ValveBoard,
+        Board::GatewayBoard,
+        Board::DaqBoard,
+    ];
+    for (i, board) in boards.into_iter().enumerate() {
+        state.board_abort.observe_abort(board, std::time::Instant::now(), T0 as u64 + 1_000 * i as u64);
+    }
+    let value = get_ok(&app, "/api/board_abort", Some("viewer")).await;
+    let errors = value["active_errors"].as_array().unwrap();
+    assert_eq!(errors.len(), boards.len(), "{value}");
+    assert!(errors.iter().all(|e| e["dismissible"] == true), "{value}");
+    out.add("board-abort/status-hitl", value);
+}
+
+/// `POST /api/gse/self-test-confirmation`: the isolation checkbox's request as
+/// the station decodes it (the UI checks that it sends exactly this), and the
+/// station's reply.
+async fn self_test_confirmation(out: &mut Fixtures) {
+    let _mode = thread_mode(Mode::Normal);
+    let root = TestDirectory::new();
+    let state = station(&root.0).await;
+    let app = crate::web::router(state.clone(), String::new());
+    let (method, path, body) = ("POST", "/api/gse/self-test-confirmation", json!({"confirmed": true}));
+    let (status, reply) = call(app.clone(), method, path, Some("isolation"), Some(body.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert!(state.gse.lock().unwrap().engine.config.dry_self_test_confirmed, "the station took the confirmation");
+    out.add("requests/gse-self-test-confirmation", json!({"method": method, "path": path, "body": body, "reply": reply}));
+}
+
 #[tokio::test]
 async fn contract_fixtures_match_the_backend() {
     let _mode = thread_mode(Mode::Normal);
@@ -559,5 +605,8 @@ async fn contract_fixtures_match_the_backend() {
     radio_modem(&app, &mut out).await;
     rrls_status(&app, &mut out).await;
     auth(&app, &mut out).await;
+    drop(_mode);
+    board_abort_hitl(&mut out).await;
+    self_test_confirmation(&mut out).await;
     out.finish();
 }
