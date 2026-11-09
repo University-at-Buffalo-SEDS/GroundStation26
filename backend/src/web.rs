@@ -6166,8 +6166,9 @@ async fn post_alert_ack(
     if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
     }
-    Json(state.acknowledge_alerts_through(body.warning_timestamp_ms, body.error_timestamp_ms))
-        .into_response()
+    let ack = state.acknowledge_alerts_through(body.warning_timestamp_ms, body.error_timestamp_ms);
+    crate::alert_history::save_acks(&state).await;
+    Json(ack).into_response()
 }
 
 #[derive(Deserialize)]
@@ -7138,6 +7139,50 @@ mod alert_history_clear_tests {
             .iter()
             .map(|alert| alert["timestamp_ms"].as_i64().unwrap())
             .collect()
+    }
+
+    async fn acknowledge(state: &Arc<AppState>, headers: &HeaderMap, warning: i64, error: i64) {
+        let response = post_alert_ack(
+            State(state.clone()),
+            headers.clone(),
+            Json(AlertAckRequest { warning_timestamp_ms: warning, error_timestamp_ms: error }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// What a station restart does to the shared acknowledgement state.
+    async fn restart(state: &Arc<AppState>) -> (i64, i64) {
+        *state.alert_ack_state.lock().unwrap() = AlertAckStateMsg::default();
+        crate::alert_history::restore(state).await;
+        let ack = state.alert_ack_state_snapshot();
+        (ack.warning_ack_timestamp_ms, ack.error_ack_timestamp_ms)
+    }
+
+    #[tokio::test]
+    async fn acknowledgements_survive_a_restart_without_hiding_a_new_occurrence() {
+        let (_root, state, _commands, headers) =
+            command_dispatch_tests::preauth_fixture().await;
+        let now = now_ms_i64();
+        acknowledge(&state, &headers, now - 2_000, now - 1_000).await;
+        assert_eq!(restart(&state).await, (now - 2_000, now - 1_000), "acknowledgements survive a restart");
+        assert_eq!(restart(&state).await, (now - 2_000, now - 1_000), "and a second one");
+
+        // The same alert raised again after the restart is a new occurrence,
+        // stamped after the saved acknowledgement, so it shows unacknowledged.
+        state.cache_recent_alert(error_event(now_ms_i64()));
+        let newest = state.recent_alerts_snapshot().iter().map(|a| a.timestamp_ms).max().unwrap();
+        assert!(newest > state.alert_ack_state_snapshot().error_ack_timestamp_ms);
+
+        // A saved acknowledgement ahead of the clock the station restarts with
+        // (no RTC, or a client clock ahead) never covers alerts raised after
+        // the restart: it is cut back to the restart time.
+        acknowledge(&state, &headers, now + 3_600_000, now + 3_600_000).await;
+        let (warning, error) = restart(&state).await;
+        let after = now_ms_i64();
+        assert!(warning <= after && error <= after, "{warning} {error} > {after}");
+        assert!(error >= now - 1_000, "earlier acknowledgements are kept");
     }
 
     #[tokio::test]

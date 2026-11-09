@@ -1,6 +1,12 @@
 //! Operator clearing of warning/error history, with a durable audit trail.
 //! Active conditions, board Abort latches and abort history are never touched:
 //! only resolved condition occurrences leave, and older events are hidden.
+//!
+//! The shared warning/error acknowledgements are saved beside the audit and
+//! restored with it, so a station restart does not reset them. An
+//! acknowledgement covers events stamped at or before its time; one saved
+//! ahead of the clock the station restarts with is cut back to the restart
+//! time, so it never covers an alert raised after the restart.
 use crate::state::AppState;
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -10,6 +16,7 @@ use std::{
 };
 
 const AUDIT_FILE: &str = "alert-history-clears.jsonl";
+const ACK_FILE: &str = "alert-acknowledgements.json";
 /// Entries returned to viewers; the file itself keeps every clear.
 const AUDIT_VIEW_LIMIT: usize = 50;
 
@@ -25,10 +32,111 @@ pub struct ClearEntry {
 static CLEAR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn audit_path(state: &AppState) -> PathBuf {
+    data_dir(state).join(AUDIT_FILE)
+}
+
+fn data_dir(state: &AppState) -> &Path {
     Path::new(&state.placeholder_db_path)
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(AUDIT_FILE)
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct SavedAcks {
+    warning_ack_timestamp_ms: i64,
+    error_ack_timestamp_ms: i64,
+}
+
+/// Serialises acknowledgement file updates across threads.
+static ACK_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn read_acks(path: &Path) -> Result<Option<SavedAcks>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn write_acks(path: &Path, acks: SavedAcks) -> Result<(), String> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec(&acks).map_err(|error| error.to_string())?;
+    let mut file = std::fs::File::create(&temporary).map_err(|error| error.to_string())?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&temporary, path))
+        .map_err(|error| error.to_string())?;
+    if let Ok(dir) = std::fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Saves the current acknowledgements. They only move forward, so the file
+/// keeps the newer of what it holds and the current state, whatever order
+/// concurrent saves run in.
+fn save_acks_blocking_at(path: &Path, current: SavedAcks) -> Result<(), String> {
+    let _serial = ACK_WRITE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // An unreadable file is replaced by the current state.
+    let saved = read_acks(path).unwrap_or(None);
+    let base = saved.unwrap_or_default();
+    let merged = SavedAcks {
+        warning_ack_timestamp_ms: base.warning_ack_timestamp_ms.max(current.warning_ack_timestamp_ms),
+        error_ack_timestamp_ms: base.error_ack_timestamp_ms.max(current.error_ack_timestamp_ms),
+    };
+    if saved == Some(merged) {
+        return Ok(());
+    }
+    write_acks(path, merged)
+}
+
+fn current_acks(state: &AppState) -> SavedAcks {
+    let ack = state.alert_ack_state_snapshot();
+    SavedAcks {
+        warning_ack_timestamp_ms: ack.warning_ack_timestamp_ms,
+        error_ack_timestamp_ms: ack.error_ack_timestamp_ms,
+    }
+}
+
+/// Saves the shared acknowledgements after they change, from a thread that
+/// may block (the GPIO acknowledge button).
+pub fn save_acks_blocking(state: &AppState) {
+    if let Err(error) = save_acks_blocking_at(&data_dir(state).join(ACK_FILE), current_acks(state)) {
+        log::warn!("Alert acknowledgements were not saved: {error}");
+    }
+}
+
+/// Saves the shared acknowledgements after they change.
+pub async fn save_acks(state: &AppState) {
+    let path = data_dir(state).join(ACK_FILE);
+    let current = current_acks(state);
+    match tokio::task::spawn_blocking(move || save_acks_blocking_at(&path, current)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log::warn!("Alert acknowledgements were not saved: {error}"),
+        Err(error) => log::warn!("Alert acknowledgements were not saved: {error}"),
+    }
+}
+
+/// Reapply the saved acknowledgements after a restart, cut back to the
+/// restart time: an alert raised from now on is never covered by them.
+fn restore_acks_blocking(path: &Path, now_ms: i64) -> Result<Option<SavedAcks>, String> {
+    let _serial = ACK_WRITE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(saved) = read_acks(path)? else {
+        return Ok(None);
+    };
+    let restored = SavedAcks {
+        warning_ack_timestamp_ms: saved.warning_ack_timestamp_ms.min(now_ms),
+        error_ack_timestamp_ms: saved.error_ack_timestamp_ms.min(now_ms),
+    };
+    if restored != saved {
+        log::warn!(
+            "Saved alert acknowledgements were ahead of the station clock; cut back to {now_ms}"
+        );
+        write_acks(path, restored)?;
+    }
+    Ok(Some(restored))
 }
 
 fn read_entries(path: &Path) -> Result<Vec<ClearEntry>, String> {
@@ -77,6 +185,16 @@ pub async fn restore(state: &AppState) {
         }
         Ok(Err(error)) => log::warn!("Cannot read alert history audit: {error}"),
         Err(error) => log::warn!("Cannot read alert history audit: {error}"),
+    }
+    let path = data_dir(state).join(ACK_FILE);
+    let now_ms = crate::telemetry_task::get_current_timestamp_ms() as i64;
+    match tokio::task::spawn_blocking(move || restore_acks_blocking(&path, now_ms)).await {
+        Ok(Ok(Some(acks))) => {
+            state.acknowledge_alerts_through(acks.warning_ack_timestamp_ms, acks.error_ack_timestamp_ms);
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => log::warn!("Cannot read saved alert acknowledgements: {error}"),
+        Err(error) => log::warn!("Cannot read saved alert acknowledgements: {error}"),
     }
 }
 

@@ -313,6 +313,7 @@ fn setup_callbacks(
             }
             let now_ms = crate::telemetry_task::get_current_timestamp_ms() as i64;
             state_warning_ack.acknowledge_alerts_through(now_ms, now_ms);
+            crate::alert_history::save_acks_blocking(&state_warning_ack);
         },
     )?;
 
