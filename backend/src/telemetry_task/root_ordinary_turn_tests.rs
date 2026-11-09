@@ -266,6 +266,8 @@ async fn root_profile_clock_and_catalog_share_ordinary_service() {
     router.clear_tx_queue();
     let mut primary = crate::rrls::Mesh::new(crate::rrls::Role::Primary, 42);
     let mut relay = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 43);
+    // The relay hears the AV bay; a5ab02b offers READY only then.
+    relay.assume_av_bay_heard_for_test();
     primary.enable_settings_framing();
     relay.enable_settings_framing();
     write_warm_clock(&clock, &now, 30843);

@@ -654,6 +654,14 @@ impl Mesh {
         self.relay_changed_at = Some(now);
         self.relay_reason = Some(reason);
     }
+    /// Test fixtures that model an RRLS which hears the AV bay throughout
+    /// (the relay case) without feeding it direct AV-bay frames.
+    #[cfg(test)]
+    #[allow(dead_code)] // Used only by hitl_mode/firmware_sim fixtures.
+    pub(crate) fn assume_av_bay_heard_for_test(&mut self) {
+        // hears_av_bay() saturates now - heard to 0: always fresh.
+        self.av_bay_heard = Some(u64::MAX);
+    }
     /// RRLS: it heard the AV bay recently enough for relaying to help.
     fn hears_av_bay(&self, now: u64) -> bool {
         self.av_bay_heard
@@ -2718,16 +2726,23 @@ mod tests {
             mesh.fallback,
             "the original three-second loss threshold remains exact"
         );
-        mesh.direct(83009);
-        for now in [83509, 84009, 84509, 85008] {
+        // Restoration (a5ab02b): RESTORE_MS of continuous direct frames and at
+        // least RELAY_MIN_DWELL_MS in relay, both measured on the boot clock.
+        let restore_at = 83008 + RELAY_MIN_DWELL_MS;
+        let mut now = 83009;
+        while now < restore_at {
             mesh.direct(now);
+            mesh.tick(now);
+            assert!(mesh.fallback, "relay keeps its minimum dwell");
+            now += 500;
         }
-        mesh.tick(85008);
+        mesh.direct(restore_at);
+        mesh.tick(restore_at - 1);
         assert!(mesh.fallback);
-        mesh.tick(85009);
+        mesh.tick(restore_at);
         assert!(
             !mesh.fallback,
-            "the original two-second restoration hysteresis remains exact"
+            "restoration is exact on the process boot clock"
         );
     }
 

@@ -6190,6 +6190,8 @@ mod raw_uart_tests {
         peer.set_timeout(Duration::from_millis(100)).unwrap();
         let (mut uart, shared, _) = recovery_uart_fixture(port);
         let mut mesh = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 2);
+        // The relay hears the AV bay; a5ab02b relays uplink only then.
+        mesh.assume_av_bay_heard_for_test();
         let mut health = 1u32.to_le_bytes().to_vec();
         health.extend_from_slice(&1u32.to_le_bytes());
         health.push(0);
@@ -6316,6 +6318,8 @@ mod raw_uart_tests {
         peer.set_timeout(Duration::from_millis(100)).unwrap();
         let (mut uart, shared, _) = recovery_uart_fixture(port);
         let mut mesh = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 2);
+        // The relay hears the AV bay; a5ab02b relays uplink only then.
+        mesh.assume_av_bay_heard_for_test();
         let mut health = 1u32.to_le_bytes().to_vec();
         health.extend_from_slice(&1u32.to_le_bytes());
         health.push(0);
@@ -6418,6 +6422,8 @@ mod raw_uart_tests {
         peer.set_timeout(Duration::from_millis(100)).unwrap();
         let (mut uart, shared, _) = recovery_uart_fixture(port);
         let mut mesh = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 2);
+        // The relay hears the AV bay; a5ab02b relays uplink only then.
+        mesh.assume_av_bay_heard_for_test();
         let mut health = 1u32.to_le_bytes().to_vec();
         health.extend_from_slice(&1u32.to_le_bytes());
         health.push(0);
