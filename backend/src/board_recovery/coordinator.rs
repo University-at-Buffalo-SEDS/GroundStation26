@@ -14,6 +14,14 @@ const CONFIRM_TTL: Duration = Duration::from_secs(30);
 const QUIESCE_TTL: Duration = Duration::from_secs(12);
 const POLL: Duration = Duration::from_millis(500);
 const _: () = assert!(POLL.as_millis() * super::exchange::POLL_BUDGET as u128 > QUERY_TTL.as_millis());
+/// Wall-clock waits on a board's network reply (fresh query, SDK delivery
+/// drain, poll cadence). A firmware_sim bay runs many times slower than real
+/// time, so these stretch with GS_SIM_WALL_FRESHNESS_SCALE in simulator
+/// builds only; every other build keeps the operational value. Local host
+/// waits (journal, proxy lease, receiver drain) are never stretched.
+fn network_wait(base: Duration) -> Duration {
+    crate::sim_freshness::wall(base)
+}
 #[cfg(test)]
 #[path = "coordinator_c_board_tests.rs"]
 mod c_board_ordering_tests;
@@ -23,6 +31,26 @@ mod control_drain_tests;
 #[cfg(test)]
 #[path = "coordinator_prepare_admission_tests.rs"]
 mod prepare_admission_tests;
+
+#[cfg(test)]
+mod network_wait_tests {
+    use super::*;
+    /// Only a firmware_sim (non test-fire, non Pi) build may stretch the waits
+    /// on a board's network reply; every other build keeps 15 s / 12 s / 500 ms.
+    #[test]
+    fn network_waits_keep_operational_values_outside_simulator_builds() {
+        let scale = crate::sim_freshness::scale() as u32;
+        if !crate::sim_freshness::SCALING_BUILD {
+            assert_eq!(scale, 1);
+        }
+        assert_eq!(network_wait(QUERY_TTL), QUERY_TTL * scale);
+        assert_eq!(network_wait(QUIESCE_TTL), QUIESCE_TTL * scale);
+        assert_eq!(network_wait(POLL), POLL * scale);
+        assert_eq!(QUERY_TTL, Duration::from_secs(15));
+        assert_eq!(QUIESCE_TTL, Duration::from_secs(12));
+        assert_eq!(POLL, Duration::from_millis(500));
+    }
+}
 
 #[cfg(test)]
 mod explicit_launch_reset_tests {
@@ -678,7 +706,7 @@ async fn refresh_prepare_queries(
             if fresh {
                 break;
             }
-            if start.elapsed() > QUERY_TTL {
+            if start.elapsed() > network_wait(QUERY_TTL) {
                 return Err("Fresh query timed out before challenge");
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -1356,7 +1384,7 @@ async fn fresh_query(
             }
             return Ok(observation);
         }
-        if start.elapsed() > QUERY_TTL {
+        if start.elapsed() > network_wait(QUERY_TTL) {
             return Err("Dedicated query timed out; SDK ACK is not readback");
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1443,7 +1471,7 @@ async fn exchange(
             if !row.fresh(Stamp::now()) {return Err("Original preparation query expired before SDK admission");}
             exchange.packet(Stamp::now()).map(|_|())
         }).await?;
-    let mut next_poll = WallInstant::now() + POLL;
+    let mut next_poll = WallInstant::now() + network_wait(POLL);
     loop {
         if crate::gse::with_closed_operator_queue(state, token, || ()).is_none() {
             return Err("Stop superseded board recovery");
@@ -1479,7 +1507,7 @@ async fn exchange(
             authorize(state, headers, ticket).await?;
             let packet=exchange.poll_packet(Stamp::now())?;
             send(state,headers,ticket,&router,token,packet,||exchange.packet(Stamp::now()).map(|_|())).await?;
-            next_poll = WallInstant::now() + POLL;
+            next_poll = WallInstant::now() + network_wait(POLL);
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1594,7 +1622,7 @@ async fn wait_sdk(
         let Some(reason) = sdk_pending_reason(state, router, scope) else {
             return if origin_current(state,token){Ok(())}else{Err("Recovery generation, Stop or newer manual control changed")};
         };
-        if start.elapsed() > QUIESCE_TTL {
+        if start.elapsed() > network_wait(QUIESCE_TTL) {
             return Err(reason);
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
