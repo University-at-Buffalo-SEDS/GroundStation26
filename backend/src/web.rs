@@ -994,7 +994,7 @@ async fn get_kg50_input_status(State(state): State<Arc<AppState>>) -> impl IntoR
 /// The selection is durable once saved. A send the SDK refuses here is retried
 /// from the board's next report, so it does not fail the operator's request.
 fn publish_kg50_input(state: &AppState, cfg: &loadcell::LoadcellCalibrationFile) {
-    state.kg50_input_sync.note_published();
+    state.kg50_input_sync.note_selected();
     if let Err(error) = publish_daq_calibration(state, cfg) {
         log::warn!("sending DAQ 50 kg input: {error}");
     }

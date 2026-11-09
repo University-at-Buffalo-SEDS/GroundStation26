@@ -2138,6 +2138,47 @@ mod persistence_callback_tests {
         kg50_input_pump(&source, &peer);
         assert_eq!(*applied.lock().unwrap(), vec![1, 1, 0]);
     }
+    /// A board on the SDK's same-sender timestamp order (every DAQ firmware
+    /// up to 8ce1685) that cached a stray newer AMP2 write from "GS" drops the
+    /// station's older-stamped P6 selection, yet acknowledges it. Re-stamping
+    /// with the wall clock converges only when the stray stamp is in the past.
+    #[test]
+    fn a_restamped_selection_outranks_a_stray_newer_value_only_from_the_past() {
+        const NAME: &str = "network_variables::persistence_callback_tests::a_restamped_selection_outranks_a_stray_newer_value_only_from_the_past";
+        if !isolated(NAME) {
+            return;
+        }
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let sink = applied.clone();
+        let (source, peer) = kg50_input_pair(move |input| sink.lock().unwrap().push(input));
+        let stray = crate::loadcell::LoadcellCalibrationFile {
+            kg50_input: crate::loadcell::Kg50Input::Amp2,
+            kg50_input_stamp_ms: 2_000_000,
+            ..Default::default()
+        };
+        set_daq_kg50_input(&source, &stray).unwrap();
+        kg50_input_pump(&source, &peer);
+        let mut cfg = crate::loadcell::LoadcellCalibrationFile {
+            kg50_input: crate::loadcell::Kg50Input::P6Differential,
+            kg50_input_stamp_ms: 1_000_000,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            set_daq_kg50_input(&source, &cfg).unwrap();
+            kg50_input_pump(&source, &peer);
+        }
+        assert_eq!(*applied.lock().unwrap(), vec![0], "older stamp never applies");
+        // Station clock behind the stray stamp: the re-stamp still loses.
+        cfg.kg50_input_stamp_ms = 1_999_999;
+        set_daq_kg50_input(&source, &cfg).unwrap();
+        kg50_input_pump(&source, &peer);
+        assert_eq!(*applied.lock().unwrap(), vec![0]);
+        // Wall clock past the stray stamp: the re-stamped selection applies.
+        cfg.kg50_input_stamp_ms = 2_000_100;
+        set_daq_kg50_input(&source, &cfg).unwrap();
+        kg50_input_pump(&source, &peer);
+        assert_eq!(*applied.lock().unwrap(), vec![0, 1]);
+    }
     #[test]
     fn unusable_amp2_coefficients_do_not_hold_back_the_kg50_input() {
         const NAME: &str = "network_variables::persistence_callback_tests::unusable_amp2_coefficients_do_not_hold_back_the_kg50_input";
