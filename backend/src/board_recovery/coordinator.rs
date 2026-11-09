@@ -890,8 +890,8 @@ fn prepare_inner(
             if first_binding.is_some() || row.value.boot == u64::MAX || row.value.result != 0 {
                 return Err("The board needs commissioning first; use Review recovery");
             }
-            if !resync_outputs_safe(board, &row.value) {
-                return Err("Resync never moves outputs, and this board's outputs do not read safe. Use Review recovery or Reset all boards.");
+            if !resync_outputs_ready(board, &row.value, Some(phase)) {
+                return Err(if phase <= 1 { "This board's outputs do not read back consistently, so Resync cannot verify them. Query the board again, or use Reset all boards." } else { "Resync never moves outputs, and this board's outputs do not read safe. Use Review recovery or Reset all boards." });
             }
             if row.value.state == Some(phase) && row.value.flags & 1 == 0 {
                 return Err("The board already matches the station's phase; nothing to resync");
@@ -1017,7 +1017,7 @@ fn prepare_inner(
         .any(|t| t.context.boot == u64::MAX || t.context.result == 7 || t.first_binding.is_some());
     let resync_label = resync_phase.map(phase_label);
     let resync_summary = resync_label.as_ref().zip(names.first()).map(|(label, board)| if resync_phase.is_some_and(|phase| phase <= 1) { format!(
-        "Resync {board} to {label}. The board leaves whatever state it is in, including Launch, without an Abort: it stops its own launch sequence, drives its outputs to their safe state, and sets its state machine, phase and recovery epoch to match the station. Its outputs must already read safe.") } else { format!(
+        "Resync {board} to {label}. The board leaves whatever state it is in, including Launch, without an Abort: it stops its own launch sequence, drives its outputs to their safe state, and sets its state machine, phase and recovery epoch to match the station.") } else { format!(
         "Resync {board} to {label}. This sets only the board's state machine, phase and recovery epoch to match the station, and clears a latched board Abort. No outputs move: valves, servos, supplies, igniter and stepper stay exactly as they are and must already read safe. Command any output explicitly afterwards.") });
     let phrase = if let (Some(label), Some(board)) = (resync_label.as_ref(), names.first()) {
         format!("RESYNC {board} TO {}", label.to_ascii_uppercase())

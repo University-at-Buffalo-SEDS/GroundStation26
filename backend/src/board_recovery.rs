@@ -287,7 +287,10 @@ fn resync_board_block_reason(board: Board, row: Option<&Readback>, target: Optio
     if matches!(row.boot, 0 | u64::MAX) || row.result == 7 {
         return Some("The board needs commissioning first. Use Review recovery.".into());
     }
-    if !resync_outputs_safe(board, row) {
+    if !resync_outputs_ready(board, row, target) && target.is_some_and(|phase| phase <= 1) {
+        return Some("This board's outputs do not read back consistently, so Resync cannot verify them. Query the board again, or use Reset all boards.".into());
+    }
+    if !resync_outputs_ready(board, row, target) {
         return Some("Resync never moves outputs, and this board's outputs do not read safe. Use Review recovery or Reset all boards.".into());
     }
     if let Some(phase) = target && row.state == Some(phase) && row.flags & 1 == 0 {
@@ -297,6 +300,19 @@ fn resync_board_block_reason(board: Board, row: Option<&Readback>, target: Optio
 }
 /// The board refuses RESYNC unless its commanded outputs already read safe;
 /// it never drives them. Mirror that here so the operator sees why.
+/// Resync to a fill phase or Armed never moves an output, so they must
+/// already read safe. Resync to Startup or Idle drives every output of the
+/// board to its safe state itself (igniter, supplies, valves, stepper asleep)
+/// before it changes state, so its outputs need only be readable and
+/// consistent; a board left in Launch with its stepper holding is the case
+/// this exists for.
+fn resync_outputs_ready(board: Board, row: &Readback, target: Option<u8>) -> bool {
+    if target.is_some_and(|phase| phase <= 1) {
+        return row.flags & (STATE_VALID | OUTPUTS_VALID) == STATE_VALID | OUTPUTS_VALID
+            && query_domain_consistent(board, row);
+    }
+    resync_outputs_safe(board, row)
+}
 fn resync_outputs_safe(board: Board, row: &Readback) -> bool {
     row.flags & (STATE_VALID | OUTPUTS_VALID | 2) == STATE_VALID | OUTPUTS_VALID | 2
         && safe_output_mask(board) == Some(row.outputs)

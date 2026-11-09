@@ -167,7 +167,7 @@ impl Exchange {
                 && query.value.flags & RESYNC_IMPLEMENTATION != 0
                 && query.value.result == 0
                 && query.value.boot != u64::MAX
-                && resync_outputs_safe(board, &query.value),
+                && resync_outputs_ready(board, &query.value, Some(desired)),
             _ => false,
         };
         if index(board).is_none()

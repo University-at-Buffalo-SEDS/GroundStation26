@@ -270,7 +270,7 @@ async fn resync_returns_a_board_left_in_launch_to_idle_without_an_abort() {
     assert_eq!(code, StatusCode::CONFLICT);
     assert!(refused["message"].as_str().unwrap().contains("overpressure"), "{refused}");
     crate::gse::set_overpressure_latch_for_test(&state, None);
-    // Outputs that do not read safe refuse too, before anything is sent.
+    // Outputs that do not read back consistently refuse too, before anything is sent.
     model.lock().unwrap().output_override = Some(2);
     f.query(Board::ActuatorBoard).await;
     let (code, refused) = resync_prepare_raw(&f, "AB").await;
@@ -292,4 +292,21 @@ async fn resync_returns_a_board_left_in_launch_to_idle_without_an_abort() {
     drop(m);
     assert_eq!(state.manual_abort_intent.epoch(), 0, "no Stop was sent");
     assert!(state.board_abort.masks().0 == 0, "no board Abort");
+}
+
+/// To Startup/Idle the board drives its outputs safe itself, so an AB left in
+/// Launch with its stepper holding (outputs not yet safe) may be resynced;
+/// to a fill phase the outputs must already read safe.
+#[test]
+fn resync_to_idle_accepts_readable_unsafe_outputs_but_a_fill_phase_does_not() {
+    let row = |flags: u8, outputs: u32| Readback { result: 0, state: Some(7), flags, nonce: 1, boot: 42, epoch: 3, uptime: 1, outputs, issuer: 7 };
+    let holding = row(0x24 | STATE_VALID | OUTPUTS_VALID | RESYNC_IMPLEMENTATION, 16);
+    assert!(resync_outputs_ready(Board::ActuatorBoard, &holding, Some(1)));
+    assert!(resync_outputs_ready(Board::ActuatorBoard, &holding, Some(0)));
+    assert!(!resync_outputs_ready(Board::ActuatorBoard, &holding, Some(5)));
+    assert_eq!(resync_board_block_reason(Board::ActuatorBoard, Some(&holding), Some(1)), None);
+    // Unreadable outputs are refused for every target.
+    let unreadable = row(0x24 | STATE_VALID | RESYNC_IMPLEMENTATION, 0);
+    assert!(!resync_outputs_ready(Board::ActuatorBoard, &unreadable, Some(1)));
+    assert!(resync_board_block_reason(Board::ActuatorBoard, Some(&unreadable), Some(1)).unwrap().contains("consistently"));
 }
