@@ -2340,15 +2340,7 @@ async fn handle_packet_inner(
     } else {
         state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
     }
-    if crate::simulation_clock_ms().is_none() {
-        let sender = state.health_sender_id(pkt.sender());
-        state.network_health.lock().unwrap().observe_clock(
-            &sender,
-            pkt.timestamp(),
-            get_current_timestamp_ms(),
-            std::time::Instant::now(),
-        );
-    }
+    observe_board_clock(state, pkt.sender(), pkt.timestamp());
     #[cfg(test)]
     if crate::runtime_mode::is_test_fire() {
         crate::recovery_pending_probe::before_automatic(state, &pkt).await;
@@ -2977,6 +2969,21 @@ async fn handle_packet_inner(
 
         Vec::new()
     }
+}
+
+/// Board network time against the station's network time at receipt, for the
+/// clock-offset column of network health. On hardware that is the host wall
+/// clock; a simulator station runs on its model clock, which is also the time
+/// the boards are synced to, so the offset is taken against that instead.
+fn observe_board_clock(state: &AppState, sender: &str, source_ms: u64) {
+    let sender = state.health_sender_id(sender);
+    let station_ms = procedure_clock::timestamp_ms().max(0) as u64;
+    state.network_health.lock().unwrap().observe_clock(
+        &sender,
+        source_ms,
+        station_ms,
+        std::time::Instant::now(),
+    );
 }
 
 pub fn get_current_timestamp_ms() -> u64 {
@@ -7614,6 +7621,47 @@ mod tests {
         crate::mode_suite!(TestFire);
         if crate::operator_queue::isolated_case(module_path!(), "recognized_compact_mcu_dequeue_keeps_original_automatic_admission") { return; }
         recognized_dequeue_qualifies_once(true).await;
+    }
+
+    #[tokio::test]
+    async fn board_clock_offset_is_measured_against_the_model_clock_in_a_simulation() {
+        const NAME: &str = "board_clock_offset_is_measured_against_the_model_clock_in_a_simulation";
+        if crate::operator_queue::isolated_case(module_path!(), NAME) { return; }
+        // A simulator station runs on a model clock: board packets carry the
+        // model's network time, so the offset must be taken against it, not
+        // skipped (network health showed no clock offset in every simulation).
+        if std::env::var_os("GS_CLOCK_OFFSET_MODEL_CHILD").is_none() {
+            let root = std::path::PathBuf::from(std::env::var_os("GS_RECOVERY_ISOLATED_ROOT").unwrap());
+            let clock = root.join("clock-offset-model-clock");
+            std::fs::write(&clock, "100000").unwrap();
+            let case = format!("{}::{NAME}", module_path!().split_once("::").unwrap().1);
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &case, "--nocapture", "--test-threads=1"])
+                .env("GS_CLOCK_OFFSET_MODEL_CHILD", "1")
+                .env("GS_SIM_CLOCK_FILE", clock)
+                .env("GS_SIM_NETWORK_EPOCH_MS", "1767225600000")
+                .output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success() && stdout.contains("1 passed; 0 failed; 0 ignored;"), "{stdout}\n{stderr}");
+            return;
+        }
+        let model = procedure_clock::now();
+        if model.model_monotonic_ms().is_none() {
+            // Only a firmware_sim or HITL station reads the model clock file.
+            return;
+        }
+        let station_ms = model.timestamp_ms() as u64;
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        observe_board_clock(&state, "DAQ", station_ms - 40);
+        observe_board_clock(&state, "VB", station_ms + 1_500);
+        let rows = state.network_health.lock().unwrap().snapshot(std::time::Instant::now(), false);
+        let offset = |id: &str| rows.iter().find(|r| r.sender_id == id).and_then(|r| r.clock_offset_ms);
+        let daq = offset("DAQ").expect("a simulated board's clock offset is reported");
+        let vb = offset("VB").expect("a simulated board's clock offset is reported");
+        assert!((-40 - 5..=-40).contains(&daq), "DAQ offset {daq}");
+        assert!((1_500 - 5..=1_500).contains(&vb), "VB offset {vb}");
     }
 
     #[tokio::test]
