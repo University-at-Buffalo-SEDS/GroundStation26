@@ -638,6 +638,9 @@ impl Switch {
             }
         }
         let challenge = json!({
+            // The UI decodes the binding flattened into the challenge and
+            // rejects one without its contract version.
+            "version": 2,
             "backend_instance": binding.backend_instance,
             "principal_context": binding.principal_context,
             "authority_id": binding.authority_id,

@@ -229,6 +229,13 @@ async fn confirmed_simulation_change_saves_the_selection_then_requests_a_clean_r
     assert_eq!(status, StatusCode::OK, "{challenge}");
     assert_eq!(challenge["target"]["id"], target);
     assert_eq!(challenge["expires_in_ms"], 15_000);
+    // The UI decodes the binding flattened into the challenge, version included;
+    // without it every review failed as "Unsupported mode challenge".
+    assert_eq!(challenge["version"], 2);
+    for key in ["backend_instance", "principal_context", "authority_id", "revision", "policy_epoch",
+                "current_id", "target_id", "ticket", "transition_id", "current", "summary"] {
+        assert!(challenge.get(key).is_some(), "challenge missing {key}: {challenge}");
+    }
     let phrase = challenge["required_confirmation"].as_str().unwrap().to_owned();
     assert_eq!(phrase, format!("RESTART {}", target.to_uppercase()));
     // A wrong phrase consumes the ticket and changes nothing.
