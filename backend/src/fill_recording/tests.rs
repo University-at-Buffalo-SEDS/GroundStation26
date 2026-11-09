@@ -725,3 +725,48 @@ async fn accepted_zero_rechecks_permission_session_stop_reset_and_recording_rece
         }
     }
 }
+
+/// HITL fill (gse_flows sim): with a 100 psi nitrous target under a 150 psi
+/// hardware ceiling every Fill was refused with "Nitrous target must be below
+/// the hardware pressure ceiling": admission compared the engine's built-in
+/// 750 psi target, which only the Normal/test-fire operational tick replaced
+/// with the configured one. After a station tick HITL admits the Fill against
+/// the configured target; Normal and test fire (whose operational tick needs
+/// live fill-system routes this fixture does not model) still do.
+#[tokio::test]
+async fn actual_http_fill_is_admitted_against_the_configured_nitrous_target() {
+    if crate::operator_queue::isolated_case(
+        module_path!(),
+        "actual_http_fill_is_admitted_against_the_configured_nitrous_target",
+    ) {
+        return;
+    }
+    let f = Fixture::new_phase(false, gse_sequence::Phase::Passed).await;
+    let mut targets = f.state.fill_targets_snapshot();
+    targets.nitrous.target_pressure_psi = 100.0;
+    f.state.set_fill_targets(targets);
+    {
+        // The gse_flows settings: 50 psi nitrogen test, 150 psi ceiling.
+        let mut rt = f.state.gse.lock().unwrap();
+        rt.engine.config.nitrogen_target_psi = 50.0;
+        rt.engine.config.pressure_ceiling_psi = Some(150.0);
+        rt.engine.nitrous_target_psi = if crate::runtime_mode::is_hitl() {
+            // As at boot: nothing has copied the configured target yet.
+            gse_sequence::Engine::default().nitrous_target_psi
+        } else {
+            100.0
+        };
+    }
+    if crate::runtime_mode::is_hitl() {
+        // The HITL sequence loop ticks every 200 ms.
+        crate::gse::tick(&f.state, true);
+    }
+    let result = press(f.state.clone(), Some("fill-token")).await;
+    assert_eq!(result.0, StatusCode::OK, "{}", result.1);
+    f.pump();
+    // The fill opens its supply, or first captures the empty-tank zero.
+    assert!(
+        !f.sent.lock().unwrap().is_empty() || f.state.auto_zero.lock().unwrap().pending(),
+        "the accepted fill started"
+    );
+}

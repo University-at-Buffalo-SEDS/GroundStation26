@@ -745,6 +745,19 @@ fn restore_operational(state: &AppState) {
     }
 }
 
+impl Runtime {
+    /// The engine checks fill admission, its pressure ceilings and Turbocharge
+    /// against its own copy of the nitrous target, which starts at its
+    /// built-in 750 psi. Adopt the configured target whenever no sequence owns
+    /// the engine; a running or paused session keeps the target it started
+    /// with. The station's sequence loop calls this every tick in every mode;
+    /// Normal and test fire also copy it on their operational tick.
+    pub(crate) fn adopt_nitrous_target(&mut self, target_psi: f32) {
+        if !self.engine.active() {
+            self.engine.nitrous_target_psi = target_psi;
+        }
+    }
+}
 fn load_config(state: &AppState) {
     match std::fs::read(config_path())
         .map_err(|e| e.to_string())
@@ -1854,6 +1867,8 @@ pub(crate) fn pause_fill_for_recoverable_fault_for_generation(
 }
 
 pub fn tick(state: &Arc<AppState>, interlock: bool) {
+    let configured = state.fill_targets_snapshot().nitrous.target_pressure_psi;
+    state.gse.lock().unwrap().adopt_nitrous_target(configured);
     // Overpressure precedes cold flow, sequences, pause and hold logic.
     overpressure::evaluate(state);
     if state.gse.lock().unwrap().overpressure.owns_valves() {
