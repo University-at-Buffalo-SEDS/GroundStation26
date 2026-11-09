@@ -1592,6 +1592,51 @@ pub(crate) fn decode_rf_status(words: &[u32]) -> Option<RfModemStatus> {
     })
 }
 
+/// GLOBAL_RETRIES (S5) the modems on this link actually use, as far as
+/// this station knows: the larger of the RF board's reported readback (RF
+/// BOARD_HEALTH, at most 2 minutes old) and this station's own last check.
+/// Every broadcast packet holds the air for 1 + S5 copies, so pacing for the
+/// profile's S5=1 while the modems still use 10 overruns them about 5.5x.
+pub(crate) fn link_global_retries() -> Option<u16> {
+    let rf = RF_BOARD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|seen| {
+        (unix_ms().saturating_sub(seen.status.received_unix_ms) <= 120_000)
+            .then_some(seen.status.global_retries)
+            .flatten()
+    });
+    let own = GLOBAL.lock().unwrap_or_else(|e| e.into_inner()).report.as_ref().and_then(|report| {
+        let written = report
+            .writes
+            .iter()
+            .find(|w| w.number == 5)
+            .filter(|_| report.outcome == Outcome::Applied)
+            .map(|w| w.to);
+        written
+            .or_else(|| report.registers.iter().find(|r| r.number == 5).and_then(|r| r.observed))
+            .and_then(|v| u16::try_from(v).ok())
+    });
+    rf.into_iter().chain(own).max()
+}
+
+/// GLOBAL_RETRIES assumed until a readback proves the modems' value: the
+/// deployed modems read S5=10 on 10-28, and a station that cannot check
+/// (startup gate closed, simulated link) or an RF board that does not report
+/// must not pace for S5=1 on a link that still sends eleven copies.
+pub(crate) const UNPROVEN_GLOBAL_RETRIES: u16 = 10;
+
+/// What this station paces for: the proven value, or the deployed one.
+pub(crate) fn pacing_global_retries() -> u16 {
+    link_global_retries().unwrap_or(UNPROVEN_GLOBAL_RETRIES)
+}
+
+/// The host share (percent of `usable_air_bps`) that keeps this host under
+/// what the air carries with `global_retries` copies, or None when the
+/// profile's pacing already fits. 94% of the modem rate leaves room for the
+/// modem's own framing.
+pub(crate) fn link_share_cap_percent(modem_air_bps: u64, usable_air_bps: u64, global_retries: u16) -> Option<u8> {
+    let carried = modem_air_bps * 94 / 100 / (1 + u64::from(global_retries));
+    (carried < usable_air_bps).then(|| (carried * 100 / usable_air_bps.max(1)).clamp(1, 100) as u8)
+}
+
 struct RfSeen {
     status: RfModemStatus,
     uptime_ticks: u64,

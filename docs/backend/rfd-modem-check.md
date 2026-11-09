@@ -7,12 +7,30 @@ be written by one node, they write only that setting, save it, reboot the
 modem and verify it.
 
 The default profile is the embedded `backend/comms/rfd-profile.json`
-(`rfd-async-64k-global1`): S3=3968, S4=10, **S5=1**, S6=50, S11=32768, S18=0.
+(`rfd-async-64k-drain`): S3=3968, S4=10, **S5=1**, **S6=10**, S11=32768, S18=0.
 The modems read S5=10 on 10-28. Every broadcast packet (DESTID 32768) holds the
 air for 1 + S5 copies, so S5=10 leaves 64000/11 = 5818 bit/s of air for
 32000 bit/s of host pacing: the modems' buffers overflowed and most AV-bay
 frames never arrived (bench: AV-bay data 2-4 s old, about 11 frames/s heard).
 The profile check now rejects a usable air rate the copies cannot carry.
+S6=10 lets the modem start a packet 10 ms after the host goes quiet instead of
+50 ms.
+
+### Host pacing
+
+The modem arbitrates the air itself (ASYNC, listen-before-talk, its own
+copies). Host pacing only keeps the modem's 4 KiB buffer from overflowing,
+because RTS/CTS is off. Each host (GS, RRLS, RF board) therefore paces with one
+token bucket sized just under the modem's drain rate: `usable_air_bps` 30000
+against 64000 / (1 + S5) = 32000 bit/s, with `host_default_share_percent` and
+`rf_share_percent` both 100. One host alone may use the whole link. The UART
+packet window is 250 ms with a 15 ms idle boundary (S6 + 5 ms), so a short
+frame waits at most about 15 ms for its packet to close. Priority order is
+unchanged (receipts, time sync and commands first), and an RRLS relay keeps
+its own relay-only cap. The earlier profile held the GS to 25 % and the RF to
+35 % of 32 kbit/s with 100 ms bursts and 55 ms gaps, so each host reserved
+airtime the other was not using and frames waited in host queues while the
+air was idle.
 The default profile is applied automatically: GS, RRLS and the RF board's
 default build write its link-wide registers too, so S5=1 lands on all three
 modems with no flag, environment variable or manual AT command. On a correctly
@@ -107,14 +125,14 @@ process run. RFDesign does not publish EEPROM endurance.
 
 ### Register plan
 
-| Reg | Name | Default profile (global1) | Opt-in one-retry-layer | Policy |
+| Reg | Name | Default profile (drain) | Opt-in one-retry-layer | Policy |
 |---|---|---|---|---|
 | S1 | SERIAL_SPEED | 115 | 115 | report (changing it cuts this host off) |
 | S2 | AIR_SPEED | 64 | 64 | report, always: link-critical |
 | S3 | MAX_DATA | 3968 | 3968 | link-wide |
 | S4 | MAX_RETRIES | 10 | 10 | link-wide |
 | S5 | GLOBAL_RETRIES | **1** (modems read 10 until rolled out) | **0** | link-wide |
-| S6 | SER_BREAK_DETECT_MS | 50 | **20** | fix (local) |
+| S6 | SER_BREAK_DETECT_MS | **10** | **20** | fix (local) |
 | S7, S8 | TX/RXENCAP | 0 | 0 | link-wide |
 | S11 | DESTID | 32768 | 32768 | fix (local; broadcast so RRLS hears both ends) |
 | S13 | MAVLINK1 | 0 | 0 | fix (local) |
@@ -258,13 +276,15 @@ the real bay it reaches RF only over the radio. Holding the radio would have
 cost a 10 s outage on every boot and the check would never have run. The
 implemented gate:
 
-* a restored (persisted) flight phase other than Startup, Idle, PreFill or
-  FillTest, for example after a brown-out reboot in flight, skips the check
-  at once and never holds the radio;
-* otherwise the radio runs normally. The first validated FLIGHT_STATE
-  received after boot (the same authorization path as every managed update)
-  decides: Startup, Idle, PreFill or FillTest runs the check, anything else
-  skips it for this boot. GS answers RF's refresh with its stored flight
+* the radio runs normally until a validated FLIGHT_STATE (the same
+  authorization path as every managed update) allows the check: Startup,
+  Idle, PreFill or FillTest, or Aborted at rest (Aborted with no change for
+  15 s, past an ABORT's delivery window; no countdown or launch runs while
+  Aborted). Fill states, Armed, flight, Landed and Recovery defer it until
+  the gate opens; it is never skipped for the boot (the bench station stayed
+  Aborted, so its RF modem kept S5=10). After a restored (persisted) flight
+  phase, for example a brown-out reboot in flight, the network state must
+  also have held for 15 s. GS answers RF's refresh with its stored flight
   state, so this is normally a few seconds after the link comes up; on a
   fresh install with no stored state it is the operator's first flight-state
   change (for example Startup to Idle);

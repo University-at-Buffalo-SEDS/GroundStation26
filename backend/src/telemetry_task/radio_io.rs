@@ -121,6 +121,32 @@ fn radio_lane_priority(priority: u8, payload: &[u8]) -> u8 {
         priority
     }
 }
+/// ABORT or an operator command: served before everything else in the
+/// writer's control lane.
+fn urgent_control(payload: &[u8]) -> bool {
+    is_abort_frame(payload)
+        || (!payload.starts_with(b"SDT")
+            && serialize::peek_frame_info_unchecked(payload).is_ok_and(|info| {
+                let ty = info.envelope.ty;
+                !own_retransmit(payload)
+                    && RECOVERY_CONTROL_TYPES.iter().any(|name| ty == crate::telemetry_schema::data_type(name))
+            }))
+}
+/// The station's own requests the SDK retransmits until answered (board
+/// readback queries, managed-variable writes). FLIGHT_STATE stays with the
+/// operator commands: it is the operator's state change, in order. On a
+/// link whose downlink is failing they repeat without end; receipts and time
+/// sync go before them so the far side stops retransmitting.
+fn own_retransmit(payload: &[u8]) -> bool {
+    use sedsnet::config::DataType;
+    !payload.starts_with(b"SDT")
+        && serialize::peek_frame_info_unchecked(payload).is_ok_and(|info| {
+            let ty = info.envelope.ty;
+            ty == crate::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST")
+                || matches!(ty, DataType::ManagedVariableRequest | DataType::ManagedVariableValue)
+        })
+}
+
 fn is_operator_control_type(ty: sedsnet::config::DataType) -> bool {
     RECOVERY_CONTROL_TYPES.iter().any(|name| ty == crate::telemetry_schema::data_type(name))
         || ty == crate::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST")
@@ -277,6 +303,15 @@ pub struct TxQueueBudget {
     /// While one is still waiting to be written, a copy is redundant.
     pending_receipts: Mutex<Vec<(usize, usize, u64)>>,
     coalesced_receipts: std::sync::atomic::AtomicU64,
+    /// Radio only: retries accepted and dropped because identical bytes were
+    /// still waiting (a pending command or a parked canonical frame).
+    coalesced_frames: std::sync::atomic::AtomicU64,
+    /// Radio: the writer's paced rate (bytes/s), 0 until known. Bounds what
+    /// may wait by airtime instead of frame count.
+    paced_bytes_per_s: std::sync::atomic::AtomicU64,
+    /// Radio: accepted time sync frames (allocation identity) and when they
+    /// go stale; the writer drops them past that instead of sending late.
+    time_sync_expiry: Mutex<Vec<(usize, usize, TxDeadline)>>,
 }
 
 /// A frame the radio budget owns but has not yet handed to the writer. It
@@ -293,6 +328,11 @@ struct Parked {
     /// install, which later compact frames depend on.
     chunk: bool,
     chunk_dictionary: bool,
+    /// Replaceable frames (heartbeat, time sync, best-effort telemetry) are
+    /// worthless once this old; they are dropped instead of sent late.
+    expires: Option<TxDeadline>,
+    /// A replaceable template install: replaced only by a newer install.
+    install: bool,
     lease: Option<sedsnet::router::PackedWriteLease>,
     activity: Option<Arc<TransportTxActivity>>,
     sender: mpsc::UnboundedSender<(u8, Vec<u8>)>,
@@ -302,11 +342,22 @@ struct Parked {
 /// reached 14k frames; the router serves that queue in priority order inside
 /// a 3 ms pass, so umbilical commands and receipts waited behind refused
 /// radio frames and every pass re-offered each of them). Bounded in frames
-/// and bytes; past PARK_SHED_BYTES the oldest best-effort telemetry is shed
-/// (counted in `shed_frames`) so what waits stays about a second fresh.
+/// and bytes, and by airtime once the writer's paced rate is known. Only the
+/// newest frame of a replaceable stream waits, and none waits past its
+/// staleness age (dropped frames are counted in `shed_frames`).
 const PARKED_FRAMES: usize = 1024;
 const PARK_MAX_BYTES: usize = 64 * 1024;
-const PARK_SHED_BYTES: usize = 1024;
+/// Once the writer's paced rate is known, the park holds at most this much
+/// airtime (bench Pi, S5=10: 1024 frames, 52 KB, about 50 s of air).
+const PARK_MAX_AIR_MS: u64 = 1_500;
+const PARK_MIN_BYTES: usize = 384;
+/// Control frames (receipts, commands, canonical time sync) admitted ahead of
+/// the writer: at most this much airtime once the paced rate is known.
+const CONTROL_MAX_AIR_MS: u64 = 1_000;
+const CONTROL_MIN_BYTES: usize = 256;
+/// Age past which a replaceable frame is dropped instead of sent.
+const STALE_TELEMETRY_MS: u64 = 1_500;
+const STALE_TIME_SYNC_MS: u64 = 500;
 
 /// The reservation belongs to the starving class, not to exact bytes: the
 /// router re-encodes a refused frame on every offer (a fresh discovery
@@ -366,6 +417,13 @@ static RADIO_TX_BUDGET: OnceLock<Arc<TxQueueBudget>> = OnceLock::new();
 pub fn register_radio_tx_budget(budget: Arc<TxQueueBudget>) {
     let _ = RADIO_TX_BUDGET.set(budget);
 }
+/// The radio writer's paced rate, so what the budget lets wait is bounded by
+/// airtime (see `TxQueueBudget::set_paced_bytes_per_s`).
+pub fn set_radio_paced_bytes_per_s(rate: u64) {
+    if let Some(budget) = RADIO_TX_BUDGET.get() {
+        budget.set_paced_bytes_per_s(rate);
+    }
+}
 /// Radio side refusal reasons and the bytes currently owned by the writer.
 pub fn radio_tx_budget_diagnostics() -> Option<serde_json::Value> {
     let budget = RADIO_TX_BUDGET.get()?;
@@ -397,6 +455,9 @@ impl TxQueueBudget {
             completions: std::sync::atomic::AtomicU64::new(0),
             pending_receipts: Mutex::new(Vec::new()),
             coalesced_receipts: std::sync::atomic::AtomicU64::new(0),
+            coalesced_frames: std::sync::atomic::AtomicU64::new(0),
+            paced_bytes_per_s: std::sync::atomic::AtomicU64::new(0),
+            time_sync_expiry: Mutex::new(Vec::new()),
         }
     }
 
@@ -440,6 +501,145 @@ impl TxQueueBudget {
         lease:sedsnet::router::PackedWriteLease,activity:&Arc<TransportTxActivity>)->sedsnet::TelemetryResult<()> {
         self.try_send_inner(sender,priority,lease.bytes(),Some(&lease),Some(activity))
     }
+    /// The radio writer's current paced rate, in bytes per second.
+    pub fn set_paced_bytes_per_s(&self, rate: u64) {
+        self.paced_bytes_per_s.store(rate, Ordering::Relaxed);
+    }
+    fn air_bytes(&self, ms: u64, min: usize, max: usize) -> usize {
+        match self.paced_bytes_per_s.load(Ordering::Relaxed) {
+            0 => max,
+            rate => usize::try_from(rate.saturating_mul(ms) / 1000).unwrap_or(max).clamp(min, max),
+        }
+    }
+    /// Control bytes the writer sends before giving queued ordinary frames a
+    /// turn: about half a second of airtime once the paced rate is known.
+    fn control_burst_bytes(&self) -> usize {
+        if !self.short_lookahead {
+            return MAX_CONTROL_BYTES;
+        }
+        self.air_bytes(500, 128, MAX_CONTROL_BYTES)
+    }
+    fn park_cap_bytes(&self) -> usize {
+        self.air_bytes(PARK_MAX_AIR_MS, PARK_MIN_BYTES, PARK_MAX_BYTES)
+    }
+    fn control_cap_bytes(&self) -> usize {
+        self.air_bytes(CONTROL_MAX_AIR_MS, CONTROL_MIN_BYTES, self.limit)
+    }
+    /// A frame that only the newest of its stream matters for, and how long
+    /// it stays worth sending: best-effort telemetry and heartbeats
+    /// (`shed_stream`) and time sync, which is useless once it has waited.
+    fn replaceable(&self, payload: &[u8]) -> Option<(u64, u64)> {
+        use sedsnet::config::DataType;
+        if let Some(stream) = self.shed_stream(payload) {
+            return Some((stream, STALE_TELEMETRY_MS));
+        }
+        let time_sync = |ty: DataType| {
+            matches!(ty, DataType::TimeSyncAnnounce | DataType::TimeSyncRequest | DataType::TimeSyncResponse)
+        };
+        if payload.starts_with(b"SDT") {
+            let body = sdt_body(payload)?;
+            if payload.get(3) != Some(&2) {
+                return None;
+            }
+            let mut off = 1;
+            let template = sdt_template_id(body, &mut off)?;
+            return self
+                .recovery_classifier
+                .peek_type(payload)
+                .is_some_and(time_sync)
+                .then_some(((2u64 << 40) | u64::from(template), STALE_TIME_SYNC_MS));
+        }
+        let info = serialize::peek_frame_info(payload).ok()?;
+        let ty = info.envelope.ty;
+        time_sync(ty).then(|| {
+            let mut key = (3u64 << 40) | u64::from(ty.as_u32());
+            for target in info.envelope.target_senders.iter() {
+                key = key.rotate_left(13) ^ *target;
+            }
+            (key, STALE_TIME_SYNC_MS)
+        })
+    }
+    /// An SDT template install whose frame is best-effort telemetry, a
+    /// heartbeat or time sync: its template stream. A newer install of the
+    /// same template carries the same template and newer data, so it may
+    /// replace an older parked one; an install is never dropped otherwise,
+    /// since later compact frames depend on it.
+    fn replaceable_install(&self, payload: &[u8]) -> Option<u64> {
+        use sedsnet::config::DataType;
+        if !payload.starts_with(b"SDT\x01") {
+            return None;
+        }
+        let body = sdt_body(payload)?;
+        let mut off = 0;
+        let template = sdt_template_id(body, &mut off)?;
+        let info = serialize::peek_frame_info(body.get(off..)?).ok()?;
+        let ty = info.envelope.ty;
+        let best_effort = info.reliable.is_none()
+            && info.envelope.target_senders.is_empty()
+            && !sedsnet::is_reliable_type(ty)
+            && !sedsnet::discovery::is_discovery_type(ty)
+            && !is_operator_control_type(ty)
+            && !matches!(ty, DataType::ManagedVariableRequest | DataType::ManagedVariableValue)
+            && (!is_protected_type(Some(ty))
+                || matches!(ty, DataType::TimeSyncAnnounce | DataType::TimeSyncRequest));
+        best_effort.then_some((1u64 << 40) | u64::from(template))
+    }
+    /// Radio: a replaceable frame with no room is accepted and dropped. The
+    /// router would otherwise keep it and offer it on every pass (130k
+    /// HEARTBEAT re-offers in 20 s on the bench Pi), then send it stale; the
+    /// next heartbeat or time sync supersedes it anyway.
+    fn drop_replaceable_or_refuse(&self, payload: &[u8]) -> sedsnet::TelemetryResult<()> {
+        if self.short_lookahead && self.replaceable(payload).is_some() {
+            self.shed_frames.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        Err(sedsnet::TelemetryError::Io("side tx busy"))
+    }
+    fn is_time_sync(&self, payload: &[u8]) -> bool {
+        self.short_lookahead && self.replaceable(payload).is_some_and(|(_, age)| age == STALE_TIME_SYNC_MS)
+    }
+    /// Remember when an accepted time sync frame goes stale.
+    fn note_time_sync(&self, bytes: &[u8], expires: TxDeadline) {
+        let mut list = self.time_sync_expiry.lock().unwrap();
+        if list.len() >= 64 {
+            list.remove(0);
+        }
+        list.push((bytes.as_ptr() as usize, bytes.len(), expires));
+    }
+    /// True for an accepted time sync frame that waited past its age.
+    fn stale_time_sync(&self, payload: &[u8]) -> bool {
+        let identity = (payload.as_ptr() as usize, payload.len());
+        self.time_sync_expiry
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(ptr, len, expires)| (*ptr, *len) == identity && expires.ready())
+    }
+    fn forget_time_sync(&self, payload: &[u8]) {
+        let identity = (payload.as_ptr() as usize, payload.len());
+        self.time_sync_expiry.lock().unwrap().retain(|(ptr, len, _)| (*ptr, *len) != identity);
+    }
+    /// Drop expired replaceable frames from the park.
+    fn drop_stale(&self, parked: &mut VecDeque<Parked>) {
+        let now = TxDeadline::now();
+        let mut index = 0;
+        while index < parked.len() {
+            if parked[index].expires.is_some_and(|at| at.ready_at(now.wall, now.simulated_ms)) {
+                let frame = parked.remove(index).expect("index in range");
+                self.retire_parked(frame);
+            } else {
+                index += 1;
+            }
+        }
+    }
+    fn retire_parked(&self, frame: Parked) {
+        self.forget_write_lease(&frame.bytes);
+        self.forget_time_sync(&frame.bytes);
+        if let Some(activity) = &frame.activity {
+            activity.complete_frame(&frame.bytes);
+        }
+        self.shed_frames.fetch_add(1, Ordering::Relaxed);
+    }
     pub fn diagnostics(&self) -> serde_json::Value {
         let r = &self.refusals;
         let load = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
@@ -452,6 +652,8 @@ impl TxQueueBudget {
             "parked_total": self.parked_total.load(Ordering::Relaxed),
             "shed_frames": self.shed_frames.load(Ordering::Relaxed),
             "coalesced_receipts": self.coalesced_receipts.load(Ordering::Relaxed),
+            "ordered_exhausted_by_type": ORDERED_EXHAUSTION.counts(),
+            "coalesced_frames": self.coalesced_frames.load(Ordering::Relaxed),
             "control_limit_bytes": self.limit,
             "ordinary_limit_bytes": self.ordinary_limit,
             "refusals": {
@@ -581,11 +783,31 @@ impl TxQueueBudget {
                 .iter()
                 .any(|(queued_priority, bytes)| *queued_priority == priority && bytes == payload)
         }) {
+            // Radio: the identical command still waiting is written first (a
+            // failed write requeues that same allocation), so the retry is
+            // accepted and dropped instead of being refused on every router
+            // pass (24k refusals on the bench Pi). The original owner is
+            // kept. Wired sides keep the refusal.
+            if self.short_lookahead {
+                self.coalesced_frames.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
             // The router retains this retry on transient refusal. Reporting
             // success here would invent another accepted transport owner;
             // discarding the original would risk losing the command.
             *stage = RefusalStage::DuplicateCommand;
             return Err(sedsnet::TelemetryError::Io("side tx busy"));
+        }
+        // Radio: a canonical frame whose identical bytes are already parked
+        // (a reliable retransmission offered while the first copy waits) is
+        // the same transmission. SDT frames are never compared: identical
+        // compact bytes are distinct frames of a stateful stream.
+        if self.short_lookahead
+            && !payload.starts_with(b"SDT")
+            && self.parked.lock().unwrap().iter().any(|p| p.bytes == payload)
+        {
+            self.coalesced_frames.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
         }
         // Side callbacks receive schema chunks individually. Once the first
         // chunk is admitted, finish that transfer even when it crosses the
@@ -633,18 +855,25 @@ impl TxQueueBudget {
             // Receipts are essential but must leave room for a new operator
             // command. Keep the same aggregate bound and retain refused frames
             // in the router; never discard an accepted receipt.
+            // Radio: bounded by airtime once the paced rate is known, so a
+            // receipt or command never waits behind seconds of control frames.
+            let limit = if self.short_lookahead { self.control_cap_bytes() } else { self.limit };
             let allowance = if is_delivery_receipt(payload) {
-                self.limit.saturating_sub((self.limit / 4).min(256))
+                limit.saturating_sub((limit / 4).min(256))
             } else {
-                self.limit
+                limit
             };
-            self.pending_control
+            if self
+                .pending_control
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                     pending
                         .checked_add(payload.len())
                         .filter(|total| *total <= allowance)
                 })
-                .map_err(|_| sedsnet::TelemetryError::Io("side tx busy"))?;
+                .is_err()
+            {
+                return self.drop_replaceable_or_refuse(payload);
+            }
         } else {
             let kind = self.recovery_classifier.peek_type(payload);
             // Radio only: the wired budget has no reservation or headroom.
@@ -659,7 +888,15 @@ impl TxQueueBudget {
                 .saturating_add(if protected { PROTECTED_ORDINARY_HEADROOM } else { 0 });
             let starving = !protected
                 && (payload.len() > self.ordinary_limit / 2 || must_not_starve_type(kind));
-            let reserved_for_large = if protected { 0 } else { self.large_reservation(starving, kind) };
+            // Radio with a park: no reservation. Every frame the writer cannot
+            // take yet waits in order in the park, so holding room for a
+            // refused large frame only refused other offers (157k on the
+            // bench Pi).
+            let reserved_for_large = if protected || self.park_frames > 0 {
+                0
+            } else {
+                self.large_reservation(starving, kind)
+            };
             // Nothing may pass a parked frame: compact SDT frames depend on
             // the templates of the frames accepted before them.
             let behind_parked = self.short_lookahead && !self.parked.lock().unwrap().is_empty();
@@ -692,10 +929,10 @@ impl TxQueueBudget {
             if admitted.is_err() {
                 if reserved_for_large != 0 {
                     *stage = RefusalStage::LargeFrameReservation;
-                } else if starving {
+                } else if starving && self.park_frames == 0 {
                     self.note_large_waiter(payload.len(), kind);
                 }
-                return Err(sedsnet::TelemetryError::Io("side tx busy"));
+                return self.drop_replaceable_or_refuse(payload);
             }
             if starving && reserved_for_large == 0 {
                 self.clear_large_waiter();
@@ -734,6 +971,9 @@ impl TxQueueBudget {
         drop(commands);
         let owned = payload.to_vec();
         let identity = (owned.as_ptr() as usize, owned.len());
+        if self.is_time_sync(payload) {
+            self.note_time_sync(&owned, TxDeadline::now().after(Duration::from_millis(STALE_TIME_SYNC_MS)));
+        }
         if let Some(key) = receipt {
             self.pending_receipts.lock().unwrap().push((identity.0, identity.1, key));
         }
@@ -783,6 +1023,7 @@ impl TxQueueBudget {
     }
 
     fn complete(&self, priority: u8, payload: &[u8]) {
+        self.forget_time_sync(payload);
         {
             let mut receipts = self.pending_receipts.lock().unwrap();
             if let Some(index) = receipts.iter().position(|(address, len, _)| {
@@ -860,20 +1101,45 @@ impl TxQueueBudget {
             return None;
         }
         let _ = reserved_for_large;
-        let shed_stream = self.shed_stream(payload);
+        let replaceable = self.replaceable(payload);
+        let install = self.replaceable_install(payload);
+        let shed_stream = replaceable.map(|(stream, _)| stream).or(install);
         let (chunk, chunk_dictionary) = self.chunk_kind(payload);
         let mut parked = self.parked.lock().unwrap();
+        // Only the newest of a stream is worth sending, and nothing
+        // replaceable is sent once stale.
+        self.drop_stale(&mut parked);
+        if let Some(stream) = shed_stream {
+            // A compact frame never replaces the install it depends on.
+            while let Some(index) = parked
+                .iter()
+                .position(|p| p.shed_stream == Some(stream) && (install.is_some() || !p.install))
+            {
+                let frame = parked.remove(index).expect("index just found");
+                self.retire_parked(frame);
+            }
+        }
+        let cap = self.park_cap_bytes();
+        // An empty park takes any one frame, so a frame larger than the
+        // airtime cap still progresses.
         let fits = |parked: &VecDeque<Parked>| {
-            parked.len() < self.park_frames
-                && parked.iter().map(|p| p.bytes.len()).sum::<usize>() + payload.len() <= PARK_MAX_BYTES
+            parked.is_empty()
+                || (parked.len() < self.park_frames
+                    && parked.iter().map(|p| p.bytes.len()).sum::<usize>() + payload.len() <= cap)
         };
         while !fits(&parked) {
-            if !self.shed_oldest(&mut parked) {
+            // Oldest replaceable first; never a frame peers depend on.
+            let Some(index) = parked.iter().position(|p| p.expires.is_some()) else {
                 return None;
-            }
+            };
+            let frame = parked.remove(index).expect("index just found");
+            self.retire_parked(frame);
         }
         let owned = payload.to_vec();
         let identity = (owned.as_ptr() as usize, owned.len());
+        if self.is_time_sync(payload) {
+            self.note_time_sync(&owned, TxDeadline::now().after(Duration::from_millis(STALE_TIME_SYNC_MS)));
+        }
         let mut records = self.write_leases.lock().unwrap();
         let mut park = |bytes: Vec<u8>| {
             parked.push_back(Parked {
@@ -883,6 +1149,8 @@ impl TxQueueBudget {
                 shed_stream,
                 chunk,
                 chunk_dictionary,
+                expires: replaceable.map(|(_, max_age)| TxDeadline::now().after(Duration::from_millis(max_age))),
+                install: install.is_some(),
                 lease: lease.cloned(),
                 activity: activity.cloned(),
                 sender: sender.clone(),
@@ -907,9 +1175,6 @@ impl TxQueueBudget {
         }
         drop(records);
         self.parked_total.fetch_add(1, Ordering::Relaxed);
-        while parked.iter().map(|p| p.bytes.len()).sum::<usize>() > PARK_SHED_BYTES
-            && self.shed_oldest(&mut parked)
-        {}
         Some(Ok(()))
     }
 
@@ -973,25 +1238,6 @@ impl TxQueueBudget {
         (true, transfers.iter().find(|(known, _)| *known == id).is_none_or(|(_, d)| *d))
     }
 
-    /// Drop the oldest best-effort frame that a fresher parked frame of the
-    /// same stream supersedes; false when none is.
-    fn shed_oldest(&self, parked: &mut VecDeque<Parked>) -> bool {
-        let Some(index) = parked.iter().enumerate().position(|(i, p)| {
-            p.shed_stream.is_some_and(|stream| {
-                parked.iter().skip(i + 1).any(|later| later.shed_stream == Some(stream))
-            })
-        }) else {
-            return false;
-        };
-        let frame = parked.remove(index).expect("index just found");
-        self.forget_write_lease(&frame.bytes);
-        if let Some(activity) = &frame.activity {
-            activity.complete_frame(&frame.bytes);
-        }
-        self.shed_frames.fetch_add(1, Ordering::Relaxed);
-        true
-    }
-
     fn forget_write_lease(&self, payload: &[u8]) {
         let mut leases = self.write_leases.lock().unwrap();
         if let Some(index) = leases.iter().position(|(address, len, _)| {
@@ -1008,6 +1254,7 @@ impl TxQueueBudget {
             return;
         }
         let mut parked = self.parked.lock().unwrap();
+        self.drop_stale(&mut parked);
         loop {
             // Chunks never change the compact dictionary unless they wrap a
             // template install, so other frames may pass them: a schema
@@ -1097,7 +1344,9 @@ fn discard_retired_write(
     let retired = budget
         .and_then(|budget| budget.write_lease(payload))
         .is_some_and(|lease| lease.discard_if_retired())
-        || crate::abort_retirement::suppress_write(payload);
+        || crate::abort_retirement::suppress_write(payload)
+        // Time sync is never sent late; the next one replaces it.
+        || budget.is_some_and(|budget| budget.stale_time_sync(payload));
     if !retired {
         return false;
     }
@@ -1338,6 +1587,8 @@ struct WireBacklog {
     priorities: PriorityBacklog,
     preserve_order: bool,
     control_bytes: usize,
+    /// Control bytes before ordinary frames get a turn.
+    control_burst: usize,
 }
 impl WireBacklog {
     fn new(preserve_order: bool) -> Self {
@@ -1351,6 +1602,7 @@ impl WireBacklog {
             priorities: PriorityBacklog::new(),
             preserve_order,
             control_bytes: 0,
+            control_burst: MAX_CONTROL_BYTES,
         }
     }
     fn push(&mut self, priority: u8, payload: Vec<u8>, front: bool) {
@@ -1393,7 +1645,8 @@ impl WireBacklog {
             let retired = budget
                 .write_lease(bytes)
                 .is_some_and(|lease| lease.discard_if_retired())
-                || crate::abort_retirement::suppress_write(bytes);
+                || crate::abort_retirement::suppress_write(bytes)
+                || budget.stale_time_sync(bytes);
             if retired {
                 budget.complete(priority, bytes);
                 if let Some(activity) = activity {
@@ -1504,7 +1757,7 @@ impl WireBacklog {
         if !self.preserve_order
             || self.receipts.is_empty()
             || self.application_bytes < 256
-            || (self.control_bytes >= MAX_CONTROL_BYTES
+            || (self.control_bytes >= self.control_burst
                 && (!self.ordered.is_empty() || !self.routing.is_empty()))
         {
             return None;
@@ -1586,17 +1839,50 @@ impl WireBacklog {
         }
         packet
     }
+    /// The frame `backlog_pop` would take next from the priority lanes.
+    fn next_priority_frame(&self) -> Option<&Vec<u8>> {
+        self.priorities.last_key_value().and_then(|(_, queue)| queue.front())
+    }
+    /// Take the first priority-lane frame (highest priority, FIFO within it)
+    /// that `matches`.
+    fn pop_first_matching(&mut self, matches: impl Fn(&[u8]) -> bool) -> Option<(u8, Vec<u8>)> {
+        let (priority, index) = self.priorities.iter().rev().find_map(|(priority, queue)| {
+            queue.iter().position(|bytes| matches(bytes)).map(|index| (*priority, index))
+        })?;
+        let queue = self.priorities.get_mut(&priority).expect("priority just found");
+        let bytes = queue.remove(index).expect("index just found");
+        if queue.is_empty() {
+            self.priorities.remove(&priority);
+        }
+        if priority >= 254 {
+            self.priority_bytes = self.priority_bytes.saturating_add(bytes.len());
+        }
+        Some((priority, bytes))
+    }
     fn pop(&mut self) -> Option<(u8, Vec<u8>)> {
         if self.preserve_order {
             // Bound control bursts so schema/bootstrap still makes progress.
             if (!self.priorities.is_empty() || !self.receipts.is_empty())
-                && (self.control_bytes < MAX_CONTROL_BYTES
+                && (self.control_bytes < self.control_burst
                     || (self.ordered.is_empty() && self.routing.is_empty()))
             {
                 // Separate receipt and application FIFOs: a new managed value
                 // shares priority 255 with ACKs and otherwise sits behind the
                 // whole ACK backlog. Bound application bursts too, so neither
                 // side can starve the other. Stateful SDT order stays intact.
+                // ABORT and operator commands first; then receipts and time
+                // sync; the station's own retransmittable requests last.
+                if self.next_priority_frame().is_some_and(|bytes| own_retransmit(bytes)) {
+                    let packet = self
+                        .pop_first_matching(urgent_control)
+                        .or_else(|| self.receipts.pop_front())
+                        .or_else(|| self.pop_first_matching(|bytes| !own_retransmit(bytes)));
+                    if let Some(packet) = packet {
+                        self.application_bytes = 0;
+                        self.control_bytes = self.control_bytes.saturating_add(packet.1.len());
+                        return Some(packet);
+                    }
+                }
                 let packet = if !self.priorities.is_empty()
                     && (self.receipts.is_empty() || self.application_bytes < 256)
                 {
@@ -3238,8 +3524,8 @@ mod priority_tests {
 
     /// While the writer is full, the next frames are parked once instead of
     /// being refused (and re-offered by the router) on every pass, and they
-    /// reach the writer in order as it drains. Past PARK_SHED_BYTES the oldest
-    /// best-effort telemetry is shed; frames that carry state never are.
+    /// reach the writer in order as it drains. Only the newest best-effort
+    /// telemetry frame of a stream waits; frames that carry state never shed.
     #[test]
     fn full_writer_parks_frames_in_order_and_sheds_only_stale_telemetry() {
         crate::telemetry_schema::initialize().unwrap();
@@ -3259,7 +3545,7 @@ mod priority_tests {
             budget.try_send(&tx, 0, &gps(stamp)).unwrap();
         }
         let d = budget.diagnostics();
-        assert!(d["parked_bytes"].as_u64().unwrap() <= PARK_SHED_BYTES as u64 + 64, "{d}");
+        assert!(d["parked_bytes"].as_u64().unwrap() <= 400, "{d}");
         assert!(d["shed_frames"].as_u64().unwrap() > 150, "{d}");
         let (p, f) = rx.try_recv().unwrap();
         assert!(rx.try_recv().is_err());
@@ -3477,6 +3763,7 @@ pub(super) fn spawn_comms_worker_threads(
                         return;
                     }
                     if let Some(budget) = &comms_handle.tx_budget {
+                        backlog.control_burst = budget.control_burst_bytes();
                         backlog.prune_retired(budget, comms_handle.transport_activity.as_deref());
                         failed_writes.retain(|frame| {
                             !discard_retired_write(
@@ -4534,6 +4821,47 @@ impl RadioRefusalBackoff {
     }
 }
 
+/// The SDK reports "ordered end-to-end delivery exhausted retries" without
+/// the stream. Retried deliveries are sampled about once a second; when the
+/// error comes, the sampled ones that are gone (type and pending owners) are
+/// logged and counted per type for `/api/network_diagnostics`.
+struct OrderedExhaustion {
+    state: Mutex<(Option<std::time::Instant>, Vec<(u64, String, Vec<u64>)>, std::collections::BTreeMap<String, u64>)>,
+}
+static ORDERED_EXHAUSTION: OrderedExhaustion = OrderedExhaustion { state: Mutex::new((None, Vec::new(), std::collections::BTreeMap::new())) };
+impl OrderedExhaustion {
+    fn refresh(&self, router: &Router) {
+        let mut state = self.state.lock().unwrap();
+        if state.0.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        state.0 = Some(std::time::Instant::now());
+        state.1 = router
+            .export_reliable_pending_stats()
+            .into_iter()
+            .filter(|row| row.retries > 0)
+            .map(|row| (row.packet_id, format!("{:?}", row.data_type), row.pending_destinations))
+            .collect();
+    }
+    fn note_exhausted(&self, router: &Router) {
+        let pending: std::collections::BTreeSet<u64> =
+            router.export_reliable_pending_stats().iter().map(|row| row.packet_id).collect();
+        let mut state = self.state.lock().unwrap();
+        let gone: Vec<_> = state.1.iter().filter(|(id, _, _)| !pending.contains(id)).cloned().collect();
+        for (id, ty, owners) in &gone {
+            log::warn!("ordered end-to-end delivery exhausted: type={ty} packet={id} pending_owners={owners:?}");
+            *state.2.entry(ty.clone()).or_default() += 1;
+        }
+        if gone.is_empty() {
+            *state.2.entry("unsampled".into()).or_default() += 1;
+        }
+        state.1.retain(|(id, _, _)| pending.contains(id));
+    }
+    fn counts(&self) -> serde_json::Value {
+        serde_json::json!(self.state.lock().unwrap().2)
+    }
+}
+
 /// The router worker's queue service: TX (unless the radio backoff holds
 /// it), then RX, which is never held back. A TX error (one frame's delivery
 /// expiring or exhausting its retries) ends only this TX pass; RX still
@@ -4546,7 +4874,11 @@ pub(super) fn process_router_queues_with_backoff(
 ) {
     if backoff.tx_due(router, budget) {
         backoff.run_tx(router, budget, || {
+            ORDERED_EXHAUSTION.refresh(router);
             if let Err(err) = router.process_tx_queue_with_timeout(super::ROUTER_TX_BUDGET_MS) {
+                if matches!(&err, sedsnet::TelemetryError::HandlerError(m) if m.contains("exhausted retries")) {
+                    ORDERED_EXHAUSTION.note_exhausted(router);
+                }
                 log_telemetry_error("router tx queue processing failed", err);
             }
         });

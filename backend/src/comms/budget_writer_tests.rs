@@ -21,9 +21,9 @@ fn pair(
     peer.set_timeout(Duration::from_millis(1)).unwrap();
     let mut mesh = crate::rrls::Mesh::new(crate::rrls::Role::Primary, 7);
     if let Some(entropy) = entropy {
-        mesh.enable_budget_with_entropy(Profile::MATCHED, entropy);
+        mesh.enable_budget_with_entropy(Profile::shipped(), entropy);
     } else {
-        mesh.enable_budget(Profile::MATCHED);
+        mesh.enable_budget(Profile::shipped());
     }
     let shared = Arc::new(Mutex::new(mesh));
     let mut uart = UartComms::test_mesh_pty(port, shared.clone());
@@ -115,7 +115,7 @@ fn actual_budget_uart_entropy_and_effective_override() {
                 .as_ref()
                 .unwrap()
                 .airtime_config(),
-            (32000, 25)
+            (30000, 18)
         );
         let bytes = drain(&mut peer);
         assert!(
@@ -138,7 +138,7 @@ fn actual_budget_uart_entropy_and_effective_override() {
     assert!(shared.lock().unwrap().budget_transport_fault_for_test());
     assert_eq!(shared.lock().unwrap().negotiated_air_share(0), Some(15));
     uart.write_lock.lock().unwrap().radio_capacity =
-        Some(rfd_capacity::Capacity::new(32000, 25, 16));
+        Some(rfd_profile::capacity(115200));
     clock(&path, 10);
     uart.service_transmit().unwrap();
     assert!(!shared.lock().unwrap().budget_transport_fault_for_test());
@@ -154,7 +154,7 @@ fn actual_budget_uart_entropy_and_effective_override() {
             .as_ref()
             .unwrap()
             .airtime_config(),
-        (32000, 25)
+        (30000, 18)
     );
     writer_debt_case(&path, 204, 10_000);
     writer_debt_case(&path, 374, 20_000);
@@ -170,7 +170,7 @@ fn logical_send(from: &mut crate::rrls::Mesh, to: &mut crate::rrls::Mesh, now: u
 }
 fn healthy_writer(shared: &crate::rrls::Shared, now: u64) -> crate::rrls::Mesh {
     let mut relay = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 9);
-    relay.enable_budget(Profile::MATCHED);
+    relay.enable_budget(Profile::shipped());
     let mut primary = shared.lock().unwrap();
     primary.tick(now);
     assert_eq!(logical_send(&mut primary, &mut relay, now)[3], 0);
@@ -183,10 +183,12 @@ fn healthy_writer(shared: &crate::rrls::Shared, now: u64) -> crate::rrls::Mesh {
 fn rf_reply(query: &[u8]) -> Vec<u8> {
     let mut b = vec![b'R', b'R', 1, 14, 1, 1];
     b.extend_from_slice(&query[6..22]);
-    b.extend_from_slice(&115200u32.to_le_bytes());
-    b.extend_from_slice(&32000u32.to_le_bytes());
-    b.push(35);
-    for v in [16u16, 100, 55] {
+    // The RF reports the shipped profile's tuple.
+    let p = Profile::shipped();
+    b.extend_from_slice(&p.baud.to_le_bytes());
+    b.extend_from_slice(&p.usable_bps.to_le_bytes());
+    b.push(p.rf_share);
+    for v in [p.overhead, p.burst_ms, p.gap_ms] {
         b.extend_from_slice(&v.to_le_bytes());
     }
     b.push(0);
@@ -211,7 +213,7 @@ fn writer_debt_case(path: &std::path::Path, wire_bytes: usize, start: u64) {
             .as_ref()
             .unwrap()
             .airtime_config(),
-        (32000, 25)
+        (30000, 18)
     );
     clock(path, start + 3000);
     uart.service_transmit().unwrap();
@@ -228,7 +230,9 @@ fn writer_debt_case(path: &std::path::Path, wire_bytes: usize, start: u64) {
         .unwrap()
         .next_air_virtual_ms()
         .unwrap();
-    clock(path, start + 3080);
+    // Just before the old write's air debt is paid.
+    assert!(before_next > start + 3001, "the old write leaves air debt");
+    clock(path, before_next - 1);
     uart.service_transmit().unwrap();
     uart.service_background_transmit().unwrap();
     assert!(
@@ -240,7 +244,7 @@ fn writer_debt_case(path: &std::path::Path, wire_bytes: usize, start: u64) {
         let cap = guard.radio_capacity.as_ref().unwrap();
         // A relay request no longer downshifts the primary: its share and
         // its unpaid air debt are both kept exactly.
-        assert_eq!(cap.airtime_config(), (32000, 25));
+        assert_eq!(cap.airtime_config(), (30000, 18));
         cap.next_air_virtual_ms().unwrap()
     };
     assert_eq!(after_next, before_next, "unpaid air debt is retained, never forgiven");
@@ -248,7 +252,7 @@ fn writer_debt_case(path: &std::path::Path, wire_bytes: usize, start: u64) {
     let mut grant_at = None;
     let mut false_health_at = None;
     let mut last_health_seq = 0;
-    for now in (start + 3090..=start + 5000).step_by(10) {
+    for now in (before_next.max(start + 3090)..=start + 5000).step_by(10) {
         clock(path, now);
         uart.service_transmit().unwrap();
         // Actual worker may reserve the ordinary turn for pending SDK traffic.
@@ -282,7 +286,7 @@ fn writer_debt_case(path: &std::path::Path, wire_bytes: usize, start: u64) {
                     .as_ref()
                     .unwrap()
                     .airtime_config(),
-                (32000, 25)
+                (30000, 18)
             );
             if body[3] == 0 {
                 assert_eq!(body[12], 0);
@@ -332,11 +336,13 @@ fn writer_debt_case(path: &std::path::Path, wire_bytes: usize, start: u64) {
     }
     assert!(false_health_at.is_some());
     let grant_at = grant_at.expect("realwriter makesprotocolprogressafterpaid204/374Bowner");
-    // The primary keeps its 25% share (1000 B/s at 32 kbit/s) throughout.
-    assert!(grant_at - (start + 2999) >= (wire_bytes as u64 + 16) * 1000 / 1000);
+    // The primary keeps its pacing throughout (18% of 30 kbit/s until a
+    // readback proves the modems' S5): the GRANT waits at least for the paid
+    // owner's airtime, which is no shorter than at the full 3750 B/s.
+    assert!(grant_at - (start + 2999) >= (wire_bytes as u64 + 16) * 1000 / 3750);
     assert!(grant_at < start + 5000);
     println!(
-        "actualpaidowner{wire_bytes}B falseHEALTHat{:?} GRANTat{} capacity25",
+        "actualpaidowner{wire_bytes}B falseHEALTHat{:?} GRANTat{} capacity18",
         false_health_at.map(|t| t - start),
         grant_at - start
     );
@@ -376,7 +382,7 @@ fn inactive_base_ack_writer(
     let mut uart = UartComms::test_mesh_pty(port, shared.clone());
     uart.enable_radio_capacity_control();
     uart.write_lock.lock().unwrap().radio_capacity =
-        Some(rfd_capacity::Capacity::new(32000, 50, 16));
+        Some(rfd_profile::capacity(115200));
     uart.service_transmit().unwrap();
     uart.service_background_transmit().unwrap();
     let bytes = drain(&mut peer);
@@ -400,7 +406,7 @@ fn inactive_base_ack_writer(
             .as_ref()
             .unwrap()
             .airtime_config(),
-        (32000, 35)
+        (30000, 18)
     );
     assert_eq!(shared.lock().unwrap().recovery_air_share(now), Some(35));
     println!(
@@ -464,7 +470,7 @@ fn reserved_revoke_keeps_wire_context_after_actual_refusal(
             .as_ref()
             .unwrap()
             .airtime_config(),
-        (32000, 25)
+        (30000, 18)
     );
     println!(
         "ACTUAL_RESERVED_REVOKE prefix{limit} frozen_seq0_after_full_HEALTH1 fullretry{}B",

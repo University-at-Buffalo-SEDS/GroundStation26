@@ -137,7 +137,8 @@ pub fn configure(link: &crate::comms_config::CommsLinkConfig) -> anyhow::Result<
         .map_err(|_| anyhow::anyhow!("cannot generate recovery session identity"))?;
     let mut mesh = Mesh::new(role, u32::from_le_bytes(random));
     if crate::comms::rfd_profile::active().is_some_and(|p| {
-        p.transport.usable_air_bps == 32_000 && p.transport.frame_overhead_bytes == 16
+        (p.is_embedded_default() || p.transport.usable_air_bps == 32_000)
+            && p.transport.frame_overhead_bytes == 16
     }) && std::env::var_os("GS_RADIO_AIR_SHARE_PERCENT").is_none()
     {
         mesh.enable_settings_framing();

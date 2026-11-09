@@ -76,6 +76,10 @@ const UART_STARTUP_TIMEOUT: Duration = Duration::from_millis(500);
 const UART_NORMAL_TIMEOUT: Duration = Duration::from_millis(50);
 #[cfg(target_os = "linux")]
 const UART_TX_POLL_TIMEOUT: Duration = Duration::from_millis(10);
+/// After part of a frame was accepted, how long the writer keeps waiting for
+/// the UART to drain (plus the rest of the frame's wire time at 100 us/byte).
+#[cfg(target_os = "linux")]
+const UART_PARTIAL_WRITE_RESUME: Duration = Duration::from_millis(500);
 #[cfg(target_os = "linux")]
 const I2C_SLOT_SIZE: usize = 32;
 #[cfg(target_os = "linux")]
@@ -607,9 +611,13 @@ enum RecoveryEgressSelection {
     PaidBudgetOnly,
 }
 
+/// Per-packet air overhead charged for bytes heard from other modems.
+const RADIO_HEARD_PACKET_OVERHEAD_BYTES: u64 = 16;
+
 #[derive(Default)]
 struct UartWriteState {
     radio_capacity: Option<rfd_capacity::Capacity>,
+    heard_air: rfd_capacity::HeardAir,
     cts_ready: bool,
     retry_tracker: Option<sedsnet::router::RetryTracker>,
     retry_peer_session: Option<Option<u32>>,
@@ -642,6 +650,9 @@ pub struct UartComms {
     protocol: SerialProtocol,
     recovery: Option<crate::rrls::Shared>,
     write_lock: std::sync::Arc<std::sync::Mutex<UartWriteState>>,
+    /// Raw-UART radio: air bytes received from other modems since the writer
+    /// last charged them to its pacing (the channel is shared, half duplex).
+    heard_air: std::sync::Arc<std::sync::atomic::AtomicU64>,
     baud_rate: u32,
     hardware_flow_control: bool,
     slow_start_deadline: Option<Instant>,
@@ -745,6 +756,7 @@ impl UartComms {
             protocol: SerialProtocol::RawUart,
             recovery: Some(recovery),
             write_lock: Default::default(),
+            heard_air: Default::default(),
             baud_rate: 115200,
             hardware_flow_control: false,
             slow_start_deadline: None,
@@ -795,6 +807,7 @@ impl UartComms {
             protocol: cfg.protocol.clone(),
             recovery: crate::rrls::attach(&cfg.port),
             write_lock: Default::default(),
+            heard_air: Default::default(),
             baud_rate: cfg.baud_rate as u32,
             hardware_flow_control: cfg.hardware_flow_control,
             slow_start_deadline: Some(Instant::now() + UART_STARTUP_TIMEOUT),
@@ -810,6 +823,16 @@ impl UartComms {
             self.slow_start_deadline = None;
         }
         Ok(())
+    }
+
+    /// Raw-UART radio: count received bytes plus the modem's per-packet
+    /// overhead (air packets of about 256 bytes) as air another modem used.
+    fn note_heard_air(&self, n: usize) {
+        if matches!(self.protocol, SerialProtocol::RawUart) {
+            let n = n as u64;
+            let air = n + RADIO_HEARD_PACKET_OVERHEAD_BYTES * n.div_ceil(256);
+            self.heard_air.fetch_add(air, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     fn fill_rx_buf(&mut self) -> std::io::Result<()> {
@@ -848,6 +871,7 @@ impl UartComms {
                     );
                     self.rx_buf.extend_from_slice(&scratch[..n]);
                     maybe_log_raw_uart_rx(&scratch[..n], &self.protocol);
+                    self.note_heard_air(n);
                     Ok(())
                 }
                 Err(err) if is_idle_serial_timeout(&err) => {
@@ -901,6 +925,7 @@ impl UartComms {
                     );
                     self.rx_buf.extend_from_slice(&scratch[..n]);
                     maybe_log_raw_uart_rx(&scratch[..n], &self.protocol);
+                    self.note_heard_air(n);
                     Ok(())
                 }
                 Err(err) if is_idle_serial_timeout(&err) => {
@@ -991,7 +1016,23 @@ impl UartComms {
             None
         };
         if let Some(capacity) = state.radio_capacity.as_mut() {
+            // Pace for the copies the modems actually send (S5), not only
+            // the profile's, while they differ.
+            let link_cap = rfd_profile::active().and_then(|profile| {
+                rfd_modem::link_share_cap_percent(
+                    profile.modem.air_bps,
+                    profile.transport.usable_air_bps,
+                    rfd_modem::pacing_global_retries(),
+                )
+            });
+            let requested = match link_cap {
+                None => requested,
+                Some(cap) => Some(requested.map_or(cap.min(capacity.default_share()), |r| r.min(cap))),
+            };
             capacity.apply_recovery_share(requested, wall, virtual_ms);
+            let heard = self.heard_air.swap(0, std::sync::atomic::Ordering::Relaxed);
+            state.heard_air.charge(capacity, wall, virtual_ms, heard);
+            crate::telemetry_task::set_radio_paced_bytes_per_s(capacity.paced_bytes_per_s());
         }
         true
     }
@@ -1714,7 +1755,7 @@ fn write_all_fd_with_poll_counted(
     accepted: &mut usize,
 ) -> std::io::Result<()> {
     *accepted = 0;
-    let deadline = Instant::now() + timeout;
+    let mut deadline = Instant::now() + timeout;
     let mut written_total = 0usize;
 
     while written_total < bytes.len() {
@@ -1723,6 +1764,13 @@ fn write_all_fd_with_poll_counted(
             Ok(n) => {
                 written_total += n;
                 *accepted = written_total;
+                // A started frame is finished: on EAGAIN wait for the UART
+                // to drain and resume. Abandoning it would leave a prefix on
+                // the wire and the retry would send the whole frame again.
+                // Bounded by the rest of the frame's wire time plus margin.
+                let rest = (bytes.len() - written_total) as u64;
+                deadline = Instant::now()
+                    + timeout.max(UART_PARTIAL_WRITE_RESUME + Duration::from_micros(rest * 100));
                 continue;
             }
             Err(err)
@@ -3550,6 +3598,7 @@ impl CommsDevice for UartComms {
             protocol: self.protocol.clone(),
             recovery: self.recovery.clone(),
             write_lock: self.write_lock.clone(),
+            heard_air: self.heard_air.clone(),
             baud_rate: self.baud_rate,
             hardware_flow_control: self.hardware_flow_control,
             slow_start_deadline: None,
@@ -5607,6 +5656,7 @@ mod raw_uart_tests {
             protocol: SerialProtocol::RawUart,
             recovery: Some(shared.clone()),
             write_lock: Default::default(),
+            heard_air: Default::default(),
             baud_rate: 115200,
             hardware_flow_control: false,
             slow_start_deadline: None,
@@ -7066,6 +7116,7 @@ mod raw_uart_tests {
             protocol: SerialProtocol::RawUart,
             recovery: None,
             write_lock: Default::default(),
+            heard_air: Default::default(),
             baud_rate: 115200,
             hardware_flow_control: false,
             slow_start_deadline: None,
@@ -7251,6 +7302,7 @@ mod raw_uart_tests {
             protocol: SerialProtocol::RawUart,
             recovery: None,
             write_lock: Default::default(),
+            heard_air: Default::default(),
             baud_rate: 115200,
             hardware_flow_control: false,
             slow_start_deadline: None,
@@ -8003,6 +8055,7 @@ mod uart_duplex_tests {
             protocol: SerialProtocol::PacketFramed,
             recovery: None,
             write_lock: Default::default(),
+            heard_air: Default::default(),
             baud_rate: 57600,
             hardware_flow_control: false,
             slow_start_deadline: None,

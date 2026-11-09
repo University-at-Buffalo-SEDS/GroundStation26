@@ -47,6 +47,12 @@ pub(super) struct UplinkReport {
     pub command_latency_p50_ms: u64,
     pub command_latency_max_ms: u64,
     pub virtual_ms: u64,
+    /// Age (receive time minus creation stamp) of what the FC received.
+    pub heartbeats_received: u64,
+    pub heartbeat_age_max_ms: u64,
+    pub gps_received: u64,
+    pub gps_age_max_ms: u64,
+    pub park_bytes_peak: u64,
 }
 
 /// `air_bytes_per_ms`: the station's paced share of the RFD air link.
@@ -57,6 +63,18 @@ pub(super) fn run_uplink(virtual_ms: u64, air_bytes_per_ms: f64) -> UplinkReport
 /// `station_load_per_s`: extra ordinary GS->FC frames per second (GPS_DATA),
 /// to drive the uplink into the saturated state seen on the bench.
 pub(super) fn run_uplink_with(virtual_ms: u64, air_bytes_per_ms: f64, station_load_per_s: u64) -> UplinkReport {
+    run_uplink_model(virtual_ms, air_bytes_per_ms, station_load_per_s, false, 100)
+}
+
+/// `tell_budget`: the writer publishes its paced rate to the radio budget,
+/// as the production writer does.
+pub(super) fn run_uplink_model(
+    virtual_ms: u64,
+    air_bytes_per_ms: f64,
+    station_load_per_s: u64,
+    tell_budget: bool,
+    fc_state_period_ms: u64,
+) -> UplinkReport {
     let _tuning = StationTuning::install();
     crate::telemetry_schema::initialize().unwrap();
     let clock = Arc::new(AtomicU64::new(1_000));
@@ -84,6 +102,9 @@ pub(super) fn run_uplink_with(virtual_ms: u64, air_bytes_per_ms: f64, station_lo
         Box::new(move || gs_clock.load(Ordering::Acquire)),
     ));
     let budget = Arc::new(TxQueueBudget::new_radio(2048, 256));
+    if tell_budget {
+        budget.set_paced_bytes_per_s((air_bytes_per_ms * 1000.0) as u64);
+    }
     let offers = Arc::new(AtomicU64::new(0));
     let (tx, mut rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
     let callback_budget = budget.clone();
@@ -124,16 +145,37 @@ pub(super) fn run_uplink_with(virtual_ms: u64, air_bytes_per_ms: f64, station_lo
     let commands_in = commands_seen.clone();
     let fc_now = clock.clone();
     let fc_clock = clock.clone();
+    // (count, max age) for GPS_DATA and HEARTBEAT received by the FC.
+    let ages: Arc<Mutex<[(u64, u64); 2]>> = Default::default();
+    let gps_ages = ages.clone();
+    let beat_ages = ages.clone();
+    let beat_now = clock.clone();
     let fc = Router::new_with_clock(
-        RouterConfig::new([EndpointHandler::new_packet_handler(
-            crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"),
-            move |pkt: &Packet| {
-                if pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND") {
-                    commands_in.lock().unwrap().push((pkt.payload()[0], fc_now.load(Ordering::Acquire)));
-                }
-                Ok(())
-            },
-        )])
+        RouterConfig::new([
+            EndpointHandler::new_packet_handler(
+                crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"),
+                move |pkt: &Packet| {
+                    let now = fc_now.load(Ordering::Acquire);
+                    if pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND") {
+                        commands_in.lock().unwrap().push((pkt.payload()[0], now));
+                    }
+                    if pkt.data_type() == crate::telemetry_schema::data_type("GPS_DATA") {
+                        let mut a = gps_ages.lock().unwrap();
+                        a[0] = (a[0].0 + 1, a[0].1.max(now.saturating_sub(pkt.timestamp())));
+                    }
+                    Ok(())
+                },
+            ),
+            EndpointHandler::new_packet_handler(
+                crate::telemetry_schema::endpoint("HEART_BEAT"),
+                move |pkt: &Packet| {
+                    let now = beat_now.load(Ordering::Acquire);
+                    let mut a = beat_ages.lock().unwrap();
+                    a[1] = (a[1].0 + 1, a[1].1.max(now.saturating_sub(pkt.timestamp())));
+                    Ok(())
+                },
+            ),
+        ])
         .with_sender("FC")
         .with_timesync(TimeSyncConfig {
             role: TimeSyncRole::Consumer,
@@ -160,6 +202,7 @@ pub(super) fn run_uplink_with(virtual_ms: u64, air_bytes_per_ms: f64, station_lo
             &[
                 crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"),
                 crate::telemetry_schema::endpoint("BOARD_RECOVERY_FC"),
+                crate::telemetry_schema::endpoint("HEART_BEAT"),
             ],
         )
         .unwrap(),
@@ -190,6 +233,7 @@ pub(super) fn run_uplink_with(virtual_ms: u64, air_bytes_per_ms: f64, station_lo
     for step in 0..virtual_ms {
         let now = start + step;
         clock.store(now, Ordering::Release);
+        set_test_station_clock(Some(now));
         // Station load: heartbeat, and a larger status frame toward the FC.
         if step % 500 == 0 {
             let heartbeat = Packet::new(
@@ -229,13 +273,13 @@ pub(super) fn run_uplink_with(virtual_ms: u64, air_bytes_per_ms: f64, station_lo
             }
         }
         // FC load: reliable ordered flight state and ordered text.
-        if step % 100 == 0 {
+        if step % fc_state_period_ms == 0 {
             let state = Packet::new(
                 crate::telemetry_schema::data_type("FLIGHT_STATE"),
                 &[crate::telemetry_schema::endpoint("GROUND_STATION")],
                 "FC",
                 now,
-                Arc::from([(step / 100 % 10) as u8]),
+                Arc::from([(step / fc_state_period_ms % 10) as u8]),
             )
             .unwrap();
             if fc.tx_queue(state).is_ok() {
@@ -258,6 +302,7 @@ pub(super) fn run_uplink_with(virtual_ms: u64, air_bytes_per_ms: f64, station_lo
         if !backlog.refill(&mut rx, &mut drain) {
             break;
         }
+        backlog.control_burst = budget.control_burst_bytes();
         credit = (credit + air_bytes_per_ms).min(512.0);
         if !backlog.receipts.is_empty() {
             oldest_receipt_wait.get_or_insert(now);
@@ -288,6 +333,9 @@ pub(super) fn run_uplink_with(virtual_ms: u64, air_bytes_per_ms: f64, station_lo
             }
             let _ = fc.rx_packed_from_side(&bytes, fc_side);
         }
+        report.park_bytes_peak = report
+            .park_bytes_peak
+            .max(budget.diagnostics()["parked_bytes"].as_u64().unwrap_or(0));
         if backlog.receipts.is_empty() {
             if let Some(since) = oldest_receipt_wait.take() {
                 report.max_receipt_wait_ms = report.max_receipt_wait_ms.max(now - since);
@@ -295,6 +343,7 @@ pub(super) fn run_uplink_with(virtual_ms: u64, air_bytes_per_ms: f64, station_lo
         }
     }
     let _ = drain;
+    set_test_station_clock(None);
     report.virtual_ms = virtual_ms;
     let seen = commands_seen.lock().unwrap();
     let end = start + virtual_ms;
@@ -323,6 +372,9 @@ pub(super) fn run_uplink_with(virtual_ms: u64, air_bytes_per_ms: f64, station_lo
         .sum();
     report.offers = offers.load(Ordering::Relaxed);
     report.flight_states_delivered = delivered.load(Ordering::Relaxed);
+    let a = *ages.lock().unwrap();
+    (report.gps_received, report.gps_age_max_ms) = a[0];
+    (report.heartbeats_received, report.heartbeat_age_max_ms) = a[1];
     let fc_stats = fc.export_runtime_stats();
     for side in &fc_stats.sides {
         for ty in &side.data_types {
@@ -425,7 +477,9 @@ fn modeled_bench_uplink_keeps_receipts_time_sync_and_commands_flowing() {
     eprintln!("BENCH_UPLINK {report:#?}");
     assert_eq!(report.flight_states_delivered, report.flight_states_sent, "{report:#?}");
     assert!(report.max_receipt_wait_ms < 1_000, "{report:#?}");
-    assert!(report.timesync_announces >= 25, "{report:#?}");
+    // Time sync that waited past 500 ms is dropped, not sent stale; the
+    // next announce replaces it.
+    assert!(report.timesync_announces >= 22, "{report:#?}");
     assert_eq!(report.commands_delivered, report.commands_sent, "{report:#?}");
     assert!(report.command_latency_max_ms < 1_000, "{report:#?}");
     assert!(
@@ -438,10 +492,13 @@ fn modeled_bench_uplink_keeps_receipts_time_sync_and_commands_flowing() {
 /// small frames (receipts and heartbeats), driven like the generic worker.
 fn capacity_frames_per_second(share: u64, gap_ms: u64, receipts: bool) -> (f64, f64) {
     use crate::comms::rfd_capacity::{Capacity, Defaults};
-    use crate::comms::virtual_uart::WireDrain;
-    let mut cap = Capacity::from_defaults(115200, Defaults {
+    capacity_rate(Capacity::from_defaults(115200, Defaults {
         air_bps: 32_000, overhead_bytes: 16, packet_burst_ms: 100, packet_gap_ms: gap_ms, host_share_percent: share,
-    });
+    }), receipts)
+}
+
+fn capacity_rate(mut cap: crate::comms::rfd_capacity::Capacity, receipts: bool) -> (f64, f64) {
+    use crate::comms::virtual_uart::WireDrain;
     let mut wire = WireDrain::default();
     let (mut frames, mut bytes) = (0u64, 0u64);
     let seconds = 20u64;
@@ -744,4 +801,355 @@ fn managed_variable_request_is_not_starved_by_parked_frames() {
         }
     }
     assert!(written.iter().any(|f| *f == request), "the request reaches the writer");
+}
+
+/// The RFD modem already arbitrates the air (ASYNC, LBT, its own copies).
+/// Host pacing only has to keep the 4 KiB modem buffer from overflowing
+/// (no RTS/CTS), so with the default profile one host alone may use the
+/// modem's whole serial-to-air drain rate: S5=1 sends each packet twice on
+/// 64 kbit/s air, about 32 kbit/s. Before, the GS held itself to a 25% share
+/// with 100 ms bursts and 55 ms gaps (about 620 B/s of receipts) and the RF
+/// to 35%, each reserving airtime the other was not using.
+#[test]
+fn one_host_alone_can_use_the_modem_drain_rate() {
+    crate::telemetry_schema::initialize().unwrap();
+    let profile = crate::comms::rfd_profile::Profile::parse(include_bytes!("../../comms/rfd-profile.json")).unwrap();
+    let drain = profile.modem.air_bps / (1 + profile.modem.broadcast_retries) / 8;
+    let cap = crate::comms::rfd_capacity::Capacity::from_defaults(
+        115200,
+        crate::comms::rfd_capacity::Defaults {
+            air_bps: profile.transport.usable_air_bps,
+            overhead_bytes: profile.transport.frame_overhead_bytes,
+            packet_burst_ms: profile.transport.packet_burst_ms,
+            packet_gap_ms: profile.transport.packet_gap_ms,
+            host_share_percent: profile.transport.host_default_share_percent,
+        },
+    );
+    let (frames, bytes) = capacity_rate(cap, true);
+    // Air bytes include the per-frame modem overhead the pacing charges.
+    let air = bytes + frames * profile.transport.frame_overhead_bytes as f64;
+    eprintln!("ONE_HOST_RATE frames/s {frames:.1} B/s {bytes:.0} air B/s {air:.0} drain {drain}");
+    assert!(air >= drain as f64 * 0.7, "one host uses at least 70% of the {drain} B/s drain: {air:.0} B/s");
+    assert!(air <= drain as f64, "and never more than the modem can drain: {air:.0} B/s");
+}
+
+/// A retry of a frame whose identical bytes are still waiting for the writer
+/// (a reliable retransmission, or a command the router offers again) was
+/// refused on every router pass until the first copy was written: on the
+/// bench Pi 24k duplicate_command refusals. The copy already waiting carries
+/// the same bytes first, so the retry is accepted and dropped.
+#[test]
+fn identical_retry_of_a_waiting_frame_is_coalesced_not_refused() {
+    crate::telemetry_schema::initialize().unwrap();
+    let command = serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+        &[crate::telemetry_schema::endpoint("AV_BAY_UNDERGLOW_OWNER")], "GS", 1, Arc::from([1_u8])).unwrap()).to_vec();
+    let telemetry = vec![5u8; 60];
+    let budget = TxQueueBudget::new_radio(2048, 256);
+    let (tx, mut rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
+    budget.try_send(&tx, 16, &command).unwrap();
+    // Fill the ordinary allowance so the next frame parks.
+    budget.try_send(&tx, 0, &[1; 250]).unwrap();
+    budget.try_send(&tx, 0, &telemetry).unwrap();
+    assert_eq!(budget.diagnostics()["parked_frames"], 1);
+    for _ in 0..100 {
+        budget.try_send(&tx, 16, &command).expect("a command retry is not refused");
+        budget.try_send(&tx, 0, &telemetry).expect("a retry of a parked frame is not refused");
+    }
+    let d = budget.diagnostics();
+    assert_eq!(d["refusals"]["duplicate_command"], 0);
+    assert_eq!(d["parked_frames"], 1, "the parked copy is not duplicated");
+    let mut written = Vec::new();
+    while let Ok((p, f)) = rx.try_recv() {
+        budget.complete(p, &f);
+        written.push(f);
+    }
+    assert_eq!(written.iter().filter(|f| **f == command).count(), 1);
+    assert_eq!(written.iter().filter(|f| **f == telemetry).count(), 1);
+    // Once written, the same bytes are a new transmission again.
+    budget.try_send(&tx, 16, &command).unwrap();
+    assert_eq!(rx.try_recv().unwrap().1, command);
+}
+
+/// The large-frame reservation made every smaller ordinary frame leave room
+/// for a refused large one. With the radio park every frame the writer cannot
+/// take yet waits in order, so the reservation only ever refused offers:
+/// 157k large_frame_reservation refusals on the bench Pi. The radio has no
+/// reservation; nothing is refused for one.
+#[test]
+fn radio_never_refuses_for_a_large_frame_reservation() {
+    let budget = TxQueueBudget::new_radio(2048, 256);
+    let (tx, rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
+    budget.try_send(&tx, 0, &[1; 250]).unwrap();
+    // Fill the park with frames that cannot be shed (schema chunks).
+    let mut transfer = 0u32;
+    loop {
+        let mut chunk = vec![0u8; 1000];
+        chunk[..4].copy_from_slice(b"SDT\x03");
+        chunk[4..8].copy_from_slice(&transfer.to_le_bytes());
+        chunk[8..10].copy_from_slice(&1u16.to_le_bytes());
+        chunk[10..12].copy_from_slice(&2u16.to_le_bytes());
+        transfer += 1;
+        if budget.try_send(&tx, 254, &chunk).is_err() {
+            break;
+        }
+    }
+    // Top the park up with short frames until it takes no more.
+    for k in 0u32.. {
+        let mut filler = vec![9u8; 8];
+        filler[..4].copy_from_slice(&k.to_le_bytes());
+        if budget.try_send(&tx, 0, &filler).is_err() {
+            break;
+        }
+    }
+    // A starving frame and then short frames meet the full park.
+    let _ = budget.try_send(&tx, 0, &[2; 200]);
+    for n in 0..50u8 {
+        let _ = budget.try_send(&tx, 0, &[3, n, 0, 0, 0, 0, 0, 0]);
+    }
+    assert_eq!(budget.diagnostics()["refusals"]["large_frame_reservation"], 0);
+    assert!(budget.large_waiter.lock().unwrap().is_none(), "no reservation is held");
+    drop(rx);
+}
+
+/// Both modems share one half-duplex air channel. Each host paces only its own
+/// UART, just under one modem's drain rate. When both hosts are busy at once
+/// (a schema transfer from the GS while the RF streams telemetry), each modem
+/// only gets part of the air; without RTS/CTS its 4 KiB buffer must not
+/// overflow, and receipts, time sync and commands must still reach the air
+/// within 1 s. Each host hears the other's packets (broadcast), so the air
+/// they use is visible to it.
+struct SharedAirHost {
+    cap: crate::comms::rfd_capacity::Capacity,
+    heard: crate::comms::rfd_capacity::HeardAir,
+    wire: crate::comms::virtual_uart::WireDrain,
+    /// Bytes in the modem buffer, oldest first: (remaining, created, priority).
+    modem: std::collections::VecDeque<(usize, u64, bool)>,
+    modem_bytes: usize,
+    peak: usize,
+    overflowed: usize,
+    priority_waiting: std::collections::VecDeque<u64>,
+    priority_worst_ms: u64,
+    bulk_delivered: usize,
+    bulk: bool,
+}
+
+fn shared_air_run(a_bulk: bool, b_bulk: bool) -> [SharedAirHost; 2] {
+    const MODEM_BUFFER: usize = 4096;
+    const AIR_PACKET: usize = 256;
+    let profile = crate::comms::rfd_profile::Profile::parse(include_bytes!("../../comms/rfd-profile.json")).unwrap();
+    let copies = 1 + profile.modem.broadcast_retries;
+    let overhead = profile.transport.frame_overhead_bytes as usize;
+    let air_bits_per_ms = profile.modem.air_bps / 1000;
+    let new_host = |bulk| SharedAirHost {
+        cap: crate::comms::rfd_capacity::Capacity::from_defaults(115200, crate::comms::rfd_capacity::Defaults {
+            air_bps: profile.transport.usable_air_bps,
+            overhead_bytes: profile.transport.frame_overhead_bytes,
+            packet_burst_ms: profile.transport.packet_burst_ms,
+            packet_gap_ms: profile.transport.packet_gap_ms,
+            host_share_percent: profile.transport.host_default_share_percent,
+        }),
+        heard: Default::default(),
+        wire: Default::default(),
+        modem: Default::default(),
+        modem_bytes: 0,
+        peak: 0,
+        overflowed: 0,
+        priority_waiting: Default::default(),
+        priority_worst_ms: 0,
+        bulk_delivered: 0,
+        bulk,
+    };
+    let mut hosts = [new_host(a_bulk), new_host(b_bulk)];
+    let wall = std::time::Instant::now();
+    let mut air_free_at = 0u64;
+    let mut turn = 0usize;
+    for now in 0..20_000u64 {
+        // The air: one packet at a time, modems alternate when both hold data.
+        if now >= air_free_at {
+            let order = [turn, 1 - turn];
+            if let Some(&tx) = order.iter().find(|&&i| hosts[i].modem_bytes > 0) {
+                turn = 1 - tx;
+                let mut take = AIR_PACKET.min(hosts[tx].modem_bytes);
+                let sent = take;
+                while take > 0 {
+                    let front = hosts[tx].modem.front_mut().unwrap();
+                    let part = take.min(front.0);
+                    front.0 -= part;
+                    take -= part;
+                    if front.0 == 0 {
+                        let (_, created, priority) = hosts[tx].modem.pop_front().unwrap();
+                        if priority {
+                            let host = &mut hosts[tx];
+                            host.priority_worst_ms = host.priority_worst_ms.max(now - created);
+                        }
+                    }
+                }
+                hosts[tx].modem_bytes -= sent;
+                hosts[tx].bulk_delivered += sent;
+                let air_ms = (copies as usize * (sent + overhead) * 8).div_ceil(air_bits_per_ms as usize) as u64;
+                air_free_at = now + air_ms.max(1);
+                // The other host's modem hears the first copy.
+                let other = &mut hosts[1 - tx];
+                other.heard.charge(&mut other.cap, wall, Some(now), (sent + overhead) as u64);
+            }
+        }
+        for host in hosts.iter_mut() {
+            // A receipt, time sync or command every 100 ms.
+            if now % 100 == 0 {
+                host.priority_waiting.push_back(now);
+            }
+            if !host.wire.ready(now) {
+                continue;
+            }
+            let (len, created, priority) = if let Some(&created) = host.priority_waiting.front() {
+                (60usize, created, true)
+            } else if host.bulk {
+                (200, now, false)
+            } else {
+                continue;
+            };
+            if !host.cap.ready_for(wall, Some(now), priority) {
+                continue;
+            }
+            if priority {
+                host.priority_waiting.pop_front();
+            }
+            host.cap.committed(wall, Some(now), len);
+            host.wire.committed(now, len, 115200);
+            host.cap.drained_virtual(host.wire.stop_us());
+            if host.modem_bytes + len > MODEM_BUFFER {
+                host.overflowed += len;
+                continue;
+            }
+            host.modem.push_back((len, created, priority));
+            host.modem_bytes += len;
+            host.peak = host.peak.max(host.modem_bytes);
+        }
+    }
+    for host in hosts.iter_mut() {
+        if let Some(&created) = host.priority_waiting.front() {
+            host.priority_worst_ms = host.priority_worst_ms.max(20_000 - created);
+        }
+    }
+    hosts
+}
+
+#[test]
+fn both_hosts_saturated_never_overflow_a_modem_and_keep_priority_frames_under_1s() {
+    for (a_bulk, b_bulk) in [(true, true), (false, true), (true, false)] {
+        let hosts = shared_air_run(a_bulk, b_bulk);
+        for (index, host) in hosts.iter().enumerate() {
+            eprintln!(
+                "SHARED_AIR bulk=({a_bulk},{b_bulk}) host {index}: peak {} B overflowed {} B priority worst {} ms delivered {} B/s",
+                host.peak, host.overflowed, host.priority_worst_ms, host.bulk_delivered / 20
+            );
+            assert_eq!(host.overflowed, 0, "host {index} overflowed its modem (bulk {a_bulk},{b_bulk})");
+            assert!(host.priority_worst_ms < 1_000, "host {index} priority frames waited {} ms", host.priority_worst_ms);
+            if host.bulk {
+                assert!(host.bulk_delivered / 20 >= 800, "a busy host keeps a fair part of the air: {} B/s", host.bulk_delivered / 20);
+            }
+        }
+    }
+}
+
+
+/// Bench Pi (GS dev, both modems GLOBAL_RETRIES 10): the station's air share
+/// is a few hundred bytes per second, less than its own demand. The park
+/// filled to its 1024-frame cap (52 KB, about 50 s of airtime), so heartbeats,
+/// time sync and AV-bay requests were sent tens of seconds late, and every
+/// router pass re-offered refused frames (130k HEARTBEAT re-offers in 20 s).
+/// Old dev in this model: park 14.5 KB, heartbeats 20 s and telemetry 29 s
+/// old on arrival. With the writer's paced rate known, what waits is bounded
+/// by airtime: only the newest replaceable frame of a stream waits, stale
+/// ones are dropped, and control bursts leave ordinary frames a turn. This
+/// link is oversubscribed (receipts alone take half of it), so a heartbeat
+/// can still wait a few seconds behind discovery and schema frames.
+#[test]
+fn slow_bench_air_keeps_queued_frames_within_two_seconds() {
+    // FC: four reliable flight states per second (bench AV bay: about 4.2
+    // reliable messages per second), so receipts alone take half the air.
+    let report = run_uplink_model(40_000, 0.4, 20, true, 250);
+    eprintln!("SLOW_BENCH_UPLINK {report:#?}");
+    assert!(report.park_bytes_peak <= 640, "the park holds about 1.5 s of air: {report:#?}");
+    assert!(report.heartbeats_received >= 3, "{report:#?}");
+    assert!(report.heartbeat_age_max_ms <= 5_000, "heartbeats arrive within the FC's reach: {report:#?}");
+    assert!(report.gps_received >= 1, "{report:#?}");
+    assert!(report.gps_age_max_ms <= 2_500, "telemetry is never sent stale: {report:#?}");
+    assert_eq!(report.flight_states_delivered, report.flight_states_sent, "{report:#?}");
+    assert_eq!(report.commands_delivered, report.commands_sent, "{report:#?}");
+    assert!(report.command_latency_max_ms < 1_000, "{report:#?}");
+    assert!(report.refusals < 25 * report.written_frames, "{report:#?}");
+}
+
+/// Faithful bench run (GS fix, bench RF, S5=10): with the downlink dead, the
+/// station's own ordered retransmits (197 BOARD_RECOVERY_REQUEST in 75 s)
+/// filled the control lane ahead of receipts: 47 RELIABLE_ACK sent against
+/// 26.5k refused offers. Receipts and time sync responses are small and are
+/// what stop the far side retransmitting, so they go before the station's
+/// own retransmittable requests; ABORT and operator commands stay first.
+#[test]
+fn receipts_and_time_sync_go_ahead_of_own_ordered_retransmits() {
+    crate::telemetry_schema::initialize().unwrap();
+    let pack = |ty: sedsnet::config::DataType, endpoint: sedsnet::config::DataEndpoint, stamp: u64, payload: Vec<u8>| {
+        serialize::pack_packet(&Packet::new(ty, &[endpoint], "GS", stamp, Arc::from(payload)).unwrap()).to_vec()
+    };
+    let request = |n: u64| pack(crate::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST"),
+        crate::telemetry_schema::endpoint("BOARD_RECOVERY_RF"), n, vec![n as u8; 32]);
+    let ack = |n: u64| pack(DataType::ReliableAck, sedsnet::config::DataEndpoint::TelemetryError, n, n.to_le_bytes().to_vec());
+    let time_sync = pack(DataType::TimeSyncResponse, sedsnet::config::DataEndpoint::TimeSync, 9, vec![0; 32]);
+    let abort = pack(crate::telemetry_schema::data_type("ABORT"), crate::telemetry_schema::endpoint("ABORT"), 7,
+        b"SEDS_MANUAL_ABORT_V1:K".to_vec());
+    let mut backlog = WireBacklog::new(true);
+    for n in 0..6 {
+        backlog.push(255, request(n), false);
+    }
+    backlog.push(255, time_sync.clone(), false);
+    for n in 0..3 {
+        backlog.push(255, ack(n), false);
+    }
+    backlog.push(255, abort.clone(), false);
+    let mut order = Vec::new();
+    while let Some((_, bytes)) = backlog.pop() {
+        order.push(bytes);
+    }
+    let types: Vec<_> = order
+        .iter()
+        .map(|b| serialize::peek_frame_info_unchecked(b).unwrap().envelope.ty)
+        .collect();
+    let first_request = types
+        .iter()
+        .position(|t| *t == crate::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST"))
+        .unwrap();
+    let last_ack = types.iter().rposition(|t| *t == DataType::ReliableAck).unwrap();
+    let time_sync_at = types.iter().position(|t| *t == DataType::TimeSyncResponse).unwrap();
+    assert_eq!(types[0], crate::telemetry_schema::data_type("ABORT"), "ABORT first: {types:?}");
+    assert!(last_ack < first_request, "every receipt before the first own retransmit: {types:?}");
+    assert!(time_sync_at < first_request, "time sync before own retransmits: {types:?}");
+    assert_eq!(order.len(), 11);
+}
+
+/// Faithful (GS dev 93b8401, newest firmware, S5=1): RF/FC/PB re-anchored
+/// to TIME_SYNC_ANNOUNCE frames that reached the air seconds to tens of
+/// seconds after creation (park about 50 KB), so after about 100 s the AV
+/// bay stamped packets 90-130 s in the past. A time sync frame that has
+/// waited more than 0.5 s since the radio accepted it is dropped at the
+/// writer, never sent late; the next announce replaces it.
+#[test]
+fn time_sync_waiting_more_than_half_a_second_is_dropped_not_sent() {
+    crate::telemetry_schema::initialize().unwrap();
+    let announce = serialize::pack_packet(&Packet::new(DataType::TimeSyncAnnounce,
+        &[sedsnet::config::DataEndpoint::TimeSync], "GS", 5, Arc::from(vec![0u8; 16])).unwrap()).to_vec();
+    let budget = TxQueueBudget::new_radio(2048, 256);
+    let (tx, mut rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
+    set_test_station_clock(Some(10_000));
+    budget.try_send(&tx, 255, &announce).unwrap();
+    let (priority, bytes) = rx.try_recv().unwrap();
+    // Still fresh at 0.4 s: written.
+    set_test_station_clock(Some(10_400));
+    assert!(!discard_retired_write(Some(&budget), None, priority, &bytes));
+    // Waited 0.6 s for the writer: dropped and released.
+    set_test_station_clock(Some(10_600));
+    assert!(discard_retired_write(Some(&budget), None, priority, &bytes), "a stale time sync is never sent");
+    assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+    set_test_station_clock(None);
 }

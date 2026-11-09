@@ -8,20 +8,20 @@ use std::sync::OnceLock;
 pub(crate) struct Profile {
     version: u64,
     name: String,
-    modem: Modem,
+    pub(crate) modem: Modem,
     pub transport: Transport,
 }
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct Modem {
-    serial_baud: u64,
-    air_bps: u64,
-    max_data_bytes: u64,
-    max_retries: u64,
-    broadcast_retries: u64,
-    serial_break_ms: u64,
-    tx_encapsulation: u64,
-    rx_encapsulation: u64,
+pub(crate) struct Modem {
+    pub(crate) serial_baud: u64,
+    pub(crate) air_bps: u64,
+    pub(crate) max_data_bytes: u64,
+    pub(crate) max_retries: u64,
+    pub(crate) broadcast_retries: u64,
+    pub(crate) serial_break_ms: u64,
+    pub(crate) tx_encapsulation: u64,
+    pub(crate) rx_encapsulation: u64,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,10 +120,10 @@ impl Profile {
                 && (1..=100).contains(&t.host_default_share_percent),
             "invalid RFD application capacity"
         );
-        anyhow::ensure!(
-            t.rf_share_percent + (2 * t.host_default_share_percent).max(50) <= 100,
-            "RF and host shares exceed the shared link, including the 15/35 relay split"
-        );
+        // The modem arbitrates the air itself (ASYNC with LBT and its own
+        // copies); host pacing only keeps its 4 KiB buffer from overflowing.
+        // Each host may therefore pace up to the whole usable rate; the
+        // shares no longer have to partition the air.
         // Every broadcast packet (DESTID 32768) holds the air for 1 +
         // GLOBAL_RETRIES copies. The application pacing (usable_air_bps) is
         // only honest if the air can carry it with those copies: 10 retries
@@ -261,20 +261,21 @@ mod tests {
     }
     #[test]
     fn shipping_profile_is_the_deployed_matched_modem_settings() {
-        // The startup check enforces this by default. GLOBAL_RETRIES (S5) is
-        // link-wide: it is written only when GS_RFD_PROFILE_ROLLED_OUT names
-        // this profile after all three modems were set to S5=1 (they read
-        // S4=10, S5=10, S6=50 on 10-28).
+        // The startup check enforces this by default and the default build of
+        // every node applies its link-wide registers (the modems read S4=10,
+        // S5=10, S6=50 on 10-28). Each host paces just under the S5=1 drain
+        // rate (64000 / 2 bit/s) with no share partition.
         let p = Profile::parse(include_bytes!("../../comms/rfd-profile.json")).unwrap();
         assert!(p.is_embedded_default());
-        assert_eq!(p.name(), "rfd-async-64k-global1");
+        assert_eq!(p.name(), "rfd-async-64k-drain");
         assert_eq!(p.modem.max_retries, 10);
         assert_eq!(p.modem.broadcast_retries, 1);
-        assert_eq!(p.modem.serial_break_ms, 50);
+        assert_eq!(p.modem.serial_break_ms, 10);
         assert_eq!(p.modem.max_data_bytes, 3968);
-        assert_eq!(p.transport.packet_gap_ms, 55);
-        assert_eq!(p.transport.usable_air_bps, 32000);
-        assert_eq!(p.transport.host_default_share_percent, 25);
+        assert_eq!(p.transport.packet_gap_ms, 15);
+        assert_eq!(p.transport.usable_air_bps, 30000);
+        assert_eq!(p.transport.host_default_share_percent, 100);
+        assert_eq!(p.transport.rf_share_percent, 100);
     }
     /// The deployed modems broadcast every packet 1 + 10 times; the host
     /// pacing assumed 32000 bit/s of the 64000 bit/s air. Faithful
@@ -293,15 +294,16 @@ mod tests {
         );
     }
     #[test]
-    fn one_retry_layer_profile_is_opt_in_and_keeps_the_transport_tuple() {
+    fn one_retry_layer_profile_is_opt_in() {
         let p = Profile::parse(include_bytes!(
             "../../../config/radio/rfd-async-64k-one-retry-layer.json"
         ))
         .unwrap();
         assert!(!p.is_embedded_default());
         assert_eq!((p.modem.broadcast_retries, p.modem.serial_break_ms), (0, 20));
-        let d = Profile::parse(include_bytes!("../../comms/rfd-profile.json")).unwrap();
-        assert_eq!(p.recovery_budget_tuple(), d.recovery_budget_tuple());
+        // It keeps its own transport tuple (55 ms gap, shares); GS and RRLS
+        // that select it negotiate the recovery budget with that tuple.
+        assert_eq!(p.transport.packet_gap_ms, 55);
     }
     #[test]
     fn mismatched_or_unbounded_profiles_are_rejected() {
@@ -312,8 +314,8 @@ mod tests {
             ("modem", "max_retries", 0),
             ("modem", "tx_encapsulation", 2),
             ("transport", "usable_air_bps", 64001),
-            ("transport", "rf_share_percent", 80),
-            ("transport", "host_default_share_percent", 40),
+            ("transport", "rf_share_percent", 101),
+            ("transport", "host_default_share_percent", 101),
             ("transport", "packet_burst_ms", 500),
             ("transport", "packet_gap_ms", 10),
             ("transport", "rf_share_percent", 0),

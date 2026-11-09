@@ -989,3 +989,26 @@ fn default_build_expects_and_applies_one_broadcast_retry() {
     let report = run(&mut modem, &plan, Trigger::Startup, Mode::Fix, TIMING, &open, true);
     assert_eq!(report.outcome, Outcome::Applied, "{report:?}");
 }
+
+/// Bench Pi: both modems still at S5=10 while the GS paced for the profile's
+/// S5=1. The host must pace for the copies the air actually carries.
+#[test]
+fn pacing_follows_the_modems_actual_global_retries() {
+    assert_eq!(link_share_cap_percent(64_000, 30_000, 1), None, "S5=1 fits the profile");
+    // 64000 * 0.94 / 11 = 5469 bit/s of 30000.
+    assert_eq!(link_share_cap_percent(64_000, 30_000, 10), Some(18));
+    assert_eq!(link_share_cap_percent(64_000, 30_000, 100), Some(1));
+}
+
+/// Until a readback proves otherwise the station assumes the deployed S5=10:
+/// in the faithful bench reproduction neither the GS (simulated link) nor
+/// the bench RF reported S5, the GS paced 30 kbit/s into a link carrying
+/// about 5.8 kbit/s, and its modem dropped 59 KB in 90 s.
+#[test]
+fn unproven_link_paces_for_the_deployed_global_retries() {
+    assert_eq!(UNPROVEN_GLOBAL_RETRIES, 10);
+    if link_global_retries().is_none() {
+        assert_eq!(pacing_global_retries(), 10);
+        assert_eq!(link_share_cap_percent(64_000, 30_000, pacing_global_retries()), Some(18));
+    }
+}

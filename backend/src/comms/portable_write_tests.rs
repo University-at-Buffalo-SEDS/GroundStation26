@@ -225,3 +225,44 @@ fn boxed_serial_port_preserves_full_success_and_actual_failed_prefix() {
         "fixture must observe an actual boxed SerialPort partial write"
     );
 }
+
+/// A raw UART write that has started must finish: on EAGAIN after a partial
+/// write the writer waits for writability and resumes. Giving up after the
+/// 10 ms poll left a frame prefix on the wire and the retry sent the whole
+/// frame again behind it (bench Pi: "operation would block" on ttyAMA0).
+#[cfg(target_os = "linux")]
+#[test]
+fn partial_uart_write_waits_and_resumes_instead_of_leaving_a_prefix() {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) }, 0);
+    let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETPIPE_SZ, 65536) };
+    let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) } as usize;
+    // The kernel buffer is nearly full; the reader (the UART) drains it 30 ms later.
+    super::write_all_fd_with_poll(writer.as_raw_fd(), &vec![0u8; capacity - 5000], super::UART_TX_POLL_TIMEOUT).unwrap();
+    let drain = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let mut all = Vec::new();
+        let mut buf = [0u8; 8192];
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(800);
+        while std::time::Instant::now() < until {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&buf[..n]),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+        all
+    });
+    // Larger than PIPE_BUF so the pipe, like a tty, accepts a partial write.
+    let frame: Vec<u8> = (0..20000u32).map(|n| n as u8).collect();
+    let mut accepted = 0;
+    let result = super::write_all_fd_with_poll_counted(writer.as_raw_fd(), &frame, super::UART_TX_POLL_TIMEOUT, &mut accepted);
+    drop(writer);
+    let received = drain.join().unwrap();
+    assert!(result.is_ok(), "a started frame is finished, not abandoned: {result:?} after {accepted} bytes");
+    assert_eq!(&received[capacity - 5000..], &frame[..]);
+}

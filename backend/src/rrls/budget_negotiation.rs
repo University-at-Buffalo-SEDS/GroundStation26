@@ -40,6 +40,14 @@ impl Profile {
         gap_ms: 55,
         flags: 0,
     };
+    /// The shipped profile's tuple (backend/comms/rfd-profile.json).
+    #[cfg(test)]
+    pub(crate) fn shipped() -> Self {
+        crate::comms::rfd_profile::Profile::parse(include_bytes!("../../comms/rfd-profile.json"))
+            .unwrap()
+            .recovery_budget_tuple()
+            .unwrap()
+    }
     pub(crate) fn valid(self) -> bool {
         self.baud > 0
             && self.baud <= 2_000_000
@@ -69,6 +77,15 @@ impl Shares {
         relay_high: 50,
     };
     pub(crate) fn valid(self, profile: Profile) -> bool {
+        // RF share 100: the profile does not partition the air. The modem
+        // arbitrates it and every host charges the air it hears from the
+        // others to its own pacing, so the shares only bound relay service.
+        if profile.rf_share == 100 {
+            return profile.valid()
+                && self.primary_fallback <= self.primary_direct
+                && self.relay_base <= self.relay_high
+                && u16::from(self.primary_direct) + u16::from(self.relay_high) <= 100;
+        }
         // Legacy RF40 cannot expand; old healthy25+RF40+base35 remains bounded.
         profile.valid()
             && u16::from(self.primary_direct) + 40 + u16::from(self.relay_base) <= 100
@@ -1166,6 +1183,10 @@ mod tests {
     #[test]
     fn defaults_and_conservation_reject_bad_profiles() {
         assert!(Shares::CANDIDATE.valid(Profile::MATCHED));
+        assert!(
+            Shares::CANDIDATE.valid(Profile::shipped()),
+            "the shipped drain profile (RF share 100) still negotiates a budget"
+        );
         let mut bad = Profile::MATCHED;
         bad.rf_share = 40;
         assert!(!Shares::CANDIDATE.valid(bad));

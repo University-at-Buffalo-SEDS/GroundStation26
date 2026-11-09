@@ -165,7 +165,7 @@ async fn root_profile_clock_and_catalog_share_ordinary_service() {
                 .env("GS_SIM_CLOCK_FILE", dir.join("clock"))
                 .env("GS_SIMULATED_SERIAL_PTY", "1")
                 .env("GS_RRLS_ROLE", "primary")
-                .env("GS_RADIO_AIR_BIT_RATE_BPS", "32000")
+                .env("GS_RADIO_AIR_BIT_RATE_BPS", "30000")
                 .env_remove("GS_RADIO_AIR_SHARE_PERCENT")
                 .env("GS_SIM_TRACE_RELIABLE", "1")
                 .env("GS_NETWORK_VARIABLE_CACHE", dir.join("network.json"))

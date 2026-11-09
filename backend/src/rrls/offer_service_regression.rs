@@ -34,7 +34,7 @@ fn accepted_offer_must_reach_paid_service_before_original_probe_deadline() {
     crate::comms::rfd_profile::initialize(&link).unwrap();
     let p = crate::comms::rfd_profile::active()
         .expect("matched production profile must be initialized");
-    assert_eq!(p.transport.usable_air_bps, 32000);
+    assert_eq!(p.transport.usable_air_bps, 30000);
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("offer_pressure_fixture.json")).unwrap();
     let probe = unhex(fixture["probe"].as_str().unwrap());
@@ -91,7 +91,7 @@ fn accepted_offer_must_reach_paid_service_before_original_probe_deadline() {
         35,
         p.transport.frame_overhead_bytes,
     );
-    assert_eq!(capacity.airtime_config(), (32000, 35));
+    assert_eq!(capacity.airtime_config(), (30000, 35));
     let mut offered_at = None;
     let mut charged = 0usize;
     for now in 10070..=10900 {
@@ -173,7 +173,7 @@ fn profile() {
             .unwrap()
             .transport
             .usable_air_bps,
-        32000
+        30000
     );
 }
 fn fixture() -> serde_json::Value {

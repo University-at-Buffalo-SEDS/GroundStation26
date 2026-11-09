@@ -172,7 +172,7 @@ async fn cold_routing_cannot_hide_paid_bootstrap_before_catalog_owner_starts() {
     let original = serialize::unpack_packet(catalog).unwrap();
     let direct_ad = address(99);
     let mut primary = crate::rrls::Mesh::new(crate::rrls::Role::Primary, 42);
-    primary.enable_budget(crate::rrls::budget_negotiation::Profile::MATCHED);
+    primary.enable_budget(crate::rrls::budget_negotiation::Profile::shipped());
     let shared = Arc::new(Mutex::new(primary));
     let (mut peer, port) = serialport::TTYPort::pair().unwrap();
     peer.set_timeout(Duration::from_millis(1)).unwrap();
@@ -514,7 +514,7 @@ async fn actual_partial_or_no_write_owner_blocks_protocol_across_unrelated_succe
     let budget = Arc::new(TxQueueBudget::new(32768));
     budget.try_send(&sender, 0, &bulk).unwrap();
     let mut primary = crate::rrls::Mesh::new(crate::rrls::Role::Primary, 42);
-    primary.enable_budget(crate::rrls::budget_negotiation::Profile::MATCHED);
+    primary.enable_budget(crate::rrls::budget_negotiation::Profile::shipped());
     let shared = Arc::new(Mutex::new(primary));
     let (mut peer, port) = serialport::TTYPort::pair().unwrap();
     peer.set_timeout(Duration::from_millis(1)).unwrap();
@@ -779,13 +779,13 @@ async fn queued_revoke_follows_completed_health_before_startup_controls() {
     let path = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
     let clock = AtomicU64::new(0);
     let mut primary = crate::rrls::Mesh::new(crate::rrls::Role::Primary, 42);
-    primary.enable_budget(crate::rrls::budget_negotiation::Profile::MATCHED);
+    primary.enable_budget(crate::rrls::budget_negotiation::Profile::shipped());
     primary.tick(0);
     // Production enqueue coalesces unserved HEALTH0 when normal tick issues HEALTH1.
     // The already-owned REVOKE was created from HEALTH0 and must not retain seq0.
     let shared = Arc::new(Mutex::new(primary));
     let mut relay = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 43);
-    relay.enable_budget(crate::rrls::budget_negotiation::Profile::MATCHED);
+    relay.enable_budget(crate::rrls::budget_negotiation::Profile::shipped());
     let relay = Arc::new(Mutex::new(relay));
     let (mut peer, port) = serialport::TTYPort::pair().unwrap();
     peer.set_timeout(Duration::from_millis(1)).unwrap();

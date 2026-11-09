@@ -49,6 +49,50 @@ pub(crate) struct Capacity {
     default_share_percent: u64,
     fixed_share: bool,
 }
+/// All modems share one half-duplex channel and each host paces only its own
+/// UART, just under one modem's drain rate. Air the host hears from others is
+/// charged to its own bucket, so busy hosts together stay under the drain and
+/// no modem buffer (4 KiB, no RTS/CTS) overflows. Heard air takes at most
+/// this share of the bucket, so a busy neighbour never starves this host.
+const HEARD_AIR_MAX_PERCENT: u64 = 60;
+/// Heard-air credit carried over a quiet spell, in us.
+const HEARD_CREDIT_MAX_US: u64 = 150_000;
+
+/// Air heard from other modems not yet charged, and the credit (us of this
+/// host's air time) heard traffic may still take.
+pub(crate) struct HeardAir {
+    pending_us: u64,
+    credit_us: u64,
+    at: Option<(Instant, Option<u64>)>,
+}
+impl Default for HeardAir {
+    fn default() -> Self {
+        Self { pending_us: 0, credit_us: HEARD_CREDIT_MAX_US, at: None }
+    }
+}
+impl HeardAir {
+    /// Charge `air_bytes` heard from other modems (payload plus per-packet
+    /// overhead) to `cap`, at most HEARD_AIR_MAX_PERCENT of its pacing.
+    pub(crate) fn charge(&mut self, cap: &mut Capacity, wall: Instant, virtual_ms: Option<u64>, air_bytes: u64) {
+        let elapsed_ms = match (self.at, virtual_ms) {
+            (None, _) => 0,
+            (Some((_, Some(then))), Some(now)) => now.saturating_sub(then),
+            (Some((then, _)), _) => wall.saturating_duration_since(then).as_millis().min(u128::from(u64::MAX)) as u64,
+        };
+        self.at = Some((wall, virtual_ms));
+        self.credit_us = self
+            .credit_us
+            .saturating_add(elapsed_ms.saturating_mul(10 * HEARD_AIR_MAX_PERCENT))
+            .min(HEARD_CREDIT_MAX_US);
+        let cost_us = (u128::from(air_bytes) * 8_000_000).div_ceil(cap.paced_bps()).min(u128::from(u64::MAX)) as u64;
+        let charged = cost_us.min(self.credit_us);
+        self.credit_us -= charged;
+        self.pending_us = self.pending_us.saturating_add(charged);
+        let millis = self.pending_us / 1_000;
+        self.pending_us %= 1_000;
+        cap.charge_heard_air_ms(wall, virtual_ms, millis);
+    }
+}
 fn bounded_env(name: &str, default: u64, min: u64, max: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -883,6 +927,32 @@ impl Capacity {
                 .unwrap_or(*next_wall);
             *next_virtual = next_virtual.map(|next| next.saturating_add(extra));
         }
+    }
+    /// Air time other modems used, charged like this host's own frames
+    /// without touching packet boundaries or command loans.
+    pub(crate) fn charge_heard_air_ms(&mut self, wall: Instant, virtual_ms: Option<u64>, millis: u64) {
+        if millis == 0 {
+            return;
+        }
+        let base_wall = self.next.map_or(wall, |(next, _)| next.max(wall));
+        let base_virtual = virtual_ms.map(|now| match self.next {
+            Some((_, Some(next))) => next.max(now),
+            _ => now,
+        });
+        self.next = Some((
+            base_wall.checked_add(Duration::from_millis(millis)).unwrap_or(base_wall),
+            base_virtual.map(|now| now.saturating_add(millis)),
+        ));
+    }
+    pub(crate) fn default_share(&self) -> u8 {
+        self.default_share_percent.clamp(1, 100) as u8
+    }
+    /// The current paced rate in payload bytes per second.
+    pub(crate) fn paced_bytes_per_s(&self) -> u64 {
+        (self.paced_bps() / 8).min(u128::from(u64::MAX)) as u64
+    }
+    fn paced_bps(&self) -> u128 {
+        (u128::from(self.air_bps) * u128::from(self.share_percent) / 100).max(1)
     }
     pub(crate) fn committed(
         &mut self,

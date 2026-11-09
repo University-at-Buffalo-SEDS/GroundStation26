@@ -67,8 +67,8 @@ impl Channel {
                 host_share_percent: share_percent,
             },
         );
-        assert_eq!(capacity.airtime_config(), (32000, share_percent));
-        assert_eq!(capacity.packetization(), (100, 55));
+        assert_eq!(capacity.airtime_config(), (t.usable_air_bps, share_percent));
+        assert_eq!(capacity.packetization(), (t.packet_burst_ms, t.packet_gap_ms));
         (
             Self {
                 budget: Arc::new(TxQueueBudget::new_radio(2048, 256)),
