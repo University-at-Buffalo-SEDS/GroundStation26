@@ -398,6 +398,7 @@ pub struct AppState {
 
 impl AppState {
     // HITL has no Abort-delivery gate that needs both ledgers at once.
+    #[cfg(test)]
     pub(crate) fn has_pending_recovery_control_tx(&self)->bool {
         self.has_pending_umbilical_control_tx() || self.has_pending_radio_control_tx()
     }

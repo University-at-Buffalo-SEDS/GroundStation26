@@ -3165,10 +3165,6 @@ pub(crate) fn verified_recovery_host_idle(state: &AppState) -> bool {
     }
     true
 }
-/// Read-only: a cold-flow session currently owns the outputs.
-pub(crate) fn cold_flow_active(state: &AppState) -> bool {
-    cold_flow::runtime_active(&state.gse.lock().unwrap())
-}
 /// Explicit reset may retire host Launch metadata only after host work has
 /// drained. Board completion is still verified by the recovery transaction. A
 /// Launch waiting on its Valve Board, or the latch left by an earlier Stop, is
@@ -3287,23 +3283,63 @@ pub(crate) fn prepare_verified_startup(state: &Arc<AppState>) -> Result<(), &'st
     rt.fill_trim = None;
     Ok(())
 }
-/// Retries after which a pending ABORT counts as undeliverable rather than
-/// still in delivery.
-const ABORT_CLEAR_DELIVERY_RETRIES: u32 = 3;
-/// An ABORT still in its normal delivery attempts, or a controller frame still
-/// on the umbilical, holds Clear GSE abort. An ABORT that keeps failing (a
+/// A reliable command frame outstanding at least this long (from when the
+/// station first saw it pending) counts as undeliverable rather than still in
+/// delivery. One shared rule for Clear GSE abort and the station mode switch.
+pub(crate) const UNDELIVERABLE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+static DELIVERY_FIRST_SEEN: std::sync::Mutex<Option<std::collections::HashMap<(usize, u64), std::time::Instant>>> = std::sync::Mutex::new(None);
+/// The pending reliable frames of these types that are still in their normal
+/// delivery window: outstanding less than UNDELIVERABLE_AFTER, judged both by
+/// when the station first saw them pending and by their retry count, and not
+/// waiting behind a predecessor. Returns their packet ids.
+pub(crate) fn commands_still_in_delivery(router: &sedsnet::router::Router, kinds: &[sedsnet::config::DataType]) -> Vec<u64> {
+    let rows = router.export_reliable_pending_stats();
+    let now = std::time::Instant::now();
+    let window = crate::sim_freshness::wall(UNDELIVERABLE_AFTER);
+    let retry_ms = u64::from(sedsnet::config::runtime_tuning_config().reliable_retransmit_ms.max(1));
+    let mut seen = DELIVERY_FIRST_SEEN.lock().unwrap();
+    let seen = seen.get_or_insert_with(Default::default);
+    // Pending in the SDK but not yet a tracked delivery (still queued, or no
+    // advertised destination yet): tracked per type under a synthetic key.
+    let queued = kinds.iter().filter(|kind| !rows.iter().any(|row| row.data_type == **kind)
+        && router.try_has_pending_reliable_tx_type(**kind).unwrap_or(true))
+        .map(|kind| (1u64 << 63) | u64::from(kind.as_u32()))
+        .collect::<Vec<_>>();
+    let owner = router as *const sedsnet::router::Router as usize;
+    seen.retain(|(router_id, id), _| *router_id != owner || queued.contains(id) || rows.iter().any(|row| row.packet_id == *id));
+    let mut fresh = queued.into_iter()
+        .filter(|key| now.duration_since(*seen.entry((owner, *key)).or_insert(now)) < window)
+        .collect::<Vec<_>>();
+    fresh.extend(rows.iter()
+        .filter(|row| kinds.contains(&row.data_type) && !row.waiting_for_predecessor)
+        .filter(|row| {
+            let first = *seen.entry((owner, row.packet_id)).or_insert(now);
+            now.duration_since(first) < window
+                && u64::from(row.retries).saturating_mul(retry_ms) < window.as_millis() as u64
+        })
+        .map(|row| row.packet_id));
+    fresh
+}
+#[cfg(test)]
+pub(crate) fn age_delivery_tracking_for_test(by: std::time::Duration) {
+    if let Some(seen) = DELIVERY_FIRST_SEEN.lock().unwrap().as_mut() {
+        for first in seen.values_mut() { *first = first.checked_sub(by).unwrap_or(*first); }
+    }
+}
+/// An ABORT still in its normal delivery window, or a controller frame still
+/// on the umbilical, holds Clear GSE abort. An ABORT outstanding longer (a
 /// dead or saturated radio link) and the radio writer's own backlog do not:
 /// clearing sends no output command and board aborts stay latched on the
-/// boards, and a late ABORT only re-aborts its board, so waiting on a frame
-/// the network cannot deliver would leave the station aborted forever.
+/// boards, and a late ABORT only re-aborts its board (the operator is told),
+/// so waiting on a frame the network cannot deliver would leave the station
+/// aborted forever.
+/// HITL never holds Clear GSE abort on delivery (unchanged).
+fn clear_blocked_by_abort_delivery(state: &AppState, router: &sedsnet::router::Router) -> bool {
+    !crate::runtime_mode::is_hitl() && abort_delivery_in_progress(state, router)
+}
 fn abort_delivery_in_progress(state: &AppState, router: &sedsnet::router::Router) -> bool {
-    let abort = crate::telemetry_schema::data_type("ABORT");
     state.has_pending_umbilical_control_tx()
-        || router.export_reliable_pending_stats().iter().any(|pending| {
-            pending.data_type == abort
-                && pending.retries < ABORT_CLEAR_DELIVERY_RETRIES
-                && !pending.waiting_for_predecessor
-        })
+        || !commands_still_in_delivery(router, &[crate::telemetry_schema::data_type("ABORT")]).is_empty()
 }
 /// Station mode changes wait for host output work, never for frames the
 /// network cannot deliver. A sequence, cold flow, manual valve control, an
@@ -3338,14 +3374,7 @@ pub(crate) fn mode_switch_block_reason(state: &AppState) -> Option<&'static str>
     let router = state.topology_router.get()?;
     let kinds = ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND"]
         .map(crate::telemetry_schema::data_type);
-    router
-        .export_reliable_pending_stats()
-        .iter()
-        .any(|pending| {
-            kinds.contains(&pending.data_type)
-                && pending.retries < ABORT_CLEAR_DELIVERY_RETRIES
-                && !pending.waiting_for_predecessor
-        })
+    (!commands_still_in_delivery(router, &kinds).is_empty())
         .then_some("a board command is still being delivered")
 }
 /// Operator recovery only: never dispatch a valve, ignition or launch command.
@@ -3395,12 +3424,15 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
         StatusCode::SERVICE_UNAVAILABLE,
         "Network is not initialized".into(),
     ))?;
-    if !hitl && abort_delivery_in_progress(state, router) {
+    if clear_blocked_by_abort_delivery(state, router) {
         return Err((
             StatusCode::CONFLICT,
-            "Abort delivery is still pending; retry after the network drains".into(),
+            "Abort delivery is still pending; retry in a few seconds (an Abort that cannot be delivered stops holding this after 5 s)".into(),
         ));
     }
+    // Clearing past an Abort the network could not deliver: that board may
+    // still receive it later and abort again. Say so, naming where it is owed.
+    let undelivered_abort = !hitl && router.try_has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT")).unwrap_or(true);
     crate::system_clock::required_control_network_utc_ms(router).map_err(|error| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3469,11 +3501,15 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
     rt.engine.config.dry_self_test_confirmed = false;
     drop(rt);
     state.set_local_flight_state(FlightState::Idle);
+    if undelivered_abort {
+        state.add_notification(UNDELIVERED_ABORT_AFTER_CLEAR);
+    }
     crate::sequences::refresh_action_policy_now(state);
     state.broadcast_action_policy_snapshot();
     progress::flush(state);
     Ok(())
 }
+pub(crate) const UNDELIVERED_ABORT_AFTER_CLEAR: &str = "GSE abort cleared while an Abort was still undelivered (most likely to the AV bay over the radio). If that board receives it later, it will abort again and Launch will show it: check that board's link and recover it if it does.";
 
 /// Signed RRLS request at the primary: exactly the local endpoint's checks.
 pub(crate) fn clear_abort_for_proxy(
@@ -6898,3 +6934,61 @@ pub(crate) fn native_owned_startup_snapshot(state:&AppState) -> serde_json::Valu
 
 #[cfg(test)]
 mod launch_preparation_contention_tests;
+
+#[cfg(test)]
+mod undeliverable_command_tests {
+    use super::*;
+    use std::sync::Arc;
+    fn stalled_router() -> Arc<sedsnet::router::Router> {
+        let router = sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS"));
+        let opts = sedsnet::router::RouterSideOptions { reliable_enabled: true, ..Default::default() };
+        let radio = router.add_side_packed_with_options("rocket_comms", |_| Err(sedsnet::TelemetryError::Io("side tx busy")), opts);
+        let announce = sedsnet::discovery::build_discovery_announce("FC", 1,
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"), crate::telemetry_schema::endpoint("ABORT")]).unwrap();
+        router.rx_from_side(&announce, radio).unwrap();
+        router.process_all_queues_with_timeout(0).unwrap();
+        router.tx_queue(sedsnet::packet::Packet::new(crate::telemetry_schema::data_type("ABORT"),
+            &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")], "GS", 1, Arc::from(&b"SEDS_MANUAL_ABORT_V1:"[..])).unwrap()).unwrap();
+        let _ = router.process_all_queues_with_timeout(0);
+        Arc::new(router)
+    }
+    /// The bench fault: an ABORT to the AV bay that the starved radio never
+    /// delivers. aed4351 held Clear GSE abort (and the mode switch) on any
+    /// pending ABORT, forever. Now both wait while it is still in its normal
+    /// delivery window (5 s outstanding), then stop holding; a controller
+    /// frame on the umbilical still holds both; HITL clear never waits.
+    #[tokio::test]
+    async fn an_undeliverable_abort_stops_holding_clear_and_mode_switch_after_its_window() {
+        crate::telemetry_schema::initialize().unwrap();
+        let _mode = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Normal);
+        let state = crate::state::tests::test_app_state().await;
+        let router = stalled_router();
+        state.topology_router.set(router.clone()).unwrap();
+        let abort = crate::telemetry_schema::data_type("ABORT");
+        assert!(router.has_pending_reliable_tx_type(abort));
+        // Still within its delivery window: both hold.
+        assert!(clear_blocked_by_abort_delivery(&state, &router));
+        assert_eq!(mode_switch_block_reason(&state), Some("a board command is still being delivered"));
+        // Outstanding past the window: neither holds, though the SDK still owns
+        // it (the old rule, which refused for as long as it was pending).
+        age_delivery_tracking_for_test(UNDELIVERABLE_AFTER + std::time::Duration::from_millis(100));
+        assert!(router.has_pending_reliable_tx_type(abort), "the old rule would still refuse");
+        assert!(!clear_blocked_by_abort_delivery(&state, &router));
+        assert_eq!(mode_switch_block_reason(&state), None);
+        // A controller frame still being written on the umbilical holds both.
+        let bytes = sedsnet::wire_format::pack_packet(&sedsnet::packet::Packet::new(crate::telemetry_schema::data_type("VALVE_COMMAND"),
+            &[crate::telemetry_schema::endpoint("VALVE_BOARD")], "GS", 3, Arc::from(&b"\x00"[..])).unwrap()).to_vec();
+        let mut held = None;
+        state.transport_tx_activity.try_enqueue_owned(true, bytes, |b| { held = Some(b); Ok(()) }).unwrap();
+        assert!(clear_blocked_by_abort_delivery(&state, &router));
+        assert_eq!(mode_switch_block_reason(&state), Some("a fill-board command is still being sent"));
+        state.transport_tx_activity.complete_frame(&held.unwrap());
+        // HITL Clear GSE abort never waits on delivery (unchanged).
+        drop(_mode);
+        let _hitl = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Hitl);
+        let fresh = stalled_router();
+        assert!(!commands_still_in_delivery(&fresh, &[abort]).is_empty(), "a new ABORT is in its window");
+        assert!(!clear_blocked_by_abort_delivery(&state, &fresh));
+        state.request_shutdown();
+    }
+}
