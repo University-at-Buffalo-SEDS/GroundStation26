@@ -402,6 +402,23 @@ mod tests {
         state
             .board_abort
             .observe_abort(Board::RFBoard, Instant::now(), 123456);
+        if crate::runtime_mode::is_test_fire() {
+            // A test fire runs without the AV bay: its actual Abort is still
+            // retained in history but never holds the stand's Launch.
+            assert!(crate::board_abort::blocked_message(&state).is_none());
+            assert_eq!(state.board_abort.history_snapshot().actual_abort, 1);
+            state
+                .board_abort
+                .observe_abort(Board::ValveBoard, Instant::now(), 123457);
+            assert!(
+                crate::board_abort::blocked_message(&state)
+                    .unwrap()
+                    .contains("report Abort"),
+                "actual stand Abort was incorrectly scoped away"
+            );
+            assert_eq!(state.board_abort.history_snapshot().actual_abort, 0b1_0001, "RF and VB");
+            return;
+        }
         assert!(
             crate::board_abort::blocked_message(&state)
                 .unwrap()

@@ -236,7 +236,21 @@ mod actual_policy_tests {
             .observe_abort(Board::RFBoard, std::time::Instant::now(), 100);
         assert!(selection.current(&state).is_err());
         let selection = Selection::capture(&state, &["FC".into()]).unwrap();
-        assert_eq!(selection.targets, expected | 3);
+        if crate::runtime_mode::is_test_fire() {
+            // A test fire's reset covers the stand only: an aborted AV-bay
+            // board is not a mandatory target (it does not block Launch either),
+            // but the operator may still name it explicitly.
+            assert_eq!(selection.targets, expected | 2);
+            let selection = Selection::capture(&state, &["RF".into(), "FC".into()]).unwrap();
+            assert_eq!(selection.targets, expected | 3);
+            state
+                .board_abort
+                .observe_abort(Board::ValveBoard, std::time::Instant::now(), 101);
+            let selection = Selection::capture(&state, &[]).unwrap();
+            assert_eq!(selection.targets, 1 << index(Board::ValveBoard).unwrap());
+        } else {
+            assert_eq!(selection.targets, expected | 3);
+        }
         assert!(Selection::capture(&state, &["FC".into(), "FC".into()]).is_err());
     }
     #[tokio::test]

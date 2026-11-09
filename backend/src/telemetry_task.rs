@@ -7459,7 +7459,11 @@ mod tests {
             assert_eq!(state.manual_abort_intent.epoch(), manual);
             assert_eq!(state.deferred_abort.manual_epoch(), observed);
         }
-        assert_eq!(state.board_abort.snapshot(0).active_errors.len(), 7);
+        // A test fire has no AV bay: RF, FC and PB Aborts show no error there.
+        assert_eq!(
+            state.board_abort.snapshot(0).active_errors.len(),
+            if crate::runtime_mode::is_test_fire() { 4 } else { 7 }
+        );
         for reboot_phase in [FlightState::Startup, FlightState::Idle, FlightState::Armed] {
             let packet = Packet::new(
                 crate::telemetry_schema::data_type("FLIGHT_STATE"),

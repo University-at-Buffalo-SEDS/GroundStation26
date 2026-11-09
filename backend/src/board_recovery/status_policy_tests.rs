@@ -217,6 +217,20 @@ async fn actual_get_abort_observation_never_turns_capability_into_recovery_proof
             .all(Option::is_none)
     );
     let selected = scope::Selection::capture(&f.state, &[]).unwrap();
+    if crate::runtime_mode::is_test_fire() {
+        // A test fire's reset scope is the stand: an aborted AV-bay board
+        // neither blocks Launch nor becomes a mandatory reset target.
+        assert!(!selected.boards().contains(&Board::RFBoard));
+        f.state
+            .board_abort
+            .observe_abort(Board::ValveBoard, WallInstant::now(), 101);
+        let selected = scope::Selection::capture(&f.state, &[]).unwrap();
+        assert!(
+            selected.boards().contains(&Board::ValveBoard),
+            "PREPARE still includes an actual stand Abort independent of base capability"
+        );
+        return;
+    }
     assert!(
         selected.boards().contains(&Board::RFBoard),
         "PREPARE still includes actual Abort independent of base capability"

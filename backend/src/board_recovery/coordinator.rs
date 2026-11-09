@@ -4478,6 +4478,22 @@ mod tests {
             )
             .unwrap();
             fixture.inject_state(packet).await;
+            let in_mode = crate::board_recovery::scope::mode_scope(crate::station_mode::local_mode())
+                & (1 << index(*board).unwrap())
+                != 0;
+            if !in_mode {
+                // A test fire has no AV bay: its Abort shows no error and
+                // cannot hold the stand's Launch.
+                assert!(
+                    state.board_abort.snapshot(0).active_errors.is_empty(),
+                    "{}",
+                    board.sender_id()
+                );
+                assert!(crate::board_abort::blocked_message(&state).is_none());
+                model.lock().unwrap().state = crate::types::FlightState::Recovery as u8;
+                fixture.query(*board).await;
+                continue;
+            }
             assert_eq!(
                 state.board_abort.snapshot(0).active_errors.len(),
                 1,
@@ -4728,7 +4744,11 @@ mod tests {
                 "FC reboot cannot change durable global flight phase"
             );
         }
-        assert_eq!(state.board_abort.snapshot(0).active_errors.len(), 4);
+        // A test fire has no AV bay, so the FC Abort shows no error there.
+        assert_eq!(
+            state.board_abort.snapshot(0).active_errors.len(),
+            if crate::runtime_mode::is_test_fire() { 3 } else { 4 }
+        );
     }
 
     #[tokio::test]
