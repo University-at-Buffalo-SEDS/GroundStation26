@@ -6,6 +6,7 @@ use crate::{
     state::AppState,
     types::{Board, NetworkTopologyStatus},
 };
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 const VERSION: u8 = 1;
@@ -76,20 +77,25 @@ pub(crate) struct LaunchOrigin {
     pub(crate) session: u32,
 }
 struct Received {
-    owner: usize,
     observation: Observation,
     at: Instant,
     transit_ms: u64,
     launch_origin: Option<LaunchOrigin>,
 }
-static CACHE: OnceLock<Mutex<Option<Received>>> = OnceLock::new();
-static COMMAND_BARRIER: OnceLock<Mutex<Option<(usize, Instant)>>> = OnceLock::new();
-fn command_barrier() -> &'static Mutex<Option<(usize, Instant)>> {
-    COMMAND_BARRIER.get_or_init(|| Mutex::new(None))
+// Keyed by the owning AppState. A station process has exactly one, so each
+// map holds at most one entry there; in-process tests each own a separate
+// entry and cannot replace or clear another test's observation or barrier.
+static CACHE: OnceLock<Mutex<HashMap<usize, Received>>> = OnceLock::new();
+static COMMAND_BARRIER: OnceLock<Mutex<HashMap<usize, Instant>>> = OnceLock::new();
+fn owner(state: &AppState) -> usize {
+    state as *const _ as usize
+}
+fn command_barrier() -> &'static Mutex<HashMap<usize, Instant>> {
+    COMMAND_BARRIER.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cache() -> &'static Mutex<Option<Received>> {
-    CACHE.get_or_init(|| Mutex::new(None))
+fn cache() -> &'static Mutex<HashMap<usize, Received>> {
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 fn age(value: Option<u64>) -> u16 {
     value
@@ -330,10 +336,8 @@ pub fn encode_control_observation(state: &AppState, max_bytes: usize) -> Vec<u8>
         for (i, value) in runtime.mirror_valves().into_iter().enumerate() {
             if let Some((open, source_age)) = value {
                 let key = [0, 1, 2, 9, 10][i];
-                let barrier = *command_barrier().lock().unwrap();
-                if barrier.is_some_and(|(owner, at)| {
-                    owner == state as *const _ as usize && !state.umbilical_report_after(key, at)
-                }) {
+                let barrier = command_barrier().lock().unwrap().get(&owner(state)).copied();
+                if barrier.is_some_and(|at| !state.umbilical_report_after(key, at)) {
                     continue;
                 }
                 // A still-fresh previous report cannot confirm a newly pending request.
@@ -484,8 +488,7 @@ fn accept_control_observation_inner(
                     session,
                 })
         });
-    *cache().lock().unwrap() = Some(Received {
-        owner: state as *const _ as usize,
+    cache().lock().unwrap().insert(owner(state), Received {
         observation,
         launch_origin,
         at: Instant::now(),
@@ -496,17 +499,14 @@ fn accept_control_observation_inner(
 pub fn note_command_outcome(state: &AppState) {
     // Primary HTTP/channel admission can precede the command worker's pending mark.
     // Require a NEW actual board report; neither admission nor target values qualify.
-    *command_barrier().lock().unwrap() = Some((state as *const _ as usize, Instant::now()));
+    command_barrier().lock().unwrap().insert(owner(state), Instant::now());
 }
-pub fn invalidate_control_observation() {
-    *cache().lock().unwrap() = None;
+pub fn invalidate_control_observation(state: &AppState) {
+    cache().lock().unwrap().remove(&owner(state));
 }
 fn with_received<T>(state: &AppState, f: impl FnOnce(&Observation, u64) -> T) -> Option<T> {
     let guard = cache().lock().unwrap();
-    let r = guard.as_ref()?;
-    if r.owner != state as *const _ as usize {
-        return None;
-    }
+    let r = guard.get(&owner(state))?;
     Some(f(
         &r.observation,
         r.transit_ms
@@ -532,8 +532,8 @@ pub(crate) fn observation_has_board_guard(bytes: &[u8]) -> bool {
 /// be replaced with this RRLS executable's locally compiled policy.
 pub(crate) fn board_state_proof_policy(state: &AppState) -> Option<bool> {
     let cache = cache().lock().unwrap();
-    let received = cache.as_ref()?;
-    if received.owner != state as *const _ as usize || received.launch_origin.is_none() {
+    let received = cache.get(&owner(state))?;
+    if received.launch_origin.is_none() {
         return None;
     }
     let elapsed = received.transit_ms.saturating_add(
@@ -544,8 +544,8 @@ pub(crate) fn board_state_proof_policy(state: &AppState) -> Option<bool> {
 /// whether that primary is a TestFire build. Zero means explicitly optional.
 pub(crate) fn board_history_required_scope(state: &AppState) -> Option<u8> {
     let cache = cache().lock().unwrap();
-    let received = cache.as_ref()?;
-    if received.owner != state as *const _ as usize || received.launch_origin.is_none() {
+    let received = cache.get(&owner(state))?;
+    if received.launch_origin.is_none() {
         return None;
     }
     let elapsed = received.transit_ms.saturating_add(
@@ -562,8 +562,8 @@ pub(crate) fn board_history_required_scope(state: &AppState) -> Option<u8> {
 /// TestFire primary's signed policy. Crash-history scope remains separate.
 pub(crate) fn board_required_state_mask(state: &AppState) -> Option<u8> {
     let guard = cache().lock().unwrap();
-    let received = guard.as_ref()?;
-    if received.owner != state as *const _ as usize || received.launch_origin.is_none() {
+    let received = guard.get(&owner(state))?;
+    if received.launch_origin.is_none() {
         return None;
     }
     let elapsed = received.transit_ms.saturating_add(
@@ -587,8 +587,7 @@ pub(crate) fn capture_launch_origin(state: &AppState) -> Option<LaunchOrigin> {
     // register, so the opposing nesting would deadlock an RRLS Launch.
     let (origin,observation,at,transit_ms) = {
         let cache=cache().lock().unwrap();
-        let received=cache.as_ref()?;
-        if received.owner != state as *const _ as usize { return None; }
+        let received=cache.get(&owner(state))?;
         let origin=received.launch_origin?;
         received.observation.board_proof_policy?;
         let elapsed=received.transit_ms.saturating_add(received.at.elapsed().as_millis().min(u64::MAX as u128) as u64);
@@ -605,8 +604,8 @@ pub(crate) fn capture_launch_origin(state: &AppState) -> Option<LaunchOrigin> {
     // the board lookup. An intervening cache replacement is not a new ticket.
     {
         let cache=cache().lock().unwrap();
-        let current=cache.as_ref()?;
-        if current.owner != state as *const _ as usize || current.at!=at
+        let current=cache.get(&owner(state))?;
+        if current.at!=at
             || current.transit_ms!=transit_ms || current.launch_origin!=Some(origin)
             || current.observation!=observation
             || transit_ms.saturating_add(at.elapsed().as_millis().min(u64::MAX as u128) as u64)>SOURCE_FRESH_MS {
@@ -1030,7 +1029,7 @@ mod tests {
         assert_eq!(value.encode().len(), 87);
         assert!(accept_control_observation_with_context(&state, &value.encode(), 0, [9;16], 23));
         assert_eq!(board_history_required_scope(&state), None);
-        invalidate_control_observation();
+        invalidate_control_observation(&state);
         assert_eq!(board_history_required_scope(&state), None);
     }
     #[tokio::test]
@@ -1158,7 +1157,7 @@ mod tests {
                 .iter()
                 .all(|c| !c.enabled && c.actuated.is_none())
         );
-        invalidate_control_observation();
+        invalidate_control_observation(&state);
         assert!(action_policy(&state).is_none());
     }
     #[test]

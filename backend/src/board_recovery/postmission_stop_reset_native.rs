@@ -15,6 +15,9 @@ impl Drop for PostmissionNativeIngress {
 // Private actual-host operator-flow diagnostic; peer application state is an explicit model.
 #[tokio::test]
 async fn local_stop_postmission_reset_actual_runtime_diagnostic() {
+    // Own process: the test-fire receipt probe and the native peer services
+    // are process-wide and another diagnostic cannot share them.
+    if isolated("local_stop_postmission_reset_actual_runtime_diagnostic") { return; }
     use tower::ServiceExt;
     use crate::types::FlightState;
     let mut observed = Vec::new();
@@ -100,6 +103,8 @@ async fn local_stop_postmission_reset_actual_runtime_diagnostic() {
 #[tokio::test]
 async fn local_stop_active_startup_abort_reset_actual_runtime_diagnostic() {
     crate::mode_suite!(Normal, TestFire, Testing);
+    // Own process, as above.
+    if isolated("local_stop_active_startup_abort_reset_actual_runtime_diagnostic") { return; }
     use tower::ServiceExt;
     use crate::types::FlightState;
     let mut observed = Vec::new();

@@ -486,7 +486,7 @@ async fn recovery_websocket_policy_uses_primary_projection_and_new_signed_observ
     }
     let (root, _, _) = super::tests::fixtures();
     let state = crate::recording_export::tests::export_state(&root.0, false).await;
-    crate::primary_mirror::invalidate_control_observation();
+    crate::primary_mirror::invalidate_control_observation(&state);
     let mut published = state.action_policy_tx.subscribe();
     state.set_action_policy(crate::sequences::ActionPolicyMsg {
         local_phase_controls: false,

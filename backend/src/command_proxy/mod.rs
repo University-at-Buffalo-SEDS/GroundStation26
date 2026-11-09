@@ -1405,7 +1405,7 @@ fn accept_presentation(
 }
 fn invalidate_presentation(state: &crate::state::AppState) {
     retained_config::disconnected();
-    crate::primary_mirror::invalidate_control_observation();
+    crate::primary_mirror::invalidate_control_observation(state);
     if crate::rrls::is_rrls() {
         state.broadcast_action_policy_snapshot();
     }
