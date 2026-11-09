@@ -168,6 +168,35 @@ fn publish_change(state: &AppState, change: Change) {
         );
     }
 }
+/// Resolved occurrences still held for display; None while the journal restores.
+pub fn resolved_history_len(state: &AppState) -> Option<usize> {
+    state.alert_conditions.registry.lock().unwrap().resolved_history_len()
+}
+/// Drop resolved history in RAM, publish the new revision, and queue the
+/// checkpoint that removes the same rows from the durable journal.
+pub fn clear_resolved_history(state: &AppState) -> Result<usize, String> {
+    let removed = state
+        .alert_conditions
+        .registry
+        .lock()
+        .unwrap()
+        .clear_resolved_history()?;
+    if removed > 0 {
+        state.alert_conditions.broadcast();
+        request_repair(state);
+    }
+    Ok(removed)
+}
+#[cfg(test)]
+pub(crate) fn restore_empty_for_test(state: &AppState) {
+    state
+        .alert_conditions
+        .registry
+        .lock()
+        .unwrap()
+        .restore(Vec::new())
+        .unwrap();
+}
 /// Called from the existing heartbeat cadence. Coalesced and monotonic backoff;
 /// no extra task, SDK traffic, or recursive alert is created by journal failure.
 pub fn request_repair(state: &AppState) {
@@ -209,6 +238,7 @@ pub fn request_repair(state: &AppState) {
 /// Initialize inside the existing writer task. Producers can stage evidence
 /// during this await; Registry::restore applies it after loading old records.
 pub async fn initialize(state: &AppState) -> Option<Store> {
+    crate::alert_history::restore(state).await;
     initialize_with_restore_gate(state, std::future::ready(())).await
 }
 // The production gate is immediately ready. Tests can hold the actual writer

@@ -548,6 +548,24 @@ impl AppState {
         snapshot
     }
 
+    /// Hide events at or before `cutoff_ms` from history and the alarm cache,
+    /// and tell every viewer. Acknowledgments and active conditions are unchanged.
+    pub fn clear_alert_history_through(&self, cutoff_ms: i64) -> AlertAckStateMsg {
+        let mut slot = self.alert_ack_state.lock().unwrap();
+        let changed = cutoff_ms > slot.history_cleared_through_ms;
+        slot.history_cleared_through_ms = slot.history_cleared_through_ms.max(cutoff_ms);
+        let snapshot = slot.clone();
+        drop(slot);
+        self.recent_alerts_cache
+            .lock()
+            .unwrap()
+            .retain(|alert| alert.timestamp_ms > snapshot.history_cleared_through_ms);
+        if changed {
+            let _ = self.alert_ack_tx.send(snapshot.clone());
+        }
+        snapshot
+    }
+
     pub fn launch_clock_snapshot(&self) -> LaunchClockMsg {
         self.launch_clock.lock().unwrap().clone()
     }

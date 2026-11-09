@@ -391,6 +391,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleared_history_checkpoint_survives_restart_and_keeps_the_active_fault() {
+        let path = path("cleared-history");
+        let store = Store::open(&path, "epoch".into()).await.unwrap();
+        let mut r = Registry::new("epoch".into(), []);
+        r.restore(Vec::new()).unwrap();
+        let abort = Key::BoardAbort(BoardKey::Fc);
+        for (key, state, at) in [
+            (abort, ConditionState::Active, 1),
+            (abort, ConditionState::Resolved, 2),
+            (Key::GatewayLowVoltage, ConditionState::Active, 3),
+        ] {
+            let e = r.observe(key, state, "fixture".into(), at).journal.unwrap();
+            store.append(std::slice::from_ref(&e)).await.unwrap();
+            r.journal_succeeded(&e.authority, e.revision);
+        }
+        assert_eq!(r.clear_resolved_history(), Ok(1));
+        let snapshot = r.snapshot();
+        store.checkpoint(&snapshot).await.unwrap();
+        assert!(r.checkpoint_succeeded("epoch", snapshot.revision));
+        store.close().await;
+        let reopened = Store::open(&path, "next".into()).await.unwrap();
+        let rows = reopened.restore().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, Key::GatewayLowVoltage.wire());
+        assert_eq!(rows[0].state, ConditionState::Active);
+        reopened.close().await;
+        cleanup(&path).await;
+    }
+
+    #[tokio::test]
     async fn late_old_revision_does_not_resurrect_resolved_latest_record() {
         let path = path("ordering");
         let store = Store::open(&path, "epoch".into()).await.unwrap();

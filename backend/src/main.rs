@@ -18,6 +18,7 @@ mod alert_condition_journal;
 mod alert_condition_producers;
 mod alert_condition_runtime;
 mod alert_conditions;
+mod alert_history;
 mod antenna;
 mod auth;
 mod auto_zero;

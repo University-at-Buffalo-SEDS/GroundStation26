@@ -238,6 +238,7 @@ pub struct Registry {
     board_edge_sequence: u64,
     board_abort_bindings: BTreeMap<BoardKey, BoardAbortBinding>,
     restored_board_occurrences: BTreeMap<BoardKey, String>,
+    history_checkpoint_due: bool,
 }
 impl Registry {
     /// Expected keys must reflect the actually configured/running producers.
@@ -264,6 +265,7 @@ impl Registry {
             board_edge_sequence: 0,
             board_abort_bindings: BTreeMap::new(),
             restored_board_occurrences: BTreeMap::new(),
+            history_checkpoint_due: false,
         }
     }
     fn advance(&mut self) {
@@ -717,6 +719,7 @@ impl Registry {
         }
         self.pending.clear();
         self.persistence_error = None;
+        self.history_checkpoint_due = false;
         if self.bootstrap_incomplete.is_some() {
             self.integrity_persisted = true;
         }
@@ -733,7 +736,29 @@ impl Registry {
     }
     pub fn needs_repair(&self) -> bool {
         self.persistence_error.is_some()
+            || self.history_checkpoint_due
             || (self.bootstrap_incomplete.is_some() && !self.integrity_persisted)
+    }
+    /// Operator history clear. Only resolved occurrences leave; active and
+    /// unknown conditions, abort bindings and integrity gaps are untouched.
+    /// The journal keeps the old rows until the next checkpoint replaces them.
+    pub fn clear_resolved_history(&mut self) -> Result<usize, String> {
+        if !self.restored {
+            return Err("Condition history is still loading; try again shortly".into());
+        }
+        let removed = self.warnings.len() + self.errors.len();
+        if removed == 0 {
+            return Ok(0);
+        }
+        self.warnings.clear();
+        self.errors.clear();
+        self.history_checkpoint_due = true;
+        self.advance();
+        Ok(removed)
+    }
+    pub fn resolved_history_len(&self) -> Option<usize> {
+        self.restored
+            .then(|| self.warnings.len() + self.errors.len())
     }
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
@@ -883,6 +908,47 @@ mod tests {
             .changed
         );
         assert_eq!(r.snapshot().revision, revision);
+    }
+    #[test]
+    fn clearing_history_drops_only_resolved_records_and_requires_a_durable_checkpoint() {
+        let mut r = Registry::new("station-epoch".into(), [Key::GatewayLowVoltage]);
+        assert!(
+            r.clear_resolved_history().is_err(),
+            "history still loading from the journal cannot be cleared"
+        );
+        r.restore(Vec::new()).unwrap();
+        let abort = Key::BoardAbort(BoardKey::Fc);
+        for (key, at) in [(abort, 10), (Key::GatewayLowVoltage, 20)] {
+            let c = r.observe(key, ConditionState::Active, "Raised".into(), at);
+            commit(&mut r, c);
+            let c = r.observe(key, ConditionState::Resolved, "Cleared".into(), at + 1);
+            commit(&mut r, c);
+        }
+        let c = r.observe(abort, ConditionState::Active, "Raised again".into(), 30);
+        commit(&mut r, c);
+        let c = r.observe(Key::StationHeartbeatEnqueue, ConditionState::Unknown, "Unconfirmed".into(), 31);
+        commit(&mut r, c);
+        assert!(!r.needs_repair());
+        let before = r.snapshot().revision;
+
+        assert_eq!(r.clear_resolved_history(), Ok(2));
+
+        let snapshot = r.snapshot();
+        assert!(snapshot.revision > before, "viewers must see a new revision");
+        assert_eq!(snapshot.records.len(), 2);
+        assert!(snapshot.records.iter().all(|record| record.state != ConditionState::Resolved));
+        assert_eq!(r.current_state(abort), Some(ConditionState::Active));
+        assert_eq!(r.current_state(Key::StationHeartbeatEnqueue), Some(ConditionState::Unknown));
+        assert!(r.needs_repair(), "the cleared history must be checkpointed to the journal");
+        let stale = snapshot.revision;
+        let c = r.observe(abort, ConditionState::Active, "Raised again, new detail".into(), 32);
+        commit(&mut r, c);
+        assert!(!r.checkpoint_succeeded("station-epoch", stale));
+        assert!(r.needs_repair());
+        let current = r.snapshot().revision;
+        assert!(r.checkpoint_succeeded("station-epoch", current));
+        assert!(!r.needs_repair());
+        assert_eq!(r.clear_resolved_history(), Ok(0));
     }
     #[test]
     fn resolved_history_is_bounded_without_evicting_active_or_hiding_journal_failure() {

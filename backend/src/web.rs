@@ -446,6 +446,11 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
             post(dismiss_notification),
         )
         .route("/api/alerts/ack", post(post_alert_ack))
+        .route(
+            "/api/alerts/history/clear",
+            post(post_alert_history_clear),
+        )
+        .route("/api/alerts/history/clears", get(get_alert_history_clears))
         .route("/api/action_policy", get(get_action_policy))
         .route("/api/board_abort", get(crate::board_abort::get_status))
         .route(
@@ -661,6 +666,9 @@ pub struct ErrorMsg {
 pub struct AlertAckStateMsg {
     pub warning_ack_timestamp_ms: i64,
     pub error_ack_timestamp_ms: i64,
+    /// Operator-cleared history: events at or before this time are not shown.
+    #[serde(default)]
+    pub history_cleared_through_ms: i64,
 }
 
 /// DTO returned by /api/alerts
@@ -6057,7 +6065,9 @@ async fn get_alerts(
         (None, Some(b)) => b,
         (None, None) => return Json(Vec::<AlertDto>::new()).into_response(),
     };
-    let cutoff = now_ms - (minutes as i64) * 60_000;
+    // Operator-cleared history stays hidden after reseeds and restarts.
+    let cutoff = (now_ms - (minutes as i64) * 60_000)
+        .max(state.alert_ack_state_snapshot().history_cleared_through_ms.saturating_add(1));
 
     let cols=sqlx::query("PRAGMA table_info(alerts)").fetch_all(&db).await.unwrap_or_default();
     let query=if cols.iter().any(|row|row.get::<String,_>("name")=="condition_json") {
@@ -6107,6 +6117,55 @@ async fn post_alert_ack(
     }
     Json(state.acknowledge_alerts_through(body.warning_timestamp_ms, body.error_timestamp_ms))
         .into_response()
+}
+
+#[derive(Deserialize)]
+struct AlertHistoryClearRequest {
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// Clears resolved conditions and older warning/error events for every viewer.
+/// Active conditions, board Abort latches and abort history are not touched.
+async fn post_alert_history_clear(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AlertHistoryClearRequest>,
+) -> axum::response::Response {
+    let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let user = match principal.username {
+        Some(name) if !principal.anonymous && !name.is_empty() => name,
+        _ => {
+            return (StatusCode::FORBIDDEN, "Sign in to clear alert history").into_response();
+        }
+    };
+    if !body.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Confirm before clearing alert history",
+        )
+            .into_response();
+    }
+    match crate::alert_history::clear(&state, user).await {
+        Ok(entry) => Json(entry).into_response(),
+        Err((status, message)) => (status, message).into_response(),
+    }
+}
+
+async fn get_alert_history_clears(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    match crate::alert_history::recent_entries(&state).await {
+        Ok(entries) => Json(entries).into_response(),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    }
 }
 
 async fn get_boards(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
@@ -6998,3 +7057,112 @@ mod alert_condition_readonly_tests {
 #[cfg(test)]
 #[path = "operator_queue/safe_manual_http_tests.rs"]
 mod safe_manual_http_tests;
+
+#[cfg(test)]
+mod alert_history_clear_tests {
+    use super::*;
+    use crate::alert_conditions::{BoardKey, ConditionState, Key};
+
+    fn error_event(timestamp_ms: i64) -> AlertDto {
+        AlertDto {
+            timestamp_ms,
+            severity: "error".into(),
+            message: format!("fixture error {timestamp_ms}"),
+            condition: None,
+        }
+    }
+
+    async fn alert_times(state: &Arc<AppState>, headers: &HeaderMap) -> Vec<i64> {
+        let response = get_alerts(
+            State(state.clone()),
+            headers.clone(),
+            Query(HistoryParams { minutes: Some(60) }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice::<Vec<serde_json::Value>>(&body)
+            .unwrap()
+            .iter()
+            .map(|alert| alert["timestamp_ms"].as_i64().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn clearing_history_keeps_active_conditions_requires_a_signed_in_confirmation_and_is_audited() {
+        let (_root, state, _commands, headers) =
+            command_dispatch_tests::preauth_fixture().await;
+        crate::alert_condition_runtime::restore_empty_for_test(&state);
+        let fc_abort = Key::BoardAbort(BoardKey::Fc);
+        let ab_abort = Key::BoardAbort(BoardKey::Ab);
+        for (state_now, at) in [(ConditionState::Active, 10), (ConditionState::Resolved, 11)] {
+            crate::alert_condition_runtime::observe(&state, fc_abort, state_now, "FC Abort".into(), at);
+        }
+        crate::alert_condition_runtime::observe(&state, ab_abort, ConditionState::Active, "AB Abort".into(), 12);
+        let now = crate::telemetry_task::get_current_timestamp_ms() as i64;
+        state.cache_recent_alert(error_event(now - 2_000));
+        state.cache_recent_alert(error_event(now - 1_000));
+        assert_eq!(alert_times(&state, &headers).await.len(), 2);
+
+        let anonymous = post_alert_history_clear(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(AlertHistoryClearRequest { confirm: true }),
+        )
+        .await;
+        assert!(anonymous.status().is_client_error());
+        let unconfirmed = post_alert_history_clear(
+            State(state.clone()),
+            headers.clone(),
+            Json(AlertHistoryClearRequest { confirm: false }),
+        )
+        .await;
+        assert_eq!(unconfirmed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(alert_times(&state, &headers).await.len(), 2, "nothing cleared without confirmation");
+
+        let mut ack_rx = state.alert_ack_tx.subscribe();
+        let cleared = post_alert_history_clear(
+            State(state.clone()),
+            headers.clone(),
+            Json(AlertHistoryClearRequest { confirm: true }),
+        )
+        .await;
+        assert_eq!(cleared.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(cleared.into_body(), 4096).await.unwrap();
+        let entry: crate::alert_history::ClearEntry = serde_json::from_slice(&body).unwrap();
+        assert_eq!(entry.cleared_by, "operator");
+        assert_eq!(entry.resolved_conditions_cleared, 1);
+        assert!(entry.cleared_through_ms >= now - 1_000);
+        assert_eq!(
+            ack_rx.try_recv().unwrap().history_cleared_through_ms,
+            entry.cleared_through_ms,
+            "every viewer is told to drop the cleared events"
+        );
+
+        assert!(alert_times(&state, &headers).await.is_empty());
+        assert!(state.recent_alerts_snapshot().is_empty(), "alarm cache no longer holds cleared events");
+        let records = state.alert_conditions.snapshot().records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key, ab_abort.wire());
+        assert_eq!(records[0].state, ConditionState::Active, "active errors are never cleared");
+        assert_eq!(state.alert_conditions.current_state(ab_abort), Some(ConditionState::Active));
+
+        state.cache_recent_alert(error_event(entry.cleared_through_ms + 1));
+        assert_eq!(alert_times(&state, &headers).await, vec![entry.cleared_through_ms + 1]);
+
+        let audit = get_alert_history_clears(State(state.clone()), headers.clone()).await;
+        let body = axum::body::to_bytes(audit.into_body(), 4096).await.unwrap();
+        let entries: Vec<crate::alert_history::ClearEntry> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(entries, vec![entry.clone()]);
+
+        state.clear_alert_history_through(0);
+        *state.alert_ack_state.lock().unwrap() = AlertAckStateMsg::default();
+        crate::alert_history::restore(&state).await;
+        assert_eq!(
+            state.alert_ack_state_snapshot().history_cleared_through_ms,
+            entry.cleared_through_ms,
+            "a restart keeps cleared events hidden"
+        );
+    }
+}
