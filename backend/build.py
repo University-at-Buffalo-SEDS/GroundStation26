@@ -211,6 +211,7 @@ def main() -> None:
     raw_args, remote = _remote_build().take_argument(raw_args)
     if remote:
         os.environ[_remote_build().ENV] = remote
+        _remote_build().connect()
 
     force_pi = False
     force_no_pi = False

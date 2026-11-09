@@ -1104,6 +1104,8 @@ def main() -> None:
     raw_args, remote = _remote_build().take_argument(raw_args)
     if remote:
         os.environ[_remote_build().ENV] = remote
+        # Authenticate once here, before the parallel builds share it.
+        _remote_build().connect()
 
     frontend_platforms = {"web", "frontend_web"}
 

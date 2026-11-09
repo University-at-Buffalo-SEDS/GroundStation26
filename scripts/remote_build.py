@@ -107,8 +107,12 @@ class Remote:
         self.destination = f"{user}@{host}" if user else host
         self.password = password
         self._askpass: Optional[Path] = None
-        # Unix sockets cap paths near 104 bytes; system temp dirs can exceed it.
-        self._control = Path(tempfile.mkdtemp(prefix="gsrb", dir="/tmp")) / "%C"
+        # One shared connection per user and host: the backend and frontend
+        # builds run in parallel and must not each prompt for a password on
+        # the same terminal. Unix sockets cap paths near 104 bytes, so /tmp.
+        control = Path("/tmp") / f"gsrb-{os.getuid()}"
+        control.mkdir(mode=0o700, exist_ok=True)
+        self._control = control / "%C"
 
     def env(self) -> dict[str, str]:
         environment = os.environ.copy()
@@ -128,7 +132,7 @@ class Remote:
     def ssh_options(self) -> list[str]:
         # One authenticated connection is reused for every step.
         return ["-o", "ControlMaster=auto", "-o", f"ControlPath={self._control}",
-                "-o", "ControlPersist=120", "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ControlPersist=900", "-o", "StrictHostKeyChecking=accept-new",
                 "-o", "ServerAliveInterval=30"]
 
     def ssh(self, command: str, capture: bool = False) -> str:
@@ -172,9 +176,14 @@ class Remote:
     def pull(self, remote: str, local: Path, delete: bool = False) -> None:
         self.rsync(f"{self.destination}:{remote}", str(local), [], delete=delete)
 
+    def connect(self) -> None:
+        """Authenticate once; later ssh and rsync calls reuse this connection."""
+        print(f"Connecting to {self.destination} for the remote build...", flush=True)
+        subprocess.run(["ssh", *self.ssh_options(), self.destination, "true"], env=self.env(), check=True)
+
     def close(self) -> None:
-        subprocess.run(["ssh", *self.ssh_options(), "-O", "exit", self.destination],
-                       env=self.env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # The shared connection is left to ControlPersist: the other parallel
+        # build may still be using it.
         if self._askpass is not None:
             self._askpass.unlink(missing_ok=True)
 
@@ -273,6 +282,15 @@ def _check_local_target() -> None:
 
 def requested() -> Optional[str]:
     return os.environ.get(ENV) or None
+
+
+def connect() -> None:
+    """Open the shared connection before the parallel builds start."""
+    remote = Remote(requested() or "")
+    try:
+        remote.connect()
+    finally:
+        remote.close()
 
 
 def build_backend(repo_root: Path, features: list[str], debug: bool) -> None:

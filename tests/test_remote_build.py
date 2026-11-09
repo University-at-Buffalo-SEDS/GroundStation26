@@ -44,6 +44,16 @@ class HostSpecTests(unittest.TestCase):
         self.assertFalse(askpass.exists())
 
 
+class SharedConnectionTests(unittest.TestCase):
+    def test_parallel_builds_share_one_authenticated_connection(self) -> None:
+        # Separate connections made the backend and frontend builds prompt for
+        # the password on the same terminal at once, splitting the keystrokes.
+        first, second = remote_build.Remote("rylan@jupiter"), remote_build.Remote("rylan@jupiter")
+        option = lambda remote: next(o for o in remote.ssh_options() if o.startswith("ControlPath="))
+        self.assertEqual(option(first), option(second))
+        self.assertIn("ControlMaster=auto", first.ssh_options())
+
+
 class ArgumentTests(unittest.TestCase):
     def test_takes_every_remote_form_and_keeps_other_arguments(self) -> None:
         for args, spec in [
