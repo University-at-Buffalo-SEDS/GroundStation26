@@ -357,11 +357,11 @@ async fn only_a_launch_countdown_or_moving_outputs_hold_the_station_mode() {
     let (status, body) = f.prepare("administrator", target).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // Manual valve control still holds the outputs.
+    // The manual-control latch outlives the valve command that set it: a
+    // latched flag with nothing moving never holds the switch.
     f.state.gse.lock().unwrap().manual_control = true;
     let (status, body) = f.prepare("administrator", target).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert!(body["error"].as_str().unwrap().contains("manual valve control"), "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
     f.state.gse.lock().unwrap().manual_control = false;
 
     // Board and flight state never hold it.

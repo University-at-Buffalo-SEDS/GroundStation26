@@ -917,9 +917,9 @@ pub(crate) fn can_change(principal: &AuthPrincipal) -> bool {
 
 /// Why a mode change is refused right now, if anything. Only a launch in
 /// progress (a pending Launch command or the T-minus countdown) and output
-/// work the switch would orphan (a GSE sequence, turbocharge, cold flow or
-/// manual valve control moving valves) hold it. Flight state, board state and
-/// abort state never do, and the switch reopens once the launch is past T-0.
+/// work the switch would orphan (a running GSE sequence, turbocharge or cold
+/// flow) hold it. Flight state, board state, abort state and the manual-control
+/// latch never do, and the switch reopens once the launch is past T-0.
 pub(crate) fn station_busy(state: &AppState, _rrls: bool) -> Option<String> {
     if state.shutdown_requested.load(Ordering::SeqCst) {
         return Some("the backend is already shutting down".into());

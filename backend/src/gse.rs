@@ -3350,14 +3350,15 @@ fn abort_delivery_in_progress(state: &AppState, router: &sedsnet::router::Router
         || !commands_still_in_delivery(router, &[crate::telemetry_schema::data_type("ABORT")]).is_empty()
 }
 /// Output work a station mode change would orphan: the switch resets the
-/// sequence engine, so a sequence in progress, cold flow or manual valve
-/// control holds it. Each releases the moment that work ends (the engine
-/// leaves its active phases), never on a separate latch. Abort and delivery
-/// state do not hold it: a mode change sends no output command.
+/// sequence engine, so a sequence in progress or cold flow holds it, and each
+/// releases the moment that work ends (the engine leaves its active phases).
+/// The manual-control latch does not: it stays set after a single manual valve
+/// command or an abort's cancel, long after anything moved. Abort and delivery
+/// state do not either: a mode change sends no output command.
 pub(crate) fn mode_switch_block_reason(state: &AppState) -> Option<&'static str> {
     let rt = state.gse.lock().unwrap();
-    if rt.engine.active() || rt.manual_control {
-        return Some("a sequence or manual valve control is moving valves");
+    if rt.engine.active() {
+        return Some("a GSE sequence is running");
     }
     if cold_flow::runtime_active(&rt) {
         return Some("cold flow is running");
