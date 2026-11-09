@@ -1065,6 +1065,11 @@ fn both_hosts_saturated_never_overflow_a_modem_and_keep_priority_frames_under_1s
 /// can still wait a few seconds behind discovery and schema frames.
 #[test]
 fn slow_bench_air_keeps_queued_frames_within_two_seconds() {
+    // The model is deterministic alone; run it in its own process so state
+    // other in-process tests leave behind cannot change its refusal count.
+    if crate::operator_queue::isolated_native_case(module_path!(), "slow_bench_air_keeps_queued_frames_within_two_seconds") {
+        return;
+    }
     // FC: four reliable flight states per second (bench AV bay: about 4.2
     // reliable messages per second), so receipts alone take half the air.
     let report = run_uplink_model(40_000, 0.4, 20, true, 250);
@@ -1187,4 +1192,22 @@ fn schema_chunks_never_hold_recovery_quiesce_but_chunked_controls_do() {
         activity.try_enqueue_owned(classifier.classify(&bytes), bytes, |_| Ok(())).unwrap();
     }
     assert!(!activity.has_pending_control(), "parked schema chunks do not block Reset all");
+}
+
+/// HITL Reset all (S5=1, 23ac94c): quiesce still reported "a control frame is
+/// still being written on the AV-bay radio link" in one cycle. Time sync is an
+/// SDK-internal type outside the station schema, so it counted as recovery
+/// control, and the station sends it about once a second. Time sync is never
+/// work owed to the boards a recovery resets.
+#[test]
+fn time_sync_frames_are_not_recovery_control() {
+    crate::telemetry_schema::initialize().unwrap();
+    for ty in [DataType::TimeSyncAnnounce, DataType::TimeSyncRequest, DataType::TimeSyncResponse] {
+        let frame = serialize::pack_packet(&Packet::new(ty, &[sedsnet::config::DataEndpoint::TimeSync], "GS", 1,
+            Arc::from(vec![0u8; if ty == DataType::TimeSyncResponse { 32 } else { 16 }])).unwrap()).to_vec();
+        assert!(!is_recovery_control_frame(&frame), "{ty:?}");
+    }
+    let abort = serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type("ABORT"),
+        &[crate::telemetry_schema::endpoint("ABORT")], "GS", 1, Arc::from(&b"SEDS_MANUAL_ABORT_V1:K"[..])).unwrap()).to_vec();
+    assert!(is_recovery_control_frame(&abort));
 }
