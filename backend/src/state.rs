@@ -967,6 +967,19 @@ impl AppState {
         );
     }
 
+    /// The network health name of a packet sender: the board's sender id, or
+    /// the hostname of a compact `@addr:` sender.
+    pub(crate) fn health_sender_id(&self, sender: &str) -> String {
+        if let Some(board) = self.board_from_network_sender(sender) {
+            return board.sender_id().to_string();
+        }
+        sender
+            .strip_prefix("@addr:")
+            .and_then(|address| address.parse::<u32>().ok())
+            .and_then(|address| self.topology_router.get()?.resolve_address(address))
+            .map_or_else(|| sender.to_string(), |address| address.hostname.to_string())
+    }
+
     /// Ingress captures retain their arrival clocks across probe/lock delays.
     pub(crate) fn mark_board_seen_at(
         &self,
@@ -977,13 +990,8 @@ impl AppState {
     ) {
         let board = self.board_from_network_sender(sender);
         let Some(board) = board else {
-            let resolved = sender
-                .strip_prefix("@addr:")
-                .and_then(|address| address.parse::<u32>().ok())
-                .and_then(|address| self.topology_router.get()?.resolve_address(address))
-                .map(|address| address.hostname);
             self.network_health.lock().unwrap().observe(
-                resolved.as_deref().unwrap_or(sender),
+                &self.health_sender_id(sender),
                 received_at,
                 timestamp_ms,
             );

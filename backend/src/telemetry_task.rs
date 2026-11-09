@@ -2326,8 +2326,9 @@ async fn handle_packet_inner(
         state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
     }
     if crate::simulation_clock_ms().is_none() {
+        let sender = state.health_sender_id(pkt.sender());
         state.network_health.lock().unwrap().observe_clock(
-            pkt.sender(),
+            &sender,
             pkt.timestamp(),
             get_current_timestamp_ms(),
             std::time::Instant::now(),
