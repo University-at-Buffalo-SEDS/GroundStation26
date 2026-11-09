@@ -1152,3 +1152,39 @@ fn time_sync_waiting_more_than_half_a_second_is_dropped_not_sent() {
     assert_eq!(budget.pending.load(Ordering::Acquire), 0);
     set_test_station_clock(None);
 }
+
+/// Faithful HITL Reset all: parked SDT chunks of a schema transfer were
+/// counted as recovery control, so recovery quiesce reported "a control frame
+/// is still being written on the AV-bay radio link" while only schema bytes
+/// waited. A chunk transfer is control only when the frame it carries is (or
+/// when its first chunk was never seen).
+#[test]
+fn schema_chunks_never_hold_recovery_quiesce_but_chunked_controls_do() {
+    crate::telemetry_schema::initialize().unwrap();
+    let chunk = |id: u32, index: u16, total: u16, data: &[u8]| {
+        let mut bytes = b"SDT\x03".to_vec();
+        bytes.extend(id.to_le_bytes());
+        bytes.extend(index.to_le_bytes());
+        bytes.extend(total.to_le_bytes());
+        bytes.extend_from_slice(data);
+        bytes.extend(crc32fast::hash(&bytes).to_le_bytes());
+        bytes
+    };
+    let schema = serialize::pack_packet(&Packet::new(DataType::DiscoverySchema,
+        &[sedsnet::config::DataEndpoint::Discovery], "GS", 1, Arc::from(vec![7u8; 600])).unwrap()).to_vec();
+    let request = serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST"),
+        &[crate::telemetry_schema::endpoint("BOARD_RECOVERY_RF")], "GS", 1, Arc::from(vec![1u8; 32])).unwrap()).to_vec();
+    let classifier = RecoveryFrameClassifier::default();
+    assert!(!classifier.classify(&chunk(5, 0, 2, &schema[..400])), "schema chunk 0");
+    assert!(!classifier.classify(&chunk(5, 1, 2, &schema[400..])), "schema chunk 1");
+    assert!(classifier.classify(&chunk(7, 0, 2, &request[..request.len() / 2])), "chunked control");
+    assert!(classifier.classify(&chunk(7, 1, 2, &request[request.len() / 2..])), "rest of chunked control");
+    assert!(classifier.classify(&chunk(9, 1, 2, &[0; 40])), "a transfer whose first chunk was not seen");
+    // The ledger recovery quiesce reads: only schema chunks owned -> quiet.
+    let activity = TransportTxActivity::default();
+    for (index, part) in [(0u16, &schema[..400]), (1, &schema[400..])] {
+        let bytes = chunk(11, index, 2, part);
+        activity.try_enqueue_owned(classifier.classify(&bytes), bytes, |_| Ok(())).unwrap();
+    }
+    assert!(!activity.has_pending_control(), "parked schema chunks do not block Reset all");
+}

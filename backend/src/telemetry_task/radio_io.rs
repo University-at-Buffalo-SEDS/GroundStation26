@@ -1393,7 +1393,12 @@ pub(crate) fn is_recovery_control_frame(payload:&[u8])->bool {
 /// One cache per physical side; template identifiers are not global. Only a
 /// CRC-valid canonical template can teach an ordinary type; misses stay control.
 #[derive(Default)]
-pub struct RecoveryFrameClassifier {templates:Mutex<VecDeque<(u32,bool,sedsnet::config::DataType)>>}
+pub struct RecoveryFrameClassifier {
+    templates:Mutex<VecDeque<(u32,bool,sedsnet::config::DataType)>>,
+    /// SDT chunk transfers by id: whether the frame they carry is recovery
+    /// control. Learned from the first chunk; an unknown transfer is control.
+    chunk_transfers:Mutex<VecDeque<(u32,bool)>>,
+}
 fn sdt_template_id(bytes:&[u8],off:&mut usize)->Option<u32>{let mut value=0;for shift in (0..35).step_by(7){let b=*bytes.get(*off)?;*off+=1;if shift==28&&b>15{return None;}value|=u32::from(b&127)<<shift;if b&128==0{return Some(value);}}None}
 /// CRC-checked SDT body (between the 4-byte tag and the CRC).
 fn sdt_body(bytes:&[u8])->Option<&[u8]>{
@@ -1414,8 +1419,34 @@ impl RecoveryFrameClassifier {
                 if let Some(i)=templates.iter().position(|(id,_,_)|*id==key){templates.remove(i);}
                 if templates.len()>=256{templates.pop_front();}templates.push_back((key,control,info.envelope.ty));control},
             2|4|5=>{let mut off=1;sdt_template_id(body,&mut off).and_then(|id|templates.iter().find(|(key,_,_)|*key==id).map(|(_,control,_)|*control)).unwrap_or(true)},
+            3=>{drop(templates);self.classify_chunk(bytes)},
             _=>true,
         }
+    }
+    /// A schema or other bulk transfer split into SDT chunks is not recovery
+    /// control (it never blocks recovery quiesce); a chunked control frame,
+    /// or a chunk of a transfer whose first chunk was not seen, is.
+    fn classify_chunk(&self,bytes:&[u8])->bool {
+        if bytes.len()<16 {return true;}
+        let id=u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let index=u16::from_le_bytes([bytes[8],bytes[9]]);
+        let mut transfers=self.chunk_transfers.lock().unwrap();
+        if index!=0 {
+            return transfers.iter().find(|(known,_)|*known==id).is_none_or(|(_,control)|*control);
+        }
+        let data=&bytes[12..bytes.len()-4];
+        let frame=if data.starts_with(b"SDT\x01") {
+            let mut off=4;
+            if sdt_template_id(data,&mut off).is_none() {return true;}
+            &data[off..]
+        } else {
+            data
+        };
+        let control=is_recovery_control_frame(frame);
+        transfers.retain(|(known,_)|*known!=id);
+        if transfers.len()>=32 {transfers.pop_front();}
+        transfers.push_back((id,control));
+        control
     }
     /// The wire type of a canonical frame or of an SDT frame whose template
     /// this side already accepted. Read-only: a refused frame teaches nothing.
