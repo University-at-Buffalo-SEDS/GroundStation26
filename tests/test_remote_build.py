@@ -1,7 +1,9 @@
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -52,6 +54,31 @@ class SharedConnectionTests(unittest.TestCase):
         option = lambda remote: next(o for o in remote.ssh_options() if o.startswith("ControlPath="))
         self.assertEqual(option(first), option(second))
         self.assertIn("ControlMaster=auto", first.ssh_options())
+
+
+class GuardTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("setsid") and shutil.which("bash"), "needs Linux setsid")
+    def test_remote_work_stops_when_the_local_side_goes_away(self) -> None:
+        marker = f"gsrb-guard-test-{os.getpid()}"
+        guard = subprocess.Popen(["bash", "-c", remote_build.GUARD, "guard", f"sleep 60 # {marker}", ""],
+                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+        alive = lambda: subprocess.run(["pgrep", "-f", marker], capture_output=True).returncode == 0
+        deadline = time.monotonic() + 5
+        while not alive():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        guard.stdin.close()  # what Ctrl-C, a kill or a lost connection does
+        self.assertNotEqual(guard.wait(timeout=10), 0)
+        deadline = time.monotonic() + 5
+        while alive():
+            self.assertLess(time.monotonic(), deadline, "remote work outlived its build")
+            time.sleep(0.05)
+
+    @unittest.skipUnless(shutil.which("setsid") and shutil.which("bash"), "needs Linux setsid")
+    def test_finished_remote_work_returns_its_status(self) -> None:
+        guard = subprocess.run(["bash", "-c", remote_build.GUARD, "guard", "exit 7", ""],
+                               stdin=subprocess.PIPE, timeout=10)
+        self.assertEqual(guard.returncode, 7)
 
 
 class ArgumentTests(unittest.TestCase):

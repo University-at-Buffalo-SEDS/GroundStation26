@@ -21,6 +21,7 @@ import hashlib
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
 import socket
@@ -89,6 +90,31 @@ CROSS_ENV = {
 PASSTHROUGH_ENV = ("MAPLIBRE_GL_VERSION", "MAPLIBRE_GL_BASE_URL", "CARGO_NET_OFFLINE")
 
 
+# Runs one remote command so that it never outlives the local build. The
+# command gets its own process group; a watcher reads the ssh channel's stdin,
+# which the local side holds open and never writes. Ctrl-C, a kill or a lost
+# connection closes it, and the watcher then stops the whole group and removes
+# the named container. Background jobs read /dev/null unless redirected, hence
+# the saved descriptor 3.
+GUARD = r"""
+exec 3<&0
+cmd=$1; name=$2
+setsid bash -c "$cmd" </dev/null &
+job=$!
+(
+  while IFS= read -r _ <&3; do :; done
+  kill -TERM -- "-$job" 2>/dev/null
+  if [ -n "$name" ]; then docker rm -f "$name" >/dev/null 2>&1; fi
+  sleep 10
+  kill -KILL -- "-$job" 2>/dev/null
+) &
+watch=$!
+wait "$job"; rc=$?
+kill "$watch" 2>/dev/null
+exit "$rc"
+"""
+
+
 class Remote:
     def __init__(self, spec: str):
         spec = spec.strip()
@@ -139,9 +165,29 @@ class Remote:
         cmd = ["ssh", *self.ssh_options(), self.destination, command]
         if capture:
             return subprocess.run(cmd, env=self.env(), check=True, text=True,
-                                  stdout=subprocess.PIPE).stdout
+                                  stdout=subprocess.PIPE, stdin=subprocess.DEVNULL).stdout
         _stream(cmd, self.env())
         return ""
+
+    def run(self, command: str, label: str, container: str = "") -> None:
+        """Run a long remote command that stops when this build stops."""
+        remote = "bash -c " + " ".join(shlex.quote(part) for part in (GUARD, "gs-remote-build", command, container))
+        print(f"Running on {self.destination}: {label}", flush=True)
+        _append_log(f"Running on {self.destination}: {command}\n")
+        # The pipe is the guard's lifeline: held open, never written, closed
+        # by any exit of this process (including a kill) or of ssh.
+        proc = subprocess.Popen(["ssh", *self.ssh_options(), self.destination, remote],
+                                env=self.env(), stdin=subprocess.PIPE)
+        try:
+            rc = proc.wait()
+        except BaseException:
+            _stop(proc)
+            raise
+        finally:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        if rc != 0:
+            raise subprocess.CalledProcessError(rc, ["ssh", self.destination, label])
 
     def rsync(self, source: str, destination: str, filters: list[str], delete: bool, lock: Optional[str] = None,
               extra: Optional[list[str]] = None) -> None:
@@ -200,14 +246,40 @@ def _checkout_files(local: Path) -> list[str]:
     return present
 
 
+def _stop(proc: subprocess.Popen) -> None:
+    if proc.stdin is not None:
+        proc.stdin.close()
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+def _append_log(line: str) -> None:
+    log = os.environ.get("GS_BUILD_LOG")
+    if log:
+        with open(log, "a", encoding="utf-8") as output:
+            output.write(line)
+
+
 def _remote_dir(path: str) -> str:
     return path.rsplit("/", 1)[0]
 
 
 def _stream(cmd: list[str], env: dict[str, str]) -> None:
     printable = " ".join(shlex.quote(str(part)) for part in cmd)
-    print(f"Running: {printable}", flush=True)
-    subprocess.run(cmd, env=env, check=True)
+    print(f"Running: {printable[:300]}{'...' if len(printable) > 300 else ''}", flush=True)
+    proc = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL)
+    try:
+        rc = proc.wait()
+    except BaseException:
+        _stop(proc)
+        raise
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, cmd)
 
 
 def _version(command: list[str], pattern: str, default: str) -> str:
@@ -246,9 +318,10 @@ def _image(remote: Remote) -> str:
         print(f"Building the remote builder image {tag} (first use only; several minutes)...", flush=True)
         build_args = " ".join(f"--build-arg {k}={shlex.quote(v)}" for k, v in args.items())
         dockerfile = shlex.quote(DOCKERFILE)
-        remote.ssh(f"mkdir -p {REMOTE_ROOT} && flock {REMOTE_ROOT}/image.lock sh -c "
+        remote.run(f"mkdir -p {REMOTE_ROOT} && flock {REMOTE_ROOT}/image.lock sh -c "
                    + shlex.quote(f"docker image inspect {tag} >/dev/null 2>&1 || "
-                                 f"printf %s {dockerfile} | docker build {build_args} -t {tag} -"))
+                                 f"printf %s {dockerfile} | docker build --progress=plain {build_args} -t {tag} -"),
+                   f"build the builder image {tag}")
     return tag
 
 
@@ -267,10 +340,12 @@ def _container(remote: Remote, tag: str, workdir: str, command: str, env: dict[s
         **env,
     }
     flags = " ".join(f"-e {shlex.quote(f'{k}={v}')}" for k, v in variables.items())
-    remote.ssh(f"mkdir -p {REMOTE_ROOT}/home {REMOTE_ROOT}/cargo-home && "
-               f"docker run --rm --init --user \"$(id -u):$(id -g)\" {flags} "
+    name = f"gsrb-{secrets.token_hex(6)}"
+    remote.run(f"mkdir -p {REMOTE_ROOT}/home {REMOTE_ROOT}/cargo-home && "
+               f"docker run --rm --init --name {name} --user \"$(id -u):$(id -g)\" {flags} "
                f"-v \"{REMOTE_ROOT_ABS}\":/build -w {shlex.quote('/build/' + workdir)} {tag} "
-               f"bash -c {shlex.quote(command)}")
+               f"bash -c {shlex.quote(command)}",
+               command, container=name)
 
 
 def _check_local_target() -> None:
