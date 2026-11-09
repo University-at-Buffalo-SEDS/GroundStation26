@@ -1380,8 +1380,11 @@ pub(crate) const RECOVERY_CONTROL_TYPES: &[&str] = &[
 ];
 pub(crate) fn is_recovery_control_frame(payload:&[u8])->bool {
     let Ok(info)=serialize::peek_frame_info_unchecked(payload) else {return true;};
+    // Receipts, discovery and time sync are never work owed to the boards a
+    // recovery resets (time sync is sent about once a second).
     if info.ack_only() || sedsnet::discovery::is_discovery_type(info.envelope.ty) || matches!(info.envelope.ty,
-        sedsnet::config::DataType::ReliableAck|sedsnet::config::DataType::ReliablePartialAck|sedsnet::config::DataType::ReliablePacketRequest) {return false;}
+        sedsnet::config::DataType::ReliableAck|sedsnet::config::DataType::ReliablePartialAck|sedsnet::config::DataType::ReliablePacketRequest
+        |sedsnet::config::DataType::TimeSyncAnnounce|sedsnet::config::DataType::TimeSyncRequest|sedsnet::config::DataType::TimeSyncResponse) {return false;}
     if RECOVERY_CONTROL_TYPES.iter().any(|name|info.envelope.ty==crate::telemetry_schema::data_type(name)){return true;}
     static KNOWN:OnceLock<Vec<sedsnet::config::DataType>>=OnceLock::new();
     let known=KNOWN.get_or_init(||{
