@@ -11,15 +11,18 @@ applies on the primary ground station and on the RRLS.
 
 ## Mode at start
 
-1. The saved selection `<GS_STATION_MODE_DIR>/selection.json`
+1. `GS_STATION_MODE`: `normal`, `hitl`, `test_fire` or `testing`. The old
+   spellings `hitl_mode`, `test_fire_mode`, `hitl-mode` and `test-fire-mode`
+   are accepted too.
+2. Otherwise the saved selection `<GS_STATION_MODE_DIR>/selection.json`
    (default `data/station-mode`), if its role (`primary` or `rrls`) matches.
-2. Otherwise `GS_STATION_MODE`: `normal`, `hitl`, `test_fire` or `testing`.
-   The old spellings `hitl_mode`, `test_fire_mode`, `hitl-mode` and
-   `test-fire-mode` are accepted too.
 3. Otherwise `normal`.
 
-`run_groundstation.py --testing|--hitl-mode|--test-fire-mode` sets
-`GS_STATION_MODE`. Delete `selection.json` to fall back to the variable.
+`run_groundstation.py` always sets `GS_STATION_MODE` (`normal` unless
+`--testing|--hitl-mode|--test-fire-mode` is given), so the launcher's flag
+wins. The supervisor (`--switchable-modes`, systemd) sets it from the saved
+selection, so a confirmed switch survives a restart there. A switch on a
+backend started without the supervisor lasts until that backend stops.
 
 ## Switching from the UI
 

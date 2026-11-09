@@ -164,8 +164,8 @@ def main() -> None:
     features: list[str] = []
     if is_raspberry_pi() and not args.rrls and not flight_sim_mode:
         features.append("raspberry_pi")
-    # One binary holds every mode; the flag picks the boot mode. A selection
-    # saved by an earlier switch (data/station-mode/selection.json) wins.
+    # One binary holds every mode; the flag picks the boot mode and wins over
+    # a selection saved by an earlier in-process switch.
     boot_mode = boot_mode_for(testing_mode or flight_sim_mode, hitl_mode, test_fire_mode)
     os.environ["GS_STATION_MODE"] = boot_mode
     print(f"Station mode at start: {boot_mode}")
