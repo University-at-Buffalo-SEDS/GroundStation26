@@ -187,6 +187,12 @@ pub(crate) fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>>
                 let mut m = mesh.lock().unwrap();
                 let now = m.now();
                 let frames: Vec<_> = (0..4).filter_map(|_| m.take_station_pairing()).collect();
+                // Unpaired and HITL stations run no settings worker. Undrained
+                // general SETTINGS frames fill the four-slot inbox, and a full
+                // inbox rejects every fragmentation probe, including the BUNDLE.
+                if !crate::mission_sync::running() {
+                    while m.take_settings().is_some() {}
+                }
                 (now, m.settings_available(now), frames)
             };
             let Some(lock) = worker() else { break };

@@ -2028,7 +2028,11 @@ impl Mesh {
         // Conservative existing peer rates: Primary may use15%, standby RRLS25%.
         let peer_min_bytes_per_second =
             usable * if self.role == Role::Primary { 25 } else { 15 } / 800;
-        if let Some(state) = self.settings_framing.as_mut() {
+        // Pairing frames (at most ~120 B) always travel whole. A probe that
+        // gets no OFFER costs PROBE_MS plus a 30 s legacy cooldown per step,
+        // which stalled BUNDLE and DONE past the pairing window.
+        let pairing = crate::station_pairing::exchange::recognizes(payload);
+        if let Some(state) = self.settings_framing.as_mut().filter(|_| !pairing) {
             let own = local_bytes_per_second;
             let peer = peer_min_bytes_per_second;
             if state.admit(payload, owner, now, lifetime, context, own, peer)

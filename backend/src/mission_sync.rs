@@ -66,6 +66,11 @@ impl Catalog {
     }
 }
 static RUNTIME: OnceLock<Arc<Mutex<Runtime>>> = OnceLock::new();
+
+/// True once the paired settings worker owns the general SETTINGS inbox.
+pub(crate) fn running() -> bool {
+    RUNTIME.get().is_some()
+}
 struct Runtime {
     installation: String,
     actors: Vec<String>,
