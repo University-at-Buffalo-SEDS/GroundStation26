@@ -100,3 +100,72 @@ async fn failed_reset_retry_still_must_include_an_unhealthy_pending_board() {
     let value = body(response).await;
     assert!(value["message"].as_str().unwrap().contains("has not since read back healthy"), "{value}");
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_query_replies_reach_every_board_with_no_operation_running() {
+    if isolated("background_query_replies_reach_every_board_with_no_operation_running") { return; }
+    let fixture = Fixture::new().await;
+    let state = fixture.state();
+    assert!(state.board_recovery.coordinator.operation().is_none());
+    for board in BOARDS {
+        state.network_health.lock().unwrap().observe(board.sender_id(), WallInstant::now(), 100);
+    }
+    let mut refresh = ReadonlyQueryRefresh::default();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let _ = refresh.poll(&state);
+            // Every board this station mode tracks (test-fire has no AV bay).
+            let scope = super::super::scope::mode_scope(crate::station_mode::local_mode());
+            let done = BOARDS.iter().enumerate().filter(|(at, _)| scope & (1 << at) != 0).all(|(at, _)| {
+                let inner = state.board_recovery.inner.lock().unwrap();
+                inner.queries[at].as_ref().is_some_and(|query| query.received)
+                    && inner.values[at].as_ref().is_some_and(|row| row.fresh(Stamp::now()))
+            });
+            if done { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("every background read-only query reply is observed without any recovery operation");
+    let control = state.board_recovery.coordinator.0.lock().unwrap();
+    assert!(control.expected.iter().all(Option::is_none), "background replies never need an operation slot");
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_prepare_queries_complete_while_background_queries_are_outstanding() {
+    if isolated("concurrent_prepare_queries_complete_while_background_queries_are_outstanding") { return; }
+    let fixture = Fixture::new().await;
+    let state = fixture.state();
+    *state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+    // Learn every board's Abort episode first, as an operator's status page does.
+    for board in BOARDS { fixture.query(board).await; }
+    // Hold the wire so every background query is outstanding when PREPARE starts.
+    fixture.ignition_wire_hold.store(1, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fixture.ignition_wire_hold.load(Ordering::Acquire) != 2 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }).await.unwrap();
+    let mut old = [0u64; 7];
+    for (at, board) in BOARDS.iter().enumerate() {
+        // A never-owned CoreBusy offer may be retried, exactly as PREPARE does.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while super::super::request_board_query(&state, *board).status() != StatusCode::OK {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("background query admitted");
+        old[at] = state.board_recovery.inner.lock().unwrap().queries[at].as_ref().unwrap().nonce;
+    }
+    let release = fixture.ignition_wire_hold.clone();
+    let released = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        release.store(0, Ordering::Release);
+    });
+    let ticket = fixture.prepare("reset_startup", None).await;
+    released.await.unwrap();
+    assert_eq!(ticket["targets"].as_array().unwrap().len(), BOARDS.len(), "{ticket}");
+    let inner = state.board_recovery.inner.lock().unwrap();
+    for (at, old) in old.iter().enumerate() {
+        let query = inner.queries[at].as_ref().unwrap();
+        assert_ne!(query.nonce, *old, "PREPARE used its own distinct query");
+        assert!(query.received);
+    }
+    drop(inner);
+    assert!(fixture.models.iter().all(|(_, model)| model.lock().unwrap().applied == 0));
+}
