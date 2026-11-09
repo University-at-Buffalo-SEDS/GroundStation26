@@ -12,7 +12,7 @@ use tokio::time::Duration;
 
 use super::{
     COMMS_ERROR_LOG_INTERVAL_MS, env_usize, get_current_timestamp_ms, log_telemetry_error,
-    process_router_queues, timesync_enabled,
+    timesync_enabled,
 };
 
 // Managed values retain their application type on wire but use discovery's
@@ -41,33 +41,94 @@ fn is_abort_frame(payload: &[u8]) -> bool {
             .is_ok_and(|info| info.envelope.ty == crate::telemetry_schema::data_type("ABORT"))
 }
 
-/// Exact payload identity for the starvation reservation (not security).
-fn payload_identity(payload: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    payload.hash(&mut hasher);
-    hasher.finish()
-}
-
 /// Discovery state the peer needs on a bounded schedule: route announcements,
 /// topology, addresses, time sources, schema and link capabilities. Requests
 /// (including MANAGED_VARIABLE_REQUEST) and LEAVE are excluded.
+#[cfg(test)]
 fn must_not_starve(payload: &[u8]) -> bool {
-    use sedsnet::config::DataType;
     !payload.starts_with(b"SDT")
-        && serialize::peek_frame_info_unchecked(payload).is_ok_and(|info| {
-            matches!(
-                info.envelope.ty,
-                DataType::DiscoveryAnnounce
-                    | DataType::DiscoveryTimeSyncSources
-                    | DataType::DiscoveryTopology
-                    | DataType::DiscoverySchema
-                    | DataType::DiscoveryLinkCapabilities
-                    | DataType::DiscoveryAddress
-                    | DataType::ManagedVariableValue
-            )
-        })
+        && must_not_starve_type(
+            serialize::peek_frame_info_unchecked(payload)
+                .ok()
+                .map(|info| info.envelope.ty),
+        )
 }
+fn must_not_starve_type(ty: Option<sedsnet::config::DataType>) -> bool {
+    use sedsnet::config::DataType;
+    ty.is_some_and(|ty| {
+        matches!(
+            ty,
+            DataType::DiscoveryAnnounce
+                | DataType::DiscoveryTimeSyncSources
+                | DataType::DiscoveryTopology
+                | DataType::DiscoverySchema
+                | DataType::DiscoveryLinkCapabilities
+                | DataType::DiscoveryAddress
+                | DataType::ManagedVariableValue
+        )
+    })
+}
+
+/// Small frames with a bounded-latency contract on the radio: end-to-end
+/// receipts (a late ACK makes the sender's ordered stream exhaust its retries
+/// and discard every queued message of that type), time sync (the station
+/// leads the AV bay's clock when the RF has no GPS fix) and Abort. They are
+/// never held for a large-frame reservation and may use a small headroom
+/// above the ordinary allowance, also when the side transport wraps them in
+/// a compact SDT frame whose type is known only from its accepted template.
+fn is_protected_type(ty: Option<sedsnet::config::DataType>) -> bool {
+    use sedsnet::config::DataType;
+    ty.is_some_and(|ty| {
+        matches!(
+            ty,
+            DataType::ReliableAck
+                | DataType::ReliablePartialAck
+                | DataType::ReliablePacketRequest
+                | DataType::TimeSyncAnnounce
+                | DataType::TimeSyncRequest
+                | DataType::TimeSyncResponse
+        ) || ty == crate::telemetry_schema::data_type("ABORT")
+    })
+}
+/// Radio lanes by what a canonical frame is, not by its schema priority.
+/// Operator controls (commands, Abort, network-variable writes such as
+/// AV_BAY_UNDERGLOW, recovery requests), receipts and time sync are written
+/// first, from the control allowance. Unreliable telemetry whose schema
+/// priority is 200 or more (GPS_DATA, HEARTBEAT are 255) used to share the
+/// control allowance and, by priority, went ahead of a priority-200 command
+/// in the writer: on the bench the control allowance sat at about 1 KB, the
+/// command copy never reached the air and its retries were refused as
+/// duplicates. Such telemetry is now ordinary, below every control.
+/// Compact SDT frames and discovery keep their priority. Radio only; the
+/// result is what the writer and `complete` see, so accounting stays exact.
+fn radio_lane_priority(priority: u8, payload: &[u8]) -> u8 {
+    if payload.starts_with(b"SDT") {
+        return priority;
+    }
+    // CRC-checked: only a real canonical frame changes lane.
+    let Ok(info) = serialize::peek_frame_info(payload) else {
+        return priority;
+    };
+    let ty = info.envelope.ty;
+    if sedsnet::discovery::is_discovery_type(ty) {
+        return priority;
+    }
+    if is_protected_type(Some(ty)) || is_operator_control_type(ty) {
+        255
+    } else if (200..254).contains(&priority) && !sedsnet::is_reliable_type(ty) {
+        199
+    } else {
+        priority
+    }
+}
+fn is_operator_control_type(ty: sedsnet::config::DataType) -> bool {
+    RECOVERY_CONTROL_TYPES.iter().any(|name| ty == crate::telemetry_schema::data_type(name))
+        || ty == crate::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST")
+}
+
+/// Extra ordinary bytes a protected compact frame may use. One time-sync or
+/// receipt frame is under 64 bytes; two fit.
+const PROTECTED_ORDINARY_HEADROOM: usize = 128;
 
 fn is_managed_variable_request(payload: &[u8]) -> bool {
     !payload.starts_with(b"SDT")
@@ -86,6 +147,21 @@ fn is_delivery_receipt(payload: &[u8]) -> bool {
                     | sedsnet::config::DataType::ReliablePacketRequest
             )
         })
+}
+
+/// What a canonical receipt says, ignoring its timestamp: type, payload (the
+/// acknowledged packet id), sender and endpoints.
+fn receipt_key(payload: &[u8]) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let packet = serialize::unpack_packet(payload).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    packet.data_type().as_u32().hash(&mut hasher);
+    packet.payload().hash(&mut hasher);
+    packet.sender().hash(&mut hasher);
+    for endpoint in packet.endpoints() {
+        endpoint.as_u32().hash(&mut hasher);
+    }
+    Some(hasher.finish())
 }
 
 // Only delivery/application controls may consume the reserved command bytes.
@@ -150,32 +226,80 @@ pub struct TxQueueBudget {
     write_leases: Mutex<Vec<(usize, usize, sedsnet::router::PackedWriteLease)>>,
     recovery_classifier: RecoveryFrameClassifier,
     refusals: TxRefusalCounters,
-    /// The oldest refused ordinary frame that must not starve (discovery
+    /// Room held for a refused ordinary frame that must not starve (discovery
     /// announcements/topology/address/schema, or any frame over half the
-    /// ordinary allowance): (payload hash, length, first refusal). While
-    /// fresh, every other ordinary frame must leave room for it, so a stream
-    /// of short frames cannot hold it off. Live: DISCOVERY_SCHEMA had 0 sends
-    /// against 1.37M refusals and DISCOVERY_ANNOUNCE about 1 per 30 s, the
-    /// route TTL, so RF lost its route to the station and sent no telemetry.
+    /// ordinary allowance). While fresh, every smaller ordinary frame must
+    /// leave room for it, so a stream of short frames cannot hold it off.
+    /// Live: DISCOVERY_SCHEMA had 0 sends against 1.37M refusals and
+    /// DISCOVERY_ANNOUNCE about 1 per 30 s, the route TTL, so RF lost its
+    /// route to the station and sent no telemetry.
     large_waiter: Mutex<Option<Waiter>>,
     /// Last 16 admitted radio frames, one bit each: set for a
     /// MANAGED_VARIABLE_REQUEST. Time-free, so model-time tests behave.
     recent_admissions: std::sync::atomic::AtomicU32,
+    /// Radio only: ordinary frames accepted while the writer allowance was
+    /// full, released to the writer in arrival order as completions free
+    /// room. A refused frame is offered again by the router on every queue
+    /// pass (each virtual millisecond), so a frame that only waits for the
+    /// writer is parked here once instead of being refused hundreds of times.
+    parked: Mutex<VecDeque<Parked>>,
+    parked_total: std::sync::atomic::AtomicU64,
+    /// Park capacity in frames (zero: never park).
+    park_frames: usize,
+    /// Accepted offers (including parked) and finished writes, for the
+    /// router worker's backoff while the radio only refuses.
+    admissions: std::sync::atomic::AtomicU64,
+    completions: std::sync::atomic::AtomicU64,
+    /// Radio only: receipts accepted but not yet written, by allocation and
+    /// meaning (type, acknowledged id, endpoints). A sender that sees no ACK
+    /// retransmits every 200-250 ms and each copy that arrives is
+    /// acknowledged again; on a backed-up uplink those identical receipts
+    /// queued behind each other, delaying the next new receipt further.
+    /// While one is still waiting to be written, a copy is redundant.
+    pending_receipts: Mutex<Vec<(usize, usize, u64)>>,
+    coalesced_receipts: std::sync::atomic::AtomicU64,
 }
 
+/// A frame the radio budget owns but has not yet handed to the writer. It
+/// already holds its transport activity owner and write lease record.
+struct Parked {
+    priority: u8,
+    bytes: Vec<u8>,
+    protected: bool,
+    lease: Option<sedsnet::router::PackedWriteLease>,
+    activity: Option<Arc<TransportTxActivity>>,
+    sender: mpsc::UnboundedSender<(u8, Vec<u8>)>,
+}
+/// At most this many parked frames, and at most the ordinary allowance in
+/// bytes (plus the protected headroom for a protected frame).
+const PARKED_FRAMES: usize = 8;
+
+/// The reservation belongs to the starving class, not to exact bytes: the
+/// router re-encodes a refused frame on every offer (a fresh discovery
+/// address or topology snapshot, an SDT template install that becomes a
+/// compact reference), so a payload-hash owner never matched its own retry.
+/// It then refused every other ordinary frame until it expired, was replaced
+/// by the next re-encoded frame, and so on: about 2.3M of 2.6M radio refusals
+/// in 120 virtual s were this reservation (full-network RFD simulation).
+/// The held room may now be taken by a starving frame of the waiting type
+/// (its own re-encoded retry), any must-not-starve discovery frame, or any
+/// starving frame when the waiter's type is unknown (an SDT reference).
 #[derive(Clone, Copy)]
 struct Waiter {
-    identity: u64,
+    /// The largest starving frame refused while this reservation is held.
     len: usize,
-    since: std::time::Instant,
-    /// Other frames refused for it since its own last attempt. A waiter the
-    /// router stopped offering (retired or superseded) expires after
-    /// WAITER_MAX_MISSES, or after LARGE_WAITER_MS of wall time.
+    /// Wire type of the first starving frame refused, when known.
+    ty: Option<sedsnet::config::DataType>,
+    /// Expires LARGE_WAITER_MS (station clock; virtual in the simulator)
+    /// after the last starving refusal, so a frame the router retired or
+    /// superseded cannot hold the room.
+    until: TxDeadline,
+    /// Smaller frames refused for it since the last starving offer.
     misses: u32,
 }
 
 /// How long a refused starving frame holds its reservation.
-const LARGE_WAITER_MS: u128 = 1_000;
+const LARGE_WAITER_MS: u64 = 1_000;
 const WAITER_MAX_MISSES: u32 = 256;
 /// MANAGED_VARIABLE_REQUEST may take at most this many of the last 16
 /// admitted radio frames while other traffic is waiting; an idle link always
@@ -229,13 +353,28 @@ impl TxQueueBudget {
             refusals: TxRefusalCounters::default(),
             large_waiter: Mutex::new(None),
             recent_admissions: std::sync::atomic::AtomicU32::new(0),
+            parked: Mutex::new(VecDeque::new()),
+            parked_total: std::sync::atomic::AtomicU64::new(0),
+            park_frames: 0,
+            admissions: std::sync::atomic::AtomicU64::new(0),
+            completions: std::sync::atomic::AtomicU64::new(0),
+            pending_receipts: Mutex::new(Vec::new()),
+            coalesced_receipts: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// The radio budget without its park: every frame that does not fit is
+    /// refused, as before parking existed (reservation-only tests).
+    #[cfg(test)]
+    fn new_radio_unparked(control_limit: usize, ordinary_limit: usize) -> Self {
+        Self { park_frames: 0, ..Self::new_radio(control_limit, ordinary_limit) }
     }
 
     pub fn new_radio(control_limit: usize, ordinary_limit: usize) -> Self {
         Self {
             ordinary_limit: ordinary_limit.max(1).min(control_limit),
             short_lookahead: true,
+            park_frames: PARKED_FRAMES,
             ..Self::new(control_limit)
         }
     }
@@ -261,7 +400,7 @@ impl TxQueueBudget {
     }
 
     pub fn try_send_leased_tracked(&self,sender:&mpsc::UnboundedSender<(u8,Vec<u8>)>,priority:u8,
-        lease:sedsnet::router::PackedWriteLease,activity:&TransportTxActivity)->sedsnet::TelemetryResult<()> {
+        lease:sedsnet::router::PackedWriteLease,activity:&Arc<TransportTxActivity>)->sedsnet::TelemetryResult<()> {
         self.try_send_inner(sender,priority,lease.bytes(),Some(&lease),Some(activity))
     }
     pub fn diagnostics(&self) -> serde_json::Value {
@@ -271,6 +410,10 @@ impl TxQueueBudget {
             "pending_bytes": self.pending.load(Ordering::Acquire),
             "pending_control_bytes": self.pending_control.load(Ordering::Acquire),
             "pending_ordinary_bytes": self.pending_ordinary.load(Ordering::Acquire),
+            "parked_frames": self.parked.lock().unwrap().len(),
+            "parked_bytes": self.parked.lock().unwrap().iter().map(|p| p.bytes.len()).sum::<usize>(),
+            "parked_total": self.parked_total.load(Ordering::Relaxed),
+            "coalesced_receipts": self.coalesced_receipts.load(Ordering::Relaxed),
             "control_limit_bytes": self.limit,
             "ordinary_limit_bytes": self.ordinary_limit,
             "refusals": {
@@ -283,40 +426,40 @@ impl TxQueueBudget {
                 "transport_busy": load(&r.transport_busy),
                 "other": load(&r.other),
             },
-            "meaning": "refusals are writer backpressure (frame kept by the router and retried); none of them reached the air",
+            "meaning": "refusals are writer backpressure (frame kept by the router and retried); none of them reached the air. Parked frames were accepted while the writer allowance was full and go to the writer in order as it drains",
         })
     }
 
-    /// Bytes held back for a fresh large waiter that this smaller frame
-    /// must leave free. Zero for the waiter itself or anything larger.
-    fn large_reservation(&self, identity: u64) -> usize {
+    /// Bytes a smaller (non-starving) frame must leave free for a fresh
+    /// reservation. Zero for any starving frame: it may take the room.
+    fn large_reservation(&self, starving: bool, kind: Option<sedsnet::config::DataType>) -> usize {
         let mut slot = self.large_waiter.lock().unwrap();
         let Some(waiter) = slot.as_mut() else { return 0 };
-        if waiter.identity == identity {
-            waiter.misses = 0;
+        if waiter.misses >= WAITER_MAX_MISSES || waiter.until.ready() {
+            *slot = None;
             return 0;
         }
-        if waiter.misses >= WAITER_MAX_MISSES
-            || waiter.since.elapsed().as_millis() >= LARGE_WAITER_MS
-        {
-            *slot = None;
+        if starving && (waiter.ty.is_none() || waiter.ty == kind || must_not_starve_type(kind)) {
+            waiter.misses = 0;
             return 0;
         }
         waiter.misses += 1;
         waiter.len
     }
-    /// First come, first served: a later starving frame waits its turn.
-    fn note_large_waiter(&self, identity: u64, len: usize) {
-        let mut waiter = self.large_waiter.lock().unwrap();
-        if waiter.is_none() {
-            *waiter = Some(Waiter { identity, len, since: std::time::Instant::now(), misses: 0 });
+    fn note_large_waiter(&self, len: usize, ty: Option<sedsnet::config::DataType>) {
+        let until = TxDeadline::now().after(Duration::from_millis(LARGE_WAITER_MS));
+        let mut slot = self.large_waiter.lock().unwrap();
+        let len = len.min(self.ordinary_limit);
+        match slot.as_mut() {
+            Some(waiter) => {
+                waiter.len = waiter.len.max(len);
+                waiter.until = until;
+            }
+            None => *slot = Some(Waiter { len, ty, until, misses: 0 }),
         }
     }
-    fn clear_large_waiter(&self, identity: u64) {
-        let mut waiter = self.large_waiter.lock().unwrap();
-        if waiter.is_some_and(|w| w.identity == identity) {
-            *waiter = None;
-        }
+    fn clear_large_waiter(&self) {
+        *self.large_waiter.lock().unwrap() = None;
     }
     /// A request is admissible on an idle radio, or while requests hold
     /// fewer than MANAGED_REQUEST_SHARE_OF_16 of the last 16 admissions.
@@ -331,10 +474,13 @@ impl TxQueueBudget {
         priority: u8,
         payload: &[u8],
         lease: Option<&sedsnet::router::PackedWriteLease>,
-        activity:Option<&TransportTxActivity>,
+        activity:Option<&Arc<TransportTxActivity>>,
     ) -> sedsnet::TelemetryResult<()> {
         let mut stage = RefusalStage::Other;
         let result = self.try_send_admit(sender, priority, payload, lease, activity, &mut stage);
+        if result.is_ok() {
+            self.admissions.fetch_add(1, Ordering::Relaxed);
+        }
         if result.is_ok() && self.short_lookahead {
             let request = u32::from(is_managed_variable_request(payload));
             let _ = self.recent_admissions.try_update(Ordering::AcqRel, Ordering::Acquire, |bits| {
@@ -363,7 +509,7 @@ impl TxQueueBudget {
         priority: u8,
         payload: &[u8],
         lease: Option<&sedsnet::router::PackedWriteLease>,
-        activity:Option<&TransportTxActivity>,
+        activity:Option<&Arc<TransportTxActivity>>,
         stage: &mut RefusalStage,
     ) -> sedsnet::TelemetryResult<()> {
         if payload.is_empty() {
@@ -371,7 +517,10 @@ impl TxQueueBudget {
                 "empty transport write",
             ));
         }
+        // Earlier parked frames go first; they keep the side's wire order.
+        self.drain_parked();
         let priority = radio_transport_priority(priority, payload);
+        let priority = if self.short_lookahead { radio_lane_priority(priority, payload) } else { priority };
         let mut commands = (priority >= 16
             && payload.len() <= crate::comms::RADIO_COMMAND_BATCH_MAX_BYTES
             && crate::comms::is_radio_batch_command(255, payload))
@@ -423,6 +572,16 @@ impl TxQueueBudget {
         }
         let control = uses_command_reserve(priority, payload);
         *stage = if control { RefusalStage::ControlBudget } else { RefusalStage::OrdinaryBudget };
+        let receipt = (self.short_lookahead && control && is_delivery_receipt(payload))
+            .then(|| receipt_key(payload))
+            .flatten();
+        if let Some(key) = receipt
+            && self.pending_receipts.lock().unwrap().iter().any(|(_, _, k)| *k == key)
+        {
+            // The identical receipt already waiting will be written first.
+            self.coalesced_receipts.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
         if control {
             // Receipts are essential but must leave room for a new operator
             // command. Keep the same aggregate bound and retain refused frames
@@ -440,30 +599,57 @@ impl TxQueueBudget {
                 })
                 .map_err(|_| sedsnet::TelemetryError::Io("side tx busy"))?;
         } else {
-            let allowance =
-                self.ordinary_limit
-                    .saturating_add(if continuation && !self.short_lookahead {
-                        64 * 1024
-                    } else {
-                        0
-                    });
-            let identity = payload_identity(payload);
-            let reserved_for_large = self.large_reservation(identity);
-            let admitted = self.pending_ordinary
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                    pending
-                        .checked_add(payload.len())
-                        .filter(|total| *total + reserved_for_large <= allowance)
-                });
+            let kind = self.recovery_classifier.peek_type(payload);
+            // Radio only: the wired budget has no reservation or headroom.
+            let protected = self.short_lookahead && is_protected_type(kind);
+            let allowance = self
+                .ordinary_limit
+                .saturating_add(if continuation && !self.short_lookahead {
+                    64 * 1024
+                } else {
+                    0
+                })
+                .saturating_add(if protected { PROTECTED_ORDINARY_HEADROOM } else { 0 });
+            let starving = !protected
+                && (payload.len() > self.ordinary_limit / 2 || must_not_starve_type(kind));
+            let reserved_for_large = if protected { 0 } else { self.large_reservation(starving, kind) };
+            // Nothing may pass a parked frame: compact SDT frames depend on
+            // the templates of the frames accepted before them.
+            let behind_parked = self.short_lookahead && !self.parked.lock().unwrap().is_empty();
+            let admitted = if behind_parked {
+                Err(0)
+            } else {
+                self.pending_ordinary
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                        pending
+                            .checked_add(payload.len())
+                            .filter(|total| *total + reserved_for_large <= allowance)
+                    })
+            };
+            // Request rate refusals stay with the router, which owns the share.
+            if admitted.is_err() && self.short_lookahead && !is_managed_variable_request(payload) {
+                drop(commands.take());
+                if let Some(result) =
+                    self.try_park(sender, priority, payload, lease, activity, protected, reserved_for_large)
+                {
+                    if result.is_ok() && starving && reserved_for_large == 0 {
+                        self.clear_large_waiter();
+                    }
+                    *stage = RefusalStage::TransportBusy;
+                    return result;
+                }
+            }
             if admitted.is_err() {
                 if reserved_for_large != 0 {
                     *stage = RefusalStage::LargeFrameReservation;
-                } else if payload.len() > self.ordinary_limit / 2 || must_not_starve(payload) {
-                    self.note_large_waiter(identity, payload.len());
+                } else if starving {
+                    self.note_large_waiter(payload.len(), kind);
                 }
                 return Err(sedsnet::TelemetryError::Io("side tx busy"));
             }
-            self.clear_large_waiter(identity);
+            if starving && reserved_for_large == 0 {
+                self.clear_large_waiter();
+            }
         }
         let ceiling = if self.short_lookahead {
             self.limit.saturating_add(self.ordinary_limit)
@@ -498,6 +684,9 @@ impl TxQueueBudget {
         drop(commands);
         let owned = payload.to_vec();
         let identity = (owned.as_ptr() as usize, owned.len());
+        if let Some(key) = receipt {
+            self.pending_receipts.lock().unwrap().push((identity.0, identity.1, key));
+        }
         // The receiver may pop immediately, but every worker takes this lock
         // before IO. Publish admission/progress atomically with actual channel
         // acceptance; a closed channel never admits the SDK offer.
@@ -506,7 +695,10 @@ impl TxQueueBudget {
         let offer=|bytes| sender.send((priority,bytes)).map_err(|_|sedsnet::TelemetryError::HandlerError("radio tx queue closed"));
         let accepted=if let Some(activity)=activity {
             activity.try_enqueue_owned(self.recovery_classifier.classify(payload),owned,offer)
-        }else{offer(owned)};
+        }else{
+            // Learn accepted templates for the protected-type lookup above.
+            offer(owned).inspect(|()|{self.recovery_classifier.classify(payload);})
+        };
         if let Err(error)=accepted {drop(records);self.complete(priority,payload);return Err(error);}
         if let Some(lease) = lease {
             match lease.admit() {
@@ -541,6 +733,14 @@ impl TxQueueBudget {
     }
 
     fn complete(&self, priority: u8, payload: &[u8]) {
+        {
+            let mut receipts = self.pending_receipts.lock().unwrap();
+            if let Some(index) = receipts.iter().position(|(address, len, _)| {
+                *address == payload.as_ptr() as usize && *len == payload.len()
+            }) {
+                receipts.swap_remove(index);
+            }
+        }
         let mut leases = self.write_leases.lock().unwrap();
         if let Some(index) = leases.iter().position(|(address, len, _)| {
             *address == payload.as_ptr() as usize && *len == payload.len()
@@ -565,6 +765,149 @@ impl TxQueueBudget {
             self.pending_control.fetch_sub(len, Ordering::AcqRel);
         } else {
             self.pending_ordinary.fetch_sub(len, Ordering::AcqRel);
+        }
+        self.completions.fetch_add(1, Ordering::Release);
+        self.drain_parked();
+    }
+
+    /// (refusals, admissions, completions) so far.
+    fn activity_counters(&self) -> (u64, u64, u64) {
+        let r = &self.refusals;
+        let refusals = [
+            &r.duplicate_command,
+            &r.control_budget,
+            &r.ordinary_budget,
+            &r.aggregate_ceiling,
+            &r.large_frame_reservation,
+            &r.managed_request_rate,
+            &r.transport_busy,
+            &r.other,
+        ]
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .sum();
+        (
+            refusals,
+            self.admissions.load(Ordering::Relaxed),
+            self.completions.load(Ordering::Acquire),
+        )
+    }
+
+    /// Accept a frame the writer allowance cannot take yet. None when the
+    /// park is full (the router keeps the frame and offers it again).
+    #[allow(clippy::too_many_arguments)]
+    fn try_park(
+        &self,
+        sender: &mpsc::UnboundedSender<(u8, Vec<u8>)>,
+        priority: u8,
+        payload: &[u8],
+        lease: Option<&sedsnet::router::PackedWriteLease>,
+        activity: Option<&Arc<TransportTxActivity>>,
+        protected: bool,
+        reserved_for_large: usize,
+    ) -> Option<sedsnet::TelemetryResult<()>> {
+        let mut parked = self.parked.lock().unwrap();
+        let bytes: usize = parked.iter().map(|p| p.bytes.len()).sum();
+        let headroom = if protected { PROTECTED_ORDINARY_HEADROOM } else { 0 };
+        let frames = self.park_frames + usize::from(protected && self.park_frames != 0);
+        if parked.len() >= frames
+            || bytes + payload.len() + reserved_for_large > self.ordinary_limit + headroom
+        {
+            return None;
+        }
+        let owned = payload.to_vec();
+        let identity = (owned.as_ptr() as usize, owned.len());
+        let mut records = self.write_leases.lock().unwrap();
+        let mut park = |bytes: Vec<u8>| {
+            parked.push_back(Parked {
+                priority,
+                bytes,
+                protected,
+                lease: lease.cloned(),
+                activity: activity.cloned(),
+                sender: sender.clone(),
+            });
+            Ok(())
+        };
+        let accepted = if let Some(activity) = activity {
+            activity.try_enqueue_owned(self.recovery_classifier.classify(payload), owned, park)
+        } else {
+            park(owned).inspect(|()| {
+                self.recovery_classifier.classify(payload);
+            })
+        };
+        if let Err(error) = accepted {
+            return Some(Err(error));
+        }
+        if let Some(lease) = lease {
+            match lease.admit() {
+                Ok(()) => records.push((identity.0, identity.1, lease.clone())),
+                Err(error) => log::warn!("radio write tracking unavailable: {error}"),
+            }
+        }
+        self.parked_total.fetch_add(1, Ordering::Relaxed);
+        Some(Ok(()))
+    }
+
+    fn forget_write_lease(&self, payload: &[u8]) {
+        let mut leases = self.write_leases.lock().unwrap();
+        if let Some(index) = leases.iter().position(|(address, len, _)| {
+            *address == payload.as_ptr() as usize && *len == payload.len()
+        }) {
+            leases.swap_remove(index);
+        }
+    }
+
+    /// Hand parked frames to the writer, oldest first, while they fit the
+    /// ordinary allowance. A frame the router retired meanwhile is dropped.
+    fn drain_parked(&self) {
+        if !self.short_lookahead {
+            return;
+        }
+        let mut parked = self.parked.lock().unwrap();
+        while let Some(front) = parked.front() {
+            if front.lease.as_ref().is_some_and(|lease| lease.discard_if_retired()) {
+                let frame = parked.pop_front().expect("front just seen");
+                self.forget_write_lease(&frame.bytes);
+                if let Some(activity) = &frame.activity {
+                    activity.complete_frame(&frame.bytes);
+                }
+                continue;
+            }
+            let len = front.bytes.len();
+            let allowance = self.ordinary_limit
+                + if front.protected { PROTECTED_ORDINARY_HEADROOM } else { 0 };
+            if self
+                .pending_ordinary
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                    pending.checked_add(len).filter(|total| *total <= allowance)
+                })
+                .is_err()
+            {
+                break;
+            }
+            let ceiling = self.limit.saturating_add(self.ordinary_limit);
+            if self
+                .pending
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                    pending.checked_add(len).filter(|total| *total <= ceiling)
+                })
+                .is_err()
+            {
+                self.pending_ordinary.fetch_sub(len, Ordering::AcqRel);
+                break;
+            }
+            let frame = parked.pop_front().expect("front just seen");
+            if let Err(mpsc::error::SendError((_, bytes))) =
+                frame.sender.send((frame.priority, frame.bytes))
+            {
+                self.pending.fetch_sub(len, Ordering::AcqRel);
+                self.pending_ordinary.fetch_sub(len, Ordering::AcqRel);
+                self.forget_write_lease(&bytes);
+                if let Some(activity) = &frame.activity {
+                    activity.complete_frame(&bytes);
+                }
+            }
         }
     }
 }
@@ -636,22 +979,39 @@ pub(crate) fn is_recovery_control_frame(payload:&[u8])->bool {
 /// One cache per physical side; template identifiers are not global. Only a
 /// CRC-valid canonical template can teach an ordinary type; misses stay control.
 #[derive(Default)]
-pub struct RecoveryFrameClassifier {templates:Mutex<VecDeque<(u32,bool)>>}
+pub struct RecoveryFrameClassifier {templates:Mutex<VecDeque<(u32,bool,sedsnet::config::DataType)>>}
+fn sdt_template_id(bytes:&[u8],off:&mut usize)->Option<u32>{let mut value=0;for shift in (0..35).step_by(7){let b=*bytes.get(*off)?;*off+=1;if shift==28&&b>15{return None;}value|=u32::from(b&127)<<shift;if b&128==0{return Some(value);}}None}
+/// CRC-checked SDT body (between the 4-byte tag and the CRC).
+fn sdt_body(bytes:&[u8])->Option<&[u8]>{
+    if !bytes.starts_with(b"SDT")||bytes.len()<8{return None;}let end=bytes.len()-4;
+    (crc32fast::hash(&bytes[..end])==u32::from_le_bytes(bytes[end..].try_into().unwrap())).then(||&bytes[4..end])
+}
 impl RecoveryFrameClassifier {
+    /// Call once per frame the transport accepted, in callback order: only
+    /// accepted templates are ever referenced by later compact frames.
     pub fn classify(&self,bytes:&[u8])->bool {
-        fn id(bytes:&[u8],off:&mut usize)->Option<u32>{let mut value=0;for shift in (0..35).step_by(7){let b=*bytes.get(*off)?;*off+=1;if shift==28&&b>15{return None;}value|=u32::from(b&127)<<shift;if b&128==0{return Some(value);}}None}
         if !bytes.starts_with(b"SDT"){return is_recovery_control_frame(bytes);}
-        if bytes.len()<8{return true;}let end=bytes.len()-4;
-        if crc32fast::hash(&bytes[..end])!=u32::from_le_bytes(bytes[end..].try_into().unwrap()){return true;}
-        let body=&bytes[4..end];let mut templates=self.templates.lock().unwrap();
+        let Some(body)=sdt_body(bytes) else {return true;};
+        let mut templates=self.templates.lock().unwrap();
         match bytes[3] {
-            1=>{let mut off=0;let Some(key)=id(body,&mut off)else{return true;};let Some(frame)=body.get(off..)else{return true;};
-                if serialize::peek_frame_info_unchecked(frame).is_err(){return true;}
+            1=>{let mut off=0;let Some(key)=sdt_template_id(body,&mut off)else{return true;};let Some(frame)=body.get(off..)else{return true;};
+                let Ok(info)=serialize::peek_frame_info_unchecked(frame) else {return true;};
                 let control=is_recovery_control_frame(frame);
-                if let Some(i)=templates.iter().position(|(id,_)|*id==key){templates.remove(i);}
-                if templates.len()>=256{templates.pop_front();}templates.push_back((key,control));control},
-            2|4|5=>{let mut off=1;id(body,&mut off).and_then(|id|templates.iter().find(|(key,_)|*key==id).map(|(_,control)|*control)).unwrap_or(true)},
+                if let Some(i)=templates.iter().position(|(id,_,_)|*id==key){templates.remove(i);}
+                if templates.len()>=256{templates.pop_front();}templates.push_back((key,control,info.envelope.ty));control},
+            2|4|5=>{let mut off=1;sdt_template_id(body,&mut off).and_then(|id|templates.iter().find(|(key,_,_)|*key==id).map(|(_,control,_)|*control)).unwrap_or(true)},
             _=>true,
+        }
+    }
+    /// The wire type of a canonical frame or of an SDT frame whose template
+    /// this side already accepted. Read-only: a refused frame teaches nothing.
+    fn peek_type(&self,bytes:&[u8])->Option<sedsnet::config::DataType>{
+        if !bytes.starts_with(b"SDT"){return serialize::peek_frame_info(bytes).ok().map(|info|info.envelope.ty);}
+        let body=sdt_body(bytes)?;
+        match bytes[3] {
+            1=>{let mut off=0;sdt_template_id(body,&mut off)?;serialize::peek_frame_info(body.get(off..)?).ok().map(|info|info.envelope.ty)},
+            2|4|5=>{let mut off=1;let id=sdt_template_id(body,&mut off)?;self.templates.lock().unwrap().iter().find(|(key,_,_)|*key==id).map(|(_,_,ty)|*ty)},
+            _=>None,
         }
     }
 }
@@ -2282,7 +2642,11 @@ mod priority_tests {
         chunk[10..12].copy_from_slice(&18u16.to_le_bytes());
         budget.try_send(&tx, 254, &chunk).unwrap();
         chunk[8..10].copy_from_slice(&1u16.to_le_bytes());
-        assert!(budget.try_send(&tx, 254, &chunk).is_err());
+        // The next chunk is parked (accepted, not yet handed to the writer).
+        budget.try_send(&tx, 254, &chunk).unwrap();
+        assert_eq!(budget.diagnostics()["parked_frames"], 1);
+        chunk[8..10].copy_from_slice(&2u16.to_le_bytes());
+        assert!(budget.try_send(&tx, 254, &chunk).is_err(), "the park holds one allowance");
         // The same protected allowance survives a full ordinary lookahead.
         for id in 0..64 {
             let mut control = [0xff; 32];
@@ -2293,6 +2657,8 @@ mod priority_tests {
         assert_eq!(&prefix[8..10], &[0, 0]);
         assert!(budget.try_send(&tx, 254, &chunk).is_err());
         budget.complete(priority, &prefix);
+        // Completion moved the parked chunk to the writer; chunk 2 now parks.
+        assert_eq!(budget.diagnostics()["parked_frames"], 0);
         budget.try_send(&tx, 254, &chunk).unwrap();
         assert_eq!(budget.pending_ordinary.load(Ordering::Acquire), 192);
         while let Ok((priority, bytes)) = rx.try_recv() {
@@ -2571,7 +2937,7 @@ mod priority_tests {
             .unwrap(),
         )
         .to_vec();
-        let budget = TxQueueBudget::new_radio(2048, 256);
+        let budget = TxQueueBudget::new_radio_unparked(2048, 256);
         let (tx, mut rx) = mpsc::unbounded_channel();
         // Ordinary traffic fills most of the allowance and a schema chunk is
         // now waiting for its room: every later ordinary frame is refused.
@@ -2590,7 +2956,7 @@ mod priority_tests {
 
     #[test]
     fn large_ordinary_frame_is_not_starved_by_a_stream_of_small_frames() {
-        let budget = TxQueueBudget::new_radio(2048, 256);
+        let budget = TxQueueBudget::new_radio_unparked(2048, 256);
         let (tx, mut rx) = mpsc::unbounded_channel();
         // Small frames keep the ordinary allowance partly full.
         budget.try_send(&tx, 0, &[1; 100]).unwrap();
@@ -2623,6 +2989,110 @@ mod priority_tests {
         budget.complete(p, &f);
         assert!(budget.try_send(&tx, 0, &vec![5u8; 256 - announce.len() + 1]).is_err(), "cannot jump the announcement");
         budget.try_send(&tx, 0, &announce).unwrap();
+    }
+
+    /// The router re-encodes a refused frame on every offer, so its retry
+    /// never had the bytes of the frame that took the reservation. On
+    /// a511984 the retry was refused for the reservation held for its own
+    /// earlier encoding, and so was every other ordinary frame, until 256
+    /// refusals or 1 s later; then the next encoding took a new reservation.
+    #[test]
+    fn re_encoded_retry_takes_its_own_reservation() {
+        use sedsnet::config::{DataEndpoint, DataType};
+        let address = |stamp: u64, fill: u8| {
+            serialize::pack_packet(&Packet::new(DataType::DiscoveryAddress, &[DataEndpoint::Discovery], "GS", stamp, Arc::from(vec![fill; 60])).unwrap()).to_vec()
+        };
+        let budget = TxQueueBudget::new_radio_unparked(2048, 256);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        budget.try_send(&tx, 0, &[1; 200]).unwrap();
+        let first = address(1, 7);
+        assert!(budget.try_send(&tx, 255, &first).is_err(), "no room yet");
+        let (p, f) = rx.try_recv().unwrap();
+        budget.complete(p, &f);
+        // Room exists; the router now offers a fresh encoding of the frame.
+        let retry = address(2, 8);
+        assert_ne!(first, retry);
+        budget.try_send(&tx, 255, &retry).expect("the re-encoded retry takes the held room");
+        // With the reservation released, small frames flow again at once.
+        budget.try_send(&tx, 0, &[3; 40]).unwrap();
+        assert_eq!(budget.diagnostics()["refusals"]["large_frame_reservation"], 0);
+    }
+
+    fn sdt_wrapped(frame: &[u8], template: u8) -> Vec<u8> {
+        let mut bytes = b"SDT\x01".to_vec();
+        bytes.push(template);
+        bytes.extend_from_slice(frame);
+        bytes.extend(crc32fast::hash(&bytes).to_le_bytes());
+        bytes
+    }
+
+    /// Time sync and receipts wrapped by the side transport are opaque to a
+    /// plain frame peek. On a511984 a compact TIME_SYNC_ANNOUNCE was refused
+    /// for a large-frame reservation like telemetry (live: 0 announces per
+    /// minute on the radio against 30 on the umbilical).
+    #[test]
+    fn compact_time_sync_and_receipts_are_never_held_for_a_reservation() {
+        use sedsnet::config::{DataEndpoint, DataType};
+        crate::telemetry_schema::initialize().unwrap();
+        let announce = serialize::pack_packet(&Packet::new(DataType::TimeSyncAnnounce, &[DataEndpoint::TimeSync], "GS", 5, Arc::from(vec![0u8; 16])).unwrap()).to_vec();
+        let announce = sdt_wrapped(&announce, 3);
+        let budget = TxQueueBudget::new_radio_unparked(2048, 256);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        budget.try_send(&tx, 0, &[1; 100]).unwrap();
+        // A schema chunk waits for its room: ordinary frames must leave it.
+        assert!(budget.try_send(&tx, 254, &[2; 192]).is_err());
+        assert!(budget.try_send(&tx, 254, &[3; 40]).is_err());
+        budget.try_send(&tx, 254, &announce).expect("time sync is not held for the chunk");
+        // Its accepted template now identifies the compact references too.
+        let mut reference = b"SDT\x02".to_vec();
+        reference.extend_from_slice(&[0, 3, 1, 2, 3]);
+        reference.extend(crc32fast::hash(&reference).to_le_bytes());
+        budget.try_send(&tx, 254, &reference).expect("a compact reference to time sync is protected");
+        assert!(rx.try_recv().is_ok());
+    }
+
+    /// A sender retransmits an unacknowledged message every 200-250 ms and
+    /// each copy is acknowledged again. A receipt identical to one still
+    /// waiting for the writer is redundant and is not queued twice.
+    #[test]
+    fn identical_waiting_receipt_is_coalesced() {
+        use sedsnet::config::{DataEndpoint, DataType};
+        let ack = |stamp| serialize::pack_packet(&Packet::new(DataType::ReliableAck, &[DataEndpoint::TelemetryError], "GS", stamp, Arc::from(9u64.to_le_bytes())).unwrap()).to_vec();
+        let budget = TxQueueBudget::new_radio(2048, 256);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        budget.try_send(&tx, 255, &ack(1)).unwrap();
+        budget.try_send(&tx, 255, &ack(2)).unwrap();
+        let (p, f) = rx.try_recv().unwrap();
+        assert!(rx.try_recv().is_err(), "the copy was not queued");
+        assert_eq!(budget.diagnostics()["coalesced_receipts"], 1);
+        budget.complete(p, &f);
+        // Once written, a later receipt for the same message goes out again.
+        budget.try_send(&tx, 255, &ack(3)).unwrap();
+        assert!(rx.try_recv().is_ok());
+    }
+
+    /// While the writer is full, the next frames are parked once instead of
+    /// being refused (and re-offered by the router) on every pass, and they
+    /// reach the writer in order as it drains.
+    #[test]
+    fn full_writer_parks_frames_in_order() {
+        let budget = TxQueueBudget::new_radio(2048, 256);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        budget.try_send(&tx, 0, &[1; 200]).unwrap();
+        budget.try_send(&tx, 0, &[2; 100]).unwrap();
+        budget.try_send(&tx, 0, &[3; 100]).unwrap();
+        assert!(budget.try_send(&tx, 0, &[4; 100]).is_err(), "park is bounded");
+        assert_eq!(budget.diagnostics()["parked_frames"], 2);
+        let (p, f) = rx.try_recv().unwrap();
+        assert!(rx.try_recv().is_err());
+        budget.complete(p, &f);
+        let mut order = Vec::new();
+        while let Ok((p, f)) = rx.try_recv() {
+            order.push(f[0]);
+            budget.complete(p, &f);
+        }
+        assert_eq!(order, [2, 3]);
+        assert_eq!(budget.pending.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -2672,7 +3142,7 @@ mod priority_tests {
 
     #[test]
     fn radio_refusals_are_counted_by_reason_and_never_reach_the_writer() {
-        let budget = TxQueueBudget::new_radio(2048, 256);
+        let budget = TxQueueBudget::new_radio_unparked(2048, 256);
         let (tx, mut rx) = mpsc::unbounded_channel();
         budget.try_send(&tx, 0, &[1; 200]).unwrap();
         for _ in 0..3 {
@@ -3802,6 +4272,106 @@ fn handle_worker_recv_error(
     }
 }
 
+/// Router TX passes while the radio writer is full. The SDK offers every
+/// refused frame again on its next pass (one router millisecond later), so a
+/// saturated radio turned each waiting frame into about a thousand refusals
+/// per second: 2,400 per wall second in the full-network simulation, while
+/// the queued frames could not move anyway. After a pass in which the radio
+/// only refused, the next TX pass waits until the radio writer finishes a
+/// frame (room may exist), the router's TX queue changes (new work, such as
+/// an umbilical command), or RADIO_REFUSAL_BACKOFF_MS passes. RX processing
+/// is never held back, and nothing changes while the radio accepts frames.
+pub(super) const RADIO_REFUSAL_BACKOFF_MS: u64 = 8;
+/// Consecutive refusal-only passes double the wait, up to this.
+const RADIO_REFUSAL_BACKOFF_MAX_MS: u64 = 64;
+#[derive(Default)]
+pub(super) struct RadioRefusalBackoff {
+    /// (TX queue length, radio completions, deadline) when the radio last
+    /// refused everything it was offered in a pass.
+    held: Option<(u32, u64, TxDeadline)>,
+    /// Current wait after a refusal-only pass.
+    wait_ms: u64,
+    /// A model's virtual clock in place of the station clock.
+    #[cfg(test)]
+    model_clock: Option<Arc<std::sync::atomic::AtomicU64>>,
+}
+impl RadioRefusalBackoff {
+    #[cfg(test)]
+    pub(super) fn with_model_clock(clock: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self { held: None, wait_ms: 0, model_clock: Some(clock) }
+    }
+    fn now(&self) -> TxDeadline {
+        #[cfg(test)]
+        if let Some(clock) = &self.model_clock {
+            return TxDeadline { wall: std::time::Instant::now(), simulated_ms: Some(clock.load(Ordering::Acquire)) };
+        }
+        TxDeadline::now()
+    }
+    fn queue_len(router: &Router) -> u32 {
+        router.queue_counters()[2]
+    }
+    /// Whether a TX pass should run now.
+    pub(super) fn tx_due(&mut self, router: &Router, budget: Option<&TxQueueBudget>) -> bool {
+        let (Some((queued, completions, until)), Some(budget)) = (self.held, budget) else {
+            return true;
+        };
+        let due = until.ready_at(std::time::Instant::now(), self.now().simulated_ms)
+            || budget.activity_counters().2 != completions
+            || Self::queue_len(router) != queued;
+        if due {
+            self.held = None;
+        }
+        due
+    }
+    /// Run one TX pass, recording whether the radio only refused.
+    pub(super) fn run_tx(
+        &mut self,
+        router: &Router,
+        budget: Option<&TxQueueBudget>,
+        pass: impl FnOnce(),
+    ) {
+        let before = budget.map(TxQueueBudget::activity_counters);
+        pass();
+        if let (Some(budget), Some((refused, admitted, _))) = (budget, before) {
+            let (refused_after, admitted_after, completions) = budget.activity_counters();
+            if refused_after > refused && admitted_after == admitted {
+                self.wait_ms = (self.wait_ms * 2).clamp(RADIO_REFUSAL_BACKOFF_MS, RADIO_REFUSAL_BACKOFF_MAX_MS);
+                self.held = Some((
+                    Self::queue_len(router),
+                    completions,
+                    self.now().after(Duration::from_millis(self.wait_ms)),
+                ));
+            } else if admitted_after != admitted {
+                self.wait_ms = 0;
+            }
+        }
+    }
+}
+
+/// The router worker's queue service: TX (unless the radio backoff holds
+/// it), then RX, which is never held back. A TX error (one frame's delivery
+/// expiring or exhausting its retries) ends only this TX pass; RX still
+/// runs, since skipping it would also hold back the ACKs that let every
+/// other side's ordered streams advance.
+pub(super) fn process_router_queues_with_backoff(
+    router: &Router,
+    budget: Option<&TxQueueBudget>,
+    backoff: &mut RadioRefusalBackoff,
+) {
+    if backoff.tx_due(router, budget) {
+        backoff.run_tx(router, budget, || {
+            if let Err(err) = router.process_tx_queue_with_timeout(super::ROUTER_TX_BUDGET_MS) {
+                log_telemetry_error("router tx queue processing failed", err);
+            }
+        });
+    }
+    if super::ROUTER_RX_BUDGET_MS > 0
+        && let Err(err) = router.process_rx_queue_with_timeout(super::ROUTER_RX_BUDGET_MS)
+    {
+        super::log_router_rx_error(err);
+    }
+}
+
 pub(super) fn spawn_router_worker_thread(
     router: Arc<Router>,
     state: Arc<AppState>,
@@ -3811,6 +4381,7 @@ pub(super) fn spawn_router_worker_thread(
         .spawn(move || {
             let mut shutdown_rx = state.shutdown_subscribe();
             let mut last_clock_refresh = std::time::Instant::now();
+            let mut radio_backoff = RadioRefusalBackoff::default();
             loop {
                 match shutdown_rx.try_recv() {
                     Ok(_)
@@ -3846,9 +4417,11 @@ pub(super) fn spawn_router_worker_thread(
                         did_work |= queued;
                     }
                 }
-                if let Err(e) = process_router_queues(&router) {
-                    log_telemetry_error("router queue processing failed", e);
-                }
+                process_router_queues_with_backoff(
+                    &router,
+                    RADIO_TX_BUDGET.get().map(Arc::as_ref),
+                    &mut radio_backoff,
+                );
                 state.mark_discovered_relays_seen();
                 if !did_work {
                     thread::sleep(Duration::from_millis(COMMS_IDLE_SLEEP_MS));
@@ -5260,3 +5833,7 @@ mod recovery_control_tests {
 #[cfg(test)]
 #[path = "radio_owner_ack_loss_tests.rs"]
 mod owner_ack_loss_tests;
+
+#[cfg(test)]
+#[path = "radio_refusal_storm_tests.rs"]
+mod refusal_storm_tests;
