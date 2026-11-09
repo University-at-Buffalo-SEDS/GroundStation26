@@ -3347,41 +3347,20 @@ fn abort_delivery_in_progress(state: &AppState, router: &sedsnet::router::Router
     state.has_pending_umbilical_control_tx()
         || !commands_still_in_delivery(router, &[crate::telemetry_schema::data_type("ABORT")]).is_empty()
 }
-/// Station mode changes wait for host output work, never for frames the
-/// network cannot deliver. A sequence, cold flow, manual valve control, an
-/// automatic abort being dispatched, a manual Abort being delivered, an
-/// umbilical controller frame, or a controller command still in its normal
-/// delivery attempts holds the switch. A latched abort with no motion and a
-/// command that keeps failing over a dead or saturated link do not: switching
-/// mode sends no output command, so waiting on them would pin the station in
-/// its mode forever.
+/// Output work a station mode change would orphan: the switch resets the
+/// sequence engine, so a sequence in progress, cold flow or manual valve
+/// control holds it. Each releases the moment that work ends (the engine
+/// leaves its active phases), never on a separate latch. Abort and delivery
+/// state do not hold it: a mode change sends no output command.
 pub(crate) fn mode_switch_block_reason(state: &AppState) -> Option<&'static str> {
-    {
-        let rt = state.gse.lock().unwrap();
-        if rt.engine.active() || rt.manual_control {
-            return Some("a sequence or manual valve control holds the outputs");
-        }
-        if cold_flow::runtime_active(&rt) {
-            return Some("cold flow is running");
-        }
-        if rt.automatic_abort_in_flight {
-            return Some("an automatic abort is still being dispatched");
-        }
-        if !crate::runtime_mode::is_hitl() && rt.operational.running {
-            return Some("a GSE operation is still running");
-        }
+    let rt = state.gse.lock().unwrap();
+    if rt.engine.active() || rt.manual_control {
+        return Some("a sequence or manual valve control is moving valves");
     }
-    if state.manual_abort_intent.pending_epoch().is_some() || state.deferred_abort.manual_pending() {
-        return Some("a manual Abort is still being delivered");
+    if cold_flow::runtime_active(&rt) {
+        return Some("cold flow is running");
     }
-    if state.has_pending_umbilical_control_tx() {
-        return Some("a fill-board command is still being sent");
-    }
-    let router = state.topology_router.get()?;
-    let kinds = ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND"]
-        .map(crate::telemetry_schema::data_type);
-    (!commands_still_in_delivery(router, &kinds).is_empty())
-        .then_some("a board command is still being delivered")
+    None
 }
 /// Operator recovery only: never dispatch a valve, ignition or launch command.
 fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)> {
@@ -6972,9 +6951,10 @@ mod undeliverable_command_tests {
         state.topology_router.set(router.clone()).unwrap();
         let abort = crate::telemetry_schema::data_type("ABORT");
         assert!(router.has_pending_reliable_tx_type(abort));
-        // Still within its delivery window: both hold.
+        // Still within its delivery window: it holds the clear. Delivery never
+        // holds a mode change, which sends no output command.
         assert!(clear_blocked_by_abort_delivery(&state, &router));
-        assert_eq!(mode_switch_block_reason(&state), Some("a board command is still being delivered"));
+        assert_eq!(mode_switch_block_reason(&state), None);
         // Outstanding past the window: neither holds, though the SDK still owns
         // it (the old rule, which refused for as long as it was pending).
         age_delivery_tracking_for_test(UNDELIVERABLE_AFTER + std::time::Duration::from_millis(100));
@@ -6987,7 +6967,7 @@ mod undeliverable_command_tests {
         let mut held = None;
         state.transport_tx_activity.try_enqueue_owned(true, bytes, |b| { held = Some(b); Ok(()) }).unwrap();
         assert!(clear_blocked_by_abort_delivery(&state, &router));
-        assert_eq!(mode_switch_block_reason(&state), Some("a fill-board command is still being sent"));
+        assert_eq!(mode_switch_block_reason(&state), None);
         state.transport_tx_activity.complete_frame(&held.unwrap());
         // HITL Clear GSE abort never waits on delivery (unchanged).
         drop(_mode);

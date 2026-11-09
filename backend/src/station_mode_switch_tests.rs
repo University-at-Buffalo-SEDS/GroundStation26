@@ -295,17 +295,27 @@ async fn busy_station_refuses_with_the_server_reason() {
     };
     let s = f.snapshot("administrator").await;
     assert_eq!(s["options"][0]["available"], false);
-    assert!(s["options"][0]["reason"].as_str().unwrap().contains("T clock"));
-    assert!(s["reason"].as_str().unwrap().contains("T clock"));
+    assert!(s["options"][0]["reason"].as_str().unwrap().contains("countdown"));
+    assert!(s["reason"].as_str().unwrap().contains("countdown"));
     let (status, body) = f.prepare("administrator", target).await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert!(body["error"].as_str().unwrap().contains("T clock"), "{body}");
+    assert!(body["error"].as_str().unwrap().contains("countdown"), "{body}");
     *f.state.launch_clock.lock().unwrap() = LaunchClockMsg::idle();
 
+    // After T-0 the launch is past: the switch reopens.
+    *f.state.launch_clock.lock().unwrap() = LaunchClockMsg {
+        kind: LaunchClockKind::TPlus,
+        anchor_timestamp_ms: Some(1),
+        duration_ms: None,
+    };
+    let (status, body) = f.prepare("administrator", target).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    *f.state.launch_clock.lock().unwrap() = LaunchClockMsg::idle();
+
+    // Flight state alone never holds a mode change.
     *f.state.state.lock().unwrap() = FlightState::Armed;
     let (status, body) = f.prepare("administrator", target).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert!(body["error"].as_str().unwrap().contains("Armed"), "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
     *f.state.state.lock().unwrap() = FlightState::Idle;
 
     f.state.launch_sequence_command_pending.store(true, Ordering::SeqCst);
@@ -318,20 +328,24 @@ async fn busy_station_refuses_with_the_server_reason() {
     // at confirm and nothing is saved.
     let (status, challenge) = f.prepare("administrator", target).await;
     assert_eq!(status, StatusCode::OK);
-    *f.state.state.lock().unwrap() = FlightState::NitrousFill;
+    *f.state.launch_clock.lock().unwrap() = LaunchClockMsg {
+        kind: LaunchClockKind::TMinus,
+        anchor_timestamp_ms: Some(1),
+        duration_ms: Some(10_000),
+    };
     let phrase = challenge["required_confirmation"].as_str().unwrap().to_owned();
     let (status, body) = f
         .call("POST", "/api/station-modes/confirm", "administrator", Some(Fixture::confirmation(&challenge, &phrase)))
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert!(body["error"].as_str().unwrap().contains("NitrousFill"), "{body}");
+    assert!(body["error"].as_str().unwrap().contains("countdown"), "{body}");
     assert!(f.selection().is_none());
     assert!(!f.signal.requested());
     assert_eq!(crate::runtime_mode::current(), Mode::Normal);
 }
 
 #[tokio::test]
-async fn a_latched_abort_with_nothing_moving_never_pins_the_station_mode() {
+async fn only_a_launch_countdown_or_moving_outputs_hold_the_station_mode() {
     use crate::types::FlightState;
     let _mode = thread_mode(Mode::Normal);
     let f = fixture().await;
@@ -350,11 +364,19 @@ async fn a_latched_abort_with_nothing_moving_never_pins_the_station_mode() {
     assert!(body["error"].as_str().unwrap().contains("manual valve control"), "{body}");
     f.state.gse.lock().unwrap().manual_control = false;
 
-    // Flight states with live outputs still refuse.
+    // Board and flight state never hold it.
     *f.state.state.lock().unwrap() = FlightState::NitrousFill;
     let (status, body) = f.prepare("administrator", target).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A sequence in progress holds it, and finishing releases it at once.
+    f.state.gse.lock().unwrap().engine.status.phase = gse_sequence::Phase::Filling;
+    let (status, body) = f.prepare("administrator", target).await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert!(body["error"].as_str().unwrap().contains("NitrousFill"), "{body}");
+    assert!(body["error"].as_str().unwrap().contains("sequence"), "{body}");
+    f.state.gse.lock().unwrap().engine.status.phase = gse_sequence::Phase::Passed;
+    let (status, body) = f.prepare("administrator", target).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]
@@ -384,14 +406,14 @@ async fn activity_just_before_restart_cancels_it_and_restores_the_selection() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(f.selection().unwrap().target_id, target);
-    *f.state.state.lock().unwrap() = crate::types::FlightState::PreFill;
+    f.state.launch_sequence_command_pending.store(true, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(!f.signal.requested(), "an active station is never restarted");
     assert_eq!(f.selection().unwrap(), previous, "previous selection restored");
     let s = f.snapshot("administrator").await;
     assert_eq!(s["transition"]["state"], "failed");
-    assert!(s["transition"]["error"].as_str().unwrap().contains("PreFill"));
-    *f.state.state.lock().unwrap() = crate::types::FlightState::Idle;
+    assert!(s["transition"]["error"].as_str().unwrap().contains("Launch"));
+    f.state.launch_sequence_command_pending.store(false, Ordering::SeqCst);
     let (status, _) = f.prepare("administrator", target).await;
     assert_eq!(status, StatusCode::OK, "a cancelled restart can be retried");
 }

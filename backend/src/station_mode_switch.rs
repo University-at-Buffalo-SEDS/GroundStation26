@@ -915,41 +915,25 @@ pub(crate) fn can_change(principal: &AuthPrincipal) -> bool {
             || principal.allows_command_name(COMMAND_NAME))
 }
 
-/// Why the station is not idle enough for a mode change, if anything.
-pub(crate) fn station_busy(state: &AppState, rrls: bool) -> Option<String> {
-    use crate::types::FlightState;
+/// Why a mode change is refused right now, if anything. Only a launch in
+/// progress (a pending Launch command or the T-minus countdown) and output
+/// work the switch would orphan (a GSE sequence, turbocharge, cold flow or
+/// manual valve control moving valves) hold it. Flight state, board state and
+/// abort state never do, and the switch reopens once the launch is past T-0.
+pub(crate) fn station_busy(state: &AppState, _rrls: bool) -> Option<String> {
     if state.shutdown_requested.load(Ordering::SeqCst) {
         return Some("the backend is already shutting down".into());
-    }
-    if crate::gse::active(state) {
-        return Some("a GSE sequence is running".into());
-    }
-    if crate::gse::turbocharge_active_nowait(state) {
-        return Some("turbocharge is running or its state is busy".into());
     }
     if state.launch_sequence_command_pending.load(Ordering::SeqCst) {
         return Some("a Launch command is pending".into());
     }
-    let flight = state.local_flight_state_snapshot();
-    // Aborted is a safe resting state: a mode change sends no output command.
-    if !matches!(flight, FlightState::Startup | FlightState::Idle | FlightState::Aborted) {
-        return Some(format!(
-            "flight state is {flight:?}; switch only from Startup, Idle or Aborted"
-        ));
+    if state.launch_clock_snapshot().kind == crate::telemetry_db::LaunchClockKind::TMinus {
+        return Some("the launch countdown is running".into());
     }
-    if state.launch_clock_snapshot().kind != crate::telemetry_db::LaunchClockKind::Idle {
-        return Some("the T clock is running".into());
+    if crate::gse::turbocharge_active_nowait(state) {
+        return Some("turbocharge is running or its state is busy".into());
     }
-    if let Some(reason) = crate::gse::mode_switch_block_reason(state) {
-        return Some(reason.into());
-    }
-    if !crate::board_recovery::coordinator::manual_utc_idle(state) {
-        return Some("a board recovery or reset is in progress".into());
-    }
-    if rrls && crate::rrls::status().forwarding {
-        return Some("this RRLS is relaying recovery traffic for the primary".into());
-    }
-    None
+    crate::gse::mode_switch_block_reason(state).map(Into::into)
 }
 struct Refusal(StatusCode, String);
 impl Refusal {
