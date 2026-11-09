@@ -172,6 +172,25 @@ fn ground_permitted(state: &AppState) -> bool {
     prelaunch(state)
         && !state.launch_history.lock().unwrap().automatic_actions_inhibited()
 }
+/// The specific reason `permitted` is false, in operator words.
+fn admission_block_reason(state: &AppState, ticket: LaunchAdmission) -> Option<&'static str> {
+    if !prelaunch(state) {
+        return Some("The vehicle is not in a prelaunch state");
+    }
+    if state.launch_history.lock().unwrap().automatic_actions_inhibited() {
+        return Some("Automatic actions are inhibited after a Launch; reset the boards to re-enable them");
+    }
+    if !same(ticket, LaunchAdmission::capture(state))
+        || state.operator_admission_barrier.load(std::sync::atomic::Ordering::Acquire) != 0
+    {
+        return Some("A board recovery or reset is in progress; try again when it finishes");
+    }
+    match manual_stop_state(state) {
+        CurrentState::Current => None,
+        CurrentState::PendingBusy => Some("The network router is busy; try again in a moment"),
+        CurrentState::Invalid => Some("A Stop or Abort is still being delivered to the boards"),
+    }
+}
 fn permitted(state: &AppState, ticket: LaunchAdmission) -> bool {
     ownership_state(state, ticket) == CurrentState::Current && ground_permitted(state)
 }
@@ -527,8 +546,8 @@ pub(super) fn status(state: &AppState) -> Status {
         "Current ground readiness is required"
     } else if state.topology_router.get().is_none() {
         "Current command router unavailable"
-    } else if !permitted(state, ticket) {
-        "Current Stop/state/Launch admission is unavailable"
+    } else if let Some(reason) = admission_block_reason(state, ticket) {
+        reason
     } else if matches!(
         state.launch_clock_snapshot().kind,
         crate::telemetry_db::LaunchClockKind::TMinus | crate::telemetry_db::LaunchClockKind::TPlus
