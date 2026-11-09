@@ -86,8 +86,9 @@ as the gate opens (for example when an Aborted station comes to rest). The gate 
 checked again before the first write and before `AT&W`.
 
 Operator override: `GS_RFD_MODEM_CHECK=skip` (no check), `verify` (read and
-report only) or `fix` (default in normal and test-fire modes). HITL and testing
-modes and `firmware_sim` builds default to `skip`, and a simulated PTY link
+report only) or `fix` (default in normal, HITL and test-fire modes; HITL runs
+the real AV-bay radio). Testing mode and `firmware_sim` builds default to
+`skip`, and a simulated PTY link
 (`GS_SIMULATED_SERIAL_PTY=1`) is always skipped. The startup check runs once,
 under the mode the backend started in; a later switch into normal or test fire
 does not rerun it (the operator check stays available).

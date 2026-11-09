@@ -1237,10 +1237,9 @@ pub(crate) fn configured_mode() -> Mode {
         return mode;
     }
     // Follows the station mode in force. The startup check below still runs
-    // once per process, with the mode at that moment.
-    if crate::runtime_mode::is_testing()
-        || crate::runtime_mode::is_hitl()
-        || cfg!(feature = "firmware_sim")
+    // once per process, with the mode at that moment. HITL runs the real
+    // AV-bay radio (the bench deploy), so it applies the profile like normal.
+    if crate::runtime_mode::is_testing() || cfg!(feature = "firmware_sim")
     {
         Mode::Skip
     } else {
@@ -1308,7 +1307,7 @@ pub(crate) fn before_av_bay_open(link: &CommsLinkConfig) {
         Some(_) if mode == Mode::Skip => Report::skipped(
             Trigger::Startup,
             mode,
-            "modem check off: skipped by default in HITL and testing modes and simulator builds (set GS_RFD_MODEM_CHECK=verify or fix to run it)",
+            "modem check off: skipped by default in testing mode and simulator builds (set GS_RFD_MODEM_CHECK=verify or fix to run it)",
         ),
         Some(_) if simulated_link() => {
             Report::skipped(Trigger::Startup, mode, "simulated serial link")

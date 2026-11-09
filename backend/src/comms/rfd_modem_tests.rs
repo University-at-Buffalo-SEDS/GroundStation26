@@ -1012,3 +1012,16 @@ fn unproven_link_paces_for_the_deployed_global_retries() {
         assert_eq!(link_share_cap_percent(64_000, 30_000, pacing_global_retries()), Some(18));
     }
 }
+
+/// The bench deploy runs in HITL mode with the real AV-bay radio. The modem
+/// configuration check was skipped there by default, so the station's own
+/// RFD kept GLOBAL_RETRIES 10 whatever the RF board was reflashed to. HITL
+/// applies the profile like normal mode; only testing mode, simulator builds
+/// and simulated links skip it.
+#[test]
+fn hitl_applies_the_modem_profile_like_normal_mode() {
+    crate::mode_suite!(Hitl);
+    if std::env::var_os("GS_RFD_MODEM_CHECK").is_none() && !cfg!(feature = "firmware_sim") {
+        assert_eq!(configured_mode(), Mode::Fix);
+    }
+}
