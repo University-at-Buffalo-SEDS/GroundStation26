@@ -3,6 +3,8 @@ mod prelude;
 mod umbilical_owner_tests;
 #[cfg(test)]
 mod held_launch_tests;
+#[cfg(test)]
+mod side_starvation_tests;
 use prelude::*;
 
 mod commands;
@@ -3035,9 +3037,11 @@ fn log_router_decode_error(err: sedsnet::TelemetryError) {
 }
 
 fn process_router_queues(router: &Router) -> Result<(), sedsnet::TelemetryError> {
+    // A TX error (one frame's delivery expiring or exhausting its retries)
+    // ends only this TX pass. RX still runs: skipping it would also hold back
+    // the ACKs that let every other side's ordered streams advance.
     if let Err(err) = router.process_tx_queue_with_timeout(ROUTER_TX_BUDGET_MS) {
         log_telemetry_error("router tx queue processing failed", err);
-        return Ok(());
     }
     if ROUTER_RX_BUDGET_MS > 0
         && let Err(err) = router.process_rx_queue_with_timeout(ROUTER_RX_BUDGET_MS)

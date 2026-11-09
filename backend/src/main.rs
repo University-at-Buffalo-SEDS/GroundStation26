@@ -183,6 +183,14 @@ fn network_delivery_tuning() -> sedsnet::config::RuntimeTuningConfig {
         payload_compress_threshold: usize::MAX,
         reliable_retransmit_ms: env_usize("GS_RELIABLE_RETRANSMIT_MS", 250, 100, 5000) as u32,
         reliable_max_retries: 17,
+        // The end-to-end reliable window is ONE pool shared by every side.
+        // At the SDK default (32), commands to slow or unreachable radio
+        // boards, each held for the 4.5 s delivery window, filled it and
+        // starved the wired umbilical boards: their commands and recovery
+        // queries waited for slots and answered only in bursts, every 4–8 s.
+        // A larger pool keeps room for the umbilical while the radio backs
+        // up; each entry stays bounded by the network memory budget below.
+        reliable_max_end_to_end_pending: env_usize("GS_RELIABLE_MAX_E2E_PENDING", 1024, 32, 8192),
         ..Default::default()
     }
 }
