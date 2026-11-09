@@ -4,6 +4,8 @@ mod umbilical_owner_tests;
 #[cfg(test)]
 mod held_launch_tests;
 #[cfg(test)]
+mod launch_mode_gate_tests;
+#[cfg(test)]
 mod side_starvation_tests;
 use prelude::*;
 
@@ -291,9 +293,11 @@ fn start_launch_clock_from_valve_sequence_status(state: &Arc<AppState>) {
         return;
     }
 
-    state.clear_launch_sequence_command_pending();
+    // The countdown takes over from the pending Launch: start it first, so
+    // there is no instant at which neither holds station mode changes.
     let now_ms = procedure_clock::timestamp_ms();
     state.set_launch_clock(launch_countdown_clock(now_ms));
+    state.clear_launch_sequence_command_pending();
 
     gs_debug_println!(
         "Valve-board sequence started launch clock; T-0 in {} ms",
@@ -404,10 +408,13 @@ async fn send_local_ground_station_launch(
             return;
         }
     };
+    // Station mode changes stay refused until the countdown starts.
+    state.launch_mode_gate.mark_sent();
     if let Err(error) =
         crate::gse::queue_admitted_launch_packets(&state, &router, ticket, vec![packet])
     {
         state.clear_launch_sequence_command_pending();
+        state.launch_mode_gate.clear_sent();
         emit_notification_warning(&state, error);
         return;
     }
@@ -527,6 +534,9 @@ async fn send_flight_computer_launch(
             return;
         }
     };
+    // Station mode changes stay refused until the countdown starts. A partly
+    // admitted Launch below keeps refusing them: a packet may be on its way.
+    state.launch_mode_gate.mark_sent();
     if let Err(error) = crate::gse::queue_admitted_launch_packets(&state, &router, ticket, packets)
     {
         // An accepted first packet remains an honest SDK owner. Only a
@@ -582,6 +592,8 @@ struct HeldLaunch {
     queued_generation: Option<u64>,
     /// Stop/reset ownership at the press; any later Stop or reset refuses it.
     pressed: crate::gse::LaunchAdmission,
+    /// The press keeps holding station mode changes while it is held.
+    _launch_hold: Option<crate::launch_mode_gate::LaunchHold>,
 }
 
 /// Refusals a Launch press would meet anyway, checked before the zero so a
@@ -843,13 +855,16 @@ pub async fn telemetry_task(
                         TelemetryCommand::QueuedOperator {recovery_origin,..}=>*recovery_origin,
                         _=>None,
                     };
-                    let (cmd, _operator_claim, plumbing_origin, launch_revision, queued_generation) = match cmd {
-                        TelemetryCommand::QueuedOperator { recovery_origin, launch_revision, generation, command, plumbing_origin } => {
+                    // An admitted Launch press holds station mode changes until
+                    // this iteration is done with it (sent or refused) or, held
+                    // behind the loadcell zero, until the held send finishes.
+                    let (cmd, _operator_claim, plumbing_origin, launch_revision, queued_generation, launch_hold) = match cmd {
+                        TelemetryCommand::QueuedOperator { recovery_origin, launch_revision, generation, command, plumbing_origin, launch_hold } => {
                             if command.automatic_generation().is_some() || matches!(*command, TelemetryCommand::QueuedOperator { .. }) { continue; }
                             let Some(claim) = crate::gse::claim_manual_dispatch(&state, generation, recovery_origin) else { continue; };
-                            (*command, Some(claim), plumbing_origin, launch_revision, Some(generation))
+                            (*command, Some(claim), plumbing_origin, launch_revision, Some(generation), launch_hold)
                         }
-                        command => (command, None, None, None, None),
+                        command => (command, None, None, None, None, None),
                     };
                     let sealed_phase=matches!(cmd,TelemetryCommand::OperatorPhase{..});
                     let cmd = if let TelemetryCommand::OperatorPhase { mut intent } = cmd {
@@ -1007,6 +1022,7 @@ pub async fn telemetry_task(
                             }
                         TelemetryCommand::Abort => {
                                 state.clear_launch_sequence_command_pending();
+                                state.launch_mode_gate.clear_sent();
                                 let queued = if automatic_abort {
                                     crate::gse::queue_automatic_abort_for_generation(&state, &router,
                                         automatic_generation.expect("automatic abort has generation"),
@@ -1205,6 +1221,7 @@ pub async fn telemetry_task(
                                 if hold_launch_for_loadcell_zero(&state, &router, HeldLaunch {
                                     command: TelemetryCommand::Launch, launch_revision, recovery_origin, queued_generation,
                                     pressed: crate::gse::LaunchAdmission::capture(&state),
+                                    _launch_hold: launch_hold.clone(),
                                 }) { continue; }
                                 if crate::runtime_mode::is_test_fire() {
                                     handle_local_ground_station_launch_command(state.clone(), router.clone(),launch_revision).await;
@@ -1216,6 +1233,7 @@ pub async fn telemetry_task(
                                 if hold_launch_for_loadcell_zero(&state, &router, HeldLaunch {
                                     command: TelemetryCommand::GroundStationLaunch, launch_revision, recovery_origin, queued_generation,
                                     pressed: crate::gse::LaunchAdmission::capture(&state),
+                                    _launch_hold: launch_hold.clone(),
                                 }) { continue; }
                                 handle_local_ground_station_launch_command(state.clone(), router.clone(),launch_revision).await;
                             }
@@ -5421,6 +5439,7 @@ mod tests {
             // Match authenticated ingress: relative state commands retain the
             // original guard revision and dispatch generation in the queue.
             let queued = TelemetryCommand::QueuedOperator {
+            launch_hold: None,
             recovery_origin: None,
                 generation: crate::gse::automatic_generation(&state),
                 launch_revision: crate::board_abort::capture_launch_revision_named(
@@ -5512,6 +5531,7 @@ mod tests {
         state
             .cmd_tx
             .send(TelemetryCommand::QueuedOperator {
+            launch_hold: None,
             recovery_origin: None,
                 generation: crate::gse::automatic_generation(&state),
                 launch_revision: crate::board_abort::capture_launch_revision_named(
@@ -5718,6 +5738,7 @@ mod tests {
             state
                 .cmd_tx
                 .send(TelemetryCommand::QueuedOperator {
+            launch_hold: None,
             recovery_origin: None,
                     launch_revision: None,
                     plumbing_origin: None,
@@ -5730,6 +5751,7 @@ mod tests {
         state
             .cmd_tx
             .send(TelemetryCommand::QueuedOperator {
+            launch_hold: None,
             recovery_origin: None,
                 launch_revision: None,
                 plumbing_origin: None,
@@ -5795,6 +5817,7 @@ mod tests {
         state
             .cmd_tx
             .send(TelemetryCommand::QueuedOperator {
+            launch_hold: None,
             recovery_origin: None,
                 launch_revision: None,
                 plumbing_origin: None,
@@ -5932,6 +5955,7 @@ mod tests {
             launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
             launch_clock_tx,
             launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
+            launch_mode_gate: Default::default(),
             launch_indicator_latched: Arc::new(AtomicBool::new(false)),
             abort_indicator_latched: Arc::new(AtomicBool::new(false)),
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),

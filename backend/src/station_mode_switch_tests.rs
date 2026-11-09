@@ -426,6 +426,44 @@ async fn activity_just_before_restart_cancels_it_and_restores_the_selection() {
 }
 
 #[tokio::test]
+async fn launch_admission_and_a_committed_mode_change_exclude_each_other() {
+    use crate::launch_mode_gate::MODE_CHANGE_IN_PROGRESS;
+    let _mode = thread_mode(Mode::Normal);
+    let f = fixture().await;
+    let mut slow = f.switch.config.clone();
+    slow.switch_delay = Duration::from_millis(300);
+    let switch = Arc::new(Switch::new(slow, f.signal.clone()));
+    let f = Fixture { switch, ..f };
+    let target = mode_id(other_mode());
+
+    // A Launch admitted between review and confirmation refuses the switch,
+    // and nothing is saved.
+    let (status, challenge) = f.prepare("administrator", target).await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    let launch = f.state.launch_mode_gate.admit().unwrap();
+    let phrase = challenge["required_confirmation"].as_str().unwrap().to_owned();
+    let (status, body) = f
+        .call("POST", "/api/station-modes/confirm", "administrator", Some(Fixture::confirmation(&challenge, &phrase)))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("Launch"), "{body}");
+    assert!(f.selection().is_none());
+    drop(launch);
+
+    // A committed switch refuses every Launch press until it is done.
+    let (_, challenge) = f.prepare("administrator", target).await;
+    let phrase = challenge["required_confirmation"].as_str().unwrap().to_owned();
+    let (status, body) = f
+        .call("POST", "/api/station-modes/confirm", "administrator", Some(Fixture::confirmation(&challenge, &phrase)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.state.launch_mode_gate.admit().unwrap_err(), MODE_CHANGE_IN_PROGRESS);
+    assert!(wait_for(|| !f.state.launch_mode_gate.mode_change_committed()).await);
+    assert_eq!(f.snapshot("administrator").await["transition"]["state"], "applied");
+    assert!(f.state.launch_mode_gate.admit().is_ok(), "Launch is admitted again after the switch");
+}
+
+#[tokio::test]
 async fn restarted_process_reports_the_saved_transition_as_applied_or_failed() {
     let _mode = thread_mode(Mode::Normal);
     let root = TestDirectory::new();

@@ -695,6 +695,27 @@ impl Switch {
             return Err(Refusal::conflict("The confirmation phrase did not match. Review again."));
         }
         let target = self.admit(principal, state, &request.binding)?;
+        // From here every Launch press is refused until the switch ends, and a
+        // Launch admitted since the check above refuses the switch: Launch
+        // admission and this commit share the launch gate's lock.
+        state
+            .launch_mode_gate
+            .begin_mode_change()
+            .map_err(|busy| Refusal::conflict(format!("Station is not idle: {busy}")))?;
+        let committed = self.commit(principal, state, &ticket, target, &request);
+        if committed.is_err() {
+            state.launch_mode_gate.end_mode_change();
+        }
+        committed
+    }
+    fn commit(
+        self: &Arc<Self>,
+        principal: &AuthPrincipal,
+        state: &Arc<AppState>,
+        ticket: &Ticket,
+        target: Target,
+        request: &Confirmation,
+    ) -> Result<Value, Refusal> {
         let selection = Selection {
             version: 1,
             role: self.config.role().into(),
@@ -785,6 +806,8 @@ impl Switch {
         );
         let mut runtime = self.runtime.lock().unwrap();
         runtime.restarting = false;
+        // Launch presses are admitted again, in whichever mode is now in force.
+        state.launch_mode_gate.end_mode_change();
         match result {
             Ok(token) => {
                 if let Some(transition) = runtime.transition.as_mut() {
@@ -837,6 +860,7 @@ impl Switch {
         };
         let restored = restore_selection(path, previous);
         runtime.restarting = false;
+        state.launch_mode_gate.end_mode_change();
         if let Some(transition) = runtime.transition.as_mut() {
             transition.state = "failed";
             transition.phase = "Restart cancelled; the station stays in its current mode".into();
@@ -927,11 +951,22 @@ pub(crate) fn station_busy(state: &AppState, _rrls: bool) -> Option<String> {
     if state.shutdown_requested.load(Ordering::SeqCst) {
         return Some("the backend is already shutting down".into());
     }
-    if state.launch_sequence_command_pending.load(Ordering::SeqCst) {
-        return Some("a Launch command is pending".into());
+    // An admitted or sent Launch, checked before the clock: the countdown
+    // starts before the sent Launch stops holding (launch_mode_gate).
+    if let Some(reason) = state.launch_mode_gate.launch_hold() {
+        return Some(reason.into());
     }
-    if state.launch_clock_snapshot().kind == crate::telemetry_db::LaunchClockKind::TMinus {
-        return Some("the launch countdown is running".into());
+    // A Launch still waiting for its countdown. A countdown started from the
+    // flight state leaves the flag set; past T-0 it no longer holds the switch.
+    let pending = state.launch_sequence_command_pending.load(Ordering::SeqCst);
+    match state.launch_clock_snapshot().kind {
+        crate::telemetry_db::LaunchClockKind::TMinus => {
+            return Some("the launch countdown is running".into());
+        }
+        crate::telemetry_db::LaunchClockKind::Idle if pending => {
+            return Some(crate::launch_mode_gate::LAUNCH_PENDING.into());
+        }
+        _ => {}
     }
     if crate::gse::turbocharge_active_nowait(state) {
         return Some("turbocharge is running or its state is busy".into());

@@ -102,6 +102,9 @@ pub enum TelemetryCommand {
         launch_revision: Option<u64>,
         command: Box<TelemetryCommand>,
         plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+        /// An admitted Launch press: holds station mode changes until the
+        /// worker is done with it or the queued command is discarded.
+        launch_hold: Option<crate::launch_mode_gate::LaunchHold>,
     },
     #[serde(skip)]
     AutomaticNitrogenClose {

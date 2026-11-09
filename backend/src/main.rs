@@ -60,6 +60,7 @@ mod i18n;
 mod launch_analytics;
 mod launch_clock_sync;
 mod launch_history;
+mod launch_mode_gate;
 mod layout;
 mod kg50_input_sync;
 mod loadcell;
@@ -1494,6 +1495,7 @@ async fn main() -> anyhow::Result<()> {
         launch_clock: Arc::new(Mutex::new(restored_clock)),
         launch_clock_tx,
         launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
+        launch_mode_gate: Default::default(),
         launch_indicator_latched: Arc::new(AtomicBool::new(false)),
         abort_indicator_latched: Arc::new(AtomicBool::new(false)),
         hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),

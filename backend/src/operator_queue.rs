@@ -396,6 +396,7 @@ mod tests {
         let (db_tx, db_rx) = mpsc::channel(8);
         let token = close(&state);
         tx.try_send(TelemetryCommand::QueuedOperator {
+            launch_hold: None,
             recovery_origin: None,
             launch_revision: None,
             generation: token.generation,
@@ -427,6 +428,7 @@ mod tests {
             .store(token.generation + 1, Ordering::Release);
         state.operator_admission_barrier.store(0, Ordering::Release);
         tx.send(TelemetryCommand::QueuedOperator {
+            launch_hold: None,
             recovery_origin: None,
             launch_revision: None,
             generation: token.generation,
@@ -436,6 +438,7 @@ mod tests {
         .await
         .unwrap();
         tx.send(TelemetryCommand::QueuedOperator {
+            launch_hold: None,
             recovery_origin: None,
             launch_revision: None,
             generation: token.generation + 1,

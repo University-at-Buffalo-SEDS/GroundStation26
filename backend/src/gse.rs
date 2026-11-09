@@ -5838,6 +5838,7 @@ pub(crate) fn commit_local_manual_stop(
         let mut current = state.state.lock().unwrap();
         *current = FlightState::Aborted;
         state.clear_launch_sequence_command_pending();
+        state.launch_mode_gate.clear_sent();
         state.set_abort_indicator_latched(true);
     }).is_some()
 }
@@ -5848,6 +5849,7 @@ pub(crate) fn accept_observed_abort(state: &AppState, automatic: bool, generatio
         return false;
     }
     state.clear_launch_sequence_command_pending();
+    state.launch_mode_gate.clear_sent();
     state.set_abort_indicator_latched(true);
     true
 }
@@ -5885,6 +5887,7 @@ mod recovery_generation_tests {
                 crate::telemetry_task::command_at_dispatch(
                     &state,
                     crate::types::TelemetryCommand::QueuedOperator {
+            launch_hold: None,
             recovery_origin: None,
                         launch_revision: None,
                         plumbing_origin: None,
@@ -6033,6 +6036,7 @@ mod final_launch_admission_tests {
         let generation = automatic_generation(&state);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         tx.send(TelemetryCommand::QueuedOperator {
+            launch_hold: None,
             recovery_origin: None,
             generation,
             command: Box::new(TelemetryCommand::Launch),
@@ -6086,6 +6090,7 @@ mod final_launch_admission_tests {
         let generation = automatic_generation(&state);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         tx.send(TelemetryCommand::QueuedOperator {
+            launch_hold: None,
             recovery_origin: None,
             generation,
             command: Box::new(TelemetryCommand::Launch),
@@ -6769,6 +6774,7 @@ mod recovery_quiescence_tests {
             .unwrap();
         commands
             .try_send(TelemetryCommand::QueuedOperator {
+            launch_hold: None,
             recovery_origin: None,
                 launch_revision: None,
                 generation: old + 1,

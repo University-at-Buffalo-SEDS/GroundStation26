@@ -6004,6 +6004,7 @@ mod tests {
         state
             .cmd_tx
             .send(crate::types::TelemetryCommand::QueuedOperator {
+            launch_hold: None,
             recovery_origin: None,
                 launch_revision: None,
                 generation: crate::gse::automatic_generation(&state),

@@ -2565,6 +2565,22 @@ fn command_disabled_message(state:&AppState,command:&TelemetryCommand)->String {
     reason.map_or_else(||format!("{name} is unavailable under the current GroundStation policy. Check its control details."),|reason|format!("{name}: {reason}"))
 }
 
+/// Admits a Launch press against station mode changes: the returned hold
+/// travels with the queued command, and a committed mode change refuses it.
+fn admit_launch_press(
+    state: &AppState,
+    cmd: &TelemetryCommand,
+) -> Result<Option<crate::launch_mode_gate::LaunchHold>, String> {
+    if !matches!(cmd, TelemetryCommand::Launch | TelemetryCommand::GroundStationLaunch) {
+        return Ok(None);
+    }
+    state
+        .launch_mode_gate
+        .admit()
+        .map(Some)
+        .map_err(|reason| format!("{}: {reason}", command_name(cmd)))
+}
+
 /// Why a Launch press must be refused at once, matching the action policy's
 /// launch-journal and turbocharge reasons. The send path checks these again.
 fn launch_press_block(state: &AppState, cmd: &TelemetryCommand) -> Option<&'static str> {
@@ -2868,6 +2884,15 @@ async fn dispatch_command_inner(
     } else {
         None
     };
+    // From here a Launch holds station mode changes, and a committed mode
+    // change refuses it (one lock; see launch_mode_gate).
+    let launch_hold = match admit_launch_press(&state, &cmd) {
+        Ok(hold) => hold,
+        Err(message) => {
+            emit_notification_warning(&state, &message);
+            return (StatusCode::CONFLICT, message);
+        }
+    };
     let now_ms = software_command_clock_ms();
     let mut admission_rejection=None;
     let duplicate = match crate::gse::record_operator_command_with_recovery_origin_diagnostic(
@@ -2977,6 +3002,7 @@ async fn dispatch_command_inner(
     }
     if let Some(permit) = permit {
         permit.send(TelemetryCommand::QueuedOperator {
+            launch_hold,
             recovery_origin,
             launch_revision,
             plumbing_origin,
@@ -2988,6 +3014,7 @@ async fn dispatch_command_inner(
     if state
         .cmd_tx
         .send(TelemetryCommand::QueuedOperator {
+            launch_hold,
             recovery_origin,
             launch_revision,
             plumbing_origin,
@@ -5910,6 +5937,13 @@ pub(crate) async fn handle_ws_control_text_with_source(
                 emit_notification_warning(&state_for_recv,command_disabled_message(&state_for_recv,&cmd.cmd));
                 return;
             }
+            let launch_hold = match admit_launch_press(&state_for_recv, &cmd.cmd) {
+                Ok(hold) => hold,
+                Err(message) => {
+                    emit_notification_warning(&state_for_recv, message);
+                    return;
+                }
+            };
             let now_ms = software_command_clock_ms();
             let mut admission_rejection=None;
             match crate::gse::record_operator_command_with_recovery_origin_diagnostic(
@@ -6016,7 +6050,8 @@ pub(crate) async fn handle_ws_control_text_with_source(
             );
             if let Err(e) = cmd_tx
                 .send(TelemetryCommand::QueuedOperator {
-            recovery_origin,
+                    launch_hold,
+                    recovery_origin,
                     launch_revision,
                     plumbing_origin,
                     generation: admission_generation,

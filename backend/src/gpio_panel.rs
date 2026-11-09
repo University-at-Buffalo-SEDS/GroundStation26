@@ -206,14 +206,27 @@ fn setup_callbacks(
             TelemetryCommand::Launch
         };
 
-        if queue_gpio_command(
-            &tx_launch,
-            generation,
-            None,
-            launch_revision,
-            launch_command,
-        )
-        .is_err()
+        // The press holds station mode changes from here (launch_mode_gate).
+        let launch_hold = match state_launch.launch_mode_gate.admit() {
+            Ok(hold) => hold,
+            Err(reason) => {
+                emit_notification_warning(
+                    &state_launch,
+                    format!("Ignored launch button press: {reason}"),
+                );
+                return;
+            }
+        };
+        if tx_launch
+            .try_send(TelemetryCommand::QueuedOperator {
+                launch_hold: Some(launch_hold),
+                recovery_origin: None,
+                launch_revision,
+                plumbing_origin: None,
+                generation,
+                command: Box::new(launch_command),
+            })
+            .is_err()
         {
             eprintln!("GPIO launch button: failed to send command");
         }
@@ -421,7 +434,8 @@ fn queue_gpio_command(
     command: TelemetryCommand,
 ) -> Result<(), mpsc::error::TrySendError<TelemetryCommand>> {
     tx.try_send(TelemetryCommand::QueuedOperator {
-            recovery_origin: None,
+        launch_hold: None,
+        recovery_origin: None,
         launch_revision,
         plumbing_origin,
         generation,

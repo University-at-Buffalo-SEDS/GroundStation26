@@ -346,6 +346,10 @@ pub struct AppState {
     /// the valve board confirms that its sequence started.
     pub launch_sequence_command_pending: Arc<AtomicBool>,
 
+    /// Launch admission and station mode changes, under one lock: a Launch
+    /// holds mode changes from admission until its countdown starts.
+    pub launch_mode_gate: Arc<crate::launch_mode_gate::LaunchModeGate>,
+
     /// True after a successful launch initiation until explicitly reset or process restart.
     pub launch_indicator_latched: Arc<AtomicBool>,
 
@@ -628,6 +632,11 @@ impl AppState {
         }
         *current = next.clone();
         drop(current);
+        if next.kind != LaunchClockKind::Idle {
+            // The countdown holds mode changes from here; the sent Launch,
+            // checked before the clock, no longer needs to.
+            self.launch_mode_gate.clear_sent();
+        }
         self.publish_daq_launch_clock(&next, claim);
         let _ = self.launch_clock_tx.send(next);
     }
@@ -672,6 +681,7 @@ impl AppState {
             .clock
         };
         self.clear_launch_sequence_command_pending();
+        self.launch_mode_gate.clear_sent();
         *current = next.clone();
         drop(current);
         // A T-clock reset (also part of Reset all boards) starts a new flight.
@@ -4416,6 +4426,7 @@ pub(crate) mod tests {
             launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
             launch_clock_tx,
             launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
+            launch_mode_gate: Default::default(),
             launch_indicator_latched: Arc::new(AtomicBool::new(false)),
             abort_indicator_latched: Arc::new(AtomicBool::new(false)),
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),

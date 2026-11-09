@@ -33,15 +33,23 @@ fn install(state: &Arc<AppState>, hook: impl FnOnce(&AppState) + Send + 'static)
     *BEFORE_SEND.lock().unwrap() = Some((Arc::as_ptr(state) as usize, Box::new(hook)));
 }
 
-struct Rig {
-    state: Arc<AppState>,
-    router: Arc<Router>,
+pub(super) struct Rig {
+    pub(super) state: Arc<AppState>,
+    pub(super) router: Arc<Router>,
     _peers: crate::ignition_pair::fixture::Peers,
 }
 
 /// The same armed fixtures the existing Launch suites use in each build.
 async fn rig(before_launch: bool) -> Rig {
-    let state = crate::state::tests::test_app_state().await;
+    rig_with(before_launch, None).await
+}
+
+/// `rig`, with the command queue replaced so a test can see what is queued.
+pub(super) async fn rig_with(before_launch: bool, commands: Option<mpsc::Sender<TelemetryCommand>>) -> Rig {
+    let mut state = crate::state::tests::test_app_state().await;
+    if let Some(commands) = commands {
+        Arc::get_mut(&mut state).unwrap().cmd_tx = commands;
+    }
     let (router, peers) = if crate::runtime_mode::is_test_fire() {
         let router = Arc::new(Router::new(
             sedsnet::router::RouterConfig::new([crate::ignition_pair::fixture::handler(&state, |_| Ok(()))])
@@ -103,12 +111,13 @@ fn press(rig: &Rig) -> bool {
             recovery_origin: None,
             queued_generation: Some(crate::gse::automatic_generation(&rig.state)),
             pressed: crate::gse::LaunchAdmission::capture(&rig.state),
+            _launch_hold: None,
         },
     )
 }
 
 /// The worker's immediate (setting off) Launch path in this build.
-async fn immediate(rig: &Rig) {
+pub(super) async fn immediate(rig: &Rig) {
     let revision = crate::board_abort::capture_launch_revision_named(&rig.state, "Launch");
     if crate::runtime_mode::is_test_fire() {
         handle_local_ground_station_launch_command(rig.state.clone(), rig.router.clone(), revision).await;
