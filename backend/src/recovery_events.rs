@@ -56,15 +56,28 @@ pub fn parse_fc_message(text: &str) -> Option<(Deployment, f64)> {
     value.is_finite().then_some((kind, value))
 }
 
-/// Flight-state edges that the FC takes right after firing a deployment.
-pub fn deployment_for_transition(previous: FlightState, next: FlightState) -> Option<Deployment> {
-    match (previous, next) {
-        (FlightState::Apogee | FlightState::Coast | FlightState::Ascent, FlightState::Descent) => {
-            Some(Deployment::Drogue)
-        }
-        (FlightState::Descent, FlightState::Reefing) => Some(Deployment::Main),
-        _ => None,
+/// Deployments implied by an accepted FC flight-state change. The FC fires
+/// the drogue right before entering Descent and the main right before
+/// Reefing, so any in-flight change that crosses one of those states implies
+/// that deployment. Crossing (not only the adjacent edge) matters because the
+/// GS can miss intermediate reports in flight: Apogee -> Reefing still means
+/// both parachutes deployed.
+pub fn deployments_for_transition(previous: FlightState, next: FlightState) -> Vec<Deployment> {
+    let (prev, next) = (previous as u8, next as u8);
+    let in_flight = |s: u8| (FlightState::Launch as u8..=FlightState::Recovery as u8).contains(&s);
+    if !in_flight(prev) || !in_flight(next) || next <= prev {
+        return Vec::new();
     }
+    let mut out = Vec::new();
+    for (kind, edge) in [
+        (Deployment::Drogue, FlightState::Descent as u8),
+        (Deployment::Main, FlightState::Reefing as u8),
+    ] {
+        if prev < edge && next >= edge {
+            out.push(kind);
+        }
+    }
+    out
 }
 
 /// One notification per deployment per launch cycle, per station state (a
@@ -174,8 +187,10 @@ pub fn observe_fc_state(
         rearm_for_new_cycle(state);
         return None;
     }
-    let kind = deployment_for_transition(previous, next)?;
-    notify(state, kind, Evidence::State { altitude_m: None }, event_ms)
+    deployments_for_transition(previous, next)
+        .into_iter()
+        .filter_map(|kind| notify(state, kind, Evidence::State { altitude_m: None }, event_ms))
+        .last()
 }
 
 #[cfg(test)]
@@ -207,20 +222,41 @@ mod tests {
                     crate::types::u8_to_flight_state(a).unwrap(),
                     crate::types::u8_to_flight_state(b).unwrap(),
                 );
-                if let Some(kind) = deployment_for_transition(a, b) {
+                for kind in deployments_for_transition(a, b) {
                     hits.push((a, b, kind));
                 }
             }
         }
-        assert_eq!(
-            hits,
-            vec![
-                (S::Ascent, S::Descent, Deployment::Drogue),
-                (S::Coast, S::Descent, Deployment::Drogue),
-                (S::Apogee, S::Descent, Deployment::Drogue),
-                (S::Descent, S::Reefing, Deployment::Main),
-            ]
-        );
+        // Every adjacent edge the FC takes after firing is still mapped.
+        for edge in [
+            (S::Ascent, S::Descent, Deployment::Drogue),
+            (S::Coast, S::Descent, Deployment::Drogue),
+            (S::Apogee, S::Descent, Deployment::Drogue),
+            (S::Descent, S::Reefing, Deployment::Main),
+        ] {
+            assert!(hits.contains(&edge), "{edge:?}");
+        }
+        // Missed intermediate reports still imply what was crossed.
+        assert_eq!(deployments_for_transition(S::Apogee, S::Reefing), vec![Deployment::Drogue, Deployment::Main]);
+        assert_eq!(deployments_for_transition(S::Launch, S::Landed), vec![Deployment::Drogue, Deployment::Main]);
+        assert_eq!(deployments_for_transition(S::Descent, S::Landed), vec![Deployment::Main]);
+        // Never from prelaunch, Aborted, backwards or within one stage.
+        assert!(deployments_for_transition(S::Armed, S::Reefing).is_empty());
+        assert!(deployments_for_transition(S::Aborted, S::Landed).is_empty());
+        assert!(deployments_for_transition(S::Reefing, S::Descent).is_empty());
+        assert!(deployments_for_transition(S::Ascent, S::Apogee).is_empty());
+        assert!(deployments_for_transition(S::Landed, S::Recovery).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missed_descent_report_still_raises_both_notifications_once() {
+        let state = crate::state::tests::test_app_state().await;
+        let text = observe_fc_state(&state, FlightState::Apogee, FlightState::Reefing, 5_000).unwrap();
+        assert!(text.starts_with("Main parachute deployed at"));
+        let history = state.notifications_snapshot();
+        assert!(history.iter().any(|n| n.message.starts_with("Drogue parachute deployed at") && n.persistent));
+        assert!(observe_fc_state(&state, FlightState::Reefing, FlightState::Landed, 6_000).is_none());
+        rearm_for_new_cycle(&state);
     }
 
     #[test]
