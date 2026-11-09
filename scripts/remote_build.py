@@ -331,7 +331,13 @@ def _workspace(local: Path) -> str:
     return f"ws/{name}"
 
 
-def _container(remote: Remote, tag: str, workdir: str, command: str, env: dict[str, str]) -> None:
+def _container(remote: Remote, tag: str, mounts: dict[str, Path], workdir: Path, command: str,
+               env: dict[str, str]) -> None:
+    """Run `command` with each remote workspace mounted at its local path.
+
+    The station resolves config, layout, users and calibration through
+    env!("CARGO_MANIFEST_DIR"), so the binary must be compiled at the same
+    absolute path it runs from on the station, as a local build would be."""
     variables = {
         "HOME": "/build/home",
         "CARGO_HOME": "/build/cargo-home",
@@ -340,10 +346,12 @@ def _container(remote: Remote, tag: str, workdir: str, command: str, env: dict[s
         **env,
     }
     flags = " ".join(f"-e {shlex.quote(f'{k}={v}')}" for k, v in variables.items())
+    volumes = " ".join(f"-v \"{REMOTE_ROOT_ABS}/{workspace}\":{shlex.quote(str(local))}"
+                       for workspace, local in mounts.items())
     name = f"gsrb-{secrets.token_hex(6)}"
     remote.run(f"mkdir -p {REMOTE_ROOT}/home {REMOTE_ROOT}/cargo-home && "
                f"docker run --rm --init --name {name} --user \"$(id -u):$(id -g)\" {flags} "
-               f"-v \"{REMOTE_ROOT_ABS}\":/build -w {shlex.quote('/build/' + workdir)} {tag} "
+               f"-v \"{REMOTE_ROOT_ABS}\":/build {volumes} -w {shlex.quote(str(workdir))} {tag} "
                f"bash -c {shlex.quote(command)}",
                command, container=name)
 
@@ -374,20 +382,24 @@ def build_backend(repo_root: Path, features: list[str], debug: bool) -> None:
     remote = Remote(requested() or "")
     try:
         tag = _image(remote)
+        repo_root = repo_root.resolve()
         workspace = _workspace(repo_root)
         remote.push(repo_root, f"{REMOTE_ROOT}/{workspace}")
         env = dict(CROSS_ENV)
+        mounts = {workspace: repo_root}
         frontend = os.environ.get("GS_FRONTEND_SOURCE_DIR")
         if frontend:
-            frontend_workspace = _workspace(Path(frontend))
-            remote.push(Path(frontend), f"{REMOTE_ROOT}/{frontend_workspace}")
-            env["GS_FRONTEND_SOURCE_DIR"] = f"/build/{frontend_workspace}"
+            frontend_path = Path(frontend).resolve()
+            frontend_workspace = _workspace(frontend_path)
+            remote.push(frontend_path, f"{REMOTE_ROOT}/{frontend_workspace}")
+            mounts[frontend_workspace] = frontend_path
+            env["GS_FRONTEND_SOURCE_DIR"] = str(frontend_path)
         cargo = ["cargo", "build", "-p", "groundstation_backend", "--target", TARGET]
         if not debug:
             cargo.insert(2, "--release")
         for feature in features:
             cargo += ["--features", feature]
-        _container(remote, tag, f"{workspace}/backend", " ".join(shlex.quote(p) for p in cargo), env)
+        _container(remote, tag, mounts, repo_root / "backend", " ".join(shlex.quote(p) for p in cargo), env)
         profile = "debug" if debug else "release"
         target_dir = Path(os.environ.get("CARGO_TARGET_DIR") or repo_root / "target")
         local = target_dir / profile / "groundstation_backend"
@@ -407,13 +419,14 @@ def build_frontend(checkout: Path, script: Path, args: list[str]) -> None:
     remote = Remote(requested() or "")
     try:
         tag = _image(remote)
+        checkout = checkout.resolve()
         workspace = _workspace(checkout)
         remote.push(checkout, f"{REMOTE_ROOT}/{workspace}")
-        relative = script.resolve().parent.relative_to(checkout.resolve())
+        relative = script.resolve().parent.relative_to(checkout)
         workdir = f"{workspace}/{relative}" if str(relative) != "." else workspace
         remote_args = [arg for arg in args if not arg.startswith("log=")]
         command = " ".join(shlex.quote(p) for p in ["python3", script.name, *remote_args])
-        _container(remote, tag, workdir, command, {})
+        _container(remote, tag, {workspace: checkout}, script.resolve().parent, command, {})
         # Only the published output: the local wrapper keeps its own state in
         # dist/ (the prior output it set aside), which a mirror of the remote
         # dist/ would delete.
