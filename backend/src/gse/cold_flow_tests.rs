@@ -916,6 +916,47 @@ pub(super) fn before_packet_admission(state: &AppState, packet: &sedsnet::packet
     }
 }
 
+/// The operator's Cancel found the SDK core held: nothing was decided, so the
+/// same Cancel is admitted once the router pass ends instead of refused.
+#[tokio::test]
+async fn cold_flow_cancel_waits_out_a_held_sdk_core() {
+    const NAME: &str = "gse::cold_flow::tests::cold_flow_cancel_waits_out_a_held_sdk_core";
+    const CHILD: &str = "GS_COLD_FLOW_WAIT_CORE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1").env("GS_RRLS_ROLE", "off").env("GS_SIM_MODE", "0")
+            .env_remove("GS_SIM_CLOCK_FILE")
+            .output().unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success() && text.contains("1 passed"), "{text}");
+        return;
+    }
+    let mut f = Fixture::configured(true).await;
+    let key = f.start().await;
+    f.hold();
+    let pause = super::super::nonwaiting_admission_tests::Pause::install(&f.state);
+    let router = f.state.topology_router.get().unwrap().clone();
+    let seed = sedsnet::packet::Packet::new(crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+        &[crate::telemetry_schema::endpoint("GROUND_STATION")], "GS", 100, Arc::from([0u8])).unwrap();
+    let held = std::thread::Builder::new().name("production-sdk-core-holder".into())
+        .spawn(move || router.seed_managed_variable(seed)).unwrap();
+    pause.core_entered.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    let busy = perform(&f.state, &key, LaunchAdmission::capture(&f.state), Request::Cancel);
+    assert_eq!(busy, Err(ADMISSION_BUSY), "a held core is a busy refusal, never a final one");
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        pause.release();
+        let result = held.join().unwrap();
+        drop(pause);
+        result
+    });
+    perform_waiting_out_core(&f.state, &key, LaunchAdmission::capture(&f.state), Request::Cancel)
+        .await
+        .expect("the same Cancel is admitted once the core is free");
+    assert!(release.join().unwrap().is_ok());
+    assert!(matches!(f.phase(), ColdPhase::CancelClosing | ColdPhase::CancelRelieving | ColdPhase::Cancelled));
+}
 #[tokio::test]
 async fn actual_cold_flow_held_core_preserves_run_packet_and_stop_revokes() {
     const NAME: &str = "gse::cold_flow::tests::actual_cold_flow_held_core_preserves_run_packet_and_stop_revokes";

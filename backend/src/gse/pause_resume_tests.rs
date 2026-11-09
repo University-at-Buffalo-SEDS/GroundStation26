@@ -28,6 +28,13 @@ impl Drop for Plant {
 impl Plant {
     async fn new() -> Self {
         let (state, sent, peer) = button_test_state().await;
+        Self::from_station(state, sent, peer)
+    }
+    async fn holdable() -> (Self, crate::core_busy::hold::Holdable) {
+        let (state, sent, peer, core) = super::tests::button_test_state_holdable().await;
+        (Self::from_station(state, sent, peer), core)
+    }
+    fn from_station(state: Arc<AppState>, sent: TestCommands, peer: Arc<sedsnet::router::Router>) -> Self {
         let path = std::env::temp_dir().join(format!("gse-pause-{}.json", rand::random::<u128>()));
         let plant = Self {
             state,
@@ -298,6 +305,32 @@ async fn routed_self_test_nitrogen_and_fill_pause_resume_then_complete() {
     assert!(progress::controls(&plant.state).is_none(), "completed fill leaves no live run");
 }
 
+/// A held SDK core is not undelivered commands: the operator's Resume waits
+/// out the router pass instead of being refused as delivery-pending.
+#[tokio::test]
+async fn resume_waits_out_a_held_sdk_core() {
+    let (mut plant, core) = Plant::holdable().await;
+    assert!(handle_command(&plant.state, &TelemetryCommand::ValveSelfTest));
+    plant.until(|rt| rt.engine.status.phase == Phase::SelfHold && rt.engine.progress_observation(rt.input(true, true)).self_index == 2);
+    plant.pause();
+    assert!(plant.controls().resume.allowed);
+    let key = plant.key();
+    let held = core.hold();
+    assert_eq!(
+        resume_test_under_dispatch(&plant.state),
+        Err(ROUTER_CORE_BUSY.to_string()),
+        "a held core is not a pending delivery"
+    );
+    assert_eq!(plant.phase(), Phase::Paused);
+    let release = held.release_after(std::time::Duration::from_millis(60));
+    let kind = plant.state.gse.lock().unwrap().progress.current().map(|s| s.kind);
+    progress::resume_waiting_out_core(&plant.state, &key, LaunchAdmission::capture(&plant.state), kind)
+        .await
+        .expect("the same Resume is admitted once the core is free");
+    release.join().unwrap();
+    let resumed = plant.until(|rt| rt.engine.status.phase == Phase::Idle);
+    assert!(resumed.contains(&(2, false)), "the interrupted dump valve is re-tested");
+}
 #[tokio::test]
 async fn routed_test_cancel_from_pause_relieves_and_ends_the_run() {
     let mut plant = Plant::new().await;

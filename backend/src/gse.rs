@@ -1422,7 +1422,9 @@ fn handle_command_inner(
         let policy = state.action_policy_snapshot();
         let nitrous_target = state.fill_targets_snapshot().nitrous.target_pressure_psi;
         let progress_mass_target=state.fill_targets_snapshot().nitrous.target_mass_kg;
-        let fill_waits = action == Action::StartFill && fill_resume_awaits_retirement(state);
+        let fill_retirement = if action == Action::StartFill { fill_resume_retirement(state) } else { Ok(false) };
+        let fill_waits = fill_retirement != Ok(false);
+        let fill_waits_busy = fill_retirement.is_err();
         let result = {
             let mut rt = state.gse.lock().unwrap();
             if !crate::runtime_mode::is_hitl() && !operational_action_allowed(&rt, action) {
@@ -1461,7 +1463,8 @@ fn handle_command_inner(
                 && fill_waits
                 && fill_resume_candidate(&rt, input, progress_mass_target)
             {
-                Err(RETIREMENT_PENDING.into())
+                // A held SDK core decided nothing; the operator's Resume retries.
+                Err(if fill_waits_busy { ROUTER_CORE_BUSY } else { RETIREMENT_PENDING }.into())
             } else {
                 let previous_phase = rt.engine.status.phase;
                 let resuming_fill = previous_phase == Phase::Paused
@@ -1585,6 +1588,12 @@ pub(crate) const RETIREMENT_PENDING: &str =
 /// A StartFill that would actually resume a paused fill session (not a 0.2 kg
 /// no-op) must wait for the same SDK command retirement as the modal Resume.
 fn fill_resume_awaits_retirement(state: &AppState) -> bool {
+    // A held SDK core is never retired.
+    fill_resume_retirement(state) != Ok(false)
+}
+/// Probes the SDK only when a StartFill would actually resume a paused fill.
+/// Err while the SDK core was held (nothing decided).
+fn fill_resume_retirement(state: &AppState) -> Result<bool, sedsnet::router::TryPendingTypeError> {
     let target_kg = state.fill_targets_snapshot().nitrous.target_mass_kg;
     let input = {
         let policy = state.action_policy_snapshot();
@@ -1595,8 +1604,10 @@ fn fill_resume_awaits_retirement(state: &AppState) -> bool {
         let input = rt.input(input.0, input.1);
         fill_resume_candidate(&rt, input, target_kg)
     };
-    // Probe the SDK only when a StartFill would actually resume a paused fill.
-    candidate && !commands_retired(state)
+    if !candidate {
+        return Ok(false);
+    }
+    try_commands_retired(state).map(|retired| !retired)
 }
 fn fill_resume_candidate(rt: &Runtime, input: Inputs, target_kg: f32) -> bool {
     rt.engine.status.phase == Phase::Paused
@@ -1612,23 +1623,35 @@ fn fill_resume_candidate(rt: &Runtime, input: Inputs, target_kg: f32) -> bool {
 /// still owned by the command SDK, so none can be transmitted or retried
 /// later and overtake a pause closure. A busy SDK core is never retired.
 pub(super) fn commands_retired(state: &AppState) -> bool {
-    !manual_stop_pending(state)
-        && state.topology_router.get().is_some_and(|router| {
-            ["VALVE_COMMAND", "ACTUATOR_COMMAND"].iter().all(|name| {
-                matches!(
-                    router.try_has_pending_reliable_tx_type(crate::telemetry_schema::data_type(name)),
-                    Ok(false)
-                )
-            })
-        })
+    matches!(try_commands_retired(state), Ok(true))
+}
+/// Err only while another thread holds the SDK core: nothing was decided, so
+/// an operator Resume may check again instead of reporting delivery pending.
+pub(super) fn try_commands_retired(state: &AppState) -> Result<bool, sedsnet::router::TryPendingTypeError> {
+    // Same as `manual_stop_pending`, but a held core is reported, not waited on.
+    if manual_stop_ram_pending(state) {
+        return Ok(false);
+    }
+    let Some(router) = state.topology_router.get() else { return Ok(false); };
+    if crate::abort_retirement::try_has_pending_reliable_tx_type(router, crate::telemetry_schema::data_type("ABORT"))? {
+        return Ok(false);
+    }
+    for name in ["VALVE_COMMAND", "ACTUATOR_COMMAND"] {
+        if router.try_has_pending_reliable_tx_type(crate::telemetry_schema::data_type(name))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 /// Resume the paused valve self-test or nitrogen test. Caller holds DISPATCH
 /// and has validated the run key and ownership epoch.
 pub(super) fn resume_test_under_dispatch(state: &Arc<AppState>) -> Result<(), String> {
     let is_prelaunch = prelaunch(state);
     let policy = state.action_policy_snapshot();
-    if !commands_retired(state) {
-        return Err(RETIREMENT_PENDING.into());
+    match try_commands_retired(state) {
+        Ok(true) => {}
+        Ok(false) => return Err(RETIREMENT_PENDING.into()),
+        Err(_) => return Err(ROUTER_CORE_BUSY.into()),
     }
     let effects = {
         let mut rt = state.gse.lock().unwrap();
@@ -2660,6 +2683,36 @@ mod tests {
         }
     }
 
+    /// A held SDK core is not a pending Abort: Clear GSE abort waits out the
+    /// router pass instead of refusing the operator.
+    #[tokio::test]
+    async fn clear_abort_waits_out_a_held_sdk_core() {
+        crate::mode_suite!(Normal);
+        let state = crate::state::tests::test_app_state().await;
+        let (router, core) = crate::core_busy::hold::router(
+            sedsnet::router::RouterConfig::new([]).with_sender("GS"),
+        );
+        crate::telemetry_task::refresh_host_network_time(
+            &router,
+            crate::telemetry_task::get_current_timestamp_ms(),
+        );
+        state.topology_router.set(router).unwrap();
+        *state.state.lock().unwrap() = FlightState::Aborted;
+        let path = std::env::temp_dir().join(format!("gs-clear-abort-busy-{}.json", rand::random::<u64>()));
+        state.gse.lock().unwrap().operational.path = Some(path.clone());
+        let held = core.hold();
+        assert_eq!(
+            clear_ground_abort(&state),
+            Err((StatusCode::SERVICE_UNAVAILABLE, ROUTER_CORE_BUSY.to_string())),
+            "a held core decides nothing; it is never a pending Abort"
+        );
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Aborted);
+        let release = held.release_after(std::time::Duration::from_millis(60));
+        clear_ground_abort_waiting_out_core(&state).await.unwrap();
+        release.join().unwrap();
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
+        let _ = std::fs::remove_file(path);
+    }
     #[tokio::test]
     async fn clear_abort_without_network_time_preserves_latched_state() {
         let state = crate::state::tests::test_app_state().await;
@@ -2692,6 +2745,24 @@ mod tests {
     pub(super) async fn button_test_state_observed(
         observer: Option<FillRecordingTestObserver>,
     ) -> (Arc<AppState>, TestCommands, Arc<sedsnet::router::Router>) {
+        button_test_state_with(observer, |config| Arc::new(sedsnet::router::Router::new(config))).await
+    }
+    /// The same station, with a host router whose SDK core a test can hold.
+    pub(super) async fn button_test_state_holdable()
+    -> (Arc<AppState>, TestCommands, Arc<sedsnet::router::Router>, crate::core_busy::hold::Holdable) {
+        let mut core = None;
+        let (state, sent, peer) = button_test_state_with(None, |config| {
+            let (router, holdable) = crate::core_busy::hold::router(config);
+            core = Some(holdable);
+            router
+        })
+        .await;
+        (state, sent, peer, core.unwrap())
+    }
+    async fn button_test_state_with(
+        observer: Option<FillRecordingTestObserver>,
+        make_router: impl FnOnce(sedsnet::router::RouterConfig) -> Arc<sedsnet::router::Router>,
+    ) -> (Arc<AppState>, TestCommands, Arc<sedsnet::router::Router>) {
         let state = crate::state::tests::test_app_state().await;
         *state.state.lock().unwrap() = FlightState::Idle;
         let sent: TestCommands = Default::default();
@@ -2718,9 +2789,7 @@ mod tests {
         let peer = Arc::new(sedsnet::router::Router::new(
             sedsnet::router::RouterConfig::new(endpoints).with_sender("GSE_TEST"),
         ));
-        let router = Arc::new(sedsnet::router::Router::new(
-            sedsnet::router::RouterConfig::new([]).with_sender("GS"),
-        ));
+        let router = make_router(sedsnet::router::RouterConfig::new([]).with_sender("GS"));
         crate::telemetry_task::refresh_host_network_time(
             &router,
             crate::telemetry_task::get_current_timestamp_ms(),
@@ -3235,7 +3304,7 @@ pub(crate) fn verified_recovery_host_idle(state: &AppState) -> bool {
 /// drained. Board completion is still verified by the recovery transaction. A
 /// Launch waiting on its Valve Board, or the latch left by an earlier Stop, is
 /// not work: this reset is the way out of both.
-/// Plain-language reason `operator_reset_host_idle` is false, for the operator.
+/// Plain-language reason `try_operator_reset_host_idle` is not Ok(true), for the operator.
 /// Host work that blocks a reset or resync, from RAM owners only: never waits
 /// on the network router, so a recovery in flight can recheck it.
 pub(crate) fn operator_work_block_reason(state: &AppState) -> Option<String> {
@@ -3267,7 +3336,7 @@ pub(crate) fn operator_reset_block_reason(state: &AppState) -> Option<String> {
         match crate::abort_retirement::try_has_pending_reliable_tx_type(router, crate::telemetry_schema::data_type(name)) {
             Ok(false) => {}
             Ok(true) => return Some(format!("A {name} is still waiting for a board acknowledgement; wait for it to finish or time out.")),
-            Err(_) => return Some("The network router is busy; try again in a moment.".into()),
+            Err(_) => return Some(ROUTER_CORE_BUSY.into()),
         }
     }
     None
@@ -3285,15 +3354,22 @@ pub(crate) fn overpressure_holds_abort(state: &AppState) -> bool {
     let now = rt.now();
     rt.overpressure.latched() || rt.overpressure.board_owns(now)
 }
-pub(crate) fn operator_reset_host_idle(state: &AppState) -> bool {
-    operator_reset_host_idle_ram(state)
-        // Recovery status is a read-only poll: never wait behind the SDK owner.
-        // Busy means not yet eligible for Reset, never a manual-command veto.
-        && state.topology_router.get().is_some_and(|router| {
-            ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND"]
-                .iter().all(|name| matches!(crate::abort_retirement::try_has_pending_reliable_tx_type(
-                    router, crate::telemetry_schema::data_type(name)), Ok(false)))
-        })
+/// Never waits behind the SDK owner. Err only while another thread holds the
+/// SDK core, so nothing was decided; never a manual-command veto.
+pub(crate) fn try_operator_reset_host_idle(
+    state: &AppState,
+) -> Result<bool, sedsnet::router::TryPendingTypeError> {
+    if !operator_reset_host_idle_ram(state) {
+        return Ok(false);
+    }
+    let Some(router) = state.topology_router.get() else { return Ok(false); };
+    for name in ["ABORT", "VALVE_COMMAND", "ACTUATOR_COMMAND", "FLIGHT_COMMAND"] {
+        if crate::abort_retirement::try_has_pending_reliable_tx_type(
+            router, crate::telemetry_schema::data_type(name))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 /// Host work owners only (RAM), without the router's in-flight commands.
 pub(crate) fn operator_reset_host_idle_ram(state: &AppState) -> bool {
@@ -3360,19 +3436,46 @@ static DELIVERY_FIRST_SEEN: std::sync::Mutex<Option<std::collections::HashMap<(u
 /// delivery window: outstanding less than UNDELIVERABLE_AFTER, judged both by
 /// when the station first saw them pending and by their retry count, and not
 /// waiting behind a predecessor. Returns their packet ids.
+#[cfg(test)]
 pub(crate) fn commands_still_in_delivery(router: &sedsnet::router::Router, kinds: &[sedsnet::config::DataType]) -> Vec<u64> {
+    // A held SDK core counts as still queued: never report delivery done.
+    delivery_ids(router, kinds, true).unwrap_or_default()
+}
+/// Same as [`commands_still_in_delivery`], except that a held SDK core is
+/// reported as such instead of being counted as a queued command.
+pub(crate) fn try_commands_still_in_delivery(
+    router: &sedsnet::router::Router,
+    kinds: &[sedsnet::config::DataType],
+) -> Result<Vec<u64>, sedsnet::router::TryPendingTypeError> {
+    delivery_ids(router, kinds, false)
+}
+fn delivery_ids(
+    router: &sedsnet::router::Router,
+    kinds: &[sedsnet::config::DataType],
+    busy_is_queued: bool,
+) -> Result<Vec<u64>, sedsnet::router::TryPendingTypeError> {
+    // Sample the nonwaiting pending check first, so a held core is reported
+    // before the stats export below waits for that core.
+    let mut pending = Vec::with_capacity(kinds.len());
+    for kind in kinds {
+        pending.push(match router.try_has_pending_reliable_tx_type(*kind) {
+            Ok(pending) => pending,
+            Err(_) if busy_is_queued => true,
+            Err(busy) => return Err(busy),
+        });
+    }
     let rows = router.export_reliable_pending_stats();
     let now = std::time::Instant::now();
     let window = crate::sim_freshness::wall(UNDELIVERABLE_AFTER);
     let retry_ms = u64::from(sedsnet::config::runtime_tuning_config().reliable_retransmit_ms.max(1));
-    let mut seen = DELIVERY_FIRST_SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let seen = seen.get_or_insert_with(Default::default);
     // Pending in the SDK but not yet a tracked delivery (still queued, or no
     // advertised destination yet): tracked per type under a synthetic key.
-    let queued = kinds.iter().filter(|kind| !rows.iter().any(|row| row.data_type == **kind)
-        && router.try_has_pending_reliable_tx_type(**kind).unwrap_or(true))
-        .map(|kind| (1u64 << 63) | u64::from(kind.as_u32()))
+    let queued = kinds.iter().zip(pending)
+        .filter(|(kind, pending)| *pending && !rows.iter().any(|row| row.data_type == **kind))
+        .map(|(kind, _)| (1u64 << 63) | u64::from(kind.as_u32()))
         .collect::<Vec<_>>();
+    let mut seen = DELIVERY_FIRST_SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let seen = seen.get_or_insert_with(Default::default);
     let owner = router as *const sedsnet::router::Router as usize;
     seen.retain(|(router_id, id), _| *router_id != owner || queued.contains(id) || rows.iter().any(|row| row.packet_id == *id));
     let mut fresh = queued.into_iter()
@@ -3388,7 +3491,7 @@ pub(crate) fn commands_still_in_delivery(router: &sedsnet::router::Router, kinds
                 && u64::from(row.retries).saturating_mul(retry_ms) < window.as_millis() as u64
         })
         .map(|row| row.packet_id));
-    fresh
+    Ok(fresh)
 }
 #[cfg(test)]
 pub(crate) fn age_delivery_tracking_for_test(by: std::time::Duration) {
@@ -3404,13 +3507,20 @@ pub(crate) fn age_delivery_tracking_for_test(by: std::time::Duration) {
 /// so waiting on a frame the network cannot deliver would leave the station
 /// aborted forever.
 /// HITL never holds Clear GSE abort on delivery (unchanged).
-fn clear_blocked_by_abort_delivery(state: &AppState, router: &sedsnet::router::Router) -> bool {
-    !crate::runtime_mode::is_hitl() && abort_delivery_in_progress(state, router)
+/// Err only while another thread holds the SDK core: nothing was decided.
+fn clear_blocked_by_abort_delivery(
+    state: &AppState,
+    router: &sedsnet::router::Router,
+) -> Result<bool, sedsnet::router::TryPendingTypeError> {
+    if crate::runtime_mode::is_hitl() {
+        return Ok(false);
+    }
+    Ok(state.has_pending_umbilical_control_tx()
+        || !try_commands_still_in_delivery(router, &[crate::telemetry_schema::data_type("ABORT")])?.is_empty())
 }
-fn abort_delivery_in_progress(state: &AppState, router: &sedsnet::router::Router) -> bool {
-    state.has_pending_umbilical_control_tx()
-        || !commands_still_in_delivery(router, &[crate::telemetry_schema::data_type("ABORT")]).is_empty()
-}
+/// Refusal for an operator action whose router check found the SDK core
+/// held: nothing was changed, so the same action may be tried again.
+pub(crate) const ROUTER_CORE_BUSY: &str = "The network router is busy; try again in a moment.";
 /// Output work a station mode change would orphan: the switch resets the
 /// sequence engine, so a sequence in progress or cold flow holds it, and each
 /// releases the moment that work ends (the engine leaves its active phases).
@@ -3474,7 +3584,8 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
         StatusCode::SERVICE_UNAVAILABLE,
         "Network is not initialized".into(),
     ))?;
-    if clear_blocked_by_abort_delivery(state, router) {
+    let busy = || (StatusCode::SERVICE_UNAVAILABLE, ROUTER_CORE_BUSY.to_string());
+    if clear_blocked_by_abort_delivery(state, router).map_err(|_| busy())? {
         return Err((
             StatusCode::CONFLICT,
             "Abort delivery is still pending; retry in a few seconds (an Abort that cannot be delivered stops holding this after 5 s)".into(),
@@ -3482,7 +3593,10 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
     }
     // Clearing past an Abort the network could not deliver: that board may
     // still receive it later and abort again. Say so, naming where it is owed.
-    let undelivered_abort = !hitl && router.try_has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT")).unwrap_or(true);
+    let undelivered_abort = !hitl
+        && router
+            .try_has_pending_reliable_tx_type(crate::telemetry_schema::data_type("ABORT"))
+            .map_err(|_| busy())?;
     crate::system_clock::required_control_network_utc_ms(router).map_err(|error| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3568,7 +3682,7 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
 pub(crate) const UNDELIVERED_ABORT_AFTER_CLEAR: &str = "GSE abort cleared while an Abort was still undelivered (most likely to the AV bay over the radio). If that board receives it later, it will abort again and Launch will show it: check that board's link and recover it if it does.";
 
 /// Signed RRLS request at the primary: exactly the local endpoint's checks.
-pub(crate) fn clear_abort_for_proxy(
+pub(crate) async fn clear_abort_for_proxy(
     state: &Arc<AppState>,
     principal: &crate::auth::AuthPrincipal,
     admission_generation: u64,
@@ -3579,10 +3693,19 @@ pub(crate) fn clear_abort_for_proxy(
     let Some(_claim) = claim_operator_dispatch(state, admission_generation) else {
         return StatusCode::CONFLICT;
     };
-    match clear_ground_abort(state) {
+    match clear_ground_abort_waiting_out_core(state).await {
         Ok(()) => StatusCode::OK,
         Err((status, _)) => status,
     }
+}
+/// The router check found the SDK core held before anything was cleared.
+fn clear_refused_busy(error: &(StatusCode, String)) -> bool {
+    error.0 == StatusCode::SERVICE_UNAVAILABLE && error.1 == ROUTER_CORE_BUSY
+}
+/// Clear GSE abort for an operator: a held SDK core decided nothing, so the
+/// whole check-and-clear runs again, briefly, with no guard held between.
+async fn clear_ground_abort_waiting_out_core(state: &Arc<AppState>) -> Result<(), (StatusCode, String)> {
+    crate::core_busy::retry(|| clear_ground_abort(state), clear_refused_busy).await
 }
 
 async fn clear_abort(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -3612,7 +3735,8 @@ async fn clear_abort(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
         )
             .into_response();
     };
-    match clear_ground_abort(&state) {
+    // A held SDK core decided nothing: check and clear again, briefly.
+    match clear_ground_abort_waiting_out_core(&state).await {
         Ok(()) => Json(serde_json::json!({"cleared": true})).into_response(),
         Err(error) => error.into_response(),
     }
@@ -4059,31 +4183,56 @@ pub(crate) fn operator_phase_public_context(state:&AppState)->Option<(bool,u64,b
     state.gse.try_lock().ok().map(|runtime|(runtime.ground_station_control,runtime.phase_control_revision,runtime.cold_flow.is_none()))
 }
 pub(crate) fn operator_phase_runtime_available(state:&AppState)->bool {
-    state.gse.try_lock().ok().is_some_and(|runtime|runtime.cold_flow.is_none())
+    operator_phase_runtime_context(state)==Some(true)
+}
+/// None while another owner holds the runtime.
+pub(crate) fn operator_phase_runtime_context(state:&AppState)->Option<bool> {
+    state.gse.try_lock().ok().map(|runtime|runtime.cold_flow.is_none())
 }
 pub(crate) fn operator_phase_ticket(state:&AppState,token:crate::operator_queue::Token)->LaunchAdmission {
     LaunchAdmission {board_abort_revision:state.board_abort.abort_revision(),generation:token.generation,
         manual_epoch:token.manual_epoch,observed_manual_epoch:token.observed_manual_epoch}
 }
+/// Why an operator phase step was not admitted. `Busy` admitted nothing (a
+/// held SDK core or a momentarily held phase owner), so the same step may be
+/// offered again; `Refused` is final for this request.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PhaseRefusal {
+    Busy(String),
+    Refused(String),
+}
+impl std::fmt::Display for PhaseRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { Self::Busy(text) | Self::Refused(text) => f.write_str(text) }
+    }
+}
+impl From<PhaseRefusal> for String {
+    fn from(value: PhaseRefusal) -> Self { value.to_string() }
+}
 pub(crate) fn commit_operator_phase(
     state: &AppState,
     intent: &crate::operator_phase::Intent,
     prepared: &mut sedsnet::router::PreparedManagedBatch<'_>,
-) -> Result<(), String> {
+) -> Result<(), PhaseRefusal> {
+    let refused = |text: &str| PhaseRefusal::Refused(text.into());
     let dispatch = dispatch_gate();
-    if !intent.validate(state)
-        || !crate::operator_phase::button_allowed(state)
+    if !crate::operator_phase::button_allowed(state)
         || !crate::operator_phase::controls_allowed(state)
-    { return Err("Phase authority changed; request a new phase step.".into()); }
-    let (expected, target, revision, local) = intent.context();
-    let target = target.ok_or("Use the explicit Fire/Abort/reset action at this boundary.")?;
-    let runtime = state.gse.try_lock().map_err(|_| "Phase controller busy")?;
-    if !local || runtime.phase_control_revision != revision || !runtime.ground_station_control {
-        return Err("Phase authority changed".into());
+    { return Err(refused("Phase authority changed; request a new phase step.")); }
+    match intent.admission(state) {
+        crate::operator_phase::Admission::Valid => {}
+        crate::operator_phase::Admission::Busy => return Err(PhaseRefusal::Busy("Phase authority check busy".into())),
+        crate::operator_phase::Admission::Invalid => return Err(refused("Phase authority changed; request a new phase step.")),
     }
-    let mut current = state.state.try_lock().map_err(|_| "Phase state busy")?;
-    if *current != expected { return Err("Global phase changed; request a new phase step".into()); }
-    let router = state.topology_router.get().ok_or("Phase router unavailable")?;
+    let (expected, target, revision, local) = intent.context();
+    let target = target.ok_or_else(|| refused("Use the explicit Fire/Abort/reset action at this boundary."))?;
+    let runtime = state.gse.try_lock().map_err(|_| PhaseRefusal::Busy("Phase controller busy".into()))?;
+    if !local || runtime.phase_control_revision != revision || !runtime.ground_station_control {
+        return Err(refused("Phase authority changed"));
+    }
+    let mut current = state.state.try_lock().map_err(|_| PhaseRefusal::Busy("Phase state busy".into()))?;
+    if *current != expected { return Err(refused("Global phase changed; request a new phase step")); }
+    let router = state.topology_router.get().ok_or_else(|| refused("Phase router unavailable"))?;
     // Same Stop -> board-Abort -> SDK Core.try/Schema.try order as automatic
     // phase publication. Preparation, allocation and retirement stay outside.
     let admitted = with_stop_admission(state, intent.ticket(), || {
@@ -4096,9 +4245,13 @@ pub(crate) fn commit_operator_phase(
         })
     });
     drop(current); drop(runtime); drop(dispatch);
-    admitted.map_err(str::to_string)?
-        .map_err(|_| "Stop or board context changed".to_string())?
-        .map_err(|error| format!("Phase update was not admitted: {error:?}"))
+    match admitted.map_err(refused)?.map_err(|_| refused("Stop or board context changed"))? {
+        Ok(()) => Ok(()),
+        Err(error @ (sedsnet::router::TryManagedBatchError::CoreBusy
+            | sedsnet::router::TryManagedBatchError::SchemaBusy)) =>
+            Err(PhaseRefusal::Busy(format!("Phase update was not admitted: {error:?}"))),
+        Err(error) => Err(refused(&format!("Phase update was not admitted: {error:?}"))),
+    }
 }
 
 /// Ownership snapshot taken before launch journal work. No intent lock is
@@ -5602,10 +5755,22 @@ fn claim_operator_inflight_under_gate(state: &AppState) -> Option<OperatorDispat
 
 /// A sealed safe direction may cross a retained recovery barrier without
 /// reopening it. Retire the coordinator's original quiescence proof first.
+#[cfg(test)]
 pub(crate) fn admit_safe_manual<T>(
     state: &AppState,
     intent: &crate::operator_queue::safe_manual::Intent,
     offer: impl FnOnce() -> T,
+) -> Option<(T, OperatorDispatchClaim)> {
+    admit_safe_manual_unless_unadmitted(state, intent, offer, |_| false)
+}
+/// `unadmitted` marks a result the SDK never took ownership of (its core was
+/// held). That offer leaves the relief epoch where it was, so the caller may
+/// offer the same intent again.
+pub(crate) fn admit_safe_manual_unless_unadmitted<T>(
+    state: &AppState,
+    intent: &crate::operator_queue::safe_manual::Intent,
+    offer: impl FnOnce() -> T,
+    unadmitted: impl Fn(&T) -> bool,
 ) -> Option<(T, OperatorDispatchClaim)> {
     use std::sync::atomic::Ordering;
     let _dispatch = dispatch_gate();
@@ -5625,7 +5790,11 @@ pub(crate) fn admit_safe_manual<T>(
             }
             let claim = OperatorDispatchClaim(count.clone());
             if !state.operator_queue.advance_relief_epoch(token.relief_epoch) { return None; }
-            Some((offer(), claim))
+            let result = offer();
+            if unadmitted(&result) {
+                state.operator_queue.restore_relief_epoch(token.relief_epoch);
+            }
+            Some((result, claim))
         }).flatten()
     }).flatten()
 }
@@ -7104,20 +7273,20 @@ mod undeliverable_command_tests {
         assert!(router.has_pending_reliable_tx_type(abort));
         // Still within its delivery window: it holds the clear. Delivery never
         // holds a mode change, which sends no output command.
-        assert!(clear_blocked_by_abort_delivery(&state, &router));
+        assert_eq!(clear_blocked_by_abort_delivery(&state, &router), Ok(true));
         assert_eq!(mode_switch_block_reason(&state), None);
         // Outstanding past the window: neither holds, though the SDK still owns
         // it (the old rule, which refused for as long as it was pending).
         age_delivery_tracking_for_test(UNDELIVERABLE_AFTER + std::time::Duration::from_millis(100));
         assert!(router.has_pending_reliable_tx_type(abort), "the old rule would still refuse");
-        assert!(!clear_blocked_by_abort_delivery(&state, &router));
+        assert_eq!(clear_blocked_by_abort_delivery(&state, &router), Ok(false));
         assert_eq!(mode_switch_block_reason(&state), None);
         // A controller frame still being written on the umbilical holds both.
         let bytes = sedsnet::wire_format::pack_packet(&sedsnet::packet::Packet::new(crate::telemetry_schema::data_type("VALVE_COMMAND"),
             &[crate::telemetry_schema::endpoint("VALVE_BOARD")], "GS", 3, Arc::from(&b"\x00"[..])).unwrap()).to_vec();
         let mut held = None;
         state.transport_tx_activity.try_enqueue_owned(true, bytes, |b| { held = Some(b); Ok(()) }).unwrap();
-        assert!(clear_blocked_by_abort_delivery(&state, &router));
+        assert_eq!(clear_blocked_by_abort_delivery(&state, &router), Ok(true));
         assert_eq!(mode_switch_block_reason(&state), None);
         state.transport_tx_activity.complete_frame(&held.unwrap());
         // HITL Clear GSE abort never waits on delivery (unchanged).
@@ -7125,7 +7294,7 @@ mod undeliverable_command_tests {
         let _hitl = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Hitl);
         let fresh = stalled_router();
         assert!(!commands_still_in_delivery(&fresh, &[abort]).is_empty(), "a new ABORT is in its window");
-        assert!(!clear_blocked_by_abort_delivery(&state, &fresh));
+        assert_eq!(clear_blocked_by_abort_delivery(&state, &fresh), Ok(false));
         state.request_shutdown();
     }
 }

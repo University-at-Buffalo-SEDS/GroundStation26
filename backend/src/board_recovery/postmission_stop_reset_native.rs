@@ -94,7 +94,11 @@ async fn local_stop_postmission_reset_actual_runtime_diagnostic() {
         }
 
         publisher.abort(); let _=publisher.await;
-        let _=drain.send(()); state.request_shutdown(); let _=deferred.await;
+        let _=drain.send(());
+        // Drop the fixture first: it checks that its wire/receiver workers are
+        // still alive, and the shutdown requested below ends the receiver.
+        drop(fixture);
+        state.request_shutdown(); let _=deferred.await;
     }
     assert!(observed.iter().all(|(_,after,status)|*after==15&&*status==200),"explicit Stop postmission reset remains unavailable: {observed:?}");
 }
@@ -208,7 +212,11 @@ async fn local_stop_active_startup_abort_reset_actual_runtime_diagnostic() {
         }
 
         publisher.abort(); let _=publisher.await;
-        let _=drain.send(()); state.request_shutdown(); let _=deferred.await;
+        let _=drain.send(());
+        // Drop the fixture first: it checks that its wire/receiver workers are
+        // still alive, and the shutdown requested below ends the receiver.
+        drop(fixture);
+        state.request_shutdown(); let _=deferred.await;
     }
     assert!(observed.iter().all(|(_,after,status)|*after==15&&*status==200),"explicit Stop postmission reset remains unavailable: {observed:?}");
 }

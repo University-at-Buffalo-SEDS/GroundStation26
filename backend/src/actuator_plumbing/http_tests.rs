@@ -106,6 +106,49 @@ impl Drop for Pause {
     }
 }
 
+/// Holds the fixture host's real SDK core on a named holder thread (through
+/// the host clock's existing pause hook) until released.
+pub(crate) struct HeldCore {
+    pause: crate::gse::nonwaiting_admission_tests::Pause,
+    holder: Option<std::thread::JoinHandle<sedsnet::TelemetryResult<()>>>,
+}
+pub(crate) fn hold_host_core(fixture: &Fixture) -> HeldCore {
+    let pause = crate::gse::nonwaiting_admission_tests::Pause::install(&fixture.state);
+    let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
+    let _ = fixture.host.enable_managed_variable(ty);
+    let seed = Packet::new(ty, &[crate::telemetry_schema::endpoint("FLIGHT_STATE")], "GS", 1, Arc::from([0u8])).unwrap();
+    let host = fixture.host.clone();
+    let holder = std::thread::Builder::new()
+        .name("production-sdk-core-holder".into())
+        .spawn(move || host.seed_managed_variable(seed))
+        .unwrap();
+    pause.core_entered.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    assert!(
+        matches!(
+            fixture.host.try_has_pending_reliable_tx_type(crate::telemetry_schema::types::ABORT),
+            Err(sedsnet::router::TryPendingTypeError::CoreBusy)
+        ),
+        "the real SDK core must be held"
+    );
+    HeldCore { pause, holder: Some(holder) }
+}
+impl HeldCore {
+    /// Ends the hold from another thread after `delay`, as a router pass ends.
+    pub(crate) fn release_after(self, delay: std::time::Duration) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            drop(self);
+        })
+    }
+}
+impl Drop for HeldCore {
+    fn drop(&mut self) {
+        self.pause.release_core();
+        if let Some(holder) = self.holder.take() {
+            let _ = holder.join();
+        }
+    }
+}
 pub(crate) struct Fixture {
     pub(crate) state: Arc<AppState>,
     root: PathBuf,

@@ -409,6 +409,18 @@ fn apply_bounded(state: &Arc<AppState>, mut plan: Plan, recover: bool) -> bool {
     !plan.failed
 }
 
+/// Admission found the SDK core held before changing anything.
+const ADMISSION_BUSY: &str = "Cold-flow admission busy; retry this action";
+/// An operator's cold-flow request: a held SDK core decided nothing, so the
+/// same request is admitted again, briefly, with no guard held between.
+async fn perform_waiting_out_core(
+    state: &Arc<AppState>,
+    key: &RunKey,
+    requested: LaunchAdmission,
+    request: Request,
+) -> Result<(), &'static str> {
+    crate::core_busy::retry(|| perform(state, key, requested, request), |error| *error == ADMISSION_BUSY).await
+}
 fn perform(
     state: &Arc<AppState>,
     key: &RunKey,
@@ -420,14 +432,14 @@ fn perform(
     let plan = {
         let _dispatch = dispatch_gate();
         match ownership_state(state, requested) {
-            CurrentState::PendingBusy => return Err("Cold-flow admission busy; retry this action"),
+            CurrentState::PendingBusy => return Err(ADMISSION_BUSY),
             CurrentState::Invalid => return Err("Cold-flow admission changed or Stop/Launch is active"),
             CurrentState::Current => {}
         }
         if !ground_permitted(state) {
             return Err("Cold-flow admission changed or Stop/Launch is active");
         }
-        let retired = matches!(request, Request::Resume) && commands_retired(state);
+        let retired = if matches!(request, Request::Resume) { super::try_commands_retired(state) } else { Ok(false) };
         let mut rt = state.gse.lock().unwrap();
         let input = input(&rt, state, simulation, interlock(state, &policy));
         let session = rt
@@ -462,8 +474,11 @@ fn perform(
                 }
             }
             Request::Resume => {
-                if !retired || session.pending.is_some() {
+                if session.pending.is_some() || retired == Ok(false) {
                     return Err(super::RETIREMENT_PENDING);
+                }
+                if retired.is_err() {
+                    return Err(ADMISSION_BUSY);
                 }
                 session.controller.resume(input)?
             }
@@ -894,7 +909,7 @@ async fn release(
     let Some(_claim) = claim_operator_dispatch(&state, ticket.generation) else {
         return StatusCode::CONFLICT.into_response();
     };
-    let result = perform(&state, &key, ticket, Request::Release);
+    let result = perform_waiting_out_core(&state, &key, ticket, Request::Release).await;
     if result.is_ok() {
         audit_admission("release", &key, &actor);
     }
@@ -910,13 +925,13 @@ async fn cancel(
         Ok(actor) => actor,
         Err(e) => return *e,
     };
-    let response = cancel_authenticated(&state, key.clone(), ticket);
+    let response = cancel_authenticated(&state, key.clone(), ticket).await;
     if response.status().is_success() {
         audit_admission("cancel", &key, &actor);
     }
     response
 }
-pub(super) fn cancel_authenticated(
+pub(super) async fn cancel_authenticated(
     state: &Arc<AppState>,
     key: RunKey,
     ticket: LaunchAdmission,
@@ -924,9 +939,9 @@ pub(super) fn cancel_authenticated(
     let Some(_claim) = claim_operator_dispatch(state, ticket.generation) else {
         return StatusCode::CONFLICT.into_response();
     };
-    reply(perform(state, &key, ticket, Request::Cancel), key)
+    reply(perform_waiting_out_core(state, &key, ticket, Request::Cancel).await, key)
 }
-pub(super) fn park_authenticated(
+pub(super) async fn park_authenticated(
     state: &Arc<AppState>,
     key: RunKey,
     ticket: LaunchAdmission,
@@ -934,9 +949,9 @@ pub(super) fn park_authenticated(
     let Some(_claim) = claim_operator_dispatch(state, ticket.generation) else {
         return StatusCode::CONFLICT.into_response();
     };
-    reply(perform(state, &key, ticket, Request::Park), key)
+    reply(perform_waiting_out_core(state, &key, ticket, Request::Park).await, key)
 }
-pub(super) fn resume_authenticated(
+pub(super) async fn resume_authenticated(
     state: &Arc<AppState>,
     key: RunKey,
     ticket: LaunchAdmission,
@@ -944,7 +959,7 @@ pub(super) fn resume_authenticated(
     let Some(_claim) = claim_operator_dispatch(state, ticket.generation) else {
         return StatusCode::CONFLICT.into_response();
     };
-    reply(perform(state, &key, ticket, Request::Resume), key)
+    reply(perform_waiting_out_core(state, &key, ticket, Request::Resume).await, key)
 }
 /// Live Pause/Resume/Cancel admission for the owned cold-flow run.
 pub(super) fn controls(
@@ -1047,7 +1062,7 @@ pub(crate) async fn dispatch_panel(state: &Arc<AppState>, intent: PanelIntent) {
     let Some(_claim) = claim_operator_dispatch(state, intent.generation) else {
         return;
     };
-    if perform(state, &intent.key, ticket, Request::Release).is_ok() {
+    if perform_waiting_out_core(state, &intent.key, ticket, Request::Release).await.is_ok() {
         audit_admission("physical_panel_release", &intent.key, &principal);
     }
     // Every path ends here. There is NO normal Launch fallback.

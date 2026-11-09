@@ -147,10 +147,24 @@ pub(crate) async fn dispatch(
             Arc::from(&[intent.byte][..]),
         )
         .map_err(|_| "Safe manual packet invalid")?;
-        let (accepted, _claim) =
-            crate::gse::admit_safe_manual(&state, &intent, || intent.router.try_tx_queue(packet))
+        // A refusal only because the SDK core was held admitted nothing; the
+        // same safe direction is offered again within the shared window.
+        const BUSY: &str = "SDK core stayed busy; safe manual command was not sent";
+        crate::core_busy::retry_blocking(
+            || {
+                let packet = packet.clone();
+                let (accepted, _claim) = crate::gse::admit_safe_manual_unless_unadmitted(
+                    &state,
+                    &intent,
+                    || intent.router.try_tx_queue(packet),
+                    |result| result.as_ref().is_err_and(crate::core_busy::is_core_busy),
+                )
                 .ok_or("Safe manual command cancelled by newer control or recovery")?;
-        accepted.map_err(|_| "SDK did not accept safe manual command; no application retry")?;
+                accepted.map_err(|error| if crate::core_busy::is_core_busy(&error) { BUSY }
+                    else { "SDK did not accept safe manual command; no application retry" })
+            },
+            |error| *error == BUSY,
+        )?;
         crate::telemetry_task::flush_command_tx(&intent.router, "safe manual relief");
         Ok::<_, &'static str>(())
     })

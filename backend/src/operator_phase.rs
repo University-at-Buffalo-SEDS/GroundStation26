@@ -57,17 +57,38 @@ impl Intent {
         true
     }
     pub(crate) fn validate(&self, state: &AppState) -> bool {
-        self.revision != u64::MAX
+        self.admission(state) == Admission::Valid
+    }
+    /// `Busy` only when a momentarily held owner (the GSE runtime, or the SDK
+    /// core read for a pending Stop) kept the check from finishing; every
+    /// condition it did read still held.
+    pub(crate) fn admission(&self, state: &AppState) -> Admission {
+        if !(self.revision != u64::MAX
             && self.captured.elapsed() <= Duration::from_secs(5)
             && self.token.generation == crate::gse::automatic_generation(state)
             && self.token.manual_epoch == state.manual_abort_intent.epoch()
             && self.token.observed_manual_epoch == state.deferred_abort.manual_epoch()
-            && self.token.relief_epoch == state.operator_queue.relief_epoch()
-            && crate::gse::operator_phase_mode(state).is_some_and(|(enabled, revision)| {
-                enabled == self.local && revision == self.revision
-            })
-            && state.local_flight_state_snapshot() == self.expected
-            && (!self.local || self.target.is_some() && local_allowed(state))
+            && self.token.relief_epoch == state.operator_queue.relief_epoch())
+        {
+            return Admission::Invalid;
+        }
+        match crate::gse::operator_phase_mode(state) {
+            None => return Admission::Busy,
+            Some((enabled, revision)) if enabled != self.local || revision != self.revision => {
+                return Admission::Invalid;
+            }
+            Some(_) => {}
+        }
+        if state.local_flight_state_snapshot() != self.expected {
+            return Admission::Invalid;
+        }
+        if !self.local {
+            return Admission::Valid;
+        }
+        if self.target.is_none() {
+            return Admission::Invalid;
+        }
+        local_admission(state)
     }
     pub(crate) fn original_command(&self) -> TelemetryCommand {
         if self.forward {
@@ -98,15 +119,38 @@ pub(crate) fn fc_prelaunch_is_raw(state: &AppState) -> bool {
     local_mode(state)
 }
 
+/// Outcome of a phase admission check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Admission {
+    Valid,
+    Busy,
+    Invalid,
+}
 pub(crate) fn local_allowed(state: &AppState) -> bool {
-    local_mode(state)
-        && !state
+    local_admission(state) == Admission::Valid
+}
+fn local_admission(state: &AppState) -> Admission {
+    if !local_mode(state)
+        || state
             .shutdown_requested
             .load(std::sync::atomic::Ordering::Acquire)
-        && !state.abort_indicator_latched()
-        && crate::gse::manual_stop_state(state) == crate::gse::CurrentState::Current
-        && state.board_abort.masks().0 == 0
-        && crate::gse::operator_phase_runtime_available(state)
+        || state.abort_indicator_latched()
+    {
+        return Admission::Invalid;
+    }
+    match crate::gse::manual_stop_state(state) {
+        crate::gse::CurrentState::Current => {}
+        crate::gse::CurrentState::PendingBusy => return Admission::Busy,
+        crate::gse::CurrentState::Invalid => return Admission::Invalid,
+    }
+    if state.board_abort.masks().0 != 0 {
+        return Admission::Invalid;
+    }
+    match crate::gse::operator_phase_runtime_context(state) {
+        None => Admission::Busy,
+        Some(true) => Admission::Valid,
+        Some(false) => Admission::Invalid,
+    }
 }
 /// Plain-language reason a phase step is refused, checked in admission order.
 pub(crate) fn refusal_reason(state: &AppState, forward: bool) -> String {
@@ -282,32 +326,48 @@ pub(crate) fn project(state: &AppState, policy: &mut crate::sequences::ActionPol
     }
 }
 
-pub(crate) fn apply(state: &Arc<AppState>, intent: &Intent) -> Result<(), String> {
-    if !intent.local()
-        || !intent.validate(state)
-        || !button_allowed(state)
-        || !controls_allowed(state)
-    {
-        return Err("Phase request changed or expired; choose a new phase action.".into());
+/// One attempt. A `Busy` refusal admitted nothing; see [`apply`].
+pub(crate) fn apply_once(state: &Arc<AppState>, intent: &Intent) -> Result<(), crate::gse::PhaseRefusal> {
+    use crate::gse::PhaseRefusal::{Busy, Refused};
+    let expired = "Phase request changed or expired; choose a new phase action.";
+    if !intent.local() || !button_allowed(state) || !controls_allowed(state) {
+        return Err(Refused(expired.into()));
+    }
+    match intent.admission(state) {
+        Admission::Valid => {}
+        Admission::Busy => return Err(Busy(expired.into())),
+        Admission::Invalid => return Err(Refused(expired.into())),
     }
     let target = intent
         .target
-        .ok_or("Use explicit Fire, Abort or verified reset at this phase boundary.")?;
+        .ok_or_else(|| Refused("Use explicit Fire, Abort or verified reset at this phase boundary.".into()))?;
     let router = state
         .topology_router
         .get()
-        .ok_or("Phase router unavailable")?;
+        .ok_or_else(|| Refused("Phase router unavailable".into()))?;
     let packet = crate::network_variables::operator_phase_packet(router, target as u8)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Refused(e.to_string()))?;
     let mut prepared = router
         .prepare_network_variable_batch(
             vec![packet],
             crate::network_variables::automatic_idle_batch_limits(),
         )
-        .map_err(|error| format!("Phase update could not be prepared: {:?}", error.error))?;
+        .map_err(|error| Refused(format!("Phase update could not be prepared: {:?}", error.error)))?;
     crate::gse::commit_operator_phase(state, intent, &mut prepared)?;
     state.publish_operator_phase_observation();
     Ok(())
+}
+/// The operator's phase step. A refusal only because the SDK core (or the
+/// phase owner) was momentarily held admitted nothing, so the same validated
+/// intent is offered again within the shared window, every guard released
+/// between attempts; any other refusal returns at once.
+pub(crate) async fn apply(state: &Arc<AppState>, intent: &Intent) -> Result<(), String> {
+    crate::core_busy::retry(
+        || apply_once(state, intent),
+        |error| matches!(error, crate::gse::PhaseRefusal::Busy(_)),
+    )
+    .await
+    .map_err(String::from)
 }
 
 pub(crate) fn controls_allowed(state: &AppState) -> bool {
@@ -392,7 +452,7 @@ mod tests {
         };
         assert!(intent.local());
         let mut updates = fixture.state.state_tx.subscribe();
-        apply(&fixture.state, &intent).unwrap();
+        apply(&fixture.state, &intent).await.unwrap();
         assert_eq!(
             fixture.state.local_flight_state_snapshot(),
             FlightState::PreFill
@@ -411,7 +471,7 @@ mod tests {
         assert_eq!(cached.sender(), "GS");
         assert_eq!(cached.payload(), [FlightState::PreFill as u8]);
         assert!(
-            apply(&fixture.state, &intent).is_err(),
+            apply(&fixture.state, &intent).await.is_err(),
             "old relative intent cannot retarget new phase"
         );
     }
@@ -428,7 +488,7 @@ mod tests {
             fixture.state.set_preexisting_flight_state_for_test(phase);
             let value = intent(&fixture.state, phase != FlightState::Startup);
             assert!(
-                apply(&fixture.state, &value).is_err(),
+                apply(&fixture.state, &value).await.is_err(),
                 "Fire/Abort/reset boundary must be explicit"
             );
         }
@@ -452,7 +512,7 @@ mod tests {
         );
         let value = intent(&fixture.state, true);
         fixture.state.manual_abort_intent.request();
-        assert!(apply(&fixture.state, &value).is_err());
+        assert!(apply(&fixture.state, &value).await.is_err());
         let fixture = crate::actuator_plumbing::http_tests::Fixture::new().await;
         let value = intent(&fixture.state, true);
         fixture
@@ -539,12 +599,12 @@ mod tests {
         let fixture = crate::actuator_plumbing::http_tests::Fixture::new().await;
         let mut old = intent(&fixture.state, true);
         old.captured -= Duration::from_secs(6);
-        assert!(apply(&fixture.state, &old).is_err());
+        assert!(apply(&fixture.state, &old).await.is_err());
         let old = intent(&fixture.state, true);
         fixture
             .state
             .set_preexisting_flight_state_for_test(FlightState::Armed);
-        assert!(apply(&fixture.state, &old).is_err());
+        assert!(apply(&fixture.state, &old).await.is_err());
         fixture
             .state
             .set_preexisting_flight_state_for_test(FlightState::Idle);
@@ -555,7 +615,7 @@ mod tests {
             .lock()
             .unwrap()
             .software_buttons_enabled = false;
-        assert!(apply(&fixture.state, &old).is_err());
+        assert!(apply(&fixture.state, &old).await.is_err());
         fixture
             .state
             .action_policy
@@ -564,7 +624,7 @@ mod tests {
             .software_buttons_enabled = true;
         fixture.state.action_policy.lock().unwrap().key_enabled = false;
         assert!(
-            apply(&fixture.state, &old).is_err(),
+            apply(&fixture.state, &old).await.is_err(),
             "key disable must survive local phase mode"
         );
     }
@@ -688,6 +748,34 @@ mod tests {
             [1]
         );
         assert!(events.try_recv().is_err());
+    }
+    /// A held SDK core admits nothing, so the operator's phase step is offered
+    /// again until the router pass ends instead of being refused outright.
+    #[tokio::test]
+    async fn operator_phase_step_waits_out_a_held_sdk_core() {
+        crate::mode_suite!(Hitl);
+        let fixture = crate::actuator_plumbing::http_tests::Fixture::new().await;
+        if fixture.state.hitl_button_interlock_enabled() {
+            fixture.state.toggle_hitl_safety_interlock(0);
+        }
+        fixture
+            .host
+            .enable_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"))
+            .unwrap();
+        let value = intent(&fixture.state, true);
+        let core = crate::actuator_plumbing::http_tests::hold_host_core(&fixture);
+        let first = apply_once(&fixture.state, &value);
+        assert!(
+            matches!(first, Err(crate::gse::PhaseRefusal::Busy(_))),
+            "a held core is a busy refusal, never a final one: {first:?}"
+        );
+        assert_eq!(fixture.state.local_flight_state_snapshot(), FlightState::Idle);
+        let release = core.release_after(Duration::from_millis(60));
+        apply(&fixture.state, &value)
+            .await
+            .expect("the same step is admitted once the core is free");
+        release.join().unwrap();
+        assert_eq!(fixture.state.local_flight_state_snapshot(), FlightState::PreFill);
     }
     #[tokio::test]
     async fn public_local_master_selection_survives_unchanged_runtime_contention() {

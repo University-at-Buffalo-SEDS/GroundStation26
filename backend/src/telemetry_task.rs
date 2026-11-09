@@ -855,11 +855,13 @@ pub async fn telemetry_task(
                     let cmd = if let TelemetryCommand::OperatorPhase { mut intent } = cmd {
                         if let Some(origin)=recovery_origin
                             && !intent.bind_manual_claim(&state,&origin) {continue;}
-                        if !intent.validate(&state) {emit_notification_warning(&state,"Phase request changed or expired; choose a new phase action.");continue;}
+                        // A local step validates inside apply, which waits out a
+                        // momentarily held owner instead of refusing it.
                         if intent.local() {
-                            if let Err(error)=crate::operator_phase::apply(&state,&intent){emit_notification_warning(&state,error);}
+                            if let Err(error)=crate::operator_phase::apply(&state,&intent).await{emit_notification_warning(&state,error);}
                             continue;
                         }
+                        if !intent.validate(&state) {emit_notification_warning(&state,"Phase request changed or expired; choose a new phase action.");continue;}
                         if crate::runtime_mode::is_hitl() {intent.original_command()} else {continue;}
                     } else {cmd};
                     if crate::runtime_mode::is_hitl() && !sealed_phase && matches!(cmd,TelemetryCommand::AdvanceFlightState|TelemetryCommand::RewindFlightState) {

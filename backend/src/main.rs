@@ -39,6 +39,7 @@ mod command_proxy;
 mod comms;
 mod comms_config;
 mod control_ingress;
+mod core_busy;
 mod deferred_abort;
 mod dummy_packets;
 mod ethernet_autoconfig;

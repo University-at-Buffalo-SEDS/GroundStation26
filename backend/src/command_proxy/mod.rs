@@ -909,7 +909,7 @@ async fn execute_primary_inner(
                 return Outcome::Denied;
             }
             if let Some(origin) = clear_abort_origin {
-                crate::gse::clear_abort_for_proxy(&state, &principal, origin)
+                crate::gse::clear_abort_for_proxy(&state, &principal, origin).await
             } else {
             let Ok(command) = serde_json::from_value::<crate::types::TelemetryCommand>(
                 serde_json::Value::String(name.clone()),

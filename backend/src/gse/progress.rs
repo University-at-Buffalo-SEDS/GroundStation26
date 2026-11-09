@@ -327,7 +327,7 @@ pub(crate) fn controls(state: &AppState) -> Option<wire::RunControls> {
     let cancel_command = state.is_command_allowed(&TelemetryCommand::CancelFill);
     let fill_command = state.is_command_allowed(&TelemetryCommand::StartFill);
     let mass_target = state.fill_targets_snapshot().nitrous.target_mass_kg;
-    let retired = super::commands_retired(state);
+    let retired = super::try_commands_retired(state);
     let rt = state.gse.lock().unwrap();
     let summary = rt.progress.current().filter(|s| !s.outcome.terminal())?;
     let (key, kind) = (summary.key.clone(), summary.kind);
@@ -395,12 +395,11 @@ pub(crate) fn controls(state: &AppState) -> Option<wire::RunControls> {
         },
         _ => Err("This sequence cannot resume".into()),
     };
-    let resume = resume.and_then(|()| {
-        if retired {
-            Ok(())
-        } else {
-            Err(super::RETIREMENT_PENDING.into())
-        }
+    let resume = resume.and_then(|()| match retired {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(super::RETIREMENT_PENDING.into()),
+        // A held SDK core decided nothing; the Resume handler checks again.
+        Err(_) => Err(super::ROUTER_CORE_BUSY.into()),
     });
     let cancel = wire::validate_cancel(
         &key,
@@ -553,7 +552,7 @@ async fn cancel(
     if let Err(error) = require_primary_operational_station() {
         return error.into_response();
     }
-    if super::cold_flow::owns_run(&state,&key){return super::cold_flow::cancel_authenticated(&state,key,requested);}
+    if super::cold_flow::owns_run(&state,&key){return super::cold_flow::cancel_authenticated(&state,key,requested).await;}
 
     let Some(_claim) = claim_operator_dispatch(&state, requested.generation) else {
         return StatusCode::CONFLICT.into_response();
@@ -668,7 +667,7 @@ async fn pause(
         return error.into_response();
     }
     if super::cold_flow::owns_run(&state, &key) {
-        return super::cold_flow::park_authenticated(&state, key, requested);
+        return super::cold_flow::park_authenticated(&state, key, requested).await;
     }
     let Some(_claim) = claim_operator_dispatch(&state, requested.generation) else {
         return StatusCode::CONFLICT.into_response();
@@ -728,6 +727,34 @@ async fn dump(
     crate::sequences::refresh_action_policy_projection(&state);
     control_reply(result, key)
 }
+/// The operator's Resume of an engine-owned run. A held SDK core decided
+/// nothing: the same admission runs again, briefly, with the dispatch gate
+/// released between attempts.
+pub(super) async fn resume_waiting_out_core(
+    state: &Arc<AppState>,
+    key: &RunKey,
+    requested: LaunchAdmission,
+    kind: Option<Kind>,
+) -> Result<(), String> {
+    crate::core_busy::retry(|| {
+        let _dispatch = dispatch_gate();
+        admitted(state, key, requested, |c| &c.resume).and_then(|()| {
+            if kind == Some(Kind::Fill) {
+                handle_command_inner(state, &TelemetryCommand::StartFill, None, None);
+                let rt = state.gse.lock().unwrap();
+                if rt.progress.current().is_some_and(|s| s.key == *key)
+                    && matches!(rt.engine.status.phase, Phase::FillSetup | Phase::Filling)
+                {
+                    Ok(())
+                } else {
+                    Err(rt.engine.status.message.clone())
+                }
+            } else {
+                super::resume_test_under_dispatch(state)
+            }
+        })
+    }, |error: &String| error == super::ROUTER_CORE_BUSY).await
+}
 async fn resume(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -746,7 +773,7 @@ async fn resume(
         if !principal.allows_command_name("AutoColdFlow") {
             return StatusCode::FORBIDDEN.into_response();
         }
-        return super::cold_flow::resume_authenticated(&state, key, requested);
+        return super::cold_flow::resume_authenticated(&state, key, requested).await;
     }
     let kind = state
         .gse
@@ -770,24 +797,7 @@ async fn resume(
     let Some(_claim) = claim_operator_dispatch(&state, requested.generation) else {
         return StatusCode::CONFLICT.into_response();
     };
-    let result = {
-        let _dispatch = dispatch_gate();
-        admitted(&state, &key, requested, |c| &c.resume).and_then(|()| {
-            if kind == Some(Kind::Fill) {
-                handle_command_inner(&state, &TelemetryCommand::StartFill, None, None);
-                let rt = state.gse.lock().unwrap();
-                if rt.progress.current().is_some_and(|s| s.key == key)
-                    && matches!(rt.engine.status.phase, Phase::FillSetup | Phase::Filling)
-                {
-                    Ok(())
-                } else {
-                    Err(rt.engine.status.message.clone())
-                }
-            } else {
-                super::resume_test_under_dispatch(&state)
-            }
-        })
-    };
+    let result = resume_waiting_out_core(&state, &key, requested, kind).await;
     flush_effects(&state);
     flush(&state);
     crate::sequences::refresh_action_policy_projection(&state);

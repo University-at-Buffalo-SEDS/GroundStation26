@@ -2,13 +2,19 @@ use super::*;
 use std::sync::{Mutex, atomic::Ordering};
 use tower::ServiceExt;
 
-async fn fixture() -> (
+type Fixture = (
     crate::recording_export::tests::TestDirectory,
     Arc<AppState>,
     HeaderMap,
     Arc<Mutex<Vec<sedsnet::packet::Packet>>>,
     mpsc::Receiver<TelemetryCommand>,
-) {
+);
+async fn fixture() -> Fixture {
+    fixture_with(|config| Arc::new(sedsnet::router::Router::new(config))).await
+}
+async fn fixture_with(
+    make_router: impl FnOnce(sedsnet::router::RouterConfig) -> Arc<sedsnet::router::Router>,
+) -> Fixture {
     let (root, state, rx, headers) = command_dispatch_tests::preauth_fixture().await;
     let observed = Arc::new(Mutex::new(Vec::new()));
     let handlers = ["ACTUATOR_BOARD", "VALVE_BOARD"].map(|owner| {
@@ -21,7 +27,7 @@ async fn fixture() -> (
             },
         )
     });
-    let router = Arc::new(sedsnet::router::Router::new(
+    let router = make_router(
         sedsnet::router::RouterConfig::new(handlers)
             .with_sender("GS")
             .with_memory_config(
@@ -29,7 +35,7 @@ async fn fixture() -> (
                     .unwrap(),
             )
             .unwrap(),
-    ));
+    );
     router
         .try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(
             1_793_563_200_000,
@@ -94,6 +100,28 @@ async fn safe_manual_http_relief_crosses_retained_recovery_without_reopening_or_
         assert!(crate::gse::capture_operator_origin(&state).is_none());
         assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
     }
+}
+/// A held SDK core admitted nothing: the safe direction is offered again
+/// until the router pass ends, and the relief epoch moves exactly once.
+#[tokio::test]
+async fn safe_manual_http_relief_waits_out_a_held_sdk_core() {
+    let mut core = None;
+    let (_root, state, headers, observed, _commands) = fixture_with(|config| {
+        let (router, holdable) = crate::core_busy::hold::router(config);
+        core = Some(holdable);
+        router
+    })
+    .await;
+    let core = core.unwrap();
+    state.set_umbilical_valve_state(9, true);
+    let epoch = state.operator_queue.relief_epoch();
+    let release = core.hold().release_after(std::time::Duration::from_millis(60));
+    let response = http(state.clone(), headers.clone(), "NitrogenClose").await;
+    release.join().unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(observed.lock().unwrap().last().unwrap().payload(), &[12]);
+    assert_eq!(state.operator_queue.relief_epoch(), epoch + 1, "one admitted relief advances once");
+    assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
 }
 #[tokio::test]
 async fn safe_manual_http_requires_auth_software_enable_and_known_safe_polarity() {

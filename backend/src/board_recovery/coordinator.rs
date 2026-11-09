@@ -84,6 +84,35 @@ mod explicit_launch_reset_tests {
         *state.state.lock().unwrap() = crate::types::FlightState::Idle;
         assert!(host_action_allowed(&state, "reset_startup"));
     }
+    /// Reset from Launch checks that the router has drained. A held SDK core
+    /// decides nothing, so Prepare and Confirm wait it out instead of refusing.
+    #[tokio::test]
+    async fn launch_reset_admission_waits_out_a_held_sdk_core() {
+        let state = crate::state::tests::test_app_state().await;
+        *state.state.lock().unwrap() = crate::types::FlightState::Launch;
+        let endpoint = crate::telemetry_schema::endpoint("ACTUATOR_BOARD");
+        let (router, core) = crate::core_busy::hold::router(sedsnet::router::RouterConfig::new([
+            sedsnet::router::EndpointHandler::new_packet_handler(endpoint, |_| Ok(())),
+        ]));
+        state.topology_router.set(router).unwrap();
+        assert_eq!(host_admission(&state, "reset_startup"), HostAdmission::Allowed);
+        let held = core.hold();
+        assert_eq!(host_admission(&state, "reset_startup"), HostAdmission::RouterBusy,
+            "a held core is not a refusal");
+        assert_eq!(host_admission(&state, "recover_abort"), HostAdmission::Refused,
+            "a real refusal never waits");
+        let release = held.release_after(Duration::from_millis(60));
+        let admitted = crate::core_busy::retry(
+            || match host_admission(&state, "reset_startup") {
+                HostAdmission::RouterBusy => Err(()),
+                admission => Ok(admission),
+            },
+            |_| true,
+        )
+        .await;
+        release.join().unwrap();
+        assert_eq!(admitted, Ok(HostAdmission::Allowed));
+    }
     /// A test fire happens with the fill sequence holding Paused. Reset all
     /// boards is the only Launch unlock, so it must stay available then, and
     /// still refuse while a sequence is moving valves.
@@ -309,7 +338,7 @@ impl FinalProofs {
             })
     }
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Prepare {
     action: String,
@@ -320,7 +349,7 @@ struct Prepare {
     backend_instance: String,
     reset_epoch: String,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Confirm {
     ticket: String,
@@ -448,16 +477,31 @@ pub(super) fn host_safe(state: &AppState) -> bool {
 pub(super) fn host_action_allowed(state: &AppState, action: &str) -> bool {
     host_action_allowed_with(state, action, true)
 }
+/// Admission's host check. `RouterBusy` only when the drained-router check
+/// found the SDK core held: nothing was decided and the check may run again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HostAdmission {
+    Allowed,
+    Refused,
+    RouterBusy,
+}
+pub(super) fn host_admission(state: &AppState, action: &str) -> HostAdmission {
+    host_admission_with(state, action, true)
+}
 /// `router_drained` also requires that no ABORT or output command is still
 /// owed to any board. Admission (PREPARE/CONFIRM) asks for that; an admitted
 /// recovery does not, because its own scoped quiesce (`wait_sdk`) decides
 /// which in-flight frames matter to its boards, and an unrelated command
 /// still retrying to another board must not abort it midway.
 fn host_action_allowed_with(state: &AppState, action: &str, router_drained: bool) -> bool {
+    host_admission_with(state, action, router_drained) == HostAdmission::Allowed
+}
+fn host_admission_with(state: &AppState, action: &str, router_drained: bool) -> HostAdmission {
+    let allowed = |yes: bool| if yes { HostAdmission::Allowed } else { HostAdmission::Refused };
     // Resync has its own phase window (resync_target), with no
     // sequence moving valves and no active overpressure latch.
-    if action == "resync" { return resync_work_block_reason(state).is_none(); }
-    if host_safe(state) { return true; }
+    if action == "resync" { return allowed(resync_work_block_reason(state).is_none()); }
+    if host_safe(state) { return HostAdmission::Allowed; }
     if action == "reset_startup"
         && {
             use crate::types::FlightState as F;
@@ -465,11 +509,17 @@ fn host_action_allowed_with(state: &AppState, action: &str, router_drained: bool
             matches!(flight_state, F::Launch | F::Landed | F::Recovery)
                 || crate::gse::prelaunch_flight_state(flight_state)
         }
-        && if router_drained { crate::gse::operator_reset_host_idle(state) } else { crate::gse::operator_reset_host_idle_ram(state) }
     {
-        return true;
+        return if router_drained {
+            match crate::gse::try_operator_reset_host_idle(state) {
+                Ok(idle) => allowed(idle),
+                Err(_) => HostAdmission::RouterBusy,
+            }
+        } else {
+            allowed(crate::gse::operator_reset_host_idle_ram(state))
+        };
     }
-    false
+    HostAdmission::Refused
 }
 /// Why PREPARE's host check failed, naming what to do next.
 fn prepare_host_block_reason(state: &AppState, action: &str) -> String {
@@ -502,11 +552,14 @@ fn owned_host_block_reason(state: &AppState, action: &str) -> String {
 /// failure is reported rather than failing the reset.
 /// A ticket stays usable only while the host action is allowed and, for
 /// Resync, the station is still in the exact phase frozen at PREPARE.
-fn ticket_host_current(state: &AppState, ticket: &Ticket) -> bool {
-    host_action_allowed(state, &ticket.action)
-        && (ticket.action != "resync"
-            || ticket.targets.iter().all(|target|
-                resync_target(state.local_flight_state_snapshot()) == Some(target.desired)))
+fn ticket_host_admission(state: &AppState, ticket: &Ticket) -> HostAdmission {
+    match host_admission(state, &ticket.action) {
+        HostAdmission::Allowed if ticket.action == "resync"
+            && !ticket.targets.iter().all(|target|
+                resync_target(state.local_flight_state_snapshot()) == Some(target.desired)) =>
+            HostAdmission::Refused,
+        admission => admission,
+    }
 }
 fn finish_operator_reset(state: &AppState, reset: u8) {
     state.board_abort.note_reset_completed(reset);
@@ -565,7 +618,8 @@ impl Runtime {
             || !origin_current(state, ticket.token)
             || ticket.reset_selection.is_some_and(|selection| selection.current(state).is_err())
         || ticket.mode != crate::station_mode::local_mode()
-            || !ticket_host_current(state, ticket)
+            // A held SDK core decided nothing; Confirm checks again.
+            || ticket_host_admission(state, ticket) == HostAdmission::Refused
             || state.launch_history.lock().unwrap().snapshot() != ticket.clock
         {
             return None;
@@ -649,12 +703,15 @@ pub(super) async fn prepare(
     // Say why in plain language before any query. prepare_inner rechecks.
     if request.action == "resync" {
         // The router check is a try-lock; busy is not a refusal reason.
-        let mut reason = resync_host_block_reason(&state);
-        for _ in 0..20 {
-            if !reason.as_deref().is_some_and(|text| text.contains("router is busy")) { break; }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            reason = resync_host_block_reason(&state);
-        }
+        let reason = crate::core_busy::retry(
+            || match resync_host_block_reason(&state) {
+                Some(reason) if reason == crate::gse::ROUTER_CORE_BUSY => Err(reason),
+                reason => Ok(reason),
+            },
+            |_| true,
+        )
+        .await
+        .unwrap_or_else(Some);
         if let Some(reason) = reason {
             return error(StatusCode::CONFLICT, "resync_unavailable", &reason);
         }
@@ -667,7 +724,12 @@ pub(super) async fn prepare(
     if let Err(message) = refresh_prepare_queries(&state, &headers, &request, token, reset_selection).await {
         return error(StatusCode::CONFLICT, "fresh_query_required", message);
     }
-    let result = prepare_inner(&state, &headers, &principal, request, token, reset_selection);
+    // A held SDK core decided nothing: run the same checks again, briefly.
+    let result = crate::core_busy::retry(
+        || prepare_inner(&state, &headers, &principal, request.clone(), token, reset_selection),
+        |message| *message == crate::gse::ROUTER_CORE_BUSY,
+    )
+    .await;
     match result {
         Ok(value) => Json(value).into_response(),
         Err(message) => error(StatusCode::CONFLICT, "recovery_unavailable", message),
@@ -786,7 +848,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Response>,
 {
-    let deadline = tokio::time::Instant::now() + super::CORE_BUSY_RETRY_WINDOW;
+    let deadline = tokio::time::Instant::now() + crate::core_busy::CORE_BUSY_RETRY_WINDOW;
     loop {
         current()?;
         let response = tokio::time::timeout_at(deadline, offer()).await
@@ -830,8 +892,10 @@ fn prepare_inner(
     {
         return Err("The station's recovery session changed (a reset, Stop or restart happened since this page loaded). Reload the board status and prepare the recovery again.");
     }
-    if !host_action_allowed(state, &request.action) {
-        return Err(intern(prepare_host_block_reason(state, &request.action)));
+    match host_admission(state, &request.action) {
+        HostAdmission::Allowed => {}
+        HostAdmission::RouterBusy => return Err(crate::gse::ROUTER_CORE_BUSY),
+        HostAdmission::Refused => return Err(intern(prepare_host_block_reason(state, &request.action))),
     }
     let router = state.topology_router.get().ok_or("Router unavailable")?;
     crate::system_clock::required_control_network_utc_ms(router)
@@ -1095,13 +1159,26 @@ pub(super) async fn confirm(
             );
         }
     };
-    let response = admit_confirmation(state.clone(), headers, principal, request, origin, boundary);
+    // A held SDK core decided nothing: run the same admission again, briefly,
+    // with the coordinator released between attempts.
+    let response = crate::core_busy::retry(
+        || {
+            let response = admit_confirmation(state.clone(), headers.clone(), principal.clone(), request.clone(), origin, boundary);
+            if response.extensions().get::<ConfirmCoreBusy>().is_some() { Err(response) } else { Ok(response) }
+        },
+        |_| true,
+    )
+    .await
+    .unwrap_or_else(|response| response);
     #[cfg(test)]
     if response.status() == StatusCode::OK {
         tests::pause_response(&state).await;
     }
     response
 }
+/// Marks a Confirm refused only because the SDK core was held.
+#[derive(Clone, Copy)]
+struct ConfirmCoreBusy;
 fn admit_confirmation(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -1126,6 +1203,7 @@ fn admit_confirmation(
             "Prepare a fresh explicit intent.",
         );
     };
+    let host = ticket_host_admission(&state, ticket);
     if ticket.created.elapsed() > CONFIRM_TTL
         || ticket.id != request.ticket
         || ticket.backend != request.backend_instance
@@ -1137,7 +1215,7 @@ fn admit_confirmation(
         || ticket.phrase != request.confirmation
         || ticket.reset_selection.is_some_and(|selection| selection.current(&state).is_err())
         || ticket.mode != crate::station_mode::local_mode()
-        || !ticket_host_current(&state, ticket)
+        || host == HostAdmission::Refused
         || state.launch_history.lock().unwrap().snapshot() != ticket.clock
         || control
             .operation
@@ -1149,6 +1227,12 @@ fn admit_confirmation(
             "stale_confirmation",
             "Ticket expired or immutable intent/session/Stop context changed.",
         );
+    }
+    if host == HostAdmission::RouterBusy {
+        // Every other check held; only the drained-router read was busy.
+        let mut response = error(StatusCode::SERVICE_UNAVAILABLE, "router_busy", crate::gse::ROUTER_CORE_BUSY);
+        response.extensions_mut().insert(ConfirmCoreBusy);
+        return response;
     }
     if ticket.targets.iter().any(|target| target.first_binding.is_none()
         && target.context.boot != u64::MAX && !target.prepared_query.fresh(Stamp::now())) {

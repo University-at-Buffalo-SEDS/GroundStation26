@@ -81,6 +81,14 @@ impl Control {
     pub(crate) fn advance_relief_epoch(&self, expected: u64) -> bool {
         expected.checked_add(1).is_some_and(|next| self.relief_epoch.compare_exchange(expected, next, Ordering::AcqRel, Ordering::Acquire).is_ok())
     }
+    /// Undo [`Self::advance_relief_epoch`] for an offer the SDK never admitted
+    /// (its core was held), so the same intent can be offered again. Called
+    /// only under the dispatch owner that advanced it.
+    pub(crate) fn restore_relief_epoch(&self, expected: u64) {
+        if let Some(next) = expected.checked_add(1) {
+            let _ = self.relief_epoch.compare_exchange(next, expected, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
     pub(crate) fn take_receiver(&self) -> Option<mpsc::Receiver<Request>> {
         self.receiver.lock().unwrap().take()
     }

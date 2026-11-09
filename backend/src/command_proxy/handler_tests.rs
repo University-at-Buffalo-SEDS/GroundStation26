@@ -1090,7 +1090,7 @@ async fn proxied_clear_gse_abort_runs_the_local_endpoint_checks_at_the_primary()
             &state,
             &state.auth.paired_proxy_actor("operator", Permission::SendCommands).unwrap(),
             crate::gse::capture_operator_origin(&state).unwrap_or(0),
-        ),
+        ).await,
         axum::http::StatusCode::CONFLICT
     );
     state.request_shutdown();
