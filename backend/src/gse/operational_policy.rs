@@ -1234,7 +1234,7 @@ mod tests {
                     && rt.engine.test_hold() == Some(&gse_sequence::TestHold::Passed);
                 drop(rt);
                 if hold {
-                    let _dispatch = DISPATCH_GATE.lock().unwrap();
+                    let _dispatch = dispatch_gate();
                     super::super::dump_test_hold_under_dispatch(&state).unwrap();
                 }
             }

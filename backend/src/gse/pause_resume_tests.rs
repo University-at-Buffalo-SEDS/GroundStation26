@@ -136,7 +136,7 @@ impl Plant {
                 && rt.engine.test_hold() == Some(&gse_sequence::TestHold::Passed)
         };
         if hold {
-            let _dispatch = DISPATCH_GATE.lock().unwrap();
+            let _dispatch = dispatch_gate();
             dump_test_hold_under_dispatch(&self.state).unwrap();
         }
         let rt = self.state.gse.lock().unwrap();
@@ -193,7 +193,7 @@ impl Plant {
         let controls = self.controls();
         assert!(controls.resume.allowed, "{:?}", controls.resume);
         assert!(!controls.pause.allowed);
-        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let _dispatch = dispatch_gate();
         let kind = self.state.gse.lock().unwrap().progress.current().unwrap().kind;
         if kind == crate::sequence_progress::Kind::Fill {
             handle_command_inner(&self.state, &TelemetryCommand::StartFill, None, None);
@@ -474,7 +474,7 @@ async fn routed_nitrogen_leak_holds_pressure_until_dump_then_ends_at_zero() {
     assert!(controls.cancel.allowed, "Cancel is available");
     assert!(!controls.resume.allowed, "a leak verdict cannot resume");
     {
-        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let _dispatch = dispatch_gate();
         dump_test_hold_under_dispatch(&plant.state).unwrap();
     }
     // The same run stays open (its modal stays) until the tank is empty.

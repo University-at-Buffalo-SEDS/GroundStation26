@@ -48,6 +48,21 @@ use std::{
 // Serialize effect preparation/admission with manual handoff. Transport
 // processing happens after this gate is released (callbacks may reenter GSE).
 static DISPATCH_GATE: Mutex<()> = Mutex::new(());
+/// Take the dispatch gate. It guards no data, so a panic while another path
+/// held it leaves nothing inconsistent; poisoning must never stop a later
+/// Stop, Abort or ordinary dispatch.
+fn dispatch_gate() -> std::sync::MutexGuard<'static, ()> {
+    DISPATCH_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+/// Nonwaiting form: None only while another owner holds the gate. A poisoned
+/// gate counts as acquired, never as Busy.
+fn try_dispatch_gate() -> Option<std::sync::MutexGuard<'static, ()>> {
+    match DISPATCH_GATE.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
 
 const KEYS: [u8; 5] = [0, 1, 2, 9, 10];
 const OPEN: [u8; 5] = [0, 1, 2, 9, 10];
@@ -1143,7 +1158,7 @@ pub(crate) fn handle_command_with_origins(
         return true;
     }
     let handled = {
-        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let _dispatch = dispatch_gate();
         handle_command_inner(state, cmd, plumbing_origin, launch_revision)
     };
     if let Some(observation) = automatic_observation.as_ref() {
@@ -1169,7 +1184,7 @@ pub(crate) fn classify_fill_for_recording(
     state: &AppState,
     origin: &crate::fill_recording::Origin,
 ) -> Result<crate::fill_recording::Disposition, crate::fill_recording::Error> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     classify_fill_for_recording_under_gate(state, origin, true)
 }
 fn classify_fill_for_recording_under_gate(
@@ -1237,7 +1252,7 @@ pub(crate) fn apply_recorded_fill(
 ) -> Result<(), crate::fill_recording::Error> {
     use crate::fill_recording::{Disposition, Error};
     {
-        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let _dispatch = dispatch_gate();
         let now = classify_fill_for_recording_under_gate(state, &prepared.origin, true)?;
         if !state.fill_recording.current(&prepared.receipt) {
             return Err(Error::Unavailable);
@@ -1269,7 +1284,7 @@ pub(crate) fn apply_recorded_fill(
         return Ok(());
     }
     {
-        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let _dispatch = dispatch_gate();
         let now = classify_fill_for_recording_under_gate(state, &prepared.origin, true)?;
         if !state.fill_recording.current(&prepared.receipt) {
             return Err(Error::Unavailable);
@@ -1295,7 +1310,7 @@ pub(crate) fn consume_fill_noop(state: &Arc<AppState>, cmd: &TelemetryCommand) -
     if !matches!(cmd, TelemetryCommand::StartFill) {
         return false;
     }
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if cold_flow::active(state) {
         return false;
     }
@@ -1671,7 +1686,7 @@ fn remember_automatic_cutoff_target(runtime: &mut Runtime, mass: f32, target: f3
 /// Admit a late asynchronous fill completion through the same launch gate.
 pub(crate) fn start_fill_after_automatic_zero(state: &Arc<AppState>, generation: u64) {
     let _claim = {
-        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let _dispatch = dispatch_gate();
         let Some(claim) = claim_operator_dispatch_under_gate(state, generation) else {
             return;
         };
@@ -1721,7 +1736,7 @@ pub(crate) fn queue_automatic_supply_close(
     command: u8,
     generation: u64,
 ) -> sedsnet::TelemetryResult<bool> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     let Some(_claim) = claim_operator_dispatch_under_gate(state, generation) else {
         return Ok(false);
     };
@@ -1776,7 +1791,7 @@ pub(crate) fn pause_fill_for_recoverable_fault_for_generation(
     generation: u64,
 ) {
     let _claim = {
-        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let _dispatch = dispatch_gate();
         let Some(claim) = claim_operator_dispatch_under_gate(state, generation) else {
             return;
         };
@@ -1819,7 +1834,7 @@ pub fn tick(state: &Arc<AppState>, interlock: bool) {
         return;
     }
     let _claim = {
-        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let _dispatch = dispatch_gate();
         let Some(claim) = claim_operator_dispatch_under_gate(state, automatic_generation(state))
         else {
             return;
@@ -2767,7 +2782,7 @@ mod tests {
     #[tokio::test]
     async fn manual_handoff_fences_prepared_effects_before_the_requested_command() {
         let (state, sent, peer) = button_test_state().await;
-        let prepared = DISPATCH_GATE.lock().unwrap();
+        let prepared = dispatch_gate();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let manual_state = state.clone();
@@ -3159,7 +3174,7 @@ pub fn report_safety(state: &Arc<AppState>) {
     if cold_flow::active(state){return;}
     if !crate::runtime_mode::is_hitl() {
         let _claim = {
-            let _dispatch = DISPATCH_GATE.lock().unwrap();
+            let _dispatch = dispatch_gate();
             let Some(claim) =
                 claim_operator_dispatch_under_gate(state, automatic_generation(state))
             else {
@@ -3338,6 +3353,8 @@ pub(crate) fn prepare_verified_startup(state: &Arc<AppState>) -> Result<(), &'st
 /// station first saw it pending) counts as undeliverable rather than still in
 /// delivery. One shared rule for Clear GSE abort and the station mode switch.
 pub(crate) const UNDELIVERABLE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+// First-seen times only: still valid if a panic interrupts an update, so a
+// poisoned lock is taken over instead of failing Clear GSE abort.
 static DELIVERY_FIRST_SEEN: std::sync::Mutex<Option<std::collections::HashMap<(usize, u64), std::time::Instant>>> = std::sync::Mutex::new(None);
 /// The pending reliable frames of these types that are still in their normal
 /// delivery window: outstanding less than UNDELIVERABLE_AFTER, judged both by
@@ -3348,7 +3365,7 @@ pub(crate) fn commands_still_in_delivery(router: &sedsnet::router::Router, kinds
     let now = std::time::Instant::now();
     let window = crate::sim_freshness::wall(UNDELIVERABLE_AFTER);
     let retry_ms = u64::from(sedsnet::config::runtime_tuning_config().reliable_retransmit_ms.max(1));
-    let mut seen = DELIVERY_FIRST_SEEN.lock().unwrap();
+    let mut seen = DELIVERY_FIRST_SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let seen = seen.get_or_insert_with(Default::default);
     // Pending in the SDK but not yet a tracked delivery (still queued, or no
     // advertised destination yet): tracked per type under a synthetic key.
@@ -3375,7 +3392,7 @@ pub(crate) fn commands_still_in_delivery(router: &sedsnet::router::Router, kinds
 }
 #[cfg(test)]
 pub(crate) fn age_delivery_tracking_for_test(by: std::time::Duration) {
-    if let Some(seen) = DELIVERY_FIRST_SEEN.lock().unwrap().as_mut() {
+    if let Some(seen) = DELIVERY_FIRST_SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
         for first in seen.values_mut() { *first = first.checked_sub(by).unwrap_or(*first); }
     }
 }
@@ -4002,7 +4019,7 @@ fn launch_preparation_gate(
                     .into(),
             );
         }
-        let dispatch = DISPATCH_GATE.lock().unwrap();
+        let dispatch = dispatch_gate();
         if retried && started.elapsed() >= window {
             return Err(
                 "Launch preparation timed out waiting for SDK Core; no launch intent was saved"
@@ -4053,7 +4070,7 @@ pub(crate) fn commit_operator_phase(
     intent: &crate::operator_phase::Intent,
     prepared: &mut sedsnet::router::PreparedManagedBatch<'_>,
 ) -> Result<(), String> {
-    let dispatch = DISPATCH_GATE.lock().unwrap();
+    let dispatch = dispatch_gate();
     if !intent.validate(state)
         || !crate::operator_phase::button_allowed(state)
         || !crate::operator_phase::controls_allowed(state)
@@ -4216,7 +4233,7 @@ pub(crate) fn with_fill_recording_publication(
     publication: &mut crate::fill_recording::Publication,
 ) -> Result<(), crate::fill_recording::Error> {
     use crate::fill_recording::Error;
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     origin.remaining()?;
     if state.operator_admission_barrier.load(std::sync::atomic::Ordering::Acquire) != 0 {
         return Err(Error::Stale);
@@ -4230,7 +4247,7 @@ pub(crate) fn with_fill_recording_publication(
         .map_err(|_| Error::Stale)?
 }
 pub(crate) fn fill_origin_current(state: &AppState, ticket: LaunchAdmission) -> CurrentState {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if state.operator_admission_barrier.load(std::sync::atomic::Ordering::Acquire) != 0
         || with_stop_admission(state, ticket, || ()).is_err() {
         return CurrentState::Invalid;
@@ -4238,10 +4255,10 @@ pub(crate) fn fill_origin_current(state: &AppState, ticket: LaunchAdmission) -> 
     manual_stop_state(state)
 }
 pub(crate) fn recording_publication_gate() -> std::sync::MutexGuard<'static, ()> {
-    DISPATCH_GATE.lock().unwrap()
+    dispatch_gate()
 }
 pub(crate) fn revoke_fill_recording(state: &AppState) {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     state.fill_recording.revoke_under_dispatch();
 }
 
@@ -4265,7 +4282,7 @@ fn with_plumbing_admission_inner<T>(
     admit: impl FnOnce() -> T,
     prepared: bool,
 ) -> Result<T, &'static str> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if manual_stop_pending(state) {
         return Err("Manual Stop is pending; plumbing admission refused");
     }
@@ -4282,7 +4299,7 @@ pub(crate) fn with_motion_context<T>(
     ticket: LaunchAdmission,
     admit: impl FnOnce() -> T,
 ) -> Result<T, &'static str> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if manual_stop_ram_pending(state) {
         return Err("Manual Stop is pending; plumbing admission refused");
     }
@@ -4296,7 +4313,7 @@ pub(crate) fn with_prepared_motion_admission<T>(
 ) -> Result<T, &'static str> {
     #[cfg(not(test))]
     let _ = first_attempt;
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if manual_stop_ram_pending(state) {
         return Err("Manual Stop is pending; plumbing admission refused");
     }
@@ -4325,7 +4342,7 @@ pub(crate) fn queue_plumbing_with_stop_fence(
     router: &sedsnet::router::Router,
     origin: Option<crate::actuator_plumbing::MotionOrigin>,
 ) -> Result<(), String> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     queue_plumbing_under_dispatch_with_stop_fence(state, router, origin, false)
 }
 
@@ -4336,7 +4353,7 @@ pub(crate) fn reserve_plumbing_worker(
     ticket: LaunchAdmission,
     reserve: impl FnOnce() -> bool,
 ) -> bool {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     reserve_plumbing_worker_under_dispatch(state, ticket, reserve)
 }
 pub(crate) fn reserve_plumbing_worker_under_dispatch(
@@ -4486,7 +4503,7 @@ fn with_launch_admission<T>(
         }
         Some(crate::ignition_pair::capture_route_token(state).map_err(str::to_string)?)
     } else { None };
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if cold_flow::active(state){return Err("Rocket Launch is inhibited while cold flow owns the valves".into());}
     with_stop_admission(state, ticket, || ()).map_err(str::to_string)?;
     let required = crate::board_abort::required_mask(state)
@@ -4679,7 +4696,7 @@ pub(crate) fn queue_prepared_launch_packets(
     // Even a partial batch has real SDK owners. Persist/describe that admitted
     // Launch truthfully; no implicit retry and no automatic Abort are allowed.
     if let Some(prepared) = prepared.filter(|_| accepted > 0) {
-        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let _dispatch = dispatch_gate();
         with_stop_admission(state,ticket,||()) .map_err(|e|format!("SDK admitted {accepted}/{total} Launch packets, but {e}; explicit recovery required"))?;
         let claim=claim_operator_dispatch_under_gate(state,ticket.generation).ok_or_else(||format!("SDK admitted {accepted}/{total} Launch packets, recovery closed before publication"))?;
         crate::network_variables::commit_admitted_launch(&prepared).map_err(|e| {
@@ -4710,7 +4727,7 @@ pub(crate) fn admit_simulated_retraction_stamped(
     // Sampling/validation is outside the shared admission boundary.
     let source = crate::actuator_plumbing::validated_motion_stamp(state, router, origin)?;
     let observed_utc=crate::system_clock::required_control_network_utc_ms(router).map_err(|_|"Testing canonical UTC unavailable")?;
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     let mut accepted = false;
     state.board_abort.change_launch_context_if(|| {
         with_stop_admission(state, ticket, || {
@@ -5098,7 +5115,7 @@ pub(crate) fn sync_calibration_after_automatic_zero(
     generation: u64,
     calibration: &crate::loadcell::LoadcellCalibrationFile,
 ) -> Result<(), String> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     let Some(_claim) = claim_operator_dispatch_under_gate(state, generation) else {
         return Err("Automatic zero cancelled by closed admission".into());
     };
@@ -5121,7 +5138,7 @@ pub(crate) fn queue_automatic_abort_for_generation(
     generation: u64,
     reason: &str,
 ) -> sedsnet::TelemetryResult<bool> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     let Some(_claim) = claim_operator_dispatch_under_gate(state, generation) else {
         return Ok(false);
     };
@@ -5198,7 +5215,7 @@ pub(crate) fn record_operator_command_with_recovery_origin_diagnostic(
     duplicate_window_ms:u64, launch_revision:Option<u64>, diagnostic:RecoveryAdmissionDiagnostic<'_>,
 )->Result<OperatorCommandAdmission,String> {
     let RecoveryAdmissionDiagnostic { origin: recovery_origin, rejection } = diagnostic;
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     // A second copy must not spend a relief epoch then disappear as Duplicate:
     // that would invalidate the only queued real command. Check duplicates
     // under the same owner/generation/Stop/deadline context, without mutation.
@@ -5278,7 +5295,7 @@ mod operator_admission_tests {
         // Model only the coordinator's in-memory publication boundary: no
         // physical reset or board proof is authorized by this test helper.
         {
-            let _dispatch = DISPATCH_GATE.lock().unwrap();
+            let _dispatch = dispatch_gate();
             state.last_command_ms.lock().unwrap().clear();
             state
                 .automatic_generation
@@ -5507,7 +5524,7 @@ impl Drop for OperatorDispatchClaim {
 }
 /// Capture before authentication/IO awaits; closed admission has no origin.
 pub(crate) fn capture_operator_origin(state: &AppState) -> Option<u64> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     (!state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) && state
         .operator_admission_barrier
         .load(std::sync::atomic::Ordering::Acquire)
@@ -5518,7 +5535,7 @@ pub(crate) fn claim_operator_dispatch(
     state: &AppState,
     generation: u64,
 ) -> Option<OperatorDispatchClaim> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     claim_operator_dispatch_under_gate(state, generation)
 }
 /// Only this RAM flag is published under the dispatch gate; file IO remains
@@ -5527,7 +5544,7 @@ pub(crate) fn claim_plumbing_settings_dispatch(
     state: &AppState,
     generation: u64,
 ) -> Option<OperatorDispatchClaim> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     let claim = claim_operator_dispatch_under_gate(state, generation)?;
     if state.plumbing_drive.motion_worker_pending() {
         return None;
@@ -5591,7 +5608,7 @@ pub(crate) fn admit_safe_manual<T>(
     offer: impl FnOnce() -> T,
 ) -> Option<(T, OperatorDispatchClaim)> {
     use std::sync::atomic::Ordering;
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if !intent.current(state) || state.operator_queue.fill_launch_active() || !state.action_policy.lock().unwrap().software_buttons_enabled {
         return None;
     }
@@ -5614,7 +5631,7 @@ pub(crate) fn admit_safe_manual<T>(
 }
 
 pub(crate) fn claim_manual_dispatch(state:&AppState,generation:u64,origin:Option<crate::operator_queue::manual_origin::Origin>)->Option<OperatorDispatchClaim> {
-    let _dispatch=DISPATCH_GATE.lock().unwrap();
+    let _dispatch=dispatch_gate();
     if let Some(origin)=origin {
         if origin.generation()!=generation || !origin.dispatched(state) {return None;}
         claim_operator_inflight_under_gate(state)
@@ -5630,7 +5647,7 @@ pub(crate) fn commit_local_manual_stop(
     claim: &crate::manual_abort_intent::Claim,
     receipt: &crate::manual_abort_utc::LocalStopAdmission,
 ) -> bool {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if matches!(receipt.generation(), 0 | u64::MAX)
         || receipt.generation() != automatic_generation(state)
         || receipt.epoch() != claim.epoch()
@@ -5646,7 +5663,7 @@ pub(crate) fn commit_local_manual_stop(
 }
 
 pub(crate) fn accept_observed_abort(state: &AppState, automatic: bool, generation: u64) -> bool {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if automatic && (generation != automatic_generation(state) || !automatic_abort_allowed(state)) {
         return false;
     }
@@ -6132,8 +6149,7 @@ mod final_launch_admission_tests {
             std::thread::spawn(move || inhibit_automatic_actions_for_launch(&worker_state));
         // Generous bound: a loaded host can take well over a second to reach
         // the wait. Never panic while holding the journal: unwinding would
-        // poison it, the worker would then panic inside DISPATCH_GATE, and
-        // that process-wide gate would fail every later test that takes it.
+        // poison it and the worker would then panic on it.
         let limit = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if state.gse.try_lock().is_err() {
@@ -6451,7 +6467,7 @@ pub(crate) fn with_closed_operator_queue<T>(
     token: crate::operator_queue::Token,
     drain: impl FnOnce() -> T,
 ) -> Option<T> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if token.owner == 0
         || state
             .operator_admission_barrier
@@ -6905,7 +6921,7 @@ pub(crate) fn try_commit_automatic_idle(
 ) -> Result<(), crate::automatic_startup_idle::Error> {
     use crate::automatic_startup_idle::Error;
     use std::sync::atomic::Ordering;
-    let _dispatch = DISPATCH_GATE.try_lock().map_err(|_| Error::Busy)?;
+    let _dispatch = try_dispatch_gate().ok_or(Error::Busy)?;
     if original.generation != automatic_generation(state)
         || state.operator_admission_barrier.load(Ordering::Acquire) != 0
         || state.shutdown_requested.load(Ordering::Acquire)
@@ -6953,7 +6969,7 @@ pub(crate) fn try_commit_automatic_phase(
     if !(1..=6).contains(&(proposal.target as u8))
         || identity.phase != proposal.target as u8
         || identity.original.generation != original.generation { return Err(Error::Ineligible); }
-    let _dispatch = DISPATCH_GATE.try_lock().map_err(|_| Error::Busy)?;
+    let _dispatch = try_dispatch_gate().ok_or(Error::Busy)?;
     if original.generation != automatic_generation(state)
         || state.operator_admission_barrier.load(Ordering::Acquire) != 0
         || state.shutdown_requested.load(Ordering::Acquire)
@@ -7018,7 +7034,7 @@ pub(crate) fn try_commit_automatic_policy(
     expected: crate::sequences::SequencePolicyState,
     next: crate::sequences::SequencePolicyState,
 ) {
-    let Ok(_dispatch) = DISPATCH_GATE.try_lock() else { return; };
+    let Some(_dispatch) = try_dispatch_gate() else { return; };
     if state.operator_admission_barrier.load(std::sync::atomic::Ordering::Acquire) != 0
         || manual_stop_state(state) != CurrentState::Current { return; }
     let Ok(history) = state.launch_history.try_lock() else { return; };

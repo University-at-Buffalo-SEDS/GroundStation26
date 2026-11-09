@@ -166,6 +166,18 @@ static ENTRIES: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 /// Retired entries in [`ENTRIES`]; zero keeps the writer check lock-free.
 static RETIRED: AtomicUsize = AtomicUsize::new(0);
 
+/// Every entry stays a valid record if a panic interrupts an update, so a
+/// poisoned lock is taken over rather than failing every later ABORT check.
+/// The retired count is rebuilt because the panic may have preceded it.
+fn entries() -> std::sync::MutexGuard<'static, Vec<Entry>> {
+    ENTRIES.lock().unwrap_or_else(|poisoned| {
+        let entries = poisoned.into_inner();
+        recount(&entries);
+        ENTRIES.clear_poison();
+        entries
+    })
+}
+
 fn router_key(router: &Router) -> usize {
     router as *const Router as usize
 }
@@ -180,7 +192,7 @@ fn recount(entries: &[Entry]) {
 
 /// Record an automatic ABORT the router has just accepted.
 pub(crate) fn register_automatic(router: &Router, packet_id: u64, reason: &str, cause: AbortCause) {
-    let mut entries = ENTRIES.lock().unwrap();
+    let mut entries = entries();
     let key = router_key(router);
     if entries.iter().any(|e| e.router == key && e.packet_id == packet_id) {
         return;
@@ -209,7 +221,7 @@ pub(crate) fn register_automatic(router: &Router, packet_id: u64, reason: &str, 
 #[cfg(test)]
 pub(crate) fn origin(router: &Router, packet_id: u64) -> AbortOrigin {
     let key = router_key(router);
-    if ENTRIES.lock().unwrap().iter().any(|e| e.router == key && e.packet_id == packet_id) {
+    if entries().iter().any(|e| e.router == key && e.packet_id == packet_id) {
         AbortOrigin::Automatic
     } else {
         AbortOrigin::Manual
@@ -221,9 +233,7 @@ pub(crate) fn is_retired(router: &Router, packet_id: u64) -> bool {
         return false;
     }
     let key = router_key(router);
-    ENTRIES
-        .lock()
-        .unwrap()
+    entries()
         .iter()
         .any(|e| e.router == key && e.packet_id == packet_id && e.retired.is_some())
 }
@@ -243,9 +253,7 @@ pub(crate) fn suppress_write(payload: &[u8]) -> bool {
     let Ok(id) = sedsnet::wire_format::packet_id_from_wire(payload) else {
         return false;
     };
-    ENTRIES
-        .lock()
-        .unwrap()
+    entries()
         .iter()
         .any(|e| e.packet_id == id && e.retired.is_some())
 }
@@ -287,7 +295,7 @@ pub(crate) fn retire_on_operator_clear(state: &AppState, router: &Router) -> usi
     let key = router_key(router);
     let causes = cause_states(state, key);
     let retired = {
-        let mut entries = ENTRIES.lock().unwrap();
+        let mut entries = entries();
         refresh_locked(&mut entries, key, router, &rows, any_abort_pending, Instant::now());
         let mut retired = Vec::new();
         for entry in entries.iter_mut().filter(|e| e.router == key) {
@@ -306,7 +314,7 @@ pub(crate) fn retire_on_operator_clear(state: &AppState, router: &Router) -> usi
 
 /// Apply (b) and (c) to this router's pending automatic aborts.
 pub(crate) fn evaluate(state: &AppState, router: &Router, now: Instant) {
-    if ENTRIES.lock().unwrap().is_empty() {
+    if entries().is_empty() {
         return;
     }
     let any_abort_pending = router.try_has_pending_reliable_tx_type(abort_type()).unwrap_or(true);
@@ -316,7 +324,7 @@ pub(crate) fn evaluate(state: &AppState, router: &Router, now: Instant) {
     let max_age = crate::sim_freshness::wall(AUTOMATIC_ABORT_MAX_AGE);
     let causes = cause_states(state, key);
     let (retired, query) = {
-        let mut entries = ENTRIES.lock().unwrap();
+        let mut entries = entries();
         refresh_locked(&mut entries, key, router, &rows, any_abort_pending, now);
         let mut retired = Vec::new();
         let mut query = 0u8;
@@ -356,9 +364,7 @@ pub(crate) fn evaluate(state: &AppState, router: &Router, now: Instant) {
 /// Each unretired entry's cause state, read without holding the registry
 /// (the predicates take station locks).
 fn cause_states(state: &AppState, key: usize) -> Vec<(u64, CauseState)> {
-    let causes = ENTRIES
-        .lock()
-        .unwrap()
+    let causes = entries()
         .iter()
         .filter(|e| e.router == key && e.retired.is_none())
         .map(|e| (e.packet_id, e.cause.clone()))
@@ -492,7 +498,41 @@ pub(crate) fn spawn(state: Arc<AppState>, router: Arc<Router>) -> tokio::task::J
 #[cfg(test)]
 pub(crate) fn retired_reason(router: &Router, packet_id: u64) -> Option<RetireReason> {
     let key = router_key(router);
-    ENTRIES.lock().unwrap().iter()
+    entries().iter()
         .find(|e| e.router == key && e.packet_id == packet_id)
         .and_then(|e| e.retired)
+}
+
+#[cfg(test)]
+mod poison_tests {
+    use super::*;
+    /// A panic part-way through an update must not stop later ABORT checks;
+    /// the next update rebuilds the retired count from what was written.
+    #[test]
+    fn a_panic_inside_the_entries_lock_keeps_abort_retirement_working() {
+        // Own process: this poisons a process-wide lock on purpose.
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "a_panic_inside_the_entries_lock_keeps_abort_retirement_working",
+        ) {
+            return;
+        }
+        let router = Router::new(sedsnet::router::RouterConfig::new([]));
+        register_automatic(&router, 7, "test", AbortCause::Unknown("test".into()));
+        let key = router_key(&router);
+        let _ = std::thread::spawn(move || {
+            let mut entries = ENTRIES.lock().unwrap();
+            for entry in entries.iter_mut().filter(|e| e.router == key) {
+                entry.retired = Some(RetireReason::OperatorCleared);
+            }
+            panic!("interrupted before the retired count was updated");
+        })
+        .join();
+        assert!(ENTRIES.is_poisoned());
+        // The next locked update takes the lock over and rebuilds the count.
+        register_automatic(&router, 8, "test", AbortCause::Unknown("test".into()));
+        assert!(!ENTRIES.is_poisoned());
+        assert!(is_retired(&router, 7));
+        assert!(!is_retired(&router, 8));
+    }
 }

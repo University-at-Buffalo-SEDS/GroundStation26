@@ -498,7 +498,7 @@ async fn actual_routes_require_current_permission_run_and_epoch_and_wait_for_con
             let work = observed.clone();
             let waiter = std::thread::spawn(move || {
                 if old_under_dispatch {
-                    let _gate = DISPATCH_GATE.lock().unwrap();
+                    let _gate = dispatch_gate();
                     project_and_publish(
                         &work,
                         crate::sequence_progress_stage::Batch::empty(),
@@ -514,12 +514,12 @@ async fn actual_routes_require_current_permission_run_and_epoch_and_wait_for_con
                 std::thread::yield_now();
             }
             if old_under_dispatch {
-                assert!(DISPATCH_GATE.try_lock().is_err());
+                assert!(try_dispatch_gate().is_none());
                 println!(
                     "SEQUENCE_CONTROL old_report_clock_under_dispatch=RED actual_fifo_read=blocked"
                 );
             } else {
-                assert!(DISPATCH_GATE.try_lock().is_ok());
+                assert!(try_dispatch_gate().is_some());
                 assert!(observed.gse.try_lock().is_ok());
                 let ticket = LaunchAdmission::capture(&observed);
                 let at = Instant::now();

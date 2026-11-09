@@ -559,7 +559,7 @@ async fn cancel(
         return StatusCode::CONFLICT.into_response();
     };
     let accepted = {
-        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let _dispatch = dispatch_gate();
         let stop_pending = manual_stop_pending(&state);
         let command_allowed = state.is_command_allowed(&TelemetryCommand::CancelFill)
             && !state
@@ -674,7 +674,7 @@ async fn pause(
         return StatusCode::CONFLICT.into_response();
     };
     let result = {
-        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let _dispatch = dispatch_gate();
         admitted(&state, &key, requested, |c| &c.pause).and_then(|()| {
             handle_command_inner(&state, &TelemetryCommand::PauseFill, None, None);
             let rt = state.gse.lock().unwrap();
@@ -719,7 +719,7 @@ async fn dump(
         return StatusCode::CONFLICT.into_response();
     };
     let result = {
-        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let _dispatch = dispatch_gate();
         admitted(&state, &key, requested, hold_dump_gate)
             .and_then(|()| super::dump_test_hold_under_dispatch(&state))
     };
@@ -771,7 +771,7 @@ async fn resume(
         return StatusCode::CONFLICT.into_response();
     };
     let result = {
-        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let _dispatch = dispatch_gate();
         admitted(&state, &key, requested, |c| &c.resume).and_then(|()| {
             if kind == Some(Kind::Fill) {
                 handle_command_inner(&state, &TelemetryCommand::StartFill, None, None);

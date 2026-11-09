@@ -9,7 +9,7 @@ pub(crate) fn invalidate_capture_epoch(
     expected_generation: u64,
 ) -> Result<u64, &'static str> {
     // Non-reentrant: callers must not already hold DISPATCH_GATE.
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     invalidate_capture_epoch_under_dispatch(state, expected_generation)
 }
 
@@ -60,7 +60,7 @@ pub(crate) fn close_operator_admission(
     expected_generation: u64,
     owner: u64,
 ) -> Result<(), &'static str> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if matches!(owner, 0 | u64::MAX) || automatic_generation(state) != expected_generation {
         return Err("Recovery admission ticket is unavailable or stale");
     }
@@ -83,7 +83,7 @@ pub(crate) fn advance_with_clock_fence(
     owner: u64,
     fence: &crate::launch_history::RecoveryFence,
 ) -> Result<u64, &'static str> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if owner == 0
         || state
             .operator_admission_barrier
@@ -112,7 +112,7 @@ pub(crate) fn advance_with_clock_fence(
 /// Only the owner that closed admission can reopen it, and only while the
 /// journal is not closed for recovery.
 pub(crate) fn reopen_unstarted_recovery_admission(state: &AppState, owner: u64) -> Result<(), &'static str> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if matches!(owner, 0 | u64::MAX) {
         return Err("Recovery owner is unavailable");
     }
@@ -136,7 +136,7 @@ pub(crate) fn finish_satisfied_recovery(
     satisfied: impl FnOnce(&crate::launch_history::RecoveryPending) -> bool,
 ) -> Result<(), &'static str> {
     // The caller holds the recovery coordinator's lock: never wait here.
-    let _dispatch = DISPATCH_GATE.try_lock().map_err(|_| "Dispatch gate busy")?;
+    let _dispatch = try_dispatch_gate().ok_or("Dispatch gate busy")?;
     let owner = state.operator_admission_barrier.load(std::sync::atomic::Ordering::Acquire);
     if matches!(owner, 0 | u64::MAX)
         || state.operator_dispatch_inflight.load(std::sync::atomic::Ordering::Acquire) != 0
@@ -165,7 +165,7 @@ pub(crate) fn transfer_closed_recovery_owner(
     new_owner: u64,
     fence: &crate::launch_history::RecoveryFence,
 ) -> Result<crate::launch_history::RecoveryFence, &'static str> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if matches!(old_owner, 0 | u64::MAX)
         || matches!(new_owner, 0 | u64::MAX)
         || new_owner == old_owner
@@ -203,7 +203,7 @@ pub(crate) fn reopen_operator_admission_and_journal(
     owner: u64,
     fence: &crate::launch_history::RecoveryFence,
 ) -> Result<(), &'static str> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if owner == 0
         || state
             .operator_admission_barrier
@@ -243,7 +243,7 @@ pub(crate) fn advance_verified_recovery(
     token: crate::operator_queue::Token,
     fence: &crate::launch_history::RecoveryFence,
 ) -> Result<u64, &'static str> {
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if state
         .operator_admission_barrier
         .load(std::sync::atomic::Ordering::Acquire)
@@ -341,7 +341,7 @@ pub(crate) fn finalize_verified_recovery(
     let proxy_nonce = proxy
         .as_ref()
         .map(|_| crate::command_proxy::recovery::Barrier::prepare_reopen_nonce());
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     if state
         .operator_admission_barrier
         .load(std::sync::atomic::Ordering::Acquire)

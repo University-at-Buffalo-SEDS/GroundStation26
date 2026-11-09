@@ -250,7 +250,7 @@ fn apply(state: &Arc<AppState>, plan: Plan) -> bool {
 /// and cursor, so later service never retimestamps or republishes a success.
 fn retain_busy(state: &Arc<AppState>, mut plan: Plan, recover: bool) -> bool {
     plan.deferred = true;
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     let mut rt = state.gse.lock().unwrap();
     if let Some(session) = rt.cold_flow.as_mut().filter(|s| {
         s.key == plan.key && s.revision == plan.revision && !s.retired
@@ -343,7 +343,7 @@ fn apply_bounded(state: &Arc<AppState>, mut plan: Plan, recover: bool) -> bool {
         };
         let simulation = crate::simulation_clock_ms();
         let accepted = {
-            let _dispatch = DISPATCH_GATE.lock().unwrap();
+            let _dispatch = dispatch_gate();
             let valid = {
                 let rt = state.gse.lock().unwrap();
                 rt.cold_flow.as_ref().is_some_and(|s| {
@@ -389,7 +389,7 @@ fn apply_bounded(state: &Arc<AppState>, mut plan: Plan, recover: bool) -> bool {
     }
     if plan.failed && recover {
         let closure = {
-            let _dispatch = DISPATCH_GATE.lock().unwrap();
+            let _dispatch = dispatch_gate();
             let mut rt = state.gse.lock().unwrap();
             if rt.cold_flow.as_ref().is_some_and(|s| {
                 s.key == plan.key && s.revision == plan.revision && !s.retired
@@ -418,7 +418,7 @@ fn perform(
     let simulation = crate::simulation_clock_ms();
     let policy = state.action_policy_snapshot();
     let plan = {
-        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let _dispatch = dispatch_gate();
         match ownership_state(state, requested) {
             CurrentState::PendingBusy => return Err("Cold-flow admission busy; retry this action"),
             CurrentState::Invalid => return Err("Cold-flow admission changed or Stop/Launch is active"),
@@ -608,7 +608,7 @@ fn recording_preflight(
 ) -> Result<(), PreparationError> {
     let simulation = crate::simulation_clock_ms();
     let policy = state.action_policy_snapshot();
-    let _dispatch = DISPATCH_GATE.lock().unwrap();
+    let _dispatch = dispatch_gate();
     preparation_ownership(state, requested)?;
     if matches!(
         state.launch_clock_snapshot().kind,
@@ -745,7 +745,7 @@ async fn start(
         let simulation = crate::simulation_clock_ms();
         let policy = state.action_policy_snapshot();
         let attempt = (|| -> Result<(RunKey, Plan), PreparationError> {
-            let _dispatch = DISPATCH_GATE.lock().unwrap();
+            let _dispatch = dispatch_gate();
             if origin.remaining().is_err() || !state.fill_recording.current(&recording) {
                 return Err(PreparationError::Invalid(
                     "Recording proof expired before cold-flow admission",
@@ -1056,7 +1056,7 @@ pub(crate) async fn dispatch_panel(state: &Arc<AppState>, intent: PanelIntent) {
 pub(super) fn tick(state: &Arc<AppState>, is_interlocked: bool) -> bool {
     let simulation = crate::simulation_clock_ms();
     let plan = {
-        let _dispatch = DISPATCH_GATE.lock().unwrap();
+        let _dispatch = dispatch_gate();
         let ticket = {
             let rt = state.gse.lock().unwrap();
             let Some(session) = rt.cold_flow.as_ref().filter(|s| s.active()) else {

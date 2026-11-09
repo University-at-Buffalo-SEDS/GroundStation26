@@ -143,7 +143,7 @@ async fn held_sdk_core_returns_without_journal_mutation_or_dispatch_lock_retenti
     assert!(result.unwrap_err().contains("SDK Core"));
     thread.join().unwrap();
     assert!(
-        DISPATCH_GATE.try_lock().is_ok(),
+        try_dispatch_gate().is_some(),
         "DISPATCH released even while actual SDK core remains held"
     );
     assert_eq!(

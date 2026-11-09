@@ -1177,7 +1177,7 @@ mod tests {
                 super::super::tick(&state, true);
             } else {
                 let progressed = {
-                    let _gate = DISPATCH_GATE.lock().unwrap();
+                    let _gate = dispatch_gate();
                     tick(&state, true)
                 };
                 assert!(progressed);
@@ -1724,7 +1724,7 @@ mod tests {
                 rt.engine.tick(input)
             };
             {
-                let _gate = DISPATCH_GATE.lock().unwrap();
+                let _gate = dispatch_gate();
                 apply(&state, effects);
             }
             flush_effects(&state);
@@ -1747,7 +1747,7 @@ mod tests {
             rt.valve_pressure = None;
         }
         {
-            let _gate = DISPATCH_GATE.lock().unwrap();
+            let _gate = dispatch_gate();
             assert!(guard_closed_pressure(&state));
         }
         assert_eq!(
@@ -1772,7 +1772,7 @@ mod tests {
             });
         }
         {
-            let _gate = DISPATCH_GATE.lock().unwrap();
+            let _gate = dispatch_gate();
             assert!(guard_closed_pressure(&state));
         }
         flush_effects(&state);
