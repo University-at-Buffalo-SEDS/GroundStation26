@@ -240,6 +240,16 @@ fn prerequisites(state: &AppState, rt: &Runtime, input: Inputs) -> bool {
     }
     true
 }
+/// Why Turbocharge cannot be configured to run, if a setting is the reason.
+pub(super) fn configuration_reason(rt: &Runtime) -> Option<&'static str> {
+    if rt.engine.config.turbocharge_max_added_mass_kg.is_none() {
+        Some("Configure maximum added nitrogen mass before Turbocharge")
+    } else if rt.turbo_inventory_pending && rt.turbo_evidence.is_none() {
+        Some("Interrupted nitrogen accounting requires a verified liquid fill or explicit reset/requalification")
+    } else {
+        None
+    }
+}
 pub(super) fn allowed(state: &AppState, rt: &Runtime, original: Inputs) -> bool {
     if !prerequisites(state, rt, original) {
         return false;
@@ -758,7 +768,7 @@ pub(super) fn decorate_status(state: &AppState, response: &mut serde_json::Value
             .is_some_and(|mass| accepts_mass(state, &rt, mass))
     );
     response["valve_pressure"]=rt.valve_pressure.map_or(serde_json::Value::Null,|p|serde_json::json!({"psi":p.value,"source":"VB/FUEL_TANK_PRESSURE","source_timestamp_ms":rt.last_valve_pressure_source_ms,"age_ms":now.checked_sub(p.at_ms)}));
-    response["turbocharge"] = serde_json::json!({"active":rt.turbocharge.is_some(),"pending_inventory_qualification":rt.turbo_inventory_pending,"phase":rt.turbocharge.as_ref().map(Controller::phase),"evidence":rt.turbo_evidence,"max_added_nitrogen_mass_kg":rt.engine.config.turbocharge_max_added_mass_kg,"disabled_reason":if rt.engine.config.turbocharge_max_added_mass_kg.is_none(){Some("Configure maximum added nitrogen mass before Turbocharge")}else if rt.turbo_inventory_pending && rt.turbo_evidence.is_none(){Some("Interrupted nitrogen accounting requires a verified liquid fill or explicit reset/requalification")}else{None}});
+    response["turbocharge"] = serde_json::json!({"active":rt.turbocharge.is_some(),"pending_inventory_qualification":rt.turbo_inventory_pending,"phase":rt.turbocharge.as_ref().map(Controller::phase),"evidence":rt.turbo_evidence,"max_added_nitrogen_mass_kg":rt.engine.config.turbocharge_max_added_mass_kg,"disabled_reason":configuration_reason(&rt)});
 }
 
 #[cfg(test)]

@@ -687,6 +687,10 @@ impl Engine {
             Effects::default()
         }
     }
+    /// Why `action` would be refused now, in operator words; None if allowed.
+    pub fn refusal_reason(&self, action: Action, input: Inputs) -> Option<String> {
+        self.validate_request(action, input).err()
+    }
     fn validate_request(&self, action: Action, input: Inputs) -> Result<(), String> {
         if !self.allows(action, input) {
             if !input.prelaunch {

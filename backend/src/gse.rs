@@ -932,9 +932,17 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
     let rt = state.gse.lock().unwrap();
     let input = rt.input(is_prelaunch, interlock(state, policy));
     policy.controls.retain(|c| c.cmd != "Turbocharge");
-    policy.controls.push(ActionControl { disabled_reason: None, requested: None, network_note: None,
+    let turbo_enabled = turbocharge::allowed(state, &rt, input);
+    policy.controls.push(ActionControl {
+        disabled_reason: (!turbo_enabled).then(|| {
+            turbocharge::configuration_reason(&rt)
+                .map(str::to_owned)
+                .or_else(|| rt.engine.refusal_reason(Action::StartFill, input).filter(|_| !input.prelaunch || !input.interlock))
+                .unwrap_or_else(|| "Turbocharge runs only during a fill, after the nitrogen test passes.".into())
+        }),
+        requested: None, network_note: None,
         cmd: "Turbocharge".into(),
-        enabled: turbocharge::allowed(state, &rt, input),
+        enabled: turbo_enabled,
         blink: BlinkMode::None,
         actuated: Some(rt.turbocharge.is_some()),
     });
@@ -951,7 +959,17 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
         let waits = action == Action::StartFill && fill_waits;
         let enabled = enabled && !waits;
         policy.controls.retain(|c| c.cmd != cmd);
-        policy.controls.push(ActionControl { disabled_reason: waits.then(|| RETIREMENT_PENDING.into()), requested: None, network_note: None,
+        // Say why it is disabled: the engine names the missing step.
+        let reason = if waits {
+            Some(RETIREMENT_PENDING.into())
+        } else if enabled {
+            None
+        } else {
+            Some(rt.engine.refusal_reason(action, input).unwrap_or_else(|| {
+                "Not available at this step of the operational sequence.".into()
+            }))
+        };
+        policy.controls.push(ActionControl { disabled_reason: reason, requested: None, network_note: None,
             cmd: cmd.into(),
             enabled,
             blink: BlinkMode::None,
