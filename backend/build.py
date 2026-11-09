@@ -127,6 +127,12 @@ def refresh_sedsnet_dependency(repo_root: Path) -> None:
         print(result.stdout, end="")
 
 
+def _remote_build():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import remote_build
+    return remote_build
+
+
 def build_backend(
         backend_dir: Path,
         force_pi: bool,
@@ -163,6 +169,11 @@ def build_backend(
 
     try:
         refresh_sedsnet_dependency(backend_dir.parent)
+        remote = _remote_build()
+        if remote.requested():
+            features = [cmd[i + 1] for i, part in enumerate(cmd) if part == "--features"]
+            remote.build_backend(backend_dir.parent, features, debug_mode)
+            return
         run(cmd, cwd=backend_dir)
     except FileNotFoundError as e:
         _print_missing_tool("Backend build", e, backend_dir)
@@ -176,7 +187,7 @@ def print_usage(exit_code: int = 1) -> None:
     print("Backend build script")
     print("")
     print("Usage:")
-    print("  ./backend/build.py [pi_build|no_pi] [testing|hitl-mode|test-fire-mode] [debug] [log=<path>]")
+    print("  ./backend/build.py [pi_build|no_pi] [testing|hitl-mode|test-fire-mode] [debug] [log=<path>] [--remote HOST]")
     print("")
     print("What this script owns:")
     print("  - backend cargo builds")
@@ -189,6 +200,7 @@ def print_usage(exit_code: int = 1) -> None:
     print("  testing|hitl-mode|test-fire-mode  # accepted; same binary (set GS_STATION_MODE at run time)")
     print("  debug                             # build without --release")
     print("  log=<path>                        # tee command output into a log file")
+    print("  --remote HOST                     # compile on HOST (user:password@host, user@host or host) and copy the binary back")
     sys.exit(exit_code)
 
 
@@ -196,6 +208,9 @@ def main() -> None:
     raw_args = [a.strip() for a in sys.argv[1:]]
     if any(a in {"-h", "--help", "help"} for a in raw_args):
         print_usage(0)
+    raw_args, remote = _remote_build().take_argument(raw_args)
+    if remote:
+        os.environ[_remote_build().ENV] = remote
 
     force_pi = False
     force_no_pi = False

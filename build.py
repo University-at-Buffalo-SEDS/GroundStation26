@@ -585,7 +585,20 @@ def _stop_frontend_process_tree(proc) -> None:
         proc.wait()
 
 
+def _remote_build():
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+    import remote_build
+    return remote_build
+
+
 def _execute_frontend_script_with_wasm_opt_fallback(script: Path, checkout_dir: Path, args: list[str], environment: dict[str, str], lifecycle: dict, allow_fallback: bool = True) -> None:
+    # Reusing existing output compiles nothing, so it stays local.
+    if _remote_build().requested() and "existing" not in args:
+        try:
+            _remote_build().build_frontend(checkout_dir, script, args)
+        finally:
+            lifecycle["stopped"] = True
+        return
     cmd = [sys.executable, str(script), *args]
     cmd_line = f"Running: {' '.join(str(part) for part in cmd)} (cwd={checkout_dir})"
     print(cmd_line)
@@ -1047,6 +1060,8 @@ def print_usage(exit_code: int = 1) -> None:
     print("  ./build.py --frontend-dev          # build frontend from dev instead of stable main")
     print("  ./build.py plain                   # docker only: pass --progress plain")
     print("  ./build.py log=build.log           # tee command output into a log file")
+    print("  ./build.py --remote HOST [...]     # compile backend and web UI on HOST (user:password@host, user@host or host)")
+    print("                                     # in an Ubuntu 24.04 container, then copy the results back (needs ssh, rsync, docker)")
     print("  ./build.py docker [pi_build|no_pi] [testing]")
     print("  ./build.py rrls                   # headless recovery backend + web UI, no local launch GPIO")
     print("  ./build.py --backend-only          # local: build backend only (backend_only also accepted)")
@@ -1084,6 +1099,11 @@ def main() -> None:
     raw_args = [a.strip() for a in sys.argv[1:]]
     if any(a in {"-h", "--help", "help"} for a in raw_args):
         print_usage(0)
+    # Before lowercasing: a password in the host is case-sensitive. The
+    # backend and frontend children read it from the environment.
+    raw_args, remote = _remote_build().take_argument(raw_args)
+    if remote:
+        os.environ[_remote_build().ENV] = remote
 
     frontend_platforms = {"web", "frontend_web"}
 
