@@ -5906,6 +5906,7 @@ mod tests {
             pending_db_writes: Arc::new(AtomicUsize::new(0)),
             ignition_observer: Arc::new(Default::default()),
         transport_tx_activity: Arc::new(Default::default()),
+        radio_tx_activity: Arc::new(Default::default()),
             db_write_notify: Arc::new(Notify::new()),
             notifications: Arc::new(Mutex::new(Vec::new())),
             notifications_tx,

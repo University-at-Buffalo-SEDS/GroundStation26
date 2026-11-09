@@ -294,6 +294,10 @@ pub struct AppState {
 
     /// Software TX ownership from callback admission through physical write.
     pub transport_tx_activity: Arc<crate::telemetry_task::TransportTxActivity>,
+    /// Physical writer ownership on the AV-bay radio side only. Kept apart
+    /// from the umbilical ledger so a fill-board recovery can tell that
+    /// nothing is still being written toward the boards it resets.
+    pub radio_tx_activity: Arc<crate::telemetry_task::TransportTxActivity>,
     pub ignition_observer: Arc<crate::ignition_pair::observer::Observer>,
 
     /// Notifies waiters when pending DB writes changes.
@@ -398,12 +402,23 @@ pub struct AppState {
 }
 
 impl AppState {
+    // HITL has no Abort-delivery gate that needs both ledgers at once.
+    #[cfg_attr(feature = "hitl_mode", allow(dead_code))]
     pub(crate) fn has_pending_recovery_control_tx(&self)->bool {
-        self.transport_tx_activity.has_pending_control() || crate::rrls::has_pending_recovery_control()
+        self.has_pending_umbilical_control_tx() || self.has_pending_radio_control_tx()
+    }
+    /// A controller frame still owned by the umbilical writer (fill boards).
+    pub(crate) fn has_pending_umbilical_control_tx(&self)->bool {
+        self.transport_tx_activity.has_pending_control()
+    }
+    /// A controller frame still owned by the AV-bay radio writer or the RRLS relay.
+    pub(crate) fn has_pending_radio_control_tx(&self)->bool {
+        self.radio_tx_activity.has_pending_control() || crate::rrls::has_pending_recovery_control()
     }
     #[cfg(test)]
     pub(crate) fn has_pending_transport_tx(&self) -> bool {
-        self.transport_tx_activity.has_pending() || crate::rrls::status().queued_frames != 0
+        self.transport_tx_activity.has_pending() || self.radio_tx_activity.has_pending()
+            || crate::rrls::status().queued_frames != 0
     }
 
     /// Reset derived samples after a physical KG50 input change. The caller
@@ -4395,6 +4410,7 @@ pub(crate) mod tests {
             pending_db_writes: Arc::new(AtomicUsize::new(0)),
             ignition_observer: Arc::new(Default::default()),
             transport_tx_activity: Arc::new(Default::default()),
+            radio_tx_activity: Arc::new(Default::default()),
             db_write_notify: Arc::new(Notify::new()),
             notifications: Arc::new(Mutex::new(Vec::new())),
             notifications_tx,

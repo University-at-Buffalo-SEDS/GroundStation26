@@ -1461,6 +1461,7 @@ async fn main() -> anyhow::Result<()> {
         pending_db_writes: Arc::new(AtomicUsize::new(0)),
         ignition_observer: Arc::new(Default::default()),
         transport_tx_activity: Arc::new(Default::default()),
+        radio_tx_activity: Arc::new(Default::default()),
         db_write_notify: Arc::new(Notify::new()),
         notifications: Arc::new(Mutex::new(Vec::new())),
         notifications_tx,
@@ -2067,7 +2068,7 @@ async fn main() -> anyhow::Result<()> {
     let (rocket_side, rocket_retry_tracker) = {
         let rocket_tx = rocket_tx.clone();
         let budget = rocket_tx_budget.clone();
-        let activity = state.transport_tx_activity.clone();
+        let activity = state.radio_tx_activity.clone();
         let opts = rocket_router_side_options(&comms_links.av_bay, rrls::is_rrls());
         router.add_side_packed_leased_with_priority_and_options(
             "rocket_comms",
@@ -2173,7 +2174,7 @@ async fn main() -> anyhow::Result<()> {
     let telemetry_shutdown_rx = state.shutdown_subscribe();
     let safety_shutdown_rx = state.shutdown_subscribe();
     let mut comms_workers = vec![CommsWorkerHandle {
-        transport_activity: Some(state.transport_tx_activity.clone()),
+        transport_activity: Some(state.radio_tx_activity.clone()),
         name: "rocket_comms",
         tx_budget: Some(rocket_tx_budget.clone()),
         comms: rocket_comms,

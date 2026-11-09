@@ -1484,26 +1484,118 @@ async fn exchange(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+/// Which in-flight control work must drain before a recovery touches boards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum QuiesceScope {
+    /// An AV-bay board (RF, FC or PB) is a target: everything must drain.
+    All,
+    /// Only fill boards (AB, VB, GB, DAQ) are targets.
+    FillOnly,
+}
+impl QuiesceScope {
+    fn of(targets: &[Target]) -> Self {
+        if targets.iter().any(|target| matches!(target.board, Board::RFBoard | Board::FlightComputer | Board::PowerBoard)) {
+            Self::All
+        } else {
+            Self::FillOnly
+        }
+    }
+}
+/// Reliable types that only ever travel to the AV bay. A backlog of them on
+/// the radio never reaches a fill board, so it cannot race a fill reset.
+const AV_BAY_ONLY_TYPES: &[&str] = &["FLIGHT_COMMAND", "AV_BAY_UNDERGLOW", "FLIGHT_BUZZER"];
+/// FLIGHT_STATE is the station's managed phase publication to every board.
+/// For a fill-only reset it blocks only while one of its undelivered copies
+/// is still owed to a fill board (or to a board the station cannot name);
+/// copies owed only to AV-bay boards do not race the fill boards. ABORT and
+/// every other shared type stay blocking in every scope.
+const FILL_SCOPE_ATTRIBUTED_TYPES: &[&str] = &["FLIGHT_STATE"];
+/// The board an end-to-end pending destination names. SEDSnet 4.3.11 keys
+/// destinations by `hash_bytes_u64(0x517C_C1B7_2722_0A95, sender)`, or by the
+/// compact address for an `@addr:` sender; a test pins this against a live
+/// router so an SDK change cannot silently break the attribution.
+fn pending_destination_board(router: &sedsnet::router::Router, owner: u64) -> Option<Board> {
+    const SENDER_HASH_SEED: u64 = 0x517C_C1B7_2722_0A95;
+    let named = [Board::RFBoard, Board::FlightComputer, Board::PowerBoard, Board::ActuatorBoard,
+        Board::ValveBoard, Board::GatewayBoard, Board::DaqBoard]
+        .into_iter()
+        .find(|board| sedsnet::packet::hash_bytes_u64(SENDER_HASH_SEED, board.sender_id().as_bytes()) == owner);
+    named.or_else(|| {
+        let address = u32::try_from(owner).ok()?;
+        let peer = router.resolve_address(address)?;
+        Board::from_sender_id(crate::types::canonical_sender_id(peer.hostname.as_ref()))
+    })
+}
+/// Whether an undelivered frame of this type is owed to anything but
+/// non-target AV-bay boards. Unattributable pending work counts as owed.
+fn owed_beyond_av_bay(router: &sedsnet::router::Router, ty: sedsnet::config::DataType) -> bool {
+    let rows = router.export_reliable_pending_stats();
+    let rows = rows.iter().filter(|row| row.data_type == ty).collect::<Vec<_>>();
+    if rows.is_empty() {
+        // Pending in the SDK but not as a tracked end-to-end delivery.
+        return true;
+    }
+    rows.iter().any(|row| row.pending_destinations.is_empty() || row.pending_destinations.iter().any(|owner| {
+        !matches!(pending_destination_board(router, *owner),
+            Some(Board::RFBoard | Board::FlightComputer | Board::PowerBoard))
+    }))
+}
+/// Why the SDK or a writer still owns control work for this scope, if it does.
+// Safety catalog (About safety): reset-all-boards. Keep backend/src/safety_catalog_rules.rs in step.
+fn sdk_pending_reason(state: &AppState, router: &sedsnet::router::Router, scope: QuiesceScope) -> Option<&'static str> {
+    static TYPE_REASONS: std::sync::OnceLock<Vec<(&'static str, &'static str)>> = std::sync::OnceLock::new();
+    let reasons = TYPE_REASONS.get_or_init(|| crate::telemetry_task::RECOVERY_CONTROL_TYPES.iter().map(|name| {
+        let text: &'static str = Box::leak(format!(
+            "The network still has an undelivered {name} frame{}; recovery waits until it is delivered or expires, and sends nothing to the boards before then.",
+            if AV_BAY_ONLY_TYPES.contains(name) { " for the AV bay" } else { "" }).into_boxed_str());
+        (*name, text)
+    }).collect());
+    let ledger = |state: &AppState| match scope {
+        QuiesceScope::All => state.has_pending_umbilical_control_tx().then_some(
+            "A control frame is still being written on the umbilical link to the fill boards.")
+            .or_else(|| state.has_pending_radio_control_tx().then_some(
+                "A control frame is still being written on the AV-bay radio link.")),
+        QuiesceScope::FillOnly => state.has_pending_umbilical_control_tx().then_some(
+            "A control frame is still being written on the umbilical link to the fill boards."),
+    };
+    if let Some(reason) = ledger(state) { return Some(reason); }
+    for (name, reason) in reasons {
+        if scope == QuiesceScope::FillOnly && AV_BAY_ONLY_TYPES.contains(name) {
+            continue;
+        }
+        let ty = crate::telemetry_schema::data_type(name);
+        // A busy SDK core is unknown, so it counts as pending.
+        let pending = router.try_has_pending_reliable_tx_type(ty);
+        if matches!(pending, Ok(false)) {
+            continue;
+        }
+        if scope == QuiesceScope::FillOnly && FILL_SCOPE_ATTRIBUTED_TYPES.contains(name)
+            && matches!(pending, Ok(true)) && !owed_beyond_av_bay(router, ty) {
+            continue;
+        }
+        return Some(reason);
+    }
+    // Close the SDK→physical ownership handoff window.
+    ledger(state)
+}
+#[cfg(test)]
 fn sdk_pending(state:&AppState,router:&sedsnet::router::Router)->bool {
-    state.has_pending_recovery_control_tx() || crate::telemetry_task::RECOVERY_CONTROL_TYPES.iter()
-        .any(|name| !matches!(router.try_has_pending_reliable_tx_type(crate::telemetry_schema::data_type(name)),Ok(false)))
-        ||state.has_pending_recovery_control_tx() // Close the SDK→physical ownership handoff window.
+    sdk_pending_reason(state, router, QuiesceScope::All).is_some()
 }
 async fn wait_sdk(
     state: &Arc<AppState>,
     router: &sedsnet::router::Router,
     token: Token,
+    scope: QuiesceScope,
 ) -> Result<(), &'static str> {
     let start = WallInstant::now();
     loop {
         if !origin_current(state,token){return Err("Recovery generation, Stop or newer manual control changed");}
-        if !sdk_pending(state,router){
+        let Some(reason) = sdk_pending_reason(state, router, scope) else {
             return if origin_current(state,token){Ok(())}else{Err("Recovery generation, Stop or newer manual control changed")};
-        }
+        };
         if start.elapsed() > QUIESCE_TTL {
-            return Err(
-                "SDK/local transport still owns work or new Stop; hidden modem retirement is not inferred",
-            );
+            return Err(reason);
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -1541,7 +1633,8 @@ async fn run(
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    wait_sdk(state, &router, ticket.token).await?;
+    let quiesce = QuiesceScope::of(&ticket.targets);
+    wait_sdk(state, &router, ticket.token, quiesce).await?;
     let mut fence = {
         let mut history = state.launch_history.lock().unwrap();
         history
@@ -1734,7 +1827,7 @@ async fn run(
         .await
         .map_err(|_| "Startup publication worker failed")??;
         send(state,headers,ticket,&router,token,packet,||Ok(())).await?;
-        wait_sdk(state, &router, token).await?;
+        wait_sdk(state, &router, token, quiesce).await?;
     }
     authorize(state, headers, ticket).await?;
     #[cfg(all(test, any(feature="hitl_mode",feature="firmware_sim")))]
