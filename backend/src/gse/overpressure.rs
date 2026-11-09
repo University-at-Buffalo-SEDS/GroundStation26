@@ -48,6 +48,10 @@ pub(crate) const SETTLE_MS: u64 = 1_000;
 /// A sensor fault stays reported to the operator this long after the last
 /// implausible step, and is notified at most once per this interval.
 const SENSOR_FAULT_SHOW_MS: u64 = 60_000;
+/// A Valve Board "sensor stale" report within this long of the board
+/// (re)connecting describes the outage or its restart, which the board-offline
+/// alert already covers, so it is recorded but not raised as a warning.
+const SENSOR_STALE_RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 /// A sample older than this is stale and neither counts nor clears a streak.
 const FRESH_MS: u64 = 2000;
 
@@ -548,6 +552,12 @@ pub(crate) fn board_warning(state: &Arc<AppState>, text: &str) -> Option<String>
     };
     let display = text[..text.rfind(" [").unwrap_or(text.len())].to_string();
     let burn = launched(state);
+    let settled_connection = state
+        .network_health
+        .lock()
+        .unwrap()
+        .connected_for(crate::types::Board::ValveBoard.sender_id(), std::time::Instant::now())
+        .is_some_and(|connected| connected >= SENSOR_STALE_RECONNECT_GRACE);
     let action = {
         let mut rt = state.gse.lock().unwrap();
         let now = rt.now();
@@ -564,6 +574,9 @@ pub(crate) fn board_warning(state: &Arc<AppState>, text: &str) -> Option<String>
                     b.code == code && now.saturating_sub(b.at_ms) < SENSOR_FAULT_SHOW_MS
                 });
                 rt.overpressure.board_sensor = Some(BoardReport { code, psi, trip, at_ms: now });
+                if code == 'S' && !settled_connection {
+                    return None;
+                }
                 return (!repeat).then(|| match code {
                     'I' => format!(
                         "{display}. Tank pressure sensor implausible or not connected (reading {psi} psi); not an overpressure."
@@ -803,7 +816,9 @@ pub(crate) fn acknowledge(state: &AppState) -> Result<(), String> {
     .map_err(|error| format!("Valve Board overpressure acknowledgement not sent: {error:?}"))
 }
 
-pub(super) fn decorate_status(rt: &Runtime, response: &mut serde_json::Value) {
+/// `vb_connected`: the Valve Board is on the network now. Its stale-sensor
+/// report is hidden while it is offline; the board-offline alert covers that.
+pub(super) fn decorate_status(rt: &Runtime, vb_connected: bool, response: &mut serde_json::Value) {
     response["overpressure_latched"] = serde_json::json!(rt.overpressure.latched());
     response["overpressure"] = rt.overpressure.latch.as_ref().map_or(
         serde_json::json!({"latched": false}),
@@ -830,19 +845,20 @@ pub(super) fn decorate_status(rt: &Runtime, response: &mut serde_json::Value) {
             })
         },
     );
-    response["overpressure"]["sensor"] = sensor_status(rt);
+    response["overpressure"]["sensor"] = sensor_status(rt, vb_connected);
 }
 
 /// Tank pressure sensor health for the operator: an implausible step on the
 /// station's own check, or a Valve Board sensor fault report. Never a trip.
-fn sensor_status(rt: &Runtime) -> serde_json::Value {
+fn sensor_status(rt: &Runtime, vb_connected: bool) -> serde_json::Value {
     let now = rt.now();
     let station = rt.overpressure.sensor_fault_recent(now);
     let board = rt
         .overpressure
         .board_sensor
         .as_ref()
-        .filter(|b| now.saturating_sub(b.at_ms) <= SENSOR_FAULT_SHOW_MS);
+        .filter(|b| now.saturating_sub(b.at_ms) <= SENSOR_FAULT_SHOW_MS)
+        .filter(|b| vb_connected || b.code != 'S');
     let message = match (station, board) {
         (Some(fault), _) => Some(sensor_fault_message(fault)),
         (None, Some(b)) => Some(match b.code {

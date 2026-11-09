@@ -2317,7 +2317,13 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         response["qd"] = serde_json::json!(format!("{:?}", rt.operational.qd.status(rt.now())));
     }
     turbocharge::decorate_status(&state, &mut response);
-    overpressure::decorate_status(&state.gse.lock().unwrap(), &mut response);
+    let vb_connected = state
+        .network_health
+        .lock()
+        .unwrap()
+        .connected_for(crate::types::Board::ValveBoard.sender_id(), std::time::Instant::now())
+        .is_some();
+    overpressure::decorate_status(&state.gse.lock().unwrap(), vb_connected, &mut response);
     response["valve_reports"] = serde_json::to_value(crate::valve_report_health::status(&state))
         .expect("valve report health serializable");
     response["sequence_progress"]=progress::envelope(&state);

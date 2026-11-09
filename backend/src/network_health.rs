@@ -14,6 +14,8 @@ struct Record {
     launch_log: Option<(crate::daq_launch_log::Observation, Instant, u64)>,
     first: Instant,
     last: Instant,
+    /// Start of the current connected spell: first contact or last reconnect.
+    connected_since: Instant,
     healthy: bool,
     last_seen_ms: u64,
     disconnects: u64,
@@ -51,6 +53,7 @@ impl Record {
             self.offline_ms = self.offline_ms.saturating_add(outage);
             self.longest_ms = self.longest_ms.max(outage);
             self.reconnects = self.reconnects.saturating_add(1);
+            self.connected_since = now;
         }
         self.healthy = true;
         self.last = now;
@@ -160,6 +163,7 @@ impl Tracker {
                     launch_log: None,
                     first: now,
                     last: now,
+                    connected_since: now,
                     healthy: true,
                     last_seen_ms: wall_ms,
                     disconnects: 0,
@@ -278,6 +282,13 @@ impl Tracker {
         }
         let offset = (source_ms as i128 - wall_ms as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
         self.record(sender, now, wall_ms).clock = Some((offset, now));
+    }
+    /// How long `sender` has been continuously connected, or `None` while it
+    /// is offline or has never been seen.
+    pub fn connected_for(&self, sender: &str, now: Instant) -> Option<std::time::Duration> {
+        let r = self.boards.get(canonical_sender_id(sender.trim()))?;
+        (r.healthy && elapsed(now, r.last) <= TIMEOUT_MS)
+            .then(|| now.saturating_duration_since(r.connected_since))
     }
     pub fn membership(&mut self, sender: &str, side: &str) {
         if let Some(r) = self.boards.get_mut(canonical_sender_id(sender)) {

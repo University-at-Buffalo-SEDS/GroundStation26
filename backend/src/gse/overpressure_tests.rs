@@ -373,6 +373,28 @@ fn valve_board_reports_parse_only_their_exact_tag() {
 }
 
 #[tokio::test]
+async fn stale_sensor_reports_stay_quiet_while_the_valve_board_is_offline_or_reconnecting() {
+    let mut f = Fixture::new().await;
+    let stale = "Valve Board overpressure sensor stale [S2]";
+    let observe = |f: &Fixture, at: std::time::Instant| {
+        f.state.network_health.lock().unwrap().observe("VB", at, 0);
+    };
+    // Offline: the board-offline alert already covers it.
+    assert!(f.board(stale).is_none());
+    // Just reconnected: the report describes the outage, not the sensor.
+    observe(&f, std::time::Instant::now());
+    assert!(f.board(stale).is_none());
+    // Connected well past the grace: a stale sensor is raised.
+    let now = std::time::Instant::now();
+    let mut f2 = Fixture::new().await;
+    observe(&f2, now - std::time::Duration::from_secs(11));
+    observe(&f2, now);
+    assert_eq!(f2.board(stale).as_deref(), Some("Valve Board overpressure sensor stale"));
+    // Invalid and implausible sensors are real faults and always warn.
+    assert!(f.board("Valve Board overpressure sensor invalid: 4095 [F1]").is_some());
+}
+
+#[tokio::test]
 async fn valve_board_relief_is_adopted_once_and_blocks_reclosure() {
     let mut f = Fixture::new().await;
     // Ordinary warnings pass through untouched.
@@ -626,7 +648,7 @@ impl Fixture {
     fn status(&self) -> serde_json::Value {
         let rt = self.state.gse.lock().unwrap();
         let mut response = serde_json::json!({});
-        overpressure::decorate_status(&rt, &mut response);
+        overpressure::decorate_status(&rt, true, &mut response);
         response
     }
 }
