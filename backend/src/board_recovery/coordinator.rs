@@ -638,22 +638,12 @@ async fn refresh_prepare_queries(
     // read-only slot, nonce and freshness wait.
     let results = futures::future::join_all(boards.into_iter().map(|board| async move {
         // Background status collection may already own this read-only slot.
-        // Wait for that request to finish/expire, then create a DISTINCT nonce;
-        // its old reply is never reused as the explicit preparation's proof.
-        let waiting_since = WallInstant::now();
-        loop {
-            if !origin_current(state, token) {
-                return Err("Recovery origin changed while waiting");
-            }
-            let now = Stamp::now();
-            let pending = state.board_recovery.inner.lock().unwrap().queries[index(board).unwrap()]
-                .as_ref().is_some_and(|query| !query.received && now.checked_duration_since(query.sent)
-                    .is_none_or(|age| age <= QUERY_TTL));
-            if !pending { break; }
-            if waiting_since.elapsed() >= QUERY_TTL {
-                return Err("Previous read-only query has not completed; preparation timed out");
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        // Replace it at once with a DISTINCT nonce instead of waiting for it:
+        // on a slow link that wait alone could use most of the window. The
+        // background query's reply then no longer matches and is rejected,
+        // so it is never reused as this preparation's proof.
+        if !origin_current(state, token) {
+            return Err("Recovery origin changed before query");
         }
         admit_prepare_query(
             || {
@@ -664,11 +654,13 @@ async fn refresh_prepare_queries(
                 // Abort episode. prepare_inner still fences the changed selection.
                 Ok(())
             },
-            || super::query(
-                State(state.clone()),
-                headers.clone(),
-                Json(QueryRequest { board: board.sender_id().into() }),
-            ),
+            // Same session check as the read-only query route, every offer.
+            || async move {
+                match crate::web::authorize_headers(state, headers, Permission::ViewData).await {
+                    Ok(_) => super::prepare_board_query(state, board),
+                    Err(response) => response,
+                }
+            },
         ).await?;
         let nonce = state.board_recovery.inner.lock().unwrap().queries[index(board).unwrap()]
             .as_ref()

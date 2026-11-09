@@ -1020,6 +1020,14 @@ impl ReadonlyQueryRefresh {
         if !self.due(at, now) {
             return false;
         }
+        // Never replace a query still awaiting its reply (for example the one
+        // a recovery PREPARE is waiting on); it answers the same demand.
+        let stamp = Stamp::now();
+        if state.board_recovery.inner.lock().unwrap().queries[at].as_ref().is_some_and(|query| {
+            !query.received && stamp.checked_duration_since(query.sent).is_none_or(|age| age <= QUERY_TTL)
+        }) {
+            return false;
+        }
         let response = request_board_query(state, board);
         self.record_response(at, now, &response)
     }
@@ -1129,6 +1137,15 @@ fn rejected_query_offer(reason: sedsnet::TelemetryError) -> Response {
     response
 }
 pub(crate) fn request_board_query(state: &Arc<AppState>, board: Board) -> Response {
+    send_board_query(state, board, false)
+}
+/// PREPARE's own dedicated query. It replaces an outstanding read-only query
+/// at once with a distinct nonce; that query's reply then no longer matches
+/// and is rejected, so it can never serve as the preparation's proof.
+fn prepare_board_query(state: &Arc<AppState>, board: Board) -> Response {
+    send_board_query(state, board, true)
+}
+fn send_board_query(state: &Arc<AppState>, board: Board, supersede_pending: bool) -> Response {
     if let Err(response) = primary_only() {
         return response;
     }
@@ -1218,7 +1235,7 @@ pub(crate) fn request_board_query(state: &Arc<AppState>, board: Board) -> Respon
             "Query nonce duplicated its live context; no request was queued.",
         );
     }
-    if inner.queries[at].as_ref().is_some_and(|query| {
+    if !supersede_pending && inner.queries[at].as_ref().is_some_and(|query| {
         !query.received
             && now
                 .checked_duration_since(query.sent)

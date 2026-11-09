@@ -169,3 +169,42 @@ async fn concurrent_prepare_queries_complete_while_background_queries_are_outsta
     drop(inner);
     assert!(fixture.models.iter().all(|(_, model)| model.lock().unwrap().applied == 0));
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_replaces_a_lost_background_query_at_once_and_never_accepts_its_reply() {
+    if isolated("prepare_replaces_a_lost_background_query_at_once_and_never_accepts_its_reply") { return; }
+    let fixture = Fixture::new().await;
+    let state = fixture.state();
+    *state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+    fixture.query(Board::ActuatorBoard).await;
+    let at = index(Board::ActuatorBoard).unwrap();
+    // A background query whose reply was lost on the link: still pending.
+    let lost = 0x5eed_u64;
+    state.board_recovery.inner.lock().unwrap().queries[at] =
+        Some(Query { abort_revision: state.board_abort.query_revision(Board::ActuatorBoard), nonce: lost, sent: Stamp::now(), received: false });
+    // Background demand never replaces a pending query.
+    let mut refresh = ReadonlyQueryRefresh::default();
+    assert!(!refresh.request(&state, Board::ActuatorBoard));
+    assert_eq!(state.board_recovery.inner.lock().unwrap().queries[at].as_ref().unwrap().nonce, lost);
+    let started = WallInstant::now();
+    let ticket = fixture.prepare("recover_abort", Some("AB")).await;
+    assert!(started.elapsed() < Duration::from_secs(3), "PREPARE did not wait out the lost query");
+    assert!(ticket["ticket"].is_string());
+    let inner = state.board_recovery.inner.lock().unwrap();
+    let query = inner.queries[at].as_ref().unwrap();
+    assert_ne!(query.nonce, lost, "PREPARE used its own distinct nonce");
+    assert!(query.received);
+    assert_eq!(inner.values[at].as_ref().unwrap().value.nonce, query.nonce);
+    drop(inner);
+    // A late reply to the replaced query is rejected, never taken as proof.
+    let mut wire = [0u8; 40];
+    wire[0] = 1; wire[2] = 1; wire[3] = 0x3e;
+    wire[4..12].copy_from_slice(&lost.to_le_bytes());
+    wire[12..20].copy_from_slice(&42u64.to_le_bytes());
+    wire[20..24].copy_from_slice(&9u32.to_le_bytes());
+    wire[28..32].copy_from_slice(&0u32.to_le_bytes());
+    wire[32..40].copy_from_slice(&issuer(&state.board_recovery.identity.unwrap()).to_le_bytes());
+    let late = Packet::new(crate::telemetry_schema::data_type(STATUS_TYPE),
+        &[crate::telemetry_schema::endpoint("GROUND_STATION")], "AB", 1, Arc::from(wire)).unwrap();
+    assert_eq!(super::super::observe(&state, &late), Err("Expired or different recovery query"));
+    assert_ne!(state.board_recovery.inner.lock().unwrap().values[at].as_ref().unwrap().value.nonce, lost);
+}
