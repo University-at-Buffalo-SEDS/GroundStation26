@@ -1103,7 +1103,14 @@ pub(crate) fn flight_state_block(state: crate::types::FlightState) -> Option<Str
 
 pub(crate) fn station_block_reason(state: &crate::state::AppState) -> Option<String> {
     let flight = *state.state.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(reason) = flight_state_block(flight) {
+    if flight == crate::types::FlightState::Aborted {
+        // Aborted at rest may apply the profile: one modem reboot and a few
+        // seconds of radio loss beat a link left at S5=10 for good (a GS
+        // restarted while Aborted otherwise never checked its modem).
+        if let Some(reason) = aborted_rest_block(state) {
+            return Some(reason);
+        }
+    } else if let Some(reason) = flight_state_block(flight) {
         return Some(reason);
     }
     if state.operator_queue.fill_launch_active() {
@@ -1117,17 +1124,52 @@ pub(crate) fn station_block_reason(state: &crate::state::AppState) -> Option<Str
     running.then(|| "a sequence is running".into())
 }
 
+/// Why an Aborted station is not at rest: a Launch command or countdown, a
+/// GSE sequence, turbocharge or cold flow, or an ABORT still being processed
+/// or delivered.
+fn aborted_rest_block(state: &crate::state::AppState) -> Option<String> {
+    use std::sync::atomic::Ordering;
+    if state.launch_sequence_command_pending.load(Ordering::SeqCst) {
+        return Some("Aborted: a Launch command is pending".into());
+    }
+    if state.launch_clock_snapshot().kind == crate::telemetry_db::LaunchClockKind::TMinus {
+        return Some("Aborted: the launch countdown is running".into());
+    }
+    if crate::gse::turbocharge_active_nowait(state) {
+        return Some("Aborted: turbocharge is running or its state is busy".into());
+    }
+    if let Some(reason) = crate::gse::mode_switch_block_reason(state) {
+        return Some(format!("Aborted: {reason}"));
+    }
+    if state.deferred_abort.manual_pending() {
+        return Some("Aborted: an operator abort is still being processed".into());
+    }
+    if let Some(router) = state.topology_router.get() {
+        let abort = crate::telemetry_schema::data_type("ABORT");
+        match crate::abort_retirement::try_has_pending_reliable_tx_type(router, abort) {
+            Ok(false) => {}
+            Ok(true) => return Some("Aborted: an abort is still being delivered".into()),
+            Err(_) => return Some("Aborted: abort delivery state is busy".into()),
+        }
+    }
+    None
+}
+
 // --- Orchestration -----------------------------------------------------------
 
 #[derive(Default)]
 struct Global {
     report: Option<Report>,
     startup_done: bool,
+    /// The startup check met a closed station gate; it runs once the gate
+    /// opens (for example once an Aborted station is at rest).
+    startup_deferred: bool,
 }
 
 static GLOBAL: Mutex<Global> = Mutex::new(Global {
     report: None,
     startup_done: false,
+    startup_deferred: false,
 });
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static AV_BAY: std::sync::OnceLock<CommsLinkConfig> = std::sync::OnceLock::new();
@@ -1271,9 +1313,38 @@ pub(crate) fn before_av_bay_open(link: &CommsLinkConfig) {
         Some(_) if simulated_link() => {
             Report::skipped(Trigger::Startup, mode, "simulated serial link")
         }
+        Some(_) if gate().is_err() => {
+            GLOBAL.lock().unwrap_or_else(|e| e.into_inner()).startup_deferred = true;
+            Report::skipped(
+                Trigger::Startup,
+                mode,
+                format!(
+                    "not checked yet: {}; it runs once the station allows it",
+                    gate().err().unwrap_or_default()
+                ),
+            )
+        }
         Some(plan) => run_on_port(serial, &plan, Trigger::Startup, mode),
     };
     store(report);
+}
+
+/// Called with every station gate refresh: runs a startup check that met a
+/// closed gate, once, as soon as the gate opens.
+pub(crate) fn run_deferred_startup_check() {
+    if gate().is_err() {
+        return;
+    }
+    {
+        let mut global = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        if !global.startup_deferred {
+            return;
+        }
+        global.startup_deferred = false;
+    }
+    if let Err(reason) = request_check(configured_mode(), Trigger::Startup) {
+        log::warn!("deferred RFD modem check not started: {reason}");
+    }
 }
 
 fn run_on_port(serial: &SerialLinkConfig, plan: &Plan, trigger: Trigger, mode: Mode) -> Report {
@@ -1344,6 +1415,10 @@ pub(crate) fn test_releases() -> u64 {
 /// sequence, while another check runs, or without an RFD radio.
 /// `Mode::Reset` reboots the modem ("Reset radio") and needs no profile.
 pub(crate) fn request_operator_check(mode: Mode) -> Result<(), String> {
+    request_check(mode, Trigger::Operator)
+}
+
+fn request_check(mode: Mode, trigger: Trigger) -> Result<(), String> {
     let link = AV_BAY
         .get()
         .ok_or_else(|| "the AV-bay link is not configured".to_string())?;
@@ -1376,12 +1451,12 @@ pub(crate) fn request_operator_check(mode: Mode) -> Result<(), String> {
             }
             let report = if RELEASES.load(Ordering::Acquire) == releases {
                 Report::failed(
-                    Trigger::Operator,
+                    trigger,
                     mode,
                     "the radio link did not release the port; not checked",
                 )
             } else {
-                run_on_port(&serial, &plan, Trigger::Operator, mode)
+                run_on_port(&serial, &plan, trigger, mode)
             };
             store(report);
             HOLD.store(false, Ordering::Release);

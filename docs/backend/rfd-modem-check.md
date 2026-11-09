@@ -49,15 +49,22 @@ profile selected.
 
 Neither the check nor the reset runs, not even to read, when:
 
-* the flight state is anything other than Startup, Idle, PreFill or
-  FillTest. Launch through Landed are blocked as required. Fill states,
-  Armed, Recovery and Aborted are blocked too, because the radio carries
-  live AV-bay or recovery data then;
+* the flight state is anything other than Startup, Idle, PreFill, FillTest
+  or Aborted at rest. Launch through Landed are blocked as required. Fill
+  states, Armed and Recovery are blocked too, because the radio carries live
+  AV-bay or recovery data then;
+* Aborted is allowed only at rest: no Launch command pending, no countdown,
+  no GSE sequence, turbocharge or cold flow, and no ABORT still being
+  processed or delivered. Applying the profile then costs one modem reboot
+  and a few seconds of radio loss, which beats a link left at S5=10 (the
+  bench GS restarted while Aborted and never checked its modem);
 * the launch sequence is active, or any sequence run is not finished;
 * the station state is not yet known.
 
 At startup the gate is seeded from the restored flight state before the
-radio opens, so a backend restart in flight skips the check. The gate is
+radio opens, so a backend restart in flight does not check the modem then.
+A startup check that meets a closed gate is deferred and runs once, as soon
+as the gate opens (for example when an Aborted station comes to rest). The gate is
 checked again before the first write and before `AT&W`.
 
 Operator override: `GS_RFD_MODEM_CHECK=skip` (no check), `verify` (read and

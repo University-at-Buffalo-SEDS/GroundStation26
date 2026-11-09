@@ -688,6 +688,42 @@ fn flight_states_from_launch_onward_block_reconfiguration() {
     }
 }
 
+/// Bench Pi: the GS restarted while Aborted, so its startup modem check was
+/// skipped ("station is in flight state Aborted") and never ran again; both
+/// modems stayed at S5=10 and the AV bay read about 36 s behind. Aborted at
+/// rest (no launch, countdown, sequence or ABORT still being delivered) may
+/// apply the profile: one modem reboot, a few seconds of radio loss.
+#[tokio::test]
+async fn aborted_at_rest_allows_the_modem_fix_but_not_while_an_abort_is_delivered() {
+    let state = crate::state::tests::test_app_state().await;
+    *state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+    assert_eq!(station_block_reason(&state), None, "Aborted at rest");
+    crate::telemetry_schema::initialize().unwrap();
+    let abort = sedsnet::packet::Packet::new(
+        crate::telemetry_schema::data_type("ABORT"),
+        &[crate::telemetry_schema::endpoint("ABORT")],
+        "GS",
+        1,
+        std::sync::Arc::from(&b"SEDS_MANUAL_ABORT_V1:K"[..]),
+    )
+    .unwrap();
+    state.deferred_abort.observe(&abort, 1);
+    assert!(
+        station_block_reason(&state).is_some_and(|r| r.contains("abort")),
+        "an operator ABORT still being processed blocks it"
+    );
+    let state = crate::state::tests::test_app_state().await;
+    *state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+    state.launch_sequence_command_pending.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(station_block_reason(&state).is_some(), "a pending Launch blocks it");
+    // Flight and fill states stay blocked.
+    for flight in [crate::types::FlightState::Launch, crate::types::FlightState::NitrousFill, crate::types::FlightState::Recovery] {
+        let state = crate::state::tests::test_app_state().await;
+        *state.state.lock().unwrap() = flight;
+        assert!(station_block_reason(&state).is_some(), "{flight:?}");
+    }
+}
+
 #[tokio::test]
 async fn station_gate_follows_flight_state_and_sequences() {
     let state = crate::state::tests::test_app_state().await;
