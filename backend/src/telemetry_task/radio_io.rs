@@ -19,15 +19,26 @@ use super::{
 // scheduling priority (254). Only self-contained application frames can safely
 // bypass the schema FIFO. This is a host transport tag, not a wire/API change.
 fn radio_transport_priority(priority: u8, payload: &[u8]) -> u8 {
-    if priority == 254
+    if (priority == 254
         && !payload.starts_with(b"SDT")
         && serialize::peek_frame_info_unchecked(payload)
-            .is_ok_and(|info| !sedsnet::discovery::is_discovery_type(info.envelope.ty))
+            .is_ok_and(|info| !sedsnet::discovery::is_discovery_type(info.envelope.ty)))
+        || is_abort_frame(payload)
     {
         255
     } else {
         priority
     }
+}
+
+/// ABORT is schema priority 0 (lowest), so on a busy radio it waited behind
+/// the 256-byte ordinary allowance and every large-frame reservation and
+/// never reached the AV bay. On the radio it is written first and uses the
+/// command reserve, like a board command. Umbilical ordering is unchanged.
+fn is_abort_frame(payload: &[u8]) -> bool {
+    !payload.starts_with(b"SDT")
+        && serialize::peek_frame_info_unchecked(payload)
+            .is_ok_and(|info| info.envelope.ty == crate::telemetry_schema::data_type("ABORT"))
 }
 
 /// Exact payload identity for the starvation reservation (not security).
@@ -2544,6 +2555,37 @@ mod priority_tests {
         }
         assert_eq!(frames, 4);
         assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn manual_abort_is_not_starved_by_ordinary_traffic_or_a_large_frame_reservation() {
+        crate::telemetry_schema::initialize().unwrap();
+        let abort = serialize::pack_packet(
+            &Packet::new(
+                crate::telemetry_schema::data_type("ABORT"),
+                &[crate::telemetry_schema::endpoint("ABORT")],
+                "GS",
+                123,
+                Arc::from(&b"SEDS_MANUAL_ABORT_V1:K"[..]),
+            )
+            .unwrap(),
+        )
+        .to_vec();
+        let budget = TxQueueBudget::new_radio(2048, 256);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // Ordinary traffic fills most of the allowance and a schema chunk is
+        // now waiting for its room: every later ordinary frame is refused.
+        budget.try_send(&tx, 0, &[1; 100]).unwrap();
+        assert!(budget.try_send(&tx, 0, &[2; 192]).is_err());
+        assert!(budget.try_send(&tx, 0, &[3; 40]).is_err());
+        // The schema-priority-0 Abort is still admitted, at the top priority.
+        budget.try_send(&tx, 0, &abort).unwrap();
+        let mut written = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            written.push(frame);
+        }
+        assert!(written.iter().any(|(p, f)| *p == 255 && *f == abort), "Abort reaches the writer first-class");
+        assert!(!is_abort_frame(&[1; 100]));
     }
 
     #[test]
