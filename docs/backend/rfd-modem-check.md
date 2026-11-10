@@ -87,9 +87,13 @@ checked again before the first write and before `AT&W`.
 
 Operator override: `GS_RFD_MODEM_CHECK=skip` (no check), `verify` (read and
 report only) or `fix` (default in normal, HITL and test-fire modes; HITL runs
-the real AV-bay radio). Testing mode and `firmware_sim` builds default to
-`skip`, and a simulated PTY link
-(`GS_SIMULATED_SERIAL_PTY=1`) is always skipped. The startup check runs once,
+the real AV-bay radio). Testing mode defaults to `skip`. A `firmware_sim`
+build defaults to `skip` unless the simulator models this station's modem
+(`FIRMWARE_SIM_RFD_MODEM` for the GS station, announced to the backend with
+`GS_SIMULATED_RFD_MODEM=1`); then it follows the station mode like hardware,
+and the model's readback proves S5 the same way the bench modem does. A
+simulated PTY link (`GS_SIMULATED_SERIAL_PTY=1`) with no simulated modem is
+always skipped. Until S5 is read back, pacing assumes S5=10. The startup check runs once,
 under the mode the backend started in; a later switch into normal or test fire
 does not rerun it (the operator check stays available).
 

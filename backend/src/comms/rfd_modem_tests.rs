@@ -1018,6 +1018,18 @@ fn unproven_link_paces_for_the_deployed_global_retries() {
 /// RFD kept GLOBAL_RETRIES 10 whatever the RF board was reflashed to. HITL
 /// applies the profile like normal mode; only testing mode, simulator builds
 /// and simulated links skip it.
+/// A simulator build runs the check only against a simulated modem that
+/// answers the command mode; otherwise S5 stays unproven and pacing assumes
+/// 10. Testing mode never runs it.
+#[test]
+fn simulator_builds_check_only_a_simulated_modem() {
+    assert_eq!(default_mode(false, true, false), Mode::Skip);
+    assert_eq!(default_mode(false, true, true), Mode::Fix);
+    assert_eq!(default_mode(true, true, true), Mode::Skip);
+    assert_eq!(default_mode(true, false, false), Mode::Skip);
+    assert_eq!(default_mode(false, false, false), Mode::Fix);
+}
+
 #[test]
 fn hitl_applies_the_modem_profile_like_normal_mode() {
     crate::mode_suite!(Hitl);

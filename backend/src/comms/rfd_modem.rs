@@ -1236,11 +1236,16 @@ pub(crate) fn configured_mode() -> Mode {
     {
         return mode;
     }
-    // Follows the station mode in force. The startup check below still runs
-    // once per process, with the mode at that moment. HITL runs the real
-    // AV-bay radio (the bench deploy), so it applies the profile like normal.
-    if crate::runtime_mode::is_testing() || cfg!(feature = "firmware_sim")
-    {
+    default_mode(crate::runtime_mode::is_testing(), cfg!(feature = "firmware_sim"), simulated_modem())
+}
+
+/// Follows the station mode in force. The startup check still runs once per
+/// process, with the mode at that moment. HITL runs the real AV-bay radio
+/// (the bench deploy), so it applies the profile like normal. A simulator
+/// build checks only a simulated modem that answers the command mode, so its
+/// readback proves the registers the same way the bench's does.
+fn default_mode(testing: bool, firmware_sim: bool, simulated_modem: bool) -> Mode {
+    if testing || (firmware_sim && !simulated_modem) {
         Mode::Skip
     } else {
         Mode::Fix
@@ -1281,8 +1286,17 @@ fn rolled_out(profile: &super::rfd_profile::Profile) -> bool {
         || std::env::var("GS_RFD_PROFILE_ROLLED_OUT").is_ok_and(|v| v.trim() == profile.name())
 }
 
+/// The simulator models the RFD900x command mode on this station's radio
+/// (FirmwareSimulator FIRMWARE_SIM_RFD_MODEM for the station's index) and
+/// says so with GS_SIMULATED_RFD_MODEM=1. AT commands then reach that model.
+fn simulated_modem() -> bool {
+    std::env::var("GS_SIMULATED_RFD_MODEM").as_deref() == Ok("1")
+}
+
+/// A simulated serial link with no modem model: AT commands would go on the
+/// air as data, so the check never runs there.
 fn simulated_link() -> bool {
-    std::env::var("GS_SIMULATED_SERIAL_PTY").as_deref() == Ok("1")
+    std::env::var("GS_SIMULATED_SERIAL_PTY").as_deref() == Ok("1") && !simulated_modem()
 }
 
 /// Called by the AV-bay opener before the radio port is opened for data.
@@ -1307,7 +1321,7 @@ pub(crate) fn before_av_bay_open(link: &CommsLinkConfig) {
         Some(_) if mode == Mode::Skip => Report::skipped(
             Trigger::Startup,
             mode,
-            "modem check off: skipped by default in testing mode and simulator builds (set GS_RFD_MODEM_CHECK=verify or fix to run it)",
+            "modem check off: skipped by default in testing mode and in simulator builds without a simulated modem (set GS_RFD_MODEM_CHECK=verify or fix to run it)",
         ),
         Some(_) if simulated_link() => {
             Report::skipped(Trigger::Startup, mode, "simulated serial link")
