@@ -380,7 +380,6 @@ struct Ticket {
     ticket: String,
     transition_id: String,
     binding: Binding,
-    target: Target,
     principal: String,
     created: Instant,
 }
@@ -659,7 +658,6 @@ impl Switch {
             ticket,
             transition_id,
             binding,
-            target,
             principal: principal_context(principal),
             created: Instant::now(),
         });
