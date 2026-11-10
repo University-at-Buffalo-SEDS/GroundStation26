@@ -222,7 +222,8 @@ header after the rejected span (`rejected_rr_v1_span_is_never_reparsed_for_a_fal
 `rf_board` holds the RF board's own result once its BOARD_HEALTH carries it
 (see phase 2): outcome, map source, mode, `rolled_out_all_nodes`, flags
 (`eeprom_saved`, `rebooted`, `resumed_with_ato`, `forwarding_entries`,
-`skipped_by_flight_gate`, `pending`, `needs_attention`), the observed
+`skipped_by_flight_gate`, `pending`, `verified_on_earlier_boot`,
+`needs_attention`), the observed
 `air_speed`, `max_data`, `max_retries`, `global_retries`, `serial_break_ms`,
 `dest_id` and `rtscts`, and a summary. Connectivity → Radio modem shows it
 below the station result, or "RF modem not reported" for older RF firmware.
@@ -322,6 +323,17 @@ u16 fields use 0xFFFF and u8 fields 0xFF for unread; 0xFE means 254 or more.
 Values are those read after the last write and verification. GS decodes the
 block (`rfd_modem::decode_rf_status`), shows it in Connectivity and raises a
 notification for every finished RF check.
+
+Flag 0x80 (word 13 bits 23:16, with outcome Skipped and neither the pending
+nor the gate flag) means RF did not check this boot because a flash marker
+says this firmware image matched, or applied and verified, the profile on an
+earlier boot. The radio was never held and the register fields are unread,
+so that boot gives no S5 readback (pacing then relies on the station's own
+check). It is not an attention case. The same boot can turn pending again
+when RF hears no radio frame within 60 s (the marker is erased so a swapped
+modem is rechecked). The gate flag with Mismatch, or with VerifyFailed and
+Saved, means a flight-state change stopped the check before or after the
+save. The RF check is bounded at 16 s.
 
 **Build cost.** Release RF image: flash 471,332 B of 474,624 B (unmodified
 dev 465,968 B, +5.2 KiB), RAM 112,840 B of 114,688 B (+16 B static). The

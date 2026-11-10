@@ -69,7 +69,8 @@
     "rtscts": 0,
     "serial_break_ms": 50,
     "skipped_by_flight_gate": false,
-    "summary": "RF modem settings match the profile; nothing written"
+    "summary": "RF modem settings match the profile; nothing written",
+    "verified_on_earlier_boot": false
   },
   "rolled_out_all_nodes": true,
   "running": false

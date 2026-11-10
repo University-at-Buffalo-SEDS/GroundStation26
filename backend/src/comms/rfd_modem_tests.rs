@@ -868,6 +868,26 @@ fn rf_board_status_block_decodes() {
     assert!(decode_rf_status(&adc).is_none());
 }
 
+/// RF firmware that verified this profile on an earlier boot skips the check
+/// (flag 0x80, outcome Skipped, registers unread): shown, never an attention
+/// case, and no S5 readback this boot. Pending on the same boot wins.
+#[test]
+fn rf_board_verified_on_an_earlier_boot_is_not_an_attention_case() {
+    let unread = 1 | (2 << 8) | (2 << 10) | (3 << 13) | (0xFF << 24);
+    let verified = decode_rf_status(&rf_health(unread | (0x80 << 16), u32::MAX, u32::MAX, 5)).unwrap();
+    assert!(verified.verified_on_earlier_boot && !verified.needs_attention && !verified.pending);
+    assert_eq!(verified.outcome, Outcome::Skipped);
+    assert_eq!(verified.global_retries, None, "no readback this boot");
+    assert!(verified.summary.contains("already verified the profile on an earlier boot"), "{}", verified.summary);
+    let repending = decode_rf_status(&rf_health(unread | ((0x80 | 0x20) << 16), u32::MAX, u32::MAX, 70)).unwrap();
+    assert!(repending.pending && !repending.verified_on_earlier_boot);
+    assert!(repending.summary.contains("Startup or Idle"), "{}", repending.summary);
+    // Stopped by a flight-state change after saving: saved, not verified.
+    let stopped = decode_rf_status(&rf_health(1 | (5 << 4) | (2 << 10) | ((0x10 | 0x01) << 16) | (1 << 24), 3968 | (10 << 16), 32768 | (64 << 16) | (10 << 24), 9)).unwrap();
+    assert!(stopped.needs_attention && stopped.eeprom_saved && stopped.skipped_by_flight_gate);
+    assert_eq!(stopped.summary, "RF modem check stopped by a flight-state change after saving; not verified");
+}
+
 #[test]
 fn rf_board_check_notifies_once_per_result_and_again_after_reboot() {
     *RF_BOARD.lock().unwrap() = None;

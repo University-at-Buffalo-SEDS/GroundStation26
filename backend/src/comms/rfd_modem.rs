@@ -1498,6 +1498,9 @@ pub(crate) struct RfModemStatus {
     pub skipped_by_flight_gate: bool,
     /// Waiting for the first flight state, or running (the RF radio is held).
     pub pending: bool,
+    /// Not checked this boot because this firmware image verified the
+    /// profile on an earlier boot (no register readback this boot).
+    pub verified_on_earlier_boot: bool,
     pub needs_attention: bool,
     pub air_speed: Option<u16>,
     pub max_data: Option<u16>,
@@ -1517,6 +1520,10 @@ const RF_FLAG_FORWARDING: u32 = 0x08;
 const RF_FLAG_GATE: u32 = 0x10;
 const RF_FLAG_PENDING: u32 = 0x20;
 const RF_FLAG_ATTENTION: u32 = 0x40;
+/// The check did not run this boot: a flash marker says this RF firmware
+/// image already matched, or applied and verified, this modem profile on an
+/// earlier boot. The radio was never held and the register fields are unread.
+const RF_FLAG_VERIFIED: u32 = 0x80;
 
 /// Decodes the RF block. BOARD_HEALTH flags 4, 32 and 64 own these words on
 /// other boards, so the block exists only when they are clear.
@@ -1555,25 +1562,35 @@ pub(crate) fn decode_rf_status(words: &[u32]) -> Option<RfModemStatus> {
     };
     let pending = flags & RF_FLAG_PENDING != 0;
     let gate = flags & RF_FLAG_GATE != 0;
+    let saved = flags & RF_FLAG_SAVED != 0;
+    // A verified boot that hears no radio frame within 60 s erases its
+    // marker and turns pending on the same boot; pending wins.
+    let verified = !pending && !gate && flags & RF_FLAG_VERIFIED != 0 && outcome == Outcome::Skipped;
     let summary = if pending {
-        "RF modem check pending: it runs once the RF board receives a Startup, Idle, PreFill or FillTest flight state".to_string()
+        "RF modem check pending: it runs once a flight state from the station allows it (on current RF firmware: Startup or Idle, 3 s after the last station write)".to_string()
     } else {
         match outcome {
+            Outcome::Skipped if verified => {
+                "RF modem not checked this boot: this firmware image already verified the profile on an earlier boot".into()
+            }
             Outcome::Skipped if gate => {
-                "RF modem not checked this boot: the flight state was not Startup, Idle, PreFill or FillTest".into()
+                "RF modem not checked this boot: the flight state did not allow it (nothing reached the modem)".into()
             }
             Outcome::Skipped if mode == Mode::Skip => "RF modem check off in this RF build".into(),
             Outcome::Skipped => "RF modem not checked".into(),
             Outcome::Matched => "RF modem settings match the profile; nothing written".into(),
             Outcome::Applied => "RF modem settings written, saved and verified after reboot".into(),
             Outcome::Mismatch if gate => {
-                "RF modem settings differ; not written because the flight state changed".into()
+                "RF modem settings differ; the check was stopped by a flight-state change before saving and any unsaved write was discarded".into()
             }
             Outcome::Mismatch => "RF modem settings differ from the profile and were left in place (verify-only, link-wide or unconfirmed register map)".into(),
             Outcome::ApplyFailed => "RF modem refused a setting or the save; changes discarded".into(),
+            Outcome::VerifyFailed if gate && saved => {
+                "RF modem check stopped by a flight-state change after saving; not verified".into()
+            }
             Outcome::VerifyFailed => "RF modem settings did not verify after the save; not retried".into(),
             Outcome::NoResponse => "RF modem did not enter command mode; RF runs on its current settings".into(),
-            Outcome::Failed => "RF modem check failed (serial error or time bound)".into(),
+            Outcome::Failed => "RF modem check failed (serial error or its time bound)".into(),
             Outcome::Reset => "RF modem reset".into(),
         }
     };
@@ -1588,6 +1605,7 @@ pub(crate) fn decode_rf_status(words: &[u32]) -> Option<RfModemStatus> {
         forwarding_entries: flags & RF_FLAG_FORWARDING != 0,
         skipped_by_flight_gate: gate,
         pending,
+        verified_on_earlier_boot: verified,
         needs_attention: flags & RF_FLAG_ATTENTION != 0
             || !matches!(
                 outcome,
