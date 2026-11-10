@@ -144,6 +144,9 @@ fn sdk_drops_a_command_queued_behind_an_exhausted_one() {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Between {
     Nothing,
+    /// The FC receives every command throughout; only its acknowledgements
+    /// are lost during the outage.
+    AcksLost,
     /// An Abort latched and cleared again (R3).
     AbortLatched,
     /// Another operator command dispatched (R3).
@@ -160,6 +163,12 @@ enum Between {
 /// it and is dropped when EvaluationRelax exhausts. Returns when the FC got
 /// the Deploy after its press (ms) and the station's notifications.
 async fn operator_bay(flight: crate::types::FlightState, between: Between) -> (Option<u64>, Vec<String>) {
+    let (delivered, notes, _) = operator_bay_timed(flight, between).await;
+    (delivered, notes)
+}
+/// `operator_bay`, plus the ms after the first press at which the station
+/// first said a press got no confirmation from the FC.
+async fn operator_bay_timed(flight: crate::types::FlightState, between: Between) -> (Option<u64>, Vec<String>, Option<u64>) {
     let _mode = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Hitl);
     let state = crate::state::tests::test_app_state().await;
     let _tuning = StationTuning::install();
@@ -195,11 +204,12 @@ async fn operator_bay(flight: crate::types::FlightState, between: Between) -> (O
         Ok(())
     });
     let mut backoff = RadioRefusalBackoff::default();
+    let acks_lost = between == Between::AcksLost;
     let mut pump = |link_up: bool| {
         process_router_queues_with_backoff(&host, None, &mut backoff);
         crate::operator_command_resend::service(&state, &host);
         for bytes in std::mem::take(&mut *to_fc.lock().unwrap()) {
-            if link_up {
+            if link_up || acks_lost {
                 let _ = fc.rx_packed_from_side(&bytes, 0);
             }
         }
@@ -231,6 +241,7 @@ async fn operator_bay(flight: crate::types::FlightState, between: Between) -> (O
     let start = std::time::Instant::now();
     let ms = || start.elapsed().as_millis() as u64;
     let (mut relax, mut deploy_at, mut disturbed) = (false, None, false);
+    let mut undelivered_at = None;
     while ms() < span + 2_500 {
         if !relax {
             press(14, true);
@@ -253,12 +264,49 @@ async fn operator_bay(flight: crate::types::FlightState, between: Between) -> (O
             }
         }
         pump(ms() >= outage_ms);
+        if undelivered_at.is_none()
+            && state.notifications_snapshot().iter().any(|n| n.message.contains("no confirmation from FC"))
+        {
+            undelivered_at = Some(ms());
+        }
         std::thread::sleep(Duration::from_millis(2));
     }
     let sent = deploy_at.unwrap();
     let delivered = got.lock().unwrap().iter().find(|(b, at)| *b == 12 && *at >= sent).map(|(_, at)| (*at - sent).as_millis() as u64);
     let notes = state.notifications_snapshot().into_iter().map(|n| n.message).collect();
-    (delivered, notes)
+    (delivered, notes, undelivered_at)
+}
+
+/// pyroI (candidate 7ad9582): every copy of a relayed ExpandParachute was
+/// lost before the RRLS; the station retired it after its retry span and
+/// nothing told the operator. A press whose own packet runs out of retries
+/// is reported, once and in one line naming that press, by the end of its
+/// retry span, and is never re-sent (R1). Here the press is EvaluationRelax
+/// (the harness's first press, its own packet the head that runs out).
+#[tokio::test]
+async fn a_press_whose_every_copy_was_lost_is_reported_unconfirmed() {
+    let span = reliable_retry_span_ms();
+    let (_, notes, at) = operator_bay_timed(crate::types::FlightState::Ascent, Between::Nothing).await;
+    eprintln!("UNCONFIRMED span={span} at={at:?} notes={notes:?}");
+    let lost: Vec<_> = notes.iter().filter(|n| n.contains("no confirmation from FC")).collect();
+    assert_eq!(lost.len(), 1, "one line: {notes:?}");
+    assert_eq!(lost[0].as_str(), "EvaluationRelax: no confirmation from FC. Check FC state before pressing again.");
+    let at = at.expect("reported");
+    assert!(at <= span + 500, "reported {at} ms after the press (span {span})");
+}
+
+/// The reverse case: the FC got and ran the command, and only every one of
+/// its acknowledgements was lost. The station cannot tell the two apart, so
+/// the notice never claims the command was not delivered and never tells the
+/// operator to press again without checking the FC first (a duplicate pyro
+/// command is the risk).
+#[tokio::test]
+async fn a_press_whose_acknowledgements_were_lost_is_never_called_undelivered() {
+    let (_, notes, _) = operator_bay_timed(crate::types::FlightState::Ascent, Between::AcksLost).await;
+    eprintln!("ACKS_LOST notes={notes:?}");
+    let line = notes.iter().find(|n| n.starts_with("EvaluationRelax")).unwrap_or_else(|| panic!("reported: {notes:?}"));
+    assert!(!line.contains("not delivered") && !line.contains("press again"), "{line}");
+    assert!(line.contains("Check FC state before pressing again"), "{line}");
 }
 
 fn noted(notes: &[String], words: &str) -> bool {

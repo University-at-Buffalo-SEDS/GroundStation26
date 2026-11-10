@@ -25,6 +25,13 @@
 //! - R8 every re-send, and every drop that is not re-sent, raises its own
 //!   operator notification and log line;
 //! - R9 only operator presses are recorded; automatic station commands never.
+//!
+//! An operator command that is itself the retired head (every copy went
+//! unanswered for its whole retry span, for example lost on a degraded relay
+//! uplink) is never re-sent (R1); the operator is told in one line that the
+//! FC did not confirm it. The station cannot tell a lost command from lost
+//! acknowledgements, so it never says "not delivered" and asks the operator
+//! to check the FC state before pressing again.
 use crate::state::AppState;
 use crate::types::{FlightState, TelemetryCommand};
 use sedsnet::router::Router;
@@ -58,6 +65,13 @@ struct Press {
 
 /// The newest operator flight command per router (router address).
 static NEWEST: Mutex<BTreeMap<usize, Press>> = Mutex::new(BTreeMap::new());
+/// Recent operator presses per router (packet ID, command byte), newest last,
+/// so a retired head can be named whichever press it was.
+static RECENT: Mutex<BTreeMap<usize, std::collections::VecDeque<(u64, u8)>>> = Mutex::new(BTreeMap::new());
+/// Presses per router whose own packet ran out of retries (no acknowledgement
+/// came back): reported once.
+static UNDELIVERED: Mutex<BTreeMap<usize, Vec<u8>>> = Mutex::new(BTreeMap::new());
+const RECENT_PRESSES: usize = 16;
 
 fn router_key(router: &Router) -> usize {
     router as *const Router as usize
@@ -102,6 +116,14 @@ pub(crate) fn record_operator_press(state: &AppState, router: &Router, byte: u8,
         NEWEST.lock().unwrap().remove(&router_key(router));
         return;
     };
+    {
+        let mut recent = RECENT.lock().unwrap();
+        let presses = recent.entry(router_key(router)).or_default();
+        presses.push_back((packet_id, byte));
+        while presses.len() > RECENT_PRESSES {
+            presses.pop_front();
+        }
+    }
     NEWEST.lock().unwrap().insert(router_key(router), Press {
         packet_id,
         byte,
@@ -121,6 +143,23 @@ pub(crate) fn record_operator_press(state: &AppState, router: &Router, byte: u8,
 pub(crate) fn note_retired(router: &Router, heads: &[u64]) {
     if heads.is_empty() {
         return;
+    }
+    // An operator press that was itself a retired head was never delivered.
+    {
+        let mut recent = RECENT.lock().unwrap();
+        if let Some(presses) = recent.get_mut(&router_key(router)) {
+            let lost: Vec<u8> = presses.iter().filter(|(id, _)| heads.contains(id)).map(|(_, byte)| *byte).collect();
+            presses.retain(|(id, _)| !heads.contains(id));
+            if !lost.is_empty() {
+                UNDELIVERED.lock().unwrap().entry(router_key(router)).or_default().extend(lost);
+            }
+        }
+    }
+    if let Some(press) = NEWEST.lock().unwrap().get_mut(&router_key(router))
+        && heads.contains(&press.packet_id)
+    {
+        // Reported above; never re-sent (R1).
+        press.done = true;
     }
     let pending: BTreeSet<u64> = router.export_reliable_pending_stats().iter().map(|row| row.packet_id).collect();
     if let Some(press) = NEWEST.lock().unwrap().get_mut(&router_key(router))
@@ -182,6 +221,20 @@ fn command_for(byte: u8) -> Option<TelemetryCommand> {
     .find(|cmd| crate::telemetry_task::hitl_flight_command_id(cmd) == Some(byte))
 }
 
+/// The one-line notice for a press whose own packet got no acknowledgement.
+fn unconfirmed_message(state: &AppState, byte: u8) -> String {
+    let label = label_for(byte);
+    if effect_and_admissible(state, byte).0 {
+        format!("{label}: no confirmation from FC, but the station already sees its effect.")
+    } else {
+        format!("{label}: no confirmation from FC. Check FC state before pressing again.")
+    }
+}
+
+fn label_for(byte: u8) -> String {
+    command_for(byte).map_or_else(|| format!("Flight command {byte}"), |c| crate::sequences::command_name(&c).to_string())
+}
+
 /// R7: what the station already knows about the FC for this command.
 fn effect_and_admissible(state: &AppState, byte: u8) -> (bool, bool) {
     use crate::recovery_events::{already_deployed, Deployment};
@@ -199,6 +252,15 @@ fn effect_and_admissible(state: &AppState, byte: u8) -> (bool, bool) {
 /// Run from the telemetry task: decide on a dropped operator press, at most
 /// once (R5), and re-send it or tell the operator why not (R8).
 pub(crate) fn service(state: &AppState, router: &Router) {
+    let undelivered = UNDELIVERED.lock().unwrap().remove(&router_key(router)).unwrap_or_default();
+    for byte in undelivered {
+        // No acknowledgement came back: the FC may still have run it and only
+        // its acknowledgements were lost, so never claim it was not delivered
+        // and never invite a blind second press of a pyro command.
+        let message = unconfirmed_message(state, byte);
+        log::warn!("{message} (no acknowledgement within its retry span)");
+        crate::web::emit_notification_warning(state, message);
+    }
     let press = {
         let mut newest = NEWEST.lock().unwrap();
         let Some(p) = newest.get_mut(&router_key(router)).filter(|p| !p.done) else { return };
@@ -221,7 +283,7 @@ pub(crate) fn service(state: &AppState, router: &Router) {
         p.clone()
     };
     let cmd = command_for(press.byte);
-    let label = cmd.as_ref().map_or_else(|| format!("Flight command {}", press.byte), |c| crate::sequences::command_name(c).to_string());
+    let label = label_for(press.byte);
     let (effect_seen, fc_admissible) = effect_and_admissible(state, press.byte);
     let context = Context {
         age: press.pressed_at.elapsed(),
@@ -274,5 +336,31 @@ pub(crate) fn service(state: &AppState, router: &Router) {
 pub(crate) fn backdate_press_for_test(router: &Router, ms: u64) {
     if let Some(p) = NEWEST.lock().unwrap().get_mut(&router_key(router)) {
         p.pressed_at -= Duration::from_millis(ms);
+    }
+}
+
+#[cfg(test)]
+mod unconfirmed_tests {
+    use super::*;
+    use crate::rocket_commands::FlightComputerCommands as Fc;
+
+    /// The softened notice guides a pyro decision too: it appears only when
+    /// the station already sees that same command's deployment, never for a
+    /// different command's (drogue seen, main pressed).
+    #[tokio::test]
+    async fn the_unconfirmed_notice_softens_only_for_the_pressed_commands_own_effect() {
+        let state = crate::state::tests::test_app_state().await;
+        let deploy = Fc::DeployParachute as u8;
+        let expand = Fc::ExpandParachute as u8;
+        let check = |byte| unconfirmed_message(&state, byte);
+        assert_eq!(check(deploy), "DeployParachute: no confirmation from FC. Check FC state before pressing again.");
+        // The FC reaches Descent: the drogue deployed.
+        crate::recovery_events::observe_fc_state(&state, FlightState::Ascent, FlightState::Descent, 1);
+        assert_eq!(check(deploy), "DeployParachute: no confirmation from FC, but the station already sees its effect.");
+        assert_eq!(check(expand), "ExpandParachute: no confirmation from FC. Check FC state before pressing again.",
+            "the drogue says nothing about the main");
+        // The FC reaches Reefing: the main deployed.
+        crate::recovery_events::observe_fc_state(&state, FlightState::Descent, FlightState::Reefing, 2);
+        assert_eq!(check(expand), "ExpandParachute: no confirmation from FC, but the station already sees its effect.");
     }
 }
