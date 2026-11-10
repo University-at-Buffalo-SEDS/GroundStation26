@@ -408,6 +408,21 @@
       "priority": 0
     },
     {
+      "name": "GPS_STATUS",
+      "doc": "RF GPS status, 4 x f32: state (0 no module, 1 silent, 2 no fix, 3 fix), satellites, s since last byte, s since last fix (-1 never).",
+      "reliable": "Off",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 4
+      },
+      "endpoints": [
+        "GROUND_STATION"
+      ],
+      "priority": 16
+    },
+    {
       "name": "EULER_ANGLES",
       "doc": "Initial condition euler angles: 3 x float32 values.",
       "reliable": "Unordered",

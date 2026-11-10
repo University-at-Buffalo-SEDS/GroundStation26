@@ -6103,6 +6103,50 @@ mod tests {
         );
     }
 
+    /// RF sends GPS_STATUS every period with or without a GPS module, so the
+    /// station can tell no module from no fix from no data path.
+    #[tokio::test]
+    async fn rf_gps_status_becomes_a_displayed_telemetry_row() {
+        let (db_tx, mut db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+        // No module response: state 0, no satellites, never heard, never fixed.
+        let status = [0.0_f32, 0.0, -1.0, -1.0];
+        let pkt = Packet::new(
+            crate::telemetry_schema::data_type("GPS_STATUS"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            Board::RFBoard.sender_id(),
+            123_456,
+            f32_payload(&status),
+        )
+        .expect("failed to build RF GPS_STATUS packet");
+
+        let row = handle_packet(&state, &db_tx, &db_overflow, pkt)
+            .await
+            .into_iter()
+            .next()
+            .expect("RF GPS_STATUS packet should produce a telemetry row");
+        assert_eq!(row.data_type, "GPS_STATUS");
+        assert_eq!(row.sender_id, Board::RFBoard.sender_id());
+        assert_eq!(row.values, status.map(Some).to_vec());
+        match db_rx.recv().await.expect("GPS_STATUS should queue a DB write") {
+            DbQueueItem::Write(DbWrite::Telemetry { data_type, .. }) => {
+                assert_eq!(data_type, "GPS_STATUS")
+            }
+            other => panic!("unexpected DB item for GPS_STATUS: {other:?}"),
+        }
+
+        for layout in [
+            include_str!("../layout/layout.json"),
+            include_str!("../layout/layout_hitl.json"),
+        ] {
+            assert!(
+                layout.contains("\"data_type\": \"GPS_STATUS\""),
+                "Normal and HITL layouts must show GPS_STATUS"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn imu_packets_are_split_into_accel_and_gyro_rows() {
         let (db_tx, mut db_rx) = mpsc::channel(8);

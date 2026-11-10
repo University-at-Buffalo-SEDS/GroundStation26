@@ -4969,7 +4969,9 @@ mod tests {
         // priority200 commands after its original admission.
         for admitted in 0..3usize {
             let mut seen=false;
-            'search: for budget in [18905usize,18957,19009] {for pressure in 0..7 {
+            // These budgets sit just above the warm-up floor, which grows with the
+            // registered GS schema; recalibrate them when a schema type is added.
+            'search: for budget in [19130usize,19182,19234] {for pressure in 0..7 {
                 let mut scene=crate::ignition_pair::constrained_fixture::Scene::new(budget).await;
                 scene.warm().await.unwrap();
                 // Fresh queried SAME Router scope; this does not claim the old

@@ -6505,7 +6505,9 @@ mod final_launch_admission_tests {
         assert!(bare_partial,"the original bare SDK partial boundary remains exercised independently");
         let bare_zero=make_router(16);assert!(bare_zero.try_tx_queue(launch_packet()).is_err());assert!(!bare_zero.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("FLIGHT_COMMAND")));
         let mut partial_seen=false;
-        for budget in [18905usize,18957,19009] {
+        // These budgets sit just above the warm-up floor, which grows with the
+        // registered GS schema; recalibrate them when a schema type is added.
+        for budget in [19130usize,19182,19234] {
             let mut scene=crate::ignition_pair::constrained_fixture::Scene::new(budget).await;
             scene.warm().await.unwrap();scene.preload_readonly_gps_pressure();
             assert!(scene.scope_current(),"pair and required scope must remain current at original offer");
@@ -6526,7 +6528,7 @@ mod final_launch_admission_tests {
         assert!(partial_seen,"actual SDK must retain the first admitted owner when second admission fails");
         // Additional readonly Ordered QUERY pressure is an actual retained
         // SDK owner; fresh proof remains valid and no queue is processed.
-        let mut scene=crate::ignition_pair::constrained_fixture::Scene::new(18957).await;
+        let mut scene=crate::ignition_pair::constrained_fixture::Scene::new(19182).await;
         scene.warm().await.unwrap();scene.preload_readonly_gps_pressure();
         assert!(scene.preload_readonly_query(crate::types::Board::RFBoard));
         let state=&scene.state;let ticket=inhibit_automatic_actions_for_launch(state).unwrap();

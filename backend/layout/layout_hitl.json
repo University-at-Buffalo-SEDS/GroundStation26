@@ -750,6 +750,88 @@
               "enabled": false,
               "kind": "raw"
             }
+          },
+          {
+            "id": "gps_status",
+            "label": "GPS Status",
+            "data_type": "GPS_STATUS",
+            "channels": [
+              "Module (0 no response, 1 silent, 2 no fix, 3 fix)",
+              "Satellites",
+              "Last byte age (s)",
+              "Last fix age (s)"
+            ],
+            "channel_formatters": [
+              {
+                "kind": "integer"
+              },
+              {
+                "kind": "integer"
+              },
+              {
+                "precision": 1
+              },
+              {
+                "precision": 1
+              }
+            ],
+            "chart": {
+              "enabled": false
+            },
+            "summary_items": [
+              {
+                "label": "Module (0 no response, 1 silent, 2 no fix, 3 fix)",
+                "data_type": "GPS_STATUS",
+                "index": 0,
+                "formatter": {
+                  "kind": "integer"
+                },
+                "display_filter": {
+                  "enabled": false,
+                  "kind": "raw"
+                }
+              },
+              {
+                "label": "Satellites",
+                "data_type": "GPS_STATUS",
+                "index": 1,
+                "formatter": {
+                  "kind": "integer"
+                },
+                "display_filter": {
+                  "enabled": false,
+                  "kind": "raw"
+                }
+              },
+              {
+                "label": "Last byte age (s, -1 never)",
+                "data_type": "GPS_STATUS",
+                "index": 2,
+                "formatter": {
+                  "precision": 1
+                },
+                "display_filter": {
+                  "enabled": false,
+                  "kind": "raw"
+                }
+              },
+              {
+                "label": "Last fix age (s, -1 never)",
+                "data_type": "GPS_STATUS",
+                "index": 3,
+                "formatter": {
+                  "precision": 1
+                },
+                "display_filter": {
+                  "enabled": false,
+                  "kind": "raw"
+                }
+              }
+            ],
+            "display_filter": {
+              "enabled": false,
+              "kind": "raw"
+            }
           }
         ],
         "chart": {
