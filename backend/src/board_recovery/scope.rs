@@ -2,6 +2,11 @@
 //! Prospective/Unknown history is deliberately NOT admitted recovery ownership.
 use super::*;
 
+/// `board_abort::Runtime::with_reset_context`'s refusal when another owner
+/// holds the register for a moment.
+const REGISTER_BUSY: &str = "Reset policy owner busy";
+/// How long a step check waits out a busy register.
+const REGISTER_BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 #[derive(Clone, Copy)]
 pub(crate) struct Selection {
     context: crate::board_abort::ResetContext,
@@ -107,6 +112,21 @@ impl Selection {
     }
     pub(crate) fn current(&self, state: &AppState) -> Result<(), &'static str> {
         self.with_current(state, || Ok(()))
+    }
+    /// `current` for a running recovery's step checks, which hold no other
+    /// lock: a board-abort register held for a moment by an observation (an
+    /// Abort push, a readback) is waited out briefly instead of failing that
+    /// board's reset with "Reset policy owner busy".
+    pub(crate) async fn current_waiting(&self, state: &AppState) -> Result<(), &'static str> {
+        let start = std::time::Instant::now();
+        loop {
+            match self.current(state) {
+                Err(REGISTER_BUSY) if start.elapsed() < REGISTER_BUSY_WAIT => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                other => return other,
+            }
+        }
     }
     pub(crate) fn with_current<T>(
         &self,
@@ -224,6 +244,30 @@ mod actual_policy_tests {
         assert_eq!(mode_scope(TestFire), 0x78);
         assert_eq!(mode_scope(Hitl), 0x7f);
         assert_eq!(mode_scope(Testing), 0x7f);
+    }
+    /// audit-hitl-b390753 cycle 1: DAQ's Reset all leg failed with "Reset
+    /// policy owner busy" because a concurrent observation held the
+    /// board-abort register at the moment of a step check. A step check
+    /// waits a moment for the register; a changed policy still fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_step_check_waits_out_a_briefly_busy_abort_register() {
+        let state = crate::state::tests::test_app_state().await;
+        let selection = Selection::capture(&state, &[]).unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let _guard = state.board_abort.hold_register_for_test();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            })
+        };
+        held_rx.recv().unwrap();
+        assert_eq!(selection.current(&state), Err(REGISTER_BUSY), "the plain check refuses at once");
+        assert_eq!(selection.current_waiting(&state).await, Ok(()), "the step check waits it out");
+        holder.join().unwrap();
+        state.board_abort.observe_abort(Board::RFBoard, std::time::Instant::now(), 100);
+        assert!(selection.current_waiting(&state).await.is_err(), "a changed policy still fails");
     }
     #[tokio::test]
     async fn actual_abort_and_explicit_optional_are_mandatory_without_unknown_roster() {

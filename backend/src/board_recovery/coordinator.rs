@@ -1507,7 +1507,7 @@ async fn authorize(
     {
         return Err(intern(owned_host_block_reason(state, &ticket.action)));
     }
-    if let Some(selection) = ticket.reset_selection { selection.current(state)?; }
+    if let Some(selection) = ticket.reset_selection { selection.current_waiting(state).await?; }
     if let Some(boundary) = ticket.boundary {
         boundary.clock_failure().current().map_err(|error| error.message())?;
     }

@@ -377,6 +377,11 @@ impl Runtime {
         }
         apply()
     }
+    /// Holds the register as a concurrent observation would.
+    #[cfg(test)]
+    pub(crate) fn hold_register_for_test(&self) -> impl Sized + '_ {
+        self.register.lock().unwrap()
+    }
     pub(crate) fn abort_revision(&self) -> u64 {
         self.abort_counter.load(Ordering::Acquire)
     }
