@@ -2,6 +2,9 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
+/// Serializes the tests that set or depend on `rrls::primary_relaying()`.
+static RELAYING_FLAG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 async fn fixture(sender: Option<&str>) -> tests::HttpFixture {
     let fixture = tests::http_fixture().await;
     *fixture.state.launch_history.lock().unwrap() = crate::launch_history::Store::open(
@@ -489,6 +492,7 @@ async fn stale_commissioning_identity_allows_only_prepare_not_actual_recovery_pr
 /// AV-bay board has reported since the pause.
 #[tokio::test]
 async fn background_av_bay_queries_pause_while_the_av_bay_path_is_degraded() {
+    let _relaying = RELAYING_FLAG.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let fixture = tests::http_fixture().await;
     let state = fixture.state.clone();
     let mut refresh = ReadonlyQueryRefresh::default();
@@ -541,6 +545,9 @@ async fn background_av_bay_queries_pause_while_the_av_bay_path_is_degraded() {
 /// at most one AV-bay query in the stream.
 #[tokio::test]
 async fn background_refresh_keeps_one_av_bay_query_in_the_ordered_stream() {
+    // Another test sets the process-wide "primary relaying" flag, which
+    // pauses background AV-bay queries.
+    let _relaying = RELAYING_FLAG.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let fixture = tests::http_fixture().await;
     let state = fixture.state.clone();
     let host = Arc::new(sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS")));
