@@ -12,7 +12,7 @@
   "expires_in_ms": 15000,
   "policy_epoch": "boot-fixture:epoch-1",
   "principal_context": "user:operator",
-  "required_confirmation": "RESTART TESTING-SIMULATION",
+  "required_confirmation": null,
   "revision": "boot-fixture:epoch-1",
   "summary": "Simulation is set at start, so the station saves this selection, shuts down cleanly and its supervisor restarts it in Testing mode in simulation. Live connections drop for a few seconds and reconnect on their own. The switch is allowed only while the station is idle and is checked again just before the restart.",
   "target": {

@@ -32,11 +32,12 @@ backend started without the supervisor lasts until that backend stops.
    a change is refused right now.
 2. **Review mode change** calls `POST /api/station-modes/prepare` with the
    status it read (instance, policy epoch, revision, current and target). The
-   server re-checks the rules below. It returns a single-use 15 s review ticket
-   and a phrase to type: `SWITCH TO HITL` for an in-process switch, or
-   `RESTART TESTING-SIMULATION` for a Simulation change.
+   server re-checks the rules below. It returns a single-use 15 s review ticket.
+   Nothing is typed: `required_confirmation` is `null`, and Confirm in the
+   review is the confirmation.
 3. **Confirm mode change** calls `POST /api/station-modes/confirm`. The server
-   checks the ticket, phrase, session and rules again. It writes
+   checks the ticket, session and rules again. An older UI may still send a
+   `confirmation` phrase; it is ignored. It writes
    `selection.json` (fsync and atomic rename) and answers `accepted` with a
    pending transition. Then:
    - **Same Simulation flag (in process):** about 0.2 s later the backend

@@ -12,7 +12,7 @@
   "expires_in_ms": 15000,
   "policy_epoch": "boot-fixture:epoch-1",
   "principal_context": "user:operator",
-  "required_confirmation": "SWITCH TO HITL",
+  "required_confirmation": null,
   "revision": "boot-fixture:epoch-1",
   "summary": "The station saves this selection and switches to HITL mode in place. Sign-ins and connections are kept; the layout and controls refresh on their own. The switch is allowed only while the station is idle and is checked again at the moment it happens.",
   "target": {

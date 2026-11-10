@@ -126,7 +126,10 @@ impl Fixture {
         for key in ["current", "target", "summary", "required_confirmation", "expires_in_ms"] {
             object.remove(key);
         }
-        object.insert("confirmation".into(), phrase.into());
+        // The current UI types nothing and sends no phrase; older UIs echo one.
+        if !phrase.is_empty() {
+            object.insert("confirmation".into(), phrase.into());
+        }
         body
     }
     fn selection(&self) -> Option<Selection> {
@@ -236,11 +239,12 @@ async fn confirmed_simulation_change_saves_the_selection_then_requests_a_clean_r
                 "current_id", "target_id", "ticket", "transition_id", "current", "summary"] {
         assert!(challenge.get(key).is_some(), "challenge missing {key}: {challenge}");
     }
-    let phrase = challenge["required_confirmation"].as_str().unwrap().to_owned();
-    assert_eq!(phrase, format!("RESTART {}", target.to_uppercase()));
-    // A wrong phrase consumes the ticket and changes nothing.
+    // Nothing to type: Confirm on the review is the confirmation.
+    assert!(challenge["required_confirmation"].is_null(), "{challenge}");
+    let phrase = String::new();
+    // Another session naming the ticket consumes it and changes nothing.
     let (status, body) = f
-        .call("POST", "/api/station-modes/confirm", "operator", Some(Fixture::confirmation(&challenge, "restart")))
+        .call("POST", "/api/station-modes/confirm", "administrator", Some(Fixture::confirmation(&challenge, "")))
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     let (status, _) = f
@@ -261,8 +265,9 @@ async fn confirmed_simulation_change_saves_the_selection_then_requests_a_clean_r
     forged["ticket"] = "0".repeat(32).into();
     let (status, _) = f.call("POST", "/api/station-modes/confirm", "viewer", Some(forged)).await;
     assert_eq!(status, StatusCode::CONFLICT);
+    // An older UI still echoing the old phrase is accepted the same way.
     let (status, receipt) = f
-        .call("POST", "/api/station-modes/confirm", "operator", Some(Fixture::confirmation(&challenge, &phrase)))
+        .call("POST", "/api/station-modes/confirm", "operator", Some(Fixture::confirmation(&challenge, "RESTART TESTING-SIMULATION")))
         .await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert_eq!(receipt["accepted"], true);
@@ -340,7 +345,7 @@ async fn busy_station_refuses_with_the_server_reason() {
         anchor_timestamp_ms: Some(1),
         duration_ms: Some(10_000),
     };
-    let phrase = challenge["required_confirmation"].as_str().unwrap().to_owned();
+    let phrase = String::new();
     let (status, body) = f
         .call("POST", "/api/station-modes/confirm", "administrator", Some(Fixture::confirmation(&challenge, &phrase)))
         .await;
@@ -407,7 +412,7 @@ async fn activity_just_before_restart_cancels_it_and_restores_the_selection() {
     let f = Fixture { switch, ..f };
     let target = "testing-simulation";
     let (_, challenge) = f.prepare("administrator", target).await;
-    let phrase = challenge["required_confirmation"].as_str().unwrap().to_owned();
+    let phrase = String::new();
     let (status, _) = f
         .call("POST", "/api/station-modes/confirm", "administrator", Some(Fixture::confirmation(&challenge, &phrase)))
         .await;
@@ -474,7 +479,7 @@ async fn launch_admission_and_a_committed_mode_change_exclude_each_other() {
     let (status, challenge) = f.prepare("administrator", target).await;
     assert_eq!(status, StatusCode::OK, "{challenge}");
     let launch = f.state.launch_mode_gate.admit().unwrap();
-    let phrase = challenge["required_confirmation"].as_str().unwrap().to_owned();
+    let phrase = String::new();
     let (status, body) = f
         .call("POST", "/api/station-modes/confirm", "administrator", Some(Fixture::confirmation(&challenge, &phrase)))
         .await;
@@ -485,7 +490,7 @@ async fn launch_admission_and_a_committed_mode_change_exclude_each_other() {
 
     // A committed switch refuses every Launch press until it is done.
     let (_, challenge) = f.prepare("administrator", target).await;
-    let phrase = challenge["required_confirmation"].as_str().unwrap().to_owned();
+    let phrase = String::new();
     let (status, body) = f
         .call("POST", "/api/station-modes/confirm", "administrator", Some(Fixture::confirmation(&challenge, &phrase)))
         .await;
@@ -545,8 +550,8 @@ async fn rrls_offers_a_simulated_primary_for_every_mode_and_switches_only_itself
     let (status, challenge) = f.prepare("administrator", &target).await;
     assert_eq!(status, StatusCode::OK, "{challenge}");
     assert!(challenge["summary"].as_str().unwrap().contains("only this RRLS"));
-    let phrase = challenge["required_confirmation"].as_str().unwrap().to_owned();
-    assert!(phrase.starts_with("RESTART "), "a Simulation change restarts");
+    assert!(challenge["summary"].as_str().unwrap().contains("restarts"), "a Simulation change restarts");
+    let phrase = String::new();
     let (status, _) = f
         .call("POST", "/api/station-modes/confirm", "administrator", Some(Fixture::confirmation(&challenge, &phrase)))
         .await;
@@ -573,8 +578,8 @@ async fn switch_in_process(f: &Fixture, user: &str, target: &str) -> (Value, Val
     let before = f.snapshot(user).await;
     let (status, challenge) = f.prepare(user, target).await;
     assert_eq!(status, StatusCode::OK, "{challenge}");
-    let phrase = challenge["required_confirmation"].as_str().unwrap().to_owned();
-    assert_eq!(phrase, format!("SWITCH TO {}", target.to_uppercase()));
+    assert!(challenge["required_confirmation"].is_null(), "{challenge}");
+    let phrase = String::new();
     let (status, receipt) = f
         .call("POST", "/api/station-modes/confirm", user, Some(Fixture::confirmation(&challenge, &phrase)))
         .await;
@@ -654,7 +659,7 @@ async fn switch_is_refused_when_the_station_is_not_idle_at_the_moment_of_the_swi
     let f = Fixture { switch, ..f };
     let epoch = crate::runtime_mode::epoch();
     let (_, challenge) = f.prepare("administrator", "normal").await;
-    let phrase = challenge["required_confirmation"].as_str().unwrap().to_owned();
+    let phrase = String::new();
     let (status, _) = f
         .call("POST", "/api/station-modes/confirm", "administrator", Some(Fixture::confirmation(&challenge, &phrase)))
         .await;

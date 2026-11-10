@@ -288,7 +288,8 @@ async fn station_modes(root: &Path, state: &Arc<AppState>, out: &mut Fixtures) {
     for key in ["current", "target", "summary", "required_confirmation", "expires_in_ms"] {
         object.remove(key);
     }
-    object.insert("confirmation".into(), challenge2["required_confirmation"].clone());
+    // Nothing is typed: Confirm sends the ticket and binding only.
+    assert!(challenge2["required_confirmation"].is_null(), "{challenge2}");
     let (status, accepted) =
         call(app.clone(), "POST", "/api/station-modes/confirm", Some("operator"), Some(confirmation)).await;
     assert_eq!(status, StatusCode::OK, "{accepted}");

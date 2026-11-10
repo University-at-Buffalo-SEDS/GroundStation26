@@ -369,7 +369,12 @@ struct Confirmation {
     binding: Binding,
     ticket: String,
     transition_id: String,
-    confirmation: String,
+    /// Older UIs still echo the typed phrase they were given. Nothing is
+    /// typed now: the single-use ticket bound to this session, target and
+    /// epoch is the confirmation, so any value here is ignored.
+    #[serde(default)]
+    #[allow(dead_code)]
+    confirmation: Option<String>,
 }
 struct Ticket {
     ticket: String,
@@ -579,13 +584,6 @@ impl Switch {
             "reason": (!notes.is_empty()).then(|| notes.join(" ")),
         })
     }
-    fn phrase(&self, target: Target) -> String {
-        if self.config.in_process(target) {
-            format!("SWITCH TO {}", target.id().to_uppercase())
-        } else {
-            format!("RESTART {}", target.id().to_uppercase())
-        }
-    }
     fn admit(&self, principal: &AuthPrincipal, state: &AppState, binding: &Binding) -> Result<Target, Refusal> {
         if !can_change(principal) {
             return Err(Refusal::forbidden(
@@ -653,7 +651,8 @@ impl Switch {
             "current": self.current_json(),
             "target": self.target_json(target, None),
             "summary": summary,
-            "required_confirmation": self.phrase(target),
+            // No phrase to type: Confirm on the review is the confirmation.
+            "required_confirmation": Value::Null,
             "expires_in_ms": TICKET_TTL.as_millis() as u64,
         });
         self.runtime.lock().unwrap().ticket = Some(Ticket {
@@ -690,9 +689,6 @@ impl Switch {
         }
         if ticket.principal != principal_context(principal) || ticket.binding != request.binding {
             return Err(Refusal::conflict("This mode review belongs to another session or target."));
-        }
-        if request.confirmation != self.phrase(ticket.target) {
-            return Err(Refusal::conflict("The confirmation phrase did not match. Review again."));
         }
         let target = self.admit(principal, state, &request.binding)?;
         // From here every Launch press is refused until the switch ends, and a
