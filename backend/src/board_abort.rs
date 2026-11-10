@@ -260,6 +260,10 @@ pub(crate) struct Snapshot {
     pub history_error: Option<String>,
     #[serde(default = "launch_gate_default")]
     pub history_blocks_launch: bool,
+    /// Times the station has re-sent the operator Abort because an AV-bay
+    /// board has not read it back yet (`manual_abort_resend`); absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abort_resends: Option<u32>,
 }
 impl Default for Snapshot {
     fn default() -> Self {
@@ -267,6 +271,7 @@ impl Default for Snapshot {
             version: 0, active_errors: Vec::new(), required_boards: Vec::new(),
             missing_required_state: Vec::new(), retraction: None,
             history_unknown_boards: Vec::new(), history_error: None, history_blocks_launch: true,
+            abort_resends: None,
         }
     }
 }
@@ -897,6 +902,7 @@ pub(crate) fn snapshot_for_state(state: &AppState) -> Snapshot {
             }
         }
         value.history_blocks_launch = !crate::runtime_mode::is_hitl();
+        value.abort_resends = state.abort_resend.active_resends().filter(|count| *count > 0);
     }
     if !crate::rrls::is_rrls() {
         value.retraction = Some(crate::actuator_plumbing::retraction_gate(state));

@@ -68,6 +68,7 @@ mod loadcell_zero;
 mod log_redaction;
 mod logger;
 mod manual_abort_intent;
+mod manual_abort_resend;
 mod manual_abort_utc;
 mod map;
 mod media;
@@ -1600,6 +1601,7 @@ async fn main() -> anyhow::Result<()> {
         operator_queue: Arc::new(crate::operator_queue::Control::default()),
         operator_dispatch_inflight: Arc::new(AtomicUsize::new(0)),
         manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
+        abort_resend: Arc::new(crate::manual_abort_resend::AbortResend::default()),
         deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
         igniter_sense: Arc::new(std::sync::Mutex::new(igniter_sense::Tracker::default())),
         board_recovery: Arc::new(crate::board_recovery::Runtime::default()),
@@ -2381,6 +2383,11 @@ async fn main() -> anyhow::Result<()> {
         state.clone(),
         state.shutdown_subscribe(),
     ));
+    let _abort_resend = tokio::spawn(crate::manual_abort_resend::service(
+        state.clone(),
+        router.clone(),
+        state.shutdown_subscribe(),
+    ));
     let _manual_utc_reservations = tokio::spawn(crate::manual_abort_utc::service(
         state.clone(),
         router.clone(),
@@ -2393,6 +2400,10 @@ async fn main() -> anyhow::Result<()> {
         {
             Ok(true) => {
                 stop_state.board_abort.request_abort_confirmation();
+                if let Some(wire) = claim.wire() {
+                    let recovery = crate::board_recovery::coordinator::recovery_activity(&stop_state).flatten();
+                    stop_state.abort_resend.arm(claim.epoch(), wire, recovery);
+                }
                 log::info!(
                     "manual Abort accepted by SDK epoch={} current={} pending={:?}",
                     claim.epoch(),

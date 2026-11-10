@@ -262,6 +262,8 @@ pub struct AppState {
     pub(crate) operator_admission_barrier: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) operator_dispatch_inflight: Arc<AtomicUsize>,
     pub(crate) manual_abort_intent: Arc<crate::manual_abort_intent::ManualAbortIntent>,
+    /// Re-sends a retained operator Abort over radio loss (`manual_abort_resend`).
+    pub(crate) abort_resend: Arc<crate::manual_abort_resend::AbortResend>,
     pub(crate) deferred_abort: Arc<crate::deferred_abort::Inbox>,
     pub(crate) board_recovery: Arc<crate::board_recovery::Runtime>,
     pub(crate) igniter_sense: Arc<Mutex<crate::igniter_sense::Tracker>>,
@@ -4390,6 +4392,7 @@ pub(crate) mod tests {
             operator_queue: Arc::new(crate::operator_queue::Control::default()),
             operator_dispatch_inflight: Arc::new(AtomicUsize::new(0)),
             manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
+            abort_resend: Arc::new(crate::manual_abort_resend::AbortResend::default()),
             deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
             igniter_sense: Arc::new(Mutex::new(crate::igniter_sense::Tracker::default())),
             board_recovery: Arc::new(crate::board_recovery::Runtime::default()),

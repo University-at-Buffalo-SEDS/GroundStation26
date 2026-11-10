@@ -384,6 +384,15 @@ pub(super) fn admit_external_query<T>(state:&AppState,offer:impl FnOnce()->T)->O
     }
     Some(offer())
 }
+/// Identity of the recovery work the coordinator holds (a prepared ticket or
+/// an operation, finished or not), so a caller can tell when a new one
+/// starts. None while the coordinator is busy.
+pub(crate) fn recovery_activity(state: &AppState) -> Option<Option<String>> {
+    let control = state.board_recovery.coordinator.0.try_lock().ok()?;
+    let operation = control.operation.as_ref().map(|value| value["id"].to_string());
+    let ticket = control.ticket.as_ref().map(|ticket| ticket.id.clone());
+    Some((operation.is_some() || ticket.is_some()).then(|| format!("operation {operation:?} ticket {ticket:?}")))
+}
 pub(crate) fn readonly_query_idle(state: &AppState) -> bool {
     state
         .board_recovery
@@ -692,6 +701,9 @@ pub(super) async fn prepare(
     if let Err(response) = primary_only() {
         return response;
     }
+    // No operator Abort re-send may start once a recovery is being prepared;
+    // one already in flight is drained below before the fresh queries.
+    state.abort_resend.disarm("a board recovery is being prepared");
     let request = match parsed {
         Ok(request) => request,
         Err(_) => return error(StatusCode::CONFLICT, "invalid_intent", "A complete explicit recovery intent is required."),
@@ -5812,6 +5824,22 @@ mod tests {
                 .recovery_pending()
                 .is_none()
         );
+    }
+    /// Preparing a recovery stops the operator Abort re-send before the
+    /// coordinator drains in-flight ABORTs and takes its fresh queries.
+    #[tokio::test]
+    async fn preparing_a_recovery_stops_the_operator_abort_resend() {
+        if isolated("preparing_a_recovery_stops_the_operator_abort_resend") { return; }
+        let fixture = Fixture::new().await;
+        *fixture.http.state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+        let state = fixture.state();
+        state.abort_resend.arm(state.manual_abort_intent.epoch(), crate::manual_abort_intent::WirePolicy::Untimed, None);
+        assert_eq!(state.abort_resend.active_resends(), Some(0));
+        for board in BOARDS {
+            fixture.query(board).await;
+        }
+        let _ticket = fixture.prepare("reset_startup", None).await;
+        assert_eq!(state.abort_resend.active_resends(), None, "no re-send after Reset all starts");
     }
     async fn changed_review_identity_is_rejected_without_adopting_fresh_query(change_boot: bool) {
         let fixture = Fixture::new().await;

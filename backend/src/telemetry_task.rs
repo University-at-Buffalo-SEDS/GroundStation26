@@ -5929,6 +5929,7 @@ mod tests {
             operator_queue: Arc::new(crate::operator_queue::Control::default()),
             operator_dispatch_inflight: Arc::new(AtomicUsize::new(0)),
             manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
+            abort_resend: Arc::new(crate::manual_abort_resend::AbortResend::default()),
             deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
             igniter_sense: Arc::new(std::sync::Mutex::new(crate::igniter_sense::Tracker::default())),
             board_recovery: Arc::new(crate::board_recovery::Runtime::default()),
