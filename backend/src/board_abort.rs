@@ -22,6 +22,8 @@ pub(crate) const BOARDS: [Board; 7] = [
     Board::GatewayBoard,
     Board::DaqBoard,
 ];
+/// RF, FC and PB in BOARDS order.
+const AV_BAY_MASK: u8 = 0b111;
 pub(crate) const PROOF_TTL: Duration = Duration::from_secs(10);
 /// Wall-clock proof window; stretched only by a simulator build (`sim_freshness`).
 fn proof_ttl() -> Duration {
@@ -223,6 +225,8 @@ pub(crate) struct Runtime {
     register: Mutex<Register>,
     abort_counter: AtomicU64,
     demand: AtomicU8,
+    /// The station just sent an operator Abort; see `board_recovery::abort_confirm`.
+    abort_sent: std::sync::atomic::AtomicBool,
     pub(crate) changed: std::sync::Arc<Notify>,
     pub(crate) query_needed: Notify,
     history: Option<crate::board_abort_history_writer::Publisher>,
@@ -569,6 +573,14 @@ impl Runtime {
             self.demand.fetch_or(mask & 0x7f, Ordering::AcqRel);
             self.query_needed.notify_one();
         }
+    }
+    /// Ask the umbilical boards for prompt readback of an Abort just sent.
+    pub(crate) fn request_abort_confirmation(&self) {
+        self.abort_sent.store(true, Ordering::Release);
+        self.query_needed.notify_one();
+    }
+    pub(crate) fn take_abort_confirmation(&self) -> bool {
+        self.abort_sent.swap(false, Ordering::AcqRel)
     }
     pub(crate) fn take_queries(&self) -> u8 {
         self.demand.swap(0, Ordering::AcqRel)
@@ -953,14 +965,30 @@ pub(crate) async fn query_service(
     let mut refresh = crate::board_recovery::ReadonlyQueryRefresh::default();
     let mut actuator = ActuatorReadbackRefresh::default();
     let mut discovery = discovery_refresh::DiscoveryRefresh::default();
+    let mut confirm = crate::board_recovery::abort_confirm::AbortConfirmRefresh::default();
+    // AV-bay demand that waits while an Abort's umbilical readback is owed.
+    let mut held_demand = 0u8;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {biased;_=shutdown.recv()=>return,_=state.board_abort.query_needed.notified()=>{},_=tick.tick()=>{}}
+        if state.board_abort.take_abort_confirmation() {
+            confirm.start();
+        }
         let demand = state.board_abort.take_queries();
         if crate::rrls::is_rrls() || !crate::board_recovery::coordinator::readonly_query_idle(&state) {
             continue;
         }
+        // Prompt Abort readback goes first in the ordered query stream.
+        let _ = confirm.poll(&state);
+        let holding = confirm.active();
+        refresh.hold_av_bay(holding);
+        let demand = if holding {
+            held_demand |= demand & AV_BAY_MASK;
+            demand & !AV_BAY_MASK
+        } else {
+            demand | std::mem::take(&mut held_demand)
+        };
         let _ = discovery.poll(&state);
         let _ = actuator.poll(&state);
         for (i, board) in BOARDS.into_iter().enumerate() {

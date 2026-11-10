@@ -2362,6 +2362,7 @@ async fn main() -> anyhow::Result<()> {
         move |claim| match crate::manual_abort_utc::publish_local_claim(&stop_state, &stop_router, claim)
         {
             Ok(true) => {
+                stop_state.board_abort.request_abort_confirmation();
                 log::info!(
                     "manual Abort accepted by SDK epoch={} current={} pending={:?}",
                     claim.epoch(),

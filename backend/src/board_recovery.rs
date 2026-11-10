@@ -1,5 +1,6 @@
 //! Verified application-state recovery with explicit authenticated intent.
 //! SDK ACKs certify delivery ownership, never board state or physical outputs.
+pub(crate) mod abort_confirm;
 pub(crate) mod coordinator;
 mod exchange;
 
@@ -1075,6 +1076,8 @@ pub(crate) struct ReadonlyQueryRefresh {
     core_busy_last: [Option<WallInstant>; 7],
     /// Background queries in a row that got no reply, per board.
     misses: [u8; 7],
+    /// No new AV-bay query while an Abort's umbilical readback is owed.
+    av_bay_held: bool,
 }
 impl ReadonlyQueryRefresh {
     fn due(&self, at: usize, now: WallInstant) -> bool {
@@ -1120,6 +1123,10 @@ impl ReadonlyQueryRefresh {
         }
         sent
     }
+    /// Hold (or release) new AV-bay background queries; see `abort_confirm`.
+    pub(crate) fn hold_av_bay(&mut self, held: bool) {
+        self.av_bay_held = held;
+    }
     pub(crate) fn poll(&mut self, state: &Arc<AppState>) -> Option<Board> {
         if crate::rrls::is_rrls() || !coordinator::readonly_query_idle(state) {
             return None;
@@ -1135,7 +1142,7 @@ impl ReadonlyQueryRefresh {
             .lock()
             .unwrap()
             .snapshot(now.wall, crate::runtime_mode::is_test_fire());
-        let (last, core_busy_last, misses) = (self.last, self.core_busy_last, self.misses);
+        let (last, core_busy_last, misses, av_bay_held) = (self.last, self.core_busy_last, self.misses, self.av_bay_held);
         // Only boards this mode tracks (test fire has no AV bay).
         let scope = scope::mode_scope(crate::station_mode::local_mode());
         let picks = {
@@ -1148,7 +1155,7 @@ impl ReadonlyQueryRefresh {
                 // A board network health marks unhealthy is still asked, at a
                 // slower cadence, so one that comes back becomes fresh without
                 // an operator Query.
-                scope & (1 << at) != 0 && core_busy_last[at].is_none_or(|busy| now.wall.checked_duration_since(busy)
+                scope & (1 << at) != 0 && !link_held(at, av_bay_held) && core_busy_last[at].is_none_or(|busy| now.wall.checked_duration_since(busy)
                     .is_some_and(|age| age >= Duration::from_millis(250))) && readonly_query_candidate(
                     true,
                     endpoint_verified(state, board, &topology),
@@ -1159,8 +1166,8 @@ impl ReadonlyQueryRefresh {
                     && readonly_backoff_due(
                         last[at],
                         now.wall,
-                        // A reply ends the backoff at once.
-                        if inner.queries[at].as_ref().is_some_and(|query| query.received) { 0 } else { misses[at] },
+                        effective_readonly_misses(at, seen,
+                            inner.queries[at].as_ref().is_some_and(|query| query.received), misses[at]),
                     )
             })
         };
@@ -1201,6 +1208,19 @@ fn readonly_backoff_due(last: Option<WallInstant>, now: WallInstant, misses: u8)
         .min(READONLY_BACKOFF_MAX);
     let wait = crate::sim_freshness::wall(wait);
     last.is_none_or(|last| now.checked_duration_since(last).is_some_and(|age| age >= wait))
+}
+/// Misses that count toward the backoff. A reply ends the backoff at once.
+/// The backoff protects a failing radio link. The umbilical is a wired
+/// 1 Mbit/s link where a lost reply means the query was dropped on the way
+/// (for example behind an AV-bay query in the one ordered query stream), so
+/// an umbilical board network health shows alive is asked at the normal
+/// cadence.
+fn effective_readonly_misses(at: usize, healthy: bool, received: bool, misses: u8) -> u8 {
+    if received || (healthy && LINK_GROUPS[1].contains(&at)) { 0 } else { misses }
+}
+/// Whether this board's link takes no new background query now.
+fn link_held(at: usize, av_bay_held: bool) -> bool {
+    av_bay_held && LINK_GROUPS[0].contains(&at)
 }
 /// Unanswered background queries in a row after issuing the next one.
 fn next_readonly_misses(previous: Option<&Query>, misses: u8) -> u8 {
@@ -1300,15 +1320,29 @@ fn rejected_query_offer(reason: sedsnet::TelemetryError) -> Response {
     response
 }
 pub(crate) fn request_board_query(state: &Arc<AppState>, board: Board) -> Response {
-    send_board_query(state, board, false)
+    send_board_query(state, board, QueryMode::Background)
+}
+/// A fresh query even while an older one is unanswered; the older query's
+/// reply still counts. Used for prompt Abort readback (`abort_confirm`).
+fn requery_board_query(state: &Arc<AppState>, board: Board) -> Response {
+    send_board_query(state, board, QueryMode::Requery)
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueryMode {
+    /// Refused while an earlier query is still waiting for its reply.
+    Background,
+    /// Replaces a waiting query, which stays acceptable as `previous`.
+    Requery,
+    /// Replaces a waiting query, whose reply is then rejected.
+    Prepare,
 }
 /// PREPARE's own dedicated query. It replaces an outstanding read-only query
 /// at once with a distinct nonce; that query's reply then no longer matches
 /// and is rejected, so it can never serve as the preparation's proof.
 fn prepare_board_query(state: &Arc<AppState>, board: Board) -> Response {
-    send_board_query(state, board, true)
+    send_board_query(state, board, QueryMode::Prepare)
 }
-fn send_board_query(state: &Arc<AppState>, board: Board, supersede_pending: bool) -> Response {
+fn send_board_query(state: &Arc<AppState>, board: Board, mode: QueryMode) -> Response {
     if let Err(response) = primary_only() {
         return response;
     }
@@ -1398,7 +1432,7 @@ fn send_board_query(state: &Arc<AppState>, board: Board, supersede_pending: bool
             "Query nonce duplicated its live context; no request was queued.",
         );
     }
-    if !supersede_pending && inner.queries[at].as_ref().is_some_and(|query| {
+    if mode == QueryMode::Background && inner.queries[at].as_ref().is_some_and(|query| {
         !query.received
             && now
                 .checked_duration_since(query.sent)
@@ -1424,7 +1458,7 @@ fn send_board_query(state: &Arc<AppState>, board: Board, supersede_pending: bool
     }
     // A recovery PREPARE wants its own reply only; a re-query keeps the
     // superseded unanswered one acceptable.
-    inner.previous[at] = if supersede_pending { None } else {
+    inner.previous[at] = if mode == QueryMode::Prepare { None } else {
         previous.filter(|query| !query.received
             && now.checked_duration_since(query.sent).is_some_and(|age| age <= QUERY_TTL))
     };
@@ -2495,6 +2529,31 @@ mod slow_link_freshness_tests {
         assert_eq!(next_readonly_misses(Some(&pending), 200), 200, "bounded");
         assert_eq!(next_readonly_misses(Some(&answered), 4), 0, "a reply resets it");
         assert_eq!(next_readonly_misses(None, 4), 0);
+    }
+    /// accept3-hitl (fadfdbc): VB/GB/DAQ background queries queued behind an
+    /// AV-bay query in the one ordered BOARD_RECOVERY_REQUEST stream and were
+    /// dropped with it when the radio exhausted its retries. Each loss counted
+    /// as a miss, so the boards were asked only every 12-30 s and their
+    /// readback expired while they kept sending heartbeats; an Abort then
+    /// showed 33-36 s late. An umbilical board the station plainly hears never
+    /// backs off; an AV-bay board, or an umbilical board gone quiet, still does.
+    #[test]
+    fn a_healthy_umbilical_board_never_backs_off() {
+        for at in 3..7 {
+            assert_eq!(effective_readonly_misses(at, true, false, 4), 0, "{at}");
+            assert_eq!(effective_readonly_misses(at, false, false, 4), 4, "{at}");
+        }
+        for at in 0..3 {
+            assert_eq!(effective_readonly_misses(at, true, false, 4), 4, "{at}");
+        }
+        assert_eq!(effective_readonly_misses(0, true, true, 4), 0, "a reply resets it");
+    }
+    #[test]
+    fn only_the_av_bay_link_is_held_after_an_abort() {
+        for at in 0..7 {
+            assert!(!link_held(at, false));
+            assert_eq!(link_held(at, true), at < 3, "{at}");
+        }
     }
     #[test]
     fn an_unanswered_query_is_retried_inside_the_launch_proof_window() {
