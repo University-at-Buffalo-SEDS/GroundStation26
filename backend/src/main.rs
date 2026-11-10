@@ -520,6 +520,34 @@ fn router_hop_reliable_enabled(link: &CommsLinkConfig) -> bool {
     }
 }
 
+/// Discovery schema snapshots and schema requests never go out on the radio.
+/// Every AV-bay board's compiled schema is a subset of the station's
+/// (`av_bay_schema_contract` keeps that a test), and the SDK keeps a compiled
+/// definition over any received one, so an exchange over the radio teaches
+/// neither end anything. At 192 B frames it was a 26-chunk transfer each way
+/// that rarely completed under radio loss and was then requested again, about
+/// 1.4 kB/s of air. The radio side carries both the direct AV-bay link and
+/// the RRLS relay (which forwards the station's own frames), so this one deny
+/// covers both. Schema still flows on every wired side.
+pub(crate) fn keep_schema_exchange_off_the_radio(
+    router: &sedsnet::router::Router,
+    radio: sedsnet::router::RouterSideId,
+    wired: &[sedsnet::router::RouterSideId],
+) -> sedsnet::TelemetryResult<()> {
+    let sources = [None, Some(radio)].into_iter().chain(wired.iter().copied().map(Some));
+    for src in sources {
+        for ty in [sedsnet::config::DataType::DiscoverySchema, sedsnet::config::DataType::DiscoverySchemaRequest] {
+            router.set_typed_route(src, ty, radio, false)?;
+            // A typed override for (src, ty) makes every unlisted destination
+            // closed, so the wired sides are opened explicitly.
+            for &side in wired.iter().filter(|side| src != Some(**side)) {
+                router.set_typed_route(src, ty, side, true)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn rocket_router_side_options(link: &CommsLinkConfig, observer: bool) -> RouterSideOptions {
     RouterSideOptions {
         reliable_enabled: router_hop_reliable_enabled(link),
@@ -2241,6 +2269,7 @@ async fn main() -> anyhow::Result<()> {
             .expect("failed to get umbilical comms lock")
             .set_side_id(side);
     }
+    keep_schema_exchange_off_the_radio(&router, rocket_side, umbilical_side.as_slice())?;
 
     if !rrls::is_rrls() {
         qualification_requests::prime_initial_cache(&router, || {
@@ -3453,6 +3482,10 @@ mod validation_loadcell_observer_tests {
 mod recovery_pending_probe;
 #[cfg(test)]
 mod contract_fixtures;
+#[cfg(test)]
+mod radio_schema_route_tests;
+#[cfg(test)]
+mod av_bay_schema_contract;
 
 mod automatic_flight_state;
 #[cfg(all(test, not(feature = "firmware_sim")))]

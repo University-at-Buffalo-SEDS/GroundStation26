@@ -75,3 +75,24 @@ discarded through the normal retirement accounting.
 These changes address application framing and admission. Hardware validation
 still requires matched modem readbacks and command/acknowledgment timing; a
 simulator pass does not establish that a physical RF link is loss-free.
+
+## No schema exchange on the radio
+
+The station never sends discovery schema snapshots or schema requests on the
+radio side (`keep_schema_exchange_off_the_radio` in `main.rs`, a typed route
+deny; the RRLS relay forwards the station's own frames, so it is covered too).
+Every AV-bay board's compiled schema is a subset of the station's, and the SDK
+keeps a compiled definition over any received one, so an exchange over the
+radio taught neither end anything. It cost a 26-chunk transfer each way at
+192 B frames, which rarely completed under radio loss and was then requested
+again. Schema still flows on the umbilical.
+
+`av_bay_schema_contract` keeps the subset true: it fails if an AV-bay board's
+`config/sedsnet.json` (snapshots in `backend/tests/board-schemas/`) has an
+endpoint or type the station schema lacks, or a type whose class, element,
+reliability, id or endpoints differ. Refresh a snapshot whenever that board's
+schema changes:
+
+```bash
+git -C <BoardRepo> show origin/dev:config/sedsnet.json > backend/tests/board-schemas/<BoardRepo>.json
+```
