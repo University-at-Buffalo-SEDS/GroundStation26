@@ -1574,6 +1574,37 @@ async fn send(
     }
 }
 const DEDICATED_QUERY_TIMEOUT: &str = "Dedicated query timed out; SDK ACK is not readback";
+/// Owners `advance_verified_recovery` only try-locks, refusing before any
+/// change when one is held for a moment (a tare sample, a journal write).
+const ADVANCE_BUSY: [&str; 2] = ["Tare capture/commit is busy", "Clock journal busy"];
+/// How long a recovery waits out such an owner before it refuses.
+const ADVANCE_BUSY_WAIT: Duration = Duration::from_millis(500);
+/// `advance_verified_recovery`, waiting out an owner that is busy for a
+/// moment instead of failing the whole recovery (G-relaycut: "Tare
+/// capture/commit is busy" refused two recoveries). Each attempt takes and
+/// drops the dispatch gate itself; nothing is held while waiting. An owner
+/// that stays busy ends in a clear refusal, before anything was sent.
+async fn advance_verified_recovery_waiting(
+    state: &Arc<AppState>,
+    token: Token,
+    fence: &crate::launch_history::RecoveryFence,
+) -> Result<u64, &'static str> {
+    let start = WallInstant::now();
+    loop {
+        match crate::gse::reset_generation::advance_verified_recovery(state, token, fence) {
+            Err(busy) if ADVANCE_BUSY.contains(&busy) => {
+                if start.elapsed() >= ADVANCE_BUSY_WAIT {
+                    return Err(intern(format!(
+                        "{busy} for {} ms; no board was sent anything. Run it again.",
+                        ADVANCE_BUSY_WAIT.as_millis()
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            other => return other,
+        }
+    }
+}
 /// Test override (ms) for how long a dedicated query waits for its reply.
 #[cfg(test)]
 static DEDICATED_QUERY_WAIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2427,8 +2458,7 @@ async fn run_inner(
         .stage_recovery_pending(&fence, pending)
         .map_err(|_| "Recovery pending marker could not be staged")?;
     verify_marker(state, &fence).await?;
-    let generation =
-        crate::gse::reset_generation::advance_verified_recovery(state, ticket.token, &fence)?;
+    let generation = advance_verified_recovery_waiting(state, ticket.token, &fence).await?;
     let token = Token {
         generation,
         ..ticket.token
@@ -6167,6 +6197,74 @@ mod tests {
         eprintln!("AGED_PROOFS operation={operation} ab_final_queries={}", queries(&ab) - before);
         assert_eq!(operation["success"], true, "{operation}");
         assert_eq!(queries(&ab) - before, 2, "AB's final proof aged while RF was asked again: asked once more");
+    }
+    /// G-relaycut-5afc836: two recoveries were refused with "Tare
+    /// capture/commit is busy" because a tare sample held auto_zero for a
+    /// moment. A recovery waits such a moment out.
+    #[tokio::test]
+    async fn reset_all_waits_out_a_briefly_busy_tare_owner() {
+        if isolated("reset_all_waits_out_a_briefly_busy_tare_owner") { return; }
+        let fixture = Fixture::new().await;
+        *fixture.http.state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+        for board in BOARDS {
+            fixture.query(board).await;
+        }
+        let ticket = fixture.prepare("reset_startup", None).await;
+        let state = fixture.state();
+        let held = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let state = state.clone();
+            let tx = held.0;
+            std::thread::spawn(move || {
+                let _tare = state.auto_zero.lock().unwrap();
+                tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+            })
+        };
+        held.1.recv().unwrap();
+        assert_eq!(fixture.confirm(&ticket).await.status(), StatusCode::OK);
+        let operation = fixture.terminal().await;
+        holder.join().unwrap();
+        eprintln!("TARE_BUSY operation={operation}");
+        assert_eq!(operation["success"], true, "{operation}");
+    }
+    /// A tare owner that never lets go still ends the recovery with a clear
+    /// refusal, not a hang, and before any board was sent anything.
+    #[tokio::test]
+    async fn reset_all_refuses_clearly_when_the_tare_owner_stays_busy() {
+        if isolated("reset_all_refuses_clearly_when_the_tare_owner_stays_busy") { return; }
+        let fixture = Fixture::new().await;
+        *fixture.http.state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+        for board in BOARDS {
+            fixture.query(board).await;
+        }
+        let ticket = fixture.prepare("reset_startup", None).await;
+        let state = fixture.state();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder = {
+            let (state, stop) = (state.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let _tare = state.auto_zero.lock().unwrap();
+                tx.send(()).unwrap();
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+        rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(fixture.confirm(&ticket).await.status(), StatusCode::OK);
+        let operation = fixture.terminal().await;
+        let took = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        holder.join().unwrap();
+        eprintln!("TARE_STUCK took={took:?} operation={operation}");
+        assert_eq!(operation["success"], false, "{operation}");
+        let message = operation["message"].as_str().unwrap();
+        assert!(message.contains("Tare capture/commit is busy for 500 ms") && message.contains("no board was sent anything"), "{message}");
+        assert!(took < Duration::from_secs(5), "refused promptly: {took:?}");
+        assert!(fixture.models.iter().all(|(_, m)| m.lock().unwrap().applied == 0), "nothing was applied");
     }
     /// Every proof reply from one board is lost: the failure says that board
     /// applied the reset but it is not yet proven.
