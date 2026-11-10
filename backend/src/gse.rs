@@ -2360,16 +2360,27 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     if let Err(e) = crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {
         return e;
     }
-    if crate::rrls::is_rrls() {
-        return match crate::primary_mirror::gse_status(&state) {
-            Some(observation) => Json(observation).into_response(),
-            None => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Fresh primary GSE observations are unavailable; valve states are unknown.",
-            )
-                .into_response(),
-        };
+    match status_value(&state) {
+        Some(response) => Json(response).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Fresh primary GSE observations are unavailable; valve states are unknown.",
+        )
+            .into_response(),
     }
+}
+
+/// The `/api/gse/status` body. Every reply carries the sequence-progress
+/// envelope: the UI treats a status without one as unavailable, so an RRLS
+/// that left it out showed none of the primary's mirrored GSE state.
+fn status_value(state: &Arc<AppState>) -> Option<serde_json::Value> {
+    if crate::rrls::is_rrls() {
+        return crate::primary_mirror::gse_status(state).map(|mut observation| {
+            observation["sequence_progress"] = progress::envelope(state);
+            observation
+        });
+    }
+    let state = state.clone();
     let flight_state = *state.state.lock().unwrap();
     let prelaunch = prelaunch_flight_state(flight_state);
     let interlock = interlock(&state, &state.action_policy_snapshot());
@@ -2434,8 +2445,12 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         .expect("valve report health serializable");
     response["sequence_progress"]=progress::envelope(&state);
     response["cold_flow"]=serde_json::to_value(cold_flow::status(&state)).expect("Cold-flow status serializable");
-    Json(response).into_response()
+    Some(response)
 }
+
+#[cfg(test)]
+#[path = "gse/status_envelope_tests.rs"]
+mod status_envelope_tests;
 
 #[cfg(test)]
 #[path = "gse/status_presentation_tests.rs"]
