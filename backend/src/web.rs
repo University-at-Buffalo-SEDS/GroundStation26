@@ -2593,6 +2593,26 @@ fn launch_press_block(state: &AppState, cmd: &TelemetryCommand) -> Option<&'stat
     crate::gse::launch_journal_block(&state.launch_history.lock().unwrap())
 }
 
+/// While the operator Abort indicator is latched, gse::queue_controller drops
+/// every controller packet except the abort-safe directions. Refuse such a HITL
+/// flight command here with that reason instead of answering "ok" and
+/// dropping it at send time. This reports the existing rule; it does not
+/// decide whether the command should be allowed after an Abort.
+fn abort_fence_block(state: &AppState, cmd: &TelemetryCommand) -> Option<String> {
+    if !state.abort_indicator_latched() || crate::rrls::is_rrls() {
+        return None;
+    }
+    let byte = crate::telemetry_task::hitl_flight_command_id(cmd)?;
+    let payload = [byte];
+    if crate::gse::abort_safe_control(crate::telemetry_schema::data_type("FLIGHT_COMMAND"), &payload) {
+        return None;
+    }
+    Some(format!(
+        "{} refused: the operator Abort is latched, and the station sends no flight-computer command except Evaluation Abort until Reset all clears it",
+        command_name(cmd)
+    ))
+}
+
 /// Validates and forwards a frontend command into the backend command channel.
 async fn send_command(
     State(state): State<Arc<AppState>>,
@@ -2858,6 +2878,11 @@ async fn dispatch_command_inner(
         let message = format!("{cmd_name}: {reason}");
         emit_notification_warning(&state, &message);
         return (StatusCode::FORBIDDEN, message);
+    }
+    if let Some(message) = abort_fence_block(&state, &cmd) {
+        log::warn!("{message}");
+        emit_notification_warning(&state, &message);
+        return (StatusCode::CONFLICT, message);
     }
     if matches!(cmd, TelemetryCommand::RetractPlumbing)
         && let Err(message) =

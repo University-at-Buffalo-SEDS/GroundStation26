@@ -4408,7 +4408,7 @@ pub(crate) fn manual_stop_pending(state: &AppState) -> bool {
         })
 }
 // Safety catalog (About safety): manual-stop. Keep backend/src/safety_catalog_rules.rs in step.
-fn abort_safe_control(kind: sedsnet::config::DataType, payload: &[u8]) -> bool {
+pub(crate) fn abort_safe_control(kind: sedsnet::config::DataType, payload: &[u8]) -> bool {
     if payload.len() != 1 {
         return false;
     }

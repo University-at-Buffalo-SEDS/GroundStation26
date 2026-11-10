@@ -7,6 +7,10 @@ mod held_launch_tests;
 mod launch_mode_gate_tests;
 #[cfg(test)]
 mod side_starvation_tests;
+#[cfg(test)]
+mod abort_fence_refusal_tests;
+#[cfg(test)]
+mod flight_command_order_tests;
 use prelude::*;
 
 mod commands;
@@ -95,7 +99,7 @@ fn command_at_dispatch_with_manual_origin(
     }
 }
 
-fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
+pub(crate) fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
     Some(match cmd {
         TelemetryCommand::DeployParachute => FlightComputerCommands::DeployParachute as u8,
         TelemetryCommand::ExpandParachute => FlightComputerCommands::ExpandParachute as u8,
