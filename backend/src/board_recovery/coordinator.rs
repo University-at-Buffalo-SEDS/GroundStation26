@@ -616,6 +616,16 @@ impl Runtime {
     pub(super) fn operation(&self) -> Option<Value> {
         self.0.lock().unwrap().operation.clone()
     }
+    /// One line of progress on the running operation (replaced by its
+    /// terminal message when it ends).
+    pub(super) fn note_progress(&self, message: String) {
+        let mut control = self.0.lock().unwrap();
+        if let Some(operation) = control.operation.as_mut()
+            && operation["completed"] != json!(true)
+        {
+            operation["message"] = json!(message);
+        }
+    }
     pub(super) fn confirmation(&self, state: &AppState, principal: &str) -> Option<Value> {
         let control = self.0.lock().unwrap();
         if control.shutdown_closed { return None; }
@@ -1563,6 +1573,62 @@ async fn send(
         }
     }
 }
+const DEDICATED_QUERY_TIMEOUT: &str = "Dedicated query timed out; SDK ACK is not readback";
+/// Test override (ms) for how long a dedicated query waits for its reply.
+#[cfg(test)]
+static DEDICATED_QUERY_WAIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn dedicated_query_wait() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = DEDICATED_QUERY_WAIT_MS.load(Ordering::Relaxed);
+        if ms != 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    network_wait(QUERY_TTL)
+}
+/// Dedicated queries a board's post-apply proof may take. A reply lost over
+/// the radio would otherwise fail a recovery every board already applied.
+const FINAL_PROOF_ATTEMPTS: usize = 3;
+/// A final proof with less than a fifth of READBACK_TTL left (3 s) is asked
+/// again before finalization.
+fn final_proof_margin() -> Duration {
+    readback_ttl() / 5
+}
+/// A board's final proof readback after it applied the request: a fresh
+/// dedicated query, asked again (each time with a new nonce) when one gets no
+/// reply, up to FINAL_PROOF_ATTEMPTS. Any other failure ends it at once. If
+/// every attempt times out, the reason names the board and says the request
+/// was applied but is not yet proven.
+async fn final_proof_query(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    ticket: &Ticket,
+    token: Token,
+    board: Board,
+    router: &Arc<sedsnet::router::Router>,
+    applied: &str,
+) -> Result<Observation, &'static str> {
+    for attempt in 1..=FINAL_PROOF_ATTEMPTS {
+        if attempt > 1 {
+            state.board_recovery.coordinator.note_progress(format!(
+                "Waiting for {} proof (query {attempt} of {FINAL_PROOF_ATTEMPTS})", board.sender_id()));
+        }
+        match fresh_query(state, headers, ticket, token, board, router).await {
+            Err(DEDICATED_QUERY_TIMEOUT) if attempt < FINAL_PROOF_ATTEMPTS => {
+                log::warn!("{} final proof query {attempt} got no reply; asking again", board.sender_id());
+            }
+            Err(DEDICATED_QUERY_TIMEOUT) => {
+                let name = board.sender_id();
+                return Err(intern(format!(
+                    "{name} applied the {applied}, but its proving readback got no reply to {FINAL_PROOF_ATTEMPTS} queries, so it is not yet proven. Query {name}, then run it again."
+                )));
+            }
+            other => return other,
+        }
+    }
+    unreachable!("the last attempt always returns")
+}
 async fn fresh_query(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -1626,8 +1692,8 @@ async fn fresh_query(
             }
             return Ok(observation);
         }
-        if start.elapsed() > network_wait(QUERY_TTL) {
-            return Err("Dedicated query timed out; SDK ACK is not readback");
+        if start.elapsed() > dedicated_query_wait() {
+            return Err(DEDICATED_QUERY_TIMEOUT);
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -2483,7 +2549,7 @@ async fn run_inner(
         // healthy readback of them) finishes the marker later.
         authorize(state, headers, ticket).await?;
         let finals = futures::future::join_all(completed.iter().map(|(board, _)| {
-            fresh_query(state, headers, ticket, token, *board, &router)
+            final_proof_query(state, headers, ticket, token, *board, &router, "recovery")
         }))
         .await;
         for ((_, terminal), query) in completed.iter().zip(finals) {
@@ -2513,8 +2579,9 @@ async fn run_inner(
     // never claim old observations remain fresh merely because IO finished.
     // Final readbacks are concurrent too, so the first proof cannot age out
     // while later boards answer. Each is a distinct dedicated query per board.
+    let applied = if reset_all { "reset" } else { "recovery" };
     let finals = futures::future::join_all(completed.iter().map(|(board, _)| {
-        fresh_query(state, headers, ticket, token, *board, &router)
+        final_proof_query(state, headers, ticket, token, *board, &router, applied)
     }))
     .await;
     let mut rows = Vec::new();
@@ -2524,6 +2591,25 @@ async fn run_inner(
             return Err("Fresh final QUERY differs from owned terminal completion");
         }
         rows.push((*board, query));
+    }
+    // A proof asked again (above) can take long enough that the boards which
+    // answered first no longer have a fresh proof at finalization. Ask those
+    // once more, together, so every proof is fresh when it is used.
+    let aged = |observation: &Observation| observation.age(Stamp::now()) + final_proof_margin() > readback_ttl();
+    let stale = rows.iter().enumerate().filter(|(_, (_, observation))| aged(observation)).map(|(at, (board, _))| (at, *board)).collect::<Vec<_>>();
+    if !stale.is_empty() {
+        authorize(state, headers, ticket).await?;
+        let again = futures::future::join_all(stale.iter().map(|(_, board)| {
+            final_proof_query(state, headers, ticket, token, *board, &router, applied)
+        }))
+        .await;
+        for ((at, _), query) in stale.into_iter().zip(again) {
+            let query = query?;
+            if !context_same(&completed[at].1, &query.value) {
+                return Err("Fresh final QUERY differs from owned terminal completion");
+            }
+            rows[at].1 = query;
+        }
     }
     let proofs = FinalProofs {
         owner: token.owner,
@@ -2735,6 +2821,9 @@ mod tests {
         /// from the board's first receipt of that nonce. Polls do not shorten it.
         recover_delay: Duration,
         first_receipt: HashMap<u64, WallInstant>,
+        /// Replies to this many QUERYs after the board applied a request are
+        /// lost on the way back (a radio drop of the final proof).
+        lose_proof_replies: usize,
     }
     type NativePeerRouter = Arc<Router>;
     struct Link {
@@ -3114,6 +3203,7 @@ mod tests {
                             resync: false,
                             recover_delay: Duration::ZERO,
                             first_receipt: HashMap::new(),
+                            lose_proof_replies: 0,
                         }))
                     });
                 models.push((board, model.clone()));
@@ -3289,6 +3379,10 @@ mod tests {
                                 if wire[1] != 0 && result != 1 && !identity_rejected {
                                     m.seen.insert(nonce, response.clone());
                                 }
+                            }
+                            if wire[1] == 0 && m.applied > 0 && m.lose_proof_replies > 0 {
+                                m.lose_proof_replies -= 1;
+                                continue;
                             }
                             drop(m);
                             let reply = Packet::new(
@@ -6013,6 +6107,88 @@ mod tests {
         eprintln!("PARTIAL_RESET retry={operation} applied={:?}", applied(&fixture));
         assert_eq!(operation["success"], true, "{operation}");
         assert!(late.lock().unwrap().applied >= 1, "VB finished by the retry");
+    }
+    /// cohortE-hitl-36ad0bc cycle 1: every board applied Reset all, but one
+    /// board's final proof reply was lost over the radio, so the operation
+    /// failed and RF and FC had to be recovered one by one. A lost proof
+    /// reply is asked again; Reset all then succeeds.
+    #[tokio::test]
+    async fn reset_all_asks_again_for_a_lost_final_proof_reply() {
+        if isolated("reset_all_asks_again_for_a_lost_final_proof_reply") { return; }
+        super::DEDICATED_QUERY_WAIT_MS.store(1_500, Ordering::Relaxed);
+        let fixture = Fixture::new().await;
+        *fixture.http.state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+        for board in BOARDS {
+            fixture.query(board).await;
+        }
+        let ticket = fixture.prepare("reset_startup", None).await;
+        let rf = fixture.models.iter().find(|(board, _)| *board == Board::RFBoard).unwrap().1.clone();
+        rf.lock().unwrap().lose_proof_replies = 1;
+        assert_eq!(fixture.confirm(&ticket).await.status(), StatusCode::OK);
+        let operation = fixture.terminal().await;
+        eprintln!("LOST_PROOF operation={operation}");
+        assert_eq!(operation["success"], true, "{operation}");
+        assert_eq!(rf.lock().unwrap().lose_proof_replies, 0, "RF's first proof reply was lost");
+    }
+    /// A proof asked again can take long enough that the boards which
+    /// answered first are no longer fresh at finalization: those are asked
+    /// once more. The operation shows which proof it is waiting for.
+    #[tokio::test]
+    async fn reset_all_refreshes_proofs_that_aged_while_one_was_asked_again() {
+        if isolated("reset_all_refreshes_proofs_that_aged_while_one_was_asked_again") { return; }
+        let fixture = Fixture::new().await;
+        *fixture.http.state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+        for board in BOARDS {
+            fixture.query(board).await;
+        }
+        let ticket = fixture.prepare("reset_startup", None).await;
+        // A lost RF proof costs one 2 s wait; proofs stay fresh for 1.8 s.
+        super::DEDICATED_QUERY_WAIT_MS.store(2_000, Ordering::Relaxed);
+        super::super::READBACK_TTL_MS.store(1_800, Ordering::Relaxed);
+        let rf = fixture.models.iter().find(|(board, _)| *board == Board::RFBoard).unwrap().1.clone();
+        rf.lock().unwrap().lose_proof_replies = 1;
+        let ab = fixture.models.iter().find(|(board, _)| *board == Board::ActuatorBoard).unwrap().1.clone();
+        let queries = |m: &std::sync::Mutex<Model>| m.lock().unwrap().requests.iter()
+            .filter(|p| p.data_type() == crate::telemetry_schema::data_type(QUERY_TYPE) && p.payload().get(1) == Some(&0)).count();
+        let before = queries(&ab);
+        assert_eq!(fixture.confirm(&ticket).await.status(), StatusCode::OK);
+        let state = fixture.state();
+        let mut progress = None;
+        for _ in 0..400 {
+            let message = state.board_recovery.coordinator.operation().and_then(|op| op["message"].as_str().map(str::to_owned));
+            if message.as_deref().is_some_and(|m| m.starts_with("Waiting for RF proof")) {
+                progress = message;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(progress.as_deref(), Some("Waiting for RF proof (query 2 of 3)"));
+        let operation = fixture.terminal().await;
+        eprintln!("AGED_PROOFS operation={operation} ab_final_queries={}", queries(&ab) - before);
+        assert_eq!(operation["success"], true, "{operation}");
+        assert_eq!(queries(&ab) - before, 2, "AB's final proof aged while RF was asked again: asked once more");
+    }
+    /// Every proof reply from one board is lost: the failure says that board
+    /// applied the reset but it is not yet proven.
+    #[tokio::test]
+    async fn reset_all_names_the_board_whose_proof_never_arrives() {
+        if isolated("reset_all_names_the_board_whose_proof_never_arrives") { return; }
+        super::DEDICATED_QUERY_WAIT_MS.store(1_500, Ordering::Relaxed);
+        let fixture = Fixture::new().await;
+        *fixture.http.state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+        for board in BOARDS {
+            fixture.query(board).await;
+        }
+        let ticket = fixture.prepare("reset_startup", None).await;
+        let rf = fixture.models.iter().find(|(board, _)| *board == Board::RFBoard).unwrap().1.clone();
+        rf.lock().unwrap().lose_proof_replies = usize::MAX;
+        assert_eq!(fixture.confirm(&ticket).await.status(), StatusCode::OK);
+        let operation = fixture.terminal().await;
+        eprintln!("NO_PROOF operation={operation}");
+        assert_eq!(operation["success"], false, "{operation}");
+        let message = operation["message"].as_str().unwrap();
+        assert!(message.contains("RF applied the reset") && message.contains("not yet proven"), "{message}");
+        assert!(!message.contains("No reset applied") && !message.contains("no reset applied"), "{message}");
     }
     /// An ABORT that is still undelivered when the prepare drain gives up
     /// refuses Reset all with a retryable reason instead of sealing queries

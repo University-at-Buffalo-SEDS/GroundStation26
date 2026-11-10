@@ -87,6 +87,20 @@ const BOARDS: [Board; 7] = [
     Board::DaqBoard,
 ];
 const READBACK_TTL: Duration = Duration::from_secs(15);
+/// Test override (ms) for READBACK_TTL where a board's readback is judged
+/// fresh, so proof-ageing paths run in seconds.
+#[cfg(test)]
+static READBACK_TTL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn readback_ttl() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = READBACK_TTL_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if ms != 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    READBACK_TTL
+}
 const QUERY_TTL: Duration = Duration::from_secs(15);
 /// An unanswered read-only query may be re-issued after this long (the
 /// superseded one stays acceptable as `previous`), so one lost reply costs a
@@ -174,7 +188,7 @@ impl Observation {
             .unwrap_or(Duration::MAX)
     }
     fn fresh(&self, now: Stamp) -> bool {
-        self.age(now) <= READBACK_TTL
+        self.age(now) <= readback_ttl()
     }
 }
 #[derive(Clone)]
