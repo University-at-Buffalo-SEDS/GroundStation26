@@ -533,3 +533,47 @@ async fn background_av_bay_queries_pause_while_the_av_bay_path_is_degraded() {
     refresh.update_av_bay_pause(&state, Stamp::now());
     assert_eq!(state.board_recovery.av_bay_pause_reason(), None, "direct path back and reported");
 }
+
+/// deploy-normal (GS eadd886): two background AV-bay queries ran back to back
+/// in the one ordered BOARD_RECOVERY_REQUEST stream across the Abort, so VB
+/// and GB were asked only after both and read Aborted 2.1 s late (AB and
+/// DAQ, asked between them, read it at 0.7 s). The background refresh keeps
+/// at most one AV-bay query in the stream.
+#[tokio::test]
+async fn background_refresh_keeps_one_av_bay_query_in_the_ordered_stream() {
+    let fixture = tests::http_fixture().await;
+    let state = fixture.state.clone();
+    let host = Arc::new(sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS")));
+    assert!(state.topology_router.set(host.clone()).is_ok());
+    let opts = sedsnet::router::RouterSideOptions { reliable_enabled: true, ..Default::default() };
+    // The radio takes every frame and nothing answers yet.
+    let radio = host.add_side_packed_with_options("rocket_comms", |_| Ok(()), opts);
+    for board in [Board::RFBoard, Board::FlightComputer, Board::PowerBoard] {
+        let announce = sedsnet::discovery::build_discovery_announce(
+            board.sender_id(), 1, &[crate::telemetry_schema::endpoint(endpoint(board))]).unwrap();
+        host.rx_from_side(&announce, radio).unwrap();
+    }
+    let mut service = crate::telemetry_task::RouterServiceForTest::default();
+    service.pump(&host);
+    let asked = |state: &Arc<AppState>| {
+        let inner = state.board_recovery.inner.lock().unwrap();
+        AV_BAY_INDICES.iter().filter(|&&at| inner.queries[at].is_some()).count()
+    };
+    let mut refresh = ReadonlyQueryRefresh::default();
+    for _ in 0..6 {
+        let mut status = state.board_status.lock().unwrap();
+        for board in [Board::RFBoard, Board::FlightComputer, Board::PowerBoard] {
+            status.get_mut(&board).unwrap().last_seen_instant = Some(std::time::Instant::now());
+        }
+        drop(status);
+        let _ = refresh.poll(&state);
+        service.pump(&host);
+    }
+    // Test fire tracks no AV-bay board, so it asks none.
+    if scope::mode_scope(crate::station_mode::local_mode()) & 1 == 0 {
+        assert_eq!(asked(&state), 0);
+        return;
+    }
+    assert!(abort_confirm::av_bay_query_in_flight(&host), "the first AV-bay query is in flight");
+    assert_eq!(asked(&state), 1, "no second AV-bay query queued behind the first");
+}

@@ -707,6 +707,26 @@ fn request_startup_topology(router: &sedsnet::router::Router) -> sedsnet::Teleme
 /// tuning mid-run.
 #[cfg(test)]
 pub(crate) static RUNTIME_TUNING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Installs the station's delivery tuning (retry span 250 ms x 18) for one
+/// test and restores the previous tuning when dropped.
+#[cfg(test)]
+pub(crate) struct StationDeliveryTuning {
+    previous: sedsnet::config::RuntimeTuningConfig,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+#[cfg(test)]
+pub(crate) fn network_delivery_tuning_for_test() -> StationDeliveryTuning {
+    let serial = RUNTIME_TUNING_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = sedsnet::config::runtime_tuning_config();
+    sedsnet::config::set_runtime_tuning_config(network_delivery_tuning()).unwrap();
+    StationDeliveryTuning { previous, _serial: serial }
+}
+#[cfg(test)]
+impl Drop for StationDeliveryTuning {
+    fn drop(&mut self) {
+        sedsnet::config::set_runtime_tuning_config(self.previous).unwrap();
+    }
+}
 
 #[cfg(test)]
 mod router_link_policy_tests {

@@ -977,7 +977,7 @@ pub(crate) async fn query_service(
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        tokio::select! {biased;_=shutdown.recv()=>return,_=state.board_abort.query_needed.notified()=>{},_=tick.tick()=>{}}
+        tokio::select! {biased;_=shutdown.recv()=>return,_=state.board_abort.query_needed.notified()=>{},_=crate::board_recovery::abort_confirm::query_stream_retired()=>{},_=tick.tick()=>{}}
         if state.board_abort.take_abort_confirmation() {
             confirm.start();
         }
@@ -989,7 +989,13 @@ pub(crate) async fn query_service(
         let _ = confirm.poll(&state);
         let holding = confirm.active();
         refresh.hold_av_bay(holding);
-        let demand = if holding {
+        // AV-bay demand also waits while another AV-bay query is in the one
+        // ordered stream, so it never queues a second one behind it.
+        let av_bay_busy = state
+            .topology_router
+            .get()
+            .is_some_and(|router| crate::board_recovery::abort_confirm::av_bay_query_in_flight(router));
+        let demand = if holding || av_bay_busy {
             held_demand |= demand & AV_BAY_MASK;
             demand & !AV_BAY_MASK
         } else {

@@ -432,7 +432,12 @@ async fn alerts(app: &axum::Router, state: &Arc<AppState>, out: &mut Fixtures) {
 /// diagnostics, as the route embeds them.
 fn radio_tx_budget(out: &mut Fixtures) {
     let budget = crate::telemetry_task::TxQueueBudget::new(4096);
-    out.add("network-diagnostics/radio-tx-budget", budget.diagnostics());
+    let mut diagnostics = budget.diagnostics();
+    // Ordered-exhaustion counts are process-wide, and other tests drive real
+    // exhaustions through the router worker's queue service; the fixture
+    // shows a station that has seen none.
+    diagnostics["ordered_exhausted_by_type"] = json!({});
+    out.add("network-diagnostics/radio-tx-budget", diagnostics);
 }
 
 /// `GET /api/radio/modem`. The route reports process-wide modem state that

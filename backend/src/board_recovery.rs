@@ -1224,8 +1224,16 @@ impl ReadonlyQueryRefresh {
             .unwrap()
             .snapshot(now.wall, crate::runtime_mode::is_test_fire());
         self.update_av_bay_pause(state, now);
-        let (last, core_busy_last, misses, av_bay_held) =
-            (self.last, self.core_busy_last, self.misses, self.av_bay_held || self.av_bay_paused_since.is_some());
+        // One AV-bay query in the ordered stream at a time: each one queued
+        // behind another holds every umbilical query (an Abort's readback
+        // included) for its whole round trip too.
+        let av_bay_busy = abort_confirm::av_bay_query_in_flight(router);
+        let (last, core_busy_last, misses, av_bay_held) = (
+            self.last,
+            self.core_busy_last,
+            self.misses,
+            self.av_bay_held || self.av_bay_paused_since.is_some() || av_bay_busy,
+        );
         // Only boards this mode tracks (test fire has no AV bay).
         let scope = scope::mode_scope(crate::station_mode::local_mode());
         let picks = {

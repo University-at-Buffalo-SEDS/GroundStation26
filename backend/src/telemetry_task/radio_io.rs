@@ -5074,6 +5074,12 @@ impl OrderedExhaustion {
                 *counts.entry("unsampled".into()).or_default() += 1;
             }
             command_heads = gone.iter().filter(|(_, ty, _)| *ty == flight_command).map(|(id, _, _)| *id).collect();
+            // Prompt Abort readback queries queued behind a retired
+            // BOARD_RECOVERY_REQUEST were dropped with it: ask again at once.
+            let recovery_request = crate::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST");
+            if gone.is_empty() || gone.iter().any(|(_, ty, _)| *ty == recovery_request) {
+                crate::board_recovery::abort_confirm::note_query_stream_retired();
+            }
             gone.iter().filter(|(_, ty, _)| *ty == flight_state).map(|(id, _, _)| *id).collect::<Vec<_>>()
         };
         // An operator flight command queued behind a retired one was dropped
@@ -5115,6 +5121,17 @@ pub(super) fn process_router_queues_with_backoff(
         && let Err(err) = router.process_rx_queue_with_timeout(super::ROUTER_RX_BUDGET_MS)
     {
         super::log_router_rx_error(err);
+    }
+}
+
+/// The router worker's queue service, for tests outside this module.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RouterServiceForTest(RadioRefusalBackoff);
+#[cfg(test)]
+impl RouterServiceForTest {
+    pub(crate) fn pump(&mut self, router: &Router) {
+        process_router_queues_with_backoff(router, None, &mut self.0);
     }
 }
 
