@@ -54,9 +54,10 @@ fn fallback_forwards_gs_heartbeat_identity_without_manufacturing_watchdog_pulses
             .as_ref(),
         expected_source.as_str()
     );
+    let lapsed = 3000 + RRLS_RELAY_LEASE_MS;
     assert!(
-        !relay.active(5000),
+        !relay.active(lapsed),
         "only the original HEALTH lease controls relay authority"
     );
-    assert!(relay.local_tx(false, &wire, 5000).is_none());
+    assert!(relay.local_tx(false, &wire, lapsed).is_none());
 }

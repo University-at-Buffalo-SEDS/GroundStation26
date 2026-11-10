@@ -36,6 +36,15 @@ const DIRECT_MIN_DWELL_MS: u64 = 10_000;
 /// only duplicates the primary's uplink on the air.
 const RRLS_AV_BAY_FRESH_MS: u64 = 5_000;
 const LEASE_MS: u64 = 2_000;
+/// RRLS side of the relay lease. A relaying RRLS hears the primary's HEALTH
+/// through hidden-node collisions with the AV bay: in the faithful sim 14 of
+/// 16 HEALTH gaps were 2-4 s. Only accepted HEALTH renews it, and HEALTH with
+/// direct=true still ends the relay at once.
+const RRLS_RELAY_LEASE_MS: u64 = 4_000;
+/// While relaying, the primary repeats each HEALTH (same session and
+/// sequence) this long after the original, so one collision does not cost a
+/// whole period. Receivers drop the repeat when they heard the original.
+const HEALTH_REPEAT_MS: u64 = 250;
 /// How long a paired RRLS keeps its control link to the primary without a
 /// fresh HEALTH (command_proxy_transport).
 const PROXY_LEASE_MS: u64 = 6_000;
@@ -493,6 +502,8 @@ pub struct Mesh {
     session: u32,
     sequence: u32,
     last_health_sent: Option<u64>,
+    /// The last HEALTH payload, until its one relaying repeat is sent.
+    health_repeat: Option<Vec<u8>>,
     last_position_sent: Option<u64>,
     primary_session: Option<u32>,
     primary_sequence: u32,
@@ -566,6 +577,7 @@ impl Mesh {
             session,
             sequence: 0,
             last_health_sent: None,
+            health_repeat: None,
             last_position_sent: None,
             primary_session: None,
             primary_sequence: 0,
@@ -650,7 +662,7 @@ impl Mesh {
                 !self.primary_direct
                     && self
                         .health_received
-                        .is_some_and(|v| now.saturating_sub(v) < LEASE_MS)
+                        .is_some_and(|v| now.saturating_sub(v) < RRLS_RELAY_LEASE_MS)
             }
         }
     }
@@ -777,6 +789,21 @@ impl Mesh {
                 }
                 self.sequence = self.sequence.wrapping_add(1);
                 self.last_health_sent = Some(now);
+                self.health_repeat = self.fallback.then(|| payload.clone());
+                self.enqueue(
+                    Outgoing {
+                        command: true,
+                        bytes: encode(HEALTH, &payload),
+                    },
+                    255,
+                    now,
+                );
+            } else if self.fallback
+                && self
+                    .last_health_sent
+                    .is_some_and(|v| now.saturating_sub(v) >= HEALTH_REPEAT_MS)
+                && let Some(payload) = self.health_repeat.take()
+            {
                 self.enqueue(
                     Outgoing {
                         command: true,
@@ -787,11 +814,11 @@ impl Mesh {
                 );
             }
         } else {
-            if !self.active(now) {
-                self.clear();
-                if !self.voice_enabled {
-                    self.last_ready_sent = None;
-                }
+            // A lapsed lease stops admission (incoming checks active); frames
+            // already queued keep their own deadlines. Direct HEALTH, which
+            // ends the relay outright, still clears them (incoming HEALTH).
+            if !self.active(now) && !self.voice_enabled {
+                self.last_ready_sent = None;
             }
             let peer_fresh = self
                 .health_received
@@ -3907,6 +3934,66 @@ mod tests {
     }
 
     #[test]
+    fn relay_lease_rides_out_lost_health_and_a_lapse_keeps_queued_frames() {
+        // Run F: the relaying RRLS had 16 HEALTH gaps of 2-5 s in 80 s; 14 were
+        // under 4 s. Each lapsed the 2 s lease and cleared the relay queue.
+        let mut rr = Mesh::new(Role::Rrls, 2);
+        rr.incoming(true, &health(1, 0, false), 0);
+        rr.av_bay_heard = Some(3_500);
+        rr.tick(3_500);
+        assert!(rr.active(3_500), "3.5 s without HEALTH keeps the relay");
+        rr.incoming(true, &encode(UP_DATA, b"relayed command"), 3_900);
+        assert!(rr.queue.iter().any(|q| q.frame.bytes.get(3) == Some(&AV_BAY_DATA)));
+        rr.tick(4_050);
+        assert!(!rr.active(4_050), "the relay lease is 4 s");
+        assert!(
+            rr.queue.iter().any(|q| q.frame.bytes.get(3) == Some(&AV_BAY_DATA)),
+            "a lapse stops admission but keeps frames already queued"
+        );
+        rr.incoming(true, &encode(UP_DATA, b"late"), 4_060);
+        assert_eq!(
+            rr.queue.iter().filter(|q| q.frame.bytes.get(3) == Some(&AV_BAY_DATA)).count(),
+            1,
+            "nothing new is admitted after the lapse"
+        );
+        // Direct HEALTH still ends the relay and drops queued uplink at once.
+        rr.incoming(true, &health(1, 1, true), 4_100);
+        assert!(!rr.queue.iter().any(|q| q.frame.bytes.get(3) == Some(&AV_BAY_DATA)));
+    }
+
+    #[test]
+    fn relaying_primary_repeats_each_health_once() {
+        let mut p = Mesh::new(Role::Primary, 1);
+        let healths = |p: &mut Mesh, now| {
+            let mut out = Vec::new();
+            while let Some(frame) = p.pop(now) {
+                if let Some((HEALTH, body)) = decode(&frame.bytes) {
+                    out.push(body.to_vec());
+                }
+            }
+            out
+        };
+        p.tick(0);
+        assert_eq!(healths(&mut p, 0).len(), 1);
+        p.tick(250);
+        assert!(healths(&mut p, 250).is_empty(), "no repeat while direct");
+        p.tick(3_000);
+        assert!(p.fallback, "relay requested");
+        let first = healths(&mut p, 3_000);
+        assert_eq!(first.len(), 1);
+        p.tick(3_100);
+        assert!(healths(&mut p, 3_100).is_empty());
+        p.tick(3_250);
+        assert_eq!(healths(&mut p, 3_250), first, "same session and sequence, 250 ms later");
+        p.tick(3_400);
+        assert!(healths(&mut p, 3_400).is_empty(), "one repeat per HEALTH");
+        p.tick(3_500);
+        let next = healths(&mut p, 3_500);
+        assert_eq!(next.len(), 1);
+        assert_ne!(next, first, "the sequence still advances once per 500 ms");
+    }
+
+    #[test]
     fn command_proxy_transport_outlasts_lost_health_frames() {
         // A relaying RRLS loses most primary HEALTH frames to hidden-node
         // collisions; a 2 s gap must not disconnect its paired control link.
@@ -4561,19 +4648,19 @@ mod tests {
         assert!(!m.active(10_000));
         m.incoming(true, &health(1, 0, false), 10_000);
         assert!(m.active(10_001));
-        assert!(!m.active(12_000));
+        assert!(!m.active(10_000 + RRLS_RELAY_LEASE_MS));
     }
     #[test]
     fn corrupt_and_replayed_health_cannot_extend_the_lease() {
         let mut m = Mesh::new(Role::Rrls, 2);
         let h = health(1, 3, false);
         m.incoming(true, &h, 0);
-        m.incoming(true, &h, 1999);
-        assert!(!m.active(2001));
+        m.incoming(true, &h, RRLS_RELAY_LEASE_MS - 1);
+        assert!(!m.active(RRLS_RELAY_LEASE_MS + 1));
         let mut bad = health(1, 4, false);
         bad[8] ^= 1;
-        m.incoming(true, &bad, 3000);
-        assert!(!m.active(3001));
+        m.incoming(true, &bad, RRLS_RELAY_LEASE_MS + 1_000);
+        assert!(!m.active(RRLS_RELAY_LEASE_MS + 1_001));
     }
     #[test]
     fn active_relay_preserves_fragments_and_does_not_echo_wrappers() {
