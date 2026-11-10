@@ -186,6 +186,21 @@ fn is_managed_variable_request(payload: &[u8]) -> bool {
         })
 }
 
+/// A managed-variable request (from any board) for a variable this station
+/// owns and answers itself. Nothing on the AV bay serves it: the boards there
+/// hold read-only replicas, so carrying it on the radio only spends uplink air.
+fn station_answered_request(payload: &[u8]) -> bool {
+    is_managed_variable_request(payload)
+        && sedsnet::wire_format::unpack_packet(payload)
+            .ok()
+            .and_then(|packet| sedsnet::discovery::decode_managed_variable_request(&packet).ok())
+            .is_some_and(crate::network_variables::station_serves)
+}
+
+/// Period of the primary's owed settings turn (one framing offer or mode
+/// reply, at most 92 B, so at most 92 B/s of the 256 B/s settings allowance).
+const SETTINGS_TURN_MS: u64 = 1_000;
+
 fn is_delivery_receipt(payload: &[u8]) -> bool {
     !payload.starts_with(b"SDT")
         && serialize::peek_frame_info_unchecked(payload).is_ok_and(|info| {
@@ -308,6 +323,10 @@ pub struct TxQueueBudget {
     parked: Mutex<VecDeque<Parked>>,
     parked_total: std::sync::atomic::AtomicU64,
     shed_frames: std::sync::atomic::AtomicU64,
+    /// Forwarded managed-variable requests the station answers itself, kept off the radio.
+    station_answered_requests: std::sync::atomic::AtomicU64,
+    /// Settings frames the primary sent on its owed turn (receipts never let it idle).
+    owed_settings_turns: std::sync::atomic::AtomicU64,
     /// Chunk transfers seen starting (id -> wraps a template install).
     chunk_transfers: Mutex<VecDeque<(u32, bool)>>,
     /// Park drain alternates between chunks and other frames.
@@ -471,6 +490,8 @@ impl TxQueueBudget {
             parked: Mutex::new(VecDeque::new()),
             parked_total: std::sync::atomic::AtomicU64::new(0),
             shed_frames: std::sync::atomic::AtomicU64::new(0),
+            station_answered_requests: std::sync::atomic::AtomicU64::new(0),
+            owed_settings_turns: std::sync::atomic::AtomicU64::new(0),
             chunk_transfers: Mutex::new(VecDeque::new()),
             park_chunk_turn: std::sync::atomic::AtomicBool::new(false),
             park_frames: 0,
@@ -674,6 +695,8 @@ impl TxQueueBudget {
             "parked_bytes": self.parked.lock().unwrap().iter().map(|p| p.bytes.len()).sum::<usize>(),
             "parked_total": self.parked_total.load(Ordering::Relaxed),
             "shed_frames": self.shed_frames.load(Ordering::Relaxed),
+            "station_answered_requests": self.station_answered_requests.load(Ordering::Relaxed),
+            "owed_settings_turns": self.owed_settings_turns.load(Ordering::Relaxed),
             "coalesced_receipts": self.coalesced_receipts.load(Ordering::Relaxed),
             "ordered_exhausted_by_type": ORDERED_EXHAUSTION.counts(),
             "coalesced_frames": self.coalesced_frames.load(Ordering::Relaxed),
@@ -783,6 +806,11 @@ impl TxQueueBudget {
         // A retired automatic ABORT is accepted and dropped: it never reaches
         // the air, and each dropped offer spends one of the SDK's retries.
         if crate::abort_retirement::suppress_write(payload) {
+            return Ok(());
+        }
+        // Accepted and dropped on the radio only: the station answers these.
+        if self.short_lookahead && station_answered_request(payload) {
+            self.station_answered_requests.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         // Earlier parked frames go first; they keep the side's wire order.
@@ -1880,6 +1908,21 @@ impl WireBacklog {
             && self.routing.is_empty()
             && self.receipts.is_empty()
             && self.priorities.is_empty()
+    }
+    /// The owed settings turn never goes ahead of control: no pending
+    /// control write and no queued application frame at command priority.
+    /// Receipts are not counted: their stream is what starved the turn, and
+    /// they wait at most one settings quantum per turn.
+    fn owed_settings_turn_allowed(&self, budget: Option<&TxQueueBudget>) -> bool {
+        budget.is_none_or(|b| {
+            !b.pending_commands
+                .lock()
+                .expect("pending radio commands poisoned")
+                .iter()
+                .any(|(_, bytes)| !is_delivery_receipt(bytes))
+        }) && !self.priorities.iter().any(|(priority, queue)| {
+            *priority >= 254 && queue.iter().any(|bytes| !is_delivery_receipt(bytes))
+        })
     }
     fn background_admission_allowed(&self, budget: Option<&TxQueueBudget>) -> bool {
         !self.has_eligible_critical()
@@ -3854,6 +3897,8 @@ pub(super) fn spawn_comms_worker_threads(
             // Preserve their relative order on every generic packed link.
             let mut backlog = WireBacklog::new(true);
             let mut ordinary_balance = OrdinaryServiceBalance::default();
+            // Station clock (simulation_clock_ms in a sim), as the backlog's own deadlines.
+            let mut last_owed_settings_turn: Option<TxDeadline> = None;
             let mut failed_writes=retained_write_retries::Retained::default();
             loop {
                 match comms_shutdown_rx.try_recv() {
@@ -3935,6 +3980,37 @@ pub(super) fn spawn_comms_worker_threads(
                                 );
                                 break;
                             }
+                        }
+                    }
+                    // A primary whose receipt lane never empties never passes
+                    // background admission, so its settings framing offer and
+                    // station-mode reply starved (RRLS commands unavailable).
+                    // One such frame is owed every SETTINGS_TURN_MS while no
+                    // control is pending: receipts wait at most one settings
+                    // quantum (92 B) per turn, and control is never preempted.
+                    if !retained_protocol_turn
+                        && !failed_writes.blocked()
+                        && last_owed_settings_turn
+                            .as_ref()
+                            .is_none_or(|at| at.after(Duration::from_millis(SETTINGS_TURN_MS)).ready())
+                        && backlog.owed_settings_turn_allowed(comms_handle.tx_budget.as_deref())
+                        && comms.transmit_ready()
+                    {
+                        last_owed_settings_turn = Some(TxDeadline::now());
+                        match comms.service_owed_settings_turn() {
+                            Ok(true) => {
+                                if let Some(budget) = comms_handle.tx_budget.as_deref() {
+                                    budget.owed_settings_turns.fetch_add(1, Ordering::Relaxed);
+                                }
+                                continue;
+                            }
+                            Ok(false) => {}
+                            Err(error) => log_repeated_worker_error(
+                                &format!("{worker_name} owed settings turn failed"),
+                                &error.to_string(),
+                                &mut last_send_error_log_ms,
+                                &mut suppressed_send_errors,
+                            ),
                         }
                     }
                     let mesh_ordinary_state = comms.ordinary_background_state();
@@ -5640,6 +5716,125 @@ mod rfd_worker_tests {
     use super::*;
     use std::error::Error;
 
+    /// A primary whose receipt lane never empties (the faithful sim: about
+    /// 6.5 owner ACKs/s plus 7.6 forwarded requests/s on the radio) never
+    /// passed background admission, so its station-mode reply and settings
+    /// framing offer never reached the air and the RRLS command proxy stayed
+    /// unavailable (409). A bounded owed turn lets one settings frame through
+    /// about once a second without preempting control.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn primary_mode_reply_gets_a_bounded_turn_under_a_continuous_receipt_stream() {
+        use std::io::Read;
+        crate::telemetry_schema::initialize().unwrap();
+        let shared = Arc::new(Mutex::new(crate::rrls::Mesh::new(crate::rrls::Role::Primary, 42)));
+        let mut reply = b"OM\x02\x01".to_vec();
+        reply.extend(42u32.to_le_bytes());
+        reply.extend(123u128.to_le_bytes());
+        reply.push(0);
+        {
+            let mut mesh = shared.lock().unwrap();
+            let now = mesh.now();
+            assert!(mesh.queue_operating_mode_reply(&reply, now));
+        }
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        serialport::SerialPort::set_timeout(&mut peer, Duration::from_millis(10)).unwrap();
+        let mut uart = crate::comms::UartComms::test_mesh_pty(port, shared.clone());
+        uart.set_side_id(0);
+        let tx = uart.try_clone_tx().unwrap().unwrap();
+        let state = crate::state::tests::test_app_state().await;
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let budget = Arc::new(TxQueueBudget::new(1 << 20));
+        let workers = spawn_comms_worker_threads(
+            Arc::new(Router::new(Default::default())),
+            state.clone(),
+            CommsWorkerHandle {
+                transport_activity: None,
+                name: "rocket_comms",
+                tx_budget: Some(budget.clone()),
+                comms: Arc::new(Mutex::new(Box::new(uart))),
+                tx_comms: Some(Arc::new(Mutex::new(tx))),
+                side_id: 0,
+                tx_rx: receiver,
+                legacy_single_worker: false,
+                prioritize_rx: false,
+                dedicated_radio_io: false,
+            },
+        )
+        .unwrap();
+        // Receipts arrive faster than 115200 baud drains them, for 3 s, and a
+        // station heartbeat (compact, LIVENESS priority) is queued every 200 ms.
+        let feeder_budget = budget.clone();
+        let heartbeat = b"SDT\x01owed-turn-heartbeat-marker".to_vec();
+        let feeder_heartbeat = heartbeat.clone();
+        let feeder = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let mut n = 0u64;
+            let mut last_heartbeat = start;
+            let _ = feeder_budget.try_send(&sender, LIVENESS_PRIORITY, &feeder_heartbeat);
+            while start.elapsed() < Duration::from_secs(3) {
+                if last_heartbeat.elapsed() >= Duration::from_millis(200) {
+                    last_heartbeat = std::time::Instant::now();
+                    let _ = feeder_budget.try_send(&sender, LIVENESS_PRIORITY, &feeder_heartbeat);
+                }
+                for _ in 0..8 {
+                    n += 1;
+                    let ack = serialize::pack_packet(
+                        &Packet::new(
+                            sedsnet::config::DataType::ReliableAck,
+                            &[sedsnet::config::DataEndpoint::TelemetryError],
+                            "GS",
+                            n,
+                            Arc::from(n.to_le_bytes()),
+                        )
+                        .unwrap(),
+                    )
+                    .to_vec();
+                    let _ = feeder_budget.try_send(&sender, 255, &ack);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            drop(sender);
+        });
+        let needle = reply.clone();
+        let marker = heartbeat.clone();
+        let (seen, heartbeats, _peer) = tokio::task::spawn_blocking(move || {
+            let start = std::time::Instant::now();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut seen = None;
+            let mut heartbeats = Vec::new();
+            while start.elapsed() < Duration::from_secs(3) {
+                if let Ok(n) = peer.read(&mut chunk) {
+                    let before = bytes.len().saturating_sub(marker.len());
+                    bytes.extend_from_slice(&chunk[..n]);
+                    let fresh = bytes[before..].windows(marker.len()).filter(|w| *w == marker).count();
+                    heartbeats.extend(std::iter::repeat_n(start.elapsed(), fresh));
+                    if seen.is_none() && bytes.windows(needle.len()).any(|w| w == needle) {
+                        seen = Some(start.elapsed());
+                    }
+                }
+            }
+            (seen, heartbeats, peer)
+        })
+        .await
+        .unwrap();
+        feeder.join().unwrap();
+        state.request_shutdown();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let at = seen.expect("the mode reply never reached the air under a continuous receipt stream");
+        assert!(at <= Duration::from_millis(2_000), "mode reply took {at:?}");
+        // The heartbeat's own 1 Hz overtake still holds alongside the owed turn
+        // (FC GND_TIMEOUT 3 s): no gap over 1.5 s, first one within 1.5 s.
+        let mut previous = Duration::ZERO;
+        for at in heartbeats.iter().chain(std::iter::once(&Duration::from_millis(2_900))) {
+            assert!(*at - previous <= Duration::from_millis(1_500), "heartbeat gap {:?} at {at:?}: {heartbeats:?}", *at - previous);
+            previous = *at;
+        }
+    }
+
     #[tokio::test]
     #[cfg(target_os = "linux")]
     async fn primary_actual_uart_worker_mode_reply_progresses_under_sdt_and_defers_to_command() {
@@ -6511,3 +6706,7 @@ mod refusal_storm_tests;
 #[cfg(test)]
 #[path = "radio_abort_retirement_tests.rs"]
 mod abort_retirement_tests;
+
+#[cfg(test)]
+#[path = "radio_station_variable_tests.rs"]
+mod station_variable_tests;

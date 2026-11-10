@@ -54,6 +54,16 @@ impl Transport {
         }
     }
 }
+fn note_rejected_frame(role: Role, reason: &str) {
+    static LAST: std::sync::Mutex<Vec<(String, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    last.retain(|(_, at)| at.elapsed() < std::time::Duration::from_secs(10));
+    if last.iter().any(|(seen, _)| seen == reason) || last.len() >= 16 {
+        return;
+    }
+    last.push((reason.to_string(), std::time::Instant::now()));
+    log::warn!("paired control frame rejected ({role:?}): {reason}");
+}
 struct Cached {
     request: [u8; 16],
     digest: [u8; 16],
@@ -1683,7 +1693,10 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                         }
                     }
                     Ok(Received::Pending) => {}
-                    Err(_) => {} // Invalid metadata never authorizes or refreshes anything.
+                    // Invalid metadata never authorizes or refreshes anything,
+                    // but say why, at most once per reason every 10 s: a silent
+                    // rejection left RRLS commands unavailable with no trace.
+                    Err(error) => note_rejected_frame(role, &error.to_string()),
                 }
             }
             if role == Role::Rrls {

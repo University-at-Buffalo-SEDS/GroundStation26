@@ -327,18 +327,26 @@ pub fn initialize_for_state(state: &crate::state::AppState, router: &Router) -> 
 fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
     initialize_for_role_seed(router, observer, true)
 }
+/// The managed variables a primary station owns (READ_WRITE) and answers
+/// requests for itself. Every other node holds read-only replicas.
+const STATION_VARIABLES: [&str; 9] = [
+    UNDERGLOW_TYPE,
+    FLIGHT_BUZZER_TYPE,
+    FLIGHT_STATE_TYPE,
+    DAQ_CALIBRATION_TYPE,
+    DAQ_KG50_CALIBRATION_TYPE,
+    "DAQ_LOG_CLOCK",
+    "DAQ_THERMAL_CALIBRATION",
+    "DAQ_FILTER_CALIBRATION",
+    "DAQ_KG50_INPUT",
+];
+/// Whether this station owns and serves `ty`, so a request for it needs no
+/// other node (an RRLS is a read-only observer and serves nothing).
+pub(crate) fn station_serves(ty: sedsnet::config::DataType) -> bool {
+    !crate::rrls::is_rrls() && STATION_VARIABLES.iter().any(|name| crate::telemetry_schema::data_type(name) == ty)
+}
 fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Result<()> {
-    for data_type in [
-        UNDERGLOW_TYPE,
-        FLIGHT_BUZZER_TYPE,
-        FLIGHT_STATE_TYPE,
-        DAQ_CALIBRATION_TYPE,
-        DAQ_KG50_CALIBRATION_TYPE,
-        "DAQ_LOG_CLOCK",
-        "DAQ_THERMAL_CALIBRATION",
-        "DAQ_FILTER_CALIBRATION",
-        "DAQ_KG50_INPUT",
-    ] {
+    for data_type in STATION_VARIABLES {
         router.enable_network_variable(
             crate::telemetry_schema::data_type(data_type),
             if observer {

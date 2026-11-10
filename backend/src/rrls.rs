@@ -1488,14 +1488,28 @@ impl Mesh {
 
     /// One independent background reply; it never takes critical capacity/loans.
     pub(crate) fn begin_mode_reply_transmission(&mut self, now: u64) -> Option<Transmission> {
+        self.begin_mode_reply(now, false)
+    }
+    /// The primary's owed settings turn (see radio_io SETTINGS_TURN_MS): one
+    /// settings framing offer or one station-mode reply, even while protected
+    /// Mesh frames such as HEALTH wait for the normal path. Nothing else.
+    pub(crate) fn begin_owed_settings_transmission(&mut self, now: u64) -> Option<Transmission> {
+        if self.role != Role::Primary {
+            return None;
+        }
+        self.begin_framing_offer_transmission(now, 0)
+            .or_else(|| self.begin_mode_reply(now, true))
+    }
+    fn begin_mode_reply(&mut self, now: u64, owed: bool) -> Option<Transmission> {
         self.observe_settings_framing(now);
         if self.role != Role::Primary
             || self.active_transmission.is_some()
-            || self
-                .queue
-                .iter()
-                .enumerate()
-                .any(|(i, q)| q.priority >= 254 && self.dependency_ready(i))
+            || (!owed
+                && self
+                    .queue
+                    .iter()
+                    .enumerate()
+                    .any(|(i, q)| q.priority >= 254 && self.dependency_ready(i)))
         {
             return None;
         }

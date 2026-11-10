@@ -356,6 +356,13 @@ pub trait CommsDevice: Send {
         Ok(())
     }
 
+    /// One owed settings framing offer or station-mode reply on a primary
+    /// radio, written only when the caller found no pending control. Returns
+    /// whether a frame was completely written.
+    fn service_owed_settings_turn(&mut self) -> TelemetryResult<bool> {
+        Ok(false)
+    }
+
     /// The TX worker calls this only after its current SDK critical selection
     /// is empty. Unknown transports retain their existing mode-only behavior.
     fn service_background_transmit(&mut self) -> TelemetryResult<()> {
@@ -616,6 +623,8 @@ impl RawUartFrameWait {
 enum RecoveryEgressSelection {
     All,
     ModeReplyOnly,
+    /// One settings framing offer or mode reply owed after a long wait.
+    OwedSettings,
     PrimaryBackground,
     PrimaryBackgroundControls,
     PaidBudgetOnly,
@@ -1143,7 +1152,8 @@ impl UartComms {
         minimum_priority: u8,
         selection: RecoveryEgressSelection,
     ) -> TelemetryResult<BackgroundProgress> {
-        let mode_only = selection == RecoveryEgressSelection::ModeReplyOnly;
+        let owed_settings = selection == RecoveryEgressSelection::OwedSettings;
+        let mode_only = selection == RecoveryEgressSelection::ModeReplyOnly || owed_settings;
         let budget_only = selection == RecoveryEgressSelection::PaidBudgetOnly;
         let primary_background = matches!(
             selection,
@@ -1195,7 +1205,15 @@ impl UartComms {
                 .radio_capacity
                 .as_ref()
                 .is_some_and(|cap| !cap.ready(capacity_wall, capacity_clock));
-            if (mode_only || budget_only) && !normal_ready {
+            // The owed settings turn may use the bounded critical loan, as a
+            // receipt does; otherwise a receipt stream keeps the normal bucket
+            // just short of ready and the turn would never be taken.
+            let owed_ready = owed_settings
+                && write_state
+                    .radio_capacity
+                    .as_ref()
+                    .is_none_or(|cap| cap.ready_for(capacity_wall, capacity_clock, true));
+            if (mode_only || budget_only) && !normal_ready && !owed_ready {
                 break;
             }
             let transmission = {
@@ -1208,6 +1226,8 @@ impl UartComms {
                 {
                     if budget_only {
                         mesh.begin_paid_budget_transmission(now)
+                    } else if owed_settings {
+                        mesh.begin_owed_settings_transmission(now)
                     } else if mode_only {
                         mesh.begin_mode_reply_transmission(now)
                     } else if primary_background {
@@ -1259,6 +1279,8 @@ impl UartComms {
                 {
                     if budget_only {
                         mesh.begin_paid_budget_transmission(now)
+                    } else if owed_settings {
+                        mesh.begin_owed_settings_transmission(now)
                     } else if mode_only {
                         mesh.begin_mode_reply_transmission(now)
                     } else if primary_background {
@@ -1321,7 +1343,7 @@ impl UartComms {
                 !cap.ready_for(
                     capacity_wall,
                     capacity_clock,
-                    transmission.closes_packet_batch(),
+                    transmission.closes_packet_batch() || owed_settings,
                 )
             }) {
                 shared
@@ -3544,6 +3566,19 @@ impl CommsDevice for UartComms {
         };
         self.observe_retry_peer_session(peer_session);
         self.flush_recovery_output(minimum_priority)
+    }
+    fn service_owed_settings_turn(&mut self) -> TelemetryResult<bool> {
+        if matches!(self.protocol, SerialProtocol::RawUart)
+            && self
+                .recovery
+                .as_ref()
+                .is_some_and(|mesh| mesh.lock().unwrap().role == crate::rrls::Role::Primary)
+        {
+            return Ok(self
+                .flush_recovery_selection_counted(0, RecoveryEgressSelection::OwedSettings)?
+                .physical_completed);
+        }
+        Ok(false)
     }
     fn service_background_mode(&mut self) -> TelemetryResult<()> {
         if matches!(self.protocol, SerialProtocol::RawUart)
