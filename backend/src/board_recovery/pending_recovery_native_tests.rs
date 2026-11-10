@@ -915,6 +915,15 @@ async fn native_contact_window(
 async fn native_contact_prelude(
     f:&Fixture,p:&Probe,goal:PreludeGoal,
 )->Result<(),tokio::time::error::Elapsed> {
+    native_contact_prelude_gated(f,p,goal,None).await
+}
+/// As `native_contact_prelude`, but a later window is sent only once `gate`
+/// is set. A caller that must act between the first window and the next one
+/// fences that order explicitly instead of racing the 250 ms window timer,
+/// which a loaded host can overrun.
+async fn native_contact_prelude_gated(
+    f:&Fixture,p:&Probe,goal:PreludeGoal,gate:Option<&std::sync::atomic::AtomicBool>,
+)->Result<(),tokio::time::error::Elapsed> {
     let state=f.state();
     let required:Vec<_>=Board::ALL.iter().copied()
         .filter(|board|state.board_required_for_progression(*board)).collect();
@@ -947,7 +956,8 @@ async fn native_contact_prelude(
                 PreludeGoal::ActualPreparedHook=>false,
             };
             if ready {break;}
-            if !stopped && windows<12 && tokio::time::Instant::now()>=next_send {
+            if !stopped && windows<12 && tokio::time::Instant::now()>=next_send
+                && gate.is_none_or(|gate|gate.load(Ordering::Acquire)) {
                 windows+=1;
                 native_contact_window(f,p,goal,Some(deadline),&mut inputs,&mut stopped).await;
                 // Schedule from NOW, never catch up an old due time in a burst.
@@ -1339,7 +1349,10 @@ async fn r17_real_policy_busy_then_later_fresh_window_accepts_one_original() {
     let began=Instant::now();
     // Poll ONE original shared positive future. Its original 3s timeout is
     // created once, never refreshed by this external observational controller.
-    let healthy=native_contact_prelude(&f,&p,PreludeGoal::ReturnedAndActualGbReceipt);
+    // The next window waits for the owner release below, so the first Busy
+    // is observed with exactly the four initial contacts processed.
+    let next_window=std::sync::atomic::AtomicBool::new(false);
+    let healthy=native_contact_prelude_gated(&f,&p,PreludeGoal::ReturnedAndActualGbReceipt,Some(&next_window));
     tokio::pin!(healthy);
     let mut busy_proof=None;
     let mut released_at=None;
@@ -1367,15 +1380,17 @@ async fn r17_real_policy_busy_then_later_fresh_window_accepts_one_original() {
                             "initial_processed_unique_ids":unique,"elapsed_us":began.elapsed().as_micros()}));
                         owner.finish();
                         let released=began.elapsed();
-                        // began precedes the first helper poll; the helper's
-                        // next window is >=250ms AFTER its first window. This
-                        // stricter comparison proves actual release beforehand.
-                        assert!(released<Duration::from_millis(250),"real owner must release before next 250ms contact boundary");
                         assert!(owner.released.load(Ordering::Acquire));
+                        // Only now may the next fresh window be sent: the real
+                        // owner is released before any later contact arrives.
+                        next_window.store(true,Ordering::Release);
                         released_at=Some(released);
                     } else {
-                        assert!(began.elapsed()<Duration::from_millis(250),
-                            "first real Busy/processed-window premise was not observed before the required release boundary");
+                        // No later window is sent before the release, so the
+                        // premise holds however slowly the host runs; only the
+                        // original 3s shared positive bounds the wait.
+                        assert!(began.elapsed()<Duration::from_secs(3),
+                            "first real Busy/processed-window premise was not observed within the original 3s window");
                     }
                 }
             }
@@ -1390,7 +1405,13 @@ async fn r17_real_policy_busy_then_later_fresh_window_accepts_one_original() {
     assert_eq!(crate::network_variables::flight_state(),0);
     assert!(crate::network_variables::automatic_idle_test_snapshot().durable_unchanged(&before));
     assert_eq!((crate::gse::automatic_generation(&state),state.manual_abort_intent.epoch(),state.deferred_abort.manual_epoch()),epochs);
-    assert_eq!(p.final_commit_counts(),[1,1,0,0,0,0],"one actual Busy followed by exactly one accepted original");
+    let counts=p.final_commit_counts();
+    assert_eq!([counts[0],counts[1],counts[2],counts[3],counts[4]],[1,1,0,0,0],
+        "one actual Busy followed by exactly one accepted original: {counts:?}");
+    // A later fresh contact may meet the SDK core or schema momentarily held
+    // elsewhere; that nonwaiting attempt changes nothing and the next fresh
+    // contact qualifies. Any other SDK refusal still fails.
+    assert_eq!(counts[5],p.sdk_contention_count(),"only transient SDK lock contention may refuse a later fresh contact: {counts:?}");
     assert_eq!(crate::recovery_pending_probe::final_outcome_observer_losses(),0);
     let cache=cached_fstate(&f).expect("actual later-window original cache");
     assert_eq!(cache.payload(),&[1]);

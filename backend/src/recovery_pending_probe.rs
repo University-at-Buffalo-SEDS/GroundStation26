@@ -60,6 +60,10 @@ pub(crate) struct Probe {
     pub(crate) block_commit: AtomicBool,
     pub(crate) automatic_completed: AtomicBool,
     final_commit_outcomes: [AtomicU64;6],
+    /// SDK refusals that were only lock contention (core or schema busy):
+    /// the attempt returned at once without effect and a later fresh contact
+    /// may qualify.
+    sdk_contention: AtomicU64,
     pub(crate) sequence_ticks: AtomicU64,
     pub(crate) packet_worker_abort: Mutex<Option<tokio::task::AbortHandle>>,
     pub(crate) commit_entered: Notify,
@@ -99,6 +103,7 @@ impl Probe {
             block_commit: AtomicBool::new(false),
             automatic_completed: AtomicBool::new(false),
             final_commit_outcomes: std::array::from_fn(|_|AtomicU64::new(0)),
+            sdk_contention: AtomicU64::new(0),
             sequence_ticks: AtomicU64::new(0),
             packet_worker_abort: Mutex::new(None),
             commit_entered: Notify::new(),
@@ -110,6 +115,9 @@ impl Probe {
     }
     pub(crate) fn final_commit_counts(&self)->[u64;6] {
         std::array::from_fn(|i|self.final_commit_outcomes[i].load(Ordering::Acquire))
+    }
+    pub(crate) fn sdk_contention_count(&self)->u64 {
+        self.sdk_contention.load(Ordering::Acquire)
     }
     pub(crate) fn install(self: &Arc<Self>) {
         assert!(NEXT.lock().unwrap().replace(self.clone()).is_none());
@@ -228,7 +236,11 @@ pub(crate) fn receive_entry(state: &Arc<AppState>, packet: &Packet) {
         return;
     }
     if let Some(p) = for_state(state) {
-        if !p.capture_entries.load(Ordering::Acquire) {
+        // Board contacts only: the station's own heartbeat can land in the
+        // capture window and is not a board entry.
+        if !p.capture_entries.load(Ordering::Acquire)
+            || state.canonical_network_sender_id(packet.sender()) == "GS"
+        {
             return;
         }
         let mut entries = p.entries.lock().unwrap();
@@ -351,5 +363,9 @@ pub(crate) fn record_final_commit_outcome(
     use crate::automatic_startup_idle::Error;
     let at=match result {Ok(())=>0,Err(Error::Busy)=>1,Err(Error::Retired)=>2,
         Err(Error::StateChanged)=>3,Err(Error::StoreChanged)=>4,Err(Error::Sdk(_))=>5};
+    use sedsnet::router::TryManagedBatchError as Sdk;
+    if matches!(result,Err(Error::Sdk(Sdk::CoreBusy|Sdk::SchemaBusy))) {
+        probe.sdk_contention.fetch_add(1,Ordering::Release);
+    }
     probe.final_commit_outcomes[at].fetch_add(1,Ordering::Release);
 }
