@@ -589,6 +589,32 @@ mod tests {
         assert_eq!(mode, Mode::Hitl);
         (root, p, r, primary, rr, pview, rview)
     }
+    /// During a relay the RRLS hears the primary's HEALTH through hidden-node
+    /// collisions (about 31% heard in the faithful sim), so its view of the
+    /// primary's sequence lags several HEALTH periods. Sealed on the RRLS's
+    /// extrapolated view (rrls command_proxy_transport), a query and its reply
+    /// are accepted without widening the freshness window.
+    #[test]
+    fn capability_exchange_survives_a_lagging_health_view() {
+        let (_root, p, r) = fixtures();
+        let mut primary = Runtime::new(Role::Primary);
+        let mut rr = Runtime::new(Role::Rrls);
+        // Last HEALTH heard was 20, 4 s ago: the RRLS estimates 26 (650 ms
+        // periods) while the primary has actually reached 28.
+        let rview = Transport { session: 7, sequence: 26 };
+        let pview = Transport { session: 7, sequence: 28 };
+        primary.connect(Some(pview));
+        rr.connect(Some(rview));
+        let query = rr.query(&r, rview).unwrap();
+        let Received::Reply(reply) = primary.receive(&p, pview, Mode::Hitl, &query).unwrap() else {
+            panic!("capability reply")
+        };
+        assert!(matches!(rr.receive(&r, rview, Mode::Normal, &reply).unwrap(), Received::Capability { .. }));
+        // Freshness is unchanged: the unextrapolated view (8 periods behind)
+        // is still refused by the primary.
+        let stale = rr.query(&r, Transport { session: 7, sequence: 20 }).unwrap();
+        assert!(primary.receive(&p, pview, Mode::Hitl, &stale).is_err());
+    }
     #[test]
     fn signed_control_roundtrip_uses_primary_build_and_replays_exact_result_without_execution() {
         let (_root, p, r, mut primary, mut rr, pview, rview) = connected();

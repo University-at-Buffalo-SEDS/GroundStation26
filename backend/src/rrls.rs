@@ -36,6 +36,12 @@ const DIRECT_MIN_DWELL_MS: u64 = 10_000;
 /// only duplicates the primary's uplink on the air.
 const RRLS_AV_BAY_FRESH_MS: u64 = 5_000;
 const LEASE_MS: u64 = 2_000;
+/// How long a paired RRLS keeps its control link to the primary without a
+/// fresh HEALTH (command_proxy_transport).
+const PROXY_LEASE_MS: u64 = 6_000;
+/// Upper bound on the primary's HEALTH period (500 ms plus loop latency),
+/// used to extrapolate its sequence without ever running ahead of it.
+const PROXY_HEALTH_PERIOD_BOUND_MS: u64 = 650;
 const MAX_FRAMES: usize = 64;
 const MAX_BYTES: usize = 65_536;
 const MAX_PAYLOAD: usize = 4_080;
@@ -2045,14 +2051,24 @@ impl Mesh {
         &self,
         now: u64,
     ) -> Option<crate::command_proxy::Transport> {
-        let session = self.operating_mode_session(now)?;
+        // The paired control link outlasts the 2 s relay lease: a relaying RRLS
+        // hears the primary through hidden-node collisions with the AV bay and
+        // misses runs of HEALTH frames. Its view extrapolates the primary's
+        // sequence conservatively, so the 2 s freshness window
+        // (command_proxy SEQUENCE_WINDOW) still measures real time.
+        if self.role == Role::Primary {
+            return Some(crate::command_proxy::Transport {
+                session: self.operating_mode_session(now)?,
+                sequence: self.sequence,
+            });
+        }
+        let last = self.health_received?;
+        let silent = now.checked_sub(last).filter(|age| *age < PROXY_LEASE_MS)?;
         Some(crate::command_proxy::Transport {
-            session,
-            sequence: if self.role == Role::Primary {
-                self.sequence
-            } else {
-                self.primary_sequence
-            },
+            session: self.primary_session?,
+            sequence: self
+                .primary_sequence
+                .wrapping_add((silent / PROXY_HEALTH_PERIOD_BOUND_MS) as u32),
         })
     }
     pub(crate) fn queue_command_proxy(&mut self, payload: &[u8], now: u64) -> bool {
@@ -3888,6 +3904,19 @@ mod tests {
     fn rrls_relay_share_carries_the_downlink_it_hears() {
         let (offered, sent) = relay_pacing_rates(false, 35);
         assert!(sent >= 0.95 * offered, "the 35% relay share carries the downlink: {sent:.0} of {offered:.0} B/s");
+    }
+
+    #[test]
+    fn command_proxy_transport_outlasts_lost_health_frames() {
+        // A relaying RRLS loses most primary HEALTH frames to hidden-node
+        // collisions; a 2 s gap must not disconnect its paired control link.
+        let mut rr = Mesh::new(Role::Rrls, 2);
+        rr.incoming(true, &health(7, 1, false), 1_000);
+        assert!(rr.command_proxy_transport(1_500).is_some());
+        let view = rr.command_proxy_transport(4_000).expect("3 s without HEALTH is not a disconnect");
+        // The primary has sent 6 or 7 more HEALTH frames; the estimate trails it.
+        assert_eq!(view.sequence, 1 + 4);
+        assert!(rr.command_proxy_transport(8_000).is_none(), "7 s without HEALTH is");
     }
 
     #[test]
