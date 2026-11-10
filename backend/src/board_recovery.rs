@@ -122,6 +122,11 @@ struct Readback {
 }
 impl Readback {
     fn decode(bytes: &[u8]) -> Option<Self> {
+        Self::decode_wire(bytes).filter(|readback| readback.nonce != 0 && readback.issuer != 0)
+    }
+    /// The wire shape only. Nonce 0 is an Abort push (`observe_abort_push`);
+    /// every query reply carries a nonzero nonce and issuer.
+    fn decode_wire(bytes: &[u8]) -> Option<Self> {
         // Every flag bit is defined; bit 7 advertises Resync (AB/VB only).
         if bytes.len() != 40 || bytes[0] != 1 || bytes[1] > 7 {
             return None;
@@ -152,9 +157,6 @@ impl Readback {
             outputs: u32_at(28),
             issuer: u64_at(32),
         };
-        if readback.nonce == 0 || readback.issuer == 0 {
-            return None;
-        }
         Some(readback)
     }
 }
@@ -192,6 +194,10 @@ struct Inner {
     previous: [Option<Query>; 7],
     rejected_statuses: u64,
     last_rejection: Option<&'static str>,
+    /// Latest Abort push accepted from each board: (boot generation, abort
+    /// epoch, uptime ms). Within one boot a push is new only if it is later by
+    /// (epoch, uptime); anything else is a replay.
+    pushed: [Option<(u64, u32, u32)>; 7],
 }
 pub(crate) struct Runtime {
     identity: Option<[u8; 16]>,
@@ -245,6 +251,7 @@ impl Default for Runtime {
                 previous: array::from_fn(|_| None),
                 rejected_statuses: 0,
                 last_rejection: None,
+                pushed: [None; 7],
             }),
             apply_requested_ms: Default::default(),
             av_bay_paused: Mutex::new(None),
@@ -511,6 +518,50 @@ pub(crate) fn endpoint_advertisement_age(
         })
         .min()
 }
+/// An unsolicited status a board sends once when it latches an Abort (nonce
+/// 0, Abort-latched flag set). It does not wait on the station's query
+/// stream, so the station sees an umbilical board's Abort within
+/// milliseconds even while an AV-bay query holds BOARD_RECOVERY_REQUEST.
+/// It can only raise that board's Abort: it never becomes a readback, never
+/// counts as launch or ignition proof, and never clears anything. A forged or
+/// replayed push can at worst show a false Abort (the safe direction), so it
+/// needs no query issuer (0 before the board's first query); it must come
+/// from that board's verified endpoint. Within one boot generation, a push is
+/// taken only if it is later by (abort epoch, uptime) than the last push
+/// taken and not earlier than the board's latest readback, so a replay is
+/// ignored even on a board whose epoch does not advance on every latch.
+fn observe_abort_push(state: &AppState, board: Board, push: Readback) -> Result<(), &'static str> {
+    if push.flags & 1 == 0 {
+        return Err("Abort push without the Abort-latched flag (ignored)");
+    }
+    let verified = state
+        .topology_router
+        .get()
+        .is_some_and(|router| endpoint_verified(state, board, &router.export_topology()));
+    if !verified {
+        return Err("Abort push from an unverified board endpoint");
+    }
+    let at = index(board).unwrap();
+    {
+        let mut inner = state.board_recovery.inner.lock().unwrap();
+        let order = (push.epoch, push.uptime);
+        let replay = inner.pushed[at].is_some_and(|(boot, epoch, uptime)| boot == push.boot && order <= (epoch, uptime))
+            || inner.values[at]
+                .as_ref()
+                .is_some_and(|row| row.value.boot == push.boot && order < (row.value.epoch, row.value.uptime));
+        if replay {
+            return Err("Replayed Abort push for an epoch already seen (ignored)");
+        }
+        inner.pushed[at] = Some((push.boot, push.epoch, push.uptime));
+    }
+    log::warn!("{} pushed its Abort latch (epoch {})", board.sender_id(), push.epoch);
+    state.board_abort.observe_abort(
+        board,
+        std::time::Instant::now(),
+        crate::telemetry_task::get_current_timestamp_ms(),
+    );
+    Ok(())
+}
 /// Called directly at SDK ingress, before DB/GSE work. Normal-runtime time is
 /// RAM-only; an explicit simulation uses the router's existing model clock.
 pub(crate) fn observe(state: &AppState, packet: &Packet) -> Result<(), &'static str> {
@@ -522,6 +573,9 @@ pub(crate) fn observe(state: &AppState, packet: &Packet) -> Result<(), &'static 
         || packet.endpoints() != [crate::telemetry_schema::endpoint("GROUND_STATION")]
     {
         return Err("Wrong recovery status destination");
+    }
+    if let Some(push) = Readback::decode_wire(packet.payload()).filter(|value| value.nonce == 0) {
+        return observe_abort_push(state, board, push);
     }
     let value = Readback::decode(packet.payload()).ok_or("Malformed recovery status")?;
     if value.flags & 0x40 != 0
@@ -2740,5 +2794,118 @@ mod launch_lock_release_tests {
             Some(row(Board::ActuatorBoard, 15, PHYSICAL_OK | 1, 3));
         assert!(!try_release_launch_lock(&state));
         assert!(state.launch_history.lock().unwrap().launch_locked());
+    }
+}
+#[cfg(test)]
+mod abort_push_tests {
+    use super::*;
+    /// The 40-byte status a board pushes when it latches an Abort: nonce 0,
+    /// issuer as last seen (0 before any query), boot generation 2.
+    fn push(flags: u8, epoch: u32, uptime: u32) -> Packet {
+        let mut wire = [0u8; 40];
+        wire[0] = 1;
+        wire[2] = crate::types::FlightState::Aborted as u8;
+        wire[3] = STATE_VALID | flags;
+        wire[12..20].copy_from_slice(&2u64.to_le_bytes());
+        wire[20..24].copy_from_slice(&epoch.to_le_bytes());
+        wire[24..28].copy_from_slice(&uptime.to_le_bytes());
+        Packet::new(
+            crate::telemetry_schema::data_type(STATUS_TYPE),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            "AB",
+            123,
+            Arc::from(wire),
+        )
+        .unwrap()
+    }
+    async fn verified_ab() -> Arc<AppState> {
+        let state = crate::state::tests::test_app_state().await;
+        let host = Arc::new(sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS")));
+        let side = host.add_side_packed("umbilical", |_| Ok(()));
+        for board in [Board::ActuatorBoard, Board::ValveBoard] {
+            host.rx_from_side(
+                &sedsnet::discovery::build_discovery_announce(
+                    board.sender_id(), 1, &[crate::telemetry_schema::endpoint(endpoint(board))]).unwrap(),
+                side,
+            )
+            .unwrap();
+        }
+        state.topology_router.set(host).unwrap();
+        state
+    }
+    const AB: usize = 3;
+
+    #[tokio::test]
+    async fn a_pushed_abort_latch_raises_the_abort_at_once() {
+        let state = verified_ab().await;
+        assert_eq!(state.board_abort.masks().0 & (1 << AB), 0);
+        observe(&state, &push(1, 9, 1_000)).unwrap();
+        assert_ne!(state.board_abort.masks().0 & (1 << AB), 0, "AB reads Aborted from its push");
+    }
+
+    #[tokio::test]
+    async fn a_push_is_never_readback_or_launch_and_ignition_proof() {
+        let state = verified_ab().await;
+        observe(&state, &push(1, 9, 1_000)).unwrap();
+        let inner = state.board_recovery.inner.lock().unwrap();
+        assert!(inner.values[AB].is_none(), "no readback row from a push");
+        assert!(inner.queries[AB].is_none(), "no query answered by a push");
+        drop(inner);
+        assert_eq!(state.board_abort.masks().1 & (1 << AB), 0, "no launch proof");
+        assert!(!state.board_abort.ignition_pair_current(), "no ignition-pair proof");
+        // A push with the latch flag that also claims healthy outputs and a
+        // clear state is still only an Abort raise.
+        let mut wire = push(1 | 4 | OUTPUTS_VALID | 2, 10, 2_000).payload().to_vec();
+        wire[2] = crate::types::FlightState::Idle as u8;
+        let packet = Packet::new(crate::telemetry_schema::data_type(STATUS_TYPE),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "AB", 124, Arc::from(wire)).unwrap();
+        observe(&state, &packet).unwrap();
+        assert!(state.board_recovery.inner.lock().unwrap().values[AB].is_none());
+        assert_eq!(state.board_abort.masks().1 & (1 << AB), 0);
+        assert_ne!(state.board_abort.masks().0 & (1 << AB), 0);
+    }
+
+    #[tokio::test]
+    async fn a_replayed_or_older_push_is_ignored() {
+        let state = verified_ab().await;
+        observe(&state, &push(1, 9, 1_000)).unwrap();
+        let revision = state.board_abort.abort_revision();
+        assert!(observe(&state, &push(1, 9, 1_000)).is_err(), "the same push again");
+        assert!(observe(&state, &push(1, 8, 5_000)).is_err(), "an older epoch");
+        assert!(observe(&state, &push(1, 9, 900)).is_err(), "earlier in the same epoch");
+        assert_eq!(state.board_abort.abort_revision(), revision, "a replay raises nothing");
+        // Older than the board's latest readback (taken after a recovery).
+        state.board_recovery.inner.lock().unwrap().values[AB] = Some(Observation {
+            value: Readback { result: 0, state: Some(1), flags: STATE_VALID, nonce: 5, boot: 2, epoch: 11,
+                uptime: 9_000, outputs: 0, issuer: 1 },
+            received: Stamp::now(),
+            observed_after: Stamp::now(),
+        });
+        assert!(observe(&state, &push(1, 10, 8_000)).is_err(), "older than the latest readback");
+        assert_eq!(state.board_abort.abort_revision(), revision);
+        // A later latch is a new Abort.
+        observe(&state, &push(1, 11, 9_500)).unwrap();
+        assert!(state.board_abort.abort_revision() > revision);
+    }
+
+    #[tokio::test]
+    async fn a_push_without_the_latch_flag_or_from_an_unverified_board_does_nothing() {
+        let state = verified_ab().await;
+        let revision = state.board_abort.abort_revision();
+        assert!(observe(&state, &push(0, 9, 1_000)).is_err());
+        assert_eq!(state.board_abort.masks().0 & (1 << AB), 0);
+        assert_eq!(state.board_abort.abort_revision(), revision);
+        assert!(state.board_recovery.inner.lock().unwrap().values[AB].is_none());
+        // It never clears an Abort either.
+        observe(&state, &push(1, 9, 1_000)).unwrap();
+        assert!(observe(&state, &push(0, 10, 2_000)).is_err());
+        assert_ne!(state.board_abort.masks().0 & (1 << AB), 0);
+        // GB never announced its endpoint here.
+        let mut wire = push(1, 9, 1_000).payload().to_vec();
+        wire[20] = 9;
+        let gb = Packet::new(crate::telemetry_schema::data_type(STATUS_TYPE),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "GB", 125, Arc::from(wire)).unwrap();
+        assert!(observe(&state, &gb).is_err());
+        assert_eq!(state.board_abort.masks().0 & (1 << 5), 0);
     }
 }
