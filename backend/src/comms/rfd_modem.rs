@@ -1496,7 +1496,8 @@ pub(crate) struct RfModemStatus {
     pub resumed_with_ato: bool,
     pub forwarding_entries: bool,
     pub skipped_by_flight_gate: bool,
-    /// Waiting for the first flight state, or running (the RF radio is held).
+    /// Not yet run this boot, or running (the RF radio is held). Current RF
+    /// firmware checks only at boot, before it joins the network.
     pub pending: bool,
     /// Not checked this boot because this firmware image verified the
     /// profile on an earlier boot (no register readback this boot).
@@ -1567,14 +1568,14 @@ pub(crate) fn decode_rf_status(words: &[u32]) -> Option<RfModemStatus> {
     // marker and turns pending on the same boot; pending wins.
     let verified = !pending && !gate && flags & RF_FLAG_VERIFIED != 0 && outcome == Outcome::Skipped;
     let summary = if pending {
-        "RF modem check pending: it runs once a flight state from the station allows it (on current RF firmware: Startup or Idle, 3 s after the last station write)".to_string()
+        "RF modem check pending: RF checks its modem at boot, before it joins the network (older RF firmware waits for Startup or Idle)".to_string()
     } else {
         match outcome {
             Outcome::Skipped if verified => {
                 "RF modem not checked this boot: this firmware image already verified the profile on an earlier boot".into()
             }
             Outcome::Skipped if gate => {
-                "RF modem not checked this boot: the flight state did not allow it (nothing reached the modem)".into()
+                "RF modem not checked this boot: RF's flight state was past Idle (nothing reached the modem)".into()
             }
             Outcome::Skipped if mode == Mode::Skip => "RF modem check off in this RF build".into(),
             Outcome::Skipped => "RF modem not checked".into(),

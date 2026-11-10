@@ -881,7 +881,12 @@ fn rf_board_verified_on_an_earlier_boot_is_not_an_attention_case() {
     assert!(verified.summary.contains("already verified the profile on an earlier boot"), "{}", verified.summary);
     let repending = decode_rf_status(&rf_health(unread | ((0x80 | 0x20) << 16), u32::MAX, u32::MAX, 70)).unwrap();
     assert!(repending.pending && !repending.verified_on_earlier_boot);
-    assert!(repending.summary.contains("Startup or Idle"), "{}", repending.summary);
+    // RF 7067e57 checks only at boot, before it joins the network: the
+    // summary never says the check waits for a station flight state.
+    assert!(repending.summary.contains("at boot, before it joins the network"), "{}", repending.summary);
+    assert!(!repending.summary.contains("once a flight state"), "{}", repending.summary);
+    let gate = decode_rf_status(&rf_health(unread | (0x10 << 16), u32::MAX, u32::MAX, 5)).unwrap();
+    assert_eq!(gate.summary, "RF modem not checked this boot: RF's flight state was past Idle (nothing reached the modem)");
     // Stopped by a flight-state change after saving: saved, not verified.
     let stopped = decode_rf_status(&rf_health(1 | (5 << 4) | (2 << 10) | ((0x10 | 0x01) << 16) | (1 << 24), 3968 | (10 << 16), 32768 | (64 << 16) | (10 << 24), 9)).unwrap();
     assert!(stopped.needs_attention && stopped.eeprom_saved && stopped.skipped_by_flight_gate);

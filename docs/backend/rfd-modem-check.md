@@ -314,7 +314,7 @@ clear; older RF firmware leaves the words zero). It is sent in every
 | 13 | 11:10 | mode: 0 skip, 1 verify, 2 fix |
 | 13 | 12 | built with the profile rolled out |
 | 13 | 14:13 | RTSCTS observed (3 unread) |
-| 13 | 23:16 | flags: 0x01 EEPROM saved, 0x02 rebooted, 0x04 data mode resumed with ATO, 0x08 forwarding entries, 0x10 skipped or stopped by the flight gate, 0x20 pending (waiting for the flight state or running), 0x40 needs attention |
+| 13 | 23:16 | flags: 0x01 EEPROM saved, 0x02 rebooted, 0x04 data mode resumed with ATO, 0x08 forwarding entries, 0x10 skipped (RF's flight state past Idle) or stopped by the flight gate, 0x20 pending (not yet run this boot, or running), 0x40 needs attention |
 | 13 | 31:24 | S5 observed (u8) |
 | 15 | 15:0 / 31:16 | S3 / S6 observed |
 | 22 | 15:0 / 23:16 / 31:24 | S11 / S2 / S4 observed |
@@ -323,6 +323,12 @@ u16 fields use 0xFFFF and u8 fields 0xFF for unread; 0xFE means 254 or more.
 Values are those read after the last write and verification. GS decodes the
 block (`rfd_modem::decode_rf_status`), shows it in Connectivity and raises a
 notification for every finished RF check.
+
+Since RF 7067e57 the check runs only at boot, before RF starts CAN and
+SEDSnet, and only from a restored Startup or Idle (or nothing restored); a
+restored phase past Idle skips it with the gate flag. It never holds the
+radio after RF has joined the network. Older RF firmware waited for a
+station flight state and could hold the radio later.
 
 Flag 0x80 (word 13 bits 23:16, with outcome Skipped and neither the pending
 nor the gate flag) means RF did not check this boot because a flash marker
