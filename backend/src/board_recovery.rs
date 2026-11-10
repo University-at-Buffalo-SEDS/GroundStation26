@@ -1094,10 +1094,11 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         let (readback_status, message) = recovery_diagnostic(primary, verified, network_utc_available,
             observation, queries[at].as_ref(), now, reconcilable);
         // While background AV-bay queries are paused, say where the row comes
-        // from instead of promising an automatic refresh.
+        // from instead of promising an automatic refresh. One line: the UI
+        // explains the pause in the row's "About these readbacks" disclosure.
         let message = match av_bay_paused {
             Some(_) if AV_BAY_INDICES.contains(&at) && matches!(readback_status, "query_required" | "readback_expired") =>
-                "Automatic status queries to the AV bay are paused while its radio link is degraded; this row is the last board readback, and the board's own status reports still arrive. Query or Recover asks the board directly.",
+                "Auto-queries paused (AV-bay link degraded) — last readback shown",
             _ => message,
         };
         let operation=queries[at].as_ref().map(|query| {
