@@ -27,11 +27,16 @@ struct Armed {
     recovery: Option<String>,
     last_sent_ms: Option<u64>,
     resends: u32,
+    /// Resumed after a bounced recovery: take the next observed recovery
+    /// identity as the baseline instead of treating it as a new recovery.
+    adopt_recovery: bool,
 }
 
 #[derive(Default)]
 pub(crate) struct AbortResend {
     armed: Mutex<Option<Armed>>,
+    /// Held while a recovery is being prepared; restored if it resets nothing.
+    suspended: Mutex<Option<Armed>>,
 }
 
 /// What the caller observed this pass.
@@ -47,16 +52,32 @@ pub(crate) struct Observation {
 impl AbortResend {
     /// The SDK accepted the operator Abort `epoch` with `wire`.
     pub(crate) fn arm(&self, epoch: u64, wire: WirePolicy, recovery: Option<String>) {
-        *self.armed.lock().unwrap() = Some(Armed { epoch, wire, recovery, last_sent_ms: None, resends: 0 });
+        *self.armed.lock().unwrap() = Some(Armed { epoch, wire, recovery, last_sent_ms: None, resends: 0, adopt_recovery: false });
     }
     /// A recovery is being prepared: stop re-sending at once, before the
     /// coordinator drains in-flight ABORTs and takes its fresh queries, so no
     /// later copy can move a board's abort epoch under the prepared intent.
     pub(crate) fn disarm(&self, why: &str) {
-        if let Some(armed) = self.armed.lock().unwrap().take()
-            && armed.resends > 0
-        {
-            log::info!("operator Abort re-send stopped after {} re-send(s): {why}", armed.resends);
+        let taken = self.armed.lock().unwrap().take();
+        if let Some(armed) = taken {
+            if armed.resends > 0 {
+                log::info!("operator Abort re-send paused after {} re-send(s): {why}", armed.resends);
+            }
+            *self.suspended.lock().unwrap() = Some(armed);
+        }
+    }
+    /// The recovery that paused the re-send reset no board: resume it. A
+    /// newer operator Abort armed meanwhile is kept instead. The next pass
+    /// stops it again if the station has left Aborted or the boards read back.
+    pub(crate) fn resume(&self) {
+        let Some(mut armed) = self.suspended.lock().unwrap().take() else { return };
+        let mut current = self.armed.lock().unwrap();
+        if current.is_none() {
+            // The recovery identity seen then is gone; adopt the current one.
+            armed.recovery = None;
+            armed.adopt_recovery = true;
+            log::info!("operator Abort re-send resumed: the recovery reset no board");
+            *current = Some(armed);
         }
     }
     /// Re-sends so far for the current operator Abort, while still active.
@@ -70,6 +91,10 @@ impl AbortResend {
         let mut guard = self.armed.lock().unwrap();
         let armed = guard.as_mut()?;
         let owed = seen.owed & AV_BAY_MASK;
+        if armed.adopt_recovery {
+            armed.recovery = seen.recovery.clone();
+            armed.adopt_recovery = false;
+        }
         if seen.epoch != armed.epoch || !seen.station_aborted || seen.recovery != armed.recovery || owed == 0 {
             if armed.resends > 0 {
                 log::info!(

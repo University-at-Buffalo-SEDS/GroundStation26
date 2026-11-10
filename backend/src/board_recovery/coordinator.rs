@@ -702,8 +702,23 @@ pub(super) async fn prepare(
         return response;
     }
     // No operator Abort re-send may start once a recovery is being prepared;
-    // one already in flight is drained below before the fresh queries.
+    // one already in flight is drained below before the fresh queries. A
+    // refused prepare resets nothing, so it re-arms the re-send.
     state.abort_resend.disarm("a board recovery is being prepared");
+    let response = prepare_after_disarm(&state, &headers, parsed, selected, token, principal).await;
+    if !response.status().is_success() {
+        state.abort_resend.resume();
+    }
+    response
+}
+async fn prepare_after_disarm(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    parsed: Result<Prepare, serde_json::Error>,
+    selected: Result<Option<super::scope::Selection>, &'static str>,
+    token: Token,
+    principal: crate::auth::AuthPrincipal,
+) -> Response {
     let request = match parsed {
         Ok(request) => request,
         Err(_) => return error(StatusCode::CONFLICT, "invalid_intent", "A complete explicit recovery intent is required."),
@@ -783,8 +798,10 @@ async fn refresh_prepare_queries(
             let blockers = quiesce_blockers(state, router, scope);
             if !blockers.iter().any(|b| b.is_abort() || *b == Blocker::RouterBusy) { break; }
             if start.elapsed() >= network_wait(ABORT_DRAIN) {
-                log::warn!("Recovery PREPARE stopped waiting for an Abort still being delivered: {blockers:?}");
-                break;
+                log::warn!("Recovery PREPARE refused: an Abort is still being delivered: {blockers:?}");
+                // A copy delivered after the prepared queries would move that
+                // board's abort epoch under the confirmed intent.
+                return Err("An Abort is still being delivered to a board; try again once it reads Aborted");
             }
             if !origin_current(state, token) {
                 return Err("Recovery origin changed while an Abort was still being delivered");
@@ -1398,7 +1415,12 @@ fn admit_confirmation(
                 });
             operation["current_host_state"] = json!(owned.local_flight_state_snapshot() as u8);
             operation["age_ms"] = json!(ticket.created.elapsed().as_millis() as u64);
+            let partial = match result {
+                Err(message) => partial_reset_message(operation, message),
+                Ok(_) => None,
+            };
             operation["message"] = json!(match result {
+                _ if partial.is_some() => partial.as_deref().unwrap_or_default(),
                 Ok(RunOutcome::StillPending(message)) => message,
                 Ok(_) if matches!(ticket.action.as_str(), "reset_startup" | "reset_startup_all7") && ticket.targets.is_empty() =>
                     "Host Startup reset completed. Global Startup broadcast was best effort; no board terminal completion or fresh board proof is claimed.",
@@ -1411,7 +1433,13 @@ fn admit_confirmation(
                 Err(message) => message,
             });
         }
+        let nothing_reset = operation_reset_nothing(control.operation.as_ref());
         drop(control);
+        if result.is_err() && nothing_reset {
+            // A recovery that reset no board leaves an owed AV-bay Abort to
+            // the re-send again.
+            owned.abort_resend.resume();
+        }
         if result == Ok(RunOutcome::Published) {
             owned.board_recovery.manual_utc.after_completed();
         }
@@ -1683,12 +1711,12 @@ async fn exchange(
                 Outcome::Rejected(code) => {
                     log::warn!("{:?} rejected recovery with board result {code}", target.board);
                     return Err(match code {
-                        2 => "Board rejected recovery as UNSUPPORTED (2); no reset applied.",
-                        3 => "Board rejected recovery as UNAUTHORIZED (3); no reset applied.",
-                        4 => "Board rejected recovery as STALE (4): it holds no fresh recorded Query for this request (check board network time sync), or a launch owner is still active. No reset applied.",
-                        5 => "Board rejected recovery as UNSAFE (5); outputs or owner not stopped. No reset applied.",
-                        6 => "Board rejected recovery as INVALID (6); request did not match its recorded recovery. No reset applied.",
-                        _ => "Board rejected recovery with an unknown result; no reset applied.",
+                        2 => "Board rejected recovery as UNSUPPORTED (2); this board was not reset.",
+                        3 => "Board rejected recovery as UNAUTHORIZED (3); this board was not reset.",
+                        4 => "Board rejected recovery as STALE (4): it holds no fresh recorded Query for this request (check board network time sync), or a launch owner is still active. This board was not reset.",
+                        5 => "Board rejected recovery as UNSAFE (5); outputs or owner not stopped. This board was not reset.",
+                        6 => "Board rejected recovery as INVALID (6); request did not match its recorded recovery. This board was not reset.",
+                        _ => "Board rejected recovery with an unknown result; this board was not reset.",
                     });
                 }
             }
@@ -1702,6 +1730,37 @@ async fn exchange(
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+/// "Reset RF, FC; refused by VB (reason)" when some boards were reset and
+/// others were not, from the operation's `board_results`.
+fn partial_reset_message(operation: &Value, failure: &str) -> Option<String> {
+    let rows = operation["board_results"].as_array()?;
+    let with = |status: &str| rows.iter().filter(|row| row["result"] == status).map(|row| row["board"].as_str().unwrap_or("?").to_string()).collect::<Vec<_>>();
+    let reset = with("reset");
+    if reset.is_empty() {
+        return None;
+    }
+    let refused = rows
+        .iter()
+        .filter(|row| row["result"] == "refused")
+        .map(|row| format!("{} ({})", row["board"].as_str().unwrap_or("?"), row["detail"].as_str().unwrap_or(failure)))
+        .collect::<Vec<_>>();
+    let unreached = with("not_attempted");
+    let mut message = format!("Partly reset: {} reset to Startup.", reset.join(", "));
+    if !refused.is_empty() {
+        message.push_str(&format!(" Not reset: {}.", refused.join("; ")));
+    }
+    if !unreached.is_empty() {
+        message.push_str(&format!(" Not reached: {}.", unreached.join(", ")));
+    }
+    message.push_str(" Run Reset all again to finish the remaining boards.");
+    Some(message)
+}
+/// True when the operation reset no board (or recorded no per-board result).
+fn operation_reset_nothing(operation: Option<&Value>) -> bool {
+    operation
+        .and_then(|operation| operation["board_results"].as_array())
+        .is_none_or(|rows| rows.iter().all(|row| row["result"] != "reset"))
 }
 /// The boards a recovery touches. In-flight control work blocks it only when
 /// that work is owed to one of these boards, or to a board the station cannot
@@ -1863,6 +1922,20 @@ fn link_reaches_targets(state: &AppState, router: &sedsnet::router::Router, scop
 }
 /// Control work still owed to the scope's boards, if any.
 // Safety catalog (About safety): reset-all-boards. Keep backend/src/safety_catalog_rules.rs in step.
+#[cfg(test)]
+static ABORT_DRAIN_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Test only: an ABORT stays pending (a quiesce blocker) until dropped.
+#[cfg(test)]
+pub(super) fn abort_drain_hold_for_test(_state: &AppState) -> impl Drop {
+    struct Hold;
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            ABORT_DRAIN_HOLD.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    ABORT_DRAIN_HOLD.store(true, std::sync::atomic::Ordering::Release);
+    Hold
+}
 pub(super) fn quiesce_blockers(state: &AppState, router: &sedsnet::router::Router, scope: QuiesceScope) -> Vec<Blocker> {
     let ledger = |state: &AppState| {
         let mut out = Vec::new();
@@ -1875,6 +1948,10 @@ pub(super) fn quiesce_blockers(state: &AppState, router: &sedsnet::router::Route
         out
     };
     let mut blockers = ledger(state);
+    #[cfg(test)]
+    if ABORT_DRAIN_HOLD.load(std::sync::atomic::Ordering::Acquire) {
+        blockers.push(Blocker::Frame { name: "ABORT", boards: scope.targets, unnamed: false, retries: 0, supersedable: false });
+    }
     let mut rows = None;
     let affected = scope.with_relays();
     for name in crate::telemetry_task::RECOVERY_CONTROL_TYPES {
@@ -2297,6 +2374,27 @@ async fn run_inner(
         if wave_failed {
             break;
         }
+    }
+    // Per-board outcome for the operation result, so a partial reset is
+    // reported as one: which boards were reset, which refused and why, and
+    // which were not reached.
+    let board_results = ticket
+        .targets
+        .iter()
+        .map(|target| {
+            let outcome = results.iter().find(|(t, _)| t.board == target.board).map(|(_, result)| result);
+            let (status, detail) = match outcome {
+                Some(Ok(BoardResult::Applied(_))) if !reconcile_only => ("reset", None),
+                Some(Ok(BoardResult::Applied(_))) => ("refused", Some("identity reconciliation applies no reset")),
+                Some(Ok(BoardResult::Io(_))) => ("commissioning", None),
+                Some(Err(message)) => ("refused", Some(*message)),
+                None => ("not_attempted", None),
+            };
+            json!({"board": target.board.sender_id(), "result": status, "detail": detail})
+        })
+        .collect::<Vec<_>>();
+    if let Some(operation) = state.board_recovery.coordinator.0.lock().unwrap().operation.as_mut() {
+        operation["board_results"] = json!(board_results);
     }
     let mut completed = Vec::new();
     let mut failure = None;
@@ -5840,6 +5938,68 @@ mod tests {
         }
         let _ticket = fixture.prepare("reset_startup", None).await;
         assert_eq!(state.abort_resend.active_resends(), None, "no re-send after Reset all starts");
+    }
+    /// A late Abort copy moves one board's abort epoch after Reset all is
+    /// confirmed. The other boards are reset and that one refuses. The result
+    /// must say exactly that (never "No reset applied"), and the next Reset
+    /// all must finish the remaining board without the reset ones blocking it.
+    #[tokio::test]
+    async fn partial_reset_all_reports_each_board_and_a_retry_finishes_it() {
+        if isolated("partial_reset_all_reports_each_board_and_a_retry_finishes_it") { return; }
+        let fixture = Fixture::new().await;
+        *fixture.http.state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+        for board in BOARDS {
+            fixture.query(board).await;
+        }
+        let ticket = fixture.prepare("reset_startup", None).await;
+        let late = fixture.models.iter().find(|(board, _)| *board == Board::ValveBoard).unwrap().1.clone();
+        late.lock().unwrap().epoch += 1; // the delayed ABORT copy lands at VB
+        assert_eq!(fixture.confirm(&ticket).await.status(), StatusCode::OK);
+        let operation = fixture.terminal().await;
+        let applied = |f: &Fixture| f.models.iter().map(|(b, m)| (*b, m.lock().unwrap().applied)).collect::<Vec<_>>();
+        eprintln!("PARTIAL_RESET first={operation} applied={:?}", applied(&fixture));
+        assert_eq!(operation["success"], false, "{operation}");
+        let message = operation["message"].as_str().unwrap();
+        assert!(!message.contains("No reset applied") && !message.contains("no reset applied"), "{message}");
+        assert!(message.contains("VB") && message.contains("STALE"), "names the refusing board and why: {message}");
+        assert!(message.contains("RF") && message.contains("DAQ"), "names the boards that were reset: {message}");
+        let results = operation["board_results"].as_array().expect("per-board results");
+        assert_eq!(results.len(), BOARDS.len(), "{operation}");
+        // Retry: the reset boards must not block it, and VB is finished.
+        for board in BOARDS {
+            fixture.query(board).await;
+        }
+        let ticket = fixture.prepare("reset_startup", None).await;
+        assert_eq!(fixture.confirm(&ticket).await.status(), StatusCode::OK);
+        let operation = fixture.terminal().await;
+        eprintln!("PARTIAL_RESET retry={operation} applied={:?}", applied(&fixture));
+        assert_eq!(operation["success"], true, "{operation}");
+        assert!(late.lock().unwrap().applied >= 1, "VB finished by the retry");
+    }
+    /// An ABORT that is still undelivered when the prepare drain gives up
+    /// refuses Reset all with a retryable reason instead of sealing queries
+    /// against an epoch about to move; the operator Abort re-send is re-armed.
+    #[tokio::test]
+    async fn prepare_refuses_while_an_abort_is_still_being_delivered_and_rearms_the_resend() {
+        if isolated("prepare_refuses_while_an_abort_is_still_being_delivered_and_rearms_the_resend") { return; }
+        let fixture = Fixture::new().await;
+        *fixture.http.state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+        let state = fixture.state();
+        for board in BOARDS {
+            fixture.query(board).await;
+        }
+        state.abort_resend.arm(state.manual_abort_intent.epoch(), crate::manual_abort_intent::WirePolicy::Untimed, None);
+        // Hold an ABORT pending for longer than the prepare drain.
+        let hold = super::abort_drain_hold_for_test(&state);
+        let response = super::super::tests::http(state.clone(), "POST", "/api/board-recovery/prepare", Some("operator"),
+            json!({"action":"reset_startup","boards":BOARDS.iter().map(|b|b.sender_id()).collect::<Vec<_>>(),"board":null,"mode":null,
+                   "backend_instance":hex(&state.board_recovery.identity.unwrap()),"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state))})).await;
+        drop(hold);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let value = body(response).await;
+        assert!(value["message"].as_str().unwrap_or_default().contains("still being delivered"), "{value}");
+        assert!(fixture.models.iter().all(|(_, m)| m.lock().unwrap().applied == 0));
+        assert_eq!(state.abort_resend.active_resends(), Some(0), "a bounced prepare re-arms the Abort re-send");
     }
     async fn changed_review_identity_is_rejected_without_adopting_fresh_query(change_boot: bool) {
         let fixture = Fixture::new().await;
