@@ -194,6 +194,34 @@ pub struct Status {
     pub recovery_budget: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_decision: Option<RelayDecision>,
+    /// RRLS only: why relay pacing is below the profile rate, for the operator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pacing_warning: Option<String>,
+}
+/// The RRLS relay paces for the modem copies it can prove. Without a modem
+/// readback it assumes S5=10, which caps the relay far below the profile rate
+/// (18% of 30 kbit/s); the relay then forwards only a fraction of what it
+/// hears. Say so instead of relaying slowly in silence.
+pub(crate) fn relay_pacing_warning(cap_percent: Option<u8>, proven_global_retries: Option<u16>) -> Option<String> {
+    let cap = cap_percent?;
+    Some(match proven_global_retries {
+        None => format!(
+            "Relay running at unproven-S5 pacing: no modem readback proves GLOBAL_RETRIES, so relaying is capped at {cap}% of the profile rate. Verify this station's modem."
+        ),
+        Some(s5) => format!("Relay capped at {cap}% of the profile rate: the modem reads GLOBAL_RETRIES={s5}."),
+    })
+}
+fn current_relay_pacing_warning(role: Role) -> Option<String> {
+    if role != Role::Rrls {
+        return None;
+    }
+    let profile = crate::comms::rfd_profile::active()?;
+    let cap = crate::comms::rfd_modem::link_share_cap_percent(
+        profile.modem.air_bps,
+        profile.transport.usable_air_bps,
+        crate::comms::rfd_modem::pacing_global_retries(),
+    );
+    relay_pacing_warning(cap, crate::comms::rfd_modem::link_global_retries())
 }
 pub fn status() -> Status {
     if let Some((_, shared)) = RADIO.get() {
@@ -217,6 +245,7 @@ pub fn status() -> Status {
                 "expected_tuple":m.budget_profile.map(|p|serde_json::json!({"uart_baud":p.baud,"usable_air_bps":p.usable_bps,"rf_share_percent":p.rf_share,"frame_overhead_bytes":p.overhead,"packet_burst_ms":p.burst_ms,"packet_gap_ms":p.gap_ms,"flags":p.flags})),
                 "actual_effective_tuple":m.budget_actual,"pending_queued_owner":m.queue.iter().any(|q|Mesh::budget_kind(&q.frame.bytes)),"inflight_owner":m.budget_inflight})),
             relay_decision: Some(m.relay_decision(now)),
+            pacing_warning: current_relay_pacing_warning(m.role),
         }
     } else {
         Status {
@@ -233,6 +262,7 @@ pub fn status() -> Status {
             settings_framing: None,
             recovery_budget: None,
             relay_decision: None,
+            pacing_warning: None,
         }
     }
 }
@@ -578,6 +608,14 @@ impl Mesh {
             self.direct_since = Some(now);
         }
         self.last_direct = Some(now);
+    }
+    /// Whether air this station's modem hears is charged against its own
+    /// pacing. An RRLS that is relaying hears mostly the AV-bay downlink it is
+    /// about to forward, already paid for by the RF board's own share; charging
+    /// it again starved the relay (rrls_relay_share_carries_the_downlink_it_hears).
+    /// The primary and an RRLS in standby keep charging heard air.
+    pub(crate) fn charges_heard_air(&self, now: u64) -> bool {
+        !(self.role == Role::Rrls && self.active(now))
     }
     pub fn active(&self, now: u64) -> bool {
         match self.role {
@@ -1180,12 +1218,15 @@ impl Mesh {
                 VOICE_EXPIRY_MS
             } else if q.independent_discovery() {
                 3_000
-            } else if q.priority == 255
-                || (q.priority < 254 && q.frame.bytes.get(3) == Some(&DOWN_DATA))
-            {
-                // Retain sparse reports through bounded sensor bursts. Reliable
-                // interactive controls retain their 250 ms deadline at priority 254.
-                // Stateful SDT fragments remain owned and ordered; never coalesce.
+            } else if q.priority == 255 || q.frame.bytes.get(3) == Some(&DOWN_DATA) {
+                // Retain sparse reports through bounded sensor bursts. Relayed
+                // downlink reliable state and receipts (board readbacks,
+                // FLIGHT_STATE, ACKs at priority 254) get the same lifetime: they
+                // are only useful if they arrive, and a late one is superseded,
+                // never harmful. With 250 ms they expired in any relay capacity
+                // gap while bulk telemetry survived. Uplink controls relayed to
+                // the AV bay keep 250 ms below: the station retransmits them
+                // every 250 ms. Stateful SDT fragments remain owned and ordered.
                 1500
             } else {
                 250
@@ -3735,30 +3776,141 @@ mod tests {
         }
     }
 
+    /// Relay share against the downlink the RRLS hears and must forward. Run
+    /// with RELAY_HEARD_AIR=1 to print the rates; returns (offered, sent) B/s.
+    fn relay_pacing_rates(charge_heard: bool, share: u8) -> (f64, f64) {
+        use crate::comms::rfd_capacity::{Capacity, Defaults, HeardAir};
+        use crate::comms::virtual_uart::WireDrain;
+        let mut cap = Capacity::from_defaults(115_200, Defaults {
+            air_bps: 30_000, overhead_bytes: 16, packet_burst_ms: 250, packet_gap_ms: 15, host_share_percent: 100,
+        });
+        let wall = std::time::Instant::now();
+        cap.apply_recovery_share(Some(share), wall, Some(1_000));
+        let mut heard = HeardAir::default();
+        let mut wire = WireDrain::default();
+        // The sim's RF downlink during a relay (run pyroB, 236-268 s): about
+        // 33 frames/s, 839 B/s at the RF UART. The RRLS hears all of it (plus
+        // modem packet overhead) and forwards each frame in an 8 B RR envelope.
+        let (frame, period_ms) = (25u64, 30u64);
+        let mut queue = 0u64;
+        let (mut offered, mut sent) = (0u64, 0u64);
+        for now in 1_000u64..21_000 {
+            if now % period_ms == 0 {
+                if charge_heard {
+                    heard.charge(&mut cap, wall, Some(now), frame + 16);
+                }
+                queue += 1;
+                offered += frame + 8 + 8;
+            }
+            if queue > 0 && wire.ready(now) && cap.ready_for(wall, Some(now), false) {
+                let len = (frame + 8 + 8) as usize;
+                cap.committed(wall, Some(now), len);
+                wire.committed(now, len, 115_200);
+                cap.drained_virtual(wire.stop_us());
+                queue -= 1;
+                sent += len as u64;
+            }
+        }
+        (offered as f64 / 20.0, sent as f64 / 20.0)
+    }
+
+    /// The heard-air decision comms.rs applies, driven by the real Mesh.
     #[test]
-    fn telemetry_retention_does_not_extend_reliable_control_deadlines() {
+    fn relaying_rrls_does_not_pay_for_the_downlink_it_relays() {
         crate::telemetry_schema::initialize().unwrap();
-        for (name, size, age, survives) in [
-            ("FLIGHT_COMMAND", 1, 251, false),
-            ("BATTERY_VOLTAGE", 4, 1_499, true),
-            ("BATTERY_VOLTAGE", 4, 1_501, false),
-        ] {
+        let mut relay = Mesh::new(Role::Rrls, 2);
+        assert!(relay.charges_heard_air(0), "an RRLS in standby charges heard air");
+        relay.incoming(true, &health(1, 0, false), 0);
+        assert!(relay.active(0) && !relay.charges_heard_air(0), "a relaying RRLS does not");
+        let primary = Mesh::new(Role::Primary, 1);
+        assert!(primary.charges_heard_air(0), "the primary keeps charging the RF air it hears");
+        // What that decision is worth at the drain profile, 35% relay share:
+        let (offered, relaying) = relay_pacing_rates(relay.charges_heard_air(0), 35);
+        let (_, charged) = relay_pacing_rates(primary.charges_heard_air(0), 35);
+        eprintln!("RELAY_PACING offered={offered:.0} relaying_rrls={relaying:.0} charged={charged:.0} B/s");
+        assert!(relaying >= 2.0 * charged, "the relay is not starved by its own heard charge: {relaying:.0} vs {charged:.0} B/s");
+        assert!(charged < 0.5 * offered, "the same heard downlink still charges a charged host: {charged:.0} of {offered:.0} B/s");
+    }
+
+    /// Even uncharged, the 35% share carries about 68% of the measured
+    /// downlink: 16 B of UART framing per 25 B frame. Needs the RRLS to batch
+    /// queued downlink frames per UART write, as the station does.
+    #[test]
+    #[ignore = "per-frame overhead: needs RRLS downlink batching"]
+    fn rrls_relay_share_carries_the_downlink_it_hears() {
+        let (offered, sent) = relay_pacing_rates(false, 35);
+        assert!(sent >= 0.95 * offered, "the 35% relay share carries the downlink: {sent:.0} of {offered:.0} B/s");
+    }
+
+    #[test]
+    fn unproven_s5_relay_pacing_is_reported_to_the_operator() {
+        // Without a modem readback the relay paces for S5=10: 18% of the profile.
+        let cap = crate::comms::rfd_modem::link_share_cap_percent(64_000, 30_000, 10);
+        assert_eq!(cap, Some(18));
+        let warning = relay_pacing_warning(cap, None).expect("unproven pacing is reported");
+        assert!(warning.contains("unproven-S5") && warning.contains("18%"), "{warning}");
+        assert!(relay_pacing_warning(cap, Some(10)).is_some_and(|w| w.contains("GLOBAL_RETRIES=10")));
+        // A proven S5=1 fits the profile: no cap, no warning.
+        assert_eq!(crate::comms::rfd_modem::link_share_cap_percent(64_000, 30_000, 1), None);
+        assert_eq!(relay_pacing_warning(None, Some(1)), None);
+    }
+
+    #[test]
+    fn relayed_downlink_state_survives_capacity_gaps_but_uplink_controls_keep_250_ms() {
+        // Downlink reliable state and receipts (board readbacks, FLIGHT_STATE,
+        // ACKs) are only useful if they arrive; a late copy is superseded by
+        // the next one, never harmful. They keep the 1.5 s relay lifetime of
+        // sparse telemetry, so a relay capacity gap longer than 250 ms no
+        // longer drops exactly the safety-relevant frames while bulk survives.
+        // An uplink control relayed to the AV bay keeps 250 ms: the station
+        // retransmits it every 250 ms, so a stale copy is never needed.
+        crate::telemetry_schema::initialize().unwrap();
+        let wire = |name: &str, size: usize, sender: &str, to: &str| {
             let packet = sedsnet::packet::Packet::new(
                 crate::telemetry_schema::data_type(name),
-                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
-                "RF",
+                &[crate::telemetry_schema::endpoint(to)],
+                sender,
                 0,
                 vec![0; size].into(),
             )
             .unwrap();
-            let wire = sedsnet::wire_format::pack_packet(&packet);
+            sedsnet::wire_format::pack_packet(&packet).to_vec()
+        };
+        for (name, size, age, survives) in [
+            ("BOARD_STATE_STATUS", 40, 251, true),
+            ("BOARD_STATE_STATUS", 40, 1_499, true),
+            ("BOARD_STATE_STATUS", 40, 1_501, false),
+            ("FLIGHT_STATE", 1, 1_499, true),
+            ("BATTERY_VOLTAGE", 4, 1_499, true),
+            ("BATTERY_VOLTAGE", 4, 1_501, false),
+        ] {
             let mut relay = Mesh::new(Role::Rrls, 2);
             relay.incoming(true, &health(1, 0, false), 0);
-            relay.incoming(false, &wire, 0);
-            assert_eq!(relay.pop(age).is_some(), survives, "{name} age{age}");
+            relay.incoming(false, &wire(name, size, "RF", "GROUND_STATION"), 0);
+            assert_eq!(relay.pop(age).is_some(), survives, "downlink {name} age {age}");
             assert_eq!(relay.dropped, u64::from(!survives));
             assert!(relay.queue.is_empty() && relay.bytes == 0);
         }
+        // Uplink: a station FLIGHT_COMMAND relayed to the AV bay.
+        for (age, survives) in [(249, true), (251, false)] {
+            let mut relay = Mesh::new(Role::Rrls, 2);
+            relay.incoming(true, &health(1, 0, false), 0);
+            relay.incoming(false, &wire("BATTERY_VOLTAGE", 4, "RF", "GROUND_STATION"), 0);
+            assert!(relay.pop(0).is_some(), "the RRLS hears the AV bay");
+            relay.incoming(true, &encode(UP_DATA, &wire("FLIGHT_COMMAND", 1, "GS", "FLIGHT_CONTROLLER")), 0);
+            assert_eq!(relay.pop(age).is_some(), survives, "uplink FLIGHT_COMMAND age {age}");
+        }
+        // Board state queued after bulk still leaves first.
+        let mut relay = Mesh::new(Role::Rrls, 2);
+        relay.incoming(true, &health(1, 0, false), 0);
+        relay.incoming(false, &wire("BATTERY_VOLTAGE", 4, "RF", "GROUND_STATION"), 0);
+        relay.incoming(false, &wire("BOARD_STATE_STATUS", 40, "RF", "GROUND_STATION"), 10);
+        let first = relay.pop(400).expect("a frame after a 400 ms gap");
+        let (_, body) = decode(&first.bytes).unwrap();
+        assert_eq!(
+            sedsnet::wire_format::peek_frame_info(body).unwrap().envelope.ty,
+            crate::telemetry_schema::data_type("BOARD_STATE_STATUS")
+        );
     }
 
     fn independent_address(now: u64) -> Vec<u8> {

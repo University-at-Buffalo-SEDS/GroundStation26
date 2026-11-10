@@ -503,6 +503,7 @@ async fn rrls_status(app: &axum::Router, out: &mut Fixtures) {
         settings_framing: None,
         recovery_budget: None,
         relay_decision: None,
+        pacing_warning: None,
     };
     let idle = serde_json::to_value(idle).unwrap();
     for key in idle.as_object().unwrap().keys() {
@@ -523,6 +524,7 @@ async fn rrls_status(app: &axum::Router, out: &mut Fixtures) {
         settings_framing: None,
         recovery_budget: None,
         relay_decision: None,
+        pacing_warning: None,
     };
     out.add("rrls/status-relaying", serde_json::to_value(relaying).unwrap());
 }

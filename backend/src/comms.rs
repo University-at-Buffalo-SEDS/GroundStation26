@@ -1074,6 +1074,7 @@ impl UartComms {
         wall: Instant,
         virtual_ms: Option<u64>,
     ) -> bool {
+        let mut charge_heard = true;
         let requested = if let Some(shared) = self.recovery.as_ref() {
             let mut mesh = shared.lock().unwrap();
             if let Some(expected) = mesh.budget_expected_profile() {
@@ -1090,7 +1091,9 @@ impl UartComms {
                     return false;
                 }
             }
-            mesh.recovery_air_share(mesh.now())
+            let now = mesh.now();
+            charge_heard = mesh.charges_heard_air(now);
+            mesh.recovery_air_share(now)
         } else {
             None
         };
@@ -1110,7 +1113,15 @@ impl UartComms {
             };
             capacity.apply_recovery_share(requested, wall, virtual_ms);
             let heard = self.heard_air.swap(0, std::sync::atomic::Ordering::Relaxed);
-            state.heard_air.charge(capacity, wall, virtual_ms, heard);
+            if charge_heard {
+                state.heard_air.charge(capacity, wall, virtual_ms, heard);
+            } else {
+                // A relaying RRLS: heard air is not charged, and no pending
+                // charge carries over when relaying ends. The reset credit is
+                // the normal ceiling, so the first charge afterwards takes no
+                // more than the normal 150 ms credit (HEARD_CREDIT_MAX_US).
+                state.heard_air = rfd_capacity::HeardAir::default();
+            }
             crate::telemetry_task::set_radio_paced_bytes_per_s(capacity.paced_bytes_per_s());
         }
         true
