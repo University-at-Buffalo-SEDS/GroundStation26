@@ -9,6 +9,12 @@ use std::sync::{Arc, Mutex};
 /// received an ABORT (None: never within `run_ms`), and the ABORT packets the
 /// station re-sent.
 fn abort_across_a_deaf_rf(resend: bool, deaf_ms: u64, run_ms: u64) -> (Option<u64>, u64) {
+    abort_across_rf(resend, deaf_ms, run_ms, false)
+}
+
+/// `readback_never`: the AV bay never reads back Aborted (its readback is
+/// stuck elsewhere) even though RF acknowledged the ABORT.
+fn abort_across_rf(resend: bool, deaf_ms: u64, run_ms: u64, readback_never: bool) -> (Option<u64>, u64) {
     let _serial = crate::RUNTIME_TUNING_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let previous = sedsnet::config::runtime_tuning_config();
     sedsnet::config::set_runtime_tuning_config(crate::network_delivery_tuning()).unwrap();
@@ -64,7 +70,7 @@ fn abort_across_a_deaf_rf(resend: bool, deaf_ms: u64, run_ms: u64) -> (Option<u6
     let mut sent = 0u64;
     while now.load(Ordering::Relaxed) < abort_at + run_ms {
         pump(5);
-        let owed = if got.lock().unwrap().is_some() { 0 } else { 0b111 };
+        let owed = if got.lock().unwrap().is_some() && !readback_never { 0 } else { 0b111 };
         if resend
             && resender
                 .step(&gs, Observation { now_ms: now.load(Ordering::Relaxed), epoch: 1, station_aborted: true, recovery: None, owed })
@@ -126,4 +132,16 @@ fn resend_stops_on_readback_reset_or_recovery() {
     resender.arm(1, WirePolicy::Untimed, None);
     assert_eq!(resender.step(&gs, seen(0b1111000, true, None)), None);
     assert_eq!(resender.active_resends(), None);
+}
+
+/// deploy-hitl-a1: the ABORT reached and was acknowledged by the AV bay at
+/// once, but RF and PB read back late (their readback queries waited on the
+/// radio). The re-send fired every second for 20 s; each copy re-latched the
+/// umbilical boards and held the radio's capacity. An acknowledged ABORT is
+/// never re-sent, however late the readback.
+#[test]
+fn an_acknowledged_abort_is_not_resent_for_a_late_readback() {
+    let (latched, sent) = abort_across_rf(true, 0, 20_000, true);
+    assert!(latched.is_some_and(|ms| ms < 500), "RF got it at once: {latched:?}");
+    assert_eq!(sent, 0, "no re-send of an acknowledged ABORT");
 }

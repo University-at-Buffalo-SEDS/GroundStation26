@@ -7,8 +7,10 @@
 //! and PB used to latch such an Abort only when a later recovery query reached
 //! them. Now, while the operator Abort is retained and a present AV-bay board
 //! this mode tracks does not yet read Aborted, the station sends the ABORT
-//! again whenever none is in flight (one at a time; a fresh packet ID, the
-//! original wire and stamp). It stops when every such board reads Aborted,
+//! again when the last one ran out of retries before that board acknowledged
+//! it (one at a time; a fresh packet ID, the original wire and stamp). An
+//! ABORT the AV bay acknowledged is never re-sent because its readback is
+//! late: every copy re-latches the umbilical boards and costs radio air. It stops when every such board reads Aborted,
 //! when the station leaves Aborted (Clear or Reset all), when a recovery is
 //! prepared or running, or on a newer operator Abort (which re-arms it).
 //! Re-sending an Abort only ever moves a board toward the safe state.
@@ -30,6 +32,10 @@ struct Armed {
     /// Resumed after a bounced recovery: take the next observed recovery
     /// identity as the baseline instead of treating it as a new recovery.
     adopt_recovery: bool,
+    /// The ABORT in flight as last seen: (AV-bay boards it still owed, its
+    /// retries). Only an ABORT that ran out of retries with an owed AV-bay
+    /// board still pending is sent again.
+    in_flight: Option<(u8, u32)>,
 }
 
 #[derive(Default)]
@@ -52,7 +58,7 @@ pub(crate) struct Observation {
 impl AbortResend {
     /// The SDK accepted the operator Abort `epoch` with `wire`.
     pub(crate) fn arm(&self, epoch: u64, wire: WirePolicy, recovery: Option<String>) {
-        *self.armed.lock().unwrap() = Some(Armed { epoch, wire, recovery, last_sent_ms: None, resends: 0, adopt_recovery: false });
+        *self.armed.lock().unwrap() = Some(Armed { epoch, wire, recovery, last_sent_ms: None, resends: 0, adopt_recovery: false, in_flight: None });
     }
     /// A recovery is being prepared: stop re-sending at once, before the
     /// coordinator drains in-flight ABORTs and takes its fresh queries, so no
@@ -107,17 +113,37 @@ impl AbortResend {
             return None;
         }
         let abort = crate::telemetry_schema::data_type("ABORT");
-        if router.export_reliable_pending_stats().iter().any(|row| row.data_type == abort) {
+        let rows = router.export_reliable_pending_stats();
+        let pending = rows
+            .iter()
+            .filter(|row| row.data_type == abort)
+            .map(|row| {
+                let boards = row.pending_destinations.iter().fold(0u8, |mask, owner| {
+                    crate::board_recovery::coordinator::pending_destination_board(router, *owner)
+                        .and_then(|board| crate::board_abort::BOARDS.iter().position(|b| *b == board))
+                        .map_or(mask, |i| mask | (1 << i))
+                });
+                (boards & AV_BAY_MASK, row.retries)
+            })
+            .max_by_key(|(_, retries)| *retries);
+        if let Some(row) = pending {
+            armed.in_flight = Some(row);
+            return None;
+        }
+        // No ABORT in flight. Send again only if the last one ran out of
+        // retries while an AV-bay board that still owes the Abort had not
+        // acknowledged it. One the AV bay acknowledged is never re-sent:
+        // a late readback is not a lost Abort.
+        let max_retries = sedsnet::config::runtime_tuning_config().reliable_max_retries;
+        let exhausted = armed
+            .in_flight
+            .take()
+            .is_some_and(|(boards, retries)| boards & owed != 0 && retries.saturating_add(3) >= max_retries);
+        if !exhausted {
             return None;
         }
         let retry_ms = u64::from(sedsnet::config::runtime_tuning_config().reliable_retransmit_ms.max(1));
         if armed.last_sent_ms.is_some_and(|last| seen.now_ms.saturating_sub(last) < retry_ms) {
-            return None;
-        }
-        // The first pass after arming only starts the clock: the original
-        // ABORT may not have reached the SDK's pending table yet.
-        if armed.last_sent_ms.is_none() {
-            armed.last_sent_ms = Some(seen.now_ms);
             return None;
         }
         match crate::telemetry_task::queue_manual_abort_wire_receipted(router, armed.wire) {
@@ -125,7 +151,7 @@ impl AbortResend {
                 armed.resends = armed.resends.saturating_add(1);
                 armed.last_sent_ms = Some(seen.now_ms);
                 log::warn!(
-                    "operator Abort re-sent ({}): no Aborted readback yet from {}",
+                    "operator Abort re-sent ({}): the last ABORT ran out of retries before {} acknowledged it",
                     armed.resends,
                     crate::board_abort::BOARDS
                         .iter()

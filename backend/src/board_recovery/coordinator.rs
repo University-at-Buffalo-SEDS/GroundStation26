@@ -1737,7 +1737,10 @@ fn partial_reset_message(operation: &Value, failure: &str) -> Option<String> {
     let rows = operation["board_results"].as_array()?;
     let with = |status: &str| rows.iter().filter(|row| row["result"] == status).map(|row| row["board"].as_str().unwrap_or("?").to_string()).collect::<Vec<_>>();
     let reset = with("reset");
-    if reset.is_empty() {
+    // Only a genuinely partial reset is reported this way. When every board
+    // was reset the failure came later (publication, final readback): keep
+    // its own reason.
+    if reset.is_empty() || reset.len() == rows.len() {
         return None;
     }
     let refused = rows
@@ -1755,6 +1758,17 @@ fn partial_reset_message(operation: &Value, failure: &str) -> Option<String> {
     }
     message.push_str(" Run Reset all again to finish the remaining boards.");
     Some(message)
+}
+#[cfg(test)]
+#[test]
+fn a_failure_after_every_board_reset_keeps_its_own_reason() {
+    let all = json!({"board_results": BOARDS.iter().map(|b| json!({"board": b.sender_id(), "result": "reset", "detail": null})).collect::<Vec<_>>()});
+    assert_eq!(partial_reset_message(&all, "Final readback timed out"), None);
+    let mut partial = all.clone();
+    partial["board_results"][4]["result"] = json!("refused");
+    partial["board_results"][4]["detail"] = json!("STALE");
+    let message = partial_reset_message(&partial, "x").unwrap();
+    assert!(message.contains("Not reset: VB (STALE)"), "{message}");
 }
 /// True when the operation reset no board (or recorded no per-board result).
 fn operation_reset_nothing(operation: Option<&Value>) -> bool {
