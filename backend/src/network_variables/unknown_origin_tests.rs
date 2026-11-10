@@ -2,6 +2,13 @@ use super::*;
 use sedsnet::router::RouterConfig;
 
 fn run(case: &str, retained: Option<(u8, u64)>) {
+    run_with(case, retained, true)
+}
+
+/// `get`: whether the board asks with a managed GET. Boards back off an
+/// unanswered GET to every 4 s, so a station that has or acquires an
+/// authoritative state must push it, not wait for the next GET.
+fn run_with(case: &str, retained: Option<(u8, u64)>, get: bool) {
     const CHILD: &str = "GS_UNKNOWN_ORIGIN_CHILD";
     if std::env::var(CHILD).ok().as_deref() != Some(case) {
         let root = std::env::temp_dir().join(format!("gs-origin-{}", rand::random::<u128>()));
@@ -74,7 +81,9 @@ fn run(case: &str, retained: Option<(u8, u64)>) {
     });
     source.announce_discovery().unwrap();
     peer.announce_discovery().unwrap();
-    peer.request_managed_variable(ty).unwrap();
+    if get {
+        peer.request_managed_variable(ty).unwrap();
+    }
     for _ in 0..32 {
         source.process_all_queues().unwrap();
         peer.process_all_queues().unwrap();
@@ -86,9 +95,9 @@ fn run(case: &str, retained: Option<(u8, u64)>) {
             .iter()
             .all(|(_, stamp)| *stamp != 0)
     );
-    if let Some(expected) = expected {
+    if let (true, Some(expected)) = (get, expected) {
         assert_eq!(observations.lock().unwrap().last().copied(), Some(expected));
-    } else {
+    } else if expected.is_none() {
         assert!(observations.lock().unwrap().is_empty());
     }
     publish_current(&source).unwrap();
@@ -104,6 +113,13 @@ fn run(case: &str, retained: Option<(u8, u64)>) {
             .all(|(_, stamp)| *stamp != 0),
         "refresh must not publish zero origin"
     );
+    if let (false, Some(expected)) = (get, expected) {
+        assert_eq!(
+            observations.lock().unwrap().last().copied(),
+            Some(expected),
+            "bootstrap pushes retained authoritative state without a board GET"
+        );
+    }
     assert_eq!(
         store().lock().unwrap().values.flight_state_stamp,
         before.flight_state_stamp
@@ -141,4 +157,16 @@ fn retained_idle_origin() {
 #[test]
 fn retained_launch_is_history() {
     run("retained_launch_is_history", Some((7, 1000)))
+}
+#[test]
+fn retained_idle_pushed_without_get() {
+    run_with("retained_idle_pushed_without_get", Some((0, 1000)), false)
+}
+#[test]
+fn retained_abort_pushed_without_get() {
+    run_with("retained_abort_pushed_without_get", Some((15, 1000)), false)
+}
+#[test]
+fn unknown_origin_new_state_pushed_without_get() {
+    run_with("unknown_origin_new_state_pushed_without_get", None, false)
 }
