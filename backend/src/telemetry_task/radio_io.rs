@@ -4980,6 +4980,8 @@ impl OrderedExhaustion {
         let pending: std::collections::BTreeSet<u64> =
             router.export_reliable_pending_stats().iter().map(|row| row.packet_id).collect();
         let flight_state = crate::telemetry_schema::data_type("FLIGHT_STATE");
+        let flight_command = crate::telemetry_schema::data_type("FLIGHT_COMMAND");
+        let command_heads: Vec<u64>;
         let heads = {
             let mut guard = self.state.lock().unwrap();
             let (sampled, counts) = &mut *guard;
@@ -4995,8 +4997,12 @@ impl OrderedExhaustion {
             if gone.is_empty() {
                 *counts.entry("unsampled".into()).or_default() += 1;
             }
+            command_heads = gone.iter().filter(|(_, ty, _)| *ty == flight_command).map(|(id, _, _)| *id).collect();
             gone.iter().filter(|(_, ty, _)| *ty == flight_state).map(|(id, _, _)| *id).collect::<Vec<_>>()
         };
+        // An operator flight command queued behind a retired one was dropped
+        // with it; the telemetry task decides whether to send it again.
+        crate::operator_command_resend::note_retired(router, &command_heads);
         match crate::network_variables::resend_dropped_flight_state(router, &heads) {
             Ok(true) => log::warn!("FLIGHT_STATE: the latest value was dropped behind an exhausted write; sent it again"),
             Ok(false) => {}

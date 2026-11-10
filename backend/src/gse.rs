@@ -4662,7 +4662,12 @@ pub(crate) fn queue_controller_with_launch_revision(
                 // retry this exact original packet/ticket, never a new intent.
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-        Ok(result)=>return result.map(|()|true),
+        Ok(result)=>return result.map(|()|{
+            if kind == crate::telemetry_schema::data_type("FLIGHT_COMMAND") {
+                crate::operator_command_resend::note_queued(router, packet.packet_id());
+            }
+            true
+        }),
         Err(_)=>return Ok(false),
     }
     }

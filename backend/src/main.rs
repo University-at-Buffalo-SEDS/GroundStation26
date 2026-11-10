@@ -79,6 +79,7 @@ mod network_health;
 mod network_traffic;
 mod network_variables;
 mod operator_queue;
+mod operator_command_resend;
 mod operator_phase;
 mod primary_mirror;
 mod qualification_requests;

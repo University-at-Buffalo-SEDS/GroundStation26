@@ -93,6 +93,12 @@ pub fn rearm_for_new_cycle(state: &AppState) {
     LEDGER.lock().unwrap().retain(|(k, _)| *k != key);
 }
 
+/// Whether this launch cycle already reported `kind` (FC message or state).
+pub fn already_deployed(state: &AppState, kind: Deployment) -> bool {
+    let key = station_key(state);
+    LEDGER.lock().unwrap().iter().any(|(k, seen)| *k == key && seen[kind.index()])
+}
+
 fn claim(state: &AppState, kind: Deployment) -> bool {
     let key = station_key(state);
     let mut ledger = LEDGER.lock().unwrap();

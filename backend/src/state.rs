@@ -816,6 +816,9 @@ impl AppState {
     }
 
     pub fn set_abort_indicator_latched(&self, latched: bool) {
+        if latched {
+            crate::operator_command_resend::note_abort(self);
+        }
         self.abort_indicator_latched
             .store(latched, Ordering::SeqCst);
     }

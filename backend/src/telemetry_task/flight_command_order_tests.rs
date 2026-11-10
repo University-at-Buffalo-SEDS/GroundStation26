@@ -132,11 +132,203 @@ fn deploy_behind_an_unacknowledged_fc_command_waits_at_most_one_retry_span() {
 /// the Deploy although the link came back while the operator's press was still
 /// live. The Deploy must reach the FC.
 #[test]
-#[ignore = "reproduces the Ordered FLIGHT_COMMAND strand (the Deploy is dropped unsent); enabled with its fix"]
-fn deploy_behind_an_exhausted_fc_command_still_reaches_the_fc() {
+#[ignore = "the raw SDK strand without the station's re-send: kept to show the SDK behaviour"]
+fn sdk_drops_a_command_queued_behind_an_exhausted_one() {
     let span = reliable_retry_span_ms();
     let delivered = flight_command_bay(span + 1_000, &[(0, 14), (2_000, 12)], span + 6_000);
-    eprintln!("DEPLOY_BEHIND_EXHAUSTED span={span} delivered={delivered:?}");
-    let deploy = delivered[1].unwrap_or_else(|| panic!("Deploy was dropped behind the exhausted command: {delivered:?}"));
-    assert!(deploy <= span + 750, "Deploy reached the FC {deploy} ms after it was pressed (span {span} ms)");
+    eprintln!("SDK_DROPS_BEHIND_EXHAUSTED span={span} delivered={delivered:?}");
+    assert_eq!(delivered, vec![None, None], "the SDK alone drops the queued command");
+}
+
+/// What happens between the operator's presses in `operator_bay`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Between {
+    Nothing,
+    /// An Abort latched and cleared again (R3).
+    AbortLatched,
+    /// Another operator command dispatched (R3).
+    NewerCommand,
+    /// The Deploy press is made to look older than its retry span (R2).
+    PressAged,
+    /// The Deploy was queued by the station itself, not pressed (R9).
+    Automatic,
+}
+
+/// The station (real AppState, HITL, flight state `flight`) and the FC on
+/// real SDK routers. The FC is unreachable for span + 1 s. The operator
+/// presses EvaluationRelax at 0 and Deploy at 2 s, so the Deploy waits behind
+/// it and is dropped when EvaluationRelax exhausts. Returns when the FC got
+/// the Deploy after its press (ms) and the station's notifications.
+async fn operator_bay(flight: crate::types::FlightState, between: Between) -> (Option<u64>, Vec<String>) {
+    let _mode = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Hitl);
+    let state = crate::state::tests::test_app_state().await;
+    let _tuning = StationTuning::install();
+    crate::telemetry_schema::initialize().unwrap();
+    state.action_policy.lock().unwrap().software_buttons_enabled = true;
+    *state.state.lock().unwrap() = flight;
+    let span = reliable_retry_span_ms();
+    let outage_ms = span + 1_000;
+    let host = Arc::new(Router::new(RouterConfig::new([]).with_sender("GS")));
+    crate::telemetry_task::refresh_host_network_time(&host, get_current_timestamp_ms());
+    let got = Arc::new(Mutex::new(Vec::<(u8, std::time::Instant)>::new()));
+    let seen = got.clone();
+    let fc = Arc::new(Router::new(
+        RouterConfig::new([EndpointHandler::new_packet_handler(
+            crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"),
+            move |packet| {
+                seen.lock().unwrap().push((packet.payload()[0], std::time::Instant::now()));
+                Ok(())
+            },
+        )])
+        .with_sender("FC"),
+    ));
+    let to_fc = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let out = to_fc.clone();
+    host.add_side_packed("FC", move |bytes| {
+        out.lock().unwrap().push(bytes.to_vec());
+        Ok(())
+    });
+    let to_host = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let back = to_host.clone();
+    fc.add_side_packed("GS", move |bytes| {
+        back.lock().unwrap().push(bytes.to_vec());
+        Ok(())
+    });
+    let mut backoff = RadioRefusalBackoff::default();
+    let mut pump = |link_up: bool| {
+        process_router_queues_with_backoff(&host, None, &mut backoff);
+        crate::operator_command_resend::service(&state, &host);
+        for bytes in std::mem::take(&mut *to_fc.lock().unwrap()) {
+            if link_up {
+                let _ = fc.rx_packed_from_side(&bytes, 0);
+            }
+        }
+        let _ = fc.process_all_queues_with_timeout(0);
+        for bytes in std::mem::take(&mut *to_host.lock().unwrap()) {
+            if link_up {
+                let _ = host.rx_packed_from_side(&bytes, 0);
+            }
+        }
+    };
+    fc.announce_discovery().unwrap();
+    host.announce_discovery().unwrap();
+    for _ in 0..50 {
+        pump(true);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    got.lock().unwrap().clear();
+    // What the telemetry task does for an operator's HITL flight command.
+    let press = |byte: u8, operator: bool| {
+        if operator {
+            crate::operator_command_resend::note_operator_dispatch(&state);
+        }
+        let before = crate::operator_command_resend::pending_flight_commands(&host);
+        crate::telemetry_task::queue_locally_routed_flight_command(&state, &host, "test", &[byte]).unwrap();
+        if operator {
+            crate::operator_command_resend::record_operator_press(&state, &host, byte, &before);
+        }
+    };
+    let start = std::time::Instant::now();
+    let ms = || start.elapsed().as_millis() as u64;
+    let (mut relax, mut deploy_at, mut disturbed) = (false, None, false);
+    while ms() < span + 2_500 {
+        if !relax {
+            press(14, true);
+            relax = true;
+        }
+        if deploy_at.is_none() && ms() >= 2_000 {
+            press(12, between != Between::Automatic);
+            deploy_at = Some(std::time::Instant::now());
+        }
+        if !disturbed && ms() >= 3_000 {
+            disturbed = true;
+            match between {
+                Between::AbortLatched => {
+                    state.set_abort_indicator_latched(true);
+                    state.set_abort_indicator_latched(false);
+                }
+                Between::NewerCommand => crate::operator_command_resend::note_operator_dispatch(&state),
+                Between::PressAged => crate::operator_command_resend::backdate_press_for_test(&host, span),
+                _ => {}
+            }
+        }
+        pump(ms() >= outage_ms);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let sent = deploy_at.unwrap();
+    let delivered = got.lock().unwrap().iter().find(|(b, at)| *b == 12 && *at >= sent).map(|(_, at)| (*at - sent).as_millis() as u64);
+    let notes = state.notifications_snapshot().into_iter().map(|n| n.message).collect();
+    (delivered, notes)
+}
+
+fn noted(notes: &[String], words: &str) -> bool {
+    notes.iter().any(|n| n.contains("Deploy") && n.contains(words))
+}
+
+/// R1, R5, R8: the Deploy dropped behind the exhausted EvaluationRelax is
+/// re-sent once and reaches the FC as soon as the link returns, inside the
+/// press's own retry span, with its own notification.
+#[tokio::test]
+async fn deploy_dropped_behind_an_exhausted_fc_command_is_resent() {
+    let span = reliable_retry_span_ms();
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::Nothing).await;
+    eprintln!("DEPLOY_RESENT span={span} delivered={delivered:?} notes={notes:?}");
+    let ms = delivered.unwrap_or_else(|| panic!("the Deploy never reached the FC: {notes:?}"));
+    assert!(ms <= span + 750, "Deploy reached the FC {ms} ms after the press (span {span})");
+    assert!(noted(&notes, "re-sent after the link recovered"), "{notes:?}");
+}
+
+/// R3: an Abort after the press means no re-send, and the operator is told.
+#[tokio::test]
+async fn deploy_is_not_resent_after_an_abort() {
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::AbortLatched).await;
+    assert_eq!(delivered, None, "{notes:?}");
+    assert!(noted(&notes, "not re-sent: an Abort"), "{notes:?}");
+}
+
+/// R3: a newer operator command means no re-send.
+#[tokio::test]
+async fn deploy_is_not_resent_after_a_newer_operator_command() {
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::NewerCommand).await;
+    assert_eq!(delivered, None, "{notes:?}");
+    assert!(noted(&notes, "a newer operator command"), "{notes:?}");
+}
+
+/// R2: a press older than its retry span is not re-sent; the operator is told.
+#[tokio::test]
+async fn deploy_older_than_its_retry_span_is_not_resent_and_is_reported() {
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::PressAged).await;
+    assert_eq!(delivered, None, "{notes:?}");
+    assert!(noted(&notes, "beyond its"), "{notes:?}");
+}
+
+/// R7: the FC would refuse a Deploy at or before Armed; no re-send.
+#[tokio::test]
+async fn deploy_the_fc_would_refuse_is_not_resent() {
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Armed, Between::Nothing).await;
+    assert_eq!(delivered, None, "{notes:?}");
+    assert!(noted(&notes, "would now refuse"), "{notes:?}");
+}
+
+/// R9: a command the station queued itself is never re-sent.
+#[tokio::test]
+async fn automatic_station_command_is_never_resent() {
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::Automatic).await;
+    assert_eq!(delivered, None, "{notes:?}");
+    assert!(!noted(&notes, "re-sent"), "{notes:?}");
+}
+
+/// R2/R3/R4/R7 precedence: safety first, then age, then the FC's view.
+#[test]
+fn resend_verdict_follows_the_rules() {
+    use crate::operator_command_resend::{verdict, Context, Verdict};
+    let ok = Context { age: Duration::from_millis(1_000), span: Duration::from_millis(4_500), aborted: false,
+        newer_command: false, effect_seen: false, admissible: true };
+    assert_eq!(verdict(&ok), Verdict::Resend);
+    assert_eq!(verdict(&Context { aborted: true, ..ok }), Verdict::Aborted);
+    assert_eq!(verdict(&Context { newer_command: true, ..ok }), Verdict::Superseded);
+    assert_eq!(verdict(&Context { age: Duration::from_millis(4_500), ..ok }), Verdict::TooOld);
+    assert_eq!(verdict(&Context { effect_seen: true, ..ok }), Verdict::AlreadyDone);
+    assert_eq!(verdict(&Context { admissible: false, ..ok }), Verdict::Inadmissible);
+    assert_eq!(verdict(&Context { aborted: true, age: Duration::from_millis(9_000), ..ok }), Verdict::Aborted);
 }

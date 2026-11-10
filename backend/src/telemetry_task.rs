@@ -870,6 +870,9 @@ pub async fn telemetry_task(
                         }
                         command => (command, None, None, None, None, None),
                     };
+                    if _operator_claim.is_some() {
+                        crate::operator_command_resend::note_operator_dispatch(&state);
+                    }
                     let sealed_phase=matches!(cmd,TelemetryCommand::OperatorPhase{..});
                     let cmd = if let TelemetryCommand::OperatorPhase { mut intent } = cmd {
                         if let Some(origin)=recovery_origin
@@ -1462,6 +1465,7 @@ pub async fn telemetry_task(
                         | TelemetryCommand::ReinitAfter30
                         | TelemetryCommand::ReinitAfter50 if crate::runtime_mode::is_hitl() => {
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
+                                let before = crate::operator_command_resend::pending_flight_commands(&router);
                                 if let Err(e) = queue_locally_routed_flight_command(
                                     &state,
                                     &router,
@@ -1470,6 +1474,9 @@ pub async fn telemetry_task(
                                 ) {
                                     log_telemetry_error("failed to log HITL flight command", e);
                                 } else {
+                                    if _operator_claim.is_some() {
+                                        crate::operator_command_resend::record_operator_press(&state, &router, cmd_id, &before);
+                                    }
                                     flush_command_tx(&router, "HITL flight command tx");
                                 }
                                 gs_debug_println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
@@ -1508,6 +1515,7 @@ pub async fn telemetry_task(
                     }
                 }
                 _ = handle_interval.tick() => {
+                    crate::operator_command_resend::service(&state, &router);
                     if crate::network_variables::reconcile_network_outputs_for_state(&state, &router) {
                         sequences::refresh_action_policy_now(&state);
                         state.broadcast_action_policy_snapshot();
