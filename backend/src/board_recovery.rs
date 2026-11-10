@@ -202,8 +202,14 @@ pub(crate) struct Runtime {
     /// or resync, in station wall ms. A board may briefly stop sampling while
     /// it drives its outputs safe; its warnings from that window are not faults.
     apply_requested_ms: [std::sync::atomic::AtomicU64; 7],
+    /// Why background AV-bay status queries are paused, while they are
+    /// (`ReadonlyQueryRefresh`); shown on the AV-bay rows and in the status.
+    av_bay_paused: Mutex<Option<&'static str>>,
 }
 impl Runtime {
+    pub(crate) fn av_bay_pause_reason(&self) -> Option<&'static str> {
+        *self.av_bay_paused.lock().unwrap()
+    }
     pub(crate) fn note_apply_requested(&self, board: Board) {
         if let Some(i) = index(board) {
             self.apply_requested_ms[i].store(
@@ -241,6 +247,7 @@ impl Default for Runtime {
                 last_rejection: None,
             }),
             apply_requested_ms: Default::default(),
+            av_bay_paused: Mutex::new(None),
         }
     }
 }
@@ -1002,6 +1009,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
     let host_pending = state.launch_history.lock().unwrap().recovery_pending();
     let actual_abort_mask = state.board_abort.masks().0;
     let unsatisfied_pending = unsatisfied_pending_mask(&state);
+    let av_bay_paused = state.board_recovery.av_bay_pause_reason();
     let boards=BOARDS.iter().enumerate().map(|(at,&board)| {
         // A pending target that a fresh verified readback shows healthy no
         // longer needs recovery; only the unsatisfied ones are shown.
@@ -1031,6 +1039,13 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
             .or_else(|| resync_board_block_reason(board, readback, resync_target_state))).flatten();
         let (readback_status, message) = recovery_diagnostic(primary, verified, network_utc_available,
             observation, queries[at].as_ref(), now, reconcilable);
+        // While background AV-bay queries are paused, say where the row comes
+        // from instead of promising an automatic refresh.
+        let message = match av_bay_paused {
+            Some(_) if AV_BAY_INDICES.contains(&at) && matches!(readback_status, "query_required" | "readback_expired") =>
+                "Automatic status queries to the AV bay are paused while its radio link is degraded; this row is the last board readback, and the board's own status reports still arrive. Query or Recover asks the board directly.",
+            _ => message,
+        };
         let operation=queries[at].as_ref().map(|query| {
             let mut operation_id=digest::Context::new(&digest::SHA256);operation_id.update(&identity);operation_id.update(&query.nonce.to_le_bytes());operation_id.update(board.sender_id().as_bytes());
             let pending=!query.received&&now.checked_duration_since(query.sent).is_some_and(|age|age<=QUERY_TTL);
@@ -1057,7 +1072,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
     let build = serde_json::to_value(mode.local_build_mode).unwrap();
     Json(json!({"version":1,"backend_instance":hex(&identity),"principal":{"username":principal.username,"context":principal_context(&identity,&headers,&principal)},"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state)),"flight_state":state.local_flight_state_snapshot()as u8,"automatic_actions_inhibited":state.launch_history.lock().unwrap().automatic_actions_inhibited(),
         "clock":{"network_utc_available":network_utc_available,"required_for_recovery":true},
-        "permissions":{"query":primary,"recover":can_recover,"reset_startup":can_reset_startup,"change_mode":false},"reset_startup_blocked_reason":reset_startup_blocked,"recover_blocked_reason":recover_blocked,
+        "permissions":{"query":primary,"recover":can_recover,"reset_startup":can_reset_startup,"change_mode":false},"reset_startup_blocked_reason":reset_startup_blocked,"recover_blocked_reason":recover_blocked,"av_bay_status_queries_paused":av_bay_paused,
         "resync_target_state":resync_target_state,"resync_target_label":resync_target_state.map(phase_label),
         "reset_startup_policy":reset_startup_policy,
         "confirmation":confirmation,"host_recovery":host_pending.map(|pending|json!({"pending":!pending.published,"verified":pending.verified,"publication_acknowledged":pending.published,"targets":pending.targets.iter().map(|target|target.board.as_str()).collect::<Vec<_>>()})),
@@ -1078,6 +1093,12 @@ pub(crate) struct ReadonlyQueryRefresh {
     misses: [u8; 7],
     /// No new AV-bay query while an Abort's umbilical readback is owed.
     av_bay_held: bool,
+    /// Background AV-bay queries paused since then, because the AV-bay radio
+    /// path is degraded. BOARD_RECOVERY_REQUEST is one ordered SDK stream, so
+    /// an AV-bay query waiting on a slow or lost radio path holds every
+    /// umbilical query behind it for its whole retry span (about 4.5 s), and
+    /// drops them if it gives up.
+    av_bay_paused_since: Option<WallInstant>,
 }
 impl ReadonlyQueryRefresh {
     fn due(&self, at: usize, now: WallInstant) -> bool {
@@ -1104,7 +1125,7 @@ impl ReadonlyQueryRefresh {
             return false;
         };
         let now = WallInstant::now();
-        if !self.due(at, now) {
+        if !self.due(at, now) || (self.av_bay_paused_since.is_some() && AV_BAY_INDICES.contains(&at)) {
             return false;
         }
         // Never replace a query still awaiting its reply (for example the one
@@ -1127,6 +1148,66 @@ impl ReadonlyQueryRefresh {
     pub(crate) fn hold_av_bay(&mut self, held: bool) {
         self.av_bay_held = held;
     }
+    /// Pause background AV-bay queries while the AV-bay radio path is
+    /// degraded: the primary relies on an RRLS relay, or a background AV-bay
+    /// query went unanswered past its retry window. Resume, visibly, only when
+    /// the direct path is back and every present AV-bay board has sent a
+    /// status report since the pause. Operator queries and recovery (Reset
+    /// all's fresh queries included) are never paused.
+    fn update_av_bay_pause(&mut self, state: &Arc<AppState>, now: Stamp) {
+        let relaying = crate::rrls::primary_relaying();
+        let lost = {
+            let inner = state.board_recovery.inner.lock().unwrap();
+            AV_BAY_INDICES.iter().any(|&at| {
+                inner.queries[at].as_ref().is_some_and(|query| {
+                    !query.received && now.checked_duration_since(query.sent).is_some_and(|age| age > query_retry())
+                })
+            })
+        };
+        match self.av_bay_paused_since {
+            None if relaying || lost => {
+                let reason = if relaying {
+                    "the AV bay is reached through the RRLS relay"
+                } else {
+                    "an AV-bay status query went unanswered"
+                };
+                log::warn!("AV-bay background status queries paused: {reason}; rows show status reports until the link is healthy");
+                self.av_bay_paused_since = Some(now.wall);
+                *state.board_recovery.av_bay_paused.lock().unwrap() = Some(reason);
+            }
+            Some(since) if !relaying => {
+                // Every AV-bay board this mode tracks must have reported since
+                // the pause. A board that stays silent keeps the pause: there
+                // is nothing to query it about until it is heard again.
+                let scope = scope::mode_scope(crate::station_mode::local_mode());
+                let reported = state.board_status.try_lock().ok().is_some_and(|status| {
+                    AV_BAY_INDICES.iter().filter(|&&at| scope & (1 << at) != 0).all(|&at| {
+                        status
+                            .get(&BOARDS[at])
+                            .and_then(|row| row.last_seen_instant)
+                            .is_some_and(|seen| seen.checked_duration_since(since).is_some())
+                    })
+                });
+                if reported {
+                    log::info!("AV-bay background status queries resumed: the direct path is back and every AV-bay board reported since the pause");
+                    self.av_bay_paused_since = None;
+                    for at in AV_BAY_INDICES {
+                        self.misses[at] = 0;
+                    }
+                    // A query lost while paused must not re-pause at once.
+                    let mut inner = state.board_recovery.inner.lock().unwrap();
+                    for at in AV_BAY_INDICES {
+                        if inner.queries[at].as_ref().is_some_and(|query| !query.received) {
+                            inner.queries[at] = None;
+                        }
+                    }
+                    drop(inner);
+                    *state.board_recovery.av_bay_paused.lock().unwrap() = None;
+                }
+            }
+            _ => {}
+        }
+    }
     pub(crate) fn poll(&mut self, state: &Arc<AppState>) -> Option<Board> {
         if crate::rrls::is_rrls() || !coordinator::readonly_query_idle(state) {
             return None;
@@ -1142,7 +1223,9 @@ impl ReadonlyQueryRefresh {
             .lock()
             .unwrap()
             .snapshot(now.wall, crate::runtime_mode::is_test_fire());
-        let (last, core_busy_last, misses, av_bay_held) = (self.last, self.core_busy_last, self.misses, self.av_bay_held);
+        self.update_av_bay_pause(state, now);
+        let (last, core_busy_last, misses, av_bay_held) =
+            (self.last, self.core_busy_last, self.misses, self.av_bay_held || self.av_bay_paused_since.is_some());
         // Only boards this mode tracks (test fire has no AV bay).
         let scope = scope::mode_scope(crate::station_mode::local_mode());
         let picks = {
@@ -1182,7 +1265,9 @@ impl ReadonlyQueryRefresh {
     }
 }
 /// AV-bay (radio) and umbilical (fill) board indices into BOARDS.
-const LINK_GROUPS: [&[usize]; 2] = [&[0, 1, 2], &[3, 4, 5, 6]];
+const LINK_GROUPS: [&[usize]; 2] = [&AV_BAY_INDICES, &[3, 4, 5, 6]];
+/// RF, FC and PB in BOARDS.
+const AV_BAY_INDICES: [usize; 3] = [0, 1, 2];
 /// At most one due board per link per pass, each link with its own cursor.
 fn pick_per_link(cursor: &mut [usize; 2], eligible: impl Fn(usize) -> bool) -> Vec<usize> {
     let mut picks = Vec::new();

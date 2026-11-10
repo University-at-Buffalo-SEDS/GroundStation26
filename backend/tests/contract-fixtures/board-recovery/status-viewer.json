@@ -1,5 +1,6 @@
 {
   "automatic_actions_inhibited": false,
+  "av_bay_status_queries_paused": null,
   "backend_instance": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
   "boards": [
     {

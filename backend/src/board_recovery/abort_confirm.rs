@@ -18,6 +18,12 @@ use super::*;
 pub(crate) const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 /// A board that answered without showing the Abort is asked again after this.
 const CONFIRM_REQUERY: Duration = Duration::from_millis(250);
+/// The window stays open this long at most while an AV-bay query (one ordered
+/// BOARD_RECOVERY_REQUEST stream) still holds the umbilical queries behind it.
+const CONFIRM_WINDOW_MAX: Duration = Duration::from_secs(10);
+/// A prompt query unanswered this long was most likely dropped with the
+/// ordered stream's tail when an AV-bay query ahead of it gave up: ask again.
+const CONFIRM_LOST: Duration = Duration::from_secs(3);
 /// Umbilical (fill) board indices into BOARDS.
 const UMBILICAL: [usize; 4] = [3, 4, 5, 6];
 
@@ -26,6 +32,8 @@ pub(crate) struct AbortConfirmRefresh {
     since: Option<Stamp>,
     /// Umbilical boards (BOARDS mask) whose Abort readback is still owed.
     owed: u8,
+    /// An AV-bay BOARD_RECOVERY_REQUEST was in flight at the last poll.
+    av_bay_head: bool,
 }
 impl AbortConfirmRefresh {
     /// Start (or restart) the window for an Abort the station just sent.
@@ -37,8 +45,9 @@ impl AbortConfirmRefresh {
     /// Abort readback.
     pub(crate) fn active(&mut self) -> bool {
         let now = Stamp::now();
+        let window = if self.av_bay_head { CONFIRM_WINDOW_MAX } else { CONFIRM_WINDOW };
         if self.owed == 0
-            || self.since.is_some_and(|since| now.checked_duration_since(since).is_none_or(|age| age >= CONFIRM_WINDOW))
+            || self.since.is_some_and(|since| now.checked_duration_since(since).is_none_or(|age| age >= window))
         {
             self.since = None;
             self.owed = 0;
@@ -48,6 +57,9 @@ impl AbortConfirmRefresh {
     /// Ask the umbilical boards that still owe an Abort readback. Returns the
     /// mask (BOARDS order) of boards a query went to.
     pub(crate) fn poll(&mut self, state: &Arc<AppState>) -> u8 {
+        if self.since.is_some() {
+            self.av_bay_head = state.topology_router.get().is_some_and(|router| av_bay_query_in_flight(router));
+        }
         if !self.active() || crate::rrls::is_rrls() {
             return 0;
         }
@@ -70,13 +82,31 @@ impl AbortConfirmRefresh {
         })
     }
 }
+/// Whether an AV-bay BOARD_RECOVERY_REQUEST is in flight: the one ordered
+/// stream then holds every umbilical query behind it.
+fn av_bay_query_in_flight(router: &sedsnet::router::Router) -> bool {
+    let ty = crate::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST");
+    router.export_reliable_pending_stats().iter().any(|row| {
+        row.data_type == ty
+            && row.pending_destinations.iter().any(|owner| {
+                coordinator::pending_destination_board(router, *owner)
+                    .is_some_and(|board| matches!(board, Board::RFBoard | Board::FlightComputer | Board::PowerBoard))
+            })
+    })
+}
 /// Whether a board needs a prompt query now, given its latest query.
 fn confirm_query_due(query: Option<&Query>, since: Stamp, now: Stamp) -> bool {
     match query {
         // Asked since the Abort: wait for the reply, then ask again shortly
-        // after a reply that did not show the Abort.
+        // after a reply that did not show the Abort, or once the query looks
+        // lost (dropped behind an AV-bay query that gave up).
         Some(query) if query.sent.checked_duration_since(since).is_some() => {
-            query.received && now.checked_duration_since(query.sent).is_some_and(|age| age >= CONFIRM_REQUERY)
+            let age = now.checked_duration_since(query.sent);
+            if query.received {
+                age.is_some_and(|age| age >= CONFIRM_REQUERY)
+            } else {
+                age.is_some_and(|age| age >= CONFIRM_LOST)
+            }
         }
         // Not asked since the Abort; an older query cannot show it.
         _ => true,
@@ -100,6 +130,9 @@ mod tests {
         assert!(confirm_query_due(Some(&query(since - Duration::from_millis(500), true)), since, at(0)));
         // One prompt query in flight at a time.
         assert!(!confirm_query_due(Some(&query(at(10), false)), since, at(2_000)));
+        // Unanswered past CONFIRM_LOST: dropped with the ordered stream's tail
+        // behind an AV-bay query that gave up. Ask again.
+        assert!(confirm_query_due(Some(&query(at(10), false)), since, at(10) + CONFIRM_LOST));
         // It answered without the Abort (an Aborted reply sets the board's
         // Abort row and stops the asking): ask again shortly after.
         assert!(!confirm_query_due(Some(&query(at(10), true)), since, at(200)));
@@ -152,5 +185,42 @@ mod tests {
         }
         assert_eq!(confirm.poll(&state), 0);
         assert!(!confirm.active(), "every umbilical board reads Aborted: the window closes early");
+    }
+
+    /// Relay-cut runs: an AV-bay query waiting on the radio holds the one
+    /// ordered BOARD_RECOVERY_REQUEST stream, so the umbilical confirm queries
+    /// sit behind it for up to its 4.5 s retry span. The window must not close
+    /// at 3 s while that query is still in flight.
+    #[tokio::test]
+    async fn the_window_stays_open_while_an_av_bay_query_holds_the_ordered_stream() {
+        let fixture = crate::board_recovery::tests::http_fixture().await;
+        let state = fixture.state.clone();
+        let host = Arc::new(Router::new(RouterConfig::new([]).with_sender("GS")));
+        assert!(state.topology_router.set(host.clone()).is_ok());
+        let opts = RouterSideOptions { reliable_enabled: true, ..Default::default() };
+        // The radio never takes a frame; the umbilical is fine.
+        let radio = host.add_side_packed_with_options("rocket_comms", |_| Err(sedsnet::TelemetryError::Io("side tx busy")), opts.clone());
+        let _umbilical = host.add_side_packed_with_options("umbilical_comms", |_| Ok(()), opts);
+        let announce = sedsnet::discovery::build_discovery_announce(
+            "FC", 1, &[crate::telemetry_schema::endpoint(endpoint(Board::FlightComputer))]).unwrap();
+        host.rx_from_side(&announce, radio).unwrap();
+        host.process_all_queues_with_timeout(0).unwrap();
+        host.tx_queue(sedsnet::packet::Packet::new(
+            crate::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST"),
+            &[crate::telemetry_schema::endpoint(endpoint(Board::FlightComputer))], "GS", 1, Arc::from(&[0u8; 32][..])).unwrap()).unwrap();
+        let _ = host.process_all_queues_with_timeout(0);
+        assert!(av_bay_query_in_flight(&host), "the FC query holds the ordered stream");
+        for board in BOARDS {
+            state.board_status.lock().unwrap().get_mut(&board).unwrap().last_seen_instant = Some(std::time::Instant::now());
+        }
+        let mut confirm = AbortConfirmRefresh::default();
+        confirm.start();
+        let _ = confirm.poll(&state);
+        tokio::time::sleep(CONFIRM_WINDOW + Duration::from_millis(300)).await;
+        for board in BOARDS {
+            state.board_status.lock().unwrap().get_mut(&board).unwrap().last_seen_instant = Some(std::time::Instant::now());
+        }
+        let _ = confirm.poll(&state);
+        assert!(confirm.active(), "still open past {CONFIRM_WINDOW:?} while the AV-bay query is in flight");
     }
 }

@@ -480,3 +480,47 @@ async fn stale_commissioning_identity_allows_only_prepare_not_actual_recovery_pr
             .all(Option::is_none)
     );
 }
+
+/// Relay-cut runs: background AV-bay queries waiting on a lost radio path
+/// held the one ordered BOARD_RECOVERY_REQUEST stream, so the umbilical rows
+/// read back an Abort 4-23 s after the boards latched it. The background
+/// refresh pauses AV-bay queries while the AV-bay path is degraded, says so
+/// on the rows, and resumes only when the direct path is back and every
+/// AV-bay board has reported since the pause.
+#[tokio::test]
+async fn background_av_bay_queries_pause_while_the_av_bay_path_is_degraded() {
+    let fixture = tests::http_fixture().await;
+    let state = fixture.state.clone();
+    let mut refresh = ReadonlyQueryRefresh::default();
+    let seen = |state: &Arc<AppState>| {
+        let mut status = state.board_status.lock().unwrap();
+        for board in [Board::RFBoard, Board::FlightComputer, Board::PowerBoard] {
+            status.get_mut(&board).unwrap().last_seen_instant = Some(std::time::Instant::now());
+        }
+    };
+    // A background FC query went unanswered past its retry window.
+    state.board_recovery.inner.lock().unwrap().queries[1] =
+        Some(Query { abort_revision: 0, nonce: 9, sent: Stamp::now() - query_retry() - Duration::from_millis(100), received: false });
+    refresh.update_av_bay_pause(&state, Stamp::now());
+    assert_eq!(state.board_recovery.av_bay_pause_reason(), Some("an AV-bay status query went unanswered"));
+    assert!(!refresh.request(&state, Board::FlightComputer), "no background AV-bay query while paused");
+    // Status reports from every AV-bay board since the pause prove the link: resume.
+    std::thread::sleep(Duration::from_millis(5));
+    seen(&state);
+    refresh.update_av_bay_pause(&state, Stamp::now());
+    assert_eq!(state.board_recovery.av_bay_pause_reason(), None, "resumed after status reports");
+    // The primary relies on the RRLS relay: paused even with fresh reports,
+    // until the direct path is back and the boards have reported again.
+    crate::rrls::set_primary_relaying_for_test(true);
+    refresh.update_av_bay_pause(&state, Stamp::now());
+    assert_eq!(state.board_recovery.av_bay_pause_reason(), Some("the AV bay is reached through the RRLS relay"));
+    std::thread::sleep(Duration::from_millis(5));
+    seen(&state);
+    refresh.update_av_bay_pause(&state, Stamp::now());
+    assert!(state.board_recovery.av_bay_pause_reason().is_some(), "still relaying");
+    crate::rrls::set_primary_relaying_for_test(false);
+    std::thread::sleep(Duration::from_millis(5));
+    seen(&state);
+    refresh.update_av_bay_pause(&state, Stamp::now());
+    assert_eq!(state.board_recovery.av_bay_pause_reason(), None, "direct path back and reported");
+}

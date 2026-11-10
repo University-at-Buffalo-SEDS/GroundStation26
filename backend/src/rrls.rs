@@ -82,6 +82,17 @@ pub fn is_rrls() -> bool {
     std::env::var("GS_RRLS_ROLE").ok().as_deref() == Some("rrls")
 }
 
+/// The primary has asked an RRLS to relay: its direct AV-bay path is lost.
+static PRIMARY_RELAYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether this primary currently relies on an RRLS for the AV bay.
+pub(crate) fn primary_relaying() -> bool {
+    PRIMARY_RELAYING.load(std::sync::atomic::Ordering::Acquire)
+}
+#[cfg(test)]
+pub(crate) fn set_primary_relaying_for_test(relaying: bool) {
+    PRIMARY_RELAYING.store(relaying, std::sync::atomic::Ordering::Release);
+}
+
 pub type Shared = Arc<Mutex<Mesh>>;
 static RADIO: OnceLock<(String, Shared)> = OnceLock::new();
 
@@ -697,6 +708,9 @@ impl Mesh {
         }
     }
     fn set_relay(&mut self, fallback: bool, now: u64, reason: RelayReason) {
+        if self.role == Role::Primary {
+            PRIMARY_RELAYING.store(fallback, std::sync::atomic::Ordering::Release);
+        }
         if self.fallback != fallback {
             self.relay_transitions = self.relay_transitions.saturating_add(1);
             log::info!(
