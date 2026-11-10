@@ -1151,8 +1151,8 @@ impl ReadonlyQueryRefresh {
     /// Pause background AV-bay queries while the AV-bay radio path is
     /// degraded: the primary relies on an RRLS relay, or a background AV-bay
     /// query went unanswered past its retry window. Resume, visibly, only when
-    /// the direct path is back and every present AV-bay board has sent a
-    /// status report since the pause. Operator queries and recovery (Reset
+    /// the direct path is back, at least AV_BAY_MIN_PAUSE has passed, and every
+    /// AV-bay board has sent a status report since the pause. Operator queries and recovery (Reset
     /// all's fresh queries included) are never paused.
     fn update_av_bay_pause(&mut self, state: &Arc<AppState>, now: Stamp) {
         let relaying = crate::rrls::primary_relaying();
@@ -1175,7 +1175,7 @@ impl ReadonlyQueryRefresh {
                 self.av_bay_paused_since = Some(now.wall);
                 *state.board_recovery.av_bay_paused.lock().unwrap() = Some(reason);
             }
-            Some(since) if !relaying => {
+            Some(since) if !relaying && now.wall.checked_duration_since(since).is_some_and(|paused| paused >= av_bay_min_pause()) => {
                 // Every AV-bay board this mode tracks must have reported since
                 // the pause. A board that stays silent keeps the pause: there
                 // is nothing to query it about until it is heard again.
@@ -1268,6 +1268,13 @@ impl ReadonlyQueryRefresh {
 const LINK_GROUPS: [&[usize]; 2] = [&AV_BAY_INDICES, &[3, 4, 5, 6]];
 /// RF, FC and PB in BOARDS.
 const AV_BAY_INDICES: [usize; 3] = [0, 1, 2];
+/// A paused AV-bay refresh stays paused at least one reliable retry span
+/// (250 ms x 18), so a lost query's tail has drained before the next one goes
+/// and status reports alone cannot make it flap.
+const AV_BAY_MIN_PAUSE: Duration = Duration::from_millis(4_500);
+fn av_bay_min_pause() -> Duration {
+    crate::sim_freshness::wall(AV_BAY_MIN_PAUSE)
+}
 /// At most one due board per link per pass, each link with its own cursor.
 fn pick_per_link(cursor: &mut [usize; 2], eligible: impl Fn(usize) -> bool) -> Vec<usize> {
     let mut picks = Vec::new();

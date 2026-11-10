@@ -813,10 +813,13 @@ async fn refresh_prepare_queries(
             log::info!("Recovery PREPARE waited {} ms for an Abort to be delivered before its fresh queries", start.elapsed().as_millis());
         }
     }
-    // Query every board at once, so the earliest prepared query is not aged
-    // by the later boards' round trips before CONFIRM. Each board keeps its own
-    // read-only slot, nonce and freshness wait.
-    let results = futures::future::join_all(boards.into_iter().map(|board| async move {
+    // BOARD_RECOVERY_REQUEST is one ordered SDK stream: one query in flight at
+    // a time, whatever the board. Ask the umbilical boards first, all at once
+    // (their round trips are short), so none waits behind a radio query; then
+    // the AV-bay boards one at a time, each with the full freshness wait. Sent
+    // together, the three radio queries ran back to back in the one stream
+    // and the last missed the window (deploy-hitl: Reset all failed 3 of 3).
+    let query_one = |board: Board| async move {
         // Background status collection may already own this read-only slot.
         // Replace it at once with a DISTINCT nonce instead of waiting for it:
         // on a slow link that wait alone could use most of the window. The
@@ -859,14 +862,35 @@ async fn refresh_prepare_queries(
                 break;
             }
             if start.elapsed() > network_wait(QUERY_TTL) {
-                return Err("Fresh query timed out before challenge");
+                return Err(if AV_BAY_MASK & index(board).map_or(0, |i| 1 << i) != 0 {
+                    "An AV-bay board's fresh query got no reply within 15 s over the radio (the radio round trip is the limit); run Reset all again"
+                } else {
+                    "Fresh query timed out before challenge"
+                });
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         Ok::<(), &'static str>(())
-    }))
-    .await;
-    results.into_iter().collect::<Result<Vec<()>, _>>()?;
+    };
+    let is_av_bay = |board: &Board| index(*board).is_some_and(|i| AV_BAY_MASK & (1 << i) != 0);
+    let (av_bay, umbilical): (Vec<Board>, Vec<Board>) = boards.into_iter().partition(is_av_bay);
+    futures::future::join_all(umbilical.iter().copied().map(query_one))
+        .await
+        .into_iter()
+        .collect::<Result<Vec<()>, _>>()?;
+    for board in &av_bay {
+        query_one(*board).await?;
+    }
+    // The radio queries ran one after another: re-ask, once, any whose
+    // readback aged out while the later ones were answered.
+    for board in &av_bay {
+        let stale = state.board_recovery.inner.lock().unwrap().values[index(*board).unwrap()]
+            .as_ref()
+            .is_none_or(|row| !row.fresh(Stamp::now()));
+        if stale {
+            query_one(*board).await?;
+        }
+    }
     Ok(())
 }
 // Retry only a rejected, never-owned read-only offer, before Confirm seals UTC.

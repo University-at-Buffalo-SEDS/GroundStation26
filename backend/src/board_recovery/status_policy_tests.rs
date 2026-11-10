@@ -504,11 +504,19 @@ async fn background_av_bay_queries_pause_while_the_av_bay_path_is_degraded() {
     refresh.update_av_bay_pause(&state, Stamp::now());
     assert_eq!(state.board_recovery.av_bay_pause_reason(), Some("an AV-bay status query went unanswered"));
     assert!(!refresh.request(&state, Board::FlightComputer), "no background AV-bay query while paused");
-    // Status reports from every AV-bay board since the pause prove the link: resume.
+    // Status reports right away do not end the pause: the lost query's retry
+    // span must run out first, or the refresh flaps (deploy-hitl: ten
+    // pause/resume pairs in 60 s, resuming 0.25 s after pausing).
     std::thread::sleep(Duration::from_millis(5));
     seen(&state);
     refresh.update_av_bay_pause(&state, Stamp::now());
-    assert_eq!(state.board_recovery.av_bay_pause_reason(), None, "resumed after status reports");
+    assert!(state.board_recovery.av_bay_pause_reason().is_some(), "no resume within the minimum pause");
+    // After the minimum pause, reports from every AV-bay board since the
+    // pause prove the link: resume.
+    refresh.av_bay_paused_since = refresh.av_bay_paused_since.map(|since| since - av_bay_min_pause());
+    seen(&state);
+    refresh.update_av_bay_pause(&state, Stamp::now());
+    assert_eq!(state.board_recovery.av_bay_pause_reason(), None, "resumed after the minimum pause and status reports");
     // The primary relies on the RRLS relay: paused even with fresh reports,
     // until the direct path is back and the boards have reported again.
     crate::rrls::set_primary_relaying_for_test(true);
@@ -520,6 +528,7 @@ async fn background_av_bay_queries_pause_while_the_av_bay_path_is_degraded() {
     assert!(state.board_recovery.av_bay_pause_reason().is_some(), "still relaying");
     crate::rrls::set_primary_relaying_for_test(false);
     std::thread::sleep(Duration::from_millis(5));
+    refresh.av_bay_paused_since = refresh.av_bay_paused_since.map(|since| since - av_bay_min_pause());
     seen(&state);
     refresh.update_av_bay_pause(&state, Stamp::now());
     assert_eq!(state.board_recovery.av_bay_pause_reason(), None, "direct path back and reported");
