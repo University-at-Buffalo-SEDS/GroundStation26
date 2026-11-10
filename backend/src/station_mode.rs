@@ -718,10 +718,11 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
             let observation = {
                 let mut link = mesh.lock().unwrap();
                 let now = link.now();
+                let (connected, session) = mode_link(&link, now);
                 Observation {
                     now,
-                    connected: link.settings_available(now),
-                    session: link.operating_mode_session(now),
+                    connected,
+                    session,
                     frames: (0..4).filter_map(|_| link.take_operating_mode()).collect(),
                 }
             };
@@ -777,6 +778,11 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/api/station_mode", get(status))
 }
+/// The mesh link the mode worker follows (connected, session).
+fn mode_link(link: &crate::rrls::Mesh, now: u64) -> (bool, Option<u32>) {
+    link.mode_sync_link(now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,6 +1093,70 @@ mod tests {
         assert_eq!(snapshot.effective_mode, Some(local_mode()));
         assert!(snapshot.synchronized && snapshot.persisted);
         assert_eq!(snapshot.primary_station.as_deref(), Some(crate::rrls_sim_primary::PRIMARY_ID));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    /// pyroI (candidate 7ad9582): RRLS-issued commands over the relay were
+    /// 503 "matching current mode". The relaying RRLS misses runs of HEALTH;
+    /// each 2 s gap dropped its mode session, cleared the verified mode, and
+    /// re-verifying needed a round trip across the hidden node. A 3 s gap must
+    /// keep the verified mode, like the paired control link (6 s).
+    #[test]
+    fn rrls_mode_sync_survives_a_three_second_health_gap() {
+        use crate::rrls::{Mesh, Role};
+        let root = root();
+        crate::rrls_sim_primary::write_pairing(&root).unwrap();
+        let rr_pairing = Pairing::from_file(&root.join("rrls/pairing.json")).unwrap();
+        let gs_pairing = Pairing::from_file(&root.join("primary/pairing.json")).unwrap();
+        let mut gs =
+            crate::rrls_sim_primary::SimulatedPrimary::new(gs_pairing, root.join("generation"))
+                .unwrap();
+        let mut rr = Mesh::new(Role::Rrls, 5);
+        let mut observer = Runtime::new(&rr_pairing, true, root.join("rrls-mode")).unwrap();
+        let mut up = Vec::new();
+        for step in 0..100u64 {
+            let now = step * 50;
+            let frames = gs.step(now, std::mem::take(&mut up));
+            // 2 s to 5 s: hidden-node collisions, the RRLS hears nothing.
+            if !(2_000..5_000).contains(&now) {
+                for frame in frames {
+                    rr.incoming(frame.command, &frame.bytes, now);
+                }
+            }
+            let (connected, session) = mode_link(&rr, now);
+            observer.connect_mesh(connected, session);
+            while let Some(wire) = rr.take_operating_mode() {
+                observer.receive(&rr_pairing, &wire, now).unwrap();
+            }
+            if observer.connected && observer.last_verified.is_none() && observer.pending.is_none() {
+                let nonce = format!("{:032x}", rand::random::<u128>());
+                observer.pending = Some((nonce.clone(), now));
+                let query = seal(&rr_pairing, crate::rrls_sim_primary::PRIMARY_ID, Message::Query { nonce }).unwrap();
+                assert!(rr.queue_settings(&query, now));
+            }
+            rr.tick(now);
+            while let Some(frame) = rr.pop(now) {
+                if !(2_000..5_000).contains(&now) {
+                    up.push((frame.command, frame.bytes));
+                }
+            }
+            if now == 1_950 {
+                assert!(observer.snapshot(now).synchronized, "synchronized before the gap");
+            }
+            if (2_000..5_000).contains(&now) {
+                assert!(observer.snapshot(now).synchronized, "still synchronized {} ms into the gap", now - 2_000);
+            }
+        }
+        // The bound holds the other way too: past PROXY_LEASE_MS without
+        // HEALTH the mode session ends and the verified mode is dropped.
+        let silent_from = 10_000;
+        for step in 0..80u64 {
+            let now = silent_from + step * 100;
+            let (connected, session) = mode_link(&rr, now);
+            observer.connect_mesh(connected, session);
+            rr.tick(now);
+            while rr.pop(now).is_some() {}
+        }
+        assert!(!observer.snapshot(silent_from + 7_900).synchronized, "mode dropped once HEALTH is gone for over 6 s");
         std::fs::remove_dir_all(root).unwrap();
     }
     fn fixture(root: &Path, id: &str, seed: u8) -> Pairing {

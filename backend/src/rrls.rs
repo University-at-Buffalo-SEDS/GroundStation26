@@ -2135,6 +2135,24 @@ impl Mesh {
                 .and(self.primary_session),
         }
     }
+    /// The link the station-mode worker follows: (connected, session). A
+    /// relaying RRLS misses runs of HEALTH to hidden-node collisions; like
+    /// its paired control link (command_proxy_transport) it keeps the
+    /// primary's session for PROXY_LEASE_MS rather than dropping the
+    /// verified mode at each 2 s gap. A different session still replaces it
+    /// only through accepted HEALTH. The primary is unchanged.
+    pub(crate) fn mode_sync_link(&self, now: u64) -> (bool, Option<u32>) {
+        if self.role == Role::Primary {
+            return (self.settings_available(now), self.operating_mode_session(now));
+        }
+        let fresh = self
+            .health_received
+            .is_some_and(|last| now >= last && now - last < PROXY_LEASE_MS);
+        (
+            fresh || self.settings_available(now),
+            if fresh { self.primary_session } else { None },
+        )
+    }
     pub fn settings_available(&self, now: u64) -> bool {
         let radio_seen = match self.role {
             Role::Primary => self.relay_seen,
