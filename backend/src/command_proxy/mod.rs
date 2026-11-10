@@ -17,6 +17,10 @@ use wire::{Envelope, Message, Outcome};
 
 const MAX_RESULTS: usize = 64;
 const SEQUENCE_WINDOW: u32 = 4;
+/// A reply that exactly matches the RRLS's own outstanding query or request
+/// is accepted up to this many periods after it was sealed: the request's own
+/// timeout. Over a hidden-node relay one GS-RRLS round trip can take 4 s.
+const LATE_REPLY_WINDOW: u32 = SEQUENCE_WINDOW * 2;
 const DISCOVERY_COOLDOWN_MS: u64 = 30_000;
 /// RRLS live view of the primary's control observation (fill boards
 /// included). One signed QueryObserve and one Capability reply per period,
@@ -103,6 +107,9 @@ struct Runtime {
     boot: [u8; 16],
     session: Option<u32>,
     query: Option<[u8; 16]>,
+    /// RRLS: the request it last sealed, until its result is accepted. Only
+    /// this request's result may arrive after the normal sequence window.
+    awaiting: std::cell::Cell<Option<[u8; 16]>>,
     capability: Option<([u8; 16], Mode, u64)>,
     results: VecDeque<Cached>,
     observation: Vec<u8>,
@@ -128,6 +135,7 @@ impl Runtime {
             role,
             session: None,
             query: None,
+            awaiting: std::cell::Cell::new(None),
             capability: None,
             results: VecDeque::new(),
             observation: Vec::new(),
@@ -302,6 +310,7 @@ impl Runtime {
         } else {
             ensure!(launch_origin.is_none(), "Unexpected launch origin");
         }
+        self.awaiting.set(Some(request));
         wire::seal(
             pairing,
             self.peer(pairing)?,
@@ -335,8 +344,20 @@ impl Runtime {
         );
         let primary = self.role == Role::Primary;
         let envelope = wire::open(pairing, bytes, if primary { "rrls" } else { "primary" })?;
+        // Over a hidden-node relay the RRLS can hear a reply after its view
+        // moved past the window. It still takes one that exactly matches its
+        // own outstanding query or request, until that exchange's timeout.
+        // The primary's request freshness is unchanged.
+        let own_late_reply = !primary
+            && transport.session == envelope.session
+            && transport.sequence.wrapping_sub(envelope.sequence) <= LATE_REPLY_WINDOW
+            && match envelope.message {
+                Message::Capability { .. } => self.query == Some(envelope.request),
+                Message::Reply { .. } => self.awaiting.get() == Some(envelope.request),
+                _ => false,
+            };
         ensure!(
-            transport.accepts(&envelope, primary),
+            transport.accepts(&envelope, primary) || own_late_reply,
             "Stale primary connection contract"
         );
         match envelope.message.clone() {
@@ -468,6 +489,11 @@ impl Runtime {
                             .is_some_and(|(boot, _, _)| boot == envelope.boot),
                     "Wrong primary result boot"
                 );
+                if self.awaiting.get() == Some(envelope.request) {
+                    self.awaiting.set(None);
+                } else {
+                    ensure!(!own_late_reply, "Stale primary connection contract");
+                }
                 Ok(Received::Result {
                     boot: envelope.boot,
                     request: envelope.request,
@@ -594,6 +620,58 @@ mod tests {
     /// primary's sequence lags several HEALTH periods. Sealed on the RRLS's
     /// extrapolated view (rrls command_proxy_transport), a query and its reply
     /// are accepted without widening the freshness window.
+    /// pyroH2: over the hidden-node relay the primary's capability reply
+    /// reached the RRLS after its view had moved past SEQUENCE_WINDOW, and was
+    /// refused as stale, so RRLS commands stayed 503. A reply that exactly
+    /// matches the RRLS's own outstanding query is accepted until that query's
+    /// timeout; nothing else is.
+    #[test]
+    fn a_delayed_reply_to_the_rrls_own_query_is_accepted_until_its_timeout() {
+        let (_root, p, r) = fixtures();
+        let mut primary = Runtime::new(Role::Primary);
+        let mut rr = Runtime::new(Role::Rrls);
+        let sealed = Transport { session: 7, sequence: 20 };
+        primary.connect(Some(Transport { session: 7, sequence: 21 }));
+        rr.connect(Some(sealed));
+        let query = rr.query(&r, sealed).unwrap();
+        let Received::Reply(reply) = primary.receive(&p, Transport { session: 7, sequence: 21 }, Mode::Hitl, &query).unwrap() else {
+            panic!("capability reply")
+        };
+        // Past the late bound the reply is refused even though it matches.
+        let too_late = Transport { session: 7, sequence: 20 + LATE_REPLY_WINDOW + 1 };
+        assert!(rr.receive(&r, too_late, Mode::Normal, &reply).is_err());
+        // Beyond the 4-period window but within the query's timeout: accepted.
+        let later = Transport { session: 7, sequence: 20 + SEQUENCE_WINDOW + 2 };
+        assert!(matches!(rr.receive(&r, later, Mode::Normal, &reply).unwrap(), Received::Capability { .. }));
+        // Replayed once the query is answered: refused.
+        assert!(rr.receive(&r, later, Mode::Normal, &reply).is_err());
+    }
+    #[test]
+    fn a_late_reply_that_is_not_the_rrls_own_outstanding_exchange_is_rejected() {
+        let (_root, p, r, mut primary, mut rr, pview, rview) = connected();
+        // Another query's reply (a different nonce), arriving late.
+        let mut other = Runtime::new(Role::Rrls);
+        other.connect(Some(rview));
+        let foreign = other.query(&r, rview).unwrap();
+        let Received::Reply(foreign_reply) = primary.receive(&p, pview, Mode::Hitl, &foreign).unwrap() else {
+            panic!("capability reply")
+        };
+        let _ = rr.query(&r, rview).unwrap();
+        let late = Transport { sequence: rview.sequence + SEQUENCE_WINDOW + 2, ..rview };
+        assert!(rr.receive(&r, late, Mode::Normal, &foreign_reply).is_err(), "unmatched nonce");
+        // A command result for this RRLS's own request, delayed past the window:
+        // accepted once; a replay, or a result for another request, is not.
+        rr.query = None;
+        let request = rr.request(&r, rview, Mode::Hitl, [5; 16], "operator".into(), Operation::Command("Pilot".into())).unwrap();
+        let Received::Execute(work) = primary.receive(&p, pview, Mode::Hitl, &request).unwrap() else { panic!("execute") };
+        let result = primary.finish(&p, work, Outcome::Queued).unwrap();
+        assert!(matches!(rr.receive(&r, late, Mode::Normal, &result).unwrap(), Received::Result { .. }));
+        assert!(rr.receive(&r, late, Mode::Normal, &result).is_err(), "replayed result");
+        let _ = rr.request(&r, rview, Mode::Hitl, [6; 16], "operator".into(), Operation::Command("Pilot".into())).unwrap();
+        assert!(rr.receive(&r, late, Mode::Normal, &result).is_err(), "result for another request");
+        // Within the normal window replies keep their existing behaviour.
+        assert!(matches!(rr.receive(&r, rview, Mode::Normal, &result).unwrap(), Received::Result { .. }));
+    }
     #[test]
     fn capability_exchange_survives_a_lagging_health_view() {
         let (_root, p, r) = fixtures();
@@ -1832,13 +1910,12 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                         continue;
                     }
                     let sequence_age = view.sequence.wrapping_sub(pending.sequence);
+                    // At most three copies; the result may still arrive until the
+                    // request's own timeout (LATE_REPLY_WINDOW), since a relayed
+                    // round trip can outlast the sequence window.
                     if !available
                         || pending.session != view.session
-                        || sequence_age > SEQUENCE_WINDOW
-                        || pending.attempts >= 3
-                            && pending
-                                .last_sent
-                                .is_some_and(|last| now >= last && now - last >= 500)
+                        || sequence_age > LATE_REPLY_WINDOW
                     {
                         finish_pending(pending.id,"unknown",false,Some("Primary response was not confirmed; inspect actual state before retrying.".into()));
                         invalidate_presentation(&state);
@@ -1847,9 +1924,11 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                         query_attempts = 0;
                         last_query = None;
                         query_created_at = None;
-                    } else if pending
-                        .last_sent
-                        .is_none_or(|last| now >= last && now - last >= 500)
+                    } else if pending.attempts < 3
+                        && sequence_age <= SEQUENCE_WINDOW
+                        && pending
+                            .last_sent
+                            .is_none_or(|last| now >= last && now - last >= 500)
                     {
                         let required = match pending.operation {
                             Operation::Command(_) => crate::auth::Permission::SendCommands,
