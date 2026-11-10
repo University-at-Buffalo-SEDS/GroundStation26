@@ -4955,8 +4955,10 @@ mod notification_delivery_tests {
     }
 }
 
-/// One bounded live display frame, retaining each stream's latest row. Raw
-/// telemetry remains in DB/recent; a slow browser cannot queue seconds of frames.
+/// One bounded live display frame. Each stream keeps its recent rows, so a
+/// radio burst of several samples reaches the display instead of only the
+/// newest one. Raw telemetry remains in DB/recent; a slow browser still cannot
+/// queue seconds of frames (per-stream and stream-count caps, frame max age).
 #[derive(Default)]
 struct LatestWsTelemetry {
     pending: std::sync::Mutex<Option<PendingWsTelemetry>>,
@@ -4964,9 +4966,12 @@ struct LatestWsTelemetry {
 }
 struct PendingWsTelemetry {
     updated: Instant,
-    rows: HashMap<(String, String), TelemetryRow>,
+    rows: HashMap<(String, String), VecDeque<TelemetryRow>>,
 }
 const WS_LIVE_STREAM_CAP: usize = 1024;
+/// Rows kept per stream in one unsent frame. A 250 ms frame of a 40 Hz stream
+/// holds ten; anything beyond this is a slow display and keeps the newest.
+const WS_LIVE_ROWS_PER_STREAM: usize = 32;
 const WS_LIVE_FRAME_MAX_AGE: StdDuration = StdDuration::from_millis(250);
 const WS_WRITE_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 
@@ -4986,22 +4991,21 @@ impl LatestWsTelemetry {
                 if let Some(oldest) = pending
                     .rows
                     .iter()
-                    .min_by_key(|(_, row)| row.timestamp_ms)
+                    .min_by_key(|(_, rows)| rows.back().map_or(i64::MIN, |row| row.timestamp_ms))
                     .map(|(key, _)| key.clone())
                 {
                     pending.rows.remove(&oldest);
                 }
             }
-            match pending.rows.entry(key) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    if row.timestamp_ms >= entry.get().timestamp_ms {
-                        entry.insert(row);
-                    }
-                }
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(row);
-                }
+            let stream = pending.rows.entry(key).or_default();
+            // Older retransmissions cannot roll a stream backward.
+            if stream.back().is_some_and(|last| row.timestamp_ms < last.timestamp_ms) {
+                continue;
             }
+            if stream.len() >= WS_LIVE_ROWS_PER_STREAM {
+                stream.pop_front();
+            }
+            stream.push_back(row);
         }
         pending.updated = Instant::now();
         drop(slot);
@@ -5013,7 +5017,7 @@ impl LatestWsTelemetry {
             self.ready.notified().await;
             let frame = self.pending.lock().unwrap().take();
             if let Some(frame) = frame {
-                let mut rows: Vec<_> = frame.rows.into_values().collect();
+                let mut rows: Vec<_> = frame.rows.into_values().flatten().collect();
                 rows.sort_by_key(|row| row.timestamp_ms);
                 return (frame.updated, rows);
             }
@@ -5072,8 +5076,11 @@ mod ws_freshness_tests {
         let frame: serde_json::Value =
             serde_json::from_str(&next_ws_output(&mut rx, &latest).await.unwrap()).unwrap();
         assert_eq!(frame["ty"], "TelemetryBatch");
-        assert_eq!(frame["data"].as_array().unwrap().len(), 1);
-        assert_eq!(frame["data"][0]["timestamp_ms"], 999);
+        // A slow display keeps a bounded tail of each stream, newest last.
+        let data = frame["data"].as_array().unwrap();
+        assert_eq!(data.len(), WS_LIVE_ROWS_PER_STREAM);
+        assert_eq!(data[0]["timestamp_ms"], 1000 - WS_LIVE_ROWS_PER_STREAM as i64);
+        assert_eq!(data[data.len() - 1]["timestamp_ms"], 999);
         assert!(latest.pending.lock().unwrap().is_none());
     }
     #[tokio::test]
@@ -5086,7 +5093,8 @@ mod ws_freshness_tests {
         // Older retransmissions cannot roll a stream backward.
         latest.publish(vec![row("KG1000", 10)]);
         let (_, rows) = latest.recv().await;
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 1 + 2 * WS_LIVE_ROWS_PER_STREAM);
+        assert!(!rows.iter().any(|r| r.data_type == "KG1000" && r.timestamp_ms == 10));
         assert!(
             rows.iter()
                 .any(|r| r.data_type == "COMBUSTION_CHAMBER_PRESSURE" && r.timestamp_ms == 50)
@@ -5100,6 +5108,24 @@ mod ws_freshness_tests {
         }
         assert_eq!(latest.recv().await.1.len(), WS_LIVE_STREAM_CAP);
     }
+    /// Radio links deliver several samples of one stream in one burst. Each
+    /// sample must reach the display, not only the newest one in the flush.
+    #[tokio::test]
+    async fn burst_of_one_stream_reaches_the_display_in_order() {
+        let latest = LatestWsTelemetry::default();
+        let (_tx, mut rx) = mpsc::channel::<String>(1);
+        latest.publish((0..5).map(|i| row("ACCEL_DATA", 1_000 + i * 200)).collect());
+        let frame: serde_json::Value =
+            serde_json::from_str(&next_ws_output(&mut rx, &latest).await.unwrap()).unwrap();
+        let stamps = frame["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["timestamp_ms"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(stamps, vec![1_000, 1_200, 1_400, 1_600, 1_800]);
+    }
+
     #[tokio::test]
     async fn expired_unsent_display_frame_is_not_replayed() {
         let latest = LatestWsTelemetry::default();
