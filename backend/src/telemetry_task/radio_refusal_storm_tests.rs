@@ -1316,3 +1316,183 @@ fn fc_heartbeat_gap_stays_under_two_seconds_under_schema_saturation_and_nonce_ch
         "worst FC heartbeat gaps (gap ms, count, ms since the last at the end): {worst:?}"
     );
 }
+
+/// How the RF owner treats the station's frames in the FLIGHT_STATE bay.
+#[derive(Clone, Copy, PartialEq)]
+enum RfOwner {
+    Answers,
+    Silent,
+    /// Frames reach RF only after this many ms (a slow radio).
+    Late(u64),
+}
+
+/// The station with RF on the radio side and GB on the umbilical, both
+/// FLIGHT_STATE readers, on real SDK routers with the station's delivery
+/// tuning (retry span 250 ms x 18). Returns, for each write in
+/// `writes` (ms after the first write, value), the ms after that write at
+/// which GB first held that value (None: never within `run_ms`), and every
+/// value GB applied in order.
+fn flight_state_bay(rf_mode: RfOwner, writes: &[(u64, u8)], run_ms: u64) -> (Vec<Option<u64>>, Vec<u8>) {
+    use sedsnet::router::NetworkVariablePermissions;
+    let _tuning = StationTuning::install();
+    crate::telemetry_schema::initialize().unwrap();
+    let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
+    let host = Arc::new(Router::new(RouterConfig::new([]).with_sender("GS")));
+    host.enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE).unwrap();
+    crate::telemetry_task::refresh_host_network_time(&host, get_current_timestamp_ms());
+    let applied = Arc::new(Mutex::new(Vec::<(u8, std::time::Instant)>::new()));
+    let mut peers = Vec::new();
+    let mut outbound = Vec::new();
+    for name in ["RF", "GB"] {
+        let peer = Arc::new(Router::new(RouterConfig::new([]).with_sender(name)));
+        peer.enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY).unwrap();
+        if name == "GB" {
+            let seen = applied.clone();
+            peer.on_network_variable_update(ty, move |packet| {
+                seen.lock().unwrap().push((packet.payload()[0], std::time::Instant::now()));
+                Ok(())
+            })
+            .unwrap();
+        }
+        let to_peer = Arc::new(Mutex::new(Vec::<(std::time::Instant, Vec<u8>)>::new()));
+        let out = to_peer.clone();
+        host.add_side_packed(name, move |bytes| {
+            out.lock().unwrap().push((std::time::Instant::now(), bytes.to_vec()));
+            Ok(())
+        });
+        let to_host = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let back = to_host.clone();
+        peer.add_side_packed("GS", move |bytes| {
+            back.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        });
+        peers.push(peer);
+        outbound.push((to_peer, to_host));
+    }
+    let mut backoff = RadioRefusalBackoff::default();
+    let mut pump = |rf: RfOwner| {
+        process_router_queues_with_backoff(&host, None, &mut backoff);
+        for (side, (peer, (to_peer, to_host))) in peers.iter().zip(&outbound).enumerate() {
+            let ready: Vec<Vec<u8>> = {
+                let mut queue = to_peer.lock().unwrap();
+                let due = |at: &std::time::Instant| match (side, rf) {
+                    (0, RfOwner::Silent) => None,
+                    (0, RfOwner::Late(ms)) => Some(at.elapsed() >= Duration::from_millis(ms)),
+                    _ => Some(true),
+                };
+                let mut ready = Vec::new();
+                queue.retain(|(at, bytes)| match due(at) {
+                    None => false,
+                    Some(true) => {
+                        ready.push(bytes.clone());
+                        false
+                    }
+                    Some(false) => true,
+                });
+                ready
+            };
+            for bytes in ready {
+                let _ = peer.rx_packed_from_side(&bytes, 0);
+            }
+            let _ = peer.process_all_queues_with_timeout(0);
+            for bytes in std::mem::take(&mut *to_host.lock().unwrap()) {
+                let _ = host.rx_packed_from_side(&bytes, side);
+            }
+        }
+    };
+    for peer in &peers {
+        peer.announce_discovery().unwrap();
+    }
+    host.announce_discovery().unwrap();
+    for _ in 0..50 {
+        pump(RfOwner::Answers);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let start = std::time::Instant::now();
+    let mut sent_at = Vec::new();
+    let mut next = 0;
+    while start.elapsed() < Duration::from_millis(run_ms) {
+        if let Some(&(at, value)) = writes.get(next)
+            && start.elapsed() >= Duration::from_millis(at)
+        {
+            let stamp = host.network_time_ms().unwrap();
+            host.set_network_variable(
+                Packet::new(ty, &[crate::telemetry_schema::endpoint("FLIGHT_STATE")], "GS", stamp, Arc::from([value]))
+                    .unwrap()
+                    .with_nonce(0x4000 + next as u16),
+            )
+            .unwrap();
+            sent_at.push(std::time::Instant::now());
+            next += 1;
+        }
+        pump(rf_mode);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let applied = applied.lock().unwrap().clone();
+    let delivered = writes
+        .iter()
+        .zip(&sent_at)
+        .map(|(&(_, value), sent)| {
+            applied
+                .iter()
+                .find(|(seen, at)| *seen == value && at >= sent)
+                .map(|(_, at)| (*at - *sent).as_millis() as u64)
+        })
+        .collect();
+    (delivered, applied.iter().map(|(value, _)| *value).collect())
+}
+
+fn reliable_retry_span_ms() -> u64 {
+    let tuning = crate::network_delivery_tuning();
+    u64::from(tuning.reliable_retransmit_ms) * u64::from(tuning.reliable_max_retries + 1)
+}
+
+/// accept4: the station wrote Idle, RF never acknowledged it, and the Abort
+/// written 3 s later waited behind it. When Idle ran out of retries on RF,
+/// the SDK dropped the Abort unsent; GB and DAQ (which take an Abort only
+/// from FLIGHT_STATE) stayed in Idle for ~100 s. The Abort must still reach
+/// GB, within the retry span of the write it waited behind.
+#[test]
+fn abort_behind_an_unacknowledged_flight_state_still_reaches_gb() {
+    let span = reliable_retry_span_ms();
+    let (delivered, applied) = flight_state_bay(RfOwner::Silent, &[(0, 1), (500, 15)], span + 3_000);
+    eprintln!("ABORT_BEHIND_SILENT_RF span={span} delivered={delivered:?} applied={applied:?}");
+    assert!(delivered[0].is_some_and(|ms| ms < 500), "Idle reaches GB at once: {delivered:?}");
+    let abort = delivered[1].unwrap_or_else(|| panic!("the Abort never reached GB: applied {applied:?}"));
+    assert!(abort <= span + 750, "Abort reached GB {abort} ms after it was written (span {span} ms)");
+    assert_eq!(applied.last(), Some(&15), "GB ends in Aborted: {applied:?}");
+}
+
+/// No exhaustion: RF acknowledges, but late (two thirds of the retry span).
+/// The Abort waits behind Idle for as long as RF takes (the SDK's ordering),
+/// never longer than the retry span, and is delivered once.
+#[test]
+fn abort_behind_a_slow_rf_owner_reaches_gb_within_the_retry_span() {
+    let span = reliable_retry_span_ms();
+    let (delivered, applied) = flight_state_bay(RfOwner::Late(span * 2 / 3), &[(0, 1), (500, 15)], span + 3_000);
+    eprintln!("ABORT_BEHIND_SLOW_RF span={span} delivered={delivered:?} applied={applied:?}");
+    let abort = delivered[1].unwrap_or_else(|| panic!("the Abort never reached GB: applied {applied:?}"));
+    assert!(abort <= span + 750, "Abort reached GB {abort} ms after it was written (span {span} ms)");
+    assert_eq!(applied, vec![1, 15], "Idle then Aborted, once each");
+}
+
+/// A later write wins: Abort, then Idle, both stranded behind a silent RF.
+/// Only the latest (Idle) may be sent again, never the stale Abort after it.
+#[test]
+fn resent_flight_state_is_the_latest_value_not_a_stale_one() {
+    let span = reliable_retry_span_ms();
+    let (delivered, applied) = flight_state_bay(RfOwner::Silent, &[(0, 1), (300, 15), (600, 0)], 2 * span + 3_000);
+    eprintln!("LATEST_WINS span={span} delivered={delivered:?} applied={applied:?}");
+    assert_eq!(applied.last(), Some(&0), "the latest write (Startup) wins: {applied:?}");
+    assert!(!applied.contains(&15), "a superseded Abort is never replayed after a newer write: {applied:?}");
+}
+
+/// Nothing stuck: every write reaches GB once, in order, without resends.
+#[test]
+fn flight_state_writes_with_answering_owners_are_neither_repeated_nor_reordered() {
+    let (delivered, applied) =
+        flight_state_bay(RfOwner::Answers, &[(0, 1), (300, 2), (600, 15), (900, 0), (1_200, 1)], 2_500);
+    eprintln!("ANSWERING_OWNERS delivered={delivered:?} applied={applied:?}");
+    assert!(delivered.iter().all(|ms| ms.is_some_and(|ms| ms < 300)), "{delivered:?}");
+    assert_eq!(applied, vec![1, 2, 15, 0, 1], "each write once, in order");
+}

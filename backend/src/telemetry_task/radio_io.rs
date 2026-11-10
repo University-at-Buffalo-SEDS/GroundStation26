@@ -4937,43 +4937,74 @@ impl RadioRefusalBackoff {
 }
 
 /// The SDK reports "ordered end-to-end delivery exhausted retries" without
-/// the stream. Retried deliveries are sampled about once a second; when the
+/// the stream. Retried deliveries are sampled up to once a second; when the
 /// error comes, the sampled ones that are gone (type and pending owners) are
-/// logged and counted per type for `/api/network_diagnostics`.
+/// logged and counted per type for `/api/network_diagnostics`. A FLIGHT_STATE
+/// stream that gave up also dropped any newer write queued behind it, which
+/// is then sent again.
 struct OrderedExhaustion {
-    state: Mutex<(Option<std::time::Instant>, Vec<(u64, String, Vec<u64>)>, std::collections::BTreeMap<String, u64>)>,
+    state: Mutex<ExhaustionState>,
 }
-static ORDERED_EXHAUSTION: OrderedExhaustion = OrderedExhaustion { state: Mutex::new((None, Vec::new(), std::collections::BTreeMap::new())) };
+/// Per router (keyed by address): when it was last sampled and the retrying
+/// deliveries seen then; plus the per-type counts.
+type ExhaustionState = (
+    std::collections::BTreeMap<usize, (std::time::Instant, Vec<(u64, sedsnet::config::DataType, Vec<u64>)>)>,
+    std::collections::BTreeMap<String, u64>,
+);
+static ORDERED_EXHAUSTION: OrderedExhaustion =
+    OrderedExhaustion { state: Mutex::new((std::collections::BTreeMap::new(), std::collections::BTreeMap::new())) };
 impl OrderedExhaustion {
     fn refresh(&self, router: &Router) {
+        let key = router as *const Router as usize;
+        // Several samples per retry span, so a write is always seen retrying
+        // before it can exhaust.
+        let tuning = sedsnet::config::runtime_tuning_config();
+        let span = u64::from(tuning.reliable_retransmit_ms) * u64::from(tuning.reliable_max_retries + 1);
+        let every = Duration::from_millis((span / 4).clamp(50, 1_000));
         let mut state = self.state.lock().unwrap();
-        if state.0.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+        if state.0.get(&key).is_some_and(|(at, _)| at.elapsed() < every) {
             return;
         }
-        state.0 = Some(std::time::Instant::now());
-        state.1 = router
+        // Routers that stopped sampling (dropped ones) are forgotten.
+        state.0.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(60));
+        let rows = router
             .export_reliable_pending_stats()
             .into_iter()
             .filter(|row| row.retries > 0)
-            .map(|row| (row.packet_id, format!("{:?}", row.data_type), row.pending_destinations))
+            .map(|row| (row.packet_id, row.data_type, row.pending_destinations))
             .collect();
+        state.0.insert(key, (std::time::Instant::now(), rows));
     }
     fn note_exhausted(&self, router: &Router) {
+        let key = router as *const Router as usize;
         let pending: std::collections::BTreeSet<u64> =
             router.export_reliable_pending_stats().iter().map(|row| row.packet_id).collect();
-        let mut state = self.state.lock().unwrap();
-        let gone: Vec<_> = state.1.iter().filter(|(id, _, _)| !pending.contains(id)).cloned().collect();
-        for (id, ty, owners) in &gone {
-            log::warn!("ordered end-to-end delivery exhausted: type={ty} packet={id} pending_owners={owners:?}");
-            *state.2.entry(ty.clone()).or_default() += 1;
+        let flight_state = crate::telemetry_schema::data_type("FLIGHT_STATE");
+        let heads = {
+            let mut guard = self.state.lock().unwrap();
+            let (sampled, counts) = &mut *guard;
+            let gone: Vec<_> = sampled.get_mut(&key).map_or_else(Vec::new, |(_, rows)| {
+                let gone = rows.iter().filter(|(id, _, _)| !pending.contains(id)).cloned().collect();
+                rows.retain(|(id, _, _)| pending.contains(id));
+                gone
+            });
+            for (id, ty, owners) in &gone {
+                log::warn!("ordered end-to-end delivery exhausted: type={ty:?} packet={id} pending_owners={owners:?}");
+                *counts.entry(format!("{ty:?}")).or_default() += 1;
+            }
+            if gone.is_empty() {
+                *counts.entry("unsampled".into()).or_default() += 1;
+            }
+            gone.iter().filter(|(_, ty, _)| *ty == flight_state).map(|(id, _, _)| *id).collect::<Vec<_>>()
+        };
+        match crate::network_variables::resend_dropped_flight_state(router, &heads) {
+            Ok(true) => log::warn!("FLIGHT_STATE: the latest value was dropped behind an exhausted write; sent it again"),
+            Ok(false) => {}
+            Err(err) => log::warn!("FLIGHT_STATE: could not resend the dropped latest value: {err}"),
         }
-        if gone.is_empty() {
-            *state.2.entry("unsampled".into()).or_default() += 1;
-        }
-        state.1.retain(|(id, _, _)| pending.contains(id));
     }
     fn counts(&self) -> serde_json::Value {
-        serde_json::json!(self.state.lock().unwrap().2)
+        serde_json::json!(self.state.lock().unwrap().1)
     }
 }
 

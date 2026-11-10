@@ -854,6 +854,40 @@ pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
     Ok(())
 }
 
+/// FLIGHT_STATE is an ordered end-to-end stream: a write waits until every
+/// owner has acknowledged the one before it, and when that earlier write runs
+/// out of retries on one owner the SDK retires the stream and drops every
+/// newer write queued behind it, unsent. GB and DAQ take an Abort only from
+/// FLIGHT_STATE, so an Abort queued behind an Idle that RF never acknowledged
+/// never reached them. `exhausted_heads` are the FLIGHT_STATE writes that
+/// were being sent when the stream gave up. If the latest value is not one of
+/// them and is no longer pending, it was dropped: send it again, read now so
+/// a later Reset or Idle still wins. The copy keeps the original stamp (and
+/// the durable record is untouched) but needs a fresh identity, since the
+/// SDK will not resend a retired packet ID. Launch is left to its own
+/// admission, which owns its exact packet. Returns whether it was re-sent.
+pub(crate) fn resend_dropped_flight_state(router: &Router, exhausted_heads: &[u64]) -> Result<bool> {
+    if exhausted_heads.is_empty() {
+        return Ok(false);
+    }
+    let ty = crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE);
+    let Some(latest) = router.get_cached_network_variable(ty)? else {
+        return Ok(false);
+    };
+    let ours = crate::types::canonical_sender_id(latest.sender())
+        == crate::types::canonical_sender_id(router.sender().as_ref());
+    if !ours
+        || latest.payload() == [7]
+        || exhausted_heads.contains(&latest.packet_id())
+        || router.export_reliable_pending_stats().iter().any(|row| row.data_type == ty)
+    {
+        return Ok(false);
+    }
+    let again = packet_bytes_at(FLIGHT_STATE_TYPE, "FLIGHT_STATE", Arc::from(latest.payload()), latest.timestamp())?;
+    router.set_network_variable(again)?;
+    Ok(true)
+}
+
 /// Pure launch preparation. No desired state, file, managed cache or SDK owner
 /// is changed until the caller wins its original Stop/board admission boundary.
 #[cfg_attr(test, derive(Clone))]
