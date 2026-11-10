@@ -1971,3 +1971,138 @@ async fn dump_route_is_offered_only_at_a_nitrogen_hold_and_keeps_the_run() {
     assert_eq!(rt.progress.current().unwrap().key, key, "same run; its modal stays open");
     assert!(!rt.progress.current().unwrap().outcome.terminal());
 }
+
+/// gse_flows sim: cold flow cancelled from a passed nitrogen-test hold left
+/// the engine Cancelled while the station still reported the nitrogen test
+/// passed, so StartFill stayed refused ("the sequence is Cancelled"). An
+/// operator Cancel returns to Passed when the result still counts; cold flow
+/// must do the same, and must stay Cancelled when it does not.
+#[test]
+fn ending_cold_flow_returns_to_passed_only_while_the_nitrogen_result_counts() {
+    for mode in [crate::station_mode::Mode::Normal, crate::station_mode::Mode::Hitl] {
+        let _mode = crate::runtime_mode::test_support::thread_mode(mode);
+        let hitl = mode == crate::station_mode::Mode::Hitl;
+        let baseline = gse_sequence::Baseline {
+            average_psi: 0.0, min_psi: 0.0, max_psi: 0.0, noise_psi: 0.5, samples: 50,
+        };
+        for counts in [true, false] {
+            let mut rt = Runtime::default();
+            rt.engine.config.maximum_zero_offset_psi = Some(8.0);
+            if hitl {
+                rt.engine.status.nitrogen_passed = counts;
+                rt.engine.status.baseline = Some(baseline.clone());
+            } else {
+                rt.operational.saved.qualification.complete(Milestone::SelfTest, 0).unwrap();
+                if counts {
+                    rt.operational.saved.qualification.complete(Milestone::NitrogenTest, 0).unwrap();
+                    rt.operational.saved.baseline = Some(baseline.clone());
+                }
+            }
+            // Cold flow owns the engine as Paused while it runs.
+            rt.engine.status.phase = Phase::Paused;
+            end_engine_after_cold_flow(&mut rt);
+            let want = if counts { Phase::Passed } else { Phase::Cancelled };
+            assert_eq!(rt.engine.status.phase, want, "{mode:?} counts={counts}");
+            assert_eq!(rt.engine.status.nitrogen_passed, counts, "{mode:?}");
+            if counts {
+                assert!(rt.engine.status.baseline.is_some(), "{mode:?}: fill needs the zero baseline");
+            }
+            // The fill gate itself is unchanged: it admits only from Passed.
+            let input = Inputs {
+                now_ms: 1000,
+                pressure: Some(gse_sequence::Sample { value: 0.0, at_ms: 1000 }),
+                valves: [None; 5],
+                prelaunch: true,
+                interlock: true,
+            };
+            let reason = rt.engine.refusal_reason(Action::StartFill, input);
+            assert_eq!(reason.is_none(), counts, "{mode:?}: {reason:?}");
+        }
+    }
+}
+
+/// The same over the routed station: a passed nitrogen hold handed to cold
+/// flow, cold flow cancelled through the sequence route, then the operator's
+/// StartFill is admitted and the fill configures its valves.
+#[tokio::test]
+async fn cold_flow_cancelled_from_a_passed_hold_unlocks_the_fill() {
+    if crate::operator_queue::isolated_native_case(module_path!(),
+        "cold_flow_cancelled_from_a_passed_hold_unlocks_the_fill") { return; }
+    let mut f = Fixture::new().await;
+    let path = f._root.0.join("qualification.json");
+    let mut targets = f.state.fill_targets_snapshot();
+    targets.nitrous.target_pressure_psi = 140.0;
+    f.state.set_fill_targets(targets);
+    {
+        let mut rt = f.state.gse.lock().unwrap();
+        rt.engine.status.baseline = Some(gse_sequence::Baseline {
+            average_psi: 0.0, min_psi: 0.0, max_psi: 0.0, noise_psi: 0.5, samples: 50,
+        });
+        if !crate::runtime_mode::is_hitl() {
+            rt.operational.path = Some(path.clone());
+            rt.operational.saved.qualification.complete(Milestone::SelfTest, 0).unwrap();
+            rt.operational.running = true;
+        }
+        let now = rt.now();
+        let reserved = super::progress::reserve(&f.state);
+        let input = rt.input(true, true);
+        rt.progress_start(reserved, Kind::NitrogenTest, input);
+        let _ = rt.engine.hold_test_pressure(now, gse_sequence::TestHold::Passed);
+    }
+    for _ in 0..20 {
+        f.step(115.);
+    }
+    if !crate::runtime_mode::is_hitl() { f.state.gse.lock().unwrap().operational.topology_stable = true; }
+    let key = f.start().await;
+    f.until(ColdPhase::AwaitingRelease, 115.);
+    let (code, value) = f
+        .call("/api/gse/sequences/cancel", serde_json::to_value(&key).unwrap(), Some("cold-origin-token"))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{value}");
+    for _ in 0..300 {
+        if f.phase() == ColdPhase::Cancelled {
+            break;
+        }
+        f.step(0.);
+    }
+    assert_eq!(f.phase(), ColdPhase::Cancelled);
+    for _ in 0..5 {
+        f.step(0.);
+    }
+    if !crate::runtime_mode::is_hitl() { f.state.gse.lock().unwrap().operational.topology_stable = true; }
+    {
+        let rt = f.state.gse.lock().unwrap();
+        assert_eq!(rt.engine.status.phase, Phase::Passed, "{}", rt.engine.status.message);
+        assert!(rt.engine.status.nitrogen_passed);
+    }
+    assert_eq!(command_allowed(&f.state, &TelemetryCommand::StartFill), Some(true));
+    assert!(handle_command(&f.state, &TelemetryCommand::StartFill));
+    let phase = f.state.gse.lock().unwrap().engine.status.phase;
+    assert_eq!(phase, Phase::FillSetup, "{}", f.state.gse.lock().unwrap().engine.status.message);
+}
+
+/// A cold flow started at rest, without a counting nitrogen test, still ends
+/// Cancelled and the fill stays refused.
+#[tokio::test]
+async fn cold_flow_without_a_counting_nitrogen_test_stays_cancelled() {
+    if crate::operator_queue::isolated_native_case(module_path!(),
+        "cold_flow_without_a_counting_nitrogen_test_stays_cancelled") { return; }
+    let mut f = Fixture::new().await;
+    let key = f.start().await;
+    f.hold();
+    let (code, value) = f
+        .call("/api/gse/sequences/cancel", serde_json::to_value(&key).unwrap(), Some("cold-origin-token"))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{value}");
+    for _ in 0..300 {
+        if f.phase() == ColdPhase::Cancelled {
+            break;
+        }
+        f.step(0.);
+    }
+    assert_eq!(f.phase(), ColdPhase::Cancelled);
+    f.step(0.);
+    let rt = f.state.gse.lock().unwrap();
+    assert_eq!(rt.engine.status.phase, Phase::Cancelled);
+    assert!(!rt.engine.status.nitrogen_passed);
+}

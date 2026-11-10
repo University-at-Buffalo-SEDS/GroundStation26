@@ -217,8 +217,36 @@ fn observe(rt: &mut Runtime, input: Inputs) {
     rt.progress
         .observe_cold_flow(cold, view, crate::sequence_progress_service::now_ms());
     rt.engine.status.message = format!("Auto Cold Flow: {:?}; {:?}", cold.phase, cold.issue);
-    if cold.phase == ColdPhase::Cancelled {
-        rt.engine.status.phase = Phase::Cancelled;
+    // Cold flow owns the engine as Paused; once it ends the engine is free.
+    // A later sequence the operator started is never overwritten.
+    if cold.phase == ColdPhase::Cancelled
+        && matches!(rt.engine.status.phase, Phase::Paused | Phase::Cancelled | Phase::Passed)
+    {
+        end_engine_after_cold_flow(rt);
+    }
+}
+/// Cold flow ended (its controller reached Cancelled; dump and vent are open).
+/// While the nitrogen-test result still counts, the engine returns to Passed,
+/// as an operator Cancel does (operational_policy.rs), so the fill is offered
+/// again; otherwise it stays Cancelled. Normal and test fire take the result
+/// from the saved qualification, HITL from the engine's own record.
+fn end_engine_after_cold_flow(rt: &mut Runtime) {
+    rt.engine.status.phase = Phase::Cancelled;
+    let counts = if crate::runtime_mode::is_hitl() {
+        rt.engine.status.nitrogen_passed || rt.engine.status.nitrogen_overridden
+    } else {
+        let qualification = &rt.operational.saved.qualification;
+        if qualification.nitrogen_satisfied() {
+            rt.engine.status.nitrogen_passed = qualification.completed(Milestone::NitrogenTest);
+            rt.engine.status.nitrogen_overridden = qualification.nitrogen_override().is_some();
+            rt.engine.status.baseline = rt.operational.saved.baseline.clone();
+            true
+        } else {
+            false
+        }
+    };
+    if counts {
+        rt.engine.status.phase = Phase::Passed;
     }
 }
 fn make_plan(rt: &mut Runtime, effects: Effects, input: Inputs) -> Option<Plan> {
