@@ -2338,10 +2338,15 @@ impl Mesh {
         fn canonical(bytes: &[u8]) -> Option<FrameClass> {
             let p = sedsnet::wire_format::peek_frame_info(bytes).ok()?;
             let gps = p.envelope.ty == crate::telemetry_schema::data_type("GPS_DATA");
+            // ABORT's schema priority is 0 (class Error), the lowest here: a
+            // relayed Abort waited behind relayed telemetry and expired.
+            let abort = p.envelope.ty == crate::telemetry_schema::data_type("ABORT");
             Some(FrameClass {
                 recovery_control: crate::telemetry_task::is_recovery_control_frame(bytes),
                 priority: if gps {
                     255
+                } else if abort {
+                    254
                 // Reliable low-priority telemetry keeps its schema priority and
                 // telemetry lifetime; use the UART batch-closing priority floor.
                 } else if sedsnet::message_priority(p.envelope.ty) >= 16
@@ -3931,6 +3936,42 @@ mod tests {
     fn rrls_relay_share_carries_the_downlink_it_hears() {
         let (offered, sent) = relay_pacing_rates(false, 35);
         assert!(sent >= 0.95 * offered, "the 35% relay share carries the downlink: {sent:.0} of {offered:.0} B/s");
+    }
+
+    /// pyroI (candidate 7ad9582): the RRLS heard the operator's ABORT and
+    /// queued it at priority 0, ABORT's schema priority, behind the relayed
+    /// downlink, where it expired unsent. FC latched the Abort only 6.9 s
+    /// after the operator pressed it, from the GS's later re-send.
+    #[test]
+    fn a_relayed_abort_goes_ahead_of_relayed_telemetry() {
+        crate::telemetry_schema::initialize().unwrap();
+        let packet = |name: &str, payload: Vec<u8>| {
+            sedsnet::wire_format::pack_packet(
+                &sedsnet::packet::Packet::new(
+                    crate::telemetry_schema::data_type(name),
+                    &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
+                    "GS",
+                    1,
+                    payload.into(),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let mut rr = Mesh::new(Role::Rrls, 2);
+        rr.incoming(true, &health(1, 0, false), 0);
+        rr.av_bay_heard = Some(10);
+        // Relayed downlink already waiting, then the operator's Abort.
+        rr.incoming(true, &encode(DOWN_DATA, &packet("BATTERY_VOLTAGE", vec![0; 4])), 10);
+        rr.incoming(true, &encode(UP_DATA, &packet("ABORT", b"SEDS_MANUAL_ABORT_V1:".to_vec())), 10);
+        let abort = rr
+            .queue
+            .iter()
+            .find(|q| q.frame.bytes.get(3) == Some(&AV_BAY_DATA))
+            .expect("the Abort is queued for the AV bay");
+        assert!(abort.priority >= 254, "relayed Abort priority {}", abort.priority);
+        let first = rr.pop(10).expect("a frame goes");
+        assert_eq!(decode(&first.bytes).unwrap().0, AV_BAY_DATA, "the Abort goes first");
     }
 
     #[test]
