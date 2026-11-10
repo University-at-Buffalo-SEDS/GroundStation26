@@ -980,15 +980,18 @@ pub(crate) async fn query_service(
         tokio::select! {biased;_=shutdown.recv()=>return,_=state.board_abort.query_needed.notified()=>{},_=crate::board_recovery::abort_confirm::query_stream_retired()=>{},_=tick.tick()=>{}}
         if state.board_abort.take_abort_confirmation() {
             confirm.start();
+            refresh.clear_av_bay_backoff();
         }
         let demand = state.board_abort.take_queries();
         if crate::rrls::is_rrls() || !crate::board_recovery::coordinator::readonly_query_idle(&state) {
             continue;
         }
-        // Prompt Abort readback goes first in the ordered query stream.
+        // Prompt Abort readback goes first in the ordered query stream:
+        // umbilical boards, then the AV-bay boards one at a time.
         let _ = confirm.poll(&state);
+        let _ = confirm.poll_av_bay(&state);
         let holding = confirm.active();
-        refresh.hold_av_bay(holding);
+        refresh.hold_av_bay(holding || confirm.av_bay_active());
         // AV-bay demand also waits while another AV-bay query is in the one
         // ordered stream, so it never queues a second one behind it.
         let av_bay_busy = state

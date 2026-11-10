@@ -1213,6 +1213,13 @@ impl ReadonlyQueryRefresh {
         }
         sent
     }
+    /// A local Abort: AV-bay boards owe Abort readback, not background
+    /// polling, so their read-only backoff starts over.
+    pub(crate) fn clear_av_bay_backoff(&mut self) {
+        for at in AV_BAY_INDICES {
+            self.misses[at] = 0;
+        }
+    }
     /// Hold (or release) new AV-bay background queries; see `abort_confirm`.
     pub(crate) fn hold_av_bay(&mut self, held: bool) {
         self.av_bay_held = held;

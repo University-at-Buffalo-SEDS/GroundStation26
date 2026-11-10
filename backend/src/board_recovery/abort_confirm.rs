@@ -26,6 +26,14 @@ const CONFIRM_WINDOW_MAX: Duration = Duration::from_secs(10);
 const CONFIRM_LOST: Duration = Duration::from_secs(3);
 /// Umbilical (fill) board indices into BOARDS.
 const UMBILICAL: [usize; 4] = [3, 4, 5, 6];
+/// AV-bay boards in the order their Abort readback is asked: FC, PB, RF.
+const AV_BAY_ORDER: [usize; 3] = [1, 2, 0];
+/// How long after an Abort the AV-bay boards are asked for readback. Over an
+/// RRLS relay one query can take its whole 4.5 s retry span.
+const AV_BAY_CONFIRM_WINDOW: Duration = Duration::from_secs(20);
+/// An AV-bay board that answered without showing the Abort is asked again
+/// after this: each radio query holds the one ordered stream.
+const AV_BAY_REQUERY: Duration = Duration::from_secs(2);
 
 /// Bumped each time a BOARD_RECOVERY_REQUEST head gave up its retries. The
 /// SDK drops the queued tail with it, so every prompt query asked before the
@@ -57,6 +65,9 @@ pub(crate) struct AbortConfirmRefresh {
     av_bay_head: Option<Stamp>,
     /// Retired-stream generation when each board's prompt query was asked.
     asked_generation: [u64; 7],
+    /// AV-bay phase: when it started, and the AV-bay boards still owed.
+    av_bay_since: Option<Stamp>,
+    av_bay_owed: u8,
 }
 impl AbortConfirmRefresh {
     /// Start (or restart) the window for an Abort the station just sent.
@@ -65,6 +76,8 @@ impl AbortConfirmRefresh {
         self.owed = UMBILICAL.iter().fold(0, |mask, at| mask | (1 << at));
         self.av_bay_head = None;
         self.asked_generation = [query_stream_generation(); 7];
+        self.av_bay_since = self.since;
+        self.av_bay_owed = AV_BAY_ORDER.iter().fold(0, |mask, at| mask | (1 << at));
     }
     /// True while the window is open and an umbilical board still owes its
     /// Abort readback.
@@ -118,6 +131,77 @@ impl AbortConfirmRefresh {
             }
         })
     }
+    /// True while an AV-bay board still owes its Abort readback.
+    pub(crate) fn av_bay_active(&mut self) -> bool {
+        let now = Stamp::now();
+        if self.av_bay_owed == 0
+            || self.av_bay_since.is_some_and(|since| {
+                now.checked_duration_since(since).is_none_or(|age| age >= AV_BAY_CONFIRM_WINDOW)
+            })
+        {
+            self.av_bay_since = None;
+            self.av_bay_owed = 0;
+        }
+        self.av_bay_since.is_some()
+    }
+    /// Ask the next AV-bay board that owes its Abort readback. Returns the
+    /// mask (BOARDS order) of the board a query went to.
+    ///
+    /// This is Abort confirmation, not background refresh: the degraded-link
+    /// pause and the read-only backoff do not apply. It waits for the
+    /// umbilical readback (an AV-bay query ahead of those would hold them in
+    /// the one ordered stream) and keeps one AV-bay query in flight at a time.
+    pub(crate) fn poll_av_bay(&mut self, state: &Arc<AppState>) -> u8 {
+        if !self.av_bay_active() || self.active() || crate::rrls::is_rrls() {
+            return 0;
+        }
+        let Some(since) = self.av_bay_since else { return 0 };
+        let Some(router) = state.topology_router.get() else { return 0 };
+        let aborted = state.board_abort.masks().0;
+        self.av_bay_owed &= scope::mode_scope(crate::station_mode::local_mode())
+            & crate::board_abort::present_mask(state)
+            & !aborted;
+        if self.av_bay_owed == 0 || av_bay_query_in_flight(router) {
+            return 0;
+        }
+        let now = Stamp::now();
+        let generation = query_stream_generation();
+        // The owed, due board asked longest ago goes next (never asked since
+        // the Abort first, then in AV_BAY_ORDER), so a silent board that
+        // keeps coming due cannot starve the others.
+        let next = {
+            let inner = state.board_recovery.inner.lock().unwrap();
+            AV_BAY_ORDER
+                .into_iter()
+                .enumerate()
+                .filter(|&(_, at)| {
+                    self.av_bay_owed & (1 << at) != 0
+                        && query_due(
+                            inner.queries[at].as_ref(),
+                            since,
+                            now,
+                            self.asked_generation[at] != generation,
+                            AV_BAY_REQUERY,
+                        )
+                })
+                .min_by_key(|&(rank, at)| {
+                    // Time from the Abort to this board's latest ask; None
+                    // (not asked since the Abort) sorts first.
+                    let asked = inner.queries[at]
+                        .as_ref()
+                        .and_then(|query| query.sent.checked_duration_since(since));
+                    (asked, rank)
+                })
+                .map(|(_, at)| at)
+        };
+        match next {
+            Some(at) if requery_board_query(state, BOARDS[at]).status() == StatusCode::OK => {
+                self.asked_generation[at] = generation;
+                1 << at
+            }
+            _ => 0,
+        }
+    }
 }
 /// Whether an AV-bay BOARD_RECOVERY_REQUEST is in flight: the one ordered
 /// stream then holds every umbilical query behind it.
@@ -135,6 +219,11 @@ pub(crate) fn av_bay_query_in_flight(router: &sedsnet::router::Router) -> bool {
 /// `retired_since_asked`: a BOARD_RECOVERY_REQUEST head gave up after this
 /// board's prompt query was asked, and dropped the queued tail with it.
 fn confirm_query_due(query: Option<&Query>, since: Stamp, now: Stamp, retired_since_asked: bool) -> bool {
+    query_due(query, since, now, retired_since_asked, CONFIRM_REQUERY)
+}
+/// `confirm_query_due` with the re-ask delay after a reply that did not show
+/// the Abort as a parameter.
+fn query_due(query: Option<&Query>, since: Stamp, now: Stamp, retired_since_asked: bool, requery: Duration) -> bool {
     match query {
         // Asked since the Abort: wait for the reply, then ask again shortly
         // after a reply that did not show the Abort, or once the query is
@@ -142,7 +231,7 @@ fn confirm_query_due(query: Option<&Query>, since: Stamp, now: Stamp, retired_si
         Some(query) if query.sent.checked_duration_since(since).is_some() => {
             let age = now.checked_duration_since(query.sent);
             if query.received {
-                age.is_some_and(|age| age >= CONFIRM_REQUERY)
+                age.is_some_and(|age| age >= requery)
             } else {
                 retired_since_asked || age.is_some_and(|age| age >= CONFIRM_LOST)
             }
@@ -177,6 +266,20 @@ mod tests {
         // Abort row and stops the asking): ask again shortly after.
         assert!(!confirm_query_due(Some(&query(at(10), true)), since, at(200), false));
         assert!(confirm_query_due(Some(&query(at(10), true)), since, at(10) + CONFIRM_REQUERY, false));
+    }
+
+    /// Each radio query holds the one ordered stream: an AV-bay board that
+    /// answered without the Abort is asked again after 2 s, not 250 ms. Lost
+    /// and retired queries keep their re-ask.
+    #[test]
+    fn an_av_bay_board_answering_without_the_abort_is_asked_again_after_two_seconds() {
+        let since = Stamp::now();
+        let at = |ms: u64| since + Duration::from_millis(ms);
+        let query = |sent: Stamp, received: bool| Query { abort_revision: 0, nonce: 1, sent, received };
+        assert!(!query_due(Some(&query(at(10), true)), since, at(10) + CONFIRM_REQUERY, false, AV_BAY_REQUERY));
+        assert!(query_due(Some(&query(at(10), true)), since, at(10) + AV_BAY_REQUERY, false, AV_BAY_REQUERY));
+        assert!(query_due(Some(&query(at(10), false)), since, at(20), true, AV_BAY_REQUERY));
+        assert!(query_due(Some(&query(at(10), false)), since, at(10) + CONFIRM_LOST, false, AV_BAY_REQUERY));
     }
 
     /// accept-hitl and hitl-abort runs: AB/VB/GB/DAQ latched within one probe
@@ -225,6 +328,149 @@ mod tests {
         }
         assert_eq!(confirm.poll(&state), 0);
         assert!(!confirm.active(), "every umbilical board reads Aborted: the window closes early");
+    }
+
+    /// pyroF (relay): RF's Abort readback took 19.7 s. RF reports its state
+    /// only when asked, and its background query was on a 30 s backoff (the
+    /// degraded-link pause on dev holds it for the whole relay). After an
+    /// Abort each AV-bay board is asked once the umbilical readback is in,
+    /// one AV-bay query in the ordered stream at a time.
+    #[tokio::test]
+    async fn av_bay_boards_are_asked_one_at_a_time_after_the_umbilical_readback() {
+        let fixture = crate::board_recovery::tests::http_fixture().await;
+        let state = fixture.state.clone();
+        let host = Arc::new(Router::new(RouterConfig::new([]).with_sender("GS")));
+        assert!(state.topology_router.set(host.clone()).is_ok());
+        let opts = RouterSideOptions { reliable_enabled: true, ..Default::default() };
+        let radio = host.add_side_packed_with_options("rocket_comms", |_| Ok(()), opts.clone());
+        let umbilical = host.add_side_packed_with_options("umbilical_comms", |_| Ok(()), opts);
+        for board in BOARDS {
+            let side = if UMBILICAL.contains(&index(board).unwrap()) { umbilical } else { radio };
+            let announce = sedsnet::discovery::build_discovery_announce(
+                board.sender_id(), 1, &[crate::telemetry_schema::endpoint(endpoint(board))]).unwrap();
+            host.rx_from_side(&announce, side).unwrap();
+            state.board_status.lock().unwrap().get_mut(&board).unwrap().last_seen_instant = Some(std::time::Instant::now());
+        }
+        let mut service = crate::telemetry_task::RouterServiceForTest::default();
+        service.pump(&host);
+        let mut confirm = AbortConfirmRefresh::default();
+        confirm.start();
+        assert_eq!(confirm.poll_av_bay(&state), 0, "umbilical readback goes first");
+        if scope::mode_scope(crate::station_mode::local_mode()) & 0b111 == 0 {
+            // Test fire tracks no AV bay: nothing is owed there.
+            for board in [Board::ActuatorBoard, Board::ValveBoard, Board::GatewayBoard, Board::DaqBoard] {
+                state.board_abort.observe_abort(board, std::time::Instant::now(), 1);
+            }
+            let _ = confirm.poll(&state);
+            assert_eq!(confirm.poll_av_bay(&state), 0);
+            assert!(!confirm.av_bay_active());
+            return;
+        }
+        assert_eq!(confirm.poll(&state), 0b111_1000);
+        for board in [Board::ActuatorBoard, Board::ValveBoard, Board::GatewayBoard, Board::DaqBoard] {
+            state.board_abort.observe_abort(board, std::time::Instant::now(), 1);
+        }
+        let _ = confirm.poll(&state);
+        assert!(!confirm.active(), "umbilical readback is in");
+        assert!(confirm.av_bay_active());
+        assert_eq!(confirm.poll_av_bay(&state), 0b010, "FC first");
+        service.pump(&host);
+        assert!(av_bay_query_in_flight(&host));
+        assert_eq!(confirm.poll_av_bay(&state), 0, "one AV-bay query in flight at a time");
+        // FC reads Aborted and its query is answered: PB next, then RF.
+        state.board_abort.observe_abort(Board::FlightComputer, std::time::Instant::now(), 2);
+        let mut next = Vec::new();
+        for board in [Board::PowerBoard, Board::RFBoard] {
+            let start = std::time::Instant::now();
+            let sent = loop {
+                service.pump(&host);
+                let sent = confirm.poll_av_bay(&state);
+                if sent != 0 || start.elapsed() > Duration::from_secs(10) {
+                    break sent;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            next.push(sent);
+            state.board_abort.observe_abort(board, std::time::Instant::now(), 3);
+        }
+        assert_eq!(next, [0b100, 0b001], "PB, then RF");
+        assert_eq!(confirm.poll_av_bay(&state), 0);
+        assert!(!confirm.av_bay_active(), "every AV-bay board reads Aborted");
+    }
+
+    /// Review of 925b07a: a silent FC (unreachable over the relay) comes due
+    /// again each time its query gives up, and must not starve PB and RF.
+    #[tokio::test]
+    async fn a_silent_av_bay_board_does_not_starve_the_others() {
+        let _tuning = crate::network_delivery_tuning_for_test();
+        let fixture = crate::board_recovery::tests::http_fixture().await;
+        let state = fixture.state.clone();
+        let host = Arc::new(Router::new(RouterConfig::new([]).with_sender("GS")));
+        assert!(state.topology_router.set(host.clone()).is_ok());
+        let opts = RouterSideOptions { reliable_enabled: true, ..Default::default() };
+        // The radio takes every frame and nothing comes back.
+        let radio = host.add_side_packed_with_options("rocket_comms", |_| Ok(()), opts.clone());
+        let umbilical = host.add_side_packed_with_options("umbilical_comms", |_| Ok(()), opts);
+        for board in BOARDS {
+            let side = if UMBILICAL.contains(&index(board).unwrap()) { umbilical } else { radio };
+            let announce = sedsnet::discovery::build_discovery_announce(
+                board.sender_id(), 1, &[crate::telemetry_schema::endpoint(endpoint(board))]).unwrap();
+            host.rx_from_side(&announce, side).unwrap();
+        }
+        for board in [Board::ActuatorBoard, Board::ValveBoard, Board::GatewayBoard, Board::DaqBoard] {
+            state.board_abort.observe_abort(board, std::time::Instant::now(), 1);
+        }
+        let mut service = crate::telemetry_task::RouterServiceForTest::default();
+        service.pump(&host);
+        let mut confirm = AbortConfirmRefresh::default();
+        confirm.start();
+        if scope::mode_scope(crate::station_mode::local_mode()) & 0b111 == 0 {
+            let _ = confirm.poll(&state);
+            assert_eq!(confirm.poll_av_bay(&state), 0, "test fire tracks no AV bay");
+            return;
+        }
+        let announce = |host: &Router| {
+            for board in BOARDS {
+                let side = if UMBILICAL.contains(&index(board).unwrap()) { umbilical } else { radio };
+                let announce = sedsnet::discovery::build_discovery_announce(
+                    board.sender_id(), 1, &[crate::telemetry_schema::endpoint(endpoint(board))]).unwrap();
+                host.rx_from_side(&announce, side).unwrap();
+            }
+        };
+        let mut asked = 0u8;
+        let mut order = Vec::new();
+        let start = std::time::Instant::now();
+        let mut announced = start;
+        while asked & 0b111 != 0b111 && start.elapsed() < AV_BAY_CONFIRM_WINDOW {
+            // The boards keep announcing, as they do on the bench.
+            if announced.elapsed() >= Duration::from_secs(1) {
+                announce(&host);
+                announced = std::time::Instant::now();
+            }
+            service.pump(&host);
+            for board in BOARDS {
+                state.board_status.lock().unwrap().get_mut(&board).unwrap().last_seen_instant = Some(std::time::Instant::now());
+            }
+            let _ = confirm.poll(&state);
+            let sent = confirm.poll_av_bay(&state);
+            if sent != 0 {
+                order.push(sent);
+            }
+
+            asked |= sent;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(asked & 0b111, 0b111, "FC, PB and RF are all asked: {order:?}");
+    }
+
+    /// A local Abort clears the AV-bay read-only backoff, so background
+    /// refresh after the confirm window starts at the normal cadence.
+    #[test]
+    fn abort_clears_the_av_bay_readonly_backoff() {
+        let mut refresh = ReadonlyQueryRefresh::default();
+        refresh.misses = [6, 6, 6, 6, 6, 6, 6];
+        refresh.clear_av_bay_backoff();
+        assert_eq!(refresh.misses, [0, 0, 0, 6, 6, 6, 6]);
     }
 
     /// Relay-cut runs: an AV-bay query waiting on the radio holds the one
