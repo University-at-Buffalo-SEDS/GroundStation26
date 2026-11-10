@@ -1981,6 +1981,32 @@ fn simulated_serial_pty() -> bool {
     *ENABLED.get_or_init(|| std::env::var("GS_SIMULATED_SERIAL_PTY").ok().as_deref() == Some("1"))
 }
 
+/// Sim/trace only (GS_SIM_TRACE_RELIABLE): which radio TX check held a
+/// frame back, at most once per check per 100 ms of simulated (or wall) time.
+fn trace_radio_gate_refusal(gate: &'static str, priority: u8, payload: &[u8]) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some()) {
+        return;
+    }
+    const GATES: [&str; 5] = ["cts", "recovery_capacity", "control_capacity", "ordinary_capacity", "wire_quiet"];
+    static LAST: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(u64::MAX) }; 5];
+    let Some(slot) = GATES.iter().position(|name| *name == gate) else {
+        return;
+    };
+    let now = crate::simulation_clock_ms().unwrap_or_else(unix_now_ms);
+    let last = LAST[slot].load(std::sync::atomic::Ordering::Relaxed);
+    if last != u64::MAX && now.saturating_sub(last) < 100 {
+        return;
+    }
+    LAST[slot].store(now, std::sync::atomic::Ordering::Relaxed);
+    log::info!(
+        "full-bay radio gate held side=rocket_comms gate={gate} sim={:?} priority={priority} len={} type={:?}",
+        crate::simulation_clock_ms(),
+        payload.len(),
+        serialize::peek_frame_info_unchecked(payload).map(|info| info.envelope.ty)
+    );
+}
+
 fn is_idle_serial_timeout(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
@@ -3649,11 +3675,13 @@ impl CommsDevice for UartComms {
         };
         let mut state = self.write_lock.lock().unwrap();
         if self.hardware_flow_control && !state.cts_ready {
+            trace_radio_gate_refusal("cts", priority, payload);
             return false;
         }
         let wall = Instant::now();
         let clock = crate::simulation_clock_ms();
         if !self.refresh_recovery_capacity(&mut state, wall, clock) {
+            trace_radio_gate_refusal("recovery_capacity", priority, payload);
             return false;
         }
         if state.radio_capacity.as_ref().is_some_and(|cap| {
@@ -3666,6 +3694,7 @@ impl CommsDevice for UartComms {
             }
             false
         }) {
+            trace_radio_gate_refusal("control_capacity", priority, payload);
             return false;
         }
         if control.is_none()
@@ -3675,6 +3704,7 @@ impl CommsDevice for UartComms {
                 closes_radio_packet_batch(priority, payload) || radio_liveness_frame(priority, payload),
             )
         {
+            trace_radio_gate_refusal("ordinary_capacity", priority, payload);
             return false;
         }
         #[cfg(target_os = "linux")]
@@ -3682,7 +3712,11 @@ impl CommsDevice for UartComms {
             && matches!(self.protocol, SerialProtocol::RawUart)
             && let Some(now) = crate::simulation_clock_ms()
         {
-            return state.wire.ready(now);
+            let ready = state.wire.ready(now);
+            if !ready {
+                trace_radio_gate_refusal("wire_quiet", priority, payload);
+            }
+            return ready;
         }
         true
     }
