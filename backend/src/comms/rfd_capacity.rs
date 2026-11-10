@@ -782,6 +782,25 @@ impl Capacity {
         }
         self.share_percent = share;
     }
+    /// Sim/trace only: why the bucket holds a frame now.
+    pub(crate) fn hold_detail(&self, wall: Instant, virtual_ms: Option<u64>) -> String {
+        let until = |deadline: Option<(Instant, Option<u64>)>| {
+            deadline.map_or(0, |(at_wall, at_virtual)| match (virtual_ms, at_virtual) {
+                (Some(now), Some(at)) => at.saturating_sub(now),
+                _ => at_wall.saturating_duration_since(wall).as_millis().min(u128::from(u64::MAX)) as u64,
+            })
+        };
+        format!(
+            " bucket_wait_ms={} packet_gap_ms={} packet_ready={} early_frame={} owner_bytes={} completed_owner={} share={}%",
+            until(self.next),
+            until(self.next_packet),
+            self.packet_ready(wall, virtual_ms),
+            self.early_frame_outstanding,
+            self.ordinary_owner_bytes,
+            self.completed_ordinary_owner,
+            self.share_percent
+        )
+    }
     pub(crate) fn ready(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
         Self::reached(self.next, wall, virtual_ms) && self.packet_ready(wall, virtual_ms)
     }
@@ -797,7 +816,7 @@ impl Capacity {
             },
         )
     }
-    fn packet_ready(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
+    pub(crate) fn packet_ready(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
         let reached = |deadline: Option<(Instant, Option<u64>)>| {
             deadline.is_none_or(
                 |(next_wall, next_virtual)| match (virtual_ms, next_virtual) {
