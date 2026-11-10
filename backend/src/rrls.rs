@@ -507,6 +507,9 @@ pub struct Mesh {
     topology_peer_seen: Option<u64>,
     topology_relay_rx: Option<u64>,
     last_ready_sequence: Option<u32>,
+    /// The previous owed settings turn carried a budget frame; the next one
+    /// gives a waiting framing offer or mode reply its turn first.
+    owed_turn_was_budget: bool,
     last_ready_sent: Option<u64>,
     queue: VecDeque<Queued>,
     bytes: usize,
@@ -574,6 +577,7 @@ impl Mesh {
             topology_peer_seen: None,
             topology_relay_rx: None,
             last_ready_sequence: None,
+            owed_turn_was_budget: false,
             last_ready_sent: None,
             queue: VecDeque::new(),
             bytes: 0,
@@ -1491,12 +1495,28 @@ impl Mesh {
         self.begin_mode_reply(now, false)
     }
     /// The primary's owed settings turn (see radio_io SETTINGS_TURN_MS): one
-    /// settings framing offer or one station-mode reply, even while protected
-    /// Mesh frames such as HEALTH wait for the normal path. Nothing else.
+    /// relay budget frame (the RRLS's grant), else one settings framing offer,
+    /// else one station-mode reply, even while protected Mesh frames such as
+    /// HEALTH wait for the normal path. Nothing else.
     pub(crate) fn begin_owed_settings_transmission(&mut self, now: u64) -> Option<Transmission> {
         if self.role != Role::Primary {
             return None;
         }
+        // Alternate after a budget frame, so a budget frame queued on every
+        // turn can never starve the settings it was added to carry.
+        if self.owed_turn_was_budget
+            && let Some(settings) = self
+                .begin_framing_offer_transmission(now, 0)
+                .or_else(|| self.begin_mode_reply(now, true))
+        {
+            self.owed_turn_was_budget = false;
+            return Some(settings);
+        }
+        if let Some(budget) = self.begin_paid_budget_transmission(now) {
+            self.owed_turn_was_budget = true;
+            return Some(budget);
+        }
+        self.owed_turn_was_budget = false;
         self.begin_framing_offer_transmission(now, 0)
             .or_else(|| self.begin_mode_reply(now, true))
     }

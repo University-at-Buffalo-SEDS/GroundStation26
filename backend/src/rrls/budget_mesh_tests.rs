@@ -488,3 +488,38 @@ fn queue_flags_preserve_each_other_and_reserved_bits_without_layout_growth() {
     assert_eq!(std::mem::size_of::<Queued>(), 48);
     assert_eq!(std::mem::size_of::<Option<Queued>>(), 48);
 }
+
+/// The primary's relay grant is a paid budget frame. Paid budget admission
+/// waits for an empty receipt lane, which never happens on the radio, so the
+/// RRLS never got its grant and stayed at the 35% base share (faithful sim:
+/// primary pending_queued_owner true, RRLS requested 35 throughout a relay).
+/// The primary's owed settings turn carries a queued budget frame first.
+#[test]
+fn owed_settings_turn_carries_a_queued_primary_budget_frame() {
+    let (mut p, _r) = paired();
+    p.direct(0);
+    p.tick(0);
+    let health = p.begin_transmission(0).unwrap();
+    assert_eq!(health.frame().bytes[3], HEALTH);
+    p.finish_transmission(health, true);
+    // A station-mode reply is waiting too.
+    let mut reply = b"OM\x02\x01".to_vec();
+    reply.extend(7u32.to_le_bytes());
+    reply.extend(123u128.to_le_bytes());
+    reply.push(0);
+    assert!(p.queue_operating_mode_reply(&reply, 0));
+    let owed = p.begin_owed_settings_transmission(0).expect("the owed turn carries the queued budget frame");
+    let budget = owed.frame().bytes.clone();
+    assert_eq!(budget[3], BUDGET_CONTROL);
+    p.finish_transmission(owed, true);
+    // Another budget frame is queued for the next turn: the waiting mode
+    // reply goes first, then the budget frame on the turn after.
+    p.enqueue(Outgoing { command: true, bytes: budget }, 254, 0);
+    let second = p.begin_owed_settings_transmission(0).expect("second owed turn");
+    assert!(second.frame().bytes.windows(reply.len()).any(|w| w == reply) || second.frame().bytes[3] != BUDGET_CONTROL,
+        "the mode reply goes on the turn after a budget frame");
+    p.finish_transmission(second, true);
+    let third = p.begin_owed_settings_transmission(0).expect("third owed turn");
+    assert_eq!(third.frame().bytes[3], BUDGET_CONTROL, "then the budget frame");
+    p.finish_transmission(third, true);
+}
