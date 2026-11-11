@@ -21,24 +21,89 @@ const SEQUENCE_WINDOW: u32 = 4;
 /// is accepted up to this many periods after it was sealed: the request's own
 /// timeout. Over a hidden-node relay one GS-RRLS round trip can take 4 s.
 const LATE_REPLY_WINDOW: u32 = SEQUENCE_WINDOW * 2;
-const DISCOVERY_COOLDOWN_MS: u64 = 30_000;
+/// RRLS discovery while it holds no capability: one query per step, each
+/// step jittered by DISCOVERY_JITTER_PERCENT, then every 8 s for as long as
+/// it lasts. The air the RRLS shares with the primary and the AV bay is busy
+/// most of the time (no carrier sense in the shipped profile), so the old
+/// burst of three queries in one second shared one busy period and was then
+/// followed by 30 s of silence with every RRLS button disabled.
+const DISCOVERY_STEPS_MS: [u64; 5] = [500, 1_000, 2_000, 4_000, 8_000];
+const DISCOVERY_JITTER_PERCENT: u64 = 30;
+/// A discovery query keeps its nonce this long, so the answer to an earlier
+/// copy still counts; later steps seal a fresh nonce. Well inside the reply's
+/// own LATE_REPLY_WINDOW.
+const DISCOVERY_NONCE_MS: u64 = 3_000;
+fn discovery_delay(step: u8) -> u64 {
+    jittered(
+        DISCOVERY_STEPS_MS[usize::from(step).min(DISCOVERY_STEPS_MS.len() - 1)],
+        DISCOVERY_JITTER_PERCENT,
+    )
+}
+/// `base` plus or minus `percent` of it, uniformly.
+fn jittered(base: u64, percent: u64) -> u64 {
+    let spread = base * percent / 100;
+    base - spread + rand::random::<u64>() % (2 * spread + 1)
+}
 /// RRLS live view of the primary's control observation (fill boards
-/// included). One signed QueryObserve and one Capability reply per period,
-/// each at most MAX_WIRE bytes plus mesh framing: under 55 B/s worst case,
-/// about a fifth of the 256 B/s settings allowance. Replies are bound to a
-/// fresh nonce and their ages are source age plus the elapsed upper bound
-/// since this query, so a lost or late reply only lets rows go stale.
+/// included), and the RRLS's only presence at the primary while idle (the
+/// primary shows it Offline once its last verified exchange is 15 s old).
+/// One signed QueryObserve per period; an unanswered one is sent again with
+/// a fresh nonce up to REFRESH_RETRIES times, REFRESH_REPLY_MS plus 200 to
+/// 700 ms apart, and the period halves while no exchange has been verified
+/// for REFRESH_STALE_MS. Replies are bound to their nonce and their ages are
+/// source age plus the elapsed upper bound since that query, so a lost or
+/// late reply only lets rows go stale.
 pub(crate) const OBSERVE_REFRESH_MS: u64 = 10_000;
-fn observe_refresh_due(now: u64, last: Option<u64>, link_idle_direct: bool, idle: bool) -> bool {
+const REFRESH_STALE_MS: u64 = 10_000;
+const REFRESH_STALE_PERIOD_MS: u64 = 5_000;
+const REFRESH_REPLY_MS: u64 = 1_500;
+const REFRESH_RETRIES: u8 = 3;
+fn refresh_retry_delay() -> u64 {
+    REFRESH_REPLY_MS + 200 + rand::random::<u64>() % 501
+}
+/// Period of the observe refresh: shorter while the RRLS has not verified an
+/// exchange (Capability or Result) recently.
+fn observe_refresh_period(now: u64, last_exchange: Option<u64>) -> u64 {
+    if last_exchange
+        .and_then(|at| now.checked_sub(at))
+        .is_some_and(|age| age < REFRESH_STALE_MS)
+    {
+        OBSERVE_REFRESH_MS
+    } else {
+        REFRESH_STALE_PERIOD_MS
+    }
+}
+fn observe_refresh_due(
+    now: u64,
+    last: Option<u64>,
+    link_idle_direct: bool,
+    idle: bool,
+    period: u64,
+) -> bool {
     link_idle_direct
         && idle
-        && last.is_none_or(|last| now.checked_sub(last).is_none_or(|age| age >= OBSERVE_REFRESH_MS))
+        && last.is_none_or(|last| now.checked_sub(last).is_none_or(|age| age >= period))
 }
-fn discovery_retry_due(now: u64, last: Option<u64>, attempts: u8) -> bool {
-    attempts >= 3
-        && last
-            .and_then(|last| now.checked_sub(last))
-            .is_some_and(|age| age >= DISCOVERY_COOLDOWN_MS)
+/// An unanswered refresh copy is sent again, with a fresh nonce, after its
+/// own delay; at most REFRESH_RETRIES times per refresh.
+fn refresh_retry_due(now: u64, copies: u8, sent: Option<(u64, u64)>, link_idle_direct: bool, idle: bool) -> bool {
+    link_idle_direct
+        && idle
+        && (1..=REFRESH_RETRIES).contains(&copies)
+        && sent.is_some_and(|(at, delay)| now.checked_sub(at).is_none_or(|age| age >= delay))
+}
+/// A pending request is sent again only after its previous copy had a full
+/// turn of the shared air (RRLS -> primary -> RRLS, about 400 ms), with up to
+/// 150 ms of jitter from the request's own random id so copies do not lock
+/// onto a periodic sender. Copies stop at REQUEST_COPIES or once the sealed
+/// HEALTH sequence leaves the primary's SEQUENCE_WINDOW; freshness is unchanged.
+/// A capability kept across a lost transport is restored only if the same
+/// primary session returns within this long; after it, discovery runs again.
+const CACHED_CAPABILITY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const REQUEST_RESEND_MS: u64 = 400;
+const REQUEST_COPIES: u8 = 5;
+fn request_resend_delay(id: &[u8; 16], attempts: u8) -> u64 {
+    REQUEST_RESEND_MS + u64::from(id[usize::from(attempts) % id.len()]) % 151
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Transport {
@@ -115,6 +180,14 @@ struct Runtime {
     /// this request's result may arrive after the normal sequence window.
     awaiting: std::cell::Cell<Option<[u8; 16]>>,
     capability: Option<([u8; 16], Mode, u64)>,
+    /// RRLS: the capability verified under a primary session, kept while the
+    /// transport is briefly lost (HEALTH unheard for PROXY_LEASE_MS) and
+    /// restored if the same session returns. A new session means the primary
+    /// restarted, and it is dropped. The primary still checks boot, mode,
+    /// sequence freshness, nonce and signature on every request.
+    /// Restored only within CACHED_CAPABILITY_TTL of the loss, and the worker
+    /// re-verifies it with an immediate observe refresh.
+    cached_capability: Option<(u32, ([u8; 16], Mode, u64), std::time::Instant)>,
     results: VecDeque<Cached>,
     observation: Vec<u8>,
     extended_observation: bool,
@@ -142,6 +215,7 @@ impl Runtime {
             answered_query: None,
             awaiting: std::cell::Cell::new(None),
             capability: None,
+            cached_capability: None,
             results: VecDeque::new(),
             observation: Vec::new(),
             extended_observation: false,
@@ -172,9 +246,24 @@ impl Runtime {
                 self.admission.rotate_transport();
                 self.boot = self.admission.boot();
             }
+            if self.role == Role::Rrls {
+                if let (Some(old), Some(capability)) = (self.session, self.capability) {
+                    self.cached_capability = Some((old, capability, std::time::Instant::now()));
+                }
+            }
             self.session = session;
             self.query = None;
-            self.capability = None;
+            self.capability = match (self.cached_capability, session) {
+                (Some((cached, capability, lost)), Some(now))
+                    if cached == now && lost.elapsed() < CACHED_CAPABILITY_TTL =>
+                {
+                    Some(capability)
+                }
+                _ => None,
+            };
+            if session.is_some() {
+                self.cached_capability = None;
+            }
             self.results.clear();
             self.extended_observation = false;
             self.readiness_demand = false;
@@ -562,16 +651,75 @@ mod observe_refresh_tests {
     use super::*;
     #[test]
     fn refresh_is_bounded_and_only_when_idle_on_a_direct_link() {
-        assert!(observe_refresh_due(0, None, true, true));
-        assert!(!observe_refresh_due(0, None, false, true));
-        assert!(!observe_refresh_due(0, None, true, false));
-        assert!(!observe_refresh_due(OBSERVE_REFRESH_MS - 1, Some(0), true, true));
-        assert!(observe_refresh_due(OBSERVE_REFRESH_MS, Some(0), true, true));
+        let p = OBSERVE_REFRESH_MS;
+        assert!(observe_refresh_due(0, None, true, true, p));
+        assert!(!observe_refresh_due(0, None, false, true, p));
+        assert!(!observe_refresh_due(0, None, true, false, p));
+        assert!(!observe_refresh_due(OBSERVE_REFRESH_MS - 1, Some(0), true, true, p));
+        assert!(observe_refresh_due(OBSERVE_REFRESH_MS, Some(0), true, true, p));
         // A clock that moved backwards restarts the period instead of stalling.
-        assert!(observe_refresh_due(5, Some(10), true, true));
-        // Query plus reply, each a full frame with mesh framing, per period.
-        let worst_bytes_per_s = 2 * (MAX_WIRE as u64 + 16) * 1000 / OBSERVE_REFRESH_MS;
-        assert!(worst_bytes_per_s <= 256 / 4, "{worst_bytes_per_s} B/s");
+        assert!(observe_refresh_due(5, Some(10), true, true, p));
+        // Worst case: no reply is ever heard, so one copy at most every
+        // REFRESH_REPLY_MS + 200 ms (retries, then the shortened period),
+        // each answered by a full reply. Counting both as MAX_WIRE frames with
+        // mesh framing (actual: 132 B query, 238 B reply, about 240 B/s), it
+        // stays under a tenth of the shipped profile's 30 kbit/s usable air.
+        // An RRLS that hears replies sends one query per 10 s.
+        let worst_bytes_per_s = 2 * (MAX_WIRE as u64 + 16) * 1000 / (REFRESH_REPLY_MS + 200);
+        assert!(worst_bytes_per_s <= 30_000 / 8 / 10, "{worst_bytes_per_s} B/s");
+    }
+    /// Bench 2026-11-11 (rrls-txgap-ROOTCAUSE.md): the idle refresh was one
+    /// unacknowledged frame every 10 s, and 79% of them were lost on the
+    /// shared air, so the primary showed the RRLS Offline for most of the run.
+    #[test]
+    fn an_unanswered_refresh_is_retried_with_jitter_then_the_period_shortens() {
+        // Retries: copies 1..=3 may be followed by another, after its delay.
+        let delay = refresh_retry_delay();
+        assert!((REFRESH_REPLY_MS + 200..=REFRESH_REPLY_MS + 700).contains(&delay));
+        assert!(!refresh_retry_due(1_000 + delay - 1, 1, Some((1_000, delay)), true, true));
+        assert!(refresh_retry_due(1_000 + delay, 1, Some((1_000, delay)), true, true));
+        assert!(refresh_retry_due(1_000 + delay, 3, Some((1_000, delay)), true, true));
+        assert!(!refresh_retry_due(1_000 + delay, 4, Some((1_000, delay)), true, true), "three retries");
+        assert!(!refresh_retry_due(1_000 + delay, 0, Some((1_000, delay)), true, true), "answered");
+        assert!(!refresh_retry_due(1_000 + delay, 1, Some((1_000, delay)), false, true), "relaying");
+        assert!(!refresh_retry_due(1_000 + delay, 1, Some((1_000, delay)), true, false), "busy");
+        // Period: 10 s while an exchange was verified in the last 10 s, else 5 s.
+        assert_eq!(observe_refresh_period(20_000, Some(15_000)), OBSERVE_REFRESH_MS);
+        assert_eq!(observe_refresh_period(20_000, Some(10_000)), REFRESH_STALE_PERIOD_MS);
+        assert_eq!(observe_refresh_period(20_000, None), REFRESH_STALE_PERIOD_MS);
+        assert_eq!(observe_refresh_period(20_000, Some(30_000)), REFRESH_STALE_PERIOD_MS);
+        // With the reply window, a stale RRLS still sends within the primary's
+        // 15 s Offline threshold several times over.
+        assert!(REFRESH_STALE_PERIOD_MS + REFRESH_REPLY_MS + 700 < 15_000 / 2);
+    }
+    #[test]
+    fn discovery_is_spread_and_never_silent_for_long() {
+        let mut previous = 0;
+        for step in 0..20u8 {
+            let base = DISCOVERY_STEPS_MS[usize::from(step).min(4)];
+            for _ in 0..50 {
+                let delay = discovery_delay(step);
+                assert!(delay >= base * 7 / 10 && delay <= base * 13 / 10, "step {step}: {delay}");
+                assert!(delay <= 8_000 * 13 / 10, "never silent past 8 s + 30%");
+            }
+            assert!(base >= previous, "backs off");
+            previous = base;
+        }
+        // The first five steps spread over about 15 s, not one second.
+        assert_eq!(DISCOVERY_STEPS_MS.iter().sum::<u64>(), 15_500);
+        // Spread, not fixed: one of 200 delays differs from the base.
+        assert!((0..200).any(|_| discovery_delay(2) != 2_000));
+    }
+    #[test]
+    fn request_copies_wait_a_turn_and_stay_inside_the_freshness_window() {
+        for id in [[0u8; 16], [255; 16], [150; 16], [7; 16]] {
+            for attempts in 0..REQUEST_COPIES {
+                let delay = request_resend_delay(&id, attempts);
+                assert!((REQUEST_RESEND_MS..=REQUEST_RESEND_MS + 150).contains(&delay));
+            }
+        }
+        // All copies fit in the 4-period window (HEALTH every 500 ms).
+        assert!(u64::from(REQUEST_COPIES - 1) * REQUEST_RESEND_MS <= u64::from(SEQUENCE_WINDOW) * 500);
     }
 }
 
@@ -893,12 +1041,7 @@ mod tests {
         assert!(primary.receive(&p, pview, Mode::Hitl, &query).is_err());
     }
     #[test]
-    fn capability_recovery_uses_bounded_bursts_and_does_not_reinterpret_clock_rollback() {
-        assert!(!discovery_retry_due(30_000, Some(0), 2));
-        assert!(!discovery_retry_due(29_999, Some(0), 3));
-        assert!(discovery_retry_due(30_000, Some(0), 3));
-        assert!(!discovery_retry_due(0, Some(30_000), 3));
-        assert!(!discovery_retry_due(u64::MAX, None, 3));
+    fn capability_recovery_uses_a_fresh_nonce_per_discovery_round() {
         let (_root, p, r, mut primary, mut rr, pview, rview) = connected();
         let old = rr.query(&r, rview).unwrap();
         rr.query = None; // The worker changes only this nonce after cooldown.
@@ -917,6 +1060,127 @@ mod tests {
             rr.receive(&r, rview, Mode::Normal, &new_reply).unwrap(),
             Received::Capability { .. }
         ));
+    }
+    /// Bench 2026-11-11 15:30: one lost request or reply wiped the RRLS's
+    /// capability ("Primary response was not confirmed"), and every later
+    /// request was refused until discovery succeeded again on a full channel.
+    /// The capability survives an unanswered request and a brief transport
+    /// loss in the same primary session; the primary's checks are unchanged.
+    #[test]
+    fn a_valid_capability_survives_lost_air_and_only_the_primary_retires_it() {
+        let (_root, p, r, mut primary, mut rr, pview, rview) = connected();
+        let held = rr.capability.expect("capability");
+        // Request sealed and lost on the air: nothing came back.
+        let _lost = rr
+            .request(&r, rview, Mode::Hitl, [8; 16], "operator".into(), Operation::Command("Pilot".into()))
+            .unwrap();
+        // HEALTH unheard past PROXY_LEASE_MS, then heard again: same session.
+        rr.connect(None);
+        assert!(rr.capability.is_none(), "no capability while disconnected");
+        rr.connect(Some(rview));
+        assert_eq!(rr.capability, Some(held), "same primary session keeps it");
+        let next = rr
+            .request(&r, rview, Mode::Hitl, [9; 16], "operator".into(), Operation::Command("Pilot".into()))
+            .unwrap();
+        assert!(matches!(primary.receive(&p, pview, Mode::Hitl, &next).unwrap(), Received::Execute(_)));
+        // Freshness is still enforced on the restored capability.
+        let stale = rr
+            .request(&r, Transport { sequence: 10, ..rview }, Mode::Hitl, [10; 16], "operator".into(), Operation::Command("Pilot".into()))
+            .unwrap();
+        assert!(primary.receive(&p, pview, Mode::Hitl, &stale).is_err());
+        // A new primary session (the primary restarted) never inherits it.
+        rr.connect(None);
+        rr.connect(Some(Transport { session: 8, ..rview }));
+        assert!(rr.capability.is_none());
+        rr.connect(Some(rview));
+        assert!(rr.capability.is_none(), "dropped once another session was seen");
+        // Past its time-to-live a kept capability is not restored, even for
+        // the same session.
+        let (_root, _p, _r, _primary, mut rr, _pview, rview) = connected();
+        rr.connect(None);
+        let (session, capability, lost) = rr.cached_capability.unwrap();
+        rr.cached_capability = Some((session, capability, lost - CACHED_CAPABILITY_TTL));
+        rr.connect(Some(rview));
+        assert!(rr.capability.is_none(), "expired");
+        // The primary retires an old boot itself: a request sealed on it is
+        // refused, and the next Capability replaces it.
+        let (_root, p, r, mut primary, mut rr, pview, rview) = connected();
+        let old = rr.capability.unwrap().0;
+        primary.connect(None);
+        primary.connect(Some(pview));
+        let refused = rr
+            .request(&r, rview, Mode::Hitl, [11; 16], "operator".into(), Operation::Command("Pilot".into()))
+            .unwrap();
+        assert!(primary.receive(&p, pview, Mode::Hitl, &refused).is_err());
+        rr.query = None;
+        let query = rr.query_observe(&r, rview).unwrap();
+        let Received::Reply(reply) = primary.receive(&p, pview, Mode::Hitl, &query).unwrap() else {
+            panic!("capability reply")
+        };
+        assert!(matches!(rr.receive(&r, rview, Mode::Normal, &reply).unwrap(), Received::Capability { .. }));
+        assert_ne!(rr.capability.unwrap().0, old);
+    }
+    /// The RRLS sends up to REQUEST_COPIES copies of one sealed request. The
+    /// primary executes it once per request nonce (its results cache, keyed by
+    /// request id and contract digest) and answers every later copy with the
+    /// cached signed result or Pending, never a second execution. This covers
+    /// pyro, Abort and every other proxied command alike.
+    #[test]
+    fn every_copy_of_a_request_executes_at_most_once() {
+        for command in ["DeployParachute", "ExpandParachute", "Pilot", "ToggleAvBayUnderglow"] {
+            let (_root, p, r, mut primary, rr, pview, rview) = connected();
+            let id = nonce();
+            let request = rr
+                .request(&r, rview, Mode::Hitl, id, "operator".into(), Operation::Command(command.into()))
+                .unwrap();
+            let mut executions = 0;
+            let mut work = None;
+            // Copies spread over the whole freshness window, some before and
+            // some after the primary finished the first.
+            for copy in 0..REQUEST_COPIES {
+                let view = Transport { sequence: pview.sequence + u32::from(copy) / 2, ..pview };
+                match primary.receive(&p, view, Mode::Hitl, &request).unwrap() {
+                    Received::Execute(w) => {
+                        executions += 1;
+                        work = Some(w);
+                    }
+                    Received::Pending | Received::Reply(_) => {}
+                    _ => panic!("unexpected"),
+                }
+                if copy == 1 {
+                    primary.finish(&p, work.take().unwrap(), Outcome::Queued).unwrap();
+                }
+            }
+            assert_eq!(executions, 1, "{command}");
+            // A copy past the freshness window is refused, not executed.
+            let late = Transport { sequence: pview.sequence + SEQUENCE_WINDOW, ..pview };
+            assert!(!matches!(primary.receive(&p, late, Mode::Hitl, &request), Ok(Received::Execute(_))));
+        }
+    }
+    #[test]
+    fn a_late_result_upgrades_only_the_matching_unconfirmed_request() {
+        let id = [0x5a; 16];
+        let unknown = Some(RequestStatus {
+            request_id: hex(&id),
+            operation: "Pilot".into(),
+            phase: "unknown",
+            primary_accepted: false,
+            device_confirmed: false,
+            error: Some("Primary response was not confirmed; inspect actual state before retrying.".into()),
+        });
+        let mut last = unknown.clone();
+        upgrade_late_result(&mut last, [0x5b; 16], &Outcome::Queued);
+        assert_eq!(last.as_ref().unwrap().phase, "unknown");
+        upgrade_late_result(&mut last, id, &Outcome::Queued);
+        let accepted = last.clone().unwrap();
+        assert_eq!((accepted.phase, accepted.primary_accepted, accepted.error), ("accepted_by_primary", true, None));
+        // Only an "unknown" status is rewritten.
+        upgrade_late_result(&mut last, id, &Outcome::Busy);
+        assert_eq!(last.as_ref().unwrap().phase, "accepted_by_primary");
+        let mut last = unknown;
+        upgrade_late_result(&mut last, id, &Outcome::Busy);
+        assert_eq!(last.as_ref().unwrap().phase, "rejected_by_primary");
+        assert!(!last.unwrap().primary_accepted);
     }
     #[test]
     fn frame_bound_and_signed_identity_role_tamper_checks() {
@@ -1308,6 +1572,28 @@ fn finish_pending(id: [u8; 16], phase: &'static str, accepted: bool, error: Opti
         error,
     });
 }
+/// The primary's signed result for a request this RRLS already reported as
+/// unconfirmed arrived late (its id and contract digest matched): report the
+/// primary's actual outcome instead of "unknown".
+fn note_late_result(id: [u8; 16], outcome: &Outcome) {
+    upgrade_late_result(&mut broker().lock().unwrap().status.last, id, outcome);
+}
+fn upgrade_late_result(last: &mut Option<RequestStatus>, id: [u8; 16], outcome: &Outcome) {
+    let Some(last) = last
+        .as_mut()
+        .filter(|last| last.request_id == hex(&id) && last.phase == "unknown")
+    else {
+        return;
+    };
+    if matches!(outcome, Outcome::Queued) {
+        last.phase = "accepted_by_primary";
+        last.primary_accepted = true;
+        last.error = None;
+    } else {
+        last.phase = "rejected_by_primary";
+        last.error = Some(format!("Primary refused request: {outcome:?}"));
+    }
+}
 fn finish_revoked(pending: &Pending) {
     let sent = pending.attempts != 0;
     finish_pending(
@@ -1666,6 +1952,17 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
         let mut readiness_phase = 0u8;
         let mut readiness_poll_at = None::<std::time::Instant>;
         let mut last_observe_refresh = None::<u64>;
+        // RRLS: the last Capability or Result it verified, the copies of the
+        // current observe refresh with the last copy's time and retry delay,
+        // and the discovery schedule while it holds no capability.
+        let mut last_exchange = None::<u64>;
+        let mut refresh_copies = 0u8;
+        let mut refresh_sent = None::<(u64, u64)>;
+        let mut discovery_step = 0u8;
+        let mut next_discovery = None::<u64>;
+        // RRLS: the last request that timed out unconfirmed (id, contract
+        // digest), so a signed result that arrives late still updates it.
+        let mut unconfirmed = None::<([u8; 16], [u8; 16])>;
 
         loop {
             tokio::select! {_=shutdown.recv()=>break,_=tick.tick()=>{}}
@@ -1697,6 +1994,12 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                 query_attempts = 0;
                 last_query = None;
                 query_created_at = None;
+                discovery_step = 0;
+                next_discovery = None;
+                last_observe_refresh = None;
+                refresh_copies = 0;
+                refresh_sent = None;
+                unconfirmed = None;
                 outbox.clear();
                 invalidate_presentation(&state);
                 let id = broker()
@@ -1799,6 +2102,11 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                             );
                         }
                         debug_assert_ne!(boot, [0; 16]);
+                        last_exchange = Some(now);
+                        refresh_copies = 0;
+                        refresh_sent = None;
+                        discovery_step = 0;
+                        next_discovery = None;
                         broker().lock().unwrap().status.primary_mode = Some(mode);
                         if readiness_phase == 4 {
                             readiness_phase = 0;
@@ -1830,6 +2138,11 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                         outcome,
                         observation,
                     }) => {
+                        last_exchange = Some(now);
+                        if unconfirmed == Some((request, digest)) {
+                            unconfirmed = None;
+                            note_late_result(request, &outcome);
+                        }
                         let created =
                             broker()
                                 .lock()
@@ -1919,15 +2232,10 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                     last_query = None;
                     query_created_at = None;
                 }
-                if runtime.capability.is_none()
-                    && discovery_retry_due(now, last_query, query_attempts)
-                {
-                    // A brief control-only loss must not permanently disable a
-                    // healthy connection. Retry bounded discovery, never an old command.
-                    runtime.query = None;
-                    query_attempts = 0;
-                    last_query = None;
-                    query_created_at = None;
+                if readiness_phase == 4 && runtime.capability.is_none() && query_attempts >= 3 {
+                    // The readiness re-check went unanswered and no capability
+                    // is held: ordinary discovery takes over.
+                    readiness_phase = 0;
                 }
                 let mode = crate::station_mode::snapshot();
                 let available = runtime.capability.is_some_and(|(_, primary, _)| {
@@ -1948,10 +2256,13 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                                 .map(|(_, name)| (*name).into())
                                 .collect()
                         });
-                    broker.status.reason=if available {"Requests are checked by the primary; device confirmation still requires actual telemetry."} else if runtime.capability.is_none() && query_attempts >= 3 && last_query.is_some_and(|last| now.saturating_sub(last) >= 500) {"The primary did not provide a signed control capability; bounded discovery will retry after its cooldown."} else {"Waiting for signed primary control capability and matching current mode."}.into();
+                    broker.status.reason=if available {"Requests are checked by the primary; device confirmation still requires actual telemetry."} else if runtime.capability.is_none() && discovery_step >= 3 {"The primary has not answered this RRLS's signed control query yet; discovery keeps retrying every few seconds."} else {"Waiting for signed primary control capability and matching current mode."}.into();
                 }
-                if (runtime.capability.is_none() || matches!(readiness_phase, 1 | 3 | 4))
-                    && readiness_phase != 2
+                // Readiness checks keep their own bounded burst (at most three
+                // queries 500 ms apart inside the 4 s readiness timeout).
+                let readiness_query = matches!(readiness_phase, 1 | 3)
+                    || (readiness_phase == 4 && runtime.capability.is_some());
+                if readiness_query
                     && query_attempts < 3
                     && last_query.is_none_or(|last| now >= last && now - last >= 500)
                     && let Ok(query) = if readiness_phase == 1 {
@@ -1966,19 +2277,51 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                             query_attempts += 1;
                             last_query = Some(now);
                         }
+                if !readiness_query
+                    && runtime.capability.is_none()
+                    && readiness_phase != 2
+                    && next_discovery.is_none_or(|at| now >= at)
+                {
+                    if query_created_at
+                        .is_some_and(|created| now.checked_sub(created).is_none_or(|age| age >= DISCOVERY_NONCE_MS))
+                    {
+                        runtime.query = None;
+                        query_created_at = None;
+                    }
+                    if let Ok(query) = runtime.query(&pairing, view)
+                        && mesh.lock().unwrap().queue_command_proxy(&query, now)
+                    {
+                        query_created_at.get_or_insert(now);
+                        last_query = Some(now);
+                        next_discovery = Some(now.saturating_add(discovery_delay(discovery_step)));
+                        discovery_step = discovery_step.saturating_add(1);
+                    }
+                }
                 let idle = runtime.capability.is_some()
                     && readiness_reply.is_none()
                     && !matches!(readiness_phase, 1..=3)
                     && last_query != Some(now)
                     && broker().lock().unwrap().pending.is_none();
                 let link_idle_direct = mesh.lock().unwrap().observation_refresh_allowed(now);
-                if observe_refresh_due(now, last_observe_refresh, link_idle_direct, idle) {
-                    last_observe_refresh = Some(now);
+                let retry = refresh_retry_due(now, refresh_copies, refresh_sent, link_idle_direct, idle);
+                // A new refresh waits for the previous copy's reply window, so
+                // retries and the next period never send back to back.
+                let period = observe_refresh_period(now, last_exchange);
+                if retry
+                    || (observe_refresh_due(now, last_observe_refresh, link_idle_direct, idle, period)
+                        && refresh_sent.is_none_or(|(at, _)| now.checked_sub(at).is_none_or(|age| age >= REFRESH_REPLY_MS)))
+                {
                     // Fresh nonce: an unanswered earlier query cannot be replayed.
                     runtime.query = None;
                     if let Ok(query) = runtime.query_observe(&pairing, view) {
                         if mesh.lock().unwrap().queue_command_proxy(&query, now) {
                             query_created_at = Some(now);
+                            if !retry {
+                                last_observe_refresh = Some(now);
+                                refresh_copies = 0;
+                            }
+                            refresh_copies = refresh_copies.saturating_add(1);
+                            refresh_sent = Some((now, refresh_retry_delay()));
                         } else {
                             runtime.query = None;
                         }
@@ -1993,9 +2336,10 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                         continue;
                     }
                     let sequence_age = view.sequence.wrapping_sub(pending.sequence);
-                    // At most three copies; the result may still arrive until the
-                    // request's own timeout (LATE_REPLY_WINDOW), since a relayed
-                    // round trip can outlast the sequence window.
+                    // Copies while the sealed sequence is fresh; the result may
+                    // still arrive until the request's own timeout
+                    // (LATE_REPLY_WINDOW), since a relayed round trip can
+                    // outlast the sequence window.
                     if !available
                         || pending.session != view.session
                         || sequence_age > LATE_REPLY_WINDOW
@@ -2012,12 +2356,24 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                             query_attempts = 0;
                             last_query = None;
                             query_created_at = None;
+                            discovery_step = 0;
+                            next_discovery = None;
+                        } else {
+                            // Lost air, not a rejection: the primary refuses with a
+                            // signed result, and a changed boot or mode arrives in
+                            // its next Capability. Re-verify now, and let a late
+                            // signed result still report this request's outcome.
+                            unconfirmed = pending.wire.as_deref().map(|wire| (pending.id, wire::contract_digest(wire)));
+                            last_observe_refresh = None;
+                            refresh_copies = 0;
+                            refresh_sent = None;
                         }
-                    } else if pending.attempts < 3
+                    } else if pending.attempts < REQUEST_COPIES
                         && sequence_age <= SEQUENCE_WINDOW
-                        && pending
-                            .last_sent
-                            .is_none_or(|last| now >= last && now - last >= 500)
+                        && pending.last_sent.is_none_or(|last| {
+                            now >= last
+                                && now - last >= request_resend_delay(&pending.id, pending.attempts)
+                        })
                     {
                         let required = match pending.operation {
                             Operation::Command(_) => crate::auth::Permission::SendCommands,
