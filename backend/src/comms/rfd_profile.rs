@@ -263,13 +263,15 @@ mod tests {
     fn shipping_profile_is_the_deployed_matched_modem_settings() {
         // The startup check enforces this by default and the default build of
         // every node applies its link-wide registers (the modems read S4=10,
-        // S5=10, S6=50 on 10-28). Each host paces just under the S5=1 drain
-        // rate (64000 / 2 bit/s) with no share partition.
+        // S5=10, S6=50 on 10-28). S5=0: on the 2026-11-10 bench pair
+        // (scripts/rfd_link_test.py) S5=1 at 10 frames/s lost 49% with a 1.0 s
+        // median round trip; S5=0 lost 5.5% at 120 ms. SEDSnet's reliable
+        // retries recover single losses.
         let p = Profile::parse(include_bytes!("../../comms/rfd-profile.json")).unwrap();
         assert!(p.is_embedded_default());
         assert_eq!(p.name(), "rfd-async-64k-drain");
         assert_eq!(p.modem.max_retries, 10);
-        assert_eq!(p.modem.broadcast_retries, 1);
+        assert_eq!(p.modem.broadcast_retries, 0);
         assert_eq!(p.modem.serial_break_ms, 10);
         assert_eq!(p.modem.max_data_bytes, 3968);
         assert_eq!(p.transport.packet_gap_ms, 15);

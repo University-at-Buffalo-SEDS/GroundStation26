@@ -136,7 +136,7 @@ process run. RFDesign does not publish EEPROM endurance.
 | S2 | AIR_SPEED | 64 | 64 | report, always: link-critical |
 | S3 | MAX_DATA | 3968 | 3968 | link-wide |
 | S4 | MAX_RETRIES | 10 | 10 | link-wide |
-| S5 | GLOBAL_RETRIES | **1** (modems read 10 until rolled out) | **0** | link-wide |
+| S5 | GLOBAL_RETRIES | **0** (was 1; modems read 10 until rolled out) | **0** | link-wide |
 | S6 | SER_BREAK_DETECT_MS | **10** | **20** | fix (local) |
 | S7, S8 | TX/RXENCAP | 0 | 0 | link-wide |
 | S11 | DESTID | 32768 | 32768 | fix (local; broadcast so RRLS hears both ends) |
@@ -155,7 +155,26 @@ profile's `name`. Otherwise they are reported and left alone. Even then S2 and S
 and S19 have no expectation. Local registers (S6, S11, S13, S18) are always
 repaired.
 
-### S5=1 (default profile)
+### S5=0 (default profile since 2026-11-10)
+
+Bench pair, GS Pi and RRLS Mac radios, `scripts/rfd_link_test.py` (ping/echo,
+120 B frames, both directions):
+
+| S5 | rate | lost | median RTT | max RTT |
+|---|---|---|---|---|
+| 1 | 2/s | 5% | 262 ms | 1427 ms |
+| 1 | 10/s | 49% | 1044 ms | 2614 ms |
+| 0 | 2/s | 2.5% | 120 ms | 133 ms |
+| 0 | 10/s | 5.5% | 120 ms | 137 ms |
+
+One-way with a silent receiver at S5=0: 20 frames/s (2.9 KB/s) lost 0.5%,
+40 frames/s lost 6%. Losses come from both ends transmitting at once (ASYNC
+has no turn-taking); air speed (125/250) and TX power (1-20) did not raise
+the collapse point, and S6=20 lost more than S6=10. SEDSnet's reliable
+retries recover the single losses S5=1 used to cover, without its seconds of
+queueing.
+
+### S5=1 (previous default profile)
 
 Faithful simulation (FirmwareSimulator `--scenario faithful`, 7 boards, Normal,
 Idle): with S5=10 the GS heard 2.9 frames/s from the AV bay; with S5=1, 11.8

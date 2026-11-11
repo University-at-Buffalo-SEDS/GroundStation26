@@ -6,7 +6,7 @@
     "air_bps": 64000,
     "max_data_bytes": 3968,
     "max_retries": 10,
-    "broadcast_retries": 1,
+    "broadcast_retries": 0,
     "serial_break_ms": 10,
     "tx_encapsulation": 0,
     "rx_encapsulation": 0

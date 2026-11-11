@@ -1012,14 +1012,14 @@ fn reset_is_never_a_startup_mode() {
 }
 
 /// The embedded default profile is the deployed configuration: a default
-/// build expects S5=1 and writes it (link-wide registers included) with no
+/// build expects S5=0 and writes it (link-wide registers included) with no
 /// environment flag. Opt-in profiles still need GS_RFD_PROFILE_ROLLED_OUT.
 #[test]
-fn default_build_expects_and_applies_one_broadcast_retry() {
+fn default_build_expects_and_applies_no_broadcast_retry() {
     let profile = super::super::rfd_profile::Profile::parse(include_bytes!("../../comms/rfd-profile.json")).unwrap();
     let plan = plan_for_profile(&profile);
     let s5 = plan.regs.iter().find(|e| e.number == 5).unwrap();
-    assert_eq!(s5.value, Some(1));
+    assert_eq!(s5.value, Some(0));
     assert_eq!(s5.policy, Policy::Fix, "the default profile is applied automatically");
     let mut modem = SimModem::new();
     let report = run(&mut modem, &plan, Trigger::Startup, Mode::Fix, TIMING, &open, true);

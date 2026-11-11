@@ -821,15 +821,19 @@ fn managed_variable_request_is_not_starved_by_parked_frames() {
 /// The RFD modem already arbitrates the air (ASYNC, LBT, its own copies).
 /// Host pacing only has to keep the 4 KiB modem buffer from overflowing
 /// (no RTS/CTS), so with the default profile one host alone may use the
-/// modem's whole serial-to-air drain rate: S5=1 sends each packet twice on
-/// 64 kbit/s air, about 32 kbit/s. Before, the GS held itself to a 25% share
+/// modem's whole serial-to-air drain rate (usable_air_bps, measured on the
+/// bench with S5=0). Before, the GS held itself to a 25% share
 /// with 100 ms bursts and 55 ms gaps (about 620 B/s of receipts) and the RF
 /// to 35%, each reserving airtime the other was not using.
 #[test]
 fn one_host_alone_can_use_the_modem_drain_rate() {
     crate::telemetry_schema::initialize().unwrap();
     let profile = crate::comms::rfd_profile::Profile::parse(include_bytes!("../../comms/rfd-profile.json")).unwrap();
-    let drain = profile.modem.air_bps / (1 + profile.modem.broadcast_retries) / 8;
+    // S5=0 bench pair (2026-11-10, scripts/rfd_link_test.py): one-way 2.9 KB/s
+    // lost 0.5% and 5.8 KB/s lost 6%, well under air_bps/8; the profile's
+    // usable_air_bps is that measured drain.
+    let drain = (profile.modem.air_bps / (1 + profile.modem.broadcast_retries))
+        .min(profile.transport.usable_air_bps) / 8;
     let cap = crate::comms::rfd_capacity::Capacity::from_defaults(
         115200,
         crate::comms::rfd_capacity::Defaults {
