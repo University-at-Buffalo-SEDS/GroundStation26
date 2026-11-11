@@ -145,3 +145,139 @@ fn an_acknowledged_abort_is_not_resent_for_a_late_readback() {
     assert!(latched.is_some_and(|ms| ms < 500), "RF got it at once: {latched:?}");
     assert_eq!(sent, 0, "no re-send of an acknowledged ABORT");
 }
+
+/// The station on two sides: the radio to the AV bay ("RF", which owns the
+/// ABORT endpoint here) and the umbilical ("GB"). The radio is dead from the
+/// start of the run for `outage_ms` (longer than the 30 s discovery TTL, as in
+/// a takeover or any long radio outage). The operator Aborts `abort_after_ms`
+/// into the outage. `unheard_until_ms` (after the Abort): the AV bay is not
+/// heard, so it neither owes nor confirms the Abort. Returns when, after the
+/// Abort, RF and GB first received an ABORT.
+fn abort_across_a_radio_outage(outage_ms: u64, abort_after_ms: u64, unheard_until_ms: u64, run_ms: u64) -> (Option<u64>, Option<u64>) {
+    let _serial = crate::RUNTIME_TUNING_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let previous = sedsnet::config::runtime_tuning_config();
+    sedsnet::config::set_runtime_tuning_config(crate::network_delivery_tuning()).unwrap();
+    crate::telemetry_schema::initialize().unwrap();
+    let now = Arc::new(AtomicU64::new(1_000));
+    let clock = |n: &Arc<AtomicU64>| {
+        let n = n.clone();
+        Box::new(move || n.load(Ordering::Relaxed)) as Box<dyn sedsnet::router::Clock + Send + Sync>
+    };
+    let abort = crate::telemetry_schema::data_type("ABORT");
+    let board = |name: &str, got: &Arc<Mutex<Option<u64>>>| {
+        let (seen, at) = (got.clone(), now.clone());
+        Arc::new(Router::new_with_clock(
+            RouterConfig::new([EndpointHandler::new_packet_handler(crate::telemetry_schema::endpoint("ABORT"), move |p| {
+                if p.data_type() == abort {
+                    seen.lock().unwrap().get_or_insert(at.load(Ordering::Relaxed));
+                }
+                Ok(())
+            })])
+            .with_sender(name),
+            clock(&now),
+        ))
+    };
+    let (rf_got, gb_got) = (Arc::new(Mutex::new(None::<u64>)), Arc::new(Mutex::new(None::<u64>)));
+    let gs = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("GS"), clock(&now)));
+    let (rf, gb) = (board("RF", &rf_got), board("GB", &gb_got));
+    type Wire = Arc<Mutex<Vec<Vec<u8>>>>;
+    let (to_rf, rf_to_gs, to_gb, gb_to_gs): (Wire, Wire, Wire, Wire) = Default::default();
+    let link: crate::comms_config::CommsLinkConfig =
+        serde_json::from_value(serde_json::json!({"interface": "serial", "port": "/dev/test-radio", "protocol": "raw_uart"})).unwrap();
+    let tx = |w: &Wire| { let w = w.clone(); move |b: &[u8]| { w.lock().unwrap().push(b.to_vec()); Ok(()) } };
+    let gs_radio = gs.add_side_packed_with_options("rocket_comms", tx(&to_rf), crate::rocket_router_side_options(&link, false));
+    let rf_side = rf.add_side_packed_with_options("radio", tx(&rf_to_gs), crate::rocket_router_side_options(&link, false));
+    let gs_umbilical = gs.add_side_packed("umbilical_comms", tx(&to_gb));
+    let gb_side = gb.add_side_packed("umbilical", tx(&gb_to_gs));
+    let start = now.load(Ordering::Relaxed);
+    let abort_at = start + 1_000 + abort_after_ms;
+    let radio_back = start + 1_000 + outage_ms;
+    let pump = |steps: usize| {
+        for _ in 0..steps {
+            now.fetch_add(10, Ordering::Relaxed);
+            let t = now.load(Ordering::Relaxed);
+            let radio = t < start + 1_000 || t >= radio_back;
+            for r in [&gs, &rf, &gb] {
+                let _ = r.poll_discovery();
+                let _ = r.process_all_queues();
+            }
+            for b in std::mem::take(&mut *to_rf.lock().unwrap()) {
+                if radio { let _ = rf.rx_packed_from_side(&b, rf_side); }
+            }
+            for b in std::mem::take(&mut *rf_to_gs.lock().unwrap()) {
+                if radio { let _ = gs.rx_packed_from_side(&b, gs_radio); }
+            }
+            for b in std::mem::take(&mut *to_gb.lock().unwrap()) {
+                let _ = gb.rx_packed_from_side(&b, gb_side);
+            }
+            for b in std::mem::take(&mut *gb_to_gs.lock().unwrap()) {
+                let _ = gs.rx_packed_from_side(&b, gs_umbilical);
+            }
+        }
+    };
+    for r in [&gs, &rf, &gb] {
+        r.announce_discovery().unwrap();
+    }
+    pump(100);
+    while now.load(Ordering::Relaxed) < abort_at {
+        pump(10);
+    }
+    let resender = AbortResend::default();
+    let routed = av_bay_routed_now(&gs);
+    crate::telemetry_task::queue_manual_abort_wire_receipted(&gs, WirePolicy::Untimed).unwrap();
+    arm_now(&resender, routed);
+    while now.load(Ordering::Relaxed) < abort_at + run_ms {
+        pump(5);
+        let t = now.load(Ordering::Relaxed);
+        let heard = t >= abort_at + unheard_until_ms;
+        let aborted = rf_got.lock().unwrap().is_some();
+        let (owed, unheard) = match (aborted, heard) {
+            (true, _) => (0, 0),
+            (false, true) => (0b111, 0),
+            (false, false) => (0, 0b111),
+        };
+        resender.step(&gs, observation(t, owed, unheard));
+    }
+    sedsnet::config::set_runtime_tuning_config(previous).unwrap();
+    let since = |got: &Arc<Mutex<Option<u64>>>| got.lock().unwrap().map(|t| t - abort_at);
+    (since(&rf_got), since(&gb_got))
+}
+
+/// rrls_takeover on GS fc0de4d: the radio was out 40 s, the Abort came 0.4 s
+/// after it returned, and the station's radio route to the AV bay had aged
+/// out (no AV-bay discovery frame heard yet). The SDK routed the ABORT to the
+/// umbilical only, the re-send never fired (no AV-bay board ever owed it in
+/// flight), and the AV bay never got the Abort. It must get it once the AV
+/// bay is reachable again.
+#[test]
+fn an_abort_sent_while_the_radio_route_is_expired_reaches_the_av_bay() {
+    let (rf, gb) = abort_across_a_radio_outage(40_000, 39_500, 0, 20_000);
+    eprintln!("ABORT_AFTER_ROUTE_EXPIRY rf={rf:?} gb={gb:?}");
+    assert!(gb.is_some_and(|ms| ms < 500), "the umbilical got it at once: {gb:?}");
+    let ms = rf.unwrap_or_else(|| panic!("the AV bay never got the Abort"));
+    // Radio back 0.5 s after the Abort; rediscovery takes a topology request.
+    assert!(ms <= 500 + 2 * TOPOLOGY_REQUEST_MS_FOR_TEST + 1_000, "AV bay got it {ms} ms after the Abort");
+}
+
+/// The same outage, with the Abort pressed while the AV bay is unheard: it
+/// neither owes nor confirms the Abort, which must not end the re-send.
+#[test]
+fn an_abort_pressed_while_the_av_bay_is_unheard_reaches_it_when_heard_again() {
+    let (rf, gb) = abort_across_a_radio_outage(40_000, 35_000, 6_000, 20_000);
+    eprintln!("ABORT_WHILE_UNHEARD rf={rf:?} gb={gb:?}");
+    assert!(gb.is_some_and(|ms| ms < 500), "the umbilical got it at once: {gb:?}");
+    let ms = rf.unwrap_or_else(|| panic!("the AV bay never got the Abort"));
+    assert!(ms <= 6_000 + 2 * TOPOLOGY_REQUEST_MS_FOR_TEST + 1_000, "AV bay got it {ms} ms after the Abort");
+}
+
+// Pre-fix API shims: the resender knows nothing about routes or unheard boards.
+const TOPOLOGY_REQUEST_MS_FOR_TEST: u64 = 2_000;
+fn av_bay_routed_now(_router: &Router) -> bool {
+    true
+}
+fn arm_now(resender: &AbortResend, _routed: bool) {
+    resender.arm(1, WirePolicy::Untimed, None);
+}
+fn observation(now_ms: u64, owed: u8, _unheard: u8) -> Observation {
+    Observation { now_ms, epoch: 1, station_aborted: true, recovery: None, owed }
+}
