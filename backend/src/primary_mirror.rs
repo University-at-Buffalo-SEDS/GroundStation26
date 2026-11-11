@@ -17,6 +17,12 @@ const SAFETY_LEN: usize = 87;
 const PROOF_POLICY_LEN:usize=88;
 const UNKNOWN: u16 = u16::MAX;
 const SOURCE_FRESH_MS: u64 = 1500;
+/// The RRLS follows the primary's action enable (key, software buttons and
+/// per-command enables) for this long. Over the hidden-node relay one
+/// GS-RRLS round trip takes 2-4 s, so SOURCE_FRESH_MS left every RRLS action
+/// disabled. Presentation only: the primary checks every request, and Launch
+/// keeps its own 2 s board-state ages.
+const POLICY_FRESH_MS: u64 = 6000;
 const VALVES: [&str; 5] = ["Pilot", "NormallyOpen", "Dump", "Nitrogen", "Nitrous"];
 const FILL: [Board; 4] = [
     Board::GatewayBoard,
@@ -642,7 +648,7 @@ pub(crate) fn retraction_presentation(
 pub fn action_policy(state: &AppState) -> Option<ActionPolicyMsg> {
     let launch_provenance = launch_provenance_current(state);
     with_received(state, |r, elapsed| {
-        let fresh = elapsed <= SOURCE_FRESH_MS;
+        let fresh = elapsed <= POLICY_FRESH_MS;
         ActionPolicyMsg {
             local_phase_controls: false,
             local_phase_controls_reason: None,
@@ -1144,7 +1150,11 @@ mod tests {
                 .actuated,
             None
         );
-        assert!(accept_control_observation(&state, &snapshot.encode(), 1600));
+        // A relayed round trip of 3 s still follows the primary's action enable.
+        assert!(accept_control_observation(&state, &snapshot.encode(), 3000));
+        assert_eq!(action_policy(&state).unwrap().software_buttons_enabled, snapshot.flags & 2 != 0);
+        assert!(snapshot.flags & 2 != 0, "fixture has software buttons enabled");
+        assert!(accept_control_observation(&state, &snapshot.encode(), POLICY_FRESH_MS + 100));
         let expired = action_policy(&state).unwrap();
         assert!(
             gse_status(&state).is_none(),
