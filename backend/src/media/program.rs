@@ -312,7 +312,7 @@ pub(super) fn telemetry_snapshot(
     let (profile_id, profile) = presentation
         .broadcast
         .rundown
-        .profile(phase, crate::runtime_mode::is_test_fire());
+        .profile_with_fc(phase, app.fc_phase.snapshot().map(|seen| seen.phase), crate::runtime_mode::is_test_fire());
     let fill_source = app.fill_targets.lock().unwrap().fill_source;
     let stats: Vec<_> = {
         let rows = app.recent_telemetry_cache.lock().unwrap();

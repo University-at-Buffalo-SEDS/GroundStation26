@@ -230,9 +230,22 @@ impl Rundown {
         Ok(())
     }
     pub fn profile(&self, phase: FlightState, test_fire: bool) -> (&str, &Profile) {
+        self.profile_with_fc(phase, None, test_fire)
+    }
+    /// Profile keys are FlightState names. In flight or landed, the FC's own
+    /// detailed phase (Ascent..Reefing, Recovery) is tried first, then the
+    /// station's state (InFlight, Landed, or a fill sub-phase), then the
+    /// default for that state.
+    pub fn profile_with_fc(&self, phase: FlightState, fc: Option<FlightState>, test_fire: bool) -> (&str, &Profile) {
+        let detailed = fc
+            .filter(|_| matches!(phase, FlightState::InFlight | FlightState::Landed))
+            .filter(|fc| fc.network() == phase.network())
+            .map(|fc| format!("{fc:?}"));
         let phase = format!("{phase:?}");
         let id = if test_fire {
             "test_fire"
+        } else if let Some(id) = detailed.as_ref().and_then(|name| self.phase_profiles.get(name)) {
+            id.as_str()
         } else if let Some(id) = self.phase_profiles.get(&phase) {
             id.as_str()
         } else {
@@ -328,6 +341,25 @@ mod tests {
         );
         assert_eq!(r.profile(FlightState::Recovery, false).0, "recovery");
     }
+    /// After the state split the station is InFlight while the FC reports
+    /// its detailed phase: a Descent profile still applies, then InFlight.
+    #[test]
+    fn in_flight_profiles_follow_the_fc_detailed_phase() {
+        let mut r = Rundown::default();
+        r.phase_profiles.insert("Descent".into(), "recovery".into());
+        r.validate().unwrap();
+        assert_eq!(r.profile_with_fc(FlightState::InFlight, Some(FlightState::Descent), false).0, "recovery");
+        assert_eq!(r.profile_with_fc(FlightState::InFlight, Some(FlightState::Ascent), false).0, "flight");
+        assert_eq!(r.profile_with_fc(FlightState::InFlight, None, false).0, "flight");
+        r.phase_profiles.insert("InFlight".into(), "ground".into());
+        r.validate().unwrap();
+        assert_eq!(r.profile_with_fc(FlightState::InFlight, Some(FlightState::Ascent), false).0, "ground");
+        assert_eq!(r.profile_with_fc(FlightState::InFlight, Some(FlightState::Descent), false).0, "recovery");
+        assert_eq!(r.profile_with_fc(FlightState::Landed, Some(FlightState::Recovery), false).0, "recovery");
+        assert_eq!(r.profile_with_fc(FlightState::NitrousFill, Some(FlightState::Descent), false).0, "ground",
+            "the FC phase never applies on the ground");
+    }
+
     #[test]
     fn edits_roundtrip_and_invalid_bounds_fail() {
         let mut r = Rundown::default();
