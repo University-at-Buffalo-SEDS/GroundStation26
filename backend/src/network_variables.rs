@@ -628,10 +628,43 @@ fn record_network_value(output: NetworkOutput, packet: &Packet) {
     let Some(&byte) = packet.payload().first() else {
         return;
     };
+    record_readback(output, byte != 0);
+}
+
+fn record_readback(output: NetworkOutput, value: bool) {
     let requested = output.requested();
-    network_confirmation()[output.index()].network_value(byte != 0, requested, network_now());
+    network_confirmation()[output.index()].network_value(value, requested, network_now());
     NETWORK_RECONCILE_ARMED.store(true, Ordering::Release);
     NETWORK_VALUE_CHANGED.store(true, Ordering::Release);
+}
+
+/// The FC's own report of the cosmetic outputs it applied, in BOARD_HEALTH
+/// word 14 (sent every 5 s, one-way, so a lost end-to-end ACK no longer hides
+/// a delivered write). Word 14 is the UART-drop counter on other boards
+/// (word 1 flag 8), which the FC never sets; the FC marks its own use with
+/// the tag in bits 16..31. Bits: 0 underglow on, 1 buzzer on, 2 the underglow
+/// value came from a network write this boot, 3 likewise for the buzzer.
+/// FC 13de2ca does not send it yet (proposed FC change); until it does,
+/// nothing here fires.
+pub(crate) const FC_OUTPUTS_TAG: u32 = 0x4F55;
+
+/// [underglow, buzzer]: the value the FC reports it applied from a network
+/// write, if it reports one.
+pub(crate) fn fc_outputs_from_health(words: &[u32]) -> [Option<bool>; 2] {
+    let tagged = words.len() == 24 && words[1] & 8 == 0 && words[14] >> 16 == FC_OUTPUTS_TAG;
+    let word = if tagged { words[14] } else { 0 };
+    let read = |value: u32, applied: u32| (tagged && word & applied != 0).then_some(word & value != 0);
+    [read(1, 4), read(2, 8)]
+}
+
+/// An FC BOARD_HEALTH report: its applied output values are the variables'
+/// readback, like an inbound network value.
+pub(crate) fn observe_fc_health_outputs(words: &[u32]) {
+    for (output, value) in NetworkOutput::ALL.into_iter().zip(fc_outputs_from_health(words)) {
+        if let Some(value) = value {
+            record_readback(output, value);
+        }
+    }
 }
 
 /// Set when an inbound value changed what the controls show, so the next
@@ -2039,6 +2072,60 @@ mod tests {
             publish(output, 0);
             assert_eq!(network_output_view(output).confirmed, Some(false));
         }
+    }
+
+    #[test]
+    fn fc_health_outputs_are_read_only_from_the_tagged_word() {
+        let mut words = [0u32; 24];
+        words[0] = 1;
+        words[4] = 1000;
+        assert_eq!(fc_outputs_from_health(&words), [None, None], "FC 13de2ca: no tag, no readback");
+        words[14] = (FC_OUTPUTS_TAG << 16) | 1 | 4 | 8;
+        assert_eq!(fc_outputs_from_health(&words), [Some(true), Some(false)]);
+        words[14] = (FC_OUTPUTS_TAG << 16) | 1 | 2;
+        assert_eq!(fc_outputs_from_health(&words), [None, None], "a restored value is not a network write");
+        words[14] = (FC_OUTPUTS_TAG << 16) | 2 | 8;
+        words[1] = 8;
+        assert_eq!(fc_outputs_from_health(&words), [None, None], "word 14 is a UART counter here");
+        words[1] = 0;
+        assert_eq!(fc_outputs_from_health(&words), [None, Some(true)]);
+        assert_eq!(fc_outputs_from_health(&words[..23]), [None, None]);
+    }
+
+    /// Bench 2026-11-11: the FC applied every underglow write (ST-Link
+    /// counters) but the GS confirmed none, because the end-to-end ACK was
+    /// lost on the busy radio. The FC's own health report confirms it.
+    #[test]
+    fn cosmetic_variables_confirm_from_the_fc_health_report() {
+        if crate::operator_queue::isolated_native_case(
+            module_path!(),
+            "cosmetic_variables_confirm_from_the_fc_health_report",
+        ) {
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let gs = Arc::new(Router::new(
+            RouterConfig::new([]).with_sender(Board::GroundStation.sender_id()),
+        ));
+        initialize_for_role_seed(&gs, false, false).unwrap();
+        NetworkOutput::Underglow.commit_requested(true).unwrap();
+        NetworkOutput::FlightBuzzer.commit_requested(false).unwrap();
+        let _ = set_network_output(&gs, NetworkOutput::Underglow, true, "set_underglow");
+        let _ = set_network_output(&gs, NetworkOutput::FlightBuzzer, false, "set_flight_buzzer");
+        for output in NetworkOutput::ALL {
+            assert_eq!(network_output_view(output).confirmed, None, "{output:?}: the ACK never came back");
+        }
+        let mut words = [0u32; 24];
+        words[0] = 1;
+        words[4] = 1000;
+        words[14] = (FC_OUTPUTS_TAG << 16) | 1 | 4 | 8;
+        observe_fc_health_outputs(&words);
+        assert_eq!(network_output_view(NetworkOutput::Underglow).confirmed, Some(true));
+        assert_eq!(network_output_view(NetworkOutput::FlightBuzzer).confirmed, Some(false));
+        // The FC reports a different value: no longer confirmed.
+        words[14] = (FC_OUTPUTS_TAG << 16) | 4;
+        observe_fc_health_outputs(&words);
+        assert_eq!(network_output_view(NetworkOutput::Underglow).confirmed, None);
     }
 
     #[test]

@@ -26,6 +26,12 @@
 //!   operator notification and log line;
 //! - R9 only operator presses are recorded; automatic station commands never.
 //!
+//! An operator Deploy/Expand never enters that queue: the station holds it
+//! while an earlier FLIGHT_COMMAND is unresolved and submits it once the
+//! stream is idle (rules P1..P6 below), so it cannot be dropped behind an
+//! earlier command and every transmission is its first. R1..R9 cover the
+//! other operator flight commands.
+//!
 //! An operator command that is itself the retired head (every copy went
 //! unanswered for its whole retry span, for example lost on a degraded relay
 //! uplink) is never re-sent (R1); the operator is told in one line that the
@@ -57,6 +63,11 @@ struct Press {
     dispatch: u64,
     abort_epoch: u64,
     behind: bool,
+    /// The FLIGHT_COMMANDs unresolved when it was queued (registered before it).
+    before: BTreeSet<u64>,
+    /// An earlier command in `before` retired while this press was never
+    /// seen as a pending row: it may still sit in the transmit queue.
+    unproven_since: Option<Instant>,
     dropped_at: Option<Instant>,
     missing_since: Option<Instant>,
     seen_pending: bool,
@@ -112,6 +123,9 @@ fn is_deploy(byte: u8) -> bool {
 /// An operator Deploy/Expand still queued, unacknowledged, or pressed less
 /// than DEPLOY_SETTLE ago. The FC reset to Startup refuses meanwhile.
 pub(crate) fn deploy_in_progress(router: &Router) -> bool {
+    if pyro_held(router) {
+        return true;
+    }
     let Some((packet_id, pressed)) = LAST_DEPLOY.lock().unwrap().get(&router_key(router)).copied() else {
         return false;
     };
@@ -130,17 +144,18 @@ static LAST_QUEUED: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
 
 pub(crate) fn note_queued(router: &Router, packet_id: u64) {
     LAST_QUEUED.lock().unwrap().insert(router_key(router), packet_id);
+    UNSEEN.lock().unwrap().entry(router_key(router)).or_default().insert(packet_id);
 }
 
 /// An operator's flight command was just queued (R9: called only from the
 /// operator dispatch, right after the queue call on the same thread).
 /// `before` is `pending_flight_commands` taken right before it was queued:
 /// a non-empty set means the press waits behind an earlier command.
-pub(crate) fn record_operator_press(state: &AppState, router: &Router, byte: u8, before: &BTreeSet<u64>) {
+pub(crate) fn record_operator_press(state: &AppState, router: &Router, byte: u8, before: &BTreeSet<u64>) -> Option<u64> {
     let (dispatch, abort_epoch) = counters(state);
     let Some(packet_id) = LAST_QUEUED.lock().unwrap().remove(&router_key(router)) else {
         NEWEST.lock().unwrap().remove(&router_key(router));
-        return;
+        return None;
     };
     if is_deploy(byte) {
         LAST_DEPLOY.lock().unwrap().insert(router_key(router), (packet_id, Instant::now()));
@@ -164,11 +179,190 @@ pub(crate) fn record_operator_press(state: &AppState, router: &Router, byte: u8,
         dispatch,
         abort_epoch,
         behind: !before.is_empty(),
+        before: before.clone(),
+        unproven_since: None,
         dropped_at: None,
         missing_since: None,
         seen_pending: false,
         done: false,
     });
+    Some(packet_id)
+}
+
+// ---- Operator Deploy/Expand: never queued behind an earlier FC command ----
+//
+// The SDK drops every FLIGHT_COMMAND queued behind a head that runs out of
+// retries, and the FC fires a Deploy/Expand again for any copy with a new
+// packet ID (FC recovery.c manual_deployment, in any flight state). So an
+// operator pyro press is never handed to the SDK while an earlier
+// FLIGHT_COMMAND is unresolved: the station holds it and submits it as the
+// only FLIGHT_COMMAND once the stream is idle. A held press has provably never
+// been transmitted (the SDK has never seen it), so sending it is its first and
+// only transmission. Rules:
+// - P1 held at most PYRO_HOLD_LIMIT after the press (the FC's own bound for
+//   an operator pyro request, board_recovery_operator_pyro_allowed);
+// - P2 an Abort or manual stop while held drops every held command;
+// - P3 on release the station's admission (R4) and the FC's view (R7) are
+//   checked again;
+// - P4 a press of the same pyro command as an earlier one that is still
+//   unresolved (held, queued or awaiting FC confirmation) is never sent: a
+//   second copy could fire twice;
+// - P5 while a pyro press is held, later operator flight commands queue
+//   behind it in the station, so the operator's order is kept;
+// - P6 every hold, release and drop raises its own notice.
+
+/// The FC refuses an operator Deploy/Expand stamped more than 15 s ago.
+pub(crate) const PYRO_HOLD_LIMIT: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Debug)]
+struct Held {
+    byte: u8,
+    pressed_at: Instant,
+    abort_epoch: u64,
+}
+
+/// Operator flight commands held by the station per router, oldest first.
+static HELD: Mutex<BTreeMap<usize, std::collections::VecDeque<Held>>> = Mutex::new(BTreeMap::new());
+/// FLIGHT_COMMANDs the station queued that have not yet been seen as SDK
+/// pending rows: still in the router's transmit queue, or already gone.
+static UNSEEN: Mutex<BTreeMap<usize, BTreeSet<u64>>> = Mutex::new(BTreeMap::new());
+/// Operator pyro presses handed to the SDK per router: (packet ID, byte).
+static SUBMITTED_PYRO: Mutex<BTreeMap<usize, Vec<(u64, u8)>>> = Mutex::new(BTreeMap::new());
+
+fn flight_command_type() -> sedsnet::config::DataType {
+    crate::telemetry_schema::data_type("FLIGHT_COMMAND")
+}
+
+/// The FLIGHT_COMMANDs that may still be ahead of a new one: SDK pending rows
+/// plus those queued but never seen as rows while the router still holds
+/// FLIGHT_COMMAND work.
+fn unresolved_flight_commands(router: &Router) -> BTreeSet<u64> {
+    let mut ahead = pending_flight_commands(router);
+    let mut unseen = UNSEEN.lock().unwrap();
+    if let Some(ids) = unseen.get_mut(&router_key(router)) {
+        ids.retain(|id| !ahead.contains(id));
+        if !ids.is_empty() && !router.has_pending_reliable_tx_type(flight_command_type()) {
+            ids.clear();
+        }
+        ahead.extend(ids.iter().copied());
+    }
+    ahead
+}
+
+/// P4: why a press of this pyro command must not be sent, if it must not.
+fn duplicate_pyro(router: &Router, byte: u8, ahead: &BTreeSet<u64>) -> Option<&'static str> {
+    if HELD.lock().unwrap().get(&router_key(router)).is_some_and(|q| q.iter().any(|h| h.byte == byte)) {
+        return Some("is already held to be sent");
+    }
+    let mut submitted = SUBMITTED_PYRO.lock().unwrap();
+    let list = submitted.entry(router_key(router)).or_default();
+    list.retain(|(id, _)| ahead.contains(id));
+    list.iter().any(|(_, b)| *b == byte).then_some("is still awaiting FC confirmation")
+}
+
+fn notify(state: &AppState, message: String) {
+    log::warn!("{message}");
+    crate::web::emit_notification_warning(state, message);
+}
+
+/// Queue one operator flight command now. `ahead` is what was unresolved.
+fn send_now(state: &AppState, router: &Router, byte: u8, ahead: &BTreeSet<u64>) -> sedsnet::TelemetryResult<()> {
+    crate::telemetry_task::queue_locally_routed_flight_command(state, router, "HITL flight command", &[byte])?;
+    if let Some(id) = record_operator_press(state, router, byte, ahead)
+        && is_deploy(byte)
+    {
+        SUBMITTED_PYRO.lock().unwrap().entry(router_key(router)).or_default().push((id, byte));
+    }
+    crate::telemetry_task::flush_command_tx(router, "HITL flight command tx");
+    Ok(())
+}
+
+fn hold(router: &Router, held: Held, front: bool) {
+    let mut all = HELD.lock().unwrap();
+    let queue = all.entry(router_key(router)).or_default();
+    if front {
+        queue.push_front(held);
+    } else {
+        queue.push_back(held);
+    }
+}
+
+/// The telemetry task's operator HITL flight command (R9: operator presses only).
+pub(crate) fn submit_operator_flight_command(state: &AppState, router: &Router, byte: u8) -> sedsnet::TelemetryResult<()> {
+    let label = label_for(byte);
+    let ahead = unresolved_flight_commands(router);
+    if is_deploy(byte)
+        && let Some(why) = duplicate_pyro(router, byte, &ahead)
+    {
+        notify(state, format!("{label} not sent: an earlier {label} press {why}, and a second copy could fire it twice. Check FC state before pressing again."));
+        return Ok(());
+    }
+    let holding = HELD.lock().unwrap().get(&router_key(router)).is_some_and(|q| !q.is_empty());
+    if holding || (is_deploy(byte) && !ahead.is_empty()) {
+        hold(router, Held { byte, pressed_at: Instant::now(), abort_epoch: counters(state).1 }, false);
+        let behind = if holding { "an earlier held operator command" } else { "an earlier flight-computer command that is still awaiting FC confirmation" };
+        notify(state, format!(
+            "{label} held, not sent yet: it waits behind {behind}. It is sent once no earlier flight-computer command is pending, or dropped with a notice if that takes more than {} s.",
+            PYRO_HOLD_LIMIT.as_secs()
+        ));
+        return Ok(());
+    }
+    send_now(state, router, byte, &ahead)
+}
+
+/// A pyro press is held: the FC reset path treats it as a Deploy in progress.
+fn pyro_held(router: &Router) -> bool {
+    HELD.lock().unwrap().get(&router_key(router)).is_some_and(|q| q.iter().any(|h| is_deploy(h.byte)))
+}
+
+/// Run from the telemetry task: release, or drop with a notice, the oldest
+/// held operator command.
+fn service_held(state: &AppState, router: &Router) {
+    let Some(front) = HELD.lock().unwrap().get(&router_key(router)).and_then(|q| q.front().cloned()) else {
+        return;
+    };
+    let label = label_for(front.byte);
+    let age = front.pressed_at.elapsed();
+    let pop = || HELD.lock().unwrap().get_mut(&router_key(router)).and_then(|q| q.pop_front());
+    // P2
+    if counters(state).1 != front.abort_epoch || state.abort_indicator_latched() || crate::gse::manual_stop_pending(state) {
+        let dropped: Vec<Held> = HELD.lock().unwrap().remove(&router_key(router)).map(Vec::from).unwrap_or_default();
+        for held in dropped {
+            notify(state, format!("{} was never sent: an Abort or manual stop came while it was held behind an earlier flight-computer command.", label_for(held.byte)));
+        }
+        return;
+    }
+    let ahead = unresolved_flight_commands(router);
+    // P1
+    if age >= PYRO_HOLD_LIMIT {
+        pop();
+        notify(state, format!(
+            "{label} was never sent: it was held {:.1} s behind an earlier flight-computer command that was neither confirmed nor ran out of retries within {} s. Press it again if it is still needed.",
+            age.as_secs_f64(), PYRO_HOLD_LIMIT.as_secs()
+        ));
+        return;
+    }
+    if !ahead.is_empty() {
+        return;
+    }
+    pop();
+    // P3
+    let (effect_seen, fc_admissible) = effect_and_admissible(state, front.byte);
+    if effect_seen {
+        notify(state, format!("{label} was never sent: the station already sees its effect."));
+        return;
+    }
+    if !(fc_admissible && command_for(front.byte).is_some_and(|c| state.is_command_allowed(&c))) {
+        notify(state, format!("{label} was never sent: the flight computer or the station would now refuse it."));
+        return;
+    }
+    match send_now(state, router, front.byte, &ahead) {
+        Ok(()) => notify(state, format!(
+            "{label} sent {} ms after the press: it was held until the earlier flight-computer command was confirmed or ran out of retries.",
+            age.as_millis()
+        )),
+        Err(err) => notify(state, format!("{label} was never sent: {err}. Press it again if it is still needed.")),
+    }
 }
 
 /// The router retired these exhausted FLIGHT_COMMAND heads. A newest press
@@ -201,8 +395,20 @@ pub(crate) fn note_retired(router: &Router, heads: &[u64]) {
         && press.dropped_at.is_none()
         && !heads.contains(&press.packet_id)
         && !pending.contains(&press.packet_id)
+        // Proof it never reached the air: a retired head was registered
+        // before it and existed until it retired, so the SDK never released
+        // this press (one released entry per Ordered type, in order), and the
+        // retirement removed it with the head.
+        && heads.iter().any(|head| press.before.contains(head))
     {
-        press.dropped_at = Some(Instant::now());
+        // Seen registered, or no FLIGHT_COMMAND left anywhere in the router:
+        // it is gone. Otherwise it may still be queued and become the new
+        // head, so nothing is decided yet.
+        if press.seen_pending || !router.has_pending_reliable_tx_type(flight_command_type()) {
+            press.dropped_at = Some(Instant::now());
+        } else {
+            press.unproven_since = Some(Instant::now());
+        }
     }
 }
 
@@ -287,6 +493,7 @@ fn effect_and_admissible(state: &AppState, byte: u8) -> (bool, bool) {
 /// Run from the telemetry task: decide on a dropped operator press, at most
 /// once (R5), and re-send it or tell the operator why not (R8).
 pub(crate) fn service(state: &AppState, router: &Router) {
+    service_held(state, router);
     let undelivered = UNDELIVERED.lock().unwrap().remove(&router_key(router)).unwrap_or_default();
     for byte in undelivered {
         // No acknowledgement came back: the FC may still have run it and only
@@ -299,6 +506,19 @@ pub(crate) fn service(state: &AppState, router: &Router) {
     let press = {
         let mut newest = NEWEST.lock().unwrap();
         let Some(p) = newest.get_mut(&router_key(router)).filter(|p| !p.done) else { return };
+        if p.dropped_at.is_none() && p.unproven_since.is_some() {
+            if pending_flight_commands(router).contains(&p.packet_id) {
+                // It survived in the transmit queue and is the new head.
+                p.unproven_since = None;
+                p.seen_pending = true;
+            } else if !router.has_pending_reliable_tx_type(flight_command_type()) {
+                p.done = true;
+                let label = label_for(p.byte);
+                drop(newest);
+                notify(state, format!("{label} may have been dropped behind an earlier flight-computer command that ran out of retries. The station cannot tell whether it was sent, so it was not re-sent. Check FC state before pressing again."));
+            }
+            return;
+        }
         if p.dropped_at.is_none() {
             // A press that leaves the pending set without being dropped was
             // delivered (or refused for good); it is never re-sent. The grace
@@ -319,6 +539,13 @@ pub(crate) fn service(state: &AppState, router: &Router) {
     };
     let cmd = command_for(press.byte);
     let label = label_for(press.byte);
+    if is_deploy(press.byte) {
+        // Provably never transmitted: hold it again (P1..P3 decide), with
+        // its original press time and Abort epoch.
+        hold(router, Held { byte: press.byte, pressed_at: press.pressed_at, abort_epoch: press.abort_epoch }, true);
+        notify(state, format!("{label} was dropped unsent behind an earlier flight-computer command that ran out of retries. It is held and sent once no earlier flight-computer command is pending."));
+        return;
+    }
     let (effect_seen, fc_admissible) = effect_and_admissible(state, press.byte);
     let context = Context {
         age: press.pressed_at.elapsed(),
@@ -364,6 +591,16 @@ pub(crate) fn service(state: &AppState, router: &Router) {
     );
     log::warn!("{message}");
     crate::web::emit_notification_warning(state, message);
+}
+
+/// Makes every held command look `by` older (P1 cases).
+#[cfg(test)]
+pub(crate) fn backdate_held_for_test(router: &Router, by: Duration) {
+    if let Some(queue) = HELD.lock().unwrap().get_mut(&router_key(router)) {
+        for held in queue {
+            held.pressed_at -= by;
+        }
+    }
 }
 
 /// Makes the recorded press look `ms` older (R2 cases).

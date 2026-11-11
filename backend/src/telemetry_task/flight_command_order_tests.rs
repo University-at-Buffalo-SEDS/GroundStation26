@@ -157,18 +157,22 @@ enum Between {
     Automatic,
 }
 
+const DEPLOY: u8 = 12;
+const FOCUS: u8 = 15;
+
 /// The station (real AppState, HITL, flight state `flight`) and the FC on
 /// real SDK routers. The FC is unreachable for span + 1 s. The operator
-/// presses EvaluationRelax at 0 and Deploy at 2 s, so the Deploy waits behind
-/// it and is dropped when EvaluationRelax exhausts. Returns when the FC got
-/// the Deploy after its press (ms) and the station's notifications.
-async fn operator_bay(flight: crate::types::FlightState, between: Between) -> (Option<u64>, Vec<String>) {
-    let (delivered, notes, _) = operator_bay_timed(flight, between).await;
+/// presses EvaluationRelax at 0 and `second` at 2 s, so `second` waits behind
+/// it. A non-pyro `second` is queued in the SDK and dropped when
+/// EvaluationRelax exhausts; a Deploy is held by the station instead. Returns
+/// when the FC got `second` after its press (ms) and the notifications.
+async fn operator_bay(flight: crate::types::FlightState, between: Between, second: u8) -> (Option<u64>, Vec<String>) {
+    let (delivered, notes, _) = operator_bay_timed(flight, between, second).await;
     (delivered, notes)
 }
 /// `operator_bay`, plus the ms after the first press at which the station
 /// first said a press got no confirmation from the FC.
-async fn operator_bay_timed(flight: crate::types::FlightState, between: Between) -> (Option<u64>, Vec<String>, Option<u64>) {
+async fn operator_bay_timed(flight: crate::types::FlightState, between: Between, second: u8) -> (Option<u64>, Vec<String>, Option<u64>) {
     let _mode = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Hitl);
     let state = crate::state::tests::test_app_state().await;
     let _tuning = StationTuning::install();
@@ -231,11 +235,9 @@ async fn operator_bay_timed(flight: crate::types::FlightState, between: Between)
     let press = |byte: u8, operator: bool| {
         if operator {
             crate::operator_command_resend::note_operator_dispatch(&state);
-        }
-        let before = crate::operator_command_resend::pending_flight_commands(&host);
-        crate::telemetry_task::queue_locally_routed_flight_command(&state, &host, "test", &[byte]).unwrap();
-        if operator {
-            crate::operator_command_resend::record_operator_press(&state, &host, byte, &before);
+            crate::operator_command_resend::submit_operator_flight_command(&state, &host, byte).unwrap();
+        } else {
+            crate::telemetry_task::queue_locally_routed_flight_command(&state, &host, "test", &[byte]).unwrap();
         }
     };
     let start = std::time::Instant::now();
@@ -248,7 +250,7 @@ async fn operator_bay_timed(flight: crate::types::FlightState, between: Between)
             relax = true;
         }
         if deploy_at.is_none() && ms() >= 2_000 {
-            press(12, between != Between::Automatic);
+            press(second, between != Between::Automatic);
             deploy_at = Some(std::time::Instant::now());
         }
         if !disturbed && ms() >= 3_000 {
@@ -259,7 +261,10 @@ async fn operator_bay_timed(flight: crate::types::FlightState, between: Between)
                     state.set_abort_indicator_latched(false);
                 }
                 Between::NewerCommand => crate::operator_command_resend::note_operator_dispatch(&state),
-                Between::PressAged => crate::operator_command_resend::backdate_press_for_test(&host, span),
+                Between::PressAged => {
+                    crate::operator_command_resend::backdate_press_for_test(&host, span);
+                    crate::operator_command_resend::backdate_held_for_test(&host, crate::operator_command_resend::PYRO_HOLD_LIMIT);
+                }
                 _ => {}
             }
         }
@@ -272,7 +277,7 @@ async fn operator_bay_timed(flight: crate::types::FlightState, between: Between)
         std::thread::sleep(Duration::from_millis(2));
     }
     let sent = deploy_at.unwrap();
-    let delivered = got.lock().unwrap().iter().find(|(b, at)| *b == 12 && *at >= sent).map(|(_, at)| (*at - sent).as_millis() as u64);
+    let delivered = got.lock().unwrap().iter().find(|(b, at)| *b == second && *at >= sent).map(|(_, at)| (*at - sent).as_millis() as u64);
     let notes = state.notifications_snapshot().into_iter().map(|n| n.message).collect();
     (delivered, notes, undelivered_at)
 }
@@ -286,7 +291,7 @@ async fn operator_bay_timed(flight: crate::types::FlightState, between: Between)
 #[tokio::test]
 async fn a_press_whose_every_copy_was_lost_is_reported_unconfirmed() {
     let span = reliable_retry_span_ms();
-    let (_, notes, at) = operator_bay_timed(crate::types::FlightState::Ascent, Between::Nothing).await;
+    let (_, notes, at) = operator_bay_timed(crate::types::FlightState::Ascent, Between::Nothing, FOCUS).await;
     eprintln!("UNCONFIRMED span={span} at={at:?} notes={notes:?}");
     let lost: Vec<_> = notes.iter().filter(|n| n.contains("no confirmation from FC")).collect();
     assert_eq!(lost.len(), 1, "one line: {notes:?}");
@@ -302,68 +307,252 @@ async fn a_press_whose_every_copy_was_lost_is_reported_unconfirmed() {
 /// command is the risk).
 #[tokio::test]
 async fn a_press_whose_acknowledgements_were_lost_is_never_called_undelivered() {
-    let (_, notes, _) = operator_bay_timed(crate::types::FlightState::Ascent, Between::AcksLost).await;
+    let (_, notes, _) = operator_bay_timed(crate::types::FlightState::Ascent, Between::AcksLost, FOCUS).await;
     eprintln!("ACKS_LOST notes={notes:?}");
     let line = notes.iter().find(|n| n.starts_with("EvaluationRelax")).unwrap_or_else(|| panic!("reported: {notes:?}"));
     assert!(!line.contains("not delivered") && !line.contains("press again"), "{line}");
     assert!(line.contains("Check FC state before pressing again"), "{line}");
 }
 
-fn noted(notes: &[String], words: &str) -> bool {
-    notes.iter().any(|n| n.contains("Deploy") && n.contains(words))
+fn noted(notes: &[String], label: &str, words: &str) -> bool {
+    notes.iter().any(|n| n.starts_with(label) && n.contains(words))
 }
 
-/// R1, R5, R8: the Deploy dropped behind the exhausted EvaluationRelax is
-/// re-sent once and reaches the FC as soon as the link returns, inside the
-/// press's own retry span, with its own notification.
+/// R1, R5, R8: a non-pyro command dropped behind the exhausted
+/// EvaluationRelax is re-sent once and reaches the FC as soon as the link
+/// returns, inside the press's own retry span, with its own notification.
 #[tokio::test]
-async fn deploy_dropped_behind_an_exhausted_fc_command_is_resent() {
+async fn command_dropped_behind_an_exhausted_fc_command_is_resent() {
     let span = reliable_retry_span_ms();
-    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::Nothing).await;
-    eprintln!("DEPLOY_RESENT span={span} delivered={delivered:?} notes={notes:?}");
-    let ms = delivered.unwrap_or_else(|| panic!("the Deploy never reached the FC: {notes:?}"));
-    assert!(ms <= span + 750, "Deploy reached the FC {ms} ms after the press (span {span})");
-    assert!(noted(&notes, "re-sent after the link recovered"), "{notes:?}");
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::Nothing, FOCUS).await;
+    eprintln!("FOCUS_RESENT span={span} delivered={delivered:?} notes={notes:?}");
+    let ms = delivered.unwrap_or_else(|| panic!("EvaluationFocus never reached the FC: {notes:?}"));
+    assert!(ms <= span + 750, "EvaluationFocus reached the FC {ms} ms after the press (span {span})");
+    assert!(noted(&notes, "EvaluationFocus", "re-sent after the link recovered"), "{notes:?}");
 }
 
 /// R3: an Abort after the press means no re-send, and the operator is told.
 #[tokio::test]
-async fn deploy_is_not_resent_after_an_abort() {
-    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::AbortLatched).await;
+async fn command_is_not_resent_after_an_abort() {
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::AbortLatched, FOCUS).await;
     assert_eq!(delivered, None, "{notes:?}");
-    assert!(noted(&notes, "not re-sent: an Abort"), "{notes:?}");
+    assert!(noted(&notes, "EvaluationFocus", "not re-sent: an Abort"), "{notes:?}");
 }
 
 /// R3: a newer operator command means no re-send.
 #[tokio::test]
-async fn deploy_is_not_resent_after_a_newer_operator_command() {
-    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::NewerCommand).await;
+async fn command_is_not_resent_after_a_newer_operator_command() {
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::NewerCommand, FOCUS).await;
     assert_eq!(delivered, None, "{notes:?}");
-    assert!(noted(&notes, "a newer operator command"), "{notes:?}");
+    assert!(noted(&notes, "EvaluationFocus", "a newer operator command"), "{notes:?}");
 }
 
 /// R2: a press older than its retry span is not re-sent; the operator is told.
 #[tokio::test]
-async fn deploy_older_than_its_retry_span_is_not_resent_and_is_reported() {
-    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::PressAged).await;
+async fn command_older_than_its_retry_span_is_not_resent_and_is_reported() {
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::PressAged, FOCUS).await;
     assert_eq!(delivered, None, "{notes:?}");
-    assert!(noted(&notes, "beyond its"), "{notes:?}");
-}
-
-/// R7: the FC would refuse a Deploy at or before Armed; no re-send.
-#[tokio::test]
-async fn deploy_the_fc_would_refuse_is_not_resent() {
-    let (delivered, notes) = operator_bay(crate::types::FlightState::Armed, Between::Nothing).await;
-    assert_eq!(delivered, None, "{notes:?}");
-    assert!(noted(&notes, "would now refuse"), "{notes:?}");
+    assert!(noted(&notes, "EvaluationFocus", "beyond its"), "{notes:?}");
 }
 
 /// R9: a command the station queued itself is never re-sent.
 #[tokio::test]
 async fn automatic_station_command_is_never_resent() {
-    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::Automatic).await;
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::Automatic, DEPLOY).await;
     assert_eq!(delivered, None, "{notes:?}");
-    assert!(!noted(&notes, "re-sent"), "{notes:?}");
+    assert!(!noted(&notes, "DeployParachute", "sent"), "{notes:?}");
+}
+
+/// P1, P6: an operator Deploy pressed behind an unacknowledged FC command is
+/// held by the station (never handed to the SDK, so never cancelled with
+/// the exhausted head) and sent once the stream is idle; it reaches the FC as
+/// soon as the link returns, exactly once.
+#[tokio::test]
+async fn deploy_behind_an_exhausted_fc_command_is_held_then_sent_once() {
+    let span = reliable_retry_span_ms();
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::Nothing, DEPLOY).await;
+    eprintln!("DEPLOY_HELD span={span} delivered={delivered:?} notes={notes:?}");
+    let ms = delivered.unwrap_or_else(|| panic!("the Deploy never reached the FC: {notes:?}"));
+    assert!(ms <= span + 750, "Deploy reached the FC {ms} ms after the press (span {span})");
+    assert!(noted(&notes, "DeployParachute", "held, not sent yet"), "{notes:?}");
+    assert!(noted(&notes, "DeployParachute", "ms after the press: it was held until the earlier"), "{notes:?}");
+    assert!(!noted(&notes, "DeployParachute", "dropped unsent"), "{notes:?}");
+}
+
+/// P2: an Abort while a Deploy is held: never sent, and the operator is told.
+#[tokio::test]
+async fn held_deploy_is_never_sent_after_an_abort() {
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::AbortLatched, DEPLOY).await;
+    assert_eq!(delivered, None, "{notes:?}");
+    assert!(noted(&notes, "DeployParachute", "was never sent: an Abort or manual stop came while it was held"), "{notes:?}");
+}
+
+/// P5: an unrelated newer operator command does not cancel a held Deploy.
+#[tokio::test]
+async fn held_deploy_survives_a_newer_operator_command() {
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::NewerCommand, DEPLOY).await;
+    assert!(delivered.is_some(), "{notes:?}");
+}
+
+/// P1: a Deploy held beyond the FC's 15 s bound is never sent.
+#[tokio::test]
+async fn deploy_held_beyond_the_fc_bound_is_never_sent() {
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::PressAged, DEPLOY).await;
+    assert_eq!(delivered, None, "{notes:?}");
+    assert!(noted(&notes, "DeployParachute", "was never sent: it was held"), "{notes:?}");
+}
+
+/// P3 (R7): the FC would refuse a Deploy at or before Armed; never sent.
+#[tokio::test]
+async fn held_deploy_the_fc_would_refuse_is_never_sent() {
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Armed, Between::Nothing, DEPLOY).await;
+    assert_eq!(delivered, None, "{notes:?}");
+    assert!(noted(&notes, "DeployParachute", "would now refuse"), "{notes:?}");
+}
+
+/// What the FC handler got in `saturated_bay`: (byte, packet ID), in order.
+type FcLog = Vec<(u8, u64)>;
+
+/// Bench 2026-11-11 (GS 8f5a97d, FC 13de2ca, RFD900x, S5=0, nearly saturated
+/// channel), on real SDK routers. Every frame reaches the FC; every frame
+/// back from it is lost (its ACKs never arrive). The station's router gets a
+/// TX turn only every `turn_ms`, so a retry span takes longer than its
+/// nominal 250 ms x 18. The operator presses Deploy at 0 and, once the
+/// station sees the drogue, Expand at `expand_at_ms`. Returns what the FC
+/// handler got and the station's notifications.
+async fn saturated_bay(turn_ms: u64, second: u8, second_at_ms: u64, run_ms: u64) -> (FcLog, Vec<String>) {
+    use crate::rocket_commands::FlightComputerCommands as Fc;
+    let _mode = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Hitl);
+    let state = crate::state::tests::test_app_state().await;
+    let _tuning = StationTuning::install();
+    crate::telemetry_schema::initialize().unwrap();
+    crate::fc_command_gate::forget(&state);
+    state.action_policy.lock().unwrap().software_buttons_enabled = true;
+    *state.state.lock().unwrap() = crate::types::FlightState::Ascent;
+    let host = Arc::new(Router::new(RouterConfig::new([]).with_sender("GS")));
+    crate::telemetry_task::refresh_host_network_time(&host, get_current_timestamp_ms());
+    let got = Arc::new(Mutex::new(FcLog::new()));
+    let seen = got.clone();
+    let fc = Arc::new(Router::new(
+        RouterConfig::new([EndpointHandler::new_packet_handler(
+            crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"),
+            move |packet| {
+                seen.lock().unwrap().push((packet.payload()[0], packet.packet_id()));
+                Ok(())
+            },
+        )])
+        .with_sender("FC"),
+    ));
+    let to_fc = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let out = to_fc.clone();
+    host.add_side_packed("FC", move |bytes| {
+        out.lock().unwrap().push(bytes.to_vec());
+        Ok(())
+    });
+    let to_host = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let back = to_host.clone();
+    fc.add_side_packed("GS", move |bytes| {
+        back.lock().unwrap().push(bytes.to_vec());
+        Ok(())
+    });
+    let mut backoff = RadioRefusalBackoff::default();
+    let deliver = |acks: bool| {
+        for bytes in std::mem::take(&mut *to_fc.lock().unwrap()) {
+            let _ = fc.rx_packed_from_side(&bytes, 0);
+        }
+        let _ = fc.process_all_queues_with_timeout(0);
+        for bytes in std::mem::take(&mut *to_host.lock().unwrap()) {
+            if acks {
+                let _ = host.rx_packed_from_side(&bytes, 0);
+            }
+        }
+    };
+    fc.announce_discovery().unwrap();
+    host.announce_discovery().unwrap();
+    for _ in 0..50 {
+        process_router_queues_with_backoff(&host, None, &mut backoff);
+        deliver(true);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    got.lock().unwrap().clear();
+    // The telemetry task's operator HITL flight command.
+    let press = |byte: u8| {
+        crate::operator_command_resend::note_operator_dispatch(&state);
+        crate::operator_command_resend::submit_operator_flight_command(&state, &host, byte).unwrap();
+    };
+    let start = std::time::Instant::now();
+    let ms = || start.elapsed().as_millis() as u64;
+    let (mut deploy, mut drogue, mut expand) = (false, false, false);
+    let mut last_turn = 0;
+    while ms() < run_ms {
+        if !deploy {
+            press(Fc::DeployParachute as u8);
+            deploy = true;
+        }
+        if !drogue && ms() >= 100 {
+            // The FC's deploy report: the station sees the drogue.
+            crate::recovery_events::observe_fc_state(&state, crate::types::FlightState::Ascent, crate::types::FlightState::Descent, 1);
+            drogue = true;
+        }
+        if !expand && ms() >= second_at_ms {
+            press(second);
+            expand = true;
+        }
+        if ms() >= last_turn + turn_ms {
+            last_turn = ms();
+            process_router_queues_with_backoff(&host, None, &mut backoff);
+        }
+        crate::operator_command_resend::service(&state, &host);
+        deliver(false);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let got = got.lock().unwrap().clone();
+    let notes = state.notifications_snapshot().into_iter().map(|n| n.message).collect();
+    (got, notes)
+}
+
+fn copies(got: &FcLog, byte: u8) -> usize {
+    got.iter().filter(|(b, _)| *b == byte).map(|(_, id)| *id).collect::<std::collections::BTreeSet<_>>().len()
+}
+
+/// The bench strand. Deploy's ACKs are lost; on the saturated channel its
+/// retries take ~7 s to run out, longer than the nominal retry span. Expand,
+/// pressed behind it, was cancelled from the Ordered queue unsent and then
+/// refused a re-send as "older than its retry span": the operator's pyro
+/// press was dropped. It must reach the FC exactly once, and the Deploy that
+/// may already have fired must never be sent a second time.
+#[tokio::test]
+async fn expand_pressed_behind_an_unconfirmed_deploy_reaches_the_fc_once() {
+    use crate::rocket_commands::FlightComputerCommands as Fc;
+    let (got, notes) = saturated_bay(400, Fc::ExpandParachute as u8, 500, 9_500).await;
+    eprintln!("SATURATED_BAY got={got:?} notes={notes:?}");
+    assert_eq!(copies(&got, Fc::DeployParachute as u8), 1, "Deploy is never sent twice: {got:?} {notes:?}");
+    assert_eq!(copies(&got, Fc::ExpandParachute as u8), 1, "Expand reaches the FC exactly once: {got:?} {notes:?}");
+    assert!(
+        notes.iter().any(|n| n.starts_with("DeployParachute: no confirmation from FC")),
+        "the unconfirmed Deploy is still reported: {notes:?}"
+    );
+    assert!(!notes.iter().any(|n| n.contains("was not re-sent")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.starts_with("ExpandParachute held, not sent yet")), "{notes:?}");
+    assert!(
+        notes.iter().any(|n| n.starts_with("ExpandParachute sent ") && n.contains("held until the earlier flight-computer command was confirmed or ran out of retries")),
+        "{notes:?}"
+    );
+}
+
+/// P4: a second Deploy pressed while the first is still awaiting FC
+/// confirmation is never sent, at any time: the first may already have
+/// fired, and the FC fires again for a copy with a new packet ID.
+#[tokio::test]
+async fn a_second_deploy_while_the_first_is_unconfirmed_is_never_sent() {
+    use crate::rocket_commands::FlightComputerCommands as Fc;
+    let (got, notes) = saturated_bay(400, Fc::DeployParachute as u8, 500, 9_500).await;
+    eprintln!("SECOND_DEPLOY got={got:?} notes={notes:?}");
+    assert_eq!(copies(&got, Fc::DeployParachute as u8), 1, "{got:?} {notes:?}");
+    assert!(
+        notes.iter().any(|n| n == "DeployParachute not sent: an earlier DeployParachute press is still awaiting FC confirmation, and a second copy could fire it twice. Check FC state before pressing again."),
+        "{notes:?}"
+    );
 }
 
 /// R2/R3/R4/R7 precedence: safety first, then age, then the FC's view.

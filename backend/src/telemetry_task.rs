@@ -1478,19 +1478,16 @@ pub async fn telemetry_task(
                         | TelemetryCommand::ReinitAfter30
                         | TelemetryCommand::ReinitAfter50 if crate::runtime_mode::is_hitl() => {
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
-                                let before = crate::operator_command_resend::pending_flight_commands(&router);
-                                if let Err(e) = queue_locally_routed_flight_command(
-                                    &state,
-                                    &router,
-                                    "HITL flight command",
-                                    &[cmd_id],
-                                ) {
-                                    log_telemetry_error("failed to log HITL flight command", e);
+                                // An operator press is held, not queued, while an
+                                // earlier FC command could drop it (Deploy/Expand).
+                                let result = if _operator_claim.is_some() {
+                                    crate::operator_command_resend::submit_operator_flight_command(&state, &router, cmd_id)
                                 } else {
-                                    if _operator_claim.is_some() {
-                                        crate::operator_command_resend::record_operator_press(&state, &router, cmd_id, &before);
-                                    }
-                                    flush_command_tx(&router, "HITL flight command tx");
+                                    queue_locally_routed_flight_command(&state, &router, "HITL flight command", &[cmd_id])
+                                        .map(|()| flush_command_tx(&router, "HITL flight command tx"))
+                                };
+                                if let Err(e) = result {
+                                    log_telemetry_error("failed to log HITL flight command", e);
                                 }
                                 gs_debug_println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
                             }
@@ -2458,6 +2455,9 @@ async fn handle_packet_inner(
                     && let Some(word6) = words.get(6)
                 {
                     crate::fc_command_gate::observe(state, *word6);
+                }
+                if crate::types::canonical_sender_id(sender_id.trim()) == "FC" {
+                    crate::network_variables::observe_fc_health_outputs(&words);
                 }
             }
         }
