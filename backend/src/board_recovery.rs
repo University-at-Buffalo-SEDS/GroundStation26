@@ -1225,19 +1225,21 @@ impl ReadonlyQueryRefresh {
         self.av_bay_held = held;
     }
     /// Pause background AV-bay queries while the AV-bay radio path is
-    /// degraded: the primary relies on an RRLS relay, or a background AV-bay
-    /// query went unanswered past its retry window. Resume, visibly, only when
+    /// degraded: the primary relies on an RRLS relay, or AV_BAY_PAUSE_MISSES
+    /// background queries to one AV-bay board in a row went unanswered. Resume, visibly, only when
     /// the direct path is back, at least AV_BAY_MIN_PAUSE has passed, and every
     /// AV-bay board still on the network has sent a status report since the pause. Operator queries and recovery (Reset
     /// all's fresh queries included) are never paused.
     fn update_av_bay_pause(&mut self, state: &Arc<AppState>, now: Stamp) {
         let relaying = crate::rrls::primary_relaying();
+        let misses = self.misses;
         let lost = {
             let inner = state.board_recovery.inner.lock().unwrap();
             AV_BAY_INDICES.iter().any(|&at| {
-                inner.queries[at].as_ref().is_some_and(|query| {
-                    !query.received && now.checked_duration_since(query.sent).is_some_and(|age| age > query_retry())
-                })
+                misses[at].saturating_add(1) >= AV_BAY_PAUSE_MISSES
+                    && inner.queries[at].as_ref().is_some_and(|query| {
+                        !query.received && now.checked_duration_since(query.sent).is_some_and(|age| age > query_retry())
+                    })
             })
         };
         match self.av_bay_paused_since {
@@ -1358,6 +1360,11 @@ const AV_BAY_INDICES: [usize; 3] = [0, 1, 2];
 /// (250 ms x 18), so a lost query's tail has drained before the next one goes
 /// and status reports alone cannot make it flap.
 const AV_BAY_MIN_PAUSE: Duration = Duration::from_millis(4_500);
+/// Background AV-bay queries pause after this many unanswered in a row from
+/// one board. The S5=0 link loses about 5% of frames at random (bench
+/// 2026-11-10), so pausing on one lost query paused and resumed every 30-40 s
+/// and left every AV-bay row stale; three in a row is a degraded path.
+const AV_BAY_PAUSE_MISSES: u8 = 3;
 /// An AV-bay board not heard for this long before a pause began counts as
 /// off the network; the resume does not wait for its report.
 const AV_BAY_OFFLINE: Duration = Duration::from_secs(10);

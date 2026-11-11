@@ -502,9 +502,14 @@ async fn background_av_bay_queries_pause_while_the_av_bay_path_is_degraded() {
             status.get_mut(&board).unwrap().last_seen_instant = Some(std::time::Instant::now());
         }
     };
-    // A background FC query went unanswered past its retry window.
+    // One background FC query unanswered past its retry window is a lost
+    // frame on a ~5% loss link, not a degraded path: no pause.
     state.board_recovery.inner.lock().unwrap().queries[1] =
         Some(Query { abort_revision: 0, nonce: 9, sent: Stamp::now() - query_retry() - Duration::from_millis(100), received: false });
+    refresh.update_av_bay_pause(&state, Stamp::now());
+    assert_eq!(state.board_recovery.av_bay_pause_reason(), None, "one lost query does not pause");
+    // The third unanswered query in a row does.
+    refresh.misses[1] = AV_BAY_PAUSE_MISSES - 1;
     refresh.update_av_bay_pause(&state, Stamp::now());
     assert_eq!(state.board_recovery.av_bay_pause_reason(), Some("an AV-bay status query went unanswered"));
     assert!(!refresh.request(&state, Board::FlightComputer), "no background AV-bay query while paused");
