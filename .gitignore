@@ -36,3 +36,5 @@ Cargo.lock
 
 # Legacy local frontend checkouts are external build inputs, never vendored.
 /ui/
+
+frontend/.web-build.lock
