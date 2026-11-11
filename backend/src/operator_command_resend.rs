@@ -144,7 +144,7 @@ static LAST_QUEUED: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
 
 pub(crate) fn note_queued(router: &Router, packet_id: u64) {
     LAST_QUEUED.lock().unwrap().insert(router_key(router), packet_id);
-    UNSEEN.lock().unwrap().entry(router_key(router)).or_default().insert(packet_id);
+    UNSEEN.lock().unwrap().entry(router_key(router)).or_default().insert(packet_id, Instant::now());
 }
 
 /// An operator's flight command was just queued (R9: called only from the
@@ -225,9 +225,17 @@ struct Held {
 static HELD: Mutex<BTreeMap<usize, std::collections::VecDeque<Held>>> = Mutex::new(BTreeMap::new());
 /// FLIGHT_COMMANDs the station queued that have not yet been seen as SDK
 /// pending rows: still in the router's transmit queue, or already gone.
-static UNSEEN: Mutex<BTreeMap<usize, BTreeSet<u64>>> = Mutex::new(BTreeMap::new());
-/// Operator pyro presses handed to the SDK per router: (packet ID, byte).
-static SUBMITTED_PYRO: Mutex<BTreeMap<usize, Vec<(u64, u8)>>> = Mutex::new(BTreeMap::new());
+/// The SDK dispatches an accepted FLIGHT_COMMAND or cancels it within its
+/// retry lifetime (`expire_deferred_original`), so an entry older than
+/// `unseen_horizon()` is no longer in the transmit queue.
+static UNSEEN: Mutex<BTreeMap<usize, BTreeMap<u64, Instant>>> = Mutex::new(BTreeMap::new());
+/// Operator pyro presses handed to the SDK per router: (packet ID, byte,
+/// press time).
+static SUBMITTED_PYRO: Mutex<BTreeMap<usize, Vec<(u64, u8, Instant)>>> = Mutex::new(BTreeMap::new());
+
+fn unseen_horizon() -> Duration {
+    retry_span() + Duration::from_secs(1)
+}
 
 fn flight_command_type() -> sedsnet::config::DataType {
     crate::telemetry_schema::data_type("FLIGHT_COMMAND")
@@ -240,24 +248,36 @@ fn unresolved_flight_commands(router: &Router) -> BTreeSet<u64> {
     let mut ahead = pending_flight_commands(router);
     let mut unseen = UNSEEN.lock().unwrap();
     if let Some(ids) = unseen.get_mut(&router_key(router)) {
-        ids.retain(|id| !ahead.contains(id));
+        ids.retain(|id, at| !ahead.contains(id) && at.elapsed() < unseen_horizon());
         if !ids.is_empty() && !router.has_pending_reliable_tx_type(flight_command_type()) {
             ids.clear();
         }
-        ahead.extend(ids.iter().copied());
+        ahead.extend(ids.keys().copied());
     }
     ahead
 }
 
-/// P4: why a press of this pyro command must not be sent, if it must not.
-fn duplicate_pyro(router: &Router, byte: u8, ahead: &BTreeSet<u64>) -> Option<&'static str> {
-    if HELD.lock().unwrap().get(&router_key(router)).is_some_and(|q| q.iter().any(|h| h.byte == byte)) {
-        return Some("is already held to be sent");
+/// P4: the notice for a press of this pyro command that must not be sent,
+/// if it must not. The block lasts only while the earlier press is held or
+/// unresolved in the SDK: it ends when that press is confirmed, runs out of
+/// retries (reported "no confirmation from FC") or is dropped unsent, and an
+/// unregistered one is forgotten after `unseen_horizon()`.
+fn duplicate_pyro(router: &Router, byte: u8, ahead: &BTreeSet<u64>) -> Option<String> {
+    let label = label_for(byte);
+    if let Some(held) = HELD.lock().unwrap().get(&router_key(router)).and_then(|q| q.iter().find(|h| h.byte == byte).cloned()) {
+        return Some(format!(
+            "{label} not sent: the {label} pressed {:.1} s ago is held and not sent yet, and a second copy could fire it twice. Pressing again works once that press is sent and confirmed, reported unconfirmed, or reported never sent (at most {} s after it).",
+            held.pressed_at.elapsed().as_secs_f64(), PYRO_HOLD_LIMIT.as_secs()
+        ));
     }
     let mut submitted = SUBMITTED_PYRO.lock().unwrap();
     let list = submitted.entry(router_key(router)).or_default();
-    list.retain(|(id, _)| ahead.contains(id));
-    list.iter().any(|(_, b)| *b == byte).then_some("is still awaiting FC confirmation")
+    list.retain(|(id, _, _)| ahead.contains(id));
+    let (_, _, at) = list.iter().find(|(_, b, _)| *b == byte)?;
+    Some(format!(
+        "{label} not sent: the {label} sent {:.1} s ago is still awaiting FC confirmation, and a second copy could fire it twice. Pressing again works as soon as the FC confirms it or its retries run out (the station then reports \"{label}: no confirmation from FC\"). Check FC state first.",
+        at.elapsed().as_secs_f64()
+    ))
 }
 
 fn notify(state: &AppState, message: String) {
@@ -271,7 +291,7 @@ fn send_now(state: &AppState, router: &Router, byte: u8, ahead: &BTreeSet<u64>) 
     if let Some(id) = record_operator_press(state, router, byte, ahead)
         && is_deploy(byte)
     {
-        SUBMITTED_PYRO.lock().unwrap().entry(router_key(router)).or_default().push((id, byte));
+        SUBMITTED_PYRO.lock().unwrap().entry(router_key(router)).or_default().push((id, byte, Instant::now()));
     }
     crate::telemetry_task::flush_command_tx(router, "HITL flight command tx");
     Ok(())
@@ -292,9 +312,9 @@ pub(crate) fn submit_operator_flight_command(state: &AppState, router: &Router, 
     let label = label_for(byte);
     let ahead = unresolved_flight_commands(router);
     if is_deploy(byte)
-        && let Some(why) = duplicate_pyro(router, byte, &ahead)
+        && let Some(notice) = duplicate_pyro(router, byte, &ahead)
     {
-        notify(state, format!("{label} not sent: an earlier {label} press {why}, and a second copy could fire it twice. Check FC state before pressing again."));
+        notify(state, notice);
         return Ok(());
     }
     let holding = HELD.lock().unwrap().get(&router_key(router)).is_some_and(|q| !q.is_empty());

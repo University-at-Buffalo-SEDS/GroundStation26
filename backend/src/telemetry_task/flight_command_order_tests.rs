@@ -420,7 +420,7 @@ type FcLog = Vec<(u8, u64)>;
 /// nominal 250 ms x 18. The operator presses Deploy at 0 and, once the
 /// station sees the drogue, Expand at `expand_at_ms`. Returns what the FC
 /// handler got and the station's notifications.
-async fn saturated_bay(turn_ms: u64, second: u8, second_at_ms: u64, run_ms: u64) -> (FcLog, Vec<String>) {
+async fn saturated_bay(turn_ms: u64, later: &[(u64, u8)], run_ms: u64) -> (FcLog, Vec<String>) {
     use crate::rocket_commands::FlightComputerCommands as Fc;
     let _mode = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Hitl);
     let state = crate::state::tests::test_app_state().await;
@@ -482,7 +482,7 @@ async fn saturated_bay(turn_ms: u64, second: u8, second_at_ms: u64, run_ms: u64)
     };
     let start = std::time::Instant::now();
     let ms = || start.elapsed().as_millis() as u64;
-    let (mut deploy, mut drogue, mut expand) = (false, false, false);
+    let (mut deploy, mut drogue, mut next) = (false, false, 0);
     let mut last_turn = 0;
     while ms() < run_ms {
         if !deploy {
@@ -494,9 +494,11 @@ async fn saturated_bay(turn_ms: u64, second: u8, second_at_ms: u64, run_ms: u64)
             crate::recovery_events::observe_fc_state(&state, crate::types::FlightState::Ascent, crate::types::FlightState::Descent, 1);
             drogue = true;
         }
-        if !expand && ms() >= second_at_ms {
-            press(second);
-            expand = true;
+        if let Some(&(at, byte)) = later.get(next)
+            && ms() >= at
+        {
+            press(byte);
+            next += 1;
         }
         if ms() >= last_turn + turn_ms {
             last_turn = ms();
@@ -524,7 +526,7 @@ fn copies(got: &FcLog, byte: u8) -> usize {
 #[tokio::test]
 async fn expand_pressed_behind_an_unconfirmed_deploy_reaches_the_fc_once() {
     use crate::rocket_commands::FlightComputerCommands as Fc;
-    let (got, notes) = saturated_bay(400, Fc::ExpandParachute as u8, 500, 9_500).await;
+    let (got, notes) = saturated_bay(400, &[(500, Fc::ExpandParachute as u8)], 9_500).await;
     eprintln!("SATURATED_BAY got={got:?} notes={notes:?}");
     assert_eq!(copies(&got, Fc::DeployParachute as u8), 1, "Deploy is never sent twice: {got:?} {notes:?}");
     assert_eq!(copies(&got, Fc::ExpandParachute as u8), 1, "Expand reaches the FC exactly once: {got:?} {notes:?}");
@@ -546,13 +548,28 @@ async fn expand_pressed_behind_an_unconfirmed_deploy_reaches_the_fc_once() {
 #[tokio::test]
 async fn a_second_deploy_while_the_first_is_unconfirmed_is_never_sent() {
     use crate::rocket_commands::FlightComputerCommands as Fc;
-    let (got, notes) = saturated_bay(400, Fc::DeployParachute as u8, 500, 9_500).await;
+    let (got, notes) = saturated_bay(400, &[(500, Fc::DeployParachute as u8)], 9_500).await;
     eprintln!("SECOND_DEPLOY got={got:?} notes={notes:?}");
     assert_eq!(copies(&got, Fc::DeployParachute as u8), 1, "{got:?} {notes:?}");
-    assert!(
-        notes.iter().any(|n| n == "DeployParachute not sent: an earlier DeployParachute press is still awaiting FC confirmation, and a second copy could fire it twice. Check FC state before pressing again."),
-        "{notes:?}"
-    );
+    let blocked: Vec<_> = notes.iter().filter(|n| n.starts_with("DeployParachute not sent:")).collect();
+    assert_eq!(blocked.len(), 1, "{notes:?}");
+    assert!(blocked[0].contains("is still awaiting FC confirmation, and a second copy could fire it twice"), "why: {}", blocked[0]);
+    assert!(blocked[0].contains("Pressing again works as soon as the FC confirms it or its retries run out"), "when: {}", blocked[0]);
+}
+
+/// P4 ends with the earlier press: once the first Deploy runs out of retries
+/// unconfirmed (~7 s on this channel), the operator's next press is sent,
+/// exactly once. A press made before that is blocked with its reason.
+#[tokio::test]
+async fn a_deploy_pressed_after_the_first_ran_out_unconfirmed_is_sent_once() {
+    use crate::rocket_commands::FlightComputerCommands as Fc;
+    let deploy = Fc::DeployParachute as u8;
+    let (got, notes) = saturated_bay(400, &[(500, deploy), (8_500, deploy)], 10_000).await;
+    eprintln!("REPRESS got={got:?} notes={notes:?}");
+    let first_unconfirmed = notes.iter().position(|n| n.starts_with("DeployParachute: no confirmation from FC")).unwrap_or_else(|| panic!("{notes:?}"));
+    assert!(notes[..first_unconfirmed].iter().any(|n| n.starts_with("DeployParachute not sent:")), "the early press is blocked: {notes:?}");
+    assert!(!notes[first_unconfirmed..].iter().any(|n| n.starts_with("DeployParachute not sent:")), "the later press is not: {notes:?}");
+    assert_eq!(copies(&got, deploy), 2, "the first and the operator's later press, once each: {got:?} {notes:?}");
 }
 
 /// R2/R3/R4/R7 precedence: safety first, then age, then the FC's view.
