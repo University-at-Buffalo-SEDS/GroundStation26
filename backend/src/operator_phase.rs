@@ -323,6 +323,26 @@ pub(crate) fn project(state: &AppState, policy: &mut crate::sequences::ActionPol
         };
         control.enabled = mask & bit != 0;
         control.blink = crate::sequences::BlinkMode::None;
+        if !control.enabled && !deny {
+            control.disabled_reason = ladder_reason(state, phase, bit == 2);
+        }
+    }
+}
+/// Why State +1/-1 cannot step from `phase`: outside the prelaunch ladder, or
+/// at one of its ends. Other refusals carry the policy-wide reason.
+fn ladder_reason(state: &AppState, phase: FlightState, forward: bool) -> Option<String> {
+    if !ORDER.contains(&phase) {
+        let shown = state.fc_phase.snapshot().map(|seen| seen.phase)
+            .filter(|fc| phase.is_in_flight() || matches!(phase, FlightState::Landed) && fc.network() == phase.network())
+            .unwrap_or(phase);
+        return Some(format!(
+            "State step only works in the prelaunch ladder (Startup to Armed); FC is in {}. Use Reset flight state to Idle, or Reset FC to Startup.",
+            crate::mission_phase::detailed_label(shown)));
+    }
+    match (phase, forward) {
+        (FlightState::Armed, true) => Some("Armed is the last prelaunch step; use Fire to launch.".into()),
+        (FlightState::Startup, false) => Some("Startup is the first prelaunch step.".into()),
+        _ => None,
     }
 }
 
@@ -402,6 +422,42 @@ mod tests {
             _ => panic!("sealed origin required"),
         }
     }
+    /// Bench, 2026-11-11: after an operator deploy the FC reports Descent and
+    /// State +1/-1 showed only the generic reason. Outside the prelaunch
+    /// ladder each says why and what to use instead.
+    #[tokio::test]
+    async fn state_step_outside_the_prelaunch_ladder_says_why() {
+        crate::mode_suite!(Hitl);
+        let fixture = crate::actuator_plumbing::http_tests::Fixture::new().await;
+        if fixture.state.hitl_button_interlock_enabled() {
+            fixture.state.toggle_hitl_safety_interlock(0);
+        }
+        fixture.state.set_preexisting_flight_state_for_test(FlightState::InFlight);
+        crate::fc_phase::observe(&fixture.state, FlightState::Descent as u8, crate::fc_phase::Source::FcStateReport, 0);
+        let policy = fixture.state.action_policy_snapshot();
+        assert!(policy.local_phase_controls, "{policy:?}");
+        for cmd in ["AdvanceFlightState", "RewindFlightState"] {
+            let control = policy.controls.iter().find(|c| c.cmd == cmd).unwrap();
+            assert!(!control.enabled, "{cmd}");
+            assert_eq!(
+                control.disabled_reason.as_deref(),
+                Some("State step only works in the prelaunch ladder (Startup to Armed); FC is in Descent. Use Reset flight state to Idle, or Reset FC to Startup."),
+                "{cmd}"
+            );
+        }
+        // The ends of the ladder name the next action too.
+        fixture.state.set_preexisting_flight_state_for_test(FlightState::Armed);
+        let policy = fixture.state.action_policy_snapshot();
+        let advance = policy.controls.iter().find(|c| c.cmd == "AdvanceFlightState").unwrap();
+        assert!(!advance.enabled);
+        assert_eq!(advance.disabled_reason.as_deref(), Some("Armed is the last prelaunch step; use Fire to launch."));
+        fixture.state.set_preexisting_flight_state_for_test(FlightState::Startup);
+        let policy = fixture.state.action_policy_snapshot();
+        let rewind = policy.controls.iter().find(|c| c.cmd == "RewindFlightState").unwrap();
+        assert!(!rewind.enabled);
+        assert_eq!(rewind.disabled_reason.as_deref(), Some("Startup is the first prelaunch step."));
+    }
+
     #[tokio::test]
     async fn local_phase_http_permission_and_actual_managed_publication_need_no_fc_or_launch_proof()
     {
