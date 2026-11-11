@@ -2730,6 +2730,11 @@ impl Mesh {
                 {
                     self.av_bay_heard = Some(now);
                 }
+                // Display-only: the listener ingest decodes frames addressed
+                // to the primary, which this station's router never delivers.
+                if !command && !self.takeover {
+                    crate::rrls_listener::observe(payload);
+                }
             }
             if self.role == Role::Rrls && self.active(now) {
                 let priority = if command {

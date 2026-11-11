@@ -2223,7 +2223,7 @@ impl AppState {
         }
         for control in &mut policy.controls {
             if let Some(view) = crate::sequences::network_output_view(&control.cmd)
-                && !crate::rrls::is_rrls()
+                && (!crate::rrls::is_rrls() || crate::rrls::takeover_active())
             {
                 control.requested = Some(view.requested);
                 control.actuated = view.confirmed;

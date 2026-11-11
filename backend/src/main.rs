@@ -98,6 +98,7 @@ mod sd_download;
 mod ring_buffer;
 mod rocket_commands;
 mod rrls;
+mod rrls_listener;
 mod runtime_mode;
 mod rrls_radio;
 mod rrls_sim_primary;
@@ -2358,6 +2359,9 @@ async fn main() -> anyhow::Result<()> {
         // battery, Euler angles, status), so the RRLS sees all AV-bay data
         // without acknowledging or transmitting anything.
         router.set_route(Some(rocket_side), rocket_side, false)?;
+        // Display-only ingest of AV-bay frames addressed to the primary
+        // (rrls_listener): a receive-only shadow router that never transmits.
+        rrls_listener::start(state.clone(), rocket_router_side_options(&comms_links.av_bay, true))?;
         // RRLS takeover: while it owns the AV bay its router transmits on the
         // radio (discovery included, so the AV bay routes telemetry to it once
         // the primary's routes expire); otherwise it only observes and relays.
