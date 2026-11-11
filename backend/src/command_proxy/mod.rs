@@ -2001,12 +2001,18 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                         || sequence_age > LATE_REPLY_WINDOW
                     {
                         finish_pending(pending.id,"unknown",false,Some("Primary response was not confirmed; inspect actual state before retrying.".into()));
-                        invalidate_presentation(&state);
-                        runtime.capability = None;
-                        runtime.query = None;
-                        query_attempts = 0;
-                        last_query = None;
-                        query_created_at = None;
+                        // A lost reply ends only this request. The capability is
+                        // still the primary's signed, fresh grant: dropping it here
+                        // disabled every RRLS control after one lost reply and
+                        // waited out a 30 s discovery cooldown on a busy channel.
+                        if !available || pending.session != view.session {
+                            invalidate_presentation(&state);
+                            runtime.capability = None;
+                            runtime.query = None;
+                            query_attempts = 0;
+                            last_query = None;
+                            query_created_at = None;
+                        }
                     } else if pending.attempts < 3
                         && sequence_age <= SEQUENCE_WINDOW
                         && pending
