@@ -488,12 +488,20 @@ impl AppState {
         let address = sender
             .strip_prefix("@addr:")
             .and_then(|value| value.parse::<u32>().ok())?;
-        let hostname = self
+        if let Some(hostname) = self
             .topology_router
-            .get()?
-            .resolve_address(address)?
-            .hostname;
-        Board::from_sender_id(canonical_sender_id(hostname.as_ref()))
+            .get()
+            .and_then(|router| router.resolve_address(address))
+            .map(|resolved| resolved.hostname)
+        {
+            return Board::from_sender_id(canonical_sender_id(hostname.as_ref()));
+        }
+        // Not yet resolved (an RRLS that has only listened, or before the
+        // address advertisement): the compact source is the deterministic wire
+        // identity of the board's sender name.
+        Board::ALL.iter().copied().find(|board| {
+            sedsnet::packet::sender_address_u32(board.sender_id()) == address
+        })
     }
 
     /// Converts compact on-wire address senders back to the stable board ID
@@ -2758,6 +2766,20 @@ fn t_plus_anchor_timestamp(current: &LaunchClockMsg, timestamp_ms: i64) -> i64 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// A freshly started RRLS hears compact senders before any address
+    /// advertisement: they still name their boards (bench 2026-11-11: the RRLS
+    /// showed the GS and RF as @addr:3561204631 / @addr:3997908571).
+    #[tokio::test]
+    async fn an_unresolved_compact_sender_names_its_board() {
+        let state = test_app_state().await;
+        assert_eq!(state.board_from_network_sender("@addr:3561204631"), Some(Board::GroundStation));
+        assert_eq!(state.board_from_network_sender("@addr:3997908571"), Some(Board::RFBoard));
+        assert_eq!(state.board_from_network_sender("@addr:1"), None);
+        for board in Board::ALL {
+            let alias = format!("@addr:{}", sedsnet::packet::sender_address_u32(board.sender_id()));
+            assert_eq!(state.board_from_network_sender(&alias), Some(*board), "{board:?}");
+        }
+    }
     #[tokio::test]
     async fn rrls_received_states_retain_authoritative_clock_without_daq_origination() {
         const CHILD: &str = "GS_RRLS_CLOCK_OBSERVER_TEST_CHILD";
