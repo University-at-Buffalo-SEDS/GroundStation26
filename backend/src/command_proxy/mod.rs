@@ -2698,7 +2698,7 @@ mod board_abort_readiness_tests {
         let (_root, p, r, mut primary, mut rr, pv, rv) = super::tests::connected();
         let state = crate::state::tests::test_app_state().await;
         primary.observation = crate::primary_mirror::encode_control_observation(&state, 96);
-        assert_eq!(primary.observation.len(), 88);
+        assert_eq!(primary.observation.len(), 89);
         let legacy = rr.query(&r, rv).unwrap();
         let Received::Reply(reply) = primary.receive(&p, pv, Mode::Normal, &legacy).unwrap() else {
             panic!("legacy reply")
@@ -2721,7 +2721,7 @@ mod board_abort_readiness_tests {
         else {
             panic!("observe cap")
         };
-        assert_eq!(observation.len(), 88);
+        assert_eq!(observation.len(), 89);
         assert!(primary.extended_observation);
         assert!(!primary.take_readiness_demand());
         let refresh = rr.query_for_readiness(&r, rv, true).unwrap();

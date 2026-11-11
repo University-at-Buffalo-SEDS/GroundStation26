@@ -15,6 +15,12 @@ const BOARD_LEN: usize = 75;
 const ORIGIN_LEN: usize = 83;
 const SAFETY_LEN: usize = 87;
 const PROOF_POLICY_LEN:usize=88;
+/// One more byte: the primary's network-variable view of underglow and the
+/// buzzer (request, confirmation, any readback), which only it can know.
+const NETVAR_LEN: usize = 89;
+/// Network-variable byte: per output (underglow bits 0-2, buzzer bits 3-5)
+/// requested, confirmed (the network carries the request) and readback seen.
+const NETVAR_OUTPUTS: [&str; 2] = ["ToggleAvBayUnderglow", "ToggleFlightBuzzer"];
 const UNKNOWN: u16 = u16::MAX;
 const SOURCE_FRESH_MS: u64 = 1500;
 /// The RRLS follows the primary's action enable (key, software buttons and
@@ -76,6 +82,7 @@ struct Observation {
     safety: Option<(u8, u8, u16)>,
     board_proof_policy:Option<bool>,
     board_proof_test_fire: bool,
+    netvar: Option<u8>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LaunchOrigin {
@@ -135,7 +142,9 @@ impl Observation {
         out.extend(self.step_bits.to_le_bytes());
         if let Some((active, required, proven, ages)) = self.board_guard {
             out.extend([
-                if self.board_proof_policy.is_some() {
+                if self.netvar.is_some() && self.board_proof_policy.is_some() {
+                    6
+                } else if self.board_proof_policy.is_some() {
                     5
                 } else if self.safety.is_some() {
                     4
@@ -156,14 +165,19 @@ impl Observation {
                 if let Some((policy, phase, remaining)) = self.safety {
                     out.extend([policy, phase]);
                     out.extend(remaining.to_le_bytes());
-                    if let Some(enforced)=self.board_proof_policy {out.push(2|u8::from(enforced)|(u8::from(self.board_proof_test_fire)<<2));}
+                    if let Some(enforced)=self.board_proof_policy {
+                        out.push(2|u8::from(enforced)|(u8::from(self.board_proof_test_fire)<<2));
+                        if let Some(netvar) = self.netvar {
+                            out.push(netvar);
+                        }
+                    }
                 }
             }
         }
         out
     }
     fn decode(bytes: &[u8]) -> Option<Self> {
-        if !matches!(bytes.len(), LEN | BOARD_LEN | ORIGIN_LEN | SAFETY_LEN | PROOF_POLICY_LEN)
+        if !matches!(bytes.len(), LEN | BOARD_LEN | ORIGIN_LEN | SAFETY_LEN | PROOF_POLICY_LEN | NETVAR_LEN)
             || bytes[0] != VERSION
             || bytes[1] & !31 != 0
             || bytes[26] & !31 != 0
@@ -179,6 +193,7 @@ impl Observation {
         if bytes.len() != LEN
             && (bytes[57]
                 != match bytes.len() {
+                    NETVAR_LEN => 6,
                     PROOF_POLICY_LEN=>5,
                     SAFETY_LEN => 4,
                     ORIGIN_LEN => 3,
@@ -205,7 +220,10 @@ impl Observation {
                 return None;
             }
         }
-        if bytes.len()==PROOF_POLICY_LEN && (bytes[87]&!7!=0 ||bytes[87]&5!=0&&bytes[87]&2==0) {return None;}
+        if bytes.len()>=PROOF_POLICY_LEN && (bytes[87]&!7!=0 ||bytes[87]&5!=0&&bytes[87]&2==0) {return None;}
+        if bytes.len() == NETVAR_LEN && (bytes[87] & 2 == 0 || !netvar_valid(bytes[88])) {
+            return None;
+        }
         let word = |i| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
         let mask = |i| u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
         let edges = word(50);
@@ -237,9 +255,32 @@ impl Observation {
             launch_revision: (bytes.len() >= ORIGIN_LEN)
                 .then(|| u64::from_le_bytes(bytes[75..83].try_into().unwrap())),
             safety: (bytes.len() >= SAFETY_LEN).then(|| (bytes[83], bytes[84], word(85))),
-            board_proof_policy:(bytes.len()==PROOF_POLICY_LEN&&bytes[87]&2!=0).then(||bytes[87]&1!=0),
-            board_proof_test_fire: bytes.len()==PROOF_POLICY_LEN&&bytes[87]&4!=0,
+            board_proof_policy:(bytes.len()>=PROOF_POLICY_LEN&&bytes[87]&2!=0).then(||bytes[87]&1!=0),
+            board_proof_test_fire: bytes.len()>=PROOF_POLICY_LEN&&bytes[87]&4!=0,
+            netvar: (bytes.len() == NETVAR_LEN).then(|| bytes[88]),
         })
+    }
+}
+/// Bits 6-7 are reserved; a confirmation is of the request, so a confirmed
+/// output without a readback is malformed.
+fn netvar_valid(byte: u8) -> bool {
+    byte & 0xc0 == 0 && (0..2).all(|i| byte >> (3 * i) & 0b010 == 0 || byte >> (3 * i) & 0b100 != 0)
+}
+fn netvar_byte(views: [crate::network_variables::NetworkOutputView; 2]) -> u8 {
+    views.iter().enumerate().fold(0, |byte, (i, view)| {
+        byte | (u8::from(view.requested)
+            | u8::from(view.confirmed == Some(view.requested)) << 1
+            | u8::from(view.readback_seen) << 2)
+            << (3 * i)
+    })
+}
+fn netvar_view(byte: u8, index: usize) -> crate::network_variables::NetworkOutputView {
+    let bits = byte >> (3 * index);
+    let requested = bits & 1 != 0;
+    crate::network_variables::NetworkOutputView {
+        requested,
+        confirmed: (bits & 0b010 != 0).then_some(requested),
+        readback_seen: bits & 0b100 != 0,
     }
 }
 /// Configuration projection only; never freshness, proof or execution authority.
@@ -321,6 +362,11 @@ pub fn encode_control_observation(state: &AppState, max_bytes: usize) -> Vec<u8>
         }),
         board_proof_policy:(max_bytes>=PROOF_POLICY_LEN).then(||state.board_state_proof_enforced()),
         board_proof_test_fire: crate::runtime_mode::is_test_fire(),
+        netvar: (max_bytes >= NETVAR_LEN).then(|| {
+            netvar_byte(NETVAR_OUTPUTS.map(|cmd| {
+                crate::sequences::network_output_view(cmd).expect("network-variable output")
+            }))
+        }),
     };
     for (i, name) in crate::command_proxy::command_catalog()
         .iter()
@@ -439,6 +485,7 @@ pub(crate) fn simulated_idle_observation() -> Vec<u8> {
         safety: None,
         board_proof_policy: None,
         board_proof_test_fire: false,
+        netvar: None,
     }
     .encode()
 }
@@ -682,7 +729,19 @@ pub fn action_policy(state: &AppState) -> Option<ActionPolicyMsg> {
                             .position(|v| v == name)
                             .and_then(|index| valve_observation(r, index, elapsed)),
                     };
-                    ActionControl { disabled_reason: None, requested: None, network_note: None,
+                    // Underglow and buzzer: the primary's own request and
+                    // network confirmation, as fresh as the action enables.
+                    let netvar = NETVAR_OUTPUTS
+                        .iter()
+                        .position(|cmd| cmd == name)
+                        .zip(r.netvar.filter(|_| fresh))
+                        .map(|(index, byte)| netvar_view(byte, index));
+                    let actuated = match netvar {
+                        Some(view) => view.confirmed,
+                        None => actuated,
+                    };
+                    ActionControl { disabled_reason: None, requested: netvar.map(|view| view.requested),
+                        network_note: netvar.and_then(crate::sequences::network_output_note),
                         cmd: (*name).into(),
                         enabled: fresh
                             && (*name!="ToggleBoardStateProofInterlock"||r.board_proof_policy.is_some())
@@ -905,6 +964,7 @@ mod tests {
             safety: None,
             board_proof_policy:None,
             board_proof_test_fire:false,
+            netvar: None,
         }
     }
     #[test]
@@ -1090,6 +1150,74 @@ mod tests {
         );
     }
 
+    /// Bench 2026-11-11: the RRLS showed underglow and buzzer as "Requested:
+    /// unknown; Unconfirmed" while the primary showed them confirmed. The
+    /// RRLS cannot know the request; the primary's view now rides in the
+    /// observation, and an older 88-byte observation still decodes unchanged.
+    #[test]
+    fn netvar89_carries_the_primarys_request_and_confirmation() {
+        use crate::network_variables::NetworkOutputView as V;
+        let mut value = example();
+        value.board_guard = Some((0, 0, 0, [UNKNOWN; 7]));
+        value.launch_revision = Some(8);
+        value.safety = Some((0b111101, 4, 45));
+        value.board_proof_policy = Some(true);
+        let old88 = value.encode();
+        assert_eq!(old88.len(), 88);
+        let byte = netvar_byte([
+            V { requested: true, confirmed: Some(true), readback_seen: true },
+            V { requested: false, confirmed: None, readback_seen: false },
+        ]);
+        assert_eq!(byte, 0b000_111);
+        value.netvar = Some(byte);
+        let bytes = value.encode();
+        assert_eq!(bytes.len(), NETVAR_LEN);
+        assert_eq!(&bytes[58..88], &old88[58..88]);
+        assert_eq!(bytes[57], 6);
+        assert_eq!(Observation::decode(&bytes), Some(value.clone()));
+        assert_eq!(Observation::decode(&old88).unwrap().netvar, None);
+        for bad in [0x40, 0x80, 0b010, 0b010_000] {
+            let mut invalid = bytes.clone();
+            invalid[88] = bad;
+            assert!(Observation::decode(&invalid).is_none(), "{bad:#x}");
+        }
+        let mut too_long = bytes.clone();
+        too_long.push(0);
+        assert!(Observation::decode(&too_long).is_none());
+        // A confirmation the primary has not seen is never synthesized.
+        assert_eq!(netvar_byte([V { requested: true, confirmed: None, readback_seen: true }; 2]), 0b101_101);
+    }
+    #[tokio::test]
+    async fn rrls_rows_show_the_primarys_network_variable_state() {
+        let state = crate::state::tests::test_app_state().await;
+        let mut value = example();
+        value.enabled = u64::MAX;
+        value.board_guard = Some((0, 0, 0, [UNKNOWN; 7]));
+        value.launch_revision = Some(8);
+        value.safety = Some((0b111101, 4, 45));
+        value.board_proof_policy = Some(true);
+        let row = |policy: &ActionPolicyMsg, cmd: &str| {
+            let c = policy.controls.iter().find(|c| c.cmd == cmd).unwrap();
+            (c.requested, c.actuated, c.network_note.clone())
+        };
+        // An older primary sends no network-variable byte: unknown, as before.
+        assert!(accept_control_observation(&state, &value.encode(), 10));
+        let policy = action_policy(&state).unwrap();
+        assert_eq!(row(&policy, "ToggleAvBayUnderglow"), (None, None, None));
+        // Underglow On and confirmed; buzzer Off with no network value yet.
+        value.netvar = Some(0b000_111);
+        assert!(accept_control_observation(&state, &value.encode(), 10));
+        let policy = action_policy(&state).unwrap();
+        assert_eq!(row(&policy, "ToggleAvBayUnderglow"), (Some(true), Some(true), None));
+        assert_eq!(
+            row(&policy, "ToggleFlightBuzzer"),
+            (Some(false), None, Some(crate::sequences::WAITING_FOR_NETWORK.to_string()))
+        );
+        // A stale observation shows no confirmation, like every other row.
+        assert!(accept_control_observation(&state, &value.encode(), POLICY_FRESH_MS + 100));
+        let policy = action_policy(&state).unwrap();
+        assert_eq!(row(&policy, "ToggleAvBayUnderglow"), (None, None, None));
+    }
     #[tokio::test]
     async fn delayed_source_reports_expire_without_confirming_command_intent() {
         let state = crate::state::tests::test_app_state().await;
