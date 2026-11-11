@@ -174,20 +174,32 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
         .clamp(min, max)
 }
 
+/// The station's reliable delivery span: one frame's retries end this long
+/// after its first send (retransmit interval x attempts, 400 ms x 12 = 4.8 s).
+/// Pauses that must outlast a lost frame's retry tail derive from it.
+pub(crate) fn reliable_delivery_span() -> Duration {
+    let tuning = network_delivery_tuning();
+    Duration::from_millis(
+        u64::from(tuning.reliable_retransmit_ms) * (u64::from(tuning.reliable_max_retries) + 1),
+    )
+}
 fn network_delivery_tuning() -> sedsnet::config::RuntimeTuningConfig {
     // Radio schema frames are bounded to 256 bytes. At the configured
     // 40% share of a 64 kbps link, one framed chunk takes under 90 ms.
-    // Retry at 250 ms so one lost receipt can recover inside a 500 ms target;
-    // 18 attempts retain the previous 4.5-second total delivery window.
+    // Retry at 400 ms, 12 attempts: a 4.8 s window, still at least the 4.5 s
+    // a schema transfer needs.
+    // With air turn-taking an ACK can wait up to one 200 ms AV-bay turn, so the
+    // bench-calibrated model (FirmwareSimulator docs/rfd-air-scheduling.md)
+    // puts spurious resends at 4.8% for 400 ms against 56% for 250 ms.
     sedsnet::config::RuntimeTuningConfig {
         // Embedded peers omit the zstd decoder. Header templates still reduce
         // link overhead, but canonical payloads must remain decodable there.
         payload_compress_threshold: usize::MAX,
-        reliable_retransmit_ms: env_usize("GS_RELIABLE_RETRANSMIT_MS", 250, 100, 5000) as u32,
-        reliable_max_retries: 17,
+        reliable_retransmit_ms: env_usize("GS_RELIABLE_RETRANSMIT_MS", 400, 100, 5000) as u32,
+        reliable_max_retries: 11,
         // The end-to-end reliable window is ONE pool shared by every side.
         // At the SDK default (32), commands to slow or unreachable radio
-        // boards, each held for the 4.5 s delivery window, filled it and
+        // boards, each held for the delivery window (then 4.5 s), filled it and
         // starved the wired umbilical boards: their commands and recovery
         // queries waited for slots and answered only in bursts, every 4–8 s.
         // A larger pool keeps room for the umbilical while the radio backs
@@ -710,7 +722,7 @@ fn request_startup_topology(router: &sedsnet::router::Router) -> sedsnet::Teleme
 /// tuning mid-run.
 #[cfg(test)]
 pub(crate) static RUNTIME_TUNING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-/// Installs the station's delivery tuning (retry span 250 ms x 18) for one
+/// Installs the station's delivery tuning (retry span 400 ms x 12) for one
 /// test and restores the previous tuning when dropped.
 #[cfg(test)]
 pub(crate) struct StationDeliveryTuning {
@@ -925,14 +937,20 @@ mod router_link_policy_tests {
         let tuning = super::network_delivery_tuning();
         tuning.validate().unwrap();
         if std::env::var_os("GS_RELIABLE_RETRANSMIT_MS").is_none() {
-            assert_eq!(tuning.reliable_retransmit_ms, 250);
-            assert_eq!(tuning.reliable_max_retries, 17);
+            assert_eq!(tuning.reliable_retransmit_ms, 400);
+            assert_eq!(tuning.reliable_max_retries, 11);
             assert!(
                 u64::from(tuning.reliable_retransmit_ms)
                     * u64::from(tuning.reliable_max_retries + 1)
                     >= 4500
             );
+            assert_eq!(super::reliable_delivery_span(), Duration::from_millis(4_800));
         }
+        // Undeliverable is judged at least 1 s past the span, whatever the tuning.
+        assert!(
+            crate::gse::undeliverable_after()
+                >= super::reliable_delivery_span() + Duration::from_secs(1)
+        );
     }
 
     use super::*;

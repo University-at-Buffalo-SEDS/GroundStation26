@@ -18,9 +18,15 @@ use super::*;
 pub(crate) const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 /// A board that answered without showing the Abort is asked again after this.
 const CONFIRM_REQUERY: Duration = Duration::from_millis(250);
-/// The window stays open this long at most while an AV-bay query (one ordered
-/// BOARD_RECOVERY_REQUEST stream) still holds the umbilical queries behind it.
-const CONFIRM_WINDOW_MAX: Duration = Duration::from_secs(10);
+/// The window stays open at most this long after the press while an AV-bay
+/// query (one ordered BOARD_RECOVERY_REQUEST stream) still holds the
+/// umbilical queries behind it: two whole delivery spans plus CONFIRM_WINDOW
+/// (12.6 s at 400 ms x 12). It bounds a hung window; a live AV-bay head that
+/// starts after the press and lives its whole span still gets its
+/// CONFIRM_WINDOW tail.
+fn confirm_window_max() -> Duration {
+    2 * crate::reliable_delivery_span() + CONFIRM_WINDOW
+}
 /// A prompt query unanswered this long was most likely dropped with the
 /// ordered stream's tail when an AV-bay query ahead of it gave up: ask again.
 const CONFIRM_LOST: Duration = Duration::from_secs(3);
@@ -29,7 +35,7 @@ const UMBILICAL: [usize; 4] = [3, 4, 5, 6];
 /// AV-bay boards in the order their Abort readback is asked: FC, PB, RF.
 const AV_BAY_ORDER: [usize; 3] = [1, 2, 0];
 /// How long after an Abort the AV-bay boards are asked for readback. Over an
-/// RRLS relay one query can take its whole 4.5 s retry span.
+/// RRLS relay one query can take its whole 4.8 s retry span.
 const AV_BAY_CONFIRM_WINDOW: Duration = Duration::from_secs(20);
 /// An AV-bay board that answered without showing the Abort is asked again
 /// after this: each radio query holds the one ordered stream.
@@ -86,7 +92,7 @@ impl AbortConfirmRefresh {
         let expired = |from: Stamp, window: Duration| now.checked_duration_since(from).is_none_or(|age| age >= window);
         if self.owed == 0
             || self.since.is_some_and(|since| {
-                expired(since, CONFIRM_WINDOW_MAX)
+                expired(since, confirm_window_max())
                     || (expired(since, CONFIRM_WINDOW) && self.av_bay_head.is_none_or(|head| expired(head, CONFIRM_WINDOW)))
             })
         {
@@ -246,6 +252,30 @@ mod tests {
     use super::*;
     use sedsnet::packet::Packet;
     use sedsnet::router::{Router, RouterConfig, RouterSideOptions};
+
+    /// An AV-bay head that starts 2.5 s after the press and lives the whole
+    /// delivery span (4.8 s) retires at 7.3 s; the umbilical queries behind
+    /// it still get their CONFIRM_WINDOW tail (to 10.3 s). A fixed 10 s cap
+    /// cut that off. The cap only bounds a hung window.
+    #[test]
+    fn a_late_av_bay_head_living_its_whole_span_still_gets_its_tail() {
+        let span = crate::reliable_delivery_span();
+        let mut refresh = AbortConfirmRefresh::default();
+        refresh.start();
+        let press = Stamp::now();
+        let retired = Duration::from_millis(2_500) + span;
+        let now = retired + CONFIRM_WINDOW - Duration::from_millis(200);
+        assert!(now > Duration::from_secs(10), "the case the old cap cut off");
+        refresh.since = Some(press - now);
+        refresh.av_bay_head = Some(press - (now - retired));
+        assert!(refresh.active(), "within 3 s of the head's retirement");
+        // A head still seen in flight long after the press: the cap closes it.
+        refresh.start();
+        refresh.since = Some(Stamp::now() - confirm_window_max() - Duration::from_millis(50));
+        refresh.av_bay_head = Some(Stamp::now());
+        assert!(!refresh.active(), "a hung window is bounded");
+        assert_eq!(confirm_window_max(), 2 * span + CONFIRM_WINDOW);
+    }
 
     #[test]
     fn a_board_is_asked_once_per_reply_until_it_reads_aborted() {
@@ -475,7 +505,7 @@ mod tests {
 
     /// Relay-cut runs: an AV-bay query waiting on the radio holds the one
     /// ordered BOARD_RECOVERY_REQUEST stream, so the umbilical confirm queries
-    /// sit behind it for up to its 4.5 s retry span. The window must not close
+    /// sit behind it for up to its 4.8 s retry span. The window must not close
     /// at 3 s while that query is still in flight.
     #[tokio::test]
     async fn the_window_stays_open_while_an_av_bay_query_holds_the_ordered_stream() {

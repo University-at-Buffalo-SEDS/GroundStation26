@@ -1260,7 +1260,7 @@ pub(crate) struct ReadonlyQueryRefresh {
     /// Background AV-bay queries paused since then, because the AV-bay radio
     /// path is degraded. BOARD_RECOVERY_REQUEST is one ordered SDK stream, so
     /// an AV-bay query waiting on a slow or lost radio path holds every
-    /// umbilical query behind it for its whole retry span (about 4.5 s), and
+    /// umbilical query behind it for its whole retry span (about 4.8 s), and
     /// drops them if it gives up.
     av_bay_paused_since: Option<WallInstant>,
 }
@@ -1322,7 +1322,7 @@ impl ReadonlyQueryRefresh {
     /// Pause background AV-bay queries while the AV-bay radio path is
     /// degraded: the primary relies on an RRLS relay, or AV_BAY_PAUSE_MISSES
     /// background queries to one AV-bay board in a row went unanswered. Resume, visibly, only when
-    /// the direct path is back, at least AV_BAY_MIN_PAUSE has passed, and every
+    /// the direct path is back, at least av_bay_min_pause() has passed, and every
     /// AV-bay board still on the network has sent a status report since the pause. Operator queries and recovery (Reset
     /// all's fresh queries included) are never paused.
     fn update_av_bay_pause(&mut self, state: &Arc<AppState>, now: Stamp) {
@@ -1454,10 +1454,6 @@ impl ReadonlyQueryRefresh {
 const LINK_GROUPS: [&[usize]; 2] = [&AV_BAY_INDICES, &[3, 4, 5, 6]];
 /// RF, FC and PB in BOARDS.
 const AV_BAY_INDICES: [usize; 3] = [0, 1, 2];
-/// A paused AV-bay refresh stays paused at least one reliable retry span
-/// (250 ms x 18), so a lost query's tail has drained before the next one goes
-/// and status reports alone cannot make it flap.
-const AV_BAY_MIN_PAUSE: Duration = Duration::from_millis(4_500);
 /// Background AV-bay queries pause after this many unanswered in a row from
 /// one board. The S5=0 link loses about 5% of frames at random (bench
 /// 2026-11-10), so pausing on one lost query paused and resumed every 30-40 s
@@ -1466,8 +1462,12 @@ const AV_BAY_PAUSE_MISSES: u8 = 3;
 /// An AV-bay board not heard for this long before a pause began counts as
 /// off the network; the resume does not wait for its report.
 const AV_BAY_OFFLINE: Duration = Duration::from_secs(10);
+/// A paused AV-bay refresh stays paused at least one reliable retry span
+/// (crate::reliable_delivery_span, 400 ms x 12 = 4.8 s), so a lost query's
+/// tail has drained before the next one goes and status reports alone cannot
+/// make it flap.
 fn av_bay_min_pause() -> Duration {
-    crate::sim_freshness::wall(AV_BAY_MIN_PAUSE)
+    crate::sim_freshness::wall(crate::reliable_delivery_span())
 }
 /// At most one due board per link per pass, each link with its own cursor.
 fn pick_per_link(cursor: &mut [usize; 2], eligible: impl Fn(usize) -> bool) -> Vec<usize> {

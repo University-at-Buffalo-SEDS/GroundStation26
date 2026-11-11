@@ -85,7 +85,7 @@ fn abort_across_rf(resend: bool, deaf_ms: u64, run_ms: u64, readback_never: bool
 }
 
 /// RF's modem check holds the radio for 10 s across an operator Abort. The
-/// ABORT's 4.5 s delivery window runs out while RF is deaf. FC and PB (behind
+/// ABORT's 4.8 s delivery window runs out while RF is deaf. FC and PB (behind
 /// RF) must still get the Abort within the hold plus about one retry
 /// interval, not only when a later recovery query reaches them.
 #[test]
@@ -95,8 +95,8 @@ fn operator_abort_reaches_the_av_bay_after_a_ten_second_rf_hold() {
     eprintln!("ABORT_ACROSS_RF_HOLD latched_ms={latched:?} resends={sent}");
     let ms = latched.unwrap_or_else(|| panic!("the Abort never reached RF ({sent} sent)"));
     assert!(ms <= 10_000 + 2 * retry, "Abort reached RF {ms} ms after it was sent");
-    // One in flight at a time: a re-send only when the previous one's 4.5 s
-    // window has run out (at about 4.5 s and 9 s here).
+    // One in flight at a time: a re-send only when the previous one's 4.8 s
+    // window has run out (at about 4.8 s and 9.6 s here).
     assert!((1..=2).contains(&sent), "no stacking: {sent} re-sends in 20 s");
 }
 

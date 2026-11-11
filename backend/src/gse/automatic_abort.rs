@@ -713,7 +713,7 @@ pub(super) mod tests {
         assert!(operator_reset_block_reason(&state).is_some_and(|r| r.contains("ABORT")));
         // The normal delivery window still holds Clear (unchanged rule).
         assert!(clear_ground_abort(&state).unwrap_err().1.contains("delivery is still pending"));
-        crate::gse::age_delivery_tracking_for_test(crate::sim_freshness::wall(UNDELIVERABLE_AFTER) * 2);
+        crate::gse::age_delivery_tracking_for_test(crate::sim_freshness::wall(undeliverable_after()) * 2);
         clear_ground_abort(&state).unwrap();
         assert_eq!(
             crate::abort_retirement::retired_reason(&router, id),

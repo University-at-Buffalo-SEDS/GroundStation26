@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 /// After the immediate republish also fails, wait at least this long before
 /// new network traffic may trigger another one. A failed attempt keeps about
-/// 4 frames/s on air for 4.5 s; with this gap it uses under a third of that.
+/// 4 frames/s on air for 4.8 s; with this gap it uses under a third of that.
 pub(super) const REPUBLISH_GAP: Duration = Duration::from_secs(10);
 
 /// One pending-row observation of the SDK's frozen reliable frame.

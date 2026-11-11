@@ -10,7 +10,7 @@
 //! (a) the operator cleared the GSE abort;
 //! (b) every pending destination proved, by a validated status reply to a
 //!     query issued after the abort was raised, that it is not aborted, and
-//!     the abort is past its normal delivery window ([`UNDELIVERABLE_AFTER`]),
+//!     the abort is past its normal delivery window ([`undeliverable_after`]),
 //!     so a frame still in ordinary flight is never cancelled by a reply that
 //!     simply raced it;
 //! (c) it is older than [`AUTOMATIC_ABORT_MAX_AGE`] AND the condition that
@@ -28,7 +28,7 @@
 //! the frame up. Until it does, station checks that wait on a pending ABORT
 //! ignore a retired one (see [`try_has_pending_reliable_tx_type`]).
 //!
-//! [`UNDELIVERABLE_AFTER`]: crate::gse::UNDELIVERABLE_AFTER
+//! [`undeliverable_after`]: crate::gse::undeliverable_after
 use crate::state::AppState;
 use sedsnet::router::{Router, TryPendingTypeError};
 use std::sync::{
@@ -38,9 +38,9 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 /// The age past which an automatic ABORT whose cause has cleared is retired. A small ABORT frame takes
-/// under 100 ms of RFD airtime and the SDK's whole retry budget is 4.5 s
-/// (18 attempts 250 ms apart); the station already calls an ABORT
-/// undeliverable after 5 s. 30 s is six of those windows: an abort that has
+/// under 100 ms of RFD airtime and the SDK's whole retry budget is 4.8 s
+/// (12 attempts 400 ms apart); the station already calls an ABORT
+/// undeliverable after 5.8 s (crate::gse::undeliverable_after). 30 s is five of those windows: an abort that has
 /// not landed by then is waiting on a dead or saturated link, and landing it
 /// later would abort a board on a condition that is gone. A cause still
 /// present keeps it in delivery, however old.
@@ -323,7 +323,7 @@ pub(crate) fn evaluate(state: &AppState, router: &Router, now: Instant) {
     }
     let any_abort_pending = router.try_has_pending_reliable_tx_type(abort_type()).unwrap_or(true);
     let rows = router.export_reliable_pending_stats();
-    let delivery_window = crate::sim_freshness::wall(crate::gse::UNDELIVERABLE_AFTER);
+    let delivery_window = crate::sim_freshness::wall(crate::gse::undeliverable_after());
     let max_age = crate::sim_freshness::wall(AUTOMATIC_ABORT_MAX_AGE);
     let causes = cause_states(state, router);
     let (retired, query) = {
@@ -408,7 +408,7 @@ fn refresh_locked(
                 || !any_abort_pending
                 || (rows.iter().any(|row| row.data_type == abort_type())
                     && now.saturating_duration_since(entry.raised_at)
-                        >= crate::sim_freshness::wall(crate::gse::UNDELIVERABLE_AFTER)) =>
+                        >= crate::sim_freshness::wall(crate::gse::undeliverable_after())) =>
             {
                 entry.gone_since.get_or_insert(now);
             }

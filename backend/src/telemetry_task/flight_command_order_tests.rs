@@ -31,7 +31,7 @@ fn reliable_retry_span_ms() -> u64 {
 }
 
 /// The station and the FC on real SDK routers with the station's delivery
-/// tuning (250 ms x 18). The FC is unreachable for the first `outage_ms`
+/// tuning (400 ms x 12). The FC is unreachable for the first `outage_ms`
 /// (frames to it are lost, as in a radio outage before the RRLS relay takes
 /// over). FLIGHT_COMMAND is an Ordered reliable stream, so a command waits
 /// until the one before it is acknowledged. Returns, per command written at

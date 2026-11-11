@@ -1,7 +1,7 @@
 //! Re-send a retained operator Abort while an AV-bay board has not read it back.
 //!
-//! ABORT is an unordered reliable SDK packet with a 4.5 s delivery window
-//! (250 ms x 18). If the radio cannot carry it for that long, the SDK retires
+//! ABORT is an unordered reliable SDK packet with a 4.8 s delivery window
+//! (400 ms x 12, crate::reliable_delivery_span). If the radio cannot carry it for that long, the SDK retires
 //! it silently. RF's own modem check, for one, holds the radio for up to 16 s
 //! with the modem in command mode, and nothing on the air reaches RF then. FC
 //! and PB used to latch such an Abort only when a later recovery query reached

@@ -3552,15 +3552,23 @@ pub(crate) fn prepare_verified_startup(state: &Arc<AppState>) -> Result<(), &'st
     rt.fill_trim = None;
     Ok(())
 }
+/// Margin past the reliable delivery span before a frame counts as
+/// undeliverable: the span starts at the first copy, and under load a frame
+/// can wait behind the air-turn gate before that copy goes.
+pub(crate) const UNDELIVERABLE_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
 /// A reliable command frame outstanding at least this long (from when the
 /// station first saw it pending) counts as undeliverable rather than still in
-/// delivery. One shared rule for Clear GSE abort and the station mode switch.
-pub(crate) const UNDELIVERABLE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+/// delivery: the station's delivery span (crate::reliable_delivery_span,
+/// 400 ms x 12 = 4.8 s) plus UNDELIVERABLE_MARGIN. One shared rule for Clear
+/// GSE abort and the station mode switch.
+pub(crate) fn undeliverable_after() -> std::time::Duration {
+    crate::reliable_delivery_span() + UNDELIVERABLE_MARGIN
+}
 // First-seen times only: still valid if a panic interrupts an update, so a
 // poisoned lock is taken over instead of failing Clear GSE abort.
 static DELIVERY_FIRST_SEEN: std::sync::Mutex<Option<std::collections::HashMap<(usize, u64), std::time::Instant>>> = std::sync::Mutex::new(None);
 /// The pending reliable frames of these types that are still in their normal
-/// delivery window: outstanding less than UNDELIVERABLE_AFTER, judged both by
+/// delivery window: outstanding less than undeliverable_after(), judged both by
 /// when the station first saw them pending and by their retry count, and not
 /// waiting behind a predecessor. Returns their packet ids.
 #[cfg(test)]
@@ -3593,7 +3601,7 @@ fn delivery_ids(
     }
     let rows = router.export_reliable_pending_stats();
     let now = std::time::Instant::now();
-    let window = crate::sim_freshness::wall(UNDELIVERABLE_AFTER);
+    let window = crate::sim_freshness::wall(undeliverable_after());
     let retry_ms = u64::from(sedsnet::config::runtime_tuning_config().reliable_retransmit_ms.max(1));
     // Pending in the SDK but not yet a tracked delivery (still queued, or no
     // advertised destination yet): tracked per type under a synthetic key.
@@ -7472,7 +7480,7 @@ mod undeliverable_command_tests {
         assert_eq!(mode_switch_block_reason(&state), None);
         // Outstanding past the window: neither holds, though the SDK still owns
         // it (the old rule, which refused for as long as it was pending).
-        age_delivery_tracking_for_test(UNDELIVERABLE_AFTER + std::time::Duration::from_millis(100));
+        age_delivery_tracking_for_test(undeliverable_after() + std::time::Duration::from_millis(100));
         assert!(router.has_pending_reliable_tx_type(abort), "the old rule would still refuse");
         assert_eq!(clear_blocked_by_abort_delivery(&state, &router), Ok(false));
         assert_eq!(mode_switch_block_reason(&state), None);

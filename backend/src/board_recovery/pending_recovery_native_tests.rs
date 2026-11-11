@@ -26,8 +26,8 @@ async fn native(divisor: Option<u64>, reject: bool) -> (Fixture, Arc<Probe>) {
     let _ = crate::network_variables::flight_state();
     sedsnet::config::set_runtime_tuning_config(crate::network_delivery_tuning()).unwrap();
     let tuning = sedsnet::config::runtime_tuning_config();
-    assert_eq!(tuning.reliable_retransmit_ms, 250);
-    assert_eq!(tuning.reliable_max_retries, 17);
+    assert_eq!(tuning.reliable_retransmit_ms, 400);
+    assert_eq!(tuning.reliable_max_retries, 11);
     let probe = Probe::new(divisor);
     probe.reject_gb.store(reject, Ordering::Release);
     probe.install();
@@ -433,10 +433,11 @@ async fn r2_slow_model_natural_exhaustion_keeps_original_identity() {
     assert_eq!((after_retirement.packet_id(), after_retirement.timestamp(), after_retirement.payload()),
         (original.id, original.utc, original_cache.payload()));
     let rows = p.received.lock().unwrap();
+    let attempts = sedsnet::config::runtime_tuning_config().reliable_max_retries as usize + 1;
     assert_eq!(
         rows.len(),
-        18,
-        "original initial+17 retransmissions required"
+        attempts,
+        "original initial plus every retransmission required"
     );
     assert!(
         rows.iter()

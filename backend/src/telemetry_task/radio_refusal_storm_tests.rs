@@ -1351,7 +1351,7 @@ enum RfOwner {
 
 /// The station with RF on the radio side and GB on the umbilical, both
 /// FLIGHT_STATE readers, on real SDK routers with the station's delivery
-/// tuning (retry span 250 ms x 18). Returns, for each write in
+/// tuning (retry span 400 ms x 12). Returns, for each write in
 /// `writes` (ms after the first write, value), the ms after that write at
 /// which GB first held that value (None: never within `run_ms`), and every
 /// value GB applied in order.

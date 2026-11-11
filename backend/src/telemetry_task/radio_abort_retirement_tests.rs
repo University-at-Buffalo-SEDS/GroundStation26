@@ -245,10 +245,10 @@ async fn automatic_abort_is_retired_once_every_destination_reports_non_abort() {
     // Past the window, a destination without a fresh proof holds it.
     let owed = bench.owed(id);
     bench.state.board_abort.observe_abort(owed[0], Instant::now(), 0);
-    retirement::evaluate(&bench.state, &bench.router, after(crate::gse::UNDELIVERABLE_AFTER));
+    retirement::evaluate(&bench.state, &bench.router, after(crate::gse::undeliverable_after()));
     assert_eq!(retirement::retired_reason(&bench.router, id), None);
     bench.prove_non_abort(&owed[..1]);
-    retirement::evaluate(&bench.state, &bench.router, after(crate::gse::UNDELIVERABLE_AFTER));
+    retirement::evaluate(&bench.state, &bench.router, after(crate::gse::undeliverable_after()));
     assert_eq!(
         retirement::retired_reason(&bench.router, id),
         Some(RetireReason::DestinationsReportedNonAbort)
@@ -262,7 +262,7 @@ async fn automatic_abort_is_retired_after_its_bounded_age() {
     let mut bench = Bench::new().await;
     let id = bench.raise();
     bench.saturated();
-    retirement::evaluate(&bench.state, &bench.router, after(crate::gse::UNDELIVERABLE_AFTER));
+    retirement::evaluate(&bench.state, &bench.router, after(crate::gse::undeliverable_after()));
     assert_eq!(retirement::retired_reason(&bench.router, id), None, "no proof yet");
     bench.gb_back();
     retirement::evaluate(&bench.state, &bench.router, after(retirement::AUTOMATIC_ABORT_MAX_AGE));
