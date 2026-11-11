@@ -885,22 +885,7 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
     }
     // A manual handoff never grants an opening that the retained physical
     // supply interlock forbids. Explicit/toggle closes remain available.
-    let now = rt.now();
-    let closed = |index: usize| {
-        rt.valves[index].is_some_and(|v| !v.open && v.at_ms <= now && now - v.at_ms <= 2_000)
-    };
-    if state.supply_enforcement_enabled()
-        && matches!(cmd, TelemetryCommand::Nitrogen)
-        && !rt.valves[3].is_some_and(|v| v.open)
-        && (rt.engine.nitrous_session() || !closed(4))
-    {
-        return Some(false);
-    }
-    if state.supply_enforcement_enabled()
-        && matches!(cmd, TelemetryCommand::Nitrous)
-        && !rt.valves[4].is_some_and(|v| v.open)
-        && !closed(3)
-    {
+    if supply_refusal(state, &rt, cmd).is_some() {
         return Some(false);
     }
     if !crate::runtime_mode::is_hitl()
@@ -934,6 +919,64 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
             ))
     {
         return Some(false);
+    }
+    None
+}
+/// Why the supply interlock refuses opening Nitrogen or Nitrous (the one
+/// rule command_allowed applies), so a refusal names it.
+fn supply_refusal(state: &AppState, rt: &Runtime, cmd: &TelemetryCommand) -> Option<&'static str> {
+    if !state.supply_enforcement_enabled() {
+        return None;
+    }
+    supply_refusal_at(rt, rt.now(), cmd)
+}
+fn supply_refusal_at(rt: &Runtime, now: u64, cmd: &TelemetryCommand) -> Option<&'static str> {
+    let closed = |index: usize| {
+        rt.valves[index].is_some_and(|v| !v.open && v.at_ms <= now && now - v.at_ms <= 2_000)
+    };
+    match cmd {
+        TelemetryCommand::Nitrogen if !rt.valves[3].is_some_and(|v| v.open) => {
+            if rt.engine.nitrous_session() {
+                Some("Supply interlock: a nitrous fill session is active, so Nitrogen stays closed.")
+            } else if !closed(4) {
+                Some("Supply interlock: Nitrous must read closed within the last 2 s before Nitrogen opens (no fresh Valve Board report).")
+            } else {
+                None
+            }
+        }
+        TelemetryCommand::Nitrous if !rt.valves[4].is_some_and(|v| v.open) && !closed(3) => {
+            Some("Supply interlock: Nitrogen must read closed within the last 2 s before Nitrous opens (no fresh Valve Board report).")
+        }
+        _ => None,
+    }
+}
+/// The specific reason command_allowed refuses `cmd`, for the refusal message.
+pub fn command_refusal_reason(state: &AppState, cmd: &TelemetryCommand) -> Option<String> {
+    if command_allowed(state, cmd) != Some(false) {
+        return None;
+    }
+    let policy = state.action_policy_snapshot();
+    let is_prelaunch = prelaunch(state);
+    let cold_flow_active = cold_flow::active(state);
+    let rt = state.gse.lock().unwrap();
+    if overpressure::command_allowed(&rt, cmd) == Some(false) {
+        return Some("The tank overpressure latch owns the valves; only relief-direction controls are available.".into());
+    }
+    if let Some(reason) = supply_refusal(state, &rt, cmd) {
+        return Some(reason.into());
+    }
+    if cold_flow_active && !cold_flow::manual_handoff(cmd) {
+        return Some("Auto Cold Flow owns the GSE; pause, cancel or abort it first.".into());
+    }
+    if !crate::runtime_mode::is_hitl() && rt.operational.saved.qualification.fault().is_some() && valve_command(cmd) {
+        return Some("A GSE qualification fault is latched; only closing commands are available.".into());
+    }
+    if let Some(action) = action(cmd) {
+        let input = rt.input(is_prelaunch, interlock(state, &policy));
+        return rt.engine.refusal_reason(action, input);
+    }
+    if rt.engine.active() {
+        return Some("A GSE sequence is running.".into());
     }
     None
 }
@@ -2474,6 +2517,23 @@ mod tests {
         assert!(hitl_nitrogen_override_blocker(&rt, true, now).unwrap().contains("empty-tank limit"));
         rt.pressure = Some(Sample { value: 3.0, at_ms: now });
         assert_eq!(hitl_nitrogen_override_blocker(&rt, true, now), None);
+    }
+    #[test]
+    fn a_supply_interlock_refusal_names_the_valve_that_must_read_closed() {
+        use super::*;
+        let mut rt = Runtime::default();
+        let now = 10_000;
+        let valve = |open, at_ms| Some(ValveState { open, at_ms });
+        // Nitrogen closed but its report is 3 s old: Nitrous may not open.
+        rt.valves = [None, None, None, valve(false, now - 3_000), valve(false, now)];
+        assert!(supply_refusal_at(&rt, now, &TelemetryCommand::Nitrous).unwrap().contains("Nitrogen must read closed"));
+        // A fresh closed Nitrogen admits it; closes are never refused.
+        rt.valves[3] = valve(false, now - 500);
+        assert_eq!(supply_refusal_at(&rt, now, &TelemetryCommand::Nitrous), None);
+        assert_eq!(supply_refusal_at(&rt, now, &TelemetryCommand::NitrousClose), None);
+        // Nitrogen needs a fresh closed Nitrous.
+        rt.valves[4] = None;
+        assert!(supply_refusal_at(&rt, now, &TelemetryCommand::Nitrogen).unwrap().contains("Nitrous must read closed"));
     }
     #[test]
     fn completion_valve_snapshot_retains_only_fresh_actual_open_and_closed() {

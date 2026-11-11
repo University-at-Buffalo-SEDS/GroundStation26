@@ -2561,7 +2561,10 @@ fn command_disabled_message(state:&AppState,command:&TelemetryCommand)->String {
     }
     let policy=state.action_policy_snapshot();
     let reason=policy.controls.iter().find(|control|control.cmd==name)
-        .and_then(|control|control.disabled_reason.as_deref());
+        .and_then(|control|control.disabled_reason.clone())
+        .or_else(||crate::gse::command_refusal_reason(state,command))
+        .or_else(||(crate::runtime_mode::is_hitl()&&!state.hitl_button_interlock_satisfied())
+            .then(||"Enable the HITL button interlock.".to_string()));
     reason.map_or_else(||format!("{name} is unavailable under the current GroundStation policy. Check its control details."),|reason|format!("{name}: {reason}"))
 }
 
