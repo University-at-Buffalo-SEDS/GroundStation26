@@ -23,6 +23,37 @@ const COOLDOWN_MS: u64 = 30_000;
 const PROBE_CHARGE: usize = 75; //47-byte body + RR/UART12 + air overhead16.
 const OFFER_CHARGE: usize = 73;
 const SETTINGS_KIND: u8 = 10;
+/// A message of at most this many UART bytes is sent whole, in one write,
+/// with no probe/offer handshake. Every RFD air packet costs about 45 ms
+/// before its first byte, and the RRLS shares air the primary and the AV bay
+/// keep nearly full (bench 2026-11-11: ~27 frames/s). At the 92 B quantum a
+/// signed mode or clock message (250-400 B) took a probe, an offer and four
+/// to six fragments, any one of which could collide, with no fragment retry
+/// (GS: completed 0, expired 37). Whole, it is one air packet, far inside the
+/// smallest MAX_DATA the profile allows (1028 B) and the RR frame limit.
+/// Receivers are unchanged: whole SETTINGS frames are what every build
+/// accepts (the framing layer's own legacy fallback), and larger messages
+/// still use the 92 B framing protocol, so mixed builds interoperate.
+const WHOLE_MAX: usize = 512;
+const _: () = assert!(WHOLE_MAX >= QUANTUM && WHOLE_MAX <= 1028);
+#[cfg(not(test))]
+fn whole_max() -> usize {
+    WHOLE_MAX
+}
+// The framing tests exercise the fragment protocol with 357-363 B messages;
+// they keep the quantum as the whole-message bound unless a test opts in.
+#[cfg(test)]
+thread_local! {
+    static TEST_WHOLE_MAX: std::cell::Cell<usize> = const { std::cell::Cell::new(QUANTUM) };
+}
+#[cfg(test)]
+fn whole_max() -> usize {
+    TEST_WHOLE_MAX.with(std::cell::Cell::get)
+}
+#[cfg(test)]
+pub(super) fn use_production_whole_max_for_test() {
+    TEST_WHOLE_MAX.with(|max| max.set(WHOLE_MAX));
+}
 /// Allocation identity is stable while the original Vec moves through queue /
 /// active selection. No address is dereferenced and identical bytes are NOT identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,7 +327,7 @@ impl State {
         if self.tx.is_some() {
             return Admission::Busy;
         }
-        if inner.len() + OUTER <= QUANTUM || inner.len() > MAX_INNER {
+        if inner.len() + OUTER <= whole_max() || inner.len() > MAX_INNER {
             return Admission::Legacy;
         }
         if !self.observe(c) {
@@ -861,6 +892,33 @@ mod tests {
     }
     fn payload() -> Vec<u8> {
         (0..363).map(|i| (i % 251) as u8).collect()
+    }
+    /// Bench 2026-11-11: signed mode and clock messages (250-400 B) took a
+    /// probe, an offer and up to six 92 B fragments on a nearly full channel
+    /// and rarely completed. In production they go whole; only larger
+    /// messages negotiate, with the unchanged 92 B protocol.
+    #[test]
+    fn messages_up_to_whole_max_go_whole_without_a_handshake() {
+        use_production_whole_max_for_test();
+        let mut sender = State::new(false);
+        for len in [100, 363, WHOLE_MAX - OUTER] {
+            let data = vec![7u8; len];
+            assert_eq!(
+                sender.admit(&data, OwnerId::of(&data), 0, 30_000, context(0, 1_000_000), 480, 1400),
+                Admission::Legacy,
+                "{len} B"
+            );
+            assert!(!sender.owns(OwnerId::of(&data)), "no framing owner, no probe");
+        }
+        let large = vec![7u8; WHOLE_MAX - OUTER + 1];
+        assert_eq!(
+            sender.admit(&large, OwnerId::of(&large), 0, 30_000, context(0, 1_000_000), 4_800, 14_000),
+            Admission::Fragmented
+        );
+        // The wire protocol a mixed-build peer sees is unchanged.
+        let p = sender.physical(&large, OwnerId::of(&large), context(1, 1_000_000)).unwrap();
+        assert_eq!(p.action, Action::Probe);
+        assert_eq!((p.body.len(), p.body[44]), (47, QUANTUM as u8));
     }
     fn negotiated() -> (State, State, Vec<u8>) {
         let mut sender = State::new(true);
