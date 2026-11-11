@@ -406,7 +406,8 @@ mod tests {
         let fix = position().fix("RRLS");
         assert!(fix.manual && !fix.stale);
         assert_eq!(fix.altitude_reference, AltitudeReference::Unknown);
-        assert!(super::super::encode_position(&fix).is_none());
+        // Sent over the radio as a saved (version 2) position, never as live GPS.
+        assert_eq!(super::super::encode_position(&fix).unwrap()[0], 2);
     }
     #[test]
     fn paired_content_excludes_local_metadata_and_rejects_concurrent_edits() {

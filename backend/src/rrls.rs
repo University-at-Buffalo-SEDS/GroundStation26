@@ -869,10 +869,11 @@ impl Mesh {
                 self.last_ready_sent = Some(now);
             }
         }
-        if self
-            .last_position_sent
-            .is_none_or(|last| now.saturating_sub(last) >= 5_000)
-            && let Some(fix) = crate::antenna::local_fix()
+        // Live GPS every 5 s; a saved position (no GPS) only every 30 s.
+        if let Some(fix) = crate::antenna::advertised_fix()
+            && self
+                .last_position_sent
+                .is_none_or(|last| now.saturating_sub(last) >= if fix.manual { 30_000 } else { 5_000 })
                 && let Some(encoded) = crate::antenna::encode_position(&fix)
             {
                 let mut payload = Vec::with_capacity(39);
