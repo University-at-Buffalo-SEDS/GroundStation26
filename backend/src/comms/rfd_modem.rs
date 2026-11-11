@@ -689,7 +689,15 @@ fn map_source(identity: Option<&str>, snap: &Snapshot, plan: &Plan) -> MapSource
             .find(|e| e.number == number)
             .and_then(|e| e.value)
     };
-    let async_identity = identity.is_some_and(|s| s.to_ascii_uppercase().contains("ASYNC"));
+    // The V1.1 manual's numbering (Table 3-2) is the asynchronous 2.x
+    // firmware's. RFD ASYNC 4.03 on RFD900x2 numbers differently above S5
+    // (S17 DUTY_CYCLE, S18 LBT_RSSI, S19 RTSCTS), so a 4.x modem that lists no
+    // names is never fingerprinted: a V1.1-numbered RTSCTS write would land on
+    // its LBT_RSSI.
+    let async_identity = identity.is_some_and(|s| {
+        let s = s.to_ascii_uppercase();
+        s.contains("ASYNC") && !s.split_whitespace().any(|word| word.starts_with("4."))
+    });
     let fingerprint = async_identity
         && value(1).is_some()
         && value(1) == expected(1)

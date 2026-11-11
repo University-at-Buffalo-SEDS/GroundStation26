@@ -38,6 +38,8 @@ struct SimModem {
     refuse_reg: Option<u8>,
     save_does_not_persist: bool,
     ati5_names: bool,
+    /// The ATI identity line.
+    identity: &'static str,
     noise: bool,
     write_error_after: Option<usize>,
     written: usize,
@@ -91,6 +93,7 @@ impl SimModem {
             refuse_reg: None,
             save_does_not_persist: false,
             ati5_names: true,
+            identity: "RFD ASYNC 4.03 on RFD900X2",
             noise: false,
             write_error_after: None,
             written: 0,
@@ -133,7 +136,7 @@ impl SimModem {
         }
         let reply: String = match cmd {
             "AT" => "OK\r\n".into(),
-            "ATI" => "RFD ASYNC 4.03 on RFD900X2\r\n".into(),
+            "ATI" => format!("{}\r\n", self.identity),
             "ATI5" => self
                 .ram
                 .iter()
@@ -518,11 +521,19 @@ fn different_register_names_block_writes() {
 
 #[test]
 fn unnamed_ati5_falls_back_to_a_v1_1_fingerprint() {
+    // Only an asynchronous 2.x modem: the firmware the V1.1 manual describes.
     let mut modem = SimModem::new();
     modem.ati5_names = false;
+    modem.identity = "RFD ASYNC 2.69 on RFD900X";
     let report = check(&mut modem, Mode::Fix);
     assert_eq!(report.map_source, MapSource::Fingerprint);
     assert_eq!(report.outcome, Outcome::Applied, "{report:?}");
+    // The same unnamed readback from ASYNC 4.03 writes nothing.
+    let mut modem = SimModem::new();
+    modem.ati5_names = false;
+    let report = check(&mut modem, Mode::Fix);
+    assert_eq!(report.map_source, MapSource::Unconfirmed);
+    assert!(report.writes.is_empty(), "{report:?}");
 }
 
 #[test]
@@ -1061,4 +1072,20 @@ fn hitl_applies_the_modem_profile_like_normal_mode() {
     if std::env::var_os("GS_RFD_MODEM_CHECK").is_none() && !cfg!(feature = "firmware_sim") {
         assert_eq!(configured_mode(), Mode::Fix);
     }
+}
+
+/// The V1.1 number fallback must never be used on ASYNC 4.x: its map differs
+/// above S5 (S18 is LBT_RSSI there, not RTSCTS). A 4.03 modem that lists no
+/// names is unconfirmed (nothing written); a 2.x modem with V1.1 values still
+/// fingerprints.
+#[test]
+fn an_async_4_modem_without_register_names_is_never_fingerprinted() {
+    let plan = plan();
+    let v11 = |n: u8, v: i64| (n, None, Some(v));
+    let snap = Snapshot {
+        named: Vec::new(),
+        values: vec![v11(1, 115), v11(2, 64), v11(3, 3968), v11(11, 32768), v11(18, 0)],
+    };
+    assert_eq!(map_source(Some("RFD ASYNC 4.03 on RFD900X2"), &snap, &plan), MapSource::Unconfirmed);
+    assert_eq!(map_source(Some("RFD ASYNC 2.69 on RFD900X"), &snap, &plan), MapSource::Fingerprint);
 }
