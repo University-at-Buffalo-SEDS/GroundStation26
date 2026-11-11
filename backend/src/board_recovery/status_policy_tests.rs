@@ -584,3 +584,37 @@ async fn background_refresh_keeps_one_av_bay_query_in_the_ordered_stream() {
     assert!(abort_confirm::av_bay_query_in_flight(&host), "the first AV-bay query is in flight");
     assert_eq!(asked(&state), 1, "no second AV-bay query queued behind the first");
 }
+
+/// C-hitl-0495e79 cycle 2: Reset all's prepare asked PB for a fresh readback
+/// while background AV-bay queries were paused. The pause then resumed and
+/// cleared PB's unanswered query as "lost", so PB's reply no longer matched
+/// and the prepare waited out its 15 s window ("An AV-bay board's fresh query
+/// got no reply"). While a prepare's fresh queries are in flight, the
+/// background refresh leaves every query slot alone.
+#[tokio::test]
+async fn the_background_refresh_never_touches_a_prepares_query() {
+    let _relaying = RELAYING_FLAG.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = tests::http_fixture().await;
+    let state = fixture.state.clone();
+    let host = Arc::new(sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS")));
+    assert!(state.topology_router.set(host).is_ok());
+    let pb = index(Board::PowerBoard).unwrap();
+    let mut refresh = ReadonlyQueryRefresh::default();
+    // Paused long enough to resume, and every AV-bay board reported since.
+    refresh.av_bay_paused_since = Some(WallInstant::now() - av_bay_min_pause() - Duration::from_secs(1));
+    *state.board_recovery.av_bay_paused.lock().unwrap() = Some("an AV-bay status query went unanswered");
+    for board in [Board::RFBoard, Board::FlightComputer, Board::PowerBoard] {
+        state.board_status.lock().unwrap().get_mut(&board).unwrap().last_seen_instant = Some(std::time::Instant::now());
+    }
+    // The prepare's PB query, unanswered past the background retry age.
+    let prepare = Query { abort_revision: 0, nonce: 77, sent: Stamp::now() - query_retry() - Duration::from_millis(500), received: false };
+    state.board_recovery.inner.lock().unwrap().queries[pb] = Some(prepare.clone());
+    let refreshing = coordinator::PrepareQueries::begin(&state);
+    let _ = refresh.poll(&state);
+    let kept = state.board_recovery.inner.lock().unwrap().queries[pb].as_ref().map(|query| query.nonce);
+    assert_eq!(kept, Some(77), "the prepare's query stays in its slot");
+    drop(refreshing);
+    // Afterwards the resume may clear a query that really was lost.
+    let _ = refresh.poll(&state);
+    assert!(state.board_recovery.inner.lock().unwrap().queries[pb].as_ref().is_none_or(|query| query.nonce != 77));
+}

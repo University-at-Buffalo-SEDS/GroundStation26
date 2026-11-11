@@ -182,6 +182,8 @@ struct Control {
     expected: [Option<u64>; 7],
     boundary: Option<u64>,
     inbox: [VecDeque<Packet>; 7],
+    /// Prepares whose fresh queries are in flight (`PrepareQueries`).
+    preparing: usize,
 }
 #[derive(Clone)]
 struct Target {
@@ -393,6 +395,25 @@ pub(crate) fn recovery_activity(state: &AppState) -> Option<Option<String>> {
     let ticket = control.ticket.as_ref().map(|ticket| ticket.id.clone());
     Some((operation.is_some() || ticket.is_some()).then(|| format!("operation {operation:?} ticket {ticket:?}")))
 }
+/// Recovery PREPAREs whose own fresh queries are in flight. While any is,
+/// no background, demand or Abort-confirm query may take a board's query
+/// slot: one would replace the prepare's query (its reply then no longer
+/// matches) or, on the AV-bay pause's resume, clear it as lost, and the
+/// prepare would wait out its whole window (C-hitl-0495e79 cycle 2).
+/// Held (per station) for the duration of a prepare's fresh queries.
+pub(crate) struct PrepareQueries(Arc<AppState>);
+impl PrepareQueries {
+    pub(crate) fn begin(state: &Arc<AppState>) -> Self {
+        state.board_recovery.coordinator.0.lock().unwrap().preparing += 1;
+        Self(state.clone())
+    }
+}
+impl Drop for PrepareQueries {
+    fn drop(&mut self) {
+        let mut control = self.0.board_recovery.coordinator.0.lock().unwrap();
+        control.preparing = control.preparing.saturating_sub(1);
+    }
+}
 pub(crate) fn readonly_query_idle(state: &AppState) -> bool {
     state
         .board_recovery
@@ -402,6 +423,7 @@ pub(crate) fn readonly_query_idle(state: &AppState) -> bool {
         .ok()
         .is_some_and(|control| {
             !control.shutdown_closed
+                && control.preparing == 0
                 && control
                     .ticket
                     .as_ref()
@@ -758,7 +780,10 @@ async fn prepare_after_disarm(
     }
     // Ceiling waiting can consume the two-second observation window. Refresh
     // dedicated queries now, under the same explicit request's original origin.
-    if let Err(message) = refresh_prepare_queries(&state, &headers, &request, token, reset_selection).await {
+    let refreshing = PrepareQueries::begin(&state);
+    let refreshed = refresh_prepare_queries(&state, &headers, &request, token, reset_selection).await;
+    drop(refreshing);
+    if let Err(message) = refreshed {
         return error(StatusCode::CONFLICT, "fresh_query_required", message);
     }
     // A held SDK core decided nothing: run the same checks again, briefly.
@@ -2854,6 +2879,8 @@ mod tests {
         /// Replies to this many QUERYs after the board applied a request are
         /// lost on the way back (a radio drop of the final proof).
         lose_proof_replies: usize,
+        /// Every QUERY reply is lost (a board that never answers).
+        silent_queries: bool,
     }
     type NativePeerRouter = Arc<Router>;
     struct Link {
@@ -3234,6 +3261,7 @@ mod tests {
                             recover_delay: Duration::ZERO,
                             first_receipt: HashMap::new(),
                             lose_proof_replies: 0,
+                            silent_queries: false,
                         }))
                     });
                 models.push((board, model.clone()));
@@ -3409,6 +3437,9 @@ mod tests {
                                 if wire[1] != 0 && result != 1 && !identity_rejected {
                                     m.seen.insert(nonce, response.clone());
                                 }
+                            }
+                            if wire[1] == 0 && m.silent_queries {
+                                continue;
                             }
                             if wire[1] == 0 && m.applied > 0 && m.lose_proof_replies > 0 {
                                 m.lose_proof_replies -= 1;
@@ -6312,6 +6343,50 @@ mod tests {
         assert!(value["message"].as_str().unwrap_or_default().contains("still being delivered"), "{value}");
         assert!(fixture.models.iter().all(|(_, m)| m.lock().unwrap().applied == 0));
         assert_eq!(state.abort_resend.active_resends(), Some(0), "a bounced prepare re-arms the Abort re-send");
+        assert!(super::readonly_query_idle(&state), "a refused prepare releases the query slots: background and Abort-confirm queries resume");
+    }
+    /// An operator Abort during a prepare's fresh queries ends the prepare at
+    /// once (its origin changed) and releases the query slots, so the Abort's
+    /// confirm polls never wait on the prepare.
+    #[tokio::test]
+    async fn an_abort_during_a_prepare_releases_the_query_slots_at_once() {
+        if isolated("an_abort_during_a_prepare_releases_the_query_slots_at_once") { return; }
+        let fixture = Fixture::new().await;
+        *fixture.http.state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+        let state = fixture.state();
+        for board in BOARDS {
+            fixture.query(board).await;
+        }
+        // PB never answers, so the prepare waits on it with its slots held.
+        fixture.models.iter().find(|(board, _)| *board == Board::PowerBoard).unwrap().1.lock().unwrap().silent_queries = true;
+        let prepare = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                super::super::tests::http(state.clone(), "POST", "/api/board-recovery/prepare", Some("operator"),
+                    json!({"action":"reset_startup","boards":BOARDS.iter().map(|b|b.sender_id()).collect::<Vec<_>>(),"board":null,"mode":null,
+                           "backend_instance":hex(&state.board_recovery.identity.unwrap()),"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state))})).await
+            })
+        };
+        let start = std::time::Instant::now();
+        while super::readonly_query_idle(&state) && start.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(!super::readonly_query_idle(&state), "the prepare holds the query slots while it waits");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!super::readonly_query_idle(&state), "still waiting on PB");
+        // The operator presses Abort.
+        state.manual_abort_intent.request();
+        state.board_abort.request_abort_confirmation();
+        let pressed = std::time::Instant::now();
+        while !super::readonly_query_idle(&state) && pressed.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let released = pressed.elapsed();
+        eprintln!("ABORT_DURING_PREPARE released_after={released:?}");
+        assert!(super::readonly_query_idle(&state), "the Abort released the query slots");
+        assert!(released < Duration::from_millis(250), "released {released:?} after the Abort");
+        let response = prepare.await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
     async fn changed_review_identity_is_rejected_without_adopting_fresh_query(change_boot: bool) {
         let fixture = Fixture::new().await;
