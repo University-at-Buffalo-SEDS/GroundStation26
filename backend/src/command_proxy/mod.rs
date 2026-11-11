@@ -107,6 +107,10 @@ struct Runtime {
     boot: [u8; 16],
     session: Option<u32>,
     query: Option<[u8; 16]>,
+    /// RRLS: the query whose Capability it already accepted. The RRLS re-sends
+    /// an unanswered query every period and the primary answers each copy, so
+    /// later copies of the same answer are dropped quietly, not as rejections.
+    answered_query: Option<[u8; 16]>,
     /// RRLS: the request it last sealed, until its result is accepted. Only
     /// this request's result may arrive after the normal sequence window.
     awaiting: std::cell::Cell<Option<[u8; 16]>>,
@@ -135,6 +139,7 @@ impl Runtime {
             role,
             session: None,
             query: None,
+            answered_query: None,
             awaiting: std::cell::Cell::new(None),
             capability: None,
             results: VecDeque::new(),
@@ -356,6 +361,14 @@ impl Runtime {
                 Message::Reply { .. } => self.awaiting.get() == Some(envelope.request),
                 _ => false,
             };
+        if !primary
+            && transport.session == envelope.session
+            && matches!(envelope.message, Message::Capability { .. })
+            && self.query.is_none()
+            && self.answered_query == Some(envelope.request)
+        {
+            return Ok(Received::Pending);
+        }
         ensure!(
             transport.accepts(&envelope, primary) || own_late_reply,
             "Stale primary connection contract"
@@ -416,6 +429,7 @@ impl Runtime {
                     "Unsolicited primary capability"
                 );
                 self.query = None;
+                self.answered_query = Some(envelope.request);
                 self.capability = Some((envelope.boot, mode, commands));
                 Ok(Received::Capability {
                     boot: envelope.boot,
@@ -643,8 +657,9 @@ mod tests {
         // Beyond the 4-period window but within the query's timeout: accepted.
         let later = Transport { session: 7, sequence: 20 + SEQUENCE_WINDOW + 2 };
         assert!(matches!(rr.receive(&r, later, Mode::Normal, &reply).unwrap(), Received::Capability { .. }));
-        // Replayed once the query is answered: refused.
-        assert!(rr.receive(&r, later, Mode::Normal, &reply).is_err());
+        // Replayed once the query is answered: dropped without effect (it
+        // refreshes nothing; the RRLS's repeated query draws such copies).
+        assert!(matches!(rr.receive(&r, later, Mode::Normal, &reply).unwrap(), Received::Pending));
     }
     #[test]
     fn a_late_reply_that_is_not_the_rrls_own_outstanding_exchange_is_rejected() {
@@ -671,6 +686,38 @@ mod tests {
         assert!(rr.receive(&r, late, Mode::Normal, &result).is_err(), "result for another request");
         // Within the normal window replies keep their existing behaviour.
         assert!(matches!(rr.receive(&r, rview, Mode::Normal, &result).unwrap(), Received::Result { .. }));
+    }
+    /// Bench 2026-11-10: the RRLS re-sent its unanswered query each period and
+    /// the primary answered every copy; each later copy of the accepted answer
+    /// was logged as "Unsolicited primary capability".
+    #[test]
+    fn a_repeated_answer_to_an_accepted_query_is_dropped_quietly() {
+        let (_root, p, r) = fixtures();
+        let mut primary = Runtime::new(Role::Primary);
+        let mut rr = Runtime::new(Role::Rrls);
+        let rview = Transport { session: 7, sequence: 20 };
+        let pview = Transport { session: 7, sequence: 21 };
+        primary.connect(Some(pview));
+        rr.connect(Some(rview));
+        let first = rr.query(&r, rview).unwrap();
+        let again = rr.query(&r, Transport { session: 7, sequence: 21 }).unwrap();
+        let Received::Reply(reply) = primary.receive(&p, pview, Mode::Hitl, &first).unwrap() else {
+            panic!("capability reply")
+        };
+        let Received::Reply(copy) = primary.receive(&p, Transport { session: 7, sequence: 22 }, Mode::Hitl, &again).unwrap() else {
+            panic!("second capability reply")
+        };
+        assert!(matches!(rr.receive(&r, rview, Mode::Normal, &reply).unwrap(), Received::Capability { .. }));
+        // Arriving after the sequence window, too.
+        let later = Transport { session: 7, sequence: 40 };
+        assert!(matches!(rr.receive(&r, later, Mode::Normal, &copy).unwrap(), Received::Pending));
+        assert!(matches!(rr.receive(&r, later, Mode::Normal, &reply).unwrap(), Received::Pending));
+        // A new query is still answered normally.
+        let next = rr.query(&r, later).unwrap();
+        let Received::Reply(fresh) = primary.receive(&p, Transport { session: 7, sequence: 41 }, Mode::Hitl, &next).unwrap() else {
+            panic!("fresh capability reply")
+        };
+        assert!(matches!(rr.receive(&r, later, Mode::Normal, &fresh).unwrap(), Received::Capability { .. }));
     }
     #[test]
     fn capability_exchange_survives_a_lagging_health_view() {
