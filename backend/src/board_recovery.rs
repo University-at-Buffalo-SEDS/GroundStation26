@@ -307,11 +307,13 @@ fn resync_board(board: Board) -> bool {
 /// including Launch, without an Abort first: the board stops its own launch
 /// owner and drives its outputs safe (AB/VB firmware that accepts RESYNC to
 /// Startup/Idle). Test fire keeps Startup/Idle on Recover/Reset. From Launch
-/// onward the station itself never resyncs: the Flight Computer owns flight.
+/// until Landed the station never resyncs: the Flight Computer owns flight.
+/// After landing it does again: a board is matched to Landed, which moves no
+/// output (they must already read safe), like the fill phases and Armed.
 // Safety catalog (About safety): board-resync. Keep backend/src/safety_catalog_rules.rs in step.
 pub(crate) fn resync_target(state: crate::types::FlightState) -> Option<u8> {
     use crate::types::FlightState as F;
-    (matches!(state, F::PreFill | F::FillTest | F::NitrogenFill | F::NitrousFill | F::Armed)
+    (matches!(state, F::PreFill | F::FillTest | F::NitrogenFill | F::NitrousFill | F::Armed | F::Landed)
         || matches!(state, F::Startup | F::Idle) && !crate::runtime_mode::is_test_fire())
         .then_some(state as u8)
 }
@@ -332,7 +334,7 @@ pub(crate) fn resync_work_block_reason(state: &AppState) -> Option<String> {
         F::Startup if crate::runtime_mode::is_test_fire() => return Some("The station is in Startup and moves to Idle on its own. In test fire, Resync matches a board to a fill phase or Armed; use Review recovery or Reset all boards to return a board to Startup or Idle.".into()),
         F::Idle if crate::runtime_mode::is_test_fire() => return Some("The station is Idle. In test fire, use Review recovery (Recover to Idle) to return a board to Idle; Resync is for the fill phases and Armed.".into()),
         F::Aborted => return Some("The station is Aborted, so Resync cannot clear a board's Abort. Use Review recovery or Reset all boards.".into()),
-        _ if resync_target(phase).is_none() => return Some("Resync is not available from Launch onward: nothing aborts or acts automatically after Launch, and the Flight Computer owns the flight states.".into()),
+        _ if resync_target(phase).is_none() => return Some("Resync is not available in flight (Launch until Landed): nothing aborts or acts automatically then, and the Flight Computer owns the flight states. It is available again once the station is Landed.".into()),
         _ => {}
     }
     if crate::gse::overpressure_holds_abort(state) {

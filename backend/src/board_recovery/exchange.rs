@@ -406,14 +406,15 @@ mod tests {
             Exchange::prepare_operation_at(board, q, 2, OP_RESYNC, desired, now, router.clone(), boundary)
         };
         let first = if crate::runtime_mode::is_test_fire() { 2 } else { 0 };
-        for phase in first..=6 {
+        // Landed (13): resync is available again after landing.
+        for phase in (first..=6).chain([13]) {
             let exchange = prepare(Board::ActuatorBoard, &query(ready, 0, 42), phase).unwrap();
             assert_eq!(&exchange.packet(now).unwrap().payload()[..4], &[1, OP_RESYNC, phase, 0]);
         }
-        // Launch onward (and Startup/Idle in test fire), other boards, no
+        // In flight (and Startup/Idle in test fire), other boards, no
         // capability bit, unsafe outputs and the commissioning sentinel are
         // refused before any packet.
-        for phase in (0..first).chain([7, 8, 13, 14, 15]) {
+        for phase in (0..first).chain([7, 8, 11, 14, 15]) {
             assert!(prepare(Board::ActuatorBoard, &query(ready, 0, 42), phase).is_err(), "{phase}");
         }
         for board in [Board::FlightComputer, Board::GatewayBoard, Board::DaqBoard] {

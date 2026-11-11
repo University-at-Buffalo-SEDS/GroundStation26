@@ -137,8 +137,8 @@ async fn resync_refusals_name_the_reason_and_send_nothing() {
     } else { Vec::new() };
     for (phase, needle) in test_fire.into_iter().chain([
         (crate::types::FlightState::Aborted, "Reset all boards"),
-        (crate::types::FlightState::Launch, "Launch onward"),
-        (crate::types::FlightState::Landed, "Launch onward"),
+        (crate::types::FlightState::Launch, "in flight"),
+        (crate::types::FlightState::Descent, "in flight"),
     ]) {
         *state.state.lock().unwrap() = phase;
         let (code, value) = resync_prepare_raw(&f, "AB").await;
@@ -176,7 +176,7 @@ async fn resync_window_is_the_fill_phases_and_armed_without_active_safety() {
         F::Launch, F::Ascent, F::Coast, F::Apogee, F::Descent, F::Reefing, F::Landed,
         F::Recovery, F::Aborted,
     ] {
-        let allowed = matches!(phase, F::PreFill | F::FillTest | F::NitrogenFill | F::NitrousFill | F::Armed)
+        let allowed = matches!(phase, F::PreFill | F::FillTest | F::NitrogenFill | F::NitrousFill | F::Armed | F::Landed)
             || matches!(phase, F::Startup | F::Idle) && !crate::runtime_mode::is_test_fire();
         *state.state.lock().unwrap() = phase;
         assert_eq!(resync_target(phase), allowed.then_some(phase as u8), "{phase:?}");
