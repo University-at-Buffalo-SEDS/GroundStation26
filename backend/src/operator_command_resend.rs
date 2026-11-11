@@ -124,6 +124,10 @@ pub(crate) fn record_operator_press(state: &AppState, router: &Router, byte: u8,
             presses.pop_front();
         }
     }
+    if let Some(notice) = crate::fc_command_gate::note_press_at(state, byte, &label_for(byte), Instant::now()) {
+        log::warn!("{notice}");
+        crate::web::emit_notification_warning(state, notice);
+    }
     NEWEST.lock().unwrap().insert(router_key(router), Press {
         packet_id,
         byte,
@@ -224,7 +228,9 @@ fn command_for(byte: u8) -> Option<TelemetryCommand> {
 /// The one-line notice for a press whose own packet got no acknowledgement.
 fn unconfirmed_message(state: &AppState, byte: u8) -> String {
     let label = label_for(byte);
-    if effect_and_admissible(state, byte).0 {
+    if let Some(reason) = crate::fc_command_gate::active_reason(state, Instant::now()) {
+        format!("{label}: no confirmation from FC. The FC reports it refuses flight commands because {reason}.")
+    } else if effect_and_admissible(state, byte).0 {
         format!("{label}: no confirmation from FC, but the station already sees its effect.")
     } else {
         format!("{label}: no confirmation from FC. Check FC state before pressing again.")
@@ -350,6 +356,7 @@ mod unconfirmed_tests {
     #[tokio::test]
     async fn the_unconfirmed_notice_softens_only_for_the_pressed_commands_own_effect() {
         let state = crate::state::tests::test_app_state().await;
+        crate::fc_command_gate::forget(&state);
         let deploy = Fc::DeployParachute as u8;
         let expand = Fc::ExpandParachute as u8;
         let check = |byte| unconfirmed_message(&state, byte);
@@ -362,5 +369,20 @@ mod unconfirmed_tests {
         // The FC reaches Reefing: the main deployed.
         crate::recovery_events::observe_fc_state(&state, FlightState::Descent, FlightState::Reefing, 2);
         assert_eq!(check(expand), "ExpandParachute: no confirmation from FC, but the station already sees its effect.");
+    }
+
+    /// When the FC reports it refuses flight commands, the unconfirmed notice
+    /// says why instead of only asking the operator to check.
+    #[tokio::test]
+    async fn the_unconfirmed_notice_names_the_fcs_refusal_reason() {
+        let state = crate::state::tests::test_app_state().await;
+        let relax = Fc::EvaluationRelax as u8;
+        crate::fc_command_gate::forget(&state);
+        crate::fc_command_gate::observe_at(&state, 9 << 24, Instant::now());
+        assert_eq!(
+            unconfirmed_message(&state, relax),
+            "EvaluationRelax: no confirmation from FC. The FC reports it refuses flight commands because its persistent store is not ready and its recovery floor failed."
+        );
+        crate::fc_command_gate::forget(&state);
     }
 }

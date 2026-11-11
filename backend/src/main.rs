@@ -76,6 +76,7 @@ mod media_runtime;
 mod mission_phase;
 mod valve_report_health;
 mod mission_sync;
+mod fc_command_gate;
 mod network_health;
 mod network_traffic;
 mod network_variables;

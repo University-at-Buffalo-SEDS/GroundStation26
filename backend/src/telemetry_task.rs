@@ -2443,6 +2443,11 @@ async fn handle_packet_inner(
                 {
                     crate::web::emit_notification_warning(state, notice);
                 }
+                if crate::types::canonical_sender_id(sender_id.trim()) == "FC"
+                    && let Some(word6) = words.get(6)
+                {
+                    crate::fc_command_gate::observe(state, *word6);
+                }
             }
         }
         return Vec::new();
