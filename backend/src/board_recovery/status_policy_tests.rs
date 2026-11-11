@@ -547,6 +547,8 @@ async fn background_av_bay_queries_pause_while_the_av_bay_path_is_degraded() {
 /// off, RF and FC rows expired for good and showed "recovery required".
 #[tokio::test]
 async fn an_av_bay_pause_resumes_without_a_board_that_was_already_off() {
+    // Test fire tracks no AV-bay board; see the test below.
+    crate::mode_suite!(Normal, Hitl, Testing);
     let _relaying = RELAYING_FLAG.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let fixture = tests::http_fixture().await;
     let state = fixture.state.clone();
@@ -580,6 +582,27 @@ async fn an_av_bay_pause_resumes_without_a_board_that_was_already_off() {
     seen(&state, &[Board::FlightComputer]);
     refresh.update_av_bay_pause(&state, Stamp::now());
     assert_eq!(state.board_recovery.av_bay_pause_reason(), None, "the powered-off PB is not waited for");
+}
+
+/// Test fire tracks no AV-bay board (mode scope 0x78), so no report can end
+/// a pause: the minimum pause alone resumes it once the direct path is back.
+/// (3250eda waited for "at least one" report and never resumed in test fire.)
+#[tokio::test]
+async fn a_test_fire_av_bay_pause_resumes_after_the_minimum_pause() {
+    crate::mode_suite!(TestFire);
+    let _relaying = RELAYING_FLAG.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = tests::http_fixture().await;
+    let state = fixture.state.clone();
+    let mut refresh = ReadonlyQueryRefresh::default();
+    crate::rrls::set_primary_relaying_for_test(true);
+    refresh.update_av_bay_pause(&state, Stamp::now());
+    assert!(state.board_recovery.av_bay_pause_reason().is_some());
+    crate::rrls::set_primary_relaying_for_test(false);
+    refresh.update_av_bay_pause(&state, Stamp::now());
+    assert!(state.board_recovery.av_bay_pause_reason().is_some(), "the minimum pause still holds");
+    refresh.av_bay_paused_since = refresh.av_bay_paused_since.map(|since| since - av_bay_min_pause());
+    refresh.update_av_bay_pause(&state, Stamp::now());
+    assert_eq!(state.board_recovery.av_bay_pause_reason(), None, "no AV-bay report to wait for in test fire");
 }
 
 /// deploy-normal (GS eadd886): two background AV-bay queries ran back to back

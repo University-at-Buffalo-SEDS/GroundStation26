@@ -1263,7 +1263,10 @@ impl ReadonlyQueryRefresh {
                 // AV-bay row, until it is switched on.
                 let scope = scope::mode_scope(crate::station_mode::local_mode());
                 let present_after = since.checked_sub(AV_BAY_OFFLINE).unwrap_or(since);
-                let reported = state.board_status.try_lock().ok().is_some_and(|status| {
+                // Test fire tracks no AV-bay board (mode scope 0x78): there is
+                // no report to wait for, so the minimum pause alone resumes.
+                let tracked = AV_BAY_INDICES.iter().any(|&at| scope & (1 << at) != 0);
+                let reported = !tracked || state.board_status.try_lock().ok().is_some_and(|status| {
                     let seen: Vec<_> = AV_BAY_INDICES.iter().filter(|&&at| scope & (1 << at) != 0)
                         .filter_map(|&at| status.get(&BOARDS[at]).and_then(|row| row.last_seen_instant))
                         .filter(|seen| seen.checked_duration_since(present_after).is_some())
