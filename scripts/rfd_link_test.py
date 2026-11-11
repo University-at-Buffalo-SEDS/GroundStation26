@@ -7,6 +7,7 @@ Run with the station service and RRLS stopped (they own the serial ports).
   set   PORT S5=1 S6=10 ...  write registers, AT&W and reboot (ATZ)
   echo  PORT                 answer every PING with a PONG; report receive stats
   ping  PORT --rate R ...    send PINGs, report loss and round-trip latency
+  duplex PORT --rate R ...   run on both ends at once: send PINGs, count the peer's
 
 Frames: A5 5A | kind u8 | seq u32 | sent_ns u64 | pad_len u16 | pad | crc32.
 Anything else on the air (RF board telemetry, SEDSnet) is counted as foreign
@@ -217,10 +218,28 @@ def cmd_ping(args):
           f"foreign_B={parser.foreign} bad_crc={parser.bad_crc}")
 
 
+def cmd_duplex(args):
+    # Run on both ends at once: each sends PINGs and counts the peer's.
+    port = Port(args.port, args.baud)
+    parser = Parser()
+    pad = bytes(args.size)
+    start = time.monotonic()
+    next_send, seq, got = start, 0, 0
+    while time.monotonic() < start + args.duration + args.drain:
+        now = time.monotonic()
+        if now < start + args.duration and now >= next_send:
+            port.write(frame(PING, seq, time.monotonic_ns(), pad))
+            seq += 1
+            next_send += 1.0 / args.rate
+        got += sum(kind == PING for kind, *_ in parser.feed(port.read(0.005)))
+    print(f"RESULT duplex rate={args.rate}/s size={args.size}B duration={args.duration}s sent={seq} "
+          f"received_from_peer={got} foreign_B={parser.foreign} bad_crc={parser.bad_crc}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("regs", "set", "echo", "ping"):
+    for name in ("regs", "set", "echo", "ping", "duplex"):
         p = sub.add_parser(name)
         p.add_argument("port")
         p.add_argument("--baud", type=int, default=115200)
@@ -236,8 +255,13 @@ def main():
             p.add_argument("--size", type=int, default=32, help="pad bytes per PING")
             p.add_argument("--duration", type=float, default=20)
             p.add_argument("--drain", type=float, default=5, help="seconds to wait for late PONGs")
+        if name == "duplex":
+            p.add_argument("--rate", type=float, default=5, help="PINGs per second")
+            p.add_argument("--size", type=int, default=32, help="pad bytes per PING")
+            p.add_argument("--duration", type=float, default=12)
+            p.add_argument("--drain", type=float, default=1, help="seconds to keep counting after sending")
     args = ap.parse_args()
-    {"regs": cmd_regs, "set": cmd_set, "echo": cmd_echo, "ping": cmd_ping}[args.cmd](args)
+    {"regs": cmd_regs, "set": cmd_set, "echo": cmd_echo, "ping": cmd_ping, "duplex": cmd_duplex}[args.cmd](args)
 
 
 if __name__ == "__main__":

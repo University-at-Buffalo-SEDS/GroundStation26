@@ -174,6 +174,32 @@ the collapse point, and S6=20 lost more than S6=10. SEDSnet's reliable
 retries recover the single losses S5=1 used to cover, without its seconds of
 queueing.
 
+**Capacity sweep, 2026-11-11** (same pair, S5=0, stations stopped, AV bay
+idle on air at about 100 B/s). One way, silent receiver, 12 s per point:
+
+| frame | offered | delivered | goodput |
+|---|---|---|---|
+| 32 B | 1, 3, 6 KB/s | 99.6, 100, 97.3% | 0.6, 1.8, 3.5 KB/s |
+| 128 B | 1, 3, 6 KB/s | 100, 100, 97.3% | 0.9, 2.6, 5.0 KB/s |
+| 512 B | 6, 7, 7.6 KB/s | 100% | 5.8, 6.7, 7.3 KB/s |
+| 512 B | 8.2, 9 KB/s | 75, 72% | 5.9, 6.2 KB/s |
+| 1-2 KB | 1, 3, 6 KB/s | 94-100% | up to 6.0 KB/s |
+
+One direction carries about 7.3 KB/s (59 kbit/s) before the modem overflows.
+Both ends sending at once (`duplex` on each, 12 s):
+
+| frame | each end offers | delivered (Mac to Pi / Pi to Mac) |
+|---|---|---|
+| 512 B | 0.5 KB/s | 77% / 92% |
+| 512 B | 1.5 KB/s | 88% / 89% |
+| 512 B | 3 KB/s | 0% / 5% |
+| 64 B | 1.5 KB/s | 2% / 42% |
+
+The channel is not the limit; simultaneous transmitters are. Two ends at a
+combined 6 KB/s, under the one-way ceiling, deliver almost nothing, and small
+frames collapse sooner. Taking turns on the air (each station sending only in
+its own slot of the shared clock) is what would recover the one-way figure.
+
 ### S5=1 (previous default profile)
 
 Faithful simulation (FirmwareSimulator `--scenario faithful`, 7 boards, Normal,
