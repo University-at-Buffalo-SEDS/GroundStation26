@@ -179,7 +179,17 @@ pub(crate) mod flight_state_timeline;
 mod derived;
 use derived::*;
 
+#[cfg(test)]
+pub(crate) fn reset_operator_flight_state_for_test(state: &Arc<AppState>) {
+    reset_operator_flight_state(state);
+}
+
 fn reset_operator_flight_state(state: &Arc<AppState>) {
+    // Never reset the station alone while the FC reports past Startup.
+    if let Some(reason) = crate::operator_phase::reset_flight_state_block_reason(state) {
+        crate::web::emit_notification_warning(state, reason);
+        return;
+    }
     // Use the managed network variable and existing persistence path, not a
     // frontend-only display override. Do not operate physical outputs here.
     state.set_local_flight_state(FlightState::Idle);

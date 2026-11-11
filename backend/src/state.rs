@@ -2095,6 +2095,7 @@ impl AppState {
             crate::board_abort::block_policy(self, &mut local);
             crate::ignition_pair::project_fresh_proof(self, &mut local);
             crate::operator_phase::project(self,&mut local);
+            crate::operator_phase::project_reset_flight_state(self, &mut local);
             local.launch_zero = crate::auto_zero::before_launch::status(self);
             if self.operator_queue.fill_launch_active() {
                 for control in &mut local.controls {

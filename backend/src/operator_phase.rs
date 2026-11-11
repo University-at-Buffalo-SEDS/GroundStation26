@@ -328,6 +328,26 @@ pub(crate) fn project(state: &AppState, policy: &mut crate::sequences::ActionPol
         }
     }
 }
+/// Why HITL "Reset flight state to Idle" must wait: the FC reports a phase
+/// past Startup. Resetting only the station would split it from the FC;
+/// Reset all boards resets both (CONTRACT.md "Reset protocol").
+pub(crate) fn reset_flight_state_block_reason(state: &AppState) -> Option<String> {
+    let fc = state.fc_phase.snapshot()?.phase;
+    (fc != FlightState::Startup).then(|| format!(
+        "FC is in {}; use Reset all boards, which resets the FC too.",
+        crate::mission_phase::detailed_label(fc)))
+}
+pub(crate) fn project_reset_flight_state(state: &AppState, policy: &mut crate::sequences::ActionPolicyMsg) {
+    if !crate::runtime_mode::is_hitl() {
+        return;
+    }
+    let Some(reason) = reset_flight_state_block_reason(state) else { return };
+    for control in policy.controls.iter_mut().filter(|c| c.cmd == "ResetFlightState") {
+        control.enabled = false;
+        control.blink = crate::sequences::BlinkMode::None;
+        control.disabled_reason = Some(reason.clone());
+    }
+}
 /// Why State +1/-1 cannot step from `phase`: outside the prelaunch ladder, or
 /// at one of its ends. Other refusals carry the policy-wide reason.
 fn ladder_reason(state: &AppState, phase: FlightState, forward: bool) -> Option<String> {
@@ -456,6 +476,30 @@ mod tests {
         let rewind = policy.controls.iter().find(|c| c.cmd == "RewindFlightState").unwrap();
         assert!(!rewind.enabled);
         assert_eq!(rewind.disabled_reason.as_deref(), Some("Startup is the first prelaunch step."));
+    }
+
+    /// Bench: "Reset flight state to Idle" reset only the station while the FC
+    /// stayed in Descent. While the FC reports past Startup it is disabled
+    /// and points at Reset all boards, which resets the FC too; the command
+    /// itself refuses the same way.
+    #[tokio::test]
+    async fn reset_flight_state_waits_for_an_fc_past_startup() {
+        crate::mode_suite!(Hitl);
+        let fixture = crate::actuator_plumbing::http_tests::Fixture::new().await;
+        fixture.state.set_preexisting_flight_state_for_test(FlightState::InFlight);
+        let reset = |state: &AppState| state.action_policy_snapshot().controls.into_iter()
+            .find(|c| c.cmd == "ResetFlightState").unwrap();
+        crate::fc_phase::observe(&fixture.state, FlightState::Descent as u8, crate::fc_phase::Source::FcStateReport, 0);
+        let control = reset(&fixture.state);
+        assert!(!control.enabled);
+        assert_eq!(control.disabled_reason.as_deref(),
+            Some("FC is in Descent; use Reset all boards, which resets the FC too."));
+        crate::telemetry_task::reset_operator_flight_state_for_test(&fixture.state);
+        assert_eq!(fixture.state.local_flight_state_snapshot(), FlightState::InFlight, "the station alone is never reset");
+        crate::fc_phase::observe(&fixture.state, FlightState::Startup as u8, crate::fc_phase::Source::FcStateReport, 0);
+        assert!(reset(&fixture.state).enabled);
+        crate::telemetry_task::reset_operator_flight_state_for_test(&fixture.state);
+        assert_eq!(fixture.state.local_flight_state_snapshot(), FlightState::Idle);
     }
 
     #[tokio::test]
