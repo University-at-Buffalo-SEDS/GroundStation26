@@ -51,8 +51,8 @@ async fn resync_moves_only_the_board_phase_and_never_its_outputs() {
     f.query(Board::ActuatorBoard).await;
     f.query(Board::ValveBoard).await;
     let status = resync_status(&f).await;
-    assert_eq!(status["resync_target_state"], 5, "{status}");
-    assert_eq!(status["resync_target_label"], "NitrousFill");
+    assert_eq!(status["resync_target_state"], 2, "{status}");
+    assert_eq!(status["resync_target_label"], "Fill");
     let row = resync_row(&status, "AB");
     assert_eq!(row["capabilities"]["resync"], true, "{status}");
     assert!(row["resync_blocked_reason"].is_null(), "{status}");
@@ -63,9 +63,9 @@ async fn resync_moves_only_the_board_phase_and_never_its_outputs() {
     assert_eq!(resync_row(&status, "VB")["capabilities"]["resync"], false);
 
     let ticket = f.prepare("resync", Some("AB")).await;
-    assert_eq!(ticket["confirmation"], "RESYNC AB TO NITROUSFILL");
+    assert_eq!(ticket["confirmation"], "RESYNC AB TO FILL");
     assert_eq!(ticket["targets"], json!(["AB"]));
-    assert_eq!(ticket["resync_target_state"], 5);
+    assert_eq!(ticket["resync_target_state"], 2);
     assert_eq!(ticket["outputs_unchanged"], true);
     assert!(ticket["summary"].as_str().unwrap().contains("No outputs move"), "{ticket}");
     assert_eq!(f.confirm(&ticket).await.status(), StatusCode::OK);
@@ -75,10 +75,10 @@ async fn resync_moves_only_the_board_phase_and_never_its_outputs() {
     assert!(op["reset_applied_state"].is_null());
     {
         let m = model.lock().unwrap();
-        assert_eq!((m.state, m.epoch, m.applied), (5, 9, 1));
+        assert_eq!((m.state, m.epoch, m.applied), (2, 9, 1));
         let mutations: Vec<_> = m.requests.iter().filter(|p| p.payload()[1] != 0).collect();
         assert_eq!(mutations.len(), 1, "exactly one RESYNC, no replay");
-        assert_eq!((mutations[0].payload()[1], mutations[0].payload()[2]), (2, 5));
+        assert_eq!((mutations[0].payload()[1], mutations[0].payload()[2]), (2, 2));
     }
     for (id, other) in &f.models {
         if *id != Board::ActuatorBoard {
@@ -89,7 +89,7 @@ async fn resync_moves_only_the_board_phase_and_never_its_outputs() {
     assert_eq!(state.local_flight_state_snapshot(), crate::types::FlightState::NitrousFill);
     let after = resync_status(&f).await;
     let row = resync_row(&after, "AB");
-    assert_eq!(row["state"], 5, "{after}");
+    assert_eq!(row["state"], 2, "{after}");
     assert_eq!(row["abort_latched"], false);
     assert_eq!(row["commanded_outputs"], outputs_before, "outputs unchanged");
     assert!(row["resync_blocked_reason"].as_str().unwrap().contains("already matches"), "{after}");
@@ -113,8 +113,10 @@ async fn resync_confirmation_is_bound_to_the_frozen_station_phase() {
     model.lock().unwrap().resync = true;
     f.query(Board::ValveBoard).await;
     let ticket = f.prepare("resync", Some("VB")).await;
-    assert_eq!(ticket["confirmation"], "RESYNC VB TO NITROGENFILL");
-    *state.state.lock().unwrap() = crate::types::FlightState::NitrousFill;
+    assert_eq!(ticket["confirmation"], "RESYNC VB TO FILL");
+    // Moving between fill sub-phases keeps the network value: the station
+    // must leave Fill for the reviewed ticket to go stale.
+    *state.state.lock().unwrap() = crate::types::FlightState::Armed;
     let response = f.confirm(&ticket).await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let m = model.lock().unwrap();
@@ -179,7 +181,7 @@ async fn resync_window_is_the_fill_phases_and_armed_without_active_safety() {
         let allowed = matches!(phase, F::PreFill | F::FillTest | F::NitrogenFill | F::NitrousFill | F::Armed | F::Landed)
             || matches!(phase, F::Startup | F::Idle) && !crate::runtime_mode::is_test_fire();
         *state.state.lock().unwrap() = phase;
-        assert_eq!(resync_target(phase), allowed.then_some(phase as u8), "{phase:?}");
+        assert_eq!(resync_target(phase), allowed.then_some(phase.network() as u8), "{phase:?}");
         assert_eq!(host_action_allowed(&state, "resync"), allowed, "{phase:?}");
         assert_eq!(resync_host_block_reason(&state).is_none(), allowed, "{phase:?}");
     }
@@ -225,21 +227,23 @@ fn resync_board_reasons_follow_the_readback() {
         issuer: 7,
     };
     let safe = 0x24 | STATE_VALID | OUTPUTS_VALID | 2 | 1;
-    assert!(resync_board_block_reason(Board::ActuatorBoard, None, Some(5)).unwrap().contains("Query"));
-    assert!(resync_board_block_reason(Board::ActuatorBoard, Some(&row(safe, 0, 0)), Some(5)).unwrap().contains("does not support"));
-    assert_eq!(resync_board_block_reason(Board::ActuatorBoard, Some(&row(safe | RESYNC_IMPLEMENTATION, 0, 0)), Some(5)), None);
-    assert_eq!(resync_board_block_reason(Board::ValveBoard, Some(&row(safe | RESYNC_IMPLEMENTATION, 6, 0)), Some(5)), None);
+    assert!(resync_board_block_reason(Board::ActuatorBoard, None, Some(2)).unwrap().contains("Query"));
+    assert!(resync_board_block_reason(Board::ActuatorBoard, Some(&row(safe, 0, 0)), Some(2)).unwrap().contains("does not support"));
+    assert_eq!(resync_board_block_reason(Board::ActuatorBoard, Some(&row(safe | RESYNC_IMPLEMENTATION, 0, 0)), Some(2)), None);
+    assert_eq!(resync_board_block_reason(Board::ValveBoard, Some(&row(safe | RESYNC_IMPLEMENTATION, 6, 0)), Some(2)), None);
     // Outputs that do not read safe: Resync would have to move them, so it refuses.
     let unsafe_flags = (safe | RESYNC_IMPLEMENTATION) & !2;
-    let reason = resync_board_block_reason(Board::ActuatorBoard, Some(&row(unsafe_flags, 2, 0)), Some(5)).unwrap();
+    let reason = resync_board_block_reason(Board::ActuatorBoard, Some(&row(unsafe_flags, 2, 0)), Some(2)).unwrap();
     assert!(reason.contains("never moves outputs") && reason.contains("Review recovery"), "{reason}");
-    assert!(resync_board_block_reason(Board::ValveBoard, Some(&row(safe | RESYNC_IMPLEMENTATION, 0, 0)), Some(5)).is_some());
+    assert!(resync_board_block_reason(Board::ValveBoard, Some(&row(safe | RESYNC_IMPLEMENTATION, 0, 0)), Some(2)).is_some());
     // Already in the phase with no Abort latched: nothing to do.
     let synced = (safe | RESYNC_IMPLEMENTATION) & !1;
-    assert!(resync_board_block_reason(Board::ActuatorBoard, Some(&row(synced, 0, 5)), Some(5)).unwrap().contains("already matches"));
+    assert!(resync_board_block_reason(Board::ActuatorBoard, Some(&row(synced, 0, 2)), Some(2)).unwrap().contains("already matches"));
+    // Old firmware still reporting its fill sub-phase matches the network Fill.
+    assert!(resync_board_block_reason(Board::ActuatorBoard, Some(&row(synced, 0, 4)), Some(2)).unwrap().contains("already matches"));
     let mut commissioning = row(safe | RESYNC_IMPLEMENTATION, 0, 0);
     commissioning.boot = u64::MAX;
-    assert!(resync_board_block_reason(Board::ActuatorBoard, Some(&commissioning), Some(5)).unwrap().contains("commissioning"));
+    assert!(resync_board_block_reason(Board::ActuatorBoard, Some(&commissioning), Some(2)).unwrap().contains("commissioning"));
 }
 
 /// HITL bench: after a launch the station is back in Idle but AB is still in
@@ -303,7 +307,7 @@ fn resync_to_idle_accepts_readable_unsafe_outputs_but_a_fill_phase_does_not() {
     let holding = row(0x24 | STATE_VALID | OUTPUTS_VALID | RESYNC_IMPLEMENTATION, 16);
     assert!(resync_outputs_ready(Board::ActuatorBoard, &holding, Some(1)));
     assert!(resync_outputs_ready(Board::ActuatorBoard, &holding, Some(0)));
-    assert!(!resync_outputs_ready(Board::ActuatorBoard, &holding, Some(5)));
+    assert!(!resync_outputs_ready(Board::ActuatorBoard, &holding, Some(2)));
     assert_eq!(resync_board_block_reason(Board::ActuatorBoard, Some(&holding), Some(1)), None);
     // Unreadable outputs are refused for every target.
     let unreadable = row(0x24 | STATE_VALID | RESYNC_IMPLEMENTATION, 0);

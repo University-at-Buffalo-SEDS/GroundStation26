@@ -6,6 +6,13 @@
     {
       "abort_latched": null,
       "age_ms": null,
+      "blocked_reasons": {
+        "prepare_recover": "Only the primary ground station can recover boards.",
+        "query": "Only the primary ground station can query boards.",
+        "recover": "Only the primary ground station can recover boards.",
+        "reset_startup_any_state": "Not available on this board.",
+        "resync": "Not available on this board."
+      },
       "boot": null,
       "capabilities": {
         "endpoint_verified": false,
@@ -15,6 +22,7 @@
         "query": false,
         "recover": false,
         "reset_startup": false,
+        "reset_startup_any_state": false,
         "resync": false
       },
       "commanded_outputs": null,
@@ -22,6 +30,7 @@
       "display_connected": false,
       "display_known": false,
       "epoch": null,
+      "fc_phase": null,
       "first_uncertainty_reconcilable": false,
       "id": "RF",
       "identity_kind": "unknown",
@@ -42,6 +51,8 @@
       "receipt_age_ms": null,
       "recovery_reason": null,
       "recovery_required": false,
+      "reset_fc_startup_warning": null,
+      "reset_startup_any_state_blocked_reason": "Not available on this board.",
       "result": null,
       "resync_blocked_reason": null,
       "safe_outputs": null,
@@ -52,6 +63,13 @@
     {
       "abort_latched": null,
       "age_ms": null,
+      "blocked_reasons": {
+        "prepare_recover": "Only the primary ground station can recover boards.",
+        "query": "Only the primary ground station can query boards.",
+        "recover": "Only the primary ground station can recover boards.",
+        "reset_startup_any_state": "Only the primary ground station can reset boards.",
+        "resync": "Not available on this board."
+      },
       "boot": null,
       "capabilities": {
         "endpoint_verified": false,
@@ -61,6 +79,7 @@
         "query": false,
         "recover": false,
         "reset_startup": false,
+        "reset_startup_any_state": false,
         "resync": false
       },
       "commanded_outputs": null,
@@ -68,6 +87,7 @@
       "display_connected": false,
       "display_known": false,
       "epoch": null,
+      "fc_phase": null,
       "first_uncertainty_reconcilable": false,
       "id": "FC",
       "identity_kind": "unknown",
@@ -88,6 +108,8 @@
       "receipt_age_ms": null,
       "recovery_reason": null,
       "recovery_required": false,
+      "reset_fc_startup_warning": null,
+      "reset_startup_any_state_blocked_reason": "Only the primary ground station can reset boards.",
       "result": null,
       "resync_blocked_reason": null,
       "safe_outputs": null,
@@ -98,6 +120,13 @@
     {
       "abort_latched": null,
       "age_ms": null,
+      "blocked_reasons": {
+        "prepare_recover": "Only the primary ground station can recover boards.",
+        "query": "Only the primary ground station can query boards.",
+        "recover": "Only the primary ground station can recover boards.",
+        "reset_startup_any_state": "Not available on this board.",
+        "resync": "Not available on this board."
+      },
       "boot": null,
       "capabilities": {
         "endpoint_verified": false,
@@ -107,6 +136,7 @@
         "query": false,
         "recover": false,
         "reset_startup": false,
+        "reset_startup_any_state": false,
         "resync": false
       },
       "commanded_outputs": null,
@@ -114,6 +144,7 @@
       "display_connected": false,
       "display_known": false,
       "epoch": null,
+      "fc_phase": null,
       "first_uncertainty_reconcilable": false,
       "id": "PB",
       "identity_kind": "unknown",
@@ -134,6 +165,8 @@
       "receipt_age_ms": null,
       "recovery_reason": null,
       "recovery_required": false,
+      "reset_fc_startup_warning": null,
+      "reset_startup_any_state_blocked_reason": "Not available on this board.",
       "result": null,
       "resync_blocked_reason": null,
       "safe_outputs": null,
@@ -144,6 +177,13 @@
     {
       "abort_latched": null,
       "age_ms": null,
+      "blocked_reasons": {
+        "prepare_recover": "Only the primary ground station can recover boards.",
+        "query": "Only the primary ground station can query boards.",
+        "recover": "Only the primary ground station can recover boards.",
+        "reset_startup_any_state": "Not available on this board.",
+        "resync": "The board's recovery endpoint is not verified on the network yet."
+      },
       "boot": null,
       "capabilities": {
         "endpoint_verified": false,
@@ -153,6 +193,7 @@
         "query": false,
         "recover": false,
         "reset_startup": false,
+        "reset_startup_any_state": false,
         "resync": false
       },
       "commanded_outputs": null,
@@ -160,6 +201,7 @@
       "display_connected": false,
       "display_known": false,
       "epoch": null,
+      "fc_phase": null,
       "first_uncertainty_reconcilable": false,
       "id": "AB",
       "identity_kind": "unknown",
@@ -180,6 +222,8 @@
       "receipt_age_ms": null,
       "recovery_reason": null,
       "recovery_required": false,
+      "reset_fc_startup_warning": null,
+      "reset_startup_any_state_blocked_reason": "Not available on this board.",
       "result": null,
       "resync_blocked_reason": null,
       "safe_outputs": null,
@@ -190,6 +234,13 @@
     {
       "abort_latched": null,
       "age_ms": null,
+      "blocked_reasons": {
+        "prepare_recover": "Only the primary ground station can recover boards.",
+        "query": "Only the primary ground station can query boards.",
+        "recover": "Only the primary ground station can recover boards.",
+        "reset_startup_any_state": "Not available on this board.",
+        "resync": "The board's recovery endpoint is not verified on the network yet."
+      },
       "boot": null,
       "capabilities": {
         "endpoint_verified": false,
@@ -199,6 +250,7 @@
         "query": false,
         "recover": false,
         "reset_startup": false,
+        "reset_startup_any_state": false,
         "resync": false
       },
       "commanded_outputs": null,
@@ -206,6 +258,7 @@
       "display_connected": false,
       "display_known": false,
       "epoch": null,
+      "fc_phase": null,
       "first_uncertainty_reconcilable": false,
       "id": "VB",
       "identity_kind": "unknown",
@@ -226,6 +279,8 @@
       "receipt_age_ms": null,
       "recovery_reason": null,
       "recovery_required": false,
+      "reset_fc_startup_warning": null,
+      "reset_startup_any_state_blocked_reason": "Not available on this board.",
       "result": null,
       "resync_blocked_reason": null,
       "safe_outputs": null,
@@ -236,6 +291,13 @@
     {
       "abort_latched": null,
       "age_ms": null,
+      "blocked_reasons": {
+        "prepare_recover": "Only the primary ground station can recover boards.",
+        "query": "Only the primary ground station can query boards.",
+        "recover": "Only the primary ground station can recover boards.",
+        "reset_startup_any_state": "Not available on this board.",
+        "resync": "Not available on this board."
+      },
       "boot": null,
       "capabilities": {
         "endpoint_verified": false,
@@ -245,6 +307,7 @@
         "query": false,
         "recover": false,
         "reset_startup": false,
+        "reset_startup_any_state": false,
         "resync": false
       },
       "commanded_outputs": null,
@@ -252,6 +315,7 @@
       "display_connected": false,
       "display_known": false,
       "epoch": null,
+      "fc_phase": null,
       "first_uncertainty_reconcilable": false,
       "id": "GB",
       "identity_kind": "unknown",
@@ -272,6 +336,8 @@
       "receipt_age_ms": null,
       "recovery_reason": null,
       "recovery_required": false,
+      "reset_fc_startup_warning": null,
+      "reset_startup_any_state_blocked_reason": "Not available on this board.",
       "result": null,
       "resync_blocked_reason": null,
       "safe_outputs": null,
@@ -282,6 +348,13 @@
     {
       "abort_latched": null,
       "age_ms": null,
+      "blocked_reasons": {
+        "prepare_recover": "Only the primary ground station can recover boards.",
+        "query": "Only the primary ground station can query boards.",
+        "recover": "Only the primary ground station can recover boards.",
+        "reset_startup_any_state": "Not available on this board.",
+        "resync": "Not available on this board."
+      },
       "boot": null,
       "capabilities": {
         "endpoint_verified": false,
@@ -291,6 +364,7 @@
         "query": false,
         "recover": false,
         "reset_startup": false,
+        "reset_startup_any_state": false,
         "resync": false
       },
       "commanded_outputs": null,
@@ -298,6 +372,7 @@
       "display_connected": false,
       "display_known": false,
       "epoch": null,
+      "fc_phase": null,
       "first_uncertainty_reconcilable": false,
       "id": "DAQ",
       "identity_kind": "unknown",
@@ -318,6 +393,8 @@
       "receipt_age_ms": null,
       "recovery_reason": null,
       "recovery_required": false,
+      "reset_fc_startup_warning": null,
+      "reset_startup_any_state_blocked_reason": "Not available on this board.",
       "result": null,
       "resync_blocked_reason": null,
       "safe_outputs": null,
@@ -331,7 +408,11 @@
     "required_for_recovery": true
   },
   "confirmation": null,
+  "fc_phase": null,
+  "fill_phase": null,
+  "fill_phase_label": null,
   "flight_state": 0,
+  "flight_state_label": "Startup",
   "host_recovery": null,
   "last_rejection": null,
   "mode_capability": {

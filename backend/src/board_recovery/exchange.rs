@@ -168,6 +168,15 @@ impl Exchange {
                 && query.value.result == 0
                 && query.value.boot != u64::MAX
                 && resync_outputs_ready(board, &query.value, Some(desired)),
+            // The FC reset from any state: FC only, to Startup, on firmware
+            // that advertises it, with no pulse running (it refuses too).
+            OP_RESET_ANY => board == Board::FlightComputer
+                && desired == 0
+                && first.is_none()
+                && query.value.flags & FC_RESET_ANY_STATE != 0
+                && query.value.result == 0
+                && query.value.boot != u64::MAX
+                && query.value.flags & (OUTPUTS_VALID | 2) == OUTPUTS_VALID | 2,
             _ => false,
         };
         if index(board).is_none()
@@ -406,25 +415,26 @@ mod tests {
             Exchange::prepare_operation_at(board, q, 2, OP_RESYNC, desired, now, router.clone(), boundary)
         };
         let first = if crate::runtime_mode::is_test_fire() { 2 } else { 0 };
+        // Network values only: a fill sub-phase resyncs a board to Fill (2);
         // Landed (13): resync is available again after landing.
-        for phase in (first..=6).chain([13]) {
+        for phase in [0u8, 1, 2, 6, 13].into_iter().filter(|phase| *phase >= first) {
             let exchange = prepare(Board::ActuatorBoard, &query(ready, 0, 42), phase).unwrap();
             assert_eq!(&exchange.packet(now).unwrap().payload()[..4], &[1, OP_RESYNC, phase, 0]);
         }
         // In flight (and Startup/Idle in test fire), other boards, no
         // capability bit, unsafe outputs and the commissioning sentinel are
         // refused before any packet.
-        for phase in (0..first).chain([7, 8, 11, 14, 15]) {
+        for phase in (0..first).chain([3, 4, 5, 7, 8, 11, 14, 15, 16]) {
             assert!(prepare(Board::ActuatorBoard, &query(ready, 0, 42), phase).is_err(), "{phase}");
         }
         for board in [Board::FlightComputer, Board::GatewayBoard, Board::DaqBoard] {
-            assert!(prepare(board, &query(ready, 0, 42), 5).is_err(), "{board:?}");
+            assert!(prepare(board, &query(ready, 0, 42), 2).is_err(), "{board:?}");
         }
-        assert!(prepare(Board::ActuatorBoard, &query(0x3f, 0, 42), 5).is_err());
-        assert!(prepare(Board::ActuatorBoard, &query(ready & !2, 2, 42), 5).is_err());
-        assert!(prepare(Board::ActuatorBoard, &query(ready, 0, u64::MAX), 5).is_err());
-        assert!(prepare(Board::ValveBoard, &query(ready, 0, 42), 5).is_err(), "VB safe mask is 6");
-        let mut exchange = prepare(Board::ValveBoard, &query(ready, 6, 42), 5).unwrap();
+        assert!(prepare(Board::ActuatorBoard, &query(0x3f, 0, 42), 2).is_err());
+        assert!(prepare(Board::ActuatorBoard, &query(ready & !2, 2, 42), 2).is_err());
+        assert!(prepare(Board::ActuatorBoard, &query(ready, 0, u64::MAX), 2).is_err());
+        assert!(prepare(Board::ValveBoard, &query(ready, 0, 42), 2).is_err(), "VB safe mask is 6");
+        let mut exchange = prepare(Board::ValveBoard, &query(ready, 6, 42), 2).unwrap();
         let mut terminal = |state: u8, flags: u8, outputs: u32| {
             let mut bytes = [0; 40];
             bytes[0] = 1;
@@ -440,10 +450,10 @@ mod tests {
             exchange.observe(&packet, now)
         };
         assert!(terminal(1, 0xbe, 6).is_err(), "Idle is not the frozen phase");
-        assert!(terminal(5, 0xbc, 6).is_err(), "outputs must still read safe");
-        assert!(terminal(5, 0xbe, 2).is_err(), "outputs must be the unchanged safe mask");
-        assert!(terminal(5, 0xbf, 6).is_err(), "Abort must be cleared");
-        assert_eq!(terminal(5, 0xbe, 6), Ok(Outcome::Applied));
+        assert!(terminal(2, 0xbc, 6).is_err(), "outputs must still read safe");
+        assert!(terminal(2, 0xbe, 2).is_err(), "outputs must be the unchanged safe mask");
+        assert!(terminal(2, 0xbf, 6).is_err(), "Abort must be cleared");
+        assert_eq!(terminal(2, 0xbe, 6), Ok(Outcome::Applied));
     }
 
     #[test]

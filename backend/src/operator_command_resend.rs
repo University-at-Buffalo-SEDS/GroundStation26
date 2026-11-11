@@ -98,6 +98,32 @@ pub(crate) fn pending_flight_commands(router: &Router) -> BTreeSet<u64> {
     router.export_reliable_pending_stats().into_iter().filter(|row| row.data_type == ty).map(|row| row.packet_id).collect()
 }
 
+/// The operator's last Deploy/Expand on each router: its packet and press time.
+static LAST_DEPLOY: Mutex<BTreeMap<usize, (u64, Instant)>> = Mutex::new(BTreeMap::new());
+/// A Deploy/Expand counts as in progress this long after its press, covering
+/// the FC's pulse after it acknowledged the command.
+pub(crate) const DEPLOY_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn is_deploy(byte: u8) -> bool {
+    use crate::rocket_commands::FlightComputerCommands as C;
+    byte == C::DeployParachute as u8 || byte == C::ExpandParachute as u8
+}
+
+/// An operator Deploy/Expand still queued, unacknowledged, or pressed less
+/// than DEPLOY_SETTLE ago. The FC reset to Startup refuses meanwhile.
+pub(crate) fn deploy_in_progress(router: &Router) -> bool {
+    let Some((packet_id, pressed)) = LAST_DEPLOY.lock().unwrap().get(&router_key(router)).copied() else {
+        return false;
+    };
+    pressed.elapsed() < DEPLOY_SETTLE || pending_flight_commands(router).contains(&packet_id)
+}
+
+#[cfg(test)]
+pub(crate) fn note_deploy_for_test(router: &Router, packet_id: u64, age: std::time::Duration) {
+    let at = Instant::now().checked_sub(age).unwrap();
+    LAST_DEPLOY.lock().unwrap().insert(router_key(router), (packet_id, at));
+}
+
 /// The FLIGHT_COMMAND packet the station last queued on each router
 /// (`gse::queue_controller`), so an operator press can name its packet.
 static LAST_QUEUED: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
@@ -116,6 +142,9 @@ pub(crate) fn record_operator_press(state: &AppState, router: &Router, byte: u8,
         NEWEST.lock().unwrap().remove(&router_key(router));
         return;
     };
+    if is_deploy(byte) {
+        LAST_DEPLOY.lock().unwrap().insert(router_key(router), (packet_id, Instant::now()));
+    }
     {
         let mut recent = RECENT.lock().unwrap();
         let presses = recent.entry(router_key(router)).or_default();

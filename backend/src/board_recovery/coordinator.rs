@@ -493,6 +493,53 @@ fn origin_current(state: &AppState, token: Token) -> bool {
         && state.operator_queue.relief_epoch() == token.relief_epoch
         && stop_unchanged(state, token)
 }
+/// The GS-authorised FC reset to Startup from any FC state (CONTRACT.md
+/// "Reset protocol"). Wire operation 3, FC only, no Abort first.
+pub(crate) const FC_RESET_ACTION: &str = "reset_fc_startup";
+pub(crate) const FC_RESET_PHRASE: &str = "RESET FC TO STARTUP";
+/// Pending Rylan's decision. false follows the contract: every FC phase is
+/// allowed, with a warning. true refuses Ascent, Coast and Apogee while no
+/// drogue deployment has been seen.
+const FC_RESET_REFUSE_BEFORE_AUTOMATIC_DEPLOY: bool = false;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FcResetPolicy {
+    Allowed { warning: Option<String> },
+    Refused(String),
+}
+
+/// The one place that decides which FC phases the reset may run from.
+pub(crate) fn fc_reset_any_state_policy(fc_phase: Option<crate::types::FlightState>, drogue_seen: bool) -> FcResetPolicy {
+    use crate::types::FlightState as F;
+    let Some(phase) = fc_phase else { return FcResetPolicy::Allowed { warning: None } };
+    let label = crate::mission_phase::detailed_label(phase);
+    if FC_RESET_REFUSE_BEFORE_AUTOMATIC_DEPLOY && matches!(phase, F::Ascent | F::Coast | F::Apogee) && !drogue_seen {
+        return FcResetPolicy::Refused(format!("FC in {label}: the reset waits for the automatic deploy."));
+    }
+    let warning = matches!(phase, F::Launch | F::Ascent | F::Coast | F::Apogee | F::Descent | F::Reefing | F::InFlight)
+        .then(|| format!("FC in {label}: after reset the FC will NOT deploy automatically; only manual Deploy/Expand."));
+    FcResetPolicy::Allowed { warning }
+}
+
+/// Why the station cannot start the FC reset now, from host owners only.
+/// `admission` also refuses while a command to the FC is still owed; an
+/// admitted reset's own scoped quiesce decides that afterwards.
+pub(crate) fn fc_reset_host_block_reason(state: &AppState, admission: bool) -> Option<String> {
+    let router = state.topology_router.get()?;
+    if crate::operator_command_resend::deploy_in_progress(router) {
+        return Some("A deploy is in progress; wait for it to finish.".into());
+    }
+    if admission {
+        let owed = [crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+            crate::telemetry_schema::data_type("ABORT"), crate::telemetry_schema::data_type("FLIGHT_STATE")];
+        if state.manual_abort_intent.pending_epoch().is_some() || state.deferred_abort.manual_pending()
+            || router.export_reliable_pending_stats().iter().any(|row| owed.contains(&row.data_type)) {
+            return Some("A command to the flight computer is still being delivered.".into());
+        }
+    }
+    None
+}
+
 pub(super) fn host_safe(state: &AppState) -> bool {
     matches!(
         state.local_flight_state_snapshot(),
@@ -532,6 +579,11 @@ fn host_admission_with(state: &AppState, action: &str, router_drained: bool) -> 
     // Resync has its own phase window (resync_target), with no
     // sequence moving valves and no active overpressure latch.
     if action == "resync" { return allowed(resync_work_block_reason(state).is_none()); }
+    // The FC reset to Startup runs from any station phase; it refuses only
+    // while a deploy or a command to the FC is still in progress.
+    if action == FC_RESET_ACTION {
+        return allowed(fc_reset_host_block_reason(state, router_drained).is_none());
+    }
     if host_safe(state) { return HostAdmission::Allowed; }
     if action == "reset_startup"
         && {
@@ -554,6 +606,9 @@ fn host_admission_with(state: &AppState, action: &str, router_drained: bool) -> 
 }
 /// Why PREPARE's host check failed, naming what to do next.
 fn prepare_host_block_reason(state: &AppState, action: &str) -> String {
+    if action == FC_RESET_ACTION {
+        return fc_reset_host_block_reason(state, true).unwrap_or_else(|| "The flight computer reset is not available right now.".into());
+    }
     if action == "resync" {
         return resync_work_block_reason(state).unwrap_or_else(|| "Resync is not allowed in the station's current phase.".into());
     }
@@ -567,6 +622,9 @@ fn prepare_host_block_reason(state: &AppState, action: &str) -> String {
 }
 /// Why an admitted recovery's host check failed, for the operation message.
 fn owned_host_block_reason(state: &AppState, action: &str) -> String {
+    if action == FC_RESET_ACTION {
+        return fc_reset_host_block_reason(state, false).map_or_else(|| "Flight computer reset stopped.".into(), |reason| format!("Flight computer reset stopped: {reason}"));
+    }
     if action == "resync" {
         return resync_work_block_reason(state).map_or_else(|| "Resync stopped: the station's phase changed.".into(), |reason| format!("Resync stopped: {reason}"));
     }
@@ -669,7 +727,7 @@ impl Runtime {
             json!({"ticket":ticket.id,"backend_instance":ticket.backend,"principal_context":ticket.principal,"reset_epoch":format!("{:016x}",ticket.token.generation),"action":ticket.action,"targets":ticket.targets.iter().map(|target|target.board.sender_id()).collect::<Vec<_>>(),"expires_in_ms":remaining.as_millis() as u64}),
         )
     }
-    fn busy(&self) -> bool {
+    pub(super) fn busy(&self) -> bool {
         self.0
             .lock()
             .unwrap()
@@ -813,6 +871,7 @@ async fn refresh_prepare_queries(
                 .filter(|board| targeted_recovery_state(*board).is_some())
                 .ok_or("Unsupported board")?,
         ],
+        FC_RESET_ACTION if request.board.as_deref() == Some("FC") && request.boards.is_empty() => vec![Board::FlightComputer],
         "resync" => vec![
             Board::from_sender_id(request.board.as_deref().ok_or("Select a board to resync")?)
                 .filter(|board| resync_board(*board))
@@ -996,6 +1055,7 @@ fn prepare_inner(
                 .filter(|board| targeted_recovery_state(*board).is_some())
                 .ok_or("Unsupported targeted application recovery board")?,
         ],
+        FC_RESET_ACTION if request.board.as_deref() == Some("FC") && request.boards.is_empty() => vec![Board::FlightComputer],
         "resync" => vec![
             Board::from_sender_id(request.board.as_deref().ok_or("Select a board to resync")?)
                 .filter(|board| resync_board(*board))
@@ -1045,12 +1105,25 @@ fn prepare_inner(
             if !resync_outputs_ready(board, &row.value, Some(phase)) {
                 return Err(if phase <= 1 { "This board's outputs do not read back consistently, so Resync cannot verify them. Query the board again, or use Reset all boards." } else { "Resync never moves outputs, and this board's outputs do not read safe. Use Review recovery or Reset all boards." });
             }
-            if row.value.state == Some(phase) && row.value.flags & 1 == 0 {
+            if super::network_state(row.value.state) == Some(phase) && row.value.flags & 1 == 0 {
                 return Err("The board already matches the station's phase; nothing to resync");
             }
             phase
         } else if request.action == "recover_abort" {
             targeted_recovery_state(board).ok_or("Unsupported targeted application recovery board")?
+        } else if request.action == FC_RESET_ACTION {
+            if let Some(reason) = super::fc_reset_board_block_reason(Some(&row.value)) {
+                return Err(intern(reason));
+            }
+            if first_binding.is_some() {
+                return Err("The flight computer needs commissioning recovery first.");
+            }
+            if let FcResetPolicy::Refused(reason) = fc_reset_any_state_policy(
+                row.value.state.and_then(crate::types::u8_to_flight_state),
+                crate::recovery_events::already_deployed(state, crate::recovery_events::Deployment::Drogue)) {
+                return Err(intern(reason));
+            }
+            0
         } else {
             0
         };
@@ -1104,7 +1177,8 @@ fn prepare_inner(
         targets.push(Target {
             board,
             desired,
-            operation: if resync_phase.is_some() { OP_RESYNC } else { OP_RECOVER },
+            operation: if resync_phase.is_some() { OP_RESYNC }
+                else if request.action == FC_RESET_ACTION { OP_RESET_ANY } else { OP_RECOVER },
             context: row.value.clone(),
             prepared_query: row.clone(),
             intent: None,
@@ -1136,9 +1210,9 @@ fn prepare_inner(
             return Err(intern(format!(
                 "Reset all boards cannot leave out {names}: the unfinished recovery still needs them and this reset cannot reach them now. Bring them back on the network and retry, or recover the other boards one at a time with Review recovery.")));
         }
-        if request.action == "resync" {
+        if request.action == "resync" || request.action == FC_RESET_ACTION {
             return Err(intern(format!(
-                "Finish the unfinished recovery first: {names} still need Review recovery or Reset all boards. Resync is available afterwards.")));
+                "Finish the unfinished recovery first: {names} still need Review recovery or Reset all boards.")));
         }
         if carried.iter().any(|t| t.kind != RecoveryIntentKind::Normal || t.original_first.is_some() || t.uncertain_first.is_some()) {
             return Err(intern(format!(
@@ -1171,7 +1245,21 @@ fn prepare_inner(
     let resync_summary = resync_label.as_ref().zip(names.first()).map(|(label, board)| if resync_phase.is_some_and(|phase| phase <= 1) { format!(
         "Resync {board} to {label}. The board leaves whatever state it is in, including Launch, without an Abort: it stops its own launch sequence, drives its outputs to their safe state, and sets its state machine, phase and recovery epoch to match the station.") } else { format!(
         "Resync {board} to {label}. This sets only the board's state machine, phase and recovery epoch to match the station, and clears a latched board Abort. No outputs move: valves, servos, supplies, igniter and stepper stay exactly as they are and must already read safe. Command any output explicitly afterwards.") });
-    let phrase = if let (Some(label), Some(board)) = (resync_label.as_ref(), names.first()) {
+    let fc_reset_warning = (request.action == FC_RESET_ACTION).then(|| {
+        let phase = targets.first().and_then(|t| t.context.state).and_then(crate::types::u8_to_flight_state);
+        match fc_reset_any_state_policy(phase, crate::recovery_events::already_deployed(state, crate::recovery_events::Deployment::Drogue)) {
+            FcResetPolicy::Allowed { warning } => warning,
+            FcResetPolicy::Refused(reason) => Some(reason),
+        }
+    }).flatten();
+    let fc_reset_summary = (request.action == FC_RESET_ACTION).then(|| format!(
+        "Reset the flight computer to Startup from {}, without an Abort first. It never fires a pyro and refuses while a pulse is running; its deployment history is kept; a new flight is needed before it deploys automatically again. Other boards and the station's phase are not changed.{}",
+        targets.first().and_then(|t| t.context.state).and_then(crate::types::u8_to_flight_state)
+            .map_or("its current state", crate::mission_phase::detailed_label),
+        fc_reset_warning.as_ref().map_or(String::new(), |w| format!(" {w}"))));
+    let phrase = if request.action == FC_RESET_ACTION {
+        FC_RESET_PHRASE.to_string()
+    } else if let (Some(label), Some(board)) = (resync_label.as_ref(), names.first()) {
         format!("RESYNC {board} TO {}", label.to_ascii_uppercase())
     } else { format!(
         "{} {}{}",
@@ -1184,7 +1272,7 @@ fn prepare_inner(
         if commissioning { " COMMISSION" } else { "" }
     ) };
     let context = principal_context(&identity, headers, principal);
-    let value = json!({"ticket":id,"backend_instance":hex(&identity),"principal_context":context,"reset_epoch":format!("{:016x}",token.generation),"expires_in_ms":original_query_remaining(&targets,Stamp::now()).as_millis() as u64,"action":request.action,"targets":names,"global_startup_best_effort":matches!(request.action.as_str(),"reset_startup"|"reset_startup_all7"),"required_proof_boards":reset_selection.map(|s|s.required_boards()),"unselected_board_verification":"unverified_best_effort","resync_target_state":resync_phase,"resync_target_label":resync_label,"outputs_unchanged":resync_phase.is_some_and(|phase| phase > 1),"summary":if let Some(text)=resync_summary.as_deref() {text} else if targets.iter().any(|target| target.first_binding.is_some()) {"Identity reconciliation ONLY for retained uncertain FIRST targets. Other targets will not reset/apply in this attempt. IO cannot clear state; a fresh Query and another distinct human confirmation are required."}else if commissioning{"Explicit commissioning leg; IO is not completion. A separate fresh confirmation is required after provisioning."}else if request.action=="recover_abort" {match targets.first().map(|target|target.board) {Some(Board::FlightComputer)=>"Reset/recover FC to Startup with verified evaluator and safe-output ownership. Preserve deployment history; a separate new flight is required. No MCU reboot or output replay.",Some(Board::RFBoard|Board::PowerBoard|Board::GatewayBoard|Board::DaqBoard)=>"Reset only selected cached application metadata to Startup. No physical recovery, power cycling, acquisition reset, reboot or resync.",_=>"Recover selected AB/VB application state to Idle with verified safe outputs. A completed launch can recover directly; active launch work must finish or be explicitly stopped first. No MCU reboot or physical-position proof."}}else{"Explicit GLOBAL Startup broadcast to ALL boards (best effort). Selected boards are verified; active launch work must finish or be explicitly stopped first. Clock, calibration and network power are preserved. Unselected boards remain unverified."},"confirmation":phrase,"still_unfinished_after":carried.iter().map(|t|t.board.as_str()).collect::<Vec<_>>()});
+    let value = json!({"ticket":id,"backend_instance":hex(&identity),"principal_context":context,"reset_epoch":format!("{:016x}",token.generation),"expires_in_ms":original_query_remaining(&targets,Stamp::now()).as_millis() as u64,"action":request.action,"targets":names,"global_startup_best_effort":matches!(request.action.as_str(),"reset_startup"|"reset_startup_all7"),"required_proof_boards":reset_selection.map(|s|s.required_boards()),"unselected_board_verification":"unverified_best_effort","resync_target_state":resync_phase,"resync_target_label":resync_label,"outputs_unchanged":resync_phase.is_some_and(|phase| phase > 1),"reset_fc_startup_warning":fc_reset_warning,"summary":if let Some(text)=resync_summary.as_deref().or(fc_reset_summary.as_deref()) {text} else if targets.iter().any(|target| target.first_binding.is_some()) {"Identity reconciliation ONLY for retained uncertain FIRST targets. Other targets will not reset/apply in this attempt. IO cannot clear state; a fresh Query and another distinct human confirmation are required."}else if commissioning{"Explicit commissioning leg; IO is not completion. A separate fresh confirmation is required after provisioning."}else if request.action=="recover_abort" {match targets.first().map(|target|target.board) {Some(Board::FlightComputer)=>"Reset/recover FC to Startup with verified evaluator and safe-output ownership. Preserve deployment history; a separate new flight is required. No MCU reboot or output replay.",Some(Board::RFBoard|Board::PowerBoard|Board::GatewayBoard|Board::DaqBoard)=>"Reset only selected cached application metadata to Startup. No physical recovery, power cycling, acquisition reset, reboot or resync.",_=>"Recover selected AB/VB application state to Idle with verified safe outputs. A completed launch can recover directly; active launch work must finish or be explicitly stopped first. No MCU reboot or physical-position proof."}}else{"Explicit GLOBAL Startup broadcast to ALL boards (best effort). Selected boards are verified; active launch work must finish or be explicitly stopped first. Clock, calibration and network power are preserved. Unselected boards remain unverified."},"confirmation":phrase,"still_unfinished_after":carried.iter().map(|t|t.board.as_str()).collect::<Vec<_>>()});
     let mut control = state.board_recovery.coordinator.0.lock().unwrap();
     if control.shutdown_closed || state.shutdown_requested.load(Ordering::Acquire) { return Err("Ground station is shutting down"); }
     if control
@@ -2760,6 +2848,7 @@ mod tests {
     mod normal_automatic_phase { include!("normal_automatic_phase_tests.rs"); }
     include!("targeted_recovery_tests.rs");
     include!("resync_tests.rs");
+    include!("fc_reset_tests.rs");
     include!("concurrent_exchange_tests.rs");
     include!("final_clock_tests.rs");
     use super::*;
@@ -2881,6 +2970,11 @@ mod tests {
         lose_proof_replies: usize,
         /// Every QUERY reply is lost (a board that never answers).
         silent_queries: bool,
+        /// FC firmware RESET_STARTUP_ANY: advertised as bit 7 on the FC and
+        /// applied like RECOVER, refused (UNSAFE) while a pulse runs.
+        reset_any: bool,
+        /// A pyro pulse is running: outputs read back, not safe.
+        pulse_active: bool,
     }
     type NativePeerRouter = Arc<Router>;
     struct Link {
@@ -3262,6 +3356,8 @@ mod tests {
                             first_receipt: HashMap::new(),
                             lose_proof_replies: 0,
                             silent_queries: false,
+                            reset_any: false,
+                            pulse_active: false,
                         }))
                     });
                 models.push((board, model.clone()));
@@ -3351,7 +3447,10 @@ mod tests {
                             );
                             let mut result = m.result;
                             let mut identity_rejected = false;
-                            if wire[1] == 1 || (wire[1] == 2 && m.resync) {
+                            if wire[1] == 3 && m.reset_any && m.pulse_active && !m.seen.contains_key(&nonce) {
+                                result = 5; // BOARD_RECOVERY_RESULT_UNSAFE: nothing changes.
+                                identity_rejected = true;
+                            } else if wire[1] == 1 || (wire[1] == 2 && m.resync) || (wire[1] == 3 && m.reset_any) {
                                 if let Some(old) = m.seen.get(&nonce) {
                                     response = old.clone();
                                 } else {
@@ -3416,8 +3515,9 @@ mod tests {
                                 response[3] = 0x04 | if m.hardened { 0x20 } else { 0 }
                                     | if physical && m.manual_v1 { 0x40 } else { 0 }
                                     | if m.state != 255 { 8 } else { 0 }
-                                    | if physical { 0x12 } else { 0 }
+                                    | if physical { if m.pulse_active { 0x10 } else { 0x12 } } else { 0 }
                                     | if m.resync && resync_board(link.board) { 0x80 } else { 0 }
+                                    | if m.reset_any && link.board == Board::FlightComputer { 0x80 } else { 0 }
                                     | if m.state == 15
                                         || m.retained_first.is_some() && m.applied == 0
                                     {
@@ -3429,6 +3529,7 @@ mod tests {
                                 response[20..24].copy_from_slice(&m.epoch.to_le_bytes());
                                 response[28..32].copy_from_slice(
                                     &m.output_override
+                                        .or(m.pulse_active.then_some(1))
                                         .unwrap_or_else(|| {
                                             safe_output_mask(link.board).unwrap_or(0)
                                         })
@@ -5145,13 +5246,13 @@ mod tests {
             ],
             Board::FlightComputer.sender_id(),
             router.network_time_ms().unwrap(),
-            Arc::from([8u8]),
+            Arc::from([16u8]),
         )
         .unwrap();
         fixture.inject_state(legitimate).await;
         assert_eq!(
             crate::network_variables::flight_state(),
-            8,
+            16,
             "legitimate normalized FC authority remains durable"
         );
         for reboot in [0u8, 1, 6] {
@@ -5169,7 +5270,7 @@ mod tests {
             fixture.inject_state(packet).await;
             assert_eq!(
                 crate::network_variables::flight_state(),
-                8,
+                16,
                 "FC reboot cannot change durable global flight phase"
             );
         }

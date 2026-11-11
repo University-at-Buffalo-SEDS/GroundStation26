@@ -156,9 +156,12 @@ impl RecoveryIntent {
             && matches!(board, "AB" | "VB")
             && self.body[2] <= 6
             && self.boot() != u64::MAX;
+        // RESET_STARTUP_ANY (3): the FC to Startup from any state, from a
+        // known boot generation (CONTRACT.md "Reset protocol").
+        let fc_reset_any = self.body[1] == 3 && board == "FC" && self.body[2] == 0 && self.boot() != u64::MAX;
         ensure!(
             self.body[0] == 1
-                && (self.body[1] == 1 || resync)
+                && (self.body[1] == 1 || resync || fc_reset_any)
                 && self.body[3] == 0
                 && (resync || self.body[2] == 0 || self.body[2] == 1 && matches!(board, "AB" | "VB"))
                 && self.source_utc_ms != 0
