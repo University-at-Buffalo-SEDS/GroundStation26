@@ -28,7 +28,7 @@ const DISCOVERY_COOLDOWN_MS: u64 = 30_000;
 /// about a fifth of the 256 B/s settings allowance. Replies are bound to a
 /// fresh nonce and their ages are source age plus the elapsed upper bound
 /// since this query, so a lost or late reply only lets rows go stale.
-const OBSERVE_REFRESH_MS: u64 = 10_000;
+pub(crate) const OBSERVE_REFRESH_MS: u64 = 10_000;
 fn observe_refresh_due(now: u64, last: Option<u64>, link_idle_direct: bool, idle: bool) -> bool {
     link_idle_direct
         && idle

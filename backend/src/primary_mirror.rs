@@ -18,11 +18,12 @@ const PROOF_POLICY_LEN:usize=88;
 const UNKNOWN: u16 = u16::MAX;
 const SOURCE_FRESH_MS: u64 = 1500;
 /// The RRLS follows the primary's action enable (key, software buttons and
-/// per-command enables) for this long. Over the hidden-node relay one
-/// GS-RRLS round trip takes 2-4 s, so SOURCE_FRESH_MS left every RRLS action
-/// disabled. Presentation only: the primary checks every request, and Launch
-/// keeps its own 2 s board-state ages.
-const POLICY_FRESH_MS: u64 = 6000;
+/// per-command enables) for this long: two observation refreshes plus one
+/// relayed round trip (2-4 s), so one lost refresh does not disable it. With
+/// 6 s against the 10 s refresh every RRLS action flapped to 'key control is
+/// disabled' for about 4 s of each cycle. Presentation only: the primary
+/// checks every request, and Launch keeps its own 2 s board-state ages.
+const POLICY_FRESH_MS: u64 = 2 * crate::command_proxy::OBSERVE_REFRESH_MS + 4_000;
 const VALVES: [&str; 5] = ["Pilot", "NormallyOpen", "Dump", "Nitrogen", "Nitrous"];
 const FILL: [Board; 4] = [
     Board::GatewayBoard,
@@ -1150,8 +1151,11 @@ mod tests {
                 .actuated,
             None
         );
-        // A relayed round trip of 3 s still follows the primary's action enable.
+        // A relayed round trip of 3 s still follows the primary's action enable,
+        // and so does an observation one refresh old (between refreshes).
         assert!(accept_control_observation(&state, &snapshot.encode(), 3000));
+        assert!(action_policy(&state).unwrap().software_buttons_enabled);
+        assert!(accept_control_observation(&state, &snapshot.encode(), crate::command_proxy::OBSERVE_REFRESH_MS + 3000));
         assert_eq!(action_policy(&state).unwrap().software_buttons_enabled, snapshot.flags & 2 != 0);
         assert!(snapshot.flags & 2 != 0, "fixture has software buttons enabled");
         assert!(accept_control_observation(&state, &snapshot.encode(), POLICY_FRESH_MS + 100));
