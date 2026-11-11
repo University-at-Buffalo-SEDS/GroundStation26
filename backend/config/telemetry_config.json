@@ -87,7 +87,7 @@
         "SD_CARD",
         "GROUND_STATION"
       ],
-      "reliable": "Ordered",
+      "reliable": "Unordered",
       "priority": 0
     },
     {
@@ -313,7 +313,7 @@
         "SD_CARD",
         "GROUND_STATION"
       ],
-      "reliable": "Ordered",
+      "reliable": "Unordered",
       "priority": 0
     },
     {
@@ -609,7 +609,7 @@
     {
       "name": "AV_BAY_UNDERGLOW",
       "doc": "Persistent avionics-bay underglow network variable (0 off, 1 on).",
-      "reliable": "Ordered",
+      "reliable": "Unordered",
       "priority": 16,
       "class": "Data",
       "element": {
@@ -624,7 +624,7 @@
     {
       "name": "FLIGHT_BUZZER",
       "doc": "Persistent Flight Computer buzzer network variable (0 off, 1 on).",
-      "reliable": "Ordered",
+      "reliable": "Unordered",
       "priority": 16,
       "class": "Data",
       "element": {
