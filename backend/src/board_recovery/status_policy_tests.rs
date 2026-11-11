@@ -538,6 +538,45 @@ async fn background_av_bay_queries_pause_while_the_av_bay_path_is_degraded() {
     assert_eq!(state.board_recovery.av_bay_pause_reason(), None, "direct path back and reported");
 }
 
+/// A powered-off AV-bay board must not hold the pause: on the bench with PB
+/// off, RF and FC rows expired for good and showed "recovery required".
+#[tokio::test]
+async fn an_av_bay_pause_resumes_without_a_board_that_was_already_off() {
+    let _relaying = RELAYING_FLAG.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = tests::http_fixture().await;
+    let state = fixture.state.clone();
+    let mut refresh = ReadonlyQueryRefresh::default();
+    let seen = |state: &Arc<AppState>, boards: &[Board]| {
+        let mut status = state.board_status.lock().unwrap();
+        for board in boards {
+            status.get_mut(board).unwrap().last_seen_instant = Some(std::time::Instant::now());
+        }
+    };
+    // PB was last heard long before; RF and FC shortly before the pause
+    // (which is back-dated by the minimum pause below).
+    let ago = |age: Duration| std::time::Instant::now().checked_sub(age);
+    {
+        let mut status = state.board_status.lock().unwrap();
+        status.get_mut(&Board::PowerBoard).unwrap().last_seen_instant = ago(AV_BAY_OFFLINE * 3);
+        for board in [Board::RFBoard, Board::FlightComputer] {
+            status.get_mut(&board).unwrap().last_seen_instant = ago(av_bay_min_pause() * 2);
+        }
+    }
+    crate::rrls::set_primary_relaying_for_test(true);
+    refresh.update_av_bay_pause(&state, Stamp::now());
+    assert!(state.board_recovery.av_bay_pause_reason().is_some());
+    crate::rrls::set_primary_relaying_for_test(false);
+    refresh.av_bay_paused_since = refresh.av_bay_paused_since.map(|since| since - av_bay_min_pause());
+    // FC has not reported since the pause: still paused.
+    std::thread::sleep(Duration::from_millis(5));
+    seen(&state, &[Board::RFBoard]);
+    refresh.update_av_bay_pause(&state, Stamp::now());
+    assert!(state.board_recovery.av_bay_pause_reason().is_some(), "a board present before the pause is waited for");
+    seen(&state, &[Board::FlightComputer]);
+    refresh.update_av_bay_pause(&state, Stamp::now());
+    assert_eq!(state.board_recovery.av_bay_pause_reason(), None, "the powered-off PB is not waited for");
+}
+
 /// deploy-normal (GS eadd886): two background AV-bay queries ran back to back
 /// in the one ordered BOARD_RECOVERY_REQUEST stream across the Abort, so VB
 /// and GB were asked only after both and read Aborted 2.1 s late (AB and

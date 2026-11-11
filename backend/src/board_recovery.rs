@@ -1228,7 +1228,7 @@ impl ReadonlyQueryRefresh {
     /// degraded: the primary relies on an RRLS relay, or a background AV-bay
     /// query went unanswered past its retry window. Resume, visibly, only when
     /// the direct path is back, at least AV_BAY_MIN_PAUSE has passed, and every
-    /// AV-bay board has sent a status report since the pause. Operator queries and recovery (Reset
+    /// AV-bay board still on the network has sent a status report since the pause. Operator queries and recovery (Reset
     /// all's fresh queries included) are never paused.
     fn update_av_bay_pause(&mut self, state: &Arc<AppState>, now: Stamp) {
         let relaying = crate::rrls::primary_relaying();
@@ -1252,17 +1252,19 @@ impl ReadonlyQueryRefresh {
                 *state.board_recovery.av_bay_paused.lock().unwrap() = Some(reason);
             }
             Some(since) if !relaying && now.wall.checked_duration_since(since).is_some_and(|paused| paused >= av_bay_min_pause()) => {
-                // Every AV-bay board this mode tracks must have reported since
-                // the pause. A board that stays silent keeps the pause: there
-                // is nothing to query it about until it is heard again.
+                // Every AV-bay board this mode tracks that was on the network
+                // before the pause must have reported since, and at least one
+                // did. A board already silent then (powered off) is not
+                // waited for: it would hold the pause, and with it every other
+                // AV-bay row, until it is switched on.
                 let scope = scope::mode_scope(crate::station_mode::local_mode());
+                let present_after = since.checked_sub(AV_BAY_OFFLINE).unwrap_or(since);
                 let reported = state.board_status.try_lock().ok().is_some_and(|status| {
-                    AV_BAY_INDICES.iter().filter(|&&at| scope & (1 << at) != 0).all(|&at| {
-                        status
-                            .get(&BOARDS[at])
-                            .and_then(|row| row.last_seen_instant)
-                            .is_some_and(|seen| seen.checked_duration_since(since).is_some())
-                    })
+                    let seen: Vec<_> = AV_BAY_INDICES.iter().filter(|&&at| scope & (1 << at) != 0)
+                        .filter_map(|&at| status.get(&BOARDS[at]).and_then(|row| row.last_seen_instant))
+                        .filter(|seen| seen.checked_duration_since(present_after).is_some())
+                        .collect();
+                    !seen.is_empty() && seen.iter().all(|seen| seen.checked_duration_since(since).is_some())
                 });
                 if reported {
                     log::info!("AV-bay background status queries resumed: the direct path is back and every AV-bay board reported since the pause");
@@ -1356,6 +1358,9 @@ const AV_BAY_INDICES: [usize; 3] = [0, 1, 2];
 /// (250 ms x 18), so a lost query's tail has drained before the next one goes
 /// and status reports alone cannot make it flap.
 const AV_BAY_MIN_PAUSE: Duration = Duration::from_millis(4_500);
+/// An AV-bay board not heard for this long before a pause began counts as
+/// off the network; the resume does not wait for its report.
+const AV_BAY_OFFLINE: Duration = Duration::from_secs(10);
 fn av_bay_min_pause() -> Duration {
     crate::sim_freshness::wall(AV_BAY_MIN_PAUSE)
 }
