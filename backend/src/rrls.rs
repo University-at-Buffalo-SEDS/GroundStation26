@@ -526,6 +526,9 @@ pub struct Mesh {
     health_streak_since: Option<u64>,
     /// RRLS standalone authority over the AV bay; see TAKEOVER_MS.
     takeover: bool,
+    /// First tick: an RRLS that has never heard the primary waits TAKEOVER_MS
+    /// from here before taking over (not at once at boot).
+    first_tick: Option<u64>,
     primary_direct: bool,
     last_direct: Option<u64>,
     direct_since: Option<u64>,
@@ -602,6 +605,7 @@ impl Mesh {
             health_received: None,
             health_streak_since: None,
             takeover: false,
+            first_tick: None,
             primary_direct: true,
             last_direct: None,
             direct_since: None,
@@ -2455,7 +2459,8 @@ impl Mesh {
         if self.role != Role::Rrls {
             return;
         }
-        let silent = self.health_received.is_none_or(|v| now.saturating_sub(v) >= TAKEOVER_MS);
+        let since = *self.first_tick.get_or_insert(now);
+        let silent = now.saturating_sub(self.health_received.unwrap_or(since)) >= TAKEOVER_MS;
         let restored = self.health_received.is_some_and(|v| now.saturating_sub(v) < LEASE_MS)
             && self.health_streak_since.is_some_and(|since| now.saturating_sub(since) >= RESTORE_MS);
         if !self.takeover && silent && self.hears_av_bay(now) {
@@ -3293,6 +3298,16 @@ mod tests {
         }
         assert!(!rr.takeover());
         assert!(rr.local_tx(true, &[1], now).is_none());
+    }
+    #[test]
+    fn a_booting_rrls_waits_before_taking_over() {
+        let mut rr = Mesh::new(Role::Rrls, 2);
+        rr.assume_av_bay_heard_for_test();
+        rr.tick(1_000);
+        rr.tick(1_000 + TAKEOVER_MS - 1);
+        assert!(!rr.takeover(), "no primary heard yet, but not silent for TAKEOVER_MS either");
+        rr.tick(1_000 + TAKEOVER_MS);
+        assert!(rr.takeover());
     }
     #[test]
     fn rrls_without_the_av_bay_does_not_take_over() {

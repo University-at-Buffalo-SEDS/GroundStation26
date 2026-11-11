@@ -2296,6 +2296,12 @@ async fn main() -> anyhow::Result<()> {
     }
     keep_schema_exchange_off_the_radio(&router, rocket_side, umbilical_side.as_slice())?;
     if rrls::is_rrls() {
+        // A listener never re-sends an overheard frame back onto the air. As an
+        // explicit route policy for the radio side this also keeps SEDSnet from
+        // discarding overheard frames addressed to the primary (reliable
+        // battery, Euler angles, status), so the RRLS sees all AV-bay data
+        // without acknowledging or transmitting anything.
+        router.set_route(Some(rocket_side), rocket_side, false)?;
         // RRLS takeover: while it owns the AV bay its router transmits on the
         // radio (discovery included, so the AV bay routes telemetry to it once
         // the primary's routes expire); otherwise it only observes and relays.
