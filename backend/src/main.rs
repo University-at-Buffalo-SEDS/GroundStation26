@@ -2310,7 +2310,9 @@ async fn main() -> anyhow::Result<()> {
             let mut egress = false;
             loop {
                 let takeover = rrls::takeover_active();
-                if takeover != egress && router.set_side_egress_enabled(rocket_side, takeover).is_ok() {
+                if takeover != egress && router.set_side_egress_enabled(rocket_side, takeover).is_ok()
+                    && network_variables::set_takeover_outputs_writable(&router, takeover).is_ok()
+                {
                     egress = takeover;
                     log::info!("RRLS radio egress {}", if takeover { "enabled for takeover" } else { "disabled (observer)" });
                 }

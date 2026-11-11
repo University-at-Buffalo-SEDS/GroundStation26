@@ -359,6 +359,21 @@ const STATION_VARIABLES: [&str; 9] = [
 pub(crate) fn station_serves(ty: sedsnet::config::DataType) -> bool {
     !crate::rrls::is_rrls() && STATION_VARIABLES.iter().any(|name| crate::telemetry_schema::data_type(name) == ty)
 }
+/// RRLS takeover: the cosmetic outputs (underglow, buzzer) become writable
+/// while it owns the AV bay and read-only again when it hands back.
+pub(crate) fn set_takeover_outputs_writable(router: &Router, writable: bool) -> Result<()> {
+    for output in NetworkOutput::ALL {
+        router.enable_network_variable(
+            crate::telemetry_schema::data_type(output.data_type()),
+            if writable {
+                NetworkVariablePermissions::READ_WRITE
+            } else {
+                NetworkVariablePermissions::READ_ONLY
+            },
+        )?;
+    }
+    Ok(())
+}
 fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Result<()> {
     for data_type in STATION_VARIABLES {
         router.enable_network_variable(
@@ -1392,6 +1407,22 @@ fn verify_qualification_boot_cache(path: &Path, completed: usize, actual: u8) ->
 mod tests {
     use super::*;
     use sedsnet::router::{EndpointHandler, RouterConfig};
+    /// Bench 2026-11-11: after the failover the RRLS refused its own underglow
+    /// toggle with PermissionDenied, because its outputs stayed read-only.
+    #[test]
+    fn a_takeover_makes_the_rrls_outputs_writable_and_hand_back_restores_read_only() {
+        crate::telemetry_schema::initialize().unwrap();
+        let router = Router::new(RouterConfig::new([]).with_sender("RRLS"));
+        let output = NetworkOutput::Underglow;
+        let ty = crate::telemetry_schema::data_type(output.data_type());
+        router.enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY).unwrap();
+        let write = |r: &Router| r.set_network_variable(packet(output.data_type(), output.endpoint(), 1).unwrap());
+        assert!(matches!(write(&router), Err(sedsnet::TelemetryError::PermissionDenied)));
+        set_takeover_outputs_writable(&router, true).unwrap();
+        assert!(write(&router).is_ok());
+        set_takeover_outputs_writable(&router, false).unwrap();
+        assert!(matches!(write(&router), Err(sedsnet::TelemetryError::PermissionDenied)));
+    }
 
     #[test]
     fn qualification_requires_fresh_startup_zero_and_exact_restart_restoration() {
