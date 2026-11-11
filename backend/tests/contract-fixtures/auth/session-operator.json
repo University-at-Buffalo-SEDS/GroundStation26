@@ -16,7 +16,9 @@
     "primary_mode": null,
     "reason": "Paired primary control has not initialized; standalone hardware authority is unavailable.",
     "supported": true,
-    "supported_commands": []
+    "supported_commands": [],
+    "takeover": false,
+    "takeover_commands": []
   },
   "expires_at_ms": 1,
   "operating_mode": {

@@ -742,13 +742,14 @@ pub(crate) fn reconcile_network_outputs<C>(
     changed
 }
 
-/// Production cadence wrapper: primary role only, polled at most every 10 ms.
+/// Production cadence wrapper: primary role (or an RRLS holding a takeover of
+/// the AV bay) only, polled at most every 10 ms.
 pub(crate) fn reconcile_network_outputs_for_state(
     state: &crate::state::AppState,
     router: &Router,
 ) -> bool {
     static NEXT_POLL: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    if crate::rrls::is_rrls()
+    if (crate::rrls::is_rrls() && !crate::rrls::takeover_active())
         || !(NETWORK_RECONCILE_ARMED.load(Ordering::Acquire)
             || NETWORK_VALUE_CHANGED.load(Ordering::Acquire))
     {

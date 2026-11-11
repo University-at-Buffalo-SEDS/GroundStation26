@@ -2516,7 +2516,7 @@ async fn send_command_entry(
         None
     };
     let remote_launch_origin = crate::command_proxy::capture_rrls_launch_origin(&state, name);
-    if crate::rrls::is_rrls() && !crate::command_proxy::local_operation(name) {
+    if crate::rrls::is_rrls() && !crate::command_proxy::rrls_runs_locally(name) {
         let principal = match authorize_headers(&state, &headers, Permission::SendCommands).await {
             Ok(principal) => principal,
             Err(error) => return error,
@@ -5915,7 +5915,7 @@ pub(crate) async fn handle_ws_control_text_with_source(
     if crate::rrls::is_rrls()
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
         && let Some(name) = value.get("cmd").and_then(|value| value.as_str())
-        && !crate::command_proxy::local_operation(name)
+        && !crate::command_proxy::rrls_runs_locally(name)
     {
         let response = crate::command_proxy::submit_with_origins(
             &state_for_recv,

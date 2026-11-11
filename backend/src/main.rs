@@ -2293,6 +2293,23 @@ async fn main() -> anyhow::Result<()> {
             .set_side_id(side);
     }
     keep_schema_exchange_off_the_radio(&router, rocket_side, umbilical_side.as_slice())?;
+    if rrls::is_rrls() {
+        // RRLS takeover: while it owns the AV bay its router transmits on the
+        // radio (discovery included, so the AV bay routes telemetry to it once
+        // the primary's routes expire); otherwise it only observes and relays.
+        let router = router.clone();
+        tokio::spawn(async move {
+            let mut egress = false;
+            loop {
+                let takeover = rrls::takeover_active();
+                if takeover != egress && router.set_side_egress_enabled(rocket_side, takeover).is_ok() {
+                    egress = takeover;
+                    log::info!("RRLS radio egress {}", if takeover { "enabled for takeover" } else { "disabled (observer)" });
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        });
+    }
 
     if !rrls::is_rrls() {
         qualification_requests::prime_initial_cache(&router, || {

@@ -402,6 +402,39 @@ pub struct AppState {
     pub auth: Arc<AuthManager>,
 }
 
+/// RRLS takeover policy: the primary is out of range, so the RRLS grants the
+/// AV-bay commands it sends itself and says why everything else is unavailable.
+fn rrls_takeover_policy(local: ActionPolicyMsg) -> ActionPolicyMsg {
+    let mut policy = ActionPolicyMsg {
+        local_phase_controls: false,
+        local_phase_controls_reason: Some("Phase steps require the primary GroundStation connection.".into()),
+        launch_zero: None,
+        key_enabled: true,
+        software_buttons_enabled: true,
+        controls: local.controls,
+    };
+    for control in &mut policy.controls {
+        let local_only = crate::command_proxy::local_operation(&control.cmd);
+        if crate::command_proxy::takeover_operation(&control.cmd) || local_only {
+            control.enabled = true;
+            control.disabled_reason = None;
+        } else if control.cmd != "Abort" {
+            control.enabled = false;
+            control.blink = crate::sequences::BlinkMode::None;
+            control.disabled_reason = Some("RRLS takeover: the primary GroundStation is out of range, and this control needs it (fill system, launch or ignition).".into());
+        }
+    }
+    for name in crate::sequences::all_command_names() {
+        if crate::command_proxy::takeover_operation(name) && !policy.controls.iter().any(|c| c.cmd == name) {
+            policy.controls.push(crate::sequences::ActionControl {
+                disabled_reason: None, requested: None, network_note: None,
+                cmd: name.into(), enabled: true, blink: crate::sequences::BlinkMode::None, actuated: None,
+            });
+        }
+    }
+    policy
+}
+
 impl AppState {
     // HITL has no Abort-delivery gate that needs both ledgers at once.
     #[cfg(test)]
@@ -2065,6 +2098,9 @@ impl AppState {
             crate::sequences::explain_disabled_policy(&mut local);
             return local;
         }
+        if crate::rrls::takeover_active() {
+            return rrls_takeover_policy(local);
+        }
         let mut mirrored =
             crate::primary_mirror::action_policy(self).unwrap_or_else(|| ActionPolicyMsg {
                 local_phase_controls: false,
@@ -2354,6 +2390,9 @@ impl AppState {
             return false;
         }
         if crate::rrls::is_rrls() {
+            if crate::rrls::takeover_active() && crate::command_proxy::takeover_operation(command_name(cmd)) {
+                return true;
+            }
             return matches!(
                 cmd,
                 TelemetryCommand::ResetTClock

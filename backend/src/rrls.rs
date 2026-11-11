@@ -48,6 +48,11 @@ const HEALTH_REPEAT_MS: u64 = 250;
 /// How long a paired RRLS keeps its control link to the primary without a
 /// fresh HEALTH (command_proxy_transport).
 const PROXY_LEASE_MS: u64 = 6_000;
+/// RRLS standalone takeover: with the primary unheard this long while the AV
+/// bay is heard, the RRLS owns the AV bay (its own router transmits). It hands
+/// back once the primary's HEALTH has been continuous for RESTORE_MS, so a
+/// primary at the edge of range does not flap authority.
+const TAKEOVER_MS: u64 = PROXY_LEASE_MS;
 /// Upper bound on the primary's HEALTH period (500 ms plus loop latency),
 /// used to extrapolate its sequence without ever running ahead of it.
 const PROXY_HEALTH_PERIOD_BOUND_MS: u64 = 650;
@@ -99,6 +104,15 @@ pub fn is_rrls() -> bool {
 
 /// The primary has asked an RRLS to relay: its direct AV-bay path is lost.
 static PRIMARY_RELAYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RRLS_TAKEOVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// RRLS: it owns the AV bay because the primary is out of range.
+pub(crate) fn takeover_active() -> bool {
+    RRLS_TAKEOVER.load(std::sync::atomic::Ordering::Acquire)
+}
+#[cfg(test)]
+pub(crate) fn set_takeover_for_test(active: bool) {
+    RRLS_TAKEOVER.store(active, std::sync::atomic::Ordering::Release);
+}
 /// Whether this primary currently relies on an RRLS for the AV bay.
 pub(crate) fn primary_relaying() -> bool {
     PRIMARY_RELAYING.load(std::sync::atomic::Ordering::Acquire)
@@ -508,6 +522,10 @@ pub struct Mesh {
     primary_session: Option<u32>,
     primary_sequence: u32,
     health_received: Option<u64>,
+    /// Start of the current unbroken run of primary HEALTH (gaps < LEASE_MS).
+    health_streak_since: Option<u64>,
+    /// RRLS standalone authority over the AV bay; see TAKEOVER_MS.
+    takeover: bool,
     primary_direct: bool,
     last_direct: Option<u64>,
     direct_since: Option<u64>,
@@ -582,6 +600,8 @@ impl Mesh {
             primary_session: None,
             primary_sequence: 0,
             health_received: None,
+            health_streak_since: None,
+            takeover: false,
             primary_direct: true,
             last_direct: None,
             direct_since: None,
@@ -775,6 +795,7 @@ impl Mesh {
 
     pub fn tick(&mut self, now: u64) {
         self.observe_settings_framing(now);
+        self.update_takeover(now);
         if self.role == Role::Primary {
             self.decide_relay(now);
             if self
@@ -2428,9 +2449,32 @@ impl Mesh {
         }
     }
 
-    /// Local router traffic is disabled on RRLS: it observes, never owns launch controls.
+    /// RRLS takeover: the primary unheard for TAKEOVER_MS while the AV bay is
+    /// heard. Ends after RESTORE_MS of continuous primary HEALTH.
+    fn update_takeover(&mut self, now: u64) {
+        if self.role != Role::Rrls {
+            return;
+        }
+        let silent = self.health_received.is_none_or(|v| now.saturating_sub(v) >= TAKEOVER_MS);
+        let restored = self.health_received.is_some_and(|v| now.saturating_sub(v) < LEASE_MS)
+            && self.health_streak_since.is_some_and(|since| now.saturating_sub(since) >= RESTORE_MS);
+        if !self.takeover && silent && self.hears_av_bay(now) {
+            self.takeover = true;
+            log::warn!("RRLS takeover: the primary has been unheard for {TAKEOVER_MS} ms while the AV bay is heard; this RRLS now commands the AV bay directly");
+        } else if self.takeover && restored {
+            self.takeover = false;
+            log::info!("RRLS takeover ended: the primary's HEALTH has been continuous for {RESTORE_MS} ms; authority handed back");
+        }
+        RRLS_TAKEOVER.store(self.takeover, std::sync::atomic::Ordering::Release);
+    }
+    #[cfg(test)]
+    pub(crate) fn takeover(&self) -> bool {
+        self.takeover
+    }
+    /// Local router traffic is disabled on RRLS (it observes and relays) except
+    /// during a takeover, when it owns the AV bay and transmits directly.
     pub fn local_tx(&self, command: bool, payload: &[u8], now: u64) -> Option<Outgoing> {
-        if self.role == Role::Rrls {
+        if self.role == Role::Rrls && !self.takeover {
             return None;
         }
         Some(Outgoing {
@@ -2562,11 +2606,16 @@ impl Mesh {
                     self.primary_session = Some(session);
                     self.primary_sequence = seq;
                     self.primary_direct = data[8] != 0;
+                    if self.health_received.is_none_or(|v| now.saturating_sub(v) >= LEASE_MS) {
+                        self.health_streak_since = Some(now);
+                    }
                     self.health_received = Some(now);
                     if let Some(budget) = self.budget.as_mut() {
                         budget.health(session, seq, data[8] != 0, now);
                     }
-                    if !self.active(now) {
+                    // A takeover keeps its own queued AV-bay commands until it
+                    // hands back.
+                    if !self.active(now) && !self.takeover {
                         self.clear();
                     }
                     None
@@ -3211,6 +3260,45 @@ mod tests {
         p.extend_from_slice(&seq.to_le_bytes());
         p.push(direct as u8);
         encode(HEALTH, &p)
+    }
+    #[test]
+    fn rrls_takes_over_the_av_bay_when_the_primary_is_out_of_range_and_hands_back() {
+        let mut rr = Mesh::new(Role::Rrls, 2);
+        rr.assume_av_bay_heard_for_test();
+        rr.incoming(true, &health(7, 1, true), 0);
+        rr.tick(1);
+        assert!(!rr.takeover() && rr.local_tx(true, &[1], 1).is_none(), "primary heard: observer only");
+        // The primary unheard for TAKEOVER_MS while the AV bay is heard.
+        rr.tick(TAKEOVER_MS);
+        assert!(rr.takeover());
+        let frame = rr.local_tx(true, &[1], TAKEOVER_MS).expect("takeover transmits directly");
+        assert_eq!(decode(&frame.bytes).unwrap().0, AV_BAY_COMMAND);
+        // One HEALTH from a primary at the edge of range does not hand back,
+        // and does not clear the takeover's queued commands.
+        let mut now = TAKEOVER_MS + 100;
+        rr.queue_settings(&[9], now);
+        let queued = rr.queue.len();
+        rr.incoming(true, &health(7, 2, true), now);
+        rr.tick(now);
+        assert!(rr.takeover());
+        assert!(rr.queue.len() >= queued);
+        // Continuous HEALTH for RESTORE_MS hands authority back.
+        let start = now;
+        let mut seq = 3;
+        while now < start + RESTORE_MS {
+            now += 500;
+            rr.incoming(true, &health(7, seq, true), now);
+            seq += 1;
+            rr.tick(now);
+        }
+        assert!(!rr.takeover());
+        assert!(rr.local_tx(true, &[1], now).is_none());
+    }
+    #[test]
+    fn rrls_without_the_av_bay_does_not_take_over() {
+        let mut rr = Mesh::new(Role::Rrls, 2);
+        rr.tick(TAKEOVER_MS * 2);
+        assert!(!rr.takeover());
     }
     #[test]
     fn optional_voice_presence_does_not_enable_standby_forwarding_or_flood_ready() {

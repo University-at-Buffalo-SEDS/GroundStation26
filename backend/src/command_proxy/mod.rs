@@ -970,6 +970,29 @@ pub(crate) fn wire_boundary(bytes: &[u8]) -> Option<u64> {
     (bytes.len() >= 132 && bytes.len() <= MAX_WIRE && bytes.starts_with(b"CP\x01") && bytes[3] <= 3)
         .then(|| u64::from_le_bytes(wire::contract_digest(bytes)[..8].try_into().unwrap()))
 }
+/// AV-bay commands an RRLS sends itself during a takeover (the primary is out
+/// of range). Fill-system, launch and ignition controls need the primary's
+/// umbilical and are never taken over; the station Abort is not yet included.
+pub(crate) fn takeover_operation(name: &str) -> bool {
+    matches!(
+        name,
+        "DeployParachute" | "ExpandParachute"
+            | "MonitorAltitude" | "RevokeMonitorAltitude"
+            | "ConsecutiveSamples" | "RevokeConsecutiveSamples"
+            | "ResetFailures" | "RevokeResetFailures"
+            | "ValidateMeasms" | "RevokeValidateMeasms"
+            | "EvaluationRelax" | "EvaluationFocus" | "EvaluationAbort"
+            | "ReinitSensors" | "ReinitBarometer" | "EnableIMU" | "DisableIMU"
+            | "AbortAfter40" | "AbortAfter100" | "AbortAfter250"
+            | "ReinitAfter15" | "ReinitAfter30" | "ReinitAfter50"
+            | "ToggleAvBayUnderglow" | "ToggleFlightBuzzer"
+    )
+}
+/// The RRLS runs `name` itself: always for local operations, and for AV-bay
+/// commands while it holds a takeover.
+pub(crate) fn rrls_runs_locally(name: &str) -> bool {
+    local_operation(name) || (crate::rrls::takeover_active() && takeover_operation(name))
+}
 pub(crate) fn local_operation(name: &str) -> bool {
     matches!(
         name,
@@ -1174,10 +1197,16 @@ pub struct Status {
     pub pending: Option<RequestStatus>,
     pub last: Option<RequestStatus>,
     pub reason: String,
+    /// RRLS takeover: the primary is out of range and this RRLS sends these
+    /// AV-bay commands itself (its own command endpoint, not the proxy).
+    #[serde(default)]
+    pub takeover: bool,
+    #[serde(default)]
+    pub takeover_commands: Vec<String>,
 }
 impl Default for Status {
     fn default() -> Self {
-        Self{supported:true,paired:false,connected:false,available:false,primary_mode:None,supported_commands:Vec::new(),pending:None,last:None,reason:"Paired primary control has not initialized; standalone hardware authority is unavailable.".into()}
+        Self{supported:true,paired:false,connected:false,available:false,primary_mode:None,supported_commands:Vec::new(),pending:None,last:None,reason:"Paired primary control has not initialized; standalone hardware authority is unavailable.".into(),takeover:false,takeover_commands:Vec::new()}
     }
 }
 // This includes the original local credential only in process memory. It is
@@ -1237,7 +1266,14 @@ pub(crate) async fn request_readiness_check() -> std::result::Result<(), String>
         .map_err(|_|"Primary readiness service stopped; no Launch was sent.".to_string())?
 }
 pub(crate) fn status() -> Status {
-    broker().lock().unwrap().status.clone()
+    let mut status = broker().lock().unwrap().status.clone();
+    if crate::rrls::is_rrls() && crate::rrls::takeover_active() {
+        status.takeover = true;
+        status.takeover_commands = crate::sequences::all_command_names().into_iter()
+            .filter(|name| takeover_operation(name)).map(String::from).collect();
+        status.reason = "RRLS takeover: the primary GroundStation is out of range, so this RRLS commands the AV bay directly. Authority returns to the primary automatically once it is heard again.".into();
+    }
+    status
 }
 fn elapsed_upper_bound(now: u64, created: u64) -> u64 {
     // A simulator clock reset or any unknown epoch must expire observations.
