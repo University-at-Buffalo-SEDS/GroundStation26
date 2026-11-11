@@ -56,10 +56,34 @@ impl Profile {
             && self.overhead <= 256
             && (1..=500).contains(&self.burst_ms)
             && (1..=1000).contains(&self.gap_ms)
-            && self.flags == 0
+            && self.flags & !Self::TURN_CADENCE == 0
     }
     pub(crate) fn matches(self, expected: Self) -> bool {
         self == expected && self.valid()
+    }
+    /// Flags bit 3: the link takes air turns (profile transport.turn_period_ms).
+    /// Bits 0-2 are RF's flow control, LoRa scheduler and UART format mismatch,
+    /// each of which still disqualifies the tuple.
+    pub(crate) const TURN_CADENCE: u8 = 8;
+    /// Why `self` (a peer's tuple) does not match `expected`, for the log;
+    /// None when it matches.
+    pub(crate) fn mismatch_reason(self, expected: Self) -> Option<String> {
+        if self.matches(expected) {
+            return None;
+        }
+        if !self.valid() {
+            return Some(format!("peer tuple is invalid or uses unknown flags 0x{:02x}", self.flags));
+        }
+        let peer_turns = self.flags & Self::TURN_CADENCE != 0;
+        let own_turns = expected.flags & Self::TURN_CADENCE != 0;
+        if peer_turns != own_turns && (Self { flags: expected.flags, ..self }) == expected {
+            return Some(if own_turns {
+                "peer does not declare the air turn cadence (flags bit 3): its firmware or profile predates turn-taking; ship GS, RRLS and RF together".into()
+            } else {
+                "peer declares the air turn cadence (flags bit 3) and this station does not: ship GS, RRLS and RF together".into()
+            });
+        }
+        Some(format!("peer tuple {self:?} differs from expected {expected:?}"))
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,6 +240,16 @@ pub(crate) fn rf_query(nonce: Nonce) -> [u8; 26] {
     b[22..].copy_from_slice(&checksum.to_le_bytes());
     b
 }
+/// A tuple mismatch disables the negotiated relay budget (the conservative
+/// role share applies); say why, once per distinct reason.
+pub(crate) fn log_profile_mismatch(reason: &str) {
+    static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.as_deref() != Some(reason) {
+        log::warn!("RF recovery profile does not match this station's; using the conservative relay share: {reason}");
+        *last = Some(reason.to_string());
+    }
+}
 pub(crate) fn rf_profile(reply: &[u8; 42], nonce: Nonce) -> Option<Profile> {
     if reply[..6] != [b'R', b'R', 1, RF_KIND, 1, 1]
         || reply[6..22] != nonce.0
@@ -239,7 +273,7 @@ pub(crate) fn rf_profile(reply: &[u8; 42], nonce: Nonce) -> Option<Profile> {
         && p.overhead <= 256
         && (1..=500).contains(&p.burst_ms)
         && (1..=1000).contains(&p.gap_ms)
-        && p.flags & !7 == 0)
+        && p.flags & !15 == 0)
         .then_some(p)
 }
 pub(crate) fn encode(message: Message) -> Frame {
@@ -679,7 +713,8 @@ impl Relay {
         }
         let profile = rf_profile(&reply, self.nonce)?;
         self.rf_reply = Some(reply);
-        if !profile.matches(self.expected) {
+        if let Some(reason) = profile.mismatch_reason(self.expected) {
+            log_profile_mismatch(&reason);
             self.high = false;
             self.grant = None;
             self.offered = None;
@@ -1235,6 +1270,24 @@ mod tests {
                     .unwrap()
                     .matches(Profile::MATCHED)
             );
+        }
+        // Bit 3 declares the air turn cadence: tuples match with or without it,
+        // a mismatch names the cause, and bits 0-2 (flow control, LoRa
+        // scheduler, UART format) still disqualify it.
+        let turns = Profile { flags: Profile::TURN_CADENCE, ..Profile::MATCHED };
+        assert!(turns.valid() && turns.matches(turns));
+        assert_eq!(rf_profile(&reply(n(2), turns), n(2)), Some(turns));
+        assert!(Profile::MATCHED.matches(Profile::MATCHED));
+        assert!(!Profile::MATCHED.matches(turns));
+        let old_peer = Profile::MATCHED.mismatch_reason(turns).unwrap();
+        assert!(old_peer.contains("does not declare the air turn cadence") && old_peer.contains("predates"), "{old_peer}");
+        let newer_peer = turns.mismatch_reason(Profile::MATCHED).unwrap();
+        assert!(newer_peer.contains("this station does not"), "{newer_peer}");
+        assert!(Profile { flags: 2, ..Profile::MATCHED }.mismatch_reason(turns).unwrap().contains("unknown flags"));
+        assert!(turns.mismatch_reason(turns).is_none());
+        for bad in [1u8, 2, 4] {
+            let with_bad = Profile { flags: Profile::TURN_CADENCE | bad, ..Profile::MATCHED };
+            assert!(!with_bad.matches(turns) && !with_bad.valid());
         }
         let observed = Profile {
             rf_share: 40,

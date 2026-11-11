@@ -1939,6 +1939,14 @@ impl WireBacklog {
             })
     }
     fn pop_critical(&mut self) -> Option<(u8, Vec<u8>)> {
+        // ABORT first: it is never held for an air turn, so a control the turn
+        // gate holds at the head (a query waiting for the station's gap) must
+        // not keep it queued (takeover fullnet: an ABORT waited 260 ms behind a
+        // held BOARD_RECOVERY_REQUEST).
+        if let Some(abort) = self.pop_first_matching(is_abort_frame) {
+            self.control_bytes = self.control_bytes.saturating_add(abort.1.len());
+            return Some(abort);
+        }
         // Canonical controls are independent of the ordered SDT dictionaries.
         // Routine heartbeat/GPS/discovery must not hide one eligible loan.
         let application = self.priorities.iter().rev().find_map(|(priority, queue)| {

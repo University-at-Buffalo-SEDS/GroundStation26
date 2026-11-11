@@ -191,7 +191,7 @@ fn rf_reply(query: &[u8]) -> Vec<u8> {
     for v in [p.overhead, p.burst_ms, p.gap_ms] {
         b.extend_from_slice(&v.to_le_bytes());
     }
-    b.push(0);
+    b.push(p.flags);
     let crc = crate::rrls::budget_negotiation::crc(&b);
     b.extend_from_slice(&crc.to_le_bytes());
     b

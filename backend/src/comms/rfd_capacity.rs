@@ -46,8 +46,131 @@ pub(crate) struct Capacity {
     air_bps: u64,
     share_percent: u64,
     overhead_bytes: u64,
-    default_share_percent: u64,
+    /// A percentage (the share is 1..=100); u8 keeps the fixed host state small.
+    default_share_percent: u8,
     fixed_share: bool,
+    /// Air turn-taking (profile `transport.turn_period_ms`, declared in the
+    /// tuple); its gate only on the station's direct RFD link. Boxed: the
+    /// capacity's fixed host state stays one pointer larger.
+    turn: Option<Box<Turns>>,
+}
+
+/// After an AV-bay transmission ends, the station writes once, coalesced, in
+/// the gap before the AV bay's next turn (docs: GroundStation26
+/// docs/backend/rfd-modem-check.md "Turn-taking"; FirmwareSimulator
+/// docs/rfd-air-scheduling.md). Two ASYNC modems transmitting at once lose
+/// both packets: the RFD900x2 bench pair lost 97-99% that way.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Turns {
+    period_ms: u16,
+    quiet_ms: u16,
+    gate: Option<TurnGate>,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TurnGate {
+    /// Quiet air that ends another station's transmission (TURN_QUIET_MS, or
+    /// derived from the modem's serial break by the profile).
+    quiet_ms: u16,
+    last_air_rx: Option<(Instant, Option<u64>)>,
+    served_rx: Option<(Instant, Option<u64>)>,
+    last_start: Option<(Instant, Option<u64>)>,
+    bypass: bool,
+    /// The link is an RRLS that relays (no takeover): it keeps its pacing.
+    standby: bool,
+    /// Standby only: the frame being admitted is the RRLS's own (observe
+    /// refresh, discovery queries), sent only after the quiet time of quiet
+    /// air or once it has waited STANDBY_MAX_WAIT_MS. Relayed frames are not.
+    sense: bool,
+    /// Standby: when the RRLS's own frame first found the air busy.
+    held_since: Option<(Instant, Option<u64>)>,
+    /// The primary relies on an RRLS relay: it free-runs at normal pacing.
+    /// While relaying, the RRLS forwards RF's burst right after hearing it,
+    /// in the very gap the station would write into, so the station's turn
+    /// writes met the relay at RF (at boot RF then got none of the station's
+    /// time sync for 10 s and stranded a FLIGHT_STATE write).
+    relaying: bool,
+    /// The current packet was started by a bypassing frame (ABORT, mesh
+    /// control): it did not use the turn, and ordinary frames may not join it.
+    out_of_turn: bool,
+}
+/// A standby RRLS sends its own frames after the gate's quiet time of no air
+/// (no AV-bay or station bytes heard): sent blind, most met GS or RF air and
+/// 79% were lost RRLS->GS (radio-tx-storm rrls-txgap root cause). It waits no
+/// longer than this, then sends anyway.
+pub(crate) const STANDBY_MAX_WAIT_MS: u64 = 200;
+/// The AV bay's transmission has ended once no air byte arrived for this long
+/// (the default; the shipped profile derives it from S6).
+pub(crate) const TURN_QUIET_MS: u64 = 20;
+/// No AV-bay air for this long (out of range, RF off or not yet heard): the
+/// station free-runs. Turns exist to avoid colliding with RF; with RF silent
+/// that reason is gone, so free-run writes use normal pacing, each packet
+/// still bounded to the turn's 15% burst so a returning AV bay is heard.
+pub(crate) const TURN_FREE_RUN_SILENCE_MS: u64 = 1_000;
+fn since_ms(from: (Instant, Option<u64>), wall: Instant, virtual_ms: Option<u64>) -> u64 {
+    match (virtual_ms, from.1) {
+        (Some(now), Some(then)) => now.saturating_sub(then),
+        _ => wall.saturating_duration_since(from.0).as_millis().min(u128::from(u64::MAX)) as u64,
+    }
+}
+fn later(a: (Instant, Option<u64>), b: (Instant, Option<u64>)) -> bool {
+    match (a.1, b.1) {
+        (Some(x), Some(y)) => x > y,
+        _ => a.0 > b.0,
+    }
+}
+impl TurnGate {
+    pub(crate) fn open(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
+        if self.bypass || (self.relaying && !self.standby) {
+            return true;
+        }
+        if self.standby {
+            return !self.sense
+                || self.quiet(wall, virtual_ms)
+                || self.held_since.is_some_and(|held| since_ms(held, wall, virtual_ms) >= STANDBY_MAX_WAIT_MS);
+        }
+        match self.last_air_rx {
+            None => true,
+            Some(rx) => {
+                let silent = since_ms(rx, wall, virtual_ms);
+                if silent >= TURN_FREE_RUN_SILENCE_MS {
+                    return true;
+                }
+                silent >= u64::from(self.quiet_ms) && self.served_rx.is_none_or(|served| later(rx, served))
+            }
+        }
+    }
+    fn quiet(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
+        self.last_air_rx.is_none_or(|rx| since_ms(rx, wall, virtual_ms) >= u64::from(self.quiet_ms))
+    }
+    fn started(&mut self, wall: Instant, virtual_ms: Option<u64>) {
+        self.held_since = None;
+        // A frame that is never held for a turn (ABORT, mesh control) and
+        // starts out of turn does not use the station's turn, and ordinary
+        // frames do not join its burst (mid-turn that would open the air to
+        // frames that must wait for the gap). Started in the station's own
+        // gap, it is the turn's write: ordinary frames may join it, so
+        // HEALTH does not cost an extra air packet.
+        self.out_of_turn = self.bypass
+            && !self.standby
+            && !TurnGate { bypass: false, ..*self }.open(wall, virtual_ms);
+        if self.out_of_turn {
+            return;
+        }
+        self.last_start = Some((wall, virtual_ms));
+        self.served_rx = self.last_air_rx;
+    }
+    fn detail(&self, wall: Instant, virtual_ms: Option<u64>) -> String {
+        format!(
+            " turn_open={} air_rx_age_ms={} served={} bypass={} standby={} sense={} held_ms={}",
+            self.open(wall, virtual_ms),
+            self.last_air_rx.map_or(-1, |rx| since_ms(rx, wall, virtual_ms) as i64),
+            self.last_air_rx.is_some_and(|rx| self.served_rx.is_some_and(|served| !later(rx, served))),
+            self.bypass,
+            self.standby,
+            self.sense,
+            self.held_since.map_or(-1, |held| since_ms(held, wall, virtual_ms) as i64)
+        )
+    }
 }
 /// All modems share one half-duplex channel and each host paces only its own
 /// UART, just under one modem's drain rate. Air the host hears from others is
@@ -127,7 +250,97 @@ impl Capacity {
             && self.packet_burst_ms == expected.burst_ms
             && self.packet_gap_ms == expected.gap_ms
             && self.uart_baud == expected.baud
-            && expected.flags == 0
+            && expected.flags == self.turn_flags()
+    }
+    /// The tuple flags this capacity declares: bit 0 is the air turn cadence.
+    pub(crate) fn turn_flags(&self) -> u8 {
+        if self.turn_period_ms() > 0 { crate::rrls::budget_negotiation::Profile::TURN_CADENCE } else { 0 }
+    }
+    fn turn_period_ms(&self) -> u16 {
+        self.turn.as_ref().map_or(0, |turns| turns.period_ms)
+    }
+    /// Profile `transport.turn_period_ms` (0 = off).
+    pub(crate) fn with_turn_period(mut self, period_ms: u64) -> Self {
+        let period_ms = u16::try_from(period_ms).unwrap_or(0);
+        self.turn = (period_ms > 0).then(|| Box::new(Turns { period_ms, quiet_ms: TURN_QUIET_MS as u16, gate: None }));
+        self
+    }
+    /// Profile `modem.serial_break_ms` (S6): an ASYNC modem closes an air
+    /// packet after S6 of UART idle, so one transmission can arrive as several
+    /// packets with output gaps between them. The faithful fullnet measured
+    /// such gaps up to 28 ms inside RF bursts at the station (S6 = 10 ms), so
+    /// the quiet time is three serial breaks, never under TURN_QUIET_MS.
+    pub(crate) fn with_turn_quiet_from_serial_break(mut self, serial_break_ms: u64) -> Self {
+        if let Some(turns) = self.turn.as_mut() {
+            turns.quiet_ms = serial_break_ms.saturating_mul(3).clamp(TURN_QUIET_MS, 100) as u16;
+        }
+        self
+    }
+    /// Station direct link only: write in the gap after AV-bay air (TurnGate).
+    pub(crate) fn enable_turn_gate(&mut self) {
+        if let Some(turns) = self.turn.as_mut() {
+            turns.gate = Some(TurnGate { quiet_ms: turns.quiet_ms, ..TurnGate::default() });
+        }
+    }
+    pub(crate) fn turn_gated(&self) -> bool {
+        self.gate().is_some()
+    }
+    fn gate(&self) -> Option<&TurnGate> {
+        self.turn.as_ref().and_then(|turns| turns.gate.as_ref())
+    }
+    fn gate_mut(&mut self) -> Option<&mut TurnGate> {
+        self.turn.as_mut().and_then(|turns| turns.gate.as_mut())
+    }
+    /// The last time the modem output air from another station.
+    pub(crate) fn note_air_rx(&mut self, at: (Instant, Option<u64>)) {
+        if let Some(turn) = self.gate_mut()
+            && turn.last_air_rx.is_none_or(|last| later(at, last))
+        {
+            turn.last_air_rx = Some(at);
+        }
+    }
+    /// ABORT is never held for a turn: set for the frame being admitted.
+    pub(crate) fn set_turn_bypass(&mut self, bypass: bool) {
+        if let Some(turn) = self.gate_mut() {
+            turn.bypass = bypass;
+        }
+    }
+    /// The primary relies on an RRLS relay: free-run (see TurnGate::relaying).
+    pub(crate) fn set_turn_relaying(&mut self, relaying: bool) {
+        if let Some(turn) = self.gate_mut() {
+            turn.relaying = relaying;
+        }
+    }
+    /// An RRLS link outside takeover: the gate is kept but does not hold.
+    pub(crate) fn set_turn_standby(&mut self, standby: bool) {
+        if let Some(turn) = self.gate_mut() {
+            turn.standby = standby;
+        }
+    }
+    /// Standby: whether the frame being admitted is the RRLS's own and must
+    /// wait for quiet air (bounded). Starts its wait when the air is busy.
+    pub(crate) fn set_turn_sense(&mut self, sense: bool, wall: Instant, virtual_ms: Option<u64>) {
+        if let Some(turn) = self.gate_mut() {
+            turn.sense = sense;
+            // ABORT or a relayed frame asking in between leaves the wait as is.
+            if !turn.standby || turn.quiet(wall, virtual_ms) {
+                turn.held_since = None;
+            } else if sense && !turn.bypass && turn.held_since.is_none() {
+                turn.held_since = Some((wall, virtual_ms));
+            }
+        }
+    }
+    fn turn_open(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
+        self.gate().is_none_or(|turn| turn.open(wall, virtual_ms))
+    }
+    /// A turn's write is bounded so it ends before the AV bay's next turn: the
+    /// same 15% of the period the AV bay's own burst may use.
+    fn effective_burst_ms(&self) -> u64 {
+        if self.gate().is_some_and(|turn| !turn.standby) {
+            u64::from(self.packet_burst_ms).min(u64::from(self.turn_period_ms()) * 15 / 100)
+        } else {
+            u64::from(self.packet_burst_ms)
+        }
     }
     pub(crate) fn airtime_config(&self) -> (u64, u64) {
         (self.air_bps, self.share_percent)
@@ -200,6 +413,7 @@ impl Capacity {
             || self.early_frame_outstanding
             || self.ordinary_owner_bytes == 0
             || !Self::reached(self.next_packet, wall, clock)
+            || !self.turn_open(wall, clock)
         {
             return false;
         }
@@ -695,7 +909,8 @@ impl Capacity {
             1_000,
         ))
         .expect("bounded gap fits u16");
-        capacity.default_share_percent = default_share;
+        debug_assert!((1..=100).contains(&default_share), "share {default_share}%");
+        capacity.default_share_percent = default_share.clamp(1, 100) as u8;
         capacity.fixed_share = configured_share.is_some();
         capacity
     }
@@ -727,7 +942,8 @@ impl Capacity {
             air_bps,
             share_percent,
             overhead_bytes,
-            default_share_percent: share_percent,
+            default_share_percent: share_percent.clamp(1, 100) as u8,
+            turn: None,
             fixed_share: false,
         }
     }
@@ -749,7 +965,7 @@ impl Capacity {
         }
         let share = requested
             .map(u64::from)
-            .unwrap_or(self.default_share_percent);
+            .unwrap_or(u64::from(self.default_share_percent));
         assert!((1..=100).contains(&share));
         if share < self.share_percent
             && let Some((next_wall, next_virtual)) = self.next
@@ -799,10 +1015,27 @@ impl Capacity {
             self.ordinary_owner_bytes,
             self.completed_ordinary_owner,
             self.share_percent
-        )
+        ) + &self.gate().map_or_else(String::new, |turn| turn.detail(wall, virtual_ms))
     }
     pub(crate) fn ready(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
-        Self::reached(self.next, wall, virtual_ms) && self.packet_ready(wall, virtual_ms)
+        // Taking turns, the turn replaces per-frame airtime pacing (as on RF):
+        // one write of at most 15% of the period per AV-bay turn already bounds
+        // the station's air, and the pacing debt from the turn's first frame
+        // otherwise ended the turn after one frame. The fullnet showed the
+        // station's heartbeats, time sync and receipts starved that way (time
+        // sync went stale in the park and the AV-bay clocks drifted).
+        (self.turn_paced(wall, virtual_ms) || Self::reached(self.next, wall, virtual_ms))
+            && self.packet_ready(wall, virtual_ms)
+    }
+    /// Taking turns with the AV bay (not standby, not free-running).
+    fn turn_paced(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
+        self.gate().is_some_and(|turn| {
+            !turn.standby
+                && !turn.relaying
+                && turn
+                    .last_air_rx
+                    .is_some_and(|rx| since_ms(rx, wall, virtual_ms) < TURN_FREE_RUN_SILENCE_MS)
+        })
     }
     fn reached(
         deadline: Option<(Instant, Option<u64>)>,
@@ -825,18 +1058,21 @@ impl Capacity {
                 },
             )
         };
+        let burst_ms = self.effective_burst_ms();
         let within_burst = self.packet_started.is_some_and(|(started, virtual_start)| {
             match (virtual_ms, virtual_start) {
                 (Some(now), Some(start)) => {
-                    now.saturating_sub(start) < u64::from(self.packet_burst_ms)
+                    now.saturating_sub(start) < burst_ms
                 }
                 _ => {
                     wall.saturating_duration_since(started)
-                        < Duration::from_millis(u64::from(self.packet_burst_ms))
+                        < Duration::from_millis(burst_ms)
                 }
             }
         });
-        within_burst || reached(self.next_packet)
+        let joins_burst = within_burst
+            && self.gate().is_none_or(|turn| turn.bypass || !turn.out_of_turn);
+        joins_burst || (reached(self.next_packet) && self.turn_open(wall, virtual_ms))
     }
     /// Read-only diagnostic snapshot; never samples a new clock or retires state.
     #[cfg(any(target_os = "linux", test))]
@@ -1002,6 +1238,9 @@ impl Capacity {
         });
         if boundary_passed {
             self.packet_started = Some((wall, virtual_ms));
+            if let Some(turn) = self.gate_mut() {
+                turn.started(wall, virtual_ms);
+            }
         }
         self.next_packet = Some((
             wall.checked_add(Duration::from_millis(packet_ms))
@@ -1040,6 +1279,269 @@ impl Capacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Air turn-taking (profile turn_period_ms): two ASYNC modems transmitting
+    /// at once lose both packets, so the station writes in the gap after the
+    /// AV bay's transmission, once per AV-bay turn, and free-runs when the AV
+    /// bay is silent. ABORT is never held.
+    #[test]
+    fn station_writes_once_in_the_gap_after_av_bay_air() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 100, 16).with_turn_period(200);
+        cap.enable_turn_gate();
+        assert!(cap.turn_gated());
+        // No AV-bay air heard yet: free-run at normal pacing (packet gap).
+        assert!(cap.ready(wall, Some(1000)));
+        cap.committed(wall, Some(1000), 40);
+        assert!(!cap.packet_ready(wall, Some(1040)), "after the 30 ms burst the packet gap applies");
+        assert!(cap.ready(wall, Some(1100)), "no turn to wait for while RF is silent");
+        cap.committed(wall, Some(1500), 40);
+        // AV-bay air last heard at 1650: held until 20 ms of quiet.
+        cap.note_air_rx((wall, Some(1650)));
+        assert!(!cap.ready(wall, Some(1660)), "the AV bay is still transmitting");
+        assert!(cap.ready(wall, Some(1670)), "its turn ended: the gap is ours");
+        cap.committed(wall, Some(1670), 40);
+        assert!(!cap.ready(wall, Some(1800)), "one write per AV-bay turn");
+        cap.note_air_rx((wall, Some(1850)));
+        assert!(!cap.ready(wall, Some(1860)));
+        assert!(cap.ready(wall, Some(1870)));
+        cap.committed(wall, Some(1870), 40);
+        assert!(!cap.ready(wall, Some(1950)));
+        cap.set_turn_bypass(true);
+        assert!(cap.ready(wall, Some(1950)), "ABORT is never held for a turn");
+        cap.set_turn_bypass(false);
+        // AV bay silent for over 1 s: free-run again.
+        assert!(!cap.ready(wall, Some(2800)));
+        assert!(cap.ready(wall, Some(2860)));
+        assert!(cap.hold_detail(wall, Some(2860)).contains("turn_open=true"));
+    }
+    #[test]
+    fn a_turn_write_ends_before_the_av_bay_next_turn() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 100, 16).with_turn_period(200);
+        cap.enable_turn_gate();
+        cap.note_air_rx((wall, Some(1000)));
+        assert!(cap.ready(wall, Some(1020)));
+        cap.committed(wall, Some(1020), 20);
+        assert!(cap.packet_ready(wall, Some(1045)), "the turn's write continues for 15% of the period");
+        assert!(!cap.packet_ready(wall, Some(1055)), "and no longer: the AV bay turns every 200 ms");
+        // Without a turn period the profile burst applies unchanged.
+        let mut plain = Capacity::new(64000, 100, 16);
+        plain.committed(wall, Some(1020), 20);
+        assert!(plain.packet_ready(wall, Some(1100)));
+        assert!(!plain.turn_gated());
+    }
+    #[test]
+    fn ordinary_frames_do_not_join_an_out_of_turn_burst() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 100, 16).with_turn_period(200);
+        cap.enable_turn_gate();
+        // The AV bay is mid-turn: HEALTH (or ABORT) goes out of turn.
+        cap.note_air_rx((wall, Some(1000)));
+        assert!(!cap.packet_ready(wall, Some(1005)));
+        cap.set_turn_bypass(true);
+        assert!(cap.packet_ready(wall, Some(1005)));
+        cap.committed(wall, Some(1005), 20);
+        assert!(cap.packet_ready(wall, Some(1010)), "further bypassing frames may follow");
+        cap.set_turn_bypass(false);
+        assert!(!cap.packet_ready(wall, Some(1010)), "ordinary frames wait for the gap");
+        // Out of turn it does not use the turn: in the gap after the AV
+        // bay's air, ordinary frames still get it.
+        cap.note_air_rx((wall, Some(1012)));
+        assert!(cap.packet_ready(wall, Some(1100)), "the out-of-turn write left the turn unused");
+        // Started in the station's own gap, it is the turn's write: ordinary
+        // frames join its burst (no extra air packet) and the turn is used.
+        let mut cap = Capacity::new(64000, 100, 16).with_turn_period(200);
+        cap.enable_turn_gate();
+        cap.note_air_rx((wall, Some(1000)));
+        cap.set_turn_bypass(true);
+        cap.committed(wall, Some(1025), 20);
+        cap.set_turn_bypass(false);
+        assert!(cap.packet_ready(wall, Some(1030)), "ordinary frames ride the in-turn HEALTH");
+        assert!(!cap.packet_ready(wall, Some(1100)), "one write per AV-bay turn");
+        // While the AV bay is silent the station free-runs at normal pacing.
+        let mut cap = Capacity::new(64000, 100, 16).with_turn_period(200);
+        cap.enable_turn_gate();
+        cap.set_turn_bypass(true);
+        cap.committed(wall, Some(5000), 20);
+        cap.set_turn_bypass(false);
+        assert!(cap.packet_ready(wall, Some(5100)));
+        cap.committed(wall, Some(5100), 20);
+        assert!(cap.packet_ready(wall, Some(5200)), "normal pacing: ready after the packet gap");
+    }
+    /// A standby RRLS's own frames (observe refresh, discovery) wait for
+    /// 20 ms of quiet air, at most 200 ms; ABORT and relayed frames never wait.
+    #[test]
+    fn a_standby_rrls_sends_its_own_frames_in_quiet_air_within_a_bound() {
+        let wall = Instant::now();
+        let standby = || {
+            let mut cap = Capacity::new(64000, 100, 16).with_turn_period(200);
+            cap.enable_turn_gate();
+            cap.set_turn_standby(true);
+            cap
+        };
+        let ask = |cap: &mut Capacity, at: u64, own: bool| {
+            cap.set_turn_sense(own, wall, Some(at));
+            cap.packet_ready(wall, Some(at))
+        };
+        // Silent: at once.
+        let mut cap = standby();
+        assert!(ask(&mut cap, 1000, true), "no air heard: send");
+        // Chatty (GS or RF bytes every 5 ms): held, then sent at the bound.
+        let mut cap = standby();
+        let mut sent = None;
+        for at in (1000..1400).step_by(5) {
+            cap.note_air_rx((wall, Some(at)));
+            if ask(&mut cap, at, true) {
+                sent = Some(at);
+                break;
+            }
+        }
+        assert_eq!(sent, Some(1200), "own frame waits at most 200 ms on busy air");
+        // Air stops: sent 20 ms after the last byte.
+        let mut cap = standby();
+        cap.note_air_rx((wall, Some(1000)));
+        assert!(!ask(&mut cap, 1010, true));
+        assert!(ask(&mut cap, 1020, true), "20 ms of quiet air");
+        // ABORT and relayed frames never wait in standby.
+        let mut cap = standby();
+        cap.note_air_rx((wall, Some(1000)));
+        cap.set_turn_bypass(true);
+        assert!(ask(&mut cap, 1001, true), "ABORT is never held");
+        cap.set_turn_bypass(false);
+        assert!(ask(&mut cap, 1001, false), "relayed frames keep the RRLS pacing");
+        // Takeover: full turn rules, not the bounded wait.
+        let mut cap = standby();
+        cap.set_turn_standby(false);
+        for at in (1000..1400).step_by(5) {
+            cap.note_air_rx((wall, Some(at)));
+            assert!(!ask(&mut cap, at, true), "in takeover the AV bay's gap is awaited at {at}");
+        }
+    }
+    /// One RF burst can reach the station as several modem packets with
+    /// output gaps up to 28 ms (faithful fullnet, S6 = 10 ms): the shipped
+    /// profile's quiet time is three serial breaks, so the station does not
+    /// open its turn inside RF's.
+    #[test]
+    fn the_quiet_time_spans_the_modem_packet_gaps_inside_one_burst() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 100, 16)
+            .with_turn_period(200)
+            .with_turn_quiet_from_serial_break(10);
+        cap.enable_turn_gate();
+        cap.note_air_rx((wall, Some(1000)));
+        assert!(!cap.packet_ready(wall, Some(1028)), "a 28 ms gap inside RF's burst");
+        assert!(cap.packet_ready(wall, Some(1030)));
+        // Never under the 20 ms default, and bounded.
+        let short = Capacity::new(64000, 100, 16).with_turn_period(200).with_turn_quiet_from_serial_break(2);
+        let long = Capacity::new(64000, 100, 16).with_turn_period(200).with_turn_quiet_from_serial_break(500);
+        assert_eq!(short.turn.as_ref().unwrap().quiet_ms, 20);
+        assert_eq!(long.turn.as_ref().unwrap().quiet_ms, 100);
+    }
+    /// A turn carries the station's queued frames together: per-frame
+    /// airtime debt from the first frame must not end the turn (the fullnet
+    /// station sent one frame per turn and starved heartbeats and time sync).
+    /// Free-running, normal pacing applies again.
+    #[test]
+    fn a_turn_carries_several_frames_despite_pacing_debt() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 15, 16).with_turn_period(200);
+        cap.enable_turn_gate();
+        cap.note_air_rx((wall, Some(1000)));
+        assert!(cap.ready(wall, Some(1025)));
+        cap.committed(wall, Some(1025), 200);
+        assert!(cap.ready(wall, Some(1030)), "the turn's burst continues");
+        cap.committed(wall, Some(1030), 100);
+        assert!(!cap.ready(wall, Some(1060)), "after the burst: the next AV-bay turn");
+        // Silent AV bay: free-run with the pacing debt.
+        let mut cap = Capacity::new(64000, 15, 16).with_turn_period(200);
+        cap.enable_turn_gate();
+        assert!(cap.ready(wall, Some(5000)));
+        cap.committed(wall, Some(5000), 200);
+        assert!(!cap.ready(wall, Some(5005)), "free-running, pacing applies");
+    }
+    /// With a full ordinary backlog, an ABORT, then the Abort-confirm query
+    /// and the heartbeat all leave in the station's next turn.
+    #[test]
+    fn abort_query_and_heartbeat_leave_within_one_turn() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 15, 16).with_turn_period(200);
+        cap.enable_turn_gate();
+        // Busy: ordinary frames have been filling every turn.
+        cap.note_air_rx((wall, Some(800)));
+        cap.committed(wall, Some(820), 300);
+        // The AV bay's next turn ends at 1000; ABORT arrives mid-turn and goes
+        // at once, out of turn.
+        cap.note_air_rx((wall, Some(990)));
+        cap.set_turn_bypass(true);
+        assert!(cap.ready(wall, Some(995)), "ABORT is never held");
+        cap.committed(wall, Some(995), 40);
+        cap.set_turn_bypass(false);
+        // The station's gap: the query and the heartbeat share one burst.
+        cap.note_air_rx((wall, Some(1000)));
+        let mut sent = Vec::new();
+        for (at, bytes) in [(1020u64, 60usize), (1024, 30)] {
+            let mut t = at.max(sent.last().copied().unwrap_or(0));
+            while !cap.ready(wall, Some(t)) {
+                t += 1;
+                assert!(t < 1200, "frame of {bytes} B held past the turn");
+            }
+            cap.committed(wall, Some(t), bytes);
+            sent.push(t);
+        }
+        // After the ABORT's own packet gap, both in the same burst, well
+        // before the AV bay's next turn at 1200.
+        assert!(sent[1] - sent[0] < 30 && sent[1] < 1100, "both inside one turn's burst: {sent:?}");
+    }
+    /// While the primary relies on an RRLS relay, the RRLS forwards RF's
+    /// burst in the station's gap; the station free-runs at normal pacing
+    /// instead of writing into that gap. The gate returns with the direct path.
+    #[test]
+    fn a_relaying_primary_free_runs() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 100, 16).with_turn_period(200);
+        cap.enable_turn_gate();
+        cap.note_air_rx((wall, Some(1000)));
+        assert!(!cap.packet_ready(wall, Some(1005)), "direct: the AV bay's turn");
+        cap.set_turn_relaying(true);
+        assert!(cap.packet_ready(wall, Some(1005)), "relaying: free-run");
+        cap.committed(wall, Some(1005), 40);
+        assert!(!cap.ready(wall, Some(1010)), "with normal pacing");
+        cap.set_turn_relaying(false);
+        cap.note_air_rx((wall, Some(1300)));
+        assert!(!cap.packet_ready(wall, Some(1305)), "direct path back: turns again");
+    }
+    #[test]
+    fn the_gate_re_engages_at_the_first_av_bay_air_after_a_silence() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 100, 16).with_turn_period(200);
+        cap.enable_turn_gate();
+        cap.note_air_rx((wall, Some(1000)));
+        cap.committed(wall, Some(1030), 20);
+        // Silent for over 1 s: free-run at normal pacing.
+        for at in [2100, 2200, 2300] {
+            assert!(cap.packet_ready(wall, Some(at)), "free-run at {at}");
+            cap.committed(wall, Some(at), 20);
+        }
+        // The first AV-bay byte: wait for its gap again, one write per turn.
+        cap.note_air_rx((wall, Some(2390)));
+        assert!(!cap.packet_ready(wall, Some(2400)), "the AV bay is back: its turn first");
+        assert!(cap.packet_ready(wall, Some(2410)));
+        cap.committed(wall, Some(2410), 20);
+        assert!(!cap.packet_ready(wall, Some(2500)), "one write per AV-bay turn again");
+    }
+    #[test]
+    fn the_declared_turn_cadence_is_part_of_the_recovery_tuple() {
+        use crate::rrls::budget_negotiation::Profile;
+        let mut cap = Capacity::new(30_000, 100, 16).with_turn_period(200);
+        cap.packet_burst_ms = 250;
+        cap.packet_gap_ms = 15;
+        let tuple = Profile { baud: 115_200, usable_bps: 30_000, rf_share: 100, overhead: 16, burst_ms: 250, gap_ms: 15, flags: Profile::TURN_CADENCE };
+        assert!(cap.recovery_profile_matches(tuple));
+        assert!(!cap.recovery_profile_matches(Profile { flags: 0, ..tuple }));
+        let plain = Capacity { turn: None, ..cap };
+        assert!(plain.recovery_profile_matches(Profile { flags: 0, ..tuple }));
+        assert!(!plain.recovery_profile_matches(tuple));
+    }
     #[test]
     fn replayed_commands_wait_for_the_real_quiet_boundary_before_ordinary_service() {
         let wall = Instant::now();

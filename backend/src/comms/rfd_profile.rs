@@ -33,6 +33,11 @@ pub(crate) struct Transport {
     idle_margin_ms: u64,
     pub rf_share_percent: u64,
     pub host_default_share_percent: u64,
+    /// Air turn-taking period (0 = off). The AV bay writes one coalesced burst
+    /// per period and the station answers in the gap after it; declared in the
+    /// budget tuple as flags bit 3, so GS, RRLS and RF ship it together.
+    #[serde(default)]
+    pub turn_period_ms: u64,
 }
 static ACTIVE: OnceLock<Option<Profile>> = OnceLock::new();
 
@@ -75,7 +80,11 @@ impl Profile {
             overhead: self.transport.frame_overhead_bytes.try_into().ok()?,
             burst_ms: self.transport.packet_burst_ms.try_into().ok()?,
             gap_ms: self.transport.packet_gap_ms.try_into().ok()?,
-            flags: 0,
+            flags: if self.transport.turn_period_ms > 0 {
+                crate::rrls::budget_negotiation::Profile::TURN_CADENCE
+            } else {
+                0
+            },
         })
     }
     pub(crate) fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
@@ -139,6 +148,10 @@ impl Profile {
                 && t.packet_gap_ms >= m.serial_break_ms + t.idle_margin_ms,
             "UART idle gap must exceed modem serial break with a guard margin"
         );
+        anyhow::ensure!(
+            t.turn_period_ms == 0 || (100..=1000).contains(&t.turn_period_ms),
+            "air turn period must be 0 (off) or 100..=1000 ms"
+        );
         let largest_burst = (m.serial_baud * t.packet_burst_ms).div_ceil(10_000) + 1028;
         anyhow::ensure!(
             largest_burst <= m.max_data_bytes,
@@ -164,6 +177,8 @@ pub(crate) fn capacity(uart_baud: u32) -> super::rfd_capacity::Capacity {
                 host_share_percent: p.transport.host_default_share_percent,
             },
         )
+        .with_turn_period(p.transport.turn_period_ms)
+        .with_turn_quiet_from_serial_break(p.modem.serial_break_ms)
     } else {
         super::rfd_capacity::Capacity::from_env(uart_baud)
     }
@@ -252,6 +267,19 @@ mod tests {
             "../../../config/radio/rfd-async-64k-low-latency.json"
         ))
         .unwrap()
+    }
+    #[test]
+    fn the_air_turn_period_is_declared_in_the_budget_tuple() {
+        let mut v: serde_json::Value = serde_json::from_slice(include_bytes!("../../comms/rfd-profile.json")).unwrap();
+        v["transport"]["turn_period_ms"] = serde_json::json!(200);
+        let p = Profile::parse(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!(p.recovery_budget_tuple().unwrap().flags, crate::rrls::budget_negotiation::Profile::TURN_CADENCE);
+        v["transport"]["turn_period_ms"] = serde_json::json!(0);
+        assert_eq!(Profile::parse(&serde_json::to_vec(&v).unwrap()).unwrap().recovery_budget_tuple().unwrap().flags, 0);
+        v["transport"]["turn_period_ms"] = serde_json::json!(50);
+        assert!(Profile::parse(&serde_json::to_vec(&v).unwrap()).is_err(), "a turn shorter than 100 ms is refused");
+        v["transport"].as_object_mut().unwrap().remove("turn_period_ms");
+        assert_eq!(Profile::parse(&serde_json::to_vec(&v).unwrap()).unwrap().transport.turn_period_ms, 0, "absent means off");
     }
     #[test]
     fn shared_profile_preserves_raw_frame_boundaries_and_bounded_capacity() {

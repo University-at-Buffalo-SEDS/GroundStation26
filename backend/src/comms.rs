@@ -638,6 +638,25 @@ enum RecoveryEgressSelection {
 const ORDINARY_STARVATION_MS: u64 = 1_000;
 
 impl UartWriteState {
+    /// Brings the station's air-turn gate up to date before a readiness
+    /// check: the AV bay's last air, and whether the frame being admitted is
+    /// one that is never held for a turn (ABORT, RR mesh control).
+    fn sync_turn(&mut self, bypass: bool, own: bool) {
+        if let Some(cap) = self.radio_capacity.as_mut()
+            && cap.turn_gated()
+        {
+            if let Some(at) = last_air_rx() {
+                cap.note_air_rx(at);
+            }
+            // An RRLS that has taken over the AV bay transmits AV-bay traffic
+            // as the station does, so it follows the station's turn rules.
+            cap.set_turn_standby(self.relay_link && !crate::rrls::takeover_active());
+            cap.set_turn_relaying(!self.relay_link && crate::rrls::primary_relaying());
+            cap.set_turn_bypass(bypass);
+            // A standby RRLS's own frames wait (bounded) for quiet air.
+            cap.set_turn_sense(own, Instant::now(), crate::simulation_clock_ms());
+        }
+    }
     /// Whether the ordinary frame now asking has waited long enough for a
     /// critical turn; starts its wait otherwise.
     fn ordinary_starved(&mut self, wall: Instant, clock: Option<u64>) -> bool {
@@ -711,6 +730,8 @@ struct UartWriteState {
     retry_peer_session: Option<Option<u32>>,
     #[cfg(target_os = "linux")]
     wire: virtual_uart::WireDrain,
+    /// An RRLS link: the turn gate stands by except during an RRLS takeover.
+    relay_link: bool,
 }
 
 #[derive(Clone, Copy, serde::Serialize)]
@@ -917,6 +938,7 @@ impl UartComms {
     /// overhead (air packets of about 256 bytes) as air another modem used.
     fn note_heard_air(&self, n: usize) {
         if matches!(self.protocol, SerialProtocol::RawUart) {
+            note_air_rx_now();
             let n = n as u64;
             let air = n + RADIO_HEARD_PACKET_OVERHEAD_BYTES * n.div_ceil(256);
             self.heard_air.fetch_add(air, std::sync::atomic::Ordering::Relaxed);
@@ -1152,6 +1174,18 @@ impl UartComms {
         minimum_priority: u8,
         selection: RecoveryEgressSelection,
     ) -> TelemetryResult<BackgroundProgress> {
+        let result = self.flush_recovery_selection_gated(minimum_priority, selection);
+        // The mesh-control turn bypass covers only the frame being admitted.
+        if let Some(cap) = self.write_lock.lock().unwrap().radio_capacity.as_mut() {
+            cap.set_turn_bypass(false);
+        }
+        result
+    }
+    fn flush_recovery_selection_gated(
+        &mut self,
+        minimum_priority: u8,
+        selection: RecoveryEgressSelection,
+    ) -> TelemetryResult<BackgroundProgress> {
         let owed_settings = selection == RecoveryEgressSelection::OwedSettings;
         let mode_only = selection == RecoveryEgressSelection::ModeReplyOnly || owed_settings;
         let budget_only = selection == RecoveryEgressSelection::PaidBudgetOnly;
@@ -1201,6 +1235,9 @@ impl UartComms {
                     "recovery budget effective transport mismatch",
                 ));
             }
+            // Selection may reach mesh control, which is never held for an air
+            // turn; the selected frame's turn is checked again below.
+            write_state.sync_turn(true, false);
             let normal_ready = !write_state
                 .radio_capacity
                 .as_ref()
@@ -1296,6 +1333,9 @@ impl UartComms {
                 }
             };
             let Some(transmission) = transmission else {
+                if let Some(cap) = write_state.radio_capacity.as_mut() {
+                    cap.set_turn_bypass(false);
+                }
                 break;
             };
             if !self.refresh_recovery_capacity(&mut write_state, capacity_wall, capacity_clock) {
@@ -1307,7 +1347,24 @@ impl UartComms {
                     "recovery budget effective transport mismatch",
                 ));
             }
-            if write_state.radio_capacity.as_ref().is_some_and(|cap| {
+            if let Some(cap) = write_state.radio_capacity.as_mut() {
+                cap.set_turn_bypass(mesh_write_bypasses_turn(
+                    &transmission.frame().bytes,
+                    transmission.follower_frame().map(|follower| &follower.bytes[..]),
+                ));
+                // A standby RRLS's own control (observe refresh, discovery,
+                // settings/pairing, position) waits, bounded, for quiet air;
+                // relayed data keeps the RRLS pacing.
+                cap.set_turn_sense(
+                    is_station_own_mesh_frame(&transmission.frame().bytes)
+                        || transmission
+                            .follower_frame()
+                            .is_some_and(|follower| is_station_own_mesh_frame(&follower.bytes)),
+                    capacity_wall,
+                    capacity_clock,
+                );
+            }
+            let refused = write_state.radio_capacity.as_ref().is_some_and(|cap| {
                 if let Some((id, receipt)) = transmission.single_control_contract() {
                     if receipt {
                         return !cap.ready_for_receipt(
@@ -1345,7 +1402,11 @@ impl UartComms {
                     capacity_clock,
                     transmission.closes_packet_batch() || owed_settings,
                 )
-            }) {
+            });
+            if refused {
+                if let Some(cap) = write_state.radio_capacity.as_mut() {
+                    cap.set_turn_bypass(false);
+                }
                 shared
                     .lock()
                     .unwrap()
@@ -1544,6 +1605,9 @@ impl UartComms {
                 io_result?;
                 Ok(())
             })();
+            if let Some(cap) = write_state.radio_capacity.as_mut() {
+                cap.set_turn_bypass(false);
+            }
             let ordinary_bytes = if result.is_ok() {
                 transmission.ordinary_background_service_bytes()
             } else {
@@ -2287,6 +2351,60 @@ fn bound_raw_uart_buffer(rx_buf: &mut Vec<u8>, failed_prefix: &mut usize) {
         );
         discard_raw_uart_prefix(rx_buf, drop_len, failed_prefix);
     }
+}
+
+// When the modem last output air from another station (the AV bay's turn):
+// virtual ms in simulation, wall ms since AIR_RX_BASE otherwise; 0 = never.
+// One direct radio link per station process.
+static AIR_RX_VIRTUAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AIR_RX_WALL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AIR_RX_BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+fn note_air_rx_now() {
+    let base = *AIR_RX_BASE.get_or_init(Instant::now);
+    let wall = Instant::now().saturating_duration_since(base).as_millis() as u64 + 1;
+    AIR_RX_WALL_MS.store(wall, std::sync::atomic::Ordering::Release);
+    AIR_RX_VIRTUAL_MS.store(crate::simulation_clock_ms().map_or(0, |ms| ms + 1), std::sync::atomic::Ordering::Release);
+}
+fn last_air_rx() -> Option<(Instant, Option<u64>)> {
+    let wall = AIR_RX_WALL_MS.load(std::sync::atomic::Ordering::Acquire);
+    let base = *AIR_RX_BASE.get()?;
+    (wall != 0).then(|| {
+        let virtual_ms = AIR_RX_VIRTUAL_MS.load(std::sync::atomic::Ordering::Acquire);
+        (base + Duration::from_millis(wall - 1), (virtual_ms != 0).then(|| virtual_ms - 1))
+    })
+}
+/// RR mesh control the station sends at priority 255: HEALTH, READY and the
+/// budget/RF-profile control frames (BASE/REVOKE/ACK and paid budget frames).
+/// Byte 3 is the mesh kind (rrls.rs HEALTH 0, READY 7, BUDGET_CONTROL 13,
+/// RF_PROFILE_CONTROL 14). Like ABORT, these are never held for an air turn:
+/// HEALTH and the budget exchange keep the link alive while the AV bay talks.
+fn is_mesh_control_frame(bytes: &[u8]) -> bool {
+    matches!(bytes.get(3), Some(0 | 7 | 13 | 14))
+}
+/// A station's own RR mesh frames other than mesh control: POSITION 8,
+/// SETTINGS 10 (pairing included) and HOST_CONTROL 11 (the RRLS's observe
+/// refresh and discovery queries). Relayed DOWN/UP data and commands are not.
+fn is_station_own_mesh_frame(bytes: &[u8]) -> bool {
+    matches!(bytes.get(3), Some(8 | 10 | 11))
+}
+/// A mesh write is never held for a turn when every frame in it is RR mesh
+/// control or carries an SDK ABORT (wrapped as AV-bay or uplink data).
+fn mesh_write_bypasses_turn(first: &[u8], follower: Option<&[u8]>) -> bool {
+    let bypass = |bytes: &[u8]| {
+        is_mesh_control_frame(bytes)
+            || (matches!(bytes.get(3), Some(2 | 5)) && bytes.len() >= 8 && is_abort_frame(&bytes[4..bytes.len() - 4]))
+    };
+    bypass(first) && follower.is_none_or(bypass)
+}
+/// A command pair is never held for a turn when it carries an ABORT.
+fn command_pair_bypasses_turn(frames: &[(u8, &[u8])]) -> bool {
+    frames.iter().any(|(_, payload)| is_abort_frame(payload))
+}
+/// An SDK ABORT frame (manual or automatic); its payload starts with the
+/// SDK envelope on the station's direct link.
+fn is_abort_frame(payload: &[u8]) -> bool {
+    serialize::peek_frame_info_unchecked(payload)
+        .is_ok_and(|info| info.envelope.ty == crate::telemetry_schema::data_type("ABORT"))
 }
 
 fn raw_uart_requires_inner_crc(kind: RawUartFrameKind, body: &[u8]) -> bool {
@@ -3104,6 +3222,9 @@ impl UartComms {
             }
             drop(mesh);
             let mut state = self.write_lock.lock().unwrap();
+            // An operator command pair waits for the station's turn, unless it
+            // carries an ABORT, which is never held.
+            state.sync_turn(command_pair_bypasses_turn(frames), true);
             let wall = Instant::now();
             let clock = crate::simulation_clock_ms();
             if !self.refresh_recovery_capacity(&mut state, wall, clock) {
@@ -3228,6 +3349,8 @@ impl UartComms {
             .map(|(id, _)| id);
         let canonical_receipt = radio_batch_control_contract(priority, payload)
             .and_then(|(id, receipt)| receipt.then_some(id));
+        // Judged on the SDK frame: below it is wrapped in the RR envelope.
+        let abort = is_abort_frame(payload);
         if self.recovery.is_some() {
             self.enable_radio_capacity_control();
         }
@@ -3274,6 +3397,10 @@ impl UartComms {
         }
         let capacity_wall = Instant::now();
         let capacity_clock = crate::simulation_clock_ms();
+        // ABORT is never held for an air turn (judged before the RR wrapping:
+        // the wrapped bytes are not an SDK frame, and the range fullnet's ABORT
+        // waited 0.4-1.5 s for the turn that way).
+        write_state.sync_turn(abort || mesh_write_bypasses_turn(payload, None), true);
         if !self.refresh_recovery_capacity(&mut write_state, capacity_wall, capacity_clock) {
             return Err(TelemetryError::HandlerError(
                 "recovery budget effective transport mismatch",
@@ -3660,12 +3787,24 @@ impl CommsDevice for UartComms {
 
     fn enable_radio_capacity_control(&mut self) {
         if matches!(self.protocol, SerialProtocol::RawUart) {
-            self.write_lock
-                .lock()
-                .unwrap()
+            // Air turns are the station's. An RRLS (its process, or its mesh
+            // role on this link) keeps its own pacing while it relays, and
+            // takes the station's turns while it has taken over the AV bay.
+            let relay_link = crate::rrls::is_rrls()
+                || self.recovery.as_ref().is_some_and(|shared| {
+                    shared.lock().unwrap().role != crate::rrls::Role::Primary
+                });
+            let mut state = self.write_lock.lock().unwrap();
+            state.relay_link = relay_link;
+            state
                 .radio_capacity
                 .get_or_insert_with(|| {
-                    let capacity = rfd_profile::capacity(self.baud_rate);
+                    let mut capacity = rfd_profile::capacity(self.baud_rate);
+                    // GS_RADIO_TURN_TAKING=0 keeps the untimed writer (the
+                    // profile still declares the cadence in its tuple).
+                    if std::env::var("GS_RADIO_TURN_TAKING").map_or(true, |v| v != "0") {
+                        capacity.enable_turn_gate();
+                    }
                     let (burst_ms, gap_ms) = capacity.packetization();
                     let (usable_air_bps, share_percent) = capacity.airtime_config();
                     log::info!("RFD UART pacing: baud={} usable_air_bps={usable_air_bps} initial_share_percent={share_percent} packet_burst_ms={burst_ms} packet_gap_ms={gap_ms} hardware_flow_control={}", self.baud_rate, self.hardware_flow_control);
@@ -3727,6 +3866,7 @@ impl CommsDevice for UartComms {
         }
         let wall = Instant::now();
         let clock = crate::simulation_clock_ms();
+        state.sync_turn(is_abort_frame(payload), true);
         if !self.refresh_recovery_capacity(&mut state, wall, clock) {
             trace_radio_gate_refusal("recovery_capacity", priority, payload, String::new);
             return false;
@@ -6168,6 +6308,377 @@ mod raw_uart_tests {
         tx.service_transmit().unwrap();
         assert_eq!(reader.join().unwrap().0, expected);
         assert!(shared.lock().unwrap().begin_transmission(0).is_none());
+    }
+
+    /// The station's air-turn gate holds ordinary frames until its turn, but
+    /// RR mesh control is never held: HEALTH keeps its 500 ms cadence while
+    /// the AV bay talks without a gap and while no AV-bay air is heard at all.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn health_leaves_every_500_ms_while_the_turn_gate_holds_ordinary_frames() {
+        if !cfg!(feature = "firmware_sim") {
+            crate::mode_suite!(Hitl);
+        }
+        const CHILD: &str = "GS_TURN_HEALTH_PTY_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::health_leaves_every_500_ms_while_the_turn_gate_holds_ordinary_frames";
+        let Some(variant) = std::env::var_os(CHILD) else {
+            for variant in ["chatty", "silent"] {
+                let clock = std::env::temp_dir()
+                    .join(format!("gs-turn-health-{variant}-{}.clock", std::process::id()));
+                std::fs::write(&clock, "30000").unwrap();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, variant)
+                    .env("GS_SIM_CLOCK_FILE", &clock)
+                    .env("GS_SIMULATED_SERIAL_PTY", "1")
+                    .env_remove("GS_RADIO_TURN_TAKING")
+                    .output()
+                    .unwrap();
+                let _ = std::fs::remove_file(clock);
+                assert!(
+                    output.status.success(),
+                    "{variant}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let chatty = variant == "chatty";
+        crate::telemetry_schema::initialize().unwrap();
+        let clock = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
+        let ordinary = serialize::pack_packet(
+            &Packet::new(
+                crate::telemetry_schema::data_type("FLIGHT_STATE"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "GS",
+                1,
+                std::sync::Arc::from([1u8]),
+            )
+            .unwrap(),
+        )
+        .to_vec();
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(1)).unwrap();
+        let (mut uart, mesh, _) = recovery_uart_fixture(port);
+        {
+            // The shipped profile's air: 200 ms turns, gate as on the station.
+            let mut capacity = rfd_capacity::Capacity::new(64000, 15, 16).with_turn_period(200);
+            capacity.enable_turn_gate();
+            uart.write_lock.lock().unwrap().radio_capacity = Some(capacity);
+        }
+        uart.enable_radio_capacity_control();
+        assert!(
+            uart.write_lock
+                .lock()
+                .unwrap()
+                .radio_capacity
+                .as_ref()
+                .is_some_and(|cap| cap.turn_gated()),
+            "the station's direct link runs with the turn gate on"
+        );
+        let mut writes = Vec::new();
+        let mut ordinary_open = 0;
+        let mut buf = [0u8; 512];
+        for now in (30_000u64..36_000).step_by(5) {
+            std::fs::write(&clock, now.to_string()).unwrap();
+            if chatty {
+                // AV-bay air every 5 ms: the 20 ms quiet gap never comes. The
+                // direct path is up (RF's window advertisements), so the
+                // primary is not relaying.
+                note_air_rx_now();
+                mesh.lock().unwrap().incoming(true, b"RS\x01\x00\x00\x00\x00\x00\x00", now);
+            }
+            if uart.transmit_ready_for(16, &ordinary) {
+                ordinary_open += 1;
+            }
+            uart.service_transmit().unwrap();
+            if matches!(peer.read(&mut buf), Ok(n) if n > 0) {
+                writes.push(now);
+                while matches!(peer.read(&mut buf), Ok(n) if n > 0) {}
+            }
+        }
+        if chatty {
+            assert_eq!(ordinary_open, 0, "ordinary frames wait for the AV bay's gap");
+        }
+        assert!(writes.len() >= 11, "HEALTH writes at {writes:?}");
+        let mut previous = 30_000;
+        for at in &writes {
+            assert!(at - previous <= 520, "HEALTH gap {}ms at {at}: {writes:?}", at - previous);
+            previous = *at;
+        }
+        assert!(36_000 - previous <= 520, "HEALTH stopped at {previous}: {writes:?}");
+    }
+
+    /// ABORT is never held for a turn, also when the radio writer pairs it
+    /// with another command (the levers fullnet: an operator ABORT sent as a
+    /// command pair waited 344 ms for the station's gap).
+    #[test]
+    fn abort_is_never_held_on_any_writer_path() {
+        crate::telemetry_schema::initialize().unwrap();
+        let pack = |name: &str, endpoint: &str, payload: &[u8]| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type(name),
+                    &[crate::telemetry_schema::endpoint(endpoint)],
+                    "GS",
+                    1,
+                    std::sync::Arc::from(payload),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let abort = pack("ABORT", "ABORT", b"SEDS_MANUAL_ABORT_V1:K");
+        let command = pack("FLIGHT_COMMAND", "FLIGHT_CONTROLLER", &[1]);
+        let other = pack("AV_BAY_UNDERGLOW", "AV_BAY_UNDERGLOW_OWNER", &[1]);
+        assert!(!command_pair_bypasses_turn(&[(255, &command), (255, &other)]));
+        assert!(command_pair_bypasses_turn(&[(255, &command), (255, &abort)]));
+        assert!(command_pair_bypasses_turn(&[(255, &abort), (255, &command)]));
+        // The single-frame SDK writer and its precheck: the frame itself.
+        assert!(is_abort_frame(&abort));
+        assert!(!is_abort_frame(&command));
+        // The mesh writer: an ABORT wrapped as AV-bay data, alone or coalesced
+        // with HEALTH, goes at once; ordinary data with HEALTH waits.
+        let wrap = |kind: u8, inner: &[u8]| {
+            let mut v = b"RR\x01".to_vec();
+            v.push(kind);
+            v.extend_from_slice(inner);
+            v.extend(crc32fast::hash(&v).to_le_bytes());
+            v
+        };
+        let health = wrap(0, &[0; 9]);
+        assert!(mesh_write_bypasses_turn(&wrap(5, &abort), None));
+        assert!(mesh_write_bypasses_turn(&wrap(2, &abort), None));
+        assert!(mesh_write_bypasses_turn(&health, Some(&wrap(5, &abort))));
+        assert!(mesh_write_bypasses_turn(&wrap(5, &abort), Some(&health)));
+        assert!(!mesh_write_bypasses_turn(&wrap(5, &command), None));
+        assert!(!mesh_write_bypasses_turn(&health, Some(&wrap(5, &other))));
+        assert!(mesh_write_bypasses_turn(&health, None));
+    }
+
+    /// The station's SDK writer wraps every frame in the RR envelope before the
+    /// turn gate. ABORT must be recognized on the SDK frame, not on the wrapped
+    /// bytes, or it waits for the station's turn (range fullnet: 0.4-1.5 s).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_abort_through_the_mesh_wrapped_sdk_writer_is_never_held() {
+        const CHILD: &str = "GS_TURN_ABORT_WRAPPED_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::an_abort_through_the_mesh_wrapped_sdk_writer_is_never_held";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env_remove("GS_RADIO_TURN_TAKING")
+                .env_remove("GS_SIM_CLOCK_FILE")
+                .env_remove("GS_SIMULATED_SERIAL_PTY")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let pack = |name: &str, endpoint: &str, payload: &[u8]| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type(name),
+                    &[crate::telemetry_schema::endpoint(endpoint)],
+                    "GS",
+                    1,
+                    std::sync::Arc::from(payload),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let abort = pack("ABORT", "ABORT", b"SEDS_MANUAL_ABORT_V1:K");
+        let ordinary = pack("FLIGHT_STATE", "FLIGHT_STATE", &[1]);
+        let (_peer, port) = serialport::TTYPort::pair().unwrap();
+        let (mut uart, mesh, _) = recovery_uart_fixture(port);
+        {
+            let mut capacity = rfd_capacity::Capacity::new(64000, 100, 16).with_turn_period(200);
+            capacity.enable_turn_gate();
+            uart.write_lock.lock().unwrap().radio_capacity = Some(capacity);
+        }
+        uart.enable_radio_capacity_control();
+        // The AV bay is mid-turn and the direct path is up.
+        let now = mesh.lock().unwrap().now();
+        mesh.lock().unwrap().incoming(true, b"RS\x01\x00\x00\x00\x00\x00\x00", now);
+        note_air_rx_now();
+        assert!(uart.send_data_with_priority(&ordinary, 16).is_err(), "ordinary data waits for the station's gap");
+        note_air_rx_now();
+        uart.send_data_with_priority(&abort, 255).expect("ABORT goes at once");
+    }
+
+    /// A standby RRLS's HOST_CONTROL (observe refresh, discovery) waits for
+    /// 20 ms of quiet air, at most 200 ms (rrls-txgap root cause: sent blind,
+    /// most met GS or RF air and were lost). Wall time: no simulation clock.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_standby_rrls_sends_host_control_in_quiet_air_within_a_bound() {
+        const CHILD: &str = "GS_TURN_RRLS_HOST_CONTROL_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::a_standby_rrls_sends_host_control_in_quiet_air_within_a_bound";
+        if std::env::var_os(CHILD).is_none() {
+            for variant in ["chatty", "quiet"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, variant)
+                    .env_remove("GS_RADIO_TURN_TAKING")
+                    .env_remove("GS_SIM_CLOCK_FILE")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{variant}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+        let chatty = std::env::var(CHILD).unwrap() == "chatty";
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(1)).unwrap();
+        let mesh = Arc::new(Mutex::new(crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 1)));
+        let mut uart = UartComms::test_mesh_pty(port, mesh.clone());
+        {
+            let mut capacity = rfd_capacity::Capacity::new(64000, 100, 16).with_turn_period(200);
+            capacity.enable_turn_gate();
+            uart.write_lock.lock().unwrap().radio_capacity = Some(capacity);
+        }
+        uart.enable_radio_capacity_control();
+        crate::rrls::set_takeover_for_test(false);
+        let mut payload = vec![0; 132];
+        payload[..4].copy_from_slice(b"CP\x01\x00");
+        {
+            let mut mesh = mesh.lock().unwrap();
+            let now = mesh.now();
+            assert!(mesh.queue_command_proxy(&payload, now));
+        }
+        let start = Instant::now();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 512];
+        let sent = loop {
+            // GS or RF bytes heard every 5 ms (chatty), or none after 50 ms.
+            if chatty || start.elapsed() < Duration::from_millis(50) {
+                note_air_rx_now();
+            }
+            uart.flush_recovery_output(0).unwrap();
+            while let Ok(n) = peer.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            if out.windows(4).any(|w| w == b"RR\x01\x0b") {
+                break start.elapsed();
+            }
+            assert!(start.elapsed() < Duration::from_millis(600), "HOST_CONTROL never sent");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        if chatty {
+            assert!(sent >= Duration::from_millis(195), "waited only {sent:?} on busy air");
+            assert!(sent <= Duration::from_millis(300), "bounded wait, sent at {sent:?}");
+        } else {
+            assert!(sent >= Duration::from_millis(65), "sent {sent:?}: before 20 ms of quiet air");
+            assert!(sent <= Duration::from_millis(150), "sent {sent:?}: quiet air must not wait for the bound");
+        }
+    }
+
+    /// An RRLS keeps its own pacing while it relays (its own frames only wait,
+    /// at most 200 ms, for quiet air), but during a takeover it transmits
+    /// AV-bay traffic itself and takes the station's air turns.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_rrls_takes_air_turns_only_while_it_has_taken_over_the_av_bay() {
+        const CHILD: &str = "GS_TURN_RRLS_TAKEOVER_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::an_rrls_takes_air_turns_only_while_it_has_taken_over_the_av_bay";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env_remove("GS_SIM_CLOCK_FILE")
+                .env_remove("GS_RADIO_TURN_TAKING")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let packet = |name: &str| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type(name),
+                    &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                    "GS",
+                    1,
+                    std::sync::Arc::from([1u8]),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let ordinary = packet("FLIGHT_STATE");
+        let abort = packet("ABORT");
+        let (_peer, port) = serialport::TTYPort::pair().unwrap();
+        let mesh = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 1);
+        let mut uart = UartComms::test_mesh_pty(port, Arc::new(Mutex::new(mesh)));
+        {
+            let mut capacity = rfd_capacity::Capacity::new(64000, 15, 16).with_turn_period(200);
+            capacity.enable_turn_gate();
+            uart.write_lock.lock().unwrap().radio_capacity = Some(capacity);
+        }
+        uart.enable_radio_capacity_control();
+        let tuple = |uart: &UartComms| {
+            uart.write_lock.lock().unwrap().radio_capacity.as_ref().unwrap().turn_flags()
+        };
+        // The profile tuple declares the cadence either way: relaying and
+        // takeover negotiate the same budget with RF.
+        let declared = tuple(&uart);
+        assert_eq!(declared, crate::rrls::budget_negotiation::Profile::TURN_CADENCE);
+        // Wall time throughout (no simulation clock in this child).
+        let step = |uart: &UartComms, takeover: bool| {
+            // The AV bay transmits without a gap.
+            note_air_rx_now();
+            crate::rrls::set_takeover_for_test(takeover);
+            (uart.transmit_ready_for(16, &ordinary), uart.transmit_ready_for(16, &abort))
+        };
+        // Relaying (standby): its own frames wait for quiet air, at most
+        // 200 ms; ABORT never waits.
+        let held = Instant::now();
+        let waited = loop {
+            let (own, abort) = step(&uart, false);
+            assert!(abort, "ABORT is never held");
+            if own {
+                break held.elapsed();
+            }
+            assert!(held.elapsed() < Duration::from_millis(400), "own frame held past its bound");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(waited >= Duration::from_millis(195), "own frames wait for quiet air: {waited:?}");
+        for _ in 0..200 {
+            assert_eq!(step(&uart, true), (false, true), "in takeover: ordinary frames wait for the gap, ABORT never");
+        }
+        assert_eq!(tuple(&uart), declared);
+        // Hand-back: relaying again; quiet air sends at once.
+        assert_eq!(step(&uart, false).1, true);
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            uart.transmit_ready_for(16, &ordinary),
+            "20 ms of quiet air: {}",
+            uart.write_lock.lock().unwrap().radio_capacity.as_ref().unwrap().hold_detail(Instant::now(), crate::simulation_clock_ms())
+        );
+        crate::rrls::set_takeover_for_test(false);
     }
 
     #[test]

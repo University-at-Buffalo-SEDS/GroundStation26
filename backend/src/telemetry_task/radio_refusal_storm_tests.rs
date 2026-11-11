@@ -1163,6 +1163,25 @@ fn receipts_and_time_sync_go_ahead_of_own_ordered_retransmits() {
     assert_eq!(order.len(), 11);
 }
 
+/// Takeover fullnet (turn-taking): a BOARD_RECOVERY_REQUEST queued ahead of
+/// an operator ABORT was held for the station's air turn and, at the head of
+/// the critical lane, kept the ABORT (never held for a turn) queued 260 ms.
+#[test]
+fn abort_leaves_the_critical_lane_ahead_of_an_earlier_control() {
+    crate::telemetry_schema::initialize().unwrap();
+    let pack = |ty: sedsnet::config::DataType, endpoint: sedsnet::config::DataEndpoint, stamp: u64, payload: Vec<u8>| {
+        serialize::pack_packet(&Packet::new(ty, &[endpoint], "GS", stamp, Arc::from(payload)).unwrap()).to_vec()
+    };
+    let request = pack(crate::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST"),
+        crate::telemetry_schema::endpoint("BOARD_RECOVERY_RF"), 1, vec![1; 32]);
+    let abort = pack(crate::telemetry_schema::data_type("ABORT"), crate::telemetry_schema::endpoint("ABORT"), 2,
+        b"SEDS_MANUAL_ABORT_V1:K".to_vec());
+    let mut backlog = WireBacklog::new(true);
+    backlog.push(255, request.clone(), false);
+    backlog.push(255, abort.clone(), false);
+    assert_eq!(backlog.pop_critical().map(|(_, b)| b), Some(abort), "ABORT first");
+}
+
 /// Faithful (GS dev 93b8401, newest firmware, S5=1): RF/FC/PB re-anchored
 /// to TIME_SYNC_ANNOUNCE frames that reached the air seconds to tens of
 /// seconds after creation (park about 50 KB), so after about 100 s the AV
