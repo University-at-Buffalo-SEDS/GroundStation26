@@ -51,6 +51,13 @@ fn completed(owner: &Observer) {
         std::thread::yield_now();
     }
 }
+/// The observer has one global worker with a one-job queue and one test
+/// pause slot, so a request made while another test's job holds the worker
+/// is dropped. The tests in this file therefore run one at a time.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 fn causal_export_change(reconnect: bool) {
     let (router, side) = actual_peer_router();
     let owner = Arc::new(Observer::default());
@@ -86,14 +93,17 @@ fn causal_export_change(reconnect: bool) {
 }
 #[test]
 fn causal_reconnect_during_actual_sdk_exports_does_not_restamp_old_route() {
+    let _serial = serial();
     causal_export_change(true);
 }
 #[test]
 fn causal_local_error_during_actual_sdk_exports_does_not_restamp_old_route() {
+    let _serial = serial();
     causal_export_change(false);
 }
 #[tokio::test]
 async fn causal_invalid_input_and_data_do_not_hard_latch_an_unsupported_side() {
+    let _serial = serial();
     for kind in [
         std::io::ErrorKind::InvalidInput,
         std::io::ErrorKind::InvalidData,
@@ -116,6 +126,7 @@ async fn causal_invalid_input_and_data_do_not_hard_latch_an_unsupported_side() {
 }
 #[test]
 fn late_capture_cannot_publish_as_fresh_and_reads_never_renew_capture_age() {
+    let _serial = serial();
     let (router, side) = actual_peer_router();
     let owner = Arc::new(Observer::default());
     owner.register_connection(side, Some(Arc::new(AtomicU64::new(1))));
@@ -146,6 +157,7 @@ fn late_capture_cannot_publish_as_fresh_and_reads_never_renew_capture_age() {
 }
 #[test]
 fn live_connection_fences_are_side_bound_and_old_tokens_cannot_cross_reconnects() {
+    let _serial = serial();
     let (router, side) = actual_peer_router();
     let owner = Arc::new(Observer::default());
     let failed = Arc::new(AtomicU64::new(1));
@@ -175,6 +187,7 @@ fn live_connection_fences_are_side_bound_and_old_tokens_cannot_cross_reconnects(
 }
 #[test]
 fn context_overflow_and_unknown_side_fail_closed() {
+    let _serial = serial();
     let (router, _) = actual_peer_router();
     let owner = Arc::new(Observer::default());
     owner.epoch.store(u64::MAX, Ordering::Release);
