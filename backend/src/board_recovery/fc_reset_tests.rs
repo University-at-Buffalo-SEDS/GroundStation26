@@ -210,3 +210,66 @@ fn fc_reset_policy_for_every_fc_phase() {
     assert_eq!(fc_reset_any_state_policy(None, false), FcResetPolicy::Allowed { warning: None });
     assert!(!FC_RESET_REFUSE_BEFORE_AUTOMATIC_DEPLOY, "the contract default allows every phase");
 }
+
+/// Bench, 2026-11-11 (HITL): after an operator deploy the FC reports Descent.
+/// One Reset all boards un-sticks both: the FC gets its op-3 any-state reset
+/// (deployment history kept, no Abort first) and the station ends Idle.
+#[tokio::test]
+async fn hitl_reset_all_resets_an_fc_left_in_descent_with_operation_3() {
+    crate::mode_suite!(Hitl);
+    if isolated("hitl_reset_all_resets_an_fc_left_in_descent_with_operation_3") {
+        return;
+    }
+    let f = Fixture::new().await;
+    let state = f.state();
+    *state.state.lock().unwrap() = crate::types::FlightState::InFlight;
+    let model = fc_reset_model(&f);
+    {
+        let mut m = model.lock().unwrap();
+        m.reset_any = true;
+        m.state = crate::types::FlightState::Descent as u8;
+    }
+    for board in BOARDS {
+        f.query(board).await;
+    }
+    let ticket = f.prepare("reset_startup", None).await;
+    assert!(ticket["summary"].as_str().unwrap().contains("flight computer is reset from Descent"), "{ticket}");
+    assert_eq!(f.confirm(&ticket).await.status(), StatusCode::OK);
+    let op = f.terminal().await;
+    assert_eq!(op["success"], true, "{op}");
+    let m = model.lock().unwrap();
+    assert_eq!(m.state, 0, "FC back in Startup");
+    let writes: Vec<_> = m.requests.iter().filter(|p| p.payload()[1] != 0).collect();
+    assert!(!writes.is_empty() && writes.iter().all(|p| p.payload()[1] == 3), "FC gets operation 3 only");
+    drop(m);
+    assert_eq!(state.local_flight_state_snapshot(), crate::types::FlightState::Idle, "station Idle after the HITL reset");
+}
+
+/// The same HITL Reset all refuses, with the reason, while a pulse runs.
+#[tokio::test]
+async fn hitl_reset_all_refuses_while_the_fc_pulses() {
+    crate::mode_suite!(Hitl);
+    if isolated("hitl_reset_all_refuses_while_the_fc_pulses") {
+        return;
+    }
+    let f = Fixture::new().await;
+    *f.state().state.lock().unwrap() = crate::types::FlightState::InFlight;
+    {
+        let model = fc_reset_model(&f);
+        let mut m = model.lock().unwrap();
+        m.reset_any = true;
+        m.pulse_active = true;
+        m.state = crate::types::FlightState::Descent as u8;
+    }
+    for board in BOARDS {
+        f.query(board).await;
+    }
+    let state = f.state();
+    let response = super::super::tests::http(state.clone(), "POST", "/api/board-recovery/prepare", Some("operator"),
+        json!({"action":"reset_startup","boards":BOARDS.iter().map(|b|b.sender_id()).collect::<Vec<_>>(),"board":null,"mode":null,
+            "backend_instance":hex(&state.board_recovery.identity.unwrap()),
+            "reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state))})).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let value = body(response).await;
+    assert!(value.to_string().contains("A deploy is in progress"), "{value}");
+}
