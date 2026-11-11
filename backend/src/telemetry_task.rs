@@ -125,7 +125,7 @@ pub(crate) fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
     })
 }
 
-const OPERATOR_MODE_FLIGHT_STATE_ORDER: [FlightState; 16] = [
+const OPERATOR_MODE_FLIGHT_STATE_ORDER: [FlightState; 17] = [
     FlightState::Startup,
     FlightState::Idle,
     FlightState::PreFill,
@@ -139,6 +139,7 @@ const OPERATOR_MODE_FLIGHT_STATE_ORDER: [FlightState; 16] = [
     FlightState::Apogee,
     FlightState::Descent,
     FlightState::Reefing,
+    FlightState::InFlight,
     FlightState::Landed,
     FlightState::Recovery,
     FlightState::Aborted,
@@ -2532,8 +2533,14 @@ async fn handle_packet_inner(
                 return Vec::new();
             }
         };
-        let new_flight_state = match u8_to_flight_state(pkt_data) {
-            Some(flight_state) => flight_state,
+        // Set (a) only; a retired value from old firmware maps to its nearest
+        // network value and is logged once. A network value equal to the
+        // current one keeps the GS-internal detail (the fill sub-phase).
+        let new_flight_state = match crate::types::network_flight_state_from_wire(pkt_data, &sender_id) {
+            Some(network) => {
+                let current = state.local_flight_state_snapshot();
+                if current.network() == network { current } else { network.local() }
+            }
             None => {
                 report_parse_error(
                     state,
@@ -2575,6 +2582,11 @@ async fn handle_packet_inner(
         // historical observations. They are not authoritative FlightState
         // events and cannot update the aggregate, clock or desired JSON.
         let retired_ingress = receive_generation != crate::gse::automatic_generation(state);
+        // The FC's own report feeds its detailed phase (shown beside "In
+        // flight") whether or not it moves the station's state.
+        if fc && !retired_ingress && !self_echo {
+            crate::fc_phase::observe(state, pkt_data, crate::fc_phase::Source::FcFlightState, pkt.timestamp() as i64);
+        }
         if retired_ingress || ((self_echo || (gs && primary_role))
             && procedure_clock::now().model_monotonic_ms().is_some())
         {
@@ -2608,7 +2620,6 @@ async fn handle_packet_inner(
                 values: vec![Some(pkt_data as f32)],
             }];
         }
-        let accepted_previous;
         {
             let mut fs = state.state.lock().unwrap();
             // The original snapshot is not final authority across a local Stop
@@ -2624,16 +2635,12 @@ async fn handle_packet_inner(
                     values: vec![Some(pkt_data as f32)],
                 }];
             }
-            accepted_previous = *fs;
             *fs = new_flight_state;
         }
-        if fc {
-            crate::recovery_events::observe_fc_state(
-                state,
-                accepted_previous,
-                new_flight_state,
-                pkt.timestamp() as i64,
-            );
+        // Deployments follow the FC's detailed phase (fc_phase); an accepted
+        // prelaunch report still starts a new deployment cycle.
+        if fc && (new_flight_state as u8) <= FlightState::Armed as u8 {
+            crate::recovery_events::rearm_for_new_cycle(state);
         }
         let purpose = procedure_clock::now();
         let explicit_model = purpose.model_monotonic_ms().is_some();
@@ -5510,7 +5517,11 @@ mod tests {
         );
         assert!(remote_result.is_ok(), "timed out waiting for remote flight state: expected={expected_states:?}, actual={:?}", remote_states.lock().expect("failed to lock remote states"));
         let states = remote_states.lock().expect("failed to lock remote states");
-        assert_eq!(states.as_slice(), expected_states.as_slice());
+        // The wire carries the network value (set (a)): fill sub-phases are Fill.
+        let expected_wire = expected_states.iter()
+            .map(|code| crate::types::u8_to_flight_state(*code).unwrap().network() as u8)
+            .collect::<Vec<_>>();
+        assert_eq!(states.as_slice(), expected_wire.as_slice());
     }
 
     #[tokio::test]
@@ -5978,6 +5989,7 @@ mod tests {
             launch_mode_gate: Default::default(),
             launch_indicator_latched: Arc::new(AtomicBool::new(false)),
             abort_indicator_latched: Arc::new(AtomicBool::new(false)),
+            fc_phase: Default::default(),
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_safety_interlocks: crate::state::default_hitl_safety_interlocks(),
@@ -7581,7 +7593,10 @@ mod tests {
         )
         .unwrap();
         handle_packet(&state, &db_tx, &overflow, packet).await;
-        assert_eq!(state.local_flight_state_snapshot(), FlightState::Ascent);
+        // Old FC firmware's retired Ascent (8) is the network InFlight; its
+        // detail stays the FC's own phase beside it.
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::InFlight);
+        assert_eq!(state.fc_phase.snapshot().map(|seen| seen.phase), Some(FlightState::Ascent));
     }
 
     #[tokio::test]

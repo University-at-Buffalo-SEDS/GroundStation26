@@ -149,7 +149,8 @@ async fn complete_live_phase_chain_preserves_canonical_json_and_original_ids() {
         assert_eq!(state.local_flight_state_snapshot(), phase);
         let packet = cached(&router).unwrap();
         peer.accept(&router, &packet).await;
-        assert_eq!(packet.payload(), &[phase as u8]);
+        // The wire carries the network value: every fill sub-phase is Fill.
+        assert_eq!(packet.payload(), &[phase.network() as u8]);
         assert!(
             ids.insert(packet.packet_id()),
             "each accepted original has its own immutable identity"

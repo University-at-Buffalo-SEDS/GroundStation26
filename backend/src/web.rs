@@ -603,7 +603,7 @@ async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
 pub enum WsOutMsg {
     TelemetryBatch(Vec<TelemetryRow>),
     Warning(WarningMsg),
-    FlightState(FlightStateMsg),
+    FlightState(FlightStateWire),
     MissionPhase(crate::mission_phase::MissionPhaseMsg),
     FlightMaxima(crate::flight_maxima::FlightMaxima),
     LaunchClock(LaunchClockMsg),
@@ -631,6 +631,32 @@ pub enum WsOutMsg {
 #[derive(Clone, Serialize)]
 pub struct FlightStateMsg {
     pub state: FlightState,
+}
+
+/// The WebSocket `FlightState` message under the state-split contract:
+/// `state` is the network-level value (set (a)), the GS-only fill sub-phase
+/// and the FC's detailed phase ride beside it.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct FlightStateWire {
+    pub state: crate::types::NetworkFlightState,
+    pub label: &'static str,
+    pub fill_phase: Option<FlightState>,
+    pub fill_phase_label: Option<&'static str>,
+    pub fc_phase: Option<crate::fc_phase::FcPhaseDto>,
+}
+
+impl FlightStateWire {
+    pub fn new(local: FlightState, state: &AppState) -> Self {
+        let network = local.network();
+        let fill_phase = crate::mission_phase::fill_phase(local);
+        Self {
+            state: network,
+            label: network.label(),
+            fill_phase,
+            fill_phase_label: fill_phase.map(crate::mission_phase::detailed_label),
+            fc_phase: state.fc_phase.dto(crate::telemetry_task::get_current_timestamp_ms()),
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -1801,7 +1827,7 @@ async fn get_flight_state(
     // overwrite the authoritative runtime state with an invented Startup.
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
-        Json(state.local_flight_state_snapshot()),
+        Json(FlightStateWire::new(state.local_flight_state_snapshot(), &state)),
     )
         .into_response()
 }
@@ -1862,10 +1888,12 @@ mod live_flight_state_tests {
         .unwrap();
         Arc::get_mut(&mut state).unwrap().auth =
             Arc::new(crate::auth::AuthManager::new(auth_path.clone()));
-        for expected in [
-            FlightState::Descent,
-            FlightState::Startup,
-            FlightState::Armed,
+        for (expected, network, fill) in [
+            (FlightState::Descent, "InFlight", None),
+            (FlightState::InFlight, "InFlight", None),
+            (FlightState::Startup, "Startup", None),
+            (FlightState::NitrousFill, "Fill", Some("NitrousFill")),
+            (FlightState::Armed, "Armed", None),
         ] {
             *state.state.lock().unwrap() = expected;
             let response = get_flight_state(State(state.clone()), HeaderMap::new())
@@ -1879,10 +1907,10 @@ mod live_flight_state_tests {
             let body = axum::body::to_bytes(response.into_body(), 1024)
                 .await
                 .unwrap();
-            assert_eq!(
-                serde_json::from_slice::<FlightState>(&body).unwrap(),
-                expected
-            );
+            // Network-level state (set (a)); the fill sub-phase rides beside it.
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["state"], network, "{expected:?}");
+            assert_eq!(body["fill_phase"].as_str(), fill, "{expected:?}");
         }
         std::fs::remove_file(auth_path).unwrap();
     }
@@ -5232,9 +5260,10 @@ async fn handle_ws(
         if ws_out_tx.send(initial_action_policy).await.is_err() {
             return;
         }
-        let initial_flight_state = serde_json::to_string(&WsOutMsg::FlightState(FlightStateMsg {
-            state: state_for_send.local_flight_state_snapshot(),
-        }))
+        let initial_flight_state = serde_json::to_string(&WsOutMsg::FlightState(FlightStateWire::new(
+            state_for_send.local_flight_state_snapshot(),
+            &state_for_send,
+        )))
         .unwrap_or_default();
         if ws_out_tx.send(initial_flight_state).await.is_err() {
             return;
@@ -5461,16 +5490,17 @@ async fn handle_ws(
                 recv = state_rx.recv() => {
                     match recv {
                         Ok(fs) => {
-                            let msg = WsOutMsg::FlightState(fs);
+                            let msg = WsOutMsg::FlightState(FlightStateWire::new(fs.state, &state_for_send));
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
                                 break;
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            let msg = WsOutMsg::FlightState(FlightStateMsg {
-                                state: state_for_send.local_flight_state_snapshot(),
-                            });
+                            let msg = WsOutMsg::FlightState(FlightStateWire::new(
+                                state_for_send.local_flight_state_snapshot(),
+                                &state_for_send,
+                            ));
                             let text = serde_json::to_string(&msg).unwrap_or_default();
                             if ws_out_tx.send(text).await.is_err() {
                                 break;

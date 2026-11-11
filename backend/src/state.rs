@@ -357,6 +357,8 @@ pub struct AppState {
 
     /// True after any abort path has triggered until process restart.
     pub abort_indicator_latched: Arc<AtomicBool>,
+    /// The FC's detailed phase from its own state report (shown beside "In flight").
+    pub fc_phase: Arc<crate::fc_phase::Tracker>,
 
     pub hitl_button_interlock_enabled: Arc<AtomicBool>,
 
@@ -2686,8 +2688,8 @@ fn launch_clock_for_transition(
             current.clone()
         }
         FlightState::Launch => launch_countdown_clock(timestamp_ms),
-        FlightState::Ascent if current.kind == LaunchClockKind::TPlus => current.clone(),
-        FlightState::Ascent => LaunchClockMsg {
+        FlightState::Ascent | FlightState::InFlight if current.kind == LaunchClockKind::TPlus => current.clone(),
+        FlightState::Ascent | FlightState::InFlight => LaunchClockMsg {
             kind: LaunchClockKind::TPlus,
             anchor_timestamp_ms: Some(t_plus_anchor_timestamp(current, timestamp_ms)),
             duration_ms: None,
@@ -2837,7 +2839,8 @@ pub(crate) mod tests {
             })
             .unwrap();
         let path = std::path::PathBuf::from(std::env::var_os("GS_NETWORK_VARIABLE_CACHE").unwrap());
-        for (index, code) in std::iter::once(1u8).chain(0u8..=15).enumerate() {
+        // The primary sends only set (a).
+        for (index, code) in [1u8, 0, 1, 2, 6, 7, 13, 15, 16].into_iter().enumerate() {
             let packet = Packet::new(
                 ty,
                 &[crate::telemetry_schema::endpoint("FLIGHT_STATE")],
@@ -4474,6 +4477,7 @@ pub(crate) mod tests {
             launch_mode_gate: Default::default(),
             launch_indicator_latched: Arc::new(AtomicBool::new(false)),
             abort_indicator_latched: Arc::new(AtomicBool::new(false)),
+            fc_phase: Default::default(),
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_safety_interlocks: default_hitl_safety_interlocks(),
@@ -4807,9 +4811,10 @@ pub(crate) mod tests {
         }
 
         let states = remote_states.lock().expect("failed to lock remote states");
+        // Fill sub-phases stay in the station: the network sees Fill (2).
         let expected = sequence
             .iter()
-            .map(|state| *state as u8)
+            .map(|state| state.network() as u8)
             .collect::<Vec<_>>();
         assert_eq!(states.as_slice(), expected.as_slice());
         assert_eq!(remote_deliveries.load(Ordering::Relaxed), sequence.len());

@@ -385,6 +385,7 @@ async fn safety_loop(
                 | FlightState::Apogee
                 | FlightState::Descent
                 | FlightState::Reefing
+                | FlightState::InFlight
                 | FlightState::Landed
                 | FlightState::Recovery
                 | FlightState::Aborted

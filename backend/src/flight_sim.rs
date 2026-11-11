@@ -339,6 +339,7 @@ fn valve_board_disconnected_for_state(state: FlightState) -> bool {
             | FlightState::Apogee
             | FlightState::Descent
             | FlightState::Reefing
+            | FlightState::InFlight
             | FlightState::Landed
             | FlightState::Recovery
     )
@@ -420,7 +421,11 @@ impl FlightSimState {
         }
         self.flight_state = fs;
         if crate::runtime_mode::is_testing() {
-            for board in crate::testing_board_lifecycle::BOARDS{self.recovery.note_state(board,fs as u8);}
+            // The FC reports its detailed phase in its own readback; every
+            // other board only ever holds the network value.
+            for board in crate::testing_board_lifecycle::BOARDS{
+                self.recovery.note_state(board,if board==Board::FlightComputer{fs as u8}else{fs.network() as u8});
+            }
         }
         if !matches!(fs, FlightState::FillTest) {
             self.saw_dump_open_after_n2 = false;
@@ -444,6 +449,9 @@ impl FlightSimState {
         } else {
             (self.flight_state as u8,now_ms)
         };
+        // The FC's FLIGHT_STATE carries only set (a): its detailed phase goes
+        // out as InFlight or Landed (state-split contract).
+        let published=crate::types::u8_to_flight_state(published).map_or(published,|state|state.network() as u8);
         if let Ok(pkt) = Packet::new(
             crate::telemetry_schema::data_type("FLIGHT_STATE"),
             &[

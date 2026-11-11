@@ -1,0 +1,15 @@
+{
+  "data": {
+    "fc_phase": {
+      "age_ms": 0,
+      "label": "Descent",
+      "source": "fc_state_report",
+      "value": 11
+    },
+    "fill_phase": null,
+    "fill_phase_label": null,
+    "label": "In flight",
+    "state": "InFlight"
+  },
+  "ty": "FlightState"
+}

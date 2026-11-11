@@ -4,8 +4,9 @@
 //! - an `ORDERED_MESSAGE` text sent from `release_parachute`/`expand_parachute`
 //!   right before the pulse: "PD approx altitude: <m>" (drogue) and
 //!   "PR approx altitude: <m>" (main/reef);
-//! - the next `FLIGHT_STATE`: Apogee->Descent (drogue) and Descent->Reefing
-//!   (main).
+//! - the FC's detailed phase (`fc_phase`, from its own state report):
+//!   Apogee->Descent (drogue) and Descent->Reefing (main). The network
+//!   FLIGHT_STATE carries only InFlight for all of these.
 //!
 //! Whichever arrives first raises one notification per deployment and launch
 //! cycle; the other is folded into it. The message carries the FC's own
@@ -63,7 +64,10 @@ pub fn parse_fc_message(text: &str) -> Option<(Deployment, f64)> {
 /// GS can miss intermediate reports in flight: Apogee -> Reefing still means
 /// both parachutes deployed.
 pub fn deployments_for_transition(previous: FlightState, next: FlightState) -> Vec<Deployment> {
-    let (prev, next) = (previous as u8, next as u8);
+    // InFlight is the FC flying with its detailed phase not yet reported:
+    // it ranks just after Launch, before any deployment edge.
+    let rank = |s: FlightState| if s == FlightState::InFlight { FlightState::Launch as u8 } else { s as u8 };
+    let (prev, next) = (rank(previous), rank(next));
     let in_flight = |s: u8| (FlightState::Launch as u8..=FlightState::Recovery as u8).contains(&s);
     if !in_flight(prev) || !in_flight(next) || next <= prev {
         return Vec::new();
@@ -252,6 +256,10 @@ mod tests {
         assert!(deployments_for_transition(S::Reefing, S::Descent).is_empty());
         assert!(deployments_for_transition(S::Ascent, S::Apogee).is_empty());
         assert!(deployments_for_transition(S::Landed, S::Recovery).is_empty());
+        // InFlight (no detail yet) ranks just after Launch.
+        assert_eq!(deployments_for_transition(S::InFlight, S::Descent), vec![Deployment::Drogue]);
+        assert!(deployments_for_transition(S::Launch, S::InFlight).is_empty());
+        assert!(deployments_for_transition(S::Apogee, S::InFlight).is_empty());
     }
 
     #[tokio::test]

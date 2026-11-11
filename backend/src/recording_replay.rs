@@ -555,7 +555,7 @@ async fn flight_snapshot_from(db: &SqlitePool) -> anyhow::Result<FlightSnapshot>
     let snapshot = snapshot_from(db).await?;
     // Repeated phase samples are not repeated launches. Select the latest
     // actual saved transition into Ascent, with Launch as a pre-ascent fallback.
-    let row=sqlx::query("WITH flight AS (SELECT id,timestamp_ms,CASE WHEN json_valid(values_json) THEN json_extract(values_json,'$[0]') END AS phase FROM telemetry WHERE id <= ? AND sender_id='FC' AND data_type='FLIGHT_STATE'), edges AS (SELECT *,LAG(phase) OVER(ORDER BY id) AS previous FROM flight) SELECT id,timestamp_ms FROM edges WHERE phase IN (7,8) AND (previous IS NULL OR previous != phase) ORDER BY id DESC LIMIT 1")
+    let row=sqlx::query("WITH flight AS (SELECT id,timestamp_ms,CASE WHEN json_valid(values_json) THEN json_extract(values_json,'$[0]') END AS phase FROM telemetry WHERE id <= ? AND sender_id='FC' AND data_type='FLIGHT_STATE'), edges AS (SELECT *,LAG(phase) OVER(ORDER BY id) AS previous FROM flight) SELECT id,timestamp_ms FROM edges WHERE phase IN (7,8,16) AND (previous IS NULL OR previous != phase) ORDER BY id DESC LIMIT 1")
         .bind(snapshot.upper_id).fetch_optional(db).await?;
     let first_id = row
         .as_ref()
@@ -708,6 +708,19 @@ mod tests {
             flight_snapshot_from(&db).await.is_err(),
             "overlappingwallclockepochs mustnotmixdifferentflights"
         );
+    }
+    /// The FC now reports InFlight (16) for Ascent..Reefing.
+    #[tokio::test]
+    async fn flight_selection_starts_at_the_network_in_flight_value() {
+        let db = db().await;
+        insert(&db, 1000, "ROLL", "[1]").await;
+        insert(&db, 5000, "FLIGHT_STATE", "[7]").await;
+        insert(&db, 6000, "FLIGHT_STATE", "[16]").await;
+        insert(&db, 7000, "FLIGHT_STATE", "[16]").await;
+        insert(&db, 10000, "FLIGHT_STATE", "[13]").await;
+        let bounds = flight_snapshot_from(&db).await.unwrap();
+        assert!(bounds.flight_detected);
+        assert_eq!(bounds.start_ms, Some(6000));
     }
     #[tokio::test]
     async fn replay_http_routes_authorize_and_read_only_the_selected_recording() {

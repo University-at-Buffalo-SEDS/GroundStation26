@@ -246,6 +246,130 @@ pub enum FlightState {
     Landed = 13,
     Recovery = 14,
     Aborted = 15,
+    /// The FC is flying (its Ascent..Reefing). Network value 16; the FC's
+    /// detailed phase reaches the GS only through its own state report.
+    InFlight = 16,
+}
+
+/// The only FLIGHT_STATE values that may ever be on the network (the
+/// state-split contract, set (a)). Every GS FLIGHT_STATE write is built from
+/// one of these; fill sub-phases and turbocharge stay GS-internal.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash)]
+#[repr(u8)]
+pub enum NetworkFlightState {
+    Startup = 0,
+    Idle = 1,
+    Fill = 2,
+    Armed = 6,
+    Launch = 7,
+    Landed = 13,
+    Aborted = 15,
+    InFlight = 16,
+}
+
+impl NetworkFlightState {
+    pub const ALL: [NetworkFlightState; 8] = [
+        Self::Startup, Self::Idle, Self::Fill, Self::Armed,
+        Self::Launch, Self::Landed, Self::Aborted, Self::InFlight,
+    ];
+    /// A set-(a) wire byte; retired and unknown values are None.
+    pub fn from_u8(value: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|state| *state as u8 == value)
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Startup => "Startup",
+            Self::Idle => "Idle",
+            Self::Fill => "Fill",
+            Self::Armed => "Armed",
+            Self::Launch => "Launch",
+            Self::Landed => "Landed",
+            Self::Aborted => "Aborted",
+            Self::InFlight => "In flight",
+        }
+    }
+    /// The GS-internal state a received network value means when the GS has
+    /// no finer detail of its own: Fill starts at PreFill.
+    pub fn local(self) -> FlightState {
+        match self {
+            Self::Startup => FlightState::Startup,
+            Self::Idle => FlightState::Idle,
+            Self::Fill => FlightState::PreFill,
+            Self::Armed => FlightState::Armed,
+            Self::Launch => FlightState::Launch,
+            Self::Landed => FlightState::Landed,
+            Self::Aborted => FlightState::Aborted,
+            Self::InFlight => FlightState::InFlight,
+        }
+    }
+}
+
+impl FlightState {
+    /// What this GS-internal (or FC-detailed) state is on the network.
+    pub fn network(self) -> NetworkFlightState {
+        use FlightState as F;
+        match self {
+            F::Startup => NetworkFlightState::Startup,
+            F::Idle => NetworkFlightState::Idle,
+            F::PreFill | F::FillTest | F::NitrogenFill | F::NitrousFill => NetworkFlightState::Fill,
+            F::Armed => NetworkFlightState::Armed,
+            F::Launch => NetworkFlightState::Launch,
+            F::Ascent | F::Coast | F::Apogee | F::Descent | F::Reefing | F::InFlight => {
+                NetworkFlightState::InFlight
+            }
+            F::Landed | F::Recovery => NetworkFlightState::Landed,
+            F::Aborted => NetworkFlightState::Aborted,
+        }
+    }
+    /// The GS-only fill sub-phase, None outside Fill.
+    pub fn fill_phase(self) -> Option<FlightState> {
+        matches!(self, FlightState::PreFill | FlightState::FillTest
+            | FlightState::NitrogenFill | FlightState::NitrousFill).then_some(self)
+    }
+    /// Ascent..Reefing, or InFlight when the FC's detailed phase is unknown.
+    pub fn is_in_flight(self) -> bool {
+        self.network() == NetworkFlightState::InFlight
+    }
+}
+
+/// A received FLIGHT_STATE byte under the state-split contract. A retired
+/// value from old firmware (3-5, 8-12, 14) maps to the nearest network value
+/// and is logged once per value as a contract violation; unknown values are
+/// None.
+pub fn network_flight_state_from_wire(value: u8, sender: &str) -> Option<NetworkFlightState> {
+    if let Some(state) = NetworkFlightState::from_u8(value) {
+        return Some(state);
+    }
+    let mapped = match value {
+        3..=5 => NetworkFlightState::Fill,
+        8..=12 => NetworkFlightState::InFlight,
+        14 => NetworkFlightState::Landed,
+        _ => return None,
+    };
+    note_retired_flight_state(value, sender, mapped);
+    Some(mapped)
+}
+
+static RETIRED_FLIGHT_STATES_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Logs one contract violation per retired value; returns whether this call
+/// was the first for `value`.
+fn note_retired_flight_state(value: u8, sender: &str, mapped: NetworkFlightState) -> bool {
+    let bit = 1u32 << value.min(31);
+    let first = RETIRED_FLIGHT_STATES_SEEN.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0;
+    if first {
+        log::warn!(
+            "FLIGHT_STATE contract violation: {sender} sent retired value {value}; treated as {} ({}). Update that board's firmware.",
+            mapped as u8,
+            mapped.label()
+        );
+    }
+    first
+}
+
+#[cfg(test)]
+pub(crate) fn retired_flight_states_seen_for_test() -> u32 {
+    RETIRED_FLIGHT_STATES_SEEN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -554,6 +678,7 @@ pub fn u8_to_flight_state(value: u8) -> Option<FlightState> {
         13 => Some(FlightState::Landed),
         14 => Some(FlightState::Recovery),
         15 => Some(FlightState::Aborted),
+        16 => Some(FlightState::InFlight),
         _ => None,
     }
 }
@@ -616,11 +741,55 @@ mod flight_state_wire_tests {
             assert_eq!(state as usize, wire);
             assert_eq!(serde_json::to_value(state).unwrap(), *expected);
         }
-        assert_eq!(u8_to_flight_state(16), None);
+        assert_eq!(u8_to_flight_state(16), Some(FlightState::InFlight));
+        assert_eq!(u8_to_flight_state(17), None);
         assert_eq!(u8_to_flight_state(255), None);
         let legacy: FlightState = serde_json::from_str("\"ParachuteDeploy\"").unwrap();
         assert_eq!(legacy, FlightState::Descent);
         assert_eq!(legacy as u8, 11);
+    }
+
+    /// The state-split contract: only set (a) is ever built for the wire.
+    #[test]
+    fn every_local_state_maps_to_a_set_a_network_value() {
+        let set_a = [0u8, 1, 2, 6, 7, 13, 15, 16];
+        let network: Vec<u8> = NetworkFlightState::ALL.iter().map(|s| *s as u8).collect();
+        assert_eq!(network, set_a);
+        for code in 0..=16u8 {
+            let local = u8_to_flight_state(code).unwrap();
+            assert!(set_a.contains(&(local.network() as u8)), "{local:?}");
+        }
+        use FlightState as F;
+        for fill in [F::PreFill, F::FillTest, F::NitrogenFill, F::NitrousFill] {
+            assert_eq!(fill.network(), NetworkFlightState::Fill);
+            assert_eq!(fill.fill_phase(), Some(fill));
+        }
+        for flying in [F::Ascent, F::Coast, F::Apogee, F::Descent, F::Reefing, F::InFlight] {
+            assert_eq!(flying.network(), NetworkFlightState::InFlight);
+            assert!(flying.is_in_flight());
+        }
+        assert_eq!(F::Recovery.network(), NetworkFlightState::Landed);
+        assert_eq!(F::Idle.fill_phase(), None);
+        for state in NetworkFlightState::ALL {
+            assert_eq!(state.local().network(), state);
+        }
+    }
+
+    #[test]
+    fn retired_wire_values_map_to_the_nearest_network_value_and_log_once() {
+        let sender = "FC";
+        assert_eq!(network_flight_state_from_wire(16, sender), Some(NetworkFlightState::InFlight));
+        assert_eq!(network_flight_state_from_wire(2, sender), Some(NetworkFlightState::Fill));
+        for (value, expected) in [(3, NetworkFlightState::Fill), (4, NetworkFlightState::Fill),
+            (5, NetworkFlightState::Fill), (8, NetworkFlightState::InFlight), (9, NetworkFlightState::InFlight),
+            (10, NetworkFlightState::InFlight), (11, NetworkFlightState::InFlight),
+            (12, NetworkFlightState::InFlight), (14, NetworkFlightState::Landed)] {
+            assert_eq!(network_flight_state_from_wire(value, sender), Some(expected), "{value}");
+            assert_ne!(retired_flight_states_seen_for_test() & (1 << value), 0, "{value} logged");
+            assert!(!note_retired_flight_state(value, sender, expected), "{value} is logged only once");
+        }
+        assert_eq!(network_flight_state_from_wire(17, sender), None);
+        assert_eq!(network_flight_state_from_wire(255, sender), None);
     }
 
     #[test]

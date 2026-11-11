@@ -50,7 +50,8 @@ async fn healthy_original_steps_keep_all_normal_prelaunch_phases_live_only() {
                 .unwrap()
                 .unwrap()
                 .payload(),
-            &[expected as u8]
+            &[expected.network() as u8],
+            "the wire carries the network value; the sub-phase stays in the station"
         );
         assert!(
             crate::network_variables::automatic_idle_test_snapshot().durable_unchanged(&before)

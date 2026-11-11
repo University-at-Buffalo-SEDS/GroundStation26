@@ -25,7 +25,7 @@
 //! comes from one `MissionPhaseMsg`, so the two can never disagree.
 //!
 //! Firmware migration path: see docs/system/mission-phases.md.
-use crate::types::FlightState;
+use crate::types::{FlightState, NetworkFlightState};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::watch;
@@ -148,7 +148,9 @@ pub fn detailed_phase(detailed: FlightState, previous: Option<MissionPhase>) -> 
             MissionPhase::Fill
         }
         S::Launch => MissionPhase::Launch,
-        S::Ascent | S::Coast | S::Apogee | S::Descent | S::Reefing => MissionPhase::InFlight,
+        S::Ascent | S::Coast | S::Apogee | S::Descent | S::Reefing | S::InFlight => {
+            MissionPhase::InFlight
+        }
         S::Landed | S::Recovery => MissionPhase::Landed,
         S::Aborted => match previous {
             Some(MissionPhase::InFlight) => MissionPhase::InFlight,
@@ -178,6 +180,7 @@ pub fn detailed_label(detailed: FlightState) -> &'static str {
         S::Landed => "Landed",
         S::Recovery => "Recovery",
         S::Aborted => "Aborted",
+        S::InFlight => "In flight",
     }
 }
 
@@ -272,9 +275,15 @@ pub struct MissionPhaseMsg {
     /// Secondary detail for the phase (`phase_detail`). The operator sees
     /// `label` alone or `label · detail`; never a second, separate state.
     pub detail: Option<String>,
-    /// Detailed shared FlightState the phase was derived from. Same value as
-    /// the `FlightState` message; clients use it only to build the detail.
-    pub detailed: FlightState,
+    /// The network-level FlightState (set (a)) the phase was derived from.
+    /// Same value as the `FlightState` message's `state`.
+    pub detailed: NetworkFlightState,
+    /// GS-internal fill sub-phase (PreFill, FillTest, NitrogenFill,
+    /// NitrousFill); None outside Fill and on the RRLS.
+    pub fill_phase: Option<FlightState>,
+    pub fill_phase_label: Option<String>,
+    /// The FC's detailed phase from its own state report.
+    pub fc_phase: Option<crate::fc_phase::FcPhaseDto>,
     pub mode: PhaseMode,
     pub manual_only: bool,
     pub aborted: bool,
@@ -295,7 +304,10 @@ impl MissionPhaseMsg {
             phase,
             label: phase.label().to_string(),
             detail: phase_detail(inputs, phase),
-            detailed: inputs.detailed,
+            detailed: inputs.detailed.network(),
+            fill_phase: fill_phase(inputs.detailed),
+            fill_phase_label: fill_phase(inputs.detailed).map(|p| detailed_label(p).to_string()),
+            fc_phase: None,
             mode: inputs.mode,
             manual_only: inputs.mode == PhaseMode::Hitl,
             aborted,
@@ -311,6 +323,42 @@ impl MissionPhaseMsg {
                 }) != MissionPhase::Landed,
             since_ms,
         }
+    }
+}
+
+/// The GS-only fill sub-phase as the API shows it. The RRLS sees only the
+/// network Fill, so it shows none.
+pub fn fill_phase(local: FlightState) -> Option<FlightState> {
+    local.fill_phase().filter(|_| !crate::rrls::is_rrls())
+}
+
+impl MissionPhaseMsg {
+    /// Adds the FC's detailed phase, and names it beside "In flight" (or
+    /// "Landed") when it says more than the phase label.
+    pub fn with_fc_phase(mut self, fc: Option<crate::fc_phase::FcPhaseDto>) -> Self {
+        if matches!(self.phase, MissionPhase::InFlight | MissionPhase::Landed)
+            && matches!(self.detailed, NetworkFlightState::InFlight | NetworkFlightState::Landed)
+        {
+            if let Some(label) = fc.as_ref().map(|p| p.label.clone()).filter(|l| l != self.phase.label()) {
+                self.detail = Some(match self.detail.take() {
+                    Some(detail) => format!("{detail} · {label}"),
+                    None => label,
+                });
+            }
+        }
+        self.fc_phase = fc;
+        self
+    }
+    /// Equal apart from the FC phase's age, which changes every tick.
+    fn same_as(&self, other: &Self) -> bool {
+        let strip = |m: &Self| {
+            let mut m = m.clone();
+            if let Some(fc) = m.fc_phase.as_mut() {
+                fc.age_ms = 0;
+            }
+            m
+        };
+        strip(self) == strip(other)
     }
 }
 
@@ -392,7 +440,8 @@ pub fn refresh(state: &crate::state::AppState) -> MissionPhaseMsg {
     } else {
         crate::telemetry_task::get_current_timestamp_ms() as i64
     };
-    let next = MissionPhaseMsg::from_inputs(&inputs, since_ms);
+    let next = MissionPhaseMsg::from_inputs(&inputs, since_ms)
+        .with_fc_phase(state.fc_phase.dto(crate::telemetry_task::get_current_timestamp_ms()));
     if next.comms_loss_landed && !current.comms_loss_landed {
         let text = "FC contact lost for 2.5 min after T+5 min; marking Landed.";
         log::warn!("{text}");
@@ -408,7 +457,7 @@ pub fn refresh(state: &crate::state::AppState) -> MissionPhaseMsg {
         state.add_notification_with_persistence(text.clone(), true);
         crate::web::persist_message_db_only(state, text);
     }
-    if next != current {
+    if !next.same_as(&current) {
         if previous != Some(phase) {
             log::info!(
                 "Mission phase {} (detailed {:?})",
@@ -450,6 +499,47 @@ pub async fn service(
 }
 
 #[cfg(test)]
+mod state_split_tests {
+    use super::*;
+
+    fn flight(detailed: FlightState) -> PhaseInputs {
+        PhaseInputs { mode: PhaseMode::Flight, detailed, required_boards_seen: true,
+            fill_activity: false, previous: None, fc_contact_lost: false }
+    }
+    fn fc(value: FlightState) -> crate::fc_phase::FcPhaseDto {
+        crate::fc_phase::FcPhaseDto { value: value as u8, label: detailed_label(value).into(),
+            source: crate::fc_phase::Source::FcStateReport, age_ms: 0 }
+    }
+
+    /// The message carries the network value; the fill sub-phase and the FC's
+    /// detailed phase ride beside it, and the operator reads "In flight · Descent".
+    #[test]
+    fn mission_phase_shows_network_state_with_fill_and_fc_detail() {
+        let fill = MissionPhaseMsg::from_inputs(&flight(FlightState::NitrousFill), 1);
+        assert_eq!(fill.phase, MissionPhase::Fill);
+        assert_eq!(fill.detailed, NetworkFlightState::Fill);
+        assert_eq!(fill.fill_phase, Some(FlightState::NitrousFill));
+        assert_eq!(fill.fill_phase_label.as_deref(), Some("Nitrous fill"));
+        let flying = MissionPhaseMsg::from_inputs(&flight(FlightState::InFlight), 1)
+            .with_fc_phase(Some(fc(FlightState::Descent)));
+        assert_eq!((flying.phase, flying.detailed), (MissionPhase::InFlight, NetworkFlightState::InFlight));
+        assert_eq!(flying.detail.as_deref(), Some("Descent"));
+        assert_eq!(flying.label, "In flight");
+        assert_eq!(flying.fill_phase, None);
+        assert_eq!(flying.fc_phase.as_ref().unwrap().value, 11);
+        let unknown = MissionPhaseMsg::from_inputs(&flight(FlightState::InFlight), 1)
+            .with_fc_phase(Some(fc(FlightState::InFlight)));
+        assert_eq!(unknown.detail, None, "no detail beyond In flight");
+        let landed = MissionPhaseMsg::from_inputs(&flight(FlightState::Landed), 1)
+            .with_fc_phase(Some(fc(FlightState::Recovery)));
+        assert_eq!(landed.detail.as_deref(), Some("Recovery"));
+        let mut aged = flying.clone();
+        aged.fc_phase.as_mut().unwrap().age_ms = 900;
+        assert!(aged.same_as(&flying), "the FC phase's age alone never republishes");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -485,7 +575,7 @@ mod tests {
                 S::Idle => P::Idle,
                 S::PreFill | S::FillTest | S::NitrogenFill | S::NitrousFill | S::Armed => P::Fill,
                 S::Launch => P::Launch,
-                S::Ascent | S::Coast | S::Apogee | S::Descent | S::Reefing => P::InFlight,
+                S::Ascent | S::Coast | S::Apogee | S::Descent | S::Reefing | S::InFlight => P::InFlight,
                 S::Landed | S::Recovery => P::Landed,
                 S::Aborted => aborted_phase,
             },
@@ -507,7 +597,7 @@ mod tests {
                     }
                     S::Launch if lost => P::Landed,
                     S::Launch => P::Launch,
-                    S::Ascent | S::Coast | S::Apogee | S::Descent | S::Reefing => {
+                    S::Ascent | S::Coast | S::Apogee | S::Descent | S::Reefing | S::InFlight => {
                         flown(P::InFlight)
                     }
                     S::Landed | S::Recovery => flown(P::Landed),
@@ -863,7 +953,7 @@ mod tests {
         state.set_preexisting_flight_state_for_test(FlightState::NitrousFill);
         let seen = tokio::time::timeout(std::time::Duration::from_millis(150), async {
             loop {
-                if rx.borrow_and_update().detailed == FlightState::NitrousFill {
+                if rx.borrow_and_update().fill_phase == Some(FlightState::NitrousFill) {
                     return;
                 }
                 rx.changed().await.unwrap();

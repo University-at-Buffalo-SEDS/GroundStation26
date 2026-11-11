@@ -50,20 +50,20 @@ async fn queued_fc_preentry_original_must_not_survive_actual_completed_reset() {
             let fresh_utc=crate::system_clock::required_control_network_utc_ms(router).unwrap();
             let fresh=Packet::new(crate::telemetry_schema::data_type("FLIGHT_STATE"),
                 &[crate::telemetry_schema::endpoint("GROUND_STATION"),crate::telemetry_schema::endpoint("FLIGHT_STATE")],
-                "FC",fresh_utc,Arc::from([FlightState::Ascent as u8])).unwrap();
+                "FC",fresh_utc,Arc::from([FlightState::InFlight as u8])).unwrap();
             let fresh_hold=crate::telemetry_task::queued_phase_probe::install(&state,fresh.packet_id());
             router.rx_packed_from_side(&sedsnet::wire_format::pack_packet(&fresh),fc_side).unwrap();
             tokio::time::timeout(Duration::from_secs(3),fresh_hold.entered.notified()).await.unwrap();
             fresh_hold.released.notify_one();
             tokio::time::timeout(Duration::from_secs(3),fresh_hold.processed.notified()).await.unwrap();
-            assert_eq!(state.local_flight_state_snapshot(),FlightState::Ascent,"fresh authority must remain functional");
+            assert_eq!(state.local_flight_state_snapshot(),FlightState::InFlight,"fresh authority must remain functional");
             assert_eq!(state.launch_clock_snapshot().kind,crate::telemetry_db::LaunchClockKind::Idle);
             fixture._db.send(DbQueueItem::Control(RecordingCommand::Pause)).await.unwrap();
             tokio::time::timeout(Duration::from_secs(3),async {
                 while state.recording_status_snapshot().mode!=RecordingModeWire::Paused {tokio::time::sleep(Duration::from_millis(2)).await;}
             }).await.unwrap();
             let db=sqlx::SqlitePool::connect(&format!("sqlite://{path}?mode=ro")).await.unwrap();
-            let fresh_rows:i64=sqlx::query_scalar("SELECT COUNT(*) FROM flight_state WHERE f_state=8 AND timestamp_ms=?")
+            let fresh_rows:i64=sqlx::query_scalar("SELECT COUNT(*) FROM flight_state WHERE f_state=16 AND timestamp_ms=?")
                 .bind(fresh_utc as i64).fetch_one(&db).await.unwrap();
             db.close().await;
             assert_eq!(fresh_rows,1,"fresh phase must still be recorded authoritatively");

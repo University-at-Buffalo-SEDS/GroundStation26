@@ -320,6 +320,7 @@ fn launched(state: &AppState) -> bool {
                 | FlightState::Apogee
                 | FlightState::Descent
                 | FlightState::Reefing
+                | FlightState::InFlight
                 | FlightState::Landed
                 | FlightState::Recovery
         )

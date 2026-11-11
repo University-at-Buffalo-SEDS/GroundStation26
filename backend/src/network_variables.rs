@@ -1,5 +1,5 @@
 use crate::telemetry_task::get_current_timestamp_ms;
-use crate::types::Board;
+use crate::types::{Board, FlightState, NetworkFlightState};
 use anyhow::{Context, Result};
 use sedsnet::packet::Packet;
 use sedsnet::router::{NetworkVariablePermissions, Router};
@@ -150,7 +150,7 @@ pub(crate) fn capture_automatic_phase_store(expected: u8, generation: u64) -> Op
 pub(crate) fn automatic_phase_packet(router: &Router, phase: u8) -> Result<Packet> {
     anyhow::ensure!((1..=6).contains(&phase), "invalid automatic prelaunch phase");
     let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
-    packet_bytes_at(FLIGHT_STATE_TYPE, "FLIGHT_STATE", Arc::from([phase]), timestamp)
+    flight_state_wire_packet(network_phase(phase)?, timestamp)
 }
 pub(crate) struct AutomaticIdleStoreGuard<'a>(std::sync::MutexGuard<'a, VariableStore>);
 impl AutomaticIdleStoreGuard<'_> {
@@ -187,7 +187,7 @@ pub(crate) fn try_automatic_idle_store() -> Option<AutomaticIdleStoreGuard<'stat
 }
 pub(crate) fn automatic_idle_packet(router: &Router) -> Result<Packet> {
     let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
-    packet_bytes_at(FLIGHT_STATE_TYPE, "FLIGHT_STATE", Arc::from([1u8]), timestamp)
+    flight_state_wire_packet(NetworkFlightState::Idle, timestamp)
 }
 pub(crate) fn automatic_idle_batch_limits() -> sedsnet::router::ManagedBatchPreparationLimits {
     // Nine actual registered variables, one original, and a complete registry
@@ -235,7 +235,7 @@ fn read_persisted(path: &Path) -> Option<PersistentVariables> {
     fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .filter(|values: &PersistentVariables| values.flight_state <= 15)
+        .filter(|values: &PersistentVariables| crate::types::u8_to_flight_state(values.flight_state).is_some())
 }
 
 #[cfg(test)]
@@ -290,6 +290,20 @@ fn packet(data_type: &str, endpoint: &str, value: u8) -> Result<Packet> {
 
 fn packet_bytes(data_type: &str, endpoint: &str, payload: Arc<[u8]>) -> Result<Packet> {
     packet_bytes_at(data_type, endpoint, payload, get_current_timestamp_ms())
+}
+
+/// The single FLIGHT_STATE wire funnel. Only set (a) is ever built here; the
+/// store keeps the GS-internal phase, and fill sub-phases leave as Fill.
+fn flight_state_wire_packet(state: NetworkFlightState, timestamp: u64) -> Result<Packet> {
+    // The simulator's set-(a) wire assertion reads this line.
+    log::info!("FLIGHT_STATE wire value={} ({})", state as u8, state.label());
+    packet_bytes_at(FLIGHT_STATE_TYPE, "FLIGHT_STATE", Arc::from([state as u8]), timestamp)
+}
+/// A stored (GS-internal) phase as it goes on the wire.
+fn network_phase(phase: u8) -> Result<NetworkFlightState> {
+    crate::types::u8_to_flight_state(phase)
+        .map(FlightState::network)
+        .ok_or_else(|| anyhow::anyhow!("invalid flight-state value {phase}"))
 }
 
 fn packet_bytes_at(
@@ -379,7 +393,7 @@ fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Resu
             ) {
                 return Ok(());
             }
-            let state =
+            let wire =
                 packet
                     .payload()
                     .first()
@@ -387,11 +401,14 @@ fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Resu
                     .ok_or(sedsnet::TelemetryError::HandlerError(
                         "empty flight-state network variable",
                     ))?;
-            if state > 15 {
+            // Set (a) only; a retired value from old firmware maps to its
+            // nearest network value and is logged once.
+            let Some(received) = crate::types::network_flight_state_from_wire(wire, packet.sender()) else {
                 return Err(sedsnet::TelemetryError::HandlerError(
                     "out-of-range flight-state network variable",
                 ));
-            }
+            };
+            let state = received as u8;
             if !observer && crate::types::canonical_sender_id(packet.sender()) == "GS" {
                 // Explicit local publishers own their local/durable transition.
                 // A reflected original packet is telemetry, never fresh intent.
@@ -406,10 +423,17 @@ fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Resu
             if crate::types::canonical_sender_id(packet.sender()) == "FC"
                 && (state == 15
                     || guard.values.flight_state == 15
-                    || (matches!(guard.values.flight_state, 7..=14) && state <= 6))
+                    || (matches!(guard.values.flight_state, 7..=14 | 16) && state <= 6))
             {
                 return Ok(());
             }
+            // The store keeps the GS-internal phase: Fill received while the
+            // store already holds a fill sub-phase is the same network value.
+            let state = if network_phase(guard.values.flight_state).ok() == Some(received) {
+                guard.values.flight_state
+            } else {
+                received.local() as u8
+            };
             let mut next = guard.values;
             if next.flight_state != state || next.flight_state_stamp == 0 {
                 next.flight_state_stamp = packet.timestamp();
@@ -818,14 +842,8 @@ pub fn set_flight_buzzer(router: &Router, enabled: bool) -> Result<()> {
 
 pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
     let request = crate::qualification_requests::Request::begin("set_flight_state");
-    anyhow::ensure!(state <= 15, "invalid flight-state value {state}");
     let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
-    let packet = packet_bytes_at(
-        FLIGHT_STATE_TYPE,
-        "FLIGHT_STATE",
-        Arc::from([state]),
-        timestamp,
-    )?;
+    let packet = flight_state_wire_packet(network_phase(state)?, timestamp)?;
     {
         let mut guard = store()
             .lock()
@@ -892,7 +910,11 @@ pub(crate) fn resend_dropped_flight_state(router: &Router, exhausted_heads: &[u6
     {
         return Ok(false);
     }
-    let again = packet_bytes_at(FLIGHT_STATE_TYPE, "FLIGHT_STATE", Arc::from(latest.payload()), latest.timestamp())?;
+    let Some(value) = latest.payload().first().copied().and_then(NetworkFlightState::from_u8)
+        .filter(|_| latest.payload().len() == 1) else {
+        return Ok(false);
+    };
+    let again = flight_state_wire_packet(value, latest.timestamp())?;
     router.set_network_variable(again)?;
     Ok(true)
 }
@@ -906,10 +928,8 @@ pub(crate) struct PreparedLaunchState {
 }
 pub(crate) fn prepare_launch_state(router: &Router) -> Result<PreparedLaunchState> {
     let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
-    let packet = packet_bytes_at(
-        FLIGHT_STATE_TYPE,
-        "FLIGHT_STATE",
-        Arc::from([7u8]),
+    let packet = flight_state_wire_packet(
+        NetworkFlightState::Launch,
         timestamp,
     )?;
     let guard = store()
@@ -949,17 +969,12 @@ pub(crate) fn commit_admitted_launch(prepared: &PreparedLaunchState) -> Result<(
 /// Stop fence and require fresh actual board readbacks before reopening.
 pub(crate) fn operator_phase_packet(router:&Router,phase:u8)->Result<Packet> {
     anyhow::ensure!(matches!(crate::types::u8_to_flight_state(phase),Some(crate::types::FlightState::Startup|crate::types::FlightState::Idle|crate::types::FlightState::PreFill|crate::types::FlightState::FillTest|crate::types::FlightState::NitrogenFill|crate::types::FlightState::NitrousFill|crate::types::FlightState::Armed)),"Operator phase cannot enter Fire or flight");
-    packet_bytes_at(FLIGHT_STATE_TYPE,"FLIGHT_STATE",Arc::from([phase]),crate::system_clock::required_control_network_utc_ms(router)?)
+    flight_state_wire_packet(network_phase(phase)?,crate::system_clock::required_control_network_utc_ms(router)?)
 }
 
 pub(crate) fn prepare_verified_recovery_startup(router: &Router) -> Result<Packet> {
     let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
-    let packet = packet_bytes_at(
-        FLIGHT_STATE_TYPE,
-        "FLIGHT_STATE",
-        Arc::from([0u8]),
-        timestamp,
-    )?;
+    let packet = flight_state_wire_packet(NetworkFlightState::Startup, timestamp)?;
     let mut guard = store()
         .lock()
         .expect("network-variable store lock poisoned");
@@ -992,12 +1007,7 @@ fn retained_non_launch_packet() -> Result<Option<Packet>> {
 
 fn flight_state_packet(values: PersistentVariables) -> Result<Packet> {
     // Reconnect must not make a retained Abort newer than a recovery cutoff.
-    packet_bytes_at(
-        FLIGHT_STATE_TYPE,
-        "FLIGHT_STATE",
-        Arc::from([values.flight_state]),
-        values.flight_state_stamp,
-    )
+    flight_state_wire_packet(network_phase(values.flight_state)?, values.flight_state_stamp)
 }
 
 fn filter_packet(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Result<Packet> {

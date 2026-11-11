@@ -345,6 +345,22 @@ async fn board_recovery(app: &axum::Router, out: &mut Fixtures) {
     }
 }
 
+/// The state-split flight state: `GET /flightstate` and the websocket
+/// `FlightState` frame in a fill sub-phase (network Fill plus `fill_phase`)
+/// and in flight (network InFlight plus the FC's detailed `fc_phase`).
+async fn flight_state(app: &axum::Router, state: &Arc<AppState>, out: &mut Fixtures) {
+    let before = state.local_flight_state_snapshot();
+    *state.state.lock().unwrap() = crate::types::FlightState::NitrousFill;
+    out.add("flight-state/get-fill", get_ok(app, "/flightstate", Some("viewer")).await);
+    *state.state.lock().unwrap() = crate::types::FlightState::InFlight;
+    crate::fc_phase::observe(state, crate::types::FlightState::Descent as u8, crate::fc_phase::Source::FcStateReport, 0);
+    let mut frame = serde_json::to_value(WsOutMsg::FlightState(crate::web::FlightStateWire::new(
+        state.local_flight_state_snapshot(), state))).unwrap();
+    frame["data"]["fc_phase"]["age_ms"] = json!(0);
+    out.add("websocket/flight-state-in-flight", frame);
+    *state.state.lock().unwrap() = before;
+}
+
 /// `GET /api/action_policy` and the websocket `ActionPolicy` frame, with a
 /// network-variable output that has a `network_note`.
 async fn action_policy(app: &axum::Router, state: &Arc<AppState>, out: &mut Fixtures) {
@@ -607,6 +623,7 @@ async fn contract_fixtures_match_the_backend() {
     let _mode = thread_mode(Mode::Normal);
     operating_mode(&app, &mut out).await;
     board_recovery(&app, &mut out).await;
+    flight_state(&app, &state, &mut out).await;
     action_policy(&app, &state, &mut out).await;
     alerts(&app, &state, &mut out).await;
     radio_tx_budget(&mut out);
