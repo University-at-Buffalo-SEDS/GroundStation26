@@ -66,14 +66,14 @@ fn abort_across_rf(resend: bool, deaf_ms: u64, run_ms: u64, readback_never: bool
     deaf_until.store(abort_at + deaf_ms, Ordering::Relaxed);
     let resender = AbortResend::default();
     crate::telemetry_task::queue_manual_abort_wire_receipted(&gs, WirePolicy::Untimed).unwrap();
-    resender.arm(1, WirePolicy::Untimed, None);
+    resender.arm(1, WirePolicy::Untimed, None, SendMark { av_bay_routed: av_bay_abort_route(&gs), ..SendMark::default() });
     let mut sent = 0u64;
     while now.load(Ordering::Relaxed) < abort_at + run_ms {
         pump(5);
         let owed = if got.lock().unwrap().is_some() && !readback_never { 0 } else { 0b111 };
         if resend
             && resender
-                .step(&gs, Observation { now_ms: now.load(Ordering::Relaxed), epoch: 1, station_aborted: true, recovery: None, owed })
+                .step(&gs, Observation { now_ms: now.load(Ordering::Relaxed), epoch: 1, station_aborted: true, recovery: None, owed, unheard: 0 })
                 .is_some()
         {
             sent += 1;
@@ -114,22 +114,22 @@ fn resend_stops_on_readback_reset_or_recovery() {
     crate::telemetry_schema::initialize().unwrap();
     let gs = Router::new(RouterConfig::new([]).with_sender("GS"));
     let seen = |owed, station_aborted, recovery: Option<&str>| Observation {
-        now_ms: 100_000, epoch: 1, station_aborted, recovery: recovery.map(str::to_string), owed,
+        now_ms: 100_000, epoch: 1, station_aborted, recovery: recovery.map(str::to_string), owed, unheard: 0,
     };
     for (owed, aborted, recovery) in [(0u8, true, None), (0b010, false, None), (0b010, true, Some("operation 7"))] {
         let resender = AbortResend::default();
-        resender.arm(1, WirePolicy::Untimed, None);
+        resender.arm(1, WirePolicy::Untimed, None, routed_mark());
         assert_eq!(resender.step(&gs, seen(owed, aborted, recovery)), None);
         assert_eq!(resender.active_resends(), None, "disarmed for ({owed:#b}, {aborted}, {recovery:?})");
     }
     // A newer operator Abort epoch also disarms the old one.
     let resender = AbortResend::default();
-    resender.arm(1, WirePolicy::Untimed, None);
+    resender.arm(1, WirePolicy::Untimed, None, routed_mark());
     assert_eq!(resender.step(&gs, Observation { epoch: 2, ..seen(0b010, true, None) }), None);
     assert_eq!(resender.active_resends(), None);
     // Umbilical-only owed boards never trigger a re-send.
     let resender = AbortResend::default();
-    resender.arm(1, WirePolicy::Untimed, None);
+    resender.arm(1, WirePolicy::Untimed, None, routed_mark());
     assert_eq!(resender.step(&gs, seen(0b1111000, true, None)), None);
     assert_eq!(resender.active_resends(), None);
 }
@@ -270,14 +270,16 @@ fn an_abort_pressed_while_the_av_bay_is_unheard_reaches_it_when_heard_again() {
     assert!(ms <= 6_000 + 2 * TOPOLOGY_REQUEST_MS_FOR_TEST + 1_000, "AV bay got it {ms} ms after the Abort");
 }
 
-// Pre-fix API shims: the resender knows nothing about routes or unheard boards.
-const TOPOLOGY_REQUEST_MS_FOR_TEST: u64 = 2_000;
-fn av_bay_routed_now(_router: &Router) -> bool {
-    true
+const TOPOLOGY_REQUEST_MS_FOR_TEST: u64 = TOPOLOGY_REQUEST_MS;
+fn av_bay_routed_now(router: &Router) -> SendMark {
+    send_mark(router)
 }
-fn arm_now(resender: &AbortResend, _routed: bool) {
-    resender.arm(1, WirePolicy::Untimed, None);
+fn arm_now(resender: &AbortResend, mark: SendMark) {
+    resender.arm(1, WirePolicy::Untimed, None, mark);
 }
-fn observation(now_ms: u64, owed: u8, _unheard: u8) -> Observation {
-    Observation { now_ms, epoch: 1, station_aborted: true, recovery: None, owed }
+fn routed_mark() -> SendMark {
+    SendMark { av_bay_routed: true, ..SendMark::default() }
+}
+fn observation(now_ms: u64, owed: u8, unheard: u8) -> Observation {
+    Observation { now_ms, epoch: 1, station_aborted: true, recovery: None, owed, unheard }
 }

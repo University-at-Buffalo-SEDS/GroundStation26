@@ -6254,7 +6254,7 @@ mod tests {
         let fixture = Fixture::new().await;
         *fixture.http.state.state.lock().unwrap() = crate::types::FlightState::Aborted;
         let state = fixture.state();
-        state.abort_resend.arm(state.manual_abort_intent.epoch(), crate::manual_abort_intent::WirePolicy::Untimed, None);
+        state.abort_resend.arm(state.manual_abort_intent.epoch(), crate::manual_abort_intent::WirePolicy::Untimed, None, crate::manual_abort_resend::send_mark_routed_for_test());
         assert_eq!(state.abort_resend.active_resends(), Some(0));
         for board in BOARDS {
             fixture.query(board).await;
@@ -6461,7 +6461,7 @@ mod tests {
         for board in BOARDS {
             fixture.query(board).await;
         }
-        state.abort_resend.arm(state.manual_abort_intent.epoch(), crate::manual_abort_intent::WirePolicy::Untimed, None);
+        state.abort_resend.arm(state.manual_abort_intent.epoch(), crate::manual_abort_intent::WirePolicy::Untimed, None, crate::manual_abort_resend::send_mark_routed_for_test());
         // Hold an ABORT pending for longer than the prepare drain.
         let hold = super::abort_drain_hold_for_test(&state);
         let response = super::super::tests::http(state.clone(), "POST", "/api/board-recovery/prepare", Some("operator"),

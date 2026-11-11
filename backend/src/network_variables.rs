@@ -945,6 +945,24 @@ pub(crate) fn resend_dropped_flight_state(router: &Router, exhausted_heads: &[u6
     if exhausted_heads.is_empty() {
         return Ok(false);
     }
+    resend_latest_flight_state(router, exhausted_heads, |_| true)
+}
+
+/// An operator Abort held because the AV bay had no route: once it has one,
+/// send the retained Aborted FLIGHT_STATE again. The one written with the
+/// Abort reached only the boards the station knew then (PB, which takes an
+/// Abort only from FLIGHT_STATE, was not among them after a long radio
+/// outage). Same stamp, fresh identity; skipped while a FLIGHT_STATE write is
+/// pending or the latest value is not Aborted. Returns whether it was sent.
+pub(crate) fn resend_aborted_flight_state(router: &Router) -> Result<bool> {
+    resend_latest_flight_state(router, &[], |value| value == NetworkFlightState::Aborted)
+}
+
+fn resend_latest_flight_state(
+    router: &Router,
+    exhausted_heads: &[u64],
+    wanted: impl Fn(NetworkFlightState) -> bool,
+) -> Result<bool> {
     let ty = crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE);
     let Some(latest) = router.get_cached_network_variable(ty)? else {
         return Ok(false);
@@ -959,7 +977,7 @@ pub(crate) fn resend_dropped_flight_state(router: &Router, exhausted_heads: &[u6
         return Ok(false);
     }
     let Some(value) = latest.payload().first().copied().and_then(NetworkFlightState::from_u8)
-        .filter(|_| latest.payload().len() == 1) else {
+        .filter(|value| latest.payload().len() == 1 && wanted(*value)) else {
         return Ok(false);
     };
     let again = flight_state_wire_packet(value, latest.timestamp())?;
