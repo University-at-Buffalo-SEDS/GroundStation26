@@ -314,6 +314,13 @@ impl Exchange {
         if row.nonce != self.nonce || row.issuer != self.issuer {
             return Err("Recovery reply belongs to another intent");
         }
+        // The board answered this request's nonce, so it was delivered: stop
+        // the SDK's end-to-end retries of the request and its polls (they
+        // were 131 of 238 BOARD_RECOVERY_REQUEST resends). The exchange's
+        // own outcome and polling are unchanged.
+        for id in core::iter::once(self.packet.packet_id()).chain(self.poll_ids.iter().copied()) {
+            let _ = self.router.complete_reliable(id);
+        }
         // Commissioning can provision generation 1 from the explicit MAX
         // sentinel. Only IO is permitted to report this first-leg transition.
         let first_identity = self.boot == u64::MAX
