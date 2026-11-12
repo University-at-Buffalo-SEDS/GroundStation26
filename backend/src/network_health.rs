@@ -2,6 +2,11 @@
 use crate::types::{BoardDiagnostics, NetworkBoardHealthEntry, RfTxTiming, canonical_sender_id};
 use std::{collections::HashMap, time::Instant};
 pub const TIMEOUT_MS: u64 = 12_000;
+/// Silence that marks a board offline, by its link. Umbilical (CAN) boards report at 1-250 Hz (frame age
+/// p99 under 1 s in the fullnet); radio boards need margin for loss (30% loss: RF 4.3 s, PB 2.8 s, FC 1.3 s
+/// longest gaps). A board whose link is not known yet keeps TIMEOUT_MS.
+pub const WIRED_TIMEOUT_MS: u64 = 3_000;
+pub const RADIO_TIMEOUT_MS: u64 = 6_000;
 /// Window for the board clock estimate (see `observe_clock`).
 const CLOCK_WINDOW_MS: u64 = 10_000;
 #[derive(Default)]
@@ -36,8 +41,11 @@ fn elapsed(now: Instant, then: Instant) -> u64 {
         .min(u64::MAX as u128) as u64
 }
 impl Record {
+    fn timeout_ms(&self) -> u64 {
+        if self.rocket { RADIO_TIMEOUT_MS } else if self.fill { WIRED_TIMEOUT_MS } else { TIMEOUT_MS }
+    }
     fn advance(&mut self, now: Instant) {
-        if self.healthy && elapsed(now, self.last) > TIMEOUT_MS {
+        if self.healthy && elapsed(now, self.last) > self.timeout_ms() {
             self.healthy = false;
             self.disconnects = self.disconnects.saturating_add(1);
         }
@@ -51,7 +59,7 @@ impl Record {
         }
         self.advance(now);
         if !self.healthy {
-            let outage = elapsed(now, self.last).saturating_sub(TIMEOUT_MS);
+            let outage = elapsed(now, self.last).saturating_sub(self.timeout_ms());
             self.offline_ms = self.offline_ms.saturating_add(outage);
             self.longest_ms = self.longest_ms.max(outage);
             self.reconnects = self.reconnects.saturating_add(1);
@@ -298,7 +306,7 @@ impl Tracker {
     /// is offline or has never been seen.
     pub fn connected_for(&self, sender: &str, now: Instant) -> Option<std::time::Duration> {
         let r = self.boards.get(canonical_sender_id(sender.trim()))?;
-        (r.healthy && elapsed(now, r.last) <= TIMEOUT_MS)
+        (r.healthy && elapsed(now, r.last) <= r.timeout_ms())
             .then(|| now.saturating_duration_since(r.connected_since))
     }
     pub fn membership(&mut self, sender: &str, side: &str) {
@@ -373,7 +381,7 @@ impl Tracker {
             let outage = if r.healthy {
                 0
             } else {
-                age.saturating_sub(TIMEOUT_MS)
+                age.saturating_sub(r.timeout_ms())
             };
             rows.push(NetworkBoardHealthEntry {
                 cpu_temperature_centi_c: None,
@@ -430,6 +438,27 @@ mod tests {
     use std::time::Duration;
     fn at(t: Instant, ms: u64) -> Instant {
         t + Duration::from_millis(ms)
+    }
+    /// A silent board is shown offline after a timeout set by its link, not a flat 12 s (fullnet: a hung FC
+    /// read healthy for 12 s). Umbilical (CAN) boards: 3 s; radio boards: 6 s, above the longest frame gap seen
+    /// at 30% radio loss (RF 4.3 s, PB 2.8 s, FC 1.3 s); a board whose link is not known yet keeps 12 s.
+    #[test]
+    fn a_silent_board_goes_offline_after_its_link_timeout() {
+        let t = Instant::now();
+        let mut tracker = Tracker::default();
+        for b in ["VB", "FC", "XX"] { tracker.observe(b, t, 100_000); }
+        tracker.membership("VB", "umbilical_comms");
+        tracker.membership("FC", "rocket_comms");
+        let healthy = |tracker: &mut Tracker, b: &str, ms| tracker.snapshot(at(t, ms), false).into_iter()
+            .find(|row| row.sender_id == b).map(|row| row.healthy).unwrap();
+        assert!(tracker.connected_for("FC", at(t, 5_900)).is_some());
+        assert!(healthy(&mut tracker, "VB", 2_900));
+        assert!(!healthy(&mut tracker, "VB", 3_100));
+        assert!(healthy(&mut tracker, "FC", 5_900));
+        assert!(!healthy(&mut tracker, "FC", 6_100));
+        assert!(healthy(&mut tracker, "XX", 11_900));
+        assert!(!healthy(&mut tracker, "XX", 12_100));
+        assert!(tracker.connected_for("VB", at(t, 3_100)).is_none());
     }
     #[test]
     fn clock_offset_ignores_transport_delay_within_its_window() {
