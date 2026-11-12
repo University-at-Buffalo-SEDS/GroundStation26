@@ -212,7 +212,19 @@ pub(crate) fn radio_packet_boundary_contract(priority: u8, payload: &[u8]) -> Op
 }
 
 /// Two or more SDK frames of one bundle class, as `bundle_followers` selects.
+/// A lone frame also leaves as a one-record bundle when that is smaller: the
+/// record names its source and ACK targets by 1-byte node index (a
+/// ReliableAck shrinks from about 59 to about 30 SDK bytes). Only canonical
+/// frames qualify, and the router hands those only to a compact-bundle side.
+pub(crate) fn single_radio_bundle_smaller(priority: u8, payload: &[u8]) -> bool {
+    radio_bundle_class(priority, payload).is_some()
+        && sedsnet::wire_bundle::pack_bundle(&[payload]).is_ok_and(|bundle| bundle.len() < payload.len())
+}
+
 pub(crate) fn is_radio_bundle(frames: &[(u8, &[u8])]) -> bool {
+    if frames.len() == 1 {
+        return single_radio_bundle_smaller(frames[0].0, frames[0].1);
+    }
     frames.len() > 1
         && frames.len() <= RADIO_BUNDLE_MAX_FRAMES
         && radio_bundle_class(frames[0].0, frames[0].1).is_some_and(|class| {
@@ -4288,11 +4300,11 @@ impl CommsDevice for UartComms {
         frames: &[(u8, &[u8])],
         leases: &[sedsnet::router::PackedWriteLease],
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        if frames.len() == 1 {
+        if is_radio_bundle(frames) {
+            self.send_bundle_tracked(frames, leases).map(|_| ())
+        } else if frames.len() == 1 {
             self.send_data_with_priority_tracked(frames[0].1, frames[0].0, leases)
                 .map(|_| ())
-        } else if is_radio_bundle(frames) {
-            self.send_bundle_tracked(frames, leases).map(|_| ())
         } else {
             self.send_command_batch_tracked(frames, leases)
         }
@@ -4311,10 +4323,10 @@ impl CommsDevice for UartComms {
                 .as_ref()
                 .is_some_and(|mesh| mesh.lock().unwrap().role == crate::rrls::Role::Primary)
         {
-            return if frames.len() == 1 {
-                self.send_data_with_priority_tracked(frames[0].1, frames[0].0, leases)
-            } else {
+            return if is_radio_bundle(frames) {
                 self.send_bundle_tracked(frames, leases)
+            } else {
+                self.send_data_with_priority_tracked(frames[0].1, frames[0].0, leases)
             }
             .map(Some);
         }
@@ -7789,6 +7801,13 @@ mod raw_uart_tests {
         assert!(is_radio_bundle(&refs));
         let abort = pack("ABORT", "ABORT", 1, b"SEDS_MANUAL_ABORT_V1:K");
         assert!(!is_radio_bundle(&[(255, &frames[0][..]), (255, &abort[..])]), "ABORT stays standalone");
+        assert!(!is_radio_bundle(&[(255, &abort[..])]), "a lone ABORT stays canonical");
+        // A lone frame becomes a one-record bundle only when that is smaller
+        // (contracts with node-table targets, e.g. ACKs: SDK test
+        // node_table_indices_round_trip_and_shrink_acks). A HEARTBEAT is not.
+        sedsnet::wire_bundle::set_node_table(&crate::types::SEDS_NODE_TABLE);
+        assert!(!single_radio_bundle_smaller(255, &frames[0]));
+        assert!(!is_radio_bundle(&refs[..1]));
         let (mut peer, port) = serialport::TTYPort::pair().unwrap();
         peer.set_timeout(Duration::from_secs(1)).unwrap();
         let (mut uart, _mesh, _) = recovery_uart_fixture(port);
