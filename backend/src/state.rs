@@ -2096,6 +2096,7 @@ impl AppState {
         let mut local = self.action_policy.lock().unwrap().clone();
         if !crate::rrls::is_rrls() {
             crate::board_abort::block_policy(self, &mut local);
+            crate::fc_command_gate::block_policy(self, &mut local);
             crate::ignition_pair::project_fresh_proof(self, &mut local);
             crate::operator_phase::project(self,&mut local);
             crate::operator_phase::project_reset_flight_state(self, &mut local);
