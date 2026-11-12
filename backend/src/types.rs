@@ -372,6 +372,10 @@ pub(crate) fn retired_flight_states_seen_for_test() -> u32 {
     RETIRED_FLIGHT_STATES_SEEN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// SEDSnet compact-bundle node table. Every SEDS build (GS, RRLS and all
+/// boards) must list the same names in the same order; append only.
+pub const SEDS_NODE_TABLE: [&str; 9] = ["GS", "RRLS", "RF", "FC", "PB", "AB", "VB", "GB", "DAQ"];
+
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]

@@ -572,9 +572,18 @@ fn rocket_router_side_options(link: &CommsLinkConfig, observer: bool) -> RouterS
         // RRLS forwards original frames through Mesh, not its local SDK.
         // Suppress local discovery/managed queries before they enter TX queues.
         egress_enabled: !observer,
+        // Offer compact bundles on the AV-bay radio. They are used only while
+        // every live peer on the link offers them too (SEDSnet negotiates it
+        // through discovery), so an older board keeps the legacy format.
+        compact_bundle: compact_bundle_enabled(),
         ..Default::default()
     }
     .with_small_packet_transport(RADIO_SIDE_MAX_FRAME_BYTES)
+}
+
+/// `GS_COMPACT_BUNDLE=0` withdraws the compact-bundle offer (A/B and field fallback).
+fn compact_bundle_enabled() -> bool {
+    std::env::var("GS_COMPACT_BUNDLE").map_or(true, |value| value.trim() != "0")
 }
 
 struct ValvePowerFreshness {
@@ -1422,6 +1431,10 @@ async fn main() -> anyhow::Result<()> {
     rrls_sim_primary::validate_startup()?;
     let daq_loadcell_cadence = DaqLoadcellCadence::from_env()?;
     telemetry_schema::initialize()?;
+    // Same ordered table on every SEDS build: bundle records name sources and
+    // frozen targets by position in it (SEDSnet drops a bundle from a node
+    // whose table differs).
+    sedsnet::wire_bundle::set_node_table(&crate::types::SEDS_NODE_TABLE);
     sedsnet::config::set_runtime_tuning_config(network_delivery_tuning())?;
 
     logger::init()?;

@@ -1860,6 +1860,40 @@ impl WireBacklog {
             None
         }
     }
+    /// Followers for a compact bundle that `first` opens: the frames this
+    /// backlog would select next anyway, in its own priority order, while they
+    /// share `first`'s pacing class and fit the bundle. The first frame that
+    /// does not (an ABORT, a command, another class, or the size limit) is put
+    /// back untouched and ends the bundle, so nothing more urgent is passed.
+    fn bundle_followers(
+        &mut self,
+        comms: &dyn CommsDevice,
+        first: (u8, &[u8]),
+    ) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        let Some(mut bytes) = comms.bundle_frame_len(first.0, first.1, None) else {
+            return out;
+        };
+        while out.len() + 1 < crate::comms::RADIO_BUNDLE_MAX_FRAMES {
+            let state = self.selection_state();
+            let Some(next) = self.pop() else {
+                self.restore_selection(state);
+                break;
+            };
+            match comms.bundle_frame_len(next.0, &next.1, Some(first)) {
+                Some(len) if bytes + len <= crate::comms::RADIO_BUNDLE_MAX_BYTES => {
+                    bytes += len;
+                    out.push(next);
+                }
+                _ => {
+                    self.restore_selection(state);
+                    self.push(next.0, next.1, true);
+                    break;
+                }
+            }
+        }
+        out
+    }
     /// Finish an already selected pair in the same bounded UART packet. A
     /// receipt turn may move behind this one third command, then remains due.
     /// No waiting, extra byte allowance, or metadata-service bypass is granted.
@@ -2362,6 +2396,87 @@ mod priority_tests {
         ) -> sedsnet::TelemetryResult<()> {
             unreachable!()
         }
+    }
+    /// The real bundle eligibility of a raw UART radio link, over a fake device.
+    struct BundleTestComms;
+    impl CommsDevice for BundleTestComms {
+        fn bundle_frame_len(&self, priority: u8, payload: &[u8], first: Option<(u8, &[u8])>) -> Option<usize> {
+            let class = crate::comms::radio_bundle_class(priority, payload)?;
+            if let Some((p, f)) = first && crate::comms::radio_bundle_class(p, f) != Some(class) {
+                return None;
+            }
+            Some(payload.len())
+        }
+        fn send_data(&mut self, _: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            unreachable!()
+        }
+        fn set_side_id(&mut self, _: RouterSideId) {}
+        fn recv_packet(&mut self, _: &Router, _: &mut dyn FnMut(&Packet)) -> sedsnet::TelemetryResult<()> {
+            unreachable!()
+        }
+    }
+    fn bundle_test_frame(name: &str, endpoint: &str, ts: u64, payload: &[u8]) -> Vec<u8> {
+        crate::telemetry_schema::initialize().unwrap();
+        serialize::pack_packet(
+            &Packet::new(
+                crate::telemetry_schema::data_type(name),
+                &[crate::telemetry_schema::endpoint(endpoint)],
+                "GS",
+                ts,
+                Arc::from(payload),
+            )
+            .unwrap(),
+        )
+        .to_vec()
+    }
+    /// A bundle takes only what the backlog would send next anyway, in its
+    /// own order, and stops at the first frame that may not join: an ABORT
+    /// (or anything more urgent) is never passed or swallowed.
+    #[test]
+    fn bundle_followers_keep_backlog_order_and_stop_before_an_abort() {
+        let a = bundle_test_frame("HEARTBEAT", "HEART_BEAT", 1, &[]);
+        let b = bundle_test_frame("HEARTBEAT", "HEART_BEAT", 2, &[]);
+        let abort = bundle_test_frame("ABORT", "ABORT", 3, b"SEDS_MANUAL_ABORT_V1:K");
+        let c = bundle_test_frame("HEARTBEAT", "HEART_BEAT", 4, &[]);
+        assert!(crate::comms::radio_bundle_class(255, &abort).is_none(), "ABORT never joins a bundle");
+        let mut backlog = WireBacklog::new(true);
+        for frame in [&a, &b, &abort, &c] {
+            backlog.push(255, frame.clone(), false);
+        }
+        let (p, first) = backlog.pop().unwrap();
+        let followers = backlog.bundle_followers(&BundleTestComms, (p, &first));
+        let mut sent: Vec<Vec<u8>> = vec![first];
+        sent.extend(followers.into_iter().map(|(_, f)| f));
+        let mut rest = Vec::new();
+        while let Some((_, f)) = backlog.pop() {
+            rest.push(f);
+        }
+        // Whatever order the backlog chose, the bundle is its prefix and ends
+        // before the ABORT, which is the very next write.
+        let mut order = sent.clone();
+        order.extend(rest.iter().cloned());
+        assert!(!sent.contains(&abort));
+        assert_eq!(rest.first(), Some(&abort), "the ABORT goes next, alone: {} sent", sent.len());
+        assert_eq!(order.len(), 4);
+    }
+    #[test]
+    fn bundle_followers_respect_the_size_and_class_limits() {
+        let mut backlog = WireBacklog::new(true);
+        let frames: Vec<Vec<u8>> = (0..40u64).map(|i| bundle_test_frame("HEARTBEAT", "HEART_BEAT", i, &[])).collect();
+        for frame in &frames {
+            backlog.push(255, frame.clone(), false);
+        }
+        let (p, first) = backlog.pop().unwrap();
+        let followers = backlog.bundle_followers(&BundleTestComms, (p, &first));
+        let bytes: usize = first.len() + followers.iter().map(|(_, f)| f.len()).sum::<usize>();
+        assert!(!followers.is_empty());
+        assert!(bytes <= crate::comms::RADIO_BUNDLE_MAX_BYTES);
+        assert!(followers.len() < crate::comms::RADIO_BUNDLE_MAX_FRAMES);
+        let mut left = 0;
+        while backlog.pop().is_some() {
+            left += 1;
+        }
+        assert_eq!(left + followers.len() + 1, frames.len(), "nothing lost or duplicated");
     }
     fn batch_test_command(name: &str, payload: &[u8]) -> Vec<u8> {
         crate::telemetry_schema::initialize().unwrap();
@@ -3951,6 +4066,7 @@ pub(super) fn spawn_comms_worker_threads(
             .map(|writer| Arc::new(Mutex::new(writer)))
             .unwrap_or_else(|| comms.clone())
     };
+    let tx_worker_router = router.clone();
     let tx_worker = thread::Builder::new()
         .name(format!("{}_comms_tx", worker_name))
         .spawn(move || {
@@ -4181,21 +4297,40 @@ pub(super) fn spawn_comms_worker_threads(
                     if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some() {
                         log::info!("full-bay transport selected side={worker_name} sim={:?} priority={priority} len={} type={:?}", crate::simulation_clock_ms(), payload.len(), serialize::peek_frame_info_unchecked(&payload).map(|info| info.envelope.ty));
                     }
-                    let follower = if retry_id.is_none() {
-                        backlog.batch_follower(&**comms, (priority, &payload))
+                    // Compact bundle: frames that would be written next anyway,
+                    // in the backlog's own priority order, of the first frame's
+                    // pacing class. Only while the radio link negotiated bundles.
+                    let bundling = retry_id.is_none()
+                        && tx_worker_router.side_compact_bundle_active(side_id)
+                        && comms.bundle_frame_len(priority, &payload, None).is_some();
+                    let mut extras: Vec<(u8, Vec<u8>)> = if bundling {
+                        backlog.refill(&mut comms_handle.tx_rx, &mut drain_remaining);
+                        backlog
+                            .bundle_followers(&**comms, (priority, &payload))
+                            .into_iter()
+                            .filter(|(p, b)| !discard_retired_write(comms_handle.tx_budget.as_deref(), comms_handle.transport_activity.as_deref(), *p, b))
+                            .collect()
                     } else {
-                        None
+                        Vec::new()
+                    };
+                    if !bundling {
+                        let follower = if retry_id.is_none() {
+                            backlog.batch_follower(&**comms, (priority, &payload))
+                        } else {
+                            None
+                        }
+                        .filter(|(p, b)| !discard_retired_write(comms_handle.tx_budget.as_deref(), comms_handle.transport_activity.as_deref(), *p, b));
+                        backlog.refill(&mut comms_handle.tx_rx, &mut drain_remaining);
+                        let third = follower.as_ref().and_then(|(next_priority, next_payload)| {
+                            let bytes = comms.command_batch_frame_len(priority, &payload)?
+                                .checked_add(comms.command_batch_frame_len(*next_priority, next_payload)?)?;
+                            backlog.batch_tail_follower_after_bytes(&**comms, bytes)
+                        })
+                        .filter(|(p, b)| !discard_retired_write(comms_handle.tx_budget.as_deref(), comms_handle.transport_activity.as_deref(), *p, b));
+                        extras.extend(follower.into_iter().chain(third));
                     }
-                    .filter(|(p, b)| !discard_retired_write(comms_handle.tx_budget.as_deref(), comms_handle.transport_activity.as_deref(), *p, b));
-                    backlog.refill(&mut comms_handle.tx_rx, &mut drain_remaining);
-                    let third = follower.as_ref().and_then(|(next_priority, next_payload)| {
-                        let bytes = comms.command_batch_frame_len(priority, &payload)?
-                            .checked_add(comms.command_batch_frame_len(*next_priority, next_payload)?)?;
-                        backlog.batch_tail_follower_after_bytes(&**comms, bytes)
-                    })
-                    .filter(|(p, b)| !discard_retired_write(comms_handle.tx_budget.as_deref(), comms_handle.transport_activity.as_deref(), *p, b));
                     let mut frames = vec![(priority, &payload[..])];
-                    frames.extend(follower.iter().chain(third.iter()).map(|(p, b)| (*p, &b[..])));
+                    frames.extend(extras.iter().map(|(p, b)| (*p, &b[..])));
                     let leases: Vec<_> = frames.iter().filter_map(|(_, bytes)|
                         comms_handle.tx_budget.as_ref().and_then(|budget| budget.write_lease(bytes))).collect();
                     let result = comms.send_tracked_counted(&frames, &leases);
@@ -4219,7 +4354,7 @@ pub(super) fn spawn_comms_worker_threads(
                             }
                             log_link_control_send(worker_name, &payload);
                             log_radio_command_event("radio TX sent", worker_name, &payload);
-                            for (next_priority, next_payload) in follower.iter().chain(third.iter()) {
+                            for (next_priority, next_payload) in extras.iter() {
                                 if let Some(budget) = &comms_handle.tx_budget {
                                     budget.complete(*next_priority, next_payload);
                                 }
@@ -4247,8 +4382,10 @@ pub(super) fn spawn_comms_worker_threads(
                             // write may already be on wire. Preserve every owner
                             // and retry their original IDs in the original order.
                             if !comms.recovery_budget_configured() {
-                                if let Some((third_priority, third_payload)) = third {
-                                    backlog.push(third_priority, third_payload, true);
+                                let mut extras = extras;
+                                let follower = if extras.is_empty() { None } else { Some(extras.remove(0)) };
+                                for (next_priority, next_payload) in extras.into_iter().rev() {
+                                    backlog.push(next_priority, next_payload, true);
                                 }
                                 backlog.restore_selected(selection_state, (priority, payload), follower);
                             } else {
@@ -4260,10 +4397,9 @@ pub(super) fn spawn_comms_worker_threads(
                                         bytes: payload,
                                     });
                                 } else {
-                                    let mut overflow: [Option<(u8, Vec<u8>)>; 3] = std::array::from_fn(|_| None);
+                                    let mut overflow: Vec<Option<(u8, Vec<u8>)>> = vec![None; 1 + extras.len()];
                                     for (index, (p, bytes)) in core::iter::once((priority, payload))
-                                        .chain(follower)
-                                        .chain(third)
+                                        .chain(extras)
                                         .enumerate()
                                     {
                                         if let Err(frame) = failed_writes.hold_new(p, bytes) {
@@ -4821,7 +4957,18 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 };
 
-                if let Ok(pkt) = serialize::unpack_packet(&payload) {
+                let records = if sedsnet::wire_bundle::is_bundle(&payload) {
+                    sedsnet::wire_bundle::unpack_bundle_frames(&payload).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let frames: Vec<&[u8]> = if records.is_empty() {
+                    vec![&payload[..]]
+                } else {
+                    records.iter().map(Vec::as_slice).collect()
+                };
+                for frame in frames {
+                    let Ok(pkt) = serialize::unpack_packet(frame) else { continue };
                     let ingress_generation = crate::gse::automatic_generation(&ingress_state);
                     ingress_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
                     ingress_state.mark_packet_received(get_current_timestamp_ms());

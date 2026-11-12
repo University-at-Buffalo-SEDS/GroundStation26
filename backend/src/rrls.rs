@@ -2405,6 +2405,21 @@ impl Mesh {
                 },
             })
         }
+        if sedsnet::wire_bundle::is_bundle(bytes) {
+            // A bundle takes its most urgent record's class; it is recovery
+            // control when any record is.
+            let frames = sedsnet::wire_bundle::unpack_bundle_frames(bytes).ok()?;
+            return frames.iter().map(|frame| canonical(frame)).try_fold(None, |acc: Option<FrameClass>, class| {
+                let class = class?;
+                Some(Some(match acc {
+                    None => class,
+                    Some(acc) => FrameClass {
+                        priority: acc.priority.max(class.priority),
+                        recovery_control: acc.recovery_control || class.recovery_control,
+                    },
+                }))
+            })?;
+        }
         if !bytes.starts_with(b"SDT") {
             return canonical(bytes);
         }

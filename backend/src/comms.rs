@@ -124,7 +124,33 @@ pub(crate) const RADIO_LIVENESS_PRIORITY: u8 = 251;
 /// The same for SDT time sync, which goes after receipts.
 pub(crate) const RADIO_TIME_SYNC_PRIORITY: u8 = 250;
 fn radio_liveness_frame(priority: u8, payload: &[u8]) -> bool {
-    matches!(priority, RADIO_LIVENESS_PRIORITY | RADIO_TIME_SYNC_PRIORITY) && payload.starts_with(b"SDT")
+    // With compact bundles the SDK hands over canonical frames instead of SDT.
+    matches!(priority, RADIO_LIVENESS_PRIORITY | RADIO_TIME_SYNC_PRIORITY)
+        && (payload.starts_with(b"SDT") || sedsnet::wire_bundle::frame_bundleable(payload))
+}
+
+/// Largest compact bundle the station writes at once (SDK bytes before the RR
+/// envelope and UART header): about one station turn share at 64 kbit/s.
+pub(crate) const RADIO_BUNDLE_MAX_BYTES: usize = 240;
+/// At most this many SDK frames share one compact bundle.
+pub(crate) const RADIO_BUNDLE_MAX_FRAMES: usize = 12;
+
+/// The pacing class a frame shares with every other record of one compact
+/// bundle: (closes the packet batch, is an end-to-end receipt). `None` keeps
+/// the frame out of bundles: ABORT and its FLIGHT_STATE write, operator
+/// commands (their own batch), side-wrapped (SDT) and sealed frames.
+pub(crate) fn radio_bundle_class(priority: u8, payload: &[u8]) -> Option<(bool, bool)> {
+    if !sedsnet::wire_bundle::frame_bundleable(payload)
+        || is_abort_frame(payload)
+        || is_abort_flight_state(payload)
+        || is_radio_batch_command(priority, payload)
+    {
+        return None;
+    }
+    Some((
+        closes_radio_packet_batch(priority, payload),
+        radio_batch_control_contract(priority, payload).is_some_and(|(_, receipt)| receipt),
+    ))
 }
 
 pub(crate) fn closes_radio_packet_batch(priority: u8, payload: &[u8]) -> bool {
@@ -183,6 +209,17 @@ pub(crate) fn radio_packet_boundary_contract(priority: u8, payload: &[u8]) -> Op
     } else {
         Some((packet.packet_id(), false))
     }
+}
+
+/// Two or more SDK frames of one bundle class, as `bundle_followers` selects.
+pub(crate) fn is_radio_bundle(frames: &[(u8, &[u8])]) -> bool {
+    frames.len() > 1
+        && frames.len() <= RADIO_BUNDLE_MAX_FRAMES
+        && radio_bundle_class(frames[0].0, frames[0].1).is_some_and(|class| {
+            frames[1..]
+                .iter()
+                .all(|(priority, payload)| radio_bundle_class(*priority, payload) == Some(class))
+        })
 }
 
 // Share one existing radio-frame-sized admission; never enlarge modem FIFOs.
@@ -332,6 +369,18 @@ pub trait CommsDevice: Send {
     /// Exact wire cost for bounded opportunistic batching; unsupported links
     /// retain their single-frame path. This never waits for future commands.
     fn command_batch_frame_len(&self, _priority: u8, _payload: &[u8]) -> Option<usize> {
+        None
+    }
+    /// SDK bytes `payload` adds to a compact bundle that `first` opened (or
+    /// opens, with `first` None). `None` keeps it out: unsupported link, or a
+    /// frame that must go alone or in another class. The caller decides whether
+    /// the link negotiated bundles; it pops followers in its own priority order.
+    fn bundle_frame_len(
+        &self,
+        _priority: u8,
+        _payload: &[u8],
+        _first: Option<(u8, &[u8])>,
+    ) -> Option<usize> {
         None
     }
     fn send_command_batch(
@@ -520,6 +569,16 @@ pub fn startup_failure_hint(cfg: &CommsLinkConfig) -> String {
 }
 
 fn tap_non_groundstation_gps_payload(payload: &[u8], packet_tap: &mut dyn FnMut(&Packet)) {
+    // A compact bundle carries several canonical frames; the router expands
+    // it itself, this tap looks at each record.
+    if sedsnet::wire_bundle::is_bundle(payload) {
+        if let Ok(frames) = sedsnet::wire_bundle::unpack_bundle_frames(payload) {
+            for frame in &frames {
+                tap_non_groundstation_gps_payload(frame, packet_tap);
+            }
+        }
+        return;
+    }
     let Ok(pkt) = serialize::unpack_packet(payload) else {
         return;
     };
@@ -3850,6 +3909,30 @@ impl UartComms {
         priority: u8,
         leases: &[sedsnet::router::PackedWriteLease],
     ) -> Result<usize, Box<dyn Error + Send + Sync>> {
+        self.send_sdk_write_tracked(payload, payload, priority, leases)
+    }
+    /// Several SDK frames of one pacing class (`radio_bundle_class`) as one
+    /// compact bundle: one RR envelope and one UART frame for all of them.
+    /// The write is admitted and paced as its first frame.
+    fn send_bundle_tracked(
+        &mut self,
+        frames: &[(u8, &[u8])],
+        leases: &[sedsnet::router::PackedWriteLease],
+    ) -> Result<usize, Box<dyn Error + Send + Sync>> {
+        let records: Vec<&[u8]> = frames.iter().map(|(_, frame)| *frame).collect();
+        let bundle = sedsnet::wire_bundle::pack_bundle(&records)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()))?;
+        self.send_sdk_write_tracked(frames[0].1, &bundle, frames[0].0, leases)
+    }
+    /// `payload` is the SDK frame that classifies the write; `sdk_wire` is
+    /// what goes on the wire (the same frame, or a bundle that starts with it).
+    fn send_sdk_write_tracked(
+        &mut self,
+        payload: &[u8],
+        sdk_wire: &[u8],
+        priority: u8,
+        leases: &[sedsnet::router::PackedWriteLease],
+    ) -> Result<usize, Box<dyn Error + Send + Sync>> {
         if !self.poll_hardware_flow_control()? {
             return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
         }
@@ -3886,7 +3969,7 @@ impl UartComms {
         let sdk_payload = payload;
         let routed = if let Some(shared) = &self.recovery {
             let mesh = shared.lock().unwrap();
-            let Some(frame) = mesh.local_tx(false, payload, mesh.now()) else {
+            let Some(frame) = mesh.local_tx(false, sdk_wire, mesh.now()) else {
                 return Ok(0);
             };
             Some(frame)
@@ -3894,7 +3977,7 @@ impl UartComms {
             None
         };
         let recovery_command = routed.as_ref().is_some_and(|frame| frame.command);
-        let payload = routed.as_ref().map_or(payload, |frame| &frame.bytes[..]);
+        let payload = routed.as_ref().map_or(sdk_wire, |frame| &frame.bytes[..]);
         #[cfg(target_os = "linux")]
         let mut write_state = self.write_lock.lock().unwrap();
         #[cfg(not(target_os = "linux"))]
@@ -4208,6 +4291,8 @@ impl CommsDevice for UartComms {
         if frames.len() == 1 {
             self.send_data_with_priority_tracked(frames[0].1, frames[0].0, leases)
                 .map(|_| ())
+        } else if is_radio_bundle(frames) {
+            self.send_bundle_tracked(frames, leases).map(|_| ())
         } else {
             self.send_command_batch_tracked(frames, leases)
         }
@@ -4218,7 +4303,7 @@ impl CommsDevice for UartComms {
         frames: &[(u8, &[u8])],
         leases: &[sedsnet::router::PackedWriteLease],
     ) -> Result<Option<usize>, Box<dyn Error + Send + Sync>> {
-        if frames.len() == 1
+        if (frames.len() == 1 || is_radio_bundle(frames))
             && matches!(self.protocol, SerialProtocol::RawUart)
             && rfd_profile::active().is_some()
             && self
@@ -4226,9 +4311,12 @@ impl CommsDevice for UartComms {
                 .as_ref()
                 .is_some_and(|mesh| mesh.lock().unwrap().role == crate::rrls::Role::Primary)
         {
-            return self
-                .send_data_with_priority_tracked(frames[0].1, frames[0].0, leases)
-                .map(Some);
+            return if frames.len() == 1 {
+                self.send_data_with_priority_tracked(frames[0].1, frames[0].0, leases)
+            } else {
+                self.send_bundle_tracked(frames, leases)
+            }
+            .map(Some);
         }
         self.send_tracked(frames, leases)?;
         Ok(None)
@@ -4467,6 +4555,23 @@ impl CommsDevice for UartComms {
             };
             Some(recovery_bytes + RAW_UART_FRAME_HEADER_SIZE)
         }
+    }
+    fn bundle_frame_len(
+        &self,
+        priority: u8,
+        payload: &[u8],
+        first: Option<(u8, &[u8])>,
+    ) -> Option<usize> {
+        if !matches!(self.protocol, SerialProtocol::RawUart) {
+            return None;
+        }
+        let class = radio_bundle_class(priority, payload)?;
+        if let Some((first_priority, first_payload)) = first
+            && radio_bundle_class(first_priority, first_payload) != Some(class)
+        {
+            return None;
+        }
+        Some(payload.len())
     }
     fn send_command_batch(
         &mut self,
@@ -7644,6 +7749,64 @@ mod raw_uart_tests {
         assert!(uart.send_data_with_priority(&ordinary, 16).is_err(), "ordinary data waits for the station's gap");
         note_air_rx_now();
         uart.send_data_with_priority(&abort, 255).expect("ABORT goes at once");
+    }
+
+    /// A compact bundle leaves as one UART frame in one RR AV_BAY_DATA
+    /// envelope (8 B once, not per SDK frame), and rebuilds every frame.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_compact_bundle_is_one_rr_envelope_and_one_uart_frame() {
+        const CHILD: &str = "GS_COMPACT_BUNDLE_RR_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::a_compact_bundle_is_one_rr_envelope_and_one_uart_frame";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env_remove("GS_RADIO_TURN_TAKING")
+                .env_remove("GS_SIM_CLOCK_FILE")
+                .env_remove("GS_SIMULATED_SERIAL_PTY")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let pack = |name: &str, endpoint: &str, ts: u64, payload: &[u8]| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type(name),
+                    &[crate::telemetry_schema::endpoint(endpoint)],
+                    "GS",
+                    ts,
+                    std::sync::Arc::from(payload),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let frames: Vec<Vec<u8>> = (0..3u64).map(|i| pack("HEARTBEAT", "HEART_BEAT", 1_000 + i, &[])).collect();
+        let refs: Vec<(u8, &[u8])> = frames.iter().map(|f| (255u8, &f[..])).collect();
+        assert!(is_radio_bundle(&refs));
+        let abort = pack("ABORT", "ABORT", 1, b"SEDS_MANUAL_ABORT_V1:K");
+        assert!(!is_radio_bundle(&[(255, &frames[0][..]), (255, &abort[..])]), "ABORT stays standalone");
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_secs(1)).unwrap();
+        let (mut uart, _mesh, _) = recovery_uart_fixture(port);
+        uart.send_tracked(&refs, &[]).expect("bundle write");
+        let mut header = [0u8; 4];
+        peer.read_exact(&mut header).unwrap();
+        assert_eq!(&header[..2], &[RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1]);
+        let len = u16::from_le_bytes([header[2], header[3]]) as usize;
+        let mut body = vec![0; len];
+        peer.read_exact(&mut body).unwrap();
+        assert_eq!(&body[..4], b"RR\x01\x05", "one AV_BAY_DATA envelope");
+        let inner = &body[4..len - 4];
+        assert_eq!(sedsnet::wire_bundle::unpack_bundle_frames(inner).unwrap(), frames);
+        let legacy: usize = frames.iter().map(|f| f.len() + 8 + 4).sum();
+        assert!(len + 4 < legacy, "bundle {} B vs {legacy} B as single frames", len + 4);
+        let mut probe = [0u8; 1];
+        peer.set_timeout(Duration::from_millis(50)).unwrap();
+        assert!(peer.read_exact(&mut probe).is_err(), "nothing else written");
     }
 
     /// Through the real writer: an Abort's first copy goes mid-turn, its
