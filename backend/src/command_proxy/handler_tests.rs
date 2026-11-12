@@ -1136,3 +1136,88 @@ async fn proxied_launch_is_refused_like_local_launch_while_a_board_reports_abort
     assert!(rx.try_recv().is_err(), "no Launch reaches the command queue");
     state.request_shutdown();
 }
+
+#[tokio::test]
+async fn rrls_operator_abort_is_forwarded_to_the_primary_at_once_and_replaces_a_pending_request() {
+    if !child(
+        "command_proxy::handler_tests::rrls_operator_abort_is_forwarded_to_the_primary_at_once_and_replaces_a_pending_request",
+        "rrls",
+    ) {
+        return;
+    }
+    let (root, _, _) = super::tests::fixtures();
+    let mesh = configure();
+    let mut health = b"RR\x01\x00".to_vec();
+    health.extend(7u32.to_le_bytes());
+    health.extend(20u32.to_le_bytes());
+    health.push(1);
+    let mut crc = u32::MAX;
+    for b in &health {
+        crc ^= u32::from(*b);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    health.extend((!crc).to_le_bytes());
+    {
+        let mut mesh = mesh.lock().unwrap();
+        let now = mesh.now();
+        mesh.incoming(true, &health, now);
+    }
+    let state = crate::recording_export::tests::export_state(&root.0, false).await;
+    user(&state.auth, true, false, false, &["ToggleAvBayUnderglow", "Abort"]);
+    sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,allowed_commands_json,created_at_ms,expires_at_ms) VALUES ('fixture-token','operator','password',1,1,'[]',0,9223372036854775807)")
+        .execute(&state.auth_db).await.unwrap();
+    let principal = state
+        .auth
+        .authorize_token(&state.auth_db, Some("fixture-token"), Permission::SendCommands)
+        .await
+        .unwrap();
+    {
+        let mut broker = broker().lock().unwrap();
+        broker.status.available = true;
+        // An older primary build that did not list Abort is still sent it: its
+        // manual-stop admission is the one path that is never refused.
+        broker.status.supported_commands = vec!["ToggleAvBayUnderglow".into()];
+    }
+    // An ordinary command is already waiting for the primary.
+    assert_eq!(
+        submit(&state, &principal, Some("fixture-token"), Operation::Command("ToggleAvBayUnderglow".into()))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    let ordinary = status().pending.unwrap().request_id;
+    // The RRLS operator presses Abort: the local stop is retained AND the Abort
+    // goes to the primary right away, ahead of (replacing) the ordinary request.
+    assert_eq!(
+        submit(&state, &principal, Some("fixture-token"), Operation::Command("Abort".into()))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    assert!(state.manual_abort_intent.pending_epoch().is_some());
+    let now = status();
+    let pending = now.pending.expect("the Abort is queued for the primary");
+    assert_eq!(pending.operation, "Abort");
+    assert_eq!(pending.phase, "pending_primary");
+    assert_ne!(pending.request_id, ordinary);
+    let last = now.last.unwrap();
+    assert_eq!(last.request_id, ordinary);
+    assert_eq!(last.phase, "superseded_by_abort");
+    {
+        let broker = broker().lock().unwrap();
+        let queued = broker.pending.as_ref().unwrap();
+        assert_eq!(queued.operation, Operation::Command("Abort".into()));
+        assert_eq!(queued.attempts, 0, "nothing delays the first copy");
+    }
+    // A second press while the Abort is still pending keeps that one request.
+    assert_eq!(
+        submit(&state, &principal, Some("fixture-token"), Operation::Command("Abort".into()))
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(status().pending.unwrap().request_id, pending.request_id);
+    state.request_shutdown();
+}
