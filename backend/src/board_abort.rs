@@ -843,6 +843,17 @@ pub(crate) fn launch_command(name: &str) -> bool {
         "Launch" | "GroundStationLaunch" | "AdvanceFlightState" | "RewindFlightState"
     )
 }
+/// The board that drives a manual valve or actuator output.
+fn output_board(cmd: &str) -> Option<Board> {
+    match cmd {
+        "Pilot" | "NormallyOpen" | "Dump" => Some(Board::ValveBoard),
+        "Igniter" | "Nitrogen" | "Nitrous" | "NitrogenClose" | "NitrousClose" | "RetractPlumbing" | "IgniterSequence" => {
+            Some(Board::ActuatorBoard)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn block_policy(state: &AppState, policy: &mut crate::sequences::ActionPolicyMsg) {
     let reason = blocked_message(state).or_else(|| {
         if crate::rrls::is_rrls() { return None; }
@@ -864,6 +875,18 @@ pub(crate) fn block_policy(state: &AppState, policy: &mut crate::sequences::Acti
                     control.blink = crate::sequences::BlinkMode::None;
                 }
             }
+        }
+    }
+    // A board that reports Abort drains valve and actuator commands until Reset all boards (VB main_thread.c,
+    // AB main_task.c). Refuse those presses with that reason instead of sending them to be dropped.
+    let aborted = state.board_abort.launch_abort_mask(state);
+    for control in &mut policy.controls {
+        if let Some(board) = output_board(&control.cmd)
+            && index(board).is_some_and(|i| aborted & (1 << i) != 0)
+        {
+            control.enabled = false;
+            control.disabled_reason = Some(format!("{} reports Abort and ignores {} until Reset all boards.", board.as_str(), control.cmd));
+            control.blink = crate::sequences::BlinkMode::None;
         }
     }
     if let Some(reason) = reason {
@@ -1232,3 +1255,43 @@ mod launch_presence_tests {
 }
 #[cfg(test)]
 mod automatic_admission_tests;
+#[cfg(test)]
+mod aborted_output_board_tests {
+    use super::*;
+    fn control<'a>(policy: &'a crate::sequences::ActionPolicyMsg, cmd: &str) -> &'a crate::sequences::ActionControl {
+        policy.controls.iter().find(|c| c.cmd == cmd).unwrap_or_else(|| panic!("{cmd} control missing"))
+    }
+    /// A board that reports Abort drains valve and actuator commands until Reset all boards. The station must
+    /// refuse those presses with that reason, not accept them and leave them unconfirmed (fullnet S-Nbench:
+    /// VB continuity Abort, then Pilot/Vent/Dump answered "ok" and never moved).
+    #[tokio::test]
+    async fn valve_commands_to_an_aborted_board_are_refused_with_the_reason() {
+        let state = crate::state::tests::test_app_state().await;
+        let now = Instant::now();
+        state.board_abort.observe_abort(Board::ValveBoard, now, 100);
+        state.board_status.lock().unwrap().get_mut(&Board::ValveBoard).unwrap().last_seen_instant = Some(now);
+        let mut policy = state.action_policy.lock().unwrap().clone();
+        block_policy(&state, &mut policy);
+        for cmd in ["Pilot", "NormallyOpen", "Dump"] {
+            let c = control(&policy, cmd);
+            assert!(!c.enabled, "{cmd} must be refused while the Valve Board reports Abort");
+            let reason = c.disabled_reason.clone().unwrap_or_default();
+            assert!(reason.contains("Valve Board") && reason.contains("Abort") && reason.contains("Reset all boards"), "{cmd}: {reason}");
+        }
+        // The Actuator Board is not aborted: its outputs keep their own policy.
+        for cmd in ["Igniter", "Nitrogen", "Nitrous"] {
+            assert!(!control(&policy, cmd).disabled_reason.clone().unwrap_or_default().contains("reports Abort"), "{cmd}");
+        }
+        state.board_abort.observe_abort(Board::ActuatorBoard, now, 101);
+        state.board_status.lock().unwrap().get_mut(&Board::ActuatorBoard).unwrap().last_seen_instant = Some(now);
+        let mut policy = state.action_policy.lock().unwrap().clone();
+        block_policy(&state, &mut policy);
+        for cmd in ["Igniter", "Nitrogen", "Nitrous", "NitrogenClose", "NitrousClose", "RetractPlumbing"] {
+            let Some(c) = policy.controls.iter().find(|c| c.cmd == cmd) else {
+                assert!(!["Igniter", "Nitrogen", "Nitrous"].contains(&cmd), "{cmd} control missing");
+                continue;
+            };
+            assert!(!c.enabled && c.disabled_reason.clone().unwrap_or_default().contains("Actuator Board reports Abort"), "{cmd}");
+        }
+    }
+}
