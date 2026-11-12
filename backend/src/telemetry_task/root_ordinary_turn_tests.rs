@@ -273,6 +273,8 @@ async fn root_profile_clock_and_catalog_share_ordinary_service() {
     relay.assume_av_bay_heard_for_test();
     primary.enable_settings_framing();
     relay.enable_settings_framing();
+    // The primary has listened since boot, so its first tick requests the relay.
+    primary.assume_listening_since_boot_for_test();
     write_warm_clock(&clock, &now, 30843);
     fn boot(from: &mut crate::rrls::Mesh, to: &mut crate::rrls::Mesh) {
         let mut total = 0;

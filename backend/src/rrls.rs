@@ -544,7 +544,8 @@ pub struct Mesh {
     /// the radio although there is no takeover (an operator Abort here).
     abort_egress_until: Option<u64>,
     /// First tick: an RRLS that has never heard the primary waits TAKEOVER_MS
-    /// from here before taking over (not at once at boot).
+    /// from here before taking over (not at once at boot); a primary that has
+    /// never heard the AV bay counts its relay loss gap from here.
     first_tick: Option<u64>,
     primary_direct: bool,
     last_direct: Option<u64>,
@@ -747,9 +748,20 @@ impl Mesh {
     /// of a restore); leave only after RESTORE_MS of continuous direct frames
     /// and at least RELAY_MIN_DWELL_MS in relay.
     fn decide_relay(&mut self, now: u64) {
+        // Before any direct frame, after a slow first tick the gap runs from
+        // that tick: the station's radio only listens once its startup modem
+        // check has finished (about 8 s), so counting from the mesh's creation asked
+        // for the relay at boot while the AV bay was audible, and the 10 s
+        // relay dwell then held both stations in relay mode to 18 s.
+        let first_tick = *self.first_tick.get_or_insert(now);
+        let listening_since = if first_tick.saturating_sub(self.clock_origin_ms) > LOSS_MS {
+            first_tick
+        } else {
+            self.clock_origin_ms
+        };
         let gap = self
             .last_direct
-            .map_or(now.saturating_sub(self.clock_origin_ms), |v| now.saturating_sub(v));
+            .map_or(now.saturating_sub(listening_since), |v| now.saturating_sub(v));
         let dwell = self.relay_changed_at.map(|at| now.saturating_sub(at));
         if !self.fallback {
             // The first request after startup has no prior restore to respect.
@@ -793,6 +805,13 @@ impl Mesh {
     pub(crate) fn assume_av_bay_heard_for_test(&mut self) {
         // hears_av_bay() saturates now - heard to 0: always fresh.
         self.av_bay_heard = Some(u64::MAX);
+    }
+    /// Test fixtures for a primary whose radio has listened since the mesh was
+    /// created, so a first tick LOSS_MS or more later finds the AV bay silent
+    /// for that long and requests the relay at once.
+    #[cfg(test)]
+    pub(crate) fn assume_listening_since_boot_for_test(&mut self) {
+        self.first_tick = Some(self.clock_origin_ms);
     }
     /// RRLS: it heard the AV bay recently enough for relaying to help.
     fn hears_av_bay(&self, now: u64) -> bool {
@@ -2912,6 +2931,21 @@ pub(crate) fn topology_observation() -> Option<TopologyObservation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Faithful fullnet boot: the primary's first tick came after its 8 s
+    /// startup modem check, and the relay loss gap counted from mesh creation
+    /// asked for the RRLS relay at once (no direct AV-bay frame for 7.4 s)
+    /// while RF was already audible. The gap now runs from the first tick.
+    #[test]
+    fn the_primary_does_not_ask_for_the_relay_at_its_first_tick_after_a_slow_boot() {
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        let origin = mesh.clock_origin_ms;
+        mesh.tick(origin + 8_000);
+        assert!(!mesh.fallback, "no relay request at the first tick");
+        mesh.tick(origin + 8_000 + LOSS_MS - 1);
+        assert!(!mesh.fallback);
+        mesh.tick(origin + 8_000 + LOSS_MS);
+        assert!(mesh.fallback, "still requested when the AV bay stays silent for LOSS_MS");
+    }
     #[test]
     fn host_control_is_bounded_independent_and_retains_serial_ownership() {
         let mut payload = vec![0; 132];
@@ -3820,6 +3854,7 @@ mod tests {
     #[test]
     fn disconnected_rrls_keeps_direct_commands_and_expired_proofs_restore_direct() {
         let mut p = Mesh::new(Role::Primary, 1);
+        p.assume_listening_since_boot_for_test();
         p.tick(3001);
         assert!(!p.active(3001));
         assert_eq!(
@@ -4949,6 +4984,7 @@ mod tests {
     #[test]
     fn relayed_frames_do_not_restore_the_direct_link() {
         let mut p = Mesh::new(Role::Primary, 1);
+        p.assume_listening_since_boot_for_test();
         p.tick(3001);
         let mut proof = 1u32.to_le_bytes().to_vec();
         proof.extend_from_slice(&0u32.to_le_bytes());
