@@ -946,7 +946,7 @@
       "endpoints": [
         "GROUND_STATION"
       ],
-      "reliable": "Ordered",
+      "reliable": "Unordered",
       "priority": 200
     },
     {

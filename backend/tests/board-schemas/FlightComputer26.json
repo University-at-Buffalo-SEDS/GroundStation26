@@ -681,7 +681,7 @@
       "endpoints": [
         "ActuatorGroundStation"
       ],
-      "reliable": "Ordered",
+      "reliable": "Unordered",
       "priority": 200
     }
   ]

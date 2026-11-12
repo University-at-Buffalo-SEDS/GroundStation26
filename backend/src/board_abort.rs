@@ -1149,6 +1149,21 @@ mod reset_scope_context_tests {
         runtime.observe_abort(Board::RFBoard, at + Duration::from_millis(3), 100);
         assert!(runtime.with_reset_context(episode, || Ok(())).is_err());
     }
+    /// BOARD_STATE_STATUS is Unordered, so an Abort push can overtake the
+    /// reply to a query asked before the Abort. That late reply shows the
+    /// board out of Abort; it must not clear the Abort the push showed.
+    #[test]
+    fn a_reply_overtaken_by_the_abort_push_does_not_clear_the_abort() {
+        let runtime = Runtime::default();
+        let asked = Instant::now();
+        let pushed = asked + Duration::from_millis(500);
+        runtime.observe_abort(Board::FlightComputer, pushed, 100);
+        runtime.observe_status(Board::FlightComputer, 12, 2, 34, Some(4), false, true,
+            asked, runtime.query_revision(Board::FlightComputer), pushed + Duration::from_millis(700), 101);
+        let i = index(Board::FlightComputer).unwrap();
+        assert!(runtime.register.lock().unwrap().rows[i].aborted, "the earlier reply left the Abort shown");
+        assert!(!runtime.non_abort_proven_after(Board::FlightComputer, asked));
+    }
     #[test]
     fn policy_aba_exhaustion_and_unidentified_abort_cannot_authorize_scoped_reset() {
         let runtime = Runtime::default();
