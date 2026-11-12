@@ -581,7 +581,9 @@ pub(super) fn status(state: &AppState) -> Status {
             runtime_active(&rt),
         )
     };
-    let reason = if owned || busy {
+    let reason = if !owned && crate::sequence_access::disabled_command(state, "AutoColdFlow") {
+        crate::sequence_access::DISABLED_REASON
+    } else if owned || busy {
         "Another ground sequence owns the valves"
     } else if target.is_none() {
         "Set the separate Cold Flow nitrogen target in GSE settings"
@@ -652,6 +654,9 @@ fn recording_preflight(
     let simulation = crate::simulation_clock_ms();
     let policy = state.action_policy_snapshot();
     let _dispatch = dispatch_gate();
+    if crate::sequence_access::disabled_command(state, "AutoColdFlow") {
+        return Err(PreparationError::Invalid(crate::sequence_access::DISABLED_REASON));
+    }
     preparation_ownership(state, requested)?;
     if matches!(
         state.launch_clock_snapshot().kind,
@@ -793,6 +798,9 @@ async fn start(
                 return Err(PreparationError::Invalid(
                     "Recording proof expired before cold-flow admission",
                 ));
+            }
+            if crate::sequence_access::disabled_command(&state, "AutoColdFlow") {
+                return Err(PreparationError::Invalid(crate::sequence_access::DISABLED_REASON));
             }
             preparation_ownership(&state, requested)?;
             if matches!(

@@ -379,6 +379,9 @@ pub struct AppState {
     /// Monotonic counter for operator requests to continue a failed fill sequence.
     pub fill_sequence_continue_requests: Arc<AtomicU64>,
 
+    /// Administrator "launch sequence only" setting.
+    pub sequence_access: Arc<crate::sequence_access::SequenceAccess>,
+
     /// In-memory recent telemetry cache used to bridge DB write lag during reseed.
     pub recent_telemetry_cache: Arc<Mutex<VecDeque<TelemetryRow>>>,
 
@@ -2106,6 +2109,7 @@ impl AppState {
                     }
                 }
             }
+            crate::sequence_access::project_policy(self, &mut local);
             crate::sequences::explain_disabled_policy(&mut local);
             return local;
         }
@@ -2375,6 +2379,9 @@ impl AppState {
 
     /// Applies the current software-action policy to decide whether a command can run.
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
+        if crate::sequence_access::refusal(self, cmd).is_some() {
+            return false;
+        }
         if self.operator_queue.fill_launch_active()
             && crate::sequences::is_fill_system_control(command_name(cmd)) {
             return false;
@@ -4512,6 +4519,7 @@ pub(crate) mod tests {
             recording_status_tx,
             last_command_ms: Arc::new(Mutex::new(HashMap::new())),
             fill_sequence_continue_requests: Arc::new(AtomicU64::new(0)),
+            sequence_access: Default::default(),
             recent_telemetry_cache: Arc::new(Mutex::new(VecDeque::new())),
             latest_gps_fix_by_sender: Arc::new(Mutex::new(HashMap::new())),
             latest_gps_satellites_by_sender: Arc::new(Mutex::new(HashMap::new())),

@@ -769,6 +769,21 @@ async fn resume(
     if let Err(error) = require_primary_operational_station() {
         return error.into_response();
     }
+    if crate::sequence_access::launch_only(&state) {
+        let command = if super::cold_flow::owns_run(&state, &key) {
+            Some("AutoColdFlow")
+        } else {
+            match state.gse.lock().unwrap().progress.current().filter(|s| s.key == key).map(|s| s.kind) {
+                Some(Kind::Fill) => Some("StartFill"),
+                Some(Kind::ValveSelfTest) => Some("ValveSelfTest"),
+                Some(Kind::NitrogenTest) => Some("NitrogenTest"),
+                _ => None,
+            }
+        };
+        if command.is_some_and(|name| crate::sequence_access::disabled_command(&state, name)) {
+            return (StatusCode::CONFLICT, crate::sequence_access::DISABLED_REASON).into_response();
+        }
+    }
     if super::cold_flow::owns_run(&state, &key) {
         if !principal.allows_command_name("AutoColdFlow") {
             return StatusCode::FORBIDDEN.into_response();

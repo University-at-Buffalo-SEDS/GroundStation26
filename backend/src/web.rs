@@ -488,6 +488,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::voice::routes(state.clone(), voice))
         .merge(crate::gse::routes())
         .merge(crate::admin::routes())
+        .merge(crate::sequence_access::routes())
         .merge(crate::checklists::routes())
         .merge(crate::client_settings::routes())
         .merge(crate::mission_sync::routes())
@@ -2586,6 +2587,9 @@ fn command_disabled_message(state:&AppState,command:&TelemetryCommand)->String {
     };
     if let Some(forward)=phase_step && crate::operator_phase::local_mode(state) {
         return format!("{name}: {}",crate::operator_phase::refusal_reason(state,forward));
+    }
+    if let Some(reason)=crate::sequence_access::refusal(state,command) {
+        return format!("{name}: {reason}");
     }
     let policy=state.action_policy_snapshot();
     let reason=policy.controls.iter().find(|control|control.cmd==name)

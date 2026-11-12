@@ -952,6 +952,9 @@ fn supply_refusal_at(rt: &Runtime, now: u64, cmd: &TelemetryCommand) -> Option<&
 }
 /// The specific reason command_allowed refuses `cmd`, for the refusal message.
 pub fn command_refusal_reason(state: &AppState, cmd: &TelemetryCommand) -> Option<String> {
+    if let Some(reason) = crate::sequence_access::refusal(state, cmd) {
+        return Some(reason.into());
+    }
     if command_allowed(state, cmd) != Some(false) {
         return None;
     }
@@ -1407,6 +1410,15 @@ fn handle_command_inner(
     plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
     launch_revision: Option<u64>,
 ) -> bool {
+    // Admin "launch sequence only": every path into the engine (operator,
+    // recorded fill, automatic zero then fill, resume) is refused here too.
+    if let Some(reason) = crate::sequence_access::refusal(state, cmd) {
+        state.add_temporary_notification(format!(
+            "{} blocked: {reason}",
+            crate::sequences::command_name(cmd)
+        ));
+        return true;
+    }
     if overpressure::command_allowed(&state.gse.lock().unwrap(), cmd) == Some(false) {
         state.add_temporary_notification(
             "Blocked: a tank overpressure error holds dump and vent open; acknowledge it after pressure drops",
@@ -4234,6 +4246,42 @@ fn turbocharge_active(rt: &Runtime) -> bool {
     rt.turbocharge.is_some() || rt.engine.status.phase == Phase::Turbocharge
 }
 /// Waits for the GSE owner: for refusing an operator press, not presentation.
+/// Run `f` with the GSE command gate held: no sequence starts meanwhile.
+pub(crate) fn with_command_gate<R>(f: impl FnOnce() -> R) -> R {
+    let _dispatch = dispatch_gate();
+    f()
+}
+/// A running or paused sequence that "launch sequence only" disables, by
+/// operator name. `all_engine` covers the self-test, nitrogen test and fill
+/// (disabled only in HITL); Turbocharge and Auto Cold Flow always count.
+pub(crate) fn running_disabled_sequence(state: &AppState, all_engine: bool) -> Option<&'static str> {
+    let zero_then_fill = state.fill_recording.continuation.lock().unwrap().is_some();
+    let rt = state.gse.lock().unwrap();
+    if cold_flow::runtime_active(&rt) {
+        return Some("Auto Cold Flow");
+    }
+    if rt.turbocharge.is_some() {
+        return Some("Turbocharge");
+    }
+    if !all_engine {
+        return None;
+    }
+    if rt.fill_trim.is_some() {
+        return Some("The fill (final mass trim)");
+    }
+    if zero_then_fill {
+        return Some("The fill (waiting for its automatic zero)");
+    }
+    if rt.engine.active() {
+        return Some(match rt.progress.current().map(|s| s.kind) {
+            Some(crate::sequence_progress::Kind::ValveSelfTest) => "The valve self-test",
+            Some(crate::sequence_progress::Kind::NitrogenTest) => "The nitrogen test",
+            Some(crate::sequence_progress::Kind::Fill) => "The fill",
+            _ => "A GSE sequence",
+        });
+    }
+    None
+}
 pub(crate) fn turbocharge_active_now(state: &AppState) -> bool {
     turbocharge_active(&state.gse.lock().unwrap())
 }
@@ -7363,6 +7411,9 @@ pub(crate) fn try_commit_automatic_policy(
 
 #[cfg(test)]
 mod local_stop_priority_tests { include!("gse/local_stop_priority_tests.rs"); }
+
+#[cfg(test)]
+mod sequence_access_tests { include!("gse/sequence_access_tests.rs"); }
 
 #[cfg(test)]
 pub(crate) fn native_owned_startup_prime(state:&Arc<AppState>) -> serde_json::Value {
