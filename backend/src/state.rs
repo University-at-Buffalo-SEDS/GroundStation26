@@ -1288,6 +1288,7 @@ impl AppState {
         let simulated = crate::flight_sim::sim_mode_enabled();
         let Some(router) = self.topology_router.get() else {
             let mut out = NetworkTopologyMsg {
+                station_time: crate::telemetry_task::station_time_status(),
                 generated_ms: now_ms,
                 simulated,
                 nodes: Vec::new(),
@@ -1523,6 +1524,7 @@ impl AppState {
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
 
         let mut out = NetworkTopologyMsg {
+            station_time: crate::telemetry_task::station_time_status(),
             generated_ms: now_ms,
             simulated,
             nodes,

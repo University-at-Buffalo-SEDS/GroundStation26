@@ -242,6 +242,157 @@ pub(crate) fn refresh_host_network_time(router: &Router, utc_ms: u64) {
     }
 }
 
+static ABSOLUTE_TIME: std::sync::LazyLock<std::sync::Mutex<crate::absolute_time::AbsoluteTime>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Station host UTC in ns: the model clock in simulation (ms resolution, the
+/// simulator's truth), else CLOCK_REALTIME at full resolution.
+fn host_utc_ns() -> i64 {
+    if crate::simulation_clock_ms().is_some() {
+        return (procedure_clock::now().utc_ms() as i64).saturating_mul(1_000_000);
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos().min(i64::MAX as u128) as i64)
+}
+
+/// Host clock synchronized by NTP (the simulator's model clock is truth).
+fn host_clock_ntp_synced() -> bool {
+    if crate::simulation_clock_ms().is_some() {
+        return std::env::var("GS_SIM_HOST_NTP").map_or(true, |v| v != "0");
+    }
+    crate::absolute_time::host_ntp_synced()
+}
+
+/// The station's time status for the network topology message.
+pub(crate) fn station_time_status() -> Option<crate::types::StationTimeStatus> {
+    let status = NETWORK_TIME_ROUTER.get()?.timesync_status()?;
+    let abs = absolute_time_status();
+    Some(crate::types::StationTimeStatus {
+        sync_state: status.state.code(),
+        is_reference: status.is_reference,
+        stratum: status.stratum,
+        error_bound_us: (status.error_bound_ns != u64::MAX).then_some(status.error_bound_ns / 1_000),
+        utc_source: match abs.source {
+            crate::absolute_time::AbsoluteSource::Gps => "gps",
+            crate::absolute_time::AbsoluteSource::Ntp => "ntp",
+            crate::absolute_time::AbsoluteSource::Held => "held",
+            crate::absolute_time::AbsoluteSource::Unsynced => "unsynced",
+        }
+        .to_string(),
+        utc_bound_us: abs.bound_us,
+    })
+}
+
+/// Absolute-time source and bound for the UI ("UTC via GPS +-X ms").
+pub(crate) fn absolute_time_status() -> crate::absolute_time::AbsoluteStatus {
+    ABSOLUTE_TIME.lock().unwrap().status()
+}
+
+/// Feeds the station's UTC to SEDSnet once a second: host time plus the
+/// absolute correction learned from RF GPS reports (or NTP, or held). A coarse
+/// step re-anchors the network clock only when `absolute_time::may_step`
+/// allows it; otherwise corrections slew.
+pub(crate) fn refresh_station_network_time(router: &Router) {
+    let mut reports: Vec<(i64, u64)> = router
+        .take_utc_reference_reports()
+        .into_iter()
+        .map(|r| (r.offset_ns, r.error_ns))
+        .collect();
+    let host_ns = host_utc_ns();
+    let mut abs = ABSOLUTE_TIME.lock().unwrap();
+    // Bootstrap: a station with no valid UTC of its own that follows an
+    // anchored remote (RF leading with GPS while the Pi has no RTC) adopts
+    // that time, then leads again with it.
+    if let Some(status) = router.timesync_status()
+        && !status.is_reference
+        && status.state.is_synced()
+        && let Some(net_ns) = router.network_time_ns()
+        && net_ns >= sedsnet::timesync::TIMESYNC_UTC_FLOOR_MS as i128 * 1_000_000
+    {
+        let fed = host_ns.saturating_add(abs.correction_ns());
+        reports.push(((net_ns as i64).saturating_sub(fed), status.error_bound_ns));
+    }
+    let stepped = abs.update(crate::absolute_time::Inputs {
+        now: std::time::Instant::now(),
+        ntp_synced: host_clock_ntp_synced(),
+        reports,
+        may_step: crate::absolute_time::may_step(
+            crate::network_variables::flight_state(),
+            crate::network_health::any_board_time_locked(),
+        ),
+    });
+    let status = abs.status();
+    let utc_ns = host_ns.saturating_add(abs.correction_ns());
+    drop(abs);
+    // Never feed 1970 or a stale RTC-less boot time as UTC.
+    if status.source == crate::absolute_time::AbsoluteSource::Unsynced
+        && !(1_577_836_800_000_000_000..4_354_819_200_000_000_000).contains(&utc_ns)
+    {
+        return;
+    }
+    if stepped {
+        log::warn!(
+            "station UTC coarse-set by {} us ({:?})",
+            status.correction_us,
+            status.source
+        );
+        router.step_local_network_time_ns(utc_ns);
+    } else if let Some(t) = sedsnet::timesync::NetworkTime::from_unix_ns(i128::from(utc_ns)) {
+        router.set_local_network_time(t.into());
+    }
+    if let Some(diff) = status.gps_minus_ntp_us {
+        log::debug!("GPS UTC minus NTP host UTC: {diff} us");
+    }
+}
+
+/// When received bytes were read, for time sync receive stamps: the
+/// simulator's model clock (the router's clock there) or a host instant.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RxReadStamp {
+    at: std::time::Instant,
+    model_ms: Option<u64>,
+}
+
+impl RxReadStamp {
+    pub(crate) fn now() -> Self {
+        Self { at: std::time::Instant::now(), model_ms: crate::simulation_clock_ms() }
+    }
+}
+
+/// The read instant on `router`'s monotonic clock.
+pub(crate) fn router_rx_ns(router: &Router, stamp: RxReadStamp) -> u64 {
+    match stamp.model_ms {
+        Some(ms) => ms.saturating_mul(1_000_000),
+        None => router
+            .clock_now_ns()
+            .saturating_sub(stamp.at.elapsed().as_nanos().min(u64::MAX as u128) as u64),
+    }
+}
+
+/// Reports a radio frame's transmit completion to SEDSnet so a time sync
+/// frame is stamped when its last byte left the UART (not when it was
+/// queued). `model_end_us` is the simulated wire's stop time; on hardware the
+/// write has drained (tcdrain) when this runs. `trailing_bytes` were written
+/// after this frame in the same write. Other frames cost a length compare.
+pub(crate) fn note_frame_written(
+    side: Option<sedsnet::router::RouterSideId>,
+    frame: &[u8],
+    model_end_us: Option<u64>,
+    trailing_bytes: usize,
+    baud: u32,
+) {
+    let (Some(side), Some(router)) = (side, NETWORK_TIME_ROUTER.get()) else {
+        return;
+    };
+    if frame.len() > 128 {
+        return;
+    }
+    let end_ns = model_end_us.map_or_else(|| router.clock_now_ns(), |us| us.saturating_mul(1_000));
+    let trailing_ns = (trailing_bytes as u64).saturating_mul(10_000_000_000) / u64::from(baud.max(1));
+    router.note_frame_sent(side, frame, end_ns.saturating_sub(trailing_ns));
+}
+
 pub fn set_network_time_router(router: Arc<Router>) {
     let _ = NETWORK_TIME_ROUTER.set(router);
 }
@@ -3164,9 +3315,6 @@ fn payload_json_from_pkt(pkt: &Packet) -> String {
 }
 
 pub fn timesync_enabled() -> bool {
-    if crate::rrls::is_rrls() {
-        return false;
-    }
     if crate::runtime_mode::is_testing() {
         return std::env::var("GROUNDSTATION_TIMESYNC").ok().as_deref() == Some("1");
     }

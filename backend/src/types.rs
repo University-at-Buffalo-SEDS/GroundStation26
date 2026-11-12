@@ -597,6 +597,19 @@ pub struct BoardDiagnostics {
     /// RF radio TX queue timing block. Missing on older RF firmware/other boards.
     #[serde(default)]
     pub rf_tx_timing: Option<RfTxTiming>,
+    /// Board's own network-time quality (SEDSnet 4.4). Missing on older firmware.
+    #[serde(default)]
+    pub time_sync: Option<BoardTimeSync>,
+}
+
+/// A board's network-time quality from its BOARD_HEALTH sync byte: "synced
+/// +-X ms" or "unsynced".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
+pub struct BoardTimeSync {
+    /// Locked (or holding over within its bound): its timestamps may be trusted.
+    pub synced: bool,
+    /// Error bound of the board's network time, microseconds; `None` when unknown.
+    pub error_bound_us: Option<u64>,
 }
 
 /// RF BOARD_HEALTH words 16..21 ("RFT1" tag). Timing and high-water cover the
@@ -641,8 +654,28 @@ pub struct NetworkBoardHealthEntry {
     pub clock_offset_ms: Option<i64>,
 }
 
+/// The station's own time: network-time quality (it normally leads, so this
+/// is "reference"; an RRLS following the GS reports its sync) and the
+/// absolute-UTC source ("UTC via GPS +-X ms", "via NTP", "unsynced").
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default)]
+pub struct StationTimeStatus {
+    /// 0 unsynced, 1 acquiring, 2 locked, 3 holdover.
+    pub sync_state: u8,
+    pub is_reference: bool,
+    pub stratum: u8,
+    /// Network-time error bound, microseconds (`None` unknown).
+    pub error_bound_us: Option<u64>,
+    /// "gps", "ntp", "held" or "unsynced".
+    pub utc_source: String,
+    /// Absolute UTC error bound, microseconds (`None` unknown).
+    pub utc_bound_us: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default)]
 pub struct NetworkTopologyMsg {
+    /// Station time quality; missing from older backends.
+    #[serde(default)]
+    pub station_time: Option<StationTimeStatus>,
     #[serde(default)]
     pub health: Vec<NetworkBoardHealthEntry>,
     pub generated_ms: u64,

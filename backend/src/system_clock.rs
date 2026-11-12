@@ -67,7 +67,8 @@ pub(crate) fn refresh_network_source(router: &sedsnet::router::Router, host_utc_
         // A wall-clock refresh here would silently undo Use client time.
         return;
     }
-    crate::telemetry_task::refresh_host_network_time(router, host_utc_ms);
+    let _ = host_utc_ms;
+    crate::telemetry_task::refresh_station_network_time(router);
 }
 
 fn select_client_network_source(

@@ -157,6 +157,43 @@ pub(crate) fn service_fault_labels(mask: u32) -> Vec<String> {
         .collect()
 }
 
+/// "SY" tag in the high half of FC BOARD_HEALTH word 22: the low byte is the
+/// FC's time sync byte (FC's word 6 bits 24..31 already carry its recovery gate).
+const FC_TIME_SYNC_TAG: u32 = 0x5359;
+
+/// Decodes a board's SEDSnet time sync byte (`TimeSyncStatus::health_byte`):
+/// RF and PB put it in word 6 bits 24..31; FC in word 22 tagged "SY". `None` when the board does not report it (older firmware).
+pub(crate) fn decode_time_sync(sender: &str, w: &[u32]) -> Option<crate::types::BoardTimeSync> {
+    if w.len() != 24 {
+        return None;
+    }
+    let byte = match sender {
+        "FC" => (w[22] >> 16 == FC_TIME_SYNC_TAG).then_some((w[22] & 0xFF) as u8)?,
+        // Boards whose word 6 bits 24..31 are otherwise unused.
+        "RF" | "PB" => (w[6] >> 24) as u8,
+        _ => return None,
+    };
+    let (synced, bound_ns) = sedsnet::timesync::decode_health_byte(byte)?;
+    Some(crate::types::BoardTimeSync {
+        synced,
+        error_bound_us: (bound_ns != u64::MAX).then_some(bound_ns / 1_000),
+    })
+}
+
+/// Monotonic ms until which some board reported itself time-synced (absolute
+/// time may then only be slewed outside Startup/Idle).
+static BOARD_TIME_LOCKED_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Some board reported a synced clock within the last 15 s (three health periods).
+pub(crate) fn any_board_time_locked() -> bool {
+    BOARD_TIME_LOCKED_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed) > monotonic_ms()
+}
+
 /// "RFT1" little-endian in BOARD_HEALTH word 16.
 const RF_TX_TIMING_TAG: u32 = 0x3154_4652;
 
@@ -203,6 +240,11 @@ impl Tracker {
         let sender = canonical_sender_id(sender.trim());
         if sender.is_empty() || sender == "GS" || sender.starts_with('@') {
             return false;
+        }
+        let mut report = report;
+        report.time_sync = decode_time_sync(sender, words);
+        if report.time_sync.is_some_and(|t| t.synced) {
+            BOARD_TIME_LOCKED_UNTIL_MS.store(monotonic_ms() + 15_000, std::sync::atomic::Ordering::Relaxed);
         }
         let record = self.record(sender, now, wall_ms);
         record.diagnostics = Some((report, now));

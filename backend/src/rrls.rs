@@ -2768,6 +2768,15 @@ fn encode(kind: u8, payload: &[u8]) -> Vec<u8> {
     v.extend_from_slice(&crc(&v).to_le_bytes());
     v
 }
+/// The SEDSnet frame inside an RR mesh wrapper, or the bytes unchanged.
+pub(crate) fn sdk_payload_of(bytes: &[u8]) -> &[u8] {
+    if bytes.starts_with(b"RR") {
+        decode(bytes).map_or(bytes, |(_, data)| data)
+    } else {
+        bytes
+    }
+}
+
 fn decode(bytes: &[u8]) -> Option<(u8, &[u8])> {
     if bytes.len() < 8 || bytes.len() > MAX_PAYLOAD + 8 || &bytes[..3] != b"RR\x01" {
         return None;

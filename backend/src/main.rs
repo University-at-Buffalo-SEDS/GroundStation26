@@ -22,6 +22,7 @@ mod alert_condition_journal;
 mod alert_condition_producers;
 mod alert_condition_runtime;
 mod alert_conditions;
+mod absolute_time;
 mod alert_history;
 mod antenna;
 mod auth;
@@ -2162,11 +2163,19 @@ async fn main() -> anyhow::Result<()> {
     .with_preferred_discovery_master(Board::GroundStation.sender_id())
     .with_memory_config(network_memory_config())?;
     if telemetry_task::timesync_enabled() {
+        // The GS leads network time (priority 50). The RRLS is a holdover and
+        // bridge source (60): it follows the GS while the GS is heard and
+        // leads the AV bay through a GS outage. RF with a GPS fix is 70.
         cfg = cfg.with_timesync(TimeSyncConfig {
             role: TimeSyncRole::Source,
-            priority: 50,
+            priority: if rrls::is_rrls() { 60 } else { 50 },
             ..TimeSyncConfig::default()
         });
+    }
+    // Safety traffic is scheduled above SEDSnet network control (time sync,
+    // schema); ordinary data stays below it.
+    for name in ["ABORT", "FLIGHT_COMMAND"] {
+        sedsnet::set_type_scheduling_class(crate::telemetry_schema::data_type(name), -1);
     }
 
     // --- Radios ---
@@ -2244,7 +2253,7 @@ async fn main() -> anyhow::Result<()> {
         )
     });
     if telemetry_task::timesync_enabled() {
-        telemetry_task::refresh_host_network_time(&router, get_current_timestamp_ms());
+        telemetry_task::refresh_station_network_time(&router);
     }
     network_variables::initialize_for_state(&state, &router)?;
     set_network_time_router(router.clone());
@@ -2318,6 +2327,10 @@ async fn main() -> anyhow::Result<()> {
             .expect("failed to get umbilical comms lock")
             .set_side_id(side);
     }
+    // RFD radio path for time sync requests (the RRLS follows the GS over it):
+    // after the transmit-complete and read stamps each frame byte still costs
+    // 64 kbit/s air (125 us) plus the receiving 115200 baud UART (86.8 us).
+    router.set_side_timesync_path(rocket_side, 211_800, 0);
     keep_schema_exchange_off_the_radio(&router, rocket_side, umbilical_side.as_slice())?;
     if rrls::is_rrls() {
         // A listener never re-sends an overheard frame back onto the air. As an

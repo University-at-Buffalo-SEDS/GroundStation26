@@ -772,6 +772,8 @@ pub struct UartComms {
     baud_rate: u32,
     hardware_flow_control: bool,
     slow_start_deadline: Option<Instant>,
+    /// When the newest received bytes were read: time sync receive stamp.
+    last_rx_read: Option<crate::telemetry_task::RxReadStamp>,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -876,6 +878,7 @@ impl UartComms {
             baud_rate: 115200,
             hardware_flow_control: false,
             slow_start_deadline: None,
+            last_rx_read: None,
         }
     }
 
@@ -927,6 +930,7 @@ impl UartComms {
             baud_rate: cfg.baud_rate as u32,
             hardware_flow_control: cfg.hardware_flow_control,
             slow_start_deadline: Some(Instant::now() + UART_STARTUP_TIMEOUT),
+            last_rx_read: None,
         })
     }
 
@@ -987,6 +991,7 @@ impl UartComms {
                         &self.protocol,
                     );
                     self.rx_buf.extend_from_slice(&scratch[..n]);
+                    self.last_rx_read = Some(crate::telemetry_task::RxReadStamp::now());
                     maybe_log_raw_uart_rx(&scratch[..n], &self.protocol);
                     self.note_heard_air(n);
                     Ok(())
@@ -1041,6 +1046,7 @@ impl UartComms {
                         &self.protocol,
                     );
                     self.rx_buf.extend_from_slice(&scratch[..n]);
+                    self.last_rx_read = Some(crate::telemetry_task::RxReadStamp::now());
                     maybe_log_raw_uart_rx(&scratch[..n], &self.protocol);
                     self.note_heard_air(n);
                     Ok(())
@@ -1516,6 +1522,26 @@ impl UartComms {
                 let virtual_stop_us = virtual_wire_now.map(|_| write_state.wire.stop_us());
                 if io_result.is_ok() {
                     #[cfg(target_os = "linux")]
+                    let end = virtual_stop_us;
+                    #[cfg(not(target_os = "linux"))]
+                    let end = None;
+                    crate::telemetry_task::note_frame_written(
+                        self.side_id,
+                        crate::rrls::sdk_payload_of(&transmission.frame().bytes),
+                        end,
+                        lengths[1],
+                        self.baud_rate,
+                    );
+                    if let Some(follower) = transmission.follower_frame() {
+                        crate::telemetry_task::note_frame_written(
+                            self.side_id,
+                            crate::rrls::sdk_payload_of(&follower.bytes),
+                            end,
+                            0,
+                            self.baud_rate,
+                        );
+                    }
+                    #[cfg(target_os = "linux")]
                     let model_stop = virtual_stop_us;
                     #[cfg(not(target_os = "linux"))]
                     let model_stop = None;
@@ -1768,7 +1794,10 @@ impl UartComms {
             // here, and the router owns their validation and reassembly.  Rejecting
             // fragments here prevents discovery from ever crossing the radio link.
             self.invalidate_retry_on_metadata(&payload);
-            queue_uart_router_payload(router, side_id, &payload, &self.protocol, packet_tap)?;
+            let rx_ns = self
+                .last_rx_read
+                .map(|stamp| crate::telemetry_task::router_rx_ns(router, stamp));
+            queue_uart_router_payload_at(router, side_id, &payload, &self.protocol, packet_tap, rx_ns)?;
         }
         Ok(processed_any)
     }
@@ -1780,6 +1809,19 @@ fn queue_uart_router_payload(
     payload: &[u8],
     protocol: &SerialProtocol,
     packet_tap: &mut dyn FnMut(&Packet),
+) -> TelemetryResult<()> {
+    queue_uart_router_payload_at(router, side_id, payload, protocol, packet_tap, None)
+}
+
+/// As `queue_uart_router_payload`, with the instant the bytes were read
+/// (router clock ns): the receive stamp of a time sync exchange.
+fn queue_uart_router_payload_at(
+    router: &Router,
+    side_id: RouterSideId,
+    payload: &[u8],
+    protocol: &SerialProtocol,
+    packet_tap: &mut dyn FnMut(&Packet),
+    rx_ns: Option<u64>,
 ) -> TelemetryResult<()> {
     if std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some()
         && let Ok(packet) = serialize::unpack_packet(payload)
@@ -1795,7 +1837,10 @@ fn queue_uart_router_payload(
     maybe_log_raw_uart_decoded(payload, protocol);
     maybe_log_raw_uart_router_queue_before(payload, protocol);
     tap_non_groundstation_gps_payload(payload, packet_tap);
-    router.rx_packed_queue_from_side(payload, side_id)?;
+    match rx_ns {
+        Some(rx_ns) => router.rx_packed_queue_from_side_at(payload, side_id, rx_ns)?,
+        None => router.rx_packed_queue_from_side(payload, side_id)?,
+    }
     maybe_log_raw_uart_router_queue_after(payload, protocol);
     Ok(())
 }
@@ -3838,6 +3883,7 @@ impl UartComms {
             )
             .into());
         }
+        let sdk_payload = payload;
         let routed = if let Some(shared) = &self.recovery {
             let mesh = shared.lock().unwrap();
             let Some(frame) = mesh.local_tx(false, payload, mesh.now()) else {
@@ -4001,6 +4047,18 @@ impl UartComms {
         };
         #[cfg(target_os = "linux")]
         let virtual_stop_us = virtual_wire_now.map(|_| write_state.wire.stop_us());
+        #[cfg(not(target_os = "linux"))]
+        let virtual_stop_us: Option<u64> = None;
+        if io_result.is_ok() && accepted > 0 {
+            // Transmit-complete stamp for a time sync frame (no-op for others).
+            crate::telemetry_task::note_frame_written(
+                self.side_id,
+                sdk_payload,
+                virtual_stop_us,
+                0,
+                self.baud_rate,
+            );
+        }
         if matches!(self.protocol, SerialProtocol::RawUart)
             && accepted > 0
             && let Some(capacity) = &mut write_state.radio_capacity
@@ -4520,6 +4578,7 @@ impl CommsDevice for UartComms {
             baud_rate: self.baud_rate,
             hardware_flow_control: self.hardware_flow_control,
             slow_start_deadline: None,
+            last_rx_read: None,
         })))
     }
 
@@ -6578,6 +6637,7 @@ mod raw_uart_tests {
             baud_rate: 115200,
             hardware_flow_control: false,
             slow_start_deadline: None,
+            last_rx_read: None,
         };
         (uart, shared, expected)
     }
@@ -8964,6 +9024,7 @@ mod raw_uart_tests {
             baud_rate: 115200,
             hardware_flow_control: false,
             slow_start_deadline: None,
+            last_rx_read: None,
         };
         for fragment in fragments {
             let framed = build_raw_uart_frame(&fragment).unwrap();
@@ -9150,6 +9211,7 @@ mod raw_uart_tests {
             baud_rate: 115200,
             hardware_flow_control: false,
             slow_start_deadline: None,
+            last_rx_read: None,
         };
         let good = vec![9, 8, 7];
         uart.rx_buf
@@ -9903,6 +9965,7 @@ mod uart_duplex_tests {
             baud_rate: 57600,
             hardware_flow_control: false,
             slow_start_deadline: None,
+            last_rx_read: None,
         };
         let receiver = std::sync::Mutex::new(receiver);
         let receive_guard = receiver.lock().unwrap();

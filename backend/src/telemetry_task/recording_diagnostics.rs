@@ -477,6 +477,7 @@ fn capture(
         crate::flight_sim::sim_mode_enabled(),
     );
     let mut mirrored = NetworkTopologyMsg {
+        station_time: None,
         generated_ms: wall.max(0) as u64,
         simulated: crate::flight_sim::sim_mode_enabled(),
         health,
