@@ -2461,6 +2461,131 @@ pub(crate) fn note_board_abort_shown(index: usize) {
 fn abort_state_now_ms() -> u64 {
     crate::simulation_clock_ms().unwrap_or_else(unix_now_ms)
 }
+/// How one write of an Abort-critical frame (ABORT, the Abort's
+/// FLIGHT_STATE=15) is admitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AbortWrite {
+    /// Bypass the air turn.
+    Now,
+    /// Take the station's gap: the turn gate is open for it now.
+    InGap,
+    /// Refuse for now (the writer retries on its next pass).
+    Hold,
+}
+/// A re-send taking the station's gap starts a random 0..=this many ms into
+/// it, so successive re-sends never sit at one phase of RF's turn. The gap
+/// is about 62 ms and the write must end before RF's next burst.
+pub(crate) const ABORT_RESEND_GAP_JITTER_MS: u64 = 20;
+/// With no turns (RF silent or gone, or relaying), a re-send leaves on the
+/// SDK's 400 ms timer plus a random 0..=this many ms.
+pub(crate) const ABORT_RESEND_FREE_JITTER_MS: u64 = 40;
+/// The first write of an Abort-critical packet goes at once, out of turn: it
+/// is never held. Its re-sends (the SDK's 400 ms retries, the same packet)
+/// went out of turn too, so a press that landed in RF's burst put every copy
+/// in RF's burst (400 ms is two turns): range4 lost all 6 copies of one
+/// Abort, and the FC status those copies hit 4 times. A re-send now takes
+/// the station's gap after RF's air, at a random offset into it; with no
+/// turns it leaves after a small random delay instead, so it never waits on
+/// a turn that does not exist.
+#[derive(Default)]
+pub(crate) struct AbortCopies {
+    written: VecDeque<u64>,
+    /// The re-send now waiting and when it may leave.
+    hold: Option<(u64, u64)>,
+}
+impl AbortCopies {
+    /// `turns`: the station is taking turns with RF now. `gap_open`: the turn
+    /// gate would admit an ordinary write now. `draw(n)`: random in 0..n.
+    pub(crate) fn decide(&mut self, id: u64, now_ms: u64, turns: bool, gap_open: bool, draw: impl FnOnce(u64) -> u64) -> AbortWrite {
+        if !self.written.contains(&id) {
+            return AbortWrite::Now;
+        }
+        if turns && !gap_open {
+            // Jitter afresh in the next gap.
+            self.hold = None;
+            return AbortWrite::Hold;
+        }
+        let limit = if turns { ABORT_RESEND_GAP_JITTER_MS } else { ABORT_RESEND_FREE_JITTER_MS };
+        let until = match self.hold {
+            Some((held, at)) if held == id => at,
+            _ => {
+                let at = now_ms + draw(limit + 1).min(limit);
+                self.hold = Some((id, at));
+                at
+            }
+        };
+        if now_ms < until {
+            AbortWrite::Hold
+        } else if turns {
+            AbortWrite::InGap
+        } else {
+            AbortWrite::Now
+        }
+    }
+    pub(crate) fn note_written(&mut self, id: u64) {
+        if !self.written.contains(&id) {
+            self.written.push_back(id);
+            if self.written.len() > 32 {
+                self.written.pop_front();
+            }
+        }
+        if self.hold.is_some_and(|(held, _)| held == id) {
+            self.hold = None;
+        }
+    }
+}
+static ABORT_COPIES: std::sync::Mutex<Option<AbortCopies>> = std::sync::Mutex::new(None);
+/// Random in 0..n for the re-send jitter.
+fn abort_jitter_draw(n: u64) -> u64 {
+    static STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut x = STATE.load(std::sync::atomic::Ordering::Relaxed);
+    if x == 0 {
+        x = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0x9e37_79b9, |d| d.as_nanos() as u64) | 1;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    STATE.store(x, std::sync::atomic::Ordering::Relaxed);
+    x % n.max(1)
+}
+/// The SDK packet an Abort-critical write carries (ABORT, or the Abort's
+/// FLIGHT_STATE=15 other than a scheduled early copy), if this is one.
+fn abort_critical_id(payload: &[u8]) -> Option<u64> {
+    let critical = is_abort_frame(payload)
+        || (is_abort_flight_state(payload) && !SENDING_ABORT_STATE_COPY.load(std::sync::atomic::Ordering::Acquire));
+    critical.then(|| serialize::unpack_packet(payload).ok().map(|packet| packet.packet_id())).flatten()
+}
+impl UartWriteState {
+    /// Brings the turn gate up to date for `payload` and decides whether it
+    /// bypasses the turn: Some(bypass), or None while an Abort-critical
+    /// re-send is held (AbortCopies).
+    fn sync_turn_for(&mut self, payload: &[u8]) -> Option<bool> {
+        self.sync_turn(false, true);
+        let Some(id) = abort_critical_id(payload) else {
+            return Some(false);
+        };
+        let wall = Instant::now();
+        let clock = crate::simulation_clock_ms();
+        let (turns, gap_open) = self
+            .radio_capacity
+            .as_ref()
+            .filter(|cap| cap.turn_gated())
+            .map_or((false, true), |cap| (cap.turn_taking_now(wall, clock), cap.turn_gap_open(wall, clock)));
+        let decision = ABORT_COPIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(Default::default)
+            .decide(id, abort_state_now_ms(), turns, gap_open, abort_jitter_draw);
+        match decision {
+            AbortWrite::Now => {
+                self.sync_turn(true, true);
+                Some(true)
+            }
+            AbortWrite::InGap => Some(false),
+            AbortWrite::Hold => None,
+        }
+    }
+}
 /// A command pair is never held for a turn when it carries an ABORT.
 fn command_pair_bypasses_turn(frames: &[(u8, &[u8])]) -> bool {
     frames.iter().any(|(_, payload)| is_abort_frame(payload))
@@ -3417,8 +3542,6 @@ impl UartComms {
         // Judged on the SDK frame: below it is wrapped in the RR envelope. An
         // early copy of the Abort's FLIGHT_STATE (AbortStateBurst) takes the
         // station's gap instead.
-        let abort = is_abort_frame(payload)
-            || (is_abort_flight_state(payload) && !SENDING_ABORT_STATE_COPY.load(std::sync::atomic::Ordering::Acquire));
         let sdk_payload = payload;
         if self.recovery.is_some() {
             self.enable_radio_capacity_control();
@@ -3469,7 +3592,14 @@ impl UartComms {
         // ABORT is never held for an air turn (judged before the RR wrapping:
         // the wrapped bytes are not an SDK frame, and the range fullnet's ABORT
         // waited 0.4-1.5 s for the turn that way).
-        write_state.sync_turn(abort || mesh_write_bypasses_turn(payload, None), true);
+        let Some(bypass) = write_state.sync_turn_for(sdk_payload) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "an Abort re-send waits for the station's gap",
+            )
+            .into());
+        };
+        write_state.sync_turn(bypass || mesh_write_bypasses_turn(payload, None), true);
         if !self.refresh_recovery_capacity(&mut write_state, capacity_wall, capacity_clock) {
             return Err(TelemetryError::HandlerError(
                 "recovery budget effective transport mismatch",
@@ -3673,6 +3803,14 @@ impl UartComms {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get_or_insert_with(Default::default)
                     .note_written(abort_state_now_ms(), sdk_payload);
+                // Its later copies (re-sends) take the station's gap.
+                if let Some(id) = abort_critical_id(sdk_payload) {
+                    ABORT_COPIES
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get_or_insert_with(Default::default)
+                        .note_written(id);
+                }
             }
         }
         io_result
@@ -3965,11 +4103,13 @@ impl CommsDevice for UartComms {
         }
         let wall = Instant::now();
         let clock = crate::simulation_clock_ms();
-        state.sync_turn(
-            is_abort_frame(payload)
-                || (is_abort_flight_state(payload) && !SENDING_ABORT_STATE_COPY.load(std::sync::atomic::Ordering::Acquire)),
-            true,
-        );
+        let Some(bypass) = state.sync_turn_for(payload) else {
+            trace_radio_gate_refusal("abort_resend_gap", priority, payload, String::new);
+            return false;
+        };
+        if bypass || mesh_write_bypasses_turn(payload, None) {
+            state.sync_turn(true, true);
+        }
         if !self.refresh_recovery_capacity(&mut state, wall, clock) {
             trace_radio_gate_refusal("recovery_capacity", priority, payload, String::new);
             return false;
@@ -6613,6 +6753,63 @@ mod raw_uart_tests {
         assert!(burst.take_due(500).is_none(), "the AV bay shows the Abort: no more copies");
     }
 
+    /// range4 fullnet: ABORT went out of turn and the SDK re-sent it every
+    /// 400 ms, two of RF's 200 ms turns, so a press that landed in RF's burst
+    /// put every copy in RF's burst: all 6 copies of one Abort lost, and the
+    /// FC status they hit 4 times. Pressed at any phase of RF's turn with RF
+    /// bursting, at least one of the first 2 re-sends now lands outside RF's
+    /// air, for any jitter drawn.
+    #[test]
+    fn an_abort_resend_lands_outside_rf_air_at_every_press_phase() {
+        // RF's air: up to about 108 ms at the start of each 200 ms turn; the
+        // station's gap opens 30 ms after it. A write lasts about 10 ms.
+        let rf_air = |t: u64| t % 200 < 108;
+        let gap_open = |t: u64| t % 200 >= 138 && t % 200 < 170;
+        for draw in [0u64, 7, 13, 20, 1_000] {
+            for phase in 0..200u64 {
+                let mut copies = AbortCopies::default();
+                let id = 77;
+                assert_eq!(copies.decide(id, phase, true, gap_open(phase), |_| 0), AbortWrite::Now, "the first copy goes at once");
+                copies.note_written(id);
+                let mut outside = 0;
+                for resend in [phase + 400, phase + 800] {
+                    let mut t = resend;
+                    loop {
+                        match copies.decide(id, t, true, gap_open(t), |limit| draw % limit) {
+                            AbortWrite::Hold => t += 1,
+                            _ => break,
+                        }
+                        assert!(t < resend + 400, "phase {phase}: a re-send waited a whole retry interval");
+                    }
+                    copies.note_written(id);
+                    if (t..t + 10).all(|x| !rf_air(x)) {
+                        outside += 1;
+                    }
+                }
+                assert!(outside >= 1, "draw {draw} phase {phase}: both re-sends met RF's air");
+            }
+        }
+    }
+
+    /// With RF silent or gone (no turns), a re-send never waits for a turn
+    /// that does not exist: it leaves on the SDK's 400 ms timer plus a small
+    /// jitter. A new packet's first copy always goes at once.
+    #[test]
+    fn with_rf_silent_an_abort_resend_leaves_at_about_400_ms() {
+        for draw in [0u64, 19, 39, 1_000] {
+            let mut copies = AbortCopies::default();
+            assert_eq!(copies.decide(5, 0, false, true, |_| 0), AbortWrite::Now);
+            copies.note_written(5);
+            let mut t = 400;
+            while copies.decide(5, t, false, true, |limit| draw % limit) == AbortWrite::Hold {
+                t += 1;
+            }
+            assert!((400..=440).contains(&t), "draw {draw}: re-sent at {t}");
+            copies.note_written(5);
+            assert_eq!(copies.decide(6, t, true, false, |_| 0), AbortWrite::Now, "a new Abort goes at once, mid-turn too");
+        }
+    }
+
     /// The station's SDK writer wraps every frame in the RR envelope before the
     /// turn gate. ABORT must be recognized on the SDK frame, not on the wrapped
     /// bytes, or it waits for the station's turn (range fullnet: 0.4-1.5 s).
@@ -6669,6 +6866,76 @@ mod raw_uart_tests {
         assert!(uart.send_data_with_priority(&ordinary, 16).is_err(), "ordinary data waits for the station's gap");
         note_air_rx_now();
         uart.send_data_with_priority(&abort, 255).expect("ABORT goes at once");
+    }
+
+    /// Through the real writer: an Abort's first copy goes mid-turn, its
+    /// re-send waits while RF holds the air, a new Abort still goes at once,
+    /// and with RF silent the re-send leaves within its small jitter.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_writer_sends_an_abort_resend_in_the_gap_and_a_new_abort_at_once() {
+        const CHILD: &str = "GS_TURN_ABORT_RESEND_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::the_writer_sends_an_abort_resend_in_the_gap_and_a_new_abort_at_once";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env_remove("GS_RADIO_TURN_TAKING")
+                .env_remove("GS_SIM_CLOCK_FILE")
+                .env_remove("GS_SIMULATED_SERIAL_PTY")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let abort = |stamp: u64| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type("ABORT"),
+                    &[crate::telemetry_schema::endpoint("ABORT")],
+                    "GS",
+                    stamp,
+                    std::sync::Arc::from(&b"SEDS_MANUAL_ABORT_V1:K"[..]),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let (_peer, port) = serialport::TTYPort::pair().unwrap();
+        let (mut uart, mesh, _) = recovery_uart_fixture(port);
+        {
+            let mut capacity = rfd_capacity::Capacity::new(64000, 100, 16).with_turn_period(200);
+            capacity.enable_turn_gate();
+            uart.write_lock.lock().unwrap().radio_capacity = Some(capacity);
+        }
+        uart.enable_radio_capacity_control();
+        let now = mesh.lock().unwrap().now();
+        mesh.lock().unwrap().incoming(true, b"RS\x01\x00\x00\x00\x00\x00\x00", now);
+        let first = abort(1);
+        note_air_rx_now();
+        uart.send_data_with_priority(&first, 255).expect("the first copy goes at once");
+        // RF holds the air: the SDK's re-send of the same packet waits.
+        for _ in 0..5 {
+            note_air_rx_now();
+            assert!(uart.send_data_with_priority(&first, 255).is_err(), "a re-send waits for the station's gap");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // A new Abort is never held.
+        note_air_rx_now();
+        uart.send_data_with_priority(&abort(2), 255).expect("a new Abort goes at once");
+        // RF silent past the free-run time: no turn to wait for.
+        std::thread::sleep(Duration::from_millis(rfd_capacity::TURN_FREE_RUN_SILENCE_MS + 50));
+        let start = Instant::now();
+        while uart.send_data_with_priority(&first, 255).is_err() {
+            assert!(start.elapsed() < Duration::from_millis(ABORT_RESEND_FREE_JITTER_MS + 30), "a re-send with RF silent waits only its jitter");
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// A standby RRLS's HOST_CONTROL (observe refresh, discovery) waits for

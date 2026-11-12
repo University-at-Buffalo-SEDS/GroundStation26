@@ -330,6 +330,15 @@ impl Capacity {
             }
         }
     }
+    /// Taking turns with RF now (gated, not standby or relaying, RF heard
+    /// within TURN_FREE_RUN_SILENCE_MS).
+    pub(crate) fn turn_taking_now(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
+        self.turn_paced(wall, virtual_ms)
+    }
+    /// The turn gate would admit a frame that does not bypass it now.
+    pub(crate) fn turn_gap_open(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
+        self.gate().is_none_or(|turn| TurnGate { bypass: false, ..*turn }.open(wall, virtual_ms))
+    }
     fn turn_open(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
         self.gate().is_none_or(|turn| turn.open(wall, virtual_ms))
     }
