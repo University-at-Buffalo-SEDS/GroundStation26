@@ -52,4 +52,4 @@ tower = { version = "0.5.3", features = ["util"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 
 [build-dependencies]
-SEDSnet = { version = "4", default-features = false, features = ["std"] }
+SEDSnet = { version = "5", default-features = false, features = ["std"] }
