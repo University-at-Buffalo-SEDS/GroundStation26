@@ -1743,15 +1743,68 @@ async fn submit_with_origins_inner(
         }
     if matches!(&operation, Operation::Command(name) if name == "Abort") {
         state.manual_abort_intent.request();
-        let mut broker = broker().lock().unwrap();
-        broker.status.last = Some(RequestStatus {
-            request_id: hex(&nonce()),
-            operation: "Abort".into(),
-            phase: "local_stop_retained",
-            primary_accepted: false,
-            device_confirmed: false,
-            error: Some("Primary observation and actual board readback are pending.".into()),
+        // The local stop alone never reaches the AV bay from a listening RRLS:
+        // send the Abort to the primary at once as well. The primary admits it
+        // through its manual-stop path (never refused for recovery or build
+        // support), and it replaces any ordinary request still waiting.
+        let view = crate::rrls::settings_transport().and_then(|mesh| {
+            let mesh = mesh.lock().unwrap();
+            let now = mesh.now();
+            mesh.command_proxy_transport(now).map(|view| (now, view))
         });
+        let mut broker = broker().lock().unwrap();
+        let forwarded = match view {
+            Some((created_at, view)) if broker.status.available => {
+                let already = broker.pending.as_ref().is_some_and(|pending| pending.operation == operation);
+                if !already {
+                    if let Some(previous) = broker.pending.take() {
+                        broker.status.last = Some(RequestStatus {
+                            request_id: hex(&previous.id),
+                            operation: operation_name(&previous.operation),
+                            phase: "superseded_by_abort",
+                            primary_accepted: false,
+                            device_confirmed: false,
+                            error: Some("An operator Abort replaced this request before the primary answered; it may still have run.".into()),
+                        });
+                    }
+                    let id = nonce();
+                    broker.pending = Some(Pending {
+                        id,
+                        actor: actor.into(),
+                        token: token.into(),
+                        operation: operation.clone(),
+                        plumbing_origin_utc_ms: None,
+                        launch_origin: None,
+                        session: view.session,
+                        sequence: view.sequence,
+                        wire: None,
+                        last_sent: None,
+                        attempts: 0,
+                        created_at,
+                    });
+                    broker.status.pending = Some(RequestStatus {
+                        request_id: hex(&id),
+                        operation: "Abort".into(),
+                        phase: "pending_primary",
+                        primary_accepted: false,
+                        device_confirmed: false,
+                        error: None,
+                    });
+                }
+                true
+            }
+            _ => false,
+        };
+        if !forwarded {
+            broker.status.last = Some(RequestStatus {
+                request_id: hex(&nonce()),
+                operation: "Abort".into(),
+                phase: "local_stop_retained",
+                primary_accepted: false,
+                device_confirmed: false,
+                error: Some("Primary observation and actual board readback are pending.".into()),
+            });
+        }
         return (StatusCode::ACCEPTED, Json(broker.status.clone())).into_response();
     }
     if matches!(&operation, Operation::Command(name) if crate::board_abort::launch_command(name)) {
