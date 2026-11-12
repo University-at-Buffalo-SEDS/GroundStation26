@@ -130,8 +130,10 @@ fn radio_liveness_frame(priority: u8, payload: &[u8]) -> bool {
 }
 
 /// Largest compact bundle the station writes at once (SDK bytes before the RR
-/// envelope and UART header): about one station turn share at 64 kbit/s.
-pub(crate) const RADIO_BUNDLE_MAX_BYTES: usize = 240;
+/// envelope and UART header). A collision truncates the received packet and a
+/// bundle has one CRC, so it is lost whole: keep bundles about the size of the
+/// largest single frames (RF uses the same 160 B).
+pub(crate) const RADIO_BUNDLE_MAX_BYTES: usize = 160;
 /// At most this many SDK frames share one compact bundle.
 pub(crate) const RADIO_BUNDLE_MAX_FRAMES: usize = 12;
 
