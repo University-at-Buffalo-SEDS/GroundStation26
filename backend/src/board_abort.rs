@@ -439,6 +439,7 @@ impl Runtime {
         let raised = !row.aborted;
         if raised { row.first_abort_ms = timestamp_ms; }
         row.aborted = true;
+        crate::comms::note_board_abort_shown(i);
         row.accepted_non_abort = false;
         if raised {
             let episode = register.alert_edges.push(board, AlertEdgeKind::Raised, None, timestamp_ms, None);
@@ -541,6 +542,7 @@ impl Runtime {
             if active & (1 << i) != 0 {
                 if !row.aborted {
                     row.aborted = true;
+                    crate::comms::note_board_abort_shown(i);
                     row.last_abort = Some(now);
                     row.abort_revision = row.abort_revision.saturating_add(1);
                     row.first_abort_ms = crate::telemetry_task::get_current_timestamp_ms();

@@ -2396,6 +2396,71 @@ fn mesh_write_bypasses_turn(first: &[u8], follower: Option<&[u8]>) -> bool {
     };
     bypass(first) && follower.is_none_or(bypass)
 }
+/// An SDK FLIGHT_STATE frame carrying Aborted (15): the Abort's flight-state
+/// write. RF latches the Abort from it, so like ABORT it is never held for an
+/// air turn.
+fn is_abort_flight_state(payload: &[u8]) -> bool {
+    serialize::peek_frame_info_unchecked(payload).is_ok_and(|info| {
+        info.envelope.ty == crate::telemetry_schema::data_type("FLIGHT_STATE")
+    }) && serialize::unpack_packet(payload).is_ok_and(|packet| packet.payload() == [15])
+}
+/// Extra copies of an Abort's FLIGHT_STATE=15 write, ahead of the reliable
+/// resend schedule (400 ms): under loss each lost copy otherwise cost RF a
+/// whole retry interval (range fullnet: RF first heard it 1.7 s after the
+/// press). The write itself bypasses the air turn, as ABORT does; the copies,
+/// due 110 and 220 ms after it, take the station's next gap after RF's air.
+/// Sent blind they would land inside RF's burst about half the time (RF holds
+/// the air for up to about 108 ms of each 200 ms turn), where RF cannot hear
+/// them and the station cannot hear RF; in the gap the first copy reaches RF
+/// within 110 + 138 ms whatever the write's phase. They stop once RF, FC and
+/// PB all show the Abort; there is no further repetition.
+pub(crate) const ABORT_STATE_COPY_OFFSETS_MS: [u64; 2] = [110, 220];
+#[derive(Default)]
+pub(crate) struct AbortStateBurst {
+    copies: Vec<(u64, Vec<u8>)>,
+    last: Option<u64>,
+}
+impl AbortStateBurst {
+    /// A FLIGHT_STATE=15 write went out: schedule its copies (once per packet).
+    pub(crate) fn note_written(&mut self, now_ms: u64, payload: &[u8]) -> bool {
+        if !is_abort_flight_state(payload) {
+            return false;
+        }
+        let Ok(packet) = serialize::unpack_packet(payload) else { return false };
+        let id = packet.packet_id();
+        if self.last == Some(id) {
+            return false;
+        }
+        self.last = Some(id);
+        self.copies = ABORT_STATE_COPY_OFFSETS_MS.iter().map(|at| (now_ms + at, payload.to_vec())).collect();
+        AV_BAY_ABORT_SHOWN.store(0, std::sync::atomic::Ordering::Release);
+        true
+    }
+    /// The next copy that is due, unless the AV bay already shows the Abort.
+    pub(crate) fn take_due(&mut self, now_ms: u64) -> Option<Vec<u8>> {
+        if AV_BAY_ABORT_SHOWN.load(std::sync::atomic::Ordering::Acquire) & 0b111 == 0b111 {
+            self.copies.clear();
+            return None;
+        }
+        let index = self.copies.iter().position(|(at, _)| *at <= now_ms)?;
+        Some(self.copies.remove(index).1)
+    }
+}
+static ABORT_STATE_BURST: std::sync::Mutex<Option<AbortStateBurst>> = std::sync::Mutex::new(None);
+/// Set while the radio writer sends one of those copies (one station radio
+/// writer per process).
+static SENDING_ABORT_STATE_COPY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// RF, FC and PB (board_abort BOARDS 0..2) that show the Abort since the last
+/// FLIGHT_STATE=15 write.
+static AV_BAY_ABORT_SHOWN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+pub(crate) fn note_board_abort_shown(index: usize) {
+    if index < 8 {
+        AV_BAY_ABORT_SHOWN.fetch_or(1 << index, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+fn abort_state_now_ms() -> u64 {
+    crate::simulation_clock_ms().unwrap_or_else(unix_now_ms)
+}
 /// A command pair is never held for a turn when it carries an ABORT.
 fn command_pair_bypasses_turn(frames: &[(u8, &[u8])]) -> bool {
     frames.iter().any(|(_, payload)| is_abort_frame(payload))
@@ -3349,8 +3414,12 @@ impl UartComms {
             .map(|(id, _)| id);
         let canonical_receipt = radio_batch_control_contract(priority, payload)
             .and_then(|(id, receipt)| receipt.then_some(id));
-        // Judged on the SDK frame: below it is wrapped in the RR envelope.
-        let abort = is_abort_frame(payload);
+        // Judged on the SDK frame: below it is wrapped in the RR envelope. An
+        // early copy of the Abort's FLIGHT_STATE (AbortStateBurst) takes the
+        // station's gap instead.
+        let abort = is_abort_frame(payload)
+            || (is_abort_flight_state(payload) && !SENDING_ABORT_STATE_COPY.load(std::sync::atomic::Ordering::Acquire));
+        let sdk_payload = payload;
         if self.recovery.is_some() {
             self.enable_radio_capacity_control();
         }
@@ -3597,6 +3666,14 @@ impl UartComms {
         }
         if io_result.is_ok() && matches!(self.protocol, SerialProtocol::RawUart) {
             report_write_leases_drained(leases);
+            if self.recovery.is_some() {
+                // An Abort's FLIGHT_STATE=15 write: schedule its early copies.
+                ABORT_STATE_BURST
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert_with(Default::default)
+                    .note_written(abort_state_now_ms(), sdk_payload);
+            }
         }
         io_result
             .map(|()| {
@@ -3672,6 +3749,28 @@ impl CommsDevice for UartComms {
     fn service_transmit(&mut self) -> TelemetryResult<()> {
         if !self.poll_hardware_flow_control()? {
             return Ok(());
+        }
+        if self.recovery.is_some() {
+            let due = ABORT_STATE_BURST
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+                .and_then(|burst| burst.take_due(abort_state_now_ms()));
+            let refused = due.as_ref().is_some_and(|copy| {
+                SENDING_ABORT_STATE_COPY.store(true, std::sync::atomic::Ordering::Release);
+                let refused = self.send_data_with_priority(copy, 255).is_err();
+                SENDING_ABORT_STATE_COPY.store(false, std::sync::atomic::Ordering::Release);
+                refused
+            });
+            if refused && let Some(copy) = due {
+                // Refused (UART busy): retry on the next service.
+                ABORT_STATE_BURST
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert_with(Default::default)
+                    .copies
+                    .insert(0, (0, copy));
+            }
         }
         let Some(shared) = &self.recovery else {
             return Ok(());
@@ -3866,7 +3965,11 @@ impl CommsDevice for UartComms {
         }
         let wall = Instant::now();
         let clock = crate::simulation_clock_ms();
-        state.sync_turn(is_abort_frame(payload), true);
+        state.sync_turn(
+            is_abort_frame(payload)
+                || (is_abort_flight_state(payload) && !SENDING_ABORT_STATE_COPY.load(std::sync::atomic::Ordering::Acquire)),
+            true,
+        );
         if !self.refresh_recovery_capacity(&mut state, wall, clock) {
             trace_radio_gate_refusal("recovery_capacity", priority, payload, String::new);
             return false;
@@ -6455,6 +6558,59 @@ mod raw_uart_tests {
         assert!(!mesh_write_bypasses_turn(&wrap(5, &command), None));
         assert!(!mesh_write_bypasses_turn(&health, Some(&wrap(5, &other))));
         assert!(mesh_write_bypasses_turn(&health, None));
+    }
+
+    /// range fullnet: RF first heard the Abort's FLIGHT_STATE=15 1.7 s after the
+    /// press, because each lost copy cost a 400 ms resend. With the first copy
+    /// lost, RF now hears an early copy before 400 ms whatever the write's
+    /// phase in RF's turn; copies stop once the AV bay shows the Abort.
+    #[test]
+    fn rf_hears_the_abort_flight_state_before_400_ms_when_the_first_copy_is_lost() {
+        crate::telemetry_schema::initialize().unwrap();
+        let state = |value: u8, stamp: u64| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type("FLIGHT_STATE"),
+                    &[crate::telemetry_schema::endpoint("FLIGHT_STATE")],
+                    "GS",
+                    stamp,
+                    std::sync::Arc::from([value]),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let aborted = state(15, 7);
+        // RF's air: a burst of at most about 108 ms at the start of each 200 ms
+        // turn; the station's gap opens 30 ms after it.
+        let station_gap = |t: u64| t % 200 >= 138;
+        for phase in 0..200u64 {
+            let mut burst = AbortStateBurst::default();
+            assert!(burst.note_written(phase, &aborted));
+            // The write itself is lost; the next reliable resend is at +400 ms.
+            // A due copy waits for the station's gap (the writer refuses it
+            // until then), and RF hears it there.
+            let mut pending = None;
+            let mut heard = None;
+            for t in phase..phase + 400 {
+                if pending.is_none() {
+                    pending = burst.take_due(t);
+                }
+                if pending.is_some() && station_gap(t) && heard.is_none() {
+                    heard = Some(t - phase);
+                }
+            }
+            assert!(heard.is_some_and(|ms| ms < 400), "phase {phase}: {heard:?}");
+        }
+        // Once per packet; never for other values; stops when the AV bay shows it.
+        let mut burst = AbortStateBurst::default();
+        assert!(!burst.note_written(0, &state(1, 8)));
+        assert!(burst.note_written(0, &aborted));
+        assert!(!burst.note_written(5, &aborted), "the same packet schedules once");
+        for board in 0..3 {
+            note_board_abort_shown(board);
+        }
+        assert!(burst.take_due(500).is_none(), "the AV bay shows the Abort: no more copies");
     }
 
     /// The station's SDK writer wraps every frame in the RR envelope before the
