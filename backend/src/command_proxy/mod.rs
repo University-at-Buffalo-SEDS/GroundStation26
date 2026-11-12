@@ -1742,6 +1742,12 @@ async fn submit_with_origins_inner(
             return (StatusCode::FORBIDDEN, "Command permission was revoked.").into_response();
         }
     if matches!(&operation, Operation::Command(name) if name == "Abort") {
+        // Direct path first: a listening RRLS may put this Abort on the radio itself.
+        if let Some(mesh) = crate::rrls::settings_transport() {
+            let mut mesh = mesh.lock().unwrap();
+            let now = mesh.now();
+            mesh.open_abort_egress(now);
+        }
         state.manual_abort_intent.request();
         // The local stop alone never reaches the AV bay from a listening RRLS:
         // send the Abort to the primary at once as well. The primary admits it

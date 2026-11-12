@@ -2368,15 +2368,20 @@ async fn main() -> anyhow::Result<()> {
         let router = router.clone();
         tokio::spawn(async move {
             let mut egress = false;
+            let mut writable = false;
             loop {
                 let takeover = rrls::takeover_active();
-                if takeover != egress && router.set_side_egress_enabled(rocket_side, takeover).is_ok()
-                    && network_variables::set_takeover_outputs_writable(&router, takeover).is_ok()
-                {
-                    egress = takeover;
-                    log::info!("RRLS radio egress {}", if takeover { "enabled for takeover" } else { "disabled (observer)" });
+                // An operator Abort on a listening RRLS opens the radio side too;
+                // Mesh::local_tx then lets only ABORT frames out.
+                let wanted = takeover || rrls::abort_egress_open();
+                if wanted != egress && router.set_side_egress_enabled(rocket_side, wanted).is_ok() {
+                    egress = wanted;
+                    log::info!("RRLS radio egress {}", if takeover { "enabled for takeover" } else if wanted { "enabled for an operator Abort (ABORT frames only)" } else { "disabled (observer)" });
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if takeover != writable && network_variables::set_takeover_outputs_writable(&router, takeover).is_ok() {
+                    writable = takeover;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(if egress && !takeover { 50 } else { 200 })).await;
             }
         });
     }

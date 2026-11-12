@@ -105,6 +105,20 @@ pub fn is_rrls() -> bool {
 /// The primary has asked an RRLS to relay: its direct AV-bay path is lost.
 static PRIMARY_RELAYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static RRLS_TAKEOVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// RRLS: an operator Abort opened the ABORT-only egress window.
+static RRLS_ABORT_EGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How long a listening RRLS may put ABORT frames on the air after its
+/// operator pressed Abort (covers the SDK's reliable retries and the
+/// station's Abort re-sends).
+const ABORT_EGRESS_MS: u64 = 10_000;
+/// RRLS: the router's radio side must be enabled for an operator Abort.
+pub(crate) fn abort_egress_open() -> bool {
+    RRLS_ABORT_EGRESS.load(std::sync::atomic::Ordering::Acquire)
+}
+fn is_abort_frame(payload: &[u8]) -> bool {
+    sedsnet::wire_format::peek_frame_info_unchecked(payload)
+        .is_ok_and(|info| info.envelope.ty == crate::telemetry_schema::data_type("ABORT"))
+}
 /// RRLS: it owns the AV bay because the primary is out of range.
 pub(crate) fn takeover_active() -> bool {
     RRLS_TAKEOVER.load(std::sync::atomic::Ordering::Acquire)
@@ -526,6 +540,9 @@ pub struct Mesh {
     health_streak_since: Option<u64>,
     /// RRLS standalone authority over the AV bay; see TAKEOVER_MS.
     takeover: bool,
+    /// Listening RRLS: until this mesh time, ABORT frames (only) may leave on
+    /// the radio although there is no takeover (an operator Abort here).
+    abort_egress_until: Option<u64>,
     /// First tick: an RRLS that has never heard the primary waits TAKEOVER_MS
     /// from here before taking over (not at once at boot).
     first_tick: Option<u64>,
@@ -605,6 +622,7 @@ impl Mesh {
             health_received: None,
             health_streak_since: None,
             takeover: false,
+            abort_egress_until: None,
             first_tick: None,
             primary_direct: true,
             last_direct: None,
@@ -2487,6 +2505,19 @@ impl Mesh {
             log::info!("RRLS takeover ended: the primary's HEALTH has been continuous for {RESTORE_MS} ms; authority handed back");
         }
         RRLS_TAKEOVER.store(self.takeover, std::sync::atomic::Ordering::Release);
+        if self.abort_egress_until.is_some_and(|until| now >= until) {
+            self.abort_egress_until = None;
+        }
+        RRLS_ABORT_EGRESS.store(self.abort_egress_until.is_some(), std::sync::atomic::Ordering::Release);
+    }
+    /// RRLS operator Abort: ABORT is the one command never refused for lack of
+    /// authority. For ABORT_EGRESS_MS a listening RRLS puts its own ABORT frames
+    /// (nothing else) on the radio, besides sending the Abort to the primary.
+    pub fn open_abort_egress(&mut self, now: u64) {
+        if self.role == Role::Rrls {
+            self.abort_egress_until = Some(now.saturating_add(ABORT_EGRESS_MS));
+            RRLS_ABORT_EGRESS.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
     #[cfg(test)]
     pub(crate) fn takeover(&self) -> bool {
@@ -2495,7 +2526,10 @@ impl Mesh {
     /// Local router traffic is disabled on RRLS (it observes and relays) except
     /// during a takeover, when it owns the AV bay and transmits directly.
     pub fn local_tx(&self, command: bool, payload: &[u8], now: u64) -> Option<Outgoing> {
-        if self.role == Role::Rrls && !self.takeover {
+        if self.role == Role::Rrls
+            && !self.takeover
+            && !(self.abort_egress_until.is_some_and(|until| now < until) && is_abort_frame(payload))
+        {
             return None;
         }
         Some(Outgoing {
@@ -3328,6 +3362,40 @@ mod tests {
         }
         assert!(!rr.takeover());
         assert!(rr.local_tx(true, &[1], now).is_none());
+    }
+    #[test]
+    fn a_listening_rrls_sends_only_abort_frames_for_a_while_after_its_operator_aborts() {
+        use std::sync::Arc;
+        let frame = |ty: &str, endpoint: &str, payload: &[u8]| {
+            sedsnet::wire_format::pack_packet(
+                &sedsnet::packet::Packet::new(
+                    crate::telemetry_schema::data_type(ty),
+                    &[crate::telemetry_schema::endpoint(endpoint)],
+                    "RRLS",
+                    1,
+                    Arc::from(payload),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let abort = frame("ABORT", "ABORT", b"SEDS_MANUAL_ABORT_V1:K");
+        let other = frame("FLIGHT_STATE", "FLIGHT_STATE", &[15]);
+        let mut rr = Mesh::new(Role::Rrls, 2);
+        rr.assume_av_bay_heard_for_test();
+        rr.incoming(true, &health(7, 1, true), 0);
+        rr.tick(1);
+        assert!(!rr.takeover());
+        assert!(rr.local_tx(false, &abort, 1).is_none(), "no operator Abort: observer only");
+        rr.open_abort_egress(10);
+        assert!(abort_egress_open());
+        let sent = rr.local_tx(false, &abort, 20).expect("the operator's Abort goes on the air");
+        assert_eq!(decode(&sent.bytes).unwrap().0, AV_BAY_DATA);
+        assert!(rr.local_tx(false, &other, 20).is_none(), "only ABORT frames");
+        assert!(rr.local_tx(false, &abort, 10 + ABORT_EGRESS_MS).is_none(), "the window closes");
+        rr.incoming(true, &health(7, 2, true), 10 + ABORT_EGRESS_MS);
+        rr.tick(10 + ABORT_EGRESS_MS);
+        assert!(!abort_egress_open());
     }
     #[test]
     fn a_booting_rrls_waits_before_taking_over() {
