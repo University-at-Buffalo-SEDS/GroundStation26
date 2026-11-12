@@ -285,6 +285,14 @@ impl TxDeadline {
         let now = Self::now();
         self.ready_at(now.wall, now.simulated_ms)
     }
+    /// Milliseconds since this instant, on the same clock as `ready`.
+    fn elapsed_ms(self) -> u64 {
+        let now = Self::now();
+        match (self.simulated_ms, now.simulated_ms) {
+            (Some(then), Some(now)) => now.saturating_sub(then),
+            _ => now.wall.saturating_duration_since(self.wall).as_millis() as u64,
+        }
+    }
 }
 
 /// Bounds accepted bytes until the generic worker finishes the physical write.
@@ -1439,6 +1447,53 @@ fn discard_retired_write(
     true
 }
 
+/// Longest the station leaves the AV-bay radio without a HEARTBEAT when it
+/// skips one that would share a write with other station traffic. FC treats
+/// the ground as lost after GND_TIMEOUT = 3000 ms without a GS HEARTBEAT (the
+/// only liveness it counts); AB/VB allow 5000 ms but hear the umbilical copy.
+/// One heartbeat per second keeps two consecutive radio losses inside FC's
+/// window. Skipping happens only on a negotiated compact-bundle link, so the
+/// HEARTBEAT is never the write's only content when it is dropped.
+pub(crate) const RADIO_HEARTBEAT_MAX_GAP_MS: u64 = 1000;
+
+/// `GS_RADIO_HEARTBEAT_SKIP=0` keeps every station HEARTBEAT on the radio.
+fn radio_heartbeat_skip_enabled() -> bool {
+    std::env::var("GS_RADIO_HEARTBEAT_SKIP").map_or(true, |value| value.trim() != "0")
+}
+
+fn is_station_heartbeat_frame(payload: &[u8]) -> bool {
+    !payload.starts_with(b"SDT")
+        && serialize::peek_frame_info_unchecked(payload)
+            .is_ok_and(|info| info.envelope.ty == crate::telemetry_schema::data_type("HEARTBEAT"))
+}
+
+/// Indices of station HEARTBEATs to drop from one write: only when the write
+/// also carries other station traffic and the last HEARTBEAT on the radio
+/// went out less than RADIO_HEARTBEAT_MAX_GAP_MS ago.
+fn radio_heartbeats_to_drop(frames: &[&[u8]], since_last_heartbeat_ms: Option<u64>) -> Vec<usize> {
+    if since_last_heartbeat_ms.is_none_or(|ms| ms >= RADIO_HEARTBEAT_MAX_GAP_MS)
+        || frames.iter().all(|f| is_station_heartbeat_frame(f))
+    {
+        return Vec::new();
+    }
+    (0..frames.len()).filter(|&i| is_station_heartbeat_frame(frames[i])).collect()
+}
+
+/// A skipped HEARTBEAT is complete: it is best effort and the next one is due.
+fn complete_skipped_heartbeat(
+    budget: Option<&TxQueueBudget>,
+    activity: Option<&TransportTxActivity>,
+    priority: u8,
+    payload: &[u8],
+) {
+    if let Some(budget) = budget {
+        budget.complete(priority, payload);
+    }
+    if let Some(activity) = activity {
+        activity.complete_frame(payload);
+    }
+}
+
 fn send_owned_write(
     comms: &mut dyn CommsDevice,
     budget: Option<&TxQueueBudget>,
@@ -2458,6 +2513,20 @@ mod priority_tests {
         assert!(!sent.contains(&abort));
         assert_eq!(rest.first(), Some(&abort), "the ABORT goes next, alone: {} sent", sent.len());
         assert_eq!(order.len(), 4);
+    }
+    #[test]
+    fn a_heartbeat_is_dropped_only_beside_other_traffic_and_within_the_gap() {
+        let hb = bundle_test_frame("HEARTBEAT", "HEART_BEAT", 1, &[]);
+        let gps = bundle_test_frame("GPS_DATA", "FLIGHT_CONTROLLER", 2, &[0; 12]);
+        let gap = RADIO_HEARTBEAT_MAX_GAP_MS;
+        // FC's GND_TIMEOUT (3000 ms) must hold two consecutive radio losses.
+        assert!(3 * gap <= 3000);
+        assert_eq!(radio_heartbeats_to_drop(&[&hb, &gps], Some(gap - 1)), vec![0]);
+        assert_eq!(radio_heartbeats_to_drop(&[&gps, &hb], Some(0)), vec![1]);
+        assert!(radio_heartbeats_to_drop(&[&gps, &hb], Some(gap)).is_empty(), "the gap is never exceeded");
+        assert!(radio_heartbeats_to_drop(&[&gps, &hb], None).is_empty(), "the first one always goes");
+        assert!(radio_heartbeats_to_drop(&[&hb], Some(0)).is_empty(), "never the write's only content");
+        assert!(radio_heartbeats_to_drop(&[&hb, &hb], Some(0)).is_empty());
     }
     #[test]
     fn bundle_followers_respect_the_size_and_class_limits() {
@@ -4084,6 +4153,8 @@ pub(super) fn spawn_comms_worker_threads(
             // Preserve their relative order on every generic packed link.
             let mut backlog = WireBacklog::new(true);
             let mut ordinary_balance = OrdinaryServiceBalance::default();
+            // Last radio write that carried the station HEARTBEAT.
+            let mut radio_heartbeat_written: Option<TxDeadline> = None;
             // Station clock (simulation_clock_ms in a sim), as the backlog's own deadlines.
             let mut last_owed_settings_turn: Option<TxDeadline> = None;
             let mut failed_writes=retained_write_retries::Retained::default();
@@ -4329,6 +4400,28 @@ pub(super) fn spawn_comms_worker_threads(
                         .filter(|(p, b)| !discard_retired_write(comms_handle.tx_budget.as_deref(), comms_handle.transport_activity.as_deref(), *p, b));
                         extras.extend(follower.into_iter().chain(third));
                     }
+                    // A HEARTBEAT that shares the write with other station
+                    // traffic is dropped while the last one on the radio is
+                    // younger than RADIO_HEARTBEAT_MAX_GAP_MS (see there).
+                    let since_heartbeat_ms = radio_heartbeat_written
+                        .map(|at| at.elapsed_ms());
+                    let drop = if bundling && radio_heartbeat_skip_enabled() {
+                        let all: Vec<&[u8]> = core::iter::once(&payload[..])
+                            .chain(extras.iter().map(|(_, f)| &f[..]))
+                            .collect();
+                        radio_heartbeats_to_drop(&all, since_heartbeat_ms)
+                    } else {
+                        Vec::new()
+                    };
+                    let mut all: Vec<(u8, Vec<u8>)> = core::iter::once((priority, payload)).chain(extras).collect();
+                    for index in drop.into_iter().rev() {
+                        let (p, f) = all.remove(index);
+                        complete_skipped_heartbeat(comms_handle.tx_budget.as_deref(), comms_handle.transport_activity.as_deref(), p, &f);
+                    }
+                    let mut extras = all.split_off(1);
+                    let (priority, payload) = all.pop().expect("the first frame is never dropped alone");
+                    let carries_heartbeat = is_station_heartbeat_frame(&payload)
+                        || extras.iter().any(|(_, f)| is_station_heartbeat_frame(f));
                     let mut frames = vec![(priority, &payload[..])];
                     frames.extend(extras.iter().map(|(p, b)| (*p, &b[..])));
                     let leases: Vec<_> = frames.iter().filter_map(|(_, bytes)|
@@ -4354,6 +4447,9 @@ pub(super) fn spawn_comms_worker_threads(
                             }
                             log_link_control_send(worker_name, &payload);
                             log_radio_command_event("radio TX sent", worker_name, &payload);
+                            if carries_heartbeat {
+                                radio_heartbeat_written = Some(TxDeadline::now());
+                            }
                             for (next_priority, next_payload) in extras.iter() {
                                 if let Some(budget) = &comms_handle.tx_budget {
                                     budget.complete(*next_priority, next_payload);
