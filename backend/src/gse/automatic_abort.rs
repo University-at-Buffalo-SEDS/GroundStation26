@@ -198,7 +198,7 @@ pub(super) mod tests {
     // worker regression covers the applicable automatic producer end to end.
     fn dispatch_abort_for_shared_policy_test(
         state: &Arc<AppState>,
-        router: &sedsnet::router::Router,
+        router: &Arc<sedsnet::router::Router>,
     ) -> bool {
         if !crate::runtime_mode::is_test_fire() {
             // The HITL suite skips every caller (HITL builds had no safety task).
@@ -522,11 +522,11 @@ pub(super) mod tests {
             max_recent_rx_ids: 1,
             queue_grow_step: 1.0,
         };
-        let bounded = sedsnet::router::Router::new(
+        let bounded = Arc::new(sedsnet::router::Router::new(
             sedsnet::router::RouterConfig::new([])
                 .with_memory_config(memory)
                 .unwrap(),
-        );
+        ));
         assert!(
             crate::telemetry_task::queue_automatic_abort_packet(
                 &bounded,

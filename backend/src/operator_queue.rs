@@ -484,7 +484,7 @@ mod tests {
         assert!(
             !crate::gse::queue_automatic_abort_for_generation(
                 &state,
-                &router(),
+                &std::sync::Arc::new(router()),
                 token.generation,
                 "closed admission control"
             )
@@ -527,7 +527,7 @@ mod tests {
         assert!(
             crate::gse::queue_automatic_abort_for_generation(
                 &state,
-                &router(),
+                &std::sync::Arc::new(router()),
                 generation,
                 "fresh positive"
             )

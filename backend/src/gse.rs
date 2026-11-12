@@ -5471,7 +5471,7 @@ pub(crate) fn sync_calibration_after_automatic_zero(
 
 pub(crate) fn queue_automatic_abort_for_generation(
     state: &Arc<AppState>,
-    router: &sedsnet::router::Router,
+    router: &Arc<sedsnet::router::Router>,
     generation: u64,
     reason: &str,
 ) -> sedsnet::TelemetryResult<bool> {

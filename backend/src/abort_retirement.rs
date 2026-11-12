@@ -144,7 +144,10 @@ impl RetireReason {
 }
 
 struct Entry {
-    router: usize,
+    /// The router that holds the frame. A dropped router's handle never
+    /// upgrades, so a later Router that reuses its address (tests create and
+    /// drop many) never inherits its entries.
+    router: std::sync::Weak<Router>,
     packet_id: u64,
     reason: String,
     cause: AbortCause,
@@ -178,8 +181,10 @@ fn entries() -> std::sync::MutexGuard<'static, Vec<Entry>> {
     })
 }
 
-fn router_key(router: &Router) -> usize {
-    router as *const Router as usize
+/// Whether `entry` belongs to `router`: the very Router it was registered
+/// with, still alive, not merely one at the same address.
+fn owned_by(entry: &Entry, router: &Router) -> bool {
+    std::ptr::eq(entry.router.as_ptr(), router) && entry.router.strong_count() > 0
 }
 
 fn abort_type() -> sedsnet::config::DataType {
@@ -191,10 +196,12 @@ fn recount(entries: &[Entry]) {
 }
 
 /// Record an automatic ABORT the router has just accepted.
-pub(crate) fn register_automatic(router: &Router, packet_id: u64, reason: &str, cause: AbortCause) {
+pub(crate) fn register_automatic(router: &Arc<Router>, packet_id: u64, reason: &str, cause: AbortCause) {
     let mut entries = entries();
-    let key = router_key(router);
-    if entries.iter().any(|e| e.router == key && e.packet_id == packet_id) {
+    // Entries of dropped routers are dead weight; their frames can no longer
+    // be offered to a writer.
+    entries.retain(|e| e.router.strong_count() > 0);
+    if entries.iter().any(|e| owned_by(e, router) && e.packet_id == packet_id) {
         return;
     }
     while entries.len() >= MAX_ENTRIES {
@@ -203,7 +210,7 @@ pub(crate) fn register_automatic(router: &Router, packet_id: u64, reason: &str, 
         entries.remove(index);
     }
     entries.push(Entry {
-        router: key,
+        router: Arc::downgrade(router),
         packet_id,
         reason: reason.to_string(),
         cause,
@@ -220,8 +227,7 @@ pub(crate) fn register_automatic(router: &Router, packet_id: u64, reason: &str, 
 
 #[cfg(test)]
 pub(crate) fn origin(router: &Router, packet_id: u64) -> AbortOrigin {
-    let key = router_key(router);
-    if entries().iter().any(|e| e.router == key && e.packet_id == packet_id) {
+    if entries().iter().any(|e| owned_by(e, router) && e.packet_id == packet_id) {
         AbortOrigin::Automatic
     } else {
         AbortOrigin::Manual
@@ -232,10 +238,9 @@ pub(crate) fn is_retired(router: &Router, packet_id: u64) -> bool {
     if RETIRED.load(Ordering::Acquire) == 0 {
         return false;
     }
-    let key = router_key(router);
     entries()
         .iter()
-        .any(|e| e.router == key && e.packet_id == packet_id && e.retired.is_some())
+        .any(|e| owned_by(e, router) && e.packet_id == packet_id && e.retired.is_some())
 }
 
 /// The radio writer's check: true for a canonical ABORT frame whose packet id
@@ -292,13 +297,12 @@ pub(crate) fn has_pending_reliable_tx_type(router: &Router, ty: sedsnet::config:
 pub(crate) fn retire_on_operator_clear(state: &AppState, router: &Router) -> usize {
     let any_abort_pending = router.try_has_pending_reliable_tx_type(abort_type()).unwrap_or(true);
     let rows = router.export_reliable_pending_stats();
-    let key = router_key(router);
-    let causes = cause_states(state, key);
+    let causes = cause_states(state, router);
     let retired = {
         let mut entries = entries();
-        refresh_locked(&mut entries, key, router, &rows, any_abort_pending, Instant::now());
+        refresh_locked(&mut entries, router, &rows, any_abort_pending, Instant::now());
         let mut retired = Vec::new();
-        for entry in entries.iter_mut().filter(|e| e.router == key) {
+        for entry in entries.iter_mut().filter(|e| owned_by(e, router)) {
             if entry.retired.is_none() && entry.gone_since.is_none() {
                 entry.retired = Some(RetireReason::OperatorCleared);
                 retired.push(Retired::of(entry, &causes));
@@ -319,16 +323,15 @@ pub(crate) fn evaluate(state: &AppState, router: &Router, now: Instant) {
     }
     let any_abort_pending = router.try_has_pending_reliable_tx_type(abort_type()).unwrap_or(true);
     let rows = router.export_reliable_pending_stats();
-    let key = router_key(router);
     let delivery_window = crate::sim_freshness::wall(crate::gse::UNDELIVERABLE_AFTER);
     let max_age = crate::sim_freshness::wall(AUTOMATIC_ABORT_MAX_AGE);
-    let causes = cause_states(state, key);
+    let causes = cause_states(state, router);
     let (retired, query) = {
         let mut entries = entries();
-        refresh_locked(&mut entries, key, router, &rows, any_abort_pending, now);
+        refresh_locked(&mut entries, router, &rows, any_abort_pending, now);
         let mut retired = Vec::new();
         let mut query = 0u8;
-        for entry in entries.iter_mut().filter(|e| e.router == key) {
+        for entry in entries.iter_mut().filter(|e| owned_by(e, router)) {
             if entry.retired.is_some() || entry.gone_since.is_some() {
                 continue;
             }
@@ -363,10 +366,10 @@ pub(crate) fn evaluate(state: &AppState, router: &Router, now: Instant) {
 
 /// Each unretired entry's cause state, read without holding the registry
 /// (the predicates take station locks).
-fn cause_states(state: &AppState, key: usize) -> Vec<(u64, CauseState)> {
+fn cause_states(state: &AppState, router: &Router) -> Vec<(u64, CauseState)> {
     let causes = entries()
         .iter()
-        .filter(|e| e.router == key && e.retired.is_none())
+        .filter(|e| owned_by(e, router) && e.retired.is_none())
         .map(|e| (e.packet_id, e.cause.clone()))
         .collect::<Vec<_>>();
     causes.into_iter().map(|(id, cause)| (id, cause.state(state))).collect()
@@ -375,13 +378,12 @@ fn cause_states(state: &AppState, key: usize) -> Vec<(u64, CauseState)> {
 /// Update destinations and SDK presence; forget long-gone entries.
 fn refresh_locked(
     entries: &mut Vec<Entry>,
-    key: usize,
     router: &Router,
     rows: &[sedsnet::diagnostics::ReliablePendingStats],
     any_abort_pending: bool,
     now: Instant,
 ) {
-    for entry in entries.iter_mut().filter(|e| e.router == key) {
+    for entry in entries.iter_mut().filter(|e| owned_by(e, router)) {
         match rows.iter().find(|row| row.packet_id == entry.packet_id) {
             Some(row) => {
                 entry.seen_pending = true;
@@ -413,12 +415,14 @@ fn refresh_locked(
             None => {}
         }
     }
+    // Also drop the entries of routers that no longer exist.
     entries.retain(|e| {
-        e.router != key
-            || e.gone_since.is_none_or(|gone| {
-                let keep = if e.retired.is_some() { RETIRED_SUPPRESSION } else { Duration::ZERO };
-                now.saturating_duration_since(gone) < keep
-            })
+        e.router.strong_count() > 0
+            && (!owned_by(e, router)
+                || e.gone_since.is_none_or(|gone| {
+                    let keep = if e.retired.is_some() { RETIRED_SUPPRESSION } else { Duration::ZERO };
+                    now.saturating_duration_since(gone) < keep
+                }))
     });
 }
 
@@ -497,9 +501,8 @@ pub(crate) fn spawn(state: Arc<AppState>, router: Arc<Router>) -> tokio::task::J
 
 #[cfg(test)]
 pub(crate) fn retired_reason(router: &Router, packet_id: u64) -> Option<RetireReason> {
-    let key = router_key(router);
     entries().iter()
-        .find(|e| e.router == key && e.packet_id == packet_id)
+        .find(|e| owned_by(e, router) && e.packet_id == packet_id)
         .and_then(|e| e.retired)
 }
 
@@ -517,12 +520,12 @@ mod poison_tests {
         ) {
             return;
         }
-        let router = Router::new(sedsnet::router::RouterConfig::new([]));
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([])));
         register_automatic(&router, 7, "test", AbortCause::Unknown("test".into()));
-        let key = router_key(&router);
+        let held = router.clone();
         let _ = std::thread::spawn(move || {
             let mut entries = ENTRIES.lock().unwrap();
-            for entry in entries.iter_mut().filter(|e| e.router == key) {
+            for entry in entries.iter_mut().filter(|e| owned_by(e, &held)) {
                 entry.retired = Some(RetireReason::OperatorCleared);
             }
             panic!("interrupted before the retired count was updated");
@@ -534,5 +537,55 @@ mod poison_tests {
         assert!(!ENTRIES.is_poisoned());
         assert!(is_retired(&router, 7));
         assert!(!is_retired(&router, 8));
+    }
+}
+
+#[cfg(test)]
+mod router_identity_tests {
+    use super::*;
+
+    /// A Router created where a dropped one lived must not inherit its
+    /// automatic ABORTs: Router::new is cheap and tests make many, so the
+    /// allocator hands the same address straight back.
+    #[tokio::test]
+    async fn a_router_at_a_reused_address_does_not_inherit_dropped_aborts() {
+        // Own process: the registry is process-wide.
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "a_router_at_a_reused_address_does_not_inherit_dropped_aborts",
+        ) {
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let state = crate::state::tests::test_app_state().await;
+        let make = || Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS"));
+        let first = Arc::new(make());
+        let address = Arc::as_ptr(&first) as usize;
+        // Registered but never seen pending: exactly the entry a stale lookup
+        // keeps alive within the delivery window.
+        register_automatic(&first, 0x5EED, "old router", AbortCause::Unknown("old".into()));
+        // Build the next Router's internals first, so the only allocation
+        // after the drop is its Arc block, which the allocator would place
+        // in the freed slot. (A registry entry pins that slot, so with the
+        // fix the address is never handed out again while it is tracked.)
+        let mut next = make();
+        drop(first);
+        let mut candidates = Vec::new();
+        for _ in 0..16 {
+            candidates.push(Arc::new(next));
+            next = make();
+        }
+        let reused = candidates.iter().filter(|r| Arc::as_ptr(r) as usize == address).count();
+        for router in &candidates {
+            assert_eq!(
+                origin(router, 0x5EED),
+                AbortOrigin::Manual,
+                "a new router inherited a dropped router's ABORT (address reused: {})",
+                Arc::as_ptr(router) as usize == address
+            );
+            assert_eq!(retire_on_operator_clear(&state, router), 0);
+            assert_eq!(retired_reason(router, 0x5EED), None);
+        }
+        eprintln!("candidates at the dropped router's address: {reused}");
     }
 }

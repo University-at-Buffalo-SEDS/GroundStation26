@@ -179,7 +179,7 @@ pub(crate) fn queue_abort_packet(router: &Router, reason: &str) -> sedsnet::Tele
 
 /// Locally generated automatic aborts retain accepted TX ownership until handoff.
 pub(crate) fn queue_automatic_abort_packet(
-    router: &Router,
+    router: &std::sync::Arc<Router>,
     reason: &str,
     cause: crate::abort_retirement::AbortCause,
 ) -> sedsnet::TelemetryResult<()> {

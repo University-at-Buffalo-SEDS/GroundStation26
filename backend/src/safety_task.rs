@@ -768,7 +768,7 @@ async fn safety_loop(
 /// Claims launch exclusion before dispatch, without holding the GSE mutex over
 /// router callbacks. Admission failure keeps the persisted recovery latch.
 #[cfg(test)]
-pub(crate) fn dispatch_safety_abort(state: &Arc<AppState>, router: &Router) -> bool {
+pub(crate) fn dispatch_safety_abort(state: &Arc<AppState>, router: &Arc<Router>) -> bool {
     let Some(claim) = crate::gse::claim_automatic_abort(state) else {
         return false;
     };
@@ -786,7 +786,7 @@ enum SafetyDispatch {
 
 fn dispatch_safety_abort_reason(
     state: &Arc<AppState>,
-    router: &Router,
+    router: &Arc<Router>,
     reason: &SafetyAbortReason,
 ) -> SafetyDispatch {
     // GENERIC_ERROR has no severity contract. It is not evidence of a massive,
@@ -833,7 +833,7 @@ fn dispatch_safety_abort_reason(
 
 fn dispatch_claimed_safety_abort(
     state: &Arc<AppState>,
-    router: &Router,
+    router: &Arc<Router>,
     _claim: crate::gse::AutomaticAbortClaim,
     cause: crate::abort_retirement::AbortCause,
 ) {
