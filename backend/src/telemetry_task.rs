@@ -245,6 +245,11 @@ pub(crate) fn refresh_host_network_time(router: &Router, utc_ms: u64) {
 static ABSOLUTE_TIME: std::sync::LazyLock<std::sync::Mutex<crate::absolute_time::AbsoluteTime>> =
     std::sync::LazyLock::new(Default::default);
 
+/// Loads the learned GPS reporting delay from (and persists it to) `dir`.
+pub(crate) fn set_absolute_time_data_dir(dir: &std::path::Path) {
+    *ABSOLUTE_TIME.lock().unwrap() = crate::absolute_time::AbsoluteTime::with_data_dir(dir);
+}
+
 /// Station host UTC in ns: the model clock in simulation (ms resolution, the
 /// simulator's truth), else CLOCK_REALTIME at full resolution.
 fn host_utc_ns() -> i64 {
@@ -274,6 +279,7 @@ pub(crate) fn station_time_status() -> Option<crate::types::StationTimeStatus> {
         stratum: status.stratum,
         error_bound_us: (status.error_bound_ns != u64::MAX).then_some(status.error_bound_ns / 1_000),
         utc_source: match abs.source {
+            crate::absolute_time::AbsoluteSource::GpsPps => "gps_pps",
             crate::absolute_time::AbsoluteSource::Gps => "gps",
             crate::absolute_time::AbsoluteSource::Ntp => "ntp",
             crate::absolute_time::AbsoluteSource::Held => "held",
@@ -281,6 +287,8 @@ pub(crate) fn station_time_status() -> Option<crate::types::StationTimeStatus> {
         }
         .to_string(),
         utc_bound_us: abs.bound_us,
+        gps_delay_us: abs.gps_delay_us,
+        gps_delay_learned: abs.gps_delay_learned,
     })
 }
 
@@ -310,8 +318,13 @@ pub(crate) fn refresh_station_network_time(router: &Router) {
         && let Some(net_ns) = router.network_time_ns()
         && net_ns >= sedsnet::timesync::TIMESYNC_UTC_FLOOR_MS as i128 * 1_000_000
     {
+        // The leader is RF on raw NMEA time: like an RF report, its GPS delay
+        // is still in it, and it is never PPS-grade from this path.
         let fed = host_ns.saturating_add(abs.correction_ns());
-        reports.push(((net_ns as i64).saturating_sub(fed), status.error_bound_ns));
+        reports.push((
+            (net_ns as i64).saturating_sub(fed),
+            status.error_bound_ns.saturating_add(20_000_000),
+        ));
     }
     let stepped = abs.update(crate::absolute_time::Inputs {
         now: std::time::Instant::now(),
@@ -342,7 +355,11 @@ pub(crate) fn refresh_station_network_time(router: &Router) {
         router.set_local_network_time(t.into());
     }
     if let Some(diff) = status.gps_minus_ntp_us {
-        log::debug!("GPS UTC minus NTP host UTC: {diff} us");
+        log::debug!(
+            "GPS UTC (delay {} us, {}) minus NTP host UTC: {diff} us",
+            status.gps_delay_us,
+            if status.gps_delay_learned { "learned" } else { "default" }
+        );
     }
 }
 

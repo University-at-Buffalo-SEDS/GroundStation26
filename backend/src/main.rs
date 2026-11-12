@@ -1452,6 +1452,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- DB path ---
     let recordings_dir = PathBuf::from("./data");
+    telemetry_task::set_absolute_time_data_dir(&recordings_dir);
     let placeholder_db_path = recordings_dir.join(DEFAULT_TELEMETRY_DB_FILENAME);
     recover_sqlite_sidecars_in_dir(&recordings_dir).await?;
     if placeholder_db_path.exists() {

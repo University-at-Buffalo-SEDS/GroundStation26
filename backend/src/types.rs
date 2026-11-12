@@ -669,6 +669,12 @@ pub struct StationTimeStatus {
     pub utc_source: String,
     /// Absolute UTC error bound, microseconds (`None` unknown).
     pub utc_bound_us: Option<u64>,
+    /// GPS reporting delay in use, microseconds, and whether it was learned
+    /// against NTP (else the default).
+    #[serde(default)]
+    pub gps_delay_us: i64,
+    #[serde(default)]
+    pub gps_delay_learned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default)]

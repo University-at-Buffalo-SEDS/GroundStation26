@@ -2,29 +2,38 @@
 //!
 //! Relative sync stays GS-led: the station is the time source the AV bay
 //! follows (GS -> RF -> FC/PB). This module only decides what UTC the station
-//! feeds its SEDSnet clock as: host time plus a correction.
+//! feeds its SEDSnet clock: host time plus a correction.
 //!
-//! Source order (the Pi has no RTC, so host time is unknown at power-up):
-//! 1. RF GPS: RF reports (GPS UTC - network time) in its time sync requests
-//!    (SEDSnet UTC reference reports, no extra frames). The median of the last
-//!    30 s of reports is the correction target.
+//! Source order (the Pi has no RTC):
+//! 1. GPS with PPS: an RF report whose error is within [`PPS_REPORT_ERROR_NS`]
+//!    (a PPS-disciplined receiver; this RF revision has none, a future board
+//!    may). It is the most accurate source.
 //! 2. NTP, when the kernel reports the host clock synchronized: correction 0.
-//!    With GPS present it is only a cross-check (the GPS-NTP difference is
-//!    logged as a free bias calibration).
-//! 3. The last estimate, held, with a growing bound.
+//!    While NTP is synced, NMEA GPS reports only teach the GPS reporting
+//!    delay (GPS UTC as reported minus true UTC), which is persisted.
+//! 3. NMEA GPS with the learned delay subtracted (the default delay when it
+//!    was never learned).
+//! 4. The last estimate, held, with a growing bound.
+//!
+//! RF reports `GPS UTC - network time` from NMEA without removing any delay;
+//! RF's network clock follows the station's within its sync bound, so the
+//! radio path is already removed by time sync.
 //!
 //! Corrections slew at [`SLEW_PPM`]. A step (coarse set) is taken only while
 //! no board is locked or the vehicle is in Startup/Idle, and never in a flight
 //! state (Armed through Recovery).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Reports older than this leave the GPS window.
+/// GPS reports older than this leave the target window.
 const GPS_WINDOW: Duration = Duration::from_secs(30);
-/// GPS is the active source while its newest report is younger than this.
+/// GPS is a live source while its newest report is younger than this.
 const GPS_FRESH: Duration = Duration::from_secs(10);
+/// Reports at or below this error come from a PPS-disciplined receiver.
+pub const PPS_REPORT_ERROR_NS: u64 = 2_000_000;
 /// Slew rate for absolute corrections, parts per million (1%: 10 ms/s).
 pub const SLEW_PPM: i64 = 10_000;
 /// A correction larger than this is stepped when stepping is allowed.
@@ -33,18 +42,30 @@ const STEP_THRESHOLD_NS: i64 = 100_000_000;
 const HOLD_DRIFT_PPB: u64 = 50_000;
 /// Error assumed for a kernel-synchronized (NTP) host clock.
 const NTP_BOUND_NS: u64 = 10_000_000;
+/// GPS reporting delay used until one is learned (NEO-M9N NMEA over SPI).
+pub const DEFAULT_GPS_DELAY_NS: i64 = 40_000_000;
+/// Delay samples kept for learning (one per report, about 0.25-1 per second).
+const DELAY_WINDOW: usize = 240;
+/// Samples needed before a learned delay is used.
+const DELAY_MIN_SAMPLES: usize = 30;
+/// Plausible GPS reporting delay range; samples outside are rejected.
+const DELAY_VALID_NS: (i64, i64) = (-50_000_000, 500_000_000);
+/// Learned delay is accepted only when 3/4 of the samples lie this close to the median.
+const DELAY_MAX_MAD_NS: i64 = 20_000_000;
+const DELAY_FILE: &str = "gps_delay.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AbsoluteSource {
-    Gps,
+    GpsPps,
     Ntp,
+    Gps,
     Held,
     #[default]
     Unsynced,
 }
 
-/// What the UI shows: "UTC via GPS +-X ms", "via NTP", "unsynced".
+/// What the UI shows: "UTC via NTP ±X ms", "via GPS ±X ms (delay 41 ms learned)".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 pub struct AbsoluteStatus {
     pub source: AbsoluteSource,
@@ -52,7 +73,11 @@ pub struct AbsoluteStatus {
     pub bound_us: Option<u64>,
     /// Correction applied to host time, microseconds.
     pub correction_us: i64,
-    /// GPS UTC minus NTP host UTC, microseconds, when both were available.
+    /// GPS reporting delay in use, microseconds.
+    pub gps_delay_us: i64,
+    /// The delay was learned against NTP (else the default).
+    pub gps_delay_learned: bool,
+    /// GPS UTC (delay removed) minus NTP host UTC, microseconds, while both run.
     pub gps_minus_ntp_us: Option<i64>,
 }
 
@@ -62,22 +87,25 @@ pub struct Inputs {
     pub now: Instant,
     /// The kernel reports the host clock NTP-synchronized.
     pub ntp_synced: bool,
-    /// UTC reports received since the last update: (GPS UTC - network time, error), ns.
+    /// RF reports since the last update: (GPS UTC - network time as reported, error), ns.
     pub reports: Vec<(i64, u64)>,
     /// A coarse step is allowed now (no board locked or Startup/Idle, never in flight).
     pub may_step: bool,
 }
 
+/// Persisted learned delay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct SavedDelay {
+    delay_us: i64,
+    samples: u32,
+}
+
 #[derive(Debug, Default)]
-pub struct AbsoluteTime {
-    correction_ns: i64,
-    window: VecDeque<(Instant, i64, u64)>,
-    last_gps: Option<Instant>,
-    last_update: Option<Instant>,
-    synced_once: bool,
-    status: AbsoluteStatus,
-    bound_ns: u64,
-    held_since: Option<Instant>,
+struct DelayLearner {
+    samples: VecDeque<i64>,
+    learned: Option<i64>,
+    saved: Option<i64>,
+    path: Option<PathBuf>,
 }
 
 fn median(values: &mut [i64]) -> i64 {
@@ -85,7 +113,75 @@ fn median(values: &mut [i64]) -> i64 {
     values[values.len() / 2]
 }
 
+impl DelayLearner {
+    fn load(path: &Path) -> Self {
+        let saved = std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<SavedDelay>(&b).ok())
+            .map(|s| s.delay_us.saturating_mul(1_000))
+            .filter(|d| (DELAY_VALID_NS.0..=DELAY_VALID_NS.1).contains(d));
+        Self { learned: saved, saved, path: Some(path.to_path_buf()), ..Default::default() }
+    }
+
+    fn delay_ns(&self) -> i64 {
+        self.learned.unwrap_or(DEFAULT_GPS_DELAY_NS)
+    }
+
+    /// One sample: reported GPS UTC minus true (NTP) UTC.
+    fn offer(&mut self, delay_ns: i64) {
+        if !(DELAY_VALID_NS.0..=DELAY_VALID_NS.1).contains(&delay_ns) {
+            return;
+        }
+        if self.samples.len() == DELAY_WINDOW {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(delay_ns);
+        if self.samples.len() < DELAY_MIN_SAMPLES {
+            return;
+        }
+        let mut v: Vec<i64> = self.samples.iter().copied().collect();
+        let med = median(&mut v);
+        // At least three quarters of the window must agree with the median.
+        let agree = v.iter().filter(|d| (**d - med).abs() <= DELAY_MAX_MAD_NS).count();
+        if agree * 4 < v.len() * 3 {
+            return;
+        }
+        self.learned = Some(med);
+        // Persist when it moved by more than 1 ms.
+        if self.saved.is_none_or(|s| (s - med).abs() > 1_000_000)
+            && let Some(path) = &self.path
+        {
+            let saved = SavedDelay { delay_us: med / 1_000, samples: self.samples.len() as u32 };
+            if let Ok(json) = serde_json::to_vec(&saved) {
+                let tmp = path.with_extension("json.tmp");
+                if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+                    self.saved = Some(med);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct AbsoluteTime {
+    correction_ns: i64,
+    /// (received, implied correction with zero delay, error, PPS-grade).
+    window: VecDeque<(Instant, i64, u64, bool)>,
+    last_gps: Option<Instant>,
+    last_update: Option<Instant>,
+    synced_once: bool,
+    status: AbsoluteStatus,
+    bound_ns: u64,
+    held_since: Option<Instant>,
+    delay: DelayLearner,
+}
+
 impl AbsoluteTime {
+    /// Uses (and persists the learned GPS delay in) `dir`.
+    pub fn with_data_dir(dir: &Path) -> Self {
+        Self { delay: DelayLearner::load(&dir.join(DELAY_FILE)), ..Default::default() }
+    }
+
     /// Correction to add to host UTC, ns.
     pub fn correction_ns(&self) -> i64 {
         self.correction_ns
@@ -103,17 +199,23 @@ impl AbsoluteTime {
             .map_or(Duration::from_secs(1), |t| input.now.saturating_duration_since(t))
             .min(Duration::from_secs(10));
         self.last_update = Some(input.now);
-        // Reports measure the network clock as it read then: host + the
-        // correction then in force. The absolute target is that plus the offset.
+        // Each report measured the network clock as it read then (host + the
+        // correction then in force); with zero GPS delay it implies this
+        // correction.
         for (offset_ns, error_ns) in &input.reports {
-            self.window
-                .push_back((input.now, self.correction_ns.saturating_add(*offset_ns), *error_ns));
+            let implied = self.correction_ns.saturating_add(*offset_ns);
+            let pps = *error_ns <= PPS_REPORT_ERROR_NS;
+            self.window.push_back((input.now, implied, *error_ns, pps));
             self.last_gps = Some(input.now);
+            if input.ntp_synced && !pps {
+                // NTP says the true correction is 0: the report is late by -implied.
+                self.delay.offer(-implied);
+            }
         }
         while self
             .window
             .front()
-            .is_some_and(|(t, _, _)| input.now.saturating_duration_since(*t) > GPS_WINDOW)
+            .is_some_and(|(t, ..)| input.now.saturating_duration_since(*t) > GPS_WINDOW)
         {
             self.window.pop_front();
         }
@@ -121,19 +223,32 @@ impl AbsoluteTime {
             .last_gps
             .is_some_and(|t| input.now.saturating_duration_since(t) <= GPS_FRESH)
             && !self.window.is_empty();
-        let mut gps_minus_ntp_us = self.status.gps_minus_ntp_us;
-        let (target, source, bound) = if gps_live {
-            let mut targets: Vec<i64> = self.window.iter().map(|(_, c, _)| *c).collect();
-            let target = median(&mut targets);
-            let mut errors: Vec<i64> = self.window.iter().map(|(_, _, e)| *e as i64).collect();
-            let bound = median(&mut errors).max(0) as u64;
-            if input.ntp_synced {
-                // Host is NTP-correct: the GPS target is the GPS-NTP difference.
-                gps_minus_ntp_us = Some(target / 1_000);
-            }
-            (Some(target), AbsoluteSource::Gps, bound)
+        let pps_live = gps_live && self.window.iter().rev().take(4).any(|r| r.3);
+        let delay = self.delay.delay_ns();
+        let gps_target = |pps_only: bool, w: &VecDeque<(Instant, i64, u64, bool)>| {
+            let mut t: Vec<i64> = w
+                .iter()
+                .filter(|r| r.3 == pps_only)
+                .map(|r| if r.3 { r.1 } else { r.1 + delay })
+                .collect();
+            let mut e: Vec<i64> = w.iter().filter(|r| r.3 == pps_only).map(|r| r.2 as i64).collect();
+            (!t.is_empty()).then(|| (median(&mut t), median(&mut e).max(0) as u64))
+        };
+        let gps_minus_ntp_us = if input.ntp_synced && gps_live {
+            gps_target(false, &self.window).map(|(t, _)| t / 1_000)
+        } else {
+            None
+        };
+        let (target, source, bound) = if let Some((t, e)) =
+            gps_target(true, &self.window).filter(|_| pps_live)
+        {
+            (Some(t), AbsoluteSource::GpsPps, e)
         } else if input.ntp_synced {
             (Some(0), AbsoluteSource::Ntp, NTP_BOUND_NS)
+        } else if let Some((t, e)) = gps_target(false, &self.window).filter(|_| gps_live) {
+            // An unlearned delay is a guess: widen the bound by the default.
+            let extra = if self.delay.learned.is_some() { 0 } else { DEFAULT_GPS_DELAY_NS as u64 };
+            (Some(t), AbsoluteSource::Gps, e.saturating_add(extra))
         } else if self.synced_once {
             let since = *self.held_since.get_or_insert(input.now);
             let drift = (input.now.saturating_duration_since(since).as_nanos() as u64)
@@ -157,16 +272,16 @@ impl AbsoluteTime {
                 self.correction_ns += error.clamp(-max, max);
             }
             self.synced_once = true;
-            if source != AbsoluteSource::Held {
-                // Unfinished slew counts toward the bound.
-                self.bound_ns = bound.saturating_add(target.abs_diff(self.correction_ns));
-            }
+            // Unfinished slew counts toward the bound.
+            self.bound_ns = bound.saturating_add(target.abs_diff(self.correction_ns));
         }
         let bound = if target.is_some() { self.bound_ns } else { bound };
         self.status = AbsoluteStatus {
             source,
             bound_us: (bound != u64::MAX).then_some(bound / 1_000),
             correction_us: self.correction_ns / 1_000,
+            gps_delay_us: self.delay.delay_ns() / 1_000,
+            gps_delay_learned: self.delay.learned.is_some(),
             gps_minus_ntp_us,
         };
         stepped
@@ -198,20 +313,96 @@ pub fn may_step(flight_state: u8, any_board_locked: bool) -> bool {
 mod tests {
     use super::*;
 
+    const MS: i64 = 1_000_000;
+
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "gs-abs-time-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn input(now: Instant, ntp: bool, reports: Vec<(i64, u64)>, may_step: bool) -> Inputs {
         Inputs { now, ntp_synced: ntp, reports, may_step }
     }
 
+    /// RF report for a host `host_err` behind true UTC with GPS `delay` late:
+    /// reported GPS UTC - network = -(delay) - (correction + host_err) + ...
+    fn report(a: &AbsoluteTime, host_behind: i64, delay: i64) -> (i64, u64) {
+        // network = host + correction = true - host_behind + correction
+        // GPS as reported = true - delay
+        (host_behind - a.correction_ns() - delay, 20 * MS as u64)
+    }
+
     #[test]
-    fn gps_median_rejects_outliers_and_steps_only_when_allowed() {
+    fn ntp_leads_and_teaches_the_gps_delay_which_persists() {
+        let dir = TempDir::new();
+        let t0 = Instant::now();
+        let mut a = AbsoluteTime::with_data_dir(dir.path());
+        assert_eq!(a.status().gps_delay_learned, false);
+        for i in 0..40u64 {
+            let jitter = ((i * 7) % 5) as i64 * MS;
+            let r = report(&a, 0, 37 * MS + jitter);
+            a.update(input(t0 + Duration::from_secs(i), true, vec![r], true));
+            assert_eq!(a.status().source, AbsoluteSource::Ntp);
+            assert_eq!(a.correction_ns(), 0, "NTP stays the source while synced");
+        }
+        let st = a.status();
+        assert!(st.gps_delay_learned);
+        assert!((st.gps_delay_us - 39_000).abs() <= 2_000, "{st:?}");
+        // A new station loads the learned value.
+        let b = AbsoluteTime::with_data_dir(dir.path());
+        assert!(b.delay.learned.is_some_and(|d| (d - st.gps_delay_us * 1_000).abs() <= 1_000_000));
+    }
+
+    #[test]
+    fn without_ntp_gps_with_the_learned_delay_sets_utc() {
+        let dir = TempDir::new();
+        std::fs::write(dir.path().join(DELAY_FILE), br#"{"delay_us":45000,"samples":200}"#).unwrap();
+        let t0 = Instant::now();
+        let mut a = AbsoluteTime::with_data_dir(dir.path());
+        // Host 5 s behind true UTC (no RTC), GPS 45 ms late.
+        let r = report(&a, 5_000 * MS, 45 * MS);
+        assert!(a.update(input(t0, false, vec![r], true)));
+        assert_eq!(a.status().source, AbsoluteSource::Gps);
+        assert!((a.correction_ns() - 5_000 * MS).abs() < MS, "{}", a.correction_ns());
+        assert!(a.status().gps_delay_learned);
+    }
+
+    #[test]
+    fn pps_gps_outranks_ntp() {
         let t0 = Instant::now();
         let mut a = AbsoluteTime::default();
-        // Host clock 5 s behind GPS; one wild report.
-        let reports = vec![(5_000_000_000, 20_000_000), (5_002_000_000, 20_000_000), (9_000_000_000, 20_000_000)];
+        // NTP host 3 ms off; a PPS receiver reports with 50 us error.
+        a.update(input(t0, true, vec![(3 * MS, 50_000)], true));
+        assert_eq!(a.status().source, AbsoluteSource::GpsPps);
+        assert_eq!(a.correction_ns(), 3 * MS);
+        assert!(a.status().bound_us.unwrap() <= 50);
+    }
+
+    #[test]
+    fn median_rejects_outliers_and_steps_only_when_allowed() {
+        let t0 = Instant::now();
+        let mut a = AbsoluteTime::default();
+        let d = DEFAULT_GPS_DELAY_NS;
+        let reports = vec![(5_000 * MS - d, 20 * MS as u64), (5_002 * MS - d, 20 * MS as u64), (9_000 * MS, 20 * MS as u64)];
         assert!(a.update(input(t0, false, reports, true)));
-        assert_eq!(a.correction_ns(), 5_002_000_000);
-        assert_eq!(a.status().source, AbsoluteSource::Gps);
-        assert!(a.status().bound_us.unwrap() <= 21_000);
+        assert_eq!(a.correction_ns(), 5_002 * MS);
     }
 
     #[test]
@@ -225,57 +416,45 @@ mod tests {
         let t0 = Instant::now();
         let mut a = AbsoluteTime::default();
         let mut now = t0;
-        // 2 s error while flying: slews at 10 ms/s, never jumps.
         for _ in 0..10 {
-            a.update(input(now, false, vec![(2_000_000_000 - a.correction_ns(), 20_000_000)], false));
+            let r = (2_000 * MS - a.correction_ns() - DEFAULT_GPS_DELAY_NS, 20 * MS as u64);
+            a.update(input(now, false, vec![r], false));
             now += Duration::from_secs(1);
         }
-        assert!(a.correction_ns() <= 100_000_000, "{}", a.correction_ns());
-        assert!(a.correction_ns() >= 80_000_000);
+        assert!(a.correction_ns() <= 100 * MS && a.correction_ns() >= 80 * MS, "{}", a.correction_ns());
     }
 
     #[test]
-    fn source_order_gps_then_ntp_then_held() {
+    fn dropout_holds_then_falls_back() {
         let t0 = Instant::now();
         let mut a = AbsoluteTime::default();
         assert!(!a.update(input(t0, false, vec![], true)));
         assert_eq!(a.status().source, AbsoluteSource::Unsynced);
         assert_eq!(a.status().bound_us, None);
-        // NTP only.
-        a.update(input(t0 + Duration::from_secs(1), true, vec![], true));
-        assert_eq!(a.status().source, AbsoluteSource::Ntp);
-        // GPS arrives: primary; difference to NTP logged.
-        a.update(input(t0 + Duration::from_secs(2), true, vec![(3_000_000, 15_000_000)], true));
+        a.update(input(t0 + Duration::from_secs(1), false, vec![(1_000 * MS, 20 * MS as u64)], true));
         assert_eq!(a.status().source, AbsoluteSource::Gps);
-        assert_eq!(a.status().gps_minus_ntp_us, Some(3_000));
-        // GPS drops out, NTP lost too: hold, bound grows.
-        a.update(input(t0 + Duration::from_secs(40), false, vec![], true));
+        let c = a.correction_ns();
+        a.update(input(t0 + Duration::from_secs(40), false, vec![], false));
         let held = a.status();
         assert_eq!(held.source, AbsoluteSource::Held);
-        a.update(input(t0 + Duration::from_secs(400), false, vec![], true));
+        a.update(input(t0 + Duration::from_secs(400), false, vec![], false));
         assert!(a.status().bound_us.unwrap() > held.bound_us.unwrap());
-        assert_eq!(a.status().correction_us, held.correction_us, "held, not moved");
-        // NTP returns: falls back to NTP (target 0), slewing.
+        assert_eq!(a.correction_ns(), c, "held, not moved");
         a.update(input(t0 + Duration::from_secs(401), true, vec![], false));
         assert_eq!(a.status().source, AbsoluteSource::Ntp);
     }
 
     #[test]
-    fn gps_dropout_holds_then_resumes_without_a_step_once_locked() {
-        let t0 = Instant::now();
-        let mut a = AbsoluteTime::default();
-        a.update(input(t0, false, vec![(1_000_000_000, 10_000_000)], true));
-        assert_eq!(a.correction_ns(), 1_000_000_000);
-        a.update(input(t0 + Duration::from_secs(20), false, vec![], false));
-        assert_eq!(a.status().source, AbsoluteSource::Held);
-        // GPS back with a 300 ms different view, boards locked in PreFill: slew.
-        let stepped = a.update(input(
-            t0 + Duration::from_secs(21),
-            false,
-            vec![(300_000_000, 10_000_000)],
-            false,
-        ));
-        assert!(!stepped);
-        assert!(a.correction_ns() > 1_000_000_000 && a.correction_ns() < 1_100_000_000);
+    fn implausible_delay_samples_are_ignored() {
+        let mut l = DelayLearner::default();
+        for _ in 0..100 {
+            l.offer(2_000 * MS);
+        }
+        assert!(l.learned.is_none());
+        // Widely scattered samples never settle.
+        for i in 0..100 {
+            l.offer(if i % 2 == 0 { 10 * MS } else { 300 * MS });
+        }
+        assert!(l.learned.is_none());
     }
 }
