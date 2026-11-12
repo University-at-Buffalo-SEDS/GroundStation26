@@ -202,8 +202,10 @@ pub(crate) fn record_operator_press(state: &AppState, router: &Router, byte: u8,
 // - P1 held at most PYRO_HOLD_LIMIT after the press (the FC's own bound for
 //   an operator pyro request, board_recovery_operator_pyro_allowed);
 // - P2 an Abort or manual stop while held drops every held command;
-// - P3 on release the station's admission (R4) and the FC's view (R7) are
-//   checked again;
+// - P3 on release the station's admission (R4) is checked again, exactly as
+//   for a press sent at once: being held never makes a press refused that
+//   would have been sent with nothing pending (R7's effect and FC-state
+//   checks belong to automatic re-sends, not to the operator's own press);
 // - P4 a press of the same pyro command as an earlier one that is still
 //   unresolved (held, queued or awaiting FC confirmation) is never sent: a
 //   second copy could fire twice;
@@ -367,13 +369,8 @@ fn service_held(state: &AppState, router: &Router) {
     }
     pop();
     // P3
-    let (effect_seen, fc_admissible) = effect_and_admissible(state, front.byte);
-    if effect_seen {
-        notify(state, format!("{label} was never sent: the station already sees its effect."));
-        return;
-    }
-    if !(fc_admissible && command_for(front.byte).is_some_and(|c| state.is_command_allowed(&c))) {
-        notify(state, format!("{label} was never sent: the flight computer or the station would now refuse it."));
+    if !command_for(front.byte).is_some_and(|c| state.is_command_allowed(&c)) {
+        notify(state, format!("{label} was never sent: the station no longer allows it (station mode or controls changed while it was held)."));
         return;
     }
     match send_now(state, router, front.byte, &ahead) {

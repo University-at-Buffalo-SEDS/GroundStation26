@@ -155,6 +155,10 @@ enum Between {
     PressAged,
     /// The Deploy was queued by the station itself, not pressed (R9).
     Automatic,
+    /// The HITL button interlock now refuses operator commands (station admission).
+    ButtonsDisabled,
+    /// The station sees the main deployed (an earlier Expand ran).
+    MainSeen,
 }
 
 const DEPLOY: u8 = 12;
@@ -261,6 +265,12 @@ async fn operator_bay_timed(flight: crate::types::FlightState, between: Between,
                     state.set_abort_indicator_latched(false);
                 }
                 Between::NewerCommand => crate::operator_command_resend::note_operator_dispatch(&state),
+                // The HITL button interlock engages with its panel enable off.
+                Between::ButtonsDisabled => state.hitl_button_interlock_enabled.store(true, std::sync::atomic::Ordering::SeqCst),
+                Between::MainSeen => {
+                    crate::recovery_events::observe_fc_state(&state, crate::types::FlightState::Ascent, crate::types::FlightState::Descent, 1);
+                    crate::recovery_events::observe_fc_state(&state, crate::types::FlightState::Descent, crate::types::FlightState::Reefing, 2);
+                }
                 Between::PressAged => {
                     crate::operator_command_resend::backdate_press_for_test(&host, span);
                     crate::operator_command_resend::backdate_held_for_test(&host, crate::operator_command_resend::PYRO_HOLD_LIMIT);
@@ -402,12 +412,24 @@ async fn deploy_held_beyond_the_fc_bound_is_never_sent() {
     assert!(noted(&notes, "DeployParachute", "was never sent: it was held"), "{notes:?}");
 }
 
-/// P3 (R7): the FC would refuse a Deploy at or before Armed; never sent.
+/// P3: the station's own admission is checked again on release.
 #[tokio::test]
-async fn held_deploy_the_fc_would_refuse_is_never_sent() {
-    let (delivered, notes) = operator_bay(crate::types::FlightState::Armed, Between::Nothing, DEPLOY).await;
+async fn held_deploy_is_never_sent_once_the_station_disallows_it() {
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::ButtonsDisabled, DEPLOY).await;
     assert_eq!(delivered, None, "{notes:?}");
-    assert!(noted(&notes, "DeployParachute", "would now refuse"), "{notes:?}");
+    assert!(noted(&notes, "DeployParachute", "was never sent: the station no longer allows it"), "{notes:?}");
+}
+
+/// P3, fullnet pair-branch (efc1fa5): held Expands were refused on release as
+/// "the station already sees its effect" (the main had deployed in an earlier
+/// pair) although the same press with nothing pending is sent. Being held
+/// never changes whether an operator press is sent.
+#[tokio::test]
+async fn held_expand_is_sent_like_a_direct_press_after_an_earlier_main_deployment() {
+    const EXPAND: u8 = 13;
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::MainSeen, EXPAND).await;
+    assert!(delivered.is_some(), "{notes:?}");
+    assert!(!noted(&notes, "ExpandParachute", "was never sent"), "{notes:?}");
 }
 
 /// What the FC handler got in `saturated_bay`: (byte, packet ID), in order.
