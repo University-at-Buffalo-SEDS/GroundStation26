@@ -155,6 +155,24 @@ pub(crate) fn radio_bundle_class(priority: u8, payload: &[u8]) -> Option<(bool, 
     ))
 }
 
+/// The SDK frames one write completes on air: the frame itself, or every
+/// record of the compact bundle that carried it (they all end together).
+fn sdk_wire_frames(frame: &[u8], sdk_wire: &[u8]) -> Vec<Vec<u8>> {
+    if sedsnet::wire_bundle::is_bundle(sdk_wire)
+        && let Ok(records) = sedsnet::wire_bundle::unpack_bundle_frames(sdk_wire)
+    {
+        return records;
+    }
+    vec![frame.to_vec()]
+}
+
+/// Transmit-complete stamps for one SDK write (see `sdk_wire_frames`).
+fn note_sdk_wire_written(side: Option<sedsnet::router::RouterSideId>, frame: &[u8], sdk_wire: &[u8], stop_us: Option<u64>, baud: u32) {
+    for record in sdk_wire_frames(frame, sdk_wire) {
+        crate::telemetry_task::note_frame_written(side, &record, stop_us, 0, baud);
+    }
+}
+
 pub(crate) fn closes_radio_packet_batch(priority: u8, payload: &[u8]) -> bool {
     if priority < 200 || payload.starts_with(b"SDT") {
         return false;
@@ -4148,13 +4166,9 @@ impl UartComms {
         let virtual_stop_us: Option<u64> = None;
         if io_result.is_ok() && accepted > 0 {
             // Transmit-complete stamp for a time sync frame (no-op for others).
-            crate::telemetry_task::note_frame_written(
-                self.side_id,
-                sdk_payload,
-                virtual_stop_us,
-                0,
-                self.baud_rate,
-            );
+            // A compact bundle ends on air as one frame: every record it
+            // carries completes with it, a time sync record anywhere in it too.
+            note_sdk_wire_written(self.side_id, sdk_payload, sdk_wire, virtual_stop_us, self.baud_rate);
         }
         if matches!(self.protocol, SerialProtocol::RawUart)
             && accepted > 0
@@ -7763,6 +7777,35 @@ mod raw_uart_tests {
         assert!(uart.send_data_with_priority(&ordinary, 16).is_err(), "ordinary data waits for the station's gap");
         note_air_rx_now();
         uart.send_data_with_priority(&abort, 255).expect("ABORT goes at once");
+    }
+
+    /// A time sync frame anywhere in a station bundle gets the bundle's
+    /// transmit-complete stamp, not only the bundle's first (classifying) frame.
+    #[test]
+    fn every_record_of_a_written_bundle_is_stamped_on_completion() {
+        crate::telemetry_schema::initialize().unwrap();
+        sedsnet::wire_bundle::set_node_table(&crate::types::SEDS_NODE_TABLE);
+        let pack = |name: &str, endpoint: &str, ts: u64, payload: &[u8]| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type(name),
+                    &[crate::telemetry_schema::endpoint(endpoint)],
+                    "GS",
+                    ts,
+                    std::sync::Arc::from(payload),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let first = pack("FLIGHT_STATE", "FLIGHT_STATE", 1, &[1]);
+        let second = pack("AV_BAY_UNDERGLOW", "AV_BAY_UNDERGLOW_OWNER", 2, &[1]);
+        let records: Vec<&[u8]> = vec![&first, &second];
+        let bundle = sedsnet::wire_bundle::pack_bundle(&records).unwrap();
+        let stamped = sdk_wire_frames(&first, &bundle);
+        assert_eq!(stamped, vec![first.clone(), second.clone()]);
+        // A plain frame is stamped as itself.
+        assert_eq!(sdk_wire_frames(&second, &second), vec![second.clone()]);
     }
 
     /// A compact bundle leaves as one UART frame in one RR AV_BAY_DATA
