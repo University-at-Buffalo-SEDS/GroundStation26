@@ -7222,6 +7222,106 @@ mod raw_uart_tests {
         assert!(36_000 - previous <= bound, "HEALTH stopped at {previous}: {writes:?}");
     }
 
+    /// R30: with HEALTH held for the station's gap during RF's burst, an
+    /// Abort's FLIGHT_STATE=15 written right after its out-of-turn ABORT
+    /// left only with the held HEALTH in the next gap (+256 ms, +292 ms).
+    /// Both the ABORT and its FLIGHT_STATE=15 must reach the wire at once.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn abort_flight_state_is_not_held_behind_health_in_rf_burst() {
+        if !cfg!(feature = "firmware_sim") {
+            crate::mode_suite!(Hitl);
+        }
+        const CHILD: &str = "GS_ABORT_STATE_BURST_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::abort_flight_state_is_not_held_behind_health_in_rf_burst";
+        if std::env::var_os(CHILD).is_none() {
+            let clock = std::env::temp_dir().join(format!("gs-abort-state-{}.clock", std::process::id()));
+            std::fs::write(&clock, "30000").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("GS_SIM_CLOCK_FILE", &clock)
+                .env("GS_SIMULATED_SERIAL_PTY", "1")
+                .env_remove("GS_RADIO_TURN_TAKING")
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_file(clock);
+            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let in_burst = |now: u64| now % 200 < 90;
+        crate::telemetry_schema::initialize().unwrap();
+        let clock = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
+        let pack = |name: &str, endpoint: &str, stamp: u64, payload: &[u8]| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type(name),
+                    &[crate::telemetry_schema::endpoint(endpoint)],
+                    "GS",
+                    stamp,
+                    std::sync::Arc::from(payload),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let abort = pack("ABORT", "ABORT", 7, b"SEDS_MANUAL_ABORT_V1:K");
+        let state = pack("FLIGHT_STATE", "FLIGHT_STATE", 7, &[15]);
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(1)).unwrap();
+        let (mut uart, mesh, _) = recovery_uart_fixture(port);
+        {
+            let mut capacity = rfd_capacity::Capacity::new(64000, 15, 16).with_turn_period(200);
+            capacity.enable_turn_gate();
+            uart.write_lock.lock().unwrap().radio_capacity = Some(capacity);
+        }
+        uart.enable_radio_capacity_control();
+        let mut buf = [0u8; 1024];
+        let mut drain = |peer: &mut serialport::TTYPort| {
+            let mut n_total = 0;
+            while let Ok(n) = peer.read(&mut buf) {
+                if n == 0 { break; }
+                n_total += n;
+            }
+            n_total
+        };
+        // Run turns until HEALTH is held inside RF's burst: a HEALTH is due
+        // (500 ms cadence) and the gate holds it.
+        let mut abort_at = None;
+        for now in (30_000u64..33_000).step_by(5) {
+            std::fs::write(&clock, now.to_string()).unwrap();
+            if in_burst(now) {
+                note_air_rx_now();
+                mesh.lock().unwrap().incoming(true, b"RS\x01\x00\x00\x00\x00\x00\x00", now);
+            }
+            uart.service_transmit().unwrap();
+            let wrote = drain(&mut peer) > 0;
+            if in_burst(now) && now % 200 >= 20 && now > 31_000 && !wrote
+                && uart.write_lock.lock().unwrap().mesh_control_held.is_some()
+            {
+                abort_at = Some(now);
+                break;
+            }
+        }
+        let now = abort_at.expect("a HEALTH held inside RF's burst");
+        // The Abort: ABORT, then its FLIGHT_STATE=15, as the SDK hands them.
+        note_air_rx_now();
+        uart.send_data_with_priority(&abort, 255).expect("the ABORT goes at once");
+        assert!(drain(&mut peer) > 0, "ABORT on the wire");
+        let mut sent = uart.send_data_with_priority(&state, 254).is_ok();
+        uart.service_transmit().unwrap();
+        let mut waited = 0;
+        while !sent && waited < 5 {
+            waited += 5;
+            std::fs::write(&clock, (now + waited).to_string()).unwrap();
+            note_air_rx_now();
+            uart.service_transmit().unwrap();
+            sent = uart.send_data_with_priority(&state, 254).is_ok();
+        }
+        assert!(sent, "the Abort's FLIGHT_STATE=15 waited for the gap behind HEALTH");
+        assert!(drain(&mut peer) > 0, "FLIGHT_STATE=15 on the wire within 5 ms");
+    }
+
     /// ABORT is never held for a turn, also when the radio writer pairs it
     /// with another command (the levers fullnet: an operator ABORT sent as a
     /// command pair waited 344 ms for the station's gap).
@@ -7941,6 +8041,76 @@ mod raw_uart_tests {
             assert!(start.elapsed() < Duration::from_millis(ABORT_RESEND_FREE_JITTER_MS + 30), "a re-send with RF silent waits only its jitter");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// R30: an ABORT written out of turn (inside RF's burst) went alone, and
+    /// its FLIGHT_STATE=15 then waited for the next gap the station heard
+    /// (+256 ms, +292 ms). The Abort's FLIGHT_STATE write must leave with it
+    /// or right after it, never held for a turn, at the priority the SDK
+    /// hands it (managed variables are network control, 254).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_out_of_turn_abort_is_followed_at_once_by_its_flight_state() {
+        const CHILD: &str = "GS_TURN_ABORT_STATE_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::an_out_of_turn_abort_is_followed_at_once_by_its_flight_state";
+        if std::env::var_os(CHILD).is_none() {
+            for priority in ["254", "255"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, priority)
+                    .env_remove("GS_RADIO_TURN_TAKING")
+                    .env_remove("GS_SIM_CLOCK_FILE")
+                    .env_remove("GS_SIMULATED_SERIAL_PTY")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "priority {priority}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+        let state_priority: u8 = std::env::var(CHILD).unwrap().parse().unwrap();
+        crate::telemetry_schema::initialize().unwrap();
+        let pack = |name: &str, endpoint: &str, stamp: u64, payload: &[u8]| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type(name),
+                    &[crate::telemetry_schema::endpoint(endpoint)],
+                    "GS",
+                    stamp,
+                    std::sync::Arc::from(payload),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let (_peer, port) = serialport::TTYPort::pair().unwrap();
+        let (mut uart, mesh, _) = recovery_uart_fixture(port);
+        {
+            let mut capacity = rfd_capacity::Capacity::new(64000, 15, 16).with_turn_period(200);
+            capacity.enable_turn_gate();
+            uart.write_lock.lock().unwrap().radio_capacity = Some(capacity);
+        }
+        uart.enable_radio_capacity_control();
+        let now = mesh.lock().unwrap().now();
+        mesh.lock().unwrap().incoming(true, b"RS\x01\x00\x00\x00\x00\x00\x00", now);
+        let abort = pack("ABORT", "ABORT", 1, b"SEDS_MANUAL_ABORT_V1:K");
+        let state = pack("FLIGHT_STATE", "FLIGHT_STATE", 1, &[15]);
+        // RF holds the air: an ordinary frame would wait for the gap.
+        note_air_rx_now();
+        uart.send_data_with_priority(&abort, 255).expect("the ABORT goes at once");
+        note_air_rx_now();
+        let start = Instant::now();
+        let mut sent = uart.send_data_with_priority(&state, state_priority).is_ok();
+        while !sent && start.elapsed() < Duration::from_millis(5) {
+            note_air_rx_now();
+            std::thread::sleep(Duration::from_millis(1));
+            sent = uart.send_data_with_priority(&state, state_priority).is_ok();
+        }
+        assert!(sent, "the Abort's FLIGHT_STATE=15 at priority {state_priority} waited for a turn");
     }
 
     /// A standby RRLS's HOST_CONTROL (observe refresh, discovery) waits for
