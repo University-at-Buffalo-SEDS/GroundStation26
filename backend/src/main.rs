@@ -2378,7 +2378,7 @@ async fn main() -> anyhow::Result<()> {
                     egress = wanted;
                     log::info!("RRLS radio egress {}", if takeover { "enabled for takeover" } else if wanted { "enabled for an operator Abort (ABORT frames only)" } else { "disabled (observer)" });
                 }
-                if takeover != writable && network_variables::set_takeover_outputs_writable(&router, takeover).is_ok() {
+                if takeover != writable && network_variables::takeover_changed(&router, takeover).is_ok() {
                     writable = takeover;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(if egress && !takeover { 50 } else { 200 })).await;
@@ -2386,6 +2386,25 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    if !rrls::is_rrls() {
+        // An RRLS gone Offline (unheard for 15 s) is no longer owed reliable
+        // frames; it returns with its next discovery announcement.
+        let router = router.clone();
+        tokio::spawn(async move {
+            let mut offline = false;
+            loop {
+                let now = rrls::topology_observation()
+                    .and_then(|observed| observed.peer_age_ms)
+                    .is_some_and(|age| age >= crate::rrls_topology::OFFLINE_AFTER_MS);
+                if now && !offline && network_variables::rrls_offline(&router).is_ok() {
+                    offline = true;
+                } else if !now {
+                    offline = false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        });
+    }
     if !rrls::is_rrls() {
         qualification_requests::prime_initial_cache(&router, || {
             network_variables::publish_bootstrap_for_state(&state, &router).map(|_| ())

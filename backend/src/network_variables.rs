@@ -297,12 +297,7 @@ fn packet_bytes(data_type: &str, endpoint: &str, payload: Arc<[u8]>) -> Result<P
 fn flight_state_wire_packet(state: NetworkFlightState, timestamp: u64) -> Result<Packet> {
     // The simulator's set-(a) wire assertion reads this line.
     log::info!("FLIGHT_STATE wire value={} ({})", state as u8, state.label());
-    // Stamped with this station's own sender: an RRLS writes it only in a
-    // takeover (its operator's Abort), and must neither pass as the primary
-    // (whose handler seeds its desired state from "GS") nor lose the re-send
-    // rules, which re-send only this router's own latest value.
-    let sender = if crate::rrls::is_rrls() { "RRLS" } else { Board::GroundStation.sender_id() };
-    packet_from(FLIGHT_STATE_TYPE, "FLIGHT_STATE", Arc::from([state as u8]), timestamp, sender)
+    packet_bytes_at(FLIGHT_STATE_TYPE, "FLIGHT_STATE", Arc::from([state as u8]), timestamp)
 }
 /// A stored (GS-internal) phase as it goes on the wire.
 fn network_phase(phase: u8) -> Result<NetworkFlightState> {
@@ -317,7 +312,17 @@ fn packet_bytes_at(
     payload: Arc<[u8]>,
     timestamp: u64,
 ) -> Result<Packet> {
-    packet_from(data_type, endpoint, payload, timestamp, Board::GroundStation.sender_id())
+    packet_from(data_type, endpoint, payload, timestamp, station_sender())
+}
+
+/// The sender every network variable this station writes carries: an RRLS
+/// writes only in a takeover, and its writes must neither pass as the
+/// primary's (whose FLIGHT_STATE handler seeds its desired state from "GS",
+/// and whose same-sender writes the SDK orders against an RRLS write by
+/// timestamp alone) nor lose the re-send rules, which re-send only this
+/// router's own latest value. RF, FC and PB accept "RRLS" as a station.
+fn station_sender() -> &'static str {
+    if crate::rrls::is_rrls() { "RRLS" } else { Board::GroundStation.sender_id() }
 }
 
 fn packet_from(
@@ -390,6 +395,27 @@ pub(crate) fn set_takeover_outputs_writable(router: &Router, writable: bool) -> 
             },
         )?;
     }
+    Ok(())
+}
+/// An RRLS's takeover changed. Starting one, it has decided the primary is
+/// out of range: the primary is forgotten as a destination now, so a write
+/// completes once the AV bay acknowledges it instead of waiting out its
+/// retries on a station that cannot answer (it stayed listed for the 30 s
+/// discovery route lifetime after the cut). It returns with its next
+/// discovery announcement.
+pub(crate) fn takeover_changed(router: &Router, takeover: bool) -> Result<()> {
+    set_takeover_outputs_writable(router, takeover)?;
+    if takeover {
+        let retired = router.forget_peer(Board::GroundStation.sender_id())?;
+        log::info!("RRLS takeover: the primary is no longer a destination ({retired} pending frame(s) released)");
+    }
+    Ok(())
+}
+/// A primary whose RRLS went Offline (unheard for 15 s, see rrls_topology)
+/// forgets it as a destination the same way.
+pub(crate) fn rrls_offline(router: &Router) -> Result<()> {
+    let retired = router.forget_peer("RRLS")?;
+    log::info!("RRLS offline: no longer a destination ({retired} pending frame(s) released)");
     Ok(())
 }
 fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Result<()> {
@@ -573,6 +599,17 @@ impl NetworkOutput {
             Self::Underglow => "AV_BAY_UNDERGLOW_OWNER",
             Self::FlightBuzzer => "FLIGHT_CONTROLLER",
         }
+    }
+    /// Whether the owner board's end-to-end acknowledgement of this station's
+    /// write means the board applied it. Underglow: RF, PB and FC apply every
+    /// well-formed write before acknowledging it (av_bay_underglow.c
+    /// apply_underglow), and this station's own writes carry its own sender
+    /// and rising timestamps, so the SDK's same-sender ordering never drops
+    /// one. Buzzer: no. The FC acknowledges a write older than the last value
+    /// it applied from any sender without applying it (flight_buzzer.c
+    /// apply_buzzer, stale_updates), so only a real readback confirms it.
+    fn ack_is_readback(self) -> bool {
+        matches!(self, Self::Underglow)
     }
     fn requested(self) -> bool {
         match self {
@@ -786,7 +823,7 @@ pub(crate) fn reconcile_network_outputs<C>(
                         && router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type(
                             output.data_type(),
                         ));
-                    entry.observe(row, queued, now, reports, retransmit, max_retries)
+                    entry.observe(row, queued, now, reports, retransmit, max_retries, output.ack_is_readback())
                 }
                 _ => entry.network_report(now, reports),
             };
@@ -3253,6 +3290,10 @@ pub fn persisted_daq_log_clock() -> Option<[u64; 2]> {
 }
 
 mod network_confirmation;
+
+#[cfg(test)]
+#[path = "network_variables/takeover_confirm_tests.rs"]
+mod takeover_confirm_tests;
 
 #[cfg(test)]
 #[path = "network_variables/daq_clock_tests.rs"]

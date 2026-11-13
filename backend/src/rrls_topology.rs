@@ -4,6 +4,10 @@ use crate::types::{
     NetworkTopologyLink, NetworkTopologyNode, NetworkTopologyNodeKind, NetworkTopologyStatus,
 };
 
+/// The primary shows the RRLS Offline, and stops owing it reliable frames,
+/// once its last verified exchange is this old.
+pub(crate) const OFFLINE_AFTER_MS: u64 = 15_000;
+
 pub(crate) fn project(
     nodes: &mut Vec<NetworkTopologyNode>,
     links: &mut Vec<NetworkTopologyLink>,
@@ -31,7 +35,7 @@ pub(crate) fn project(
     let Some(age) = observed.peer_age_ms else {
         return;
     };
-    let online = age < 15_000;
+    let online = age < OFFLINE_AFTER_MS;
     let status = if online {
         NetworkTopologyStatus::Online
     } else {

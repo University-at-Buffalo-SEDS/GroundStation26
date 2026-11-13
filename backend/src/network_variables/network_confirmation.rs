@@ -171,6 +171,7 @@ impl Confirmation {
         reports: u64,
         retransmit: Duration,
         max_retries: u32,
+        ack_is_readback: bool,
     ) -> Step {
         let Some(mut inflight) = self.inflight else {
             return Step::Idle;
@@ -195,10 +196,14 @@ impl Confirmation {
         });
         self.inflight = None;
         if acked {
-            self.readback = Some(Readback {
-                value: inflight.value,
-                at: now,
-            });
+            // Delivered. It is the readback only where the owner's receipt
+            // means applied; otherwise a later readback confirms it.
+            if ack_is_readback {
+                self.readback = Some(Readback {
+                    value: inflight.value,
+                    at: now,
+                });
+            }
             self.waiting = None;
             return Step::Changed;
         }
@@ -243,7 +248,7 @@ mod tests {
     const R: Duration = Duration::from_millis(250);
 
     fn sighting(c: &mut Confirmation, retries: u32, at: Instant) {
-        assert_eq!(c.observe(Some(retries), false, at, 0, R, 17), Step::Idle);
+        assert_eq!(c.observe(Some(retries), false, at, 0, R, 17, true), Step::Idle);
     }
 
     #[test]
@@ -254,10 +259,23 @@ mod tests {
         c.published(7, false, t, true);
         assert_eq!(c.shown(false), None);
         sighting(&mut c, 3, t);
-        assert_eq!(c.observe(None, false, t + R / 4, 0, R, 17), Step::Changed);
+        assert_eq!(c.observe(None, false, t + R / 4, 0, R, 17, true), Step::Changed);
         assert_eq!(c.shown(false), Some(false));
         assert!(c.readback_seen());
         assert!(!c.needs_attention());
+    }
+
+    #[test]
+    fn an_acknowledgement_that_does_not_mean_applied_confirms_nothing() {
+        let t = Instant::now();
+        let mut c = Confirmation::default();
+        c.published(7, true, t, true);
+        assert_eq!(c.observe(Some(3), false, t, 0, R, 17, false), Step::Idle);
+        assert_eq!(c.observe(None, false, t + R / 4, 0, R, 17, false), Step::Changed);
+        assert_eq!(c.shown(true), None, "delivered, not read back");
+        assert!(!c.needs_attention(), "delivered: no republish");
+        assert_eq!(c.network_value(true, true, t + R), Step::Changed);
+        assert_eq!(c.shown(true), Some(true), "the readback confirms it");
     }
 
     #[test]
@@ -267,13 +285,13 @@ mod tests {
         c.published(7, false, t, true);
         sighting(&mut c, 16, t);
         assert_eq!(
-            c.observe(None, false, t + Duration::from_millis(1), 0, R, 17),
+            c.observe(None, false, t + Duration::from_millis(1), 0, R, 17, true),
             Step::Republish
         );
         assert_eq!(c.shown(false), None);
         c.published(8, false, t, false);
         sighting(&mut c, 17, t);
-        assert_eq!(c.observe(None, false, t, 0, R, 17), Step::Changed);
+        assert_eq!(c.observe(None, false, t, 0, R, 17, true), Step::Changed);
         assert_eq!(c.shown(false), None);
         assert!(!c.readback_seen(), "no network value at all yet");
         assert!(c.needs_attention());
@@ -285,7 +303,7 @@ mod tests {
         let mut c = Confirmation::default();
         c.published(7, true, t, true);
         sighting(&mut c, 0, t);
-        assert_eq!(c.observe(None, false, t + R, 0, R, 17), Step::Republish);
+        assert_eq!(c.observe(None, false, t + R, 0, R, 17, true), Step::Republish);
         assert_eq!(c.shown(true), None);
     }
 
@@ -306,7 +324,7 @@ mod tests {
         assert!(c.toggle_target(false));
         c.published(1, true, t, true);
         sighting(&mut c, 0, t);
-        c.observe(None, false, t, 0, R, 17);
+        c.observe(None, false, t, 0, R, 17, true);
         // Off requested and lost: the network still carries On, so a press asks Off.
         c.published(2, false, t, true);
         assert!(!c.toggle_target(false));
@@ -318,8 +336,8 @@ mod tests {
         let t = Instant::now();
         let mut c = Confirmation::default();
         c.published(1, true, t, true);
-        assert_eq!(c.observe(None, true, t + R, 0, R, 17), Step::Idle);
-        assert_eq!(c.observe(None, true, t + R * 30, 0, R, 17), Step::Republish);
+        assert_eq!(c.observe(None, true, t + R, 0, R, 17, true), Step::Idle);
+        assert_eq!(c.observe(None, true, t + R * 30, 0, R, 17, true), Step::Republish);
     }
 
     #[test]
