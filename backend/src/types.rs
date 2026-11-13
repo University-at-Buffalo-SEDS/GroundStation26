@@ -614,6 +614,10 @@ pub struct BoardTimeSync {
     pub synced: bool,
     /// Error bound of the board's network time, microseconds; `None` when unknown.
     pub error_bound_us: Option<u64>,
+    /// Where its time comes from: stratum 1 = the GS itself, 2 = RF
+    /// re-serving the GS over CAN; `None` when the board does not report it.
+    #[serde(default)]
+    pub stratum: Option<u8>,
 }
 
 /// RF BOARD_HEALTH words 16..21 ("RFT1" tag). Timing and high-water cover the

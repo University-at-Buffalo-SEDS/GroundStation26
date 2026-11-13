@@ -174,10 +174,34 @@ pub(crate) fn decode_time_sync(sender: &str, w: &[u32]) -> Option<crate::types::
         _ => return None,
     };
     let (synced, bound_ns) = sedsnet::timesync::decode_health_byte(byte)?;
+    // Word 22 "SY" (FC, PB): the stratum in bits 8..15.
+    let stratum = (matches!(sender, "FC" | "PB") && w[22] >> 16 == FC_TIME_SYNC_TAG)
+        .then_some(((w[22] >> 8) & 0xFF) as u8)
+        .filter(|s| *s > 0);
     Some(crate::types::BoardTimeSync {
         synced,
         error_bound_us: (bound_ns != u64::MAX).then_some(bound_ns / 1_000),
+        stratum,
     })
+}
+
+#[cfg(test)]
+mod time_sync_source_tests {
+    /// FC and PB report their stratum: 2 means RF re-serves the GS to them
+    /// over CAN; RF itself reports none.
+    #[test]
+    fn stratum_shows_which_source_a_board_follows() {
+        let mut w = [0u32; 24];
+        w[22] = (0x5359 << 16) | (2 << 8) | 0x85;
+        w[6] = 0x85 << 24;
+        let fc = super::decode_time_sync("FC", &w).unwrap();
+        assert!(fc.synced);
+        assert_eq!(fc.stratum, Some(2));
+        assert_eq!(super::decode_time_sync("PB", &w).unwrap().stratum, Some(2));
+        assert_eq!(super::decode_time_sync("RF", &w).unwrap().stratum, None);
+        w[22] = (0x5359 << 16) | 0x85;
+        assert_eq!(super::decode_time_sync("FC", &w).unwrap().stratum, None, "an older FC reports none");
+    }
 }
 
 /// Monotonic ms until which some board reported itself time-synced (absolute
