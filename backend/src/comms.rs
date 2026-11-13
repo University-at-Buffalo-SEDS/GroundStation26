@@ -853,6 +853,12 @@ pub struct UartComms {
     rx_buf: Vec<u8>,
     raw_uart_frame_wait: RawUartFrameWait,
     raw_uart_data_frames: VecDeque<Vec<u8>>,
+    /// Bytes buffered behind each data frame in `raw_uart_data_frames` when
+    /// it was decoded: they arrived after it, so its last byte reached the
+    /// UART that many byte times before the read that delivered them.
+    raw_uart_data_trailing: VecDeque<usize>,
+    /// `raw_uart_data_trailing` of the frame `try_take_packet` returned last.
+    last_take_trailing: usize,
     radio_window_updates: VecDeque<RadioWindowUpdate>,
     protocol: SerialProtocol,
     recovery: Option<crate::rrls::Shared>,
@@ -961,6 +967,8 @@ impl UartComms {
             rx_buf: Vec::new(),
             raw_uart_frame_wait: RawUartFrameWait::default(),
             raw_uart_data_frames: VecDeque::new(),
+            raw_uart_data_trailing: VecDeque::new(),
+            last_take_trailing: 0,
             radio_window_updates: VecDeque::new(),
             protocol: SerialProtocol::RawUart,
             recovery: Some(recovery),
@@ -1022,6 +1030,8 @@ impl UartComms {
             rx_buf: Vec::with_capacity(STREAM_PACKET_MAX_SIZE),
             raw_uart_frame_wait: RawUartFrameWait::for_baud(cfg.baud_rate as u32),
             raw_uart_data_frames: VecDeque::with_capacity(16),
+            raw_uart_data_trailing: VecDeque::new(),
+            last_take_trailing: 0,
             radio_window_updates: VecDeque::with_capacity(8),
             protocol: cfg.protocol.clone(),
             recovery: crate::rrls::attach(&cfg.port),
@@ -1195,6 +1205,7 @@ impl UartComms {
                         }
                     } else {
                         self.raw_uart_data_frames.push_back(frame.bytes);
+                        self.raw_uart_data_trailing.push_back(self.rx_buf.len());
                     }
                 }
             }
@@ -1835,16 +1846,23 @@ impl UartComms {
     fn try_take_raw_uart_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
         if self.recovery.is_some() {
             self.drain_recovery_frames()?;
-            return Ok(self.raw_uart_data_frames.pop_front());
+        } else {
+            let _ = drain_raw_uart_buffered_frames(
+                &mut self.rx_buf,
+                &mut self.raw_uart_frame_wait,
+                &mut self.raw_uart_data_frames,
+                &mut self.raw_uart_data_trailing,
+                &mut self.radio_window_updates,
+                &self.protocol,
+            )?;
         }
-        let _ = drain_raw_uart_buffered_frames(
-            &mut self.rx_buf,
-            &mut self.raw_uart_frame_wait,
-            &mut self.raw_uart_data_frames,
-            &mut self.radio_window_updates,
-            &self.protocol,
-        )?;
-        Ok(self.raw_uart_data_frames.pop_front())
+        let frame = self.raw_uart_data_frames.pop_front();
+        self.last_take_trailing = if frame.is_some() {
+            self.raw_uart_data_trailing.pop_front().unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(frame)
     }
 
     fn try_take_packet(&mut self) -> TelemetryResult<Option<Vec<u8>>> {
@@ -1894,13 +1912,30 @@ impl UartComms {
             // here, and the router owns their validation and reassembly.  Rejecting
             // fragments here prevents discovery from ever crossing the radio link.
             self.invalidate_retry_on_metadata(&payload);
-            let rx_ns = self
-                .last_rx_read
-                .map(|stamp| crate::telemetry_task::router_rx_ns(router, stamp));
+            // The read instant is when the last buffered byte arrived; this
+            // frame's last byte arrived its trailing bytes earlier (a burst
+            // read at once would otherwise stamp every frame at its end).
+            let rx_ns = self.last_rx_read.map(|stamp| {
+                frame_rx_ns(
+                    crate::telemetry_task::router_rx_ns(router, stamp),
+                    self.last_take_trailing,
+                    self.baud_rate,
+                )
+            });
             queue_uart_router_payload_at(router, side_id, &payload, &self.protocol, packet_tap, rx_ns)?;
         }
         Ok(processed_any)
     }
+}
+
+/// Receive instant of a frame whose last byte was followed by
+/// `trailing_bytes` more before the read at `read_ns` (8N1: 10 bit times each).
+fn frame_rx_ns(read_ns: u64, trailing_bytes: usize, baud: u32) -> u64 {
+    if baud == 0 {
+        return read_ns;
+    }
+    let after = (trailing_bytes as u64).saturating_mul(10_000_000_000) / u64::from(baud);
+    read_ns.saturating_sub(after)
 }
 
 fn queue_uart_router_payload(
@@ -2411,6 +2446,7 @@ fn drain_raw_uart_buffered_frames(
     rx_buf: &mut Vec<u8>,
     wait: &mut RawUartFrameWait,
     raw_uart_data_frames: &mut VecDeque<Vec<u8>>,
+    raw_uart_data_trailing: &mut VecDeque<usize>,
     radio_window_updates: &mut VecDeque<RadioWindowUpdate>,
     protocol: &SerialProtocol,
 ) -> TelemetryResult<bool> {
@@ -2429,7 +2465,8 @@ fn drain_raw_uart_buffered_frames(
         match frame_kind {
             RawUartFrameKind::Data => {
                 note_heard_frame(&payload);
-                raw_uart_data_frames.push_back(payload)
+                raw_uart_data_frames.push_back(payload);
+                raw_uart_data_trailing.push_back(rx_buf.len());
             }
             RawUartFrameKind::Command => {
                 note_heard_frame(&payload);
@@ -4712,6 +4749,8 @@ impl CommsDevice for UartComms {
             rx_buf: Vec::new(),
             raw_uart_frame_wait: RawUartFrameWait::default(),
             raw_uart_data_frames: VecDeque::new(),
+            raw_uart_data_trailing: VecDeque::new(),
+            last_take_trailing: 0,
             radio_window_updates: VecDeque::new(),
             protocol: self.protocol.clone(),
             recovery: self.recovery.clone(),
@@ -6771,6 +6810,8 @@ mod raw_uart_tests {
             rx_buf: Vec::new(),
             raw_uart_frame_wait: RawUartFrameWait::default(),
             raw_uart_data_frames: VecDeque::new(),
+            raw_uart_data_trailing: VecDeque::new(),
+            last_take_trailing: 0,
             radio_window_updates: VecDeque::new(),
             protocol: SerialProtocol::RawUart,
             recovery: Some(shared.clone()),
@@ -9422,6 +9463,8 @@ mod raw_uart_tests {
             rx_buf: Vec::new(),
             raw_uart_frame_wait: RawUartFrameWait::default(),
             raw_uart_data_frames: VecDeque::new(),
+            raw_uart_data_trailing: VecDeque::new(),
+            last_take_trailing: 0,
             radio_window_updates: VecDeque::new(),
             protocol: SerialProtocol::RawUart,
             recovery: None,
@@ -9609,6 +9652,8 @@ mod raw_uart_tests {
             rx_buf: vec![0xa5, 0x5a, 0xff, 0x0f],
             raw_uart_frame_wait: RawUartFrameWait::default(),
             raw_uart_data_frames: VecDeque::new(),
+            raw_uart_data_trailing: VecDeque::new(),
+            last_take_trailing: 0,
             radio_window_updates: VecDeque::new(),
             protocol: SerialProtocol::RawUart,
             recovery: None,
@@ -10015,6 +10060,38 @@ mod raw_uart_tests {
         );
     }
 
+    /// RF writes a turn's frames as one burst and the station often reads
+    /// it at once. Each data frame is stamped at its own last byte: the read
+    /// instant minus the bytes that came in after it.
+    #[test]
+    fn a_burst_read_at_once_stamps_each_frame_at_its_own_end() {
+        let first = vec![7u8; 40];
+        let second = vec![9u8; 100];
+        let mut rx_buf = build_raw_uart_frame(&first).unwrap();
+        let second_wire = build_raw_uart_frame(&second).unwrap();
+        rx_buf.extend_from_slice(&second_wire);
+        let mut data_frames = VecDeque::new();
+        let mut trailing = VecDeque::new();
+        drain_raw_uart_buffered_frames(
+            &mut rx_buf,
+            &mut RawUartFrameWait::default(),
+            &mut data_frames,
+            &mut trailing,
+            &mut VecDeque::new(),
+            &SerialProtocol::RawUart,
+        )
+        .unwrap();
+        assert_eq!(data_frames, VecDeque::from([first, second]));
+        assert_eq!(trailing, VecDeque::from([second_wire.len(), 0]));
+        let read_ns = 5_000_000_000u64;
+        // 115200 baud: 86.8 us per byte.
+        assert_eq!(frame_rx_ns(read_ns, 0, 115_200), read_ns);
+        assert_eq!(
+            frame_rx_ns(read_ns, second_wire.len(), 115_200),
+            read_ns - second_wire.len() as u64 * 10_000_000_000 / 115_200
+        );
+    }
+
     #[test]
     fn raw_uart_drain_processes_window_command_behind_data_frame() {
         let data_payload = vec![1, 2, 3];
@@ -10028,6 +10105,7 @@ mod raw_uart_tests {
             &mut rx_buf,
             &mut RawUartFrameWait::default(),
             &mut data_frames,
+            &mut VecDeque::new(),
             &mut window_updates,
             &SerialProtocol::RawUart,
         )
@@ -10363,6 +10441,8 @@ mod uart_duplex_tests {
             rx_buf: Vec::new(),
             raw_uart_frame_wait: RawUartFrameWait::default(),
             raw_uart_data_frames: VecDeque::new(),
+            raw_uart_data_trailing: VecDeque::new(),
+            last_take_trailing: 0,
             radio_window_updates: VecDeque::new(),
             protocol: SerialProtocol::PacketFramed,
             recovery: None,
