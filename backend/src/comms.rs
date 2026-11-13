@@ -648,11 +648,15 @@ impl UartWriteState {
             if let Some(at) = last_air_rx() {
                 cap.note_air_rx(at);
             }
+            if let Some(at) = last_av_bay_air() {
+                cap.note_heard_source(rfd_capacity::HeardSource::AvBay, at);
+            }
             // An RRLS that has taken over the AV bay transmits AV-bay traffic
             // as the station does, so it follows the station's turn rules.
             cap.set_turn_standby(self.relay_link && !crate::rrls::takeover_active());
             cap.set_turn_relaying(!self.relay_link && crate::rrls::primary_relaying());
             cap.set_turn_bypass(bypass);
+            cap.set_turn_mesh_own(false);
             // A standby RRLS's own frames wait (bounded) for quiet air.
             cap.set_turn_sense(own, Instant::now(), crate::simulation_clock_ms());
         }
@@ -1076,6 +1080,7 @@ impl UartComms {
                 if kind == RawUartFrameKind::Ascii {
                     continue;
                 }
+                note_heard_frame(&payload);
                 if let Some(frame) = mesh.incoming(kind == RawUartFrameKind::Command, &payload, now)
                 {
                     if frame.command {
@@ -1373,6 +1378,14 @@ impl UartComms {
                 // A standby RRLS's own control (observe refresh, discovery,
                 // settings/pairing, position) waits, bounded, for quiet air;
                 // relayed data keeps the RRLS pacing.
+                // The station's own mesh frames (pairing, settings, position) keep
+                // the any-air rule for opening a turn (port of 8192bb0).
+                cap.set_turn_mesh_own(
+                    is_station_own_mesh_frame(&transmission.frame().bytes)
+                        || transmission
+                            .follower_frame()
+                            .is_some_and(|follower| is_station_own_mesh_frame(&follower.bytes)),
+                );
                 cap.set_turn_sense(
                     is_station_own_mesh_frame(&transmission.frame().bytes)
                         || transmission
@@ -2260,8 +2273,12 @@ fn drain_raw_uart_buffered_frames(
         };
         processed_any = true;
         match frame_kind {
-            RawUartFrameKind::Data => raw_uart_data_frames.push_back(payload),
+            RawUartFrameKind::Data => {
+                note_heard_frame(&payload);
+                raw_uart_data_frames.push_back(payload)
+            }
             RawUartFrameKind::Command => {
+                note_heard_frame(&payload);
                 if let Some(update) = parse_radio_window_update(&payload) {
                     maybe_log_raw_uart_command_frame(
                         "accepted radio window command frame",
@@ -2391,11 +2408,61 @@ fn note_air_rx_now() {
     AIR_BURSTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .note(abort_state_now_ms());
+        .note_any(abort_state_now_ms());
     let base = *AIR_RX_BASE.get_or_init(Instant::now);
     let wall = Instant::now().saturating_duration_since(base).as_millis() as u64 + 1;
     AIR_RX_WALL_MS.store(wall, std::sync::atomic::Ordering::Release);
     AIR_RX_VIRTUAL_MS.store(crate::simulation_clock_ms().map_or(0, |ms| ms + 1), std::sync::atomic::Ordering::Release);
+}
+// The heard air that last carried an AV-bay frame: the AIR_RX stamp when the
+// frame decoded (port of second-gap-health 1ab9ce2 / 185b3b9). The turn gate
+// and the ABORT gap copies (AirBursts) both use this stamp.
+static AIR_AV_BAY_WALL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AIR_AV_BAY_VIRTUAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Classifies a heard frame. The station's writes travel in the RR envelope as
+/// AV-bay data or commands (kinds 5, 6): station. Other RR kinds (relays to the
+/// station, mesh control) are not classified. A plain SDK frame is classified
+/// by its SEDSnet source address: the station ("GS"), the RRLS (neither), or an
+/// AV-bay board. A plain frame whose header does not decode (compact reference,
+/// fragment) is AV-bay air: only the AV bay writes plain frames on the air, and
+/// in the cons-b fullnet 60% of RF's bursts carried only those.
+fn heard_frame_source(payload: &[u8]) -> Option<rfd_capacity::HeardSource> {
+    if payload.len() >= 8 && payload.starts_with(b"RR\x01") {
+        return matches!(payload[3], 5 | 6).then_some(rfd_capacity::HeardSource::Station);
+    }
+    let Ok(info) = serialize::peek_frame_info_unchecked(payload) else {
+        return Some(rfd_capacity::HeardSource::AvBay);
+    };
+    let source = info.envelope.source_address;
+    if source == sedsnet::packet::sender_address_u32("GS") {
+        Some(rfd_capacity::HeardSource::Station)
+    } else if source == sedsnet::packet::sender_address_u32("RRLS") {
+        None
+    } else {
+        Some(rfd_capacity::HeardSource::AvBay)
+    }
+}
+fn note_heard_frame(payload: &[u8]) {
+    use std::sync::atomic::Ordering;
+    if heard_frame_source(payload) != Some(rfd_capacity::HeardSource::AvBay) {
+        return;
+    }
+    let (wall, virtual_ms) = (AIR_RX_WALL_MS.load(Ordering::Acquire), AIR_RX_VIRTUAL_MS.load(Ordering::Acquire));
+    if wall == 0 {
+        return;
+    }
+    AIR_AV_BAY_WALL_MS.store(wall, Ordering::Release);
+    AIR_AV_BAY_VIRTUAL_MS.store(virtual_ms, Ordering::Release);
+    AIR_BURSTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).note_av_bay();
+}
+fn last_av_bay_air() -> Option<(Instant, Option<u64>)> {
+    use std::sync::atomic::Ordering;
+    let wall = AIR_AV_BAY_WALL_MS.load(Ordering::Acquire);
+    let base = *AIR_RX_BASE.get()?;
+    (wall != 0).then(|| {
+        let virtual_ms = AIR_AV_BAY_VIRTUAL_MS.load(Ordering::Acquire);
+        (base + Duration::from_millis(wall - 1), (virtual_ms != 0).then(|| virtual_ms - 1))
+    })
 }
 fn last_air_rx() -> Option<(Instant, Option<u64>)> {
     let wall = AIR_RX_WALL_MS.load(std::sync::atomic::Ordering::Acquire);
@@ -2545,24 +2612,31 @@ pub(crate) enum AbortWrite {
     /// Refuse for now (the writer retries on its next pass).
     Hold,
 }
-/// When the station last heard the AV bay's air (station clock ms).
+/// When the station last heard any air, and air that carried an AV-bay frame
+/// (station clock ms; the latter is the same stamp the turn gate uses).
 #[derive(Default)]
 pub(crate) struct AirBursts {
-    last_rx: Option<u64>,
+    last_any: Option<u64>,
+    last_av: Option<u64>,
 }
 impl AirBursts {
-    pub(crate) fn note(&mut self, now_ms: u64) {
-        self.last_rx = Some(now_ms);
+    pub(crate) fn note_any(&mut self, now_ms: u64) {
+        self.last_any = Some(now_ms);
     }
-    /// RF's air was last heard TURN_QUIET_MS..=MESH_CONTROL_GAP_WINDOW_MS ago:
-    /// the station's young gap after a burst it heard.
-    pub(crate) fn young_heard_gap(&self, now_ms: u64) -> bool {
-        self.last_rx.is_some_and(|rx| {
-            (rfd_capacity::TURN_QUIET_MS..=MESH_CONTROL_GAP_WINDOW_MS).contains(&now_ms.saturating_sub(rx))
-        })
+    /// The frame just decoded was the AV bay's: it ended with the last heard air.
+    pub(crate) fn note_av_bay(&mut self) {
+        self.last_av = self.last_any;
+    }
+    /// The station's young gap after an AV-bay burst it heard: quiet air for the
+    /// gate's quiet time (`quiet_ms`, 3 x S6 = 30 ms on the shipped profile; any
+    /// heard air counts), and the AV bay's air heard at most
+    /// MESH_CONTROL_GAP_WINDOW_MS ago.
+    pub(crate) fn young_heard_gap(&self, now_ms: u64, quiet_ms: u64) -> bool {
+        let (Some(any), Some(av)) = (self.last_any, self.last_av) else { return false };
+        now_ms.saturating_sub(any) >= quiet_ms && now_ms.saturating_sub(av) <= MESH_CONTROL_GAP_WINDOW_MS
     }
 }
-static AIR_BURSTS: std::sync::Mutex<AirBursts> = std::sync::Mutex::new(AirBursts { last_rx: None });
+static AIR_BURSTS: std::sync::Mutex<AirBursts> = std::sync::Mutex::new(AirBursts { last_any: None, last_av: None });
 /// An Abort's ABORT goes again in every young gap after an RF burst the
 /// station heard, until every ABORT owner has acknowledged it or this window
 /// ends (the SDK's own 4.8 s reliable window). FC latches only on ABORT; with
@@ -4085,16 +4159,21 @@ impl CommsDevice for UartComms {
             // Only while taking turns with RF: with no turn gate or while
             // relaying through the RRLS the SDK's own re-sends (AbortCopies)
             // are the only copies; with RF silent no gap is ever young.
-            let turns = {
+            let quiet = {
                 let state = self.write_lock.lock().unwrap();
-                state.radio_capacity.as_ref().is_some_and(|cap| cap.turn_gated()) && !self.relay_link_state(&state)
+                state
+                    .radio_capacity
+                    .as_ref()
+                    .filter(|cap| cap.turn_gated() && !self.relay_link_state(&state))
+                    .map(|cap| cap.turn_quiet_ms())
             };
             let now = abort_state_now_ms();
-            let heard_gap = turns
-                && AIR_BURSTS
+            let heard_gap = quiet.is_some_and(|quiet| {
+                AIR_BURSTS
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .young_heard_gap(now);
+                    .young_heard_gap(now, quiet)
+            });
             let due = ABORT_GAP_COPIES
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -6975,6 +7054,7 @@ mod raw_uart_tests {
         let first = 10_000u64;
         let id = 7u64;
         let mut sent = Vec::new();
+        let mut gap_copy_times = Vec::new();
         let mut next_sdk = first + 400;
         let turns: Vec<u64> = (0..40).map(|k| 9_000 + 200 * k).collect();
         sdk.note_written(id);
@@ -6982,7 +7062,8 @@ mod raw_uart_tests {
         for now in 9_000..first + 6_000 {
             for (k, start) in turns.iter().enumerate() {
                 if heard(k as u64) && now >= start + 45 && now <= start + 100 && (now - start) % 5 == 0 {
-                    bursts.note(now);
+                    bursts.note_any(now);
+                    bursts.note_av_bay();
                 }
             }
             if now < first {
@@ -6995,9 +7076,10 @@ mod raw_uart_tests {
             if now - first >= ABORT_GAP_COPY_WINDOW_MS {
                 break;
             }
-            let heard_gap = bursts.young_heard_gap(now);
+            let heard_gap = bursts.young_heard_gap(now, 30);
             if copies.take_due(now, heard_gap).is_some() {
                 sent.push(now - first);
+                gap_copy_times.push(now - first);
                 continue;
             }
             if now >= next_sdk && !copies.copied_recently(id, now) {
@@ -7014,9 +7096,75 @@ mod raw_uart_tests {
                 !turns.iter().any(|start| abs >= start + 30 && abs <= start + 115),
                 "a copy at +{at} ms lands on RF's air: {sent:?}"
             );
+            // A gap copy waits for the gate's quiet time (30 ms): RF's burst can be
+            // two air packets with a gap over S6 between them (sim radio-sched-sim
+            // gapcopies-q30). The SDK's own re-send keeps its 0-20 ms jitter.
+            if gap_copy_times.contains(at) {
+                assert!(
+                    turns.iter().any(|start| abs >= start + 100 + 30 && abs <= start + 100 + MESH_CONTROL_GAP_WINDOW_MS),
+                    "a gap copy at +{at} ms before 30 ms of quiet air: {sent:?}"
+                );
+            }
         }
         let heard_gaps = turns.iter().enumerate().filter(|(k, _)| heard(*k as u64)).map(|(_, s)| s - first.min(*s)).collect();
         (sent, heard_gaps)
+    }
+
+    /// The young gap is measured from the AV bay's air (the stamp the turn gate
+    /// uses), the quiet time from any air: the RRLS's or the station's own write
+    /// opens no gap for an ABORT copy and delays one by its quiet time.
+    #[test]
+    fn an_abort_copy_gap_opens_on_av_bay_air_and_waits_for_quiet_air() {
+        let mut bursts = AirBursts::default();
+        bursts.note_any(1_000);
+        assert!(!bursts.young_heard_gap(1_040, 30), "air that carried no AV-bay frame: no gap");
+        bursts.note_any(1_100);
+        bursts.note_av_bay();
+        assert!(!bursts.young_heard_gap(1_120, 30), "20 ms: not yet quiet");
+        assert!(bursts.young_heard_gap(1_130, 30), "30 ms of quiet after the AV bay's air");
+        bursts.note_any(1_135); // the RRLS writes
+        assert!(!bursts.young_heard_gap(1_150, 30), "quiet time restarts on any air");
+        assert!(!bursts.young_heard_gap(1_170, 30), "but the gap is 70 ms old: too late for a copy");
+    }
+
+    /// Heard frames are told apart by SEDSnet source: the station's open no
+    /// AV-bay turn, the RRLS's are neither, and a plain frame whose header does
+    /// not decode is the AV bay's (only the AV bay writes plain frames on the
+    /// air; cons-b fullnet: 60% of RF's bursts carried only compact or fragment
+    /// frames). Port of 1ab9ce2 / 185b3b9.
+    #[test]
+    fn heard_frames_are_classified_by_source() {
+        crate::telemetry_schema::initialize().unwrap();
+        let frame = |sender: &str| {
+            serialize::pack_packet(
+                &Packet::new_with_nonce(
+                    sedsnet::config::DataType::ReliableAck,
+                    &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                    sender,
+                    30_000,
+                    1,
+                    std::sync::Arc::from(7u64.to_le_bytes()),
+                )
+                .unwrap(),
+            )
+        };
+        use rfd_capacity::HeardSource;
+        assert_eq!(heard_frame_source(&frame("GS")), Some(HeardSource::Station));
+        assert_eq!(heard_frame_source(&frame("RF")), Some(HeardSource::AvBay));
+        assert_eq!(heard_frame_source(&frame("FC")), Some(HeardSource::AvBay));
+        assert_eq!(heard_frame_source(&frame("RRLS")), None);
+        let wrap = |kind: u8, inner: &[u8]| {
+            let mut v = b"RR\x01".to_vec();
+            v.push(kind);
+            v.extend_from_slice(inner);
+            v.extend_from_slice(&[0, 0, 0, 0]);
+            v
+        };
+        assert_eq!(heard_frame_source(&wrap(5, &frame("GS"))), Some(HeardSource::Station));
+        assert_eq!(heard_frame_source(&wrap(6, &frame("VB"))), Some(HeardSource::Station));
+        assert_eq!(heard_frame_source(&wrap(2, &frame("RF"))), None);
+        assert_eq!(heard_frame_source(&wrap(11, &frame("RRLS"))), None);
+        assert_eq!(heard_frame_source(&[0x42, 0x07, 0x99, 0x13, 0x00]), Some(HeardSource::AvBay));
     }
 
     /// R30 fullnet: ABORT re-sends went 0.5-1.1 s apart under 30% loss: they
@@ -7100,6 +7248,17 @@ mod raw_uart_tests {
         };
         let abort = pack("ABORT", "ABORT", b"SEDS_MANUAL_ABORT_V1:Q");
         let aborted = pack("FLIGHT_STATE", "FLIGHT_STATE", &[15]);
+        let rf_frame = serialize::pack_packet(
+            &Packet::new(
+                crate::telemetry_schema::data_type("GPS_STATUS"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "RF",
+                1,
+                std::sync::Arc::from([0u8; 16]),
+            )
+            .unwrap(),
+        )
+        .to_vec();
         let (mut peer, port) = serialport::TTYPort::pair().unwrap();
         peer.set_timeout(Duration::from_millis(1)).unwrap();
         let (mut uart, mesh, _) = recovery_uart_fixture(port);
@@ -7124,9 +7283,11 @@ mod raw_uart_tests {
         let mut writes: Vec<(u64, Vec<u8>)> = Vec::new();
         for now in (30_000u64..31_000).step_by(5) {
             std::fs::write(&clock, now.to_string()).unwrap();
-            // RF's turn: on air 0-90 ms of every 200 ms period, heard.
+            // RF's turn: on air 0-90 ms of every 200 ms period, heard (frames
+            // from RF, classified as AV-bay air).
             if now % 200 < 90 {
                 note_air_rx_now();
+                note_heard_frame(&rf_frame);
                 mesh.lock().unwrap().incoming(true, b"RS\x01\x00\x00\x00\x00\x00\x00", now);
             }
             uart.service_transmit().unwrap();
@@ -7154,7 +7315,8 @@ mod raw_uart_tests {
                 // First in its write: the ABORT starts the first frame written.
                 let first_frame_end = bytes.windows(2).skip(1).position(|w| w == [0xa6, 0x5b] || w == [0xa5, 0x5a]).map_or(bytes.len(), |p| p + 1);
                 assert!(has_abort(&bytes[..first_frame_end]), "the ABORT is not first at {at}: {bytes:02x?}");
-                // RF's air was last heard at 85 ms into the turn.
+                // RF's air was last heard at 85 ms into the turn; the gate's quiet
+                // time here (no profile) is TURN_QUIET_MS.
                 assert!(at % 200 >= 85 + rfd_capacity::TURN_QUIET_MS && at % 200 <= 85 + MESH_CONTROL_GAP_WINDOW_MS, "ABORT copy outside the young gap at {at}");
             }
         }

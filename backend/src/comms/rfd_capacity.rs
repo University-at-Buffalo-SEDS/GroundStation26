@@ -96,7 +96,32 @@ pub(crate) struct TurnGate {
     /// budget/RF-profile control). Written in the gap it does not spend the
     /// station's turn: the gap stays open for the turn's own write.
     control_only: bool,
+    /// The last heard air that carried an AV-bay frame (HeardSource::AvBay,
+    /// stamped when the frame decoded). Once AV-bay air is known only it
+    /// opens a station turn: the RRLS's writes and the station's own frames
+    /// relayed back are heard air too (port of second-gap-health 1ab9ce2 /
+    /// 185b3b9, without its standby RRLS second gap).
+    av_rx: Option<(Instant, Option<u64>)>,
+    /// The AV-bay air the last turn write answered.
+    served_av: Option<(Instant, Option<u64>)>,
+    /// The frame being admitted is the station's own mesh frame (pairing,
+    /// settings, position): it keeps the any-air rule (port of 8192bb0).
+    mesh_own: bool,
+    /// Bytes committed to the current packet (reset when a packet starts).
+    packet_bytes: u32,
 }
+/// Whose frame a run of heard air carried (decoded SEDSnet sender).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeardSource {
+    /// An AV-bay board: any source but the station and the RRLS, or a plain
+    /// frame whose header does not decode (only the AV bay writes those).
+    AvBay,
+    /// The station (SEDSnet sender "GS", or the RR envelope kinds 5 and 6).
+    Station,
+}
+/// A turn's write takes no more frames once it is within this much of its
+/// byte share (see Capacity::packet_ready; port of 52c5c3a).
+pub(crate) const TURN_JOIN_RESERVE_BYTES: u64 = 64;
 /// A standby RRLS sends its own frames after the gate's quiet time of no air
 /// (no AV-bay or station bytes heard): sent blind, most met GS or RF air and
 /// 79% were lost RRLS->GS (radio-tx-storm rrls-txgap root cause). It waits no
@@ -139,7 +164,16 @@ impl TurnGate {
                 if silent >= TURN_FREE_RUN_SILENCE_MS {
                     return true;
                 }
-                silent >= u64::from(self.quiet_ms) && self.served_rx.is_none_or(|served| later(rx, served))
+                // Only AV-bay air opens a turn (once any is known); AV bay silent
+                // for 1 s: free-run. The station's own mesh frames keep the
+                // any-air rule: with one write per AV-bay turn they waited behind
+                // the SDK frames and RRLS pairing failed (turns-b3).
+                let new_turn = match self.av_rx.filter(|_| !self.mesh_own) {
+                    Some(av) if since_ms(av, wall, virtual_ms) >= TURN_FREE_RUN_SILENCE_MS => return true,
+                    Some(av) => self.served_av.is_none_or(|served| later(av, served)),
+                    None => self.served_rx.is_none_or(|served| later(rx, served)),
+                };
+                silent >= u64::from(self.quiet_ms) && new_turn
             }
         }
     }
@@ -148,6 +182,7 @@ impl TurnGate {
     }
     fn started(&mut self, wall: Instant, virtual_ms: Option<u64>) {
         self.held_since = None;
+        self.packet_bytes = 0;
         // A frame that is never held for a turn (ABORT, mesh control) and
         // starts out of turn does not use the station's turn, and ordinary
         // frames do not join its burst (mid-turn that would open the air to
@@ -162,6 +197,7 @@ impl TurnGate {
         }
         self.last_start = Some((wall, virtual_ms));
         self.served_rx = self.last_air_rx;
+        self.served_av = self.av_rx;
     }
     fn detail(&self, wall: Instant, virtual_ms: Option<u64>) -> String {
         format!(
@@ -364,11 +400,31 @@ impl Capacity {
             if gate.relaying || gate.standby {
                 return true;
             }
-            gate.last_air_rx.is_none_or(|rx| {
+            gate.av_rx.or(gate.last_air_rx).is_none_or(|rx| {
                 let silent = since_ms(rx, wall, virtual_ms);
                 silent >= TURN_FREE_RUN_SILENCE_MS || silent <= max_ms
             })
         })
+    }
+    /// Heard air that carried a frame of `source` (decoded SEDSnet sender).
+    pub(crate) fn note_heard_source(&mut self, source: HeardSource, at: (Instant, Option<u64>)) {
+        if let Some(turn) = self.gate_mut()
+            && source == HeardSource::AvBay
+            && turn.av_rx.is_none_or(|last| later(at, last))
+        {
+            turn.av_rx = Some(at);
+        }
+    }
+    /// The frame being admitted is the station's own mesh frame (pairing,
+    /// settings, position): it uses the any-air rule (see TurnGate::open).
+    pub(crate) fn set_turn_mesh_own(&mut self, own: bool) {
+        if let Some(turn) = self.gate_mut() {
+            turn.mesh_own = own;
+        }
+    }
+    /// The gate's quiet time (TURN_QUIET_MS, or 3 x S6 from the profile).
+    pub(crate) fn turn_quiet_ms(&self) -> u64 {
+        self.gate().map_or(TURN_QUIET_MS, |turn| u64::from(turn.quiet_ms))
     }
     fn turn_open(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
         self.gate().is_none_or(|turn| turn.open(wall, virtual_ms))
@@ -1110,8 +1166,17 @@ impl Capacity {
                 }
             }
         });
+        // A turn's write also stops taking frames once it holds the turn's
+        // share at the UART rate, less one small frame (port of 52c5c3a:
+        // frames started up to 30 ms into the write took station writes to
+        // about 430 B at fullnet p95, ending on RF's next burst).
+        let burst_bytes = burst_ms.saturating_mul(u64::from(self.uart_baud)) / 10_000;
         let joins_burst = within_burst
-            && self.gate().is_none_or(|turn| turn.bypass || !turn.out_of_turn);
+            && self.gate().is_none_or(|turn| {
+                turn.bypass
+                    || (!turn.out_of_turn
+                        && (turn.standby || u64::from(turn.packet_bytes) + TURN_JOIN_RESERVE_BYTES <= burst_bytes))
+            });
         joins_burst || (reached(self.next_packet) && self.turn_open(wall, virtual_ms))
     }
     /// Read-only diagnostic snapshot; never samples a new clock or retires state.
@@ -1281,6 +1346,9 @@ impl Capacity {
             if let Some(turn) = self.gate_mut() {
                 turn.started(wall, virtual_ms);
             }
+        }
+        if let Some(turn) = self.gate_mut() {
+            turn.packet_bytes = turn.packet_bytes.saturating_add(u32::try_from(framed_bytes).unwrap_or(u32::MAX));
         }
         self.next_packet = Some((
             wall.checked_add(Duration::from_millis(packet_ms))
@@ -2879,5 +2947,68 @@ mod completed_owner_quiet_phase_tests {
             "generic155ms loan is unchanged"
         );
         assert_eq!(c.next_air_virtual_ms(), Some(30_579));
+    }
+    /// The station's own mesh frames (pairing, settings, position) keep the
+    /// any-air rule: they open in the gap after any heard air, not only
+    /// after AV-bay air. With one station write per AV-bay turn, its SDK
+    /// frames took every turn, the pairing frame waited behind them, and
+    /// pairing failed (fullnet turns-b3: "Pairing frame deferred by radio
+    /// settings backpressure", one settings frame in 55 s). Port of 8192bb0.
+    #[test]
+    fn the_station_own_mesh_frames_open_after_any_air() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 100, 16).with_turn_period(200);
+        cap.enable_turn_gate();
+        cap.note_air_rx((wall, Some(1000)));
+        cap.note_heard_source(HeardSource::AvBay, (wall, Some(1000)));
+        cap.committed(wall, Some(1030), 20);
+        // The RRLS writes in the second gap.
+        cap.note_air_rx((wall, Some(1120)));
+        assert!(!cap.packet_ready(wall, Some(1150)), "SDK frames wait for the AV bay's next burst");
+        cap.set_turn_mesh_own(true);
+        assert!(cap.packet_ready(wall, Some(1150)), "the station's own mesh frame takes the gap after the RRLS");
+        cap.set_turn_mesh_own(false);
+        assert!(!cap.packet_ready(wall, Some(1150)));
+    }
+    /// A turn's write is bounded in bytes too: frames join it only while it
+    /// holds less than 15% of the period at the UART rate (less one small
+    /// frame). Started up to 30 ms into the write, a large frame took station
+    /// writes to about 430 B (fullnet p95), ending on RF's next burst. Port of 52c5c3a.
+    #[test]
+    fn a_turn_write_is_bounded_in_bytes() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 100, 16).with_turn_period(200);
+        cap.enable_turn_gate();
+        cap.note_air_rx((wall, Some(1000)));
+        cap.committed(wall, Some(1030), 100);
+        assert!(cap.packet_ready(wall, Some(1035)), "100 B: more frames may join");
+        cap.committed(wall, Some(1036), 200);
+        assert!(!cap.packet_ready(wall, Some(1040)), "300 B of the 345 B share: the write is full");
+    }
+    /// Only AV-bay air opens the station's turn: the RRLS's writes are heard
+    /// air too, but they are not an AV-bay turn; with no AV-bay air for 1 s the
+    /// station free-runs. Port of 1ab9ce2 / 185b3b9.
+    #[test]
+    fn the_station_turn_opens_on_av_bay_air_only() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 100, 16).with_turn_period(200);
+        cap.enable_turn_gate();
+        cap.note_air_rx((wall, Some(1000)));
+        cap.note_heard_source(HeardSource::AvBay, (wall, Some(1000)));
+        assert!(cap.packet_ready(wall, Some(1030)));
+        cap.committed(wall, Some(1030), 20);
+        // The RRLS writes in the second gap (its frames are neither the AV
+        // bay's nor ours).
+        cap.note_air_rx((wall, Some(1120)));
+        assert!(!cap.packet_ready(wall, Some(1160)), "the RRLS's write is not an AV-bay turn");
+        cap.note_air_rx((wall, Some(1240)));
+        cap.note_heard_source(HeardSource::AvBay, (wall, Some(1240)));
+        assert!(cap.packet_ready(wall, Some(1270)), "RF's next burst opens the turn");
+        // RF silent for 1 s while the RRLS keeps talking: free-run.
+        cap.committed(wall, Some(1270), 20);
+        for at in (1300..2300).step_by(50) {
+            cap.note_air_rx((wall, Some(at)));
+        }
+        assert!(cap.packet_ready(wall, Some(2330)), "no AV-bay air for 1 s: the station free-runs");
     }
 }
