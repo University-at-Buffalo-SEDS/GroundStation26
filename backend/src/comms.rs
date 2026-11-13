@@ -732,6 +732,9 @@ struct UartWriteState {
     wire: virtual_uart::WireDrain,
     /// An RRLS link: the turn gate stands by except during an RRLS takeover.
     relay_link: bool,
+    /// Since when a write of RR mesh control alone (HEALTH, READY, budget and
+    /// RF-profile control) has waited for the station's turn gap.
+    mesh_control_held: Option<(Instant, Option<u64>)>,
 }
 
 #[derive(Clone, Copy, serde::Serialize)]
@@ -1347,10 +1350,17 @@ impl UartComms {
                     "recovery budget effective transport mismatch",
                 ));
             }
+            let control_may_bypass = write_state.mesh_control_may_bypass(
+                &transmission.frame().bytes,
+                transmission.follower_frame().map(|follower| &follower.bytes[..]),
+                capacity_wall,
+                capacity_clock,
+            );
             if let Some(cap) = write_state.radio_capacity.as_mut() {
                 cap.set_turn_bypass(mesh_write_bypasses_turn(
                     &transmission.frame().bytes,
                     transmission.follower_frame().map(|follower| &follower.bytes[..]),
+                    control_may_bypass,
                 ));
                 // A standby RRLS's own control (observe refresh, discovery,
                 // settings/pairing, position) waits, bounded, for quiet air;
@@ -1476,6 +1486,9 @@ impl UartComms {
                         .lock()
                         .unwrap()
                         .note_settings_counted_drain(&transmission, model_stop);
+                }
+                if accepted > 0 {
+                    write_state.mesh_control_held = None;
                 }
                 if accepted > 0
                     && let Some(capacity) = &mut write_state.radio_capacity
@@ -2376,8 +2389,12 @@ fn last_air_rx() -> Option<(Instant, Option<u64>)> {
 /// RR mesh control the station sends at priority 255: HEALTH, READY and the
 /// budget/RF-profile control frames (BASE/REVOKE/ACK and paid budget frames).
 /// Byte 3 is the mesh kind (rrls.rs HEALTH 0, READY 7, BUDGET_CONTROL 13,
-/// RF_PROFILE_CONTROL 14). Like ABORT, these are never held for an air turn:
-/// HEALTH and the budget exchange keep the link alive while the AV bay talks.
+/// RF_PROFILE_CONTROL 14). They take the station's turn gap after the AV
+/// bay's air like ordinary frames, held at most MESH_CONTROL_TURN_HOLD_MS.
+/// Sent out of turn, the 500 ms HEALTH met RF's burst on air: in the confirm6
+/// fullnet 19 of the 34 RF bursts the station lost overlapped a 21-byte
+/// HEALTH, two of them the Abort's reply with every AV-bay Abort status
+/// (FC shown at 990 and 964 ms instead of about 210 ms).
 fn is_mesh_control_frame(bytes: &[u8]) -> bool {
     matches!(bytes.get(3), Some(0 | 7 | 13 | 14))
 }
@@ -2387,14 +2404,46 @@ fn is_mesh_control_frame(bytes: &[u8]) -> bool {
 fn is_station_own_mesh_frame(bytes: &[u8]) -> bool {
     matches!(bytes.get(3), Some(8 | 10 | 11))
 }
-/// A mesh write is never held for a turn when every frame in it is RR mesh
-/// control or carries an SDK ABORT (wrapped as AV-bay or uplink data).
-fn mesh_write_bypasses_turn(first: &[u8], follower: Option<&[u8]>) -> bool {
-    let bypass = |bytes: &[u8]| {
-        is_mesh_control_frame(bytes)
-            || (matches!(bytes.get(3), Some(2 | 5)) && bytes.len() >= 8 && is_abort_frame(&bytes[4..bytes.len() - 4]))
+/// Longest a write of RR mesh control alone waits for the station's turn gap
+/// before it goes anyway. RF's turns open a gap every 200 ms, so this only
+/// bounds a turn that never comes; the 2 s HEALTH leases (rrls.rs LEASE_MS,
+/// budget_negotiation LEASE_MS) then see HEALTH at most 500 + 250 ms apart.
+/// With RF silent past TURN_FREE_RUN_SILENCE_MS, or while relaying through
+/// the RRLS, the gate is open and nothing is held.
+pub(crate) const MESH_CONTROL_TURN_HOLD_MS: u64 = 250;
+/// A mesh write is never held for a turn when it carries an SDK ABORT
+/// (wrapped as AV-bay or uplink data) and every other frame in it is RR mesh
+/// control. A write of mesh control alone takes the turn gap unless
+/// `control_may_bypass` (it has waited MESH_CONTROL_TURN_HOLD_MS).
+fn mesh_write_bypasses_turn(first: &[u8], follower: Option<&[u8]>, control_may_bypass: bool) -> bool {
+    let abort = |bytes: &[u8]| {
+        matches!(bytes.get(3), Some(2 | 5)) && bytes.len() >= 8 && is_abort_frame(&bytes[4..bytes.len() - 4])
     };
-    bypass(first) && follower.is_none_or(bypass)
+    let bypass = |bytes: &[u8]| is_mesh_control_frame(bytes) || abort(bytes);
+    bypass(first)
+        && follower.is_none_or(bypass)
+        && (control_may_bypass || abort(first) || follower.is_some_and(abort))
+}
+impl UartWriteState {
+    /// Whether a write of mesh control alone may now skip the turn gap: it has
+    /// waited MESH_CONTROL_TURN_HOLD_MS. Starts the wait on first asking.
+    fn mesh_control_may_bypass(
+        &mut self,
+        first: &[u8],
+        follower: Option<&[u8]>,
+        wall: Instant,
+        clock: Option<u64>,
+    ) -> bool {
+        if !(is_mesh_control_frame(first) && follower.is_none_or(is_mesh_control_frame)) {
+            return false;
+        }
+        let since = *self.mesh_control_held.get_or_insert((wall, clock));
+        let waited = match (since.1, clock) {
+            (Some(then), Some(now)) => now.saturating_sub(then),
+            _ => wall.saturating_duration_since(since.0).as_millis() as u64,
+        };
+        waited >= MESH_CONTROL_TURN_HOLD_MS
+    }
 }
 /// An SDK FLIGHT_STATE frame carrying Aborted (15): the Abort's flight-state
 /// write. RF latches the Abort from it, so like ABORT it is never held for an
@@ -3599,7 +3648,7 @@ impl UartComms {
             )
             .into());
         };
-        write_state.sync_turn(bypass || mesh_write_bypasses_turn(payload, None), true);
+        write_state.sync_turn(bypass || mesh_write_bypasses_turn(payload, None, true), true);
         if !self.refresh_recovery_capacity(&mut write_state, capacity_wall, capacity_clock) {
             return Err(TelemetryError::HandlerError(
                 "recovery budget effective transport mismatch",
@@ -4107,7 +4156,7 @@ impl CommsDevice for UartComms {
             trace_radio_gate_refusal("abort_resend_gap", priority, payload, String::new);
             return false;
         };
-        if bypass || mesh_write_bypasses_turn(payload, None) {
+        if bypass || mesh_write_bypasses_turn(payload, None, true) {
             state.sync_turn(true, true);
         }
         if !self.refresh_recovery_capacity(&mut state, wall, clock) {
@@ -6553,9 +6602,12 @@ mod raw_uart_tests {
         assert!(shared.lock().unwrap().begin_transmission(0).is_none());
     }
 
-    /// The station's air-turn gate holds ordinary frames until its turn, but
-    /// RR mesh control is never held: HEALTH keeps its 500 ms cadence while
-    /// the AV bay talks without a gap and while no AV-bay air is heard at all.
+    /// The station's air-turn gate holds ordinary frames until its turn. RR
+    /// mesh control takes the turn gap too, never RF's burst ("turns": in the
+    /// confirm6 fullnet an out-of-turn HEALTH cut off RF's Abort reply), and
+    /// waits at most MESH_CONTROL_TURN_HOLD_MS when no gap comes ("chatty").
+    /// With no AV-bay air heard ("silent") it keeps its 500 ms cadence. Every
+    /// HEALTH gap stays far inside the 2 s HEALTH leases.
     #[test]
     #[cfg(target_os = "linux")]
     fn health_leaves_every_500_ms_while_the_turn_gate_holds_ordinary_frames() {
@@ -6565,7 +6617,7 @@ mod raw_uart_tests {
         const CHILD: &str = "GS_TURN_HEALTH_PTY_CHILD";
         const NAME: &str = "comms::raw_uart_tests::health_leaves_every_500_ms_while_the_turn_gate_holds_ordinary_frames";
         let Some(variant) = std::env::var_os(CHILD) else {
-            for variant in ["chatty", "silent"] {
+            for variant in ["turns", "chatty", "silent"] {
                 let clock = std::env::temp_dir()
                     .join(format!("gs-turn-health-{variant}-{}.clock", std::process::id()));
                 std::fs::write(&clock, "30000").unwrap();
@@ -6588,6 +6640,9 @@ mod raw_uart_tests {
             return;
         };
         let chatty = variant == "chatty";
+        let turns = variant == "turns";
+        // RF's turn: 90 ms of air from the start of every 200 ms period.
+        let in_burst = |now: u64| now % 200 < 90;
         crate::telemetry_schema::initialize().unwrap();
         let clock = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
         let ordinary = serialize::pack_packet(
@@ -6625,10 +6680,10 @@ mod raw_uart_tests {
         let mut buf = [0u8; 512];
         for now in (30_000u64..36_000).step_by(5) {
             std::fs::write(&clock, now.to_string()).unwrap();
-            if chatty {
-                // AV-bay air every 5 ms: the 20 ms quiet gap never comes. The
-                // direct path is up (RF's window advertisements), so the
-                // primary is not relaying.
+            if chatty || (turns && in_burst(now)) {
+                // AV-bay air every 5 ms (chatty: the 20 ms quiet gap never
+                // comes). The direct path is up (RF's window advertisements),
+                // so the primary is not relaying.
                 note_air_rx_now();
                 mesh.lock().unwrap().incoming(true, b"RS\x01\x00\x00\x00\x00\x00\x00", now);
             }
@@ -6644,13 +6699,23 @@ mod raw_uart_tests {
         if chatty {
             assert_eq!(ordinary_open, 0, "ordinary frames wait for the AV bay's gap");
         }
-        assert!(writes.len() >= 11, "HEALTH writes at {writes:?}");
+        if turns {
+            // The gap opens once RF's air has been quiet for the gate's quiet
+            // time; HEALTH never meets RF's air (or its last 10 ms).
+            let in_air: Vec<_> = writes.iter().filter(|at| *at % 200 < 100).collect();
+            assert!(in_air.is_empty(), "HEALTH written during RF's turn at {in_air:?}: {writes:?}");
+        }
+        // Silent: the 500 ms cadence. Turns: plus at most one turn period.
+        // Chatty: plus at most the hold bound.
+        let bound = if turns { 520 + 200 } else if chatty { 520 + MESH_CONTROL_TURN_HOLD_MS } else { 520 };
+        assert!(writes.len() >= 8, "HEALTH writes at {writes:?}");
         let mut previous = 30_000;
         for at in &writes {
-            assert!(at - previous <= 520, "HEALTH gap {}ms at {at}: {writes:?}", at - previous);
+            assert!(at - previous <= bound, "HEALTH gap {}ms at {at}: {writes:?}", at - previous);
+            assert!(at - previous < 2_000 / 2, "HEALTH gap {}ms must stay well inside the 2 s leases", at - previous);
             previous = *at;
         }
-        assert!(36_000 - previous <= 520, "HEALTH stopped at {previous}: {writes:?}");
+        assert!(36_000 - previous <= bound, "HEALTH stopped at {previous}: {writes:?}");
     }
 
     /// ABORT is never held for a turn, also when the radio writer pairs it
@@ -6691,13 +6756,17 @@ mod raw_uart_tests {
             v
         };
         let health = wrap(0, &[0; 9]);
-        assert!(mesh_write_bypasses_turn(&wrap(5, &abort), None));
-        assert!(mesh_write_bypasses_turn(&wrap(2, &abort), None));
-        assert!(mesh_write_bypasses_turn(&health, Some(&wrap(5, &abort))));
-        assert!(mesh_write_bypasses_turn(&wrap(5, &abort), Some(&health)));
-        assert!(!mesh_write_bypasses_turn(&wrap(5, &command), None));
-        assert!(!mesh_write_bypasses_turn(&health, Some(&wrap(5, &other))));
-        assert!(mesh_write_bypasses_turn(&health, None));
+        for held_long_enough in [false, true] {
+            assert!(mesh_write_bypasses_turn(&wrap(5, &abort), None, held_long_enough));
+            assert!(mesh_write_bypasses_turn(&wrap(2, &abort), None, held_long_enough));
+            assert!(mesh_write_bypasses_turn(&health, Some(&wrap(5, &abort)), held_long_enough));
+            assert!(mesh_write_bypasses_turn(&wrap(5, &abort), Some(&health), held_long_enough));
+            assert!(!mesh_write_bypasses_turn(&wrap(5, &command), None, held_long_enough));
+            assert!(!mesh_write_bypasses_turn(&health, Some(&wrap(5, &other)), held_long_enough));
+        }
+        // HEALTH alone takes the turn gap until it has waited the bound.
+        assert!(!mesh_write_bypasses_turn(&health, None, false));
+        assert!(mesh_write_bypasses_turn(&health, None, true));
     }
 
     /// range fullnet: RF first heard the Abort's FLIGHT_STATE=15 1.7 s after the
