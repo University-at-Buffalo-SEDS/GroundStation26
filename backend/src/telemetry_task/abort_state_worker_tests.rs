@@ -152,24 +152,36 @@ async fn an_abort_in_rf_burst_takes_its_flight_state_along() {
     let mut raw = Vec::new();
     let mut seen: Vec<(u64, Vec<Vec<u8>>)> = Vec::new();
     let mut parsed = 0;
-    let mut abort_at = None;
     let mut buf = [0u8; 4096];
-    for ms in 30_000u64..33_500 {
+    // Several Aborts inside RF's burst, at phases sweeping the 500 ms HEALTH
+    // cadence, so one lands while a HEALTH is due and held for the gap.
+    let aborts: Vec<u64> = (0..8u64).map(|k| 31_010 + k * 610).collect();
+    assert!(aborts.iter().all(|t| in_burst(*t)));
+    let end = aborts.last().unwrap() + 450;
+    let mut ids = Vec::new();
+    for ms in 30_000u64..end {
         set_now(ms);
         if in_burst(ms) {
             crate::comms::note_air_rx_now();
             mesh.lock().unwrap().incoming(true, b"RS\x01\x00\x00\x00\x00\x00\x00", ms);
         }
-        // An operator Abort well inside RF's burst, once HEALTH has a turn
-        // history: FLIGHT_STATE=15 is queued first, then the ABORT, and the
-        // station flushes the SDK at once (publish_local_claim).
-        if ms == 32_430 {
-            assert!(in_burst(ms));
+        if let Some(k) = aborts.iter().position(|t| *t == ms) {
             // As the station: set_network_variable (sent at once, or queued
             // while another thread is in side TX), then the ABORT queued and
             // the SDK flushed for 3 ms.
-            router.set_network_variable(pack("FLIGHT_STATE", "FLIGHT_STATE", &[15])).unwrap();
-            router.tx_queue(pack("ABORT", "ABORT", b"SEDS_MANUAL_ABORT_V1:K")).unwrap();
+            let stamp = 1_767_225_600_000 + k as u64;
+            let state = Packet::new(crate::telemetry_schema::data_type("FLIGHT_STATE"),
+                &[crate::telemetry_schema::endpoint("FLIGHT_STATE")], "GS", stamp, Arc::from([if k % 2 == 0 { 15u8 } else { 1u8 }])).unwrap();
+            let abort = Packet::new(crate::telemetry_schema::data_type("ABORT"),
+                &[crate::telemetry_schema::endpoint("ABORT")], "GS", stamp, Arc::from(&b"SEDS_MANUAL_ABORT_V1:K"[..])).unwrap();
+            if k % 2 == 0 {
+                ids.push((ms, abort.packet_id(), state.packet_id()));
+                router.set_network_variable(state).unwrap();
+                router.tx_queue(abort).unwrap();
+            } else {
+                // Leave the Abort state between cases (no ABORT).
+                router.set_network_variable(state).unwrap();
+            }
             router.process_all_queues_with_timeout(3).unwrap();
         }
         // Ordinary station telemetry keeps the router's side busy, as the
@@ -194,37 +206,23 @@ async fn an_abort_in_rf_burst_takes_its_flight_state_along() {
             seen.push((ms, sdk_frames(body)));
         }
         parsed = all.len();
-        if abort_at.is_some_and(|at| ms > at + 400) {
-            break;
-        }
-        if abort_at.is_none()
-            && seen.iter().any(|(_, sdk)| sdk.iter().any(|f| {
-                serialize::peek_frame_info_unchecked(f)
-                    .is_ok_and(|i| i.envelope.ty == crate::telemetry_schema::data_type("ABORT"))
-            }))
-        {
-            abort_at = Some(ms);
-        }
     }
-    let first = |ty: &str, payload: Option<&[u8]>| {
+    let first = |id: u64| {
         seen.iter().find_map(|(ms, sdk)| {
             sdk.iter()
-                .any(|f| {
-                    serialize::unpack_packet(f).is_ok_and(|p| {
-                        p.data_type() == crate::telemetry_schema::data_type(ty)
-                            && payload.is_none_or(|v| p.payload() == v)
-                    })
-                })
+                .any(|f| serialize::unpack_packet(f).is_ok_and(|p| p.packet_id() == id))
                 .then_some(*ms)
         })
     };
-    let abort = first("ABORT", None).expect("the ABORT reached the wire");
-    let state = first("FLIGHT_STATE", Some(&[15])).expect("FLIGHT_STATE=15 reached the wire");
-    println!("ABORT_STATE_WORKER abort_ms={abort} state_ms={state} lag_ms={}", state as i64 - abort as i64);
-    assert!(abort <= 32_436, "the ABORT goes at once, out of turn (at {abort})");
-    assert!(
-        state <= abort + 5,
-        "FLIGHT_STATE=15 left {} ms after its ABORT (the next gap is at 32_490+)",
-        state as i64 - abort as i64
-    );
+    let mut lags = Vec::new();
+    for (at, abort, state) in &ids {
+        let abort = first(*abort).expect("the ABORT reached the wire");
+        let state = first(*state).expect("FLIGHT_STATE=15 reached the wire");
+        lags.push((*at, abort as i64 - *at as i64, state as i64 - abort as i64));
+    }
+    println!("ABORT_STATE_WORKER (press, abort_after_ms, state_lag_ms) {lags:?}");
+    for (at, abort_after, lag) in &lags {
+        assert!(*abort_after <= 6, "the ABORT pressed at {at} went {abort_after} ms later");
+        assert!(*lag <= 5, "FLIGHT_STATE=15 of the Abort at {at} left {lag} ms after its ABORT: {lags:?}");
+    }
 }
