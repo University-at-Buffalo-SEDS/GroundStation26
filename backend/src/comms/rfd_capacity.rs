@@ -351,6 +351,25 @@ impl Capacity {
     pub(crate) fn turn_gap_open(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
         self.gate().is_none_or(|turn| TurnGate { bypass: false, ..*turn }.open(wall, virtual_ms))
     }
+    /// The gap is open and young: the AV bay's air ended at most `max_ms` ago.
+    /// The gate stays open until the station writes, so an unused gap would
+    /// otherwise still read open when the AV bay's next turn is already on
+    /// air but not yet heard. Free-run, relaying or no AV-bay air heard: open.
+    pub(crate) fn turn_gap_fresh(&self, wall: Instant, virtual_ms: Option<u64>, max_ms: u64) -> bool {
+        self.gate().is_none_or(|turn| {
+            let gate = TurnGate { bypass: false, ..*turn };
+            if !gate.open(wall, virtual_ms) {
+                return false;
+            }
+            if gate.relaying || gate.standby {
+                return true;
+            }
+            gate.last_air_rx.is_none_or(|rx| {
+                let silent = since_ms(rx, wall, virtual_ms);
+                silent >= TURN_FREE_RUN_SILENCE_MS || silent <= max_ms
+            })
+        })
+    }
     fn turn_open(&self, wall: Instant, virtual_ms: Option<u64>) -> bool {
         self.gate().is_none_or(|turn| turn.open(wall, virtual_ms))
     }

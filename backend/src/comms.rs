@@ -1382,7 +1382,14 @@ impl UartComms {
                     capacity_clock,
                 );
             }
-            let refused = write_state.radio_capacity.as_ref().is_some_and(|cap| {
+            let control_only = is_mesh_control_frame(&transmission.frame().bytes)
+                && transmission.follower_frame().is_none_or(|follower| is_mesh_control_frame(&follower.bytes));
+            let stale_gap = control_only
+                && !control_may_bypass
+                && write_state.radio_capacity.as_ref().is_some_and(|cap| {
+                    cap.turn_gated() && !cap.turn_gap_fresh(capacity_wall, capacity_clock, MESH_CONTROL_GAP_WINDOW_MS)
+                });
+            let refused = stale_gap || write_state.radio_capacity.as_ref().is_some_and(|cap| {
                 if let Some((id, receipt)) = transmission.single_control_contract() {
                     if receipt {
                         return !cap.ready_for_receipt(
@@ -2419,6 +2426,11 @@ fn is_station_own_mesh_frame(bytes: &[u8]) -> bool {
 /// With RF silent past TURN_FREE_RUN_SILENCE_MS, or while relaying through
 /// the RRLS, the gate is open and nothing is held.
 pub(crate) const MESH_CONTROL_TURN_HOLD_MS: u64 = 250;
+/// Mesh control takes only a young gap: at most this long after the AV bay's
+/// air was last heard. RF's next turn starts 200 ms after its last one began
+/// and is heard only once its air packet arrives, so later in an unused gap
+/// HEALTH met RF's next burst on air (confirm7b: 15 of 45 lost RF bursts).
+pub(crate) const MESH_CONTROL_GAP_WINDOW_MS: u64 = 60;
 /// A mesh write is never held for a turn when it carries an SDK ABORT
 /// (wrapped as AV-bay or uplink data) and every other frame in it is RR mesh
 /// control. A write of mesh control alone takes the turn gap unless
@@ -6625,7 +6637,7 @@ mod raw_uart_tests {
         const CHILD: &str = "GS_TURN_HEALTH_PTY_CHILD";
         const NAME: &str = "comms::raw_uart_tests::health_leaves_every_500_ms_while_the_turn_gate_holds_ordinary_frames";
         let Some(variant) = std::env::var_os(CHILD) else {
-            for variant in ["turns", "chatty", "silent"] {
+            for variant in ["turns", "turns-late", "chatty", "silent"] {
                 let clock = std::env::temp_dir()
                     .join(format!("gs-turn-health-{variant}-{}.clock", std::process::id()));
                 std::fs::write(&clock, "30000").unwrap();
@@ -6648,9 +6660,12 @@ mod raw_uart_tests {
             return;
         };
         let chatty = variant == "chatty";
-        let turns = variant == "turns";
+        let turns = variant.to_str().is_some_and(|v| v.starts_with("turns"));
+        // turns-late: HEALTH falls due late in a gap the station left unused.
+        let offset: u64 = if variant == "turns-late" { 120 } else { 0 };
         // RF's turn: 90 ms of air from the start of every 200 ms period.
-        let in_burst = |now: u64| now % 200 < 90;
+        let in_burst = |now: u64| (now + 200 - offset) % 200 < 90;
+        let phase = |at: u64| (at + 200 - offset) % 200;
         crate::telemetry_schema::initialize().unwrap();
         let clock = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
         let ordinary = serialize::pack_packet(
@@ -6712,14 +6727,18 @@ mod raw_uart_tests {
         if turns {
             // The gap opens once RF's air has been quiet for the gate's quiet
             // time; HEALTH never meets RF's air (or its last 10 ms).
-            let in_air: Vec<_> = writes.iter().filter(|at| *at % 200 < 100).collect();
+            // and only while the gap is young (before RF's next turn).
+            let in_air: Vec<_> = writes
+                .iter()
+                .filter(|at| phase(**at) < 100 || phase(**at) > 90 + MESH_CONTROL_GAP_WINDOW_MS + 5)
+                .collect();
             assert!(in_air.is_empty(), "HEALTH written during RF's turn at {in_air:?}: {writes:?}");
             // HEALTH does not spend the gap: the turn's own write (an Abort
             // re-send, ordinary frames) still has it once HEALTH's own air
             // packet is over, not only by joining that packet.
             let spent: Vec<_> = writes
                 .iter()
-                .filter(|at| !ordinary_ready.iter().any(|t| *t >= *at + 40 && *t < *at - *at % 200 + 200))
+                .filter(|at| !ordinary_ready.iter().any(|t| *t >= *at + 40 && *t < *at - phase(**at) + 200))
                 .collect();
             assert!(spent.is_empty(), "HEALTH at {spent:?} took the station's gap: ordinary ready at {ordinary_ready:?}");
         }
