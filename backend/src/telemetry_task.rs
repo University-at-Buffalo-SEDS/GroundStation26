@@ -302,12 +302,28 @@ pub(crate) fn absolute_time_status() -> crate::absolute_time::AbsoluteStatus {
 /// step re-anchors the network clock only when `absolute_time::may_step`
 /// allows it; otherwise corrections slew.
 pub(crate) fn refresh_station_network_time(router: &Router) {
+    refresh_station_network_time_at(router, host_utc_ns());
+}
+
+/// The same, with the host clock read by the caller: `host_utc_ms` from the
+/// same clock keeps the full nanosecond reading; another value (a caller's
+/// own host time) is taken as given.
+pub(crate) fn refresh_station_network_time_from_host_ms(router: &Router, host_utc_ms: u64) {
+    let now_ns = host_utc_ns();
+    let host_ns = if now_ns.div_euclid(1_000_000) == host_utc_ms as i64 {
+        now_ns
+    } else {
+        (host_utc_ms as i64).saturating_mul(1_000_000)
+    };
+    refresh_station_network_time_at(router, host_ns);
+}
+
+fn refresh_station_network_time_at(router: &Router, host_ns: i64) {
     let mut reports: Vec<(i64, u64)> = router
         .take_utc_reference_reports()
         .into_iter()
         .map(|r| (r.offset_ns, r.error_ns))
         .collect();
-    let host_ns = host_utc_ns();
     let mut abs = ABSOLUTE_TIME.lock().unwrap();
     // Bootstrap: a station with no valid UTC of its own that follows an
     // anchored remote (RF leading with GPS while the Pi has no RTC) adopts
