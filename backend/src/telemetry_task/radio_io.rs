@@ -5117,6 +5117,7 @@ pub(super) fn process_router_queues_with_backoff(
     if backoff.tx_due(router, budget) {
         backoff.run_tx(router, budget, || {
             ORDERED_EXHAUSTION.refresh(router);
+            crate::comms::retire_abort_gap_copies(router);
             if let Err(err) = router.process_tx_queue_with_timeout(super::ROUTER_TX_BUDGET_MS) {
                 if matches!(&err, sedsnet::TelemetryError::HandlerError(m) if m.contains("exhausted retries")) {
                     ORDERED_EXHAUSTION.note_exhausted(router);

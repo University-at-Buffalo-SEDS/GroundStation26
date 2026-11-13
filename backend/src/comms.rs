@@ -2388,6 +2388,10 @@ static AIR_RX_VIRTUAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 static AIR_RX_WALL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AIR_RX_BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 fn note_air_rx_now() {
+    AIR_BURSTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .note(abort_state_now_ms());
     let base = *AIR_RX_BASE.get_or_init(Instant::now);
     let wall = Instant::now().saturating_duration_since(base).as_millis() as u64 + 1;
     AIR_RX_WALL_MS.store(wall, std::sync::atomic::Ordering::Release);
@@ -2541,6 +2545,92 @@ pub(crate) enum AbortWrite {
     /// Refuse for now (the writer retries on its next pass).
     Hold,
 }
+/// When the station last heard the AV bay's air (station clock ms).
+#[derive(Default)]
+pub(crate) struct AirBursts {
+    last_rx: Option<u64>,
+}
+impl AirBursts {
+    pub(crate) fn note(&mut self, now_ms: u64) {
+        self.last_rx = Some(now_ms);
+    }
+    /// RF's air was last heard TURN_QUIET_MS..=MESH_CONTROL_GAP_WINDOW_MS ago:
+    /// the station's young gap after a burst it heard.
+    pub(crate) fn young_heard_gap(&self, now_ms: u64) -> bool {
+        self.last_rx.is_some_and(|rx| {
+            (rfd_capacity::TURN_QUIET_MS..=MESH_CONTROL_GAP_WINDOW_MS).contains(&now_ms.saturating_sub(rx))
+        })
+    }
+}
+static AIR_BURSTS: std::sync::Mutex<AirBursts> = std::sync::Mutex::new(AirBursts { last_rx: None });
+/// An Abort's ABORT goes again in every young gap after an RF burst the
+/// station heard, until every ABORT owner has acknowledged it or this window
+/// ends (the SDK's own 4.8 s reliable window). FC latches only on ABORT; with
+/// copies only on the SDK's 400 ms timer, each waiting for a heard gap, the
+/// 30% loss R30 fullnet sent them 0.5-1.1 s apart and FC showed the Abort at
+/// 2709 ms after four copies were lost. Gaps are never predicted: RF opens a
+/// turn when traffic arrives, so a predicted gap met RF's air in 13-15% of
+/// windows on the range traces.
+pub(crate) const ABORT_GAP_COPY_WINDOW_MS: u64 = 4_800;
+/// One copy per heard gap (RF's turns are 200 ms apart).
+pub(crate) const ABORT_GAP_COPY_MIN_SPACING_MS: u64 = 150;
+#[derive(Default)]
+pub(crate) struct AbortGapCopies {
+    current: Option<(u64, Vec<u8>, u64)>,
+    last_copy: Option<u64>,
+}
+impl AbortGapCopies {
+    /// The first write of an ABORT packet: copies of it follow.
+    pub(crate) fn note_written(&mut self, id: u64, payload: &[u8], now_ms: u64) {
+        if self.current.as_ref().is_some_and(|(held, _, _)| *held == id) {
+            return;
+        }
+        self.current = Some((id, payload.to_vec(), now_ms));
+        self.last_copy = Some(now_ms);
+    }
+    /// The copy to write now, if one is due: in a young heard gap not yet
+    /// used by a copy.
+    pub(crate) fn take_due(&mut self, now_ms: u64, heard_gap: bool) -> Option<Vec<u8>> {
+        let (_, bytes, first) = self.current.as_ref()?;
+        if now_ms.saturating_sub(*first) >= ABORT_GAP_COPY_WINDOW_MS {
+            self.current = None;
+            return None;
+        }
+        if !heard_gap
+            || self.last_copy.is_some_and(|last| now_ms.saturating_sub(last) < ABORT_GAP_COPY_MIN_SPACING_MS)
+        {
+            return None;
+        }
+        self.last_copy = Some(now_ms);
+        Some(bytes.clone())
+    }
+    /// The SDK no longer holds the packet: every owner acknowledged it.
+    pub(crate) fn retire_unless(&mut self, still_pending: impl Fn(u64) -> bool) {
+        if self.current.as_ref().is_some_and(|(id, _, _)| !still_pending(*id)) {
+            self.current = None;
+        }
+    }
+    /// The SDK's own re-send of `id` waits while a copy left in this turn.
+    fn copied_recently(&self, id: u64, now_ms: u64) -> bool {
+        self.current.as_ref().is_some_and(|(held, _, _)| *held == id)
+            && self.last_copy.is_some_and(|last| now_ms.saturating_sub(last) < ABORT_GAP_COPY_MIN_SPACING_MS)
+    }
+    fn active(&self) -> Option<u64> {
+        self.current.as_ref().map(|(id, _, _)| *id)
+    }
+}
+static ABORT_GAP_COPIES: std::sync::Mutex<Option<AbortGapCopies>> = std::sync::Mutex::new(None);
+/// Set while the radio writer sends an ABORT gap copy.
+static SENDING_ABORT_GAP_COPY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The station router's view: drop the copies once the ABORT is no longer
+/// pending (all owners acknowledged, or the SDK gave up). Cheap when idle.
+pub(crate) fn retire_abort_gap_copies(router: &sedsnet::router::Router) {
+    let mut guard = ABORT_GAP_COPIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(copies) = guard.as_mut() else { return };
+    let Some(id) = copies.active() else { return };
+    let pending = router.export_reliable_pending_stats().iter().any(|row| row.packet_id == id);
+    copies.retire_unless(|_| pending);
+}
 /// A re-send taking the station's gap starts a random 0..=this many ms into
 /// it, so successive re-sends never sit at one phase of RF's turn. The gap
 /// is about 62 ms and the write must end before RF's next burst.
@@ -2620,9 +2710,18 @@ fn abort_jitter_draw(n: u64) -> u64 {
 /// The SDK packet an Abort-critical write carries (ABORT, or the Abort's
 /// FLIGHT_STATE=15 other than a scheduled early copy), if this is one.
 fn abort_critical_id(payload: &[u8]) -> Option<u64> {
+    if SENDING_ABORT_GAP_COPY.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
     let critical = is_abort_frame(payload)
         || (is_abort_flight_state(payload) && !SENDING_ABORT_STATE_COPY.load(std::sync::atomic::Ordering::Acquire));
     critical.then(|| serialize::unpack_packet(payload).ok().map(|packet| packet.packet_id())).flatten()
+}
+impl UartComms {
+    /// No ABORT gap copies on an RRLS link or while the primary relays.
+    fn relay_link_state(&self, state: &UartWriteState) -> bool {
+        state.relay_link || crate::rrls::primary_relaying()
+    }
 }
 impl UartWriteState {
     /// Brings the turn gate up to date for `payload` and decides whether it
@@ -2630,9 +2729,22 @@ impl UartWriteState {
     /// re-send is held (AbortCopies).
     fn sync_turn_for(&mut self, payload: &[u8]) -> Option<bool> {
         self.sync_turn(false, true);
+        if SENDING_ABORT_GAP_COPY.load(std::sync::atomic::Ordering::Acquire) {
+            // Sent only in a young heard gap: never held for a turn.
+            self.sync_turn(true, true);
+            return Some(true);
+        }
         let Some(id) = abort_critical_id(payload) else {
             return Some(false);
         };
+        if ABORT_GAP_COPIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|copies| copies.copied_recently(id, abort_state_now_ms()))
+        {
+            return None;
+        }
         let wall = Instant::now();
         let clock = crate::simulation_clock_ms();
         let (turns, gap_open) = self
@@ -3880,6 +3992,16 @@ impl UartComms {
                         .get_or_insert_with(Default::default)
                         .note_written(id);
                 }
+                if is_abort_frame(sdk_payload)
+                    && !SENDING_ABORT_GAP_COPY.load(std::sync::atomic::Ordering::Acquire)
+                    && let Ok(packet) = serialize::unpack_packet(sdk_payload)
+                {
+                    ABORT_GAP_COPIES
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get_or_insert_with(Default::default)
+                        .note_written(packet.packet_id(), sdk_payload, abort_state_now_ms());
+                }
             }
         }
         io_result
@@ -3956,6 +4078,41 @@ impl CommsDevice for UartComms {
     fn service_transmit(&mut self) -> TelemetryResult<()> {
         if !self.poll_hardware_flow_control()? {
             return Ok(());
+        }
+        if self.recovery.is_some() {
+            // An Abort's ABORT copy goes first in this heard gap, ahead of
+            // HEALTH and the FLIGHT_STATE copies.
+            // Only while taking turns with RF: with no turn gate or while
+            // relaying through the RRLS the SDK's own re-sends (AbortCopies)
+            // are the only copies; with RF silent no gap is ever young.
+            let turns = {
+                let state = self.write_lock.lock().unwrap();
+                state.radio_capacity.as_ref().is_some_and(|cap| cap.turn_gated()) && !self.relay_link_state(&state)
+            };
+            let now = abort_state_now_ms();
+            let heard_gap = turns
+                && AIR_BURSTS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .young_heard_gap(now);
+            let due = ABORT_GAP_COPIES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+                .and_then(|copies| copies.take_due(now, heard_gap));
+            if let Some(copy) = due {
+                SENDING_ABORT_GAP_COPY.store(true, std::sync::atomic::Ordering::Release);
+                let refused = self.send_data_with_priority(&copy, 255).is_err();
+                SENDING_ABORT_GAP_COPY.store(false, std::sync::atomic::Ordering::Release);
+                if refused && let Some(copies) = ABORT_GAP_COPIES
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                {
+                    // Refused (UART busy): this turn's gap may still take it.
+                    copies.last_copy = None;
+                }
+            }
         }
         if self.recovery.is_some() {
             let due = ABORT_STATE_BURST
@@ -6804,6 +6961,203 @@ mod raw_uart_tests {
         // HEALTH alone takes the turn gap until it has waited the bound.
         assert!(!mesh_write_bypasses_turn(&health, None, false));
         assert!(mesh_write_bypasses_turn(&health, None, true));
+    }
+
+    /// Station-side model of one Abort: RF takes a 200 ms turn, on air at the
+    /// station 30-115 ms into it; the station hears turn `k` when `heard(k)`
+    /// (from 45 to 100 ms into it). Returns the ms after the first ABORT write
+    /// of every copy the station sends: its heard-gap copies and the SDK's
+    /// 400 ms re-sends, each waiting for a heard gap (AbortCopies).
+    fn abort_copy_times(heard: impl Fn(u64) -> bool, acked_after: u64) -> (Vec<u64>, Vec<u64>) {
+        let mut bursts = AirBursts::default();
+        let mut copies = AbortGapCopies::default();
+        let mut sdk = AbortCopies::default();
+        let first = 10_000u64;
+        let id = 7u64;
+        let mut sent = Vec::new();
+        let mut next_sdk = first + 400;
+        let turns: Vec<u64> = (0..40).map(|k| 9_000 + 200 * k).collect();
+        sdk.note_written(id);
+        copies.note_written(id, b"abort", first);
+        for now in 9_000..first + 6_000 {
+            for (k, start) in turns.iter().enumerate() {
+                if heard(k as u64) && now >= start + 45 && now <= start + 100 && (now - start) % 5 == 0 {
+                    bursts.note(now);
+                }
+            }
+            if now < first {
+                continue;
+            }
+            if now - first >= acked_after {
+                copies.retire_unless(|_| false);
+                break;
+            }
+            if now - first >= ABORT_GAP_COPY_WINDOW_MS {
+                break;
+            }
+            let heard_gap = bursts.young_heard_gap(now);
+            if copies.take_due(now, heard_gap).is_some() {
+                sent.push(now - first);
+                continue;
+            }
+            if now >= next_sdk && !copies.copied_recently(id, now) {
+                if !matches!(sdk.decide(id, now, true, heard_gap, |_| 0), AbortWrite::Hold) {
+                    sent.push(now - first);
+                    sdk.note_written(id);
+                    next_sdk = now + 400;
+                }
+            }
+        }
+        for at in &sent {
+            let abs = first + at;
+            assert!(
+                !turns.iter().any(|start| abs >= start + 30 && abs <= start + 115),
+                "a copy at +{at} ms lands on RF's air: {sent:?}"
+            );
+        }
+        let heard_gaps = turns.iter().enumerate().filter(|(k, _)| heard(*k as u64)).map(|(_, s)| s - first.min(*s)).collect();
+        (sent, heard_gaps)
+    }
+
+    /// R30 fullnet: ABORT re-sends went 0.5-1.1 s apart under 30% loss: they
+    /// waited for the SDK's 400 ms timer and then for a gap the station heard,
+    /// and FC latches only on ABORT. A copy now goes in every young gap after
+    /// an RF burst the station heard: at most 220 ms apart while bursts are
+    /// heard, at most one per gap, never on RF's air (a gap is never
+    /// predicted), until every owner acknowledged it or 4.8 s passed.
+    #[test]
+    fn an_abort_goes_again_in_every_heard_gap() {
+        let (sent, _) = abort_copy_times(|_| true, u64::MAX);
+        assert!(sent.len() >= 20, "copies at {sent:?}");
+        let mut previous = 0;
+        for at in &sent {
+            assert!(at - previous <= 220, "copies {} ms apart at +{at}: {sent:?}", at - previous);
+            previous = *at;
+        }
+        assert!(*sent.last().unwrap() < ABORT_GAP_COPY_WINDOW_MS, "{sent:?}");
+        // Half of RF's bursts unheard: one copy per heard gap, none in between.
+        let (sent, _) = abort_copy_times(|k| k % 2 == 0, u64::MAX);
+        let mut per_turn = std::collections::BTreeMap::new();
+        for at in &sent {
+            *per_turn.entry((10_000 + at - 9_000) / 200).or_insert(0) += 1;
+        }
+        assert!(per_turn.values().all(|n| *n == 1), "more than one copy in a gap: {sent:?}");
+        assert!(per_turn.keys().all(|k| k % 2 == 0), "a copy outside a heard gap: {sent:?}");
+        // Every owner acknowledged it after 700 ms: no copy after that.
+        let (acked, _) = abort_copy_times(|_| true, 700);
+        assert!(acked.iter().all(|at| *at < 700), "{acked:?}");
+    }
+
+    /// The station's write order in a heard gap, on the real writer: the
+    /// ABORT copy is first, ahead of HEALTH and the FLIGHT_STATE=15 copies.
+    /// With no turn gate (no turns), the writer sends no ABORT copy at all:
+    /// the SDK's re-sends are the only copies.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_abort_copy_leads_the_heard_gap_and_falls_back_without_turns() {
+        if !cfg!(feature = "firmware_sim") {
+            crate::mode_suite!(Hitl);
+        }
+        const CHILD: &str = "GS_ABORT_GAP_COPY_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::the_abort_copy_leads_the_heard_gap_and_falls_back_without_turns";
+        let Some(variant) = std::env::var_os(CHILD) else {
+            for variant in ["turns", "no-turns"] {
+                let clock = std::env::temp_dir().join(format!("gs-abort-gap-{variant}-{}.clock", std::process::id()));
+                std::fs::write(&clock, "30000").unwrap();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, variant)
+                    .env("GS_SIM_CLOCK_FILE", &clock)
+                    .env("GS_SIMULATED_SERIAL_PTY", "1")
+                    .env_remove("GS_RADIO_TURN_TAKING")
+                    .output()
+                    .unwrap();
+                let _ = std::fs::remove_file(clock);
+                assert!(
+                    output.status.success(),
+                    "{variant}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let turns = variant == "turns";
+        crate::telemetry_schema::initialize().unwrap();
+        let clock = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
+        let pack = |name: &str, endpoint: &str, payload: &[u8]| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type(name),
+                    &[crate::telemetry_schema::endpoint(endpoint)],
+                    "GS",
+                    1,
+                    std::sync::Arc::from(payload),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let abort = pack("ABORT", "ABORT", b"SEDS_MANUAL_ABORT_V1:Q");
+        let aborted = pack("FLIGHT_STATE", "FLIGHT_STATE", &[15]);
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(1)).unwrap();
+        let (mut uart, mesh, _) = recovery_uart_fixture(port);
+        {
+            let mut capacity = rfd_capacity::Capacity::new(64000, 15, 16);
+            if turns {
+                capacity = capacity.with_turn_period(200);
+                capacity.enable_turn_gate();
+            }
+            uart.write_lock.lock().unwrap().radio_capacity = Some(capacity);
+        }
+        uart.enable_radio_capacity_control();
+        // The Abort was written at 30000: its ABORT copies and FLIGHT_STATE
+        // copies are due; HEALTH falls due in the same gap.
+        ABORT_GAP_COPIES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Default::default)
+            .note_written(serialize::unpack_packet(&abort).unwrap().packet_id(), &abort, 30_000);
+        ABORT_STATE_BURST.lock().unwrap().get_or_insert_with(Default::default).note_written(30_000, &aborted);
+        let mut buf = [0u8; 2048];
+        let mut writes: Vec<(u64, Vec<u8>)> = Vec::new();
+        for now in (30_000u64..31_000).step_by(5) {
+            std::fs::write(&clock, now.to_string()).unwrap();
+            // RF's turn: on air 0-90 ms of every 200 ms period, heard.
+            if now % 200 < 90 {
+                note_air_rx_now();
+                mesh.lock().unwrap().incoming(true, b"RS\x01\x00\x00\x00\x00\x00\x00", now);
+            }
+            uart.service_transmit().unwrap();
+            let mut bytes = Vec::new();
+            while let Ok(n) = peer.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            if !bytes.is_empty() {
+                writes.push((now, bytes));
+            }
+        }
+        let marker = b"SEDS_MANUAL_ABORT_V1:Q";
+        let has_abort = |bytes: &[u8]| bytes.windows(marker.len()).any(|w| w == marker);
+        let abort_writes: Vec<u64> = writes.iter().filter(|(_, b)| has_abort(b)).map(|(at, _)| *at).collect();
+        if !turns {
+            assert!(abort_writes.is_empty(), "no turns: no ABORT gap copies, got {abort_writes:?}");
+            return;
+        }
+        assert!(abort_writes.len() >= 3, "ABORT copies at {abort_writes:?}");
+        for (at, bytes) in &writes {
+            if has_abort(bytes) {
+                // First in its write: the ABORT starts the first frame written.
+                let first_frame_end = bytes.windows(2).skip(1).position(|w| w == [0xa6, 0x5b] || w == [0xa5, 0x5a]).map_or(bytes.len(), |p| p + 1);
+                assert!(has_abort(&bytes[..first_frame_end]), "the ABORT is not first at {at}: {bytes:02x?}");
+                // RF's air was last heard at 85 ms into the turn.
+                assert!(at % 200 >= 85 + rfd_capacity::TURN_QUIET_MS && at % 200 <= 85 + MESH_CONTROL_GAP_WINDOW_MS, "ABORT copy outside the young gap at {at}");
+            }
+        }
     }
 
     /// range fullnet: RF first heard the Abort's FLIGHT_STATE=15 1.7 s after the
