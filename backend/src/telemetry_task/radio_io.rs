@@ -6971,6 +6971,10 @@ mod transport_pending_tests {
 #[path = "root_ordinary_turn_tests.rs"]
 mod root_ordinary_turn_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "abort_state_worker_tests.rs"]
+mod abort_state_worker_tests;
+
 #[cfg(test)]
 #[path = "ordinary_balance_tests.rs"]
 mod ordinary_balance_tests;

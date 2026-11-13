@@ -973,6 +973,15 @@ impl UartComms {
         }
     }
 
+    /// Test hook: the station's shipped air turn gate on this writer.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn enable_turn_gate_for_test(&mut self, share_percent: u64) {
+        let mut capacity = rfd_capacity::Capacity::new(64000, share_percent, 16).with_turn_period(200);
+        capacity.enable_turn_gate();
+        self.write_lock.lock().unwrap().radio_capacity = Some(capacity);
+        self.enable_radio_capacity_control();
+    }
+
     pub fn open(cfg: &SerialLinkConfig) -> anyhow::Result<Self> {
         #[cfg(target_os = "linux")]
         let inner = serialport::new(&cfg.port, cfg.baud_rate as u32)
@@ -2549,7 +2558,7 @@ fn bound_raw_uart_buffer(rx_buf: &mut Vec<u8>, failed_prefix: &mut usize) {
 static AIR_RX_VIRTUAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AIR_RX_WALL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AIR_RX_BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-fn note_air_rx_now() {
+pub(crate) fn note_air_rx_now() {
     AIR_BURSTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
