@@ -524,6 +524,10 @@ impl AppState {
         if crate::rrls::is_rrls() {
             return;
         }
+        self.publish_router_flight_state(next_state);
+    }
+
+    fn publish_router_flight_state(&self, next_state: FlightState) {
         let Some(router) = self.topology_router.get() else {
             log::warn!(
                 "flight-state change not dispatched because topology router is not initialized state={next_state:?}"
@@ -1862,7 +1866,16 @@ impl AppState {
     pub(crate) fn observe_local_manual_stop_admission(&self) {
         let actual = self.local_flight_state_snapshot();
         crate::flight_sim::sync_local_flight_state(actual);
-        self.queue_router_flight_state_update(actual);
+        // An RRLS in takeover is the AV bay's station: its own Abort writes the
+        // Aborted FLIGHT_STATE like the primary's (only RF and PB's way to take
+        // it). Its projections of the primary's state still never publish.
+        if crate::rrls::is_rrls() {
+            if crate::rrls::takeover_active() {
+                self.publish_router_flight_state(actual);
+            }
+        } else {
+            self.queue_router_flight_state_update(actual);
+        }
         let _ = self.state_tx.send(FlightStateMsg { state: actual });
         self.broadcast_fill_targets_snapshot();
         let tx = self.db_queue_tx.clone();

@@ -297,7 +297,12 @@ fn packet_bytes(data_type: &str, endpoint: &str, payload: Arc<[u8]>) -> Result<P
 fn flight_state_wire_packet(state: NetworkFlightState, timestamp: u64) -> Result<Packet> {
     // The simulator's set-(a) wire assertion reads this line.
     log::info!("FLIGHT_STATE wire value={} ({})", state as u8, state.label());
-    packet_bytes_at(FLIGHT_STATE_TYPE, "FLIGHT_STATE", Arc::from([state as u8]), timestamp)
+    // Stamped with this station's own sender: an RRLS writes it only in a
+    // takeover (its operator's Abort), and must neither pass as the primary
+    // (whose handler seeds its desired state from "GS") nor lose the re-send
+    // rules, which re-send only this router's own latest value.
+    let sender = if crate::rrls::is_rrls() { "RRLS" } else { Board::GroundStation.sender_id() };
+    packet_from(FLIGHT_STATE_TYPE, "FLIGHT_STATE", Arc::from([state as u8]), timestamp, sender)
 }
 /// A stored (GS-internal) phase as it goes on the wire.
 fn network_phase(phase: u8) -> Result<NetworkFlightState> {
@@ -312,10 +317,20 @@ fn packet_bytes_at(
     payload: Arc<[u8]>,
     timestamp: u64,
 ) -> Result<Packet> {
+    packet_from(data_type, endpoint, payload, timestamp, Board::GroundStation.sender_id())
+}
+
+fn packet_from(
+    data_type: &str,
+    endpoint: &str,
+    payload: Arc<[u8]>,
+    timestamp: u64,
+    sender: &str,
+) -> Result<Packet> {
     Ok(Packet::new(
         crate::telemetry_schema::data_type(data_type),
         &[crate::telemetry_schema::endpoint(endpoint)],
-        Board::GroundStation.sender_id(),
+        sender,
         timestamp,
         payload,
     )?
@@ -359,12 +374,15 @@ const STATION_VARIABLES: [&str; 9] = [
 pub(crate) fn station_serves(ty: sedsnet::config::DataType) -> bool {
     !crate::rrls::is_rrls() && STATION_VARIABLES.iter().any(|name| crate::telemetry_schema::data_type(name) == ty)
 }
-/// RRLS takeover: the cosmetic outputs (underglow, buzzer) become writable
-/// while it owns the AV bay and read-only again when it hands back.
+/// RRLS takeover: the cosmetic outputs (underglow, buzzer) and FLIGHT_STATE
+/// become writable while it owns the AV bay and read-only again when it hands
+/// back. FLIGHT_STATE carries only its operator's Abort (see
+/// AppState::observe_local_manual_stop_admission).
 pub(crate) fn set_takeover_outputs_writable(router: &Router, writable: bool) -> Result<()> {
-    for output in NetworkOutput::ALL {
+    let types = NetworkOutput::ALL.map(|output| output.data_type());
+    for data_type in types.into_iter().chain([FLIGHT_STATE_TYPE]) {
         router.enable_network_variable(
-            crate::telemetry_schema::data_type(output.data_type()),
+            crate::telemetry_schema::data_type(data_type),
             if writable {
                 NetworkVariablePermissions::READ_WRITE
             } else {

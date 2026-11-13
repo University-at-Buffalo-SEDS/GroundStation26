@@ -108,11 +108,18 @@ impl LocalStopAdmission {
     pub(crate) fn generation(&self) -> u64 { self.generation }
     pub(crate) fn epoch(&self) -> u64 { self.epoch }
     pub(crate) fn wire(&self) -> WirePolicy { self.wire }
+    /// This station's own original: the primary's, or an RRLS's while its
+    /// takeover makes it the AV bay's station (it then writes the Aborted
+    /// FLIGHT_STATE itself; RF and PB take an Abort only from that).
     fn is_primary_original(&self, state: &AppState, router: &Router) -> bool {
-        !crate::rrls::is_rrls()
+        let own_station = if crate::rrls::is_rrls() {
+            crate::rrls::takeover_active() && state.canonical_network_sender_id(&self.sender) == "RRLS"
+        } else {
+            state.board_from_network_sender(&self.sender) == Some(crate::types::Board::GroundStation)
+        };
+        own_station
             && self.router == router as *const Router as usize
             && state.topology_router.get().is_some_and(|owner| std::ptr::eq(owner.as_ref(), router))
-            && state.board_from_network_sender(&self.sender) == Some(crate::types::Board::GroundStation)
             && self.timestamp == match self.wire { WirePolicy::Untimed => 0, WirePolicy::KnownUtc(original) => original }
     }
 }
@@ -328,3 +335,5 @@ pub(crate) fn retained_bound(state: &AppState) -> Result<u64, &'static str> {
 
 #[cfg(test)]
 mod local_stop_sdk_tests { include!("local_stop_sdk_tests.rs"); }
+#[cfg(test)]
+mod rrls_takeover_abort_tests { include!("rrls_takeover_abort_tests.rs"); }
