@@ -48,9 +48,10 @@ async fn an_abort_in_rf_burst_takes_its_flight_state_along() {
         let dir = std::env::temp_dir().join(format!("gs-abort-state-worker-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("clock"), "30000").unwrap();
+        let variant = std::env::var("GS_ABORT_STATE_VARIANT").unwrap_or_else(|_| "urgent".into());
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1")
+            .env(CHILD, variant)
             .env("GS_SIM_CLOCK_FILE", dir.join("clock"))
             .env("GS_SIMULATED_SERIAL_PTY", "1")
             .env("GS_RRLS_ROLE", "primary")
@@ -84,16 +85,27 @@ async fn an_abort_in_rf_burst_takes_its_flight_state_along() {
         .with_sender("GS"),
         Box::new(move || sdk_now.load(Ordering::SeqCst)),
     ));
-    for name in ["ABORT", "FLIGHT_COMMAND"] {
-        sedsnet::set_type_scheduling_class(crate::telemetry_schema::data_type(name), -1);
+    let variant = std::env::var(CHILD).unwrap();
+    if variant != "plain" {
+        for name in ["ABORT", "FLIGHT_COMMAND"] {
+            sedsnet::set_type_scheduling_class(crate::telemetry_schema::data_type(name), -1);
+        }
     }
+    router
+        .enable_network_variable(
+            crate::telemetry_schema::data_type("FLIGHT_STATE"),
+            sedsnet::router::NetworkVariablePermissions::READ_WRITE,
+        )
+        .unwrap();
     let budget = Arc::new(TxQueueBudget::new_radio(2048, 256));
     let (sender, receiver) = mpsc::unbounded_channel();
     let queue_budget = budget.clone();
+    let activity: Arc<TransportTxActivity> = Arc::new(Default::default());
+    let side_activity = activity.clone();
     let (side, tracker) = router
         .add_side_packed_leased_with_priority_and_options(
             "rocket_comms",
-            move |lease, priority| queue_budget.try_send_leased(&sender, priority, lease),
+            move |lease, priority| queue_budget.try_send_leased_tracked(&sender, priority, lease, &side_activity),
             RouterSideOptions { reliable_enabled: false, ..Default::default() }
                 .with_small_packet_transport(192),
             RetryTrackerLimits::default(),
@@ -112,7 +124,7 @@ async fn an_abort_in_rf_burst_takes_its_flight_state_along() {
         router.clone(),
         state,
         CommsWorkerHandle {
-            transport_activity: None,
+            transport_activity: Some(activity.clone()),
             name: "rocket_comms",
             tx_budget: Some(budget),
             comms: Arc::new(Mutex::new(Box::new(rx))),
@@ -153,11 +165,23 @@ async fn an_abort_in_rf_burst_takes_its_flight_state_along() {
         // station flushes the SDK at once (publish_local_claim).
         if ms == 32_430 {
             assert!(in_burst(ms));
-            router.tx_queue(pack("FLIGHT_STATE", "FLIGHT_STATE", &[15])).unwrap();
+            // As the station: set_network_variable (sent at once, or queued
+            // while another thread is in side TX), then the ABORT queued and
+            // the SDK flushed for 3 ms.
+            router.set_network_variable(pack("FLIGHT_STATE", "FLIGHT_STATE", &[15])).unwrap();
             router.tx_queue(pack("ABORT", "ABORT", b"SEDS_MANUAL_ABORT_V1:K")).unwrap();
             router.process_all_queues_with_timeout(3).unwrap();
         }
-        router.dispatch_tx_queue_with_timeout(0).unwrap();
+        // Ordinary station telemetry keeps the router's side busy, as the
+        // router worker does on the station.
+        if ms % 20 == 0 {
+            let _ = router.tx_queue(pack("BATTERY_VOLTAGE", "GROUND_STATION", &12.5f32.to_le_bytes()));
+        }
+        // Only the RX-driven router pass dispatches: the station's router
+        // worker runs when it receives (RF's burst), not on a timer.
+        if in_burst(ms) {
+            router.dispatch_tx_queue_with_timeout(0).unwrap();
+        }
         std::thread::sleep(Duration::from_millis(1));
         while let Ok(n) = peer.read(&mut buf) {
             if n == 0 {
